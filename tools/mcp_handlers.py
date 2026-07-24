@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import shutil
@@ -95,6 +96,13 @@ logger = logging.getLogger(__name__)
 # Baked by scripts/build_dist.py in the public distribution ("owner/repo").
 # Empty in the private checkout, which disables the on-demand update path.
 _DIST_UPDATE_REPO = "OmarMokhtar-Saad/qa-agent-pro"
+
+# FROZEN-SCHEMA POLICY: editors cache tool definitions for the whole session
+# and ignore list_changed, so a signature change is invisible until the editor
+# restarts. Keep tool names/params stable; when a release DOES change one,
+# bump this to that release version — qa_setup_check then tells users whose
+# session predates it that a one-time editor restart is needed.
+_TOOL_SCHEMAS_CHANGED_IN = "1.0.8"
 
 
 def _schedule_reload() -> None:
@@ -1389,10 +1397,35 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
         ok, warning = check_backend()
         backend = (settings.qa_llm_backend or "cli").strip().lower()
         app_version = _local_version(_INSTALL_DIR)
+        restart_note = ""
+        try:
+            state = json.loads(
+                (_INSTALL_DIR / "backups" / "session-state.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            client_v = str(state.get("client_schema_version") or "")
+        except (OSError, ValueError):
+            client_v = ""
+        if client_v:
+            from tools.updater import _parse_version
+
+            have = _parse_version(client_v)
+            need = _parse_version(_TOOL_SCHEMAS_CHANGED_IN)
+            if have is not None and need is not None and have < need:
+                restart_note = (
+                    "⚠️ **One-time editor restart needed** — this editor session "
+                    f"loaded the agent's tool definitions at v{client_v}, but "
+                    f"they changed in v{_TOOL_SCHEMAS_CHANGED_IN}. Editors do "
+                    "not refresh tool definitions mid-session: quit and reopen "
+                    "the editor (Cmd+Q on macOS) to load the latest "
+                    "capabilities. Everything else updates automatically."
+                )
         lines = [
             "## Setup check",
             "",
             *([f"**App version:** v{app_version}", ""] if app_version else []),
+            *([restart_note, ""] if restart_note else []),
             *([update_note, ""] if update_note else []),
             f"**Python:** {sys.version.split()[0]}",
             f"**LLM backend:** `{backend}` — "

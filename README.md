@@ -160,6 +160,10 @@ Edit `~/qa-agent-pro/.env` (created from `.env.example`):
   handshake, so you never restart your editor.
 - **Crash resilient**: if the server process ever dies, the launcher
   respawns it and your editor session continues.
+- **Rare exception**: releases that change tool *definitions* need one
+  editor restart (editors cache definitions and ignore refresh
+  notifications) — `qa_setup_check` tells you explicitly when that is
+  the case; otherwise never restart.
 - **The install is read-only by design**: code files are hash-verified
   against `MANIFEST.sha256` and chmod'ed read-only on every start. Manual
   or AI-editor edits fail to save — and anything force-edited is restored
