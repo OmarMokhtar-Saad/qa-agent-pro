@@ -221,9 +221,17 @@ class Settings(BaseSettings):
     qa_rag_storage_path: str = "corpus"
     qa_rag_similarity_threshold: float = 0.3
     qa_rag_top_k: int = 5
-    # Corpus similarity metric: "jaccard" (default, set overlap) or "cosine"
-    # (TF-IDF cosine — weights rare/discriminative terms, better dedup). (I-051)
+    # Corpus similarity metric: "jaccard" (default, set overlap), "cosine"
+    # (TF-IDF cosine — weights rare/discriminative terms) or "bm25" (Okapi
+    # BM25, the consensus lexical-retrieval baseline; saturation-normalized
+    # to [0,1) so the threshold above applies unchanged). (I-051)
     qa_rag_similarity_mode: str = "jaccard"
+    # Freshness boost: entries decay with this half-life (days) and fresh ones
+    # get up to +15% score. 0 disables (default — no behavior change).
+    qa_rag_recency_half_life_days: int = 0
+    # Corpus size cap per file: adding beyond it prunes the oldest entries.
+    # 0 = unlimited (default).
+    qa_rag_max_entries: int = 0
 
     # TestRail API push (T-10). Base instance URL (e.g. https://acme.testrail.io),
     # a user email, and an API key. TESTRAIL_DRY_RUN defaults ON so a push
@@ -416,6 +424,8 @@ class Settings(BaseSettings):
         "qa_maestro_translate_concurrency",
         "qa_max_spec_bytes",
         "qa_max_spec_chars",
+        "qa_rag_recency_half_life_days",
+        "qa_rag_max_entries",
         "qa_update_timeout",
         mode="before",
     )

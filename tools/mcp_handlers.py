@@ -723,7 +723,11 @@ async def handle_explore_step(
 
 
 async def handle_search_corpus(
-    query: str, entry_type: str = "test_case", *, progress: ProgressCb = None
+    query: str,
+    entry_type: str = "test_case",
+    feature: str = "",
+    *,
+    progress: ProgressCb = None,
 ) -> str:
     query = (query or "").strip()
     if not query:
@@ -735,6 +739,9 @@ async def handle_search_corpus(
             query,
             entry_type=(entry_type or "test_case"),
             top_k=settings.qa_rag_top_k,
+            metadata_filter=(
+                {"feature": feature.strip()} if (feature or "").strip() else None
+            ),
         )
         if result.get("error"):
             return f"⚠️ Corpus search failed: {result['error']}"
