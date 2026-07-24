@@ -170,12 +170,13 @@ def build_server():
 
     @mcp.tool()
     async def qa_search_corpus(
-        query: str, ctx: Context, entry_type: str = "test_case"
+        query: str, ctx: Context, entry_type: str = "test_case", feature: str = ""
     ) -> str:
         """Search the RAG corpus (requires QA_RAG_ENABLED) for similar past test
-        cases or bug reports. entry_type is 'test_case' or 'bug_report'."""
+        cases or bug reports. entry_type is 'test_case' or 'bug_report'; pass
+        feature to narrow results to entries stored for that feature."""
         return await mcp_handlers.handle_search_corpus(
-            query, entry_type, progress=_make_progress(ctx)
+            query, entry_type, feature, progress=_make_progress(ctx)
         )
 
     @mcp.tool()
