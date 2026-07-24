@@ -65,6 +65,10 @@ class Settings(BaseSettings):
 
     # Model id used by both backends (CLI --model flag / API model field).
     qa_llm_model: str = "claude-sonnet-4-6"
+    # Per-LLM-call timeout in seconds (llm.py kills the subprocess beyond it).
+    # 120 suits dev; distribution installs ship 300 in .env (grounded prompts
+    # + concurrent category fan-out through a local CLI can run long).
+    qa_llm_timeout_s: int = 120
 
     # Model id for the "cursor" backend (e.g. "sonnet-4", "gpt-5"). Uses
     # cursor-agent's own model naming, which differs from qa_llm_model's.
@@ -424,6 +428,7 @@ class Settings(BaseSettings):
         "qa_maestro_translate_concurrency",
         "qa_max_spec_bytes",
         "qa_max_spec_chars",
+        "qa_llm_timeout_s",
         "qa_rag_recency_half_life_days",
         "qa_rag_max_entries",
         "qa_update_timeout",

@@ -88,7 +88,16 @@ class CursorAgentError(RuntimeError):
 
 _DEFAULT_MODEL = "claude-sonnet-4-6"
 _MAX_TOKENS = 16384
-_TIMEOUT_S = 120
+def _int_setting(name: str, default: int) -> int:
+    value = getattr(settings, name, default)
+    return value if isinstance(value, int) and value > 0 else default
+
+
+# Per-call LLM timeout (seconds). QA_LLM_TIMEOUT_S overrides (the distribution
+# ships 300 — big grounded prompts + concurrent category fan-out can exceed the
+# 120s dev default). Import-time read: a config change applies on the next
+# server reload, which distribution installs perform automatically.
+_TIMEOUT_S = _int_setting("qa_llm_timeout_s", 120)
 _CLI: str | None = None
 
 
@@ -260,6 +269,10 @@ def _popen_cli(system: str, user: str, model: str | None = None) -> subprocess.P
             "--setting-sources",
             "project",
         ],
+        # DEVNULL is load-bearing: under the MCP server, inherited stdin is the
+        # editor's protocol pipe — the CLI would stall 3s waiting on it (and
+        # could even consume protocol bytes).
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=os.path.expanduser("~"),
@@ -666,6 +679,8 @@ def _popen_cursor(
             "--sandbox",
             "enabled",
         ],
+        # Same stdin isolation as _popen_cli (MCP protocol pipe protection).
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=workdir,
