@@ -36,6 +36,18 @@ logger = logging.getLogger("qa_agents.mcp")
 SERVER_NAME = "qa-agent-pro"
 
 
+def _note_client(ctx) -> None:
+    """Forward the MCP client's name (initialize clientInfo) to the LLM layer
+    so QA_LLM_BACKEND=auto can match the backend to the host editor."""
+    try:
+        import llm
+
+        name = ctx.session.client_params.clientInfo.name
+        llm.set_host_client(name)
+    except Exception:
+        logger.debug("could not read clientInfo", exc_info=True)
+
+
 def _make_progress(ctx):
     """Adapt a FastMCP Context into the handlers' ``(message)->awaitable`` callback.
 
@@ -44,6 +56,7 @@ def _make_progress(ctx):
     keep the stream alive). Best-effort — a transport hiccup never breaks the
     tool.
     """
+    _note_client(ctx)  # every tool builds one of these — cheap host detection
     state = {"n": 0}
 
     async def progress(message: str) -> None:

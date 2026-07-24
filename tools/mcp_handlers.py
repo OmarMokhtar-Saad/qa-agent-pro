@@ -1560,7 +1560,9 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
                 _schedule_reload()
         await _emit(progress, "🔎 Checking the LLM backend…")
         ok, warning = check_backend()
-        backend = (settings.qa_llm_backend or "cli").strip().lower()
+        from llm import describe_backend
+
+        backend = describe_backend()
         app_version = _local_version(_INSTALL_DIR)
         restart_note = ""
         try:
