@@ -311,6 +311,20 @@ def main() -> None:
         )
         return
     server = build_server()
+
+    def _prewarm_backend() -> None:
+        # Warm the cursor-agent auth probe cache off the serving path: it can
+        # take up to 20s and must never run while a request is in flight.
+        try:
+            import llm as _llm
+
+            _llm._cursor_usable()
+        except Exception:
+            logger.debug("backend prewarm failed", exc_info=True)
+
+    import threading
+
+    threading.Thread(target=_prewarm_backend, daemon=True).start()
     logger.info("Starting the qa-agents MCP server over stdio…")
     server.run()
 

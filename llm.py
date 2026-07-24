@@ -1030,7 +1030,8 @@ def _run_sync_vision_cursor(
         env = {k: v for k, v in os.environ.items() if k not in _STRIP}
         try:
             proc = subprocess.run(
-                [
+                stdin=subprocess.DEVNULL,  # MCP stdin protection (see _popen_cli)
+                args=[
                     _get_cursor_cli(),
                     "-p",
                     prompt,
@@ -1133,6 +1134,10 @@ def _cursor_logged_in(cursor_path: str) -> bool:
     try:
         proc = subprocess.run(
             [cursor_path, "models"],
+            # DEVNULL is load-bearing: under the MCP server the inherited stdin
+            # is the editor's protocol pipe — without this the probe can EAT
+            # protocol messages for its whole runtime and hang the session.
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
