@@ -533,6 +533,47 @@ def shape_mobile_explore(device_id: str, payload: dict) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def _jira_config_hint(url: str) -> str:
+    """Actionable one-time-setup instructions when a pasted ticket URL needs
+    Jira credentials that are not configured (per-user .env; never shipped)."""
+    try:
+        from urllib.parse import urlparse
+
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return ""
+    looks_jira = "atlassian.net" in host or "/browse/" in url or "jira" in host
+    if not host or not looks_jira:
+        return ""
+    configured_host = ""
+    try:
+        from urllib.parse import urlparse as _p
+
+        configured_host = (_p(settings.jira_base_url).hostname or "").lower()
+    except ValueError:
+        pass
+    if configured_host == host and (settings.jira_api_token or "").strip():
+        return ""  # credentials exist for this host — the failure is elsewhere
+    return (
+        f"⚠️ **This ticket needs Jira credentials.** `{host}` requires "
+        "authentication and the agent has none configured for it yet.\n\n"
+        "One-time setup (about 2 minutes):\n"
+        "1. Create an API token at "
+        "https://id.atlassian.com/manage-profile/security/api-tokens\n"
+        "2. Open the settings file `~/qa-agent-pro/.env` "
+        "(`nano ~/qa-agent-pro/.env`, or on macOS `open -e "
+        "~/qa-agent-pro/.env`) and add:\n"
+        "```\n"
+        f"JIRA_BASE_URL=https://{host}\n"
+        "JIRA_EMAIL=your-email@company.com\n"
+        "JIRA_API_TOKEN=<paste the token here>\n"
+        "```\n"
+        "3. Run `qa_setup_check` — it reloads the server and shows Jira as "
+        "configured.\n\n"
+        "Then paste the ticket URL again and I'll read it directly."
+    )
+
+
 async def handle_generate_test_cases(
     feature_or_url: str,
     *,
@@ -564,6 +605,10 @@ async def handle_generate_test_cases(
             if openapi_text is None:
                 await _emit(progress, "🔗 Fetching the ticket / page…")
                 url_content = await fetch_url_content(text)
+                if url_content.get("error"):
+                    hint = _jira_config_hint(text)
+                    if hint:
+                        return hint
                 try:
                     ui_content = await extract_ui_elements(text, prefetched=url_content)
                 except Exception:
@@ -1174,6 +1219,10 @@ async def handle_feature_analysis(
             await _emit(progress, "🔗 Fetching the ticket…")
             url_content = await fetch_url_content(text)
             used_url = True
+            if url_content.get("error"):
+                hint = _jira_config_hint(text)
+                if hint:
+                    return hint
             if not url_content.get("error"):
                 jira_text = url_content.get("content") or ""
 
@@ -1450,6 +1499,16 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
             f"**Python:** {sys.version.split()[0]}",
             f"**LLM backend:** `{backend}` — "
             + ("✅ ready" if ok else f"❌ {warning}"),
+            "**Jira:** "
+            + (
+                "✅ configured ("
+                + str(settings.jira_base_url).strip().rstrip("/")
+                + ")"
+                if (settings.jira_base_url or "").strip()
+                and (settings.jira_api_token or "").strip()
+                else "⬜ not configured — pasting Jira ticket URLs needs "
+                "JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN in .env"
+            ),
             "",
             "**Tooling:**",
             _binary_line("cursor-agent"),
