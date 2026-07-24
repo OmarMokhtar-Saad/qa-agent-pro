@@ -1295,13 +1295,16 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
     await _audit("mcp_setup_check")
     try:
         from llm import check_backend
+        from tools.updater import _INSTALL_DIR, _local_version
 
         await _emit(progress, "🔎 Checking the LLM backend…")
         ok, warning = check_backend()
         backend = (settings.qa_llm_backend or "cli").strip().lower()
+        app_version = _local_version(_INSTALL_DIR)
         lines = [
             "## Setup check",
             "",
+            *([f"**App version:** v{app_version}", ""] if app_version else []),
             f"**Python:** {sys.version.split()[0]}",
             f"**LLM backend:** `{backend}` — "
             + ("✅ ready" if ok else f"❌ {warning}"),
