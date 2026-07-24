@@ -141,17 +141,37 @@ def _cursor_available() -> bool:
     return bool(shutil.which(cli) or os.path.exists(cli))
 
 
+_CURSOR_USABLE_CACHE: dict = {}
+
+
+def _cursor_usable() -> bool:
+    """Binary present AND able to authenticate (api key, or a login probe —
+    cursor-agent `status` lies, so we reuse the real-auth probe from
+    check_backend, cached per process). Auto mode must never pick a backend
+    that will fail at generation time."""
+    if not _cursor_available():
+        return False
+    if settings.cursor_api_key:
+        return True
+    if "login" not in _CURSOR_USABLE_CACHE:
+        try:
+            _CURSOR_USABLE_CACHE["login"] = _cursor_logged_in(_get_cursor_cli())
+        except Exception:
+            _CURSOR_USABLE_CACHE["login"] = False
+    return _CURSOR_USABLE_CACHE["login"]
+
+
 def _auto_backend() -> str:
     host = _HOST_CLIENT["name"]
-    if "cursor" in host and _cursor_available():
+    if "cursor" in host and _cursor_usable():
         return "cursor"
     if "claude" in host and _cli_available():
         return "cli"
-    # Unknown host (e.g. Gemini — no backend for it yet) or the matching CLI
-    # is missing: first available wins, keeping the previous default order.
+    # Unknown host (e.g. Gemini — no backend for it yet), or the host-matching
+    # backend cannot actually authenticate: first USABLE backend wins.
     if _cli_available():
         return "cli"
-    if _cursor_available():
+    if _cursor_usable():
         return "cursor"
     if settings.anthropic_api_key:
         return "api"
