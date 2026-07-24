@@ -15,6 +15,7 @@ the install current WITHOUT restarting the editor:
 stdout carries the MCP protocol; every log line goes to stderr. A network
 failure never blocks startup — the current version keeps serving."""
 
+import hashlib
 import json
 import logging
 import os
@@ -37,6 +38,14 @@ def _interval_seconds() -> float:
     return max(60.0, minutes * 60.0)
 
 
+def _self_hash() -> str:
+    try:
+        with open(os.path.abspath(__file__), "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return ""
+
+
 class Supervisor:
     """Owns the editor's stdio; proxies to a restartable child MCP server."""
 
@@ -48,6 +57,7 @@ class Supervisor:
         self.last_activity = time.time()
         self.closing = False
         self.restarting = False
+        self.self_hash = _self_hash()
 
     # ------------------------------------------------- child lifecycle
     def spawn(self, replay: bool) -> None:
@@ -88,6 +98,8 @@ class Supervisor:
                 log.debug("could not send tools/list_changed", exc_info=True)
 
     def restart_child(self, reason: str) -> None:
+        # A changed launcher.py hot-swaps the whole process instead.
+        self.maybe_self_exec(reason)
         with self.child_lock:
             self.restarting = True
             old = self.child
@@ -100,6 +112,40 @@ class Supervisor:
             log.info("Restarting MCP server (%s).", reason)
             self.spawn(replay=True)
             self.restarting = False
+
+    def maybe_self_exec(self, reason: str) -> None:
+        """Hot-swap the launcher itself: when an update changed launcher.py
+        on disk, re-exec on the new code — same PID, same stdio pipes — and
+        hand the recorded MCP handshake to the next incarnation, which
+        replays it and announces tools/list_changed. The editor never
+        needs a restart, even for launcher changes."""
+        if self.closing or _self_hash() == self.self_hash:
+            return
+        log.info("Launcher code changed on disk — re-exec (%s).", reason)
+        with self.child_lock:
+            self.restarting = True
+            if self.child is not None and self.child.poll() is None:
+                self.child.terminate()
+                try:
+                    self.child.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.child.kill()
+            resume = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "backups",
+                "handshake-resume.jsonl",
+            )
+            try:
+                os.makedirs(os.path.dirname(resume), exist_ok=True)
+                with open(resume, "wb") as fh:
+                    for line in self.handshake:
+                        fh.write(line)
+            except OSError:
+                resume = ""
+            args = [sys.executable, os.path.abspath(__file__)]
+            if resume and self.handshake:
+                args += ["--resume", resume]
+            os.execv(sys.executable, args)
 
     # ------------------------------------------------------------ pumps
     def _pump_child_out(self, child) -> None:
@@ -176,17 +222,35 @@ def main() -> int:
         format="%(levelname)s %(name)s: %(message)s",
         stream=sys.stderr,
     )
-    try:
-        from tools.updater import run_update_check
+    resume_path = ""
+    if "--resume" in sys.argv:
+        try:
+            resume_path = sys.argv[sys.argv.index("--resume") + 1]
+        except IndexError:
+            resume_path = ""
+    if not resume_path:
+        try:
+            from tools.updater import run_update_check
 
-        status = run_update_check(
-            force=True, repo_override=DIST_REPO, lock_override=True
-        )
-        log.info("Startup update check: %s", status)
-    except Exception as exc:  # never block startup
-        log.warning("Update check failed (%s) — starting current version.", exc)
+            status = run_update_check(
+                force=True, repo_override=DIST_REPO, lock_override=True
+            )
+            log.info("Startup update check: %s", status)
+        except Exception as exc:  # never block startup
+            log.warning("Update check failed (%s) — starting current version.", exc)
     sup = Supervisor()
-    sup.spawn(replay=False)
+    if resume_path:
+        try:
+            with open(resume_path, "rb") as fh:
+                sup.handshake = [ln for ln in fh.readlines() if ln.strip()]
+            os.unlink(resume_path)
+        except OSError:
+            sup.handshake = []
+    if sup.handshake:
+        log.info("Launcher self-updated — resuming the editor session.")
+        sup.spawn(replay=True)
+    else:
+        sup.spawn(replay=False)
     threading.Thread(target=sup.watchdog, daemon=True).start()
     sup.pump_client_in()  # blocks until the editor disconnects
     return 0
