@@ -965,18 +965,28 @@ _TC_SOURCE_PROMPTS = {
 
 
 def _tc_source_menu_markdown() -> str:
-    """Markdown fallback when no source is given and elicitation is missing."""
+    """Fallback when the native dialog is unavailable or was auto-dismissed.
+
+    Written as an instruction to the HOST assistant: present our six options
+    as a structured multiple-choice question (editors render those reliably,
+    unlike MCP elicitation dialogs), then call back with the answer."""
     return (
-        "## Where is the feature coming from?\n\n"
-        "Call `qa_generate_test_cases` again with `feature_or_url` set to one "
-        "of:\n"
-        "- a **feature description** in plain language\n"
-        "- a **Jira/issue URL**\n"
-        "- a **web page URL** (the live UI is read)\n"
-        "- a **Swagger/OpenAPI spec URL** (API test cases)\n\n"
-        "For **mobile screens** (or Jira + mobile merged), call "
-        "`qa_feature_analysis` with `mode=mobile` or `mode=jira_mobile` — "
-        "I'll list connected devices and capture the screens."
+        "## Ask the user: where is the feature coming from?\n\n"
+        "Present EXACTLY these six options to the user as a multiple-choice "
+        "question (use your ask-user/questions UI, not prose), then follow "
+        "the mapping below. Do not invent different options.\n\n"
+        "1. **Describe the feature** — user types it in plain language\n"
+        "2. **Jira ticket** — user pastes the issue URL\n"
+        "3. **Web page** — user pastes the page URL (the live UI is read)\n"
+        "4. **Swagger/OpenAPI link** — user pastes the spec URL (API test "
+        "cases)\n"
+        "5. **Mobile screens** — capture from a connected device\n"
+        "6. **Jira + mobile screens** — merge the ticket with captured "
+        "screens\n\n"
+        "After the user picks: for options 1-4 call `qa_generate_test_cases` "
+        "with `feature_or_url` set to their text/URL; for option 5 call "
+        "`qa_feature_analysis` with `mode=mobile`; for option 6 call "
+        "`qa_feature_analysis` with `mode=jira_mobile`."
     )
 
 
