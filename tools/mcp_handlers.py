@@ -530,11 +530,17 @@ async def handle_generate_test_cases(
     *,
     attached_images: list | None = None,
     force_feature_report: bool = False,
+    choose: ChooseCb = None,
+    ask_text: AskCb = None,
     progress: ProgressCb = None,
 ) -> str:
     text = (feature_or_url or "").strip()
     if not text:
-        return "⚠️ Provide a feature description or a Jira/issue URL."
+        # No source given — run the guided picker (dialogs where the client
+        # supports elicitation, markdown menu otherwise) instead of erroring.
+        return await _guided_test_cases(
+            choose=choose, ask_text=ask_text, progress=progress
+        )
     try:
         url_content = None
         ui_content = None
@@ -935,9 +941,111 @@ _FA_MODE_LABELS = {
 _TC_SOURCE_LABELS = {
     "Describe the feature": "describe",
     "From a Jira ticket": "jira",
+    "From a web page URL": "web",
+    "From a Swagger/OpenAPI link": "swagger",
     "From mobile screens": "mobile",
     "Jira + mobile screens": "jira_mobile",
 }
+
+_TC_SOURCE_PROMPTS = {
+    "describe": "Describe the feature to test:",
+    "jira": "Paste the Jira/issue URL (or describe the feature):",
+    "jira_mobile": "Paste the Jira/issue URL (or describe the feature):",
+    "web": "Paste the web page URL:",
+    "swagger": "Paste the Swagger/OpenAPI spec URL:",
+}
+
+
+def _tc_source_menu_markdown() -> str:
+    """Markdown fallback when no source is given and elicitation is missing."""
+    return (
+        "## Where is the feature coming from?\n\n"
+        "Call `qa_generate_test_cases` again with `feature_or_url` set to one "
+        "of:\n"
+        "- a **feature description** in plain language\n"
+        "- a **Jira/issue URL**\n"
+        "- a **web page URL** (the live UI is read)\n"
+        "- a **Swagger/OpenAPI spec URL** (API test cases)\n\n"
+        "For **mobile screens** (or Jira + mobile merged), call "
+        "`qa_feature_analysis` with `mode=mobile` or `mode=jira_mobile` — "
+        "I'll list connected devices and capture the screens."
+    )
+
+
+async def _guided_test_cases(
+    *,
+    choose: ChooseCb = None,
+    ask_text: AskCb = None,
+    progress: ProgressCb = None,
+) -> str:
+    """Guided source picker for test-case generation (Chainlit-starter parity).
+
+    Asks where the feature comes from — describe / Jira / web URL / Swagger
+    link / mobile screens / Jira + mobile — collects the missing input, and
+    runs the full generation. Dialogs where the client supports elicitation;
+    a markdown menu otherwise. Never raises."""
+    source = await _elicit_choice(
+        choose, "Where is the feature coming from?", list(_TC_SOURCE_LABELS)
+    )
+    if source.status == DECLINED:
+        return "👍 Cancelled."
+    src = _TC_SOURCE_LABELS.get(source.value or "", "")
+    if source.status != CHOSEN or not src:
+        # No choice dialogs — degrade to the simple typed-feature path.
+        asked = await _elicit_text(
+            ask_text,
+            "Describe the feature to test (or paste a Jira / web / Swagger URL):",
+        )
+        if asked.status == CHOSEN and (asked.value or "").strip():
+            return await handle_generate_test_cases(
+                asked.value.strip(), progress=progress
+            )
+        if asked.status == DECLINED:
+            return "👍 Cancelled."
+        return _tc_source_menu_markdown()
+    text = ""
+    if src in _TC_SOURCE_PROMPTS:
+        asked = await _elicit_text(ask_text, _TC_SOURCE_PROMPTS[src])
+        if asked.status == DECLINED:
+            return "👍 Cancelled."
+        if asked.status != CHOSEN or not (asked.value or "").strip():
+            return _tc_source_menu_markdown()
+        text = asked.value.strip()
+    images: list = []
+    if src in ("mobile", "jira_mobile"):
+        if not settings.qa_mobile_capture:
+            if src == "mobile":
+                return "ℹ️ Mobile capture is disabled (set QA_MOBILE_CAPTURE=true)."
+            # jira_mobile continues from the ticket alone (parity with the
+            # Chainlit wizard's capture-off fallback).
+        else:
+            picked_dev = await _elicit_device(choose)
+            if picked_dev.status == DECLINED:
+                return "👍 Cancelled — no device selected."
+            if picked_dev.status != CHOSEN:
+                return (
+                    "⚠️ No connected devices found. Attach a device or boot an "
+                    "emulator/simulator, then try again (check with "
+                    "`qa_list_devices`)."
+                )
+            device = await _resolve_device(picked_dev.value or "")
+            if device is None:
+                return "⚠️ Device not found — run qa_list_devices and retry."
+            screens, capture_error = await _fa_capture_screens(
+                device, choose=choose, progress=progress
+            )
+            if capture_error and not screens:
+                return f"⚠️ Couldn't capture a screenshot: {capture_error}"
+            images = screens
+    # Chainlit parity: the "Test cases" starter runs the Feature Analysis
+    # wizard, which forces the report on and generates the full suite —
+    # mirror that for every source.
+    return await handle_generate_test_cases(
+        text or "Feature captured from mobile device screens.",
+        attached_images=images or None,
+        force_feature_report=True,
+        progress=progress,
+    )
 
 
 def _fa_mode_menu_markdown() -> str:
@@ -1186,74 +1294,8 @@ async def handle_wizard(
         choice = top.value
 
         if choice == "Generate test cases":
-            source = await _elicit_choice(
-                choose, "Where is the feature coming from?", list(_TC_SOURCE_LABELS)
-            )
-            if source.status == DECLINED:
-                return "👍 Cancelled."
-            src = _TC_SOURCE_LABELS.get(source.value or "", "")
-            if source.status != CHOSEN or not src:
-                # No choice dialogs — degrade to the simple typed-feature path.
-                asked = await _elicit_text(
-                    ask_text,
-                    "Describe the feature to test (or paste a Jira/issue URL):",
-                )
-                if asked.status == CHOSEN and (asked.value or "").strip():
-                    return await handle_generate_test_cases(
-                        asked.value.strip(), progress=progress
-                    )
-                if asked.status == DECLINED:
-                    return "👍 Cancelled."
-                return _wizard_handoff_markdown(choice)
-            text = ""
-            if src in ("describe", "jira", "jira_mobile"):
-                prompt_msg = (
-                    "Describe the feature to test:"
-                    if src == "describe"
-                    else "Paste the Jira/issue URL (or describe the feature):"
-                )
-                asked = await _elicit_text(ask_text, prompt_msg)
-                if asked.status == DECLINED:
-                    return "👍 Cancelled."
-                if asked.status != CHOSEN or not (asked.value or "").strip():
-                    return _wizard_handoff_markdown(choice)
-                text = asked.value.strip()
-            images: list = []
-            if src in ("mobile", "jira_mobile"):
-                if not settings.qa_mobile_capture:
-                    if src == "mobile":
-                        return (
-                            "ℹ️ Mobile capture is disabled (set QA_MOBILE_CAPTURE=true)."
-                        )
-                    # jira_mobile continues from the ticket alone (parity with
-                    # the Chainlit wizard's capture-off fallback).
-                else:
-                    picked_dev = await _elicit_device(choose)
-                    if picked_dev.status == DECLINED:
-                        return "👍 Cancelled — no device selected."
-                    if picked_dev.status != CHOSEN:
-                        return (
-                            "⚠️ No connected devices found. Attach a device or "
-                            "boot an emulator/simulator, then run `qa_wizard` "
-                            "again (check with `qa_list_devices`)."
-                        )
-                    device = await _resolve_device(picked_dev.value or "")
-                    if device is None:
-                        return "⚠️ Device not found — run qa_list_devices and retry."
-                    screens, capture_error = await _fa_capture_screens(
-                        device, choose=choose, progress=progress
-                    )
-                    if capture_error and not screens:
-                        return f"⚠️ Couldn't capture a screenshot: {capture_error}"
-                    images = screens
-            # Chainlit parity: the "Test cases" starter runs the Feature
-            # Analysis wizard, which forces the report on and generates the
-            # full suite — mirror that for every source.
-            return await handle_generate_test_cases(
-                text or "Feature captured from mobile device screens.",
-                attached_images=images or None,
-                force_feature_report=True,
-                progress=progress,
+            return await _guided_test_cases(
+                choose=choose, ask_text=ask_text, progress=progress
             )
 
         if choice == "Report a bug":

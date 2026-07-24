@@ -119,14 +119,22 @@ def build_server():
     mcp = FastMCP(SERVER_NAME)
 
     @mcp.tool()
-    async def qa_generate_test_cases(feature_or_url: str, ctx: Context) -> str:
-        """Generate a structured test suite from a feature description or a Jira/issue URL.
+    async def qa_generate_test_cases(ctx: Context, feature_or_url: str = "") -> str:
+        """Generate a structured test suite. feature_or_url can be a feature
+        description, a Jira/issue URL, a web page URL, or a Swagger/OpenAPI
+        spec URL.
 
-        Returns a concise markdown summary plus a persisted suite_id to reuse with
-        qa_export_suite / qa_run_mobile_suite.
+        When the user asks for test cases WITHOUT saying where the feature
+        comes from, call this immediately with feature_or_url omitted — I will
+        ask them myself (describe / Jira / web / Swagger / mobile screens /
+        Jira + mobile) via a dialog or menu. Returns a concise markdown summary
+        plus a persisted suite_id to reuse with qa_export_suite.
         """
         return await mcp_handlers.handle_generate_test_cases(
-            feature_or_url, progress=_make_progress(ctx)
+            feature_or_url,
+            choose=_make_chooser(ctx),
+            ask_text=_make_asker(ctx),
+            progress=_make_progress(ctx),
         )
 
     @mcp.tool()
