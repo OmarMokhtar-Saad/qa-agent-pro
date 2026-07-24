@@ -115,9 +115,65 @@ def _resolve_model(model: str | None) -> str:
     return model or _model()
 
 
+# --------------------------------------------------------------------------- #
+# Host-aware backend auto-detection ("auto" mode)
+# --------------------------------------------------------------------------- #
+# The MCP client announces itself in the initialize handshake (clientInfo.name);
+# mcp_server.py forwards it here. With QA_LLM_BACKEND=auto the agent then speaks
+# through its host: Cursor -> cursor-agent, Claude Code/Desktop -> claude CLI,
+# anything else -> the first available backend. Explicit backend values keep
+# full priority; auto never raises.
+
+_HOST_CLIENT = {"name": ""}
+
+
+def set_host_client(name: str) -> None:
+    """Record the MCP client's name from the initialize handshake."""
+    _HOST_CLIENT["name"] = (name or "").strip().lower()
+
+
+def _cli_available() -> bool:
+    return bool(shutil.which(_get_cli()) or os.path.exists(_get_cli()))
+
+
+def _cursor_available() -> bool:
+    cli = _get_cursor_cli()
+    return bool(shutil.which(cli) or os.path.exists(cli))
+
+
+def _auto_backend() -> str:
+    host = _HOST_CLIENT["name"]
+    if "cursor" in host and _cursor_available():
+        return "cursor"
+    if "claude" in host and _cli_available():
+        return "cli"
+    # Unknown host (e.g. Gemini — no backend for it yet) or the matching CLI
+    # is missing: first available wins, keeping the previous default order.
+    if _cli_available():
+        return "cli"
+    if _cursor_available():
+        return "cursor"
+    if settings.anthropic_api_key:
+        return "api"
+    return "cli"
+
+
+def describe_backend() -> str:
+    """Human-readable backend label for status reports, e.g.
+    'auto → cursor (client: cursor)' or plain 'cli'."""
+    configured = (settings.qa_llm_backend or "cli").strip().lower()
+    if configured != "auto":
+        return configured
+    host = _HOST_CLIENT["name"] or "unknown client"
+    return f"auto → {_backend()} (client: {host})"
+
+
 def _backend() -> str:
-    """Resolve the active backend ('cli', 'api', or 'cursor'). Unknown values fall back to 'cli'."""
+    """Resolve the active backend ('cli', 'api', 'cursor', or host-detected
+    via 'auto'). Unknown values fall back to 'cli'."""
     value = (settings.qa_llm_backend or "cli").strip().lower()
+    if value == "auto":
+        return _auto_backend()
     if value not in ("cli", "api", "cursor"):
         logger.warning("Unknown QA_LLM_BACKEND=%r — falling back to 'cli'", value)
         return "cli"
