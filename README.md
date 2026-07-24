@@ -149,6 +149,8 @@ Edit `~/qa-agent-pro/.env` (created from `.env.example`):
 
 - **Versioning**: [Semantic Versioning](https://semver.org/); every release
   is a git tag (`vX.Y.Z`) with notes in [CHANGELOG.md](CHANGELOG.md).
+- **Updates on demand**: running `qa_setup_check` always checks for and
+  installs the newest release immediately, then reloads seamlessly.
 - **Updates are automatic and live**: releases are checked at startup
   AND every 15 minutes while the server runs (tune with
   `QA_UPDATE_INTERVAL_MINUTES`). A new release installs in the
