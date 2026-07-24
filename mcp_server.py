@@ -188,6 +188,21 @@ def build_server():
         )
 
     @mcp.tool()
+    async def qa_configure_jira(
+        ctx: Context, base_url: str = "", email: str = "", api_token: str = ""
+    ) -> str:
+        """Save Jira credentials into the agent's local .env so pasted ticket
+        URLs work. Collect from the user: base_url (their Jira, e.g.
+        https://company.atlassian.net), email (their Atlassian login), and
+        api_token — the USER creates it at
+        https://id.atlassian.com/manage-profile/security/api-tokens; never
+        invent or reuse one. Values are stored locally only and never shown
+        back. Afterwards run qa_setup_check to verify Jira shows configured."""
+        return await mcp_handlers.handle_configure_jira(
+            base_url, email, api_token, progress=_make_progress(ctx)
+        )
+
+    @mcp.tool()
     async def qa_list_devices(ctx: Context) -> str:
         """List attached Android/iOS devices, emulators, and simulators."""
         return await mcp_handlers.handle_list_devices(progress=_make_progress(ctx))
