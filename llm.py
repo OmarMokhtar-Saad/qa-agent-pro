@@ -1030,8 +1030,7 @@ def _run_sync_vision_cursor(
         env = {k: v for k, v in os.environ.items() if k not in _STRIP}
         try:
             proc = subprocess.run(
-                stdin=subprocess.DEVNULL,  # MCP stdin protection (see _popen_cli)
-                args=[
+                [
                     _get_cursor_cli(),
                     "-p",
                     prompt,
@@ -1050,6 +1049,7 @@ def _run_sync_vision_cursor(
                     "enabled",
                     "--trust",
                 ],
+                stdin=subprocess.DEVNULL,  # MCP stdin protection (see _popen_cli)
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=workdir,
