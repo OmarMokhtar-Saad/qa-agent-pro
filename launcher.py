@@ -38,6 +38,35 @@ def _interval_seconds() -> float:
     return max(60.0, minutes * 60.0)
 
 
+def _disk_version() -> str:
+    try:
+        with open(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"),
+            encoding="utf-8",
+        ) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _write_session_state() -> None:
+    """Record which app version's tool schemas the client last loaded
+    (observed initialize / tools-list requests). qa_setup_check compares
+    this to the release that last changed the schemas and tells the user
+    when a one-time editor restart is needed (editors ignore list_changed)."""
+    try:
+        state_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "backups"
+        )
+        os.makedirs(state_dir, exist_ok=True)
+        with open(
+            os.path.join(state_dir, "session-state.json"), "w", encoding="utf-8"
+        ) as fh:
+            json.dump({"client_schema_version": _disk_version()}, fh)
+    except OSError:
+        log.debug("could not write session state", exc_info=True)
+
+
 def _self_hash() -> str:
     try:
         with open(os.path.abspath(__file__), "rb") as fh:
@@ -178,8 +207,12 @@ class Supervisor:
                 method = None
             if method == "initialize":
                 self.handshake = [line]
+                _write_session_state()
             elif method == "notifications/initialized" and self.handshake:
                 self.handshake = self.handshake[:1] + [line]
+            elif method == "tools/list":
+                # The client re-fetched schemas — record the fresh version.
+                _write_session_state()
             for _attempt in range(3):
                 with self.child_lock:
                     child = self.child
