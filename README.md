@@ -132,7 +132,8 @@ Edit `~/qa-agent-pro/.env` (created from `.env.example`):
 | `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN` | Lets you paste Jira ticket URLs |
 | `QA_SWAGGER_ENABLED` | Swagger/OpenAPI link → API test cases |
 | `QA_MOBILE_CAPTURE` | Mobile-screen capture (Android via adb; vision needs `ANTHROPIC_API_KEY`) |
-| `QA_RAG_ENABLED` | Ground generation in your past suites + duplicate flagging |
+| `QA_RAG_ENABLED` | Learn from your past suites: grounding + duplicate flagging (on by default) |
+| `QA_MCP_ELICIT_ENABLED` | Interactive pickers in Cursor / Claude Code (on by default; automatic text-menu fallback on clients without dialog support) |
 
 ## Example prompts
 
