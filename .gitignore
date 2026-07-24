@@ -1,0 +1,9 @@
+.env
+data/
+corpus/
+backups/
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+*.log
