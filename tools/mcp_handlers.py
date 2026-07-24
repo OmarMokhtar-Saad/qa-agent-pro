@@ -996,7 +996,12 @@ async def _guided_test_cases(
         choose, "Where is the feature coming from?", list(_TC_SOURCE_LABELS)
     )
     if source.status == DECLINED:
-        return "👍 Cancelled."
+        # A dismissed dialog (incl. client auto-cancel quirks) must never dead-
+        # end — fall back to the menu so the chat flow can continue.
+        return (
+            "ℹ️ The picker dialog was dismissed — no problem, here are the "
+            "options:\n\n" + _tc_source_menu_markdown()
+        )
     src = _TC_SOURCE_LABELS.get(source.value or "", "")
     if source.status != CHOSEN or not src:
         # No choice dialogs — degrade to the simple typed-feature path.
@@ -1008,14 +1013,10 @@ async def _guided_test_cases(
             return await handle_generate_test_cases(
                 asked.value.strip(), progress=progress
             )
-        if asked.status == DECLINED:
-            return "👍 Cancelled."
         return _tc_source_menu_markdown()
     text = ""
     if src in _TC_SOURCE_PROMPTS:
         asked = await _elicit_text(ask_text, _TC_SOURCE_PROMPTS[src])
-        if asked.status == DECLINED:
-            return "👍 Cancelled."
         if asked.status != CHOSEN or not (asked.value or "").strip():
             return _tc_source_menu_markdown()
         text = asked.value.strip()
