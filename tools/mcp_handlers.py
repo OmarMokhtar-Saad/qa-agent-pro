@@ -102,7 +102,7 @@ _DIST_UPDATE_REPO = "OmarMokhtar-Saad/qa-agent-pro"
 # restarts. Keep tool names/params stable; when a release DOES change one,
 # bump this to that release version — qa_setup_check then tells users whose
 # session predates it that a one-time editor restart is needed.
-_TOOL_SCHEMAS_CHANGED_IN = "1.0.8"
+_TOOL_SCHEMAS_CHANGED_IN = "1.2.0"
 
 
 def _schedule_reload() -> None:
@@ -533,6 +533,99 @@ def shape_mobile_explore(device_id: str, payload: dict) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def _write_env_values(env_path: Path, updates: dict) -> None:
+    """Merge KEY=value pairs into a .env file: existing keys are replaced in
+    place, missing ones appended, every other line preserved. The file is
+    chmod 600 afterwards (it holds secrets)."""
+    lines: list = []
+    if env_path.exists():
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    seen: set = set()
+    out_lines: list = []
+    for line in lines:
+        stripped = line.strip()
+        key = None
+        if "=" in stripped and not stripped.startswith("#"):
+            key = stripped.split("=", 1)[0].strip()
+        if key in updates:
+            out_lines.append(f"{key}={updates[key]}")
+            seen.add(key)
+        else:
+            out_lines.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            out_lines.append(f"{key}={value}")
+    env_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+    try:
+        os.chmod(env_path, 0o600)
+    except OSError:
+        pass
+
+
+async def handle_configure_jira(
+    base_url: str = "",
+    email: str = "",
+    api_token: str = "",
+    *,
+    progress: ProgressCb = None,
+) -> str:
+    """Save Jira credentials into the agent's local .env (never logged, never
+    echoed back) and apply them — on dist installs via a seamless reload."""
+    base_url = (base_url or "").strip().rstrip("/")
+    email = (email or "").strip()
+    api_token = (api_token or "").strip()
+    if not (base_url and email and api_token):
+        return (
+            "⚠️ I need all three values to configure Jira:\n"
+            "- `base_url` — e.g. https://yourcompany.atlassian.net\n"
+            "- `email` — the user's Atlassian account email\n"
+            "- `api_token` — the USER must create it at "
+            "https://id.atlassian.com/manage-profile/security/api-tokens "
+            "(never invent one)\n\n"
+            "Ask the user for whichever value is missing, then call me again."
+        )
+    if not base_url.startswith(("http://", "https://")):
+        base_url = "https://" + base_url
+    try:
+        from tools.updater import _INSTALL_DIR
+
+        await _emit(progress, "🔐 Saving Jira credentials locally…")
+        await asyncio.to_thread(
+            _write_env_values,
+            _INSTALL_DIR / ".env",
+            {
+                "JIRA_BASE_URL": base_url,
+                "JIRA_EMAIL": email,
+                "JIRA_API_TOKEN": api_token,
+            },
+        )
+        for attr, value in (
+            ("jira_base_url", base_url),
+            ("jira_email", email),
+            ("jira_api_token", api_token),
+        ):
+            try:
+                setattr(settings, attr, value)
+            except Exception:  # assignment may be frozen — the reload covers it
+                logger.debug("settings assignment failed for %s", attr)
+        await _audit("mcp_configure_jira", detail={"base_url": base_url})
+        note = ""
+        if _test_cases_only() and _DIST_UPDATE_REPO:
+            _schedule_reload()
+            note = (
+                " The server is reloading to apply them — run `qa_setup_check` "
+                "in ~10 seconds and Jira should show ✅."
+            )
+        return (
+            f"✅ Jira credentials saved for **{base_url}** (account: {email}). "
+            "They are stored only in the local `.env` — the token is never "
+            "shown or logged." + note
+        )
+    except Exception as exc:
+        logger.exception("handle_configure_jira failed")
+        return f"⚠️ Could not save Jira settings: {exc}"
+
+
 def _jira_config_hint(url: str) -> str:
     """Actionable one-time-setup instructions when a pasted ticket URL needs
     Jira credentials that are not configured (per-user .env; never shipped)."""
@@ -570,7 +663,10 @@ def _jira_config_hint(url: str) -> str:
         "```\n"
         "3. Run `qa_setup_check` — it reloads the server and shows Jira as "
         "configured.\n\n"
-        "Then paste the ticket URL again and I'll read it directly."
+        "Then paste the ticket URL again and I'll read it directly.\n\n"
+        "💡 **Or skip the file editing**: tell me the three values right here "
+        "and I'll save them for you (I use the `qa_configure_jira` tool; the "
+        "token stays on this machine)."
     )
 
 

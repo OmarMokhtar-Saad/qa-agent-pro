@@ -137,7 +137,15 @@ Edit `~/qa-agent-pro/.env` (created from `.env.example`):
 
 ## Connect Jira (to paste ticket URLs)
 
-Each user connects with their own Atlassian account once:
+Each user connects with their own Atlassian account once.
+
+**Easiest — in chat:** create an API token at
+<https://id.atlassian.com/manage-profile/security/api-tokens>, then
+tell the agent: *"configure Jira"* and give it your Jira URL, email
+and the token — it saves them into the local `.env` for you and
+reloads (the token never leaves your machine).
+
+**Or manually:**
 
 1. Create an API token: <https://id.atlassian.com/manage-profile/security/api-tokens>
 2. Add to `~/qa-agent-pro/.env`:
