@@ -1006,8 +1006,17 @@ async def _guided_test_cases(
         choose, "Where is the feature coming from?", list(_TC_SOURCE_LABELS)
     )
     if source.status == DECLINED:
-        # A dismissed dialog (incl. client auto-cancel quirks) must never dead-
-        # end — fall back to the menu so the chat flow can continue.
+        # Some clients (Cursor 3.12) auto-cancel enum dialogs but still render
+        # free-text prompts — try one before degrading to the menu. Never a
+        # dead end either way.
+        asked = await _elicit_text(
+            ask_text,
+            "Describe the feature to test (or paste a Jira / web / Swagger URL):",
+        )
+        if asked.status == CHOSEN and (asked.value or "").strip():
+            return await handle_generate_test_cases(
+                asked.value.strip(), progress=progress
+            )
         return (
             "ℹ️ The picker dialog was dismissed — no problem, here are the "
             "options:\n\n" + _tc_source_menu_markdown()
