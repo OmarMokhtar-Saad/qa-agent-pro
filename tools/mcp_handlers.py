@@ -635,7 +635,9 @@ def _jira_config_hint(url: str) -> str:
         host = (urlparse(url).hostname or "").lower()
     except ValueError:
         return ""
-    looks_jira = "atlassian.net" in host or "/browse/" in url or "jira" in host
+    looks_jira = (
+        "atlassian.net" in host or host.startswith("jira.") or ".jira." in host
+    )
     if not host or not looks_jira:
         return ""
     configured_host = ""
@@ -691,6 +693,12 @@ async def handle_generate_test_cases(
         ui_content = None
         openapi_text = None
         if _is_url(text):
+            # Atlassian pages fetched anonymously return an empty SPA shell
+            # (no error!) — check credentials BEFORE fetching so the user gets
+            # setup instructions instead of a suite generated from nothing.
+            hint = _jira_config_hint(text)
+            if hint:
+                return hint
             # Swagger/OpenAPI link (QA_SWAGGER_ENABLED): condense the spec into
             # an endpoint summary instead of the generic page/UI path.
             if settings.qa_swagger_enabled and looks_like_openapi_url(text):
@@ -1313,12 +1321,11 @@ async def handle_feature_analysis(
         used_url = False
         if mode in ("jira", "jira_mobile") and _is_url(text):
             await _emit(progress, "🔗 Fetching the ticket…")
+            hint = _jira_config_hint(text)
+            if hint:
+                return hint
             url_content = await fetch_url_content(text)
             used_url = True
-            if url_content.get("error"):
-                hint = _jira_config_hint(text)
-                if hint:
-                    return hint
             if not url_content.get("error"):
                 jira_text = url_content.get("content") or ""
 
