@@ -28,8 +28,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import shutil
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
@@ -88,6 +91,24 @@ except ImportError:  # pragma: no cover — exercised only in distribution build
     _FULL_EDITION = False
 
 logger = logging.getLogger(__name__)
+
+# Baked by scripts/build_dist.py in the public distribution ("owner/repo").
+# Empty in the private checkout, which disables the on-demand update path.
+_DIST_UPDATE_REPO = "OmarMokhtar-Saad/qa-agent-pro"
+
+
+def _schedule_reload() -> None:
+    """Exit the server process shortly after the current response flushes.
+
+    Distribution installs only, right after an on-demand update: the
+    supervising launcher (start.sh) respawns the server on the NEW code and
+    replays the MCP handshake, so the editor session never notices."""
+
+    def _later() -> None:
+        time.sleep(2)
+        os._exit(86)
+
+    threading.Thread(target=_later, daemon=True).start()
 
 
 def _test_cases_only() -> bool:
@@ -1297,6 +1318,24 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
         from llm import check_backend
         from tools.updater import _INSTALL_DIR, _local_version
 
+        update_note = ""
+        if _test_cases_only() and _DIST_UPDATE_REPO:
+            from tools.updater import run_update_check
+
+            await _emit(progress, "⬆️ Checking for the latest release…")
+            update_status = await asyncio.to_thread(
+                run_update_check,
+                force=True,
+                repo_override=_DIST_UPDATE_REPO,
+                lock_override=True,
+            )
+            if update_status in ("updated", "healed"):
+                update_note = (
+                    "> 🔄 **A new version was just installed.** The server is "
+                    "reloading now — run `qa_setup_check` again in ~10 seconds "
+                    "to see it."
+                )
+                _schedule_reload()
         await _emit(progress, "🔎 Checking the LLM backend…")
         ok, warning = check_backend()
         backend = (settings.qa_llm_backend or "cli").strip().lower()
@@ -1305,6 +1344,7 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
             "## Setup check",
             "",
             *([f"**App version:** v{app_version}", ""] if app_version else []),
+            *([update_note, ""] if update_note else []),
             f"**Python:** {sys.version.split()[0]}",
             f"**LLM backend:** `{backend}` — "
             + ("✅ ready" if ok else f"❌ {warning}"),
