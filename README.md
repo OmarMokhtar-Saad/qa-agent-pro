@@ -149,8 +149,14 @@ Edit `~/qa-agent-pro/.env` (created from `.env.example`):
 
 - **Versioning**: [Semantic Versioning](https://semver.org/); every release
   is a git tag (`vX.Y.Z`) with notes in [CHANGELOG.md](CHANGELOG.md).
-- **Updates are automatic**: each time your editor starts the server, the
-  latest release is checked and installed. No manual steps.
+- **Updates are automatic and live**: releases are checked at startup
+  AND every 15 minutes while the server runs (tune with
+  `QA_UPDATE_INTERVAL_MINUTES`). A new release installs in the
+  background and takes effect at the next idle minute — the launcher
+  restarts the inner server and transparently replays the MCP
+  handshake, so you never restart your editor.
+- **Crash resilient**: if the server process ever dies, the launcher
+  respawns it and your editor session continues.
 - **The install is read-only by design**: code files are hash-verified
   against `MANIFEST.sha256` and chmod'ed read-only on every start. Manual
   or AI-editor edits fail to save — and anything force-edited is restored
