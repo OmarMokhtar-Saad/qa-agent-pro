@@ -135,6 +135,25 @@ Edit `~/qa-agent-pro/.env` (created from `.env.example`):
 | `QA_RAG_ENABLED` | Learn from your past suites: grounding + duplicate flagging (on by default) |
 | `QA_MCP_ELICIT_ENABLED` | Interactive pickers in Cursor / Claude Code (on by default; automatic text-menu fallback on clients without dialog support) |
 
+## Connect Jira (to paste ticket URLs)
+
+Each user connects with their own Atlassian account once:
+
+1. Create an API token: <https://id.atlassian.com/manage-profile/security/api-tokens>
+2. Add to `~/qa-agent-pro/.env`:
+
+```
+JIRA_BASE_URL=https://yourcompany.atlassian.net
+JIRA_EMAIL=you@company.com
+JIRA_API_TOKEN=<your token>
+```
+
+3. Run `qa_setup_check` — it reloads and shows Jira as configured.
+
+If a pasted ticket needs credentials that are missing, the agent
+replies with these exact steps (including your Jira host) instead of
+failing silently.
+
 ## Example prompts
 
 > Generate test cases for our new login page with email + password fields
