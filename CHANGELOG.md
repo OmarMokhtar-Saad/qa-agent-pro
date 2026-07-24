@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.0.5] - 2026-07-24
+## [1.0.6] - 2026-07-24
 
 ### Added
 
@@ -18,4 +18,6 @@ project adheres to [Semantic Versioning](https://semver.org/).
   running — no editor restart needed (GitHub Releases).
 - One-command editor registration (`connect.sh`) for Cursor, Claude Code
   and Claude Desktop.
+- RAG corpus and interactive wizard dialogs enabled by default (with
+  automatic text-menu fallback on clients without elicitation support).
 - Release-manifest integrity self-heal and read-only code lock.
