@@ -72,6 +72,20 @@ class Supervisor:
         threading.Thread(
             target=self._pump_child_out, args=(self.child,), daemon=True
         ).start()
+        if replay and self.handshake:
+            # Tool schemas may have changed across the update — tell the
+            # client to re-fetch tools/list, else it keeps stale cached
+            # schemas until the editor restarts.
+            try:
+                out = sys.stdout.buffer
+                out.write(
+                    b'{"jsonrpc": "2.0", '
+                    b'"method": "notifications/tools/list_changed"}\n'
+                )
+                out.flush()
+                log.info("Sent tools/list_changed to refresh client schemas.")
+            except Exception:
+                log.debug("could not send tools/list_changed", exc_info=True)
 
     def restart_child(self, reason: str) -> None:
         with self.child_lock:
