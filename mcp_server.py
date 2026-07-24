@@ -1,0 +1,282 @@
+"""FastMCP server exposing the QA agents/tools to Claude Desktop, Claude Code,
+and Cursor over stdio (gated by QA_MCP_ENABLED, default OFF).
+
+Run:      python mcp_server.py        (or: python -m mcp_server)
+Requires: pip install -e ".[mcp]"      (installs the optional ``fastmcp`` extra)
+
+Each registered ``qa_*`` tool is a thin adapter that turns the FastMCP request
+``Context`` into a plain async progress callback and delegates to
+``tools/mcp_handlers.py`` — which holds all business logic, audit logging, and
+concise-markdown shaping. No LLM call, prompt assembly, or secret handling lives
+here; ``fastmcp`` is imported lazily inside ``build_server`` so this module (and
+the mocked test suite) can load without the optional dependency installed.
+
+NOTE: this module must NOT use ``from __future__ import annotations`` — string
+annotations would make pydantic evaluate the ``ctx: Context`` hints against the
+module globals, where the lazily-imported ``Context`` is not defined (NameError
+at real FastMCP tool registration). Eager annotations resolve ``Context`` at
+decoration time inside ``build_server``, where it is in scope.
+"""
+
+import logging
+import os
+from pathlib import Path
+
+# Anchor the working directory to the repo root BEFORE importing settings:
+# config.settings loads the project .env from the cwd, and the data paths
+# (suite store, corpus, audit log) are cwd-relative. MCP clients may spawn
+# this server from an arbitrary directory, so re-anchor defensively.
+os.chdir(Path(__file__).resolve().parent)
+
+from config.settings import settings  # noqa: E402
+from tools import mcp_handlers  # noqa: E402
+
+logger = logging.getLogger("qa_agents.mcp")
+
+SERVER_NAME = "qa-agent-pro"
+
+
+def _make_progress(ctx):
+    """Adapt a FastMCP Context into the handlers' ``(message)->awaitable`` callback.
+
+    Every call reports incremental progress so a long-running generation or
+    device run resets the MCP client's tool-call timeout (progress notifications
+    keep the stream alive). Best-effort — a transport hiccup never breaks the
+    tool.
+    """
+    state = {"n": 0}
+
+    async def progress(message: str) -> None:
+        state["n"] += 1
+        try:
+            await ctx.report_progress(progress=state["n"], total=None, message=message)
+        except Exception:
+            logger.debug("mcp report_progress failed for %r", message, exc_info=True)
+
+    return progress
+
+
+def _make_chooser(ctx):
+    """Adapt ``ctx.elicit`` into the handlers' ``choose(message, options)`` callback,
+    mirroring ``_make_progress``. Returns ``None`` when QA_MCP_ELICIT_ENABLED is
+    off so the retrofit tools keep today's non-interactive behaviour (the wizard
+    treats a ``None``/unavailable chooser as 'render the markdown menu').
+
+    Elicitation is supported only by some clients (Claude Code, Cursor — NOT
+    Claude Desktop). A client without support makes ``ctx.elicit`` raise, which is
+    caught here and reported as UNAVAILABLE so the caller falls back to markdown.
+    """
+    if not settings.qa_mcp_elicit_enabled:
+        return None
+
+    async def choose(message, options):
+        try:
+            result = await ctx.elicit(message, response_type=list(options))
+        except Exception:
+            logger.debug("mcp elicit unavailable for %r", message, exc_info=True)
+            return mcp_handlers.ChoiceResult(mcp_handlers.UNAVAILABLE)
+        action = getattr(result, "action", None)
+        if action == "accept":
+            return mcp_handlers.ChoiceResult(
+                mcp_handlers.CHOSEN, value=getattr(result, "data", None)
+            )
+        return mcp_handlers.ChoiceResult(mcp_handlers.DECLINED)
+
+    return choose
+
+
+def _make_asker(ctx):
+    """Adapt ``ctx.elicit`` into a free-text ``ask_text(message)`` callback —
+    the text sibling of _make_chooser (same gating and degradation rules)."""
+    if not settings.qa_mcp_elicit_enabled:
+        return None
+
+    async def ask_text(message):
+        try:
+            result = await ctx.elicit(message, response_type=str)
+        except Exception:
+            logger.debug("mcp elicit(text) unavailable for %r", message, exc_info=True)
+            return mcp_handlers.ChoiceResult(mcp_handlers.UNAVAILABLE)
+        action = getattr(result, "action", None)
+        if action == "accept":
+            return mcp_handlers.ChoiceResult(
+                mcp_handlers.CHOSEN, value=getattr(result, "data", None)
+            )
+        return mcp_handlers.ChoiceResult(mcp_handlers.DECLINED)
+
+    return ask_text
+
+
+def build_server():
+    """Construct and return the FastMCP server with every qa_* tool registered.
+
+    ``fastmcp`` is imported here (not at module top level) so importing this
+    module never requires the optional extra — only actually starting the server
+    does.
+    """
+    from fastmcp import Context, FastMCP
+
+    mcp = FastMCP(SERVER_NAME)
+
+    @mcp.tool()
+    async def qa_generate_test_cases(feature_or_url: str, ctx: Context) -> str:
+        """Generate a structured test suite from a feature description or a Jira/issue URL.
+
+        Returns a concise markdown summary plus a persisted suite_id to reuse with
+        qa_export_suite / qa_run_mobile_suite.
+        """
+        return await mcp_handlers.handle_generate_test_cases(
+            feature_or_url, progress=_make_progress(ctx)
+        )
+
+    @mcp.tool()
+    async def qa_export_suite(
+        ctx: Context, suite_id: str = "", format: str = ""
+    ) -> str:
+        """Export a previously generated suite (by suite_id) to one of:
+        csv | xlsx | gherkin | playwright | testrail. Returns the written file path.
+        Reuses the stored suite; live-push dry-run defaults are preserved (this
+        writes files, it never pushes to a TMS).
+        """
+        return await mcp_handlers.handle_export_suite(
+            suite_id,
+            format,
+            choose=_make_chooser(ctx),
+            progress=_make_progress(ctx),
+        )
+
+    # Full edition only — the distribution build exposes test-case tools alone.
+    if not mcp_handlers._test_cases_only():
+
+        @mcp.tool()
+        async def qa_bug_report(description: str, ctx: Context) -> str:
+            """Turn a plain-language bug description into a structured bug report (markdown)."""
+            return await mcp_handlers.handle_bug_report(
+                description, progress=_make_progress(ctx)
+            )
+
+        @mcp.tool()
+        async def qa_explore_step(
+            feature: str, session_id: str, ctx: Context, tester_response: str = ""
+        ) -> str:
+            """Advance an exploratory-testing coaching session one step at a time.
+
+            Pass a stable session_id to keep coverage memory across calls; include
+            tester_response with what you observed after the previous step.
+            """
+            return await mcp_handlers.handle_explore_step(
+                feature, session_id, tester_response, progress=_make_progress(ctx)
+            )
+
+    @mcp.tool()
+    async def qa_search_corpus(
+        query: str, ctx: Context, entry_type: str = "test_case"
+    ) -> str:
+        """Search the RAG corpus (requires QA_RAG_ENABLED) for similar past test
+        cases or bug reports. entry_type is 'test_case' or 'bug_report'."""
+        return await mcp_handlers.handle_search_corpus(
+            query, entry_type, progress=_make_progress(ctx)
+        )
+
+    @mcp.tool()
+    async def qa_list_devices(ctx: Context) -> str:
+        """List attached Android/iOS devices, emulators, and simulators."""
+        return await mcp_handlers.handle_list_devices(progress=_make_progress(ctx))
+
+    # Full edition only — Maestro runs + the multi-workflow wizard reference
+    # modules the distribution build does not ship.
+    if not mcp_handlers._test_cases_only():
+
+        @mcp.tool()
+        async def qa_run_mobile_suite(
+            ctx: Context,
+            mode: str = "",
+            device_id: str = "",
+            suite_id: str = "",
+            app_id: str = "",
+            goal: str = "",
+        ) -> str:
+            """Drive Maestro mobile testing (requires QA_MAESTRO_ENABLED). mode is one of:
+            export (suite_id -> YAML flows in a per-suite dir),
+            run (device_id + suite_id, reads that per-suite dir, dry-run default),
+            heal (device_id + suite_id, requires QA_MAESTRO_HEAL_ENABLED), or
+            explore (device_id + goal + app_id, requires QA_MAESTRO_EXPLORE_ENABLED).
+            Per-device dry-run defaults are honoured."""
+            return await mcp_handlers.handle_run_mobile_suite(
+                mode,
+                device_id=device_id,
+                suite_id=suite_id,
+                app_id=app_id,
+                goal=goal,
+                choose=_make_chooser(ctx),
+                ask_text=_make_asker(ctx),
+                progress=_make_progress(ctx),
+            )
+
+        @mcp.tool()
+        async def qa_wizard(ctx: Context) -> str:
+            """Guided entry point for testers: pick a workflow (Test cases / Bug
+            report / Exploratory / Mobile testing) and I walk you through it
+            END-TO-END. Test cases asks where the feature comes from (describe it /
+            Jira ticket / mobile screens / Jira + mobile), captures device screens
+            when relevant, and returns the generated suite plus the Feature
+            Analysis report. No tool names or parameters needed. On clients
+            without MCP elicitation it returns a concise markdown menu instead."""
+            return await mcp_handlers.handle_wizard(
+                choose=_make_chooser(ctx),
+                ask_text=_make_asker(ctx),
+                progress=_make_progress(ctx),
+            )
+
+    @mcp.tool()
+    async def qa_setup_check(ctx: Context) -> str:
+        """Check whether THIS machine is ready: LLM backend auth, mobile tooling
+        (maestro/adb/xcrun), connected devices, and which features are enabled.
+        Run this first on a new machine."""
+        return await mcp_handlers.handle_setup_check(progress=_make_progress(ctx))
+
+    # Optional tool — only registered when the Feature Analysis feature is on.
+    if settings.qa_feature_analysis_enabled:
+
+        @mcp.tool()
+        async def qa_feature_analysis(
+            ctx: Context,
+            feature_or_url: str = "",
+            mode: str = "",
+            device_id: str = "",
+        ) -> str:
+            """Produce a compact enterprise Feature Analysis Report (requires
+            QA_FEATURE_ANALYSIS_ENABLED). mode is one of: jira (analyse a feature
+            description or Jira/issue URL), mobile (capture screens from a
+            connected device, needs QA_MOBILE_CAPTURE), or jira_mobile (merge the
+            ticket with captured screens). Omit mode and I'll ask; the mobile
+            modes also ask for the device and offer a capture-another-screen
+            loop."""
+            return await mcp_handlers.handle_feature_analysis(
+                feature_or_url,
+                mode=mode,
+                device_id=device_id,
+                choose=_make_chooser(ctx),
+                progress=_make_progress(ctx),
+            )
+
+    return mcp
+
+
+def main() -> None:
+    """Entry point. Gated behind QA_MCP_ENABLED (default OFF) — with the flag off
+    the server refuses to start rather than silently exposing the tools."""
+    logging.basicConfig(level=logging.INFO)
+    if not settings.qa_mcp_enabled:
+        logger.warning(
+            "QA_MCP_ENABLED is off — the MCP server will not start. "
+            "Set QA_MCP_ENABLED=true in .env to enable it."
+        )
+        return
+    server = build_server()
+    logger.info("Starting the qa-agents MCP server over stdio…")
+    server.run()
+
+
+if __name__ == "__main__":
+    main()
