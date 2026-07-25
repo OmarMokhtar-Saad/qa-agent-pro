@@ -65,7 +65,13 @@ def _host_resolver_rules(hostname: str, validated_ip: str) -> str:
     return (
         f"MAP {hostname} {validated_ip},"
         f"MAP {hostname}:443 {validated_ip}:443,"
-        f"MAP {hostname}:80 {validated_ip}:80"
+        f"MAP {hostname}:80 {validated_ip}:80,"
+        # Everything else fails to resolve: a redirect or subresource to any
+        # OTHER host cannot be looked up (it would otherwise be resolved
+        # UNpinned, before the post-nav final-URL SSRF re-check runs). The
+        # explicit MAPs above win because Chromium applies the first matching
+        # rule; ``~NOTFOUND`` forces ERR_NAME_NOT_RESOLVED for the rest.
+        "MAP * ~NOTFOUND"
     )
 
 

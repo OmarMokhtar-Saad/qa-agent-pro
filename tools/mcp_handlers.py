@@ -37,6 +37,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
+from urllib.parse import urlparse
 
 from agents.feature_analysis import analyze_feature, render_report_markdown
 from agents.test_scenario_agent import generate_test_scenarios
@@ -533,10 +534,28 @@ def shape_mobile_explore(device_id: str, payload: dict) -> str:
 # --------------------------------------------------------------------------- #
 
 
+def _has_control_chars(value: str) -> bool:
+    """True if *value* contains any character that could split a .env
+    value across lines. Covers C0/C1 controls (0x00-0x1F, 0x7F-0x9F)
+    plus the Unicode line/paragraph separators U+2028/U+2029 -- the full
+    set ``str.splitlines()`` recognizes, so a value that survives this
+    guard can never inject a rogue KEY= line when .env is next re-parsed
+    (str.splitlines() also breaks on U+0085/U+2028/U+2029)."""
+    return any(
+        ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F or ch in "\u2028\u2029"
+        for ch in str(value)
+    )
+
+
 def _write_env_values(env_path: Path, updates: dict) -> None:
     """Merge KEY=value pairs into a .env file: existing keys are replaced in
     place, missing ones appended, every other line preserved. The file is
     chmod 600 afterwards (it holds secrets)."""
+    for _k, _v in updates.items():
+        if _has_control_chars(str(_k)) or _has_control_chars(str(_v)):
+            raise ValueError(
+                "Refusing to write a control character to .env (possible injection)."
+            )
     lines: list = []
     if env_path.exists():
         lines = env_path.read_text(encoding="utf-8").splitlines()
@@ -584,8 +603,23 @@ async def handle_configure_jira(
             "(never invent one)\n\n"
             "Ask the user for whichever value is missing, then call me again."
         )
+    for _label, _value in (
+        ("base_url", base_url),
+        ("email", email),
+        ("api_token", api_token),
+    ):
+        if _has_control_chars(_value):
+            return (
+                f"⚠️ The {_label} contains an invalid line-break or control "
+                "character. Re-enter it as a single line (no newlines) and try again."
+            )
     if not base_url.startswith(("http://", "https://")):
         base_url = "https://" + base_url
+    if not urlparse(base_url).hostname:
+        return (
+            "⚠️ That base_url doesn't look like a valid URL — expected something "
+            "like https://yourcompany.atlassian.net."
+        )
     try:
         from tools.updater import _INSTALL_DIR
 
@@ -897,6 +931,11 @@ async def handle_search_corpus(
         return "⚠️ Provide a search query."
     if not settings.qa_rag_enabled:
         return "ℹ️ The RAG corpus is disabled (set QA_RAG_ENABLED=true to enable corpus search)."
+    entry_type = (entry_type or "test_case").strip()
+    if entry_type not in ("test_case", "bug_report"):
+        return (
+            f"⚠️ Unknown corpus '{entry_type}'. Choose 'test_case' or 'bug_report'."
+        )
     try:
         result = await query_corpus(
             query,

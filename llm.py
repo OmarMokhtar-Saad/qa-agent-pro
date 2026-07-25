@@ -90,7 +90,15 @@ _DEFAULT_MODEL = "claude-sonnet-4-6"
 _MAX_TOKENS = 16384
 def _int_setting(name: str, default: int) -> int:
     value = getattr(settings, name, default)
-    return value if isinstance(value, int) and value > 0 else default
+    if isinstance(value, int) and value > 0:
+        return value
+    # config.settings already bounds the positive-int fields with a logged
+    # warning, so this backstop should not normally fire — log (never silently
+    # clamp) if it ever does for a field settings does not range-check.
+    logger.warning(
+        "%s=%r is not a positive int — using default %d", name.upper(), value, default
+    )
+    return default
 
 
 # Per-call LLM timeout (seconds). QA_LLM_TIMEOUT_S overrides (the distribution

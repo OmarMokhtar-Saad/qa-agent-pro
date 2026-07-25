@@ -27,15 +27,61 @@ logger = logging.getLogger("qa_agents.settings")
 load_dotenv()
 
 
-def _lenient_bool(value: object) -> bool:
+_TRUTHY_TOKENS = ("1", "true", "yes", "on")
+_FALSY_TOKENS = ("0", "false", "no", "off", "")
+
+# Int fields that are nonsensical at <= 0 (timeouts, loop-bound counts,
+# concurrency). A parseable but out-of-range value (e.g. QA_LLM_TIMEOUT_S=0/-5)
+# is logged and replaced with the field default HERE, so downstream code
+# (llm._int_setting) needs no silent second clamp.
+# Deliberately EXCLUDED:
+#   * qa_rag_recency_half_life_days / qa_rag_max_entries — 0 is a documented
+#     "disable" / "unlimited" sentinel.
+#   * the byte/char/image/comment CAPS (jira_max_comments, jira_max_images,
+#     jira_max_image_bytes, qa_max_chat_images, qa_max_chat_image_bytes,
+#     qa_max_spec_bytes, qa_max_spec_chars) — 0 there is a legitimate
+#     "allow none" cap; bounding them would be a behaviour change out of scope
+#     for this hygiene batch.
+_POSITIVE_INT_FIELDS = frozenset(
+    {
+        "qa_llm_timeout_s",
+        "qa_device_command_timeout",
+        "qa_device_screenshot_timeout",
+        "qa_maestro_run_timeout",
+        "qa_maestro_explore_step_timeout",
+        "qa_maestro_translate_concurrency",
+        "qa_maestro_heal_max_attempts",
+        "qa_maestro_explore_max_steps",
+        "qa_update_timeout",
+    }
+)
+
+
+def _lenient_bool(value: object, field_name: str = "") -> bool:
     """Parse a bool the same way the pre-pydantic settings did — never raises.
 
     Anything not in the truthy set is False, so a stray value can never crash
     import (mirrors the historical ``.lower() in ("1","true","yes")`` behaviour).
+    A value that is neither a recognised truthy nor a recognised falsy token
+    (e.g. a typo like ``treu``) is logged at WARNING before falling back to
+    False, so a mistyped safety toggle (``QA_AUTH_ENABLED`` / a ``*_DRY_RUN``
+    flag) is never silently flipped — mirroring _coerce_jira_int's logged
+    fallback and honouring this module's docstring contract. Detection, not
+    prevention: the value still resolves to the default (never-raise contract).
     """
     if isinstance(value, bool):
         return value
-    return str(value).strip().lower() in ("1", "true", "yes", "on")
+    token = str(value).strip().lower()
+    if token not in _TRUTHY_TOKENS and token not in _FALSY_TOKENS:
+        logger.warning(
+            "Invalid boolean %s=%r — expected one of %s (true) / %s (false); "
+            "falling back to False",
+            (field_name or "setting").upper(),
+            value,
+            "/".join(_TRUTHY_TOKENS),
+            "/".join(t for t in _FALSY_TOKENS if t),
+        )
+    return token in _TRUTHY_TOKENS
 
 
 class Settings(BaseSettings):
@@ -355,6 +401,24 @@ class Settings(BaseSettings):
     # chmods code files read-only. OFF by default for developer checkouts.
     qa_code_lock_enabled: bool = False
 
+    # --- Usage analytics (telemetry) - opt-out; ON only in the dist. ---
+    # Anonymous usage metrics via tools/telemetry.py (PostHog). Sends only
+    # when a PostHog key is present (POSTHOG_API_KEY / the dist's baked
+    # default) AND neither opt-out is set. Constitution note: feature gates
+    # default OFF, but telemetry follows the CLI industry standard (opt-out)
+    # - it stays inert in the private checkout (no key) and is turned ON only
+    # by the distribution build, with README disclosure + two opt-outs.
+    qa_telemetry_disabled: bool = False
+    # Optional operator-set identity (known teams). When set it becomes the
+    # PostHog distinct_id and person email; otherwise an anonymous install
+    # UUID (qa_telemetry_id_path) is used. No other PII is ever collected.
+    qa_user_email: str = ""
+    # Where the anonymous install UUID is persisted (update-protected data dir).
+    qa_telemetry_id_path: str = "data/telemetry-id"
+    # PostHog project API key (a WRITE-ONLY public ingest key). Empty in the
+    # private checkout; the distribution build bakes a default. Env overrides.
+    posthog_api_key: str = ""
+
     @field_validator(
         "qa_web_search_enabled",
         "qa_rag_enabled",
@@ -382,12 +446,13 @@ class Settings(BaseSettings):
         "qa_mcp_elicit_enabled",
         "qa_auto_update_enabled",
         "qa_code_lock_enabled",
+        "qa_telemetry_disabled",
         "xray_dry_run",
         mode="before",
     )
     @classmethod
-    def _coerce_bool(cls, v: object) -> bool:
-        return _lenient_bool(v)
+    def _coerce_bool(cls, v: object, info) -> bool:
+        return _lenient_bool(v, info.field_name)
 
     @field_validator("qa_rag_similarity_threshold", mode="before")
     @classmethod
@@ -438,14 +503,27 @@ class Settings(BaseSettings):
     def _coerce_jira_int(cls, v: object, info) -> int:
         default = cls.model_fields[info.field_name].default
         if isinstance(v, int) and not isinstance(v, bool):
-            return v
-        try:
-            return int(str(v).strip())
-        except (TypeError, ValueError):
+            parsed = v
+        else:
+            try:
+                parsed = int(str(v).strip())
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid %s=%r — using default %d",
+                    info.field_name.upper(),
+                    v,
+                    default,
+                )
+                return default
+        if info.field_name in _POSITIVE_INT_FIELDS and parsed < 1:
             logger.warning(
-                "Invalid %s=%r — using default %d", info.field_name.upper(), v, default
+                "Invalid %s=%r (must be > 0) — using default %d",
+                info.field_name.upper(),
+                parsed,
+                default,
             )
             return default
+        return parsed
 
 
 def _load_settings() -> Settings:

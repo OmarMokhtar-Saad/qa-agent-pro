@@ -13,7 +13,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -21,6 +23,16 @@ from pathlib import Path
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+
+# In-process parse cache for _load_corpus_sync, keyed by str(path) ->
+# ((mtime_ns, size), entries). Loads run inside asyncio.to_thread worker
+# threads, so access is guarded by a threading.Lock. Any write to a corpus
+# file (append via _save_entry_sync, atomic replace via _prune_sync) changes
+# its mtime/size, so the key differs and the stale entry is bypassed -- no
+# explicit invalidation is needed.
+_CORPUS_CACHE: dict[str, tuple[tuple[int, int], list[dict]]] = {}
+_CORPUS_CACHE_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -140,9 +152,27 @@ def _bm25_scores(
 
 
 def _load_corpus_sync(path: Path) -> list[dict]:
-    """Read a JSONL file and return a list of entry dicts. Returns [] on any error."""
+    """Read a JSONL file and return a list of entry dicts. Returns [] on any error.
+
+    Parsed entries are cached in-process keyed by (path, mtime_ns, size): a hot
+    chat turn that re-queries the corpus no longer re-reads and re-parses the
+    whole file from disk. Any write -- an append via _save_entry_sync or the
+    atomic replace in _prune_sync -- changes the file's mtime and/or size, so the
+    key naturally differs and the stale entry is bypassed. No explicit
+    invalidation is needed, which keeps cross-session writers correct."""
     if not path.exists():
         return []
+    try:
+        st = path.stat()
+        cache_key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        cache_key = None
+    str_path = str(path)
+    if cache_key is not None:
+        with _CORPUS_CACHE_LOCK:
+            cached = _CORPUS_CACHE.get(str_path)
+            if cached is not None and cached[0] == cache_key:
+                return cached[1]
     entries: list[dict] = []
     try:
         with path.open(encoding="utf-8") as fh:
@@ -156,6 +186,10 @@ def _load_corpus_sync(path: Path) -> list[dict]:
                     logger.warning("rag_store: skipping corrupt JSONL line in %s", path)
     except OSError as exc:
         logger.warning("rag_store: could not read corpus file %s: %s", path, exc)
+        return entries
+    if cache_key is not None:
+        with _CORPUS_CACHE_LOCK:
+            _CORPUS_CACHE[str_path] = (cache_key, entries)
     return entries
 
 
@@ -174,11 +208,21 @@ def _prune_sync(path: Path, cap: int) -> None:
         entries = _load_corpus_sync(path)
         if len(entries) <= cap:
             return
-        tmp = path.with_suffix(".jsonl.tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            for e in entries[-cap:]:
-                fh.write(json.dumps(e, ensure_ascii=False) + "\n")
-        tmp.replace(path)
+        # Unique per-call temp name (+ pid) so two cross-session writers pruning
+        # the same corpus can't clobber a shared ".jsonl.tmp" and lose entries.
+        tmp = path.with_suffix(f".{os.getpid()}.{uuid.uuid4().hex}.jsonl.tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as fh:
+                for e in entries[-cap:]:
+                    fh.write(json.dumps(e, ensure_ascii=False) + "\n")
+            tmp.replace(path)
+        finally:
+            # A crashed prune must not leave its unique temp orphan behind.
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
         logger.info(
             "rag_store: pruned %s to the newest %d entries", path.name, cap
         )
@@ -186,12 +230,27 @@ def _prune_sync(path: Path, cap: int) -> None:
         logger.exception("rag_store: prune failed for %s", path)
 
 
+_SAFE_ENTRY_TYPE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
 def _corpus_path(entry_type: str) -> Path:
+    """Map an entry_type to its JSONL corpus file, fail-closed.
+
+    entry_type becomes a filename component, so anything that is not a bare
+    identifier (path separators, ``..``, other punctuation) is rejected as a
+    path-traversal attempt and coerced to the default ``test_cases`` corpus
+    rather than escaping ``qa_rag_storage_path``."""
     base = Path(settings.qa_rag_storage_path)
     if entry_type == "test_case":
         return base / "test_cases.jsonl"
     if entry_type == "bug_report":
         return base / "bug_reports.jsonl"
+    if not isinstance(entry_type, str) or not _SAFE_ENTRY_TYPE.match(entry_type):
+        logger.warning(
+            "rag_store: rejecting unsafe entry_type %r — using test_cases corpus",
+            entry_type,
+        )
+        return base / "test_cases.jsonl"
     return base / f"{entry_type}.jsonl"
 
 
@@ -285,6 +344,12 @@ async def query_corpus(
         mode = (
             getattr(settings, "qa_rag_similarity_mode", "jaccard") or "jaccard"
         ).lower()
+        if mode not in ("jaccard", "cosine", "bm25"):
+            logger.warning(
+                "Unknown QA_RAG_SIMILARITY_MODE=%r — falling back to 'jaccard'",
+                mode,
+            )
+            mode = "jaccard"
         if mode == "bm25":
             docs_tokens = [_tokenize_list(e["content"]) for e in usable]
             bm25 = _bm25_scores(_tokenize_list(query_text), docs_tokens)

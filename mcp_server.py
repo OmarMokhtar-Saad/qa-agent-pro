@@ -20,6 +20,7 @@ decoration time inside ``build_server``, where it is in scope.
 
 import logging
 import os
+import time
 from pathlib import Path
 
 # Anchor the working directory to the repo root BEFORE importing settings:
@@ -28,24 +29,59 @@ from pathlib import Path
 # this server from an arbitrary directory, so re-anchor defensively.
 os.chdir(Path(__file__).resolve().parent)
 
-from config.settings import settings  # noqa: E402
+from config.settings import settings  # noqa: E402, I001
 from tools import mcp_handlers  # noqa: E402
+from tools import telemetry  # noqa: E402
 
 logger = logging.getLogger("qa_agents.mcp")
 
 SERVER_NAME = "qa-agent-pro"
 
 
+# Latest MCP client identity from the initialize handshake (clientInfo),
+# used to tag telemetry events with the host editor (cursor / claude-code).
+_CLIENT = {"name": "", "version": ""}
+
+
 def _note_client(ctx) -> None:
     """Forward the MCP client's name (initialize clientInfo) to the LLM layer
-    so QA_LLM_BACKEND=auto can match the backend to the host editor."""
+    so QA_LLM_BACKEND=auto can match the backend to the host editor, and
+    record it (name + version) for telemetry tagging."""
     try:
         import llm
 
-        name = ctx.session.client_params.clientInfo.name
+        info = ctx.session.client_params.clientInfo
+        name = info.name
         llm.set_host_client(name)
+        _CLIENT["name"] = (name or "").strip().lower()
+        _CLIENT["version"] = str(getattr(info, "version", "") or "")
     except Exception:
         logger.debug("could not read clientInfo", exc_info=True)
+
+
+async def _tracked(name, ctx, coro):
+    """Await a tool handler while emitting a best-effort telemetry
+    ``tool_called`` event (name, duration, ok/error_type, host client).
+    Telemetry NEVER changes behaviour: the result or exception propagates
+    unchanged and any metric failure is swallowed in the telemetry layer."""
+    start = time.monotonic()
+    ok = True
+    error_type = None
+    try:
+        return await coro
+    except Exception as exc:
+        ok = False
+        error_type = type(exc).__name__
+        raise
+    finally:
+        telemetry.tool_called(
+            name,
+            duration_ms=int((time.monotonic() - start) * 1000),
+            ok=ok,
+            error_type=error_type,
+            client_name=_CLIENT.get("name", ""),
+            client_version=_CLIENT.get("version", ""),
+        )
 
 
 def _make_progress(ctx):
@@ -143,11 +179,15 @@ def build_server():
         Jira + mobile) via a dialog or menu. Returns a concise markdown summary
         plus a persisted suite_id to reuse with qa_export_suite.
         """
-        return await mcp_handlers.handle_generate_test_cases(
-            feature_or_url,
-            choose=_make_chooser(ctx),
-            ask_text=_make_asker(ctx),
-            progress=_make_progress(ctx),
+        return await _tracked(
+            "qa_generate_test_cases",
+            ctx,
+            mcp_handlers.handle_generate_test_cases(
+                feature_or_url,
+                choose=_make_chooser(ctx),
+                ask_text=_make_asker(ctx),
+                progress=_make_progress(ctx),
+            ),
         )
 
     @mcp.tool()
@@ -159,11 +199,15 @@ def build_server():
         Reuses the stored suite; live-push dry-run defaults are preserved (this
         writes files, it never pushes to a TMS).
         """
-        return await mcp_handlers.handle_export_suite(
-            suite_id,
-            format,
-            choose=_make_chooser(ctx),
-            progress=_make_progress(ctx),
+        return await _tracked(
+            "qa_export_suite",
+            ctx,
+            mcp_handlers.handle_export_suite(
+                suite_id,
+                format,
+                choose=_make_chooser(ctx),
+                progress=_make_progress(ctx),
+            ),
         )
 
     # Full edition only — the distribution build exposes test-case tools alone.
@@ -172,8 +216,12 @@ def build_server():
         @mcp.tool()
         async def qa_bug_report(description: str, ctx: Context) -> str:
             """Turn a plain-language bug description into a structured bug report (markdown)."""
-            return await mcp_handlers.handle_bug_report(
-                description, progress=_make_progress(ctx)
+            return await _tracked(
+                "qa_bug_report",
+                ctx,
+                mcp_handlers.handle_bug_report(
+                    description, progress=_make_progress(ctx)
+                ),
             )
 
         @mcp.tool()
@@ -185,8 +233,12 @@ def build_server():
             Pass a stable session_id to keep coverage memory across calls; include
             tester_response with what you observed after the previous step.
             """
-            return await mcp_handlers.handle_explore_step(
-                feature, session_id, tester_response, progress=_make_progress(ctx)
+            return await _tracked(
+                "qa_explore_step",
+                ctx,
+                mcp_handlers.handle_explore_step(
+                    feature, session_id, tester_response, progress=_make_progress(ctx)
+                ),
             )
 
     @mcp.tool()
@@ -196,8 +248,12 @@ def build_server():
         """Search the RAG corpus (requires QA_RAG_ENABLED) for similar past test
         cases or bug reports. entry_type is 'test_case' or 'bug_report'; pass
         feature to narrow results to entries stored for that feature."""
-        return await mcp_handlers.handle_search_corpus(
-            query, entry_type, feature, progress=_make_progress(ctx)
+        return await _tracked(
+            "qa_search_corpus",
+            ctx,
+            mcp_handlers.handle_search_corpus(
+                query, entry_type, feature, progress=_make_progress(ctx)
+            ),
         )
 
     @mcp.tool()
@@ -211,14 +267,22 @@ def build_server():
         https://id.atlassian.com/manage-profile/security/api-tokens; never
         invent or reuse one. Values are stored locally only and never shown
         back. Afterwards run qa_setup_check to verify Jira shows configured."""
-        return await mcp_handlers.handle_configure_jira(
-            base_url, email, api_token, progress=_make_progress(ctx)
+        return await _tracked(
+            "qa_configure_jira",
+            ctx,
+            mcp_handlers.handle_configure_jira(
+                base_url, email, api_token, progress=_make_progress(ctx)
+            ),
         )
 
     @mcp.tool()
     async def qa_list_devices(ctx: Context) -> str:
         """List attached Android/iOS devices, emulators, and simulators."""
-        return await mcp_handlers.handle_list_devices(progress=_make_progress(ctx))
+        return await _tracked(
+            "qa_list_devices",
+            ctx,
+            mcp_handlers.handle_list_devices(progress=_make_progress(ctx)),
+        )
 
     # Full edition only — Maestro runs + the multi-workflow wizard reference
     # modules the distribution build does not ship.
@@ -239,15 +303,19 @@ def build_server():
             heal (device_id + suite_id, requires QA_MAESTRO_HEAL_ENABLED), or
             explore (device_id + goal + app_id, requires QA_MAESTRO_EXPLORE_ENABLED).
             Per-device dry-run defaults are honoured."""
-            return await mcp_handlers.handle_run_mobile_suite(
-                mode,
-                device_id=device_id,
-                suite_id=suite_id,
-                app_id=app_id,
-                goal=goal,
-                choose=_make_chooser(ctx),
-                ask_text=_make_asker(ctx),
-                progress=_make_progress(ctx),
+            return await _tracked(
+                "qa_run_mobile_suite",
+                ctx,
+                mcp_handlers.handle_run_mobile_suite(
+                    mode,
+                    device_id=device_id,
+                    suite_id=suite_id,
+                    app_id=app_id,
+                    goal=goal,
+                    choose=_make_chooser(ctx),
+                    ask_text=_make_asker(ctx),
+                    progress=_make_progress(ctx),
+                ),
             )
 
         @mcp.tool()
@@ -259,10 +327,14 @@ def build_server():
             when relevant, and returns the generated suite plus the Feature
             Analysis report. No tool names or parameters needed. On clients
             without MCP elicitation it returns a concise markdown menu instead."""
-            return await mcp_handlers.handle_wizard(
-                choose=_make_chooser(ctx),
-                ask_text=_make_asker(ctx),
-                progress=_make_progress(ctx),
+            return await _tracked(
+                "qa_wizard",
+                ctx,
+                mcp_handlers.handle_wizard(
+                    choose=_make_chooser(ctx),
+                    ask_text=_make_asker(ctx),
+                    progress=_make_progress(ctx),
+                ),
             )
 
     @mcp.tool()
@@ -270,7 +342,11 @@ def build_server():
         """Check whether THIS machine is ready: LLM backend auth, mobile tooling
         (maestro/adb/xcrun), connected devices, and which features are enabled.
         Run this first on a new machine."""
-        return await mcp_handlers.handle_setup_check(progress=_make_progress(ctx))
+        return await _tracked(
+            "qa_setup_check",
+            ctx,
+            mcp_handlers.handle_setup_check(progress=_make_progress(ctx)),
+        )
 
     # Optional tool — only registered when the Feature Analysis feature is on.
     if settings.qa_feature_analysis_enabled:
@@ -289,12 +365,16 @@ def build_server():
             ticket with captured screens). Omit mode and I'll ask; the mobile
             modes also ask for the device and offer a capture-another-screen
             loop."""
-            return await mcp_handlers.handle_feature_analysis(
-                feature_or_url,
-                mode=mode,
-                device_id=device_id,
-                choose=_make_chooser(ctx),
-                progress=_make_progress(ctx),
+            return await _tracked(
+                "qa_feature_analysis",
+                ctx,
+                mcp_handlers.handle_feature_analysis(
+                    feature_or_url,
+                    mode=mode,
+                    device_id=device_id,
+                    choose=_make_chooser(ctx),
+                    progress=_make_progress(ctx),
+                ),
             )
 
     return mcp
@@ -310,7 +390,9 @@ def main() -> None:
             "Set QA_MCP_ENABLED=true in .env to enable it."
         )
         return
+    telemetry.startup_notice()
     server = build_server()
+    telemetry.server_start()
 
     def _prewarm_backend() -> None:
         # Warm the cursor-agent auth probe cache off the serving path: it can
