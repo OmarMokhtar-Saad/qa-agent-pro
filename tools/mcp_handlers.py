@@ -42,6 +42,7 @@ from urllib.parse import urlparse
 from agents.feature_analysis import analyze_feature, render_report_markdown
 from agents.test_scenario_agent import generate_test_scenarios
 from config.settings import settings
+from tools import telemetry
 from tools.audit_log import record_event
 from tools.csv_exporter import generate_test_case_csv
 from tools.device_manager import (
@@ -215,6 +216,15 @@ async def _audit(
 
 def _is_url(text: str) -> bool:
     return text.lower().startswith(("http://", "https://"))
+
+
+def _capture_error(exc: BaseException, tool: str) -> None:
+    """Best-effort dist error capture for a handler failure. Never raises; inert
+    in the private checkout / with telemetry off (no dist PostHog key)."""
+    try:
+        telemetry.capture_error_dist(exc, tool=tool, origin="mcp_handler")
+    except Exception:
+        logger.debug("mcp telemetry capture_error failed", exc_info=True)
 
 
 async def _resolve_device(device_id: str) -> dict | None:
@@ -404,21 +414,38 @@ def _format_menu_markdown() -> str:
 # --------------------------------------------------------------------------- #
 
 
-def shape_generation_result(summary: str, suite, suite_id: str, status: str) -> str:
+def shape_generation_result(
+    summary: str,
+    suite,
+    suite_id: str,
+    status: str,
+    *,
+    auto_export: bool = False,
+) -> str:
+    """Shape the generation reply.
+
+    With auto_export=True the caller appends a ready .xlsx path below, so
+    nothing here points at qa_export_suite: the tester is handed the finished
+    deliverable instead of a "which format?" question. The suite_id stays
+    visible either way (it is still the handle for a different format).
+    """
     cases = len(getattr(suite, "test_cases", []) or []) if suite is not None else 0
     icon = {"ok": "✅", "partial": "⚠️", "fallback": "⚠️", "error": "❌"}.get(status, "ℹ️")
     lines = [f"## {icon} Test cases generated", ""]
     if suite_id:
-        lines.append(f"**Suite ID:** `{suite_id}` — pass this to `qa_export_suite`.")
+        hint = "" if auto_export else " — pass this to `qa_export_suite`."
+        lines.append(f"**Suite ID:** `{suite_id}`{hint}")
     lines.append(f"**Cases:** {cases}")
     lines.append(f"**Status:** {status}")
     body = (summary or "").strip()
     if body:
         if len(body) > _SUMMARY_CAP:
-            body = (
-                body[:_SUMMARY_CAP].rstrip()
-                + "\n\n…(truncated — export the suite for the full set)"
+            tail = (
+                "the Excel file below has every case"
+                if auto_export
+                else "export the suite for the full set"
             )
+            body = body[:_SUMMARY_CAP].rstrip() + f"\n\n…(truncated — {tail})"
         lines += ["", body]
     return "\n".join(lines)
 
@@ -657,6 +684,7 @@ async def handle_configure_jira(
         )
     except Exception as exc:
         logger.exception("handle_configure_jira failed")
+        _capture_error(exc, "qa_configure_jira")
         return f"⚠️ Could not save Jira settings: {exc}"
 
 
@@ -669,9 +697,7 @@ def _jira_config_hint(url: str) -> str:
         host = (urlparse(url).hostname or "").lower()
     except ValueError:
         return ""
-    looks_jira = (
-        "atlassian.net" in host or host.startswith("jira.") or ".jira." in host
-    )
+    looks_jira = "atlassian.net" in host or host.startswith("jira.") or ".jira." in host
     if not host or not looks_jira:
         return ""
     configured_host = ""
@@ -704,6 +730,68 @@ def _jira_config_hint(url: str) -> str:
         "and I'll save them for you (I use the `qa_configure_jira` tool; the "
         "token stays on this machine)."
     )
+
+
+async def _auto_export_xlsx(suite) -> str:
+    """Best-effort Excel auto-export for QA_AUTO_EXPORT_XLSX (MCP path only).
+
+    Reuses generate_test_case_xlsx so the cell_sanitizer formula-injection
+    protection applies identically. When settings.qa_export_dir is set the file
+    lands in that stable folder under the qa_test_cases_*.xlsx naming so a
+    non-technical tester can find and re-open a persistent deliverable;
+    otherwise it keeps the legacy secure-temp behavior via the
+    _EXPORTERS["xlsx"] path exactly as qa_export_suite uses it. NEVER raises: an
+    unusable directory falls back to temp, and any exporter error returns a
+    warning note instead of breaking the already-generated (and persisted)
+    suite result.
+
+    The exporter is called via the module global (direct call for the
+    explicit-path branch, the _EXPORTERS["xlsx"] lambda for the temp branch),
+    so monkeypatch.setattr(mcp_handlers, "generate_test_case_xlsx", ...)
+    intercepts BOTH branches at call time.
+    """
+    try:
+        output_path = None
+        export_dir = (settings.qa_export_dir or "").strip()
+        if export_dir:
+            try:
+                dest = Path(export_dir).expanduser()
+                dest.mkdir(parents=True, exist_ok=True)
+                frag = (getattr(suite, "suite_id", "") or "suite")[:16]
+                stamp = time.strftime("%Y%m%d_%H%M%S")
+                output_path = str(
+                    (dest / f"qa_test_cases_{frag}_{stamp}.xlsx").resolve()
+                )
+            except OSError:
+                logger.warning(
+                    "qa_export_dir %r unusable -- falling back to temp export",
+                    export_dir,
+                    exc_info=True,
+                )
+                output_path = None
+        if output_path is not None:
+            path = await asyncio.to_thread(generate_test_case_xlsx, suite, output_path)
+        else:
+            path = await asyncio.to_thread(_EXPORTERS["xlsx"], suite)
+        try:
+            uri = Path(path).as_uri()
+        except (ValueError, OSError):
+            uri = ""
+        await _audit("mcp_auto_export_xlsx", detail={"path": path})
+        link = f"\n\n[Open the file]({uri})" if uri else ""
+        return (
+            "### \U0001f4c4 Your Excel file is ready\n\n"
+            f"**Download / open it here:**\n\n`{path}`{link}\n\n"
+            "_That spreadsheet is the finished deliverable — nothing else to "
+            "run. Need CSV, Gherkin, Playwright or TestRail instead? Just say "
+            "so._"
+        )
+    except Exception as exc:
+        logger.exception("mcp auto-export xlsx failed")
+        return (
+            f"\u26a0\ufe0f Auto-export to Excel failed: {exc} \u2014 you can still "
+            "export the suite with `qa_export_suite`."
+        )
 
 
 async def handle_generate_test_cases(
@@ -750,7 +838,9 @@ async def handle_generate_test_cases(
                 try:
                     ui_content = await extract_ui_elements(text, prefetched=url_content)
                 except Exception:
-                    logger.debug("mcp: UI extraction failed — continuing", exc_info=True)
+                    logger.debug(
+                        "mcp: UI extraction failed — continuing", exc_info=True
+                    )
                     ui_content = None
 
         captured: dict = {}
@@ -789,17 +879,38 @@ async def handle_generate_test_cases(
             suite_id = (saved.get("content") or {}).get(
                 "suite_id", ""
             ) or suite.suite_id
+        case_count = len(getattr(suite, "test_cases", []) or [])
+        if openapi_text:
+            source = "swagger"
+        elif url_content:
+            source = "jira"
+        elif attached_images:
+            source = "mobile"
+        else:
+            source = "text"
+        telemetry.add_tool_properties(case_count=case_count, source=source)
         await _audit(
             "mcp_generate_test_cases",
             entity_id=suite_id or None,
             detail={
                 "status": status,
-                "cases": len(getattr(suite, "test_cases", []) or []),
+                "cases": case_count,
             },
         )
-        return shape_generation_result(summary, suite, suite_id, status)
+        auto_export = bool(
+            settings.qa_auto_export_xlsx
+            and suite is not None
+            and getattr(suite, "test_cases", None)
+        )
+        result_md = shape_generation_result(
+            summary, suite, suite_id, status, auto_export=auto_export
+        )
+        if auto_export:
+            result_md += "\n\n" + await _auto_export_xlsx(suite)
+        return result_md
     except Exception as exc:
         logger.exception("handle_generate_test_cases failed")
+        _capture_error(exc, "qa_generate_test_cases")
         return f"⚠️ Test-case generation failed: {exc}"
 
 
@@ -849,12 +960,14 @@ async def handle_export_suite(
         except Exception as exc:
             logger.exception("mcp export failed")
             return f"⚠️ Export to {fmt} failed: {exc}"
+        telemetry.add_tool_properties(format=fmt, case_count=len(suite.test_cases))
         await _audit(
             "mcp_export_suite", entity_id=suite_id, detail={"format": fmt, "path": path}
         )
         return shape_export_result(suite_id, fmt, path, len(suite.test_cases))
     except Exception as exc:
         logger.exception("handle_export_suite failed")
+        _capture_error(exc, "qa_export_suite")
         return f"⚠️ Export failed: {exc}"
 
 
@@ -933,9 +1046,7 @@ async def handle_search_corpus(
         return "ℹ️ The RAG corpus is disabled (set QA_RAG_ENABLED=true to enable corpus search)."
     entry_type = (entry_type or "test_case").strip()
     if entry_type not in ("test_case", "bug_report"):
-        return (
-            f"⚠️ Unknown corpus '{entry_type}'. Choose 'test_case' or 'bug_report'."
-        )
+        return f"⚠️ Unknown corpus '{entry_type}'. Choose 'test_case' or 'bug_report'."
     try:
         result = await query_corpus(
             query,
@@ -954,6 +1065,7 @@ async def handle_search_corpus(
         return shape_corpus_hits(query, hits)
     except Exception as exc:
         logger.exception("handle_search_corpus failed")
+        _capture_error(exc, "qa_search_corpus")
         return f"⚠️ Corpus search failed: {exc}"
 
 
@@ -968,6 +1080,7 @@ async def handle_list_devices(*, progress: ProgressCb = None) -> str:
         return shape_devices(devices)
     except Exception as exc:
         logger.exception("handle_list_devices failed")
+        _capture_error(exc, "qa_list_devices")
         return f"⚠️ Device discovery failed: {exc}"
 
 
@@ -1121,6 +1234,7 @@ async def handle_run_mobile_suite(
         return shape_mobile_explore(device["id"], res.get("content") or {})
     except Exception as exc:
         logger.exception("handle_run_mobile_suite failed")
+        _capture_error(exc, "qa_run_mobile_suite")
         return f"⚠️ Mobile {mode} failed: {exc}"
 
 
@@ -1410,6 +1524,9 @@ async def handle_feature_analysis(
             feature_text, jira_text, screen_descriptions, None, []
         )
         markdown = render_report_markdown(report, compact=True)
+        telemetry.add_tool_properties(
+            source=("jira" if used_url else "mobile" if screens_captured else "text"),
+        )
         await _audit(
             "mcp_feature_analysis",
             detail={
@@ -1424,6 +1541,7 @@ async def handle_feature_analysis(
         return header + markdown
     except Exception as exc:
         logger.exception("handle_feature_analysis failed")
+        _capture_error(exc, "qa_feature_analysis")
         return f"⚠️ Feature analysis failed: {exc}"
 
 
@@ -1643,6 +1761,16 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
             f"**Python:** {sys.version.split()[0]}",
             f"**LLM backend:** `{backend}` — "
             + ("✅ ready" if ok else f"❌ {warning}"),
+            *(
+                [
+                    "  ↳ _Strict host match: the agent uses your editor's own "
+                    "account — Cursor → cursor-agent, Claude Code/Desktop → claude "
+                    "CLI — and never silently falls back to a different one._"
+                ]
+                if (settings.qa_llm_backend or "").strip().lower() == "auto"
+                and settings.qa_llm_strict_host
+                else []
+            ),
             "**Jira:** "
             + (
                 "✅ configured ("

@@ -131,6 +131,14 @@ class Settings(BaseSettings):
     # TimeoutError on the retry that was meant to rescue the category. Empty
     # string disables the switch (keeps retrying qa_cursor_model).
     qa_cursor_fallback_model: str = "gpt-5.2-fast"
+    # Strict host-matched auto backend (QA_LLM_STRICT_HOST, default ON). When
+    # QA_LLM_BACKEND=auto, honour ONLY the account of the host editor the tester
+    # is working in — Cursor -> cursor-agent, Claude Code/Desktop -> claude CLI —
+    # and NEVER silently fall through to a different backend/account when the
+    # host's own is present-but-unauthenticated (llm.py then fails fast with an
+    # actionable message instead of hanging on a 120s timeout). OFF restores the
+    # legacy first-available fallback as an escape hatch.
+    qa_llm_strict_host: bool = True
 
     # Cheaper/faster model for the intent router's classification pass (T-04 /
     # I-027). Empty string means "use qa_llm_model" (no override). Set to a haiku
@@ -317,6 +325,32 @@ class Settings(BaseSettings):
     # condensed to a bounded endpoint summary (tools/swagger_fetcher.py), and
     # used to ground API test-case generation.
     qa_swagger_enabled: bool = False
+    # Auto-build the Excel (xlsx) export the moment test-case generation
+    # finishes on the MCP path (tools/mcp_handlers.handle_generate_test_cases),
+    # so the reply hands the tester a ready file path -- no separate
+    # qa_export_suite call and no "which format?" round trip.
+    #
+    # Deliberately ON by default -- the one documented exception to the
+    # opt-in-defaults-OFF rule. The spreadsheet IS the deliverable a manual
+    # tester came for; it is a local file write with no external side effect;
+    # and defaulting in CODE (not in the generated .env) is the only way
+    # already-installed users pick it up, since .env files survive updates.
+    # Set QA_AUTO_EXPORT_XLSX=0 to go back to export-on-request.
+    #
+    # Reuses the SAME generate_test_case_xlsx code path (cell_sanitizer
+    # formula-injection protection included) and never fails generation -- an
+    # export error only appends a warning note.
+    qa_auto_export_xlsx: bool = True
+
+    # Directory the auto-exported .xlsx is written to, relative to the working
+    # directory (the install dir the MCP server chdirs into). Defaults to the
+    # gitignored data/exports so the file lands in a stable folder a
+    # non-technical tester can find and re-open -- their own deliverable, never
+    # auto-deleted. Set to "" for the legacy secure-temp behavior
+    # (<tempdir>/qa_agents_exports/, 0600); an unusable value degrades to that
+    # same temp path rather than failing the export. A plain string field: no
+    # bool coercer, and it adds no internal import.
+    qa_export_dir: str = "data/exports"
 
     # Distribution / test-cases-only mode. When ON, the UI exposes ONLY the
     # test-case generation flows (feature text / Jira / web URL / Swagger link
@@ -419,6 +453,18 @@ class Settings(BaseSettings):
     # private checkout; the distribution build bakes a default. Env overrides.
     posthog_api_key: str = ""
 
+    # --- Internal Chainlit web-app product analytics (PostHog) - opt-in. ---
+    # A SEPARATE PostHog PROJECT from the dist telemetry above so the internal
+    # web app's product events + error tracking never mix with the public
+    # distribution's usage data. Gated by qa_analytics_enabled (constitution:
+    # default OFF) and still honours qa_telemetry_disabled / DO_NOT_TRACK.
+    # .env only. Uses the optional ``posthog`` SDK when installed (error-tracking
+    # issue grouping) with a bare-HTTP fallback so the dist build is unaffected.
+    qa_analytics_enabled: bool = False
+    # PostHog project API key for the internal Chainlit app (write-only public
+    # ingest key). Empty leaves web-app analytics inert regardless of the flag.
+    posthog_app_api_key: str = ""
+
     @field_validator(
         "qa_web_search_enabled",
         "qa_rag_enabled",
@@ -441,13 +487,16 @@ class Settings(BaseSettings):
         "qa_spec_rag_persist",
         "qa_finetune_export_enabled",
         "qa_swagger_enabled",
+        "qa_auto_export_xlsx",
         "qa_dist_mode",
         "qa_mcp_enabled",
         "qa_mcp_elicit_enabled",
         "qa_auto_update_enabled",
         "qa_code_lock_enabled",
         "qa_telemetry_disabled",
+        "qa_analytics_enabled",
         "xray_dry_run",
+        "qa_llm_strict_host",
         mode="before",
     )
     @classmethod

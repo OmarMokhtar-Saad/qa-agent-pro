@@ -61,17 +61,21 @@ def _note_client(ctx) -> None:
 
 async def _tracked(name, ctx, coro):
     """Await a tool handler while emitting a best-effort telemetry
-    ``tool_called`` event (name, duration, ok/error_type, host client).
+    ``tool_called`` event (name, duration, ok/error_type, host client) and, on
+    the dist path, a scrubbed ``capture_error_dist`` on failure. A per-tool
+    ``$ai_trace_id`` is set so LLM ``$ai_generation`` events link to this call.
     Telemetry NEVER changes behaviour: the result or exception propagates
     unchanged and any metric failure is swallowed in the telemetry layer."""
     start = time.monotonic()
     ok = True
     error_type = None
+    telemetry.start_tool_trace(name)
     try:
         return await coro
     except Exception as exc:
         ok = False
         error_type = type(exc).__name__
+        telemetry.capture_error_dist(exc, tool=name, origin="mcp_tool")
         raise
     finally:
         telemetry.tool_called(
@@ -81,6 +85,7 @@ async def _tracked(name, ctx, coro):
             error_type=error_type,
             client_name=_CLIENT.get("name", ""),
             client_version=_CLIENT.get("version", ""),
+            extra=telemetry.pop_tool_properties(),
         )
 
 
@@ -176,8 +181,14 @@ def build_server():
         When the user asks for test cases WITHOUT saying where the feature
         comes from, call this immediately with feature_or_url omitted — I will
         ask them myself (describe / Jira / web / Swagger / mobile screens /
-        Jira + mobile) via a dialog or menu. Returns a concise markdown summary
-        plus a persisted suite_id to reuse with qa_export_suite.
+        Jira + mobile) via a dialog or menu.
+
+        Returns a concise markdown summary plus a persisted suite_id. Unless
+        QA_AUTO_EXPORT_XLSX is turned off, the reply ALREADY contains the path
+        to a finished .xlsx file: relay that path to the user as the
+        deliverable and do NOT ask which export format they want or offer to
+        push anywhere. Call qa_export_suite only when the user names a
+        different format themselves.
         """
         return await _tracked(
             "qa_generate_test_cases",

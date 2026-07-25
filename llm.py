@@ -43,19 +43,23 @@ Switching backends is a pure config change; callers are backend-agnostic.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 from typing import Awaitable, Callable, Type, TypeVar
 
 from pydantic import BaseModel
 
 from config.settings import settings
+from tools import telemetry
 
 logger = logging.getLogger("qa_agents.llm")
 
@@ -86,8 +90,22 @@ class CursorAgentError(RuntimeError):
     """
 
 
+class LLMBackendUnavailableError(RuntimeError):
+    """The host-matched 'auto' backend is unusable — its binary is missing or it
+    is not authenticated (e.g. inside Cursor with no CURSOR_API_KEY and no
+    ``cursor-agent login`` session).
+
+    Carries a tester-readable remediation message and is raised BEFORE any
+    subprocess spawn so callers fail FAST — no 120s timeout burn, no retry loop.
+    Deliberately NOT in agents.test_scenario_agent._RETRYABLE: a category must
+    abort on it immediately instead of retrying a doomed, unauthenticated call.
+    """
+
+
 _DEFAULT_MODEL = "claude-sonnet-4-6"
 _MAX_TOKENS = 16384
+
+
 def _int_setting(name: str, default: int) -> int:
     value = getattr(settings, name, default)
     if isinstance(value, int) and value > 0:
@@ -141,7 +159,15 @@ def set_host_client(name: str) -> None:
 
 
 def _cli_available() -> bool:
-    return bool(shutil.which(_get_cli()) or os.path.exists(_get_cli()))
+    """Claude CLI binary resolvable? Never raises (unlike _get_cli, which raises
+    when it cannot resolve) so the usability probes below can call it safely.
+    An explicit CLAUDE_CLI_PATH must actually exist to count — a stale or
+    deliberately-invalid override (e.g. the test-suite's /nonexistent
+    neutralizer) must read as unavailable, not available."""
+    env_path = os.getenv("CLAUDE_CLI_PATH")
+    if env_path:
+        return os.path.exists(env_path)
+    return bool(shutil.which("claude"))
 
 
 def _cursor_available() -> bool:
@@ -169,21 +195,141 @@ def _cursor_usable() -> bool:
     return _CURSOR_USABLE_CACHE["login"]
 
 
+# Artifacts the claude CLI's OAuth login writes on non-Keychain platforms.
+_CLAUDE_CRED_FILES = (
+    "~/.claude/.credentials.json",
+    "~/.config/claude/.credentials.json",
+)
+_CLI_USABLE_CACHE: dict = {}
+
+
+def _cli_logged_in(cli_path: str) -> bool:
+    """Best-effort: does the claude CLI have a usable OAuth session (no API key)?
+
+    Symmetric in intent to _cursor_logged_in, but the claude CLI has no cheap
+    offline 'am I authenticated' subcommand (and spawning `claude -p` would burn
+    a real generation call), so probe the artifacts its OAuth login writes: a
+    CLAUDE_CODE_OAUTH_TOKEN in the environment, or a credentials file in a known
+    location. When neither is found we stay LENIENT on macOS — the CLI keeps its
+    token in the login Keychain, which cannot be introspected cheaply without
+    risking a blocking prompt — so a genuinely signed-in mac user is never
+    wrongly blocked (a real call surfaces auth errors on its own). On non-macOS
+    with no token and no credentials file, return False (definitively no
+    session). Never raises.
+    """
+    if os.getenv("CLAUDE_CODE_OAUTH_TOKEN"):
+        return True
+    for candidate in _CLAUDE_CRED_FILES:
+        try:
+            path = os.path.expanduser(candidate)
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                return True
+        except OSError:
+            continue
+    return sys.platform == "darwin"
+
+
+def _cli_usable() -> bool:
+    """Binary present AND (best-effort) authenticated — symmetric to
+    _cursor_usable, cached per process. Strict auto mode must never host-match a
+    backend that would only fail at generation time. Never raises."""
+    if not _cli_available():
+        return False
+    if "auth" not in _CLI_USABLE_CACHE:
+        try:
+            _CLI_USABLE_CACHE["auth"] = _cli_logged_in(_get_cli())
+        except Exception:
+            _CLI_USABLE_CACHE["auth"] = False
+    return _CLI_USABLE_CACHE["auth"]
+
+
+def _strict_host_enabled() -> bool:
+    """QA_LLM_STRICT_HOST (default ON): in auto mode honour ONLY the host editor's
+    own backend/account and never silently fall through to a different one when
+    it is unusable. OFF restores the legacy first-available fallback."""
+    val = getattr(settings, "qa_llm_strict_host", True)
+    return val if isinstance(val, bool) else True
+
+
+def _unavailable_message(backend: str) -> str:
+    """Actionable, tester-readable remediation for a host-matched backend that is
+    present-but-unusable."""
+    if backend == "cursor":
+        return (
+            "Your MCP client is Cursor, but cursor-agent is not authenticated on "
+            "this machine. Set CURSOR_API_KEY in ~/qa-agent-pro/.env or run "
+            "`cursor-agent login`, then run qa_setup_check."
+        )
+    return (
+        "Your MCP client is Claude Code/Desktop, but the claude CLI is not "
+        "available or signed in on this machine. Install the Claude Code CLI (or "
+        "set CLAUDE_CLI_PATH) and sign in, then run qa_setup_check. If you are "
+        "authenticated another way, set QA_LLM_STRICT_HOST=false in .env to "
+        "allow fallback."
+    )
+
+
 def _auto_backend() -> str:
+    """Strict host-matched backend for QA_LLM_BACKEND=auto.
+
+    POLICY (QA_LLM_STRICT_HOST, default ON): honour ONLY the account of the host
+    the tester is working in — Cursor -> cursor-agent, Claude Code/Desktop ->
+    claude CLI — and NEVER silently fall through to a different backend/account.
+    When the host-matched backend is present-but-unauthenticated (or missing),
+    RAISE LLMBackendUnavailableError with an actionable message BEFORE any
+    subprocess spawn, so callers fail fast instead of burning a 120s timeout.
+    Only an unknown/empty host (no account to respect) keeps a first-USABLE
+    order, judged by real usability probes. Strict OFF restores the legacy
+    first-available fallback.
+    """
     host = _HOST_CLIENT["name"]
-    if "cursor" in host and _cursor_usable():
-        return "cursor"
-    if "claude" in host and _cli_available():
-        return "cli"
-    # Unknown host (e.g. Gemini — no backend for it yet), or the host-matching
-    # backend cannot actually authenticate: first USABLE backend wins.
-    if _cli_available():
+    if _strict_host_enabled():
+        if "cursor" in host:
+            if _cursor_usable():
+                return "cursor"
+            raise LLMBackendUnavailableError(_unavailable_message("cursor"))
+        if "claude" in host:
+            if _cli_usable():
+                return "cli"
+            raise LLMBackendUnavailableError(_unavailable_message("cli"))
+    # Unknown/empty host (or strict disabled): first USABLE backend wins, judged
+    # by real usability probes — never a mere binary-exists check.
+    if _cli_usable():
         return "cli"
     if _cursor_usable():
         return "cursor"
     if settings.anthropic_api_key:
         return "api"
+    if _strict_host_enabled():
+        raise LLMBackendUnavailableError(
+            "No usable LLM backend was found. Install and sign in to the claude "
+            "CLI or cursor-agent, or set ANTHROPIC_API_KEY, then run "
+            "qa_setup_check."
+        )
     return "cli"
+
+
+def _auto_backend_safe() -> str:
+    """Non-raising _auto_backend for status labels: return the backend the tester
+    WOULD use even when it is currently unusable. Never raises."""
+    try:
+        return _auto_backend()
+    except LLMBackendUnavailableError:
+        host = _HOST_CLIENT["name"]
+        if "cursor" in host:
+            return "cursor"
+        return "cli"
+
+
+def backend_unavailable_reason() -> str:
+    """Actionable remediation message when the active backend is host-matched but
+    unusable (strict auto mode), else ''. Lets callers surface the real reason
+    instead of a generic 'try again'. Never raises."""
+    try:
+        _backend()
+        return ""
+    except LLMBackendUnavailableError as exc:
+        return str(exc)
 
 
 def describe_backend() -> str:
@@ -193,7 +339,7 @@ def describe_backend() -> str:
     if configured != "auto":
         return configured
     host = _HOST_CLIENT["name"] or "unknown client"
-    return f"auto → {_backend()} (client: {host})"
+    return f"auto → {_auto_backend_safe()} (client: {host})"
 
 
 def _backend() -> str:
@@ -627,6 +773,7 @@ async def _ask_api(system: str, user: str, model: str | None = None) -> str:
         system=system,
         messages=[{"role": "user", "content": _user_content(user)}],
     )
+    _record_api_usage(resp)
     return "".join(
         block.text for block in resp.content if getattr(block, "type", "") == "text"
     ).strip()
@@ -1112,6 +1259,79 @@ async def _ask_vision_cursor(
 # Public API (backend dispatch)
 # --------------------------------------------------------------------------- #
 
+# Token usage from the most recent api-backend call, stashed here (task-local)
+# so the public wrappers can emit a $ai_generation event with REAL counts.
+# ``None`` means "no api usage this call" -> the wrapper falls back to a len//4
+# estimate (cli/cursor, or an api streaming path that yields no usage object).
+_API_USAGE: contextvars.ContextVar = contextvars.ContextVar(
+    "qa_api_usage", default=None
+)
+
+
+def _record_api_usage(resp) -> None:
+    """Stash (input_tokens, output_tokens) from an Anthropic response so the
+    public wrapper can emit real token counts. Never raises; a non-numeric or
+    mocked usage object is ignored (the wrapper then estimates)."""
+    try:
+        usage = getattr(resp, "usage", None)
+        in_tok = getattr(usage, "input_tokens", None)
+        out_tok = getattr(usage, "output_tokens", None)
+        if isinstance(in_tok, int) and isinstance(out_tok, int):
+            _API_USAGE.set((in_tok, out_tok))
+    except Exception:
+        logger.debug("could not read api usage", exc_info=True)
+
+
+def _emit_generation(
+    method: str,
+    backend: str,
+    model_arg: str | None,
+    system: str,
+    user: str,
+    result: str,
+    start: float,
+    ok: bool | None = None,
+) -> None:
+    """Emit a content-free ``$ai_generation`` telemetry event for one LLM call.
+
+    Real token counts are used whenever ``_record_api_usage`` captured them;
+    otherwise both counts are a ``len//4`` estimate flagged with
+    ``estimated=True`` (cli / cursor / api-streaming). Never raises -- telemetry
+    must never change generation behaviour."""
+    try:
+        latency_s = max(0.0, time.monotonic() - start)
+        usage = None
+        try:
+            usage = _API_USAGE.get()
+        except Exception:
+            usage = None
+        if usage:
+            in_tok, out_tok = usage
+            estimated = False
+        else:
+            in_tok = (len(system) + len(user)) // 4
+            out_tok = (len(result) // 4) if isinstance(result, str) else 0
+            estimated = True
+        resolved = (
+            _resolve_cursor_model(model_arg)
+            if backend == "cursor"
+            else _resolve_model(model_arg)
+        )
+        if ok is None:
+            ok = not (isinstance(result, str) and result.startswith("Error:"))
+        telemetry.capture_ai_generation(
+            method=method,
+            provider=backend,
+            model=resolved,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            latency_s=latency_s,
+            estimated=estimated,
+            ok=ok,
+        )
+    except Exception:
+        logger.debug("ai_generation telemetry emit failed", exc_info=True)
+
 
 def sanitize_llm_response(raw: str, friendly_msg: str) -> str:
     """Return raw unchanged unless it starts with 'Error:' — then return friendly_msg.
@@ -1166,8 +1386,19 @@ def check_backend() -> tuple[bool, str]:
     CURSOR_API_KEY is set or a `cursor-agent login` session exists.
     For 'cli': checks the claude binary resolves via shutil.which or CLAUDE_CLI_PATH.
     Returns (True, '') when healthy, (False, human-readable-warning) otherwise.
+
+    For 'auto': resolves the strict host-matched backend and reports the
+    actionable remediation when the host's own backend is present-but-unusable
+    (no silent fallback to a different account).
     """
-    backend = _backend()
+    configured = (settings.qa_llm_backend or "cli").strip().lower()
+    if configured == "auto":
+        try:
+            backend = _auto_backend()
+        except LLMBackendUnavailableError as exc:
+            return (False, str(exc))
+    else:
+        backend = _backend()
     if backend == "api":
         if not settings.anthropic_api_key:
             return (
@@ -1210,15 +1441,29 @@ async def ask(system: str, user: str, model: str | None = None) -> str:
     Pass ``model`` to override the configured model for this one call (e.g. route
     a cheap classification to a smaller model). Both backends honour it.
     """
+    _API_USAGE.set(None)
+    _ask_start = time.monotonic()
+    backend = "cli"
     try:
         backend = _backend()
         if backend == "api":
-            return await _ask_api(system, user, model)
-        if backend == "cursor":
-            return await _ask_cursor(system, user, model)
-        return await _ask_cli(system, user, model)
+            result = await _ask_api(system, user, model)
+        elif backend == "cursor":
+            result = await _ask_cursor(system, user, model)
+        else:
+            result = await _ask_cli(system, user, model)
+        _emit_generation("ask", backend, model, system, user, result, _ask_start)
+        return result
+    except LLMBackendUnavailableError as exc:
+        # Host-matched backend unusable — surface the actionable message as an
+        # Error string (ask() never raises) without a stacktrace or a spawn.
+        logger.warning("LLM backend unavailable: %s", exc)
+        return f"Error: {exc}"
     except Exception as exc:
         logger.exception("LLM call failed")
+        telemetry.capture_error(
+            exc, distinct_id="llm", properties={"origin": "llm.ask"}
+        )
         return f"Error: {exc}"
 
 
@@ -1244,12 +1489,25 @@ async def ask_vision(
     * otherwise -> a never-raising ``"Error: ..."`` string so callers degrade
       gracefully (``result.startswith("Error:")``).
     """
-    backend = _backend()
+    _API_USAGE.set(None)
+    try:
+        backend = _backend()
+    except LLMBackendUnavailableError as exc:
+        # ask_vision never raises — surface the host-matched auth error instead.
+        logger.warning("ask_vision: LLM backend unavailable: %s", exc)
+        return f"Error: {exc}"
     if backend == "cursor":
         # Screenshot -> description entirely on the cursor backend, no Anthropic
         # key needed: cursor-agent uses CURSOR_API_KEY when set, else its own
         # login session. See _run_sync_vision_cursor for the sandbox rationale.
-        return await _ask_vision_cursor(system, user, image_bytes, media_type, model)
+        _vision_start = time.monotonic()
+        _vision_result = await _ask_vision_cursor(
+            system, user, image_bytes, media_type, model
+        )
+        _emit_generation(
+            "ask_vision", "cursor", model, system, user, _vision_result, _vision_start
+        )
+        return _vision_result
     if not (backend in ("api", "cli") and settings.anthropic_api_key):
         logger.info(
             "ask_vision: no usable vision provider for backend %r -- skipping vision",
@@ -1264,6 +1522,7 @@ async def ask_vision(
 
         client = _get_client()
         encoded = base64.b64encode(image_bytes).decode("ascii")
+        _vision_api_start = time.monotonic()
         resp = await client.messages.create(
             model=_resolve_model(model),
             max_tokens=_MAX_TOKENS,
@@ -1285,11 +1544,19 @@ async def ask_vision(
                 }
             ],
         )
-        return "".join(
+        _record_api_usage(resp)
+        _vision_text = "".join(
             block.text for block in resp.content if getattr(block, "type", "") == "text"
         ).strip()
+        _emit_generation(
+            "ask_vision", backend, model, system, user, _vision_text, _vision_api_start
+        )
+        return _vision_text
     except Exception as exc:
         logger.exception("ask_vision: vision call failed")
+        telemetry.capture_error(
+            exc, distinct_id="llm", properties={"origin": "llm.ask_vision"}
+        )
         return f"Error: {exc}"
 
 
@@ -1310,10 +1577,19 @@ async def ask_json(
     """
     json_system = _json_system(system, response_model)
     backend = _backend()
-    if backend == "api":
-        raw = await _ask_json_api(json_system, user, on_progress, model)
-    elif backend == "cursor":
-        raw = await _ask_json_cursor(json_system, user, on_progress, model)
-    else:
-        raw = await _ask_json_cli(json_system, user, on_progress, model)
+    _API_USAGE.set(None)
+    _json_start = time.monotonic()
+    try:
+        if backend == "api":
+            raw = await _ask_json_api(json_system, user, on_progress, model)
+        elif backend == "cursor":
+            raw = await _ask_json_cursor(json_system, user, on_progress, model)
+        else:
+            raw = await _ask_json_cli(json_system, user, on_progress, model)
+    except Exception:
+        _emit_generation(
+            "ask_json", backend, model, json_system, user, "", _json_start, ok=False
+        )
+        raise
+    _emit_generation("ask_json", backend, model, json_system, user, raw, _json_start)
     return _parse_json_response(raw, response_model)

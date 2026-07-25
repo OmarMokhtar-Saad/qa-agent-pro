@@ -11,6 +11,8 @@ Active only when a PostHog key is present AND no opt-out is set.
 
 from __future__ import annotations
 
+import atexit
+import contextvars
 import logging
 import os
 import platform
@@ -221,13 +223,418 @@ def tool_called(
     error_type=None,
     client_name: str = "",
     client_version: str = "",
+    extra: dict | None = None,
 ) -> None:
     """Emit a ``tool_called`` event. Never raises; carries only the exception
-    CLASS name on failure (``error_type``), never message content."""
+    CLASS name on failure (``error_type``), never message content. ``extra``
+    holds content-free, handler-supplied properties (case_count / export format
+    / source type) collected via the per-tool props bag."""
     props = _base_properties(client_name, client_version)
     props["tool"] = tool
     props["duration_ms"] = int(duration_ms)
     props["ok"] = bool(ok)
     if error_type:
         props["error_type"] = str(error_type)
+    if extra:
+        for key, value in extra.items():
+            if value is not None:
+                props[key] = value
     _capture("tool_called", props)
+
+
+# --------------------------------------------------------------------------- #
+# Dist-path SDK tracing: error tracking + $ai_generation (LLM analytics)
+# --------------------------------------------------------------------------- #
+# These extend the bare-HTTP dist telemetry above with the OPTIONAL ``posthog``
+# SDK (issue grouping for error tracking) and PostHog LLM-analytics
+# ``$ai_generation`` events. They gate on the DIST key (``_enabled`` /
+# ``_api_key``) -- NEVER the Chainlit app gate (``qa_analytics_enabled`` /
+# ``posthog_app_api_key``) -- so the two surfaces stay cleanly separated. Every
+# function is never-raise and content-free: exception MESSAGES and prompt /
+# completion text are never transmitted.
+
+# Per-MCP-tool-invocation trace id + an extra-properties bag the handlers fill
+# (case_count / export format / source type). Set in mcp_server._tracked; the
+# handler body runs in the same task context and mutates the SAME bag object,
+# which _tracked reads back in its finally to enrich the tool_called event.
+_ai_trace_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "qa_ai_trace_id", default=""
+)
+_tool_props_var: contextvars.ContextVar = contextvars.ContextVar(
+    "qa_tool_props", default=None
+)
+
+_dist_sdk_sentinel = object()
+_dist_sdk_cached: object = _dist_sdk_sentinel
+
+
+def start_tool_trace(tool: str) -> str:
+    """Begin a per-tool trace: set a fresh ``$ai_trace_id`` and an empty extra-
+    properties bag so LLM generations during this call link to it and handlers
+    can attach content-free properties. Returns the trace id. Never raises."""
+    trace_id = uuid.uuid4().hex
+    try:
+        _ai_trace_id_var.set(trace_id)
+        _tool_props_var.set({})
+    except Exception:
+        logger.debug("telemetry: start_tool_trace failed", exc_info=True)
+    return trace_id
+
+
+def current_trace_id() -> str:
+    """The in-flight tool's ``$ai_trace_id`` ('' outside a tool call). Never raises."""
+    try:
+        return _ai_trace_id_var.get()
+    except Exception:
+        return ""
+
+
+def add_tool_properties(**props) -> None:
+    """Attach content-free properties (e.g. case_count / format / source) to the
+    in-flight ``tool_called`` event. No-op outside a tool trace. Never raises."""
+    try:
+        bag = _tool_props_var.get()
+        if bag is None:
+            return
+        for key, value in props.items():
+            if value is not None:
+                bag[key] = value
+    except Exception:
+        logger.debug("telemetry: add_tool_properties failed", exc_info=True)
+
+
+def pop_tool_properties() -> dict:
+    """Return and clear the in-flight tool's extra-properties bag. Never raises."""
+    try:
+        bag = _tool_props_var.get()
+        _tool_props_var.set(None)
+        return dict(bag) if bag else {}
+    except Exception:
+        return {}
+
+
+def _scrub_event_paths(event):
+    """posthog ``before_send`` hook for the dist client: strip absolute paths
+    from crash stack frames (they can leak the user's OS username) and force
+    each exception's ``value`` to its class name. Fail-CLOSED: if scrubbing
+    errors, the event is DROPPED (return None), never sent unscrubbed.
+    Empirically verified against posthog 7.29.0: this hook IS invoked for
+    ``capture_exception`` ($exception) events; frames carry ``abs_path`` /
+    ``filename`` keys."""
+    try:
+        props = event.get("properties") if isinstance(event, dict) else None
+        exc_list = props.get("$exception_list") if isinstance(props, dict) else None
+        if not exc_list:
+            return event
+        root = str(_INSTALL_DIR)
+        for entry in exc_list:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("type"):
+                entry["value"] = str(entry["type"])
+            frames = (entry.get("stacktrace") or {}).get("frames") or []
+            for frame in frames:
+                if not isinstance(frame, dict):
+                    continue
+                for key in ("abs_path", "filename"):
+                    path = frame.get(key)
+                    if not isinstance(path, str):
+                        continue
+                    if path.startswith(root):
+                        frame[key] = path[len(root) :].lstrip("/\\")
+                    else:
+                        frame[key] = os.path.basename(path)
+        return event
+    except Exception:
+        logger.debug(
+            "telemetry: before_send scrub failed - dropping event", exc_info=True
+        )
+        return None
+
+
+def _dist_sdk_client():
+    """Cached ``posthog.Posthog`` bound to the DIST key (``_api_key``), or
+    ``None`` when the SDK is absent / no key is set (bare-HTTP fallback).
+    Independent of the app-analytics ``_sdk_client``. Never raises."""
+    global _dist_sdk_cached
+    if _dist_sdk_cached is not _dist_sdk_sentinel:
+        return _dist_sdk_cached
+    _dist_sdk_cached = None
+    key = _api_key()
+    if not key:
+        return None
+    try:
+        from posthog import Posthog
+
+        client = Posthog(
+            project_api_key=key,
+            host=_POSTHOG_HOST,
+            enable_exception_autocapture=False,
+            before_send=_scrub_event_paths,
+        )
+        atexit.register(_safe_flush, client)
+        _dist_sdk_cached = client
+    except Exception:
+        logger.debug(
+            "telemetry: dist posthog SDK unavailable -- bare-HTTP error events only",
+            exc_info=True,
+        )
+        _dist_sdk_cached = None
+    return _dist_sdk_cached
+
+
+def _scrubbed_exception(exc: BaseException) -> BaseException:
+    """Return an exception carrying the ORIGINAL traceback (stack frames drive
+    issue grouping) but with the MESSAGE replaced by the class name only.
+
+    External users' exception messages can embed feature text, URLs or secrets,
+    so they must never be transmitted -- only the class name and the frames are.
+    Never raises; returns the original exception if cloning fails for any reason.
+    """
+    try:
+        cls = type(exc)
+        try:
+            scrubbed: BaseException = cls(cls.__name__)
+        except Exception:
+            scrubbed = Exception(cls.__name__)
+        scrubbed.__traceback__ = getattr(exc, "__traceback__", None)
+        return scrubbed
+    except Exception:
+        return exc
+
+
+def capture_error_dist(
+    exc: BaseException,
+    *,
+    tool: str | None = None,
+    origin: str | None = None,
+    properties: dict | None = None,
+) -> None:
+    """Report a dist-path exception to PostHog error tracking. Gated on the DIST
+    key (``_enabled``), NOT ``qa_analytics_enabled``. Privacy: only the exception
+    CLASS name and stack FRAMES are sent -- the message and absolute frame
+    paths are scrubbed (see ``_scrub_event_paths``). Never raises.
+    With the SDK present it groups via ``capture_exception``; without it a
+    best-effort bare-HTTP ``tool_error`` event (class name only) is sent."""
+    if not _enabled():
+        return
+    try:
+        props = _base_properties()
+        props["error_type"] = type(exc).__name__
+        if tool:
+            props["tool"] = str(tool)
+        if origin:
+            props["origin"] = str(origin)
+        tid = current_trace_id()
+        if tid:
+            props["$ai_trace_id"] = tid
+        if properties:
+            for key, value in properties.items():
+                if value is not None:
+                    props[key] = value
+        client = _dist_sdk_client()
+        if client is not None:
+            client.capture_exception(
+                _scrubbed_exception(exc),
+                distinct_id=_distinct_id(),
+                properties=props,
+            )
+        else:
+            _dispatch(_build_payload("tool_error", _distinct_id(), props))
+    except Exception:
+        logger.debug("telemetry: capture_error_dist failed", exc_info=True)
+
+
+def capture_ai_generation(
+    *,
+    model: str = "",
+    provider: str = "",
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    latency_s: float | None = None,
+    estimated: bool = False,
+    trace_id: str | None = None,
+    method: str = "",
+    ok: bool = True,
+    error_type: str | None = None,
+) -> None:
+    """Emit a PostHog LLM-analytics ``$ai_generation`` event for one LLM call.
+
+    Content-free by contract: ``$ai_input`` / ``$ai_output_choices`` (prompt and
+    completion text) are NEVER included -- only metadata (model, provider, token
+    counts, latency, trace id). Gated on the DIST key (``_enabled``). Never raises.
+    """
+    if not _enabled():
+        return
+    try:
+        props = _base_properties()
+        props["$ai_model"] = str(model or "")
+        props["$ai_provider"] = str(provider or "")
+        if input_tokens is not None:
+            props["$ai_input_tokens"] = int(input_tokens)
+        if output_tokens is not None:
+            props["$ai_output_tokens"] = int(output_tokens)
+        if latency_s is not None:
+            props["$ai_latency"] = round(float(latency_s), 3)
+        props["estimated"] = bool(estimated)
+        if method:
+            props["method"] = str(method)
+        props["ok"] = bool(ok)
+        if error_type:
+            props["error_type"] = str(error_type)
+        tid = trace_id or current_trace_id()
+        if tid:
+            props["$ai_trace_id"] = tid
+        _capture("$ai_generation", props)
+    except Exception:
+        logger.debug("telemetry: capture_ai_generation failed", exc_info=True)
+
+
+# --- Internal Chainlit web-app analytics (Phases 1+2) -----------------------
+# A SECOND, opt-in surface on top of the dist telemetry above. It uses a
+# SEPARATE PostHog project key (settings.posthog_app_api_key) and the official
+# ``posthog`` SDK WHEN INSTALLED (needed for error-tracking issue grouping /
+# Slack alerts), with the same never-raise bare-HTTP fallback used above so the
+# dist build stays dependency-identical: the SDK is an OPTIONAL extra imported
+# lazily, never a hard dependency. Gated by settings.qa_analytics_enabled
+# (default OFF, constitution) and the shared opt-outs (qa_telemetry_disabled /
+# DO_NOT_TRACK). distinct_id is the logged-in username (set by the caller).
+
+_APP_NAME = "chainlit"
+_sdk_sentinel = object()
+_sdk_cached: object = _sdk_sentinel
+
+
+def _app_api_key() -> str:
+    """Resolve the internal app's PostHog key (separate project). Never raises."""
+    try:
+        return (settings.posthog_app_api_key or "").strip()
+    except Exception:
+        return ""
+
+
+def analytics_enabled() -> bool:
+    """Web-app analytics send only when opted in (qa_analytics_enabled), a key is
+    present, and neither opt-out (qa_telemetry_disabled / DO_NOT_TRACK) is set."""
+    try:
+        if not settings.qa_analytics_enabled:
+            return False
+    except Exception:
+        return False
+    return bool(_app_api_key()) and not _opted_out()
+
+
+def _safe_flush(client: object) -> None:
+    """Flush a posthog client, swallowing any error (never raises)."""
+    try:
+        client.flush()
+    except Exception:
+        logger.debug("analytics: flush failed", exc_info=True)
+
+
+def _sdk_client():
+    """Return a cached ``posthog.Posthog`` client when the OPTIONAL SDK is
+    importable and a key is set, else ``None`` (bare-HTTP fallback). Never raises."""
+    global _sdk_cached
+    if _sdk_cached is not _sdk_sentinel:
+        return _sdk_cached
+    _sdk_cached = None
+    key = _app_api_key()
+    if not key:
+        return None
+    try:
+        from posthog import Posthog
+
+        client = Posthog(
+            project_api_key=key,
+            host=_POSTHOG_HOST,
+            # Explicit capture_exception() only: autocapture would install a
+            # process-wide hook shipping full tracebacks/messages (can embed
+            # user feature text), violating the class-name-only privacy contract.
+            enable_exception_autocapture=False,
+        )
+        atexit.register(_safe_flush, client)
+        _sdk_cached = client
+    except Exception:
+        logger.debug(
+            "analytics: posthog SDK unavailable - using bare-HTTP fallback",
+            exc_info=True,
+        )
+        _sdk_cached = None
+    return _sdk_cached
+
+
+def _app_properties(extra: dict | None = None) -> dict:
+    """Common web-app event props: always tag ``app: chainlit``; ``$set`` the
+    operator email when one is configured."""
+    props: dict = {"app": _APP_NAME, "$lib": "qa-agents-app"}
+    if extra:
+        props.update(extra)
+    try:
+        email = (settings.qa_user_email or "").strip()
+    except Exception:
+        email = ""
+    if email:
+        props.setdefault("$set", {})["email"] = email
+    return props
+
+
+def _build_app_payload(event: str, distinct_id: str, properties: dict) -> dict:
+    return {
+        "api_key": _app_api_key(),
+        "event": event,
+        "distinct_id": distinct_id,
+        "properties": properties,
+    }
+
+
+def capture_event(
+    event: str,
+    distinct_id: str | None = None,
+    properties: dict | None = None,
+) -> None:
+    """Emit an internal web-app product event (Phase 1). Never raises; a no-op
+    unless web-app analytics are enabled."""
+    if not analytics_enabled():
+        return
+    try:
+        did = (distinct_id or "").strip() or "anonymous"
+        props = _app_properties(properties)
+        client = _sdk_client()
+        if client is not None:
+            client.capture(distinct_id=did, event=event, properties=props)
+        else:
+            _dispatch(_build_app_payload(event, did, props))
+    except Exception:
+        logger.debug("analytics: capture_event failed", exc_info=True)
+
+
+def capture_error(
+    exc: BaseException,
+    distinct_id: str | None = None,
+    properties: dict | None = None,
+) -> None:
+    """Report an exception to PostHog error tracking (Phase 2): issue grouping,
+    fingerprints, Slack alerts. Never raises. Requires the ``posthog`` SDK for
+    grouping; without it a best-effort ``app_error`` event (exception CLASS name
+    only, no message) is sent so the failure is not lost entirely."""
+    if not analytics_enabled():
+        return
+    try:
+        did = (distinct_id or "").strip() or "anonymous"
+        props = _app_properties(properties)
+        client = _sdk_client()
+        if client is not None:
+            client.capture_exception(exc, distinct_id=did, properties=props)
+        else:
+            props["error_type"] = type(exc).__name__
+            _dispatch(_build_app_payload("app_error", did, props))
+    except Exception:
+        logger.debug("analytics: capture_error failed", exc_info=True)
+
+
+def flush() -> None:
+    """Flush queued analytics events on shutdown. Never raises."""
+    client = _sdk_client()
+    if client is not None:
+        _safe_flush(client)
