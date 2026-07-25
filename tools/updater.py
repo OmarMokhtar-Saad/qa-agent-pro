@@ -240,7 +240,43 @@ def fetch_latest_release(repo: str, token: str, timeout: float) -> Optional[dict
     )
     resp.raise_for_status()
     data = resp.json()
-    return {"tag_name": data.get("tag_name"), "zipball_url": data.get("zipball_url")}
+    asset_url = ""
+    for asset in data.get("assets") or []:
+        name = str(asset.get("name") or "")
+        if name.endswith(".zip") and asset.get("browser_download_url"):
+            asset_url = asset["browser_download_url"]
+            break
+    return {
+        "tag_name": data.get("tag_name"),
+        "zipball_url": data.get("zipball_url"),
+        "asset_url": asset_url,
+    }
+
+
+def _safe_extract_zip(zf: zipfile.ZipFile, dest: Path) -> None:
+    """Extract a release zip, refusing any member that would escape ``dest``.
+
+    Zip-slip defense-in-depth: absolute paths, any ``..`` component, a
+    target that resolves outside ``dest``, or a symlink member each abort
+    the whole extraction with ``ValueError`` (the caller degrades to the
+    'error' status and starts the current version). Never extracts a
+    single member before the whole archive has been validated."""
+    dest_root = dest.resolve()
+    for info in zf.infolist():
+        name = info.filename
+        if name.startswith(("/", "\\")) or ".." in Path(name).parts:
+            raise ValueError(f"Unsafe zip member path: {name!r}")
+        target = (dest / name).resolve()
+        if target != dest_root and dest_root not in target.parents:
+            raise ValueError(f"Zip member escapes extract dir: {name!r}")
+        # POSIX mode lives in the high 16 bits of external_attr for
+        # zips created on Unix (create_system==3); GitHub source
+        # zipballs qualify. On non-POSIX zips these bits are 0, so the
+        # path/traversal checks above remain the primary guard.
+        mode = info.external_attr >> 16
+        if stat.S_ISLNK(mode):
+            raise ValueError(f"Unsafe symlink in zip: {name!r}")
+    zf.extractall(dest)
 
 
 def download_and_extract(
@@ -259,7 +295,7 @@ def download_and_extract(
     zip_path.write_bytes(resp.content)
     extract_dir = workdir / "extracted"
     with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(extract_dir)
+        _safe_extract_zip(zf, extract_dir)
     subdirs = [p for p in extract_dir.iterdir() if p.is_dir()]
     return subdirs[0] if len(subdirs) == 1 else extract_dir
 
@@ -372,13 +408,11 @@ def migrate_env(install_dir: Path) -> int:
             return 0
         version = _local_version(install_dir) or "?"
         stamp = datetime.now().strftime("%Y-%m-%d")
-        block = (
-            ["", f"# --- new settings added by the v{version} update ({stamp}) ---"]
-            + additions
-        )
-        env.write_text(
-            "\n".join(user_lines + block) + "\n", encoding="utf-8"
-        )
+        block = [
+            "",
+            f"# --- new settings added by the v{version} update ({stamp}) ---",
+        ] + additions
+        env.write_text("\n".join(user_lines + block) + "\n", encoding="utf-8")
         logger.info(
             "migrate_env: appended %d new setting(s) to .env: %s",
             len(additions),
@@ -445,17 +479,22 @@ def run_update_check(
             return "error"
         remote = release["tag_name"]
         zipball = release.get("zipball_url")
+        # Prefer the uploaded release ASSET over the auto-generated source
+        # zipball so GitHub's per-asset download_count tracks version adoption;
+        # fall back to the zipball when no asset was attached.
+        download_url = release.get("asset_url") or zipball
         if is_newer(remote, local):
-            if not zipball:
+            if not download_url:
                 logger.warning(
-                    "Release %s has no zipball_url — skipping update.", remote
+                    "Release %s has no downloadable archive - skipping update.",
+                    remote,
                 )
                 return "error"
             logger.info(
                 "Newer release %s available (local=%s) — updating.", remote, local
             )
             with tempfile.TemporaryDirectory(prefix="qa-update-") as tmp:
-                new_tree = download_and_extract(zipball, token, timeout, Path(tmp))
+                new_tree = download_and_extract(download_url, token, timeout, Path(tmp))
                 apply_update(new_tree, install_dir, version=str(remote).lstrip("vV"))
             _pip_install(install_dir)
             migrate_env(install_dir)
@@ -469,7 +508,7 @@ def run_update_check(
             # Heal only when the latest release matches the installed version —
             # that zipball is the exact tree the local MANIFEST.sha256 describes.
             same_release = (
-                bool(zipball)
+                bool(download_url)
                 and _parse_version(remote or "") is not None
                 and _parse_version(remote or "") == _parse_version(local or "")
             )
@@ -481,7 +520,9 @@ def run_update_check(
                     remote,
                 )
                 with tempfile.TemporaryDirectory(prefix="qa-heal-") as tmp:
-                    new_tree = download_and_extract(zipball, token, timeout, Path(tmp))
+                    new_tree = download_and_extract(
+                        download_url, token, timeout, Path(tmp)
+                    )
                     apply_update(
                         new_tree,
                         install_dir,

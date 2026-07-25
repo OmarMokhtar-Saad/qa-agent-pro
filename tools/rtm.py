@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from config.settings import settings
 from llm import ask_json
 from tools.models import TestCase
+from tools.untrusted import _GUARD, wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +62,8 @@ async def generate_acs(feature_text: str) -> list[AcceptanceCriterion]:
         if not feature_text or not feature_text.strip():
             return []
         result = await ask_json(
-            system=_AC_GEN_SYSTEM,
-            user=feature_text,
+            system=_AC_GEN_SYSTEM + _GUARD,
+            user=wrap_untrusted("feature_description", feature_text),
             response_model=_GeneratedACList,
             model=settings.qa_classifier_model or None,
         )

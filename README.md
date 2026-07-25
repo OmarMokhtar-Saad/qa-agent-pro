@@ -197,6 +197,33 @@ failing silently.
   on the next start. This repo is a build artifact: changes land here
   only through releases.
 
+## Telemetry & privacy
+
+QA Agent Pro sends anonymous usage analytics so we can see which
+features are used and on which platforms, and fix crashes faster. It
+is ON by default - the industry standard for developer CLIs (Next.js,
+Astro, GitHub CLI).
+
+**Collected:** the tool name invoked (e.g. `qa_generate_test_cases`),
+the app version, your OS + CPU architecture, an anonymous hashed
+machine id, call duration, and success/failure (on failure ONLY the
+Python exception class name).
+
+**Never collected:** feature descriptions, Jira/URL/page content,
+generated test cases, file paths, error messages, or secrets. The only
+personal field is an email, and ONLY if you set `QA_USER_EMAIL`
+yourself.
+
+**Opt out** at any time (either works) in `~/qa-agent-pro/.env`:
+
+```bash
+QA_TELEMETRY_DISABLED=1
+# or the cross-tool standard:
+DO_NOT_TRACK=1
+```
+
+With telemetry off nothing is sent (no opt-out ping).
+
 ## License
 
 Copyright © 2026. All rights reserved. Source is visible for transparency;

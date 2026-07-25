@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 import httpx
 
 from config.settings import settings
+from tools.jira_fetcher import PinnedIPTransport
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +41,13 @@ async def search_web(query: str) -> dict:
             "skip_disambig": "1",
         }
 
-        # SSRF guard: resolve the DuckDuckGo API hostname before connecting
+        # SSRF guard: resolve + validate the DuckDuckGo API hostname, then PIN
+        # the connection to that exact IP and disable in-client redirects — a
+        # second DNS lookup (rebinding) or a redirect to a private/internal
+        # host therefore cannot retarget the request after the check passed.
+        # Mirrors the IP-pinning tools/jira_fetcher.py applies to every fetch.
         hostname = urlparse(_DUCKDUCKGO_URL).hostname or ""
+        pinned_ip: str | None = None
         if hostname:
             try:
                 loop = asyncio.get_running_loop()
@@ -58,6 +64,8 @@ async def search_web(query: str) -> dict:
                             "error": "Blocked: search endpoint resolved to non-public address",
                             "content": None,
                         }
+                    if pinned_ip is None:
+                        pinned_ip = info[4][0]
             except socket.gaierror as exc:
                 logger.warning("DNS resolution failed for search endpoint: %s", exc)
                 return {
@@ -65,7 +73,14 @@ async def search_web(query: str) -> dict:
                     "content": None,
                 }
 
-        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
+        transport = (
+            PinnedIPTransport(hostname, pinned_ip)
+            if hostname and pinned_ip
+            else None
+        )
+        async with httpx.AsyncClient(
+            timeout=_TIMEOUT, follow_redirects=False, transport=transport
+        ) as client:
             resp = await client.get(
                 _DUCKDUCKGO_URL,
                 params=params,
