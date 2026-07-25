@@ -12,7 +12,13 @@ import pydantic
 
 from agents.feature_analysis import analyze_feature, render_report_markdown
 from config.settings import settings
-from llm import CursorAgentError, ask, ask_json, ask_vision
+from llm import (
+    CursorAgentError,
+    ask,
+    ask_json,
+    ask_vision,
+    backend_unavailable_reason,
+)
 from tools.csv_exporter import generate_test_case_csv
 from tools.image_description import describe_images
 from tools.models import TestCase, TestSuite
@@ -1428,6 +1434,16 @@ async def generate_test_scenarios(
             "generate test cases grounded in the real content."
         )
         return (msg, "", "", "", "error")
+
+    # Fail fast on an unusable host-matched backend (strict auto mode): surface
+    # the actionable auth remediation immediately instead of running the whole
+    # 8-category fan-out against a backend that cannot authenticate (which would
+    # fail every category and, before this policy, burn a 120s timeout each).
+    # Never raises.
+    backend_reason = backend_unavailable_reason()
+    if backend_reason:
+        logger.warning("Refusing to generate — backend unavailable: %s", backend_reason)
+        return (f"⚠️ {backend_reason}", "", "", "", "error")
 
     # A bare URL is a weak feature spec — ground it in the fetched page title +
     # extracted UI so the fan-out stays on THIS page and generate_acs gets real

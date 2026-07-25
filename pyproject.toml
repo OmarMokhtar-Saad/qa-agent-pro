@@ -1,10 +1,11 @@
 [project]
 name = "qa-agent-pro"
-version = "1.4.0"
+version = "1.4.1"
 requires-python = ">=3.10"
 dependencies = [
     "fastmcp>=2.0",
     "py-machineid>=0.6",
+    "posthog>=7.29",
     "anthropic>=0.25",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
@@ -44,6 +45,12 @@ mcp = [
 ]
 telemetry = [
     "py-machineid>=0.6",
+]
+analytics = [
+    # Optional: enables PostHog error-tracking issue grouping for the internal
+    # Chainlit app (Phase 2). tools/telemetry.py imports it lazily and falls
+    # back to bare-HTTP when absent, so the dist build stays dependency-identical.
+    "posthog>=7.0",
 ]
 
 [build-system]

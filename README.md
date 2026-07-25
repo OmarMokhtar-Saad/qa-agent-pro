@@ -134,6 +134,8 @@ Edit `~/qa-agent-pro/.env` (created from `.env.example`):
 | `QA_MOBILE_CAPTURE` | Mobile-screen capture (Android via adb; vision needs `ANTHROPIC_API_KEY`) |
 | `QA_RAG_ENABLED` | Learn from your past suites: grounding + duplicate flagging (on by default) |
 | `QA_MCP_ELICIT_ENABLED` | Interactive pickers in Cursor / Claude Code (on by default; automatic text-menu fallback on clients without dialog support) |
+| `QA_AUTO_EXPORT_XLSX` | Auto-build the Excel file the instant generation finishes; the reply tells you exactly where the `.xlsx` is (on by default) |
+| `QA_EXPORT_DIR` | Folder the auto-exported Excel files are saved to -- `data/exports` in the dist, so your files persist there across sessions and updates |
 
 ## Connect Jira (to paste ticket URLs)
 
@@ -207,12 +209,18 @@ Astro, GitHub CLI).
 **Collected:** the tool name invoked (e.g. `qa_generate_test_cases`),
 the app version, your OS + CPU architecture, an anonymous hashed
 machine id, call duration, and success/failure (on failure ONLY the
-Python exception class name).
+Python exception class name). We also send content-free tool properties
+(test-case count, export format, and the source type: feature text /
+Jira / Swagger / mobile), crash stack traces for issue grouping (function
+names, project-relative file names and line numbers — exception
+messages and absolute paths are scrubbed before sending), and per-call
+AI-generation metrics (model, backend, input/output token counts, and
+latency).
 
 **Never collected:** feature descriptions, Jira/URL/page content,
-generated test cases, file paths, error messages, or secrets. The only
-personal field is an email, and ONLY if you set `QA_USER_EMAIL`
-yourself.
+generated test cases, LLM prompts or completions, exception messages,
+absolute file paths, or secrets. The only personal field is an email, and ONLY if
+you set `QA_USER_EMAIL` yourself.
 
 **Opt out** at any time (either works) in `~/qa-agent-pro/.env`:
 
