@@ -325,6 +325,71 @@ def apply_update(new_tree: Path, install_dir: Path, version: str = "update") -> 
         raise
 
 
+def _env_line_key(line: str) -> str:
+    """KEY of an active ``KEY=...`` line ('' for comments/blank/malformed)."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return ""
+    return stripped.split("=", 1)[0].strip()
+
+
+def _commented_env_key(line: str) -> str:
+    """KEY of a commented-out ``# KEY=...`` line ('' when not that shape)."""
+    stripped = line.strip()
+    if not stripped.startswith("#"):
+        return ""
+    body = stripped.lstrip("#").strip()
+    if "=" not in body:
+        return ""
+    key = body.split("=", 1)[0].strip()
+    return key if key.isidentifier() or key.replace("_", "").isalnum() else ""
+
+
+def migrate_env(install_dir: Path) -> int:
+    """Append config keys newly shipped in ``.env.example`` to the user's
+    ``.env`` after an update. User lines are NEVER modified, reordered or
+    removed; keys the user commented out count as present (deliberate
+    opt-out); template-commented keys are docs and are not propagated.
+    Returns the number of keys added; never raises."""
+    try:
+        example = install_dir / ".env.example"
+        env = install_dir / ".env"
+        if not example.is_file() or not env.is_file():
+            return 0
+        user_lines = env.read_text(encoding="utf-8").splitlines()
+        user_keys = set()
+        for line in user_lines:
+            key = _env_line_key(line) or _commented_env_key(line)
+            if key:
+                user_keys.add(key)
+        additions = []
+        for line in example.read_text(encoding="utf-8").splitlines():
+            key = _env_line_key(line)
+            if key and key not in user_keys:
+                additions.append(line.strip())
+                user_keys.add(key)
+        if not additions:
+            return 0
+        version = _local_version(install_dir) or "?"
+        stamp = datetime.now().strftime("%Y-%m-%d")
+        block = (
+            ["", f"# --- new settings added by the v{version} update ({stamp}) ---"]
+            + additions
+        )
+        env.write_text(
+            "\n".join(user_lines + block) + "\n", encoding="utf-8"
+        )
+        logger.info(
+            "migrate_env: appended %d new setting(s) to .env: %s",
+            len(additions),
+            ", ".join(a.split("=", 1)[0] for a in additions),
+        )
+        return len(additions)
+    except Exception:
+        logger.exception("migrate_env failed — user .env left unchanged")
+        return 0
+
+
 def _pip_install(install_dir: Path) -> None:
     """Run ``pip install -e .`` after a swap (deps may have changed). A failure
     is logged, not raised — startup proceeds on the newly-swapped code."""
@@ -393,6 +458,7 @@ def run_update_check(
                 new_tree = download_and_extract(zipball, token, timeout, Path(tmp))
                 apply_update(new_tree, install_dir, version=str(remote).lstrip("vV"))
             _pip_install(install_dir)
+            migrate_env(install_dir)
             if lock:
                 lock_files(install_dir)
             logger.info("Update to %s complete.", remote)
