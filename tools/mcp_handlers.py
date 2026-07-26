@@ -620,10 +620,15 @@ async def handle_configure_jira(
     email: str = "",
     api_token: str = "",
     *,
+    verify: bool = True,
     progress: ProgressCb = None,
 ) -> str:
     """Save Jira credentials into the agent's local .env (never logged, never
-    echoed back) and apply them — on dist installs via a seamless reload."""
+    echoed back) and apply them — on dist installs via a seamless reload.
+
+    ``verify=True`` (default) live-probes the just-saved values and reports
+    the outcome; ``verify=False`` skips the probe for callers that already
+    verified the exact same values themselves (_jira_preflight)."""
     base_url = (base_url or "").strip().rstrip("/")
     email = (email or "").strip()
     api_token = (api_token or "").strip()
@@ -683,6 +688,12 @@ async def handle_configure_jira(
             note = (
                 " The server is reloading to apply them — run `qa_setup_check` "
                 "in ~10 seconds and Jira should show ✅."
+            )
+        if not verify:
+            return (
+                f"✅ Jira credentials saved for **{base_url}** (account: "
+                f"{email}). They are stored only in the local `.env` — the "
+                "token is never shown or logged." + note
             )
         # Live-verify with the JUST-ENTERED values. On dist the settings
         # assignment above may be frozen, so never rely on it for the probe —
@@ -840,11 +851,16 @@ async def _jira_preflight(
         email = email_res.value.strip()
         token = token_res.value.strip()
         base_url = f"https://{host}"
-        await handle_configure_jira(base_url, email, token, progress=progress)
+        # Probe the JUST-ENTERED values (settings may be frozen on dist) and
+        # persist only credentials that actually verified — one live probe
+        # per round, so configure_jira must not probe again (verify=False).
         reprobe = await verify_jira_access(
             base_url=base_url, email=email, api_token=token
         )
         if reprobe.get("ok"):
+            await handle_configure_jira(
+                base_url, email, token, verify=False, progress=progress
+            )
             account = reprobe.get("account") or email
             proceed = await _elicit_choice(
                 choose,
@@ -854,6 +870,10 @@ async def _jira_preflight(
                 ["Proceed", "Something else"],
             )
             if proceed.status == CHOSEN and proceed.value == "Proceed":
+                # On dist installs the settings assignment can stay frozen
+                # until the scheduled reload lands, so the very next fetch may
+                # still see the old credentials once — the fetch-failure hint
+                # covers that window.
                 return None
             return (
                 f"✅ Jira access is verified for **{account}**. Tell me what "
