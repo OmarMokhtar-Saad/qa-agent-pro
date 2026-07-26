@@ -3,9 +3,15 @@ from __future__ import annotations
 import hashlib
 import uuid
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 
 def _compute_stable_id(title: str, steps: list["TestStep"]) -> str:
@@ -74,6 +80,67 @@ class TestStep(BaseModel):
         return v
 
 
+class TestDataItem(BaseModel):
+    """One field's data-provisioning plan for a test case (QA_TEST_DATA_STRATEGY).
+
+    Declares WHAT data a case needs and HOW a manual tester should source it, so
+    testers stop guessing which values must be unique per run, come from a seeded
+    account, or chain from an earlier case. ``example_value`` MUST be an obviously
+    fake placeholder — never real-looking PII.
+
+    An unknown ``strategy`` deliberately raises ValidationError (mirroring Priority /
+    TestType) so the per-category retry regenerates it — there is no lenient-coercion
+    precedent in this module.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    field: str = Field(
+        min_length=1, max_length=80, description="Data field name, e.g. 'username'"
+    )
+    strategy: Literal["unique_per_run", "seed_account", "chained", "static"] = Field(
+        description="How the value is sourced: unique_per_run / seed_account / "
+        "chained / static"
+    )
+    example_value: str = Field(
+        default="",
+        max_length=200,
+        description="A SAFE, obviously-fake example value — never real-looking PII",
+    )
+    chained_from: Optional[str] = Field(
+        default=None,
+        description="tc_id of the earlier case that produces this value "
+        "(only when strategy == 'chained')",
+    )
+    notes: str = Field(
+        default="",
+        max_length=200,
+        description="Short hint on how to obtain/rotate the value",
+    )
+
+
+def format_test_data_lines(items: list["TestDataItem"]) -> list[str]:
+    """Render a case's test_data plan into compact one-per-field display lines.
+
+    Pure and never-raises; returns [] for an empty/None plan so callers that only
+    render when a case HAS test_data stay byte-identical to the pre-feature output.
+    """
+    lines: list[str] = []
+    try:
+        for it in items or []:
+            chain = (
+                f" (from {it.chained_from})"
+                if it.strategy == "chained" and it.chained_from
+                else ""
+            )
+            example = f": {it.example_value}" if it.example_value else ""
+            note = f" — {it.notes}" if it.notes else ""
+            lines.append(f"{it.field} [{it.strategy}]{chain}{example}{note}")
+    except Exception:
+        return lines
+    return lines
+
+
 class TestCase(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -127,6 +194,14 @@ class TestCase(BaseModel):
         "it from the title and steps so the case keeps a stable identity across "
         "regenerations and exports, independent of the display-order tc_id.",
     )
+    test_data: list[TestDataItem] = Field(
+        default_factory=list,
+        description="Optional per-case data-provisioning plan: for each data field "
+        "the test needs, how to source its value (unique per run / seed account / "
+        "chained from an earlier case / static) with a SAFE fake example. Empty by "
+        "default; populated only when QA_TEST_DATA_STRATEGY is enabled and ignored "
+        "by renderers otherwise.",
+    )
 
     @field_validator("steps", mode="after")
     @classmethod
@@ -159,6 +234,13 @@ class TestSuite(BaseModel):
     test_cases: list[TestCase] = Field(
         min_length=1, description="All generated test cases"
     )
+
+    # Tester-facing report artifacts (AC-Validation / Test Plan) attached
+    # post-generation by agents.test_scenario_agent when QA_TEST_PLAN_ARTIFACTS
+    # is ON. A PrivateAttr so it is EXCLUDED from the JSON schema used as an LLM
+    # response_model (it must never pollute generation) and from serialization;
+    # tools.xlsx_generator reads it via getattr to add matching sheets.
+    _report_artifacts: Optional[dict] = PrivateAttr(default=None)
 
     @field_validator("test_cases", mode="after")
     @classmethod

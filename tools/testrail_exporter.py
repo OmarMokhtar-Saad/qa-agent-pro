@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from tools.cell_sanitizer import sanitize_cell
-from tools.models import TestSuite
+from tools.models import TestSuite, format_test_data_lines
 from tools.secure_temp import SUBDIR_NAME, make_secure_temp_path
 
 logger = logging.getLogger(__name__)
@@ -41,9 +41,15 @@ def generate_testrail_csv(suite: TestSuite, output_path: str | None = None) -> s
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
+    # The optional "Test Data" column is added ONLY when at least one case carries a
+    # data-provisioning plan (QA_TEST_DATA_STRATEGY). With none, both the header and
+    # every row are byte-identical to the pre-feature export.
+    has_test_data = any(tc.test_data for tc in suite.test_cases)
+    headers = _HEADERS + ["Test Data"] if has_test_data else _HEADERS
+
     with open(output_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
-        writer.writerow(_HEADERS)
+        writer.writerow(headers)
         for tc in suite.test_cases:
             steps_text = sanitize_cell(
                 "\n".join(f"{s.step_number}. {s.action}" for s in tc.steps)
@@ -51,17 +57,20 @@ def generate_testrail_csv(suite: TestSuite, output_path: str | None = None) -> s
             expected_text = sanitize_cell(
                 "\n".join(f"{s.step_number}. {s.expected_result}" for s in tc.steps)
             )
-            writer.writerow(
-                [
-                    sanitize_cell(tc.title),
-                    sanitize_cell(tc.module),
-                    tc.type.value,
-                    tc.priority.value,
-                    "",
-                    steps_text,
-                    expected_text,
-                ]
-            )
+            row = [
+                sanitize_cell(tc.title),
+                sanitize_cell(tc.module),
+                tc.type.value,
+                tc.priority.value,
+                "",
+                steps_text,
+                expected_text,
+            ]
+            if has_test_data:
+                row.append(
+                    sanitize_cell("\n".join(format_test_data_lines(tc.test_data)))
+                )
+            writer.writerow(row)
 
     logger.info(
         "TestRail CSV written: %s (%d test cases)", output_path, len(suite.test_cases)

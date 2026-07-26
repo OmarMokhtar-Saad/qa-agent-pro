@@ -18,9 +18,11 @@ in-memory session copy) instead of raising.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 
 from config.settings import settings
@@ -47,6 +49,19 @@ CREATE TABLE IF NOT EXISTS cases (
     FOREIGN KEY (suite_id) REFERENCES suites(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_cases_suite_id ON cases(suite_id);
+CREATE TABLE IF NOT EXISTS web_runs (
+    id           TEXT PRIMARY KEY,
+    suite_id     TEXT NOT NULL,
+    base_url     TEXT NOT NULL DEFAULT '',
+    dry_run      INTEGER NOT NULL DEFAULT 1,
+    passed       INTEGER NOT NULL DEFAULT 0,
+    failed       INTEGER NOT NULL DEFAULT 0,
+    total        INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL,
+    created_at   REAL NOT NULL,
+    FOREIGN KEY (suite_id) REFERENCES suites(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_web_runs_suite_id ON web_runs(suite_id);
 """
 
 
@@ -193,4 +208,113 @@ async def list_recent_suites(limit: int = 5) -> dict:
         return {"error": None, "content": rows}
     except Exception as exc:
         logger.exception("suite_store.list_recent_suites failed")
+        return {"error": str(exc), "content": None}
+
+
+# --------------------------------------------------------------------------- #
+# Web-run persistence (Web Suite Execution -- tools/web_runner.py)
+# --------------------------------------------------------------------------- #
+
+
+def _save_web_run_sync(
+    suite_id: str,
+    base_url: str,
+    dry_run: bool,
+    summary: dict,
+    payload: dict,
+) -> str:
+    run_id = uuid.uuid4().hex
+    now = time.time()
+    conn = _connect()
+    try:
+        with conn:  # transaction
+            # M1-web: web_runs.suite_id is an FK into suites and PRAGMA
+            # foreign_keys is ON, so a run against an in-session suite that was
+            # never persisted would raise IntegrityError and be silently dropped.
+            # Upsert a stub suites row (INSERT OR IGNORE never touches an existing
+            # suite's feature_text) so the self-contained run always persists.
+            if suite_id:
+                conn.execute(
+                    "INSERT OR IGNORE INTO suites (id, feature_text, created_at) "
+                    "VALUES (?, '', ?)",
+                    (suite_id, now),
+                )
+            conn.execute(
+                "INSERT INTO web_runs (id, suite_id, base_url, dry_run, passed, "
+                "failed, total, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    suite_id or "",
+                    base_url or "",
+                    1 if dry_run else 0,
+                    int(summary.get("passed", 0)),
+                    int(summary.get("failed", 0)),
+                    int(summary.get("total", 0)),
+                    json.dumps(payload),
+                    now,
+                ),
+            )
+        return run_id
+    finally:
+        conn.close()
+
+
+def _load_web_run_sync(run_id: str) -> dict | None:
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT id, suite_id, base_url, dry_run, passed, failed, total, "
+            "payload_json, created_at FROM web_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row[7])
+    except (ValueError, TypeError):
+        payload = {}
+    return {
+        "run_id": row[0],
+        "suite_id": row[1],
+        "base_url": row[2],
+        "dry_run": bool(row[3]),
+        "passed": row[4],
+        "failed": row[5],
+        "total": row[6],
+        "payload": payload,
+        "created_at": row[8],
+    }
+
+
+async def save_web_run(
+    suite_id: str,
+    base_url: str,
+    dry_run: bool,
+    summary: dict,
+    payload: dict,
+) -> dict:
+    """Persist one web run. Returns {"content": {"run_id": ...}}. Never raises."""
+    try:
+        run_id = await asyncio.to_thread(
+            _save_web_run_sync, suite_id, base_url, dry_run, summary, payload
+        )
+        logger.info("suite_store: saved web run %s (suite %s)", run_id, suite_id)
+        return {"error": None, "content": {"run_id": run_id}}
+    except Exception as exc:
+        logger.exception("suite_store.save_web_run failed")
+        return {"error": str(exc), "content": None}
+
+
+async def load_web_run(run_id: str) -> dict:
+    """Load a web run by id. Returns {"content": dict|None}. Never raises."""
+    try:
+        if not run_id:
+            return {"error": None, "content": None}
+        row = await asyncio.to_thread(_load_web_run_sync, run_id)
+        return {"error": None, "content": row}
+    except Exception as exc:
+        logger.exception("suite_store.load_web_run failed")
         return {"error": str(exc), "content": None}

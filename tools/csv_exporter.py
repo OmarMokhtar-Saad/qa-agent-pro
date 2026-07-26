@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from tools.cell_sanitizer import sanitize_cell
-from tools.models import TestSuite
+from tools.models import TestSuite, format_test_data_lines
 from tools.secure_temp import SUBDIR_NAME, make_secure_temp_path
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,9 @@ def generate_test_case_csv(suite: TestSuite, output_path: str | None = None) -> 
             data_lines = [
                 f"Step {s.step_number}: {s.test_data}" for s in tc.steps if s.test_data
             ]
+            # Case-level data-provisioning plan (QA_TEST_DATA_STRATEGY): appended
+            # after the per-step lines; a case with none is byte-identical to before.
+            data_lines.extend(format_test_data_lines(tc.test_data))
             test_data_text = sanitize_cell("\n".join(data_lines))
             writer.writerow(
                 [

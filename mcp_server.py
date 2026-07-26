@@ -173,7 +173,9 @@ def build_server():
     mcp = FastMCP(SERVER_NAME)
 
     @mcp.tool()
-    async def qa_generate_test_cases(ctx: Context, feature_or_url: str = "") -> str:
+    async def qa_generate_test_cases(
+        ctx: Context, feature_or_url: str = "", proceed_anyway: bool = False
+    ) -> str:
         """Generate a structured test suite. feature_or_url can be a feature
         description, a Jira/issue URL, a web page URL, or a Swagger/OpenAPI
         spec URL.
@@ -189,12 +191,18 @@ def build_server():
         deliverable and do NOT ask which export format they want or offer to
         push anywhere. Call qa_export_suite only when the user names a
         different format themselves.
+
+        For an under-specified or no-UI ticket the reply may instead be a short
+        list of clarifying questions (no suite is generated) — relay them to the
+        user. Once they answer, call again with the fuller text, or set
+        proceed_anyway=true to generate anyway with whatever is available.
         """
         return await _tracked(
             "qa_generate_test_cases",
             ctx,
             mcp_handlers.handle_generate_test_cases(
                 feature_or_url,
+                proceed_anyway=proceed_anyway,
                 choose=_make_chooser(ctx),
                 ask_text=_make_asker(ctx),
                 progress=_make_progress(ctx),
@@ -325,6 +333,28 @@ def build_server():
                     goal=goal,
                     choose=_make_chooser(ctx),
                     ask_text=_make_asker(ctx),
+                    progress=_make_progress(ctx),
+                ),
+            )
+
+        @mcp.tool()
+        async def qa_run_web_suite(
+            ctx: Context,
+            base_url: str = "",
+            suite_id: str = "",
+        ) -> str:
+            """Run a generated suite step-by-step against a live web app in a
+            real browser and report pass/fail per TC-ID (requires
+            QA_WEB_RUN_ENABLED). Dry-run default previews the planned browser
+            actions without launching a browser. Pass the base_url of the app
+            under test and the suite_id from qa_generate_test_cases."""
+            return await _tracked(
+                "qa_run_web_suite",
+                ctx,
+                mcp_handlers.handle_run_web_suite(
+                    base_url,
+                    suite_id=suite_id,
+                    choose=_make_chooser(ctx),
                     progress=_make_progress(ctx),
                 ),
             )

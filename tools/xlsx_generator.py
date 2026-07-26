@@ -11,7 +11,7 @@ from pathlib import Path
 import xlsxwriter
 
 from tools.cell_sanitizer import sanitize_cell
-from tools.models import TestSuite
+from tools.models import TestSuite, format_test_data_lines
 from tools.secure_temp import SUBDIR_NAME, make_secure_temp_path
 
 logger = logging.getLogger(__name__)
@@ -86,6 +86,7 @@ def generate_test_case_xlsx(suite: TestSuite, output_path: str | None = None) ->
     workbook = xlsxwriter.Workbook(output_path, {"strings_to_formulas": False})
     try:
         _write_workbook(workbook, suite)
+        _write_report_sheets(workbook, suite)
     finally:
         workbook.close()
 
@@ -115,6 +116,51 @@ def cleanup_temp_files(max_age_seconds: int = 3600) -> int:
     if deleted:
         logger.info("XLSX cleanup: removed %d stale file(s)", deleted)
     return deleted
+
+
+def _write_report_sheets(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
+    """Append 'AC Validation' and 'Test Plan' sheets when the suite carries
+    report_artifacts (QA_TEST_PLAN_ARTIFACTS). No-op when absent. Never raises —
+    a failure here must never break the core workbook."""
+    artifacts = getattr(suite, "_report_artifacts", None)
+    if not artifacts:
+        return
+    try:
+        from tools.test_plan_report import ac_validation_rows, plan_rows
+
+        header_fmt = workbook.add_format(
+            {
+                "bold": True,
+                "font_color": "#FFFFFF",
+                "bg_color": "#1F4E79",
+                "border": 1,
+                "valign": "vcenter",
+                "text_wrap": True,
+            }
+        )
+        cell_fmt = workbook.add_format(
+            {"border": 1, "valign": "top", "text_wrap": True}
+        )
+        for name, rows in (
+            ("AC Validation", ac_validation_rows(artifacts)),
+            ("Test Plan", plan_rows(artifacts)),
+        ):
+            if not rows:
+                continue
+            try:
+                ws = workbook.add_worksheet(name)
+                ws.set_column(0, 0, 22)
+                ws.set_column(1, max(1, len(rows[0]) - 1), 45)
+                for r, row in enumerate(rows):
+                    fmt = header_fmt if r == 0 else cell_fmt
+                    for c, value in enumerate(row):
+                        ws.write(r, c, sanitize_cell(str(value)), fmt)
+            except Exception:
+                logger.warning(
+                    "Failed writing the %s sheet — skipping it", name, exc_info=True
+                )
+    except Exception:
+        logger.warning("report-sheet generation failed — skipping", exc_info=True)
 
 
 def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
@@ -270,6 +316,10 @@ def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
         data_lines = [
             f"Step {s.step_number}: {s.test_data}" for s in tc.steps if s.test_data
         ]
+        # Case-level data-provisioning plan (QA_TEST_DATA_STRATEGY). Only present
+        # when the case declared test_data; appended after the per-step lines so a
+        # case with none renders byte-identically to before.
+        data_lines.extend(format_test_data_lines(tc.test_data))
         test_data_text = sanitize_cell("\n".join(data_lines))
 
         ws.write(row_idx, _COL_TCID, tc.tc_id, fmt)

@@ -29,6 +29,7 @@ read-only so manual/editor edits fail to save and never survive a restart.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import logging
 import os
@@ -81,10 +82,40 @@ def _is_protected(rel_posix: str) -> bool:
     return False
 
 
+def _is_derived_artifact(rel_posix: str) -> bool:
+    """True for build-derived Python bytecode: any ``*.pyc`` file OR any path with
+    a ``__pycache__`` component at ANY depth (``_is_protected`` only guards the
+    top-level one). These are legitimately excluded from ``MANIFEST.sha256`` by
+    ``build_dist.build_manifest``, so the manifest binding must IGNORE them.
+
+    CRITICAL: this predicate is the SINGLE source both ``_swap_candidate_files``
+    (so the binding ignores derived bytecode) and ``apply_update`` (so it is never
+    copied into the install) route through -- the two skip sets MUST stay
+    identical. Ignoring ``.pyc`` in the binding alone would let an attacker plant
+    a malicious ``evil.pyc`` / ``__pycache__/mod.cpython-312.pyc`` (shadowing a
+    source module) in a release asset that apply_update would then install and
+    import, bypassing the manifest. Kept separate from ``_is_protected``
+    (operator-local state) on purpose. Pure string ops -- never raises."""
+    if rel_posix.endswith(".pyc"):
+        return True
+    return "__pycache__" in rel_posix.split("/")
+
+
 _MANIFEST_NAME = "MANIFEST.sha256"
+_MANIFEST_SIG_NAME = "MANIFEST.sig"
 # Locked read-only in addition to every manifest entry (release metadata + the
 # launcher itself, so "python launcher.py" cannot be edited out from under us).
-_LOCK_EXTRA = ("MANIFEST.sha256", "launcher.py", "VERSION")
+_LOCK_EXTRA = ("MANIFEST.sha256", "MANIFEST.sig", "launcher.py", "VERSION")
+
+# Ed25519 release-signing PUBLIC key (hex, 32 bytes). The matching PRIVATE key
+# is held ONLY by the release maintainer and never lives in this repo. Filled
+# in once a keypair is generated with `python scripts/build_dist.py
+# --generate-signing-key` (paste the printed hex here). Empty => no embedded
+# key => signature verification is inert (logged) and the
+# QA_UPDATE_REQUIRE_SIGNATURE gate decides whether an unsigned release proceeds.
+_RELEASE_PUBLIC_KEY_HEX = (
+    "4c43769703fb44da543f15402a88c590990f0b0f7c0574caa935c6e16353beff"
+)
 
 
 def _make_writable(path: Path) -> None:
@@ -169,6 +200,188 @@ def lock_files(install_dir: Path) -> int:
         except OSError as exc:
             logger.warning("Could not lock %s (%s).", rel, exc)
     return locked
+
+
+def verify_manifest_signature(tree: Path) -> str:
+    """Verify ``MANIFEST.sig`` (base64 Ed25519 signature over the raw bytes of
+    ``MANIFEST.sha256``) against the embedded public key. Returns one of:
+
+    * ``"valid"``   -- signature present and cryptographically verified
+    * ``"missing"`` -- no ``MANIFEST.sig``, no embedded key, or cryptography absent
+    * ``"invalid"`` -- signature present but does NOT verify (tamper/forgery)
+
+    Never raises: any unexpected error on a PRESENT signature is treated as
+    ``"invalid"`` (fail-closed), while a genuinely absent signature/key is
+    ``"missing"`` so the caller's policy gate can decide."""
+    manifest = tree / _MANIFEST_NAME
+    sig_file = tree / _MANIFEST_SIG_NAME
+    if not _RELEASE_PUBLIC_KEY_HEX.strip():
+        return "missing"
+    if not sig_file.is_file() or not manifest.is_file():
+        return "missing"
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PublicKey,
+        )
+    except ImportError:
+        logger.warning(
+            "cryptography not installed -- cannot verify MANIFEST.sig (treating "
+            "as unsigned)."
+        )
+        return "missing"
+    try:
+        pub = Ed25519PublicKey.from_public_bytes(
+            bytes.fromhex(_RELEASE_PUBLIC_KEY_HEX.strip())
+        )
+        signature = base64.b64decode(sig_file.read_text(encoding="utf-8").strip())
+        pub.verify(signature, manifest.read_bytes())
+        return "valid"
+    except InvalidSignature:
+        logger.warning("MANIFEST.sig failed Ed25519 verification (%s).", tree)
+        return "invalid"
+    except Exception as exc:
+        logger.warning("MANIFEST.sig verification error (%s) at %s.", exc, tree)
+        return "invalid"
+
+
+def _signature_gate_ok(tree: Path, *, require: bool, context: str) -> bool:
+    """Apply the release-signature policy before a manifest tree is trusted for
+    install/heal. Returns True to PROCEED, False to ABORT. Never raises.
+
+    * valid   -> proceed
+    * invalid -> ALWAYS abort (tamper/forgery), regardless of ``require``
+    * missing -> abort iff ``require`` (QA_UPDATE_REQUIRE_SIGNATURE); otherwise
+      proceed with a loud migration warning."""
+    status = verify_manifest_signature(tree)
+    if status == "valid":
+        logger.info("Release signature verified (%s).", context)
+        return True
+    if status == "invalid":
+        logger.warning(
+            "ABORTING %s: MANIFEST.sig is present but INVALID -- refusing to "
+            "trust this release; staying on the current version.",
+            context,
+        )
+        return False
+    if require:
+        logger.warning(
+            "ABORTING %s: no valid MANIFEST.sig and QA_UPDATE_REQUIRE_SIGNATURE "
+            "is on -- refusing an unsigned release; staying on the current "
+            "version.",
+            context,
+        )
+        return False
+    logger.warning(
+        "%s: proceeding with an UNSIGNED release (no MANIFEST.sig / no embedded "
+        "public key). Set QA_UPDATE_REQUIRE_SIGNATURE=true once all releases are "
+        "signed.",
+        context,
+    )
+    return True
+
+
+# Files apply_update would copy that are legitimately ABSENT from MANIFEST.sha256
+# (a manifest cannot hash itself, and the detached signature is written after it).
+# build_dist.build_manifest lists every OTHER non-protected file, so anything else
+# missing from the manifest is an unlisted / smuggled file.
+_MANIFEST_UNLISTED_OK = (_MANIFEST_NAME, _MANIFEST_SIG_NAME)
+
+
+def _swap_candidate_files(new_tree: Path) -> list:
+    """The non-protected files apply_update would actually copy out of ``new_tree``
+    (mirrors apply_update's own selection). Never raises."""
+    files: list = []
+    try:
+        for src in sorted(new_tree.rglob("*")):
+            if not src.is_file():
+                continue
+            rel = src.relative_to(new_tree).as_posix()
+            if _is_protected(rel) or _is_derived_artifact(rel):
+                continue
+            files.append(rel)
+    except OSError as exc:
+        logger.warning("Could not enumerate release tree (%s).", exc)
+    return files
+
+
+def _manifest_binding_ok(new_tree: Path) -> bool:
+    """Bind a release tree to its MANIFEST.sha256 before it is trusted for a swap.
+
+    Guarantees a VALID signature implies the installed bytes match the signed
+    manifest (closes the C1 signing-bypass: a genuine (manifest, sig) pair could
+    otherwise ship alongside modified/added code). Two checks:
+
+    * every manifest-listed file matches on disk (``verify_integrity == []``), and
+    * every code file the swap would copy is LISTED in the manifest (no unlisted /
+      smuggled files, except the manifest + detached signature themselves).
+
+    Policy by signature status:
+      * signed ("valid")    -> binding is MANDATORY; a signed tree with no readable
+        manifest, a mismatch, or an unlisted file is REJECTED.
+      * unsigned ("missing") -> apply the SAME strict binding ONLY when a
+        MANIFEST.sha256 is present (integrity is independent of the signature); a
+        manifest-less legacy release keeps today's behavior and proceeds.
+
+    Returns True to PROCEED, False to ABORT. Never raises."""
+    try:
+        signed = verify_manifest_signature(new_tree) == "valid"
+        has_manifest = (new_tree / _MANIFEST_NAME).is_file()
+        if not has_manifest:
+            if signed:
+                logger.warning(
+                    "ABORTING: a signed release has no readable %s to bind the "
+                    "signature to its files -- refusing.",
+                    _MANIFEST_NAME,
+                )
+                return False
+            # Legacy unsigned, manifest-less release: preserve current behavior.
+            return True
+        mismatched = verify_integrity(new_tree)
+        if mismatched:
+            logger.warning(
+                "ABORTING: release tree does not match its %s (%d file(s) differ, "
+                "e.g. %s) -- refusing to install unverified bytes.",
+                _MANIFEST_NAME,
+                len(mismatched),
+                mismatched[:5],
+            )
+            return False
+        listed = set(load_manifest(new_tree).keys())
+        unlisted = [
+            rel
+            for rel in _swap_candidate_files(new_tree)
+            if rel not in listed and rel not in _MANIFEST_UNLISTED_OK
+        ]
+        if unlisted:
+            logger.warning(
+                "ABORTING: release tree carries %d file(s) absent from %s "
+                "(e.g. %s) -- refusing to install unlisted code.",
+                len(unlisted),
+                _MANIFEST_NAME,
+                unlisted[:5],
+            )
+            return False
+        return True
+    except Exception:
+        logger.warning(
+            "manifest-binding check failed -- refusing the swap (fail-closed).",
+            exc_info=True,
+        )
+        return False
+
+
+def _check_embedded_pubkey() -> None:
+    """Startup footgun guard: warn if QA_UPDATE_REQUIRE_SIGNATURE is ON but
+    _RELEASE_PUBLIC_KEY_HEX is empty -- the setting would reject every release."""
+    if settings.qa_update_require_signature and not _RELEASE_PUBLIC_KEY_HEX.strip():
+        logger.warning(
+            "QA_UPDATE_REQUIRE_SIGNATURE is ON but _RELEASE_PUBLIC_KEY_HEX is empty "
+            "in tools/updater.py -- every release will be REJECTED. "
+            "Either (a) embed a public key and rebuild, or (b) set "
+            "QA_UPDATE_REQUIRE_SIGNATURE=false in .env to allow unsigned releases "
+            "during migration."
+        )
 
 
 def _auth_headers(token: str) -> dict:
@@ -334,7 +547,7 @@ def apply_update(new_tree: Path, install_dir: Path, version: str = "update") -> 
             if not src.is_file():
                 continue
             rel = src.relative_to(new_tree).as_posix()
-            if _is_protected(rel):
+            if _is_protected(rel) or _is_derived_artifact(rel):
                 continue
             dest = install_dir / rel
             if dest.exists():
@@ -451,7 +664,7 @@ def run_update_check(
 ) -> str:
     """Startup self-update + integrity pass. Returns a status string and NEVER
     raises: ``"disabled" | "no-repo" | "up-to-date" | "updated" | "healed" |
-    "error"``. On any failure the caller starts the current version.
+    "heal-aborted" | "error"``. On any failure the caller starts the current version.
 
     ``force`` / ``repo_override`` / ``lock_override`` let a distribution
     launcher mandate the check regardless of local ``.env`` toggles; developer
@@ -460,6 +673,7 @@ def run_update_check(
     if install_dir is None:
         install_dir = _INSTALL_DIR
     try:
+        _check_embedded_pubkey()
         if not (settings.qa_auto_update_enabled or force):
             logger.info("Auto-update disabled (QA_AUTO_UPDATE_ENABLED=false).")
             return "disabled"
@@ -495,6 +709,16 @@ def run_update_check(
             )
             with tempfile.TemporaryDirectory(prefix="qa-update-") as tmp:
                 new_tree = download_and_extract(download_url, token, timeout, Path(tmp))
+                if not _signature_gate_ok(
+                    new_tree,
+                    require=settings.qa_update_require_signature,
+                    context="update",
+                ):
+                    return "error"
+                # C1: a passed gate only proves the manifest's signature; bind
+                # that manifest to the actual tree bytes before trusting the swap.
+                if not _manifest_binding_ok(new_tree):
+                    return "error"
                 apply_update(new_tree, install_dir, version=str(remote).lstrip("vV"))
             _pip_install(install_dir)
             migrate_env(install_dir)
@@ -523,12 +747,23 @@ def run_update_check(
                     new_tree = download_and_extract(
                         download_url, token, timeout, Path(tmp)
                     )
-                    apply_update(
+                    if _signature_gate_ok(
                         new_tree,
-                        install_dir,
-                        version="heal-" + str(remote).lstrip("vV"),
-                    )
-                status = "healed"
+                        require=settings.qa_update_require_signature,
+                        context="self-heal",
+                    ) and _manifest_binding_ok(new_tree):
+                        apply_update(
+                            new_tree,
+                            install_dir,
+                            version="heal-" + str(remote).lstrip("vV"),
+                        )
+                        status = "healed"
+                    else:
+                        logger.warning(
+                            "Self-heal aborted: release signature/manifest not "
+                            "trusted; leaving current files in place."
+                        )
+                        status = "heal-aborted"
             elif mismatched:
                 logger.warning(
                     "Integrity check: %d modified file(s) but no release zipball matching "
