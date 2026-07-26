@@ -53,6 +53,9 @@ _POSITIVE_INT_FIELDS = frozenset(
         "qa_maestro_heal_max_attempts",
         "qa_maestro_explore_max_steps",
         "qa_update_timeout",
+        "qa_web_run_max_cases",
+        "qa_web_run_vision_budget",
+        "qa_web_run_timeout_s",
     }
 )
 
@@ -221,6 +224,24 @@ class Settings(BaseSettings):
     qa_test_user: str = ""
     qa_test_password: str = ""
 
+    # --- Web Suite Execution -- opt-in, default OFF / dry-run ON. ---
+    # Runs a generated suite step-by-step against a live web app in a real
+    # browser (tools/web_runner.py, the web analogue of the Maestro run
+    # pipeline) and reports pass/fail per TC-ID. Off by default per the
+    # constitution; the browser is launched through the same SSRF-hardened
+    # path as tools/browser_renderer.py.
+    qa_web_run_enabled: bool = False
+    # Dry-run (default ON): translate + validate + report the PLANNED browser
+    # actions WITHOUT launching a browser or spending a vision call.
+    qa_web_run_dry_run: bool = True
+    # Max cases executed per run (bounds cost + wall time).
+    qa_web_run_max_cases: int = 20
+    # Max ask_vision screenshot judgments per run (the text assertion runs
+    # first; vision is only a bounded fallback when it is inconclusive).
+    qa_web_run_vision_budget: int = 5
+    # Per-browser-action timeout (seconds).
+    qa_web_run_timeout_s: int = 60
+
     # LangSmith — read directly by langsmith/langgraph from the environment;
     # mirrored here for visibility.
     langchain_api_key: str = ""
@@ -272,7 +293,46 @@ class Settings(BaseSettings):
     # Ambiguity pre-pass (T-11): minimum severity ("low"/"medium"/"high") at which
     # the app pauses to offer clarifying questions before generating. "off"
     # disables the pre-pass entirely (no extra LLM call).
+    #
+    # SHYJ-7154: this same flag ALSO gates the non-interactive MCP path, where it
+    # is DELIBERATELY default-ON — the second intentional exception to the
+    # defaults-OFF rule (after QA_AUTO_EXPORT_XLSX). Rationale: this gate exists
+    # precisely to stop the confirmed P0 — confidently-wrong suites (fabricated
+    # portals/endpoints) shipping to non-technical testers from under-specified /
+    # no-UI tickets. Rollout impact: existing qa-agent-pro installs will, with NO
+    # config change, receive clarifying questions (not a suite) for high-severity
+    # under-specified tickets until the caller re-invokes with proceed_anyway=true.
+    # Operator kill-switch: set QA_AMBIGUITY_GATE_SEVERITY=off.
     qa_ambiguity_gate_severity: str = "high"
+
+    # AC anchoring (SHYJ-7154 Fix 3): when the source ticket carries REAL
+    # (source-parsed) acceptance criteria, drop generated cases that cite a
+    # NON-EXISTENT AC id (hallucinated traceability). Default OFF — the advisory
+    # "AC Anchoring" warning section is always shown; only the dropping is gated.
+    qa_ac_anchoring_enforce: bool = False
+
+    # Test-plan artifacts (house rule: opt-in, default OFF). When ON, the
+    # test-generation pipeline builds an AC-Validation report (only when the
+    # ticket carried REAL source acceptance criteria) and a Test Plan / Strategy
+    # section — at most two extra ask_json calls — rendered into the summary and
+    # added as extra XLSX sheets. OFF = zero extra LLM calls.
+    qa_test_plan_artifacts: bool = False
+
+    # LLM-based risk scoring (opt-in, default OFF). When ON, generate_test_scenarios
+    # replaces the deterministic priority×type heuristic with ONE batched ask_json
+    # call that judges each case's business risk (business impact, blast radius,
+    # data-loss potential, exploitability). Any failure (LLM error/timeout/missing
+    # ids) falls through to the existing heuristic — never fails, never drops a
+    # case. OFF = zero extra LLM calls and the heuristic path is byte-identical.
+    qa_llm_risk_scoring: bool = False
+
+    # Test-data strategy (opt-in, default OFF). When ON, the per-category
+    # generation prompt asks the model to populate each case's ``test_data`` plan
+    # (which fields need unique-per-run / seed-account / chained / static values,
+    # each with a SAFE fake example and no real-looking PII), and the exporters +
+    # chat summary render a Test Data column/note. OFF = prompt byte-identical, any
+    # emitted test_data stripped before render, every export byte-identical to today.
+    qa_test_data_strategy: bool = False
 
     # RAG corpus grounding — disabled by default.
     qa_rag_enabled: bool = False
@@ -290,6 +350,28 @@ class Settings(BaseSettings):
     # Corpus size cap per file: adding beyond it prunes the oldest entries.
     # 0 = unlimited (default).
     qa_rag_max_entries: int = 0
+
+    # --- Semantic embeddings (opt-in; default disabled) --------------------
+    # Optional embedding backend powering semantic dedup + vector RAG ranking.
+    #   ""       : disabled (default) — zero cost, no optional import.
+    #   "local"  : sentence-transformers (extra: pip install -e ".[embeddings]").
+    #   "voyage" : Voyage AI over httpx (needs VOYAGE_API_KEY; no new hard dep).
+    # tools/embeddings.py degrades gracefully (never-raise) when the backend or
+    # its dependency/key is missing.
+    qa_embeddings_backend: str = ""
+    # Model id override. Empty uses the backend default (local ->
+    # all-MiniLM-L6-v2, voyage -> voyage-3).
+    qa_embeddings_model: str = ""
+    # Voyage API key (voyage backend). .env only; falls back to $VOYAGE_API_KEY.
+    voyage_api_key: str = ""
+    # Cosine threshold at/above which two cases are treated as the same for
+    # intra-suite semantic dedup. Only used when qa_embeddings_backend is set.
+    qa_semantic_dedup_threshold: float = 0.9
+    # Master gate for intra-suite semantic dedup (opt-in, default OFF). Required
+    # IN ADDITION to an embeddings backend so enabling embeddings purely for RAG
+    # ranking never silently starts DROPPING near-duplicate cases. OFF => the
+    # generation pipeline never merges cases on embedding similarity.
+    qa_semantic_dedup_enabled: bool = False
 
     # TestRail API push (T-10). Base instance URL (e.g. https://acme.testrail.io),
     # a user email, and an API key. TESTRAIL_DRY_RUN defaults ON so a push
@@ -435,6 +517,16 @@ class Settings(BaseSettings):
     # chmods code files read-only. OFF by default for developer checkouts.
     qa_code_lock_enabled: bool = False
 
+    # Release-signature enforcement for auto-updates (Ed25519). When ON, an
+    # update or self-heal is REFUSED unless the release ships a MANIFEST.sig
+    # that verifies against the public key embedded in
+    # tools/updater._RELEASE_PUBLIC_KEY_HEX. Default OFF for exactly ONE
+    # migration release so installs predating signing still update (they log a
+    # prominent unsigned-release warning); an INVALID signature is ALWAYS
+    # rejected regardless of this flag. Flip ON (see runbook) once every live
+    # release is signed. Lenient never-raising bool coercion like the rest.
+    qa_update_require_signature: bool = False
+
     # --- Usage analytics (telemetry) - opt-out; ON only in the dist. ---
     # Anonymous usage metrics via tools/telemetry.py (PostHog). Sends only
     # when a PostHog key is present (POSTHOG_API_KEY / the dist's baked
@@ -473,6 +565,9 @@ class Settings(BaseSettings):
         "qa_cot_reasoning_enabled",
         "qa_mutation_eval_enabled",
         "qa_feature_analysis_enabled",
+        "qa_test_plan_artifacts",
+        "qa_llm_risk_scoring",
+        "qa_test_data_strategy",
         "testrail_dry_run",
         "jira_fetch_comments",
         "jira_fetch_images",
@@ -493,10 +588,14 @@ class Settings(BaseSettings):
         "qa_mcp_elicit_enabled",
         "qa_auto_update_enabled",
         "qa_code_lock_enabled",
+        "qa_update_require_signature",
         "qa_telemetry_disabled",
         "qa_analytics_enabled",
         "xray_dry_run",
         "qa_llm_strict_host",
+        "qa_web_run_enabled",
+        "qa_web_run_dry_run",
+        "qa_semantic_dedup_enabled",
         mode="before",
     )
     @classmethod
@@ -515,6 +614,19 @@ class Settings(BaseSettings):
                 "Invalid QA_RAG_SIMILARITY_THRESHOLD=%r — using default 0.3", v
             )
             return 0.3
+
+    @field_validator("qa_semantic_dedup_threshold", mode="before")
+    @classmethod
+    def _coerce_semantic_threshold(cls, v: object) -> float:
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return float(v)
+        try:
+            return float(str(v).strip())
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid QA_SEMANTIC_DEDUP_THRESHOLD=%r — using default 0.9", v
+            )
+            return 0.9
 
     @field_validator("qa_rag_top_k", mode="before")
     @classmethod
@@ -546,6 +658,9 @@ class Settings(BaseSettings):
         "qa_rag_recency_half_life_days",
         "qa_rag_max_entries",
         "qa_update_timeout",
+        "qa_web_run_max_cases",
+        "qa_web_run_vision_budget",
+        "qa_web_run_timeout_s",
         mode="before",
     )
     @classmethod

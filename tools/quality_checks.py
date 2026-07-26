@@ -221,3 +221,129 @@ def quality_warning_section(cases: list[TestCase], max_examples: int = 10) -> st
     except Exception:
         logger.exception("quality_warning_section failed — returning empty string")
         return ""
+
+
+def resolve_chained_refs_to_stable(cases: list[TestCase]) -> list[TestCase]:
+    """Rewrite category-local ``chained_from`` tc_ids to the target case's stable_id.
+
+    Called per CategoryResult BEFORE cross-category flatten, while a tc_id still
+    uniquely identifies a case WITHIN its own category (every category numbers from
+    TC-001, so a raw tc_id becomes ambiguous once categories are merged). The LLM
+    only ever sees its own category's ids, so a chained ref can only mean a case in
+    the same batch. We resolve it to that case's content stable_id — which survives
+    the flatten, dedup and the final renumber — and clear any ref that names no case
+    in this category. Returns a new list; never mutates; never raises.
+    """
+    try:
+        local = {tc.tc_id: tc.stable_id for tc in cases}
+        out: list[TestCase] = []
+        for tc in cases:
+            if not tc.test_data:
+                out.append(tc)
+                continue
+            new_items = []
+            changed = False
+            for it in tc.test_data:
+                if it.strategy == "chained" and it.chained_from:
+                    target = local.get(it.chained_from)
+                    if target is None:
+                        logger.info(
+                            "resolve_chained_refs_to_stable: clearing chained_from "
+                            "%r on %s field %r — no such case in category",
+                            it.chained_from,
+                            tc.tc_id,
+                            it.field,
+                        )
+                        # genpipe L3: a dangling chained ref is no longer a chain —
+                        # downgrade the strategy so no consumer treats it as one.
+                        it = it.model_copy(
+                            update={"chained_from": None, "strategy": "static"}
+                        )
+                        changed = True
+                    elif target != it.chained_from:
+                        it = it.model_copy(update={"chained_from": target})
+                        changed = True
+                new_items.append(it)
+            out.append(
+                tc.model_copy(update={"test_data": new_items}) if changed else tc
+            )
+        return out
+    except Exception:
+        logger.exception(
+            "resolve_chained_refs_to_stable failed — returning cases unchanged"
+        )
+        return cases
+
+
+def restore_chained_refs_from_stable(cases: list[TestCase]) -> list[TestCase]:
+    """Rewrite stable_id ``chained_from`` values back to the FINAL renumbered tc_id.
+
+    Counterpart to resolve_chained_refs_to_stable, run AFTER the final TC-001..N
+    renumber. Each chained_from now holds the target case's stable_id (set at the
+    per-category boundary); map it to that case's final tc_id. A stable_id no longer
+    present (target deduped/dropped) is a dangling ref — cleared to None and logged
+    so testers never see a wrong prerequisite pointer. New list; never raises.
+    """
+    try:
+        by_stable = {tc.stable_id: tc.tc_id for tc in cases}
+        out: list[TestCase] = []
+        for tc in cases:
+            if not tc.test_data:
+                out.append(tc)
+                continue
+            new_items = []
+            changed = False
+            for it in tc.test_data:
+                if it.strategy == "chained" and it.chained_from:
+                    final_id = by_stable.get(it.chained_from)
+                    if final_id is None:
+                        logger.info(
+                            "restore_chained_refs_from_stable: clearing dangling "
+                            "chained_from on %s field %r (target case dropped)",
+                            tc.tc_id,
+                            it.field,
+                        )
+                        # genpipe L3: downgrade a dangling chain to a plain static
+                        # value so no exporter renders a broken prerequisite.
+                        it = it.model_copy(
+                            update={"chained_from": None, "strategy": "static"}
+                        )
+                        changed = True
+                    elif final_id != it.chained_from:
+                        it = it.model_copy(update={"chained_from": final_id})
+                        changed = True
+                new_items.append(it)
+            out.append(
+                tc.model_copy(update={"test_data": new_items}) if changed else tc
+            )
+        return out
+    except Exception:
+        logger.exception(
+            "restore_chained_refs_from_stable failed — returning cases unchanged"
+        )
+        return cases
+
+
+def data_notes_section(cases: list[TestCase]) -> str:
+    """Build a one-line-per-case '## Test Data' markdown note for cases that declare
+    a data plan. Returns '' when no case has test_data, so summaries stay
+    byte-identical when the feature is off/unused. Never raises.
+    """
+    try:
+        rows: list[str] = []
+        for tc in cases:
+            if not getattr(tc, "test_data", None):
+                continue
+            fields = ", ".join(f"{it.field}={it.strategy}" for it in tc.test_data)
+            rows.append(f"- {tc.tc_id}: {fields}")
+        if not rows:
+            return ""
+        header = (
+            "\n\n## Test Data\n"
+            "Each case below declares what data it needs and how to source it "
+            "(see the **Test Data** column in the exported file):\n"
+        )
+        return header + "\n".join(rows)
+    except Exception:
+        logger.exception("test_data_notes_section failed — returning empty string")
+        return ""

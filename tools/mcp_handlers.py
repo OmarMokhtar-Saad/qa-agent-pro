@@ -55,6 +55,7 @@ from tools.image_description import describe_images
 from tools.jira_fetcher import fetch_url_content
 from tools.playwright_exporter import generate_playwright_script
 from tools.rag_store import query_corpus
+from tools.requirement_analyzer import analyze_requirements, gate_triggers
 from tools.suite_store import list_recent_suites, load_suite, save_suite
 from tools.swagger_fetcher import fetch_openapi_spec, looks_like_openapi_url
 from tools.testrail_exporter import generate_testrail_csv
@@ -77,6 +78,7 @@ try:
     from tools.maestro_exporter import flow_dir_for_suite, generate_maestro_flows
     from tools.maestro_healer import heal_and_rerun
     from tools.maestro_runner import run_flows
+    from tools.web_runner import run_suite_web
 
     _FULL_EDITION = True
 except ImportError:  # pragma: no cover — exercised only in distribution builds
@@ -90,6 +92,7 @@ except ImportError:  # pragma: no cover — exercised only in distribution build
     generate_maestro_flows = None
     heal_and_rerun = None
     run_flows = None
+    run_suite_web = None
 
     _FULL_EDITION = False
 
@@ -104,7 +107,7 @@ _DIST_UPDATE_REPO = "OmarMokhtar-Saad/qa-agent-pro"
 # restarts. Keep tool names/params stable; when a release DOES change one,
 # bump this to that release version — qa_setup_check then tells users whose
 # session predates it that a one-time editor restart is needed.
-_TOOL_SCHEMAS_CHANGED_IN = "1.2.0"
+_TOOL_SCHEMAS_CHANGED_IN = "1.5.0"
 
 
 def _schedule_reload() -> None:
@@ -794,11 +797,81 @@ async def _auto_export_xlsx(suite) -> str:
         )
 
 
+def _ambiguity_source_text(
+    text: str, url_content: dict | None, openapi_text: str | None
+) -> str:
+    """The text the ambiguity gate should judge.
+
+    For a Jira/web URL, judge the FETCHED ticket content (never the bare URL, so
+    the SHYJ-7154 no-UI documentation story is assessed on its real body); for
+    an OpenAPI spec, skip the gate (an explicit spec is not ambiguous). Never
+    raises.
+    """
+    if openapi_text:
+        return ""
+    if url_content and not url_content.get("error"):
+        raw = str(url_content.get("raw_text") or url_content.get("description") or "")
+        ac = str(url_content.get("acceptance_criteria") or "")
+        combined = (raw + "\n" + ac).strip()
+        return combined or text
+    return text
+
+
+def _shape_ambiguity_clarify(questions: list, testable_surface: str = "") -> str:
+    """Render the clarifying-questions reply for the non-interactive MCP path."""
+    q_md = "\n".join(f"- {q}" for q in list(questions)[:3])
+    surface = ""
+    if testable_surface in ("backend", "api", "docs", "none"):
+        surface = (
+            " This ticket reads as a backend / API / documentation change with "
+            "no obvious user-facing screen, so the key thing to confirm is WHERE "
+            "these should be tested."
+        )
+    return (
+        "## \u26a0\ufe0f A few details will make these test cases valid\n\n"
+        "I held off generating because this ticket looks under-specified for "
+        "reliable manual test cases." + surface + "\n\n"
+        f"{q_md}\n\n"
+        "Reply with these details (especially the application URL or environment "
+        "to test against), then call `qa_generate_test_cases` again.\n\n"
+        "Prefer to generate anyway with what's available? Call "
+        "`qa_generate_test_cases` again with `proceed_anyway=true`."
+    )
+
+
+async def _maybe_ambiguity_clarify(
+    text: str, url_content: dict | None, openapi_text: str | None
+) -> str | None:
+    """Ambiguity/clarify gate for the MCP path (respects QA_AMBIGUITY_GATE_SEVERITY).
+
+    Returns a clarifying-questions markdown string when the ticket is too
+    under-specified / no-UI to generate reliable cases from; otherwise None.
+    Never raises — any failure returns None so generation proceeds.
+    """
+    try:
+        gate = (settings.qa_ambiguity_gate_severity or "high").strip().lower()
+        if gate == "off":
+            return None
+        analysis_text = _ambiguity_source_text(text, url_content, openapi_text)
+        if not analysis_text.strip():
+            return None
+        result = await analyze_requirements(analysis_text)
+        if not gate_triggers(result, gate):
+            return None
+        return _shape_ambiguity_clarify(
+            result.get("questions") or [], str(result.get("testable_surface") or "")
+        )
+    except Exception:
+        logger.debug("mcp ambiguity gate failed — proceeding", exc_info=True)
+        return None
+
+
 async def handle_generate_test_cases(
     feature_or_url: str,
     *,
     attached_images: list | None = None,
     force_feature_report: bool = False,
+    proceed_anyway: bool = False,
     choose: ChooseCb = None,
     ask_text: AskCb = None,
     progress: ProgressCb = None,
@@ -842,6 +915,17 @@ async def handle_generate_test_cases(
                         "mcp: UI extraction failed — continuing", exc_info=True
                     )
                     ui_content = None
+
+        # SHYJ-7154 Fix 2: ambiguity/clarify gate on the non-interactive MCP
+        # path. Respects QA_AMBIGUITY_GATE_SEVERITY; for an under-specified /
+        # no-UI documentation ticket it returns clarifying questions instead of
+        # generating a fabricated suite. proceed_anyway=true overrides it, and
+        # it is skipped when screenshots are attached (a real screen is present).
+        if not proceed_anyway and not attached_images:
+            clarify = await _maybe_ambiguity_clarify(text, url_content, openapi_text)
+            if clarify:
+                await _audit("mcp_ambiguity_gate", detail={"source": "generate"})
+                return clarify
 
         captured: dict = {}
 
@@ -1236,6 +1320,76 @@ async def handle_run_mobile_suite(
         logger.exception("handle_run_mobile_suite failed")
         _capture_error(exc, "qa_run_mobile_suite")
         return f"⚠️ Mobile {mode} failed: {exc}"
+
+
+def shape_web_run(base_url: str, payload: dict) -> str:
+    """Shape a web-run result. Prefers the pre-rendered per-TC markdown."""
+    if payload.get("reason") == "disabled":
+        return "ℹ️ Web suite execution is disabled (set QA_WEB_RUN_ENABLED=true)."
+    md = (payload.get("markdown") or "").strip()
+    if md:
+        return md
+    return (
+        f"## Web run on `{base_url}`\n\n"
+        f"**Passed:** {payload.get('passed', 0)}  ·  "
+        f"**Failed:** {payload.get('failed', 0)}  ·  "
+        f"**Total:** {payload.get('total', 0)}"
+    )
+
+
+async def handle_run_web_suite(
+    base_url: str,
+    suite_id: str = "",
+    *,
+    choose: ChooseCb = None,
+    progress: ProgressCb = None,
+) -> str:
+    """Run a stored suite against a live web app and report pass/fail per TC-ID.
+
+    Full edition only, gated by QA_WEB_RUN_ENABLED; dry-run (default) previews
+    the planned browser actions without launching a browser. Never raises."""
+    if _test_cases_only():
+        return _TEST_CASES_ONLY_NOTICE
+    if not settings.qa_web_run_enabled:
+        return "ℹ️ Web suite execution is disabled (set QA_WEB_RUN_ENABLED=true)."
+    base_url = (base_url or "").strip()
+    if not base_url:
+        return (
+            "⚠️ Provide the application base URL to run against, e.g. "
+            "https://staging.example.com."
+        )
+    suite_id = (suite_id or "").strip()
+    try:
+        # web L3: keep the elicitation + recent-suites lookups inside the
+        # never-raise guard so a transport error can't escape the handler.
+        if not suite_id and settings.qa_mcp_elicit_enabled:
+            picked = await _elicit_suite(choose)
+            if picked.status == CHOSEN:
+                suite_id = (picked.value or "").strip()
+            elif picked.status == DECLINED:
+                return "👍 Cancelled — no suite selected."
+        if not suite_id:
+            return await _recent_suites_markdown("qa_run_web_suite")
+        loaded = await load_suite(suite_id)
+        if loaded.get("error"):
+            return f"⚠️ Could not load suite `{suite_id}`: {loaded['error']}"
+        suite = loaded.get("content")
+        if suite is None:
+            return f"⚠️ No stored suite with id `{suite_id}`. Generate one first."
+        await _emit(progress, "🌐 Running the suite against the web app…")
+        res = await run_suite_web(suite, base_url)
+        if res.get("error"):
+            return f"⚠️ Web run failed: {res['error']}"
+        await _audit(
+            "mcp_run_web_suite",
+            entity_id=suite_id,
+            detail={"base_url": base_url},
+        )
+        return shape_web_run(base_url, res.get("content") or {})
+    except Exception as exc:
+        logger.exception("handle_run_web_suite failed")
+        _capture_error(exc, "qa_run_web_suite")
+        return f"⚠️ Web run failed: {exc}"
 
 
 _FA_MODES = ("jira", "mobile", "jira_mobile")

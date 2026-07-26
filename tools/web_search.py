@@ -74,9 +74,7 @@ async def search_web(query: str) -> dict:
                 }
 
         transport = (
-            PinnedIPTransport(hostname, pinned_ip)
-            if hostname and pinned_ip
-            else None
+            PinnedIPTransport(hostname, pinned_ip) if hostname and pinned_ip else None
         )
         async with httpx.AsyncClient(
             timeout=_TIMEOUT, follow_redirects=False, transport=transport

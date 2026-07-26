@@ -1,6 +1,6 @@
 [project]
 name = "qa-agent-pro"
-version = "1.4.1"
+version = "1.5.0"
 requires-python = ">=3.10"
 dependencies = [
     "fastmcp>=2.0",
@@ -19,6 +19,9 @@ dependencies = [
     "langsmith>=0.1",
     "xlsxwriter>=3.1",
     "bcrypt>=4.0",
+    # Ed25519 release-signature verification in tools/updater.py (auto-update
+    # trust root). Widely wheeled; the dist build pins it too via patch_pyproject.
+    "cryptography>=41.0",
 ]
 
 [project.optional-dependencies]
@@ -39,6 +42,12 @@ browser = [
 spec = [
     "pypdf>=4.0",
     "python-docx>=1.1",
+]
+embeddings = [
+    # Optional local embedding backend (QA_EMBEDDINGS_BACKEND=local). Imported
+    # lazily by tools/embeddings.py; absent by default so the disabled path and
+    # the dist build stay dependency-identical.
+    "sentence-transformers>=2.2",
 ]
 mcp = [
     "fastmcp>=2.0",

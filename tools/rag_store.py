@@ -21,6 +21,7 @@ import uuid
 from pathlib import Path
 
 from config.settings import settings
+from tools.embeddings import backend_enabled, cosine_similarity, embed_texts
 
 logger = logging.getLogger(__name__)
 
@@ -141,14 +142,39 @@ def _bm25_scores(
                 f = tf.get(t, 0)
                 if not f:
                     continue
-                s += _idf(t) * (f * (k1 + 1)) / (
-                    f + k1 * (1 - b + b * dl / avgdl)
-                )
+                s += _idf(t) * (f * (k1 + 1)) / (f + k1 * (1 - b + b * dl / avgdl))
             scores.append(s / (s + 10.0) if s > 0 else 0.0)
         return scores
     except Exception:
         logger.exception("_bm25_scores failed — returning zeros")
         return [0.0] * len(docs_tokens)
+
+
+async def _apply_semantic_scores(
+    query_text: str, scored: list[tuple[float, dict]]
+) -> list[tuple[float, dict]]:
+    """Overlay cosine(query, entry) onto the lexical scores for entries that carry
+    a stored 'embedding' vector. Vectorless (legacy) entries keep their lexical
+    score, so mixed corpora stay backward compatible. Returns the input unchanged
+    on any embedding failure or when no entry has a vector. Never raises."""
+    try:
+        if not any(isinstance(e.get("embedding"), list) for _s, e in scored):
+            return scored
+        q = await embed_texts([query_text])
+        if q.get("error") or not q.get("content"):
+            return scored
+        qv = q["content"][0]
+        out: list[tuple[float, dict]] = []
+        for s, e in scored:
+            vec = e.get("embedding")
+            if isinstance(vec, list) and len(vec) == len(qv):
+                out.append((max(0.0, cosine_similarity(qv, vec)), e))
+            else:
+                out.append((s, e))
+        return out
+    except Exception:
+        logger.exception("_apply_semantic_scores failed — keeping lexical scores")
+        return scored
 
 
 def _load_corpus_sync(path: Path) -> list[dict]:
@@ -223,9 +249,7 @@ def _prune_sync(path: Path, cap: int) -> None:
                     tmp.unlink()
                 except OSError:
                     pass
-        logger.info(
-            "rag_store: pruned %s to the newest %d entries", path.name, cap
-        )
+        logger.info("rag_store: pruned %s to the newest %d entries", path.name, cap)
     except Exception:
         logger.exception("rag_store: prune failed for %s", path)
 
@@ -275,6 +299,13 @@ async def add_to_corpus(entry_type: str, content: str, metadata: dict) -> dict:
             "metadata": metadata or {},
             "added_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
+        # Optional semantic vector (QA_EMBEDDINGS_BACKEND). Never blocks the add:
+        # embed_texts is never-raise and a failure just omits the vector. Rounded
+        # to 6 decimals to cap corpus (JSONL) bloat.
+        if backend_enabled():
+            emb = await embed_texts([content])
+            if not emb.get("error") and emb.get("content"):
+                entry["embedding"] = [round(float(x), 6) for x in emb["content"][0]]
         path = _corpus_path(entry_type)
         await asyncio.to_thread(_save_entry_sync, path, entry)
         # Strict type check: pydantic guarantees a real int in production;
@@ -365,6 +396,13 @@ async def query_corpus(
                 (_jaccard_similarity(query_tokens, _tokenize(e["content"])), e)
                 for e in usable
             ]
+
+        # Semantic overlay (QA_EMBEDDINGS_BACKEND, opt-in): replace the lexical
+        # score with query<->entry cosine for every entry that carries a stored
+        # vector. Vectorless (legacy) entries keep their lexical score, so mixed
+        # corpora stay backward compatible. Any failure leaves `scored` untouched.
+        if backend_enabled():
+            scored = await _apply_semantic_scores(query_text, scored)
 
         hl_raw = getattr(settings, "qa_rag_recency_half_life_days", 0)
         half_life = hl_raw if isinstance(hl_raw, int) else 0
