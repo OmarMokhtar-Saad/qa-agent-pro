@@ -884,11 +884,14 @@ async def _jira_preflight(
     return _jira_token_steps(host, verify_error=probe.get("error", ""))
 
 
-async def _auto_export_xlsx(suite) -> str:
+async def _auto_export_xlsx(suite, ask_text: AskCb = None) -> str:
     """Best-effort Excel auto-export for QA_AUTO_EXPORT_XLSX (MCP path only).
 
     Reuses generate_test_case_xlsx so the cell_sanitizer formula-injection
-    protection applies identically. When settings.qa_export_dir is set the file
+    protection applies identically. When elicitation dialogs are available
+    (QA_MCP_ELICIT_ENABLED + a capable client) the tester is first asked
+    where to save the file; a declined/blank/unavailable answer keeps the
+    configured default. When settings.qa_export_dir is set the file
     lands in that stable folder under the qa_test_cases_*.xlsx naming so a
     non-technical tester can find and re-open a persistent deliverable;
     otherwise it keeps the legacy secure-temp behavior via the
@@ -905,6 +908,15 @@ async def _auto_export_xlsx(suite) -> str:
     try:
         output_path = None
         export_dir = (settings.qa_export_dir or "").strip()
+        if settings.qa_mcp_elicit_enabled and ask_text is not None:
+            default_label = export_dir or "a secure temp folder"
+            asked = await _elicit_text(
+                ask_text,
+                "Where should the Excel file be saved? Reply with a folder "
+                f"path, or leave blank for the default ({default_label}).",
+            )
+            if asked.status == CHOSEN and (asked.value or "").strip():
+                export_dir = asked.value.strip()
         if export_dir:
             try:
                 dest = Path(export_dir).expanduser()
@@ -1194,7 +1206,7 @@ async def handle_generate_test_cases(
             summary, suite, suite_id, status, auto_export=auto_export
         )
         if auto_export:
-            result_md += "\n\n" + await _auto_export_xlsx(suite)
+            result_md += "\n\n" + await _auto_export_xlsx(suite, ask_text=ask_text)
         return result_md
     except Exception as exc:
         logger.exception("handle_generate_test_cases failed")
@@ -2064,10 +2076,8 @@ def _binary_line(name: str) -> str:
 async def handle_setup_check(*, progress: ProgressCb = None) -> str:
     """Machine-readiness report for tester onboarding: environment, LLM
     backend auth, integrations, CLI tooling, and feature gates — summarised
-    into an overall verdict plus concrete action items. Read-only and never
-    raises. Deliberately does NOT scan for connected devices (that needs
-    USB/simulator access and can take seconds) — qa_list_devices does that
-    on demand."""
+    into an overall verdict plus concrete action items. Read-only and
+    never raises."""
     await _audit("mcp_setup_check")
     try:
         from llm import check_backend
@@ -2196,8 +2206,9 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
                     probe = probe.parent
                 export_ok = os.access(probe, os.W_OK)
                 export_line = (
-                    f"- {'✅' if export_ok else '⚠️'} **Excel auto-export** → "
-                    f"`{dest}`" + ("" if export_ok else " — not writable")
+                    f"- {'✅' if export_ok else '⚠️'} **Excel auto-export** — "
+                    "you choose where each file is saved (default: "
+                    f"`{dest}`)" + ("" if export_ok else " — default not writable")
                 )
                 if not export_ok:
                     recommended.append(
@@ -2206,7 +2217,10 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
                         "files fall back to a temp folder."
                     )
             else:
-                export_line = "- ✅ **Excel auto-export** → secure temp directory"
+                export_line = (
+                    "- ✅ **Excel auto-export** — you choose where each file "
+                    "is saved (fallback: secure temp directory)"
+                )
 
         if blockers:
             verdict = (
@@ -2231,16 +2245,6 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
             + ("" if py_ok else " — 3.10 or newer required"),
             f"- {'✅' if ok else '❌'} **LLM backend** `{backend}` — "
             + ("ready" if ok else warning),
-            *(
-                [
-                    "  ↳ _Strict host match: the agent uses your editor's own "
-                    "account — Cursor → cursor-agent, Claude Code/Desktop → claude "
-                    "CLI — and never silently falls back to a different one._"
-                ]
-                if (settings.qa_llm_backend or "").strip().lower() == "auto"
-                and settings.qa_llm_strict_host
-                else []
-            ),
             *([export_line] if export_line else []),
             "",
             "### Integrations",
@@ -2252,9 +2256,6 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
             *([] if _test_cases_only() else [_binary_line("maestro")]),
             _binary_line("adb"),
             _binary_line("xcrun"),
-            "",
-            "_Connected devices are not scanned here (keeps this check "
-            "instant) — run `qa_list_devices` when you need them._",
             "",
             "### Feature gates",
         ]
