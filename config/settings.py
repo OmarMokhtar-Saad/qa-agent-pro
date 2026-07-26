@@ -164,6 +164,24 @@ class Settings(BaseSettings):
     # configurable (QW-11 / I-023 / B-015). When empty on a ticket, jira_fetcher
     # falls back to scanning the description for an "Acceptance Criteria" heading.
     jira_ac_field: str = "customfield_10016"
+    # Parent-story context (JIRA_FETCH_PARENT). Default **ON** — the THIRD
+    # deliberate exception to the constitution's defaults-OFF rule, alongside
+    # QA_AUTO_EXPORT_XLSX and QA_AMBIGUITY_GATE_SEVERITY / QA_JIRA_PREFLIGHT.
+    # A Jira SUB-TASK ("Add Apple Pay button") carries almost no requirements
+    # — they live on the parent story — so fetching only the sub-task makes
+    # the generator either fabricate a suite or trip the ambiguity gate, which
+    # is exactly the failure this flag exists to prevent. parent/subtasks/
+    # issuelinks are already in the DEFAULT REST field set (free to extract);
+    # only the parent BODY costs one extra authenticated GET, and a ticket
+    # with no parent makes no extra call at all. The result is injected as
+    # clearly-labelled BACKGROUND, never as the thing under test.
+    # Set JIRA_FETCH_PARENT=false to disable (complete kill-switch).
+    jira_fetch_parent: bool = True
+    # Character cap on the composed parent/related-issue BACKGROUND block so a
+    # huge epic description can never crowd out the sub-task under test. 0
+    # means "emit no background block" (same convention as jira_max_comments),
+    # which is why this field is deliberately NOT in _POSITIVE_INT_FIELDS.
+    jira_max_parent_chars: int = 1500
 
     # Ticket comments are a second REST call (/issue/{key}/comment). Off by
     # default, same as this file's other opt-in fetches — flip on in .env once
@@ -549,6 +567,7 @@ class Settings(BaseSettings):
         "testrail_dry_run",
         "jira_fetch_comments",
         "jira_fetch_images",
+        "jira_fetch_parent",
         "qa_mobile_capture",
         "qa_maestro_enabled",
         "qa_maestro_dry_run",
@@ -620,6 +639,7 @@ class Settings(BaseSettings):
         "jira_max_comments",
         "jira_max_images",
         "jira_max_image_bytes",
+        "jira_max_parent_chars",
         "qa_max_chat_images",
         "qa_max_chat_image_bytes",
         "qa_device_command_timeout",
