@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 
 from dotenv import load_dotenv
-from pydantic import field_validator
+from pydantic import ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger("qa_agents.settings")
@@ -558,6 +558,7 @@ class Settings(BaseSettings):
         "qa_rag_enabled",
         "qa_token_meter_enabled",
         "qa_coverage_regen_enabled",
+        "qa_ac_anchoring_enforce",
         "qa_cot_reasoning_enabled",
         "qa_mutation_eval_enabled",
         "qa_feature_analysis_enabled",
@@ -687,22 +688,79 @@ class Settings(BaseSettings):
         return parsed
 
 
-def _load_settings() -> Settings:
-    """Build Settings, degrading to pure defaults if anything unexpectedly fails.
+# Bound on the degrade-and-retry loop below. Pydantic reports every field error
+# in one pass, so a real environment converges in a single round; the bound only
+# exists so a pathological case cannot spin.
+_MAX_DEGRADE_ROUNDS = 12
 
-    The per-field coercers above already make individual bad values non-fatal;
-    this is a final backstop so a truly broken environment can never turn a
-    settings import into an application-wide crash (I-045 / B-017).
-    """
+
+def _offending_fields(exc: ValidationError) -> list[str]:
+    """Names of the Settings fields pydantic rejected. Never raises."""
+    names: list[str] = []
     try:
-        return Settings()
-    except Exception as exc:  # pragma: no cover - defensive backstop
-        logger.warning(
-            "Settings failed to parse the environment (%s) — falling back to "
-            "built-in defaults for all fields.",
-            exc,
-        )
-        return Settings.model_construct()
+        for err in exc.errors():
+            loc = err.get("loc") or ()
+            if loc and isinstance(loc[0], str) and loc[0] in Settings.model_fields:
+                names.append(loc[0])
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("could not read validation errors", exc_info=True)
+    return names
+
+
+def _load_settings() -> Settings:
+    """Build Settings, degrading FIELD BY FIELD rather than all-or-nothing.
+
+    The per-field coercers above already make a bad value non-fatal for every
+    field they cover. This backstop handles what they cannot: a field with no
+    coercer, or a value pydantic rejects before any validator runs.
+
+    It used to fall straight back to ``Settings.model_construct()``, which
+    resets EVERY field to its class default — so one unusable value silently
+    discarded the operator's Jira credentials, export directory and every flag,
+    logging only a warning while the surviving defaults looked plausible enough
+    to hide it. Instead, pin just the offending fields to their declared
+    defaults (init kwargs outrank the environment) and retry, so a bad value
+    costs one field. ``model_construct()`` remains the last resort if even that
+    cannot converge (I-045 / B-017).
+    """
+    overrides: dict[str, object] = {}
+    degraded: list[str] = []
+    for _ in range(_MAX_DEGRADE_ROUNDS):
+        try:
+            loaded = Settings(**overrides)
+        except ValidationError as exc:
+            fresh = [n for n in _offending_fields(exc) if n not in overrides]
+            if not fresh:
+                logger.warning(
+                    "Settings rejected the environment and the offending "
+                    "field(s) could not be identified (%s).",
+                    exc,
+                )
+                break
+            for name in fresh:
+                overrides[name] = Settings.model_fields[name].get_default(
+                    call_default_factory=True
+                )
+                degraded.append(name)
+            continue
+        except Exception as exc:  # pragma: no cover - defensive backstop
+            logger.warning("Settings failed to load (%s).", exc)
+            break
+        if degraded:
+            logger.warning(
+                "Settings: %d field(s) had an unusable value and were reset to "
+                "their defaults (%s). Every other field kept its configured "
+                "value.",
+                len(degraded),
+                ", ".join(sorted(degraded)),
+            )
+        return loaded
+    logger.warning(
+        "Settings could not parse the environment even after resetting %s — "
+        "falling back to built-in defaults for ALL fields.",
+        ", ".join(sorted(degraded)) or "nothing",
+    )
+    return Settings.model_construct()
 
 
 settings = _load_settings()
