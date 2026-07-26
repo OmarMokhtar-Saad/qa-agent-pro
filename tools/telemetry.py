@@ -248,9 +248,7 @@ def tool_called(
 # These extend the bare-HTTP dist telemetry above with the OPTIONAL ``posthog``
 # SDK (issue grouping for error tracking) and PostHog LLM-analytics
 # ``$ai_generation`` events. They gate on the DIST key (``_enabled`` /
-# ``_api_key``) -- NEVER the Chainlit app gate (``qa_analytics_enabled`` /
-# ``posthog_app_api_key``) -- so the two surfaces stay cleanly separated. Every
-# function is never-raise and content-free: exception MESSAGES and prompt /
+# ``_api_key``). Every function is never-raise and content-free: exception MESSAGES and prompt /
 # completion text are never transmitted.
 
 # Per-MCP-tool-invocation trace id + an extra-properties bag the handlers fill
@@ -411,7 +409,7 @@ def capture_error_dist(
     properties: dict | None = None,
 ) -> None:
     """Report a dist-path exception to PostHog error tracking. Gated on the DIST
-    key (``_enabled``), NOT ``qa_analytics_enabled``. Privacy: only the exception
+    key (``_enabled``). Privacy: only the exception
     CLASS name and stack FRAMES are sent -- the message and absolute frame
     paths are scrubbed (see ``_scrub_event_paths``). Never raises.
     With the SDK present it groups via ``capture_exception``; without it a
@@ -490,151 +488,9 @@ def capture_ai_generation(
         logger.debug("telemetry: capture_ai_generation failed", exc_info=True)
 
 
-# --- Internal Chainlit web-app analytics (Phases 1+2) -----------------------
-# A SECOND, opt-in surface on top of the dist telemetry above. It uses a
-# SEPARATE PostHog project key (settings.posthog_app_api_key) and the official
-# ``posthog`` SDK WHEN INSTALLED (needed for error-tracking issue grouping /
-# Slack alerts), with the same never-raise bare-HTTP fallback used above so the
-# dist build stays dependency-identical: the SDK is an OPTIONAL extra imported
-# lazily, never a hard dependency. Gated by settings.qa_analytics_enabled
-# (default OFF, constitution) and the shared opt-outs (qa_telemetry_disabled /
-# DO_NOT_TRACK). distinct_id is the logged-in username (set by the caller).
-
-_APP_NAME = "chainlit"
-_sdk_sentinel = object()
-_sdk_cached: object = _sdk_sentinel
-
-
-def _app_api_key() -> str:
-    """Resolve the internal app's PostHog key (separate project). Never raises."""
-    try:
-        return (settings.posthog_app_api_key or "").strip()
-    except Exception:
-        return ""
-
-
-def analytics_enabled() -> bool:
-    """Web-app analytics send only when opted in (qa_analytics_enabled), a key is
-    present, and neither opt-out (qa_telemetry_disabled / DO_NOT_TRACK) is set."""
-    try:
-        if not settings.qa_analytics_enabled:
-            return False
-    except Exception:
-        return False
-    return bool(_app_api_key()) and not _opted_out()
-
-
 def _safe_flush(client: object) -> None:
     """Flush a posthog client, swallowing any error (never raises)."""
     try:
         client.flush()
     except Exception:
         logger.debug("analytics: flush failed", exc_info=True)
-
-
-def _sdk_client():
-    """Return a cached ``posthog.Posthog`` client when the OPTIONAL SDK is
-    importable and a key is set, else ``None`` (bare-HTTP fallback). Never raises."""
-    global _sdk_cached
-    if _sdk_cached is not _sdk_sentinel:
-        return _sdk_cached
-    _sdk_cached = None
-    key = _app_api_key()
-    if not key:
-        return None
-    try:
-        from posthog import Posthog
-
-        client = Posthog(
-            project_api_key=key,
-            host=_POSTHOG_HOST,
-            # Explicit capture_exception() only: autocapture would install a
-            # process-wide hook shipping full tracebacks/messages (can embed
-            # user feature text), violating the class-name-only privacy contract.
-            enable_exception_autocapture=False,
-        )
-        atexit.register(_safe_flush, client)
-        _sdk_cached = client
-    except Exception:
-        logger.debug(
-            "analytics: posthog SDK unavailable - using bare-HTTP fallback",
-            exc_info=True,
-        )
-        _sdk_cached = None
-    return _sdk_cached
-
-
-def _app_properties(extra: dict | None = None) -> dict:
-    """Common web-app event props: always tag ``app: chainlit``; ``$set`` the
-    operator email when one is configured."""
-    props: dict = {"app": _APP_NAME, "$lib": "qa-agents-app"}
-    if extra:
-        props.update(extra)
-    try:
-        email = (settings.qa_user_email or "").strip()
-    except Exception:
-        email = ""
-    if email:
-        props.setdefault("$set", {})["email"] = email
-    return props
-
-
-def _build_app_payload(event: str, distinct_id: str, properties: dict) -> dict:
-    return {
-        "api_key": _app_api_key(),
-        "event": event,
-        "distinct_id": distinct_id,
-        "properties": properties,
-    }
-
-
-def capture_event(
-    event: str,
-    distinct_id: str | None = None,
-    properties: dict | None = None,
-) -> None:
-    """Emit an internal web-app product event (Phase 1). Never raises; a no-op
-    unless web-app analytics are enabled."""
-    if not analytics_enabled():
-        return
-    try:
-        did = (distinct_id or "").strip() or "anonymous"
-        props = _app_properties(properties)
-        client = _sdk_client()
-        if client is not None:
-            client.capture(distinct_id=did, event=event, properties=props)
-        else:
-            _dispatch(_build_app_payload(event, did, props))
-    except Exception:
-        logger.debug("analytics: capture_event failed", exc_info=True)
-
-
-def capture_error(
-    exc: BaseException,
-    distinct_id: str | None = None,
-    properties: dict | None = None,
-) -> None:
-    """Report an exception to PostHog error tracking (Phase 2): issue grouping,
-    fingerprints, Slack alerts. Never raises. Requires the ``posthog`` SDK for
-    grouping; without it a best-effort ``app_error`` event (exception CLASS name
-    only, no message) is sent so the failure is not lost entirely."""
-    if not analytics_enabled():
-        return
-    try:
-        did = (distinct_id or "").strip() or "anonymous"
-        props = _app_properties(properties)
-        client = _sdk_client()
-        if client is not None:
-            client.capture_exception(exc, distinct_id=did, properties=props)
-        else:
-            props["error_type"] = type(exc).__name__
-            _dispatch(_build_app_payload("app_error", did, props))
-    except Exception:
-        logger.debug("analytics: capture_error failed", exc_info=True)
-
-
-def flush() -> None:
-    """Flush queued analytics events on shutdown. Never raises."""
-    client = _sdk_client()
-    if client is not None:
-        _safe_flush(client)

@@ -1,9 +1,9 @@
 """GitHub-Release startup self-update (``QA_AUTO_UPDATE_ENABLED`` — opt-in, OFF by default).
 
 House rule: this module imports **nothing internal except ``config.settings``**
-(the launcher path must not pull in ``app.py`` or any agent). It is invoked by
-``launcher.py`` *before* Chainlit/app imports load, so an update can swap code in
-place first.
+(the launcher path must not pull in ``mcp_server.py`` or any agent). It is
+invoked by ``launcher.py`` *before* the server imports load, so an update can
+swap code in place first.
 
 Contract — **never raises to the launcher**: :func:`run_update_check` wraps its
 whole body in ``try/except`` and returns a short status string. Any failure
@@ -65,7 +65,6 @@ PROTECTED_PATHS = (
     "data",  # SQLite suite store + audit log (*.db)
     "corpus",  # RAG corpus JSONL files
     "maestro_flows",  # generated, re-exportable device flows
-    "operations/auth",  # bcrypt users.json
     ".claude",  # local settings/plans/reports/hooks state
     ".git",  # version control
     ".venv",  # virtualenv

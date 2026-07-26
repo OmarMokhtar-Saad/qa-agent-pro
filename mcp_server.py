@@ -380,9 +380,11 @@ def build_server():
 
     @mcp.tool()
     async def qa_setup_check(ctx: Context) -> str:
-        """Check whether THIS machine is ready: LLM backend auth, mobile tooling
-        (maestro/adb/xcrun), connected devices, and which features are enabled.
-        Run this first on a new machine."""
+        """Check whether THIS machine is ready: overall verdict, LLM backend
+        auth, integrations, CLI tooling (adb/xcrun), enabled features and
+        action items. Fast and read-only — it does NOT scan for connected
+        devices (qa_list_devices does that). Run this first on a new
+        machine."""
         return await _tracked(
             "qa_setup_check",
             ctx,

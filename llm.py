@@ -1461,9 +1461,7 @@ async def ask(system: str, user: str, model: str | None = None) -> str:
         return f"Error: {exc}"
     except Exception as exc:
         logger.exception("LLM call failed")
-        telemetry.capture_error(
-            exc, distinct_id="llm", properties={"origin": "llm.ask"}
-        )
+        telemetry.capture_error_dist(exc, origin="llm.ask")
         return f"Error: {exc}"
 
 
@@ -1554,9 +1552,7 @@ async def ask_vision(
         return _vision_text
     except Exception as exc:
         logger.exception("ask_vision: vision call failed")
-        telemetry.capture_error(
-            exc, distinct_id="llm", properties={"origin": "llm.ask_vision"}
-        )
+        telemetry.capture_error_dist(exc, origin="llm.ask_vision")
         return f"Error: {exc}"
 
 

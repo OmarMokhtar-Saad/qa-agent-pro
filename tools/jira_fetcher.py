@@ -391,6 +391,111 @@ async def _fetch_jira(path: str) -> dict:
         return {"error": str(exc), "content": None}
 
 
+_MYSELF_TIMEOUT = 10  # bounded live-probe timeout (seconds)
+_MAX_ACCOUNT_CHARS = 80  # cap on the externally-sourced displayName in markdown
+
+
+def _sanitize_account(value: object) -> str:
+    """Strip control chars and cap length on an externally-sourced Jira
+    displayName / email before it is embedded in returned markdown. Never
+    raises."""
+    try:
+        text = str(value or "")
+    except Exception:
+        return ""
+    cleaned = "".join(
+        ch for ch in text if ch == " " or (0x20 < ord(ch) < 0x7F) or ord(ch) > 0x9F
+    )
+    cleaned = " ".join(cleaned.split()).strip()
+    if len(cleaned) > _MAX_ACCOUNT_CHARS:
+        cleaned = cleaned[:_MAX_ACCOUNT_CHARS].rstrip() + "…"
+    return cleaned
+
+
+async def verify_jira_access(
+    *,
+    base_url: str = "",
+    email: str = "",
+    api_token: str = "",
+) -> dict:
+    """Live pre-flight probe of Jira credentials via GET /rest/api/3/myself.
+
+    Never raises (this module's contract). Accepts explicit override
+    credentials so freshly-entered values can be tested without relying on a
+    possibly-frozen settings object; each empty argument falls back to the
+    configured setting. Returns ``{"ok": bool, "error": str, "account": str}``.
+    Distinguishes 401/403 bad-credentials from network/DNS failures in the
+    error text. The returned account (displayName/email) is externally sourced
+    and is sanitized before it is handed back. SSRF posture matches _fetch_jira
+    (same operator-configured host, httpx with basic auth) plus an explicit
+    http(s) scheme guard.
+    """
+    base_url = (base_url or settings.jira_base_url or "").strip().rstrip("/")
+    email = (email or settings.jira_email or "").strip()
+    api_token = (api_token or settings.jira_api_token or "").strip()
+    if not (base_url and email and api_token):
+        return {"ok": False, "error": "missing_credentials", "account": ""}
+    if not base_url.startswith(("http://", "https://")):
+        base_url = "https://" + base_url
+    parsed = urlparse(base_url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return {
+            "ok": False,
+            "error": "The Jira base URL is not a valid http(s) address.",
+            "account": "",
+        }
+    api_url = f"{base_url}/rest/api/3/myself"
+    try:
+        async with httpx.AsyncClient(timeout=_MYSELF_TIMEOUT) as client:
+            resp = await client.get(api_url, auth=(email, api_token))
+    except httpx.TransportError as exc:
+        logger.warning(
+            "verify_jira_access transport error: %s", type(exc).__name__
+        )
+        return {
+            "ok": False,
+            "error": (
+                "Could not reach the Jira server (network or DNS error) — "
+                "check the base URL and your connection."
+            ),
+            "account": "",
+        }
+    except Exception:
+        logger.exception("verify_jira_access unexpected failure")
+        return {
+            "ok": False,
+            "error": "Could not verify Jira access due to an unexpected error.",
+            "account": "",
+        }
+    if resp.status_code == 200:
+        account = ""
+        try:
+            data = resp.json()
+            account = _sanitize_account(
+                data.get("displayName") or data.get("emailAddress") or ""
+            )
+        except Exception:
+            account = ""
+        return {"ok": True, "error": "", "account": account}
+    if resp.status_code in (401, 403):
+        return {
+            "ok": False,
+            "error": (
+                f"Jira rejected the credentials (HTTP {resp.status_code}) — the "
+                "email or API token is wrong, or the account lacks access."
+            ),
+            "account": "",
+        }
+    return {
+        "ok": False,
+        "error": (
+            f"Jira access check failed (HTTP {resp.status_code}). Verify the "
+            "base URL and try again."
+        ),
+        "account": "",
+    }
+
+
 _AC_HEADING_RE = re.compile(r"(?im)^[\s>#*_-]*acceptance\s+criteria\s*:?\s*$")
 
 # A line only counts as the NEXT section heading when it carries a real heading

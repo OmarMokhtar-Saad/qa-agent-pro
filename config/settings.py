@@ -151,6 +151,14 @@ class Settings(BaseSettings):
     jira_base_url: str = ""
     jira_api_token: str = ""
     jira_email: str = ""
+    # Jira access pre-flight (QA_JIRA_PREFLIGHT). Default **ON** — a deliberate
+    # exception to the constitution's defaults-OFF rule, with the same
+    # precedent as the ambiguity gate and QA_AUTO_EXPORT_XLSX: before fetching a
+    # Jira ticket URL on the MCP path the handler live-probes
+    # /rest/api/3/myself, so a missing/invalid credential set returns guided
+    # setup steps instead of a suite fabricated from an empty anonymous Jira
+    # SPA shell. Set QA_JIRA_PREFLIGHT=false to disable the probe (kill-switch).
+    qa_jira_preflight: bool = True
     # Jira custom-field id that holds Acceptance Criteria. Defaults to the common
     # Jira Software default; different instances use different ids, so make it
     # configurable (QW-11 / I-023 / B-015). When empty on a ticket, jira_fetcher
@@ -175,9 +183,8 @@ class Settings(BaseSettings):
 
     # Direct chat image uploads (screenshots/mockups attached to a message,
     # independent of Jira) — see tools/image_description.py -> llm.ask_vision()
-    # (api backend only, same pipeline as Jira ticket images). The Chainlit
-    # upload widget itself is always enabled (.chainlit/config.toml); these two
-    # caps just bound what the app will actually read from an upload.
+    # (api backend only, same pipeline as Jira ticket images). These two caps
+    # bound what the pipeline will actually read from an uploaded image.
     qa_max_chat_images: int = 3
     qa_max_chat_image_bytes: int = 5_000_000  # Anthropic's own per-image vision cap
     # Mobile device capture -> test cases (opt-in, off by default like the other
@@ -462,28 +469,11 @@ class Settings(BaseSettings):
     # trail. Never-raise; a failure degrades to no-audit, logged.
     qa_audit_log_path: str = "data/audit.db"
 
-    # Path to a bcrypt-hashed users file (JSON: {"username": "$2b$12$..."}) used
-    # by app.py's @cl.password_auth_callback (tools/auth.py). A missing file means
-    # auth is still enforced but no user can log in (fail-closed) rather than
-    # crashing at import time — see tools/auth.py::verify_user. (QW-4)
-    qa_auth_users_path: str = "operations/auth/users.json"
-    # Password login toggle. Defaults ON (secure): unlike feature flags, turning
-    # this OFF weakens security, so it must be an explicit local opt-out
-    # (QA_AUTH_ENABLED=false) -- e.g. a single-user laptop setup.
-    qa_auth_enabled: bool = True
-
-    # Informational mirror of the Chainlit CORS allowlist configured in
-    # .chainlit/config.toml's `allow_origins` (Chainlit reads that file directly
-    # and does not expand env vars, so this cannot drive it automatically — it
-    # exists so operators have one place to audit the intended origin list). (QW-4)
-    qa_allowed_origins: str = "http://localhost:8000"
-
     # MCP server (mcp_server.py) exposing the QA agents/tools to Claude
-    # Desktop / Claude Code / Cursor over stdio. Off by default like every
-    # other feature gate: turning it on lets an MCP client drive generation,
-    # exports, and (dry-run-defaulted) device runs, bypassing the Chainlit
-    # auth AND rate-limit layer -- so each MCP tool call is separately audited.
-    # Needs the optional extra:  pip install -e ".[mcp]".
+    # Desktop / Claude Code / Cursor over stdio — the product's primary
+    # surface. Off by default like every other feature gate: turning it on
+    # lets an MCP client drive generation, exports, and (dry-run-defaulted)
+    # device runs -- each MCP tool call is separately audited.
     qa_mcp_enabled: bool = False
 
     # Guided, choice-driven MCP wizard (qa_wizard) + missing-parameter prompts via
@@ -500,7 +490,7 @@ class Settings(BaseSettings):
     # who starts the server via `python launcher.py` gets a check against the
     # configured GitHub repo's latest Release; a newer version is downloaded,
     # swapped in (operator-local state preserved), and `pip install -e .` re-run
-    # before Chainlit starts. Any failure never blocks startup (see updater.py).
+    # before the MCP server starts. Any failure never blocks startup (see updater.py).
     qa_auto_update_enabled: bool = False
     # "owner/name" of the (private) GitHub repo to check for releases. Empty
     # disables the check even when the flag above is on.
@@ -545,18 +535,6 @@ class Settings(BaseSettings):
     # private checkout; the distribution build bakes a default. Env overrides.
     posthog_api_key: str = ""
 
-    # --- Internal Chainlit web-app product analytics (PostHog) - opt-in. ---
-    # A SEPARATE PostHog PROJECT from the dist telemetry above so the internal
-    # web app's product events + error tracking never mix with the public
-    # distribution's usage data. Gated by qa_analytics_enabled (constitution:
-    # default OFF) and still honours qa_telemetry_disabled / DO_NOT_TRACK.
-    # .env only. Uses the optional ``posthog`` SDK when installed (error-tracking
-    # issue grouping) with a bare-HTTP fallback so the dist build is unaffected.
-    qa_analytics_enabled: bool = False
-    # PostHog project API key for the internal Chainlit app (write-only public
-    # ingest key). Empty leaves web-app analytics inert regardless of the flag.
-    posthog_app_api_key: str = ""
-
     @field_validator(
         "qa_web_search_enabled",
         "qa_rag_enabled",
@@ -572,7 +550,6 @@ class Settings(BaseSettings):
         "jira_fetch_comments",
         "jira_fetch_images",
         "qa_mobile_capture",
-        "qa_auth_enabled",
         "qa_maestro_enabled",
         "qa_maestro_dry_run",
         "qa_maestro_heal_enabled",
@@ -586,11 +563,11 @@ class Settings(BaseSettings):
         "qa_dist_mode",
         "qa_mcp_enabled",
         "qa_mcp_elicit_enabled",
+        "qa_jira_preflight",
         "qa_auto_update_enabled",
         "qa_code_lock_enabled",
         "qa_update_require_signature",
         "qa_telemetry_disabled",
-        "qa_analytics_enabled",
         "xray_dry_run",
         "qa_llm_strict_host",
         "qa_web_run_enabled",

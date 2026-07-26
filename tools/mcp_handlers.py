@@ -3,8 +3,8 @@ agents and tools (gated by QA_MCP_ENABLED at the server layer).
 
 This module holds the BUSINESS LOGIC behind every MCP tool exposed by
 ``mcp_server.py``. Each handler calls the existing agents / tools, writes an
-audit event (the Chainlit auth + rate-limit layer is bypassed on the MCP
-transport, so every tool call must leave a trail), and shapes the result into
+audit event (the MCP transport has no login layer of its own, so every
+tool call must leave a trail), and shapes the result into
 CONCISE markdown — never a raw JSON dump.
 
 It imports NOTHING from ``fastmcp`` so it stays fully unit-testable with the
@@ -52,9 +52,9 @@ from tools.device_manager import (
 )
 from tools.gherkin_exporter import generate_feature_file
 from tools.image_description import describe_images
-from tools.jira_fetcher import fetch_url_content
+from tools.jira_fetcher import fetch_url_content, verify_jira_access
 from tools.playwright_exporter import generate_playwright_script
-from tools.rag_store import query_corpus
+from tools.rag_store import add_to_corpus, query_corpus
 from tools.requirement_analyzer import analyze_requirements, gate_triggers
 from tools.suite_store import list_recent_suites, load_suite, save_suite
 from tools.swagger_fetcher import fetch_openapi_spec, looks_like_openapi_url
@@ -67,7 +67,10 @@ from tools.xlsx_generator import generate_test_case_xlsx
 # imports are guarded. mcp_server.py skips registering the excluded tools when
 # _test_cases_only() is true; the handler gates below are defense in depth.
 try:
-    from agents.bug_report_agent import generate_bug_report
+    from agents.bug_report_agent import (
+        generate_bug_report,
+        is_bug_report_fallback,
+    )
     from agents.exploratory_coach_agent import coach_next_step
     from tools.coach_memory import (
         create_session_memory,
@@ -83,6 +86,7 @@ try:
     _FULL_EDITION = True
 except ImportError:  # pragma: no cover — exercised only in distribution builds
     generate_bug_report = None
+    is_bug_report_fallback = None
     coach_next_step = None
     create_session_memory = None
     strip_meta = None
@@ -161,8 +165,8 @@ ChooseCb = Optional[Callable[[str, list], Awaitable["ChoiceResult"]]]
 # Hard cap on elicitation rounds per tool call so a wizard can never loop forever.
 _MAX_ELICIT_ROUNDS = 5
 
-# Actor recorded on every MCP audit event. The MCP transport carries no logged-in
-# tester identity (unlike the Chainlit UI), so all its events share this actor.
+# Actor recorded on every MCP audit event. The MCP transport carries no
+# logged-in tester identity, so all its events share this actor.
 _ACTOR = "mcp"
 
 # In-process exploratory-session store keyed by the caller-supplied session_id.
@@ -680,10 +684,29 @@ async def handle_configure_jira(
                 " The server is reloading to apply them — run `qa_setup_check` "
                 "in ~10 seconds and Jira should show ✅."
             )
+        # Live-verify with the JUST-ENTERED values. On dist the settings
+        # assignment above may be frozen, so never rely on it for the probe —
+        # pass the explicit values through (frozen-settings pattern).
+        await _emit(progress, "🔐 Verifying Jira access…")
+        probe = await verify_jira_access(
+            base_url=base_url, email=email, api_token=api_token
+        )
+        if probe.get("ok"):
+            account = probe.get("account") or email
+            return (
+                f"✅ **Verified — Jira access confirmed for {account}** "
+                f"({base_url}). Credentials are stored only in the local "
+                "`.env` — the token is never shown or logged." + note + "\n\n"
+                "Now ask the user whether to **proceed to create the test "
+                "cases now** (re-call `qa_generate_test_cases` with their "
+                "ticket URL) or whether they need anything else."
+            )
+        host = (urlparse(base_url).hostname or base_url).lower()
         return (
-            f"✅ Jira credentials saved for **{base_url}** (account: {email}). "
-            "They are stored only in the local `.env` — the token is never "
-            "shown or logged." + note
+            "⚠️ Saved the credentials, but Jira **rejected** them: "
+            f"{probe.get('error') or 'access check failed'}\n\n"
+            + _jira_token_steps(host)
+            + note
         )
     except Exception as exc:
         logger.exception("handle_configure_jira failed")
@@ -700,8 +723,7 @@ def _jira_config_hint(url: str) -> str:
         host = (urlparse(url).hostname or "").lower()
     except ValueError:
         return ""
-    looks_jira = "atlassian.net" in host or host.startswith("jira.") or ".jira." in host
-    if not host or not looks_jira:
+    if not host or not _looks_like_jira_host(url):
         return ""
     configured_host = ""
     try:
@@ -733,6 +755,113 @@ def _jira_config_hint(url: str) -> str:
         "and I'll save them for you (I use the `qa_configure_jira` tool; the "
         "token stays on this machine)."
     )
+
+
+def _looks_like_jira_host(url: str) -> bool:
+    """True when a pasted URL's host looks like a Jira / Atlassian instance.
+    Shared by the config hint and the access pre-flight. Never raises."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    return "atlassian.net" in host or host.startswith("jira.") or ".jira." in host
+
+
+def _jira_token_steps(host: str, *, verify_error: str = "") -> str:
+    """Professional 'no access' + how-to-create-an-API-token message.
+
+    Shown when the Jira access pre-flight fails or credentials are missing.
+    Never echoes a token; *verify_error* (already sanitized) is an optional
+    one-line reason."""
+    reason = f"\n\n_Reason: {verify_error}_" if verify_error else ""
+    return (
+        f"⚠️ **I don't have access to this Jira instance (`{host}`).**"
+        + reason
+        + "\n\nTo let me read the ticket I need an Atlassian API token and the "
+        "account email:\n\n"
+        "1. Sign in to Atlassian and open "
+        "https://id.atlassian.com/manage-profile/security/api-tokens\n"
+        "2. Click **Create API token**, give it a label, and copy the token "
+        "(it is shown only once).\n"
+        "3. Note the **Atlassian account email** you signed in with.\n\n"
+        "Paste **both the account email and the API token here** and I'll "
+        "verify access and continue. The token is stored only in this "
+        "machine's local `.env` — never shown or logged."
+    )
+
+
+async def _jira_preflight(
+    url: str,
+    *,
+    ask_text: AskCb = None,
+    choose: ChooseCb = None,
+    progress: ProgressCb = None,
+) -> Optional[str]:
+    """Verify Jira access before fetching *url*.
+
+    Returns ``None`` to proceed with the original generation, or a markdown
+    string to return to the caller (guided setup steps / re-verify outcome).
+    Gated by ``settings.qa_jira_preflight`` and only acts on Jira-looking
+    hosts. With MCP elicitation available it collects the email + API token
+    inline, saves them via handle_configure_jira, re-verifies with the
+    JUST-ENTERED values (settings may be frozen on dist), and — on success
+    — asks whether to proceed. Without elicitation it returns the token
+    steps and tells the calling agent to gather the values and call
+    qa_configure_jira. Bounded by _MAX_ELICIT_ROUNDS; never a dead end, never
+    raises."""
+    if not settings.qa_jira_preflight or not _looks_like_jira_host(url):
+        return None
+    host = (urlparse(url).hostname or "").lower()
+    await _emit(progress, "🔐 Checking Jira access…")
+    probe = await verify_jira_access()
+    if probe.get("ok"):
+        return None
+    if not (settings.qa_mcp_elicit_enabled and ask_text is not None):
+        return _jira_token_steps(host, verify_error=probe.get("error", "")) + (
+            "\n\nWhen you have them, call `qa_configure_jira` with base_url "
+            f"`https://{host}`, the email and the token, then paste the ticket "
+            "URL again."
+        )
+    rounds = 0
+    while rounds < _MAX_ELICIT_ROUNDS:
+        rounds += 1
+        email_res = await _elicit_text(ask_text, "Your Atlassian account email:")
+        if email_res.status != CHOSEN or not (email_res.value or "").strip():
+            return _jira_token_steps(host, verify_error=probe.get("error", ""))
+        token_res = await _elicit_text(
+            ask_text,
+            "Your Atlassian API token (create one at "
+            "https://id.atlassian.com/manage-profile/security/api-tokens):",
+        )
+        if token_res.status != CHOSEN or not (token_res.value or "").strip():
+            return _jira_token_steps(host, verify_error=probe.get("error", ""))
+        email = email_res.value.strip()
+        token = token_res.value.strip()
+        base_url = f"https://{host}"
+        await handle_configure_jira(base_url, email, token, progress=progress)
+        reprobe = await verify_jira_access(
+            base_url=base_url, email=email, api_token=token
+        )
+        if reprobe.get("ok"):
+            account = reprobe.get("account") or email
+            proceed = await _elicit_choice(
+                choose,
+                f"✅ Verified — Jira access confirmed for {account}. "
+                "Proceed to create the test cases now, or do you need anything "
+                "else?",
+                ["Proceed", "Something else"],
+            )
+            if proceed.status == CHOSEN and proceed.value == "Proceed":
+                return None
+            return (
+                f"✅ Jira access is verified for **{account}**. Tell me what "
+                "you'd like to do next, or paste the ticket URL again to "
+                "generate the test cases."
+            )
+        probe = reprobe
+    return _jira_token_steps(host, verify_error=probe.get("error", ""))
 
 
 async def _auto_export_xlsx(suite) -> str:
@@ -866,6 +995,49 @@ async def _maybe_ambiguity_clarify(
         return None
 
 
+# Cap on the free-form feature description stored as corpus metadata (the
+# fine-tune exporter uses it as the prompt); older rows simply lack the key.
+_FEATURE_TEXT_METADATA_CAP = 2000
+
+
+async def _persist_suite_to_corpus(suite: object, feature_text: str = "") -> None:
+    """Write each generated test case into the RAG corpus (QW-6 / I-014 / F7).
+
+    This is the *write* half of the RAG loop; query_corpus in
+    test_scenario_agent is the read half. Best-effort and never disrupts the
+    tool call: a serialization or disk error for one case is logged and
+    skipped (add_to_corpus is itself never-raise).
+    """
+    cases = getattr(suite, "test_cases", None) or []
+    feature_text_capped = (feature_text or "").strip()[:_FEATURE_TEXT_METADATA_CAP]
+    written = 0
+    for tc in cases:
+        try:
+            steps_text = "\n".join(
+                f"{s.step_number}. {s.action} -> {s.expected_result}" for s in tc.steps
+            )
+            content = f"{tc.title}\n{steps_text}"
+            metadata = {
+                "feature": tc.module,
+                "module": tc.module,
+                "tc_id": tc.tc_id,
+                "stable_id": tc.stable_id,
+            }
+            if feature_text_capped:
+                metadata["feature_text"] = feature_text_capped
+        except Exception:
+            logger.warning("RAG: could not serialize a test case for corpus — skipping")
+            continue
+        try:
+            result = await add_to_corpus("test_case", content, metadata)
+            if not result.get("error"):
+                written += 1
+        except Exception:
+            logger.warning("RAG: add_to_corpus failed for a test case — ignoring")
+    if written:
+        logger.info("RAG: persisted %d test case(s) to corpus", written)
+
+
 async def handle_generate_test_cases(
     feature_or_url: str,
     *,
@@ -894,6 +1066,15 @@ async def handle_generate_test_cases(
             hint = _jira_config_hint(text)
             if hint:
                 return hint
+            # Pre-flight: verify Jira access (and collect/save credentials
+            # inline where elicitation is available) BEFORE fetching, so a
+            # bad/expired token yields guided setup steps instead of a suite
+            # fabricated from an empty anonymous SPA shell.
+            preflight = await _jira_preflight(
+                text, ask_text=ask_text, choose=choose, progress=progress
+            )
+            if preflight is not None:
+                return preflight
             # Swagger/OpenAPI link (QA_SWAGGER_ENABLED): condense the spec into
             # an endpoint summary instead of the generic page/UI path.
             if settings.qa_swagger_enabled and looks_like_openapi_url(text):
@@ -963,6 +1144,9 @@ async def handle_generate_test_cases(
             suite_id = (saved.get("content") or {}).get(
                 "suite_id", ""
             ) or suite.suite_id
+            # QW-6: seed the RAG corpus with the fresh cases — the write
+            # half of the RAG loop (query_corpus grounding is the read half).
+            await _persist_suite_to_corpus(suite, feature_text=text)
         case_count = len(getattr(suite, "test_cases", []) or [])
         if openapi_text:
             source = "swagger"
@@ -1064,6 +1248,12 @@ async def handle_bug_report(description: str, *, progress: ProgressCb = None) ->
     try:
         await _emit(progress, "🐛 Formatting the bug report…")
         report = await generate_bug_report(description)
+        # QW-8: seed the corpus, but never with the sanitized-fallback
+        # sentinel (a failed generation must not poison retrieval).
+        if is_bug_report_fallback is None or not is_bug_report_fallback(report):
+            await add_to_corpus(
+                "bug_report", report, {"description": description[:200]}
+            )
         await _audit("mcp_bug_report", detail={"chars": len(description)})
         return report
     except Exception as exc:
@@ -1528,6 +1718,8 @@ async def _guided_test_cases(
         text or "Feature captured from mobile device screens.",
         attached_images=images or None,
         force_feature_report=True,
+        choose=choose,
+        ask_text=ask_text,
         progress=progress,
     )
 
@@ -1850,9 +2042,12 @@ def _binary_line(name: str) -> str:
 
 
 async def handle_setup_check(*, progress: ProgressCb = None) -> str:
-    """Machine-readiness report for tester onboarding: Python, LLM backend
-    auth, mobile tooling, connected devices, and feature gates. Read-only and
-    never raises — the first thing to run on a new machine."""
+    """Machine-readiness report for tester onboarding: environment, LLM
+    backend auth, integrations, CLI tooling, and feature gates — summarised
+    into an overall verdict plus concrete action items. Read-only and never
+    raises. Deliberately does NOT scan for connected devices (that needs
+    USB/simulator access and can take seconds) — qa_list_devices does that
+    on demand."""
     await _audit("mcp_setup_check")
     try:
         from llm import check_backend
@@ -1876,7 +2071,7 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
                     "to see it."
                 )
                 _schedule_reload()
-        await _emit(progress, "🔎 Checking the LLM backend…")
+        await _emit(progress, "🔎 Validating the environment…")
         ok, warning = check_backend()
         from llm import describe_backend
 
@@ -1906,15 +2101,116 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
                     "the editor (Cmd+Q on macOS) to load the latest "
                     "capabilities. Everything else updates automatically."
                 )
+
+        # Validation: classify every finding as blocking / recommended /
+        # optional so the report opens with a single actionable verdict.
+        blockers: list[str] = []
+        recommended: list[str] = []
+        optional: list[str] = []
+
+        py_version = sys.version.split()[0]
+        py_ok = sys.version_info >= (3, 10)
+        if not py_ok:
+            blockers.append(
+                f"Upgrade Python to 3.10 or newer (currently {py_version})."
+            )
+        if not ok:
+            blockers.append(
+                "Fix the LLM backend — nothing generates without it. " + warning
+            )
+        if restart_note:
+            recommended.append(
+                "Quit and reopen the editor once so it reloads the agent's "
+                "latest tool definitions."
+            )
+
+        jira_ok = bool(
+            (settings.jira_base_url or "").strip()
+            and (settings.jira_api_token or "").strip()
+        )
+        jira_verified = None
+        jira_account = ""
+        if jira_ok and settings.qa_jira_preflight:
+            _probe = await verify_jira_access()
+            jira_verified = bool(_probe.get("ok"))
+            jira_account = _probe.get("account", "") or ""
+            if not jira_verified:
+                recommended.append(
+                    "Jira credentials are set but the live access check failed: "
+                    f"{_probe.get('error') or 'unknown error'} — re-run "
+                    "`qa_configure_jira` with a fresh API token."
+                )
+        if not jira_ok:
+            optional.append(
+                "Connect Jira to paste ticket URLs directly: run "
+                "`qa_configure_jira`, or set JIRA_BASE_URL / JIRA_EMAIL / "
+                "JIRA_API_TOKEN in .env."
+            )
+            _jira_status_line = (
+                "⬜ **Jira** — not configured (optional); pasting Jira "
+                "ticket URLs needs JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN "
+                "in .env, or run `qa_configure_jira`"
+            )
+        elif jira_verified is False:
+            _jira_status_line = (
+                "⚠️ **Jira** — credentials set but the live access "
+                "check failed ("
+                + str(settings.jira_base_url).strip().rstrip("/")
+                + ") — re-run `qa_configure_jira`"
+            )
+        else:
+            _jira_status_line = (
+                "✅ **Jira** — configured ("
+                + str(settings.jira_base_url).strip().rstrip("/")
+                + ")"
+                + (f", verified as {jira_account}" if jira_account else "")
+            )
+
+        export_line = ""
+        if settings.qa_auto_export_xlsx:
+            export_dir = (settings.qa_export_dir or "").strip()
+            if export_dir:
+                dest = Path(export_dir).expanduser()
+                probe = dest if dest.is_absolute() else Path.cwd() / dest
+                while not probe.exists() and probe.parent != probe:
+                    probe = probe.parent
+                export_ok = os.access(probe, os.W_OK)
+                export_line = (
+                    f"- {'✅' if export_ok else '⚠️'} **Excel auto-export** → "
+                    f"`{dest}`" + ("" if export_ok else " — not writable")
+                )
+                if not export_ok:
+                    recommended.append(
+                        f"Make the export directory `{dest}` writable (or "
+                        "change QA_EXPORT_DIR) — until then generated Excel "
+                        "files fall back to a temp folder."
+                    )
+            else:
+                export_line = "- ✅ **Excel auto-export** → secure temp directory"
+
+        if blockers:
+            verdict = (
+                f"❌ **Not ready** — {len(blockers)} blocking issue(s), "
+                "see Action items below"
+            )
+        elif recommended:
+            verdict = "⚠️ **Ready, with warnings** — see Action items below"
+        else:
+            verdict = "✅ **Ready** — all required checks passed"
+
         lines = [
             "## Setup check",
+            "",
+            f"**Overall:** {verdict}",
             "",
             *([f"**App version:** v{app_version}", ""] if app_version else []),
             *([restart_note, ""] if restart_note else []),
             *([update_note, ""] if update_note else []),
-            f"**Python:** {sys.version.split()[0]}",
-            f"**LLM backend:** `{backend}` — "
-            + ("✅ ready" if ok else f"❌ {warning}"),
+            "### Environment",
+            f"- {'✅' if py_ok else '❌'} **Python** {py_version}"
+            + ("" if py_ok else " — 3.10 or newer required"),
+            f"- {'✅' if ok else '❌'} **LLM backend** `{backend}` — "
+            + ("ready" if ok else warning),
             *(
                 [
                     "  ↳ _Strict host match: the agent uses your editor's own "
@@ -1925,35 +2221,23 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
                 and settings.qa_llm_strict_host
                 else []
             ),
-            "**Jira:** "
-            + (
-                "✅ configured ("
-                + str(settings.jira_base_url).strip().rstrip("/")
-                + ")"
-                if (settings.jira_base_url or "").strip()
-                and (settings.jira_api_token or "").strip()
-                else "⬜ not configured — pasting Jira ticket URLs needs "
-                "JIRA_BASE_URL / JIRA_EMAIL / JIRA_API_TOKEN in .env"
-            ),
+            *([export_line] if export_line else []),
             "",
-            "**Tooling:**",
+            "### Integrations",
+            "- " + _jira_status_line,
+            "",
+            "### Command-line tooling",
             _binary_line("cursor-agent"),
             # maestro only drives on-device runs — not part of the dist edition.
             *([] if _test_cases_only() else [_binary_line("maestro")]),
             _binary_line("adb"),
             _binary_line("xcrun"),
             "",
+            "_Connected devices are not scanned here (keeps this check "
+            "instant) — run `qa_list_devices` when you need them._",
+            "",
+            "### Feature gates",
         ]
-        await _emit(progress, "📱 Scanning for devices…")
-        devices = (await list_devices()).get("content") or []
-        lines.append(f"**Devices connected:** {len(devices)}")
-        for dev in devices[:6]:
-            lines.append(
-                f"- `{dev.get('id')}` — {dev.get('name')} "
-                f"({dev.get('platform')}/{dev.get('kind')})"
-            )
-        lines.append("")
-        lines.append("**Feature gates:**")
         gates = [
             (
                 "Feature Analysis (QA_FEATURE_ANALYSIS_ENABLED)",
@@ -1984,12 +2268,15 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
         ]
         for label, value in gates:
             lines.append(f"- {'✅' if value else '⬜'} {label}")
-        if not ok:
-            lines += [
-                "",
-                "> ⚠️ Fix the LLM backend first — nothing generates without it. "
-                + warning,
-            ]
+        items = (
+            [("Fix now", item) for item in blockers]
+            + [("Recommended", item) for item in recommended]
+            + [("Optional", item) for item in optional]
+        )
+        if items:
+            lines += ["", "### Action items"]
+            for idx, (tag, text) in enumerate(items, 1):
+                lines.append(f"{idx}. **{tag}:** {text}")
         return "\n".join(lines)
     except Exception as exc:
         logger.exception("handle_setup_check failed")
