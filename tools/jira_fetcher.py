@@ -396,9 +396,9 @@ _MAX_ACCOUNT_CHARS = 80  # cap on the externally-sourced displayName in markdown
 
 
 def _sanitize_account(value: object) -> str:
-    """Strip control chars and cap length on an externally-sourced Jira
-    displayName / email before it is embedded in returned markdown. Never
-    raises."""
+    """Strip control chars and markdown-significant characters, and cap
+    length, on an externally-sourced Jira displayName / email before it is
+    embedded in returned markdown. Never raises."""
     try:
         text = str(value or "")
     except Exception:
@@ -406,6 +406,7 @@ def _sanitize_account(value: object) -> str:
     cleaned = "".join(
         ch for ch in text if ch == " " or (0x20 < ord(ch) < 0x7F) or ord(ch) > 0x9F
     )
+    cleaned = "".join(ch for ch in cleaned if ch not in "`*_[]<>|#\\")
     cleaned = " ".join(cleaned.split()).strip()
     if len(cleaned) > _MAX_ACCOUNT_CHARS:
         cleaned = cleaned[:_MAX_ACCOUNT_CHARS].rstrip() + "…"
@@ -449,9 +450,7 @@ async def verify_jira_access(
         async with httpx.AsyncClient(timeout=_MYSELF_TIMEOUT) as client:
             resp = await client.get(api_url, auth=(email, api_token))
     except httpx.TransportError as exc:
-        logger.warning(
-            "verify_jira_access transport error: %s", type(exc).__name__
-        )
+        logger.warning("verify_jira_access transport error: %s", type(exc).__name__)
         return {
             "ok": False,
             "error": (
