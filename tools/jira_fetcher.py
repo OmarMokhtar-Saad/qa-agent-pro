@@ -282,6 +282,268 @@ async def _fetch_jira_images(fields: dict) -> list[dict]:
     return images
 
 
+# Jira issue keys taken from an API RESPONSE (parent.key, subtask keys, linked
+# issue keys) get interpolated into an AUTHENTICATED REST path. Treat them as
+# untrusted input: a strict syntax gate stops a crafted or compromised response
+# from smuggling "../", an absolute URL, or a query string into the request that
+# carries our Basic Auth credentials. A rejected key means no request at all.
+#
+# \Z (not $) so a trailing newline cannot slip past the anchor, independent of
+# the caller's .strip(); the {0,63} bound keeps an absurdly long project prefix
+# from reaching the URL builder at all.
+_ISSUE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_]{0,63}-\d+\Z")
+
+# Every http(s) URL is stripped out of parent/linked-issue text before it reaches
+# a prompt. That text is authored by OTHER people, so it is a strictly higher
+# injection/phishing risk than the target ticket, and parent context is
+# BACKGROUND ONLY -- it must never supply a navigation target (SHYJ-7154).
+_URL_IN_TICKET_RE = re.compile(r"https?://\S+")
+
+# Cap on how many sibling sub-tasks / linked issues are listed as context.
+_MAX_RELATED_ISSUES = 10
+
+
+def _valid_issue_key(value: object) -> str:
+    """Return *value* when it is a syntactically valid Jira issue key, else "".
+
+    Security gate for every key that comes back inside an API response and is
+    later spliced into a REST path. Never raises.
+    """
+    if not isinstance(value, str):
+        return ""
+    return value if _ISSUE_KEY_RE.match(value) else ""
+
+
+def _strip_urls(text: str) -> str:
+    """Replace every http(s) URL in *text* with a placeholder. Never raises."""
+    try:
+        return _URL_IN_TICKET_RE.sub("[link removed]", text)
+    except Exception:
+        logger.exception("_strip_urls failed — dropping the text")
+        return ""
+
+
+def _extract_parent_ref(fields: dict) -> dict | None:
+    """{key, summary, issuetype} for this issue's parent, or None.
+
+    Pure — reads only fields Jira already returned in the DEFAULT field set, so
+    it costs no extra API call. isinstance-guarded throughout (mirrors
+    _extract_names / _extract_priority); never raises.
+    """
+    try:
+        parent = fields.get("parent")
+        if not isinstance(parent, dict):
+            return None
+        key = _valid_issue_key(parent.get("key"))
+        if not key:
+            return None
+        pfields = parent.get("fields")
+        pfields = pfields if isinstance(pfields, dict) else {}
+        itype = pfields.get("issuetype")
+        return {
+            "key": key,
+            "summary": str(pfields.get("summary") or "").strip(),
+            "issuetype": (
+                str(itype.get("name") or "").strip() if isinstance(itype, dict) else ""
+            ),
+        }
+    except Exception:
+        logger.exception("Extracting the Jira parent reference failed")
+        return None
+
+
+def _extract_subtasks(fields: dict) -> list[dict]:
+    """[{key, summary, status}] for this issue's sub-tasks (capped). Never raises."""
+    try:
+        items = fields.get("subtasks")
+        if not isinstance(items, list):
+            return []
+        out: list[dict] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key = _valid_issue_key(item.get("key"))
+            if not key:
+                continue
+            sfields = item.get("fields")
+            sfields = sfields if isinstance(sfields, dict) else {}
+            status = sfields.get("status")
+            out.append(
+                {
+                    "key": key,
+                    "summary": str(sfields.get("summary") or "").strip(),
+                    "status": (
+                        str(status.get("name") or "").strip()
+                        if isinstance(status, dict)
+                        else ""
+                    ),
+                }
+            )
+            if len(out) >= _MAX_RELATED_ISSUES:
+                break
+        return out
+    except Exception:
+        logger.exception("Extracting Jira sub-tasks failed")
+        return []
+
+
+def _extract_issuelinks(fields: dict) -> list[dict]:
+    """[{relation, key, summary}] for linked issues (capped).
+
+    `relation` is the human phrase from the CORRECT direction of the link
+    ("blocks" for an outwardIssue, "is blocked by" for an inwardIssue). Never
+    raises.
+    """
+    try:
+        items = fields.get("issuelinks")
+        if not isinstance(items, list):
+            return []
+        out: list[dict] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            ltype = item.get("type")
+            ltype = ltype if isinstance(ltype, dict) else {}
+            for side, phrase_key in (
+                ("outwardIssue", "outward"),
+                ("inwardIssue", "inward"),
+            ):
+                issue = item.get(side)
+                if not isinstance(issue, dict):
+                    continue
+                key = _valid_issue_key(issue.get("key"))
+                if not key:
+                    continue
+                lfields = issue.get("fields")
+                lfields = lfields if isinstance(lfields, dict) else {}
+                out.append(
+                    {
+                        "relation": str(ltype.get(phrase_key) or "relates to").strip(),
+                        "key": key,
+                        "summary": str(lfields.get("summary") or "").strip(),
+                    }
+                )
+                break
+            if len(out) >= _MAX_RELATED_ISSUES:
+                break
+        return out
+    except Exception:
+        logger.exception("Extracting Jira issue links failed")
+        return []
+
+
+async def _fetch_jira_parent(parent_key: str) -> dict:
+    """Fetch the parent story's description + acceptance criteria.
+
+    A sub-task usually carries only a one-line title while the real requirements
+    live on its parent story. This is BACKGROUND context, not the thing under
+    test, so — exactly like _fetch_jira_comments — it never raises and returns {}
+    on any failure or when disabled via settings.
+
+    SECURITY: the URL is BUILT from settings.jira_base_url plus a regex-validated
+    key; no `self`/`href` from the response is ever followed, and redirects are
+    disabled outright, so the Basic Auth credentials can never be bounced
+    off-host (same discipline as _download_jira_attachment).
+    """
+    key = _valid_issue_key(parent_key)
+    if not settings.jira_fetch_parent or not key:
+        return {}
+    if not (settings.jira_api_token and settings.jira_email):
+        return {}
+    try:
+        url = f"{settings.jira_base_url.rstrip('/')}/rest/api/3/issue/{key}"
+        async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
+            resp = await client.get(
+                url, auth=(settings.jira_email, settings.jira_api_token)
+            )
+        if resp.status_code != 200:
+            logger.warning(
+                "Jira parent fetch HTTP %d for %s — continuing without parent context",
+                resp.status_code,
+                key,
+            )
+            return {}
+        pfields = resp.json().get("fields", {}) or {}
+        description = pfields.get("description", "") or ""
+        if isinstance(description, dict):
+            description = _extract_adf_text(description)
+        ac_raw = pfields.get(settings.jira_ac_field, "") or ""
+        if isinstance(ac_raw, dict):
+            ac_raw = _extract_adf_text(ac_raw)
+        return {
+            "description": str(description).strip(),
+            "acceptance_criteria": (
+                str(ac_raw).strip() or _extract_ac_from_description(str(description))
+            ),
+        }
+    except Exception:
+        logger.exception(
+            "Jira parent fetch failed for %s — continuing without parent context",
+            parent_key,
+        )
+        return {}
+
+
+def _build_parent_context(
+    parent: dict | None, subtasks: list[dict], issuelinks: list[dict]
+) -> str:
+    """Compose the BACKGROUND block for a ticket whose requirements live elsewhere.
+
+    Plain text only: every http(s) URL is stripped (see _strip_urls) and the
+    result is capped at settings.jira_max_parent_chars so a huge epic can never
+    crowd out the sub-task actually under test. Returns "" when there is nothing
+    to say. Never raises.
+
+    NOTE: this string is returned under its OWN key (`parent_context`) and is
+    deliberately NOT merged into raw_text/description — _find_product_urls scans
+    those, and a link inside somebody else's story must never become this
+    ticket's navigation target (SHYJ-7154).
+    """
+    try:
+        has_parent = bool(parent and parent.get("key"))
+        lines: list[str] = []
+        if has_parent:
+            label = parent.get("issuetype") or "issue"
+            head = f"Parent {label} {parent['key']}: {parent.get('summary', '')}"
+            lines.append(head.strip())
+            desc = str(parent.get("description") or "").strip()
+            if desc:
+                lines += ["", desc]
+            pac = str(parent.get("acceptance_criteria") or "").strip()
+            if pac:
+                lines += ["", "Parent acceptance criteria:", pac]
+        if subtasks:
+            heading = (
+                "Other sub-tasks under the same parent (context only):"
+                if has_parent
+                else "Sub-tasks this story is broken down into (context only):"
+            )
+            lines += ["", heading]
+            for sub_task in subtasks:
+                status = str(sub_task.get("status") or "").strip()
+                # Conditional suffix, never a post-hoc .replace(" []", ""): that
+                # would mangle a summary legitimately ending in " []".
+                suffix = f" [{status}]" if status else ""
+                lines.append(
+                    f"- {sub_task['key']}: {sub_task.get('summary', '')}{suffix}".rstrip()
+                )
+        if issuelinks:
+            lines += ["", "Linked issues (context only):"]
+            lines += [
+                f"- {ln.get('relation', 'relates to')} {ln['key']}: "
+                f"{ln.get('summary', '')}".rstrip()
+                for ln in issuelinks
+            ]
+        text = "\n".join(lines).strip()
+        if not text:
+            return ""
+        cap = settings.jira_max_parent_chars
+        return _strip_urls(text)[: cap if cap > 0 else 0]
+    except Exception:
+        logger.exception("Building the Jira parent context failed — omitting it")
+        return ""
+
+
 async def _fetch_jira(path: str) -> dict:
     """Fetch Jira issue via REST API, falling back to HTML scraping."""
     try:
@@ -332,6 +594,22 @@ async def _fetch_jira(path: str) -> dict:
                 components = _extract_names(fields.get("components"))
                 comments = await _fetch_jira_comments(key)
                 images = await _fetch_jira_images(fields)
+                # Sub-task support: parent/subtasks/issuelinks are already in the
+                # DEFAULT field set Jira returned above, so extracting them costs
+                # nothing. Only the parent's BODY needs a second call. One flag
+                # gates the whole feature so JIRA_FETCH_PARENT=false is a complete
+                # kill-switch. Every helper below is never-raise.
+                parent: dict | None = None
+                subtasks: list[dict] = []
+                issuelinks: list[dict] = []
+                parent_context = ""
+                if settings.jira_fetch_parent:
+                    parent = _extract_parent_ref(fields)
+                    subtasks = _extract_subtasks(fields)
+                    issuelinks = _extract_issuelinks(fields)
+                    if parent:
+                        parent = {**parent, **(await _fetch_jira_parent(parent["key"]))}
+                    parent_context = _build_parent_context(parent, subtasks, issuelinks)
 
                 meta_lines = []
                 if priority:
@@ -365,6 +643,16 @@ async def _fetch_jira(path: str) -> dict:
                     "components": components,
                     "comments": comments,
                     "images": images,
+                    # Sub-task background. Deliberately SEPARATE from raw_text:
+                    # _find_product_urls scans raw_text/description/
+                    # acceptance_criteria/title, and a link inside somebody
+                    # else's story must never become this ticket's navigation
+                    # target (SHYJ-7154). Absent on the no-credentials generic
+                    # fallback below, so consumers must use .get().
+                    "parent": parent,
+                    "subtasks": subtasks,
+                    "issuelinks": issuelinks,
+                    "parent_context": parent_context,
                     "raw_text": raw_text,
                     "content": raw_text,
                 }

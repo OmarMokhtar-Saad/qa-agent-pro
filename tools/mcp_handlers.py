@@ -973,7 +973,12 @@ def _ambiguity_source_text(
     if url_content and not url_content.get("error"):
         raw = str(url_content.get("raw_text") or url_content.get("description") or "")
         ac = str(url_content.get("acceptance_criteria") or "")
-        combined = (raw + "\n" + ac).strip()
+        # A Jira SUB-TASK is a one-liner on its own; its requirements live on
+        # the parent story, which jira_fetcher now supplies under its own key.
+        # Judge the gate on that too, or every sub-task keeps getting blocked
+        # as "under-specified" even though the context is right there.
+        parent = str(url_content.get("parent_context") or "")
+        combined = "\n".join(p for p in (raw, ac, parent) if p).strip()
         return combined or text
     return text
 

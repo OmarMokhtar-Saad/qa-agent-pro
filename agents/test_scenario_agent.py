@@ -20,7 +20,12 @@ from llm import (
     ask_vision,
     backend_unavailable_reason,
 )
-from tools.ac_anchor import anchoring_warning_section, filter_unanchored_cases
+from tools.ac_anchor import (
+    anchoring_warning_section,
+    filter_unanchored_cases,
+    flag_out_of_scope_cases,
+    scope_warning_section,
+)
 from tools.csv_exporter import generate_test_case_csv
 from tools.embeddings import backend_enabled, cosine_similarity, embed_texts
 from tools.image_description import describe_images
@@ -1665,6 +1670,35 @@ def _build_source_scope_directive(source_url: str, product_urls: list[str]) -> s
     )
 
 
+def _build_parent_scope_directive(target_title: str) -> str:
+    """System-prompt directive for a ticket whose PARENT story was injected as
+    background (typically a Jira sub-task).
+
+    POSITIVE framing on purpose. The model is told what the target IS and how to
+    use the background — it is NOT handed a denial list, and sibling sub-tasks
+    are NOT enumerated as exclusions: priming the model with the out-of-scope
+    material is exactly the failure mode this directive exists to prevent.
+
+    Injected into every category system prompt (which already ends with _GUARD)
+    via rtm_hint, so it also reaches the remediation round, the quality retry and
+    the cursor-fallback rebuild.
+    """
+    target = (target_title or "").strip()
+    named = f' ("{target[:120]}")' if target else ""
+    return (
+        "\n\n## Scope of This Test Suite (IMPORTANT)\n"
+        f"The single deliverable described under `## Feature to Test`{named} is "
+        "the ONE thing this suite covers. The `## Parent Story (BACKGROUND ONLY)` "
+        "block is supplied so you understand the surrounding product behaviour, "
+        "the wider acceptance criteria, and the user journey this piece plugs "
+        "into — use it to make the target's test cases more accurate and better "
+        "grounded. Every test case you write must exercise the target itself; "
+        "when background detail is needed to reach it, fold that in as a "
+        "precondition or a setup step of a target test case rather than writing "
+        "a separate test case for it."
+    )
+
+
 async def generate_test_scenarios(
     feature_text: str,
     url_content: dict | None = None,
@@ -1767,6 +1801,19 @@ async def generate_test_scenarios(
             feature_text = grounded
 
     feature_text = _scope_feature_text(feature_text, url_content, ui_content)
+    # Jira sub-task support: tools/jira_fetcher._build_parent_context composed the
+    # parent story (plus sibling/linked issue titles) into its OWN key. Keep it in
+    # a local and never merge it into raw_text/description — _find_product_urls
+    # scans those, and a link inside somebody else's story must never become this
+    # ticket's navigation target (SHYJ-7154). Every downstream use below is
+    # guarded by a truthy parent_context, so JIRA_FETCH_PARENT=false restores the
+    # previous behaviour end to end.
+    parent_context = ""
+    if url_content and not url_content.get("error"):
+        parent_context = str(url_content.get("parent_context", "") or "").strip()
+    parent_scope_directive = (
+        _build_parent_scope_directive(feature_text) if parent_context else ""
+    )
 
     # Parse explicit acceptance criteria from Jira content first (sync, fast; an
     # empty list for non-Jira URLs). This decides whether AC synthesis is needed.
@@ -1843,6 +1890,21 @@ async def generate_test_scenarios(
                     "## Acceptance Criteria\n"
                     + wrap_untrusted("jira_acceptance_criteria", ac_stripped[:2000])
                 )
+        if parent_context:
+            # Its OWN untrusted label, never folded into jira_or_web_content:
+            # parent text is authored by other people, so the containment
+            # boundary and the source attribution must stay distinct. Emitted
+            # ONLY when a parent actually exists, so a parentless ticket's prompt
+            # is byte-identical to before (prompt-injection containment test
+            # counts the untrusted blocks).
+            parts.append(
+                "## Parent Story (BACKGROUND ONLY — do not test this directly)\n"
+                + wrap_untrusted(
+                    "jira_parent_story",
+                    parent_context,
+                    limit=settings.jira_max_parent_chars,
+                )
+            )
         images = url_content.get("images") or []
         if images:
             jira_image_text = await _describe_ticket_images(images)
@@ -1883,10 +1945,6 @@ async def generate_test_scenarios(
             + wrap_untrusted("openapi_spec", openapi_text[:12000])
         )
 
-    parts.append(
-        f"## Feature to Test\n{wrap_untrusted('feature_description', feature_text)}"
-    )
-
     if ui_content and not ui_content.get("error"):
         ui_block = _build_ui_prompt_block(ui_content)
         if ui_block:
@@ -1898,12 +1956,23 @@ async def generate_test_scenarios(
             f"## Sources for Compliance Context\n{citations}\n\nWhen generating test cases that relate to compliance standards, cite the relevant source URL in the test case's expected_result or notes field."
         )
 
+    # The TARGET goes LAST. Everything above it — parent story, RAG, compliance,
+    # images, spec, OpenAPI, live UI — is background, and recency is the strongest
+    # position in a long prompt, so the one thing this suite must actually cover
+    # is the final thing the model reads. Load-bearing for a Jira sub-task, whose
+    # parent BACKGROUND block is far longer than the target itself.
+    parts.append(
+        f"## Feature to Test\n{wrap_untrusted('feature_description', feature_text)}"
+    )
+
     user_msg = "\n\n".join(parts)
 
     # Build RTM hint once — injected into every category system prompt. The
     # source-URL scope directive (Fix 1) rides along so every category is told
     # the Jira link is a reference, never a navigation target.
-    rtm_hint = format_ac_prompt_block(acs) + nav_scope_directive
+    rtm_hint = (
+        format_ac_prompt_block(acs) + nav_scope_directive + parent_scope_directive
+    )
 
     # One progress slot per category — each updates only its own slot.
     # asyncio coroutines are single-threaded so list-element assignment is race-free.
@@ -2062,6 +2131,23 @@ async def generate_test_scenarios(
     # the file is executable as-is. No-op (no LLM call) when nothing is vague.
     scored = await _rewrite_vague_fields(scored, feature_text, on_status)
 
+    # Jira sub-task scope check (advisory, FLAG-ONLY). When a parent story was
+    # injected as BACKGROUND, flag — never drop — cases whose wording tracks the
+    # parent rather than the sub-task under test.
+    #
+    # Placed HERE on purpose: after the LAST content mutation and before the tc_id
+    # renumber below. Everything upstream still changes the case set —
+    # _remediate_gaps can ADD cases (they would otherwise never be scope-checked
+    # at all), _semantic_dedupe_cases can drop them, and _rewrite_vague_fields
+    # rewrites step text. Checking here means every case that reaches the export
+    # is checked exactly once, against its final content. The returned stable_ids
+    # then still match what scope_warning_section renders from, because the
+    # renumber uses model_copy(update={"tc_id": ...}), which does NOT re-run the
+    # @model_validator that derives stable_id from (title, steps).
+    out_of_scope_ids: set[str] = set()
+    if parent_context:
+        out_of_scope_ids = flag_out_of_scope_cases(scored, feature_text, parent_context)
+
     # Renumber TC-001..N in the FINAL row order (post risk-sort) so every export's
     # TC-ID always matches its row position — TC-001 is the highest-risk case.
     # model_copy is the canonical Pydantic v2 API for producing a new instance with changed fields.
@@ -2117,6 +2203,11 @@ async def generate_test_scenarios(
     # carried REAL (source-parsed) ACs. Flags cases not traceable to any real AC
     # so hallucinated/unanchored coverage is visible rather than silently trusted.
     anchoring_section = anchoring_warning_section(renumbered, source_acs)
+
+    # Advisory sub-task scope report — cases that read as covering the parent
+    # story's background instead of the target. FLAG ONLY: nothing was dropped,
+    # and the ids are the FINAL post-renumber tc_ids (matched by stable_id).
+    scope_section = scope_warning_section(renumbered, out_of_scope_ids)
 
     # Test-plan artifacts (QA_TEST_PLAN_ARTIFACTS, house-rule opt-in, default
     # OFF -> zero extra LLM calls). When ON, build the AC-Validation report
@@ -2259,6 +2350,7 @@ async def generate_test_scenarios(
             f"{quality_section}"
             f"{test_data_section}"
             f"{anchoring_section}"
+            f"{scope_section}"
             f"{test_plan_section}"
             f"{semantic_dedup_note}"
             f"{meter_line}"
@@ -2332,6 +2424,7 @@ async def generate_test_scenarios(
         f"{quality_section}"
         f"{test_data_section}"
         f"{anchoring_section}"
+        f"{scope_section}"
         f"{test_plan_section}"
         f"{semantic_dedup_note}"
         f"{export_section}"

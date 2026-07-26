@@ -251,5 +251,10 @@ def format_ac_prompt_block(acs: list[AcceptanceCriterion]) -> str:
         "For each test case, set `requirement_id` to the ID of the AC it primarily validates.\n"
         "Use ONLY these AC IDs:\n"
         + lines
-        + "\nIf no AC applies to a test case, use JSON null for requirement_id.\n"
+        + (
+            "\nIf no AC applies to a test case, use JSON null for "
+            "requirement_id — but prefer a real AC id: a case you cannot "
+            "trace to any of the IDs above is usually testing something "
+            "outside this ticket's scope.\n"
+        )
     )
