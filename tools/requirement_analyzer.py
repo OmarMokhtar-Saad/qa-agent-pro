@@ -119,8 +119,8 @@ def gate_triggers(result: dict, gate: str) -> bool:
     """True when an analyze_requirements result meets/exceeds the *gate* severity
     and carries at least one clarifying question. gate=="off" never triggers.
 
-    Shared by the Chainlit app and the non-interactive MCP path so both honour
-    QA_AMBIGUITY_GATE_SEVERITY identically. Never raises — any failure returns
+    Used by the non-interactive MCP path to honour
+    QA_AMBIGUITY_GATE_SEVERITY. Never raises — any failure returns
     False so generation is never blocked by the gate helper itself.
     """
     try:

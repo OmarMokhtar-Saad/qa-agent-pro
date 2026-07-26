@@ -272,8 +272,8 @@ def _valid_package_name(name: object) -> bool:
 def valid_package_name(name: object) -> bool:
     """Public wrapper over :func:`_valid_package_name`.
 
-    Callers outside this module (e.g. app.py re-validating a client-controllable
-    Chainlit action payload before reusing the id in a subprocess) should use
+    Callers outside this module (e.g. mcp_handlers re-validating a
+    client-controllable app id before reusing it in a subprocess) should use
     this public name rather than importing the underscore-private helper."""
     return _valid_package_name(name)
 

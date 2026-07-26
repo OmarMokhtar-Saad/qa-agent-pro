@@ -1,9 +1,12 @@
 [project]
 name = "qa-agent-pro"
-version = "1.5.0"
+version = "1.6.0"
 requires-python = ">=3.10"
 dependencies = [
+    # The product surface is the MCP stdio server (mcp_server.py + fastmcp).
     "fastmcp>=2.0",
+    # Telemetry runtime (tools/telemetry.py): anonymous machine id + PostHog
+    # SDK error grouping. Both degrade gracefully and never raise.
     "py-machineid>=0.6",
     "posthog>=7.29",
     "anthropic>=0.25",
@@ -18,7 +21,6 @@ dependencies = [
     "langgraph>=0.2",
     "langsmith>=0.1",
     "xlsxwriter>=3.1",
-    "bcrypt>=4.0",
     # Ed25519 release-signature verification in tools/updater.py (auto-update
     # trust root). Widely wheeled; the dist build pins it too via patch_pyproject.
     "cryptography>=41.0",
@@ -49,18 +51,6 @@ embeddings = [
     # the dist build stay dependency-identical.
     "sentence-transformers>=2.2",
 ]
-mcp = [
-    "fastmcp>=2.0",
-]
-telemetry = [
-    "py-machineid>=0.6",
-]
-analytics = [
-    # Optional: enables PostHog error-tracking issue grouping for the internal
-    # Chainlit app (Phase 2). tools/telemetry.py imports it lazily and falls
-    # back to bare-HTTP when absent, so the dist build stays dependency-identical.
-    "posthog>=7.0",
-]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
@@ -81,7 +71,7 @@ markers = [
 ]
 
 [tool.ruff]
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
