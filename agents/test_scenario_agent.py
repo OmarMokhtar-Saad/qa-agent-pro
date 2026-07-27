@@ -15,6 +15,7 @@ from agents.feature_analysis import analyze_feature, render_report_markdown
 from config.settings import settings
 from llm import (
     CursorAgentError,
+    CursorUsageLimitError,
     ask,
     ask_json,
     ask_vision,
@@ -1498,6 +1499,18 @@ async def _generate_for_category(
             raise
         except _RETRYABLE as exc:
             last_exc = exc
+            if isinstance(exc, CursorUsageLimitError):
+                # Hard quota exhaustion — every retry is guaranteed to be
+                # rejected until the plan limit resets, so do not burn the
+                # extended retry budget (8 categories x 4 attempts of doomed
+                # subprocess spawns cost 3-4 minutes before failing anyway).
+                logger.error(
+                    "Category '%s' aborted without retry — cursor usage "
+                    "limit reached: %s",
+                    category_name,
+                    exc,
+                )
+                break
             if isinstance(exc, CursorAgentError):
                 max_attempts = max(max_attempts, _MAX_RETRIES_LOOP_GUARD + 1)
                 # The error's own message suggests "try again with a different

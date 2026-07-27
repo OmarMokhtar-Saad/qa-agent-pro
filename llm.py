@@ -90,6 +90,25 @@ class CursorAgentError(RuntimeError):
     """
 
 
+class CursorUsageLimitError(CursorAgentError):
+    """cursor-agent rejected the call because the plan/team usage limit is hit.
+
+    Hard quota exhaustion (e.g. "Your team has reached its usage limit"): a
+    retry cannot succeed until the limit resets, so callers must fail fast
+    instead of burning the extended CursorAgentError retry budget on calls
+    that are guaranteed to be rejected. Observed 2026-07-27: 186 rejected
+    calls across 3 runs, each run wasting 3-4 minutes on doomed retries.
+    """
+
+
+def _cursor_error(message: str) -> CursorAgentError:
+    """Classify a cursor-agent error message into the right exception type."""
+    lowered = (message or "").lower()
+    if "usage limit" in lowered or "actionrequirederror" in lowered:
+        return CursorUsageLimitError(message)
+    return CursorAgentError(message)
+
+
 class LLMBackendUnavailableError(RuntimeError):
     """The host-matched 'auto' backend is unusable — its binary is missing or it
     is not authenticated (e.g. inside Cursor with no CURSOR_API_KEY and no
@@ -1835,7 +1854,7 @@ def _stream_tokens_sync_cursor(
                 saw_result_event = True
                 result_text = event.get("result", "")
                 if event.get("is_error"):
-                    raise CursorAgentError(
+                    raise _cursor_error(
                         result_text or "cursor-agent reported an error result"
                     )
                 if not has_deltas and result_text:
@@ -1856,7 +1875,7 @@ def _stream_tokens_sync_cursor(
             err = "".join(stderr_chunks).strip()
             logger.error("cursor-agent CLI error (code %s): %s", proc.returncode, err)
             if not saw_result_event:
-                raise CursorAgentError(
+                raise _cursor_error(
                     err
                     or f"cursor-agent exited with code {proc.returncode} and no output"
                 )
