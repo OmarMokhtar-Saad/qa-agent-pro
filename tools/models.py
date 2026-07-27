@@ -242,6 +242,24 @@ class TestSuite(BaseModel):
     # tools.xlsx_generator reads it via getattr to add matching sheets.
     _report_artifacts: Optional[dict] = PrivateAttr(default=None)
 
+    # Atomic Requirements Checklist + its coverage audit (Batch 2), attached
+    # post-generation by agents.test_scenario_agent when
+    # QA_ATOMIC_CHECKLIST_ENABLED is ON. A PrivateAttr for the same reasons as
+    # _report_artifacts above: it must never pollute the JSON schema used as an
+    # LLM response_model, and must not be serialized. tools.xlsx_generator and
+    # tools.mcp_handlers read it via getattr.
+    _checklist_artifacts: Optional[dict] = PrivateAttr(default=None)
+
+    # {tc_id: note} for the XLSX Notes column — the Batch 3
+    # standing-rules pack's mechanical [ASSUMED] /
+    # [NEEDS-CLARIFICATION] label, attached post-renumber by
+    # agents.test_scenario_agent. A PrivateAttr for the same
+    # reasons as _report_artifacts above: it must never
+    # pollute the JSON schema used as an LLM response_model,
+    # and must not be serialized. tools.xlsx_generator reads
+    # it via getattr.
+    _rule_pack_notes: Optional[dict] = PrivateAttr(default=None)
+
     @field_validator("test_cases", mode="after")
     @classmethod
     def validate_unique_ids(cls, cases: list[TestCase]) -> list[TestCase]:

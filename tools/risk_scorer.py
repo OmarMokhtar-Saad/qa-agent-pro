@@ -13,7 +13,7 @@ import logging
 from pydantic import BaseModel, Field
 
 from config.settings import settings
-from llm import ask_json
+from llm import ask_json, resolve_max_tokens_tier
 from tools.models import TestCase
 from tools.untrusted import _GUARD, wrap_untrusted
 
@@ -263,6 +263,7 @@ async def score_with_llm(
                 user=user,
                 response_model=_RiskAssessment,
                 model=settings.qa_classifier_model or None,
+                max_tokens=resolve_max_tokens_tier("critic"),
             ),
             timeout=min(300, _LLM_RISK_TIMEOUT_S + len(cases)),
         )

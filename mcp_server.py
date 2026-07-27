@@ -214,9 +214,15 @@ def build_server():
         ctx: Context, suite_id: str = "", format: str = ""
     ) -> str:
         """Export a previously generated suite (by suite_id) to one of:
-        csv | xlsx | gherkin | playwright | testrail. Returns the written file path.
-        Reuses the stored suite; live-push dry-run defaults are preserved (this
-        writes files, it never pushes to a TMS).
+        csv | xlsx | gherkin | playwright | testrail | zephyr.
+        Returns the written file path. Reuses the stored suite; live-push dry-run
+        defaults are preserved (this writes files, it never pushes to a TMS).
+
+        `zephyr` is the Zephyr for Jira / Squad import pair: a 15-column workbook
+        plus its zfj_import_config.json field map. It is accepted only when
+        QA_ZEPHYR_EXPORT_ENABLED is on, and while QA_ZEPHYR_DRY_RUN is on (the
+        default) it emits a single-case PILOT workbook meant for a sandbox
+        project first, because the column layout is not vendor-verified yet.
         """
         return await _tracked(
             "qa_export_suite",
