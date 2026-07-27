@@ -6,7 +6,7 @@ import logging
 import re
 import socket
 from dataclasses import dataclass
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -103,6 +103,12 @@ async def fetch_url_content(url: str) -> dict:
 
         if is_jira:
             return await _fetch_jira(parsed.path)
+        if jira_hostname and hostname == jira_hostname:
+            board_key = selected_issue_key(url)
+            if board_key:
+                # Board/backlog URL with ?selectedIssue=KEY — fetch the ticket
+                # itself, not the board's HTML shell.
+                return await _fetch_jira(f"/browse/{board_key}")
         return await _fetch_generic(url)
 
     except Exception as exc:
@@ -377,6 +383,26 @@ def _valid_issue_key(value: object) -> str:
     if not isinstance(value, str):
         return ""
     return value if _ISSUE_KEY_RE.match(value) else ""
+
+
+def selected_issue_key(url: str) -> str:
+    """Ticket key carried in a board/backlog URL's query string, else "".
+
+    Testers copy URLs like .../boards/1276?selectedIssue=KEY-1 straight from
+    the board. The path has no /browse/ segment, so without this the ticket
+    was fetched as a generic web page and the ambiguity gate fired on the
+    thin board shell. Never raises.
+    """
+    try:
+        params = parse_qs(urlparse(url).query)
+        for name in ("selectedIssue", "selectedIssueKey"):
+            for value in params.get(name, []):
+                key = _valid_issue_key(value)
+                if key:
+                    return key
+    except Exception:
+        logger.debug("selected_issue_key: parse failed", exc_info=True)
+    return ""
 
 
 def _strip_urls(text: str) -> str:
