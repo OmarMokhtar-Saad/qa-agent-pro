@@ -54,7 +54,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Awaitable, Callable, Type, TypeVar
+from typing import Awaitable, Callable, Literal, Type, TypeVar
 
 from pydantic import BaseModel
 
@@ -139,6 +139,49 @@ def _resolve_model(model: str | None) -> str:
     smaller/faster model without changing the global backend config (I-027).
     """
     return model or _model()
+
+
+def resolve_tiered_model(site_override: str) -> str | None:
+    """Resolve the model for an opt-in-tiered, non-generation call site.
+
+    "sonnet" forces None (today's default model) regardless of the master
+    flag; "haiku" forces settings.qa_classifier_model regardless of the master
+    flag; "default" (or any value the settings coercer already normalised
+    away) follows settings.qa_model_tiering_enabled. The return value is
+    passed straight through to ask()/ask_json()'s existing model= kwarg, which
+    already treats None as "use the configured default model" -- so this
+    function adds no new fallback path, only a routing decision in front of
+    one that already exists (I-027). Never raises for any string input.
+    """
+    tier = (site_override or "default").strip().lower()
+    if tier == "sonnet":
+        return None
+    if tier == "haiku":
+        return settings.qa_classifier_model or None
+    if settings.qa_model_tiering_enabled:
+        return settings.qa_classifier_model or None
+    return None
+
+
+def resolve_max_tokens_tier(tier: Literal["category", "critic", "rewrite"]) -> int | None:
+    """Per-call-type max_tokens ceiling (QA_MAX_TOKENS_TIERING_ENABLED, opt-in).
+
+    Returns None when the master flag is OFF (the default), so ask()/ask_json()
+    fall back to their own _MAX_TOKENS constant exactly as before this helper
+    existed -- byte-identical behaviour. When ON, "category" resolves to
+    settings.qa_llm_max_tokens_category (16384 by default -- the SAME value as
+    _MAX_TOKENS, so category-class calls are unaffected either way) while
+    "critic" / "rewrite" resolve to their own, much lower configured ceilings.
+    Pure function, never raises.
+    """
+    if not settings.qa_max_tokens_tiering_enabled:
+        return None
+    if tier == "critic":
+        return settings.qa_llm_max_tokens_critic
+    if tier == "rewrite":
+        return settings.qa_llm_max_tokens_rewrite
+    return settings.qa_llm_max_tokens_category
+
 
 
 # --------------------------------------------------------------------------- #
@@ -750,6 +793,156 @@ def _user_content(user: str):
     return user
 
 
+# --- Shared cached prefix (QA_PROMPT_CACHE_ENABLED, default OFF) ----------- #
+#
+# Why the legacy marker above never actually produces a cross-category HIT:
+# Anthropic renders the cache prefix in the order tools -> system -> messages,
+# and a change in an earlier tier invalidates every later one. The 8-category
+# fan-out varies `system` per category (FOCUS / preferred type / case counts),
+# so the identical user block sitting behind it can never match across
+# categories — the marker either writes 8 distinct entries or (below the size
+# minimum) does nothing at all.
+#
+# The fix is structural: the caller hoists the per-category instruction OUT of
+# `system` into a small trailing UNCACHED user block, leaving one byte-identical
+# system + prefix for all 8 calls. See agents/test_scenario_agent.py.
+#
+# The provider's minimum cacheable prefix is measured in TOKENS and is
+# model-dependent; below it the marker is silently ignored (no error,
+# cache_creation_input_tokens == 0), so we must not pay a 1.25x write that can
+# never be read back.
+_CACHE_MIN_TOKENS_BY_MODEL: dict[str, int] = {
+    "claude-opus-4-8": 4096,
+    "claude-opus-4-7": 4096,
+    "claude-opus-4-6": 4096,
+    "claude-opus-4-5": 4096,
+    "claude-haiku-4-5": 4096,
+    "claude-sonnet-4-6": 2048,
+    "claude-haiku-3-5": 2048,
+    "claude-haiku-3": 2048,
+    "claude-sonnet-4-5": 1024,
+    "claude-sonnet-4-1": 1024,
+    "claude-sonnet-4": 1024,
+    "claude-sonnet-3-7": 1024,
+}
+# Unknown / unpublished ids (e.g. "claude-sonnet-5") take the largest published
+# minimum, so an unrecognised model degrades to "no caching" rather than to a
+# write nothing can read.
+_CACHE_MIN_TOKENS_DEFAULT = 4096
+# Chars assumed per token when deciding whether a prefix clears the minimum.
+# 5 (rather than the usual ~4) is deliberately pessimistic: over-estimating
+# tokens would mark a sub-minimum prefix and pay for an unreadable write, while
+# under-estimating only forgoes a cache we could have had.
+_CACHE_CHARS_PER_TOKEN = 5
+# Upper sanity bound on QA_PROMPT_CACHE_MIN_TOKENS. No prefix can ever reach a
+# minimum larger than the biggest context window, so an override above this is a
+# typo that would disable caching forever with no visible reason. It is ignored
+# (with a one-shot WARNING) rather than silently honoured.
+_CACHE_MIN_TOKENS_SANE_MAX = 200_000
+# One-shot latch so the override notice is logged once per process, not on every
+# single request.
+_CACHE_MIN_TOKENS_LOGGED = False
+
+# --- Silent-no-op canary state --------------------------------------------- #
+# Latched True for the REST OF THE PROCESS when either the warm-up request fails
+# outright or the canary in _log_cache_usage proves the warm-up wrote nothing.
+# _cache_prefix_ok reads it, so a latch immediately stops NEW requests from
+# carrying a marker. Requests already dispatched cannot be recalled — see the
+# runbook for what that costs. Reset only by restarting the process (tests
+# monkeypatch it).
+_CACHE_WARM_DISABLED = False
+# Cache WRITES observed on the streaming path since the last successful warm-up.
+# A healthy run observes ZERO: the warm-up performed the single write and all 8
+# category calls report reads. Reset to 0 by every successful warm_cache_prefix.
+# Deliberately a plain module int, not a ContextVar: gather()'d tasks each get
+# their OWN copy of a ContextVar, so mutations would never reach their siblings,
+# which is exactly the propagation this canary needs. The cost is that two
+# concurrent generations in one process share the counter — acceptable, because
+# the only consequence of a false latch is falling back to baseline cost.
+_CACHE_WRITES_OBSERVED = 0
+
+
+def _cache_min_chars(model: str | None) -> int:
+    """Prefix length (chars) at which a cache_control marker is worth writing."""
+    global _CACHE_MIN_TOKENS_LOGGED
+    override = getattr(settings, "qa_prompt_cache_min_tokens", 0)
+    min_tokens = 0
+    if isinstance(override, int) and not isinstance(override, bool) and override > 0:
+        if override > _CACHE_MIN_TOKENS_SANE_MAX:
+            if not _CACHE_MIN_TOKENS_LOGGED:
+                _CACHE_MIN_TOKENS_LOGGED = True
+                logger.warning(
+                    "QA_PROMPT_CACHE_MIN_TOKENS=%d exceeds the %d-token sanity "
+                    "bound — ignoring it and using the model's published "
+                    "minimum instead (otherwise prompt caching would never "
+                    "engage, with no visible reason)",
+                    override,
+                    _CACHE_MIN_TOKENS_SANE_MAX,
+                )
+        else:
+            min_tokens = override
+            if not _CACHE_MIN_TOKENS_LOGGED:
+                _CACHE_MIN_TOKENS_LOGGED = True
+                logger.info(
+                    "Prompt cache: QA_PROMPT_CACHE_MIN_TOKENS=%d overrides the "
+                    "model table — a prefix must now reach %d chars to be cached",
+                    min_tokens,
+                    min_tokens * _CACHE_CHARS_PER_TOKEN,
+                )
+    if not min_tokens:
+        min_tokens = _CACHE_MIN_TOKENS_BY_MODEL.get(
+            _resolve_model(model), _CACHE_MIN_TOKENS_DEFAULT
+        )
+    return min_tokens * _CACHE_CHARS_PER_TOKEN
+
+
+def _cache_prefix_ok(system: str, user: str, model: str | None) -> bool:
+    """True when <system + user> is long enough to be a worthwhile cache prefix.
+
+    The cached prefix is everything the provider renders BEFORE the breakpoint —
+    `system` included — so both are measured, not just the user block.
+
+    Returns False once _CACHE_WARM_DISABLED is latched, so a proven-broken cache
+    stops marking new requests instead of paying a write per call.
+    """
+    if _CACHE_WARM_DISABLED:
+        return False
+    if not getattr(settings, "qa_prompt_cache_enabled", False):
+        return False
+    return (len(system) + len(user)) >= _cache_min_chars(model)
+
+
+def _split_user_content(
+    user: str,
+    user_suffix: str | None,
+    system: str,
+    model: str | None,
+    cache_prefix: bool,
+):
+    """Build the api-backend user content for a (stable prefix, suffix) pair.
+
+    * caching ON and the prefix clears the model's minimum -> TWO text blocks,
+      ``cache_control`` on the FIRST (stable) one only; the suffix stays
+      uncached so it can vary per call without invalidating anything.
+    * otherwise -> exactly what this module sent before prompt caching existed:
+      one plain string / one legacy-marked block over the concatenated text.
+    """
+    if cache_prefix and _cache_prefix_ok(system, user, model):
+        blocks: list[dict] = [
+            {
+                "type": "text",
+                "text": user,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+        if user_suffix:
+            blocks.append({"type": "text", "text": user_suffix})
+        return blocks
+    if user_suffix:
+        return _user_content(f"{user}\n\n{user_suffix}")
+    return _user_content(user)
+
+
 def _get_client():
     """Lazily build a shared AsyncAnthropic client. Imports anthropic on first use."""
     global _CLIENT
@@ -765,13 +958,593 @@ def _get_client():
     return _CLIENT
 
 
-async def _ask_api(system: str, user: str, model: str | None = None) -> str:
+# --------------------------------------------------------------------------- #
+# Forced tool use ("structured JSON") — QA_STRUCTURED_JSON_ENABLED, api only
+# --------------------------------------------------------------------------- #
+#
+# The default path asks the model in PROSE for a JSON object (_json_system) and
+# then RAISES on JSONDecodeError / ValidationError (_parse_json_response).
+# Published reliability for JSON-in-prompt is ~90-95%, and a single failure is
+# unusually expensive in this app: agents.test_scenario_agent._generate_for_category
+# lists both exceptions in _RETRYABLE, so one malformed brace re-runs an ENTIRE
+# category — a full-cost, ~110s generation.
+#
+# Forced tool use deletes the parsing step instead of hardening it. The pydantic
+# schema is compiled into a tool ``input_schema``, ``tool_choice`` forces that
+# one tool, and the API hands back ``tool_use.input`` as an ALREADY-PARSED dict.
+# Re-serialising a dict with json.dumps cannot produce malformed JSON, so on that
+# branch a JSONDecodeError is structurally impossible (the rare no-tool-call
+# degrade path still parses accumulated text, and still raises if that text is
+# bad — see _ask_json_api_tool). Pydantic still validates the
+# semantics (sequential step numbers, unique tc_ids, enum membership), so a
+# genuinely wrong field is still caught and still retried exactly as today.
+#
+# Deliberately NOT used: ``output_config.format`` / ``client.messages.parse()``.
+# Three reasons, all load-bearing: (1) it is unavailable on this app's default
+# model (settings.qa_llm_model = claude-sonnet-4-6), while plain forced tool use
+# is GA on every model; (2) it is rejected together with ``max_tokens: 0``, which
+# is exactly what plan-cache-prefix's cache warm-up uses; (3) ``messages.parse()``
+# is non-streaming, and this module streams so on_progress can tick and so a
+# 16384-token response cannot trip the SDK's own large-max_tokens guard.
+#
+# cli and cursor drive a subprocess with no tool API at all — they keep the
+# JSON-in-prompt path byte-for-byte unchanged.
+
+# Models published as supporting strict tool use / structured outputs. An
+# unlisted id (including this app's default claude-sonnet-4-6) NEVER gets
+# ``strict: true`` — it would be a 400 per request. Non-strict forced tool use
+# still applies to every model, and is where nearly all of the win comes from.
+_STRICT_CAPABLE_MODELS = frozenset(
+    {
+        "claude-fable-5",
+        "claude-mythos-5",
+        "claude-opus-4-8",
+        "claude-sonnet-5",
+        "claude-haiku-4-5",
+        "claude-opus-4-5",
+        "claude-opus-4-1",
+    }
+)
+
+# JSON Schema keywords constrained decoding does not accept. Stripping them does
+# NOT weaken validation: pydantic re-validates the returned object afterwards, so
+# a violation still raises ValidationError and still earns the caller's retry.
+# All of these appear in tools/models.py (tc_id's pattern, the min_length/
+# max_length on titles and step text, step_number's ge, the min_length on the
+# steps/test_cases lists).
+_STRICT_DROP_KEYWORDS = frozenset(
+    {
+        "pattern",
+        "minLength",
+        "maxLength",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "minProperties",
+        "maxProperties",
+    }
+)
+
+# JSON Schema keys whose VALUE is a mapping of caller-chosen names -> subschemas.
+# Their keys are field/model names, never keywords, so keyword stripping must not
+# descend into them: a response model with a field literally named "pattern" or
+# "minimum" would otherwise have that property silently deleted and then fail
+# pydantic as missing. (No such field exists today; this keeps it that way.)
+_SCHEMA_NAME_MAPS = frozenset(
+    {"properties", "$defs", "definitions", "patternProperties"}
+)
+
+_TOOL_NAME_ILLEGAL_RE = re.compile(r"[^a-zA-Z0-9_-]")
+_TOOL_NAME_SPLIT_RE = re.compile(r"(?<!^)(?=[A-Z])")
+
+# (resolved model, schema key) pairs the API has rejected with a 400 in this
+# process. Memoised so the 8 concurrent category calls and every later call skip
+# a doomed structured attempt instead of each paying a rejected request. Cleared
+# only by a restart (tests clear it directly).
+_STRUCTURED_UNSUPPORTED: set[tuple[str, str]] = set()
+
+# Substrings that make a 400 recognisably about the TOOL DEFINITION rather than
+# about the request in general (see _schema_rejected). Matched case-insensitively
+# against the exception text. Deliberately excludes a bare "tool": that would also
+# match unrelated messages like "max_tokens: 0 is not compatible with tool_choice",
+# which have nothing to do with the schema. "tools." is the provider's field-path
+# prefix for a rejected tool definition (e.g. "tools.0.custom.input_schema: ...").
+_TOOL_400_MARKERS = ("tools.", "input_schema", "schema", "strict")
+
+# One-shot latch for the "both flags on" notice below, so a per-request helper
+# cannot spam the log.
+_BOTH_FLAGS_WARNED = False
+
+_TOOL_SYSTEM_INSTRUCTION = (
+    "\n\nCRITICAL: Respond by calling the `{tool_name}` tool exactly once, and "
+    "put your ENTIRE answer in that tool call's input — it is validated against a "
+    "schema. Write no prose, no markdown and no explanation outside the tool call."
+)
+
+
+def _structured_json_enabled() -> bool:
+    """QA_STRUCTURED_JSON_ENABLED (default OFF). Never raises."""
+    value = getattr(settings, "qa_structured_json_enabled", False)
+    return value if isinstance(value, bool) else False
+
+
+def _strict_json_enabled() -> bool:
+    """QA_STRUCTURED_JSON_STRICT (default OFF). Never raises."""
+    value = getattr(settings, "qa_structured_json_strict", False)
+    return value if isinstance(value, bool) else False
+
+
+def _schema_key(response_model: Type[T]) -> str:
+    """Stable identity for a response model, used for the rejection memo."""
+    return f"{response_model.__module__}.{response_model.__qualname__}"
+
+
+def _tool_name(response_model: Type[T]) -> str:
+    """Derive a stable, provider-legal tool name from the model class name.
+
+    ``TestSuite`` -> ``emit_test_suite``, ``_CategoryReasonedSuite`` ->
+    ``emit_category_reasoned_suite``. A meaningful name is not cosmetic: it is
+    part of what the model reads when deciding what to put in the call. It is
+    also STABLE per schema, which matters for prompt caching — the tools block
+    renders before ``system``, so a name that varied per call would invalidate
+    every later cache tier.
+    """
+    snake = _TOOL_NAME_SPLIT_RE.sub("_", response_model.__name__.lstrip("_")).lower()
+    cleaned = _TOOL_NAME_ILLEGAL_RE.sub("_", snake).strip("_")[:64]
+    return f"emit_{cleaned}" if cleaned else "emit_json"
+
+
+def _strict_schema(node: object, in_name_map: bool = False) -> object:
+    """Deep COPY of a JSON schema, adapted for constrained decoding.
+
+    Drops the keywords strict mode rejects (_STRICT_DROP_KEYWORDS) and forces
+    ``additionalProperties: false`` on every object node — pydantic only emits
+    that for models declaring ``extra="forbid"``, which is 3 of this repo's ~14
+    response models, so the other 11 would be rejected outright without this.
+
+    Copies rather than mutates because the input dict is NOT ours: the same
+    ``model_json_schema()`` result is also what ``_json_system`` renders on the
+    flag-OFF path, and callers may hold a reference. ``in_name_map`` suppresses
+    keyword stripping inside ``properties`` / ``$defs`` (see _SCHEMA_NAME_MAPS).
+    """
+    if isinstance(node, dict):
+        out: dict = {}
+        for key, value in node.items():
+            if not in_name_map and key in _STRICT_DROP_KEYWORDS:
+                continue
+            out[key] = _strict_schema(
+                value, in_name_map=(not in_name_map and key in _SCHEMA_NAME_MAPS)
+            )
+        if not in_name_map and (out.get("type") == "object" or "properties" in out):
+            out["additionalProperties"] = False
+        return out
+    if isinstance(node, list):
+        return [_strict_schema(item, in_name_map=in_name_map) for item in node]
+    return node
+
+
+def _warn_if_prompt_cache_also_on() -> None:
+    """Warn ONCE per process when structured JSON and prompt caching are both on.
+
+    The combination is not yet proven: dropping the prose schema moves ~8.8 KB out of
+    the ``system`` tier and adds ~6.3 KB of ``tools`` (which renders BEFORE system),
+    and a forced ``tool_choice`` is rejected together with the ``max_tokens: 0``
+    warm-up. Until the prompt-cache path is tools-aware, the honest advice is to run
+    one flag at a time — and an operator who never opens the runbook should still
+    hear about it. Never raises.
+    """
+    global _BOTH_FLAGS_WARNED
+    if _BOTH_FLAGS_WARNED or not getattr(settings, "qa_prompt_cache_enabled", False):
+        return
+    _BOTH_FLAGS_WARNED = True
+    logger.warning(
+        "QA_STRUCTURED_JSON_ENABLED and QA_PROMPT_CACHE_ENABLED are both on. The "
+        "tools block renders BEFORE the cached system prefix and the prose schema "
+        "has left it, so cache hits are not guaranteed and the warm-up may pay for "
+        "an entry nothing reads. Run one of the two flags at a time until the "
+        "prompt-cache path counts the tools tier (see operations/runbook.md -> "
+        "'Structured JSON via forced tool use')."
+    )
+
+
+def _tool_definition(response_model: Type[T], model: str | None) -> dict | None:
+    """Compile ``response_model`` into an Anthropic tool definition, or None.
+
+    None means "keep the JSON-in-prompt path": the flag is OFF, this
+    (model, schema) pair was already rejected with a 400, the schema is not a
+    plain object, or building it failed. Never raises — a problem here must cost
+    the caller nothing more than today's behaviour.
+    """
+    if not _structured_json_enabled():
+        return None
+    try:
+        resolved = _resolve_model(model)
+        key = (resolved, _schema_key(response_model))
+        if key in _STRUCTURED_UNSUPPORTED:
+            return None
+        _warn_if_prompt_cache_also_on()
+        schema = response_model.model_json_schema()
+        if not isinstance(schema, dict) or schema.get("type") != "object":
+            logger.info(
+                "Structured JSON: %s does not compile to an object schema — "
+                "using the JSON-in-prompt path",
+                key[1],
+            )
+            return None
+        tool: dict = {
+            "name": _tool_name(response_model),
+            "description": (
+                "Return the complete result for this request. Every field is "
+                "described in the input schema; follow it exactly."
+            ),
+            "input_schema": schema,
+        }
+        if _strict_json_enabled():
+            if resolved in _STRICT_CAPABLE_MODELS:
+                tool["input_schema"] = _strict_schema(schema)
+                tool["strict"] = True
+            else:
+                logger.info(
+                    "Structured JSON: %s is not a strict-capable model — sending "
+                    "the tool without strict (constrained decoding is skipped, "
+                    "forced tool use still applies)",
+                    resolved,
+                )
+        return tool
+    except Exception:
+        logger.warning(
+            "Structured JSON: could not build a tool definition — falling back "
+            "to the JSON-in-prompt path",
+            exc_info=True,
+        )
+        return None
+
+
+def _tool_system(system: str, tool_name: str) -> str:
+    """System prompt for the tool path: the caller's own text plus a short
+    instruction naming the tool.
+
+    Deliberately does NOT re-embed the JSON schema the way ``_json_system`` does.
+    The schema already travels in ``input_schema``, so repeating it in prose would
+    duplicate ~2,250 input tokens per call on the TestSuite model — ~18K tokens
+    across one 8-category fan-out — for no added constraint. Everything the caller
+    put in ``system`` (including tools.untrusted._GUARD) is preserved verbatim.
+    """
+    return f"{system}{_TOOL_SYSTEM_INSTRUCTION.format(tool_name=tool_name)}"
+
+
+def _schema_rejected(
+    exc: Exception, response_model: Type[T], model: str | None
+) -> bool:
+    """True when ``exc`` is a 400 that is ABOUT the tool schema.
+
+    Two filters, both load-bearing:
+
+    * ONLY a 400 counts. 429 / 5xx / connection errors are transient and must
+      propagate so the caller's existing retry (and the SDK's own backoff) handle
+      them; swallowing those into a silent fallback would hide a real outage.
+    * the 400 must actually mention the tool/schema. A 400 for an unrelated
+      reason (``prompt is too long``, a bad ``max_tokens``) would otherwise
+      permanently disable forced tool use for that pair AND be re-issued on the
+      JSON-in-prompt path — where the same 400 recurs, because that prompt is
+      ~2.5 KB LONGER — so the caller would pay two requests to receive the
+      identical error behind a WARNING blaming the schema. Unrelated 400s
+      propagate untouched instead.
+
+    Reads ``status_code`` via getattr so nothing here needs to import anthropic.
+    """
+    if getattr(exc, "status_code", None) != 400:
+        return False
+    text = str(exc).lower()
+    if not any(marker in text for marker in _TOOL_400_MARKERS):
+        logger.info(
+            "Structured JSON: got a 400 that does not look tool-related — "
+            "propagating it instead of falling back (%s)",
+            exc,
+        )
+        return False
+    key = (_resolve_model(model), _schema_key(response_model))
+    _STRUCTURED_UNSUPPORTED.add(key)
+    logger.warning(
+        "Structured JSON: the API rejected the tool schema for %s on %s (%s) — "
+        "disabling forced tool use for that pair in this process and falling "
+        "back to the JSON-in-prompt path",
+        key[1],
+        key[0],
+        exc,
+    )
+    return True
+
+
+async def _ask_json_api_tool(
+    system: str,
+    user: str,
+    on_progress: Callable[[int], Awaitable[None]] | None,
+    model: str | None,
+    tool: dict,
+    max_tokens: int | None = None,
+) -> str:
+    """Stream ONE forced tool call and return its input as a JSON string.
+
+    Streams for the same reasons the text path does (live on_progress ticks; a
+    16384-token response must not sit on a non-streaming request). Tool input
+    arrives as ``input_json_delta`` fragments rather than ``text_delta``, so this
+    walks raw stream events instead of ``stream.text_stream`` — which yields
+    nothing at all when the response is a single tool_use block.
+
+    Returns ``json.dumps(tool_use.input)``: the API already parsed that dict, so
+    re-serialising it is guaranteed-valid JSON and on that branch the caller's
+    ``_parse_json_response`` can only fail on SEMANTICS (pydantic), never on
+    syntax. (The no-tool-call degrade branch below returns accumulated text
+    instead, which CAN be malformed and is still parsed normally.) Raises ValueError — which agents.test_scenario_agent._RETRYABLE
+    already treats as retryable — on a truncated or absent tool call.
+    """
+    client = _get_client()
+    parts: list[str] = []
+    buf = ""
+    tc_count = 0
+    marker = '"tc_id"'
+    async with client.messages.stream(
+        model=_resolve_model(model),
+        max_tokens=max_tokens or _MAX_TOKENS,
+        system=system,
+        messages=[{"role": "user", "content": _user_content(user)}],
+        tools=[tool],
+        tool_choice={
+            "type": "tool",
+            "name": tool["name"],
+            # One call, one object: without this the model may emit several
+            # tool_use blocks and the first one would silently win.
+            "disable_parallel_tool_use": True,
+        },
+    ) as stream:
+        async for event in stream:
+            if getattr(event, "type", "") != "content_block_delta":
+                continue
+            delta = getattr(event, "delta", None)
+            if getattr(delta, "type", "") != "input_json_delta":
+                continue
+            chunk = getattr(delta, "partial_json", "") or ""
+            if not chunk:
+                continue
+            parts.append(chunk)
+            if on_progress:
+                # Same boundary-safe incremental count as the text path (B-026).
+                combined = buf + chunk
+                new_hits = combined.count(marker)
+                if new_hits:
+                    tc_count = min(tc_count + new_hits, _PROGRESS_TC_COUNT_CAP)
+                    await on_progress(tc_count)
+                buf = combined[-(len(marker) - 1) :]
+        final = await stream.get_final_message()
+
+    # Free real token counts: the final message is already in hand here, so the
+    # public wrapper can emit exact usage instead of a len//4 estimate. (Only on
+    # this new branch — _record_api_usage itself is plan-token-meter's territory.)
+    _record_api_usage(final)
+
+    # Truncation FIRST: a tool call cut off at max_tokens can still surface as a
+    # parseable-but-incomplete dict, which would silently ship a half suite.
+    if getattr(final, "stop_reason", "") == "max_tokens":
+        raise ValueError(
+            f"Structured tool call hit max_tokens={_MAX_TOKENS} before it "
+            "finished — the result would be a truncated object"
+        )
+
+    for block in getattr(final, "content", None) or []:
+        if getattr(block, "type", "") != "tool_use":
+            continue
+        payload = getattr(block, "input", None)
+        if isinstance(payload, dict) and payload:
+            return json.dumps(payload)
+
+    assembled = "".join(parts).strip()
+    if assembled:
+        logger.warning(
+            "Structured JSON: no usable tool_use block in the response — parsing "
+            "the accumulated tool input instead"
+        )
+        return assembled
+    raise ValueError(
+        "Structured JSON: the model returned neither a tool call nor any tool input"
+    )
+
+
+def _warm_max_tokens() -> int:
+    """max_tokens for the warm-up request. 0 = prefill only, zero output cost."""
+    value = getattr(settings, "qa_prompt_cache_warm_max_tokens", 0)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return 0
+
+
+async def warm_cache_prefix(
+    system: str,
+    user: str,
+    response_model: Type[T] | None = None,
+    model: str | None = None,
+) -> bool:
+    """Write the shared cache prefix BEFORE a concurrent fan-out. Never raises.
+
+    A cache entry only becomes readable once the first request carrying it has
+    begun streaming its response. ``asyncio.gather`` fires all 8 category calls
+    at once, so with a naive marker EVERY one of them pays the 1.25x cache
+    WRITE and the fan-out costs ~10x the input instead of ~8x — a 25%
+    regression, the exact opposite of the point. One warm-up turns that into
+    1.25x + 8 x 0.10x = 2.05x.
+
+    The warm-up is a single NON-streaming ``messages.create`` with
+    ``max_tokens=0`` carrying the identical model + system + cached user block:
+    it runs prefill (writing the cache), returns ``content: []`` with
+    ``stop_reason == "max_tokens"`` and bills zero output tokens. ``max_tokens:
+    0`` is rejected together with ``stream=True``, ``thinking.type="enabled"``,
+    ``output_config.format``, ``tool_choice`` of ``{"type": "tool"}`` /
+    ``{"type": "any"}`` and Message Batches — this request uses none of them.
+    Set QA_PROMPT_CACHE_WARM_MAX_TOKENS=1 if a future API version rejects 0.
+
+    ``response_model`` MUST be the same model the fan-out will pass to
+    ``ask_json`` so the warmed system string matches ``_json_system``'s output
+    byte for byte — otherwise the warm-up writes an entry nothing ever reads.
+
+    Returns True only when the prefix is now warm. On False the caller MUST
+    send UNMARKED prompts, so a failed warm-up degrades to today's cost instead
+    of 8 concurrent writes.
+    """
+    global _CACHE_WARM_DISABLED, _CACHE_WRITES_OBSERVED
+    if _CACHE_WARM_DISABLED:
+        return False
+    try:
+        if not getattr(settings, "qa_prompt_cache_enabled", False):
+            return False
+        if _backend() != "api":
+            # cli/cursor drive a subprocess — there is no cache_control to write.
+            return False
+        full_system = (
+            _json_system(system, response_model)
+            if response_model is not None
+            else system
+        )
+        if not _cache_prefix_ok(full_system, user, model):
+            logger.info(
+                "Prompt cache: prefix is %d chars, below the %d-char minimum "
+                "for %s — skipping the warm-up and the cache markers",
+                len(full_system) + len(user),
+                _cache_min_chars(model),
+                _resolve_model(model),
+            )
+            return False
+        client = _get_client()
+        await client.messages.create(
+            model=_resolve_model(model),
+            max_tokens=_warm_max_tokens(),
+            system=full_system,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": user,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            ],
+        )
+    except Exception:
+        _CACHE_WARM_DISABLED = True
+        logger.warning(
+            "Prompt-cache warm-up failed — prompt caching is disabled for this "
+            "process and the fan-out will run with plain, unmarked prompts",
+            exc_info=True,
+        )
+        return False
+    # A fresh entry: restart the canary's write budget for this generation.
+    _CACHE_WRITES_OBSERVED = 0
+    logger.info("Prompt cache warmed (%d prefix chars)", len(full_system) + len(user))
+    return True
+
+
+async def _log_cache_usage(stream) -> None:
+    """Log one streamed call's cache counters, and latch caching off when the
+    warm-up demonstrably wrote nothing (the SILENT no-op canary).
+
+    ``usage.cache_creation_input_tokens`` / ``usage.cache_read_input_tokens``
+    are the ONLY proof that a cache_control marker actually hit, and the
+    streaming path never sees a response object — so pull the accumulated final
+    message.
+
+    The whole saving rests on two assumptions no mocked test can prove: that a
+    breakpoint on the first ``messages`` block extends the cached prefix
+    backwards through an unmarked ``system``, and that ``max_tokens=0`` performs
+    a real prefill WRITE rather than being accepted as a no-op. If either is
+    wrong WITHOUT raising, warm_cache_prefix returns True, every marked call
+    pays a 1.25x write, and the run lands on the +25% regression this design
+    exists to prevent. The counters are the only in-process signal, so:
+
+    * FIRST observed write -> WARNING, but NO latch. Exactly one write is the
+      benign shape: the warm-up silently no-op'd while the mechanism itself
+      works, this call populated the entry, and the rest of the run reads it.
+      Latching here would throw away reads we are about to get for free.
+    * SECOND observed write -> the mechanism is broken, not just the warm-up.
+      Latch _CACHE_WARM_DISABLED so every subsequent request drops its marker
+      and falls back to baseline cost.
+
+    Waiting for the second observation costs nothing: all 8 fan-out requests are
+    dispatched before ANY of them finishes streaming, so no latch — however
+    early — can recall them. What the latch does rescue is every call issued
+    after the first response lands: the per-category quality retries, the
+    _MAX_RETRIES attempts, and up to 3 remediation rounds, each of which would
+    otherwise pay another full write.
+
+    Never raises: instrumentation must not change generation behaviour.
+    """
+    global _CACHE_WARM_DISABLED, _CACHE_WRITES_OBSERVED
+    try:
+        final = await stream.get_final_message()
+        usage = getattr(final, "usage", None)
+        written = getattr(usage, "cache_creation_input_tokens", None)
+        read = getattr(usage, "cache_read_input_tokens", None)
+        if isinstance(written, int) or isinstance(read, int):
+            logger.info(
+                "Prompt cache usage: %s tokens written, %s tokens read",
+                written if isinstance(written, int) else "?",
+                read if isinstance(read, int) else "?",
+            )
+        if not isinstance(written, int) or written <= 0:
+            return
+        _CACHE_WRITES_OBSERVED += 1
+        if _CACHE_WRITES_OBSERVED == 1:
+            logger.warning(
+                "Prompt cache: a marked call WROTE %d tokens instead of reading "
+                "— the warm-up did not populate the prefix. Not disabling yet "
+                "(one write can still mean the rest of the run reads this "
+                "entry); a second write disables caching for this process. See "
+                "the runbook section 'Shared Cached Prompt Prefix'.",
+                written,
+            )
+            return
+        if not _CACHE_WARM_DISABLED:
+            _CACHE_WARM_DISABLED = True
+            logger.warning(
+                "Prompt cache: %d marked calls WROTE instead of reading — the "
+                "cached prefix is not working on this deployment. Disabling "
+                "prompt caching for the rest of this process; every remaining "
+                "call falls back to a plain, unmarked prompt at baseline cost. "
+                "Requests already in flight cannot be recalled. Fix the "
+                "QA_PROMPT_CACHE_* configuration and restart to re-enable.",
+                _CACHE_WRITES_OBSERVED,
+            )
+    except Exception:
+        logger.debug("could not read prompt-cache usage", exc_info=True)
+
+
+async def _ask_api(
+    system: str,
+    user: str,
+    model: str | None = None,
+    user_suffix: str | None = None,
+    cache_prefix: bool = False,
+    max_tokens: int | None = None,
+) -> str:
     client = _get_client()
     resp = await client.messages.create(
         model=_resolve_model(model),
-        max_tokens=_MAX_TOKENS,
+        max_tokens=max_tokens or _MAX_TOKENS,
         system=system,
-        messages=[{"role": "user", "content": _user_content(user)}],
+        messages=[
+            {
+                "role": "user",
+                "content": _split_user_content(
+                    user, user_suffix, system, model, cache_prefix
+                ),
+            }
+        ],
     )
     _record_api_usage(resp)
     return "".join(
@@ -784,6 +1557,9 @@ async def _ask_json_api(
     user: str,
     on_progress: Callable[[int], Awaitable[None]] | None,
     model: str | None = None,
+    user_suffix: str | None = None,
+    cache_prefix: bool = False,
+    max_tokens: int | None = None,
 ) -> str:
     """Stream the API JSON response into a single raw string, ticking on_progress."""
     client = _get_client()
@@ -793,9 +1569,16 @@ async def _ask_json_api(
     marker = '"tc_id"'
     async with client.messages.stream(
         model=_resolve_model(model),
-        max_tokens=_MAX_TOKENS,
+        max_tokens=max_tokens or _MAX_TOKENS,
         system=system,
-        messages=[{"role": "user", "content": _user_content(user)}],
+        messages=[
+            {
+                "role": "user",
+                "content": _split_user_content(
+                    user, user_suffix, system, model, cache_prefix
+                ),
+            }
+        ],
     ) as stream:
         async for text in stream.text_stream:
             parts.append(text)
@@ -808,6 +1591,9 @@ async def _ask_json_api(
                     tc_count = min(tc_count + new_hits, _PROGRESS_TC_COUNT_CAP)
                     await on_progress(tc_count)
                 buf = combined[-(len(marker) - 1) :]
+        if cache_prefix:
+            # The only proof the marker hit. Never raises.
+            await _log_cache_usage(stream)
     return "".join(parts).strip()
 
 
@@ -1435,24 +2221,48 @@ def check_backend() -> tuple[bool, str]:
     return (True, "")
 
 
-async def ask(system: str, user: str, model: str | None = None) -> str:
+async def ask(
+    system: str,
+    user: str,
+    model: str | None = None,
+    user_suffix: str | None = None,
+    cache_prefix: bool = False,
+    max_tokens: int | None = None,
+) -> str:
     """Call the active LLM backend for free-form text. Never raises.
 
     Pass ``model`` to override the configured model for this one call (e.g. route
-    a cheap classification to a smaller model). Both backends honour it.
+    a cheap classification to a smaller model). Both backends honour it. Pass
+    ``max_tokens`` to override the per-call output-token ceiling on the api
+    backend (see ``resolve_max_tokens_tier``) — a no-op on cli/cursor, which
+    have no such concept.
+
+    ``user_suffix`` + ``cache_prefix`` split the user message into a large
+    STABLE prefix and a small per-call suffix so concurrent calls can share one
+    Anthropic cached prefix (see ``_split_user_content`` / ``warm_cache_prefix``).
+    On the cli/cursor backends the suffix is simply concatenated onto ``user`` as
+    a plain string — no dict/list ever reaches a subprocess backend. With both at
+    their defaults the assembled prompt is byte-identical to the pre-cache path
+    on all three backends.
     """
     _API_USAGE.set(None)
     _ask_start = time.monotonic()
     backend = "cli"
+    # cli/cursor speak plain text only — flatten the split back into one string.
+    combined_user = f"{user}\n\n{user_suffix}" if user_suffix else user
     try:
         backend = _backend()
         if backend == "api":
-            result = await _ask_api(system, user, model)
+            result = await _ask_api(
+                system, user, model, user_suffix, cache_prefix, max_tokens
+            )
         elif backend == "cursor":
-            result = await _ask_cursor(system, user, model)
+            result = await _ask_cursor(system, combined_user, model)
         else:
-            result = await _ask_cli(system, user, model)
-        _emit_generation("ask", backend, model, system, user, result, _ask_start)
+            result = await _ask_cli(system, combined_user, model)
+        _emit_generation(
+            "ask", backend, model, system, combined_user, result, _ask_start
+        )
         return result
     except LLMBackendUnavailableError as exc:
         # Host-matched backend unusable — surface the actionable message as an
@@ -1562,30 +2372,105 @@ async def ask_json(
     response_model: Type[T],
     on_progress: Callable[[int], Awaitable[None]] | None = None,
     model: str | None = None,
+    user_suffix: str | None = None,
+    cache_prefix: bool = False,
+    max_tokens: int | None = None,
 ) -> T:
     """Request structured JSON from the active backend and validate with Pydantic.
 
     Streams tokens in real time. If on_progress is provided it is called with the
     running count of ``tc_id`` keys seen so far (proxy for test cases written).
-    Pass ``model`` to override the model for this call. Raises on parse or
+    Pass ``model`` to override the model for this call, ``max_tokens`` to
+    override the api-backend output-token ceiling (a no-op on cli/cursor --
+    see ``resolve_max_tokens_tier``). Raises on parse or
     validation failure — callers should catch and fall back to ``ask()`` with a
     markdown prompt.
+
+    With QA_STRUCTURED_JSON_ENABLED and the ``api`` backend, ``response_model``
+    is compiled into a forced tool call instead of being described in prose, and
+    the API returns an already-parsed object, so on that branch a JSONDecodeError is
+    structurally impossible and only pydantic (semantic) failures can raise. Any
+    400 from that path falls back to the JSON-in-prompt path automatically, and
+    the cli/cursor backends never use it. The signature and the exception
+    contract are unchanged either way.
+
+    ``user_suffix`` + ``cache_prefix`` split the user message into a large
+    STABLE prefix (marked with ``cache_control`` on the api backend) and a small
+    per-call suffix left uncached. This is what lets the 8 concurrent category
+    calls share one cached prefix. cli/cursor get the two parts concatenated
+    into a plain string. With both at their defaults the assembled prompt is
+    byte-identical to the pre-cache path on all three backends.
     """
-    json_system = _json_system(system, response_model)
     backend = _backend()
+    # Forced tool use (QA_STRUCTURED_JSON_ENABLED, api backend only). None keeps
+    # today's JSON-in-prompt path, so the OFF path is byte-identical.
+    tool = _tool_definition(response_model, model) if backend == "api" else None
+    json_system = (
+        _tool_system(system, tool["name"])
+        if tool
+        else _json_system(system, response_model)
+    )
     _API_USAGE.set(None)
     _json_start = time.monotonic()
+    # cli/cursor speak plain text only — flatten the split back into one string.
+    combined_user = f"{user}\n\n{user_suffix}" if user_suffix else user
     try:
-        if backend == "api":
-            raw = await _ask_json_api(json_system, user, on_progress, model)
+        if tool is not None:
+            try:
+                # The tool path sends the flattened prompt: forced tool use and
+                # the cached prefix split do not compose in a single request —
+                # _warn_if_prompt_cache_also_on flags the co-enabled config.
+                raw = await _ask_json_api_tool(
+                    json_system, combined_user, on_progress, model, tool, max_tokens
+                )
+            except Exception as exc:
+                if not _schema_rejected(exc, response_model, model):
+                    raise
+                # 400 = this schema/model pair cannot do forced tool use. Retry
+                # the SAME call on the JSON-in-prompt path so the caller never
+                # sees a feature-detection failure. Memoised, so this costs at
+                # most one rejected request per pair per process.
+                json_system = _json_system(system, response_model)
+                raw = await _ask_json_api(
+                    json_system,
+                    user,
+                    on_progress,
+                    model,
+                    user_suffix,
+                    cache_prefix,
+                    max_tokens,
+                )
+        elif backend == "api":
+            raw = await _ask_json_api(
+                json_system,
+                user,
+                on_progress,
+                model,
+                user_suffix,
+                cache_prefix,
+                max_tokens,
+            )
         elif backend == "cursor":
-            raw = await _ask_json_cursor(json_system, user, on_progress, model)
+            raw = await _ask_json_cursor(
+                json_system, combined_user, on_progress, model
+            )
         else:
-            raw = await _ask_json_cli(json_system, user, on_progress, model)
+            raw = await _ask_json_cli(
+                json_system, combined_user, on_progress, model
+            )
     except Exception:
         _emit_generation(
-            "ask_json", backend, model, json_system, user, "", _json_start, ok=False
+            "ask_json",
+            backend,
+            model,
+            json_system,
+            combined_user,
+            "",
+            _json_start,
+            ok=False,
         )
         raise
-    _emit_generation("ask_json", backend, model, json_system, user, raw, _json_start)
+    _emit_generation(
+        "ask_json", backend, model, json_system, combined_user, raw, _json_start
+    )
     return _parse_json_response(raw, response_model)

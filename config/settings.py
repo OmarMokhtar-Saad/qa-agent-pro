@@ -44,6 +44,9 @@ _FALSY_TOKENS = ("0", "false", "no", "off", "")
 #     for this hygiene batch.
 _POSITIVE_INT_FIELDS = frozenset(
     {
+        "qa_checklist_max_items",
+        "qa_checklist_max_prompt_chars",
+        "qa_checklist_max_pairs",
         "qa_llm_timeout_s",
         "qa_device_command_timeout",
         "qa_device_screenshot_timeout",
@@ -52,39 +55,65 @@ _POSITIVE_INT_FIELDS = frozenset(
         "qa_maestro_translate_concurrency",
         "qa_maestro_heal_max_attempts",
         "qa_maestro_explore_max_steps",
+        "qa_coverage_regen_max_rounds",
         "qa_update_timeout",
         "qa_web_run_max_cases",
         "qa_web_run_vision_budget",
         "qa_web_run_timeout_s",
+        "qa_comment_reconcile_max_comments",
+        "qa_comment_reconcile_max_amendments",
+        "qa_llm_max_tokens_category",
+        "qa_llm_max_tokens_critic",
+        "qa_llm_max_tokens_rewrite",
     }
 )
 
 
-def _lenient_bool(value: object, field_name: str = "") -> bool:
+def _lenient_bool(value: object, field_name: str = "", default: bool = False) -> bool:
     """Parse a bool the same way the pre-pydantic settings did — never raises.
 
-    Anything not in the truthy set is False, so a stray value can never crash
-    import (mirrors the historical ``.lower() in ("1","true","yes")`` behaviour).
-    A value that is neither a recognised truthy nor a recognised falsy token
-    (e.g. a typo like ``treu``) is logged at WARNING before falling back to
-    False, so a mistyped safety toggle (``QA_AUTH_ENABLED`` / a ``*_DRY_RUN``
-    flag) is never silently flipped — mirroring _coerce_jira_int's logged
-    fallback and honouring this module's docstring contract. Detection, not
-    prevention: the value still resolves to the default (never-raise contract).
+    An unparseable value resolves to ``default`` — the field's OWN declared
+    default, passed in by ``_coerce_bool`` — not to a hard-coded False. That
+    distinction is the whole point: every ``*_DRY_RUN`` flag defaults to True,
+    so a hard-coded False fallback meant a blank or mistyped value silently
+    DISARMED the guard it was meant to preserve (``TESTRAIL_DRY_RUN=`` in a
+    .env opened a live external write). Two unparseable cases, both logged:
+
+    - **Blank** (``FLAG=`` or whitespace): an env var that is present but empty
+      is ambiguous config, not an explicit false, so it reads as unset and the
+      field default wins. This is why "" is handled BEFORE _FALSY_TOKENS.
+    - **Unrecognised** (a typo like ``treu``): same fallback, louder message.
+
+    Detection, not prevention — the never-raise contract is unchanged.
     """
     if isinstance(value, bool):
         return value
     token = str(value).strip().lower()
-    if token not in _TRUTHY_TOKENS and token not in _FALSY_TOKENS:
+    if token in _TRUTHY_TOKENS:
+        return True
+    if token == "":
         logger.warning(
-            "Invalid boolean %s=%r — expected one of %s (true) / %s (false); "
-            "falling back to False",
+            "Blank boolean %s=%r — a present-but-empty value reads as unset, so "
+            "the field default %r applies; write an explicit %s/%s to override",
             (field_name or "setting").upper(),
             value,
-            "/".join(_TRUTHY_TOKENS),
-            "/".join(t for t in _FALSY_TOKENS if t),
+            default,
+            _TRUTHY_TOKENS[1],
+            _FALSY_TOKENS[1],
         )
-    return token in _TRUTHY_TOKENS
+        return default
+    if token in _FALSY_TOKENS:
+        return False
+    logger.warning(
+        "Invalid boolean %s=%r — expected one of %s (true) / %s (false); "
+        "falling back to the field default %r",
+        (field_name or "setting").upper(),
+        value,
+        "/".join(_TRUTHY_TOKENS),
+        "/".join(t for t in _FALSY_TOKENS if t),
+        default,
+    )
+    return default
 
 
 class Settings(BaseSettings):
@@ -148,6 +177,72 @@ class Settings(BaseSettings):
     # model to cut routing cost — the classifier is a tiny, low-stakes call.
     qa_classifier_model: str = "claude-haiku-4-5"
 
+    # ---- Structured JSON via forced tool use (api backend only) -------------
+    # QA_STRUCTURED_JSON_ENABLED, default OFF (constitution: new behaviour is
+    # opt-in). When ON, llm.ask_json stops asking the model for JSON in prose and
+    # instead compiles the pydantic response_model's JSON schema into an
+    # Anthropic TOOL input_schema, forcing that one tool with tool_choice. The
+    # API then returns tool_use.input as an already-parsed dict, so on that
+    # branch a JSONDecodeError is structurally impossible -- which matters because a
+    # single parse failure today re-runs an ENTIRE test-case category
+    # (agents/test_scenario_agent.py's _RETRYABLE path: one full ~110s call).
+    # Pydantic still validates semantics, so a genuinely wrong field is still
+    # caught and still retried exactly as before.
+    # Ignored by the cli/cursor backends: they drive a subprocess that has no
+    # tool API, so they keep the JSON-in-prompt path byte-for-byte unchanged.
+    qa_structured_json_enabled: bool = False
+    # QA_STRUCTURED_JSON_STRICT, default OFF. Adds "strict": true to the tool
+    # definition, which switches the provider to CONSTRAINED DECODING (the schema
+    # becomes a grammar) instead of mere schema guidance. It is a second flag
+    # rather than part of the first because strict mode is model-gated and
+    # schema-fussy: it needs additionalProperties:false on every object node and
+    # rejects pattern / minLength / maxLength / minimum / maximum / minItems,
+    # all of which tools/models.py's TestCase uses. llm.py sanitises the schema
+    # and only sends strict on models known to support it; an API rejection is
+    # memoised per (model, schema) and degrades to non-strict forced tool use.
+    qa_structured_json_strict: bool = False
+
+    # ---- Anthropic prompt caching for the category fan-out (api backend) ----
+    # QA_PROMPT_CACHE_ENABLED, default OFF (constitution: new behaviour is
+    # opt-in). When ON, agents/test_scenario_agent.py hoists the per-category
+    # instruction OUT of the system prompt into a small trailing user block, so
+    # all 8 concurrent category calls share ONE byte-identical cached prefix
+    # (system + the whole grounded user context). Cache reads bill 0.10x input,
+    # writes 1.25x, with a 5-minute ephemeral TTL that every read refreshes.
+    # This changes the PROMPT STRUCTURE, which is exactly why it is a flag:
+    # OFF, the assembled prompt is byte-identical to the pre-cache path on all
+    # three backends. Ignored entirely by the cli/cursor backends.
+    qa_prompt_cache_enabled: bool = False
+    # Minimum cacheable prefix in TOKENS. 0 = derive it from the model, using
+    # llm.py's published table (4096 for opus 4.5-4.8 and haiku 4.5, 2048 for
+    # sonnet 4.6 and haiku 3/3.5, 1024 for sonnet 3.7-4.5; an unrecognised id
+    # takes the conservative 4096). Set this explicitly only for a model whose
+    # minimum llm.py does not know. Below the minimum a cache_control marker is
+    # silently ignored by the provider — no error, just a wasted 1.25x write —
+    # so llm.py sends a plain unmarked block instead.
+    qa_prompt_cache_min_tokens: int = 0
+    # max_tokens for the cache warm-up request that runs BEFORE the fan-out.
+    # 0 is correct and free: it runs prefill only (writing the cache), returns
+    # an empty content list with stop_reason "max_tokens" and bills zero output
+    # tokens. Raise it to 1 only if a future API version rejects 0.
+    qa_prompt_cache_warm_max_tokens: int = 0
+
+    # Model tiering for non-generation call sites (default OFF -- preserves
+    # today's sonnet behaviour byte-for-byte). AC synthesis
+    # (tools/rtm.generate_acs) already uses qa_classifier_model unconditionally
+    # and needs no flag; these two sites are opt-in because their output is
+    # user-visible free text / generated Maestro commands rather than an
+    # internal structured critique. See .claude/plans/plan-model-tiering.md for
+    # the eval-gated rollout and the >5pp quality-regression rollback rule.
+    qa_model_tiering_enabled: bool = False
+
+    # Per-site override -- "default" follows qa_model_tiering_enabled, "haiku"
+    # forces the cheap model regardless of the master flag, "sonnet" forces
+    # today's model regardless of the master flag (a per-site kill-switch that
+    # doesn't require flipping the master off for every site).
+    qa_model_tier_coverage_gaps: str = "default"
+    qa_model_tier_maestro_translate: str = "default"
+
     jira_base_url: str = ""
     jira_api_token: str = ""
     jira_email: str = ""
@@ -189,6 +284,47 @@ class Settings(BaseSettings):
     # exercising it) is unaffected until an operator explicitly wants it.
     jira_fetch_comments: bool = False
     jira_max_comments: int = 5
+
+    # --- Comment reconciliation (Batch 1) — opt-in, default OFF. -----------
+    # A Jira description is a snapshot taken at refinement; the requirements
+    # that are actually current accumulate in the comment thread. When ON,
+    # tools/comment_reconciler runs a three-stage pipeline (Python noise filter
+    # -> ONE quarantined extraction call -> deterministic Python resolution)
+    # and the MCP handler injects a fenced AMENDMENTS block carrying only the
+    # winners, with provenance emitted mechanically in code. While ON,
+    # tools/jira_fetcher also SUPPRESSES the raw "## Comments" dump from
+    # raw_text, so that block is the only comment-derived input the generation
+    # model sees. OFF = zero extra LLM calls and a byte-identical prompt.
+    qa_comment_reconcile_enabled: bool = False
+    # Hard cap on comments handed to Stage 1 (the NEWEST N are kept). NOTE the
+    # interaction with jira_max_comments above (default 5): while the
+    # reconciler is ON, tools/jira_fetcher._effective_comment_cap requests
+    # max(jira_max_comments, this) so the window here is real instead of being
+    # silently clamped to 5; the filter then keeps the newest N of what arrived.
+    qa_comment_reconcile_max_comments: int = 50
+    # Comma-separated bot names, matched WHOLE-TOKEN against the author's
+    # display name (see tools/comment_reconciler._is_bot_author) — never as a
+    # substring, so "bot" drops "Release Bot" but keeps a reviewer named
+    # "Bothaina" or "Talbot". Empty falls back to the module's built-in list.
+    qa_comment_reconcile_bot_authors: str = (
+        "jira-automation,automation for jira,github-actions,dependabot,"
+        "depbot,renovate,bot"
+    )
+    # difflib ratio a comment's inferred field key must reach against the
+    # ticket's own vocabulary before an amendment is applied. Below it the
+    # candidate is FLAGGED for clarification instead of being applied to a
+    # guessed field.
+    qa_comment_reconcile_field_threshold: float = 0.90
+    # Cosine similarity at/above which two additions count as the same
+    # requirement (only used when an embeddings backend is configured;
+    # otherwise normalised-string equality applies).
+    qa_comment_reconcile_dedup_threshold: float = 0.92
+    # Cap on amendments rendered into the block (newest survive).
+    qa_comment_reconcile_max_amendments: int = 12
+    # Character cap on the rendered block. 0 means "emit no block" (same
+    # convention as jira_max_parent_chars), which is why this field is
+    # deliberately NOT in _POSITIVE_INT_FIELDS.
+    qa_comment_reconcile_max_chars: int = 1500
 
     # Image attachments require a second, authenticated download per image
     # PLUS a vision-capable LLM call (llm.ask_vision(), api backend only) to
@@ -281,6 +417,26 @@ class Settings(BaseSettings):
     # so the flagship generation path is unchanged until validated via the eval
     # harness (T-12).
     qa_coverage_regen_enabled: bool = False
+    # Bound on the critic->generate remediation loop above (was a hardcoded
+    # module constant _MAX_REMEDIATION_ROUNDS = 3). Default lowered to 2:
+    # published self-critique research shows gains flatten after 2-3 rounds and
+    # an unbounded/over-long loop can compound errors rather than improve
+    # coverage (.claude/reports/research/testgen-accuracy-techniques-2026.md
+    # section 1). Only a floor is enforced (>=1, via _POSITIVE_INT_FIELDS) --
+    # no code-level ceiling, matching this file's existing convention for other
+    # bounded-loop-count fields (qa_maestro_heal_max_attempts,
+    # qa_maestro_explore_max_steps), which are likewise floor-only. See
+    # .claude/plans/plan-remediation-cap.md.
+    qa_coverage_regen_max_rounds: int = 2
+    # Merge the critique + gap-fill generation into ONE ask_json call per round
+    # instead of two sequential calls (critique_coverage then a full
+    # _generate_for_category pass). Off by default: the existing two-call
+    # behaviour is preserved byte-for-byte until this is validated. See
+    # .claude/plans/plan-remediation-cap.md for the model-choice tradeoff (the
+    # merged call resolves to qa_llm_model, NOT qa_classifier_model, because its
+    # output includes tester-facing generated test cases, not just an internal
+    # critique).
+    qa_coverage_regen_merge_calls: bool = False
     # Chain-of-Thought reasoning stage per category (Feature 1 / CoT). When ON,
     # each category's single ask_json call is asked to FIRST enumerate what to test
     # (fields, limits, risks, attack vectors) into an internal ``analysis`` field,
@@ -290,6 +446,48 @@ class Settings(BaseSettings):
     # are byte-identical to the pre-feature path. Adds only output tokens, so mind
     # the cli/cursor per-category timeout (_CATEGORY_TIMEOUT).
     qa_cot_reasoning_enabled: bool = False
+
+    # Terse category-generation output (opt-in, default OFF -- see
+    # .claude/plans/plan-terse-schemas.md). Every category ask_json call fills
+    # the WHOLE TestCase schema, including fields that are ALWAYS overwritten
+    # after generation regardless of what the model writes -- risk_score/
+    # risk_label/risk_rationale are unconditionally replaced by
+    # tools.risk_scorer.score_and_sort / score_with_llm on every path -- or
+    # never read by any exporter -- postconditions is accepted by every
+    # exporter's schema but rendered by NONE of them (xlsx/csv/gherkin/
+    # playwright/testrail/xray/maestro all skip it; only "preconditions" is
+    # rendered anywhere). When ON, the category system prompt tells the model
+    # to leave those fields at their schema default and keep the fields that
+    # DO matter to one concise sentence, cutting real output tokens with ZERO
+    # relaxation of the existing anti-vagueness rules and ZERO effect on any
+    # exported artifact's column layout. NOTE (rollout): the flag DOES change
+    # the generated WORDING of title/steps/test_data/expected_result, and
+    # tools/models._compute_stable_id hashes exactly those fields -- so
+    # flipping this flag re-keys every content-derived stable_id (SID-*),
+    # which dedup, suite_store persistence, TMS push and Zephyr External
+    # IDs all key off. Treat enabling it like a suite re-baseline. OFF =
+    # the assembled category prompt is byte-identical to today.
+    qa_terse_category_output_enabled: bool = False
+
+    # Per-call-type max_tokens ceiling (opt-in master flag, default OFF -- see
+    # .claude/plans/plan-terse-schemas.md). llm.py hard-codes ONE ceiling
+    # (_MAX_TOKENS = 16384) for every api-backend call, from the 8-category
+    # fan-out (which legitimately needs headroom for up to 15 detailed cases)
+    # down to the coverage critic and the vague-step rewriter (whose real
+    # output is a handful of short strings). OFF = every call keeps today's
+    # single 16384 ceiling. ON = category-class calls are unaffected
+    # (qa_llm_max_tokens_category defaults to the SAME 16384) while
+    # critic/rewrite-class calls get a much lower ceiling
+    # (qa_llm_max_tokens_critic / qa_llm_max_tokens_rewrite) as a defensive
+    # circuit breaker against a pathological repeating/looping generation on a
+    # call that should never legitimately need more than a few hundred output
+    # tokens. NOTE: max_tokens bounds worst-case spend/latency -- it does NOT
+    # itself reduce the tokens billed for a normal-sized response, since
+    # billing is on tokens actually generated, not the ceiling.
+    qa_max_tokens_tiering_enabled: bool = False
+    qa_llm_max_tokens_category: int = 16384
+    qa_llm_max_tokens_critic: int = 4096
+    qa_llm_max_tokens_rewrite: int = 4096
 
     # Spec-mutation eval axis (Feature 2). When ON, tools/eval_runner.mutation_score
     # asks an LLM for N behavioural mutations of a feature spec and judges, per
@@ -359,6 +557,28 @@ class Settings(BaseSettings):
     # emitted test_data stripped before render, every export byte-identical to today.
     qa_test_data_strategy: bool = False
 
+    # Surgical quality retry (opt-in, both default OFF -- see
+    # .claude/plans/plan-surgical-retry.md). The per-category quality gate
+    # (tools/quality_checks.quality_ratio) flags a category whose steps are
+    # >30% vague/placeholder; by default it re-runs the ENTIRE category once
+    # with a stricter reminder appended. These two independent flags change
+    # that:
+    #
+    # qa_quality_reminder_upfront: fold the stricter reminder into EVERY
+    # category's FIRST prompt instead of only on a triggered retry. Cheapest
+    # fix when it prevents the retry outright (zero extra calls); costs ~230
+    # extra words on every category's first prompt even when that category
+    # was never going to need a retry. OFF = first-attempt prompt byte-
+    # identical to today.
+    qa_quality_reminder_upfront: bool = False
+
+    # qa_surgical_quality_retry: when a retry is still needed, repair ONLY the
+    # flagged test cases (a smaller ask_json call carrying just those cases +
+    # targeted feedback, merged back by stable_id) instead of regenerating the
+    # whole category from scratch. OFF = the existing full-category retry
+    # runs unchanged.
+    qa_surgical_quality_retry: bool = False
+
     # RAG corpus grounding — disabled by default.
     qa_rag_enabled: bool = False
     qa_rag_storage_path: str = "corpus"
@@ -397,6 +617,103 @@ class Settings(BaseSettings):
     # ranking never silently starts DROPPING near-duplicate cases. OFF => the
     # generation pipeline never merges cases on embedding similarity.
     qa_semantic_dedup_enabled: bool = False
+
+    # --- Atomic Requirements Checklist (Batch 2; opt-in, default OFF) ------
+    # Master gate for the three-pass auditable-coverage pipeline:
+    #   Pass 1  tools/atomic_checklist.decompose_to_checklist -> an unbounded,
+    #           EARS-shaped, source-tagged checklist of every independently-
+    #           verifiable outcome (ONE extra ask_json, run inside the existing
+    #           concurrent enrichment gather so it costs no extra wall clock).
+    #   Pass 2  the 8-category fan-out with that checklist injected as its OWN
+    #           untrusted, CLUSTERED block (constraint-decay mitigation).
+    #   Pass 3  tools/rtm.match_checklist -> a DETERMINISTIC EXTERNAL matcher
+    #           that recomputes coverage instead of trusting the generating
+    #           model's self-assigned requirement_id.
+    # OFF => zero extra LLM calls, zero extra embedding work, and every summary
+    # and export is byte-identical to the pre-feature output.
+    qa_atomic_checklist_enabled: bool = False
+    # Tier (b) of the matcher: ONE batched entailment judgement over the
+    # ambiguous similarity band. Deliberately NOT a BERT-large NLI dependency --
+    # a compact ask_json call with a strict judging prompt that is DIFFERENT from
+    # the generator's, so the model still never marks its own homework.
+    # OFF => the ambiguous band is simply reported as uncovered.
+    qa_checklist_nli_enabled: bool = False
+    # Tier (c): a final batched adjudication over ONLY the pairs tier (b) left
+    # "unsure". Its matches are always reported as LOW confidence / review
+    # required.
+    qa_checklist_adjudicate_enabled: bool = False
+    # Deterministic remediation: when ON, the bounded critic loop's stop
+    # condition becomes "every checklist item is traced" instead of "the LLM
+    # critic ran out of patience". Requires qa_atomic_checklist_enabled.
+    qa_checklist_remediation_enabled: bool = False
+    # Embedding-cosine bands. score >= high -> HIGH-confidence match;
+    # low <= score < high -> the ambiguous band handed to tiers (b)/(c);
+    # score < low -> no match. Thresholds are dataset-dependent (TraceLLM tunes
+    # 0.01..1.0 per domain against labelled ground truth); these are
+    # conservative project-level defaults, NOT tuned optima. The lexical TF-IDF
+    # fallback uses its own fixed constants in tools/rtm.py because its scores
+    # live on a different scale.
+    qa_checklist_match_high: float = 0.75
+    qa_checklist_match_low: float = 0.30
+    # Phase-0 granularity gate. Below this the decomposition is reported as
+    # probably inflated / under-split -- ADVISORY only, it never blocks
+    # generation (house rule: log and degrade).
+    qa_checklist_min_granularity: float = 0.6
+    # Hard caps: decomposed items (anti-inflation) and the injected prompt
+    # block. MAX_PROMPT_CHARS is DERIVED FROM MAX_ITEMS: a rendered line
+    # ("- CL-017 [event_driven] When the user taps cancel, the system shall
+    # redirect the user to the Appointment Card screen.") is ~120 chars, so
+    # 200 items need ~24,000; 32,000 leaves headroom. A smaller cap would make
+    # the tool truncate its
+    # OWN prompt and then score the truncated items as coverage gaps; that is
+    # now impossible (format_checklist_prompt_block reports exactly which ids
+    # it presented and the matcher excludes the rest), but the default must
+    # still fit a full checklist so the NOT-PRESENTED bucket stays empty in
+    # normal operation.
+    qa_checklist_max_items: int = 200
+    qa_checklist_max_prompt_chars: int = 32000
+    # Hard cap on ambiguous-band pairs handed to tiers (b)/(c) -- bounds cost and
+    # latency, which the NLI traceability literature does not report.
+    qa_checklist_max_pairs: int = 40
+
+    # --- Batch 3 rule packs (opt-in, every flag default OFF) ---------------
+    # Three domain rules this repo had zero handling for. All three are
+    # implemented as rules about WHAT MUST APPEAR ON THE ATOMIC REQUIREMENTS
+    # CHECKLIST (Batch 2), not as new pipeline stages, so the existing external
+    # coverage tally enforces them and each future rule costs one prompt clause
+    # instead of one stage. All three are PURE + SYNCHRONOUS: zero extra LLM
+    # calls and zero network, whether on or off. Enforcement BY THE TALLY needs
+    # QA_ATOMIC_CHECKLIST_ENABLED as well; with the checklist off the packs
+    # degrade to prompt + advisory mode (documented, logged, not silent).
+    #
+    # QA_BILINGUAL_RULES — every documented EN/AR message pair (a DM##/MSG##
+    # table) becomes its own mandated checklist line, gets ONE test case with
+    # two steps (English locale, Arabic locale), and the two strings are carried
+    # into Expected Results MECHANICALLY: the generator writes opaque
+    # {{EN:DM01}} / {{AR:DM01}} tokens and tools/bilingual.py substitutes the
+    # values parsed from the ticket. Verbatim reproduction by an LLM
+    # hallucinates, and this way the untrusted literals never enter a prompt at
+    # all. Also switches tools/xlsx_generator.py to RTL-safe cells
+    # (reading_order=2 + RLM/LRM bidi isolation) for Arabic-majority text, and
+    # appends a templated native-speaker linguistic-validation case (the MANUAL
+    # half that an automated bilingual case cannot cover).
+    qa_bilingual_rules: bool = False
+    # QA_ATOMICITY_RULES — the anti-bundling split rule in the generator prompt
+    # ("never bundle a backend/state outcome with a UI/navigation outcome"; the
+    # split boundary is the SUBSYSTEM, not a cosmetic UI toggle) plus two
+    # DETERMINISTIC, FLAG-ONLY detectors. A bundled case passes on the visible
+    # half while the hidden half is silently broken.
+    qa_atomicity_rules: bool = False
+    # QA_STANDING_RULES — content-triggered mandates. A genuine API mention
+    # forces status-code / request-design / response-structure lines (plus error
+    # handling when a failure flow is named); any user-facing screen forces one
+    # baseline UI build-quality line. With no documented contract the cases are
+    # written against standard REST convention and labelled ASSUMED
+    # mechanically. The API trigger is two-tiered: circumstantial words ("HTTP",
+    # "JSON", "integration") need TWO distinct hits and are then reported as
+    # circumstantial, because on a pure-UI ticket a single "integration with the
+    # wallet screen" used to force four backend cases.
+    qa_standing_rules: bool = False
 
     # TestRail API push (T-10). Base instance URL (e.g. https://acme.testrail.io),
     # a user email, and an API key. TESTRAIL_DRY_RUN defaults ON so a push
@@ -458,6 +775,28 @@ class Settings(BaseSettings):
     # same temp path rather than failing the export. A plain string field: no
     # bool coercer, and it adds no internal import.
     qa_export_dir: str = "data/exports"
+
+    # Zephyr for Jira import export (Batch 4 -- tools/zephyr_exporter.py).
+    # Opt-in, OFF by default per the house rule. When ON, `zephyr` joins the
+    # qa_export_suite format list and the auto-export path additionally writes a
+    # Zephyr-shaped 15-column workbook plus its zfj_import_config.json field map
+    # next to the Excel deliverable, so a tester imports straight into Jira
+    # instead of hand-massaging the generic 11-column sheet. OFF = the export
+    # surface, the format menus and the generation reply are byte-identical to
+    # before, and tools/zephyr_exporter.py never runs.
+    qa_zephyr_export_enabled: bool = False
+
+    # Dry run for that export, ON by default -- the house rule for an external
+    # write, and the column layout is not vendor-verified yet (operations/
+    # runbook.md -> "Zephyr export pilot gate"). The IMPORT into Jira is the
+    # external write, performed by the tester on our artifact, so dry run bounds
+    # the artifact instead of suppressing it: the workbook holds ONE case (the
+    # first multi-step one, so the multi-row layout is actually exercised), is
+    # named zephyr_import_PILOT.xlsx inside a zephyr_pilot_* folder, and the
+    # reply tells the tester to import it into a SANDBOX project first. Set to
+    # false only after a pilot is recorded in the runbook. Both flags use the
+    # lenient never-raising bool coercer like every other flag.
+    qa_zephyr_dry_run: bool = True
 
     # Distribution / test-cases-only mode. When ON, the UI exposes ONLY the
     # test-case generation flows (feature text / Jira / web URL / Swagger link
@@ -558,6 +897,7 @@ class Settings(BaseSettings):
         "qa_rag_enabled",
         "qa_token_meter_enabled",
         "qa_coverage_regen_enabled",
+        "qa_coverage_regen_merge_calls",
         "qa_ac_anchoring_enforce",
         "qa_cot_reasoning_enabled",
         "qa_mutation_eval_enabled",
@@ -565,8 +905,11 @@ class Settings(BaseSettings):
         "qa_test_plan_artifacts",
         "qa_llm_risk_scoring",
         "qa_test_data_strategy",
+        "qa_quality_reminder_upfront",
+        "qa_surgical_quality_retry",
         "testrail_dry_run",
         "jira_fetch_comments",
+        "qa_comment_reconcile_enabled",
         "jira_fetch_images",
         "jira_fetch_parent",
         "qa_mobile_capture",
@@ -580,6 +923,8 @@ class Settings(BaseSettings):
         "qa_finetune_export_enabled",
         "qa_swagger_enabled",
         "qa_auto_export_xlsx",
+        "qa_zephyr_export_enabled",
+        "qa_zephyr_dry_run",
         "qa_dist_mode",
         "qa_mcp_enabled",
         "qa_mcp_elicit_enabled",
@@ -592,12 +937,57 @@ class Settings(BaseSettings):
         "qa_llm_strict_host",
         "qa_web_run_enabled",
         "qa_web_run_dry_run",
+        "qa_bilingual_rules",
+        "qa_atomicity_rules",
+        "qa_standing_rules",
         "qa_semantic_dedup_enabled",
+        "qa_atomic_checklist_enabled",
+        "qa_checklist_nli_enabled",
+        "qa_checklist_adjudicate_enabled",
+        "qa_checklist_remediation_enabled",
+        "qa_model_tiering_enabled",
+        "qa_prompt_cache_enabled",
+        "qa_structured_json_enabled",
+        "qa_structured_json_strict",
+        "qa_terse_category_output_enabled",
+        "qa_max_tokens_tiering_enabled",
         mode="before",
     )
     @classmethod
     def _coerce_bool(cls, v: object, info) -> bool:
-        return _lenient_bool(v, info.field_name)
+        # The fallback is the field's OWN default, never a hard-coded False:
+        # every *_DRY_RUN flag defaults to True, so a blank/mistyped value used
+        # to disarm the very guard it should have preserved. A non-bool default
+        # (or PydanticUndefined on a required field) degrades to False, which is
+        # the historical behaviour.
+        raw_default = getattr(cls.model_fields.get(info.field_name), "default", False)
+        return _lenient_bool(
+            v, info.field_name, raw_default if isinstance(raw_default, bool) else False
+        )
+
+    @field_validator(
+        "qa_model_tier_coverage_gaps",
+        "qa_model_tier_maestro_translate",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_model_tier(cls, v: object, info) -> str:
+        """Lenient enum-like coercer for the per-site model-tier overrides.
+
+        Mirrors _coerce_jira_int's shape: an unrecognised value is logged at
+        WARNING and replaced with "default" (follow qa_model_tiering_enabled)
+        rather than raising or wedging the setting into a value
+        resolve_tiered_model doesn't understand.
+        """
+        token = str(v).strip().lower() if v is not None else "default"
+        if token not in ("default", "haiku", "sonnet"):
+            logger.warning(
+                "Invalid %s=%r -- expected default/haiku/sonnet; using default",
+                info.field_name.upper(),
+                v,
+            )
+            return "default"
+        return token
 
     @field_validator("qa_rag_similarity_threshold", mode="before")
     @classmethod
@@ -625,6 +1015,73 @@ class Settings(BaseSettings):
             )
             return 0.9
 
+    @field_validator(
+        "qa_checklist_match_high",
+        "qa_checklist_match_low",
+        "qa_checklist_min_granularity",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_checklist_float(cls, v: object, info) -> float:
+        """Lenient, never-raising float coercer for the Batch-2 checklist bands.
+
+        Mirrors _coerce_jira_int: an unparseable value is logged and replaced
+        with the field's declared default rather than raising.
+
+        All three fields are similarity / quality SCORES, so the parsed value is
+        additionally CLAMPED to [0.0, 1.0] -- the same kind of range guard
+        _POSITIVE_INT_FIELDS gives the int caps. Without it, an operator writing
+        QA_CHECKLIST_MATCH_HIGH=75 (meaning "75%") would silently push every
+        requirement below the threshold and the report would claim 0% coverage
+        for a perfectly good suite.
+        """
+        default = cls.model_fields[info.field_name].default
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            parsed = float(v)
+        else:
+            try:
+                parsed = float(str(v).strip())
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid %s=%r — using default %s",
+                    info.field_name.upper(),
+                    v,
+                    default,
+                )
+                return default
+        if parsed < 0.0 or parsed > 1.0:
+            clamped = min(1.0, max(0.0, parsed))
+            logger.warning(
+                "%s=%r is outside the valid [0, 1] range — clamping to %s",
+                info.field_name.upper(),
+                parsed,
+                clamped,
+            )
+            return clamped
+        return parsed
+
+    @field_validator(
+        "qa_comment_reconcile_field_threshold",
+        "qa_comment_reconcile_dedup_threshold",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_reconcile_threshold(cls, v: object, info) -> float:
+        """Lenient, never-raising float coercion for the reconciler thresholds."""
+        default = cls.model_fields[info.field_name].default
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return float(v)
+        try:
+            return float(str(v).strip())
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid %s=%r — using default %s",
+                info.field_name.upper(),
+                v,
+                default,
+            )
+            return default
+
     @field_validator("qa_rag_top_k", mode="before")
     @classmethod
     def _coerce_top_k(cls, v: object) -> int:
@@ -638,6 +1095,9 @@ class Settings(BaseSettings):
 
     @field_validator(
         "jira_max_comments",
+        "qa_comment_reconcile_max_comments",
+        "qa_comment_reconcile_max_amendments",
+        "qa_comment_reconcile_max_chars",
         "jira_max_images",
         "jira_max_image_bytes",
         "jira_max_parent_chars",
@@ -650,6 +1110,7 @@ class Settings(BaseSettings):
         "qa_maestro_explore_max_steps",
         "qa_maestro_explore_step_timeout",
         "qa_maestro_translate_concurrency",
+        "qa_coverage_regen_max_rounds",
         "qa_max_spec_bytes",
         "qa_max_spec_chars",
         "qa_llm_timeout_s",
@@ -659,6 +1120,14 @@ class Settings(BaseSettings):
         "qa_web_run_max_cases",
         "qa_web_run_vision_budget",
         "qa_web_run_timeout_s",
+        "qa_checklist_max_items",
+        "qa_checklist_max_prompt_chars",
+        "qa_checklist_max_pairs",
+        "qa_prompt_cache_min_tokens",
+        "qa_prompt_cache_warm_max_tokens",
+        "qa_llm_max_tokens_category",
+        "qa_llm_max_tokens_critic",
+        "qa_llm_max_tokens_rewrite",
         mode="before",
     )
     @classmethod

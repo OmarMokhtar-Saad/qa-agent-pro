@@ -131,13 +131,64 @@ def _extract_names(items: object) -> list[str]:
     return names
 
 
-async def _fetch_jira_comments(key: str) -> list[str]:
-    """Fetch up to settings.jira_max_comments comment bodies (newest first).
+def _comment_lines(records: list[dict]) -> list[str]:
+    """Render comment records as the legacy "Author: body" strings.
+
+    The public ``comments`` key has always had this shape, so keeping it
+    byte-identical means every existing consumer and test is unaffected by the
+    richer ``comments_meta`` records added for the comment reconciler. Never
+    raises.
+    """
+    try:
+        out: list[str] = []
+        for rec in records or []:
+            body = str(rec.get("body") or "").strip()
+            if body:
+                out.append(f"{rec.get('author') or 'Unknown'}: {body}")
+        return out
+    except Exception:
+        logger.exception("Rendering Jira comment lines failed")
+        return []
+
+
+def _effective_comment_cap() -> int:
+    """How many comments to actually request from Jira.
+
+    jira_max_comments defaults to 5 while qa_comment_reconcile_max_comments
+    defaults to 50, and the reconciler can only ever see what was fetched — so
+    without this widening the deep-thread window would be a dead knob
+    (always min(5, 50) = 5) and the "long thread" case the feature exists for
+    could not occur. Widens ONLY while the reconciler is enabled; otherwise the
+    historical cap applies unchanged. Never raises.
+    """
+    try:
+        base = int(settings.jira_max_comments)
+    except Exception:
+        base = 5
+    try:
+        if settings.qa_comment_reconcile_enabled:
+            deep = int(settings.qa_comment_reconcile_max_comments)
+            if deep > base:
+                return deep
+    except Exception:
+        logger.debug("Comment-cap widening failed — using jira_max_comments")
+    return base
+
+
+async def _fetch_jira_comments(key: str) -> list[dict]:
+    """Fetch comment RECORDS for *key*, OLDEST FIRST.
+
+    Each record is ``{"id", "author", "created", "body"}``. The REST query still
+    orders by ``-created`` so a long thread yields the NEWEST N comments —
+    querying ascending would return the N OLDEST and silently drop the very
+    comments that carry the current requirements — and the page is then REVERSED
+    so every consumer reads the thread chronologically instead of backwards.
 
     Comments are supplementary context, not required for generation — never
     raises, returns [] on any failure or when disabled via settings.
     """
-    if not settings.jira_fetch_comments or settings.jira_max_comments <= 0:
+    cap = _effective_comment_cap()
+    if not settings.jira_fetch_comments or cap <= 0:
         return []
     try:
         url = f"{settings.jira_base_url.rstrip('/')}/rest/api/3/issue/{key}/comment"
@@ -146,7 +197,11 @@ async def _fetch_jira_comments(key: str) -> list[str]:
                 url,
                 auth=(settings.jira_email, settings.jira_api_token),
                 params={
-                    "maxResults": settings.jira_max_comments,
+                    # NEWEST N on purpose: orderBy="created" would return the N
+                    # OLDEST comments, i.e. precisely the ones that are not
+                    # current. The page is reversed below so the RECORDS read
+                    # chronologically.
+                    "maxResults": cap,
                     "orderBy": "-created",
                 },
             )
@@ -158,8 +213,8 @@ async def _fetch_jira_comments(key: str) -> list[str]:
             )
             return []
         data = resp.json()
-        raw_comments = data.get("comments", [])[: settings.jira_max_comments]
-        out: list[str] = []
+        raw_comments = data.get("comments", [])[:cap]
+        out: list[dict] = []
         for c in raw_comments:
             body = c.get("body", "") or ""
             if isinstance(body, dict):
@@ -167,7 +222,17 @@ async def _fetch_jira_comments(key: str) -> list[str]:
             author = (c.get("author") or {}).get("displayName", "Unknown")
             body = body.strip()
             if body:
-                out.append(f"{author}: {body}")
+                out.append(
+                    {
+                        "id": str(c.get("id") or ""),
+                        "author": author,
+                        "created": str(c.get("created") or ""),
+                        "body": body,
+                    }
+                )
+        # The page arrived newest-first (orderBy=-created); hand it back in
+        # chronological order so reading order tracks recency.
+        out.reverse()
         return out
     except Exception:
         logger.exception(
@@ -592,7 +657,14 @@ async def _fetch_jira(path: str) -> dict:
                 priority = _extract_priority(fields)
                 labels = _extract_names(fields.get("labels"))
                 components = _extract_names(fields.get("components"))
-                comments = await _fetch_jira_comments(key)
+                comment_records = await _fetch_jira_comments(key)
+                # Legacy shape, unchanged: newest-first "Author: body" strings,
+                # still capped at JIRA_MAX_COMMENTS even when the reconciler
+                # widened the fetch window, so nothing that reads `comments`
+                # today sees a longer list than it used to.
+                comments = _comment_lines(
+                    list(reversed(comment_records))[: settings.jira_max_comments]
+                )
                 images = await _fetch_jira_images(fields)
                 # Sub-task support: parent/subtasks/issuelinks are already in the
                 # DEFAULT field set Jira returned above, so extracting them costs
@@ -623,7 +695,19 @@ async def _fetch_jira(path: str) -> dict:
                 raw_text = (
                     f"{fields.get('summary', key)}\n{meta_block}{description}".strip()
                 )
-                if comments:
+                # QA_COMMENT_RECONCILE_ENABLED ON: the raw thread is
+                # SUPPRESSED here deliberately. tools/comment_reconciler turns
+                # it into a fenced, deterministically-resolved, URL-stripped
+                # AMENDMENTS block that becomes the ONLY comment-derived input
+                # the privileged generation model sees (separation of duties —
+                # a quarantined extractor reads the thread, the generator never
+                # does). Keeping the dump would ALSO reintroduce a truncation
+                # bug: agents/test_scenario_agent head-caps this text at
+                # jira_context_text[:3000], so a tail-placed comment list loses
+                # the newest comments on exactly the long tickets this feature
+                # targets. OFF (the default) keeps today's newest-first dump
+                # byte for byte.
+                if comments and not settings.qa_comment_reconcile_enabled:
                     raw_text += "\n\n## Comments\n" + "\n".join(
                         f"- {c}" for c in comments
                     )
@@ -642,6 +726,11 @@ async def _fetch_jira(path: str) -> dict:
                     "labels": labels,
                     "components": components,
                     "comments": comments,
+                    # Chronological comment RECORDS (id + author + timestamp +
+                    # body) for tools/comment_reconciler. Absent on the
+                    # credential-less generic fallback below, so consumers must
+                    # use .get().
+                    "comments_meta": comment_records,
                     "images": images,
                     # Sub-task background. Deliberately SEPARATE from raw_text:
                     # _find_product_urls scans raw_text/description/

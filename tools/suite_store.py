@@ -62,6 +62,12 @@ CREATE TABLE IF NOT EXISTS web_runs (
     FOREIGN KEY (suite_id) REFERENCES suites(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_web_runs_suite_id ON web_runs(suite_id);
+CREATE TABLE IF NOT EXISTS checklists (
+    suite_id     TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    created_at   REAL NOT NULL,
+    FOREIGN KEY (suite_id) REFERENCES suites(id) ON DELETE CASCADE
+);
 """
 
 
@@ -141,6 +147,27 @@ def _load_suite_sync(suite_id: str) -> TestSuite | None:
     return TestSuite(suite_id=suite_id, test_cases=cases)
 
 
+def _load_suite_meta_sync(suite_id: str) -> dict | None:
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT id, feature_text, source_url, created_at, created_by "
+            "FROM suites WHERE id = ?",
+            (suite_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return {
+        "suite_id": row[0],
+        "feature_text": row[1],
+        "source_url": row[2],
+        "created_at": row[3],
+        "created_by": row[4],
+    }
+
+
 def _list_recent_sync(limit: int) -> list[dict]:
     conn = _connect()
     try:
@@ -198,6 +225,25 @@ async def load_suite(suite_id: str) -> dict:
         return {"error": None, "content": suite}
     except Exception as exc:
         logger.exception("suite_store.load_suite failed")
+        return {"error": str(exc), "content": None}
+
+
+async def load_suite_meta(suite_id: str) -> dict:
+    """Load a suite's stored ROW metadata by id. Returns {"content": dict|None}.
+
+    ``load_suite`` rebuilds the TestSuite from the persisted cases; this returns
+    the suite ROW instead (feature_text / source_url / created_at / created_by).
+    Exporters that need the originating ticket -- e.g. tools/zephyr_exporter.py,
+    whose Project / Issue columns come from the Jira story key -- read it here.
+    No schema change: every column already existed. Never raises.
+    """
+    try:
+        if not suite_id:
+            return {"error": None, "content": None}
+        row = await asyncio.to_thread(_load_suite_meta_sync, suite_id)
+        return {"error": None, "content": row}
+    except Exception as exc:
+        logger.exception("suite_store.load_suite_meta failed")
         return {"error": str(exc), "content": None}
 
 
@@ -317,4 +363,83 @@ async def load_web_run(run_id: str) -> dict:
         return {"error": None, "content": row}
     except Exception as exc:
         logger.exception("suite_store.load_web_run failed")
+        return {"error": str(exc), "content": None}
+
+
+# --------------------------------------------------------------------------- #
+# Atomic Requirements Checklist persistence (Batch 2)
+#
+# The checklist + its coverage audit are a DURABLE artifact, not an in-memory
+# intermediate: a coverage claim must stay re-auditable after the session ends.
+# --------------------------------------------------------------------------- #
+
+
+def _save_checklist_sync(suite_id: str, payload: dict) -> str:
+    now = time.time()
+    conn = _connect()
+    try:
+        with conn:  # transaction
+            # checklists.suite_id is an FK into suites and PRAGMA foreign_keys is
+            # ON, so a checklist for an in-session suite that was never persisted
+            # would raise IntegrityError and be silently dropped. Upsert a stub
+            # suites row first (INSERT OR IGNORE never touches an existing
+            # suite's feature_text) — same fix as _save_web_run_sync (M1-web).
+            conn.execute(
+                "INSERT OR IGNORE INTO suites (id, feature_text, created_at) "
+                "VALUES (?, '', ?)",
+                (suite_id, now),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO checklists "
+                "(suite_id, payload_json, created_at) VALUES (?, ?, ?)",
+                (suite_id, json.dumps(payload), now),
+            )
+        return suite_id
+    finally:
+        conn.close()
+
+
+def _load_checklist_sync(suite_id: str) -> dict | None:
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT payload_json FROM checklists WHERE suite_id = ?", (suite_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    try:
+        return json.loads(row[0])
+    except (ValueError, TypeError):
+        return None
+
+
+async def save_checklist(suite_id: str, payload: dict) -> dict:
+    """Persist a suite's atomic checklist + coverage audit. Never raises."""
+    try:
+        if not suite_id:
+            return {"error": "suite_id is required", "content": None}
+        await asyncio.to_thread(_save_checklist_sync, suite_id, payload or {})
+        logger.info(
+            "suite_store: saved checklist for suite %s (%d item(s))",
+            suite_id,
+            len((payload or {}).get("items") or []),
+        )
+        return {"error": None, "content": {"suite_id": suite_id}}
+    except Exception as exc:
+        logger.exception("suite_store.save_checklist failed")
+        return {"error": str(exc), "content": None}
+
+
+async def load_checklist(suite_id: str) -> dict:
+    """Load a suite's persisted checklist payload. Returns
+    ``{"content": dict|None}`` (None when unknown). Never raises."""
+    try:
+        if not suite_id:
+            return {"error": None, "content": None}
+        payload = await asyncio.to_thread(_load_checklist_sync, suite_id)
+        return {"error": None, "content": payload}
+    except Exception as exc:
+        logger.exception("suite_store.load_checklist failed")
         return {"error": str(exc), "content": None}
