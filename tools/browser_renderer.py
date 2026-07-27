@@ -128,6 +128,9 @@ async def _public_host_error(url: str) -> str | None:
     return error
 
 
+_PLAYWRIGHT_MISSING = False  # latched True after the first failed import
+
+
 async def render_page(url: str, capture_screenshot: bool = True) -> dict:
     """Render `url` in headless Chromium and return the fully rendered HTML.
 
@@ -143,6 +146,17 @@ async def render_page(url: str, capture_screenshot: bool = True) -> dict:
     """
     # SSRF guard: validate the target BEFORE spinning up a browser, and capture
     # the validated public IP so Chromium's own DNS can be pinned to it.
+    global _PLAYWRIGHT_MISSING
+    if _PLAYWRIGHT_MISSING:
+        logger.debug("render_page: playwright known missing — skipping render")
+        return {
+            "error": (
+                "Browser rendering is not available (Playwright is not "
+                "installed). Install it with `pip install -e '.[browser]'` and "
+                "run `playwright install chromium`."
+            ),
+            **_UNAVAILABLE_RESULT,
+        }
     hostname, validated_ip, block_reason = await _validate_public_host(url)
     if block_reason:
         logger.warning("render_page: refusing to render %s — %s", url, block_reason)
@@ -152,6 +166,7 @@ async def render_page(url: str, capture_screenshot: bool = True) -> dict:
         from playwright.async_api import Error as PlaywrightError
         from playwright.async_api import async_playwright
     except ImportError:
+        _PLAYWRIGHT_MISSING = True
         logger.warning(
             "render_page: playwright is not installed -- install the 'browser' "
             "extra (`pip install -e '.[browser]'` then `playwright install "
