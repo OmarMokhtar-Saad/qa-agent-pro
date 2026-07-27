@@ -1332,10 +1332,17 @@ async def _generate_for_category(
     model_override: str | None = None
     while attempt < max_attempts:
         try:
-            category_timeout = (
+            # The tuned constants are a FLOOR, not a ceiling: prompts have
+            # grown (parent story, RAG, checklist context) and a claude-CLI
+            # category call now legitimately needs 110-300s, so an operator
+            # who raised QA_LLM_TIMEOUT_S must not have this path silently
+            # SIGKILL work at 110s anyway (observed: all 8 categories killed
+            # at -9 and the run limping to the markdown fallback).
+            category_timeout = max(
                 _CATEGORY_TIMEOUT_FALLBACK_MODEL
                 if model_override
-                else _CATEGORY_TIMEOUT
+                else _CATEGORY_TIMEOUT,
+                int(getattr(settings, "qa_llm_timeout_s", 0) or 0),
             )
             suite: TestSuite = await asyncio.wait_for(
                 ask_json(
