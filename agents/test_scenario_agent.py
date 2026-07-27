@@ -218,6 +218,28 @@ class CategoryResult:
         return self.error is None
 
 
+def _summarize_category_failures(
+    failed: list["CategoryResult"], markdown_error: str
+) -> str:
+    """Best-effort, tester-readable reason for a total generation failure.
+
+    A CursorUsageLimitError takes priority over generic errors -- it means
+    retrying is guaranteed to fail again until the quota resets, which changes
+    what the tester should do next, so it must not be masked by whichever
+    category happened to fail first.
+    """
+    usage_limit = next(
+        (r.error for r in failed if isinstance(r.error, CursorUsageLimitError)),
+        None,
+    )
+    if usage_limit is not None:
+        return str(usage_limit)[:200]
+    if failed and failed[0].error is not None:
+        exc = failed[0].error
+        return f"{type(exc).__name__}: {exc}"[:200]
+    return markdown_error[:200]
+
+
 # Each entry: (category_name, what_to_cover, preferred_type_value)
 CATEGORIES: list[tuple[str, str, str]] = [
     (
@@ -3084,11 +3106,15 @@ async def generate_test_scenarios(
         markdown_raw = await ask(system=_SYSTEM_PROMPT_MARKDOWN + _GUARD, user=user_msg)
 
         if markdown_raw.startswith("Error:"):
-            logger.error("Markdown fallback also failed: %s", markdown_raw[:200])
+            reason = _summarize_category_failures(
+                failed, markdown_raw[len("Error:") :].strip()
+            )
+            logger.error("Markdown fallback also failed: %s", reason)
             return (
-                "Something went wrong while generating test cases — "
-                "please try again in a moment. "
-                "If the problem continues, try describing the feature in a bit more detail.",
+                f"Something went wrong while generating test cases: {reason}\n\n"
+                "If this looks like a quota, auth, or timeout issue, resolve that "
+                "first — otherwise try again in a moment, or describe the feature "
+                "in a bit more detail.",
                 "",
                 "",
                 "",

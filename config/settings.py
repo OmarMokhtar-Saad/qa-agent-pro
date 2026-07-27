@@ -172,6 +172,17 @@ class Settings(BaseSettings):
     # legacy first-available fallback as an escape hatch.
     qa_llm_strict_host: bool = True
 
+    # Test-generation orchestration mode (QA_GENERATION_MODE, default "server"
+    # per the defaults-OFF rule). "server" -> the MCP server runs the 8-category
+    # LLM fan-out through its own backend (byte-identical to before host mode).
+    # "host" -> the server returns a grounded prompt for the tester's OWN chat
+    # model (any MCP host) to generate, then validates the submitted JSON — no
+    # server-side API key/CLI/quota needed. "auto" -> reuse llm's host/backend
+    # detection (server when the host editor's own backend is usable, host
+    # otherwise), which also turns a hard LLMBackendUnavailableError into
+    # graceful degradation. Resolved by llm.resolve_generation_mode().
+    qa_generation_mode: str = "server"
+
     # Cheaper/faster model for the intent router's classification pass (T-04 /
     # I-027). Empty string means "use qa_llm_model" (no override). Set to a haiku
     # model to cut routing cost — the classifier is a tiny, low-stakes call.
@@ -821,6 +832,15 @@ class Settings(BaseSettings):
     # session-only, logged).
     qa_suite_store_path: str = "data/suites.db"
 
+    # Host-mode pending-generation store (tools/prep_store.py). A prep record
+    # (grounded prompt + checklist + category specs + bounds + provenance) is
+    # persisted between qa_prepare_test_cases and qa_submit_suite. TTL after
+    # which a prep record is expired on read, and the max serialized payload
+    # size accepted (a host cannot wedge the store with a pathological
+    # submission). Both never-raise-coerced as positive ints.
+    qa_prep_ttl_s: int = 3600
+    qa_prep_max_bytes: int = 4000000
+
     # Append-only audit log (LT-1 ph2). SQLite file recording key events (suite
     # generated, exported, pushed, bug reported) so multi-team deployments have a
     # trail. Never-raise; a failure degrades to no-audit, logged.
@@ -989,6 +1009,25 @@ class Settings(BaseSettings):
             return "default"
         return token
 
+    @field_validator("qa_generation_mode", mode="before")
+    @classmethod
+    def _coerce_generation_mode(cls, v: object) -> str:
+        """Lenient enum coercer for QA_GENERATION_MODE (server|host|auto).
+
+        Mirrors _coerce_model_tier: an unrecognised value is logged at WARNING
+        and replaced with "server" (the defaults-OFF choice) rather than raising
+        or wedging the setting into a value resolve_generation_mode can't read.
+        """
+        token = str(v).strip().lower() if v is not None else "server"
+        if token not in ("server", "host", "auto"):
+            logger.warning(
+                "Invalid QA_GENERATION_MODE=%r -- expected server/host/auto; "
+                "using server",
+                v,
+            )
+            return "server"
+        return token
+
     @field_validator("qa_rag_similarity_threshold", mode="before")
     @classmethod
     def _coerce_threshold(cls, v: object) -> float:
@@ -1128,6 +1167,8 @@ class Settings(BaseSettings):
         "qa_llm_max_tokens_category",
         "qa_llm_max_tokens_critic",
         "qa_llm_max_tokens_rewrite",
+        "qa_prep_ttl_s",
+        "qa_prep_max_bytes",
         mode="before",
     )
     @classmethod

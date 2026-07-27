@@ -416,6 +416,44 @@ def _backend() -> str:
     return value
 
 
+def resolve_generation_mode() -> str:
+    """Resolve the effective test-generation mode ('server' or 'host').
+
+    QA_GENERATION_MODE (default "server", per the defaults-OFF rule) selects
+    WHERE the 8-category LLM fan-out runs:
+
+    * "server" -> the MCP server generates through its own backend. Byte-
+      identical to the behaviour before host mode existed.
+    * "host"   -> the server returns a grounded prompt for the tester's OWN chat
+      model (any MCP host) to generate, then validates the submitted JSON.
+    * "auto"   -> reuse this module's host/backend detection: server mode ONLY
+      when the tester's own host EDITOR (Cursor / Claude Code / Desktop) has a
+      usable, host-matched backend; an unknown host (ChatGPT / Kimi / Gemini) or
+      an unusable/quota-dead backend degrades to host mode. This is the graceful
+      alternative to LLMBackendUnavailableError — it never raises.
+
+    QA_LLM_STRICT_HOST is respected in auto mode: with it OFF, an unknown host
+    that has ANY usable backend may still pick server mode (legacy fallback).
+    Never raises; an unrecognised value degrades to "server".
+    """
+    mode = (getattr(settings, "qa_generation_mode", "server") or "server").strip().lower()
+    if mode in ("server", "host"):
+        return mode
+    if mode != "auto":
+        logger.warning("Unknown QA_GENERATION_MODE=%r — using 'server'", mode)
+        return "server"
+    host = _HOST_CLIENT["name"]
+    if "cursor" in host and _cursor_usable():
+        return "server"
+    if "claude" in host and _cli_usable():
+        return "server"
+    if not _strict_host_enabled() and (
+        _cli_usable() or _cursor_usable() or bool(settings.anthropic_api_key)
+    ):
+        return "server"
+    return "host"
+
+
 # --------------------------------------------------------------------------- #
 # Shared JSON helpers (backend-agnostic)
 # --------------------------------------------------------------------------- #
@@ -589,7 +627,11 @@ def _start_stderr_drain(proc: subprocess.Popen) -> tuple[threading.Thread, list[
 
 def _run_sync(system: str, user: str, model: str | None = None) -> str:
     """Run claude CLI in streaming JSON mode, reassemble full text. Runs in a thread."""
-    proc = _popen_cli(system, user, model)
+    try:
+        proc = _popen_cli(system, user, model)
+    except Exception as exc:
+        logger.error("claude CLI failed to start: %s", exc)
+        return f"Error: claude CLI failed to start: {exc}"
     stderr_thread, stderr_chunks = _start_stderr_drain(proc)
 
     parts: list[str] = []
@@ -659,7 +701,12 @@ def _stream_tokens_sync(
     model: str | None = None,
 ) -> None:
     """Run claude CLI and forward each text delta into queue. Puts None sentinel when done."""
-    proc = _popen_cli(system, user, model)
+    try:
+        proc = _popen_cli(system, user, model)
+    except Exception as exc:
+        logger.error("claude CLI failed to start: %s", exc)
+        loop.call_soon_threadsafe(queue.put_nowait, None)
+        return
     if proc_ref is not None:
         proc_ref.append(proc)
 
