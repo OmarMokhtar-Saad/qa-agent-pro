@@ -5,6 +5,7 @@ import json
 import logging
 import random
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Literal
 from urllib.parse import urlparse
@@ -16,6 +17,7 @@ from config.settings import settings
 from llm import (
     CursorAgentError,
     CursorUsageLimitError,
+    LLMStalledError,
     ask,
     ask_json,
     ask_vision,
@@ -159,6 +161,12 @@ _RETRYABLE: tuple[type[Exception], ...] = (
     # CLI issue (see llm.CursorAgentError). A fresh retry (brand-new process/
     # session) frequently succeeds, so treat it as transient like the others.
     CursorAgentError,
+    # A backend that stopped producing output for QA_CATEGORY_STALL_S x
+    # QA_CATEGORY_STALL_STRIKES is treated as a dead subprocess, and a fresh
+    # process frequently succeeds -- so it earns the same single bounded retry
+    # the old bare TimeoutError did. RuntimeError is NOT otherwise in this tuple,
+    # so this addition is required rather than incidental.
+    LLMStalledError,
 )
 
 
@@ -173,6 +181,16 @@ def _retry_delay_seconds(attempt: int) -> float:
     RNG so tests stay deterministic without needing to reseed anything.
     """
     return _RETRY_BACKOFF_BASE_S * attempt + random.uniform(0, _RETRY_BACKOFF_JITTER_S)
+
+
+def _resolve_category_ceiling() -> int:
+    """Per-call ceiling for a generation LLM call, in seconds.
+
+    Exactly the expression the primary category call site already computes, hoisted
+    so the coverage-critic calls can share it: the tuned constant is a FLOOR, and an
+    operator who raised QA_LLM_TIMEOUT_S must not have it silently undercut.
+    """
+    return max(_CATEGORY_TIMEOUT, int(getattr(settings, "qa_llm_timeout_s", 0) or 0))
 
 
 def _resolve_max_concurrency() -> int:
@@ -1365,19 +1383,31 @@ async def _generate_for_category(
                 else _CATEGORY_TIMEOUT,
                 int(getattr(settings, "qa_llm_timeout_s", 0) or 0),
             )
-            suite: TestSuite = await asyncio.wait_for(
-                ask_json(
-                    system=system,
-                    user=user_msg,
-                    response_model=response_model,
-                    on_progress=on_progress,
-                    model=model_override,
-                    user_suffix=user_suffix,
-                    cache_prefix=cache_on,
-                    max_tokens=resolve_max_tokens_tier("category"),
-                ),
-                timeout=category_timeout,
-            )
+            _t0 = time.monotonic()
+            try:
+                suite: TestSuite = await asyncio.wait_for(
+                    ask_json(
+                        system=system,
+                        user=user_msg,
+                        response_model=response_model,
+                        on_progress=on_progress,
+                        model=model_override,
+                        user_suffix=user_suffix,
+                        cache_prefix=cache_on,
+                        max_tokens=resolve_max_tokens_tier("category"),
+                    ),
+                    timeout=category_timeout,
+                )
+            except asyncio.TimeoutError as exc:
+                # asyncio.TimeoutError carries an EMPTY message, so the operator log
+                # read "failed after 2 attempts -- TimeoutError: " with nothing after
+                # the colon. Re-raise the same (still-retryable) type with the facts.
+                # Caught by the existing outer `except _RETRYABLE`, so retry counts
+                # are unchanged.
+                raise asyncio.TimeoutError(
+                    f"category '{category_name}' hit the {category_timeout:.0f}s "
+                    f"ceiling (elapsed {time.monotonic() - _t0:.0f}s)"
+                ) from exc
             logger.info(
                 "Category '%s': %d cases (attempt %d)",
                 category_name,
@@ -1907,12 +1937,19 @@ async def critique_coverage(
             else ""
         )
         user_msg = f"Feature: {feature_text}\n\nTest cases:\n{tc_lines}{ac_lines}"
-        return await ask_json(
-            system=_STRUCTURED_CRITIC_SYSTEM,
-            user=user_msg,
-            response_model=CoverageCritique,
-            model=settings.qa_classifier_model or None,
-            max_tokens=resolve_max_tokens_tier("critic"),
+        # Bounded: this call had NO deadline of any kind, and _ask_json_cli has no
+        # internal timeout, so a CLI holding the pipe open streamed forever. A
+        # TimeoutError is an Exception, so the handler below degrades it to
+        # verdict="complete" exactly like every other critic failure.
+        return await asyncio.wait_for(
+            ask_json(
+                system=_STRUCTURED_CRITIC_SYSTEM,
+                user=user_msg,
+                response_model=CoverageCritique,
+                model=settings.qa_classifier_model or None,
+                max_tokens=resolve_max_tokens_tier("critic"),
+            ),
+            timeout=_resolve_category_ceiling(),
         )
     except Exception:
         logger.warning("critique_coverage failed — treating as complete", exc_info=True)
@@ -2023,10 +2060,15 @@ async def critique_and_fill_gaps(
             + rtm_hint
             + _GUARD
         )
-        return await ask_json(
-            system=system,
-            user=merged_user,
-            response_model=_CritiqueAndFillSuite,
+        # Bounded for the same reason as critique_coverage -- and this is the branch
+        # QA_COVERAGE_REGEN_MERGE_CALLS=true actually runs, on every generation.
+        return await asyncio.wait_for(
+            ask_json(
+                system=system,
+                user=merged_user,
+                response_model=_CritiqueAndFillSuite,
+            ),
+            timeout=_resolve_category_ceiling(),
         )
     except Exception:
         logger.warning(

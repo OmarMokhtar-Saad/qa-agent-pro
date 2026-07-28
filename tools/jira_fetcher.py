@@ -289,15 +289,132 @@ def _extract_image_attachments(fields: dict) -> list[dict]:
         return []
 
 
+# Jira Cloud does not serve attachment bytes from the Jira host: it answers
+# /rest/api/3/attachment/content/{id} with a 303 to its media service at a
+# PRE-SIGNED URL. Probed 2026-07-28 against a real ticket: api.media.atlassian.com
+# returns 200 image/png (113354 bytes, "\x89PNG" magic) for the signed URL with NO
+# credentials at all -- which is why the followed hop must NOT carry our Basic
+# Auth header. Exact-hostname match only: it defeats suffix confusion
+# ("api.media.atlassian.com.evil.com") and userinfo tricks
+# ("https://api.media.atlassian.com@evil.com", whose .hostname is "evil.com").
+_ATTACHMENT_REDIRECT_HOSTS = frozenset({"api.media.atlassian.com"})
+
+
+def _allowed_attachment_redirect(location: str) -> bool:
+    """True only for an https attachment redirect to an allowlisted media host
+    (or back to the configured Jira host itself). Never raises.
+
+    A name check ALONE is not sufficient and is never used alone -- callers must
+    also run _validate_public_url + PinnedIPTransport, because a hostile or
+    split-horizon resolver can point an allowlisted NAME at a private address.
+    """
+    try:
+        parsed = urlparse(location)
+        if parsed.scheme != "https" or not parsed.hostname:
+            return False
+        host = parsed.hostname.lower()
+        if host in _ATTACHMENT_REDIRECT_HOSTS:
+            return True
+        jira_host = (urlparse(settings.jira_base_url).hostname or "").lower()
+        return bool(jira_host) and host == jira_host
+    except Exception:
+        logger.debug("Attachment redirect validation failed", exc_info=True)
+        return False
+
+
+async def _fetch_signed_media(location: str, attachment_url: str) -> bytes | None:
+    """Fetch a PRE-SIGNED Jira media URL and return its raw bytes.
+
+    Full parity with _fetch_one_hop's discipline, because a new outbound hop in
+    this module must not get weaker checks than the ones it already makes:
+    exact-hostname allowlist, _validate_public_url (scheme + DNS + every
+    resolved answer must be is_global), and PinnedIPTransport so a second
+    resolution at connect time cannot be rebound to a private address after the
+    check passed. Sends NO auth header -- the URL is already signed, and
+    forwarding Jira Basic Auth off-host is precisely what
+    _download_jira_attachment's follow_redirects=False exists to prevent.
+
+    Never raises; returns None on refusal, transport failure, non-200, a
+    text/JSON body, or an oversized body. Logs the HOSTNAME only: the signed
+    query string is a bearer credential and must never reach the log.
+    """
+    refused_host = urlparse(location).hostname or "?"
+    if not _allowed_attachment_redirect(location):
+        logger.warning(
+            "Refusing Jira attachment redirect to a disallowed target (host=%s) for %s",
+            refused_host,
+            attachment_url,
+        )
+        return None
+    try:
+        hostname, pinned_ip, ssrf_error = await _validate_public_url(location)
+        if ssrf_error or not hostname or not pinned_ip:
+            logger.warning(
+                "Refusing Jira attachment redirect (host=%s): %s",
+                refused_host,
+                ssrf_error or "host did not resolve",
+            )
+            return None
+        async with httpx.AsyncClient(
+            timeout=20,
+            follow_redirects=False,
+            transport=PinnedIPTransport(hostname, pinned_ip),
+        ) as media:
+            # No auth= here, deliberately. See the docstring.
+            resp = await media.get(location)
+            if resp.status_code != 200:
+                logger.warning(
+                    "Jira media fetch returned HTTP %d (host=%s) -- not following further",
+                    resp.status_code,
+                    hostname,
+                )
+                return None
+            ctype = str(resp.headers.get("content-type") or "").lower()
+            if ctype.startswith("text/") or ctype.startswith("application/json"):
+                logger.warning(
+                    "Jira media fetch returned non-image content-type %r (host=%s)",
+                    ctype,
+                    hostname,
+                )
+                return None
+            declared = str(resp.headers.get("content-length") or "")
+            if declared.isdigit() and int(declared) > settings.jira_max_image_bytes:
+                logger.info(
+                    "Jira media response declares %s bytes -- over the cap, discarding",
+                    declared,
+                )
+                return None
+            content = resp.content
+        if len(content) > settings.jira_max_image_bytes:
+            logger.info(
+                "Jira media body exceeded the size cap (%d bytes) -- discarding",
+                len(content),
+            )
+            return None
+        return content
+    except Exception:
+        logger.exception("Jira media fetch failed (host=%s)", refused_host)
+        return None
+
+
 async def _download_jira_attachment(url: str) -> bytes | None:
     """Download an authenticated Jira attachment's raw bytes.
 
     Refuses any URL not on the configured Jira host — defense in depth so a
-    malicious/compromised API response could never redirect this call's Basic
-    Auth credentials to an attacker-controlled host (mirrors the SSRF
-    discipline the rest of this module applies to generic URL fetches).
-    Redirects are disabled outright for the same reason. Never raises —
-    returns None on any failure, oversized body, or host mismatch.
+    malicious/compromised API response could never send this call's Basic Auth
+    credentials to an attacker-controlled host (mirrors the SSRF discipline the
+    rest of this module applies to generic URL fetches).
+
+    httpx redirect following stays DISABLED for that same reason: a redirect
+    must never carry the Authorization header to a new host. Jira Cloud,
+    however, serves attachment bytes only via a 303 to a PRE-SIGNED URL on its
+    media service, so refusing the hop outright silently dropped EVERY ticket
+    screenshot. Exactly ONE hop is therefore followed by hand, via
+    _fetch_signed_media: allowlisted hostname, _validate_public_url, IP-pinned,
+    and with NO auth header. The followed response is never itself followed.
+
+    Never raises — returns None on any failure, oversized body, host mismatch,
+    or refused redirect.
     """
     try:
         jira_host = urlparse(settings.jira_base_url).hostname
@@ -310,6 +427,21 @@ async def _download_jira_attachment(url: str) -> bytes | None:
             resp = await client.get(
                 url, auth=(settings.jira_email, settings.jira_api_token)
             )
+            # Reuses the module-level _REDIRECT_STATUSES that already drives
+            # _follow_redirects_with_pinning -- deliberately NOT a second
+            # definition, which would silently shadow it in SSRF-critical code.
+            if resp.status_code in _REDIRECT_STATUSES:
+                location = str(resp.headers.get("location") or "")
+                if not location:
+                    logger.warning(
+                        "Jira attachment redirect carried no Location header for %s",
+                        url,
+                    )
+                    return None
+                # A relative Location is legal (RFC 7231) and common behind a
+                # Jira DC reverse proxy: resolve it against the attachment URL
+                # BEFORE validation, or it would be refused as scheme-less.
+                return await _fetch_signed_media(urljoin(url, location), url)
         if resp.status_code != 200:
             logger.warning(
                 "Jira attachment download HTTP %d for %s", resp.status_code, url

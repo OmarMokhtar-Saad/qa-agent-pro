@@ -65,6 +65,9 @@ _POSITIVE_INT_FIELDS = frozenset(
         "qa_llm_max_tokens_category",
         "qa_llm_max_tokens_critic",
         "qa_llm_max_tokens_rewrite",
+        # NB: qa_category_stall_s is intentionally ABSENT -- 0 is its documented
+        # kill-switch, and membership here would rewrite it to the default.
+        "qa_category_stall_strikes",
     }
 )
 
@@ -147,6 +150,22 @@ class Settings(BaseSettings):
     # 120 suits dev; distribution installs ship 300 in .env (grounded prompts
     # + concurrent category fan-out through a local CLI can run long).
     qa_llm_timeout_s: int = 120
+
+    # Liveness (stall) detection for the streaming cli/cursor backends. The
+    # per-category deadline above cannot tell "slow but streaming" from "wedged",
+    # so it killed categories that were actively producing output (measured
+    # 2026-07-28 on a real ticket: 6 of 8 categories dropped, all mid-stream).
+    # These bound SILENCE instead of elapsed time: llm._ask_json_cli waits this
+    # long for the next token, and gives up only after this many consecutive
+    # idle windows.
+    #
+    # ON by default -- unlike a new capability, this repairs a default-path
+    # defect, and it also aborts a genuinely dead subprocess SOONER than the
+    # deadline did. 0 disables detection entirely (the kill-switch), which is why
+    # qa_category_stall_s is deliberately kept OUT of _POSITIVE_INT_FIELDS;
+    # llm._resolve_stall_policy clamps negatives at the point of use.
+    qa_category_stall_s: int = 120
+    qa_category_stall_strikes: int = 3
 
     # Model id for the "cursor" backend (e.g. "sonnet-4", "gpt-5"). Uses
     # cursor-agent's own model naming, which differs from qa_llm_model's.
@@ -1169,6 +1188,8 @@ class Settings(BaseSettings):
         "qa_llm_max_tokens_rewrite",
         "qa_prep_ttl_s",
         "qa_prep_max_bytes",
+        "qa_category_stall_s",
+        "qa_category_stall_strikes",
         mode="before",
     )
     @classmethod

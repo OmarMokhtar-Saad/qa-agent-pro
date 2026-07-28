@@ -54,6 +54,7 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Awaitable, Callable, Literal, Type, TypeVar
 
 from pydantic import BaseModel
@@ -107,6 +108,89 @@ def _cursor_error(message: str) -> CursorAgentError:
     if "usage limit" in lowered or "actionrequirederror" in lowered:
         return CursorUsageLimitError(message)
     return CursorAgentError(message)
+
+
+class LLMStalledError(RuntimeError):
+    """A streaming backend stopped producing output long enough to be dead.
+
+    Deliberately NOT a subclass of TimeoutError: on Python >=3.11 that IS
+    asyncio.TimeoutError, so this would be swallowed by the `except
+    asyncio.TimeoutError` handlers in this module. Deliberately NOT a
+    CursorAgentError either -- that would grant 4 attempts per category via
+    agents.test_scenario_agent._MAX_RETRIES_LOOP_GUARD. agents/ adds it to
+    _RETRYABLE explicitly so a stall earns exactly one retry.
+    """
+
+
+# Streaming workers get their OWN thread pool. run_in_executor(None, ...) is the
+# SHARED default pool that asyncio.to_thread also uses (_ask_cli, _ask_cursor, the
+# vision path, rtm.match_checklist), so a worker that cannot be reaped there
+# retires a slot forever -- after min(32, cpu+4) of them the whole process
+# deadlocks on every to_thread call, with no log at that point. Sized above every
+# concurrent streaming caller: the category fan-out is capped at _MAX_CONCURRENCY
+# = 3, len(CATEGORIES) = 8 bounds it if that is ever raised, plus headroom for the
+# enrichment gather and for leaked slots. A pool that is too SMALL is not merely
+# slow: a queued worker emits no tokens, which the stall detector below would
+# otherwise misread as a dead subprocess (hence the explicit "started" signal).
+# Never shut down (module-level, long-lived MCP server); its threads are
+# non-daemon, so a worker still blocked in proc.wait() can delay interpreter exit
+# -- bounded by _REAP_TIMEOUT_S on every abort path.
+_STREAM_EXECUTOR_WORKERS = 12
+_STREAM_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_STREAM_EXECUTOR_WORKERS, thread_name_prefix="qa-llm-stream"
+)
+_CURSOR_MIN_SILENCE_S = 540.0  # > the ~460s cursor-agent usage-limit event
+_REAP_TIMEOUT_S = 20.0
+_leaked_stream_workers = 0
+
+
+def _resolve_stall_policy(backend: str) -> tuple[float, int]:
+    """(idle-scan window seconds, strikes) for a streaming backend. Never raises.
+
+    Takes the backend as an ARGUMENT rather than calling _backend(), which can
+    raise LLMBackendUnavailableError via _auto_backend() -- and so a test driving
+    _ask_json_cli directly is unaffected by whichever backend is configured.
+
+    cursor-agent needs a LONGER window than cli: it takes ~460s to surface its
+    usage-limit error (measured). Aborting before that arrives would bypass the
+    CursorUsageLimitError no-retry shortcut in agents/test_scenario_agent.py and
+    replace an actionable "quota exhausted" with "no output for 360s" plus a
+    burned retry. Constant parity across backends is not behavioural parity.
+    """
+    # qa_category_stall_s is deliberately OUTSIDE settings._POSITIVE_INT_FIELDS so
+    # that 0 survives as the documented kill-switch -- which also means a negative
+    # value arrives unfloored. Unclamped, asyncio.wait_for(timeout=-5) times out
+    # INSTANTLY: three instant strikes on every category, both attempts, every
+    # run. Clamp here, where the value is consumed.
+    stall_s = max(0.0, float(getattr(settings, "qa_category_stall_s", 120) or 0))
+    strikes = max(1, int(getattr(settings, "qa_category_stall_strikes", 3) or 3))
+    if not stall_s:
+        return 0.0, strikes
+    if backend == "cursor":
+        while stall_s * strikes < _CURSOR_MIN_SILENCE_S:
+            strikes += 1
+    return stall_s, strikes
+
+
+def _has_complete_json(parts: list[str]) -> bool:
+    """True if the accumulated stream already holds a balanced JSON object.
+
+    Distinguishes "the model finished writing and the subprocess is merely slow to
+    exit" from "the stream died mid-object". Only the first balanced span is
+    needed, and _balanced_json_spans carries its own visit budget, so this cannot
+    become a hot scan on a long stream. Never raises.
+
+    This is what makes salvaging safe: breaking out on ANY received output would
+    hand truncated text to _parse_json_response, whose JSONDecodeError is itself
+    retryable -- so the retry would burn exactly as it does today while the log
+    blamed a parse error instead of the stall that actually happened.
+    """
+    try:
+        for _ in _balanced_json_spans("".join(parts)):
+            return True
+    except Exception:
+        logger.debug("balanced-JSON probe failed", exc_info=True)
+    return False
 
 
 class LLMBackendUnavailableError(RuntimeError):
@@ -182,7 +266,9 @@ def resolve_tiered_model(site_override: str) -> str | None:
     return None
 
 
-def resolve_max_tokens_tier(tier: Literal["category", "critic", "rewrite"]) -> int | None:
+def resolve_max_tokens_tier(
+    tier: Literal["category", "critic", "rewrite"],
+) -> int | None:
     """Per-call-type max_tokens ceiling (QA_MAX_TOKENS_TIERING_ENABLED, opt-in).
 
     Returns None when the master flag is OFF (the default), so ask()/ask_json()
@@ -200,7 +286,6 @@ def resolve_max_tokens_tier(tier: Literal["category", "critic", "rewrite"]) -> i
     if tier == "rewrite":
         return settings.qa_llm_max_tokens_rewrite
     return settings.qa_llm_max_tokens_category
-
 
 
 # --------------------------------------------------------------------------- #
@@ -436,7 +521,9 @@ def resolve_generation_mode() -> str:
     that has ANY usable backend may still pick server mode (legacy fallback).
     Never raises; an unrecognised value degrades to "server".
     """
-    mode = (getattr(settings, "qa_generation_mode", "server") or "server").strip().lower()
+    mode = (
+        (getattr(settings, "qa_generation_mode", "server") or "server").strip().lower()
+    )
     if mode in ("server", "host"):
         return mode
     if mode != "auto":
@@ -810,16 +897,64 @@ async def _ask_json_cli(
     loop = asyncio.get_running_loop()
     token_queue: asyncio.Queue[str | None] = asyncio.Queue()
     proc_ref: list[subprocess.Popen] = []
-    fut = loop.run_in_executor(
-        None, _stream_tokens_sync, system, user, loop, token_queue, proc_ref, model
+    # submit() rather than run_in_executor() so the consumer can distinguish a
+    # worker that is still QUEUED from one that is running: a queued worker emits
+    # no tokens through no fault of the model, and must never be reported as a
+    # dead subprocess.
+    _cf = _STREAM_EXECUTOR.submit(
+        _stream_tokens_sync, system, user, loop, token_queue, proc_ref, model
     )
+    fut = asyncio.wrap_future(_cf)
 
     parts: list[str] = []
     buf = ""
     tc_count = 0
+    stall_s, max_strikes = _resolve_stall_policy("cli")
+    strikes = 0
+    reaped = False
     try:
         while True:
-            token = await token_queue.get()
+            if stall_s:
+                try:
+                    token = await asyncio.wait_for(token_queue.get(), timeout=stall_s)
+                except asyncio.TimeoutError:
+                    strikes += 1
+                    logger.warning(
+                        "%s backend produced no output for %.0fs (idle check %d of %d)",
+                        "cli",
+                        stall_s,
+                        strikes,
+                        max_strikes,
+                    )
+                    if strikes >= max_strikes:
+                        # Saturated pool, not a dead model: a worker that never
+                        # left the queue cannot have produced anything.
+                        if not _cf.running() and not _cf.done():
+                            raise LLMStalledError(
+                                "backend worker never started -- the streaming "
+                                "executor is saturated (not a model failure)"
+                            ) from None
+                        # The sentinel is only sent from the worker's finally,
+                        # i.e. AFTER proc.wait(timeout=_TIMEOUT_S). So a model
+                        # that already finished writing looks idle during
+                        # teardown. Salvage ONLY when a complete JSON object is
+                        # already in hand -- see _has_complete_json.
+                        if _has_complete_json(parts):
+                            logger.info(
+                                "stalled after a complete JSON object arrived "
+                                "(%d chunks) -- parsing it instead of retrying",
+                                len(parts),
+                            )
+                            break
+                        raise LLMStalledError(
+                            f"no output for {stall_s * max_strikes:.0f}s "
+                            f"({max_strikes} consecutive idle checks) -- "
+                            f"treating the subprocess as dead"
+                        ) from None
+                    continue
+                strikes = 0
+            else:
+                token = await token_queue.get()
             if token is None:
                 break
             parts.append(token)
@@ -835,19 +970,57 @@ async def _ask_json_cli(
                 # Keep only the last len(marker)-1 chars so a marker straddling
                 # the boundary is counted exactly once on the next iteration.
                 buf = combined[-(len(marker) - 1) :]
-        await fut  # propagate any thread exception
+        # Bound the wait for the worker to RETURN: it is still inside
+        # proc.wait(timeout=_TIMEOUT_S), which with a raised QA_LLM_TIMEOUT_S
+        # collides exactly with the caller's category ceiling -- unbounded, it
+        # lets a fully streamed suite be cancelled and discarded. Fast teardown
+        # still propagates worker exceptions normally, which is load-bearing
+        # for the cursor backend's _cursor_error raise.
+        try:
+            await asyncio.wait_for(asyncio.shield(fut), timeout=_REAP_TIMEOUT_S)
+            reaped = True
+        except asyncio.TimeoutError:
+            if proc_ref and proc_ref[0].poll() is None:
+                proc_ref[0].kill()
+            if not parts:
+                raise LLMStalledError(
+                    f"stream ended with no output and the process did not "
+                    f"exit within {_REAP_TIMEOUT_S:.0f}s"
+                ) from None
+            logger.warning(
+                "stream ended but the process did not exit within %.0fs -- "
+                "killed it and parsing the %d chunks already received",
+                _REAP_TIMEOUT_S,
+                len(parts),
+            )
     finally:
         # Kill subprocess immediately on cancellation/timeout so it doesn't become a
         # zombie that competes with the next retry attempt.
         if proc_ref and proc_ref[0].poll() is None:
             proc_ref[0].kill()
-        # Reap the executor worker so a cancelled/timed-out call doesn't orphan
-        # the thread (NB-008). shield() lets the worker finish even if we were
-        # cancelled; its own exceptions are irrelevant here (already handled or
-        # propagated on the normal path above).
-        if not fut.done():
+        # Bounded reap. Two reasons this must not be an unbounded await:
+        # (1) proc_ref is empty until _stream_tokens_sync appends to it, so if
+        #     _popen_cli itself HANGS nothing above kills anything and this would
+        #     block forever -- the LLMStalledError would never surface.
+        # (2) the worker may still be inside proc.wait(timeout=_TIMEOUT_S).
+        # run_in_executor/submit futures cannot be cancelled once running, so a
+        # timeout is the only option; the worker is then leaked deliberately and
+        # LOUDLY, and it can only consume a slot in our own _STREAM_EXECUTOR
+        # rather than the shared pool asyncio.to_thread depends on.
+        if not reaped and not fut.done():
             try:
-                await asyncio.shield(fut)
+                await asyncio.wait_for(asyncio.shield(fut), timeout=_REAP_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                global _leaked_stream_workers
+                _leaked_stream_workers += 1
+                logger.error(
+                    "backend worker did not exit within %.0fs after abort -- leaking "
+                    "it (%d leaked this process, pool size %d); restart the server if "
+                    "this approaches the pool size",
+                    _REAP_TIMEOUT_S,
+                    _leaked_stream_workers,
+                    _STREAM_EXECUTOR_WORKERS,
+                )
             except Exception:
                 pass
 
@@ -1982,8 +2155,8 @@ async def _ask_json_cursor(
     loop = asyncio.get_running_loop()
     token_queue: asyncio.Queue[str | None] = asyncio.Queue()
     proc_ref: list[subprocess.Popen] = []
-    fut = loop.run_in_executor(
-        None,
+    # See _ask_json_cli: submit() lets the consumer tell QUEUED from running.
+    _cf = _STREAM_EXECUTOR.submit(
         _stream_tokens_sync_cursor,
         system,
         user,
@@ -1992,13 +2165,57 @@ async def _ask_json_cursor(
         proc_ref,
         model,
     )
+    fut = asyncio.wrap_future(_cf)
 
     parts: list[str] = []
     buf = ""
     tc_count = 0
+    stall_s, max_strikes = _resolve_stall_policy("cursor")
+    strikes = 0
+    reaped = False
     try:
         while True:
-            token = await token_queue.get()
+            if stall_s:
+                try:
+                    token = await asyncio.wait_for(token_queue.get(), timeout=stall_s)
+                except asyncio.TimeoutError:
+                    strikes += 1
+                    logger.warning(
+                        "%s backend produced no output for %.0fs (idle check %d of %d)",
+                        "cursor",
+                        stall_s,
+                        strikes,
+                        max_strikes,
+                    )
+                    if strikes >= max_strikes:
+                        # Saturated pool, not a dead model: a worker that never
+                        # left the queue cannot have produced anything.
+                        if not _cf.running() and not _cf.done():
+                            raise LLMStalledError(
+                                "backend worker never started -- the streaming "
+                                "executor is saturated (not a model failure)"
+                            ) from None
+                        # The sentinel is only sent from the worker's finally,
+                        # i.e. AFTER proc.wait(timeout=_TIMEOUT_S). So a model
+                        # that already finished writing looks idle during
+                        # teardown. Salvage ONLY when a complete JSON object is
+                        # already in hand -- see _has_complete_json.
+                        if _has_complete_json(parts):
+                            logger.info(
+                                "stalled after a complete JSON object arrived "
+                                "(%d chunks) -- parsing it instead of retrying",
+                                len(parts),
+                            )
+                            break
+                        raise LLMStalledError(
+                            f"no output for {stall_s * max_strikes:.0f}s "
+                            f"({max_strikes} consecutive idle checks) -- "
+                            f"treating the subprocess as dead"
+                        ) from None
+                    continue
+                strikes = 0
+            else:
+                token = await token_queue.get()
             if token is None:
                 break
             parts.append(token)
@@ -2010,13 +2227,55 @@ async def _ask_json_cursor(
                     tc_count = min(tc_count + new_hits, _PROGRESS_TC_COUNT_CAP)
                     await on_progress(tc_count)
                 buf = combined[-(len(marker) - 1) :]
-        await fut  # propagate any thread exception
+        # Bound the wait for the worker to RETURN: it is still inside
+        # proc.wait(timeout=_TIMEOUT_S), which with a raised QA_LLM_TIMEOUT_S
+        # collides exactly with the caller's category ceiling -- unbounded, it
+        # lets a fully streamed suite be cancelled and discarded. Fast teardown
+        # still propagates worker exceptions normally, which is load-bearing
+        # for the cursor backend's _cursor_error raise.
+        try:
+            await asyncio.wait_for(asyncio.shield(fut), timeout=_REAP_TIMEOUT_S)
+            reaped = True
+        except asyncio.TimeoutError:
+            if proc_ref and proc_ref[0].poll() is None:
+                proc_ref[0].kill()
+            if not parts:
+                raise LLMStalledError(
+                    f"stream ended with no output and the process did not "
+                    f"exit within {_REAP_TIMEOUT_S:.0f}s"
+                ) from None
+            logger.warning(
+                "stream ended but the process did not exit within %.0fs -- "
+                "killed it and parsing the %d chunks already received",
+                _REAP_TIMEOUT_S,
+                len(parts),
+            )
     finally:
         if proc_ref and proc_ref[0].poll() is None:
             proc_ref[0].kill()
-        if not fut.done():
+        # Bounded reap. Two reasons this must not be an unbounded await:
+        # (1) proc_ref is empty until _stream_tokens_sync appends to it, so if
+        #     _popen_cli itself HANGS nothing above kills anything and this would
+        #     block forever -- the LLMStalledError would never surface.
+        # (2) the worker may still be inside proc.wait(timeout=_TIMEOUT_S).
+        # run_in_executor/submit futures cannot be cancelled once running, so a
+        # timeout is the only option; the worker is then leaked deliberately and
+        # LOUDLY, and it can only consume a slot in our own _STREAM_EXECUTOR
+        # rather than the shared pool asyncio.to_thread depends on.
+        if not reaped and not fut.done():
             try:
-                await asyncio.shield(fut)
+                await asyncio.wait_for(asyncio.shield(fut), timeout=_REAP_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                global _leaked_stream_workers
+                _leaked_stream_workers += 1
+                logger.error(
+                    "backend worker did not exit within %.0fs after abort -- leaking "
+                    "it (%d leaked this process, pool size %d); restart the server if "
+                    "this approaches the pool size",
+                    _REAP_TIMEOUT_S,
+                    _leaked_stream_workers,
+                    _STREAM_EXECUTOR_WORKERS,
+                )
             except Exception:
                 pass
 
@@ -2539,13 +2798,9 @@ async def ask_json(
                 max_tokens,
             )
         elif backend == "cursor":
-            raw = await _ask_json_cursor(
-                json_system, combined_user, on_progress, model
-            )
+            raw = await _ask_json_cursor(json_system, combined_user, on_progress, model)
         else:
-            raw = await _ask_json_cli(
-                json_system, combined_user, on_progress, model
-            )
+            raw = await _ask_json_cli(json_system, combined_user, on_progress, model)
     except Exception:
         _emit_generation(
             "ask_json",
