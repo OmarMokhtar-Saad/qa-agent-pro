@@ -2229,6 +2229,13 @@ async def handle_submit_suite(
             # regeneration round is the tester's chat model's job, and a dead
             # fixed backend would otherwise stall this call for minutes.
             remediate=False,
+            # Same reasoning for the vague-field REWRITE, a SECOND server-side
+            # ask_json inside _finalize_generation: host mode's premise is that the
+            # server needs no key, no backend and no quota, and a weak host model is
+            # the most likely to emit vague steps -- so it would fire exactly when it
+            # hurts most. Suppressed, the deterministic quality gate still FLAGS
+            # those fields in the reply instead of rewriting them here.
+            rewrite_vague=False,
         )
         suite = captured.get("suite")
         if suite is None or not getattr(suite, "test_cases", None):

@@ -3231,6 +3231,7 @@ async def _finalize_generation(
     force_feature_report: bool = False,
     ui_content: dict | None = None,
     remediate: bool = True,
+    rewrite_vague: bool = True,
 ) -> tuple[str, str, str, str, str]:
     """Finalize a generated suite: dedupe -> remediation -> risk -> semantic
     dedup -> rule packs -> vague-field rewrite -> renumber -> RTM -> checklist
@@ -3424,7 +3425,22 @@ async def _finalize_generation(
     # Auto-fix vague step actions / expected results the quality gate would
     # otherwise only FLAG — rewrite them into concrete outcomes before export so
     # the file is executable as-is. No-op (no LLM call) when nothing is vague.
-    scored = await _rewrite_vague_fields(scored, feature_text, on_status)
+    #
+    # ``rewrite_vague`` is False ONLY on the host-mode ("boomerang") submit path,
+    # for exactly the reason ``remediate`` is above: this is a SERVER-side LLM call
+    # (one ask_json, with no asyncio.wait_for of its own), it fires precisely when a
+    # weak host model submitted vague steps, and on a configured-but-DEAD fixed
+    # backend it stalls the tester's submit for minutes instead of failing fast
+    # (_backend() runs no usability probe; only a missing backend fails fast via
+    # LLMBackendUnavailableError). Suppressed, the vague fields are still FLAGGED
+    # deterministically by quality_warning_section below -- nothing is silently
+    # accepted, it is just not rewritten server-side. It is a SEPARATE keyword from
+    # ``remediate`` on purpose: the two gate different behaviours (coverage
+    # regeneration vs. vague-field rewriting) and a caller may want one without the
+    # other. Server mode never passes it, so the default True keeps every existing
+    # caller byte-identical.
+    if rewrite_vague:
+        scored = await _rewrite_vague_fields(scored, feature_text, on_status)
 
     # Jira sub-task scope check (advisory, FLAG-ONLY). When a parent story was
     # injected as BACKGROUND, flag — never drop — cases whose wording tracks the
