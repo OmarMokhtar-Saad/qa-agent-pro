@@ -161,6 +161,47 @@ def _make_asker(ctx):
     return ask_text
 
 
+def _prepare_payload_to_content(result):
+    """Convert a PreparePayloadResult into the content list qa_prepare_test_cases
+    returns: one or more TEXT blocks (the grounded payload -- split across blocks
+    only when it exceeds the per-block byte budget, NEVER truncated) plus one
+    IMAGE block per forwarded ticket screenshot so the host's OWN multimodal model
+    sees the real image (item 6). If the fastmcp Image API is unavailable at
+    runtime the screenshot degrades to the text description already in the payload
+    (image_context) plus a one-line note -- never a silent drop. mcp / fastmcp are
+    imported lazily so importing this module never needs the optional extra."""
+    from mcp.types import TextContent
+
+    text_blocks, image_specs = mcp_handlers.assemble_prepare_payload(result)
+    blocks: list = [TextContent(type="text", text=t) for t in text_blocks]
+    for spec in image_specs:
+        try:
+            from fastmcp.utilities.types import Image
+
+            mime = spec.get("mime") or "image/png"
+            image = Image(data=spec["data"], format=(mime.split("/")[-1] or "png"))
+            blocks.append(image.to_image_content(mime_type=mime))
+        except Exception:
+            logger.warning(
+                "could not attach ticket screenshot %r as MCP image content -- "
+                "falling back to its text description",
+                spec.get("filename", "attachment"),
+                exc_info=True,
+            )
+            blocks.append(
+                TextContent(
+                    type="text",
+                    text=(
+                        "> ℹ️  Screenshot "
+                        f"'{spec.get('filename', 'attachment')}' could not be "
+                        "attached as image content; its text description (if any) "
+                        "is in the payload above."
+                    ),
+                )
+            )
+    return blocks
+
+
 def build_server():
     """Construct and return the FastMCP server with every qa_* tool registered.
 
@@ -169,6 +210,7 @@ def build_server():
     does.
     """
     from fastmcp import Context, FastMCP
+    from mcp.types import ContentBlock
 
     mcp = FastMCP(SERVER_NAME)
 
@@ -205,6 +247,100 @@ def build_server():
                 proceed_anyway=proceed_anyway,
                 choose=_make_chooser(ctx),
                 ask_text=_make_asker(ctx),
+                progress=_make_progress(ctx),
+            ),
+        )
+
+    @mcp.tool()
+    async def qa_prepare_test_cases(
+        ctx: Context, feature_or_url: str = "", proceed_anyway: bool = False
+    ) -> list[ContentBlock]:
+        """HOST-MODE generation. Instead of the server calling an LLM, THIS tool
+        returns a grounded generation payload (a system prompt, the grounded
+        feature/ticket context, a JSON schema, and 8 category instructions) for
+        YOU, the host model, to run yourself.
+
+        feature_or_url can be a feature description, a Jira/issue URL, a web page
+        URL, or a Swagger/OpenAPI spec URL -- exactly like qa_generate_test_cases.
+
+        WHAT TO DO WITH THE RESULT: generate the full test suite yourself from the
+        returned payload (produce ONE JSON object matching the payload's
+        response_schema, merging all categories into a single `test_cases`
+        array), then call `qa_submit_suite` with the returned `prep_id` and your
+        JSON. The server validates, de-duplicates, scores, exports and persists
+        it, and replies with the finished suite + file path OR a short list of
+        gaps to regenerate and resubmit under the SAME prep_id. A weaker model may
+        submit one category at a time with `qa_submit_category` instead.
+
+        If any ticket screenshots were available they are attached as image
+        content -- inspect them directly. For an under-specified or no-UI ticket
+        the reply may instead be clarifying questions (no payload); relay them, or
+        pass proceed_anyway=true to prepare anyway.
+        """
+        result = await _tracked(
+            "qa_prepare_test_cases",
+            ctx,
+            mcp_handlers.handle_prepare_test_cases(
+                feature_or_url,
+                proceed_anyway=proceed_anyway,
+                choose=_make_chooser(ctx),
+                ask_text=_make_asker(ctx),
+                progress=_make_progress(ctx),
+            ),
+        )
+        return _prepare_payload_to_content(result)
+
+    @mcp.tool()
+    async def qa_submit_suite(
+        ctx: Context, prep_id: str = "", suite_json: str = ""
+    ) -> str:
+        """Submit a host-generated test suite back to the server to be validated,
+        finalized, exported and persisted (the BACK half of host mode).
+
+        Call this AFTER qa_prepare_test_cases: pass the `prep_id` it returned and
+        `suite_json` -- the ONE JSON object you generated from the payload (a
+        single merged `test_cases` array conforming to the payload's
+        response_schema). The reply is EITHER the finished suite summary plus the
+        exported file path, OR a short structured list of coverage gaps and vague
+        cases to fix; if so, regenerate just those and call this again with the
+        SAME prep_id. Relay the file path to the user as the deliverable; do not
+        ask which export format they want.
+        """
+        return await _tracked(
+            "qa_submit_suite",
+            ctx,
+            mcp_handlers.handle_submit_suite(
+                prep_id,
+                suite_json,
+                ask_text=_make_asker(ctx),
+                progress=_make_progress(ctx),
+            ),
+        )
+
+    @mcp.tool()
+    async def qa_submit_category(
+        ctx: Context,
+        prep_id: str = "",
+        category_name: str = "",
+        suite_json: str = "",
+    ) -> str:
+        """Submit ONE category's cases for a host that generates incrementally.
+
+        Use this instead of qa_submit_suite when you produce the 8 categories in
+        separate turns: pass the `prep_id` from qa_prepare_test_cases, the
+        category name (e.g. \"Positive\", \"Negative\", \"Boundary\"), and
+        `suite_json` for THAT category. Re-submitting a category REPLACES its
+        earlier cases (newest wins). When every category is in, call
+        qa_submit_suite with the same prep_id and an EMPTY suite_json to merge and
+        finalize them.
+        """
+        return await _tracked(
+            "qa_submit_category",
+            ctx,
+            mcp_handlers.handle_submit_category(
+                prep_id,
+                category_name,
+                suite_json,
                 progress=_make_progress(ctx),
             ),
         )

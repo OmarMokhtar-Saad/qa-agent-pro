@@ -18,7 +18,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from config.settings import settings
-from llm import ask_json
+from llm import LLMBackendUnavailableError, ask_json
 from tools.untrusted import _GUARD, wrap_untrusted
 
 logger = logging.getLogger(__name__)
@@ -80,6 +80,33 @@ _SAFE_DEFAULT = {
     "issues": [],
     "questions": [],
     "testable_surface": "unclear",
+    # False = we DID classify (and, for this default, found nothing to flag).
+    # A truthy "degraded" means the classifier itself could NOT run -- see
+    # _DEGRADED_DEFAULT. The gate reads this to fail SAFE vs. proceed.
+    "degraded": False,
+}
+
+# Generic clarifying questions surfaced when the classifier could NOT run at all
+# (no usable LLM backend, or the pre-pass call failed). Host mode makes a
+# backend-less classifier the COMMON case, so the gate must fail SAFE here
+# instead of fabricating a suite from an under-specified / no-UI ticket.
+_DEGRADED_QUESTIONS = [
+    "Which application URL or environment should these test cases run against?",
+    "What are the acceptance criteria or expected behaviour for this feature?",
+    "Is this a user-facing screen, an API call, or a backend/configuration change?",
+]
+
+# Returned when classification could not be performed. severity "unknown" is
+# deliberately OUTSIDE SEVERITY_ORDER so gate_triggers() never fires on it: the
+# degraded fail-safe is driven EXPLICITLY by the caller checking
+# result["degraded"], NOT by the severity comparison (which is for classified
+# results only).
+_DEGRADED_DEFAULT = {
+    "severity": "unknown",
+    "issues": ["the requirement pre-pass could not classify this ticket"],
+    "questions": list(_DEGRADED_QUESTIONS),
+    "testable_surface": "unclear",
+    "degraded": True,
 }
 
 
@@ -104,12 +131,30 @@ async def analyze_requirements(text: str) -> dict:
             "issues": list(result.issues),
             "questions": list(result.questions[:3]),
             "testable_surface": result.testable_surface,
+            "degraded": False,
         }
-    except Exception:
-        logger.warning(
-            "analyze_requirements failed — proceeding as if no issues", exc_info=True
+    except LLMBackendUnavailableError:
+        # No usable backend to classify with (host mode on a ChatGPT/Kimi/Gemini
+        # host, or a quota-dead Cursor/CLI). This is NOT "classified and found
+        # clear": flattening it to severity "none" is exactly the SHYJ-7154
+        # fail-OPEN the gate exists to prevent. Signal it distinctly so
+        # _maybe_ambiguity_clarify can fail SAFE.
+        logger.info(
+            "analyze_requirements: no usable LLM backend to classify with — "
+            "returning degraded (gate fails SAFE unless "
+            "QA_AMBIGUITY_GATE_SEVERITY=off)"
         )
-        return dict(_SAFE_DEFAULT)
+        return dict(_DEGRADED_DEFAULT)
+    except Exception:
+        # Any other classification failure (timeout, transient provider error,
+        # malformed JSON) is ALSO an "unable to classify" state, not a clean bill
+        # of health — same fabrication risk, so also fail SAFE. Still never
+        # raises.
+        logger.warning(
+            "analyze_requirements failed to classify — returning degraded",
+            exc_info=True,
+        )
+        return dict(_DEGRADED_DEFAULT)
 
 
 SEVERITY_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}

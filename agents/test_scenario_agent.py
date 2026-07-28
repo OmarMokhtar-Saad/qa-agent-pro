@@ -1256,7 +1256,6 @@ def _category_shared_system(rtm_hint: str) -> str:
     )
 
 
-
 async def _generate_for_category(
     user_msg: str,
     category_name: str,
@@ -2182,9 +2181,7 @@ async def _remediate_gaps(
                         )
                         break
                     remaining = merged_result.gaps
-                    gap_preview = (
-                        ", ".join(merged_result.gaps[:3]) or "coverage gaps"
-                    )
+                    gap_preview = ", ".join(merged_result.gaps[:3]) or "coverage gaps"
                     new_cases = merged_result.new_cases
                 else:
                     critique = await critique_coverage(feature_text, merged, acs)
@@ -2194,7 +2191,8 @@ async def _remediate_gaps(
                     ):
                         remaining = []
                         await _emit_status(
-                            on_status, "✅ Coverage review complete — no gaps remaining."
+                            on_status,
+                            "✅ Coverage review complete — no gaps remaining.",
                         )
                         break
                     remaining = critique.gaps
@@ -2482,6 +2480,43 @@ def _build_amendment_directive() -> str:
     )
 
 
+@dataclass
+class PreparedGeneration:
+    """Everything the 8-category fan-out and the finalize half both need,
+    computed once by ``_prepare_generation``.
+
+    Carrying these as a dataclass lets ``generate_test_scenarios`` (server mode)
+    and -- from ops-3 -- host mode share ONE pipeline while the moved server-mode
+    code stays byte-identical. Nothing here is edited relative to the values the
+    pre-refactor inline body produced.
+    """
+
+    user_msg: str
+    rtm_hint: str
+    feature_text: str
+    complexity_text: str
+    acs: list[AcceptanceCriterion]
+    source_acs: list[AcceptanceCriterion]
+    checklist_items: list[ChecklistItem]
+    checklist_presented_ids: object
+    checklist_audit: dict
+    checklist_coverage: object | None
+    rule_packs: object
+    ui_content: dict | None
+    parent_context: str
+    cache_prefix_warm: bool
+    meter: TokenMeter
+    jira_image_text: str
+    attached_image_text: str
+    jira_context_text: str
+    image_notice: str
+    # Populated for ops-3 host mode (the boomerang tools hand the category
+    # specs and the response schema to the tester's own chat model). Server
+    # mode reads neither -- its fan-out uses the CATEGORIES global directly.
+    categories: list[tuple[str, str, str]]
+    category_response_schema: dict
+
+
 async def generate_test_scenarios(
     feature_text: str,
     url_content: dict | None = None,
@@ -2497,6 +2532,118 @@ async def generate_test_scenarios(
     on_report_ready: Callable[[str], None] | None = None,
     openapi_text: str | None = None,
 ) -> tuple[str, str, str, str, str]:
+    """Server-mode orchestrator: prepare the shared context, run the bounded
+    8-category fan-out, then finalize. Returns
+    (message_markdown, xlsx_path, csv_path, testrail_path, status). Never raises
+    (except asyncio.CancelledError). The two shared halves are
+    ``_prepare_generation`` (everything before the fan-out) and
+    ``_finalize_generation`` (everything after).
+    """
+    prepared = await _prepare_generation(
+        feature_text,
+        url_content,
+        ui_content,
+        attached_images=attached_images,
+        spec_text=spec_text,
+        openapi_text=openapi_text,
+        single_screen=single_screen,
+        on_status=on_status,
+    )
+    if isinstance(prepared, tuple):
+        return prepared
+
+    # Destructure into the exact local names the moved fan-out below used, so
+    # that block stays byte-identical to the pre-refactor code.
+    user_msg = prepared.user_msg
+    rtm_hint = prepared.rtm_hint
+    feature_text = prepared.feature_text
+    complexity_text = prepared.complexity_text
+    meter = prepared.meter
+    cache_prefix_warm = prepared.cache_prefix_warm
+
+    # One progress slot per category — each updates only its own slot.
+    # asyncio coroutines are single-threaded so list-element assignment is race-free.
+    category_counts = [0] * len(CATEGORIES)
+
+    def _make_on_progress(cat_idx: int) -> Callable[[int], Awaitable[None]] | None:
+        if on_progress is None:
+            return None
+
+        async def _on_progress(count: int) -> None:
+            category_counts[cat_idx] = count
+            await on_progress(sum(category_counts))
+
+        return _on_progress
+
+    sem = asyncio.Semaphore(_resolve_max_concurrency())
+
+    async def _bounded(i: int, name: str, focus: str, ptype: str) -> CategoryResult:
+        async with sem:
+            result = await _generate_for_category(
+                user_msg=user_msg,
+                category_name=name,
+                category_focus=focus,
+                preferred_type=ptype,
+                on_progress=_make_on_progress(i),
+                rtm_hint=rtm_hint,
+                feature_text=feature_text,
+                meter=meter,
+                ui_content=ui_content,
+                complexity_text=complexity_text,
+                cache_prefix=cache_prefix_warm,
+            )
+            await _emit_status(
+                on_status,
+                (
+                    f"✅ {result.category_name}: {len(result.cases)} case(s) drafted"
+                    if result.succeeded
+                    else f"⚠️ {result.category_name}: generation failed, continuing with the rest"
+                ),
+            )
+            return result
+
+    await _emit_status(
+        on_status,
+        "🧪 Creating test cases across all 8 categories: "
+        + ", ".join(name for name, _f, _p in CATEGORIES)
+        + "…",
+    )
+    tasks = [
+        _bounded(i, name, focus, ptype)
+        for i, (name, focus, ptype) in enumerate(CATEGORIES)
+    ]
+    category_results: list[CategoryResult] = await asyncio.gather(*tasks)
+
+    succeeded = [r for r in category_results if r.succeeded]
+    all_cases = [tc for r in succeeded for tc in r.cases]
+
+    return await _finalize_generation(
+        prepared,
+        all_cases,
+        category_results,
+        on_progress=on_progress,
+        on_status=on_status,
+        defer_files=defer_files,
+        on_suite_ready=on_suite_ready,
+        on_report_ready=on_report_ready,
+        single_screen=single_screen,
+        force_feature_report=force_feature_report,
+        ui_content=ui_content,
+    )
+
+
+async def _prepare_generation(
+    feature_text: str,
+    url_content: dict | None = None,
+    ui_content: dict | None = None,
+    *,
+    attached_images: list[dict] | None = None,
+    spec_text: str | None = None,
+    openapi_text: str | None = None,
+    single_screen: bool = False,
+    on_status: Callable[[str], Awaitable[None]] | None = None,
+    describe_images_server_side: bool = True,
+) -> PreparedGeneration | tuple[str, str, str, str, str]:
     """Generate test cases. Returns (message_markdown, xlsx_file_path, csv_file_path, testrail_file_path, status).
 
     status: 'ok' | 'partial' | 'fallback' | 'error'
@@ -2715,6 +2862,11 @@ async def generate_test_scenarios(
     attached_image_text = ""
     jira_context_text = ""
     image_notice = ""
+    # Host mode passes describe_images_server_side=False: it skips the server-side
+    # vision call below but MUST still tell the rule packs that images exist --
+    # the tester's own multimodal model receives the raw screenshots as MCP image
+    # content. Always False in server mode, so images_present stays byte-identical.
+    has_jira_images = False
 
     for rag_part in rag_parts:
         parts.append(wrap_untrusted("rag_similar_past_cases", rag_part))
@@ -2755,13 +2907,20 @@ async def generate_test_scenarios(
                 )
             )
         images = url_content.get("images") or []
-        if images:
+        if images and describe_images_server_side:
             jira_image_text = await _describe_ticket_images(images)
             if jira_image_text:
                 parts.append(
                     "## Ticket Images\n"
                     + wrap_untrusted("jira_ticket_images", jira_image_text[:3000])
                 )
+        elif images:
+            # Host-mode boomerang: make NO server-side llm.ask_vision call here
+            # (preserves the "no key / no backend / no quota" premise and avoids a
+            # configured-but-dead-backend stall). The raw screenshots ride to the
+            # host's OWN multimodal model as MCP image content; record only that
+            # images are present so the rule packs still see images_present.
+            has_jira_images = True
 
     if attached_images:
         attached_image_text = await describe_images(attached_images)
@@ -2816,7 +2975,7 @@ async def generate_test_scenarios(
         jira_text="\n".join(t for t in (jira_context_text, parent_context) if t),
         ui_content=ui_content,
         openapi_text=openapi_text or "",
-        images_present=bool(jira_image_text or attached_image_text),
+        images_present=bool(jira_image_text or attached_image_text or has_jira_images),
         source_ref=source_url or (feature_text or "")[:80],
     )
     # THE ENFORCEMENT SEAM. `checklist_items` below is a BATCH 2 local
@@ -2974,21 +3133,6 @@ async def generate_test_scenarios(
     # user message (the prompt-injection containment test counts those).
     rtm_hint = rtm_hint + format_rule_pack_prompt_block(rule_packs)
 
-    # One progress slot per category — each updates only its own slot.
-    # asyncio coroutines are single-threaded so list-element assignment is race-free.
-    category_counts = [0] * len(CATEGORIES)
-
-    def _make_on_progress(cat_idx: int) -> Callable[[int], Awaitable[None]] | None:
-        if on_progress is None:
-            return None
-
-        async def _on_progress(count: int) -> None:
-            category_counts[cat_idx] = count
-            await on_progress(sum(category_counts))
-
-        return _on_progress
-
-    sem = asyncio.Semaphore(_resolve_max_concurrency())
     meter = TokenMeter()
 
     # Prompt-cache warm-up (QA_PROMPT_CACHE_ENABLED, default OFF). MUST run
@@ -3006,46 +3150,71 @@ async def generate_test_scenarios(
             response_model=_category_response_model(),
         )
 
-    async def _bounded(i: int, name: str, focus: str, ptype: str) -> CategoryResult:
-        async with sem:
-            result = await _generate_for_category(
-                user_msg=user_msg,
-                category_name=name,
-                category_focus=focus,
-                preferred_type=ptype,
-                on_progress=_make_on_progress(i),
-                rtm_hint=rtm_hint,
-                feature_text=feature_text,
-                meter=meter,
-                ui_content=ui_content,
-                complexity_text=complexity_text,
-                cache_prefix=cache_prefix_warm,
-            )
-            await _emit_status(
-                on_status,
-                (
-                    f"✅ {result.category_name}: {len(result.cases)} case(s) drafted"
-                    if result.succeeded
-                    else f"⚠️ {result.category_name}: generation failed, continuing with the rest"
-                ),
-            )
-            return result
-
-    await _emit_status(
-        on_status,
-        "🧪 Creating test cases across all 8 categories: "
-        + ", ".join(name for name, _f, _p in CATEGORIES)
-        + "…",
+    return PreparedGeneration(
+        user_msg=user_msg,
+        rtm_hint=rtm_hint,
+        feature_text=feature_text,
+        complexity_text=complexity_text,
+        acs=acs,
+        source_acs=source_acs,
+        checklist_items=checklist_items,
+        checklist_presented_ids=checklist_presented_ids,
+        checklist_audit=checklist_audit,
+        checklist_coverage=checklist_coverage,
+        rule_packs=rule_packs,
+        ui_content=ui_content,
+        parent_context=parent_context,
+        cache_prefix_warm=cache_prefix_warm,
+        meter=meter,
+        jira_image_text=jira_image_text,
+        attached_image_text=attached_image_text,
+        jira_context_text=jira_context_text,
+        image_notice=image_notice,
+        categories=CATEGORIES,
+        category_response_schema=_category_response_model().model_json_schema(),
     )
-    tasks = [
-        _bounded(i, name, focus, ptype)
-        for i, (name, focus, ptype) in enumerate(CATEGORIES)
-    ]
-    category_results: list[CategoryResult] = await asyncio.gather(*tasks)
 
-    succeeded = [r for r in category_results if r.succeeded]
+
+async def _finalize_generation(
+    prepared: PreparedGeneration,
+    all_cases: list[TestCase],
+    category_results: list[CategoryResult],
+    *,
+    on_progress: Callable[[int], Awaitable[None]] | None = None,
+    on_status: Callable[[str], Awaitable[None]] | None = None,
+    defer_files: bool = False,
+    on_suite_ready: Callable[[TestSuite], None] | None = None,
+    on_report_ready: Callable[[str], None] | None = None,
+    single_screen: bool = False,
+    force_feature_report: bool = False,
+    ui_content: dict | None = None,
+    remediate: bool = True,
+) -> tuple[str, str, str, str, str]:
+    """Finalize a generated suite: dedupe -> remediation -> risk -> semantic
+    dedup -> rule packs -> vague-field rewrite -> renumber -> RTM -> checklist
+    coverage -> sections -> exports -> summary. Byte-identical to the second
+    half of the pre-refactor generate_test_scenarios; shared by server mode and
+    (ops-3) host mode. Returns the same 5-tuple.
+    """
+    user_msg = prepared.user_msg
+    rtm_hint = prepared.rtm_hint
+    feature_text = prepared.feature_text
+    complexity_text = prepared.complexity_text
+    acs = prepared.acs
+    source_acs = prepared.source_acs
+    checklist_items = prepared.checklist_items
+    checklist_presented_ids = prepared.checklist_presented_ids
+    checklist_audit = prepared.checklist_audit
+    checklist_coverage = prepared.checklist_coverage
+    rule_packs = prepared.rule_packs
+    parent_context = prepared.parent_context
+    cache_prefix_warm = prepared.cache_prefix_warm
+    meter = prepared.meter
+    jira_image_text = prepared.jira_image_text
+    attached_image_text = prepared.attached_image_text
+    jira_context_text = prepared.jira_context_text
+    image_notice = prepared.image_notice
     failed = [r for r in category_results if not r.succeeded]
-    all_cases = [tc for r in succeeded for tc in r.cases]
 
     all_cases = _dedupe_cases(all_cases)
     # SHYJ-7154 Fix 3: when the source ticket carries REAL acceptance criteria,
@@ -3066,11 +3235,21 @@ async def generate_test_scenarios(
     # Batch 2: the checklist can drive the SAME bounded loop with a deterministic
     # stop condition. Requires BOTH flags, so enabling the checklist for its
     # audit alone never silently starts extra generation rounds.
+    # ``remediate`` is False ONLY on the host-mode ("boomerang") submit path:
+    # there the regeneration round belongs to the tester's OWN chat model, and
+    # a server-side round would (a) defeat host mode's cost premise and (b) with
+    # a configured-but-DEAD fixed backend block for minutes -- _backend() runs no
+    # usability probe, ask_json has no internal timeout, and the only bound is the
+    # 120s category timeout, whose asyncio.TimeoutError IS in _RETRYABLE and so
+    # RETRIES (2-4 attempts x up to qa_coverage_regen_max_rounds rounds). Server
+    # mode never passes it, so the default True keeps every existing caller
+    # byte-identical.
     _checklist_remediation = bool(
-        checklist_items and settings.qa_checklist_remediation_enabled
+        remediate and checklist_items and settings.qa_checklist_remediation_enabled
     )
     if (
-        (settings.qa_coverage_regen_enabled or _checklist_remediation)
+        remediate
+        and (settings.qa_coverage_regen_enabled or _checklist_remediation)
         and all_cases
         and not single_screen
     ):

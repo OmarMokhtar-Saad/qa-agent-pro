@@ -34,15 +34,21 @@ import shutil
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 from urllib.parse import urlparse
 
+from agents import host_mode
 from agents.feature_analysis import analyze_feature, render_report_markdown
-from agents.test_scenario_agent import generate_test_scenarios
+from agents.test_scenario_agent import (
+    CategoryResult,
+    _finalize_generation,
+    _prepare_generation,
+    generate_test_scenarios,
+)
 from config.settings import settings
-from tools import telemetry
+from tools import prep_store, telemetry
 from tools.audit_log import record_event
 from tools.comment_reconciler import neutralize_for_display, reconcile_comments
 from tools.csv_exporter import generate_test_case_csv
@@ -1255,6 +1261,16 @@ async def _maybe_ambiguity_clarify(
         if not analysis_text.strip():
             return None
         result = await analyze_requirements(analysis_text)
+        # SHYJ-7154 fail-SAFE (host mode): a "degraded" result means the pre-pass
+        # could NOT classify (no usable backend, or the call failed), NOT that
+        # the ticket is clear. The gate is ON here (off already returned above),
+        # so treat "unable to classify" as CLARIFY — never fabricate a suite from
+        # an under-specified / no-UI ticket just because we could not check it.
+        if result.get("degraded"):
+            return _shape_ambiguity_clarify(
+                result.get("questions") or [],
+                str(result.get("testable_surface") or ""),
+            )
         if not gate_triggers(result, gate):
             return None
         return _shape_ambiguity_clarify(
@@ -1325,112 +1341,54 @@ async def handle_generate_test_cases(
         return await _guided_test_cases(
             choose=choose, ask_text=ask_text, progress=progress
         )
-    try:
-        url_content = None
-        ui_content = None
-        openapi_text = None
-        if _is_url(text):
-            # Atlassian pages fetched anonymously return an empty SPA shell
-            # (no error!) — check credentials BEFORE fetching so the user gets
-            # setup instructions instead of a suite generated from nothing.
-            hint = _jira_config_hint(text)
-            if hint:
-                return hint
-            # Pre-flight: verify Jira access (and collect/save credentials
-            # inline where elicitation is available) BEFORE fetching, so a
-            # bad/expired token yields guided setup steps instead of a suite
-            # fabricated from an empty anonymous SPA shell.
-            preflight = await _jira_preflight(
-                text, ask_text=ask_text, choose=choose, progress=progress
+    # Host-mode routing (ops-3d-3): QA_GENERATION_MODE=host -- or =auto resolving
+    # to host on a non-editor host / unusable backend -- runs the 8-category
+    # fan-out in the tester's OWN chat model. Return the grounded prepare payload
+    # instead of generating server-side. Placed BEFORE grounding so host mode
+    # grounds exactly ONCE (handle_prepare_test_cases -> _ground_and_gate fetches
+    # + gates on its own). attached_images SUPPRESS host routing: mobile
+    # screenshots / mockups are consumed by a server-side describe_images() vision
+    # call and are NOT forwarded to the host model (PreparePayloadResult.images
+    # carries only Jira ticket images), so that path stays server-mode.
+    # qa_generate_test_cases returns str, so render_prepare_payload's
+    # self-contained markdown+JSON block is what even a string-only client relays.
+    if not attached_images:
+        import llm
+
+        if llm.resolve_generation_mode() == "host":
+            return render_prepare_payload(
+                await handle_prepare_test_cases(
+                    text,
+                    proceed_anyway=proceed_anyway,
+                    choose=choose,
+                    ask_text=ask_text,
+                    progress=progress,
+                )
             )
-            if preflight is not None:
-                return preflight
-            # Swagger/OpenAPI link (QA_SWAGGER_ENABLED): condense the spec into
-            # an endpoint summary instead of the generic page/UI path.
-            if settings.qa_swagger_enabled and looks_like_openapi_url(text):
-                await _emit(progress, "🔗 Fetching the OpenAPI spec…")
-                spec_result = await fetch_openapi_spec(text)
-                if not spec_result.get("error"):
-                    openapi_text = spec_result.get("summary") or None
-            if openapi_text is None:
-                await _emit(progress, "🔗 Fetching the ticket / page…")
-                url_content = await fetch_url_content(text)
-                if url_content.get("error"):
-                    hint = _jira_config_hint(text)
-                    if hint:
-                        return hint
-                try:
-                    ui_content = await extract_ui_elements(text, prefetched=url_content)
-                except Exception:
-                    logger.debug(
-                        "mcp: UI extraction failed — continuing", exc_info=True
-                    )
-                    ui_content = None
-
-        # Batch 1: comment reconciliation (QA_COMMENT_RECONCILE_ENABLED, default
-        # OFF). Stage 1 quarantined extraction and Stage 2 deterministic
-        # resolution run HERE, exactly once, so (a) the
-        # FLAGGED_FOR_CLARIFICATION questions can feed the gate below and (b)
-        # the generation agent only ever sees the code-built amendments block —
-        # tools/jira_fetcher already suppressed the raw "## Comments" dump from
-        # raw_text while this flag is on. reconcile_comments never raises; the
-        # try/except is belt-and-braces so a reconciler fault can never cost the
-        # tester a suite they would otherwise have received.
-        amendment_questions: list = []
-        if (
-            settings.qa_comment_reconcile_enabled
-            and url_content
-            and not url_content.get("error")
-        ):
-            try:
-                await _emit(progress, "\U0001f9fe Reconciling the ticket's comments…")
-                recon = await reconcile_comments(
-                    url_content.get("comments_meta") or [],
-                    field_vocabulary_text="\n".join(
-                        str(url_content.get(key) or "")
-                        for key in ("description", "acceptance_criteria")
-                    ),
-                )
-                recon_content = recon.get("content") or {}
-                block = str(recon_content.get("block") or "")
-                if block:
-                    url_content["amendments_context"] = block
-                amendment_questions = list(recon_content.get("flagged") or [])
-                await _audit(
-                    "mcp_comment_reconcile",
-                    detail={
-                        "amendments": len(recon_content.get("amendments") or []),
-                        "flagged": len(amendment_questions),
-                        "resolutions": recon_content.get("audit") or [],
-                    },
-                )
-            except Exception:
-                logger.warning(
-                    "mcp comment reconciliation failed — generating without it",
-                    exc_info=True,
-                )
-
-        # SHYJ-7154 Fix 2: ambiguity/clarify gate on the non-interactive MCP
-        # path. Respects QA_AMBIGUITY_GATE_SEVERITY; for an under-specified /
-        # no-UI documentation ticket it returns clarifying questions instead of
-        # generating a fabricated suite. proceed_anyway=true overrides it, and
-        # it is skipped when screenshots are attached (a real screen is present).
-        # The comment-amendment questions are judged FIRST: they are concrete
-        # contradictions someone already wrote down, not a severity heuristic.
-        # They ride the SAME kill-switch rather than adding a second gate.
-        if not proceed_anyway and not attached_images:
-            gate_off = (
-                settings.qa_ambiguity_gate_severity or "high"
-            ).strip().lower() == "off"
-            if amendment_questions and not gate_off:
-                clarify = _shape_amendment_clarify(amendment_questions)
-                if clarify:
-                    await _audit("mcp_amendment_gate", detail={"source": "generate"})
-                    return clarify
-            clarify = await _maybe_ambiguity_clarify(text, url_content, openapi_text)
-            if clarify:
-                await _audit("mcp_ambiguity_gate", detail={"source": "generate"})
-                return clarify
+    try:
+        # Front half CONVERGED onto _ground_and_gate (ops-3d-3, debt item 2a):
+        # this handler and the host-mode prepare path now share ONE grounding +
+        # gating implementation, so a future safety fix (SHYJ-7154 ambiguity gate,
+        # amendment gate, comment reconcile) cannot silently miss one path. The
+        # server path passes audit_source="generate" so the audit-log "source"
+        # tag is byte-identical to the pre-convergence behaviour; the only other
+        # deltas were two log-message em-dashes that became "--" (cosmetic,
+        # unasserted). The drift regression test (tests/test_host_mode_routing.py)
+        # guards this convergence against future one-sided edits.
+        grounded = await _ground_and_gate(
+            text,
+            attached_images=attached_images,
+            proceed_anyway=proceed_anyway,
+            choose=choose,
+            ask_text=ask_text,
+            progress=progress,
+            audit_source="generate",
+        )
+        if isinstance(grounded, str):
+            return grounded
+        url_content = grounded.url_content
+        ui_content = grounded.ui_content
+        openapi_text = grounded.openapi_text
 
         captured: dict = {}
 
@@ -1524,6 +1482,841 @@ async def handle_generate_test_cases(
         logger.exception("handle_generate_test_cases failed")
         _capture_error(exc, "qa_generate_test_cases")
         return f"⚠️ Test-case generation failed: {exc}"
+
+
+# --------------------------------------------------------------------------- #
+# Host-mode ("boomerang") test-case generation -- ops-3d
+#
+# In host mode the 8-category fan-out runs in the tester's OWN chat model on any
+# MCP host. handle_prepare_test_cases runs the FRONT half (fetch + preflight +
+# gate + _prepare_generation) and returns a grounded payload + prep_id; the BACK
+# half (submit) lands in ops-3d-1b. This block is DEAD CODE behind
+# QA_GENERATION_MODE (default "server") until ops-3d-3 wires routing -- nothing
+# here touches the server path (it is a NEW helper, not a refactor of
+# handle_generate_test_cases).
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _Grounding:
+    """Result of _ground_and_gate when grounding + gating passed: the inputs
+    _prepare_generation needs. Deliberately a SEPARATE helper rather than a
+    refactor of handle_generate_test_cases, so applying this additive batch has
+    zero server-path blast radius."""
+
+    url_content: dict | None = None
+    ui_content: dict | None = None
+    openapi_text: str | None = None
+
+
+async def _ground_and_gate(
+    text: str,
+    *,
+    attached_images: list | None = None,
+    proceed_anyway: bool = False,
+    choose: ChooseCb = None,
+    ask_text: AskCb = None,
+    progress: ProgressCb = None,
+    audit_source: str = "prepare",
+) -> "str | _Grounding":
+    """Run the shared front half: URL/Jira fetch, _jira_preflight, Swagger
+    ingest, UI extraction, comment reconciliation, and the (fail-safe) ambiguity
+    gate. Returns a markdown STRING to short-circuit (setup hint / preflight /
+    clarifying questions) or a _Grounding to proceed.
+
+    A faithful re-derivation of the front half of handle_generate_test_cases; it
+    is intentionally a SEPARATE helper rather than a refactor of that handler, so
+    this additive batch cannot change server-mode behaviour. The duplication is
+    accepted deliberately: server byte-identity beats DRY here, and ops-3d-3 may
+    converge the two only if it can be shown byte-identical against the
+    equivalence fixtures.
+    """
+    url_content = None
+    ui_content = None
+    openapi_text = None
+    if _is_url(text):
+        hint = _jira_config_hint(text)
+        if hint:
+            return hint
+        preflight = await _jira_preflight(
+            text, ask_text=ask_text, choose=choose, progress=progress
+        )
+        if preflight is not None:
+            return preflight
+        if settings.qa_swagger_enabled and looks_like_openapi_url(text):
+            await _emit(progress, "\U0001f517 Fetching the OpenAPI spec…")
+            spec_result = await fetch_openapi_spec(text)
+            if not spec_result.get("error"):
+                openapi_text = spec_result.get("summary") or None
+        if openapi_text is None:
+            await _emit(progress, "\U0001f517 Fetching the ticket / page…")
+            url_content = await fetch_url_content(text)
+            if url_content.get("error"):
+                hint = _jira_config_hint(text)
+                if hint:
+                    return hint
+            try:
+                ui_content = await extract_ui_elements(text, prefetched=url_content)
+            except Exception:
+                logger.debug("mcp: UI extraction failed -- continuing", exc_info=True)
+                ui_content = None
+
+    amendment_questions: list = []
+    if (
+        settings.qa_comment_reconcile_enabled
+        and url_content
+        and not url_content.get("error")
+    ):
+        try:
+            await _emit(progress, "\U0001f9fe Reconciling the ticket's comments…")
+            recon = await reconcile_comments(
+                url_content.get("comments_meta") or [],
+                field_vocabulary_text="\n".join(
+                    str(url_content.get(key) or "")
+                    for key in ("description", "acceptance_criteria")
+                ),
+            )
+            recon_content = recon.get("content") or {}
+            block = str(recon_content.get("block") or "")
+            if block:
+                url_content["amendments_context"] = block
+            amendment_questions = list(recon_content.get("flagged") or [])
+            await _audit(
+                "mcp_comment_reconcile",
+                detail={
+                    "amendments": len(recon_content.get("amendments") or []),
+                    "flagged": len(amendment_questions),
+                    "resolutions": recon_content.get("audit") or [],
+                },
+            )
+        except Exception:
+            logger.warning(
+                "mcp comment reconciliation failed -- generating without it",
+                exc_info=True,
+            )
+
+    if not proceed_anyway and not attached_images:
+        gate_off = (
+            settings.qa_ambiguity_gate_severity or "high"
+        ).strip().lower() == "off"
+        if amendment_questions and not gate_off:
+            clarify = _shape_amendment_clarify(amendment_questions)
+            if clarify:
+                await _audit("mcp_amendment_gate", detail={"source": audit_source})
+                return clarify
+        clarify = await _maybe_ambiguity_clarify(text, url_content, openapi_text)
+        if clarify:
+            await _audit("mcp_ambiguity_gate", detail={"source": audit_source})
+            return clarify
+
+    return _Grounding(
+        url_content=url_content, ui_content=ui_content, openapi_text=openapi_text
+    )
+
+
+@dataclass
+class PreparePayloadResult:
+    """Structured result of handle_prepare_test_cases.
+
+    Exactly one of (payload + prep_id) or clarify is populated:
+    * payload / prep_id: the grounded host-mode payload + its store handle.
+    * clarify: a markdown string to relay verbatim (setup hint, preflight,
+      clarifying questions, or an error) -- no suite was prepared.
+
+    ``notice`` carries any NON-SILENT disclosure (e.g. an image that could not be
+    forwarded, or a size cap that was hit); ``images`` (raw {data, mime} dicts) is
+    populated in ops-3d-2 when the MCP tool result can carry image content.
+    ops-3d-2/3d-3 render this into MCP content; render_prepare_payload turns it
+    into plain text for a legacy (string-only) caller.
+    """
+
+    payload: dict | None = None
+    prep_id: str = ""
+    clarify: str = ""
+    notice: str = ""
+    images: list = field(default_factory=list)
+
+
+async def handle_prepare_test_cases(
+    feature_or_url: str,
+    *,
+    attached_images: list | None = None,
+    proceed_anyway: bool = False,
+    choose: ChooseCb = None,
+    ask_text: AskCb = None,
+    progress: ProgressCb = None,
+) -> PreparePayloadResult:
+    """FRONT half of host-mode generation. Grounds + gates the inputs exactly
+    like the server path, runs _prepare_generation, serializes the result into
+    the prep store, and returns the grounded payload the tester's own chat model
+    runs the fan-out against. Never raises."""
+    text = (feature_or_url or "").strip()
+    if not text:
+        return PreparePayloadResult(
+            clarify=(
+                "Tell me what to build test cases for -- a feature description, a "
+                "Jira/issue URL, a web page URL, or a Swagger/OpenAPI spec URL."
+            )
+        )
+    try:
+        grounded = await _ground_and_gate(
+            text,
+            attached_images=attached_images,
+            proceed_anyway=proceed_anyway,
+            choose=choose,
+            ask_text=ask_text,
+            progress=progress,
+        )
+        if isinstance(grounded, str):
+            return PreparePayloadResult(clarify=grounded)
+
+        async def _on_status(msg: str) -> None:
+            await _emit(progress, msg)
+
+        prepared = await _prepare_generation(
+            text,
+            grounded.url_content,
+            grounded.ui_content,
+            attached_images=attached_images,
+            openapi_text=grounded.openapi_text,
+            describe_images_server_side=False,
+            on_status=_on_status,
+        )
+        if isinstance(prepared, tuple):
+            # Early return from _prepare_generation (unreadable source / no real
+            # feature text) -- its first element is the tester-facing message.
+            return PreparePayloadResult(clarify=prepared[0])
+
+        serialized = host_mode.serialize_prepared(prepared)
+        envelope = {
+            "prepared": serialized,
+            "meta": {
+                "source_text": text,
+                "source_url": text if grounded.url_content else "",
+                "round": 0,
+            },
+        }
+        saved = await prep_store.save_prep(envelope, created_by="qa_prepare_test_cases")
+        prep_id = (saved.get("content") or {}).get("prep_id") or ""
+        if saved.get("error") or not prep_id:
+            return PreparePayloadResult(
+                clarify=(
+                    "⚠️ Could not stage the prepared generation: "
+                    f"{saved.get('error') or 'unknown store error'}"
+                )
+            )
+        payload = host_mode.build_prepare_payload(prepared, prep_id)
+        await _audit("mcp_prepare_test_cases", entity_id=prep_id, detail={})
+        # Item 6: carry the RAW ticket screenshots so the TOOL layer can forward
+        # them to the host's OWN multimodal model as MCP image content (the server
+        # made no vision call -- describe_images_server_side=False above). Present
+        # only when JIRA_FETCH_IMAGES + ANTHROPIC_API_KEY let jira_fetcher download
+        # them; otherwise empty and the payload's text image_context is the
+        # fallback. Bytes are never persisted in the prep store.
+        ticket_images = list((grounded.url_content or {}).get("images") or [])
+        return PreparePayloadResult(
+            payload=payload, prep_id=prep_id, images=ticket_images
+        )
+    except host_mode.PrepSerdeError as exc:
+        logger.warning("host-mode prepare serialization failed", exc_info=True)
+        return PreparePayloadResult(
+            clarify=f"⚠️ Could not prepare host-mode generation: {exc}"
+        )
+    except Exception as exc:
+        logger.exception("handle_prepare_test_cases failed")
+        _capture_error(exc, "qa_prepare_test_cases")
+        return PreparePayloadResult(clarify=f"⚠️ Preparation failed: {exc}")
+
+
+def render_prepare_payload(result: PreparePayloadResult) -> str:
+    """Render a PreparePayloadResult as a single markdown/JSON text block for a
+    string-only caller (a legacy MCP client, or the host-mode branch of
+    qa_generate_test_cases in ops-3d-3). ops-3d-2 renders the richer
+    multi-block / image form on capable clients. NEVER truncates silently: the
+    whole payload is embedded and any disclosure rides in ``notice``.
+    """
+    if result.clarify:
+        return result.clarify
+    if not result.payload:
+        return "⚠️ Nothing to prepare."
+    body = json.dumps(result.payload, ensure_ascii=False, indent=2)
+    parts = [
+        "## Host-mode generation -- run this in your own chat, then submit it back",
+        "",
+        f"**prep_id:** `{result.prep_id}` (pass this to `qa_submit_suite`).",
+        "",
+        "Generate the suite from the payload below, then call `qa_submit_suite` "
+        "with this prep_id and your merged JSON:",
+        "",
+        "```json",
+        body,
+        "```",
+    ]
+    if result.notice:
+        parts += ["", result.notice]
+    return "\n".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# Host-mode PREPARE result -> MCP content assembly (ops-3d-2, items 5 & 6)
+#
+# Item 5 (tool-result SIZE): a fastmcp tool may return a LIST of content blocks.
+# The grounded payload is emitted as ONE text block when it fits the per-block
+# byte budget (byte-identical to render_prepare_payload -- the legacy/string-only
+# form), and SPLIT across labeled, self-contained blocks only when it does not.
+# ops-3c made the payload chunk-friendly (flat top-level keys, self-contained
+# category entries), so a field is NEVER cut mid-value and TEXT IS NEVER
+# TRUNCATED. The only thing ever dropped for size is an IMAGE, and every drop is
+# named (item 6).
+#
+# Thresholds (stated, with rationale):
+#  * _MAX_TEXT_BLOCK_BYTES = 256 KiB -- the soft per-text-block budget. A typical
+#    grounded payload (capped ticket/AC/parent/spec/openapi text + 8 category
+#    instructions + the TestSuite schema) fits well under this, so the common
+#    case stays a single legacy-identical block; only an unusually large context
+#    triggers the split. It is a SPLIT trigger, not a truncation cap -- an
+#    oversized single field is still emitted whole in its own block.
+#  * _MAX_IMAGE_RESULT_BYTES = 4 MiB -- total RAW image bytes forwarded per
+#    result. base64 inflates ~33%, so 4 MiB raw is ~5.3 MiB on the wire; this
+#    keeps the whole tool result within sane host limits while allowing a few
+#    screenshots. Images are ALSO bounded upstream by settings.jira_max_images
+#    (count) and settings.jira_max_image_bytes (per image at download).
+# --------------------------------------------------------------------------- #
+
+_MAX_TEXT_BLOCK_BYTES = 262_144
+_MAX_IMAGE_RESULT_BYTES = 4_194_304
+
+
+def _select_prepare_images(result: PreparePayloadResult) -> tuple[list[dict], str]:
+    """Pick the ticket screenshots that fit the per-result byte budget and the
+    jira_max_images count cap. Returns (kept, disclosure): kept is a list of
+    {filename, mime, data} dicts; disclosure NAMES every image dropped for size
+    (never silent). Pure -- no fastmcp import."""
+    kept: list[dict] = []
+    dropped: list[str] = []
+    used = 0
+    max_n = max(0, int(getattr(settings, "jira_max_images", 0) or 0))
+    for img in result.images or []:
+        if not isinstance(img, dict):
+            continue
+        data = img.get("data")
+        name = img.get("filename") or "attachment"
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            continue
+        if len(kept) >= max_n or used + len(data) > _MAX_IMAGE_RESULT_BYTES:
+            dropped.append(name)
+            continue
+        used += len(data)
+        kept.append(
+            {
+                "filename": name,
+                "mime": (img.get("mime") or "image/png"),
+                "data": bytes(data),
+            }
+        )
+    disclosure = ""
+    if dropped:
+        disclosure = (
+            "> ℹ️  "
+            f"{len(dropped)} ticket screenshot(s) were NOT attached as image "
+            "content to keep the reply within the size budget "
+            f"({', '.join(dropped)}). Their text description, if any, is in the "
+            "payload above."
+        )
+    return kept, disclosure
+
+
+def _split_prepare_text_blocks(payload: dict, prep_id: str, notice: str) -> list[str]:
+    """Split a too-large payload into labeled, self-contained text blocks WITHOUT
+    truncating any field. The host reassembles ONE JSON object from the fragments.
+    """
+    cats = payload.get("categories") or []
+    meta = {
+        k: payload.get(k)
+        for k in (
+            "version",
+            "task",
+            "prep_id",
+            "untrusted_data_notice",
+            "instructions",
+            "image_context",
+        )
+    }
+    header = [
+        f"## Host-mode generation payload -- delivered across {4 + len(cats)} labeled parts",
+        "",
+        f"**prep_id:** `{prep_id}` (pass this to `qa_submit_suite`).",
+        "",
+        "This grounded payload exceeded the single-block size budget, so it is "
+        "split across the labeled blocks below WITHOUT truncation. Reassemble ONE "
+        "JSON object with top-level keys `system_prompt`, `user_context`, "
+        "`untrusted_data_notice`, `categories` (an array -- one entry per "
+        "`categories[i]` block) and `response_schema`; generate the suite; then "
+        "call `qa_submit_suite` with this prep_id and your merged JSON.",
+        "",
+        "### meta",
+        "```json",
+        json.dumps(meta, ensure_ascii=False, indent=2),
+        "```",
+    ]
+    if notice:
+        header += ["", notice]
+    blocks = ["\n".join(header)]
+    blocks.append(
+        "### system_prompt\n```\n" + str(payload.get("system_prompt") or "") + "\n```"
+    )
+    blocks.append(
+        "### user_context\n```\n" + str(payload.get("user_context") or "") + "\n```"
+    )
+    blocks.append(
+        "### response_schema\n```json\n"
+        + json.dumps(payload.get("response_schema") or {}, ensure_ascii=False, indent=2)
+        + "\n```"
+    )
+    for i, cat in enumerate(cats):
+        name = cat.get("name", "?") if isinstance(cat, dict) else "?"
+        blocks.append(
+            f"### categories[{i}]: {name}\n```json\n"
+            + json.dumps(cat, ensure_ascii=False, indent=2)
+            + "\n```"
+        )
+    return blocks
+
+
+def assemble_prepare_payload(
+    result: PreparePayloadResult,
+) -> tuple[list[str], list[dict]]:
+    """Turn a PreparePayloadResult into (text_blocks, image_specs) for the MCP
+    tool layer. text_blocks is ONE legacy-identical block when the payload fits
+    _MAX_TEXT_BLOCK_BYTES, else the split set (item 5); image_specs is the
+    byte-budget-capped {filename, mime, data} list (item 6). Any image dropped for
+    size is disclosed in an extra text block. Pure -- imports no fastmcp/mcp, so
+    it is fully unit-testable; the tool layer converts the specs to ImageContent.
+    """
+    if result.clarify or not result.payload:
+        return ([render_prepare_payload(result)], [])
+    image_specs, disclosure = _select_prepare_images(result)
+    single = render_prepare_payload(result)
+    if len(single.encode("utf-8")) <= _MAX_TEXT_BLOCK_BYTES:
+        text_blocks = [single]
+    else:
+        text_blocks = _split_prepare_text_blocks(
+            result.payload, result.prep_id, result.notice
+        )
+    if disclosure:
+        text_blocks = [*text_blocks, disclosure]
+    return (text_blocks, image_specs)
+
+
+# --------------------------------------------------------------------------- #
+# Host-mode ("boomerang") SUBMIT handlers -- ops-3d-1b
+#
+# The BACK half of host-mode generation. handle_submit_suite validates the
+# host-generated suite, runs the SHARED _finalize_generation, and returns EITHER
+# a one-round gap report (regenerate + resubmit with the same prep_id) OR the
+# finished, persisted, exported suite. handle_submit_category records one
+# category at a time for a weaker host. Like the PREPARE half this is DEAD CODE
+# behind QA_GENERATION_MODE until ops-3d-3 wires routing -- nothing here is
+# reachable from a server-mode path, and host-submitted JSON is treated as
+# UNTRUSTED throughout (json.loads only, size-capped, and sanitized via
+# tools/cell_sanitizer.sanitize_cell by EVERY exporter reachable from this path
+# -- xlsx_generator, csv_exporter, testrail_exporter AND zephyr_exporter --
+# before it reaches a spreadsheet cell).
+# --------------------------------------------------------------------------- #
+
+# Hard bound on host-mode gap/remediation rounds so a host cannot ping-pong
+# forever. Each qa_submit_suite call performs EXACTLY ONE round (there is NO
+# server-side while loop -- driving the fan-out from the tester's chat is the
+# whole point of host mode). The round counter lives in the prep envelope's
+# meta.round and is bumped via prep_store.update_prep, which preserves created_at
+# so a looping host cannot extend the prep TTL by resubmitting.
+_MAX_GAP_ROUNDS = 3
+
+
+class _CoverageView:
+    """Attribute adapter over the coverage DICT stored at
+    ``suite._checklist_artifacts['coverage']`` (produced by rtm.coverage_to_dict),
+    so host_mode.build_gap_response and rtm.checklist_tally_line -- which read
+    ATTRIBUTES off a ChecklistCoverage -- work against the persisted dict without
+    any agent edit. A non-empty coverage dict only exists when the deterministic
+    matcher actually ran, so ``ran`` is True; any attribute a reader expects but
+    the dict omits falls back to a safe empty default."""
+
+    _DEFAULTS = {
+        "ran": True,
+        "total_items": 0,
+        "presented_items": 0,
+        "total_cases": 0,
+        "links": [],
+        "covered_item_ids": [],
+        "gap_item_ids": [],
+        "not_presented_item_ids": [],
+        "orphan_tc_ids": [],
+        "confidence_counts": {},
+        "coverage_pct": 0.0,
+        "gap_rate": 0.0,
+        "orphan_rate": 0.0,
+        "tier_used": "",
+        "degraded": False,
+        "notes": [],
+    }
+
+    def __init__(self, d: dict) -> None:
+        self._d = dict(d or {})
+
+    def __getattr__(self, name: str):
+        d = object.__getattribute__(self, "_d")
+        if name in d:
+            return d[name]
+        defaults = _CoverageView._DEFAULTS
+        if name in defaults:
+            return defaults[name]
+        raise AttributeError(name)
+
+
+def _coverage_view(suite) -> "_CoverageView | None":
+    """A _CoverageView over the suite's stored coverage dict, or None when no
+    matcher coverage was attached (no checklist configured, or the matcher did
+    not run). None means "no deterministic gaps to boomerang" -> finalize."""
+    artifacts = getattr(suite, "_checklist_artifacts", None)
+    if not isinstance(artifacts, dict):
+        return None
+    cov = artifacts.get("coverage")
+    if not cov or not isinstance(cov, dict):
+        return None
+    return _CoverageView(cov)
+
+
+def _dropped_note(parsed) -> str:
+    """Non-silent disclosure of cases dropped as malformed during parse/salvage.
+    Surfaced UNCONDITIONALLY on BOTH the gap reply and the finished reply -- the
+    ops-3c review finding was that dropped_count must never be swallowed at this
+    layer. dropped_reasons is already capped upstream (parse_host_suite)."""
+    n = getattr(parsed, "dropped_count", 0) or 0
+    if not n:
+        return ""
+    reasons = getattr(parsed, "dropped_reasons", None) or []
+    lines = [
+        f"> ⚠️  {n} submitted case(s) were dropped as malformed and are not included:"
+    ]
+    lines += [f">   - {r}" for r in reasons]
+    return "\n".join(lines) + "\n\n"
+
+
+def _prep_missing_reply(prep_id: str) -> str:
+    """One message covering unknown / TTL-expired / already-finalized prep_ids.
+    A finished suite deletes its prep, so a resubmit-after-finalize lands here
+    too -- it must report cleanly, never crash or silently re-run."""
+    return (
+        f"⚠️ No active preparation for prep_id `{prep_id}`. It is unknown, "
+        "expired (its TTL elapsed), or was already finalized (a finished suite "
+        "deletes its prep). Start again with `qa_prepare_test_cases`."
+    )
+
+
+def _merge_category_rows(rows: list) -> "tuple[dict, int]":
+    """Merge accumulated per-category submission rows into ONE suite dict.
+
+    Rows arrive in insertion order. Each row payload carries a validated
+    ``test_cases`` list of JSON-native dicts (written by handle_submit_category).
+    A reserved row is skipped defensively (none are written now that the round
+    lives in the prep envelope, but the guard keeps a future magic key from being
+    parsed as a suite). tc_ids are RENUMBERED to a global unique sequence before
+    merging: every category restarts at TC-001 and TestSuite REJECTS duplicate
+    tc_ids, so a literal "dedup by tc_id" across categories would wrongly discard
+    almost every case. The throwaway ids are reassigned to TC-001..N by
+    _finalize_generation's renumber, and genuine CONTENT duplicates are removed
+    there by _dedupe_cases. Returns (merged_suite_dict, rows_used)."""
+    merged_cases: list = []
+    used = 0
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("category_name", "")
+        if name == "__round__":  # reserved-key guard (defensive; unused now)
+            continue
+        payload = row.get("payload") or {}
+        cases = payload.get("test_cases")
+        if not isinstance(cases, list):
+            continue
+        used += 1
+        for c in cases:
+            if isinstance(c, dict):
+                merged_cases.append(c)
+    renumbered = []
+    for i, c in enumerate(merged_cases, 1):
+        c = dict(c)
+        c["tc_id"] = f"TC-{i:04d}"
+        renumbered.append(c)
+    return {"test_cases": renumbered}, used
+
+
+async def handle_submit_category(
+    prep_id: str,
+    category_name: str,
+    suite_json,
+    *,
+    progress: ProgressCb = None,
+) -> str:
+    """Record ONE category's cases for a weaker host that submits incrementally.
+
+    Validates the prep still exists, parses + salvages the submitted JSON with the
+    ops-3c parser (UNTRUSTED-safe: json.loads only, size-capped), and stores the
+    validated cases keyed UNIQUE per (prep_id, category_name) via
+    prep_store.save_submission. That row is INSERT OR REPLACE, so re-submitting the
+    same category REPLACES the earlier one (newest wins) -- the reply says so.
+    Never raises."""
+    prep_id = (prep_id or "").strip()
+    category_name = (category_name or "").strip()
+    if not prep_id:
+        return (
+            "⚠️ Missing prep_id. Prepare a generation first with "
+            "`qa_prepare_test_cases`."
+        )
+    if not category_name:
+        return (
+            "⚠️ Missing category name. Pass the category you are submitting cases for."
+        )
+    try:
+        loaded = await prep_store.load_prep(prep_id)
+        if loaded.get("content") is None:
+            return _prep_missing_reply(prep_id)
+        try:
+            parsed = host_mode.parse_host_suite(suite_json)
+        except host_mode.PrepSerdeError as exc:
+            return f"⚠️ Could not read the submitted JSON for **{category_name}**: {exc}"
+        cases_json = [tc.model_dump(mode="json") for tc in parsed.suite.test_cases]
+        saved = await prep_store.save_submission(
+            prep_id,
+            category_name,
+            {"test_cases": cases_json, "dropped_count": parsed.dropped_count},
+        )
+        if saved.get("error"):
+            return f"⚠️ Could not record **{category_name}**: {saved['error']}"
+        rows = await prep_store.load_submissions(prep_id)
+        on_file = len(rows.get("content") or [])
+        await _audit(
+            "mcp_submit_category",
+            entity_id=prep_id,
+            detail={"category": category_name, "cases": len(cases_json)},
+        )
+        note = _dropped_note(parsed)
+        return (
+            f"{note}## ✅ Recorded {len(cases_json)} case(s) for "
+            f"**{category_name}**\n\n"
+            f"Re-submitting **{category_name}** REPLACES its previous rows "
+            "(newest wins).\n\n"
+            f"**{on_file}** category row(s) are now staged for prep_id `{prep_id}`. "
+            "When every category is in, call `qa_submit_suite` with this prep_id and "
+            "an EMPTY suite_json to finalize from the accumulated rows, or submit the "
+            "full merged suite_json directly."
+        )
+    except Exception as exc:
+        logger.exception("handle_submit_category failed")
+        _capture_error(exc, "qa_submit_category")
+        return f"⚠️ Recording the category failed: {exc}"
+
+
+async def handle_submit_suite(
+    prep_id: str,
+    suite_json,
+    *,
+    ask_text: AskCb = None,
+    progress: ProgressCb = None,
+) -> str:
+    """BACK half of host-mode generation: validate the host-generated suite,
+    finalize it deterministically, and return EITHER a gap report to fix and
+    resubmit (SAME prep_id) OR the finished suite + export path. Performs EXACTLY
+    ONE gap round per call. Never raises."""
+    prep_id = (prep_id or "").strip()
+    if not prep_id:
+        return (
+            "⚠️ Missing prep_id. Run `qa_prepare_test_cases` first, then "
+            "submit with the prep_id it returned."
+        )
+    try:
+        loaded = await prep_store.load_prep(prep_id)
+        envelope = loaded.get("content")
+        if not isinstance(envelope, dict):
+            return _prep_missing_reply(prep_id)
+
+        try:
+            prepared = host_mode.deserialize_prepared(envelope.get("prepared") or {})
+        except host_mode.PrepSerdeError:
+            logger.warning("host-mode submit: prep rehydrate failed", exc_info=True)
+            return (
+                f"⚠️ The staged preparation for prep_id `{prep_id}` could "
+                "not be read (it may be corrupted or from an incompatible version). "
+                "Start again with `qa_prepare_test_cases`."
+            )
+
+        meta = envelope.get("meta") or {}
+        source_text = str(meta.get("source_text") or "")
+        source_url = str(meta.get("source_url") or "") or None
+        try:
+            round_no = int(meta.get("round", 0) or 0)
+        except (TypeError, ValueError):
+            round_no = 0
+
+        # CONFLICT RULE (item 4): a non-empty suite_json is AUTHORITATIVE and any
+        # accumulated per-category rows are ignored (the reply says how many were
+        # not used). An empty suite_json merges the accumulated rows instead.
+        if isinstance(suite_json, str):
+            has_full = bool(suite_json.strip())
+        elif suite_json is None:
+            has_full = False
+        else:
+            has_full = True
+
+        conflict_note = ""
+        try:
+            if has_full:
+                parsed = host_mode.parse_host_suite(suite_json)
+                rows_res = await prep_store.load_submissions(prep_id)
+                n_rows = len(rows_res.get("content") or [])
+                if n_rows:
+                    conflict_note = (
+                        f"> ℹ️  A full suite was submitted, so {n_rows} "
+                        "accumulated per-category row(s) were NOT used.\n\n"
+                    )
+            else:
+                rows_res = await prep_store.load_submissions(prep_id)
+                rows = rows_res.get("content") or []
+                if not rows:
+                    return (
+                        "⚠️ Nothing to finalize: no suite_json was provided "
+                        "and no per-category rows are staged for prep_id "
+                        f"`{prep_id}`. Submit the merged JSON, or record categories "
+                        "first with `qa_submit_category`."
+                    )
+                merged_dict, used = _merge_category_rows(rows)
+                parsed = host_mode.parse_host_suite(merged_dict)
+                conflict_note = (
+                    f"> ℹ️  Finalized from {used} accumulated per-category "
+                    "row(s) (no full suite_json was submitted).\n\n"
+                )
+        except host_mode.PrepSerdeError as exc:
+            return (
+                f"⚠️ Could not read the submitted suite: {exc}\n\n"
+                f"Fix the JSON and resubmit with the same prep_id `{prep_id}`."
+            )
+
+        all_cases = list(parsed.suite.test_cases)
+        dropped_note = _dropped_note(parsed)
+
+        # ONE synthetic CategoryResult so _finalize_generation's "N of 8 failed"
+        # partial line correctly does NOT fire (its only use of category_results).
+        category_results = [
+            CategoryResult(category_name="Host Submission", cases=all_cases, error=None)
+        ]
+        captured: dict = {}
+
+        def _on_ready(s) -> None:
+            captured["suite"] = s
+
+        async def _on_status(msg: str) -> None:
+            await _emit(progress, msg)
+
+        summary, _x, _c, _t, status = await _finalize_generation(
+            prepared,
+            all_cases,
+            category_results,
+            defer_files=True,
+            on_suite_ready=_on_ready,
+            on_status=_on_status,
+            ui_content=prepared.ui_content,
+            # HOST PATH: never run the server-side remediation loop -- the
+            # regeneration round is the tester's chat model's job, and a dead
+            # fixed backend would otherwise stall this call for minutes.
+            remediate=False,
+        )
+        suite = captured.get("suite")
+        if suite is None or not getattr(suite, "test_cases", None):
+            await prep_store.delete_prep(prep_id)
+            return (
+                f"{dropped_note}{conflict_note}⚠️ The submitted suite "
+                "produced no usable test cases after validation. Regenerate and "
+                "resubmit."
+            )
+
+        # GAP ROUND (items 3 + 7): gaps come ONLY from the deterministic matcher.
+        # A degraded coverage view (no QA_EMBEDDINGS_BACKEND) NEVER enters the loop
+        # -- build_gap_response's own UNRELIABLE caveat stands and the suite is
+        # finalized. The loop is bounded by _MAX_GAP_ROUNDS and runs at most ONE
+        # round per call. It is additionally gated on the remediation flag; see the
+        # plan's "server-side remediation interaction" note.
+        view = _coverage_view(suite)
+        cap_note = ""
+        if (
+            settings.qa_checklist_remediation_enabled
+            and view is not None
+            and not view.degraded
+            and view.gap_item_ids
+        ):
+            if round_no < _MAX_GAP_ROUNDS:
+                new_env = dict(envelope)
+                new_meta = dict(meta)
+                new_meta["round"] = round_no + 1
+                new_env["meta"] = new_meta
+                await prep_store.update_prep(prep_id, new_env)  # KEEP the prep
+                gap_md = host_mode.build_gap_response(view, suite.test_cases, prep_id)
+                await _audit(
+                    "mcp_submit_suite_gap",
+                    entity_id=prep_id,
+                    detail={
+                        "round": round_no + 1,
+                        "gaps": len(view.gap_item_ids),
+                    },
+                )
+                return f"{dropped_note}{conflict_note}{gap_md}"
+            cap_note = (
+                "\n\n> ⚠️  Requirement coverage still shows "
+                f"{len(view.gap_item_ids)} gap(s), but the remediation round limit "
+                f"({_MAX_GAP_ROUNDS}) was reached -- finalizing the suite as-is."
+            )
+
+        # FINALIZE branch: replicate the server persistence tail
+        # (handle_generate_test_cases ~lines 1470-1533), then delete the prep.
+        await _emit(progress, "\U0001f4be Saving the suite…")
+        saved = await save_suite(suite, feature_text=source_text, source_url=source_url)
+        suite_id = (saved.get("content") or {}).get("suite_id", "") or suite.suite_id
+        _checklist_artifacts = getattr(suite, "_checklist_artifacts", None)
+        if _checklist_artifacts and suite_id:
+            await save_checklist(suite_id, _checklist_artifacts)
+        await _persist_suite_to_corpus(suite, feature_text=source_text)
+        case_count = len(getattr(suite, "test_cases", []) or [])
+        telemetry.add_tool_properties(case_count=case_count, source="host")
+        await _audit(
+            "mcp_submit_suite",
+            entity_id=suite_id or None,
+            detail={"status": status, "cases": case_count},
+        )
+        auto_export = bool(
+            settings.qa_auto_export_xlsx and getattr(suite, "test_cases", None)
+        )
+        result_md = shape_generation_result(
+            summary, suite, suite_id, status, auto_export=auto_export
+        )
+        xlsx_paths: list[str] = []
+        if auto_export:
+            result_md += "\n\n" + await _auto_export_xlsx(
+                suite,
+                ask_text=ask_text,
+                on_path=xlsx_paths.append,
+                progress=progress,
+            )
+        result_md += await _auto_export_zephyr(
+            suite,
+            source_text=source_text,
+            near_path=xlsx_paths[0] if xlsx_paths else "",
+            progress=progress,
+        )
+        await prep_store.delete_prep(prep_id)
+        return f"{dropped_note}{conflict_note}{result_md}{cap_note}"
+    except Exception as exc:
+        logger.exception("handle_submit_suite failed")
+        _capture_error(exc, "qa_submit_suite")
+        return f"⚠️ Submitting the suite failed: {exc}"
 
 
 async def handle_export_suite(
