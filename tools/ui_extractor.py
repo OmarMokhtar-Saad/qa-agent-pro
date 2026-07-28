@@ -5,7 +5,9 @@ JavaScript single-page apps (React/Vue/Angular, e.g. SauceDemo):
 
   Tier 1 -- tools/jira_fetcher.py (httpx). Fast, server-rendered pages. When it
             flags spa_shell=True (a JS-only shell) or its HTML yields zero UI
-            elements, escalate to Tier 2.
+            elements, escalate to Tier 2. A result carrying NO raw_html (e.g. a
+            Jira REST fetch, which returns ticket text) never escalates -- there
+            is no HTML for a browser to re-render -- and reports "none".
   Tier 2 -- tools/browser_renderer.py (Playwright headless Chromium). Renders
             the page for real; the resulting HTML is parsed with the same
             BeautifulSoup extractors used for Tier 1. Degrades cleanly if
@@ -107,7 +109,33 @@ async def extract_ui_elements(url: str, prefetched: dict | None = None) -> dict:
         # explained specifically instead of with a single generic message.
         render_error: str | None = None
 
-        if spa_shell or _looks_empty(ui_elements):
+        # Tier 2 renders a page's HTML, so it can only help when HTML was
+        # actually fetched. A Jira REST result carries the ticket's TEXT and no
+        # HTML at all (raw_text is used as the raw_html fallback above), so
+        # _parse_ui_elements is always empty and _looks_empty escalated EVERY
+        # Jira URL to a headless-Chromium render of an auth-walled issue/board
+        # page. Measured on a real board URL: 15.2s to "extract" 2 headings and
+        # 0 fields/buttons from the Atlassian shell -- which _looks_empty then
+        # ACCEPTED, overwriting page_title with the board's title instead of the
+        # ticket summary. Gating on raw_html fixes this and every future
+        # text-only source; _fetch_generic returns raw_html on both of its 200
+        # paths, so no real web page loses Tier 2.
+        # spa_shell stays an INDEPENDENT trigger: the fetcher setting it means
+        # "this is a JS-only shell, re-render it", and that must hold even when
+        # no HTML came back. Only the _looks_empty heuristic is gated on having
+        # HTML -- that is the branch a text-only source wrongly satisfied.
+        has_html = bool(fetch_result.get("raw_html"))
+        skip_tier2 = not spa_shell and not has_html
+        if skip_tier2:
+            # No HTML was ever parsed, so "static_html" would misreport the
+            # module contract; "none" is the documented value for that.
+            extraction_method = "none"
+            logger.debug(
+                "ui_extractor: %s returned no HTML (text-only source) -- "
+                "skipping the Tier 2 browser render",
+                url,
+            )
+        if not skip_tier2 and (spa_shell or _looks_empty(ui_elements)):
             logger.info(
                 "ui_extractor: escalating to Tier 2 browser render for %s (spa_shell=%s)",
                 url,
