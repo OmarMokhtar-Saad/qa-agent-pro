@@ -173,6 +173,20 @@ def _delete_prep_sync(prep_id: str) -> None:
         conn.close()
 
 
+def _update_prep_sync(prep_id: str, payload: dict) -> bool:
+    now_payload = json.dumps(payload)
+    conn = _connect()
+    try:
+        with conn:  # transaction
+            cur = conn.execute(
+                "UPDATE preps SET payload_json = ? WHERE id = ?",
+                (now_payload, prep_id),
+            )
+        return (cur.rowcount or 0) > 0
+    finally:
+        conn.close()
+
+
 def _save_submission_sync(prep_id: str, category_name: str, payload: dict) -> int:
     now = time.time()
     conn = _connect()
@@ -258,6 +272,33 @@ async def delete_prep(prep_id: str) -> dict:
         return {"error": None, "content": {"prep_id": prep_id}}
     except Exception as exc:
         logger.exception("prep_store.delete_prep failed")
+        return {"error": str(exc), "content": None}
+
+
+async def update_prep(prep_id: str, payload: dict) -> dict:
+    """Overwrite an existing prep record's payload IN PLACE (host-mode gap loop).
+
+    Used to persist the incremented gap-loop round in the envelope's ``meta`` so a
+    host cannot ping-pong forever. Deliberately keeps ``created_at`` unchanged, so
+    the TTL still counts from prepare and a looping host cannot extend it by
+    resubmitting. Rejects an over-large payload and a missing/unknown/expired
+    ``prep_id`` (the UPDATE simply matches no row). Never raises.
+    """
+    try:
+        if not prep_id:
+            return {"error": "prep_id is required", "content": None}
+        blob = json.dumps(payload or {})
+        if len(blob.encode("utf-8")) > _max_bytes():
+            return {
+                "error": f"prep payload exceeds {_max_bytes()} bytes",
+                "content": None,
+            }
+        updated = await asyncio.to_thread(_update_prep_sync, prep_id, payload or {})
+        if not updated:
+            return {"error": "unknown or expired prep_id", "content": None}
+        return {"error": None, "content": {"prep_id": prep_id}}
+    except Exception as exc:
+        logger.exception("prep_store.update_prep failed")
         return {"error": str(exc), "content": None}
 
 

@@ -473,7 +473,25 @@ def _json_system(system: str, response_model: Type[T]) -> str:
     )
 
 
-def _balanced_json_spans(raw: str):
+# Hard ceiling on total characters visited during the balanced-brace scan.
+# The scan re-starts from every ``{``, so on pathological input whose braces
+# never return to depth 0 (e.g. a response truncated at max_tokens mid-JSON)
+# total work is O(n^2). Bounding total visits makes it O(budget): once the
+# budget is exhausted the generator simply stops yielding and
+# _parse_json_response falls through to its legacy raw.find/rfind fallback, so
+# behaviour for realistic input is unchanged. 2,000,000 is ~4x the work of an
+# oversized 250 KB / 500-case suite (measured ~525k visits) yet caps a
+# 200k-`{` blob at ~0.19s instead of minutes.
+#
+# Above the budget, NESTED-candidate selection is no longer guaranteed: the scan
+# stops early and _parse_json_response's legacy fallback recovers the OUTERMOST
+# object. A valid response is therefore never lost, but an >1MB response whose
+# outer object fails validation and whose only valid object is a deep nested span
+# would no longer be found. That is not a realistic LLM response shape.
+_MAX_JSON_SCAN_VISITS = 2_000_000
+
+
+def _balanced_json_spans(raw: str, *, budget: int = _MAX_JSON_SCAN_VISITS):
     """Yield each balanced ``{...}`` span in ``raw`` (string/escape aware).
 
     For every ``{`` that begins a top-level (depth-0) object, walk forward
@@ -485,6 +503,7 @@ def _balanced_json_spans(raw: str):
     """
     i = 0
     n = len(raw)
+    visited = 0
     while i < n:
         if raw[i] != "{":
             i += 1
@@ -495,6 +514,9 @@ def _balanced_json_spans(raw: str):
         escaped = False
         j = i
         while j < n:
+            visited += 1
+            if visited > budget:
+                return  # budget exhausted: stop, caller uses legacy fallback
             ch = raw[j]
             if in_string:
                 if escaped:
