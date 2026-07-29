@@ -688,6 +688,29 @@ def _get_cli() -> str:
     return _CLI
 
 
+_CLI_WORKDIR: dict = {}
+
+
+def _cli_workdir() -> str:
+    """An empty directory to run the claude CLI in, so no host `.claude/settings*`
+    is visible to it as project settings. Created once per process; falls back to
+    the system temp dir, and finally to "~", so this can never stop a call.
+    """
+    got = _CLI_WORKDIR.get("path")
+    if got and os.path.isdir(got):
+        return got
+    try:
+        got = tempfile.mkdtemp(prefix="qa_agents_cli_")
+        _CLI_WORKDIR["path"] = got
+        return got
+    except Exception:
+        logger.debug("could not create a CLI workdir", exc_info=True)
+        try:
+            return tempfile.gettempdir()
+        except Exception:
+            return os.path.expanduser("~")
+
+
 def _popen_cli(system: str, user: str, model: str | None = None) -> subprocess.Popen:
     """Spawn the claude CLI in streaming-JSON mode with a sanitized environment."""
     env = {k: v for k, v in os.environ.items() if k not in _STRIP}
@@ -714,7 +737,25 @@ def _popen_cli(system: str, user: str, model: str | None = None) -> subprocess.P
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        cwd=os.path.expanduser("~"),
+        # ops-7: NOT the home directory. With cwd=~, `--setting-sources project`
+        # above resolves ~/.claude/settings.json as the PROJECT settings file, so
+        # its `env` block re-injects the very variables _STRIP is there to remove
+        # (observed: effortLevel=high + CLAUDE_CODE_EFFORT_LEVEL=high). A fresh
+        # empty directory has no .claude/, so "project settings" is genuinely
+        # empty and only the flags passed here apply. This mirrors what the cursor
+        # backend in this same file already does (cwd=workdir, "a fresh disposable
+        # directory"), so it adopts an established pattern rather than inventing
+        # one. Created once per process and left empty.
+        #
+        # THIS IS ISOLATION HYGIENE, NOT A PERFORMANCE FIX. Measured 2026-07-29
+        # with the same prompt, model and flags, changing only cwd: trivial prompt
+        # 6s from ~ vs 5s from an empty dir. The leaked effort level does NOT
+        # measurably inflate a call. The ~28s ambiguity-gate cost seen in
+        # production is the call itself -- ~5s of fixed claude-CLI process startup
+        # plus real model time on real ticket text (a 2.9 KB probe prompt took
+        # 17s). Do not cite this line as a latency improvement; the lever for that
+        # cost is boomeranging the gate to the host, not the cwd.
+        cwd=_cli_workdir(),
         env=env,
         text=True,
         bufsize=1,

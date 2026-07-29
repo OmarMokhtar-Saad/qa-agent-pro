@@ -286,6 +286,41 @@ ProgressCb = Optional[Callable[[str], Awaitable[None]]]
 _JIRA_PREFLIGHT_TTL_S = 60.0
 _JIRA_PREFLIGHT_OK: dict = {}
 
+
+def _jira_cred_key() -> tuple:
+    """Identity of the credentials in play, so changing the token invalidates."""
+    return (
+        str(settings.jira_base_url or ""),
+        str(settings.jira_email or ""),
+        str(settings.jira_api_token or "")[-8:],
+    )
+
+
+def _jira_verify_cached_ok() -> bool:
+    """True when THESE credentials verified recently. Never raises."""
+    try:
+        hit = _JIRA_PREFLIGHT_OK.get(_jira_cred_key())
+        return hit is not None and (time.monotonic() - hit) < _JIRA_PREFLIGHT_TTL_S
+    except Exception:
+        return False
+
+
+def _remember_jira_ok() -> None:
+    """Record a SUCCESSFUL verify. Only successes are cached, so a failure always
+    re-probes and a tester who just fixed their token is never made to wait.
+
+    ops-7: both call sites use this now. The v1.10.5 cache lived only inside
+    _jira_preflight, so it never suppressed the duplicate it was written for --
+    qa_setup_check probes verify_jira_access() DIRECTLY, and a real run on
+    2026-07-29 still made two GET /rest/api/3/myself calls 31s apart.
+    """
+    try:
+        _JIRA_PREFLIGHT_OK.clear()  # bounded: one live credential set at a time
+        _JIRA_PREFLIGHT_OK[_jira_cred_key()] = time.monotonic()
+    except Exception:
+        logger.debug("could not cache the Jira verify result", exc_info=True)
+
+
 # --- Guided-wizard choice callback (MCP elicitation bridge) ----------------- #
 # mcp_server.py adapts FastMCP's ctx.elicit into this async callback, mirroring
 # ProgressCb. It returns a ChoiceResult so these handlers stay importable and
@@ -1069,15 +1104,12 @@ async def _jira_preflight(
         str(settings.jira_email or ""),
         str(settings.jira_api_token or "")[-8:],
     )
-    _now = time.monotonic()
-    _hit = _JIRA_PREFLIGHT_OK.get(_pf_key)
-    if _hit is not None and _now - _hit < _JIRA_PREFLIGHT_TTL_S:
+    if _jira_verify_cached_ok():
         return None
     await _emit(progress, "🔐 Checking Jira access…")
     probe = await verify_jira_access()
     if probe.get("ok"):
-        _JIRA_PREFLIGHT_OK.clear()  # bounded: one live credential set at a time
-        _JIRA_PREFLIGHT_OK[_pf_key] = _now
+        _remember_jira_ok()
         return None
     if not (settings.qa_mcp_elicit_enabled and ask_text is not None):
         return _jira_token_steps(host, verify_error=probe.get("error", "")) + (
@@ -1816,7 +1848,19 @@ async def _ground_and_gate(
             if clarify:
                 await _audit("mcp_amendment_gate", detail={"source": audit_source})
                 return clarify
+        # ops-7: this gate is the ONLY server-side LLM call left on the host
+        # prepare path and it was completely un-logged -- a real run on
+        # 2026-07-29 showed a 28-second hole here with no output at all. Time it,
+        # so the cost is attributable instead of a mystery.
+        _gate_t0 = time.monotonic()
         clarify = await _maybe_ambiguity_clarify(text, url_content, openapi_text)
+        logger.info(
+            "prepare: ambiguity gate took %.1fs (severity=%s, model=%s) -> %s",
+            time.monotonic() - _gate_t0,
+            settings.qa_ambiguity_gate_severity,
+            settings.qa_classifier_model or "default",
+            "CLARIFY" if clarify else "proceed",
+        )
         if clarify:
             await _audit("mcp_ambiguity_gate", detail={"source": audit_source})
             return clarify
@@ -2662,13 +2706,26 @@ async def handle_submit_suite(
 
         # FINALIZE branch: replicate the server persistence tail
         # (handle_generate_test_cases ~lines 1470-1533), then delete the prep.
+        # ops-7: with the 108s advisory-gap call gone, THIS tail is the largest
+        # remaining server-side cost on a submit -- and it logged nothing. A real
+        # run on 2026-07-29 spent 43 seconds between finalize (25ms) and
+        # suite_store, with no way to tell which await it was. Time each step.
+        _t0 = time.monotonic()
         await _emit(progress, "\U0001f4be Saving the suite…")
+        _t_emit = time.monotonic()
         saved = await save_suite(suite, feature_text=source_text, source_url=source_url)
+        logger.info(
+            "submit tail: progress emit %.1fs | save_suite %.1fs",
+            _t_emit - _t0,
+            time.monotonic() - _t_emit,
+        )
         suite_id = (saved.get("content") or {}).get("suite_id", "") or suite.suite_id
         _checklist_artifacts = getattr(suite, "_checklist_artifacts", None)
         if _checklist_artifacts and suite_id:
             await save_checklist(suite_id, _checklist_artifacts)
+        _t_corpus = time.monotonic()
         await _persist_suite_to_corpus(suite, feature_text=source_text)
+        logger.info("submit tail: corpus persist %.1fs", time.monotonic() - _t_corpus)
         case_count = len(getattr(suite, "test_cases", []) or [])
         telemetry.add_tool_properties(case_count=case_count, source="host")
         await _audit(
@@ -3718,6 +3775,10 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
             _probe = await verify_jira_access()
             jira_verified = bool(_probe.get("ok"))
             jira_account = _probe.get("account", "") or ""
+            # ops-7: share the result with _jira_preflight so the generation that
+            # usually follows this check does not re-probe the same credentials.
+            if jira_verified:
+                _remember_jira_ok()
             if not jira_verified:
                 recommended.append(
                     "Jira credentials are set but the live access check failed: "
