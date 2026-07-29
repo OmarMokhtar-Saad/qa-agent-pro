@@ -133,6 +133,21 @@ _DIST_UPDATE_REPO = "OmarMokhtar-Saad/qa-agent-pro"
 _TOOL_SCHEMAS_CHANGED_IN = "1.5.0"
 
 
+def _boot_version() -> str:
+    """The installed version as it was at IMPORT time. Compared against the
+    on-disk VERSION later to notice that another process updated this install
+    underneath a running server. Never raises."""
+    try:
+        from tools.updater import _INSTALL_DIR, _local_version
+
+        return _local_version(Path(_INSTALL_DIR)) or ""
+    except Exception:
+        return ""
+
+
+_BOOT_VERSION = _boot_version()
+
+
 def _schedule_reload() -> None:
     """Exit the server process shortly after the current response flushes.
 
@@ -150,6 +165,87 @@ def _schedule_reload() -> None:
 # Wall-clock at import: anything on disk newer than this was written AFTER the
 # running server read its configuration.
 _PROCESS_START = time.time()
+
+
+# ops-6 (bug 3): cap on an elicited folder answer before it is treated as a path.
+_MAX_EXPORT_DIR_CHARS = 400
+
+
+def _safe_elicited_dir(answer: str) -> tuple[str, str]:
+    """Validate an elicited save-folder answer BEFORE it becomes a real path.
+
+    Returns ``(directory_or_empty, note)``. An empty directory means "rejected --
+    keep the configured default", and *note* is always non-empty in that case so
+    the tester is told, rather than silently getting a different location.
+
+    WHY: the answer is UNTRUSTED host-model text, and it used to be passed
+    straight to ``Path(...).mkdir(parents=True)``. On 2026-07-29 a host echoed
+    back the raw `.env` line -- inline comment included -- and the server created
+    ``data/exports       # save auto-exported .xlsx here (... sessions/`` plus an
+    ``updates)`` subdirectory, splitting on the `/` inside the comment, then
+    reported that path to the tester as the location of their file.
+
+    Rules: no comment/newline/NUL characters (a comment marker means the answer
+    is a config line, not a folder), a length cap, and the resolved path must sit
+    under the install dir, the user's home, or the system temp dir -- so an
+    answer like ``~/../../etc`` cannot direct writes anywhere it likes. Never
+    raises: any failure rejects the answer and keeps the default.
+    """
+    raw = (answer or "").strip()
+    if not raw:
+        return "", ""
+    if len(raw) > _MAX_EXPORT_DIR_CHARS:
+        return "", (
+            "\n> ℹ️  The folder you replied with was too long to be a real path, "
+            "so the configured export folder was used instead."
+        )
+    if any(ch in raw for ch in ("#", "\n", "\r", "\x00")):
+        return "", (
+            "\n> ℹ️  The folder you replied with looks like a config line rather "
+            "than a folder (it contains a comment marker or a line break), so the "
+            "configured export folder was used instead."
+        )
+    try:
+        import tempfile
+
+        from tools.updater import _INSTALL_DIR
+
+        resolved = Path(raw).expanduser().resolve()
+        roots = [
+            Path(_INSTALL_DIR).resolve(),
+            Path.home().resolve(),
+            Path(tempfile.gettempdir()).resolve(),
+        ]
+        if not any(resolved == r or r in resolved.parents for r in roots):
+            return "", (
+                "\n> ℹ️  The folder you replied with is outside the install "
+                "folder, your home folder and the temp folder, so the configured "
+                "export folder was used instead."
+            )
+        return str(resolved), ""
+    except Exception:
+        logger.debug("elicited export dir rejected", exc_info=True)
+        return "", (
+            "\n> ℹ️  The folder you replied with could not be used, so the "
+            "configured export folder was used instead."
+        )
+
+
+def _code_changed_since_start() -> bool:
+    """True when the installed VERSION differs from the one this process loaded.
+
+    Content-based, not mtime-based: a touched-but-identical VERSION must not
+    trigger a reload loop. Never raises -- an unreadable VERSION reads as
+    unchanged, so a failure can only SKIP a reload, never cause a spurious one.
+    """
+    try:
+        from tools.updater import _INSTALL_DIR, _local_version
+
+        on_disk = _local_version(Path(_INSTALL_DIR))
+        return bool(on_disk and _BOOT_VERSION and on_disk != _BOOT_VERSION)
+    except Exception:
+        logger.debug("could not compare the installed version", exc_info=True)
+        return False
 
 
 def _env_changed_since_start() -> bool:
@@ -1068,6 +1164,7 @@ async def _auto_export_xlsx(
         await _emit(progress, "📄 Writing the Excel export…")
         output_path = None
         export_dir = (settings.qa_export_dir or "").strip()
+        reject_note = ""
         if settings.qa_mcp_elicit_enabled and ask_text is not None:
             default_label = export_dir or "a secure temp folder"
             asked = await _elicit_text(
@@ -1076,7 +1173,14 @@ async def _auto_export_xlsx(
                 f"path, or leave blank for the default ({default_label}).",
             )
             if asked.status == CHOSEN and (asked.value or "").strip():
-                export_dir = asked.value.strip()
+                # ops-6 (bug 3): UNTRUSTED host text -- validate before it
+                # becomes a real directory. A rejected answer keeps the
+                # configured default AND says so.
+                picked, why = _safe_elicited_dir(asked.value)
+                if picked:
+                    export_dir = picked
+                elif why:
+                    reject_note = why
         if export_dir:
             try:
                 dest = Path(export_dir).expanduser()
@@ -1115,7 +1219,7 @@ async def _auto_export_xlsx(
             f"**Download / open it here:**\n\n`{path}`{link}\n\n"
             "_That spreadsheet is the finished deliverable — nothing else to "
             "run. Need CSV, Gherkin, Playwright or TestRail instead? Just say "
-            "so._"
+            "so._" + reject_note
         )
     except Exception as exc:
         logger.exception("mcp auto-export xlsx failed")
@@ -1802,6 +1906,12 @@ async def handle_prepare_test_cases(
                 "source_text": text,
                 "source_url": text if grounded.url_content else "",
                 "round": 0,
+                # ops-6 (bug 1): the launcher applies updates "at the next idle
+                # minute", and a host-mode flow is idle exactly between prepare
+                # and submit -- so a restart lands MID-FLOW and the envelope is
+                # deserialized by a different code version than wrote it.
+                # Observed on 2026-07-29. Stamp the writer so submit can say so.
+                "app_version": _BOOT_VERSION,
             },
         }
         saved = await prep_store.save_prep(envelope, created_by="qa_prepare_test_cases")
@@ -2270,6 +2380,22 @@ async def handle_submit_suite(
         meta = envelope.get("meta") or {}
         source_text = str(meta.get("source_text") or "")
         source_url = str(meta.get("source_url") or "") or None
+        # ops-6 (bug 1): warn (never block) when the prep was written by a
+        # different build than this one. Blocking would throw away the tester's
+        # generation work for what is usually harmless; silence is what let a
+        # split-version flow go unnoticed.
+        version_note = ""
+        try:
+            _wrote = str(meta.get("app_version") or "")
+            if _wrote and _BOOT_VERSION and _wrote != _BOOT_VERSION:
+                version_note = (
+                    f"\n> ⚠️  This prep was staged by v{_wrote} but is being "
+                    f"submitted to v{_BOOT_VERSION} -- the server updated "
+                    "mid-flow. The suite below is fine unless something looks "
+                    "wrong; if it does, re-run `qa_generate_test_cases`.\n"
+                )
+        except Exception:
+            logger.debug("prep version check failed", exc_info=True)
         try:
             round_no = int(meta.get("round", 0) or 0)
         except (TypeError, ValueError):
@@ -2524,7 +2650,10 @@ async def handle_submit_suite(
                         "gaps": len(view.gap_item_ids),
                     },
                 )
-                return f"{dropped_note}{conflict_note}{dup_note}{cov_note}{gap_md}"
+                return (
+                    f"{version_note}{dropped_note}{conflict_note}"
+                    f"{dup_note}{cov_note}{gap_md}"
+                )
             cap_note = (
                 "\n\n> ⚠️  Requirement coverage still shows "
                 f"{len(view.gap_item_ids)} gap(s), but the remediation round limit "
@@ -2588,7 +2717,10 @@ async def handle_submit_suite(
             progress=progress,
         )
         await prep_store.delete_prep(prep_id)
-        return f"{dropped_note}{conflict_note}{dup_note}{cov_note}{result_md}{cap_note}"
+        return (
+            f"{version_note}{dropped_note}{conflict_note}{dup_note}"
+            f"{cov_note}{result_md}{cap_note}"
+        )
     except Exception as exc:
         logger.exception("handle_submit_suite failed")
         _capture_error(exc, "qa_submit_suite")
@@ -3492,6 +3624,24 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
                     "> 🔄 **A new version was just installed.** The server is "
                     "reloading now — run `qa_setup_check` again in ~10 seconds "
                     "to see it."
+                )
+                _schedule_reload()
+            elif _code_changed_since_start():
+                # ops-6 (bug 2): the reload trigger used to watch ONLY .env, so an
+                # update applied by ANOTHER process sharing this install dir left
+                # this one running stale modules with no signal at all -- and
+                # qa_setup_check could not rescue it, because by the time it runs
+                # the disk is already new, so run_update_check returns
+                # "up-to-date" and the branch above never fires. Observed on
+                # 2026-07-29: 1.10.4 landed on disk at 12:44:51 while a process
+                # from 08:57:43 kept serving 1.10.3, so one host-mode flow ran its
+                # prepare on old code and its submit on new code.
+                update_note = (
+                    "> 🔄 **Newer code is installed than this server is running.** "
+                    "Another process updated this install while this one was "
+                    "already started, so the version below is what is running, "
+                    "not what is on disk. Reloading now: run `qa_setup_check` "
+                    "again in ~10 seconds."
                 )
                 _schedule_reload()
             elif _env_changed_since_start():

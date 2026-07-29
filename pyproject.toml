@@ -1,6 +1,6 @@
 [project]
 name = "qa-agent-pro"
-version = "1.10.5"
+version = "1.10.6"
 requires-python = ">=3.10"
 dependencies = [
     # The product surface is the MCP stdio server (mcp_server.py + fastmcp).
