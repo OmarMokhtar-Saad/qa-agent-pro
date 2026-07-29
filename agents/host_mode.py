@@ -35,6 +35,7 @@ Design rules honoured here:
 from __future__ import annotations
 
 import dataclasses
+import difflib
 import json
 import logging
 import re
@@ -48,7 +49,7 @@ from tools.quality_checks import (
     find_vague_expected,
     find_vague_steps,
 )
-from tools.rtm import AcceptanceCriterion, checklist_tally_line
+from tools.rtm import AcceptanceCriterion, checklist_tally_line, normalize_ac_id
 from tools.rule_packs import RulePackLine, RulePackResult
 from tools.standing_rules import Triggers
 from tools.token_meter import TokenMeter
@@ -357,6 +358,260 @@ _PAYLOAD_VERSION = 1
 # 100k-garbage-case submission cannot produce a 100k-line reason list.
 _MAX_DROPPED_REASONS = 20
 
+# --------------------------------------------------------------------------- #
+# Piece 1: host-reviewed duplicate review (QA_HOST_DEDUP_REVIEW_ENABLED)
+#
+# QA_SEMANTIC_DEDUP_ENABLED needs QA_EMBEDDINGS_BACKEND and the only keyless
+# embeddings backend is "local" (sentence-transformers, ~2 GB of torch), so on a
+# keyless host-mode deployment both are OFF and only byte-identical duplicates are
+# collapsed. The meaning engine used instead is the tester's OWN chat model, which
+# is ALREADY in the loop and already holds the merged 8-category set: prepare asks
+# it to review that set and return an optional top-level ``duplicate_groups``, and
+# submit acts on it deterministically here in Python. No extra round trip (the
+# field rides the existing submission), no server-side LLM call, no API key.
+#
+# DEFAULT IS FLAG-ONLY. Nothing is removed unless QA_HOST_DEDUP_APPLY is ALSO on.
+#
+# THREE LAYERS, in this order, because the field is UNTRUSTED INPUT -- the threat is
+# not "an untrustworthy host model" but injected content inside the _GUARD-wrapped
+# Jira/comment text that this design deliberately places in the host's context:
+#
+#   1. _extract_duplicate_groups -- SHAPE validation. json-native data only, no
+#      eval, every id checked against the submitted suite, group/size/note caps,
+#      and an overlap rule so groups cannot CHAIN. This is NOT a safety bound: it
+#      permits 50 x 12 = 550 removable ids, i.e. a DISJOINT PARTITION of the suite.
+#   2. screen_duplicate_groups -- the DETERMINISTIC SAFETY SCREEN on the apply path:
+#      no cluster larger than 4 cases, and a proportional cap on the total share of
+#      the suite one review may remove (refused WHOLESALE above it). Both bounds are
+#      corpus-independent, so they are guarantees rather than tuned guesses; a
+#      lexical similarity floor was measured and REJECTED as a gate (dup_agreements
+#      carries the numbers) and ships as an advisory label instead.
+#   3. apply_duplicate_groups -- removal over ALREADY-SCREENED groups only, with
+#      the NB-016 sole-requirement-tracer rescue mirrored from the agent.
+#
+# Every layer is pure, synchronous, stdlib-only and never raises.
+# --------------------------------------------------------------------------- #
+
+# Hard caps on the untrusted field's SHAPE. settings may lower these, never raise.
+_DUP_MAX_GROUPS = 50
+_DUP_MAX_GROUP_SIZE = 12
+# Cap on the validation/refusal notes echoed back, so a hostile field cannot turn
+# the reply into a thousand-line rejection log.
+_MAX_DUP_NOTES = 20
+# The reply section is bounded by CHARACTERS, not by group count: a group-count cap
+# still allowed a ~36 KB section, and truncating by groups degraded disclosure to an
+# aggregate count in exactly the mass-removal case. Truncation now never hides a
+# deletion -- build_duplicate_section lists every removed id when it truncates.
+_MAX_DUP_SECTION_CHARS = 3500
+_MAX_DUP_REMOVED_IDS = 100
+
+# The two bounds on REMOVAL, both corpus-independent so neither needs calibration.
+# _DUP_MAX_APPLY_GROUP_SIZE has NO .env knob on purpose: it is derived from the
+# design (8 categories, one BEHAVIOUR per test => a genuine cross-category duplicate
+# cluster is 2 cases, occasionally 3), not from a corpus, so there is nothing for an
+# operator to tune and nothing to weaken.
+_DUP_MAX_APPLY_GROUP_SIZE = 4
+_DUP_REMOVAL_RATIO_CEILING = 0.40
+_DUP_REMOVAL_RATIO_DEFAULT = 0.35
+# Presentation only -- the threshold below which a group is LABELLED low-agreement.
+_DUP_LOW_TEXT_DEFAULT = 0.50
+
+# Priority rank used to pick a group's keeper. risk_score is deliberately NOT used:
+# risk is scored later, inside _finalize_generation, so every case still scores 0
+# at this point (unlike _semantic_dedupe_cases, which runs after scoring).
+_DUP_PRIORITY_RANK = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+
+# Non-alphanumeric runs collapse to one space before the lexical comparison.
+_DUP_WS_RE = re.compile(r"[^a-z0-9]+")
+
+_HOST_DEDUP_INSTRUCTION = (
+    "\n"
+    "5. DUPLICATE REVIEW -- do this AFTER merging, before submitting. The 8 "
+    "categories are generated independently, so two of them can describe the SAME "
+    "test in different words -- a Security case about cancelling another user's "
+    "order by changing the order ID and a Negative case about cancelling an order "
+    "belonging to a different account are ONE test. Re-read the merged "
+    "`test_cases` and group any cases that verify the SAME behaviour with the SAME "
+    "data intent, differing only in wording. Add ONE optional top-level field to "
+    "the merged JSON you submit:\n"
+    '   "duplicate_groups": [["TC-014", "TC-039"], ["TC-002", "TC-021"]]\n'
+    "   Rules: use tc_id values EXACTLY as they appear in the JSON you are "
+    "submitting; every group needs at least TWO different ids; never group cases "
+    "that differ in boundary value, role, error message, or platform -- those are "
+    "distinct tests. Omit the field entirely when you find no duplicates. It is "
+    "OPTIONAL and, by default, ADVISORY: the server REPORTS the groups to the "
+    "tester and deletes nothing. The server also SCREENS every group before any "
+    "removal: a cluster naming more than 4 cases is refused outright, and the whole "
+    "review is refused if it would remove too large a share of the suite -- so group "
+    "only genuine duplicates, in small clusters of 2 or 3.\n"
+    "   About `response_schema`: it describes ONE category's suite object and sets "
+    '"additionalProperties": false. That applies to each per-category object. The '
+    "MERGED object you send to `qa_submit_suite` legitimately carries this ONE "
+    "extra top-level key (`duplicate_groups`) beside `test_cases`; the server "
+    "strips it before validating the suite against that schema, so including it is "
+    "correct and does NOT violate the schema. Per-category objects must NOT carry "
+    "it: only `qa_submit_suite` accepts it (cross-category duplicates can only be "
+    "judged on the MERGED set), and `qa_submit_category` cannot use it at all."
+)
+
+
+def _dedup_instruction() -> str:
+    """The duplicate-review clause appended to the host instructions, or "" when
+    QA_HOST_DEDUP_REVIEW_ENABLED is OFF -- in which case the prepare payload is
+    byte-identical to the pre-feature output. Never raises."""
+    try:
+        if bool(getattr(settings, "qa_host_dedup_review_enabled", False)):
+            return _HOST_DEDUP_INSTRUCTION
+    except Exception:  # pragma: no cover - settings never raises
+        logger.debug("could not read qa_host_dedup_review_enabled", exc_info=True)
+    return ""
+
+
+# --------------------------------------------------------------------------- #
+# Piece 2: host-reviewed requirement coverage (QA_HOST_COVERAGE_REVIEW_ENABLED)
+#
+# ``tools/rtm.match_checklist`` is TIERED and the tiers are NOT alternatives: tier
+# (a) (the similarity matrix, ``_similarity_matrix``) is the GATE, and the optional
+# entailment (b) / adjudication (c) tiers only RE-JUDGE pairs tier (a) already
+# shortlisted. With no QA_EMBEDDINGS_BACKEND tier (a) is a TF-IDF lexical matrix, so
+# on a keyless deployment the shortlist is built from WORD OVERLAP -- and
+# requirement <-> test-case matching is precisely the high-paraphrase-distance
+# problem where word overlap is weakest (an EARS requirement and the test that
+# verifies it share almost no vocabulary by construction). Turning on
+# QA_CHECKLIST_ADJUDICATE_ENABLED does not fix that: it adjudicates the word-overlap
+# shortlist. The honest consequence today is that the percentage is SUPPRESSED and
+# the tally stamped UNRELIABLE -- correct, but it leaves the tester with no view at
+# all of WHICH requirement went untested.
+#
+# The meaning engine used instead is the tester's OWN chat model: already in the
+# loop, already holding the merged 8-category suite, already holding the checklist
+# block. Prepare asks it for an OPTIONAL top-level ``requirement_matches`` mapping
+# {CL id: [tc_id, ...]}; submit validates and reports it here in pure Python. ZERO
+# extra round trips (it rides the existing submission) and ZERO server-side LLM
+# calls -- the last one on this path was removed deliberately.
+#
+# THIS IS MODEL JUDGEMENT, NOT MEASUREMENT. It ships as a SEPARATE, EXPLICITLY
+# LABELLED tier (``host-reviewed``) held structurally apart from the deterministic
+# measurement:
+#
+#   * NO PERCENTAGE IS PUBLISHED -- not even a labelled one. A suppressed percentage
+#     is exactly what honesty rule 1 removes, and ``rtm.checklist_tally_line``
+#     already records why: "a bold number with a caveat underneath is still read as a
+#     number". A self-graded percentage printed beside a figure the tool deliberately
+#     refuses to print would be read AS that figure. Counts of CLAIMS are printed;
+#     a ratio of them never is, and there is no percentage field to format.
+#   * NOTHING IS MERGED OR AVERAGED. ``ChecklistCoverage``, ``coverage_to_dict``,
+#     the XLSX checklist sheets and the ``suite_store`` payload are untouched, so no
+#     later reader can republish this as coverage.
+#   * IT NEVER DRIVES THE GAP LOOP. QA_CHECKLIST_REMEDIATION_ENABLED REFUSES a
+#     degraded (lexical) coverage view; letting an uncalibrated self-assessment do
+#     what a measurement is forbidden to do would invert that rule -- and it would
+#     recreate Piece 1's LOW-10 shape, a loop manufacturing the gaps it then asks the
+#     host to refill, three times over (_MAX_GAP_ROUNDS).
+#   * IT IS MONOTONE IN THE SAFE DIRECTION -- which is what replaces a "safety
+#     bound" here, because there is no destructive path to bound. The only thing this
+#     field can add is a FLAG. A hostile review claiming everything is covered
+#     removes no gap from anywhere: it merely produces no self-reported gaps, i.e.
+#     today's behaviour. A review claiming NOTHING is treated as UNUSABLE rather
+#     than as "every requirement is a gap", so the field cannot manufacture a gap
+#     list either.
+#   * ASYMMETRIC BY DESIGN. A CLAIM ("CL-007 is covered by TC-012") is unverified
+#     model judgement and is labelled as such. A NON-CLAIM is the generating model's
+#     own admission that it wrote no test for a requirement: that is the direction
+#     worth acting on, and it can only ever add work, never subtract it.
+#
+# NO LEXICAL SIMILARITY GATE. Piece 1 measured the alternative on this very repo:
+# a genuine cross-category duplicate scores difflib 0.29-0.54 / Jaccard 0.12-0.25
+# while two boundary siblings that must NOT be merged score 0.95-0.98 / 0.78-0.83 --
+# the signal is ANTI-CORRELATED with the target class, because a real paraphrase has
+# different vocabulary by construction while a sibling is identical wording with one
+# token changed. Requirement <-> case matching is the same problem, one step worse
+# (different genre, not just different words), so no lexical floor is used to accept
+# or reject a claim anywhere below. See ``dup_agreements`` for the full table.
+#
+# Every function below is pure, synchronous, stdlib-only and never raises.
+# --------------------------------------------------------------------------- #
+
+# Shape caps on the untrusted field. settings may LOWER these, never raise them.
+_HR_MAX_ITEMS = 500
+_HR_MAX_TC_PER_ITEM = 12
+_HR_MAX_NOTES = 20
+# Rendered lists are bounded by ROWS, and the largest (least actionable) list is
+# additionally bounded by CHARACTERS, so a 200-requirement checklist cannot turn the
+# reply into a wall of text. The actionable lists are rendered FIRST, so truncation
+# can never hide a self-reported gap.
+# ops-4d (MEDIUM-2, PARTIAL): these lists were ROW-capped only, so 3 lists x 60
+# rows x ~270 chars/row put the worst case near 47 KB prepended ahead of the
+# tester's export path. 20 rows bounds it at ~16 KB. This is a MITIGATION, not
+# the character budget the claims list below already uses -- tracked as a
+# follow-up, because converting the three loops to a shared character budget is a
+# refactor of a function with 66 tests around it and does not belong in a release
+# hotfix. The render ORDER already guarantees truncation cannot hide a
+# self-reported gap: SELF-REPORTED NOT COVERED is emitted first.
+_HR_MAX_ROWS = 20
+_HR_MAX_SECTION_CHARS = 4000
+# A review this sparse is LABELLED, never rejected: claiming a test for only a
+# handful of many requirements is likelier an incomplete field than a real gap list.
+_HR_SPARSE_MIN_PRESENTED = 8
+_HR_SPARSE_NUM = 1
+_HR_SPARSE_DEN = 4
+
+_HOST_COVERAGE_INSTRUCTION = (
+    "\n"
+    "REQUIREMENT COVERAGE REVIEW -- do this AFTER merging all the categories, "
+    "before submitting. `user_context` contains an ATOMIC REQUIREMENTS CHECKLIST "
+    "whose items are identified as CL-001, CL-002, ... Re-read the merged "
+    "`test_cases` and decide, for EACH checklist item, which of your test cases "
+    "actually VERIFY it.\n"
+    "   FIRST, fix what you find: if an item has no test, WRITE the missing test "
+    "case now and include it in the merged suite. Only leave an item unmatched when "
+    "you genuinely cannot test it from the material you were given.\n"
+    "   THEN add ONE optional top-level field to the merged JSON you submit:\n"
+    '   "requirement_matches": {"CL-001": ["TC-004"], "CL-002": ["TC-011", '
+    '"TC-032"]}\n'
+    "   Rules: keys are checklist item ids EXACTLY as they appear in the checklist "
+    "block; values are arrays of tc_id values EXACTLY as they appear in the JSON "
+    "you are submitting. List an item only when a case really verifies it -- leave "
+    "it out otherwise, and never invent an id. Omit the whole field if you cannot "
+    "do the review.\n"
+    "   What the server does with it: it REPORTS your judgement to the tester, "
+    "clearly labelled REVIEWED, NOT MEASURED. It is NOT turned into a coverage "
+    "percentage, it is NOT written into the exported spreadsheet, and it does NOT "
+    "change the server's own deterministic coverage figure. So do not optimise it: "
+    'an honest "no test for CL-007" is worth far more here than a full-looking '
+    "map.\n"
+    "   About `response_schema`: it describes ONE category's suite object and sets "
+    '"additionalProperties": false, which applies to each per-category object. The '
+    "MERGED object you send to `qa_submit_suite` may legitimately carry this extra "
+    "top-level key beside `test_cases`; the server strips it before validating the "
+    "suite against that schema, so including it is correct. Per-category objects "
+    "must NOT carry it: only `qa_submit_suite` accepts it, because requirement "
+    "coverage can only be judged on the MERGED set, and `qa_submit_category` cannot "
+    "use it at all."
+)
+
+
+def _coverage_instruction(prepared) -> str:
+    """The coverage-review clause appended to the host instructions, or "" when
+    QA_HOST_COVERAGE_REVIEW_ENABLED is OFF **or** this prep presented no checklist
+    item -- in which case the prepare payload is byte-identical to the pre-feature
+    output.
+
+    The second condition IS the QA_ATOMIC_CHECKLIST_ENABLED dependency, enforced in
+    code rather than documented in prose: with no checklist block in the prompt there
+    are no CL ids to map, so asking for the field would only invite invented ones.
+    Never raises."""
+    try:
+        if not bool(getattr(settings, "qa_host_coverage_review_enabled", False)):
+            return ""
+        if not list(getattr(prepared, "checklist_presented_ids", None) or []):
+            return ""
+        return _HOST_COVERAGE_INSTRUCTION
+    except Exception:  # pragma: no cover - settings never raises
+        logger.debug("could not read qa_host_coverage_review_enabled", exc_info=True)
+    return ""
+
+
 # Step-by-step instructions handed to the tester's own chat model. Code-authored
 # (trusted); the only untrusted text is inside user_context, which is already
 # _GUARD / wrap_untrusted-wrapped and must be treated as DATA.
@@ -407,6 +662,20 @@ class ParsedSubmission:
     suite: TestSuite
     dropped_count: int = 0
     dropped_reasons: list = dataclasses.field(default_factory=list)
+    # Piece 1: the host's OPTIONAL cross-category duplicate review, SHAPE-validated
+    # against this suite's tc_ids (see _extract_duplicate_groups). Still unscreened
+    # -- screen_duplicate_groups applies the safety bounds before anything is
+    # removed. Empty on the per-category path, where the field cannot be used.
+    duplicate_groups: list = dataclasses.field(default_factory=list)
+    # Why part of that field was rejected. Surfaced in the reply -- silence about a
+    # rejected untrusted field is the failure mode being avoided.
+    duplicate_notes: list = dataclasses.field(default_factory=list)
+    # Piece 2: the host's OPTIONAL `requirement_matches` field, carried RAW and
+    # UNVALIDATED. It is popped here (before TestSuite validation, which sets
+    # extra="forbid") but validated LATER, in extract_requirement_matches, because
+    # its ids must be checked against the PREP's checklist -- which _validate_suite
+    # does not have. Nothing downstream may read it without validating it.
+    raw_requirement_matches: object = None
 
 
 def build_prepare_payload(prepared, prep_id: str = "") -> dict:
@@ -516,7 +785,9 @@ def build_prepare_payload(prepared, prep_id: str = "") -> dict:
         "categories": categories,
         "response_schema": prepared.category_response_schema,
         "image_context": image_context,
-        "instructions": _HOST_GENERATION_INSTRUCTIONS,
+        "instructions": _HOST_GENERATION_INSTRUCTIONS
+        + _dedup_instruction()
+        + _coverage_instruction(prepared),
     }
 
 
@@ -579,10 +850,30 @@ def _validate_suite(data: dict) -> ParsedSubmission:
     regardless of checklist/embeddings config. Raises PrepParseError only when
     NOTHING valid remains.
     """
+    # Piece 1: duplicate_groups is a SUBMISSION-level field, not a TestSuite field
+    # (TestSuite is also the LLM response_model, so its schema must stay clean), and
+    # TestSuite sets extra="forbid" -- so pop it from a COPY before validating.
+    # Popping also keeps the fast path working: without it, a submission carrying the
+    # field would ALWAYS fail whole-suite validation and fall into the salvage branch.
+    data = dict(data) if isinstance(data, dict) else {}
+    raw_groups = data.pop("duplicate_groups", None)
+    # Piece 2: same reasoning, one field further -- pop it from the COPY so a
+    # submission carrying it still takes the fast whole-suite validation path.
+    raw_req_matches = data.pop("requirement_matches", None)
     try:
-        return ParsedSubmission(suite=TestSuite(**data))
+        suite = TestSuite(**data)
     except Exception:
         logger.debug("whole-suite validation failed; salvaging valid cases")
+    else:
+        groups, dup_notes = _extract_duplicate_groups(
+            raw_groups, {tc.tc_id for tc in suite.test_cases}
+        )
+        return ParsedSubmission(
+            suite=suite,
+            duplicate_groups=groups,
+            duplicate_notes=dup_notes,
+            raw_requirement_matches=raw_req_matches,
+        )
 
     cases = data.get("test_cases")
     if not isinstance(cases, list):
@@ -614,11 +905,600 @@ def _validate_suite(data: dict) -> ParsedSubmission:
         suite = TestSuite(test_cases=valid)
     except Exception as exc:
         raise PrepParseError(f"could not assemble a valid suite: {exc}") from exc
+    groups, dup_notes = _extract_duplicate_groups(
+        raw_groups, {tc.tc_id for tc in suite.test_cases}
+    )
     return ParsedSubmission(
         suite=suite,
         dropped_count=len(dropped),
         dropped_reasons=dropped[:_MAX_DROPPED_REASONS],
+        duplicate_groups=groups,
+        duplicate_notes=dup_notes,
+        raw_requirement_matches=raw_req_matches,
     )
+
+
+def _dup_text(tc) -> str:
+    """Normalised comparison text for the ADVISORY agreement label: title + FIRST
+    step action, lower-cased with every non-alphanumeric run collapsed to one space.
+
+    Deliberately mirrors ``agents.test_scenario_agent._semantic_payload``'s choice of
+    fields, so the reported number describes the same content the embeddings path
+    would judge. Never raises.
+    """
+    try:
+        title = getattr(tc, "title", "") or ""
+        steps = getattr(tc, "steps", None) or []
+        action = (getattr(steps[0], "action", "") or "") if steps else ""
+        return _DUP_WS_RE.sub(" ", f"{title} {action}".lower()).strip()[:600]
+    except Exception:
+        return ""
+
+
+def _dup_text_ratio(a, b) -> float:
+    """Server-measured textual agreement in [0, 1] between two cases (stdlib
+    ``difflib`` only -- no embeddings, no optional dependency, no network, no LLM, no
+    async, no I/O). Never raises.
+
+    ADVISORY ONLY. It is REPORTED, never used to veto or to authorise a removal --
+    see ``dup_agreements`` for the measurements that forbid gating on it.
+    """
+    try:
+        ta, tb = _dup_text(a), _dup_text(b)
+        if not ta or not tb:
+            return 0.0
+        return difflib.SequenceMatcher(None, ta, tb).ratio()
+    except Exception:
+        return 0.0
+
+
+def _dup_keeper_key(pair) -> tuple:
+    """Sort key picking a group's keeper: highest declared priority first, ties
+    broken by the earliest position in the submission. Deterministic and pure."""
+    idx, tc = pair
+    pri = getattr(getattr(tc, "priority", None), "value", "") or ""
+    return (_DUP_PRIORITY_RANK.get(pri, 99), idx)
+
+
+def _removal_ratio() -> float:
+    """Max share of the SUBMITTED cases one host review may remove. An operator may
+    LOWER this; the module CEILING wins, so it can never be raised."""
+    try:
+        cfg = float(
+            getattr(
+                settings, "qa_host_dedup_max_removal_ratio", _DUP_REMOVAL_RATIO_DEFAULT
+            )
+        )
+    except (TypeError, ValueError):
+        cfg = _DUP_REMOVAL_RATIO_DEFAULT
+    return max(0.0, min(_DUP_REMOVAL_RATIO_CEILING, cfg))
+
+
+def _low_text_ratio() -> float:
+    """Threshold below which a group is LABELLED low-agreement in the report. Purely
+    presentational -- it gates nothing (see ``dup_agreements``)."""
+    try:
+        cfg = float(
+            getattr(settings, "qa_host_dedup_low_text_ratio", _DUP_LOW_TEXT_DEFAULT)
+        )
+    except (TypeError, ValueError):
+        cfg = _DUP_LOW_TEXT_DEFAULT
+    return max(0.0, min(1.0, cfg))
+
+
+def _extract_duplicate_groups(raw, valid_ids) -> tuple[list, list]:
+    """Validate the SHAPE of the UNTRUSTED top-level ``duplicate_groups`` field.
+
+    Returns ``(groups, notes)``: groups is a list of lists of tc_ids that all EXIST
+    in the submitted suite; notes explains every rejection so the reply can say what
+    was ignored. NEVER raises and NEVER trusts the field -- an unreadable value
+    degrades to "no dedup" plus a note.
+
+    This is shape validation ONLY, and it is explicitly NOT a safety bound: the caps
+    below permit ``50 x 12 = 550`` removable ids, and the overlap rule only stops
+    groups from CHAINING, so nothing here prevents a DISJOINT PARTITION of the suite.
+    ``screen_duplicate_groups`` carries the bounds that gate removal; both run before
+    anything is deleted.
+
+    Rules, all enforced here in Python over already-``json.loads``'d data (no eval,
+    no ast, no dynamic attribute access):
+
+      * absent / ``None``               -> ``([], [])`` -- the common case
+      * not a list                      -> ``([], [note])``
+      * a non-list group                -> skipped + noted
+      * a non-str member                -> dropped + noted
+      * an id not in the suite          -> dropped + noted (hallucinated / stale)
+      * a repeated id inside one group (INCLUDING a self-reference) -> collapsed
+      * an id already claimed by an EARLIER group -> dropped + noted, so
+        overlapping groups cannot chain into "the whole suite is one duplicate"
+      * fewer than 2 distinct known ids -> the group is a no-op, dropped + noted
+      * beyond the group / group-size / note caps -> truncated + noted
+    """
+    notes: list = []
+
+    def _note(msg: str) -> None:
+        if len(notes) < _MAX_DUP_NOTES:
+            notes.append(msg)
+
+    try:
+        if raw is None:
+            return [], []
+        if not isinstance(raw, list):
+            return [], [
+                "`duplicate_groups` was not a list of groups -- the whole field was "
+                "ignored (no case was removed or reported as a duplicate)."
+            ]
+        try:
+            cfg_groups = int(
+                getattr(settings, "qa_host_dedup_max_groups", _DUP_MAX_GROUPS)
+                or _DUP_MAX_GROUPS
+            )
+        except (TypeError, ValueError):
+            cfg_groups = _DUP_MAX_GROUPS
+        try:
+            cfg_size = int(
+                getattr(settings, "qa_host_dedup_max_group_size", _DUP_MAX_GROUP_SIZE)
+                or _DUP_MAX_GROUP_SIZE
+            )
+        except (TypeError, ValueError):
+            cfg_size = _DUP_MAX_GROUP_SIZE
+        max_groups = min(_DUP_MAX_GROUPS, max(1, cfg_groups))
+        max_size = min(_DUP_MAX_GROUP_SIZE, max(2, cfg_size))
+
+        known = {str(i) for i in (valid_ids or ())}
+        claimed: set = set()
+        groups: list = []
+        if len(raw) > max_groups:
+            _note(
+                f"`duplicate_groups` named {len(raw)} groups -- only the first "
+                f"{max_groups} were considered."
+            )
+        for entry in raw[:max_groups]:
+            if not isinstance(entry, list):
+                _note("a `duplicate_groups` entry was not a list of tc_ids -- skipped.")
+                continue
+            members: list = []
+            for m in entry:
+                if not isinstance(m, str):
+                    _note("a non-string tc_id in `duplicate_groups` was ignored.")
+                    continue
+                tid = m.strip()
+                if tid not in known:
+                    _note(
+                        f"`{tid[:32]}` is not a tc_id in the submitted suite -- "
+                        "ignored."
+                    )
+                    continue
+                if tid in members:
+                    # Self-reference / repeat inside one group: collapse silently.
+                    continue
+                if tid in claimed:
+                    _note(
+                        f"`{tid}` was already in an earlier duplicate group -- "
+                        "ignored in the later one."
+                    )
+                    continue
+                if len(members) >= max_size:
+                    _note(
+                        f"a duplicate group named more than {max_size} cases -- the "
+                        "extra ids were ignored."
+                    )
+                    break
+                members.append(tid)
+            if len(members) < 2:
+                if members:
+                    _note(
+                        "a duplicate group named fewer than two distinct known "
+                        "cases -- skipped."
+                    )
+                continue
+            claimed.update(members)
+            groups.append(members)
+        return groups, notes[:_MAX_DUP_NOTES]
+    except Exception:
+        logger.warning(
+            "could not read duplicate_groups -- ignoring the field", exc_info=True
+        )
+        return [], [
+            "`duplicate_groups` could not be read -- it was ignored (no case was "
+            "removed)."
+        ]
+
+
+def _group_indices(cases: list, members: list) -> list:
+    """Positions in ``cases`` of a group's members, first occurrence wins. Pure."""
+    by_id: dict = {}
+    for i, tc in enumerate(cases):
+        by_id.setdefault(tc.tc_id, i)
+    return [by_id[m] for m in members if m in by_id]
+
+
+def dup_agreements(cases: list, groups: list) -> list:
+    """For each group, the LOWEST server-measured text agreement between its keeper
+    and any other member -- an ADVISORY signal shown next to the group in the reply.
+
+    WHY THIS IS NOT A GATE (measured, 2026-07-29, on this metric and on token
+    Jaccard). The review asked for a lexical similarity FLOOR that a group must clear
+    before a removal is honoured. It cannot be one: the metric does not separate the
+    classes it would have to separate.
+
+        pair                                            difflib  jaccard
+        the MOTIVATING cross-category duplicate            0.29     0.25
+          ("Cannot cancel another user's order by
+           changing the order ID" vs "Attempt to cancel
+           an order belonging to a different account")
+        two UNRELATED same-domain cases                    0.28     0.05
+        two UNRELATED cases                                0.34     0.14
+        two near-identical boilerplate cases               0.97     0.82
+        two boundary siblings (must NOT be merged)         0.95     0.83
+
+    A genuine duplicate scores 0.29 while an unrelated pair scores 0.28-0.34, and a
+    pair that must NOT be merged scores 0.95. Any floor high enough to reject the
+    hostile pairs also rejects the exact duplicate that motivates the feature, and
+    any floor low enough to admit it admits everything. Aggregating over a whole
+    review does not rescue it either: on a templated 64-case suite the medians were
+    0.97 genuine vs 0.57 hostile, but on hand-written text 0.29 vs 0.28 -- the scale
+    is entirely corpus-dependent, which is why ``tools/rtm.py`` documents its
+    embedding bands as "conservative project-level defaults, NOT tuned optima" and
+    why that matcher FLAGS instead of dropping.
+
+    Shipping an uncalibrated number as a security bound on a DESTRUCTIVE path would
+    be worse than shipping none: it would look like a guarantee. So the number is
+    MEASURED and REPORTED (the tester gets the discriminating signal) while the
+    actual bounds on removal are the two corpus-independent ones in
+    ``screen_duplicate_groups``. Never raises.
+    """
+    out: list = []
+    try:
+        for members in groups or []:
+            idxs = _group_indices(cases or [], members or [])
+            if len(idxs) < 2:
+                out.append(0.0)
+                continue
+            keep_idx = min(((i, cases[i]) for i in idxs), key=_dup_keeper_key)[0]
+            ratios = [
+                _dup_text_ratio(cases[i], cases[keep_idx])
+                for i in idxs
+                if i != keep_idx
+            ]
+            out.append(min(ratios) if ratios else 0.0)
+    except Exception:
+        logger.warning("dup_agreements failed -- omitting the labels", exc_info=True)
+        return [0.0 for _ in (groups or [])]
+    return out
+
+
+def screen_duplicate_groups(cases: list, groups: list) -> tuple[list, list]:
+    """The DETERMINISTIC SAFETY SCREEN gating every REMOVAL. Returns
+    ``(screened_groups, refusals)``. Called ONLY on the apply path.
+
+    Both bounds are CORPUS-INDEPENDENT and need no calibration -- that is the whole
+    point, because the field is attacker-influenced (the threat is not "an
+    untrustworthy host model" but injected content inside the ``_GUARD``-wrapped
+    Jira/comment text that host mode deliberately places in the host's context) and a
+    tuned lexical threshold would be a guarantee in name only (see
+    ``dup_agreements``).
+
+    1. **APPLY-PATH GROUP-SIZE BOUND** (``_DUP_MAX_APPLY_GROUP_SIZE``). A group
+       naming more than 4 cases is refused OUTRIGHT (never truncated -- partially
+       honouring a group nobody vouched for is worse). Rationale from the design, not
+       from a corpus: the fan-out has 8 categories and the project rule is one
+       BEHAVIOUR per test, so a genuine cross-category duplicate cluster is 2 cases,
+       occasionally 3. A 12-member group is not a duplicate cluster, it is a
+       partition primitive. This alone cuts the theoretical removal set from
+       50 x 11 = 550 ids to 50 x 3 = 150.
+    2. **PROPORTIONAL CAP** (``_removal_ratio()``, default 35%, ceiling 40%). If the
+       surviving groups would still remove more than that share of the SUBMITTED
+       cases, the WHOLE review is refused -- nothing removed, no group honoured --
+       and the refusal is reported verbatim. This is the bound that actually closes
+       the disjoint-partition attack: whatever the text says, a 64-case suite cannot
+       drop below 42 cases. ``max(1, ...)`` keeps a 2-case suite able to drop one
+       real duplicate.
+
+    Why the SHAPE caps in ``_extract_duplicate_groups`` are not enough: they permit
+    50 x 12 = 550 removable ids, and their overlap rule only stops CHAINING, so 5
+    DISJOINT groups of 12 would reduce a 64-case suite to 9. Never raises; on any
+    failure NO group is honoured (the safe direction).
+    """
+    refusals: list = []
+    if not cases or not groups:
+        return [], refusals
+    try:
+        screened: list = []
+        for members in groups:
+            idxs = _group_indices(cases, members)
+            if len(idxs) < 2:
+                continue
+            if len(idxs) > _DUP_MAX_APPLY_GROUP_SIZE:
+                if len(refusals) < _MAX_DUP_NOTES:
+                    refusals.append(
+                        f"a group naming {len(idxs)} cases was NOT removed: more than "
+                        f"{_DUP_MAX_APPLY_GROUP_SIZE} cases in one duplicate cluster "
+                        "is not a duplicate, so it is reported for review instead."
+                    )
+                continue
+            keep_idx = min(((i, cases[i]) for i in idxs), key=_dup_keeper_key)[0]
+            screened.append(
+                [cases[keep_idx].tc_id]
+                + [cases[i].tc_id for i in idxs if i != keep_idx]
+            )
+        removable = sum(len(g) - 1 for g in screened)
+        limit = max(1, int(len(cases) * _removal_ratio()))
+        if removable > limit:
+            logger.warning(
+                "host duplicate review refused: %d of %d cases proposed for removal "
+                "(bound %d)",
+                removable,
+                len(cases),
+                limit,
+            )
+            return [], [
+                f"REFUSED: the submitted duplicate review would remove {removable} "
+                f"of {len(cases)} submitted case(s), above the "
+                f"{_removal_ratio():.0%} safety bound ({limit} case(s)). NOTHING was "
+                "removed and NO group is treated as a duplicate. A review that large "
+                "is handled as untrusted input, not as a judgement -- the groups are "
+                "still listed below for you to act on yourself."
+            ]
+        return screened, refusals
+    except Exception:
+        logger.warning(
+            "screen_duplicate_groups failed -- honouring no group", exc_info=True
+        )
+        return [], [
+            "`duplicate_groups` could not be screened -- no group was honoured and "
+            "nothing was removed."
+        ]
+
+
+def apply_duplicate_groups(cases: list, groups: list) -> tuple[list, list, list]:
+    """REMOVE the non-keeper members of each ALREADY-SCREENED duplicate group.
+
+    ``groups`` MUST be the output of ``screen_duplicate_groups`` -- this function
+    applies no safety bound of its own. Only ever called when BOTH
+    QA_HOST_DEDUP_REVIEW_ENABLED and QA_HOST_DEDUP_APPLY are on; the default
+    behaviour is flag-only. MUST run BEFORE ``_finalize_generation``, which renumbers
+    tc_ids. Returns ``(kept_cases, removed, notes)`` where removed is a list of
+    ``(removed_tc_id, keeper_tc_id)`` pairs and notes discloses each rescue.
+
+    NB-016 mirror (see ``agents.test_scenario_agent._dedupe_cases`` and
+    ``_semantic_dedupe_cases``): a member is NEVER removed while it is the only case
+    tracing its ``requirement_id`` -- dropping it would flip that AC to a false
+    ORPHAN in the RTM / AC-anchoring reports, which are built afterwards. Ids are
+    compared through ``rtm.normalize_ac_id``, matching ``_semantic_dedupe_cases``
+    (``_dedupe_cases`` compares raw strings; the normalised form is the stricter of
+    the two).
+
+    This rescue is NOT a security bound and is not claimed as one: ``requirement_id``
+    is a field of the HOST-SUBMITTED case, so a host emitting ``null`` (the common
+    case) or the same id on every case rescues nothing. It defends against bad
+    JUDGEMENT, not against a hostile submission -- ``screen_duplicate_groups`` does
+    that. It also protects ``requirement_id`` ONLY, not atomic-checklist items; see
+    the plan's checklist-interaction note.
+
+    Never raises; on any failure every case is kept.
+    """
+    notes: list = []
+    if not cases or not groups:
+        return list(cases), [], notes
+    try:
+        drop: dict = {}
+        keepers: set = set()
+        for members in groups or []:
+            idxs = _group_indices(cases, members)
+            if len(idxs) < 2:
+                continue
+            keep_idx = min(((i, cases[i]) for i in idxs), key=_dup_keeper_key)[0]
+            keepers.add(keep_idx)
+            for i in idxs:
+                if i != keep_idx and i not in drop and i not in keepers:
+                    drop[i] = cases[keep_idx].tc_id
+
+        def _req(idx: int) -> str:
+            return normalize_ac_id(getattr(cases[idx], "requirement_id", "") or "")
+
+        covered = {_req(i) for i in range(len(cases)) if i not in drop and _req(i)}
+        for i in sorted(drop):
+            req = _req(i)
+            if req and req not in covered:
+                covered.add(req)
+                drop.pop(i)
+                if len(notes) < _MAX_DUP_NOTES:
+                    notes.append(
+                        f"`{cases[i].tc_id}` was KEPT despite being grouped as a "
+                        f"duplicate: it is the only case tracing {req}."
+                    )
+        kept = [tc for i, tc in enumerate(cases) if i not in drop]
+        if not kept:  # unreachable (a keeper is always kept); belt-and-braces
+            return list(cases), [], notes
+        removed = [(cases[i].tc_id, drop[i]) for i in sorted(drop)]
+        if removed:
+            logger.info(
+                "host-reviewed dedup removed %d near-duplicate case(s) of %d",
+                len(removed),
+                len(cases),
+            )
+        return kept, removed, notes
+    except Exception:
+        logger.warning(
+            "apply_duplicate_groups failed -- keeping every case", exc_info=True
+        )
+        return list(cases), [], notes
+
+
+def build_duplicate_section(
+    groups: list,
+    submitted_cases: list,
+    final_cases: list,
+    *,
+    removed: list | None = None,
+    applied: bool = False,
+    notes: list | None = None,
+    agreements: list | None = None,
+) -> str:
+    """The bounded, deterministic "duplicate review" block prepended to the submit
+    reply, AHEAD of the variable-length generated summary (the same ordering rule
+    that moved ``quality_section`` in front of ``checklist_section``).
+
+    Each submitted tc_id is resolved to the tc_id the tester will actually SEE:
+    ``_finalize_generation`` renumbers ids, so the mapping goes through the case's
+    content ``stable_id``, which survives both dedup and the renumber (the renumber
+    uses ``model_copy``, which does not re-derive it). A member that is not in the
+    final suite is NAMED as such instead of being silently dropped.
+
+    ``agreements[i]`` is the ADVISORY server-measured text agreement for
+    ``groups[i]``; a group below ``_low_text_ratio()`` is LABELLED so the tester can
+    see which grouping the text does not support. It is a label, never a veto -- see
+    ``dup_agreements`` for why.
+
+    Bounded by CHARACTERS (``_MAX_DUP_SECTION_CHARS``), not by group count, so the
+    section cannot grow to tens of KB. Truncation never hides a deletion: whenever
+    the group list is cut AND cases were removed, every removed tc_id is listed
+    (itself bounded, because the proportional cap bounds how many there can be).
+    Pure and synchronous. Never raises.
+    """
+    try:
+        groups = list(groups or [])
+        notes = list(notes or [])
+        removed = list(removed or [])
+        agreements = list(agreements or [])
+        if not groups and not notes and not removed:
+            return ""
+        sub_by_id = {tc.tc_id: tc for tc in (submitted_cases or [])}
+        final_by_stable: dict = {}
+        for tc in final_cases or []:
+            sid = getattr(tc, "stable_id", "") or ""
+            if sid:
+                final_by_stable.setdefault(sid, tc.tc_id)
+        removed_ids = [r[0] for r in removed if r]
+        removed_set = set(removed_ids)
+        low = _low_text_ratio()
+        lines: list = []
+        if groups or removed:
+            if applied and removed:
+                state = "cases REMOVED"
+            elif applied:
+                state = "APPLY ON -- nothing met the safety bounds, nothing removed"
+            else:
+                state = "REPORTED ONLY -- nothing removed"
+            lines += [f"## ♻️ Duplicate review ({state})", ""]
+            lines.append(
+                f"Your chat model grouped **{len(groups)}** set(s) of submitted cases "
+                "as verifying the same behaviour."
+            )
+            if applied and removed:
+                lines.append(
+                    f"**{len(removed)}** case(s) were removed -- one representative "
+                    "kept per group (highest priority, earliest submitted). Every "
+                    "removal passed two deterministic server-side bounds: no cluster "
+                    f"larger than {_DUP_MAX_APPLY_GROUP_SIZE} cases, and no more than "
+                    f"{_removal_ratio():.0%} of the submitted suite removed in total."
+                )
+            elif not applied:
+                lines.append(
+                    "Nothing was deleted. A near-duplicate judgement has no "
+                    "calibrated precision, and removing a case that is not really a "
+                    "duplicate destroys coverage a tester cannot recover -- so this "
+                    "is advisory. Review the groups below, or set "
+                    "QA_HOST_DEDUP_APPLY=true to let the server drop them (still "
+                    "subject to the same two bounds)."
+                )
+            lines.append(
+                "*Agreement* is a server-measured textual similarity, shown so you "
+                "can spot a grouping the wording does not support. It is a reading "
+                "aid, NOT a correctness check: a genuine duplicate phrased "
+                "differently can score low, so it never decides anything."
+            )
+            lines.append("")
+            budget = _MAX_DUP_SECTION_CHARS
+            shown = 0
+            for gi, members in enumerate(groups):
+                rendered: list = []
+                for m in members:
+                    tc = sub_by_id.get(m)
+                    title = ((getattr(tc, "title", "") or "") if tc else "")[:80]
+                    sid = (getattr(tc, "stable_id", "") or "") if tc else ""
+                    final_id = final_by_stable.get(sid) if sid else ""
+                    if m in removed_set:
+                        rendered.append(f'`{m}` "{title}" -- REMOVED as a duplicate')
+                    elif final_id:
+                        rendered.append(f'`{final_id}` "{title}" (submitted as `{m}`)')
+                    else:
+                        rendered.append(
+                            f'`{m}` "{title}" -- not in the final suite (already '
+                            "collapsed as an exact duplicate)"
+                        )
+                label = ""
+                if gi < len(agreements):
+                    score = agreements[gi]
+                    flag = " — LOW, review before trusting" if score < low else ""
+                    label = f" _(agreement {score:.2f}{flag})_"
+                line = "- " + "; ".join(rendered) + label
+                if shown and len(line) > budget:
+                    break
+                budget -= len(line)
+                lines.append(line)
+                shown += 1
+            if shown < len(groups):
+                lines.append(
+                    f"- …and {len(groups) - shown} more group(s); the list is "
+                    f"truncated at ~{_MAX_DUP_SECTION_CHARS} characters."
+                )
+                if removed_ids:
+                    head = ", ".join(
+                        f"`{i}`" for i in removed_ids[:_MAX_DUP_REMOVED_IDS]
+                    )
+                    extra = (
+                        f" (+{len(removed_ids) - _MAX_DUP_REMOVED_IDS} more)"
+                        if len(removed_ids) > _MAX_DUP_REMOVED_IDS
+                        else ""
+                    )
+                    lines += [
+                        "",
+                        "**Every removed case id** (listed in full because the group "
+                        f"list above was truncated): {head}{extra}",
+                    ]
+            lines.append("")
+        if notes:
+            lines.append(
+                "> ℹ️  Duplicate-review notes (the field is UNTRUSTED and is "
+                "screened server-side):"
+            )
+            lines += [f">   - {n}" for n in notes[:_MAX_DUP_NOTES]]
+            lines.append("")
+        return "\n".join(lines) + "\n"
+    except Exception:
+        logger.warning(
+            "build_duplicate_section failed -- omitting the section", exc_info=True
+        )
+        return ""
+
+
+def category_dedup_note(parsed) -> str:
+    """One line explaining that a PER-CATEGORY submission's ``duplicate_groups``
+    cannot be used at all.
+
+    It is not merely "sent to the wrong tool": finalizing from accumulated rows goes
+    through ``mcp_handlers._merge_category_rows``, which copies ONLY ``test_cases``
+    and GLOBALLY RENUMBERS every tc_id -- so there is no channel for the field and
+    stored per-category ids could not be mapped onto the merged suite even if there
+    were. Duplicate review is therefore available ONLY when the whole merged suite is
+    submitted to ``qa_submit_suite``. Empty (and therefore output-identical) when the
+    field was absent. Never raises.
+    """
+    try:
+        if not getattr(parsed, "duplicate_groups", None):
+            return ""
+        return (
+            "> ℹ️  `duplicate_groups` cannot be used on the per-category "
+            "path: finalizing from accumulated rows merges only `test_cases` and "
+            "renumbers every tc_id, so the field has no channel and per-category ids "
+            "could not be mapped onto the merged suite. Duplicate review is "
+            "available ONLY when you submit the whole merged suite to "
+            "`qa_submit_suite`.\n\n"
+        )
+    except Exception:  # pragma: no cover - defensive
+        return ""
 
 
 def parse_host_suite(text_or_obj) -> ParsedSubmission:
@@ -765,3 +1645,438 @@ def build_gap_response(
         f"`qa_submit_suite` tool with prep_id `{prep_id}` and your corrected JSON.",
     ]
     return "\n".join(lines)
+
+
+@dataclasses.dataclass
+class HostCoverageReview:
+    """The validated ``host-reviewed`` coverage view: COUNTS and LISTS only.
+
+    There is deliberately NO percentage field and no score field, so no caller --
+    now or later -- can format one from this object. That is the structural half of
+    honesty rule 1; the wording is the other half.
+
+    ``ran`` is False when the field was absent or UNUSABLE. In that case
+    ``unclaimed`` is EMPTY on purpose: an unreadable or empty field must never be
+    rendered as "every requirement is a gap", which is the only direction in which a
+    hostile field could otherwise affect a coverage report."""
+
+    ran: bool = False
+    # {item_id: [tc_id, ...]} -- every id already checked to EXIST.
+    claims: dict = dataclasses.field(default_factory=dict)
+    # PRESENTED item ids the review claimed no case for (self-reported gaps).
+    unclaimed: list = dataclasses.field(default_factory=list)
+    # Claimed ids that were never presented to the generator (honesty rule 2).
+    not_presented_claimed: list = dataclasses.field(default_factory=list)
+    notes: list = dataclasses.field(default_factory=list)
+    presented_count: int = 0
+
+
+def _hr_cap(name: str, ceiling: int) -> int:
+    """A settings int cap, floored at 1 and never allowed above the module ceiling
+    (so an operator can only tighten it). Never raises."""
+    try:
+        cfg = int(getattr(settings, name, ceiling) or ceiling)
+    except (TypeError, ValueError):
+        cfg = ceiling
+    return max(1, min(ceiling, cfg))
+
+
+def extract_requirement_matches(
+    raw, valid_tc_ids, item_ids, presented_ids
+) -> HostCoverageReview:
+    """Validate the SHAPE of the UNTRUSTED top-level ``requirement_matches`` field.
+
+    Returns a HostCoverageReview. NEVER raises and NEVER trusts the field: an
+    unreadable value degrades to "no review" plus a note, and every id is checked
+    against real data -- ``valid_tc_ids`` (the tc_ids of the SUBMITTED suite) and
+    ``item_ids`` / ``presented_ids`` (this prep's checklist, and the subset that
+    actually fitted into the generator prompt).
+
+    Rules, all enforced here in Python over already-``json.loads``'d data (no eval,
+    no ast, no dynamic attribute access):
+
+      * absent / ``None``                  -> ran=False, no notes (the common case)
+      * no checklist ids / no suite ids    -> ran=False + note (the
+        QA_ATOMIC_CHECKLIST_ENABLED dependency: nothing to match against)
+      * not a dict                         -> ran=False + note. NOT "every
+        requirement is a gap" -- see the class docstring.
+      * a non-str key                      -> dropped + noted
+      * a key not in the checklist         -> dropped + noted (hallucinated/stale)
+      * a key not in ``presented_ids``     -> moved to ``not_presented_claimed``,
+        EXCLUDED from every count, reported as NOT PRESENTED TO GENERATOR
+        (honesty rule 2, unchanged)
+      * a str value                        -> tolerated as a one-element list
+      * any other non-list value           -> dropped + noted
+      * a non-str member                   -> dropped + noted
+      * a member not in the suite          -> dropped + noted (hallucinated)
+      * a repeated member in one entry     -> collapsed silently
+      * beyond the entry / per-entry / note caps -> truncated + noted
+      * ZERO surviving claims              -> ran=False + note: an empty or broken
+        field is an UNUSABLE review, not a gap list. This is the DETERMINISTIC
+        BOUND on the one coverage-affecting direction this field has.
+      * very few claims for many presented items -> LABELLED sparse (never
+        rejected, and never gated on any similarity score)
+    """
+    rev = HostCoverageReview()
+
+    def _note(msg: str) -> None:
+        if len(rev.notes) < _HR_MAX_NOTES:
+            rev.notes.append(msg)
+
+    try:
+        if raw is None:
+            return rev
+        known_items = {str(x) for x in (item_ids or ())}
+        presented: list = []
+        presented_set: set = set()
+        for x in presented_ids or ():
+            s = str(x)
+            if s not in presented_set:
+                presented_set.add(s)
+                presented.append(s)
+        known_tcs = {str(x) for x in (valid_tc_ids or ())}
+        rev.presented_count = len(presented)
+
+        if not known_items or not known_tcs:
+            _note(
+                "`requirement_matches` was ignored: this run has no requirements "
+                "checklist to match against (QA_ATOMIC_CHECKLIST_ENABLED is off, or "
+                "the checklist was empty)."
+            )
+            return rev
+        if not isinstance(raw, dict):
+            _note(
+                "`requirement_matches` was not an object mapping requirement ids to "
+                "test-case ids -- the whole field was ignored. Nothing is reported "
+                "as covered OR as a gap from it."
+            )
+            return rev
+
+        max_items = _hr_cap("qa_host_coverage_max_items", _HR_MAX_ITEMS)
+        max_per = _hr_cap("qa_host_coverage_max_tc_per_item", _HR_MAX_TC_PER_ITEM)
+        entries = list(raw.items())
+        if len(entries) > max_items:
+            _note(
+                f"`requirement_matches` named {len(entries)} requirements -- only "
+                f"the first {max_items} were read."
+            )
+            entries = entries[:max_items]
+
+        claims: dict = {}
+        not_presented: list = []
+        for key, value in entries:
+            if not isinstance(key, str):
+                _note(
+                    "a non-string requirement id in `requirement_matches` was ignored."
+                )
+                continue
+            item_id = key.strip()
+            if item_id not in known_items:
+                _note(
+                    f"`{item_id[:32]}` is not a requirement id in this run's "
+                    "checklist -- ignored."
+                )
+                continue
+            if item_id not in presented_set:
+                if item_id not in not_presented:
+                    not_presented.append(item_id)
+                continue
+            if isinstance(value, str):
+                members_raw: list = [value]
+            elif isinstance(value, list):
+                members_raw = value
+            else:
+                _note(
+                    f"the test-case list for `{item_id}` was not a list of tc_ids "
+                    "-- ignored."
+                )
+                continue
+            members: list = []
+            for m in members_raw:
+                if not isinstance(m, str):
+                    _note("a non-string tc_id in `requirement_matches` was ignored.")
+                    continue
+                tid = m.strip()
+                if tid not in known_tcs:
+                    _note(
+                        f"`{tid[:32]}` (named for {item_id}) is not a tc_id in the "
+                        "submitted suite -- ignored."
+                    )
+                    continue
+                if tid in members:
+                    continue
+                if len(members) >= max_per:
+                    _note(
+                        f"`{item_id}` named more than {max_per} test cases -- the "
+                        "extra ids were ignored."
+                    )
+                    break
+                members.append(tid)
+            if members:
+                claims[item_id] = members
+
+        rev.not_presented_claimed = not_presented
+        if not_presented:
+            _note(
+                f"{len(not_presented)} requirement(s) named by the review were NEVER "
+                "PRESENTED to the generator (they did not fit the prompt budget). "
+                "They are listed as NOT PRESENTED TO GENERATOR and EXCLUDED from "
+                "every count here, exactly as in the deterministic report."
+            )
+        if not claims:
+            _note(
+                "`requirement_matches` claimed no test case for any presented "
+                "requirement, so it is treated as an UNUSABLE review rather than as "
+                "a gap list: an empty or broken field must not be reported as "
+                f"{len(presented)} uncovered requirement(s)."
+            )
+            return rev
+
+        rev.claims = claims
+        rev.unclaimed = [i for i in presented if i not in claims]
+        rev.ran = True
+        if (
+            len(presented) >= _HR_SPARSE_MIN_PRESENTED
+            and len(claims) * _HR_SPARSE_DEN < len(presented) * _HR_SPARSE_NUM
+        ):
+            _note(
+                f"the review claimed a test for only {len(claims)} of "
+                f"{len(presented)} presented requirement(s). A review that sparse "
+                "is more likely incomplete than a real gap list -- read the list "
+                "below as a prompt to re-check the suite, not as a count."
+            )
+        logger.info(
+            "host-reviewed coverage: %d claimed, %d unclaimed of %d presented "
+            "requirement(s) -- model judgement, not a measurement",
+            len(claims),
+            len(rev.unclaimed),
+            len(presented),
+        )
+        return rev
+    except Exception:
+        logger.warning(
+            "could not read requirement_matches -- ignoring the field", exc_info=True
+        )
+        return HostCoverageReview(
+            notes=[
+                "`requirement_matches` could not be read -- it was ignored (nothing "
+                "is reported as covered or as a gap from it)."
+            ]
+        )
+
+
+def build_coverage_review_section(
+    review,
+    submitted_cases: list,
+    final_cases: list,
+    items: list,
+    *,
+    deterministic_degraded: bool = False,
+) -> str:
+    """The bounded, deterministic ``host-reviewed`` coverage block, prepended to the
+    submit reply AHEAD of the variable-length generated summary (the same ordering
+    rule that moved ``quality_section`` in front of ``checklist_section``).
+
+    PUBLISHES NO PERCENTAGE -- see the module comment for why, and note that
+    ``HostCoverageReview`` has no field one could be computed from. Counts of CLAIMS
+    are printed, and every one of them is labelled REVIEWED, NOT MEASURED.
+
+    Each claimed tc_id is resolved to the id the tester will actually SEE:
+    ``_finalize_generation`` renumbers ids, so the mapping goes through the case's
+    content ``stable_id``, which survives dedup and the renumber. An item whose EVERY
+    claimed case vanished (collapsed as an exact duplicate, or removed by the Piece 1
+    apply path) is reported as CLAIM NO LONGER SUPPORTED rather than silently
+    rendered as covered -- the removal/coverage interaction is disclosed, not hidden.
+
+    ``deterministic_degraded`` adds an explicit non-substitution warning when the
+    deterministic percentage is suppressed for this run, which is the exact situation
+    in which this section is most likely to be misread as the coverage report.
+
+    Pure and synchronous. Never raises."""
+    try:
+        if review is None:
+            return ""
+        ran = bool(getattr(review, "ran", False))
+        notes = list(getattr(review, "notes", None) or [])
+        if not ran and not notes:
+            return ""
+        claims = dict(getattr(review, "claims", None) or {})
+        unclaimed = list(getattr(review, "unclaimed", None) or [])
+        not_presented = list(getattr(review, "not_presented_claimed", None) or [])
+        presented_count = int(getattr(review, "presented_count", 0) or 0)
+
+        by_item = {getattr(it, "item_id", ""): it for it in (items or [])}
+        sub_by_id = {tc.tc_id: tc for tc in (submitted_cases or [])}
+        final_by_stable: dict = {}
+        for tc in final_cases or []:
+            sid = getattr(tc, "stable_id", "") or ""
+            if sid:
+                final_by_stable.setdefault(sid, tc.tc_id)
+
+        def _label(item_id: str) -> str:
+            it = by_item.get(item_id)
+            if it is None:
+                return ""
+            text = (getattr(it, "text", "") or "")[:200]
+            source = getattr(it, "source", "") or "unattributed"
+            return f"{text} _[source: {source}]_"
+
+        def _final_id(tc_id: str) -> str:
+            tc = sub_by_id.get(tc_id)
+            sid = (getattr(tc, "stable_id", "") or "") if tc is not None else ""
+            return final_by_stable.get(sid, "") if sid else ""
+
+        lines: list = [
+            "## \U0001f9fe Host-reviewed requirement coverage (REVIEWED, NOT MEASURED)",
+            "",
+            "Your chat model was asked which of its own test cases verify each "
+            "requirement. This is **MODEL JUDGEMENT about its own output**, not a "
+            "measurement: it has no calibrated precision, so NO percentage is "
+            "published from it, it is NOT written into the Excel file or the suite "
+            "store, and it does NOT change the server's deterministic coverage "
+            "figure -- or the suppression of that figure -- anywhere.",
+            "",
+        ]
+        if deterministic_degraded:
+            lines += [
+                "> ⚠️  The deterministic coverage percentage is SUPPRESSED "
+                "for this run (lexical fallback -- no QA_EMBEDDINGS_BACKEND). This "
+                "section is NOT a substitute for it: nothing below is measured, and "
+                "no percentage is published here either.",
+                "",
+            ]
+        if ran:
+            lines += [
+                f"- **CLAIMED (unverified):** {len(claims)} of {presented_count} "
+                "presented requirement(s) were claimed to have a matching test. A "
+                "claim is a pointer to read, not evidence.",
+                f"- **SELF-REPORTED NOT COVERED:** {len(unclaimed)} presented "
+                "requirement(s) were claimed by no test case. The model that wrote "
+                "the suite says it did not cover them -- that is the direction worth "
+                "acting on.",
+                "",
+            ]
+
+        if unclaimed:
+            lines += [
+                "### SELF-REPORTED NOT COVERED (model-judged, not measured)",
+                "",
+            ]
+            for iid in unclaimed[:_HR_MAX_ROWS]:
+                lines.append(f"- **SELF-REPORTED NOT COVERED: {iid}** — {_label(iid)}")
+            if len(unclaimed) > _HR_MAX_ROWS:
+                lines.append(f"- …and {len(unclaimed) - _HR_MAX_ROWS} more")
+            lines.append("")
+
+        unsupported = [
+            (iid, tcs)
+            for iid, tcs in claims.items()
+            if not any(_final_id(t) for t in tcs)
+        ]
+        if unsupported:
+            lines += [
+                "### CLAIM NO LONGER SUPPORTED",
+                "",
+                "Every case these requirements named is absent from the final suite "
+                "(collapsed as an exact duplicate, or removed by duplicate review), "
+                "so the claim points at nothing. Nothing was changed because of it:",
+                "",
+            ]
+            for iid, tcs in unsupported[:_HR_MAX_ROWS]:
+                named = ", ".join(f"`{t}`" for t in tcs[:_HR_MAX_TC_PER_ITEM])
+                lines.append(f"- **{iid}** claimed {named} — not in the final suite")
+            if len(unsupported) > _HR_MAX_ROWS:
+                lines.append(f"- …and {len(unsupported) - _HR_MAX_ROWS} more")
+            lines.append("")
+
+        if not_presented:
+            lines += [
+                "### NOT PRESENTED TO GENERATOR (excluded from every count above)",
+                "",
+                "The review named these requirements, but they never fitted into the "
+                "generator prompt, so they are a configuration issue and NOT a "
+                "coverage result -- exactly as the deterministic report treats them "
+                "(raise QA_CHECKLIST_MAX_PROMPT_CHARS):",
+                "",
+            ]
+            for iid in not_presented[:_HR_MAX_ROWS]:
+                lines.append(f"- **NOT PRESENTED: {iid}** — {_label(iid)}")
+            if len(not_presented) > _HR_MAX_ROWS:
+                lines.append(f"- …and {len(not_presented) - _HR_MAX_ROWS} more")
+            lines.append("")
+
+        if claims:
+            lines += ["### Claimed links (unverified model judgement)", ""]
+            budget = _HR_MAX_SECTION_CHARS
+            shown = 0
+            for iid, tcs in claims.items():
+                rendered: list = []
+                for t in tcs:
+                    fid = _final_id(t)
+                    if fid and fid != t:
+                        rendered.append(f"`{fid}` (submitted as `{t}`)")
+                    elif fid:
+                        rendered.append(f"`{fid}`")
+                    else:
+                        rendered.append(f"`{t}` (not in the final suite)")
+                row = f"- {iid} → " + ", ".join(rendered)
+                if shown and len(row) > budget:
+                    break
+                budget -= len(row)
+                lines.append(row)
+                shown += 1
+            if shown < len(claims):
+                lines.append(
+                    f"- …and {len(claims) - shown} more claimed link(s); this "
+                    f"list is truncated at ~{_HR_MAX_SECTION_CHARS} characters. The "
+                    "actionable lists are rendered ABOVE it, so truncation here can "
+                    "never hide a self-reported gap."
+                )
+            lines.append("")
+
+        if notes:
+            lines.append(
+                "> ℹ️  Review notes (`requirement_matches` is UNTRUSTED "
+                "input and is validated server-side):"
+            )
+            lines += [f">   - {n}" for n in notes[:_HR_MAX_NOTES]]
+            lines.append("")
+        lines.append(
+            "_HONESTY BOUNDARY: this section reports TEXTUAL alignment CLAIMED by "
+            "the generating model about its own output. It is not a measurement and "
+            "it is not a verification-strength guarantee. Treat every SELF-REPORTED "
+            "NOT COVERED item as work, not noise._"
+        )
+        return "\n".join(lines) + "\n\n"
+    except Exception:
+        logger.warning(
+            "build_coverage_review_section failed -- omitting the section",
+            exc_info=True,
+        )
+        return ""
+
+
+def category_coverage_note(parsed) -> str:
+    """One line explaining that a PER-CATEGORY submission's ``requirement_matches``
+    cannot be used at all.
+
+    Structurally the same reason as ``category_dedup_note``:
+    ``mcp_handlers._merge_category_rows`` copies ONLY ``test_cases`` and GLOBALLY
+    RENUMBERS every tc_id, so the field has no channel and per-category ids could not
+    be mapped onto the merged suite. It is also semantically impossible here: a
+    requirement is frequently verified by a case from a DIFFERENT category, so
+    coverage can only be judged on the merged set. Empty (and therefore
+    output-identical) when the field was absent. Never raises."""
+    try:
+        if getattr(parsed, "raw_requirement_matches", None) is None:
+            return ""
+        return (
+            "> ℹ️  `requirement_matches` cannot be used on the "
+            "per-category path: finalizing from accumulated rows merges only "
+            "`test_cases` and renumbers every tc_id, so the field has no channel -- "
+            "and requirement coverage can only be judged on the WHOLE merged suite, "
+            "because a requirement is often verified by a case from a different "
+            "category. Send it with the merged suite to `qa_submit_suite`.\n\n"
+        )
+    except Exception:  # pragma: no cover - defensive
+        return ""

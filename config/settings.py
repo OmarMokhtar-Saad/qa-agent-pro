@@ -68,6 +68,10 @@ _POSITIVE_INT_FIELDS = frozenset(
         # NB: qa_category_stall_s is intentionally ABSENT -- 0 is its documented
         # kill-switch, and membership here would rewrite it to the default.
         "qa_category_stall_strikes",
+        "qa_host_dedup_max_groups",
+        "qa_host_dedup_max_group_size",
+        "qa_host_coverage_max_items",
+        "qa_host_coverage_max_tc_per_item",
     }
 )
 
@@ -860,6 +864,98 @@ class Settings(BaseSettings):
     qa_prep_ttl_s: int = 3600
     qa_prep_max_bytes: int = 4000000
 
+    # --- Host-reviewed duplicate review (Piece 1; opt-in, default OFF) -----
+    # qa_semantic_dedup_enabled needs qa_embeddings_backend, and the only KEYLESS
+    # embeddings backend is "local" (sentence-transformers, ~2 GB of torch), so on
+    # a keyless host-mode deployment neither runs and ONLY byte-identical
+    # duplicates are collapsed (_dedupe_cases keys on the content hash). A real
+    # 2026-07-29 run submitted 8 categories x 8 cases and kept all 64 -- the
+    # categories are generated in PARALLEL, blind to each other, which is exactly
+    # how cross-category near-duplicates appear.
+    # When this is ON, qa_prepare_test_cases asks the tester's OWN chat model --
+    # already in the loop, already holding the merged set -- to return an OPTIONAL
+    # top-level `duplicate_groups` alongside the suite, and qa_submit_suite
+    # validates and acts on it in pure Python. Zero extra round trips (the field
+    # rides the existing submission), zero extra server-side LLM calls, no API key.
+    qa_host_dedup_review_enabled: bool = False
+    # Sub-flag: actually REMOVE the non-keeper members of each reported group.
+    # Default OFF, and deliberately ASYMMETRIC with qa_semantic_dedup_enabled
+    # (which does remove): that path drops on a NUMERIC cosine >=
+    # qa_semantic_dedup_threshold over a fixed payload, with a protected-id list
+    # and the NB-016 sole-tracer rescue. A host model's free-form judgement has no
+    # threshold and no calibrated precision, and -- unlike an embedding computed
+    # server-side -- it arrives as UNTRUSTED input. The realistic threat is NOT an
+    # untrustworthy host model: it is injected content inside the _GUARD-wrapped
+    # Jira/comment text that host mode deliberately places in the host's own
+    # context. So this path is DESTRUCTIVE + attacker-influenced and is bounded by
+    # the two deterministic server-side screens below, in addition to defaulting
+    # OFF and to the NB-016 rescue mirrored in agents/host_mode.py.
+    qa_host_dedup_apply: bool = False
+    # Caps on the UNTRUSTED field's SHAPE: how many groups are considered and how
+    # many cases one group may name. Never-raise-coerced as positive ints and
+    # additionally hard-capped in agents/host_mode.py, whose constant wins when it
+    # is smaller. NB these are shape caps, not a safety bound: 50 x 12 = 550
+    # removable ids, so they do NOT stop a disjoint partition of the suite. The two
+    # ratios below are the actual bound.
+    qa_host_dedup_max_groups: int = 50
+    qa_host_dedup_max_group_size: int = 12
+    # SAFETY BOUND (the one that actually bounds the destructive path). Max share of
+    # the SUBMITTED cases one host review may remove; above it the WHOLE review is
+    # refused (nothing removed) and the refusal is reported verbatim. An operator may
+    # LOWER this; the module ceiling (0.40) in agents/host_mode.py wins, so it can
+    # never be raised. Deliberately CORPUS-INDEPENDENT: it needs no calibration, so
+    # it is a guarantee rather than a tuned guess. The second bound is a module
+    # constant with no .env knob at all (_DUP_MAX_APPLY_GROUP_SIZE = 4: more than 4
+    # cases in one "duplicate" cluster is a partition primitive, not a duplicate).
+    qa_host_dedup_max_removal_ratio: float = 0.35
+    # PRESENTATION ONLY -- not a bound. Groups whose server-measured textual
+    # agreement falls below this are LABELLED "LOW, review before trusting" in the
+    # reply. It gates nothing, because it cannot: MEASURED 2026-07-29, the
+    # motivating cross-category duplicate scores 0.29 while two unrelated cases score
+    # 0.28-0.34 and two cases that must NOT be merged score 0.95, so no threshold
+    # separates the classes (see agents/host_mode.dup_agreements for the full table).
+    # Shipping an uncalibrated number as a security bound would look like a
+    # guarantee and not be one.
+    qa_host_dedup_low_text_ratio: float = 0.5
+
+    # --- Host-reviewed requirement coverage (Piece 2; opt-in, default OFF) ---
+    # MOOT WITHOUT QA_ATOMIC_CHECKLIST_ENABLED: with no atomic requirements
+    # checklist there is nothing to match test cases against, so this flag is a
+    # safe no-op (agents/host_mode._coverage_instruction returns "" when the prep
+    # presented no checklist item, and extract_requirement_matches has no known
+    # item ids to validate against and ignores the field).
+    # WHY IT EXISTS. tools/rtm.match_checklist is TIERED and the tiers are NOT
+    # alternatives: tier (a), the similarity matrix, is the GATE, and the optional
+    # entailment/adjudication tiers only RE-JUDGE the shortlist tier (a) already
+    # surfaced. With no qa_embeddings_backend tier (a) degrades to a TF-IDF lexical
+    # matrix, so the shortlist is built from word overlap -- and requirement
+    # <-> test-case matching is exactly the high-paraphrase-distance case where
+    # word overlap is weakest. When this is ON, the tester's OWN chat model --
+    # already in the loop, already holding the merged 8-category suite and the
+    # checklist block -- returns an OPTIONAL top-level `requirement_matches`
+    # mapping {CL id: [tc_id, ...]} alongside the suite it already submits, and
+    # qa_submit_suite reports it in pure Python. Zero extra round trips, zero
+    # server-side LLM calls, no API key.
+    # IT IS MODEL JUDGEMENT, NOT MEASUREMENT, and is kept structurally apart from
+    # the deterministic measurement: it publishes NO percentage, is never averaged
+    # or merged into ChecklistCoverage, never reaches the XLSX or the suite_store,
+    # and never drives the qa_checklist_remediation_enabled gap loop (a lexical
+    # measurement is FORBIDDEN to drive that loop, so letting an uncalibrated
+    # self-assessment do it would invert the honesty rule). All three honesty rules
+    # stand unchanged: the deterministic percentage stays suppressed while the
+    # matcher is degraded, NOT-PRESENTED requirements stay excluded from every
+    # count, and the textual-coverage boundary is restated in the section.
+    qa_host_coverage_review_enabled: bool = False
+    # Caps on the UNTRUSTED field's SHAPE: how many mapping entries are read and
+    # how many tc_ids one requirement may name. Never-raise-coerced as positive
+    # ints and additionally hard-capped in agents/host_mode.py, whose constant wins
+    # when it is smaller. These are shape caps only -- unlike the duplicate review
+    # above there is NO destructive path to bound: the field is report-only by
+    # construction, and its one coverage-affecting direction (self-reported gaps)
+    # is bounded by the "no claims at all => UNUSABLE review" rule in host_mode.
+    qa_host_coverage_max_items: int = 500
+    qa_host_coverage_max_tc_per_item: int = 12
+
     # Append-only audit log (LT-1 ph2). SQLite file recording key events (suite
     # generated, exported, pushed, bug reported) so multi-team deployments have a
     # trail. Never-raise; a failure degrades to no-audit, logged.
@@ -980,6 +1076,9 @@ class Settings(BaseSettings):
         "qa_atomicity_rules",
         "qa_standing_rules",
         "qa_semantic_dedup_enabled",
+        "qa_host_dedup_review_enabled",
+        "qa_host_dedup_apply",
+        "qa_host_coverage_review_enabled",
         "qa_atomic_checklist_enabled",
         "qa_checklist_nli_enabled",
         "qa_checklist_adjudicate_enabled",
@@ -1121,6 +1220,8 @@ class Settings(BaseSettings):
     @field_validator(
         "qa_comment_reconcile_field_threshold",
         "qa_comment_reconcile_dedup_threshold",
+        "qa_host_dedup_max_removal_ratio",
+        "qa_host_dedup_low_text_ratio",
         mode="before",
     )
     @classmethod
@@ -1188,6 +1289,10 @@ class Settings(BaseSettings):
         "qa_llm_max_tokens_rewrite",
         "qa_prep_ttl_s",
         "qa_prep_max_bytes",
+        "qa_host_dedup_max_groups",
+        "qa_host_dedup_max_group_size",
+        "qa_host_coverage_max_items",
+        "qa_host_coverage_max_tc_per_item",
         "qa_category_stall_s",
         "qa_category_stall_strikes",
         mode="before",
