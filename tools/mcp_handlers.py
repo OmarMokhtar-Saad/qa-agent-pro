@@ -860,6 +860,42 @@ def _looks_like_jira_host(url: str) -> bool:
     return "atlassian.net" in host or host.startswith("jira.") or ".jira." in host
 
 
+def _skip_ui_extraction(url: str, attached_images: list | None = None) -> bool:
+    """True when scraping *url* for app UI structure cannot pay off (ops-4b).
+
+    extract_ui_elements exists to read the structure of the APP UNDER TEST. A
+    Jira link is not that app -- the page is the TICKET -- so the call returns
+    "0 headings, 0 fields, 0 buttons, 0 links (method=none)" and contributes
+    nothing: _build_ui_prompt_block already renders "" for zero elements and
+    _complexity_signal_score already scores 0. Skipping is therefore behaviour-
+    preserving, and it replaces a log line that reads like a failed extraction
+    with one that states the real reason.
+
+    Detection deliberately has TWO arms: _looks_like_jira_host covers the
+    atlassian.net / jira.* shapes, and a match against the configured
+    JIRA_BASE_URL host covers a self-hosted instance on a custom domain
+    (tickets.example.com), which the shape check alone would miss.
+
+    A MOBILE-only run never reaches the caller's extraction block at all (it is
+    guarded by _is_url and there is no URL), so *attached_images* is accepted
+    and documented rather than gated on: a real web-app URL submitted WITH
+    screenshots still has a live page worth extracting, and skipping there would
+    discard useful signal. Jira + mobile is covered by the Jira arm.
+
+    Never raises: an unparseable URL returns False and falls through to the
+    normal extraction path, so this can only ever skip known-useless work.
+    """
+    try:
+        if _looks_like_jira_host(url):
+            return True
+        host = (urlparse(url).hostname or "").lower()
+        configured = (urlparse(settings.jira_base_url).hostname or "").lower()
+        return bool(host and configured and host == configured)
+    except Exception:
+        logger.debug("_skip_ui_extraction check failed -- extracting", exc_info=True)
+        return False
+
+
 def _jira_token_steps(host: str, *, verify_error: str = "") -> str:
     """Professional 'no access' + how-to-create-an-API-token message.
 
@@ -1580,11 +1616,20 @@ async def _ground_and_gate(
                 hint = _jira_config_hint(text)
                 if hint:
                     return hint
-            try:
-                ui_content = await extract_ui_elements(text, prefetched=url_content)
-            except Exception:
-                logger.debug("mcp: UI extraction failed -- continuing", exc_info=True)
+            if _skip_ui_extraction(text, attached_images):
+                logger.info(
+                    "ui_extractor: skipped -- %s carries no app UI to extract",
+                    "the Jira ticket page",
+                )
                 ui_content = None
+            else:
+                try:
+                    ui_content = await extract_ui_elements(text, prefetched=url_content)
+                except Exception:
+                    logger.debug(
+                        "mcp: UI extraction failed -- continuing", exc_info=True
+                    )
+                    ui_content = None
 
     amendment_questions: list = []
     if (
@@ -2126,6 +2171,15 @@ async def handle_submit_category(
             detail={"category": category_name, "cases": len(cases_json)},
         )
         note = _dropped_note(parsed)
+        if settings.qa_host_dedup_review_enabled:
+            # Duplicate review is only possible on the MERGED suite -- _merge_category_rows
+            # copies only test_cases and renumbers every tc_id -- so say the field
+            # cannot be used here rather than swallowing it.
+            note += host_mode.category_dedup_note(parsed)
+        if settings.qa_host_coverage_review_enabled:
+            # Same structural reason, plus a semantic one: requirement coverage can
+            # only be judged on the WHOLE merged suite.
+            note += host_mode.category_coverage_note(parsed)
         return (
             f"{note}## ✅ Recorded {len(cases_json)} case(s) for "
             f"**{category_name}**\n\n"
@@ -2228,6 +2282,58 @@ async def handle_submit_suite(
 
         all_cases = list(parsed.suite.test_cases)
         dropped_note = _dropped_note(parsed)
+        # Piece 1: the host's OPTIONAL cross-category duplicate review. It rode in
+        # on THIS submission -- no extra round trip and no server-side LLM call --
+        # and its SHAPE was validated against the submitted tc_ids inside
+        # host_mode._extract_duplicate_groups. Shape validation is not a safety
+        # bound (it permits a disjoint partition of the suite), so
+        # host_mode.screen_duplicate_groups runs next, in BOTH modes: the reply then
+        # shows exactly what the server would act on, and every refusal is
+        # disclosed. Removal additionally needs QA_HOST_DEDUP_APPLY and MUST happen
+        # here, BEFORE _finalize_generation, because that renumbers every tc_id.
+        submitted_cases = list(all_cases)
+        dup_review_on = bool(settings.qa_host_dedup_review_enabled)
+        dup_apply = bool(settings.qa_host_dedup_apply)
+        dup_groups = list(getattr(parsed, "duplicate_groups", None) or [])
+        dup_notes = list(getattr(parsed, "duplicate_notes", None) or [])
+        dup_groups_submitted = len(dup_groups)
+        dup_removed: list = []
+        dup_note = ""
+        dup_agreements: list = []
+        if dup_review_on and dup_groups:
+            # Advisory, shown next to every group in BOTH modes. Never a veto -- see
+            # host_mode.dup_agreements for the measurements that forbid gating on it.
+            dup_agreements = host_mode.dup_agreements(all_cases, dup_groups)
+            if dup_apply:
+                screened, screen_notes = host_mode.screen_duplicate_groups(
+                    all_cases, dup_groups
+                )
+                dup_notes += screen_notes
+                if screened:
+                    all_cases, dup_removed, apply_notes = (
+                        host_mode.apply_duplicate_groups(all_cases, screened)
+                    )
+                    dup_notes += apply_notes
+        # Piece 2: the host's OPTIONAL requirement-coverage review. Like the
+        # duplicate review it rode in on THIS submission -- no extra round trip and
+        # no server-side LLM call -- but it is REPORT-ONLY: validated here, rendered
+        # as an explicitly-labelled `host-reviewed` tier, and NEVER merged into the
+        # deterministic ChecklistCoverage, the XLSX, the suite_store payload or the
+        # remediation loop below. Ids are validated against the SUBMITTED tc_ids
+        # (the ids the host itself used) and against THIS prep's checklist, so the
+        # field is a safe no-op without QA_ATOMIC_CHECKLIST_ENABLED.
+        cov_note = ""
+        cov_review = None
+        if settings.qa_host_coverage_review_enabled:
+            cov_review = host_mode.extract_requirement_matches(
+                getattr(parsed, "raw_requirement_matches", None),
+                {tc.tc_id for tc in submitted_cases},
+                [
+                    getattr(it, "item_id", "")
+                    for it in (getattr(prepared, "checklist_items", None) or [])
+                ],
+                list(getattr(prepared, "checklist_presented_ids", None) or []),
+            )
 
         # ONE synthetic CategoryResult so _finalize_generation's "N of 8 failed"
         # partial line correctly does NOT fire (its only use of category_results).
@@ -2261,6 +2367,11 @@ async def handle_submit_suite(
             # hurts most. Suppressed, the deterministic quality gate still FLAGS
             # those fields in the reply instead of rewriting them here.
             rewrite_vague=False,
+            # And the THIRD: the advisory coverage-gap critique. remediate=False
+            # leaves remaining_gaps None, which made _finalize_generation fall
+            # through to analyze_coverage_gaps unconditionally -- ~108s of
+            # fixed-backend LLM work on a path documented as needing none.
+            advisory_gaps=False,
         )
         suite = captured.get("suite")
         if suite is None or not getattr(suite, "test_cases", None):
@@ -2271,6 +2382,25 @@ async def handle_submit_suite(
                 "resubmit."
             )
 
+        # Piece 1: the bounded, deterministic duplicate-review block. Built AFTER
+        # finalize so each submitted tc_id resolves to the FINAL renumbered id via
+        # its content stable_id, and PREPENDED ahead of the variable-length summary
+        # (the same ordering rule that moved quality_section in front of
+        # checklist_section). Stays "" when the flag is OFF, so the reply for a
+        # submission WITHOUT the field is byte-identical to the pre-feature output.
+        # Every group the host sent is listed -- including any the safety screen
+        # refused to act on -- so a refusal is never silent.
+        if dup_review_on:
+            dup_note = host_mode.build_duplicate_section(
+                dup_groups,
+                submitted_cases,
+                list(getattr(suite, "test_cases", None) or []),
+                removed=dup_removed,
+                applied=dup_apply,
+                notes=dup_notes,
+                agreements=dup_agreements,
+            )
+
         # GAP ROUND (items 3 + 7): gaps come ONLY from the deterministic matcher.
         # A degraded coverage view (no QA_EMBEDDINGS_BACKEND) NEVER enters the loop
         # -- build_gap_response's own UNRELIABLE caveat stands and the suite is
@@ -2278,6 +2408,62 @@ async def handle_submit_suite(
         # round per call. It is additionally gated on the remediation flag; see the
         # plan's "server-side remediation interaction" note.
         view = _coverage_view(suite)
+        # Piece 2: built AFTER finalize so each claimed tc_id resolves to the FINAL
+        # renumbered id via its content stable_id, and told whether the DETERMINISTIC
+        # percentage is suppressed for this run -- the situation in which a
+        # model-judged view is most likely to be misread as the coverage report. It
+        # is handed the same `view` the gap loop reads, but ONLY to label itself: the
+        # loop condition below is untouched, so a model-judged gap can never drive a
+        # remediation round.
+        if cov_review is not None:
+            cov_note = host_mode.build_coverage_review_section(
+                cov_review,
+                submitted_cases,
+                list(getattr(suite, "test_cases", None) or []),
+                list(getattr(prepared, "checklist_items", None) or []),
+                deterministic_degraded=bool(
+                    view is not None and getattr(view, "degraded", False)
+                ),
+            )
+            # ops-4d (MEDIUM-1): the ONE signal in this section that is INDEPENDENT
+            # of the host. A claim survives validation on a single EXISTING tc_id --
+            # semantic relevance is never checked, by design -- so a host can quietly
+            # drop a real requirement off its OWN self-reported gap list by claiming
+            # a case covers it. That cannot subtract from the deterministic report
+            # (rendered separately and provably untouched), but it costs the tester's
+            # attention, which is the whole value of the section. Pure set arithmetic
+            # against the deterministic matcher turns that invisible false negative
+            # into a visible DISAGREEMENT. No embeddings, no percentage, no LLM call.
+            try:
+                _det_gaps = {
+                    str(g) for g in (getattr(view, "gap_item_ids", None) or [])
+                }
+                _disputed = sorted(_det_gaps & {str(k) for k in cov_review.claims})
+                if cov_note and _disputed:
+                    _shown = ", ".join(f"`{d}`" for d in _disputed[:20])
+                    _more = (
+                        f" …and {len(_disputed) - 20} more"
+                        if len(_disputed) > 20
+                        else ""
+                    )
+                    # When the matcher itself is degraded BOTH signals are weak, so
+                    # say so rather than lending the disagreement false authority.
+                    _caveat = (
+                        " Both signals are weak in this run: the matcher fell back "
+                        "to lexical matching and is stamped UNRELIABLE."
+                        if view is not None and getattr(view, "degraded", False)
+                        else ""
+                    )
+                    cov_note += (
+                        "\n> ⚠️ **The two coverage views DISAGREE about "
+                        f"{len(_disputed)} requirement(s).** The deterministic "
+                        "matcher lists them as NOT COVERED while the model claims a "
+                        f"test covers them: {_shown}{_more}. A claim is accepted on "
+                        "a valid tc_id alone, so read the named cases yourself "
+                        "before trusting either view." + _caveat + "\n"
+                    )
+            except Exception:
+                logger.debug("coverage cross-check failed -- omitted", exc_info=True)
         cap_note = ""
         if (
             settings.qa_checklist_remediation_enabled
@@ -2300,7 +2486,7 @@ async def handle_submit_suite(
                         "gaps": len(view.gap_item_ids),
                     },
                 )
-                return f"{dropped_note}{conflict_note}{gap_md}"
+                return f"{dropped_note}{conflict_note}{dup_note}{cov_note}{gap_md}"
             cap_note = (
                 "\n\n> ⚠️  Requirement coverage still shows "
                 f"{len(view.gap_item_ids)} gap(s), but the remediation round limit "
@@ -2321,7 +2507,27 @@ async def handle_submit_suite(
         await _audit(
             "mcp_submit_suite",
             entity_id=suite_id or None,
-            detail={"status": status, "cases": case_count},
+            detail={
+                "status": status,
+                "cases": case_count,
+                # `cases` is the POST-removal count, so without these two the trail
+                # cannot tell "the host generated 6 cases" from "the host removed
+                # 58". dedup_groups counts what was SUBMITTED (before the safety
+                # screen); dedup_removed counts what was actually deleted.
+                "dedup_groups": dup_groups_submitted,
+                "dedup_removed": len(dup_removed),
+                # Piece 2: counts ONLY (never the claimed content), and
+                # only when a usable review actually ran -- so a flag-OFF run's
+                # audit row is byte-identical to today's.
+                **(
+                    {
+                        "host_coverage_claimed": len(cov_review.claims),
+                        "host_coverage_unclaimed": len(cov_review.unclaimed),
+                    }
+                    if cov_review is not None and cov_review.ran
+                    else {}
+                ),
+            },
         )
         auto_export = bool(
             settings.qa_auto_export_xlsx and getattr(suite, "test_cases", None)
@@ -2344,7 +2550,7 @@ async def handle_submit_suite(
             progress=progress,
         )
         await prep_store.delete_prep(prep_id)
-        return f"{dropped_note}{conflict_note}{result_md}{cap_note}"
+        return f"{dropped_note}{conflict_note}{dup_note}{cov_note}{result_md}{cap_note}"
     except Exception as exc:
         logger.exception("handle_submit_suite failed")
         _capture_error(exc, "qa_submit_suite")

@@ -3232,6 +3232,7 @@ async def _finalize_generation(
     ui_content: dict | None = None,
     remediate: bool = True,
     rewrite_vague: bool = True,
+    advisory_gaps: bool = True,
 ) -> tuple[str, str, str, str, str]:
     """Finalize a generated suite: dedupe -> remediation -> risk -> semantic
     dedup -> rule packs -> vague-field rewrite -> renumber -> RTM -> checklist
@@ -3617,7 +3618,19 @@ async def _finalize_generation(
     # gaps (advisory, consistent with what it actually tried to close) rather than
     # an independent second critic that always surfaces more. When the loop did
     # not run (regen disabled), fall back to the standalone self-critique pass.
-    if checklist_section and _checklist_remediation and remaining_gaps is not None:
+    if not advisory_gaps:
+        # HOST PATH (ops-4a): the THIRD server-side LLM call site in this
+        # function, and the only one that was never gated. remediate=False
+        # leaves remaining_gaps at its None initialiser, so the final else
+        # below ALWAYS reached analyze_coverage_gaps -- one llm.ask through the
+        # fixed backend on EVERY host submit. Measured at ~108s (21% of a real
+        # run, 2026-07-29) and squarely against host mode's "no key, no
+        # backend, no quota" premise. Suppressed for exactly the same reason as
+        # remediate and rewrite_vague. The deterministic coverage view still
+        # reports gaps, so nothing observational is lost -- only the LLM's
+        # second-guess prose.
+        gaps_section = ""
+    elif checklist_section and _checklist_remediation and remaining_gaps is not None:
         # Batch 2: in CHECKLIST-remediation mode the leftover gaps are ALREADY
         # rendered as first-class "NOT COVERED: CL-0NN" entries in the checklist
         # coverage section immediately above, with the requirement text and its
@@ -3735,9 +3748,16 @@ async def _finalize_generation(
             f"{image_notice}"
             f"{risk_line}"
             f"{rtm_line}"
+            # ops-4c: the DETERMINISTIC quality warnings print ahead of the two
+            # variable-length sections below. checklist_section grows one line
+            # per requirement and gaps_section is free-form LLM prose, so with
+            # either of them in front, shape_generation_result's 4000-char cap
+            # could silently delete the Data Quality Notes -- and in host mode
+            # (rewrite_vague=False) that block is the ONLY report that a step is
+            # too vague to execute. Advisory prose gets truncated instead.
+            f"{quality_section}"
             f"{checklist_section}"
             f"{gaps_section}"
-            f"{quality_section}"
             f"{test_data_section}"
             f"{anchoring_section}"
             f"{scope_section}"
@@ -3810,10 +3830,13 @@ async def _finalize_generation(
         f"{image_notice}"
         f"{file_note}"
         f"{rtm_section}"
+        # ops-4c: see the compact summary above -- deterministic quality
+        # warnings must precede the variable-length checklist / gap sections so
+        # the 4000-char reply cap can never delete them.
+        f"{quality_section}"
         f"{checklist_section}"
         f"{gaps_section}"
         f"{risk_section}"
-        f"{quality_section}"
         f"{test_data_section}"
         f"{anchoring_section}"
         f"{scope_section}"
