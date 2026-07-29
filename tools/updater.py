@@ -191,11 +191,19 @@ def lock_files(install_dir: Path) -> int:
                 # (updates/heals) drops POSIX modes, so start.sh would arrive
                 # 0o644 and a bare exec-bit-preserve would leave it unrunnable.
                 # Everything else: read-only, keeping any existing exec bits.
-                if rel.endswith(".sh"):
-                    os.chmod(path, 0o555)
-                else:
-                    os.chmod(path, 0o444 | (os.stat(path).st_mode & 0o111))
-                locked += 1
+                # ops-5 (issue 5): chmod ONLY when the mode is actually wrong.
+                # This ran unconditionally on every update check -- 59 chmods
+                # every 15 minutes on an install that was already locked, each
+                # one logged at INFO as if it were work. The guard is
+                # deliberately "this file is not in the desired mode", NOT "the
+                # version looks unchanged": the lock is a security control, so a
+                # file that drifted writable (editor, stray chmod, partial
+                # extraction) must still be re-locked on the very next pass.
+                st_mode = os.stat(path).st_mode
+                desired = 0o555 if rel.endswith(".sh") else 0o444 | (st_mode & 0o111)
+                if stat.S_IMODE(st_mode) != desired:
+                    os.chmod(path, desired)
+                    locked += 1
         except OSError as exc:
             logger.warning("Could not lock %s (%s).", rel, exc)
     return locked
@@ -771,7 +779,14 @@ def run_update_check(
                     local,
                 )
             locked = lock_files(install_dir)
-            logger.info("Code lock: %d file(s) set read-only.", locked)
+            # ops-5 (issue 5): only announce real work. A no-op pass logs at
+            # DEBUG, so "Code lock: N file(s)" now means N files ACTUALLY drifted
+            # and were re-locked -- worth noticing -- instead of appearing every
+            # 15 minutes and training the reader to ignore it.
+            if locked:
+                logger.info("Code lock: %d file(s) re-locked read-only.", locked)
+            else:
+                logger.debug("Code lock: all files already read-only.")
         logger.info("Up to date (local=%s, latest=%s).", local, remote)
         return status
     except Exception as exc:

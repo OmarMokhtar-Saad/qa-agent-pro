@@ -3260,7 +3260,18 @@ async def _finalize_generation(
     image_notice = prepared.image_notice
     failed = [r for r in category_results if not r.succeeded]
 
+    _received = len(all_cases)
     all_cases = _dedupe_cases(all_cases)
+    # ops-5 (issue 7): finalize used to log NOTHING across its whole run. That is
+    # how a 108s server-side LLM call (the advisory gap critique on the host path)
+    # stayed invisible for a full session -- the only way to find it was reading
+    # branch conditions. Log the case-count funnel and the coverage tier so the
+    # next regression is visible in the log instead of requiring a code read.
+    logger.info(
+        "finalize: received %d case(s) -> %d after exact dedup",
+        _received,
+        len(all_cases),
+    )
     # SHYJ-7154 Fix 3: when the source ticket carries REAL acceptance criteria,
     # optionally drop cases that cite a non-existent AC id (hallucinated
     # traceability). Never empties the suite. Flag-gated
@@ -3650,6 +3661,22 @@ async def _finalize_generation(
         gaps_section = _format_advisory_gaps(remaining_gaps)
     else:
         gaps_section = await analyze_coverage_gaps(feature_text, renumbered, acs)
+
+    # ops-5 (issue 7): the closing funnel line. Deliberately ONE line carrying
+    # everything a reader needs to spot a silent change: the count, whether the
+    # deterministic coverage tier degraded to lexical (which suppresses the
+    # percentage), and whether the quality gate flagged anything.
+    try:
+        _cov = getattr(suite, "_checklist_artifacts", None) or {}
+        _cov_tier = str((_cov.get("coverage") or {}).get("tier_used") or "none")
+        logger.info(
+            "finalize: %d case(s) final | coverage tier=%s | quality flags=%s",
+            len(getattr(suite, "test_cases", None) or []),
+            _cov_tier,
+            "yes" if quality_section else "no",
+        )
+    except Exception:
+        logger.debug("finalize summary log failed", exc_info=True)
 
     # Shared counts used by both the compact and verbose summaries.
     tc_count = len(suite.test_cases)

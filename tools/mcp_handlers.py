@@ -185,6 +185,11 @@ _TEST_CASES_ONLY_NOTICE = (
 
 ProgressCb = Optional[Callable[[str], Awaitable[None]]]
 
+# ops-5 (issue 6): short-lived cache of a SUCCESSFUL Jira pre-flight, keyed on the
+# credentials used. Only successes are cached, so a failure always re-probes.
+_JIRA_PREFLIGHT_TTL_S = 60.0
+_JIRA_PREFLIGHT_OK: dict = {}
+
 # --- Guided-wizard choice callback (MCP elicitation bridge) ----------------- #
 # mcp_server.py adapts FastMCP's ctx.elicit into this async callback, mirroring
 # ProgressCb. It returns a ChoiceResult so these handlers stay importable and
@@ -508,6 +513,7 @@ def shape_generation_result(
     status: str,
     *,
     auto_export: bool = False,
+    submitted_count: int | None = None,
 ) -> str:
     """Shape the generation reply.
 
@@ -522,8 +528,25 @@ def shape_generation_result(
     if suite_id:
         hint = "" if auto_export else " — pass this to `qa_export_suite`."
         lines.append(f"**Suite ID:** `{suite_id}`{hint}")
-    lines.append(f"**Cases:** {cases}")
-    lines.append(f"**Status:** {status}")
+    # ops-5 (issue 8): `status` is an INTERNAL token and this reply goes to a
+    # non-technical tester. "fallback" in particular means "structured generation
+    # FAILED, this is markdown instead" -- it reads as benign, and a real run on
+    # 2026-07-29 reported exactly that with 0 cases. Translate it.
+    _STATUS_TEXT = {
+        "ok": "Complete",
+        "partial": "⚠️ Incomplete — some categories failed, cases are missing",
+        "fallback": "❌ Generation failed — no structured test cases were produced",
+        "error": "❌ Error — generation did not complete",
+    }
+    if submitted_count is not None and submitted_count != cases:
+        lines.append(
+            f"**Cases:** {cases} "
+            f"({submitted_count} submitted, {submitted_count - cases} removed "
+            "as duplicates)"
+        )
+    else:
+        lines.append(f"**Cases:** {cases}")
+    lines.append(f"**Status:** {_STATUS_TEXT.get(status, status)}")
     body = (summary or "").strip()
     if body:
         if len(body) > _SUMMARY_CAP:
@@ -941,9 +964,24 @@ async def _jira_preflight(
     if not settings.qa_jira_preflight or not _looks_like_jira_host(url):
         return None
     host = (urlparse(url).hostname or "").lower()
+    # ops-5 (issue 6): qa_setup_check then qa_generate_test_cases fired two
+    # GET /rest/api/3/myself calls 20s apart on a real run. Cache only the
+    # SUCCESS, briefly, keyed on the credentials in play -- a FAILURE must always
+    # re-probe so a tester who just fixed their token is not told to wait.
+    _pf_key = (
+        str(settings.jira_base_url or ""),
+        str(settings.jira_email or ""),
+        str(settings.jira_api_token or "")[-8:],
+    )
+    _now = time.monotonic()
+    _hit = _JIRA_PREFLIGHT_OK.get(_pf_key)
+    if _hit is not None and _now - _hit < _JIRA_PREFLIGHT_TTL_S:
+        return None
     await _emit(progress, "🔐 Checking Jira access…")
     probe = await verify_jira_access()
     if probe.get("ok"):
+        _JIRA_PREFLIGHT_OK.clear()  # bounded: one live credential set at a time
+        _JIRA_PREFLIGHT_OK[_pf_key] = _now
         return None
     if not (settings.qa_mcp_elicit_enabled and ask_text is not None):
         return _jira_token_steps(host, verify_error=probe.get("error", "")) + (
