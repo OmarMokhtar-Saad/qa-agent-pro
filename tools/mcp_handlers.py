@@ -147,6 +147,31 @@ def _schedule_reload() -> None:
     threading.Thread(target=_later, daemon=True).start()
 
 
+# Wall-clock at import: anything on disk newer than this was written AFTER the
+# running server read its configuration.
+_PROCESS_START = time.time()
+
+
+def _env_changed_since_start() -> bool:
+    """True when the install's .env was written after this process read it.
+
+    config/settings parses .env exactly once at startup, so an edit made while
+    the server is running has NO effect until the process is replaced. Callers
+    use this to schedule the reload that applies it.
+
+    Never raises: a missing or unreadable .env reads as unchanged, so a failure
+    here can only ever SKIP a reload, never trigger a spurious one.
+    """
+    try:
+        from tools.updater import _INSTALL_DIR
+
+        env_path = _INSTALL_DIR / ".env"
+        return env_path.is_file() and env_path.stat().st_mtime > _PROCESS_START
+    except Exception:
+        logger.debug("could not stat .env for the reload check", exc_info=True)
+        return False
+
+
 def _test_cases_only() -> bool:
     """True when only the test-case tools should be exposed: the distribution
     build (optional modules absent) or QA_DIST_MODE=true."""
@@ -3223,6 +3248,17 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
                     "> 🔄 **A new version was just installed.** The server is "
                     "reloading now — run `qa_setup_check` again in ~10 seconds "
                     "to see it."
+                )
+                _schedule_reload()
+            elif _env_changed_since_start():
+                # The settings rendered below came from the OLD .env, so say so
+                # plainly rather than presenting them as the applied config.
+                update_note = (
+                    "> 🔄 **Configuration changed.** `.env` was edited after this "
+                    "server started, so the settings shown below are the ones it "
+                    "booted with — not what the file says now. The server is "
+                    "reloading to apply them: run `qa_setup_check` again in ~10 "
+                    "seconds to see the live configuration."
                 )
                 _schedule_reload()
         await _emit(progress, "🔎 Validating the environment…")
