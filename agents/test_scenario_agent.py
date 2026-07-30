@@ -1415,6 +1415,16 @@ async def _generate_for_category(
                 attempt + 1,
             )
             cases = suite.test_cases
+            # F6: the category is SERVER-DERIVED here -- this function was
+            # called FOR category_name. The field is part of the response
+            # schema, so the model can and will fill it in; overwrite it
+            # unconditionally rather than trusting generated text.
+            for _tc in cases:
+                try:
+                    _tc.category = category_name or None
+                    _tc.category_source = "server" if category_name else None
+                except Exception:  # pragma: no cover - defensive
+                    logger.debug("could not stamp category", exc_info=True)
             # Record the BASE call's tokens immediately -- unconditionally, one
             # call recorded per real ask_json invocation. Previously this fired
             # ONCE, after the quality section below, using whichever `cases`
@@ -3725,6 +3735,7 @@ async def _finalize_generation(
     # line. Never breaks generation: any failure just omits the report.
     feature_report = ""
     if (settings.qa_feature_analysis_enabled or force_feature_report) and all_cases:
+        _fa_t0 = time.monotonic()
         try:
             screenshot_descriptions = "\n\n".join(
                 t for t in (jira_image_text, attached_image_text) if t
@@ -3735,6 +3746,11 @@ async def _finalize_generation(
                 screenshot_descriptions=screenshot_descriptions,
                 ui_content=ui_content,
                 acs=acs,
+            )
+            logger.info(
+                "finalize: feature-analysis report took %.1fs (server-side LLM "
+                "call; set QA_FEATURE_ANALYSIS_ENABLED=false to skip it)",
+                time.monotonic() - _fa_t0,
             )
             full_md = render_report_markdown(report)
             compact_md = render_report_markdown(report, compact=True)

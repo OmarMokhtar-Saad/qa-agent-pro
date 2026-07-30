@@ -194,6 +194,19 @@ class TestCase(BaseModel):
         "it from the title and steps so the case keeps a stable identity across "
         "regenerations and exports, independent of the display-order tc_id.",
     )
+    category: Optional[str] = Field(
+        default=None,
+        max_length=60,
+        description="Which of the 8 generation categories produced this case "
+        "(Positive / Happy Path, Negative / Error Flows, Boundary Values, Edge "
+        "Cases, State Transitions, Security, UI/UX Validation, Integration). "
+        "Bounded free text: normalised at the untrusted boundary, empty when it "
+        "could not be resolved -- never guessed.",
+    )
+    category_source: Optional[Literal["server", "host"]] = Field(
+        default=None,
+        description='Where `category` came from. "server": derived by the server (the fan-out category, or the category_name argument of a qa_submit_category call). "host": self-reported by the tester\'s chat model on a single merged submission, where the server has no grouping of its own. Set in code on every path -- a model-supplied value is always overwritten -- so a re-export can still tell the two apart.',
+    )
     test_data: list[TestDataItem] = Field(
         default_factory=list,
         description="Optional per-case data-provisioning plan: for each data field "

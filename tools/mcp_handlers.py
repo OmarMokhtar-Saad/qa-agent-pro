@@ -1879,8 +1879,11 @@ class PreparePayloadResult:
     * clarify: a markdown string to relay verbatim (setup hint, preflight,
       clarifying questions, or an error) -- no suite was prepared.
 
-    ``notice`` carries any NON-SILENT disclosure (e.g. an image that could not be
-    forwarded, or a size cap that was hit); ``images`` (raw {data, mime} dicts) is
+    ``notice`` carries any NON-SILENT disclosure. It is written ONCE, on the
+    success path (_host_mode_server_llm_notice); a further disclosure must be
+    APPENDED, never assigned, or it will silently drop that one. The image-drop
+    disclosure is emitted separately, as its own text block by
+    assemble_prepare_payload. ``images`` (raw {data, mime} dicts) is
     populated in ops-3d-2 when the MCP tool result can carry image content.
     ops-3d-2/3d-3 render this into MCP content; render_prepare_payload turns it
     into plain text for a legacy (string-only) caller.
@@ -1891,6 +1894,78 @@ class PreparePayloadResult:
     clarify: str = ""
     notice: str = ""
     images: list = field(default_factory=list)
+
+
+# Flags that put a SERVER-SIDE LLM call back on the host-mode path, split by
+# which half pays for it. Host mode's premise is that the tester's OWN model
+# generates, so each of these quietly breaks it: a keyless install degrades
+# silently, and a backed one pays latency the tester never sees.
+# NOT exhaustive by design -- see the closing line of the notice: the ambiguity
+# pre-pass and AC synthesis call the backend unconditionally.
+_SERVER_LLM_FLAGS_PREPARE: tuple = (
+    (
+        "qa_atomic_checklist_enabled",
+        "QA_ATOMIC_CHECKLIST_ENABLED",
+        "the atomic requirements checklist",
+    ),
+    (
+        "qa_comment_reconcile_enabled",
+        "QA_COMMENT_RECONCILE_ENABLED",
+        "Jira comment reconciliation",
+    ),
+)
+_SERVER_LLM_FLAGS_SUBMIT: tuple = (
+    (
+        "qa_feature_analysis_enabled",
+        "QA_FEATURE_ANALYSIS_ENABLED",
+        "a Feature Analysis report (~69s on one measured run)",
+    ),
+    ("qa_test_plan_artifacts", "QA_TEST_PLAN_ARTIFACTS", "test-plan artifacts"),
+    ("qa_llm_risk_scoring", "QA_LLM_RISK_SCORING", "LLM risk scoring"),
+    (
+        "qa_checklist_nli_enabled",
+        "QA_CHECKLIST_NLI_ENABLED",
+        "checklist entailment (needs QA_ATOMIC_CHECKLIST_ENABLED)",
+    ),
+    (
+        "qa_checklist_adjudicate_enabled",
+        "QA_CHECKLIST_ADJUDICATE_ENABLED",
+        "checklist adjudication (needs QA_ATOMIC_CHECKLIST_ENABLED)",
+    ),
+)
+_SERVER_LLM_FLAGS: tuple = _SERVER_LLM_FLAGS_PREPARE + _SERVER_LLM_FLAGS_SUBMIT
+
+
+def _host_mode_server_llm_notice() -> str:
+    """Disclose the flags that make THIS SERVER call an LLM on the host path.
+
+    Returns "" when none are on. Never raises: a setting that cannot be read is
+    simply not mentioned, so this can only ever under-report, never break a
+    prepare.
+    """
+    on: list = []
+    for attr, env, what in _SERVER_LLM_FLAGS:
+        try:
+            if getattr(settings, attr, False):
+                on.append((env, what))
+        except Exception:
+            logger.debug("could not read %s", attr, exc_info=True)
+    if not on:
+        return ""
+    lines = [
+        "> \u26a0\ufe0f  This is a host-mode generation, but these settings "
+        "still make **this server** call an LLM while grounding and finishing "
+        "your suite:"
+    ]
+    lines += [f">   - `{env}` \u2014 {what}" for env, what in on]
+    lines.append(
+        ">   Each needs a working backend and adds latency you will not see in "
+        "the chat. Set them to `false` to remove the server-side LLM work this "
+        "server controls. Note this is not the whole story: the requirement "
+        "pre-pass always classifies, and acceptance criteria are synthesised "
+        "when the ticket carries none — both call the backend by design."
+    )
+    return "\n".join(lines)
 
 
 async def handle_prepare_test_cases(
@@ -1977,7 +2052,10 @@ async def handle_prepare_test_cases(
         # fallback. Bytes are never persisted in the prep store.
         ticket_images = list((grounded.url_content or {}).get("images") or [])
         return PreparePayloadResult(
-            payload=payload, prep_id=prep_id, images=ticket_images
+            payload=payload,
+            prep_id=prep_id,
+            images=ticket_images,
+            notice=_host_mode_server_llm_notice(),
         )
     except host_mode.PrepSerdeError as exc:
         logger.warning("host-mode prepare serialization failed", exc_info=True)
@@ -2302,8 +2380,19 @@ def _merge_category_rows(rows: list) -> "tuple[dict, int]":
         if not isinstance(cases, list):
             continue
         used += 1
+        # F6: the row's category_name is SERVER-DERIVED (it is the argument the
+        # tester's tool call carried, recorded per row) so it overrides whatever
+        # a case claims about itself. Unresolvable -> left empty, never guessed.
+        canon = host_mode.normalize_category(name)
         for c in cases:
             if isinstance(c, dict):
+                c = dict(c)
+                # Unconditional: the server-derived name WINS even when it is
+                # unresolvable, otherwise the host's own claim survives on the
+                # path this comment calls server-derived (submit_category
+                # persists model_dump(), which now carries `category`).
+                c["category"] = canon or None
+                c["category_source"] = "server" if canon else None
                 merged_cases.append(c)
     renumbered = []
     for i, c in enumerate(merged_cases, 1):
@@ -2363,24 +2452,67 @@ async def handle_submit_category(
             detail={"category": category_name, "cases": len(cases_json)},
         )
         note = _dropped_note(parsed)
+        # F4: tracked SEPARATELY from `note`, which also carries the
+        # dropped-cases disclosure -- keying the route wording off `note` would
+        # promise a review that never ran whenever cases were dropped.
+        review_note = ""
         if settings.qa_host_dedup_review_enabled:
             # Duplicate review is only possible on the MERGED suite -- _merge_category_rows
             # copies only test_cases and renumbers every tc_id -- so say the field
             # cannot be used here rather than swallowing it.
-            note += host_mode.category_dedup_note(parsed)
+            review_note += host_mode.category_dedup_note(parsed)
         if settings.qa_host_coverage_review_enabled:
             # Same structural reason, plus a semantic one: requirement coverage can
             # only be judged on the WHOLE merged suite.
-            note += host_mode.category_coverage_note(parsed)
+            review_note += host_mode.category_coverage_note(parsed)
+        note += review_note
+        # F4: name the categories already staged -- a host LLM re-reading this
+        # reply otherwise has only a bare count and cannot tell what is left.
+        staged_names = ""
+        try:
+            names = [
+                str(r.get("category_name", "")).strip()
+                for r in (rows.get("content") or [])
+                if isinstance(r, dict) and str(r.get("category_name", "")).strip()
+            ]
+            if names:
+                staged_names = " (" + ", ".join(names) + ")"
+        except Exception:  # defensive -- the count alone is still correct
+            logger.debug("could not list staged category names", exc_info=True)
+        if review_note:
+            # A duplicate/coverage review note was prepended, and those reviews
+            # run ONLY on the merged suite. Here the two routes are a real
+            # CHOICE, so telling the host never to send the merged suite would
+            # contradict the note immediately above this line.
+            route = (
+                "Choose ONE route -- do not do both:\n\n"
+                "- **Finalize from these rows**: call `qa_submit_suite` with this "
+                'prep_id and an EMPTY `suite_json` (`suite_json=""`). No '
+                "duplicate or coverage review.\n"
+                "- **Or send one merged `suite_json`**: the review above runs, and "
+                "the rows staged here are ignored.\n\n"
+                "Sending both costs a round trip and the tokens to repeat every "
+                "case: a non-empty `suite_json` is authoritative, so nothing "
+                "staged here is merged in."
+            )
+        else:
+            route = (
+                "When every category is in, call `qa_submit_suite` with this "
+                'prep_id and an EMPTY `suite_json` (`suite_json=""`) -- the rows '
+                "staged above are merged for you.\n\n"
+                "> \u26a0\ufe0f  Do NOT also send a full merged `suite_json`: a "
+                "non-empty one is authoritative, so every row staged here is "
+                "**ignored** and re-sending the cases costs a round trip and the "
+                "tokens to repeat them."
+            )
         return (
             f"{note}## ✅ Recorded {len(cases_json)} case(s) for "
             f"**{category_name}**\n\n"
             f"Re-submitting **{category_name}** REPLACES its previous rows "
             "(newest wins).\n\n"
-            f"**{on_file}** category row(s) are now staged for prep_id `{prep_id}`. "
-            "When every category is in, call `qa_submit_suite` with this prep_id and "
-            "an EMPTY suite_json to finalize from the accumulated rows, or submit the "
-            "full merged suite_json directly."
+            f"**{on_file}** category row(s) staged for prep_id `{prep_id}`"
+            f"{staged_names}.\n\n"
+            f"{route}"
         )
     except Exception as exc:
         logger.exception("handle_submit_category failed")
@@ -2489,6 +2621,31 @@ async def handle_submit_suite(
             )
 
         all_cases = list(parsed.suite.test_cases)
+        # F6: on the FULL-suite path the per-case `category` is host self-report --
+        # the server has no grouping of its own there. Normalise onto a canonical
+        # name, blank anything unresolvable, and TAG the provenance so a later
+        # re-export can still tell it from a server-derived value.
+        cat_source = ""
+        if has_full:
+            _resolved = 0
+            for _tc in all_cases:
+                _canon = host_mode.normalize_category(getattr(_tc, "category", None))
+                try:
+                    _tc.category = _canon or None
+                    _tc.category_source = "host" if _canon else None
+                except Exception:  # pragma: no cover - defensive
+                    logger.debug("could not set category", exc_info=True)
+                if _canon:
+                    _resolved += 1
+            _unresolved = len(all_cases) - _resolved
+            cat_source = (
+                f"> \u2139\ufe0f  Category resolved for {_resolved} case(s)"
+                + (f", unresolved for {_unresolved}" if _unresolved else "")
+                + " -- **self-reported by your chat model**, because a single "
+                "merged submission carries no server-side grouping. Submit per "
+                "category with `qa_submit_category` for a server-derived "
+                "category instead.\n\n"
+            )
         dropped_note = _dropped_note(parsed)
         # Piece 1: the host's OPTIONAL cross-category duplicate review. It rode in
         # on THIS submission -- no extra round trip and no server-side LLM call --
@@ -2508,6 +2665,24 @@ async def handle_submit_suite(
         dup_removed: list = []
         dup_note = ""
         dup_agreements: list = []
+        # Separate variable ON PURPOSE: dup_note is reassigned wholesale below.
+        # Only meaningful when the host submitted a FULL suite -- the merge path
+        # drops the field structurally, so "the host did not send it" would be a
+        # false accusation there.
+        dup_status_note = ""
+        if dup_review_on and has_full and not dup_groups:
+            if getattr(parsed, "duplicate_review_offered", False):
+                dup_status_note = (
+                    "> \u267b\ufe0f  Duplicate review ran and reported no "
+                    "cross-category duplicates.\n\n"
+                )
+            else:
+                dup_status_note = (
+                    "> \u2139\ufe0f  Duplicate review was requested but this "
+                    "submission carried no `duplicate_groups` field, so NO "
+                    "duplicate review ran -- which is NOT the same as finding "
+                    "none. Any cross-category duplicates are still present.\n\n"
+                )
         if dup_review_on and dup_groups:
             # Advisory, shown next to every group in BOTH modes. Never a veto -- see
             # host_mode.dup_agreements for the measurements that forbid gating on it.
@@ -2695,8 +2870,8 @@ async def handle_submit_suite(
                     },
                 )
                 return (
-                    f"{version_note}{dropped_note}{conflict_note}"
-                    f"{dup_note}{cov_note}{gap_md}"
+                    f"{version_note}{dropped_note}{conflict_note}{cat_source}"
+                    f"{dup_status_note}{dup_note}{cov_note}{gap_md}"
                 )
             cap_note = (
                 "\n\n> ⚠️  Requirement coverage still shows "
@@ -2740,6 +2915,12 @@ async def handle_submit_suite(
                 # screen); dedup_removed counts what was actually deleted.
                 "dedup_groups": dup_groups_submitted,
                 "dedup_removed": len(dup_removed),
+                # Whether the field was OFFERED at all -- the signal the runbook
+                # gate asks an operator to check, and not derivable from a zero
+                # dedup_groups count.
+                "dedup_offered": bool(
+                    getattr(parsed, "duplicate_review_offered", False)
+                ),
                 # Piece 2: counts ONLY (never the claimed content), and
                 # only when a usable review actually ran -- so a flag-OFF run's
                 # audit row is byte-identical to today's.
@@ -2775,8 +2956,8 @@ async def handle_submit_suite(
         )
         await prep_store.delete_prep(prep_id)
         return (
-            f"{version_note}{dropped_note}{conflict_note}{dup_note}"
-            f"{cov_note}{result_md}{cap_note}"
+            f"{version_note}{dropped_note}{conflict_note}{cat_source}"
+            f"{dup_status_note}{dup_note}{cov_note}{result_md}{cap_note}"
         )
     except Exception as exc:
         logger.exception("handle_submit_suite failed")

@@ -627,13 +627,21 @@ _HOST_GENERATION_INSTRUCTIONS = (
     "`system_prompt` as your system instruction, `user_context` as the feature "
     "material, and that entry's `instruction` (its FOCUS, case-count range and "
     "preferred type). Emit ONLY a JSON object conforming to `response_schema`.\n"
+    "   Set each case's `category` field to that entry's `name`, copied EXACTLY "
+    '(e.g. "Positive / Happy Path"). It is what makes the exported Category '
+    "column meaningful; a value the server cannot resolve is stored empty rather "
+    "than guessed.\n"
     "3. Merge all categories into ONE JSON object with a single `test_cases` "
     "array. Keep tc_id values unique (TC-001, TC-002, ...); they are renumbered "
     "on submission.\n"
     "4. Submit the merged JSON by calling the `qa_submit_suite` tool with the "
     "`prep_id` returned alongside this payload. The server validates it, scores "
     "requirement coverage deterministically, and returns either a gap report to "
-    "fix and resubmit (same prep_id) or the finished suite and its export path."
+    "fix and resubmit (same prep_id) or the finished suite and its export path.\n"
+    "   If instead you already sent categories one at a time with "
+    "`qa_submit_category`, call `qa_submit_suite` with an EMPTY `suite_json` "
+    '(`suite_json=""`) and do NOT also send the merged JSON -- a non-empty '
+    "`suite_json` is authoritative, so every staged row would be ignored."
 )
 
 # HONESTY RULE (load-bearing): a degraded (lexical, no-embeddings) coverage object
@@ -667,6 +675,12 @@ class ParsedSubmission:
     # -- screen_duplicate_groups applies the safety bounds before anything is
     # removed. Empty on the per-category path, where the field cannot be used.
     duplicate_groups: list = dataclasses.field(default_factory=list)
+    # True when the submission actually CARRIED a `duplicate_groups` key, however
+    # malformed. Distinguishes "the host reviewed and found no duplicates" from
+    # "the host ignored the request" -- both yield an empty list, but only the
+    # second means no review happened. Always False on the per-category merge
+    # path, where _merge_category_rows structurally drops the field.
+    duplicate_review_offered: bool = False
     # Why part of that field was rejected. Surfaced in the reply -- silence about a
     # rejected untrusted field is the failure mode being avoided.
     duplicate_notes: list = dataclasses.field(default_factory=list)
@@ -856,6 +870,7 @@ def _validate_suite(data: dict) -> ParsedSubmission:
     # Popping also keeps the fast path working: without it, a submission carrying the
     # field would ALWAYS fail whole-suite validation and fall into the salvage branch.
     data = dict(data) if isinstance(data, dict) else {}
+    dup_offered = "duplicate_groups" in data
     raw_groups = data.pop("duplicate_groups", None)
     # Piece 2: same reasoning, one field further -- pop it from the COPY so a
     # submission carrying it still takes the fast whole-suite validation path.
@@ -872,6 +887,7 @@ def _validate_suite(data: dict) -> ParsedSubmission:
             suite=suite,
             duplicate_groups=groups,
             duplicate_notes=dup_notes,
+            duplicate_review_offered=dup_offered,
             raw_requirement_matches=raw_req_matches,
         )
 
@@ -914,6 +930,7 @@ def _validate_suite(data: dict) -> ParsedSubmission:
         dropped_reasons=dropped[:_MAX_DROPPED_REASONS],
         duplicate_groups=groups,
         duplicate_notes=dup_notes,
+        duplicate_review_offered=dup_offered,
         raw_requirement_matches=raw_req_matches,
     )
 
@@ -984,6 +1001,81 @@ def _low_text_ratio() -> float:
     except (TypeError, ValueError):
         cfg = _DUP_LOW_TEXT_DEFAULT
     return max(0.0, min(1.0, cfg))
+
+
+# F6: the 15 spellings actually observed in the audit trail, mapped onto the 8
+# canonical CATEGORIES names. Keys are casefolded and already segment-reduced
+# (the part before any "/"), which is why `Positive / Happy Path` -> `positive`
+# and `UI/UX Validation` -> `ui` both land here.
+_CATEGORY_ALIASES: dict = {
+    "positive": "Positive / Happy Path",
+    "happy path": "Positive / Happy Path",
+    "negative": "Negative / Error Flows",
+    "error flows": "Negative / Error Flows",
+    "boundary": "Boundary Values",
+    "boundary value": "Boundary Values",
+    "boundary values": "Boundary Values",
+    "edge": "Edge Cases",
+    "edge case": "Edge Cases",
+    "edge cases": "Edge Cases",
+    "state": "State Transitions",
+    "state transition": "State Transitions",
+    "state transitions": "State Transitions",
+    "security": "Security",
+    "ui": "UI/UX Validation",
+    "ux": "UI/UX Validation",
+    "ui ux": "UI/UX Validation",
+    "ui/ux": "UI/UX Validation",
+    "integration": "Integration",
+    "integrations": "Integration",
+}
+
+
+def _canonical_categories() -> list:
+    """The 8 canonical category names, read LAZILY so tools/ never imports
+    agents/ at module scope. Empty on any failure -- callers degrade to the
+    alias table alone."""
+    try:
+        from agents.test_scenario_agent import CATEGORIES
+
+        return [str(c[0]) for c in CATEGORIES]
+    except Exception:
+        logger.debug("could not read CATEGORIES", exc_info=True)
+        return []
+
+
+def normalize_category(raw: object) -> str:
+    """Resolve UNTRUSTED category text onto one of the 8 canonical names.
+
+    Returns "" when it cannot be resolved -- never a guess, and never the raw
+    value, so nothing unvalidated reaches the exported artifact. Never raises.
+
+    A strict match would blank nearly half the real traffic: of 27 observed
+    per-category submissions, 13 (48%) used a non-canonical spelling -- 7 of the
+    15 distinct spellings seen. See tests/test_host_mode_submit.py for the
+    fixture that recomputes this.
+    """
+    try:
+        text = str(raw or "").strip()
+        if not text:
+            return ""
+        canon = _canonical_categories()
+        folded = text.casefold()
+        for name in canon:
+            if folded == name.casefold():
+                return name
+        # `Positive / Happy Path` -> `positive`; `UI/UX Validation` -> `ui`.
+        head = folded.split("/", 1)[0].strip()
+        for key in (folded, head):
+            hit = _CATEGORY_ALIASES.get(key)
+            if hit:
+                # Only return a name the canonical list still contains, so a
+                # renamed category cannot resurrect a stale label.
+                return hit if (not canon or hit in canon) else ""
+        return ""
+    except Exception:
+        logger.debug("category normalisation failed", exc_info=True)
+        return ""
 
 
 def _extract_duplicate_groups(raw, valid_ids) -> tuple[list, list]:
@@ -1064,8 +1156,12 @@ def _extract_duplicate_groups(raw, valid_ids) -> tuple[list, list]:
                     continue
                 tid = m.strip()
                 if tid not in known:
+                    # Strip backticks/newlines: this id is UNTRUSTED host text
+                    # interpolated inside a backtick span, and a crafted value
+                    # could otherwise break out of it.
+                    _safe_tid = tid[:32].replace("`", "").replace("\n", " ")
                     _note(
-                        f"`{tid[:32]}` is not a tc_id in the submitted suite -- "
+                        f"`{_safe_tid}` is not a tc_id in the submitted suite -- "
                         "ignored."
                     )
                     continue

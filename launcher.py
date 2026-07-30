@@ -7,9 +7,10 @@ the install current WITHOUT restarting the editor:
 
 1. On start: update check + MANIFEST.sha256 self-heal + read-only lock.
 2. While running: re-checks every QA_UPDATE_INTERVAL_MINUTES (default 15).
-   A newer release installs in the background; at the next idle minute the
-   child server restarts on the new code and the recorded MCP initialize
-   handshake is replayed — the editor keeps its session, nothing to do.
+   A newer release installs in the background; the server then restarts
+   itself once no tool is running (within one check interval) and the
+   recorded MCP initialize handshake is replayed — the editor keeps its
+   session, nothing to do. Set QA_DRIFT_RESTART_ENABLED=false to disable.
 3. If the server ever crashes it is respawned the same way.
 
 stdout carries the MCP protocol; every log line goes to stderr. A network
@@ -239,12 +240,19 @@ class Supervisor:
                 status = run_update_check(
                     force=True, repo_override=DIST_REPO, lock_override=True
                 )
-                if status not in ("updated", "healed"):
+                if status != "healed":
+                    # An 'updated' status is handled by the CHILD's
+                    # drift check, which can exit BETWEEN requests. This
+                    # launcher cannot see in-flight work: last_activity
+                    # only moves on stdio traffic, so an 8-minute
+                    # generation looks idle and would be killed. A heal
+                    # writes no version stamp, so the child cannot
+                    # detect it -- that case stays here.
                     continue
-                log.info("New release installed — applying at the next idle minute.")
+                log.info("Integrity heal applied — restarting at the next idle minute.")
                 while time.time() - self.last_activity < IDLE_SECONDS:
                     time.sleep(5)
-                self.restart_child("update installed")
+                self.restart_child("integrity heal")
             except Exception as exc:
                 log.warning("Background update check failed (%s) — will retry.", exc)
 

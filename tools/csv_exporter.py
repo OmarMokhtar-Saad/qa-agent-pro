@@ -28,6 +28,7 @@ _HEADERS = [
     "Expected Results",
     "Status",
     "Notes",
+    "Category",
 ]
 
 
@@ -71,6 +72,11 @@ def generate_test_case_csv(suite: TestSuite, output_path: str | None = None) -> 
                     expected_text,
                     "Not Run",
                     "",
+                    # sanitize_cell is defence-in-depth, not a necessity: the
+                    # value is normalised to one of 8 canonical names before it
+                    # gets here, but TestCase.category itself accepts any
+                    # <=60-char string, so a future path could bypass that.
+                    sanitize_cell(getattr(tc, "category", None) or ""),
                 ]
             )
 

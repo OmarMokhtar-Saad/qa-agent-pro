@@ -184,9 +184,10 @@ failing silently.
 - **Updates are automatic and live**: releases are checked at startup
   AND every 15 minutes while the server runs (tune with
   `QA_UPDATE_INTERVAL_MINUTES`). A new release installs in the
-  background and takes effect at the next idle minute — the launcher
-  restarts the inner server and transparently replays the MCP
-  handshake, so you never restart your editor.
+  background and takes effect once no tool is running — the server
+  restarts itself and transparently replays the MCP handshake, so you
+  never restart your editor. This works even when a DIFFERENT editor
+  sharing the same install applied the update.
 - **Crash resilient**: if the server process ever dies, the launcher
   respawns it and your editor session continues.
 - **Rare exception**: releases that change tool *definitions* need one
