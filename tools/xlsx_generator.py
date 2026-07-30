@@ -10,6 +10,7 @@ from pathlib import Path
 
 import xlsxwriter
 
+from config.settings import settings
 from tools.bilingual import bidi_isolate, is_rtl_cell
 from tools.cell_sanitizer import sanitize_cell
 from tools.models import TestSuite, format_test_data_lines
@@ -115,6 +116,35 @@ def _row_height_for(cells: list[tuple[str, float]]) -> float:
             lines += max(1, math.ceil(len(logical) / width_chars))
         max_lines = max(max_lines, lines)
     return max(_MIN_ROW_HEIGHT, max_lines * _LINE_HEIGHT_PT)
+
+
+def _notes_cell(tc: object, rule_pack_note: str) -> str:
+    """Text for the Notes column of one case.
+
+    tools/risk_scorer.py scores EVERY suite and the sheet's row order IS the risk
+    order (TC-001 = highest risk), but risk_label / risk_score were never
+    exported -- while Notes was empty in 65/65 rows of the 2026-07-30 run,
+    because it only ever carried a Batch-3 rule-pack note and the rule packs are
+    off in that deployment. Opt-in via QA_XLSX_RISK_NOTES.
+
+    A rule-pack note ALWAYS wins, so no information is ever displaced, and any
+    problem degrades to the rule-pack note -- i.e. exactly today's output. Pure
+    and never raises.
+    """
+    note = rule_pack_note or ""
+    if note:
+        return note
+    try:
+        if not settings.qa_xlsx_risk_notes:
+            return note
+        label = str(getattr(tc, "risk_label", "") or "").strip()
+        if not label:
+            return note
+        score = getattr(tc, "risk_score", None)
+        return f"Risk: {label} ({score})" if score is not None else f"Risk: {label}"
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("risk note rendering failed -- Notes left as-is", exc_info=True)
+        return note
 
 
 def generate_test_case_xlsx(suite: TestSuite, output_path: str | None = None) -> str:
@@ -478,7 +508,8 @@ def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
             rtl_fmt if is_rtl_cell(expected_text) else fmt,
         )
         ws.write(row_idx, _COL_STATUS, "Not Run", status_fmt)
-        _write_text(_COL_NOTES, rule_pack_notes.get(tc.tc_id, ""))
+        notes_text = _notes_cell(tc, rule_pack_notes.get(tc.tc_id, ""))
+        _write_text(_COL_NOTES, notes_text)
         # F6: which of the 8 generation categories produced this case. Empty when
         # it could not be resolved -- never guessed. A value self-reported by the
         # host model is normalised before it reaches here.
@@ -488,7 +519,7 @@ def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
         # not just the step count -- long titles/preconditions/data/expected
         # results no longer clip. Column widths stay fixed (_COL_WIDTHS).
         row_cells = [
-            (rule_pack_notes.get(tc.tc_id, ""), _COL_WIDTHS[_COL_NOTES]),
+            (notes_text, _COL_WIDTHS[_COL_NOTES]),
             (getattr(tc, "category", None) or "", _COL_WIDTHS[_COL_CATEGORY]),
             (tc.tc_id, _COL_WIDTHS[_COL_TCID]),
             (tc.module, _COL_WIDTHS[_COL_MODULE]),
@@ -667,11 +698,23 @@ def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
 
     summary_ws.write("A11", "Priority", label_fmt)
     summary_ws.write("B11", "Count", label_fmt)
+    # 2026-07-30 run review, item 5: the Priority and Type blocks were HARDCODED
+    # literals while the Status block above was COUNTIF, so the moment a tester
+    # edited, added or deleted a row the SAME sheet contradicted itself. Same
+    # shape as summary_rows: a real formula plus the computed count as the CACHED
+    # value, so a viewer that ignores formulas still shows the right number.
+    # Column letters are DERIVED from the _COL_* indices, never hardcoded.
+    _pri_col = _col_letter(_COL_PRIORITY)
+    priority_range = f"'Test Cases'!{_pri_col}2:{_pri_col}{last_data_row}"
     for j, pri in enumerate(["Critical", "High", "Medium", "Low"], start=12):
         count = sum(1 for tc in suite.test_cases if tc.priority.value == pri)
         summary_ws.write(j, 0, pri, label_fmt)
-        summary_ws.write(j, 1, count, value_fmt)
+        summary_ws.write_formula(
+            j, 1, f'=COUNTIF({priority_range},"{pri}")', value_fmt, count
+        )
 
+    _type_col = _col_letter(_COL_TYPE)
+    type_range = f"'Test Cases'!{_type_col}2:{_type_col}{last_data_row}"
     summary_ws.write("A17", "Type", label_fmt)
     summary_ws.write("B17", "Count", label_fmt)
     for j, ttype in enumerate(
@@ -691,4 +734,6 @@ def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
     ):
         count = sum(1 for tc in suite.test_cases if tc.type.value == ttype)
         summary_ws.write(j, 0, ttype, label_fmt)
-        summary_ws.write(j, 1, count, value_fmt)
+        summary_ws.write_formula(
+            j, 1, f'=COUNTIF({type_range},"{ttype}")', value_fmt, count
+        )

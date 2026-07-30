@@ -62,7 +62,11 @@ from tools.image_description import describe_images
 from tools.jira_fetcher import fetch_url_content, verify_jira_access
 from tools.playwright_exporter import generate_playwright_script
 from tools.rag_store import add_to_corpus, query_corpus
-from tools.requirement_analyzer import analyze_requirements, gate_triggers
+from tools.requirement_analyzer import (
+    SEVERITY_ORDER,
+    analyze_requirements,
+    gate_triggers,
+)
 from tools.suite_store import (
     list_recent_suites,
     load_suite,
@@ -1479,6 +1483,99 @@ def _shape_amendment_clarify(questions: list) -> str:
         return ""
 
 
+# Opt-in ambiguity-gate verdict cache (QA_AMBIGUITY_CACHE_TTL_S; 0 = off =
+# today's behaviour). Process-local, bounded, never persisted. MEASURED 55.8s for
+# ONE small classification on the `cli` backend (2026-07-30 run), and a
+# re-prepare of the same ticket pays it again in full.
+#
+# SCOPE: this is NOT a host-mode feature. _maybe_ambiguity_clarify is reached
+# through _ground_and_gate, which handle_generate_test_cases (SERVER mode) and
+# handle_prepare_test_cases (host mode) BOTH call, so turning the TTL on changes
+# how often a SHYJ-7154 safety verdict is recomputed on EVERY generation path.
+# That is why the shipped TTL is deliberately short (300s: long enough to cover a
+# retry inside one session, short enough that an edited ticket is re-judged).
+#
+# LOAD-BEARING, two rules, both about never freezing the fail-safe:
+#   1. a `degraded` verdict is NEVER stored. `degraded` means the pre-pass could
+#      NOT classify (the SHYJ-7154 fail-safe), so caching it would freeze a
+#      transient backend outage into a sticky CLARIFY, and a later read could not
+#      tell that answer apart from a real classification.
+#   2. a result carrying no RECOGNISED `severity` is never stored either. A
+#      malformed / unexpected payload reads as "proceed" through gate_triggers'
+#      `.get("severity", "none")` default, and caching that would turn ONE bad
+#      response into a TTL-long silent bypass of the gate.
+# Only CLASSIFIED verdicts (severity in SEVERITY_ORDER, not degraded) are cached.
+_AMBIGUITY_CACHE_MAX = 32
+# key -> (monotonic_ts, clarify_markdown_or_None). A plain dict: insertion order
+# is guaranteed, so FIFO eviction needs no extra import.
+_ambiguity_cache: dict = {}
+
+
+def _ambiguity_cache_key(analysis_text: str, gate: str) -> str:
+    """Content hash + gate severity + classifier model.
+
+    The gate severity and the model are part of the key because both change the
+    VERDICT, not just its cost -- lowering the gate or switching classifier must
+    MISS rather than replay a verdict taken under the old configuration.
+    """
+    digest = hashlib.sha256(analysis_text.encode("utf-8", "replace")).hexdigest()
+    try:
+        model = str(settings.qa_classifier_model or "")
+    except Exception:  # pragma: no cover - defensive
+        model = ""
+    return f"{digest}|{gate}|{model}"
+
+
+def _ambiguity_cache_get(key: str, ttl: int) -> tuple:
+    """Return (True, verdict) on a live hit, else (False, None). Never raises."""
+    if not key or ttl <= 0:
+        return False, None
+    try:
+        entry = _ambiguity_cache.get(key)
+        if entry is None:
+            return False, None
+        ts, verdict = entry
+        if time.monotonic() - ts > ttl:
+            _ambiguity_cache.pop(key, None)
+            return False, None
+        return True, verdict
+    except Exception:
+        # MINOR-4: DROP the unreadable entry. Leaving it in place makes this key
+        # raise, be swallowed and re-classify on EVERY call for the life of the
+        # process -- a permanent, silent cache miss that looks like a working cache.
+        _ambiguity_cache.pop(key, None)
+        logger.debug("ambiguity cache read failed -- reclassifying", exc_info=True)
+        return False, None
+
+
+def _is_classified(result: dict) -> bool:
+    """True only for a result the gate can actually READ as a verdict: not
+    degraded, and carrying a severity in SEVERITY_ORDER. Anything else -- a
+    truncated response, a schema change, a stub -- counts as unclassified and is
+    never cached. Never raises."""
+    try:
+        if result.get("degraded"):
+            return False
+        return str(result.get("severity", "")).strip().lower() in SEVERITY_ORDER
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def _ambiguity_cache_put(key: str, verdict) -> None:
+    """Store a CLASSIFIED verdict. A falsy key means the cache is off (or the
+    result was not classifiable). Never raises, and never called with a degraded
+    or unclassified result."""
+    if not key:
+        return
+    try:
+        _ambiguity_cache.pop(key, None)
+        _ambiguity_cache[key] = (time.monotonic(), verdict)
+        while len(_ambiguity_cache) > _AMBIGUITY_CACHE_MAX:
+            _ambiguity_cache.pop(next(iter(_ambiguity_cache)), None)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("ambiguity cache write failed -- ignoring", exc_info=True)
+
+
 async def _maybe_ambiguity_clarify(
     text: str, url_content: dict | None, openapi_text: str | None
 ) -> str | None:
@@ -1495,6 +1592,23 @@ async def _maybe_ambiguity_clarify(
         analysis_text = _ambiguity_source_text(text, url_content, openapi_text)
         if not analysis_text.strip():
             return None
+        ttl = 0
+        try:
+            ttl = int(settings.qa_ambiguity_cache_ttl_s or 0)
+        except Exception:  # pragma: no cover - defensive
+            ttl = 0
+        cache_key = _ambiguity_cache_key(analysis_text, gate) if ttl > 0 else ""
+        hit, cached = _ambiguity_cache_get(cache_key, ttl)
+        if hit:
+            # INFO, alongside the existing timing line: the gate cost must stay
+            # attributable in the log, and a vanished line reads as a vanished
+            # step rather than a cheap one.
+            logger.info(
+                "ambiguity gate: cache HIT (ttl=%ds) -> %s -- no LLM call",
+                ttl,
+                "CLARIFY" if cached else "proceed",
+            )
+            return cached
         result = await analyze_requirements(analysis_text)
         # SHYJ-7154 fail-SAFE (host mode): a "degraded" result means the pre-pass
         # could NOT classify (no usable backend, or the call failed), NOT that
@@ -1502,15 +1616,26 @@ async def _maybe_ambiguity_clarify(
         # so treat "unable to classify" as CLARIFY — never fabricate a suite from
         # an under-specified / no-UI ticket just because we could not check it.
         if result.get("degraded"):
+            # DELIBERATELY NOT CACHED. This is the fail-safe answer to "could
+            # not classify", not a classification: caching it would freeze a
+            # transient backend outage into a sticky CLARIFY for the whole TTL.
             return _shape_ambiguity_clarify(
                 result.get("questions") or [],
                 str(result.get("testable_surface") or ""),
             )
+        # MINOR-5: only a result the gate can READ as a verdict is cacheable.
+        # An unrecognised payload falls through gate_triggers as 'proceed'
+        # (its severity default is "none"); caching that would turn ONE bad
+        # response into a TTL-long silent bypass of a safety gate.
+        cacheable = cache_key if _is_classified(result) else ""
         if not gate_triggers(result, gate):
+            _ambiguity_cache_put(cacheable, None)
             return None
-        return _shape_ambiguity_clarify(
+        verdict = _shape_ambiguity_clarify(
             result.get("questions") or [], str(result.get("testable_surface") or "")
         )
+        _ambiguity_cache_put(cacheable, verdict)
+        return verdict
     except Exception:
         logger.debug("mcp ambiguity gate failed — proceeding", exc_info=True)
         return None
@@ -1864,6 +1989,21 @@ async def _ground_and_gate(
         # decomposition (tools/atomic_checklist.py) add one each when enabled; and
         # ui_extractor's Tier-3 ask_vision is reachable for a non-Jira page URL.
         # _SERVER_LLM_FLAGS below discloses the flag-gated ones to the tester.
+        if not gate_off:
+            # 55.8s of complete silence on the 2026-07-30 run: the tester read
+            # a working gate as a hung server (Cursor's own progress bridge was
+            # ALSO down that session -- see operations/runbook.md). Advisory
+            # only, so no flag: a progress notification is not part of any
+            # generated artifact. Skipped entirely when the gate is off, so a
+            # kill-switched deployment stays silent.
+            # SCOPE: _ground_and_gate is SHARED -- handle_generate_test_cases
+            # (SERVER mode) and handle_prepare_test_cases (host mode) both call
+            # it, so this line appears on BOTH paths, not just host prepare.
+            await _emit(
+                progress,
+                "\U0001f9d0 Checking the ticket has enough detail to test\u2026",
+            )
+        # The timing line below covers SERVER mode too, for the same reason.
         _gate_t0 = time.monotonic()
         clarify = await _maybe_ambiguity_clarify(text, url_content, openapi_text)
         logger.info(
@@ -1928,12 +2068,24 @@ _SERVER_LLM_FLAGS_PREPARE: tuple = (
 )
 _SERVER_LLM_FLAGS_SUBMIT: tuple = (
     (
-        "qa_feature_analysis_enabled",
-        "QA_FEATURE_ANALYSIS_ENABLED",
+        # NOT qa_feature_analysis_enabled any more: that flag now only
+        # REGISTERS the standalone qa_feature_analysis tool and no longer buys
+        # the inline report on a host submit, so disclosing it here claims a
+        # cost the server does not pay -- exactly the kind of stale disclosure
+        # this notice exists to prevent.
+        # The finalize gate is an AND -- feature_report_enabled AND
+        # (qa_feature_analysis_enabled or force_feature_report) -- so THIS flag
+        # ON with QA_FEATURE_ANALYSIS_ENABLED OFF also costs nothing. The `what`
+        # string says so: over-claiming a cost is the same class of dishonesty
+        # as under-claiming one.
+        "qa_host_feature_report_enabled",
+        "QA_HOST_FEATURE_REPORT_ENABLED",
         # 42.0s is the only DIRECT measurement (the F10c timing line, 2026-07-30).
         # The earlier "~69s" attributed a whole unattributed finalize window to
         # this one call; that window was 70.6s on 07-29 and 45.0s on 07-30.
-        "a Feature Analysis report (42s on one measured run)",
+        "an inline Feature Analysis report on every submit -- ONLY when "
+        "QA_FEATURE_ANALYSIS_ENABLED is also true, which is what actually "
+        "builds the report (42s on one measured run)",
     ),
     ("qa_test_plan_artifacts", "QA_TEST_PLAN_ARTIFACTS", "test-plan artifacts"),
     ("qa_llm_risk_scoring", "QA_LLM_RISK_SCORING", "LLM risk scoring"),
@@ -2798,6 +2950,25 @@ async def handle_submit_suite(
         async def _on_status(msg: str) -> None:
             await _emit(progress, msg)
 
+        # Honesty rule: a suppression the tester cannot see IS a silent
+        # downgrade. Emitted only in the exact situation that changed -- the
+        # standalone tool is enabled, so the tester has reason to expect a
+        # report, but the inline one is off on this path. Attached to the
+        # FINALIZE reply only: the gap reply is an intermediate "regenerate and
+        # resubmit" instruction, not the delivered artifact, and the note would
+        # otherwise repeat on every round.
+        fa_skip_note = ""
+        if (
+            settings.qa_feature_analysis_enabled
+            and not settings.qa_host_feature_report_enabled
+        ):
+            fa_skip_note = (
+                "> \u2139\ufe0f  Feature Analysis report SKIPPED for this "
+                "host-mode submit (it is a server-side LLM call -- 42.0s on the "
+                "2026-07-30 run). Set `QA_HOST_FEATURE_REPORT_ENABLED=true` to "
+                "include it inline, or call `qa_feature_analysis` on "
+                "demand.\n\n"
+            )
         summary, _x, _c, _t, status = await _finalize_generation(
             prepared,
             all_cases,
@@ -2822,12 +2993,16 @@ async def handle_submit_suite(
             # through to analyze_coverage_gaps unconditionally -- ~108s of
             # fixed-backend LLM work on a path documented as needing none.
             advisory_gaps=False,
-            # And the FOURTH: the Feature Analysis report. QA_FEATURE_ANALYSIS_ENABLED
-            # exists to expose the qa_feature_analysis TOOL, which passes
-            # force_feature_report=True and still works. Running it implicitly on
-            # every host submit cost 42.0s (measured 2026-07-30) of fixed-backend
-            # LLM work on a path documented as needing none.
-            feature_report_enabled=False,
+            # And the FOURTH: the inline Feature Analysis report. MEASURED 42.0s
+            # on the 2026-07-30 host-mode run -- against 0.02s for the entire
+            # deterministic finalize of 65 cases -- so it was ~99.95% of this
+            # step and the single largest server-side cost left on a submit.
+            # QA_FEATURE_ANALYSIS_ENABLED exists to expose the qa_feature_analysis
+            # TOOL, which passes force_feature_report=True and still works.
+            # Hardcoding False removed the capability outright; this makes it an
+            # operator decision that still DEFAULTS to suppressed, and the gate
+            # remains an AND with qa_feature_analysis_enabled.
+            feature_report_enabled=bool(settings.qa_host_feature_report_enabled),
         )
         suite = captured.get("suite")
         if suite is None or not getattr(suite, "test_cases", None):
@@ -3043,7 +3218,8 @@ async def handle_submit_suite(
         await prep_store.delete_prep(prep_id)
         return (
             f"{version_note}{dropped_note}{conflict_note}{cat_source}"
-            f"{dup_status_note}{dup_note}{cov_note}{result_md}{cap_note}"
+            f"{fa_skip_note}{dup_status_note}{dup_note}{cov_note}{result_md}"
+            f"{cap_note}"
         )
     except Exception as exc:
         logger.exception("handle_submit_suite failed")

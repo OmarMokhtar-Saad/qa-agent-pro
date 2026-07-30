@@ -562,6 +562,22 @@ class Settings(BaseSettings):
     # Operator kill-switch: set QA_AMBIGUITY_GATE_SEVERITY=off.
     qa_ambiguity_gate_severity: str = "high"
 
+    # Ambiguity-gate verdict cache TTL, in seconds. 0 = OFF (default, today's
+    # behaviour: every prepare re-classifies). MEASURED 55.8s for ONE small
+    # classification on the `cli` backend on the 2026-07-30 run -- ~56% of the
+    # whole server-controlled cost of that session -- and a plain re-prepare of
+    # the SAME ticket pays it again in full. The cache is process-local, bounded
+    # (32 entries, FIFO) and keyed on the classified text + gate severity +
+    # classifier model, so changing the gate or the model MISSES.
+    # NB deliberately NOT in _POSITIVE_INT_FIELDS: 0 is its documented
+    # kill-switch, exactly like qa_category_stall_s, and membership there would
+    # rewrite it to the default.
+    # LOAD-BEARING: a `degraded` verdict is NEVER cached (see
+    # tools/mcp_handlers._ambiguity_cache_put). Degraded means "could not
+    # classify" -- the SHYJ-7154 fail-safe -- so caching it would freeze a
+    # transient backend outage into a sticky CLARIFY.
+    qa_ambiguity_cache_ttl_s: int = 0
+
     # AC anchoring (SHYJ-7154 Fix 3): when the source ticket carries REAL
     # (source-parsed) acceptance criteria, drop generated cases that cite a
     # NON-EXISTENT AC id (hallucinated traceability). Default OFF — the advisory
@@ -590,6 +606,19 @@ class Settings(BaseSettings):
     # chat summary render a Test Data column/note. OFF = prompt byte-identical, any
     # emitted test_data stripped before render, every export byte-identical to today.
     qa_test_data_strategy: bool = False
+
+    # Retype the "Edge Cases" fan-out category from Exploratory to Functional
+    # (opt-in, default OFF). CATEGORIES[3] tells the model the preferred `type`
+    # for that category is "Exploratory", so on the 2026-07-30 run all 8
+    # fully-SCRIPTED edge cases exported as Exploratory and the XLSX Summary
+    # reported "Exploratory 8 / Performance 0" -- test-type metrics describing
+    # unscripted charter testing for a suite that contains none. This is a PROMPT
+    # change, so it is flag-gated for two reasons: the house rule, and because
+    # tests/test_server_mode_equivalence.py's golden fixtures record the 8
+    # category prompts VERBATIM (`should be: Exploratory` included). OFF,
+    # agents.test_scenario_agent.effective_categories() returns the CATEGORIES
+    # object itself and every prompt byte is unchanged.
+    qa_edge_cases_functional_type: bool = False
 
     # Surgical quality retry (opt-in, both default OFF -- see
     # .claude/plans/plan-surgical-retry.md). The per-category quality gate
@@ -629,6 +658,21 @@ class Settings(BaseSettings):
     # Corpus size cap per file: adding beyond it prunes the oldest entries.
     # 0 = unlimited (default).
     qa_rag_max_entries: int = 0
+
+    # Relevance FLOOR for the injected "## Similar Past Test Cases" block.
+    # 0.0 = OFF (default = today's behaviour: _enrich_with_rag injects ALL top-k
+    # hits with no floor -- only the Duplicate-Risk block was ever thresholded,
+    # by qa_rag_similarity_threshold). On the 2026-07-30 run that put 5 snippets
+    # from unrelated past tickets into the prompt whose TOP score was 0.0875
+    # (886-entry corpus, bm25): wasted host-context tokens and real topic-bleed
+    # risk into the tester's own model. The scale is MODE-DEPENDENT (jaccard /
+    # cosine / bm25 normalise differently), so a value belongs with a pinned
+    # QA_RAG_SIMILARITY_MODE. Suppression is always logged with counts -- silence
+    # here would be indistinguishable from an empty corpus or a broken query. The
+    # Duplicate-Risk block keeps its own threshold and is UNAFFECTED.
+    # Coerced by _coerce_checklist_float, which CLAMPS to [0, 1]: an operator
+    # writing 15 (meaning "15%") would otherwise suppress the block permanently.
+    qa_rag_similar_min_score: float = 0.0
 
     # --- Semantic embeddings (opt-in; default disabled) --------------------
     # Optional embedding backend powering semantic dedup + vector RAG ranking.
@@ -800,6 +844,17 @@ class Settings(BaseSettings):
     # export error only appends a warning note.
     qa_auto_export_xlsx: bool = True
 
+    # Export the computed risk label/score into the XLSX Notes column (opt-in,
+    # default OFF). tools/risk_scorer.py scores EVERY suite and the sheet's row
+    # order IS the risk order (TC-001 = highest risk), but risk_label /
+    # risk_score were never exported -- while the Notes column was empty in
+    # 65/65 rows of the 2026-07-30 run, because it only ever carried a Batch-3
+    # rule-pack note and the rule packs are off in that deployment. When ON, a
+    # case with NO rule-pack note gets "Risk: CRITICAL (78)"; a rule-pack note
+    # ALWAYS wins, so nothing is ever displaced. OFF = every exported workbook is
+    # byte-identical to today.
+    qa_xlsx_risk_notes: bool = False
+
     # Directory the auto-exported .xlsx is written to, relative to the working
     # directory (the install dir the MCP server chdirs into). Defaults to the
     # gitignored data/exports so the file lands in a stable folder a
@@ -863,6 +918,21 @@ class Settings(BaseSettings):
     # submission). Both never-raise-coerced as positive ints.
     qa_prep_ttl_s: int = 3600
     qa_prep_max_bytes: int = 4000000
+
+    # --- Inline Feature Analysis report on a HOST submit (opt-in, default OFF) -
+    # QA_FEATURE_ANALYSIS_ENABLED does TWO unrelated things: it registers the
+    # standalone qa_feature_analysis tool (mcp_server.py) AND makes every
+    # _finalize_generation run agents.feature_analysis.analyze_feature -- one
+    # server-side LLM call. On the host path that second half straight-up
+    # contradicts host mode's premise (no key, no backend, no quota), and it is
+    # expensive: MEASURED 42.0s on the 2026-07-30 SHYJ-5645 run (69s on an
+    # earlier one) against 0.02s for the whole deterministic finalize of 65
+    # cases -- the report was ~99.95% of that step. This flag SPLITS them: the
+    # tool stays available on demand, the inline report on a HOST submit runs
+    # only if an operator asks for it. Server mode is untouched --
+    # _finalize_generation's feature_report_enabled parameter defaults True and
+    # only the host submit call site passes this flag.
+    qa_host_feature_report_enabled: bool = False
 
     # --- Host-reviewed duplicate review (Piece 1; opt-in, default OFF) -----
     # qa_semantic_dedup_enabled needs qa_embeddings_backend, and the only KEYLESS
@@ -1040,6 +1110,7 @@ class Settings(BaseSettings):
         "qa_test_plan_artifacts",
         "qa_llm_risk_scoring",
         "qa_test_data_strategy",
+        "qa_edge_cases_functional_type",
         "qa_quality_reminder_upfront",
         "qa_surgical_quality_retry",
         "testrail_dry_run",
@@ -1058,6 +1129,7 @@ class Settings(BaseSettings):
         "qa_finetune_export_enabled",
         "qa_swagger_enabled",
         "qa_auto_export_xlsx",
+        "qa_xlsx_risk_notes",
         "qa_zephyr_export_enabled",
         "qa_zephyr_dry_run",
         "qa_dist_mode",
@@ -1076,6 +1148,7 @@ class Settings(BaseSettings):
         "qa_atomicity_rules",
         "qa_standing_rules",
         "qa_semantic_dedup_enabled",
+        "qa_host_feature_report_enabled",
         "qa_host_dedup_review_enabled",
         "qa_host_dedup_apply",
         "qa_host_coverage_review_enabled",
@@ -1176,16 +1249,20 @@ class Settings(BaseSettings):
         "qa_checklist_match_high",
         "qa_checklist_match_low",
         "qa_checklist_min_granularity",
+        "qa_rag_similar_min_score",
         mode="before",
     )
     @classmethod
     def _coerce_checklist_float(cls, v: object, info) -> float:
-        """Lenient, never-raising float coercer for the Batch-2 checklist bands.
+        """Lenient, never-raising float coercer for the Batch-2 checklist bands
+        and the RAG relevance floor (QA_RAG_SIMILAR_MIN_SCORE, added
+        2026-07-30 -- it belongs here rather than with the reconciler
+        thresholds precisely BECAUSE this group clamps).
 
         Mirrors _coerce_jira_int: an unparseable value is logged and replaced
         with the field's declared default rather than raising.
 
-        All three fields are similarity / quality SCORES, so the parsed value is
+        All four fields are similarity / quality SCORES, so the parsed value is
         additionally CLAMPED to [0.0, 1.0] -- the same kind of range guard
         _POSITIVE_INT_FIELDS gives the int caps. Without it, an operator writing
         QA_CHECKLIST_MATCH_HIGH=75 (meaning "75%") would silently push every
@@ -1295,6 +1372,7 @@ class Settings(BaseSettings):
         "qa_host_coverage_max_tc_per_item",
         "qa_category_stall_s",
         "qa_category_stall_strikes",
+        "qa_ambiguity_cache_ttl_s",
         mode="before",
     )
     @classmethod
