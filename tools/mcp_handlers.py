@@ -134,7 +134,7 @@ _DIST_UPDATE_REPO = "OmarMokhtar-Saad/qa-agent-pro"
 # restarts. Keep tool names/params stable; when a release DOES change one,
 # bump this to that release version — qa_setup_check then tells users whose
 # session predates it that a one-time editor restart is needed.
-_TOOL_SCHEMAS_CHANGED_IN = "1.5.0"
+_TOOL_SCHEMAS_CHANGED_IN = "1.14.0"
 
 
 def _boot_version() -> str:
@@ -2198,6 +2198,14 @@ async def handle_prepare_test_cases(
                 # deserialized by a different code version than wrote it.
                 # Observed on 2026-07-29. Stamp the writer so submit can say so.
                 "app_version": _BOOT_VERSION,
+                # Parallel fan-out contract is stamped at PREPARE time so a mid-flight
+                # .env flip cannot change the finalize gate for an in-flight prep.
+                "parallel_fanout": bool(settings.qa_host_parallel_fanout_enabled),
+                "expected_categories": (
+                    host_mode.expected_category_names(prepared)
+                    if settings.qa_host_parallel_fanout_enabled
+                    else []
+                ),
             },
         }
         saved = await prep_store.save_prep(envelope, created_by="qa_prepare_test_cases")
@@ -2590,6 +2598,96 @@ def _merge_category_rows(rows: list) -> "tuple[dict, int]":
     return {"test_cases": renumbered}, used
 
 
+async def handle_prep_status(prep_id: str) -> str:
+    """Report staged vs expected categories for a prep_id. Never raises."""
+    prep_id = (prep_id or "").strip()
+    if not prep_id:
+        return "⚠️ Missing prep_id."
+    try:
+        loaded = await prep_store.load_prep(prep_id)
+        envelope = loaded.get("content")
+        if envelope is None:
+            return _prep_missing_reply(prep_id)
+        meta = envelope.get("meta") or {}
+        expected = list(meta.get("expected_categories") or [])
+        if not expected and not meta.get("parallel_fanout"):
+            try:
+                prepared = host_mode.deserialize_prepared(envelope.get("prepared") or {})
+                expected = host_mode.expected_category_names(prepared)
+            except Exception:
+                expected = []
+        rows_res = await prep_store.load_submissions(prep_id)
+        rows = rows_res.get("content") or []
+        staged_names = [
+            str(r.get("category_name") or "") for r in rows if isinstance(r, dict)
+        ]
+        status = host_mode.prep_status_view(
+            expected=expected, staged_raw_names=staged_names
+        )
+        ready = "yes" if status.get("ready") else "no"
+        missing = ", ".join(f"`{m}`" for m in status.get("missing") or []) or "(none)"
+        staged = ", ".join(f"`{s}`" for s in status.get("staged") or []) or "(none)"
+        unrec = status.get("unrecognized") or []
+        unrec_line = (
+            "- **unrecognized names:** "
+            + ", ".join(f"`{u}`" for u in unrec)
+            + "\n"
+            if unrec
+            else ""
+        )
+        return (
+            f"## Prep status (`{prep_id}`)\n\n"
+            f"- **ready to finalize (Path A):** {ready}\n"
+            f"- **staged:** {status.get('staged_count', 0)}/"
+            f"{status.get('expected_count', 0)} — {staged}\n"
+            f"- **missing:** {missing}\n"
+            + unrec_line
+            + "\nWhen ready=yes, call `qa_submit_suite` with empty `suite_json`. "
+            "Preferred Path B (merged suite_json) does not need ready=yes."
+        )
+    except Exception as exc:
+        logger.exception("handle_prep_status failed")
+        _capture_error(exc, "qa_prep_status")
+        return f"⚠️ Could not read prep status: {exc}"
+
+
+async def handle_get_category_job(prep_id: str, category_name: str) -> str:
+    """Return one self-contained category job packet as fenced JSON. Never raises."""
+    prep_id = (prep_id or "").strip()
+    category_name = (category_name or "").strip()
+    if not prep_id:
+        return "⚠️ Missing prep_id."
+    if not category_name:
+        return "⚠️ Missing category_name."
+    try:
+        loaded = await prep_store.load_prep(prep_id)
+        envelope = loaded.get("content")
+        if envelope is None:
+            return _prep_missing_reply(prep_id)
+        prepared = host_mode.deserialize_prepared(envelope.get("prepared") or {})
+        job = host_mode.build_category_job(prepared, prep_id, category_name)
+        if job is None:
+            return (
+                f"⚠️ Unknown category `{category_name}` for prep_id `{prep_id}`. "
+                "Use a name from orchestration.expected_categories / categories[].name."
+            )
+        import json as _json
+
+        return (
+            f"## Category job — **{job.get('category_name')}**\n\n"
+            f"`prep_id`: `{prep_id}`\n\n"
+            "```json\n"
+            + _json.dumps(job, ensure_ascii=False, indent=2)
+            + "\n```\n"
+        )
+    except host_mode.PrepSerdeError as exc:
+        return f"⚠️ Could not read this prep: {exc}"
+    except Exception as exc:
+        logger.exception("handle_get_category_job failed")
+        _capture_error(exc, "qa_get_category_job")
+        return f"⚠️ Could not build category job: {exc}"
+
+
 async def handle_submit_category(
     prep_id: str,
     category_name: str,
@@ -2616,6 +2714,11 @@ async def handle_submit_category(
         return (
             "⚠️ Missing category name. Pass the category you are submitting cases for."
         )
+    # Collapse aliases onto the canonical UNIQUE key so parallel workers that
+    # submit "Positive" vs "Positive / Happy Path" do not create two rows.
+    _canon = host_mode.normalize_category(category_name)
+    if _canon:
+        category_name = _canon
     try:
         loaded = await prep_store.load_prep(prep_id)
         if loaded.get("content") is None:
@@ -2815,6 +2918,32 @@ async def handle_submit_suite(
                         f"`{prep_id}`. Submit the merged JSON, or record categories "
                         "first with `qa_submit_category`."
                     )
+                # Path A completeness gate: when THIS prep requested parallel
+                # fan-out, refuse to finalize a partial staged set. Path B
+                # (non-empty suite_json) is unaffected (has_full branch above).
+                if meta.get("parallel_fanout"):
+                    expected = list(meta.get("expected_categories") or [])
+                    staged_names = [
+                        str(r.get("category_name") or "")
+                        for r in rows
+                        if isinstance(r, dict)
+                    ]
+                    status = host_mode.prep_status_view(
+                        expected=expected, staged_raw_names=staged_names
+                    )
+                    if not status.get("ready"):
+                        missing = ", ".join(
+                            f"`{m}`" for m in (status.get("missing") or [])
+                        ) or "(unknown)"
+                        return (
+                            "⚠️ Incomplete parallel fan-out: not every expected "
+                            f"category is staged for prep_id `{prep_id}`.\n\n"
+                            f"Staged {status.get('staged_count', 0)}/"
+                            f"{status.get('expected_count', 0)}. Missing: {missing}.\n\n"
+                            "Call `qa_submit_category` for each missing category "
+                            "(or submit a full merged suite_json), then finalize "
+                            "again. `qa_prep_status` shows the current set."
+                        )
                 merged_dict, used = _merge_category_rows(rows)
                 parsed = host_mode.parse_host_suite(merged_dict)
                 conflict_note = (
