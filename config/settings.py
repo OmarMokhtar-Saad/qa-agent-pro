@@ -1026,6 +1026,17 @@ class Settings(BaseSettings):
     qa_host_coverage_max_items: int = 500
     qa_host_coverage_max_tc_per_item: int = 12
 
+    # --- Host-mode parallel chat fan-out (opt-in, default OFF) -----------------
+    # When ON, qa_prepare_test_cases adds an orchestration contract so the PARENT
+    # chat can spawn one same-session worker per category (Cursor Task / equivalent).
+    # MCP cannot invoke host Task tools; this flag only changes the prepare payload,
+    # instructions, status tool, and the empty-suite finalize completeness gate.
+    # Preferred finalize (Path B): workers return JSON; parent merges + qa_submit_suite
+    # (keeps host dedup/coverage review). Fallback (Path A): qa_submit_category x N
+    # then empty qa_submit_suite, gated until all expected categories are staged.
+    # Flag OFF => prepare payload / instructions byte-identical to today.
+    qa_host_parallel_fanout_enabled: bool = False
+
     # Append-only audit log (LT-1 ph2). SQLite file recording key events (suite
     # generated, exported, pushed, bug reported) so multi-team deployments have a
     # trail. Never-raise; a failure degrades to no-audit, logged.
@@ -1152,6 +1163,7 @@ class Settings(BaseSettings):
         "qa_host_dedup_review_enabled",
         "qa_host_dedup_apply",
         "qa_host_coverage_review_enabled",
+        "qa_host_parallel_fanout_enabled",
         "qa_atomic_checklist_enabled",
         "qa_checklist_nli_enabled",
         "qa_checklist_adjudicate_enabled",

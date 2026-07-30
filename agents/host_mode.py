@@ -461,6 +461,228 @@ _HOST_DEDUP_INSTRUCTION = (
 )
 
 
+# --------------------------------------------------------------------------- #
+# Host parallel fan-out (QA_HOST_PARALLEL_FANOUT_ENABLED)
+#
+# MCP cannot spawn Cursor Task / chat subagents. When this flag is ON, prepare
+# returns an orchestration contract the PARENT chat executes in the SAME session:
+# one worker per category. Preferred finalize (Path B): merge in parent, then
+# qa_submit_suite with full suite_json (keeps host dedup/coverage review).
+# Fallback (Path A): qa_submit_category per worker, then empty suite_json -- the
+# completeness gate in mcp_handlers uses meta.expected_categories stamped at
+# prepare time. Never duplicate full user_context into jobs[] (token bomb).
+# Every helper below is pure / sync / never-raise where noted.
+# --------------------------------------------------------------------------- #
+
+_HOST_PARALLEL_INSTRUCTION = (
+    "\n"
+    "PARALLEL FAN-OUT (same chat session) -- when your host can run parallel "
+    "workers (e.g. Cursor Task / subagents), do NOT generate all 8 categories in "
+    "the parent turn:\n"
+    "1. Keep prep_id, system_prompt, user_context, and response_schema from this "
+    "payload (shared once -- copy them into each worker prompt; do not rely on "
+    "jobs[] for user_context).\n"
+    "2. Launch ONE worker per entry in `orchestration.expected_categories` / "
+    "`jobs[]` in the SAME session, in parallel. Each worker uses system_prompt + "
+    "user_context + that job's instruction; emits ONLY a JSON object matching "
+    "response_schema for THAT category; sets each case's `category` field to the "
+    "job's category_name EXACTLY.\n"
+    "3. PREFERRED finalize (Path B): parent merges all workers' test_cases into "
+    "ONE object (unique tc_ids), runs any post-merge reviews asked elsewhere in "
+    "these instructions (duplicate_groups / requirement_matches), then calls "
+    "`qa_submit_suite` with this prep_id and the merged suite_json.\n"
+    "4. FALLBACK (Path A, if workers can call MCP or parent stages for them): "
+    "call `qa_submit_category` once per category, then `qa_prep_status` until "
+    "ready=true, then `qa_submit_suite` with suite_json=\"\" . Do not finalize "
+    "early -- the server rejects an incomplete Path A finalize when this "
+    "orchestration was requested.\n"
+    "5. Optional: `qa_get_category_job(prep_id, category_name)` returns one "
+    "self-contained job packet (system_prompt + user_context + instruction + "
+    "schema) so a worker need not re-parse the full prepare blob.\n"
+)
+
+
+def _parallel_fanout_on() -> bool:
+    """Never-raise read of QA_HOST_PARALLEL_FANOUT_ENABLED."""
+    try:
+        return bool(getattr(settings, "qa_host_parallel_fanout_enabled", False))
+    except Exception:  # pragma: no cover
+        logger.debug("could not read qa_host_parallel_fanout_enabled", exc_info=True)
+        return False
+
+
+def _parallel_instruction() -> str:
+    """Appendix for prepare instructions, or "" when the flag is OFF."""
+    return _HOST_PARALLEL_INSTRUCTION if _parallel_fanout_on() else ""
+
+
+def expected_category_names(prepared) -> list:
+    """Canonical category names from prepared.categories (name is tuple[0]).
+    Never raises; returns []."""
+    try:
+        out = []
+        for entry in getattr(prepared, "categories", None) or []:
+            if isinstance(entry, (list, tuple)) and entry:
+                name = str(entry[0] or "").strip()
+            elif isinstance(entry, dict):
+                name = str(entry.get("name") or "").strip()
+            else:
+                name = ""
+            if name:
+                out.append(name)
+        return out
+    except Exception:
+        logger.debug("expected_category_names failed", exc_info=True)
+        return []
+
+
+def build_orchestration(prepared, prep_id: str = "") -> dict | None:
+    """orchestration object for the prepare payload, or None when flag OFF."""
+    if not _parallel_fanout_on():
+        return None
+    names = expected_category_names(prepared)
+    return {
+        "mode": "parallel_chat_workers",
+        "expected_categories": list(names),
+        "worker_count": len(names),
+        "finalize": {
+            "preferred": "merge_then_qa_submit_suite",
+            "fallback": "qa_submit_category_then_empty_suite",
+            "require_all_categories": True,
+        },
+        "parent_instructions": (
+            "Fan out one same-session worker per expected category; prefer Path B "
+            "(merge then qa_submit_suite). Use qa_prep_status before Path A finalize."
+        ),
+        "worker_instructions": (
+            "Emit ONLY one category's TestSuite JSON matching response_schema. "
+            "Set category to the exact category_name. No other prose."
+        ),
+        "prep_id": prep_id or "",
+    }
+
+
+def build_category_job(prepared, prep_id: str, category_name: str) -> dict | None:
+    """Self-contained packet for qa_get_category_job. None if unknown/unusable.
+
+    Includes system_prompt + user_context + instruction + response_schema for ONE
+    category. category_name is resolved via normalize_category. Never raises.
+
+    Implementation note: rebuilds the shared prompt pieces the same way
+    build_prepare_payload does (do NOT call build_prepare_payload from here in a
+    way that re-enters job construction -- call the shared helpers / duplicate the
+    small assembly). Prefer assembling from _category_shared_system + the matching
+    categories[] row from a local loop identical to build_prepare_payload.
+    """
+    try:
+        canon = normalize_category(category_name) or str(category_name or "").strip()
+        if not canon:
+            return None
+        # Assemble without recursing through build_prepare_payload's jobs branch.
+        from agents.test_scenario_agent import (
+            _CATEGORY_TASK_TEMPLATE,
+            _QUALITY_RETRY_REMINDER,
+            _case_count_bounds,
+            _category_shared_system,
+        )
+
+        system_prompt = _category_shared_system(prepared.rtm_hint)
+        min_count, max_count = _case_count_bounds(
+            prepared.complexity_text or prepared.feature_text or prepared.user_msg,
+            prepared.ui_content,
+        )
+        quality_reminder = (
+            _QUALITY_RETRY_REMINDER if settings.qa_quality_reminder_upfront else ""
+        )
+        match = None
+        for name, focus, ptype in getattr(prepared, "categories", None) or []:
+            if name == canon or normalize_category(name) == canon:
+                match = (name, focus, ptype)
+                break
+        if match is None:
+            return None
+        name, focus, ptype = match
+        instruction = (
+            _CATEGORY_TASK_TEMPLATE.format(
+                category_name=name,
+                category_focus=focus,
+                preferred_type=ptype,
+                min_count=min_count,
+                max_count=max_count,
+            )
+            + quality_reminder
+        )
+        return {
+            "prep_id": prep_id or "",
+            "category_name": name,
+            "system_prompt": system_prompt,
+            "user_context": prepared.user_msg,
+            "untrusted_data_notice": _GUARD,
+            "instruction": instruction,
+            "response_schema": prepared.category_response_schema,
+            "min_cases": min_count,
+            "max_cases": max_count,
+            "preferred_type": ptype,
+            "worker_instructions": (
+                "Emit ONLY a JSON object matching response_schema for this "
+                "category. Set each case's category field to category_name exactly."
+            ),
+        }
+    except Exception:
+        logger.warning("build_category_job failed", exc_info=True)
+        return None
+
+
+def prep_status_view(
+    *,
+    expected: list,
+    staged_raw_names: list,
+) -> dict:
+    """Compute staged/missing/ready for qa_prep_status. Pure; never raises.
+
+    Staged names are normalized; unknown aliases that normalize to "" are listed
+    under unrecognized and do not count toward ready.
+    """
+    try:
+        expected_list = [str(x) for x in (expected or []) if str(x).strip()]
+        expected_set = set(expected_list)
+        staged: list = []
+        unrecognized: list = []
+        seen: set = set()
+        for raw in staged_raw_names or []:
+            canon = normalize_category(raw)
+            if not canon:
+                if raw and str(raw) not in unrecognized:
+                    unrecognized.append(str(raw))
+                continue
+            if canon in seen:
+                continue
+            seen.add(canon)
+            staged.append(canon)
+        missing = [n for n in expected_list if n not in seen]
+        ready = bool(expected_list) and not missing and set(staged) >= expected_set
+        return {
+            "expected": expected_list,
+            "staged": staged,
+            "missing": missing,
+            "unrecognized": unrecognized,
+            "ready": ready,
+            "staged_count": len(staged),
+            "expected_count": len(expected_list),
+        }
+    except Exception:
+        logger.warning("prep_status_view failed", exc_info=True)
+        return {
+            "expected": [],
+            "staged": [],
+            "missing": [],
+            "unrecognized": [],
+            "ready": False,
+            "staged_count": 0,
+            "expected_count": 0,
+        }
+
+
 def _dedup_instruction() -> str:
     """The duplicate-review clause appended to the host instructions, or "" when
     QA_HOST_DEDUP_REVIEW_ENABLED is OFF -- in which case the prepare payload is
@@ -795,7 +1017,7 @@ def build_prepare_payload(prepared, prep_id: str = "") -> dict:
         if s
     )
 
-    return {
+    out = {
         "version": _PAYLOAD_VERSION,
         "task": "generate_test_cases_host_mode",
         "prep_id": prep_id,
@@ -807,8 +1029,27 @@ def build_prepare_payload(prepared, prep_id: str = "") -> dict:
         "image_context": image_context,
         "instructions": _HOST_GENERATION_INSTRUCTIONS
         + _dedup_instruction()
-        + _coverage_instruction(prepared),
+        + _coverage_instruction(prepared)
+        + _parallel_instruction(),
     }
+    # Flag OFF: do not add orchestration/jobs keys (key-identical to today).
+    orch = build_orchestration(prepared, prep_id)
+    if orch is not None:
+        out["orchestration"] = orch
+        # Job stubs only -- never duplicate user_context here.
+        out["jobs"] = [
+            {
+                "prep_id": prep_id or "",
+                "category_name": c.get("name") or "",
+                "instruction": c.get("instruction") or "",
+                "min_cases": c.get("min_cases"),
+                "max_cases": c.get("max_cases"),
+                "preferred_type": c.get("preferred_type") or "",
+                "focus": c.get("focus") or "",
+            }
+            for c in categories
+        ]
+    return out
 
 
 def _bounded_json_spans(raw: str, *, budget: int):

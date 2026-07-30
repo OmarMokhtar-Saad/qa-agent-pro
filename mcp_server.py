@@ -406,14 +406,16 @@ def build_server():
         feature_or_url can be a feature description, a Jira/issue URL, a web page
         URL, or a Swagger/OpenAPI spec URL -- exactly like qa_generate_test_cases.
 
-        WHAT TO DO WITH THE RESULT: generate the full test suite yourself from the
-        returned payload (produce ONE JSON object matching the payload's
-        response_schema, merging all categories into a single `test_cases`
-        array), then call `qa_submit_suite` with the returned `prep_id` and your
-        JSON. The server validates, de-duplicates, scores, exports and persists
-        it, and replies with the finished suite + file path OR a short list of
-        gaps to regenerate and resubmit under the SAME prep_id. A weaker model may
-        submit one category at a time with `qa_submit_category` instead.
+        WHAT TO DO WITH THE RESULT: when the payload includes `orchestration`
+        with mode `parallel_chat_workers`, fan out ONE same-session worker per
+        category (Cursor Task / equivalent), then PREFER merging worker JSON and
+        calling `qa_submit_suite` with the merged suite (Path B). Fallback Path A:
+        `qa_submit_category` per category, `qa_prep_status` until ready, then
+        `qa_submit_suite` with empty suite_json. Without orchestration, generate
+        the full merged suite yourself and call `qa_submit_suite`. The server
+        validates, de-duplicates, scores, exports and persists it, and replies
+        with the finished suite + file path OR gaps to regenerate under the SAME
+        prep_id. Use `qa_get_category_job` for a single-category packet.
 
         If any ticket screenshots were available they are attached as image
         content -- inspect them directly. For an under-specified or no-UI ticket
@@ -461,6 +463,37 @@ def build_server():
         )
 
     @mcp.tool()
+    async def qa_prep_status(ctx: Context, prep_id: str = "") -> str:
+        """Show which categories are staged for a host-mode prep_id and whether
+        Path A (empty suite_json) finalize is allowed yet.
+
+        Use after parallel qa_submit_category calls. ready=yes means you may call
+        qa_submit_suite with suite_json="". Path B (full merged suite_json) does
+        not require ready=yes.
+        """
+        return await _tracked(
+            "qa_prep_status",
+            ctx,
+            mcp_handlers.handle_prep_status(prep_id),
+        )
+
+    @mcp.tool()
+    async def qa_get_category_job(
+        ctx: Context, prep_id: str = "", category_name: str = ""
+    ) -> str:
+        """Return ONE self-contained category generation job for a prep_id
+        (system_prompt + user_context + instruction + response_schema).
+
+        Use when a same-session worker should not re-parse the full prepare
+        payload. category_name should match orchestration.expected_categories.
+        """
+        return await _tracked(
+            "qa_get_category_job",
+            ctx,
+            mcp_handlers.handle_get_category_job(prep_id, category_name),
+        )
+
+    @mcp.tool()
     async def qa_submit_category(
         ctx: Context,
         prep_id: str = "",
@@ -469,13 +502,14 @@ def build_server():
     ) -> str:
         """Submit ONE category's cases for a host that generates incrementally.
 
-        Use this instead of qa_submit_suite when you produce the 8 categories in
-        separate turns: pass the `prep_id` from qa_prepare_test_cases, the
-        category name (e.g. \"Positive\", \"Negative\", \"Boundary\"), and
-        `suite_json` for THAT category. Re-submitting a category REPLACES its
-        earlier cases (newest wins). When every category is in, call
-        qa_submit_suite with the same prep_id and an EMPTY suite_json to merge and
-        finalize them.
+        Use this for Path A / incremental hosts (including parallel workers that
+        stage one category each): pass the `prep_id` from qa_prepare_test_cases,
+        the category name (canonical or known alias), and `suite_json` for THAT
+        category. Names are normalized server-side. Re-submitting REPLACES that
+        category (newest wins). When every expected category is staged, call
+        qa_submit_suite with the same prep_id and an EMPTY suite_json. Prefer
+        Path B (parent merge + full suite_json) when host dedup/coverage review
+        matters. Check progress with qa_prep_status.
         """
         return await _tracked(
             "qa_submit_category",
