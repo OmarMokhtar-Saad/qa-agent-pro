@@ -71,6 +71,8 @@ from tools.rtm import (
     parse_acceptance_criteria,
     render_checklist_section,
     rtm_oneline,
+    rtm_trace,
+    traceability_warning_section,
     uncovered_items,
 )
 from tools.rule_packs import (
@@ -3243,6 +3245,7 @@ async def _finalize_generation(
     remediate: bool = True,
     rewrite_vague: bool = True,
     advisory_gaps: bool = True,
+    feature_report_enabled: bool = True,
 ) -> tuple[str, str, str, str, str]:
     """Finalize a generated suite: dedupe -> remediation -> risk -> semantic
     dedup -> rule packs -> vague-field rewrite -> renumber -> RTM -> checklist
@@ -3513,6 +3516,15 @@ async def _finalize_generation(
         ]
 
     suite = TestSuite(test_cases=renumbered)
+    # Step 0: carry the traceability counts OUT as data. build_rtm_summary has
+    # always printed them; nothing exported them, so answering "is
+    # traceability degenerate?" needed a hand investigation. Private attr, the
+    # same channel _checklist_artifacts / _report_artifacts already use --
+    # _finalize_generation cannot reach _audit itself.
+    try:
+        suite._rtm_trace = rtm_trace(acs, renumbered)
+    except Exception:  # pragma: no cover - rtm_trace never raises
+        logger.debug("could not attach _rtm_trace", exc_info=True)
 
     # M1-risk: the risk_section rendered above was built from the PRE-dedup,
     # PRE-renumber list, so it could show merged-away cases or non-final tc_ids.
@@ -3531,6 +3543,10 @@ async def _finalize_generation(
 
     # Build RTM coverage summary (empty string when no ACs were parsed)
     rtm_section = build_rtm_summary(acs, renumbered)
+    # Step 0: the coverage ratio is ALREADY inside rtm_section; this names it
+    # when it is degenerate. FLAG ONLY, and unflagged like the two advisory
+    # sections below (anchoring_warning_section / scope_warning_section).
+    rtm_section += traceability_warning_section(acs, renumbered)
 
     # Batch 2 Pass 3: EXTERNAL, deterministic, bidirectional coverage. Runs on
     # the FINAL renumbered suite so every tc_id in the report matches the
@@ -3734,7 +3750,17 @@ async def _finalize_generation(
     # markdown (with a trailing separator) to BOTH summaries, above the counts
     # line. Never breaks generation: any failure just omits the report.
     feature_report = ""
-    if (settings.qa_feature_analysis_enabled or force_feature_report) and all_cases:
+    # F13: `feature_report_enabled=False` suppresses the AUTOMATIC report on the host
+    # submit path -- 42.0s of fixed-backend LLM work (measured 2026-07-30) on a
+    # path whose whole premise is that the server makes no generation LLM call.
+    # force_feature_report stays honoured: the qa_feature_analysis TOOL passes it
+    # explicitly, so asking for the report still produces it. Only the implicit
+    # "run it on every generation too" behaviour is gated.
+    if (
+        feature_report_enabled
+        and (settings.qa_feature_analysis_enabled or force_feature_report)
+        and all_cases
+    ):
         _fa_t0 = time.monotonic()
         try:
             screenshot_descriptions = "\n\n".join(

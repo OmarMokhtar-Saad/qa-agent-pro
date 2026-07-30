@@ -153,6 +153,104 @@ def parse_acceptance_criteria(raw: str) -> list[AcceptanceCriterion]:
         return []
 
 
+def _trace_map(
+    acs: list[AcceptanceCriterion], test_cases: list[TestCase]
+) -> tuple[dict, list]:
+    """Map each AC id -> the tc_ids citing it, plus the cases citing nothing.
+
+    Extracted so build_rtm_summary, rtm_trace and traceability_warning_section all
+    read ONE computation instead of three traversals that could disagree. Match on
+    the *normalized* id so a case tagged "AC-1"/"ac001" still traces to canonical
+    "AC-001".
+    """
+    ac_to_tcs: dict[str, list[str]] = {ac.ac_id: [] for ac in acs}
+    norm_to_canonical: dict[str, str] = {
+        normalize_ac_id(ac.ac_id): ac.ac_id for ac in acs
+    }
+    orphan_tc_ids: list[str] = []
+    for tc in test_cases:
+        canonical = norm_to_canonical.get(normalize_ac_id(tc.requirement_id))
+        if canonical:
+            ac_to_tcs[canonical].append(tc.tc_id)
+        else:
+            orphan_tc_ids.append(tc.tc_id)
+    return ac_to_tcs, orphan_tc_ids
+
+
+def rtm_trace(acs: list, test_cases: list) -> dict:
+    """The traceability outcome as DATA, for the audit trail.
+
+    build_rtm_summary has always PRINTED these numbers; nothing carried them out,
+    so "is traceability degenerate?" needed a hand investigation. Never raises --
+    an unreadable suite yields zeros rather than breaking a generation.
+    """
+    try:
+        if not acs:
+            return {"acs": 0, "covered": 0, "traced_cases": 0, "orphan_cases": 0}
+        ac_to_tcs, orphan_tc_ids = _trace_map(acs, test_cases)
+        return {
+            "acs": len(acs),
+            "covered": sum(1 for tcs in ac_to_tcs.values() if tcs),
+            "traced_cases": sum(len(tcs) for tcs in ac_to_tcs.values()),
+            "orphan_cases": len(orphan_tc_ids),
+        }
+    except Exception:
+        logger.exception("rtm_trace failed -- returning zeros")
+        return {"acs": 0, "covered": 0, "traced_cases": 0, "orphan_cases": 0}
+
+
+def traceability_warning_section(acs: list, test_cases: list) -> str:
+    """Escalate a DEGENERATE traceability outcome from a percentage to a finding.
+
+    build_rtm_summary already prints "Coverage: 1 of 7 ACs covered (14%)". On the
+    2026-07-29 and 2026-07-30 runs it did exactly that and nobody read it -- a
+    percentage reads as a metric, not as a defect. This names it.
+
+    Fires when more than one AC exists but at most ONE of them is cited.
+    ``covered_count <= 1``, not ``== 1``: zero is strictly WORSE and is silent
+    under an equality test -- and it has happened, when cases were tagged with
+    checklist ids instead of AC ids.
+
+    Counts are REAL, never "all N cases": a case citing nothing lands in
+    orphan_tc_ids, so 1 traced case plus 64 orphans must not be reported as 65
+    cases tracing to one AC. FLAG ONLY -- nothing is dropped or rewritten. States
+    an observation, not an accusation: a legitimately small suite cannot cover 7
+    ACs. Never raises.
+    """
+    try:
+        if not acs or not test_cases:
+            return ""
+        ac_to_tcs, orphan_tc_ids = _trace_map(acs, test_cases)
+        total = len(acs)
+        covered = sum(1 for tcs in ac_to_tcs.values() if tcs)
+        if total <= 1 or covered > 1:
+            return ""
+        head = "\n\n> \u26a0\ufe0f  **Requirement traceability looks degenerate.** "
+        if covered == 0:
+            body = (
+                f"No test case traces to any of the {total} acceptance criteria "
+                f"({len(orphan_tc_ids)} case(s) carry no usable `requirement_id`)."
+            )
+        else:
+            cited = next((ac_id for ac_id, tcs in ac_to_tcs.items() if tcs), "")
+            traced = sum(len(tcs) for tcs in ac_to_tcs.values())
+            body = (
+                f"{traced} case(s) trace to `{cited}` and {len(orphan_tc_ids)} "
+                f"trace to nothing, out of {total} acceptance criteria "
+                f"({total - covered} never referenced)."
+            )
+        return (
+            head
+            + body
+            + " Traceability is unreliable for this suite: the RTM above cannot "
+            "tell you which requirements are actually tested. Re-check the "
+            "`requirement_id` on each case against the AC list."
+        )
+    except Exception:
+        logger.exception("traceability_warning_section failed -- returning empty")
+        return ""
+
+
 def build_rtm_summary(
     acs: list[AcceptanceCriterion], test_cases: list[TestCase]
 ) -> str:
@@ -163,21 +261,7 @@ def build_rtm_summary(
     if not acs:
         return ""
 
-    # Map each AC ID to the TC IDs that reference it. Match on the *normalized*
-    # id so a case tagged "AC-1"/"ac001" still traces to canonical "AC-001".
-    ac_to_tcs: dict[str, list[str]] = {ac.ac_id: [] for ac in acs}
-    norm_to_canonical: dict[str, str] = {
-        normalize_ac_id(ac.ac_id): ac.ac_id for ac in acs
-    }
-    orphan_tc_ids: list[str] = []
-
-    for tc in test_cases:
-        canonical = norm_to_canonical.get(normalize_ac_id(tc.requirement_id))
-        if canonical:
-            ac_to_tcs[canonical].append(tc.tc_id)
-        else:
-            orphan_tc_ids.append(tc.tc_id)
-
+    ac_to_tcs, orphan_tc_ids = _trace_map(acs, test_cases)
     covered_count = sum(1 for tcs in ac_to_tcs.values() if tcs)
     total_count = len(acs)
     pct = int(covered_count / total_count * 100) if total_count else 0
