@@ -314,7 +314,12 @@ async def add_to_corpus(entry_type: str, content: str, metadata: dict) -> dict:
         cap = cap_raw if isinstance(cap_raw, int) else 0
         if cap > 0:
             await asyncio.to_thread(_prune_sync, path, cap)
-        logger.info("rag_store: added %s entry %s to %s", entry_type, entry_id, path)
+        # DEMOTED from INFO (2026-07-30 run review, item 8): one line PER corpus
+        # entry meant 65 lines on a single submit, and because all logging goes to
+        # stderr Cursor renders every one of them as `[error]`, burying real
+        # errors. The aggregate "RAG: persisted N test case(s) to corpus" line in
+        # tools/mcp_handlers._persist_suite_to_corpus carries the operational fact.
+        logger.debug("rag_store: added %s entry %s to %s", entry_type, entry_id, path)
         return {"error": None, "content": {"id": entry_id}}
     except Exception as exc:
         logger.exception("rag_store.add_to_corpus failed")

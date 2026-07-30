@@ -304,6 +304,39 @@ CATEGORIES: list[tuple[str, str, str]] = [
     ),
 ]
 
+# Index of "Edge Cases" in CATEGORIES, plus the opt-in retype
+# (QA_EDGE_CASES_FUNCTIONAL_TYPE). See config/settings.qa_edge_cases_functional_type
+# for the measurement; the short version is that CATEGORIES[3] asks the model for
+# type "Exploratory" while the cases it produces are fully scripted, which skews
+# the XLSX Summary's type metrics.
+_EDGE_CASES_INDEX = 3
+_EDGE_CASES_SCRIPTED_NOTE = (
+    ' (these are SCRIPTED cases -- reserve type "Exploratory" for genuinely '
+    "unscripted charters)"
+)
+
+
+def effective_categories() -> list[tuple[str, str, str]]:
+    """CATEGORIES with the opt-in QA_EDGE_CASES_FUNCTIONAL_TYPE override applied.
+
+    Pure and never raises. With the flag OFF it returns the CATEGORIES object
+    ITSELF, so all 8 category prompts stay byte-identical -- which is what keeps
+    tests/test_server_mode_equivalence.py's golden fixtures valid (they record the
+    category system prompts verbatim, "should be: Exploratory" included). Read by
+    BOTH halves: the server fan-out, and prepared.categories, which is what host
+    mode builds its per-category instructions from.
+    """
+    try:
+        if not settings.qa_edge_cases_functional_type:
+            return CATEGORIES
+    except Exception:  # pragma: no cover - settings must never break generation
+        return CATEGORIES
+    out = list(CATEGORIES)
+    name, focus, _ptype = out[_EDGE_CASES_INDEX]
+    out[_EDGE_CASES_INDEX] = (name, focus + _EDGE_CASES_SCRIPTED_NOTE, "Functional")
+    return out
+
+
 # Compliance keywords that trigger optional web-search grounding
 _COMPLIANCE_KEYWORDS: list[tuple[str, str]] = [
     ("wcag", "WCAG accessibility guidelines"),
@@ -356,6 +389,16 @@ async def _enrich_with_rag(feature_text: str, parts: list[str]) -> None:
     similar_lines: list[str] = []
     duplicate_lines: list[str] = []
     threshold = settings.qa_rag_similarity_threshold
+    # Relevance FLOOR for the similar-cases block ONLY
+    # (QA_RAG_SIMILAR_MIN_SCORE; 0.0 = off = today's behaviour). The
+    # Duplicate-Risk block below keeps its own `threshold` and is
+    # deliberately UNTOUCHED, so a hit can still be flagged as a duplicate
+    # risk even when an aggressive floor keeps it out of the prompt block.
+    try:
+        floor = float(settings.qa_rag_similar_min_score or 0.0)
+    except Exception:  # pragma: no cover - defensive
+        floor = 0.0
+    suppressed = 0
 
     for hit in hits:
         score = hit.get("score", 0.0)
@@ -363,7 +406,10 @@ async def _enrich_with_rag(feature_text: str, parts: list[str]) -> None:
         meta = hit.get("metadata") or {}
         feature_label = meta.get("feature", "")
         label = f"{feature_label}: {snippet}" if feature_label else snippet
-        similar_lines.append(f"- (score={score:.2f}) {label}")
+        if floor > 0.0 and score < floor:
+            suppressed += 1
+        else:
+            similar_lines.append(f"- (score={score:.2f}) {label}")
         if score >= threshold:
             duplicate_lines.append(f"- score={score:.2f}: {label}")
 
@@ -375,6 +421,17 @@ async def _enrich_with_rag(feature_text: str, parts: list[str]) -> None:
             "The following existing test cases overlap significantly with this feature. "
             "Avoid duplicating them — extend or reference them instead:\n"
             + "\n".join(duplicate_lines)
+        )
+    if suppressed:
+        # NEVER silent: with the block gone, an operator cannot tell a floor that
+        # suppressed 5 irrelevant hits from an empty corpus or a broken query.
+        logger.info(
+            "RAG: %d of %d hit(s) scored below the relevance floor %.3f and were "
+            "omitted from the similar-cases block (%d kept)",
+            suppressed,
+            len(hits),
+            floor,
+            len(similar_lines),
         )
     logger.info(
         "RAG: injected %d similar past test cases (%d flagged as duplicate risk)",
@@ -2664,7 +2721,7 @@ async def generate_test_scenarios(
     )
     tasks = [
         _bounded(i, name, focus, ptype)
-        for i, (name, focus, ptype) in enumerate(CATEGORIES)
+        for i, (name, focus, ptype) in enumerate(effective_categories())
     ]
     category_results: list[CategoryResult] = await asyncio.gather(*tasks)
 
@@ -3224,7 +3281,7 @@ async def _prepare_generation(
         attached_image_text=attached_image_text,
         jira_context_text=jira_context_text,
         image_notice=image_notice,
-        categories=CATEGORIES,
+        categories=effective_categories(),
         category_response_schema=_category_response_model().model_json_schema(),
     )
 
@@ -3750,9 +3807,12 @@ async def _finalize_generation(
     # markdown (with a trailing separator) to BOTH summaries, above the counts
     # line. Never breaks generation: any failure just omits the report.
     feature_report = ""
-    # F13: `feature_report_enabled=False` suppresses the AUTOMATIC report on the host
-    # submit path -- 42.0s of fixed-backend LLM work (measured 2026-07-30) on a
-    # path whose whole premise is that the server makes no generation LLM call.
+    # F13: `feature_report_enabled=False` suppresses the AUTOMATIC report on the
+    # host submit path -- 42.0s of fixed-backend LLM work (measured 2026-07-30)
+    # on a path whose whole premise is that the server makes no generation LLM
+    # call. That argument is no longer hardcoded: the submit call site passes
+    # QA_HOST_FEATURE_REPORT_ENABLED (default OFF), so the suppression is the
+    # default rather than the only option, and the reply discloses it.
     # force_feature_report stays honoured: the qa_feature_analysis TOOL passes it
     # explicitly, so asking for the report still produces it. Only the implicit
     # "run it on every generation too" behaviour is gated.
@@ -3775,7 +3835,8 @@ async def _finalize_generation(
             )
             logger.info(
                 "finalize: feature-analysis report took %.1fs (server-side LLM "
-                "call; set QA_FEATURE_ANALYSIS_ENABLED=false to skip it)",
+                "call; QA_HOST_FEATURE_REPORT_ENABLED=false skips it on a host "
+                "submit, QA_FEATURE_ANALYSIS_ENABLED=false everywhere)",
                 time.monotonic() - _fa_t0,
             )
             full_md = render_report_markdown(report)
