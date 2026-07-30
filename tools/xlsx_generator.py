@@ -33,7 +33,26 @@ _COL_TESTDATA = 7  # "Step 1: data\nStep 2: data" (only steps with data)
 _COL_EXPECTED = 8  # "1. result\n2. result\n3. result"
 _COL_STATUS = 9
 _COL_NOTES = 10
-_TOTAL_COLS = 11
+# F6: APPENDED, never inserted. Every hardcoded column letter below (D for
+# Priority, J for Status, A for TC ID) is derived from these indices via
+# _col_letter(), so a future insert cannot leave a stale letter behind.
+_COL_CATEGORY = 11
+_TOTAL_COLS = 12
+
+
+def _col_letter(index: int) -> str:
+    """0-based column index -> spreadsheet letter (0 -> A, 25 -> Z, 26 -> AA)."""
+    letters = ""
+    n = int(index)
+    if n < 0:
+        # -1 % 26 == 25 would silently return a plausible "Z".
+        raise ValueError(f"column index must be >= 0, got {index!r}")
+    while True:
+        letters = chr(ord("A") + (n % 26)) + letters
+        n = n // 26 - 1
+        if n < 0:
+            return letters
+
 
 _HEADERS = [
     "TC ID",
@@ -47,9 +66,10 @@ _HEADERS = [
     "Expected Results",
     "Status",
     "Notes",
+    "Category",
 ]
 
-_COL_WIDTHS = [10, 18, 30, 12, 14, 28, 45, 28, 45, 12, 20]
+_COL_WIDTHS = [10, 18, 30, 12, 14, 28, 45, 28, 45, 12, 20, 22]
 
 
 def _prepare(text: str) -> str:
@@ -459,12 +479,17 @@ def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
         )
         ws.write(row_idx, _COL_STATUS, "Not Run", status_fmt)
         _write_text(_COL_NOTES, rule_pack_notes.get(tc.tc_id, ""))
+        # F6: which of the 8 generation categories produced this case. Empty when
+        # it could not be resolved -- never guessed. A value self-reported by the
+        # host model is normalised before it reaches here.
+        _write_text(_COL_CATEGORY, getattr(tc, "category", None) or "")
 
         # Row height: fit the tallest cell in the row (wrapped text included),
         # not just the step count -- long titles/preconditions/data/expected
         # results no longer clip. Column widths stay fixed (_COL_WIDTHS).
         row_cells = [
             (rule_pack_notes.get(tc.tc_id, ""), _COL_WIDTHS[_COL_NOTES]),
+            (getattr(tc, "category", None) or "", _COL_WIDTHS[_COL_CATEGORY]),
             (tc.tc_id, _COL_WIDTHS[_COL_TCID]),
             (tc.module, _COL_WIDTHS[_COL_MODULE]),
             (tc.title, _COL_WIDTHS[_COL_TITLE]),
@@ -479,8 +504,9 @@ def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
 
     last_data_row = len(suite.test_cases) + 1
 
-    # Conditional format on Priority column (D)
-    pri_range = f"D2:D{last_data_row}"
+    # Conditional format on the Priority column, letter DERIVED from the index.
+    _pri = _col_letter(_COL_PRIORITY)
+    pri_range = f"{_pri}2:{_pri}{last_data_row}"
     ws.conditional_format(
         pri_range,
         {
@@ -529,7 +555,8 @@ def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
         {**_status_base, "bg_color": "#E2EFDA", "font_color": "#375623"}
     )
 
-    status_col_range = f"J2:J{last_data_row}"
+    _stat = _col_letter(_COL_STATUS)
+    status_col_range = f"{_stat}2:{_stat}{last_data_row}"
     ws.conditional_format(
         status_col_range,
         {
@@ -587,7 +614,7 @@ def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
 
     # Status dropdown with tooltip indicator
     ws.data_validation(
-        f"J2:J{last_data_row}",
+        f"{_col_letter(_COL_STATUS)}2:{_col_letter(_COL_STATUS)}{last_data_row}",
         {
             "validate": "list",
             "source": ["Not Run", "Pass", "Fail", "Blocked", "In Progress", "Skipped"],
@@ -616,11 +643,13 @@ def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
     summary_ws.set_row(0, 30)
 
     total = len(suite.test_cases)
-    status_range = f"'Test Cases'!J2:J{last_data_row}"
+    _s = _col_letter(_COL_STATUS)
+    status_range = f"'Test Cases'!{_s}2:{_s}{last_data_row}"
     summary_rows = [
         (
             "Total Test Cases",
-            f"=COUNTA('Test Cases'!A2:A{last_data_row})",
+            f"=COUNTA('Test Cases'!{_col_letter(_COL_TCID)}2:"
+            f"{_col_letter(_COL_TCID)}{last_data_row})",
             value_fmt,
             total,
         ),

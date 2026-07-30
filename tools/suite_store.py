@@ -143,8 +143,64 @@ def _load_suite_sync(suite_id: str) -> TestSuite | None:
         conn.close()
     if not case_rows:
         return None
-    cases = [TestCase.model_validate_json(r[0]) for r in case_rows]
-    return TestSuite(suite_id=suite_id, test_cases=cases)
+    cases = []
+    skipped = 0
+    first_err = None
+    known = set(TestCase.model_fields)
+    for r in case_rows:
+        try:
+            cases.append(TestCase.model_validate_json(r[0]))
+            continue
+        except Exception as exc:
+            # Keep the REAL reason: the retry below raises a synthetic error.
+            first_err = first_err or exc
+        # Forward compatibility: a row written by a NEWER build can carry fields
+        # this one does not know, and TestCase sets extra="forbid". Drop only the
+        # unknown keys and retry -- never guess at a value, never mutate a known
+        # one. Additive drift only; a narrowed constraint still fails below.
+        try:
+            raw = json.loads(r[0])
+            if not isinstance(raw, dict):
+                raise ValueError("case payload is not an object")
+            dropped = sorted(k for k in raw if k not in known)
+            if not dropped:
+                raise ValueError("no unknown keys to drop")
+            cases.append(
+                TestCase.model_validate({k: v for k, v in raw.items() if k in known})
+            )
+            logger.warning(
+                "suite_store: case in suite %s carried unknown field(s) %s -- "
+                "dropped them to load it (payload written by a newer build?)",
+                suite_id,
+                ", ".join(dropped),
+            )
+        except Exception:
+            skipped += 1
+            # At most a few lines: a wholly corrupt 64-case suite must not
+            # emit 64 tracebacks, and the SYNTHETIC retry error is not the
+            # interesting one -- first_err is.
+            if skipped <= 3:
+                logger.warning(
+                    "suite_store: case in suite %s could not be loaded: %r",
+                    suite_id,
+                    first_err,
+                )
+    if skipped:
+        logger.warning(
+            "suite_store: %d case(s) in suite %s could not be loaded and are "
+            "NOT in the returned suite",
+            skipped,
+            suite_id,
+        )
+    if not cases:
+        return None
+    suite = TestSuite(suite_id=suite_id, test_cases=cases)
+    # Never swallow a shortened suite: mirrors _dropped_note's rule that a
+    # dropped count must reach the tester, not just the log. Private attr, the
+    # same channel _checklist_artifacts already uses.
+    if skipped:
+        suite._load_skipped = skipped
+    return suite
 
 
 def _load_suite_meta_sync(suite_id: str) -> dict | None:
@@ -222,7 +278,13 @@ async def load_suite(suite_id: str) -> dict:
         if not suite_id:
             return {"error": None, "content": None}
         suite = await asyncio.to_thread(_load_suite_sync, suite_id)
-        return {"error": None, "content": suite}
+        # Carry the shortfall OUT of the loader so a caller can disclose it;
+        # silently exporting fewer cases than were stored is the failure mode.
+        return {
+            "error": None,
+            "content": suite,
+            "skipped": int(getattr(suite, "_load_skipped", 0) or 0),
+        }
     except Exception as exc:
         logger.exception("suite_store.load_suite failed")
         return {"error": str(exc), "content": None}

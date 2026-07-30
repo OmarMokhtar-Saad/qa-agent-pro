@@ -20,6 +20,7 @@ decoration time inside ``build_server``, where it is in scope.
 
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -59,6 +60,143 @@ def _note_client(ctx) -> None:
         logger.debug("could not read clientInfo", exc_info=True)
 
 
+# ---- in-flight accounting for the drift restart (F1) -----------------------
+# A hot restart must never land while a tool body is executing. _tracked is the
+# single funnel every registered tool passes through, so the counter lives HERE
+# rather than in a second wrapper.
+#
+# _DRAIN_IDLE_S additionally demands a quiet gap measured from the last tool to
+# FINISH. 120s is chosen from the run this fix came from: the eight
+# qa_submit_category calls arrived 37-41s apart, so a shorter gap would
+# routinely exit in the middle of a tester's session. It still costs at most one
+# deferral against the 15-minute tick.
+_DRAIN_IDLE_S = 120.0
+_DEFER_WARN_EVERY = 20
+_INFLIGHT: dict = {"n": 0, "last_finish": 0.0}
+_INFLIGHT_LOCK = threading.Lock()
+
+
+def _drift_restart_enabled() -> bool:
+    """Kill-switch for the drift restart. An ENV read, not a settings field, so
+    an operator can disable it without the restart that settings would need."""
+    raw = str(os.environ.get("QA_DRIFT_RESTART_ENABLED", "true")).strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _inflight_enter() -> None:
+    with _INFLIGHT_LOCK:
+        _INFLIGHT["n"] += 1
+
+
+def _inflight_exit() -> None:
+    with _INFLIGHT_LOCK:
+        _INFLIGHT["n"] = max(0, _INFLIGHT["n"] - 1)
+        _INFLIGHT["last_finish"] = time.monotonic()
+
+
+def _drift_watch() -> None:
+    """Dist only: replace this process when the install it runs from changes.
+
+    WHY (F1): three MCP clients (Claude Desktop, Cursor, Claude Code) launch the
+    SAME install dir. The launcher's watchdog restarts its child only when IT won
+    the update race, so a peer client's update left this process serving stale
+    code indefinitely -- observed 2026-07-29, a launcher still emitting the
+    pre-7265baa "set read-only" wording while VERSION on disk read 1.10.7. The
+    check lives in the CHILD, not the launcher, because only the child can see
+    whether a tool is running.
+
+    Scope of the guarantee: no TOOL BODY is executing. FastMCP's result
+    serialization and non-tool traffic (tools/list, ping) are outside it, and the
+    quiet gap is what covers them in practice.
+
+    Never raises: every failure path just skips the tick, so this can only ever
+    MISS a restart, never cause a spurious one.
+    """
+    try:
+        from tools.mcp_handlers import (
+            _DIST_UPDATE_REPO,
+            _code_changed_since_start,
+            _test_cases_only,
+        )
+        from tools.updater import _INSTALL_DIR, verify_integrity
+    except Exception:
+        logger.debug("drift watch unavailable", exc_info=True)
+        return
+    if not (_test_cases_only() and _DIST_UPDATE_REPO and _drift_restart_enabled()):
+        return
+    try:
+        interval = max(
+            60.0,
+            float(os.environ.get("QA_UPDATE_INTERVAL_MINUTES", "15")) * 60.0,
+        )
+    except (TypeError, ValueError):
+        interval = 900.0
+    deferrals = 0
+    blocked = 0
+    while True:
+        time.sleep(interval)
+        try:
+            if not _code_changed_since_start():
+                continue
+            # apply_update overlays file-by-file in sorted order, so
+            # pyproject.toml/VERSION can land BEFORE tools/. Exiting onto a
+            # half-written tree would be worse than the staleness this fixes, so
+            # wait until the tree verifies against its own manifest. This branch
+            # escalates: a PERSISTENT mismatch (a locally edited file, a partial
+            # update) would otherwise disable the restart for the life of the
+            # process while logging a reassuring "waiting" line forever.
+            mismatched = verify_integrity(Path(_INSTALL_DIR))
+            if mismatched:
+                blocked += 1
+                if blocked % _DEFER_WARN_EVERY == 0:
+                    logger.warning(
+                        "drift: blocked for %d checks — %d file(s) still do not "
+                        "match the manifest (%s). This is no longer a transient "
+                        "update window; the new version will not be loaded.",
+                        blocked,
+                        len(mismatched),
+                        ", ".join(sorted(mismatched)[:5]),
+                    )
+                else:
+                    logger.info(
+                        "drift: a new version is on disk but the tree does not "
+                        "verify yet — waiting for the update to finish."
+                    )
+                continue
+            blocked = 0
+            # Logged BEFORE the lock: os._exit while holding it is safe (the
+            # process dies), but a BLOCKING stderr write while holding it would
+            # stall every _inflight_enter, i.e. every tool call.
+            logger.info(
+                "drift: installed version changed since this process loaded — "
+                "restarting as soon as no tool is running."
+            )
+            # The exit happens UNDER the lock _inflight_enter also takes, so a
+            # tool cannot slip in between the check and the exit.
+            with _INFLIGHT_LOCK:
+                busy = _INFLIGHT["n"]
+                idle = time.monotonic() - _INFLIGHT["last_finish"]
+                if not busy and idle >= _DRAIN_IDLE_S:
+                    os._exit(86)
+            deferrals += 1
+            if deferrals % _DEFER_WARN_EVERY == 0:
+                logger.warning(
+                    "drift: restart deferred %d times — this install is not "
+                    "picking up releases. Restart the editor to apply it.",
+                    deferrals,
+                )
+            else:
+                logger.info(
+                    "drift: restart deferred (%d in flight, %.0fs since the last "
+                    "tool finished, deferral #%d).",
+                    busy,
+                    idle,
+                    deferrals,
+                )
+        except Exception:
+            logger.debug("drift check failed", exc_info=True)
+
+
 async def _tracked(name, ctx, coro):
     """Await a tool handler while emitting a best-effort telemetry
     ``tool_called`` event (name, duration, ok/error_type, host client) and, on
@@ -70,6 +208,7 @@ async def _tracked(name, ctx, coro):
     ok = True
     error_type = None
     telemetry.start_tool_trace(name)
+    _inflight_enter()
     try:
         return await coro
     except Exception as exc:
@@ -87,6 +226,10 @@ async def _tracked(name, ctx, coro):
             client_version=_CLIENT.get("version", ""),
             extra=telemetry.pop_tool_properties(),
         )
+        # LAST in the finally: releasing the slot earlier would let a drift
+        # restart fire while telemetry and FastMCP's result serialization still
+        # had work to do, and os._exit does not flush buffered stdout.
+        _inflight_exit()
 
 
 def _make_progress(ctx):
@@ -587,9 +730,8 @@ def main() -> None:
         except Exception:
             logger.debug("backend prewarm failed", exc_info=True)
 
-    import threading
-
     threading.Thread(target=_prewarm_backend, daemon=True).start()
+    threading.Thread(target=_drift_watch, daemon=True).start()
     logger.info("Starting the qa-agents MCP server over stdio…")
     server.run()
 

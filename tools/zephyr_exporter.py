@@ -3,9 +3,9 @@
 
 Why this module exists
 ----------------------
-``tools/xlsx_generator.py`` emits a generic 11-column QA worksheet (TC ID,
+``tools/xlsx_generator.py`` emits a generic 12-column QA worksheet (TC ID,
 Module, Title, Priority, Type, Preconditions, Steps / Actions, Test Data,
-Expected Results, Status, Notes). That is an excellent tester deliverable and
+Expected Results, Status, Notes, Category). That is an excellent tester deliverable and
 a useless Zephyr import file, so testers hand-massage the sheet to get cases
 into Jira, and ``tools/testrail_exporter.py`` only mentions Zephyr in its
 docstring while emitting TestRail's CSV shape. This module covers that last
