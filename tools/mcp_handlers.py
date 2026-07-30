@@ -1687,6 +1687,10 @@ async def handle_generate_test_cases(
             detail={
                 "status": status,
                 "cases": case_count,
+                # Step 0: traceability outcome as data (acs / covered /
+                # traced_cases / orphan_cases), so a degenerate RTM is
+                # queryable instead of only printed.
+                **_rtm_trace_detail(suite),
             },
         )
         auto_export = bool(
@@ -1848,10 +1852,18 @@ async def _ground_and_gate(
             if clarify:
                 await _audit("mcp_amendment_gate", detail={"source": audit_source})
                 return clarify
-        # ops-7: this gate is the ONLY server-side LLM call left on the host
-        # prepare path and it was completely un-logged -- a real run on
-        # 2026-07-29 showed a 28-second hole here with no output at all. Time it,
-        # so the cost is attributable instead of a mystery.
+        # ops-7: this gate was completely un-logged -- a real run on 2026-07-29
+        # showed a 28-second hole here with no output at all. Time it, so the cost
+        # is attributable instead of a mystery.
+        # CORRECTION (2026-07-30): this comment used to claim the gate was the ONLY
+        # server-side LLM call left on the host prepare path. It is not.
+        # rtm.generate_acs (tools/rtm.py:76, via _need_acs at
+        # agents/test_scenario_agent.py:2830) fires unconditionally whenever the
+        # ticket carried no parsed ACs and has NO off switch; comment
+        # reconciliation (tools/comment_reconciler.py) and atomic-checklist
+        # decomposition (tools/atomic_checklist.py) add one each when enabled; and
+        # ui_extractor's Tier-3 ask_vision is reachable for a non-Jira page URL.
+        # _SERVER_LLM_FLAGS below discloses the flag-gated ones to the tester.
         _gate_t0 = time.monotonic()
         clarify = await _maybe_ambiguity_clarify(text, url_content, openapi_text)
         logger.info(
@@ -1918,7 +1930,10 @@ _SERVER_LLM_FLAGS_SUBMIT: tuple = (
     (
         "qa_feature_analysis_enabled",
         "QA_FEATURE_ANALYSIS_ENABLED",
-        "a Feature Analysis report (~69s on one measured run)",
+        # 42.0s is the only DIRECT measurement (the F10c timing line, 2026-07-30).
+        # The earlier "~69s" attributed a whole unattributed finalize window to
+        # this one call; that window was 70.6s on 07-29 and 45.0s on 07-30.
+        "a Feature Analysis report (42s on one measured run)",
     ),
     ("qa_test_plan_artifacts", "QA_TEST_PLAN_ARTIFACTS", "test-plan artifacts"),
     ("qa_llm_risk_scoring", "QA_LLM_RISK_SCORING", "LLM risk scoring"),
@@ -2327,6 +2342,27 @@ def _coverage_view(suite) -> "_CoverageView | None":
     return _CoverageView(cov)
 
 
+def _rtm_trace_detail(suite) -> dict:
+    """The Step 0 traceability counts, flattened for an audit detail dict.
+
+    Empty when the suite carries none (no ACs, or an older suite), so a run
+    without traceability data produces a byte-identical audit row. Never
+    raises -- the audit trail must not be able to break a generation.
+    """
+    try:
+        trace = getattr(suite, "_rtm_trace", None)
+        if not isinstance(trace, dict) or not trace.get("acs"):
+            return {}
+        return {
+            "rtm_acs": int(trace.get("acs", 0)),
+            "rtm_covered": int(trace.get("covered", 0)),
+            "rtm_orphan_cases": int(trace.get("orphan_cases", 0)),
+        }
+    except Exception:
+        logger.debug("could not read _rtm_trace", exc_info=True)
+        return {}
+
+
 def _dropped_note(parsed) -> str:
     """Non-silent disclosure of cases dropped as malformed during parse/salvage.
     Surfaced UNCONDITIONALLY on BOTH the gap reply and the finished reply -- the
@@ -2456,6 +2492,15 @@ async def handle_submit_category(
         # dropped-cases disclosure -- keying the route wording off `note` would
         # promise a review that never ran whenever cases were dropped.
         review_note = ""
+        # F11: whether a REVIEW IS AVAILABLE at all, independent of whether the
+        # host already sent the field. category_dedup_note is empty until the host
+        # sends duplicate_groups, which on THIS route it can never do -- so keying
+        # the route wording off the note steered testers away from the only route
+        # where the review works.
+        review_available = bool(
+            settings.qa_host_dedup_review_enabled
+            or settings.qa_host_coverage_review_enabled
+        )
         if settings.qa_host_dedup_review_enabled:
             # Duplicate review is only possible on the MERGED suite -- _merge_category_rows
             # copies only test_cases and renumbers every tc_id -- so say the field
@@ -2479,18 +2524,28 @@ async def handle_submit_category(
                 staged_names = " (" + ", ".join(names) + ")"
         except Exception:  # defensive -- the count alone is still correct
             logger.debug("could not list staged category names", exc_info=True)
-        if review_note:
-            # A duplicate/coverage review note was prepended, and those reviews
-            # run ONLY on the merged suite. Here the two routes are a real
-            # CHOICE, so telling the host never to send the merged suite would
-            # contradict the note immediately above this line.
+        if review_available:
+            # Name only the review(s) actually enabled -- with one flag on,
+            # promising both would over-state what the merged route delivers.
+            _enabled = []
+            if settings.qa_host_dedup_review_enabled:
+                _enabled.append("duplicate")
+            if settings.qa_host_coverage_review_enabled:
+                _enabled.append("coverage")
+            _review_label = " or ".join(_enabled) + " review"
+            # A duplicate/coverage review is enabled, and those reviews run ONLY on
+            # the merged suite. The two routes are therefore a real CHOICE, and
+            # this branch must fire on the FLAG rather than on review_note: the
+            # note is empty until the host sends the field, which is impossible on
+            # this route, so the old condition steered away from the only route
+            # that works (F11).
             route = (
                 "Choose ONE route -- do not do both:\n\n"
                 "- **Finalize from these rows**: call `qa_submit_suite` with this "
                 'prep_id and an EMPTY `suite_json` (`suite_json=""`). No '
-                "duplicate or coverage review.\n"
-                "- **Or send one merged `suite_json`**: the review above runs, and "
-                "the rows staged here are ignored.\n\n"
+                f"{_review_label}.\n"
+                "- **Or send one merged `suite_json`**: the duplicate/coverage "
+                "review runs on it, and the rows staged here are ignored.\n\n"
                 "Sending both costs a round trip and the tokens to repeat every "
                 "case: a non-empty `suite_json` is authoritative, so nothing "
                 "staged here is merged in."
@@ -2666,11 +2721,23 @@ async def handle_submit_suite(
         dup_note = ""
         dup_agreements: list = []
         # Separate variable ON PURPOSE: dup_note is reassigned wholesale below.
-        # Only meaningful when the host submitted a FULL suite -- the merge path
-        # drops the field structurally, so "the host did not send it" would be a
-        # false accusation there.
+        # Set on BOTH paths with DIFFERENT wording (F11): the full-suite path can
+        # fairly say the host did not send the field; the merge path must blame
+        # the route, because the SERVER is what discards it there.
         dup_status_note = ""
-        if dup_review_on and has_full and not dup_groups:
+        if dup_review_on and not has_full and not dup_groups:
+            # F11: the merge route cannot carry duplicate_groups at all --
+            # _merge_category_rows copies only test_cases. Saying nothing here read
+            # as "reviewed, found none"; blaming the host would be wrong, because
+            # the SERVER discards the field on this path. Name the route instead.
+            dup_status_note = (
+                "> \u2139\ufe0f  No duplicate review ran: this suite was finalized "
+                "from per-category rows, and that route cannot carry a "
+                "`duplicate_groups` field (only `test_cases` survives the merge). "
+                "To get a duplicate review, submit ONE merged `suite_json` "
+                "instead. Any cross-category duplicates are still present.\n\n"
+            )
+        elif dup_review_on and has_full and not dup_groups:
             if getattr(parsed, "duplicate_review_offered", False):
                 dup_status_note = (
                     "> \u267b\ufe0f  Duplicate review ran and reported no "
@@ -2755,6 +2822,12 @@ async def handle_submit_suite(
             # through to analyze_coverage_gaps unconditionally -- ~108s of
             # fixed-backend LLM work on a path documented as needing none.
             advisory_gaps=False,
+            # And the FOURTH: the Feature Analysis report. QA_FEATURE_ANALYSIS_ENABLED
+            # exists to expose the qa_feature_analysis TOOL, which passes
+            # force_feature_report=True and still works. Running it implicitly on
+            # every host submit cost 42.0s (measured 2026-07-30) of fixed-backend
+            # LLM work on a path documented as needing none.
+            feature_report_enabled=False,
         )
         suite = captured.get("suite")
         if suite is None or not getattr(suite, "test_cases", None):
@@ -2798,6 +2871,18 @@ async def handle_submit_suite(
         # is handed the same `view` the gap loop reads, but ONLY to label itself: the
         # loop condition below is untouched, so a model-judged gap can never drive a
         # remediation round.
+        # F11: same silence as the duplicate review had. On the merge route
+        # raw_requirement_matches is None, so the coverage review cannot run and
+        # said nothing at all about being forfeited.
+        if (
+            settings.qa_host_coverage_review_enabled
+            and not has_full
+            and (cov_review is None or not cov_review.ran)
+        ):
+            dup_status_note += (
+                "> \u2139\ufe0f  No host coverage review ran either: that also "
+                "needs ONE merged `suite_json`.\n\n"
+            )
         if cov_review is not None:
             cov_note = host_mode.build_coverage_review_section(
                 cov_review,
@@ -2915,6 +3000,7 @@ async def handle_submit_suite(
                 # screen); dedup_removed counts what was actually deleted.
                 "dedup_groups": dup_groups_submitted,
                 "dedup_removed": len(dup_removed),
+                **_rtm_trace_detail(suite),
                 # Whether the field was OFFERED at all -- the signal the runbook
                 # gate asks an operator to check, and not derivable from a zero
                 # dedup_groups count.

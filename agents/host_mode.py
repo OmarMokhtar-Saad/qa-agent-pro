@@ -451,7 +451,13 @@ _HOST_DEDUP_INSTRUCTION = (
     "strips it before validating the suite against that schema, so including it is "
     "correct and does NOT violate the schema. Per-category objects must NOT carry "
     "it: only `qa_submit_suite` accepts it (cross-category duplicates can only be "
-    "judged on the MERGED set), and `qa_submit_category` cannot use it at all."
+    "judged on the MERGED set), and `qa_submit_category` cannot use it at all.\n"
+    "   ROUTE TRADE-OFF, decide before you start (F11): this review is only "
+    "possible on the ONE-merged-`suite_json` route. If you submit per category "
+    "with `qa_submit_category` and then finalize with an EMPTY `suite_json`, "
+    "merging keeps only `test_cases` and renumbers every tc_id, so there is no "
+    "channel for `duplicate_groups` and NO duplicate review can run. Going per "
+    "category is cheaper and lets you work one at a time; it forfeits this review."
 )
 
 
