@@ -144,8 +144,10 @@ async def analyze_requirements(text: str) -> dict:
             "returning degraded (gate fails SAFE unless "
             "QA_AMBIGUITY_GATE_SEVERITY=off)"
         )
-        return dict(_DEGRADED_DEFAULT)
-    except Exception:
+        out = dict(_DEGRADED_DEFAULT)
+        out["failure_reason"] = "no usable LLM backend to classify with"
+        return out
+    except Exception as exc:
         # Any other classification failure (timeout, transient provider error,
         # malformed JSON) is ALSO an "unable to classify" state, not a clean bill
         # of health — same fabrication risk, so also fail SAFE. Still never
@@ -154,7 +156,9 @@ async def analyze_requirements(text: str) -> dict:
             "analyze_requirements failed to classify — returning degraded",
             exc_info=True,
         )
-        return dict(_DEGRADED_DEFAULT)
+        out = dict(_DEGRADED_DEFAULT)
+        out["failure_reason"] = str(exc)[:200]
+        return out
 
 
 SEVERITY_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}
