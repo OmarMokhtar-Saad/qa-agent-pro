@@ -934,6 +934,48 @@ class Settings(BaseSettings):
     # only the host submit call site passes this flag.
     qa_host_feature_report_enabled: bool = False
 
+    # --- Host-side ambiguity preflight (opt-in, default OFF) ---------------
+    # WHY: QA_GENERATION_MODE=host only boomerangs the 8-category fan-out.
+    # The SHYJ-7154 ambiguity gate still runs server-side via llm.ask_json ->
+    # QA_LLM_BACKEND (usually cli / claude subprocess). MCP cannot call the
+    # Cursor chat model as an llm.py backend. Tonight's 2026-07-30 evening
+    # run hit a Claude CLI session limit, returned degraded, and told the
+    # tester the ticket was "under-specified" even though DF01/DF02 were
+    # present. When this flag is ON and generation mode resolves to host,
+    # prepare SKIPS the server classifier and returns an ambiguity_job for
+    # the chat to run first (prepare-side preflight -- NOT the blocked F12
+    # submit-side ambiguities GO/NO-GO). Server mode is untouched.
+    qa_host_ambiguity_review_enabled: bool = False
+
+    # --- Host-derived acceptance criteria (opt-in, default OFF) -------------
+    # WHY: rtm.generate_acs is an UNCONDITIONAL server-side llm.ask_json. It
+    # fires on every prepare whose ticket carried no parsed acceptance criteria
+    # (agents/test_scenario_agent._need_acs) -- common for sub-tasks and bugs --
+    # and it has no off switch, so a keyless / quota-dead host-mode install
+    # cannot get past it. AC synthesis is PREPARE-side (its output feeds
+    # rtm_hint, the RTM and the atomic checklist), so it cannot be deferred to
+    # submit: when this flag is ON and generation mode resolves to host, prepare
+    # SKIPS the call and ships an `acceptance_criteria_job` in the payload
+    # instead. The tester's own chat model derives the criteria, tags
+    # requirement_id with them, and returns them beside its suite; submit
+    # validates that field as UNTRUSTED input and labels it MODEL-DERIVED, never
+    # ticket-sourced. Server mode is untouched (_prepare_generation's
+    # synthesize_acs parameter defaults True and only host prepare passes False).
+    qa_host_ac_review_enabled: bool = False
+
+    # --- Refuse a host submit with no verified ambiguity preflight (OFF) ----
+    # QA_HOST_AMBIGUITY_REVIEW_ENABLED hands the SHYJ-7154 pre-pass to the host,
+    # which also removes the server's only evidence that the check happened. The
+    # job now asks for an `ambiguity_result` back and the submit reply ALWAYS
+    # discloses a missing or `high` verdict. This flag turns that disclosure into
+    # a REFUSAL. Default OFF because refusing throws away a generation the tester
+    # already paid for, and the disclosure is the honest-by-default behaviour this
+    # codebase prefers; an operator who genuinely relies on the gate turns it on.
+    # Inert unless QA_HOST_AMBIGUITY_REVIEW_ENABLED actually shipped the job (it
+    # is keyed off the prep's meta stamp, not off the flag, so a mid-flow flip
+    # cannot change an in-flight prep).
+    qa_host_ambiguity_require_result: bool = False
+
     # --- Host-reviewed duplicate review (Piece 1; opt-in, default OFF) -----
     # qa_semantic_dedup_enabled needs qa_embeddings_backend, and the only KEYLESS
     # embeddings backend is "local" (sentence-transformers, ~2 GB of torch), so on
@@ -1160,6 +1202,9 @@ class Settings(BaseSettings):
         "qa_standing_rules",
         "qa_semantic_dedup_enabled",
         "qa_host_feature_report_enabled",
+        "qa_host_ambiguity_review_enabled",
+        "qa_host_ac_review_enabled",
+        "qa_host_ambiguity_require_result",
         "qa_host_dedup_review_enabled",
         "qa_host_dedup_apply",
         "qa_host_coverage_review_enabled",

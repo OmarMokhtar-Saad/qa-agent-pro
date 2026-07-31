@@ -2591,6 +2591,39 @@ def _build_amendment_directive() -> str:
     )
 
 
+# Injected into the SHARED category system prompt (via rtm_hint) when, and only
+# when, _prepare_generation was asked NOT to synthesize acceptance criteria and
+# the ticket carried none -- i.e. host mode with QA_HOST_AC_REVIEW_ENABLED.
+#
+# WORKER-FACING, and that is the whole point of its wording. This block travels
+# inside ``system_prompt``, which under QA_HOST_PARALLEL_FANOUT_ENABLED is handed
+# VERBATIM to all 8 per-category workers by build_category_job. An earlier draft
+# said "derive 3-8 acceptance criteria" here; read by a worker, that instructs
+# EACH of the 8 to derive its OWN AC-001..AC-00N list, and the merged suite then
+# carries colliding ids meaning different things per category -- which
+# extract_host_acs' id reassignment would silently re-point again. So derivation
+# lives ONLY in the parent-facing job spec (agents.host_mode.AC_JOB); this half
+# says the list is SUPPLIED, forbids deriving or renumbering, and forbids
+# inventing an id when no list arrived (null is correct there, a fabricated id is
+# not). Divergence is still DETECTED deterministically at submit -- see the
+# unknown-id line in host_mode.build_host_ac_section.
+_HOST_AC_JOB_DIRECTIVE = (
+    "\n\n## Acceptance Criteria (SUPPLIED to you -- populate requirement_id)\n"
+    "This ticket carries no acceptance criteria of its own. ONE list of derived "
+    "criteria, numbered AC-001, AC-002, ..., is produced ONCE for this run (step "
+    "0b of `jobs_to_run`) and supplied to you alongside this prompt. Set each "
+    "test case's `requirement_id` to the id from THAT list which the case "
+    "primarily validates, or JSON null when none applies.\n"
+    "Do NOT derive your own list, do NOT renumber, and do NOT invent an AC id. "
+    "If you are the SAME model that ran step 0b (no parallel fan-out), use the "
+    "list you produced there -- do not derive a second, different one now. "
+    "If no such list appears anywhere in your input, leave every "
+    "`requirement_id` null: ids invented per category collide across the merged "
+    "suite and re-point each other's traceability, which is worse than no "
+    "traceability at all.\n"
+)
+
+
 @dataclass
 class PreparedGeneration:
     """Everything the 8-category fan-out and the finalize half both need,
@@ -2754,6 +2787,7 @@ async def _prepare_generation(
     single_screen: bool = False,
     on_status: Callable[[str], Awaitable[None]] | None = None,
     describe_images_server_side: bool = True,
+    synthesize_acs: bool = True,
 ) -> PreparedGeneration | tuple[str, str, str, str, str]:
     """Generate test cases. Returns (message_markdown, xlsx_file_path, csv_file_path, testrail_file_path, status).
 
@@ -2915,8 +2949,18 @@ async def _prepare_generation(
     async def _run_rag() -> None:
         await _enrich_with_rag(feature_text, rag_parts)
 
+    # synthesize_acs=False (host mode + QA_HOST_AC_REVIEW_ENABLED): do NOT
+    # make this call. It is an UNCONDITIONAL server-side ask_json today --
+    # the second of the two calls that made "host mode" still need a
+    # backend -- and the tester's own model derives the criteria instead
+    # (see _HOST_AC_JOB_DIRECTIVE and agents.host_mode.AC_JOB). The
+    # default is True, so every server-mode caller is byte-identical.
+    _host_ac_job = _need_acs and not synthesize_acs
+
     async def _run_gen_acs() -> list[AcceptanceCriterion]:
-        return await generate_acs(feature_text) if _need_acs else []
+        if not _need_acs or not synthesize_acs:
+            return []
+        return await generate_acs(feature_text)
 
     async def _run_checklist() -> list[ChecklistItem]:
         # parent_context rides as BACKGROUND ONLY (SHYJ-7154): the decomposition
@@ -3243,6 +3287,15 @@ async def _prepare_generation(
     # needs no wrap_untrusted boundary and adds no untrusted block to the
     # user message (the prompt-injection containment test counts those).
     rtm_hint = rtm_hint + format_rule_pack_prompt_block(rule_packs)
+
+    # Host AC boomerang: appended as a SEPARATE statement for the same
+    # reason the rule-pack block above is -- three batches already rewrite
+    # the `rtm_hint = ( ... )` expression, and whichever lands first would
+    # destroy the others' anchor. Empty unless the caller passed
+    # synthesize_acs=False AND the ticket carried no ACs, so server mode
+    # keeps a byte-identical system prompt.
+    if _host_ac_job:
+        rtm_hint = rtm_hint + _HOST_AC_JOB_DIRECTIVE
 
     meter = TokenMeter()
 

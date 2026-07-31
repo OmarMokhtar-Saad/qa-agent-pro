@@ -1414,8 +1414,20 @@ def _ambiguity_source_text(
     return text
 
 
-def _shape_ambiguity_clarify(questions: list, testable_surface: str = "") -> str:
-    """Render the clarifying-questions reply for the non-interactive MCP path."""
+def _shape_ambiguity_clarify(
+    questions: list,
+    testable_surface: str = "",
+    *,
+    degraded: bool = False,
+    reason: str = "",
+) -> str:
+    """Render the clarifying-questions reply for the non-interactive MCP path.
+
+    When ``degraded`` is True the pre-pass could NOT classify (backend
+    unavailable / session limit / parse failure) -- that is NOT the same as a
+    classified "under-specified" ticket. Wording must say so (2026-07-30
+    evening run: Claude CLI session limit was relayed as a vague ticket).
+    """
     q_md = "\n".join(f"- {q}" for q in list(questions)[:3])
     surface = ""
     if testable_surface in ("backend", "api", "docs", "none"):
@@ -1423,6 +1435,30 @@ def _shape_ambiguity_clarify(questions: list, testable_surface: str = "") -> str
             " This ticket reads as a backend / API / documentation change with "
             "no obvious user-facing screen, so the key thing to confirm is WHERE "
             "these should be tested."
+        )
+    if degraded:
+        why = (
+            "I held off generating because the requirement pre-pass could not "
+            "classify this ticket (LLM backend unavailable or the classifier "
+            "call failed) -- this is a safety pause, not a judgement that the "
+            "ticket itself lacks detail."
+        )
+        detail = ""
+        clean = (reason or "").strip().replace("\n", " ")
+        if clean:
+            detail = f"\n\nClassifier error (truncated): `{clean[:160]}`"
+        return (
+            "## \u26a0\ufe0f Could not verify the ticket is testable\n\n"
+            + why
+            + surface
+            + detail
+            + "\n\n"
+            f"{q_md}\n\n"
+            "If you know the ticket is testable, call again with "
+            "`proceed_anyway=true`. Or fix the server LLM backend "
+            "(`QA_LLM_BACKEND` / Claude CLI login / API key) and retry. "
+            "With `QA_HOST_AMBIGUITY_REVIEW_ENABLED=true` in host mode the "
+            "preflight runs in your chat instead of the server CLI."
         )
     return (
         "## \u26a0\ufe0f A few details will make these test cases valid\n\n"
@@ -1622,6 +1658,8 @@ async def _maybe_ambiguity_clarify(
             return _shape_ambiguity_clarify(
                 result.get("questions") or [],
                 str(result.get("testable_surface") or ""),
+                degraded=True,
+                reason=str(result.get("failure_reason") or ""),
             )
         # MINOR-5: only a result the gate can READ as a verdict is cacheable.
         # An unrecognised payload falls through gate_triggers as 'proceed'
@@ -1882,6 +1920,7 @@ async def _ground_and_gate(
     ask_text: AskCb = None,
     progress: ProgressCb = None,
     audit_source: str = "prepare",
+    run_ambiguity_llm: bool = True,
 ) -> "str | _Grounding":
     """Run the shared front half: URL/Jira fetch, _jira_preflight, Swagger
     ingest, UI extraction, comment reconciliation, and the (fail-safe) ambiguity
@@ -2004,18 +2043,38 @@ async def _ground_and_gate(
                 "\U0001f9d0 Checking the ticket has enough detail to test\u2026",
             )
         # The timing line below covers SERVER mode too, for the same reason.
-        _gate_t0 = time.monotonic()
-        clarify = await _maybe_ambiguity_clarify(text, url_content, openapi_text)
-        logger.info(
-            "prepare: ambiguity gate took %.1fs (severity=%s, model=%s) -> %s",
-            time.monotonic() - _gate_t0,
-            settings.qa_ambiguity_gate_severity,
-            settings.qa_classifier_model or "default",
-            "CLARIFY" if clarify else "proceed",
-        )
-        if clarify:
-            await _audit("mcp_ambiguity_gate", detail={"source": audit_source})
-            return clarify
+        # run_ambiguity_llm=False: host-mode prepare with
+        # QA_HOST_AMBIGUITY_REVIEW_ENABLED -- skip the server CLI/API call and
+        # let the chat run ambiguity_job from the prepare payload instead.
+        if not run_ambiguity_llm:
+            logger.info(
+                "prepare: ambiguity gate SKIPPED (host ambiguity review; "
+                "no server-side classifier call)"
+            )
+            await _audit(
+                "mcp_ambiguity_gate",
+                detail={"source": audit_source, "skipped": "host_ambiguity_review"},
+            )
+        else:
+            _gate_t0 = time.monotonic()
+            clarify = await _maybe_ambiguity_clarify(text, url_content, openapi_text)
+            logger.info(
+                "prepare: ambiguity gate took %.1fs (severity=%s, model=%s) -> %s",
+                time.monotonic() - _gate_t0,
+                settings.qa_ambiguity_gate_severity,
+                settings.qa_classifier_model or "default",
+                "CLARIFY" if clarify else "proceed",
+            )
+            if clarify:
+                await _audit(
+                    "mcp_ambiguity_gate",
+                    detail={
+                        "source": audit_source,
+                        "degraded": "could not verify" in (clarify or "").lower()
+                        or "could not classify" in (clarify or "").lower(),
+                    },
+                )
+                return clarify
 
     return _Grounding(
         url_content=url_content, ui_content=ui_content, openapi_text=openapi_text
@@ -2103,7 +2162,7 @@ _SERVER_LLM_FLAGS_SUBMIT: tuple = (
 _SERVER_LLM_FLAGS: tuple = _SERVER_LLM_FLAGS_PREPARE + _SERVER_LLM_FLAGS_SUBMIT
 
 
-def _host_mode_server_llm_notice() -> str:
+def _host_mode_server_llm_notice(*, ac_boomeranged: bool = False) -> str:
     """Disclose the flags that make THIS SERVER call an LLM on the host path.
 
     Returns "" when none are on. Never raises: a setting that cannot be read is
@@ -2117,21 +2176,62 @@ def _host_mode_server_llm_notice() -> str:
                 on.append((env, what))
         except Exception:
             logger.debug("could not read %s", attr, exc_info=True)
-    if not on:
+    # Host-side ambiguity preflight: when ON, the SHYJ-7154 pre-pass does
+    # NOT run server-side, so the closing sentence below must not claim it
+    # always classifies. Read defensively — an unreadable setting simply
+    # means we do not claim the skip.
+    amb_skipped = False
+    try:
+        amb_skipped = bool(getattr(settings, "qa_host_ambiguity_review_enabled", False))
+    except Exception:  # pragma: no cover - settings never raises
+        logger.debug("could not read qa_host_ambiguity_review_enabled", exc_info=True)
+    # NOT `if not on: return ""` any more: with every server-LLM flag off but
+    # the preflight on, there is still something the tester must be told.
+    # ...and the same again for the AC boomerang: with every flag off and the
+    # ambiguity gate still server-side, a prepare that shipped an AC job to
+    # the chat has something the tester must be told, and a notice that
+    # misdescribes what this server did is worse than no notice.
+    if not on and not amb_skipped and not ac_boomeranged:
         return ""
-    lines = [
-        "> \u26a0\ufe0f  This is a host-mode generation, but these settings "
-        "still make **this server** call an LLM while grounding and finishing "
-        "your suite:"
-    ]
-    lines += [f">   - `{env}` \u2014 {what}" for env, what in on]
-    lines.append(
-        ">   Each needs a working backend and adds latency you will not see in "
-        "the chat. Set them to `false` to remove the server-side LLM work this "
-        "server controls. Note this is not the whole story: the requirement "
-        "pre-pass always classifies, and acceptance criteria are synthesised "
-        "when the ticket carries none — both call the backend by design."
-    )
+    lines: list = []
+    if on:
+        lines.append(
+            "> \u26a0\ufe0f  This is a host-mode generation, but these settings "
+            "still make **this server** call an LLM while grounding and finishing "
+            "your suite:"
+        )
+        lines += [f">   - `{env}` \u2014 {what}" for env, what in on]
+        tail = (
+            ">   Each needs a working backend and adds latency you will not see in "
+            "the chat. Set them to `false` to remove the server-side LLM work this "
+            "server controls."
+        )
+        if not ac_boomeranged:
+            tail += (
+                " Note this is not the whole story: acceptance criteria are "
+                "synthesised when the ticket carries none — that calls the "
+                "backend by design."
+            )
+        if not amb_skipped:
+            tail += " The requirement pre-pass also classifies on every prepare."
+        lines.append(tail)
+    if amb_skipped:
+        lines.append(
+            "> \u2139\ufe0f  `QA_HOST_AMBIGUITY_REVIEW_ENABLED` is on, so the "
+            "SHYJ-7154 requirement pre-pass did **not** run on this server: the "
+            "under-specified/no-UI check was handed to your own chat model "
+            "instead. That is why this prepare made no ambiguity-gate LLM call."
+        )
+    if ac_boomeranged:
+        lines.append(
+            "> \u2139\ufe0f  This ticket carries no acceptance criteria, and "
+            "`QA_HOST_AC_REVIEW_ENABLED` is on, so this server did **not** "
+            "synthesize any: deriving them is step 0b of the payload's "
+            "`jobs_to_run`. Return them as a top-level `acceptance_criteria` "
+            "array with your suite; they will be labelled MODEL-DERIVED, and "
+            "without them the suite finalizes with no requirements "
+            "traceability."
+        )
     return "\n".join(lines)
 
 
@@ -2157,6 +2257,26 @@ async def handle_prepare_test_cases(
             )
         )
     try:
+        # Evening-ops repair: `llm` is NOT imported at module scope in
+        # this file (only locally, inside one other handler), so the
+        # llm.resolve_generation_mode() calls below raise NameError --
+        # swallowed by this function's except into "Preparation failed".
+        import llm
+
+        _host_amb = (
+            bool(getattr(settings, "qa_host_ambiguity_review_enabled", False))
+            and llm.resolve_generation_mode() == "host"
+        )
+        # The SECOND unconditional server-side call on this path (the first
+        # being the ambiguity classifier above): rtm.generate_acs, which fires
+        # whenever the ticket carried no parsed ACs and has no off switch of
+        # its own. Decided BEFORE _prepare_generation because AC synthesis is
+        # prepare-side -- its output feeds rtm_hint and the RTM -- so it
+        # cannot be deferred to submit; what is deferred is the RESULT.
+        _host_ac = (
+            bool(getattr(settings, "qa_host_ac_review_enabled", False))
+            and llm.resolve_generation_mode() == "host"
+        )
         grounded = await _ground_and_gate(
             text,
             attached_images=attached_images,
@@ -2164,6 +2284,7 @@ async def handle_prepare_test_cases(
             choose=choose,
             ask_text=ask_text,
             progress=progress,
+            run_ambiguity_llm=not _host_amb,
         )
         if isinstance(grounded, str):
             return PreparePayloadResult(clarify=grounded)
@@ -2178,12 +2299,18 @@ async def handle_prepare_test_cases(
             attached_images=attached_images,
             openapi_text=grounded.openapi_text,
             describe_images_server_side=False,
+            synthesize_acs=not _host_ac,
             on_status=_on_status,
         )
         if isinstance(prepared, tuple):
             # Early return from _prepare_generation (unreadable source / no real
             # feature text) -- its first element is the tester-facing message.
             return PreparePayloadResult(clarify=prepared[0])
+
+        # Whether the AC job was actually SHIPPED, which is narrower than the
+        # flag: a ticket that carried real acceptance criteria needs no job at
+        # all (source_acs is non-empty and nothing was synthesized either way).
+        _ac_job = bool(_host_ac and not prepared.source_acs and not prepared.acs)
 
         serialized = host_mode.serialize_prepared(prepared)
         envelope = {
@@ -2198,6 +2325,13 @@ async def handle_prepare_test_cases(
                 # deserialized by a different code version than wrote it.
                 # Observed on 2026-07-29. Stamp the writer so submit can say so.
                 "app_version": _BOOT_VERSION,
+                # 2026-07-30 evening: stamp when prepare skipped the server
+                # classifier so a mid-flow flag flip remains auditable.
+                "host_ambiguity_review": bool(_host_amb),
+                # Stamped at PREPARE time for the same reason: submit must know
+                # whether to expect an `acceptance_criteria` field, and a
+                # mid-flow .env flip must not change that for an in-flight prep.
+                "host_ac_job": bool(_ac_job),
                 # Parallel fan-out contract is stamped at PREPARE time so a mid-flight
                 # .env flip cannot change the finalize gate for an in-flight prep.
                 "parallel_fanout": bool(settings.qa_host_parallel_fanout_enabled),
@@ -2218,7 +2352,20 @@ async def handle_prepare_test_cases(
                 )
             )
         payload = host_mode.build_prepare_payload(prepared, prep_id)
-        await _audit("mcp_prepare_test_cases", entity_id=prep_id, detail={})
+        if _host_amb:
+            payload = host_mode.attach_ambiguity_job(payload)
+        # The GENERAL job mechanism. Also indexes the ambiguity job attached
+        # just above (host_mode._LEGACY_JOB_KEYS), and is a no-op returning a
+        # key-identical payload when neither is on.
+        payload = host_mode.attach_jobs(payload, [host_mode.AC_JOB] if _ac_job else [])
+        await _audit(
+            "mcp_prepare_test_cases",
+            entity_id=prep_id,
+            detail={
+                "host_ambiguity_review": bool(_host_amb),
+                "host_ac_job": bool(_ac_job),
+            },
+        )
         # Item 6: carry the RAW ticket screenshots so the TOOL layer can forward
         # them to the host's OWN multimodal model as MCP image content (the server
         # made no vision call -- describe_images_server_side=False above). Present
@@ -2230,7 +2377,7 @@ async def handle_prepare_test_cases(
             payload=payload,
             prep_id=prep_id,
             images=ticket_images,
-            notice=_host_mode_server_llm_notice(),
+            notice=_host_mode_server_llm_notice(ac_boomeranged=_ac_job),
         )
     except host_mode.PrepSerdeError as exc:
         logger.warning("host-mode prepare serialization failed", exc_info=True)
@@ -2355,7 +2502,19 @@ def _split_prepare_text_blocks(payload: dict, prep_id: str, notice: str) -> list
             "untrusted_data_notice",
             "instructions",
             "image_context",
+            # ATTACHED keys. This dict is a WHITELIST, so anything not named
+            # here is silently dropped on the oversized-payload path -- which
+            # for a BLOCKING step-zero job (the ambiguity preflight) would
+            # mean the safety check vanishes on exactly the biggest tickets.
+            # None-valued keys are filtered out below, so a payload without
+            # them renders byte-identically to before.
+            "jobs_to_run",
+            "ambiguity_job",
+            "acceptance_criteria_job",
+            "orchestration",
+            "jobs",
         )
+        if payload.get(k) is not None
     }
     header = [
         f"## Host-mode generation payload -- delivered across {4 + len(cats)} labeled parts",
@@ -2550,7 +2709,91 @@ def _prep_missing_reply(prep_id: str) -> str:
     )
 
 
-def _merge_category_rows(rows: list) -> "tuple[dict, int]":
+_SIDECAR_KEYS = ("duplicate_groups", "acceptance_criteria", "ambiguity_result")
+
+
+def _review_sidecar(suite_json) -> "dict | None":
+    """Return the parsed object when suite_json is a REVIEW SIDECAR.
+
+    A sidecar is a JSON object that carries at least one of the recognised
+    post-merge review fields (_SIDECAR_KEYS) and has no test cases (missing
+    or empty ``test_cases``). It is how the per-category route (Path A) can
+    still deliver fields that _merge_category_rows structurally drops --
+    generalised from the duplicate-groups-only sidecar so the AC boomerang
+    works on that route too. Never raises.
+    """
+    try:
+        if isinstance(suite_json, str):
+            raw = suite_json.strip()
+            if not raw:
+                return None
+            data = json.loads(raw)
+        elif isinstance(suite_json, dict):
+            data = suite_json
+        else:
+            return None
+        if not isinstance(data, dict):
+            return None
+        if not any(k in data for k in _SIDECAR_KEYS):
+            return None
+        cases = data.get("test_cases")
+        if cases is None or cases == []:
+            return data
+        return None
+    except Exception:
+        logger.debug("review sidecar parse failed", exc_info=True)
+        return None
+
+
+# _dedup_sidecar_groups (below) is superseded by _review_sidecar for the
+# ONE call site that used to invoke it (handle_submit_suite), which now calls
+# _review_sidecar instead. Retained -- not deleted -- solely because the
+# evening ops' own tests still call it directly; it is dead in the actual
+# request path.
+def _dedup_sidecar_groups(suite_json) -> "object | None":
+    """Return raw duplicate_groups if suite_json is a dedup-only sidecar.
+
+    A sidecar is a JSON object that carries ``duplicate_groups`` and has no
+    test cases (missing or empty ``test_cases``). Never raises.
+    """
+    try:
+        if isinstance(suite_json, str):
+            raw = suite_json.strip()
+            if not raw:
+                return None
+            data = json.loads(raw)
+        elif isinstance(suite_json, dict):
+            data = suite_json
+        else:
+            return None
+        if not isinstance(data, dict) or "duplicate_groups" not in data:
+            return None
+        cases = data.get("test_cases")
+        if cases is None or cases == []:
+            return data.get("duplicate_groups")
+        return None
+    except Exception:
+        logger.debug("dedup sidecar parse failed", exc_info=True)
+        return None
+
+
+def _remap_dup_groups(groups, id_map: dict) -> list:
+    """Remap tc_ids in duplicate_groups through a merge id_map. Never raises."""
+    out = []
+    try:
+        for g in groups or []:
+            if not isinstance(g, (list, tuple)):
+                continue
+            mapped = [id_map.get(tid, tid) for tid in g if isinstance(tid, str)]
+            if mapped:
+                out.append(mapped)
+    except Exception:
+        logger.debug("dup group remap failed", exc_info=True)
+        return list(groups or [])
+    return out
+
+
+def _merge_category_rows(rows: list) -> "tuple[dict, int, dict]":
     """Merge accumulated per-category submission rows into ONE suite dict.
 
     Rows arrive in insertion order. Each row payload carries a validated
@@ -2562,7 +2805,9 @@ def _merge_category_rows(rows: list) -> "tuple[dict, int]":
     tc_ids, so a literal "dedup by tc_id" across categories would wrongly discard
     almost every case. The throwaway ids are reassigned to TC-001..N by
     _finalize_generation's renumber, and genuine CONTENT duplicates are removed
-    there by _dedupe_cases. Returns (merged_suite_dict, rows_used)."""
+    there by _dedupe_cases. Returns (merged_suite_dict, rows_used,
+    id_map) where id_map maps each pre-merge tc_id to the global
+    TC-NNNN assigned here."""
     merged_cases: list = []
     used = 0
     for row in rows or []:
@@ -2591,11 +2836,16 @@ def _merge_category_rows(rows: list) -> "tuple[dict, int]":
                 c["category_source"] = "server" if canon else None
                 merged_cases.append(c)
     renumbered = []
+    id_map: dict = {}
     for i, c in enumerate(merged_cases, 1):
         c = dict(c)
-        c["tc_id"] = f"TC-{i:04d}"
+        old_id = c.get("tc_id")
+        new_id = f"TC-{i:04d}"
+        if isinstance(old_id, str) and old_id:
+            id_map.setdefault(old_id, new_id)
+        c["tc_id"] = new_id
         renumbered.append(c)
-    return {"test_cases": renumbered}, used
+    return {"test_cases": renumbered}, used, id_map
 
 
 async def handle_prep_status(prep_id: str) -> str:
@@ -2612,7 +2862,9 @@ async def handle_prep_status(prep_id: str) -> str:
         expected = list(meta.get("expected_categories") or [])
         if not expected and not meta.get("parallel_fanout"):
             try:
-                prepared = host_mode.deserialize_prepared(envelope.get("prepared") or {})
+                prepared = host_mode.deserialize_prepared(
+                    envelope.get("prepared") or {}
+                )
                 expected = host_mode.expected_category_names(prepared)
             except Exception:
                 expected = []
@@ -2629,9 +2881,7 @@ async def handle_prep_status(prep_id: str) -> str:
         staged = ", ".join(f"`{s}`" for s in status.get("staged") or []) or "(none)"
         unrec = status.get("unrecognized") or []
         unrec_line = (
-            "- **unrecognized names:** "
-            + ", ".join(f"`{u}`" for u in unrec)
-            + "\n"
+            "- **unrecognized names:** " + ", ".join(f"`{u}`" for u in unrec) + "\n"
             if unrec
             else ""
         )
@@ -2676,9 +2926,7 @@ async def handle_get_category_job(prep_id: str, category_name: str) -> str:
         return (
             f"## Category job — **{job.get('category_name')}**\n\n"
             f"`prep_id`: `{prep_id}`\n\n"
-            "```json\n"
-            + _json.dumps(job, ensure_ascii=False, indent=2)
-            + "\n```\n"
+            "```json\n" + _json.dumps(job, ensure_ascii=False, indent=2) + "\n```\n"
         )
     except host_mode.PrepSerdeError as exc:
         return f"⚠️ Could not read this prep: {exc}"
@@ -2899,7 +3147,52 @@ async def handle_submit_suite(
 
         conflict_note = ""
         try:
-            if has_full:
+            sidecar_obj = _review_sidecar(suite_json) if has_full else None
+            sidecar_raw = (
+                sidecar_obj.get("duplicate_groups")
+                if isinstance(sidecar_obj, dict)
+                else None
+            )
+            if sidecar_obj is not None:
+                rows_res = await prep_store.load_submissions(prep_id)
+                rows = rows_res.get("content") or []
+                if not rows:
+                    return (
+                        "⚠️ Nothing to finalize: received a review sidecar "
+                        "(`duplicate_groups` / `acceptance_criteria` / "
+                        "`ambiguity_result`) but no per-category rows are staged "
+                        f"for prep_id `{prep_id}`."
+                    )
+                merged_dict, used, id_map = _merge_category_rows(rows)
+                merged_dict = dict(merged_dict)
+                # Set each key only when the sidecar actually carried it:
+                # `duplicate_groups` present-but-empty reads downstream as "the
+                # host reviewed and found none", which an AC-only sidecar
+                # must not claim.
+                if sidecar_raw is not None:
+                    merged_dict["duplicate_groups"] = _remap_dup_groups(
+                        sidecar_raw, id_map
+                    )
+                _sidecar_acs = sidecar_obj.get("acceptance_criteria")
+                if _sidecar_acs is not None:
+                    merged_dict["acceptance_criteria"] = _sidecar_acs
+                # CRITICAL fix (review round 2): without this, Path A could
+                # never carry ambiguity_result at all -- see the _SIDECAR_KEYS
+                # comment above. Same present-but-empty discipline as the other
+                # two fields: a sidecar that did not mention it must not be read
+                # as "the host verified and found nothing".
+                _sidecar_amb = sidecar_obj.get("ambiguity_result")
+                if _sidecar_amb is not None:
+                    merged_dict["ambiguity_result"] = _sidecar_amb
+                parsed = host_mode.parse_host_suite(merged_dict)
+                has_full = False
+                conflict_note = (
+                    f"> ℹ️  Finalized from {used} accumulated per-category "
+                    "row(s) plus a review sidecar (`duplicate_groups` / "
+                    "`acceptance_criteria` / `ambiguity_result`) (no full "
+                    "suite_json test_cases were submitted).\n\n"
+                )
+            elif has_full:
                 parsed = host_mode.parse_host_suite(suite_json)
                 rows_res = await prep_store.load_submissions(prep_id)
                 n_rows = len(rows_res.get("content") or [])
@@ -2932,9 +3225,10 @@ async def handle_submit_suite(
                         expected=expected, staged_raw_names=staged_names
                     )
                     if not status.get("ready"):
-                        missing = ", ".join(
-                            f"`{m}`" for m in (status.get("missing") or [])
-                        ) or "(unknown)"
+                        missing = (
+                            ", ".join(f"`{m}`" for m in (status.get("missing") or []))
+                            or "(unknown)"
+                        )
                         return (
                             "⚠️ Incomplete parallel fan-out: not every expected "
                             f"category is staged for prep_id `{prep_id}`.\n\n"
@@ -2944,7 +3238,7 @@ async def handle_submit_suite(
                             "(or submit a full merged suite_json), then finalize "
                             "again. `qa_prep_status` shows the current set."
                         )
-                merged_dict, used = _merge_category_rows(rows)
+                merged_dict, used, _id_map = _merge_category_rows(rows)
                 parsed = host_mode.parse_host_suite(merged_dict)
                 conflict_note = (
                     f"> ℹ️  Finalized from {used} accumulated per-category "
@@ -2983,6 +3277,65 @@ async def handle_submit_suite(
                 "category instead.\n\n"
             )
         dropped_note = _dropped_note(parsed)
+        # The ambiguity job's verdict. QA_HOST_AMBIGUITY_REVIEW_ENABLED
+        # removed this server's classifier call AND, until now, every
+        # signal that the blocking preflight ran at all -- submit accepted a
+        # suite identically whether the host obeyed step 0 or skipped it.
+        # Keyed off the prep's meta stamp (not the live flag) so a mid-flow
+        # .env flip cannot change an in-flight prep. UNTRUSTED and NOT a
+        # permission bit: a host that lies "none" is not stopped here. What
+        # it buys is that "no verdict" stops looking like "cleared".
+        amb_result = None
+        amb_note = ""
+        if meta.get("host_ambiguity_review"):
+            amb_result = host_mode.extract_ambiguity_result(
+                getattr(parsed, "raw_ambiguity_result", None)
+            )
+            amb_note = host_mode.build_ambiguity_result_section(amb_result)
+            if (
+                # getattr, not direct access (review round 2 MINOR): every
+                # other new flag in this program reads this way, so a
+                # partial rollback of just the settings-field edit does not
+                # turn every host submit into a bare AttributeError.
+                getattr(settings, "qa_host_ambiguity_require_result", False)
+                and not amb_result.cleared
+            ):
+                # The prep is deliberately NOT deleted: the tester can run
+                # the preflight and resubmit the same suite with the same
+                # prep_id. Refusing must cost a round trip, not the work.
+                await _audit(
+                    "mcp_submit_suite_refused",
+                    entity_id=prep_id,
+                    detail={
+                        "reason": "ambiguity_result",
+                        "severity": amb_result.severity or "absent",
+                    },
+                )
+                return (
+                    f"{amb_note}⛔ **Submission refused:** `QA_HOST_AMBIGUITY_REQUIRE_RESULT` is on and this submission "
+                    "carries no cleared ambiguity preflight. Run step 0 of "
+                    "the payload's `jobs_to_run`, then resubmit the SAME "
+                    f"suite with prep_id `{prep_id}` and a top-level "
+                    "`ambiguity_result`. Nothing was discarded."
+                )
+        # The AC boomerang's return field. It rode in on THIS submission -- no
+        # extra round trip and no server-side LLM call -- and is UNTRUSTED, so
+        # host_mode.extract_host_acs shape-validates it, re-canonicalises the
+        # ids and strips URLs before anything reads it. Adopted into
+        # prepared.acs (which _finalize_generation reads for the RTM) but
+        # NEVER into prepared.source_acs: source_acs is the ground truth the
+        # AC-anchoring check anchors against, and a model-derived criterion is
+        # not a ticket requirement. Runs only when THIS prep shipped the job,
+        # so a normal submit is byte-identical.
+        ac_result = None
+        ac_note = ""
+        if meta.get("host_ac_job"):
+            ac_result = host_mode.extract_host_acs(
+                getattr(parsed, "raw_acceptance_criteria", None)
+            )
+            if ac_result.ran and not getattr(prepared, "acs", None):
+                prepared.acs = list(ac_result.acs)
+            ac_note = host_mode.build_host_ac_section(ac_result, all_cases)
         # Piece 1: the host's OPTIONAL cross-category duplicate review. It rode in
         # on THIS submission -- no extra round trip and no server-side LLM call --
         # and its SHAPE was validated against the submitted tc_ids inside
@@ -3013,10 +3366,11 @@ async def handle_submit_suite(
             # the SERVER discards the field on this path. Name the route instead.
             dup_status_note = (
                 "> \u2139\ufe0f  No duplicate review ran: this suite was finalized "
-                "from per-category rows, and that route cannot carry a "
-                "`duplicate_groups` field (only `test_cases` survives the merge). "
-                "To get a duplicate review, submit ONE merged `suite_json` "
-                "instead. Any cross-category duplicates are still present.\n\n"
+                "from per-category rows with no `duplicate_groups` sidecar. "
+                "Either submit ONE merged `suite_json`, or finalize with "
+                '`suite_json={"duplicate_groups":[[...]]}` (empty/absent '
+                "`test_cases`) after staging categories. Any cross-category "
+                "duplicates are still present.\n\n"
             )
         elif dup_review_on and has_full and not dup_groups:
             if getattr(parsed, "duplicate_review_offered", False):
@@ -3260,7 +3614,8 @@ async def handle_submit_suite(
                 )
                 return (
                     f"{version_note}{dropped_note}{conflict_note}{cat_source}"
-                    f"{dup_status_note}{dup_note}{cov_note}{gap_md}"
+                    f"{amb_note}{ac_note}{dup_status_note}{dup_note}"
+                    f"{cov_note}{gap_md}"
                 )
             cap_note = (
                 "\n\n> ⚠️  Requirement coverage still shows "
@@ -3304,6 +3659,21 @@ async def handle_submit_suite(
                 # screen); dedup_removed counts what was actually deleted.
                 "dedup_groups": dup_groups_submitted,
                 "dedup_removed": len(dup_removed),
+                # Counts ONLY, and only when the AC job actually ran, so a
+                # flag-OFF run's audit row is byte-identical to today's.
+                **(
+                    {
+                        "host_acs": len(ac_result.acs),
+                        "host_acs_dropped": ac_result.dropped,
+                    }
+                    if ac_result is not None
+                    else {}
+                ),
+                **(
+                    {"host_ambiguity_severity": (amb_result.severity or "absent")}
+                    if amb_result is not None
+                    else {}
+                ),
                 **_rtm_trace_detail(suite),
                 # Whether the field was OFFERED at all -- the signal the runbook
                 # gate asks an operator to check, and not derivable from a zero
@@ -3347,8 +3717,8 @@ async def handle_submit_suite(
         await prep_store.delete_prep(prep_id)
         return (
             f"{version_note}{dropped_note}{conflict_note}{cat_source}"
-            f"{fa_skip_note}{dup_status_note}{dup_note}{cov_note}{result_md}"
-            f"{cap_note}"
+            f"{fa_skip_note}{amb_note}{ac_note}{dup_status_note}{dup_note}"
+            f"{cov_note}{result_md}{cap_note}"
         )
     except Exception as exc:
         logger.exception("handle_submit_suite failed")
