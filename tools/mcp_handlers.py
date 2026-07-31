@@ -2373,11 +2373,18 @@ async def handle_prepare_test_cases(
         # them; otherwise empty and the payload's text image_context is the
         # fallback. Bytes are never persisted in the prep store.
         ticket_images = list((grounded.url_content or {}).get("images") or [])
+        _notice = _host_mode_server_llm_notice(ac_boomeranged=_ac_job)
+        # Item 2b: disclose any OTHER in-flight prep (fetched worker packets /
+        # staged rows) so an interrupted run is resumable instead of silently
+        # evaporating. APPEND, never assign -- see PreparePayloadResult.
+        _unfinished = await _unfinished_preps_note(exclude_prep_id=prep_id)
+        if _unfinished:
+            _notice = (_notice + "\n\n" + _unfinished) if _notice else _unfinished
         return PreparePayloadResult(
             payload=payload,
             prep_id=prep_id,
             images=ticket_images,
-            notice=_host_mode_server_llm_notice(ac_boomeranged=_ac_job),
+            notice=_notice,
         )
     except host_mode.PrepSerdeError as exc:
         logger.warning("host-mode prepare serialization failed", exc_info=True)
@@ -2709,6 +2716,49 @@ def _prep_missing_reply(prep_id: str) -> str:
     )
 
 
+async def _unfinished_preps_note(exclude_prep_id: str = "") -> str:
+    """Markdown disclosure of in-flight preps (fetched worker packets or
+    staged category rows) so an interrupted host-mode run is resumable
+    instead of evaporating at TTL (2026-07-31 SHYJ-5645 incident).
+
+    DISCLOSURE ONLY -- never blocks anything. Returns "" when
+    QA_PREP_DISCLOSE_UNFINISHED is off, nothing qualifies, or the store
+    errors. The line prints the prep_id, which is the capability token for
+    that prep -- that is why the flag defaults OFF. Times render as the
+    server's local HH:MM. Never raises."""
+    try:
+        if not bool(getattr(settings, "qa_prep_disclose_unfinished", False)):
+            return ""
+        res = await prep_store.list_unfinished_preps(limit=3)
+        rows = res.get("content") or []
+        lines = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            pid = str(r.get("prep_id") or "")
+            if not pid or pid == exclude_prep_id:
+                continue
+            started = time.strftime(
+                "%H:%M", time.localtime(float(r.get("created_at") or 0))
+            )
+            expires = time.strftime(
+                "%H:%M", time.localtime(float(r.get("expires_at") or 0))
+            )
+            staged = int(r.get("staged_count") or 0)
+            expected = int(r.get("expected_count") or 0)
+            count = f"{staged}/{expected}" if expected else f"{staged}"
+            lines.append(
+                f"> ⏳ Unfinished prep `{pid}` from {started}: {count} "
+                f"category row(s) staged, expires ~{expires}. Resume with "
+                "`qa_prep_status` + `qa_submit_category` (same prep_id), "
+                "or ignore it -- it expires on its own."
+            )
+        return ("\n".join(lines) + "\n") if lines else ""
+    except Exception:
+        logger.debug("unfinished-preps disclosure failed", exc_info=True)
+        return ""
+
+
 _SIDECAR_KEYS = ("duplicate_groups", "acceptance_criteria", "ambiguity_result")
 
 
@@ -2791,6 +2841,50 @@ def _remap_dup_groups(groups, id_map: dict) -> list:
         logger.debug("dup group remap failed", exc_info=True)
         return list(groups or [])
     return out
+
+
+def _fanout_incomplete_note(meta: object, rows: list, prep_id: str) -> str:
+    """Refusal text when a parallel-fan-out prep's staged set is INCOMPLETE.
+
+    Returns "" when this prep never requested fan-out, or every expected
+    category is staged. ONE decision point shared by BOTH staged finalize
+    routes -- the bare ``suite_json=""`` merge AND the review-SIDECAR merge --
+    because a sidecar finalize builds exactly the same merged suite from the
+    same rows and deletes the prep on success. The sidecar branch used to be
+    ungated (it only checked "are there any rows at all"), so a host that
+    crashed after staging 5 of 8 categories and then followed the "finalize
+    with a review sidecar" instruction shipped a silently truncated 5/8 suite
+    -- precisely the loss this gate exists to prevent. Never raises; on an
+    unexpected error it fails OPEN (returns "") so a legitimate finalize is
+    never blocked by the guard itself.
+    """
+    try:
+        if not isinstance(meta, dict) or not meta.get("parallel_fanout"):
+            return ""
+        expected = list(meta.get("expected_categories") or [])
+        staged_names = [
+            str(r.get("category_name") or "") for r in rows if isinstance(r, dict)
+        ]
+        status = host_mode.prep_status_view(
+            expected=expected, staged_raw_names=staged_names
+        )
+        if status.get("ready"):
+            return ""
+        missing = (
+            ", ".join(f"`{m}`" for m in (status.get("missing") or [])) or "(unknown)"
+        )
+        return (
+            "⚠️ Incomplete parallel fan-out: not every expected "
+            f"category is staged for prep_id `{prep_id}`.\n\n"
+            f"Staged {status.get('staged_count', 0)}/"
+            f"{status.get('expected_count', 0)}. Missing: {missing}.\n\n"
+            "Call `qa_submit_category` for each missing category "
+            "(or submit a full merged suite_json), then finalize "
+            "again. `qa_prep_status` shows the current set."
+        )
+    except Exception:  # pragma: no cover - defensive, must never block a finalize
+        logger.debug("fan-out completeness gate failed", exc_info=True)
+        return ""
 
 
 def _merge_category_rows(rows: list) -> "tuple[dict, int, dict]":
@@ -2892,8 +2986,13 @@ async def handle_prep_status(prep_id: str) -> str:
             f"{status.get('expected_count', 0)} — {staged}\n"
             f"- **missing:** {missing}\n"
             + unrec_line
-            + "\nWhen ready=yes, call `qa_submit_suite` with empty `suite_json`. "
-            "Preferred Path B (merged suite_json) does not need ready=yes."
+            + "\nPRIMARY finalize (Path A, crash-safe): when ready=yes, call "
+            "`qa_submit_suite` with an empty `suite_json` -- or, to keep the "
+            "duplicate review, the small review SIDECAR object described in "
+            "your preparation instructions (no `test_cases`). ALTERNATIVE "
+            "(Path B, one merged `suite_json`) does not need ready=yes, but "
+            "nothing is saved until that single call, so an interrupted chat "
+            "loses every category."
         )
     except Exception as exc:
         logger.exception("handle_prep_status failed")
@@ -2915,6 +3014,13 @@ async def handle_get_category_job(prep_id: str, category_name: str) -> str:
         if envelope is None:
             return _prep_missing_reply(prep_id)
         prepared = host_mode.deserialize_prepared(envelope.get("prepared") or {})
+        # 2026-07-31 incident: fetching a worker packet is real orchestration
+        # activity -- that run fetched 8 and staged none. prep_store gates the
+        # write (no-op unless QA_PREP_SLIDING_TTL_ENABLED or
+        # QA_PREP_DISCLOSE_UNFINISHED is on: the TTL needs it to slide, the
+        # disclosure needs it to SEE this exact shape) and never raises, so the
+        # fetch is never blocked by it.
+        await prep_store.touch_prep(prep_id)
         job = host_mode.build_category_job(prepared, prep_id, category_name)
         if job is None:
             return (
@@ -3042,16 +3148,58 @@ async def handle_submit_category(
             # note is empty until the host sends the field, which is impossible on
             # this route, so the old condition steered away from the only route
             # that works (F11).
+            # F11/F4 (iteration 4): this GENERAL "how to keep your review"
+            # explanation must NOT name a review FIELD by its literal token.
+            # The per-submission notes above (category_dedup_note /
+            # category_coverage_note) are the only place a field name may
+            # appear, and only when THIS submission's own payload carried it;
+            # naming it here too would read as "a review already ran" or "you
+            # were supposed to send it here". Pinned by
+            # test_submit_category_is_silent_without_the_field in both
+            # tests/test_host_dedup_review.py and test_host_coverage_review.py.
+            # The field NAME is taught once, at prepare time, by
+            # host_mode._HOST_DEDUP_INSTRUCTION.
+            _sidecar_line = (
+                " The empty finalize is not the only option here: to KEEP "
+                "the duplicate review on THIS route, finalize instead with "
+                "the small review SIDECAR object described in your "
+                "preparation instructions -- that review field alone, with "
+                "empty or absent `test_cases`. The server remaps its tc_ids "
+                "across the merge, so staging categories does NOT forfeit "
+                "that review."
+                if settings.qa_host_dedup_review_enabled
+                else ""
+            )
+            _coverage_line = (
+                " The coverage review is the one review no sidecar can "
+                "carry: it is judged against the merged suite's global "
+                "tc_ids, so it needs the merged route below."
+                if settings.qa_host_coverage_review_enabled
+                else ""
+            )
+            # MINOR (iteration 5): when the duplicate review is reachable from
+            # the staged route (via the sidecar described above), naming it on
+            # the merged bullet too made the two adjacent sentences read as an
+            # even choice. Name only what the merged route UNIQUELY provides.
+            _merged_label = (
+                "coverage review"
+                if settings.qa_host_coverage_review_enabled
+                else _review_label
+            )
             route = (
                 "Choose ONE route -- do not do both:\n\n"
-                "- **Finalize from these rows**: call `qa_submit_suite` with this "
-                'prep_id and an EMPTY `suite_json` (`suite_json=""`). No '
-                f"{_review_label}.\n"
-                "- **Or send one merged `suite_json`**: the duplicate/coverage "
-                "review runs on it, and the rows staged here are ignored.\n\n"
-                "Sending both costs a round trip and the tokens to repeat every "
-                "case: a non-empty `suite_json` is authoritative, so nothing "
-                "staged here is merged in."
+                "- **Finalize from these rows (crash-safe, recommended)**: "
+                "when every category is staged, call `qa_submit_suite` with "
+                'this prep_id and an EMPTY `suite_json` (`suite_json=""`); '
+                "no case is re-sent and nothing already staged can be lost."
+                f"{_sidecar_line}{_coverage_line}\n"
+                f"- **Or send one merged `suite_json`**: the {_merged_label} "
+                "runs on it, and the rows staged here are ignored -- but "
+                "nothing at all is saved until that single call, so an "
+                "interrupted chat loses every category.\n\n"
+                "Sending both costs a round trip and the tokens to repeat "
+                "every case: a non-empty `suite_json` is authoritative, so "
+                "nothing staged here is merged in."
             )
         else:
             route = (
@@ -3163,6 +3311,15 @@ async def handle_submit_suite(
                         "`ambiguity_result`) but no per-category rows are staged "
                         f"for prep_id `{prep_id}`."
                     )
+                # CRITICAL (iteration 5): the SIDECAR finalize merges the same
+                # staged rows and deletes the prep on success, so it needs the
+                # same completeness gate as the bare empty finalize below --
+                # otherwise the route these instructions now recommend for
+                # keeping the duplicate review on Path A would silently ship a
+                # truncated suite after a host crash.
+                _gate = _fanout_incomplete_note(meta, rows, prep_id)
+                if _gate:
+                    return _gate
                 merged_dict, used, id_map = _merge_category_rows(rows)
                 merged_dict = dict(merged_dict)
                 # Set each key only when the sidecar actually carried it:
@@ -3214,30 +3371,10 @@ async def handle_submit_suite(
                 # Path A completeness gate: when THIS prep requested parallel
                 # fan-out, refuse to finalize a partial staged set. Path B
                 # (non-empty suite_json) is unaffected (has_full branch above).
-                if meta.get("parallel_fanout"):
-                    expected = list(meta.get("expected_categories") or [])
-                    staged_names = [
-                        str(r.get("category_name") or "")
-                        for r in rows
-                        if isinstance(r, dict)
-                    ]
-                    status = host_mode.prep_status_view(
-                        expected=expected, staged_raw_names=staged_names
-                    )
-                    if not status.get("ready"):
-                        missing = (
-                            ", ".join(f"`{m}`" for m in (status.get("missing") or []))
-                            or "(unknown)"
-                        )
-                        return (
-                            "⚠️ Incomplete parallel fan-out: not every expected "
-                            f"category is staged for prep_id `{prep_id}`.\n\n"
-                            f"Staged {status.get('staged_count', 0)}/"
-                            f"{status.get('expected_count', 0)}. Missing: {missing}.\n\n"
-                            "Call `qa_submit_category` for each missing category "
-                            "(or submit a full merged suite_json), then finalize "
-                            "again. `qa_prep_status` shows the current set."
-                        )
+                # Shared with the sidecar branch above -- ONE decision point.
+                _gate = _fanout_incomplete_note(meta, rows, prep_id)
+                if _gate:
+                    return _gate
                 merged_dict, used, _id_map = _merge_category_rows(rows)
                 parsed = host_mode.parse_host_suite(merged_dict)
                 conflict_note = (
@@ -4846,6 +4983,11 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
         ]
         for label, value in gates:
             lines.append(f"- {'✅' if value else '⬜'} {label}")
+        # Item 2b: unfinished host-mode preps (disclosure only, flag-gated;
+        # empty string when QA_PREP_DISCLOSE_UNFINISHED is off or none exist).
+        _unfinished = await _unfinished_preps_note()
+        if _unfinished:
+            lines += ["", "### Unfinished host-mode preps", _unfinished.rstrip()]
         items = (
             [("Fix now", item) for item in blockers]
             + [("Recommended", item) for item in recommended]

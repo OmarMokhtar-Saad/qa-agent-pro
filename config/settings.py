@@ -1073,11 +1073,45 @@ class Settings(BaseSettings):
     # chat can spawn one same-session worker per category (Cursor Task / equivalent).
     # MCP cannot invoke host Task tools; this flag only changes the prepare payload,
     # instructions, status tool, and the empty-suite finalize completeness gate.
-    # Preferred finalize (Path B): workers return JSON; parent merges + qa_submit_suite
-    # (keeps host dedup/coverage review). Fallback (Path A): qa_submit_category x N
-    # then empty qa_submit_suite, gated until all expected categories are staged.
+    # Primary finalize (Path A, crash-safe -- 2026-07-31 incident): qa_submit_category
+    # x N as each worker returns, then empty qa_submit_suite (+ optional
+    # acceptance_criteria/ambiguity_result sidecar), gated until all expected
+    # categories are staged. Fallback (Path B): merge in parent + ONE full
+    # qa_submit_suite -- keeps the dedup/coverage review (which needs the merged
+    # suite's global tc_ids) but is lost wholesale if the chat dies before that
+    # single call, which is exactly how the first live run died.
     # Flag OFF => prepare payload / instructions byte-identical to today.
     qa_host_parallel_fanout_enabled: bool = False
+
+    # --- Prep crash-safety (2026-07-31 SHYJ-5645 incident; opt-in, default OFF) --
+    # The first live parallel fan-out was silently lost: 8 worker packets fetched
+    # via qa_get_category_job, the host window reloaded, no submit ever arrived,
+    # and the prep expired after QA_PREP_TTL_S with no trace and no resume path.
+    # Two independent, disclosure-first mitigations, each behind its own flag:
+    #
+    # Sliding TTL: qa_get_category_job / qa_submit_category refresh the prep's
+    # TTL clock so an ACTIVE orchestration cannot expire mid-run. Bounded by
+    # qa_prep_max_lifetime_s from creation (the same anti-extension stance
+    # prep_store.update_prep takes for the gap loop), so activity can never
+    # extend a prep forever. OFF => the fixed created_at TTL, unchanged.
+    qa_prep_sliding_ttl_enabled: bool = False
+    # Hard ceiling (seconds) on a prep's TOTAL lifetime under the sliding TTL.
+    # Lenient never-raise int coercion like the rest; <=0 -> the default.
+    qa_prep_max_lifetime_s: int = 14400
+    # Disclose unfinished preps (a fetched worker packet or >=1 staged category
+    # row, not yet expired) on qa_setup_check and qa_prepare_test_cases:
+    # "unfinished prep <id> from HH:MM, N/8 staged, expires ~HH:MM -- resume
+    # with qa_prep_status / qa_submit_category, or ignore". DISCLOSURE ONLY --
+    # it never blocks a new prepare and never auto-resumes anything. The line
+    # PRINTS the prep_id, which is a capability token for that prep, so keep it
+    # OFF where the tool output is shared more widely than the tester's chat.
+    # The "fetched packet" signal is preps.touched_at, which qa_get_category_job
+    # and save_submission write whenever EITHER this flag or
+    # qa_prep_sliding_ttl_enabled is on -- so a run that fetched 8 packets and
+    # staged nothing (the incident) is disclosed even with the sliding TTL off.
+    # Writing the timestamp is free while TTL enforcement stays off: prep_store
+    # ._expired() reads touched_at only under qa_prep_sliding_ttl_enabled.
+    qa_prep_disclose_unfinished: bool = False
 
     # Append-only audit log (LT-1 ph2). SQLite file recording key events (suite
     # generated, exported, pushed, bug reported) so multi-team deployments have a
@@ -1209,6 +1243,8 @@ class Settings(BaseSettings):
         "qa_host_dedup_apply",
         "qa_host_coverage_review_enabled",
         "qa_host_parallel_fanout_enabled",
+        "qa_prep_sliding_ttl_enabled",
+        "qa_prep_disclose_unfinished",
         "qa_atomic_checklist_enabled",
         "qa_checklist_nli_enabled",
         "qa_checklist_adjudicate_enabled",
@@ -1423,6 +1459,7 @@ class Settings(BaseSettings):
         "qa_llm_max_tokens_rewrite",
         "qa_prep_ttl_s",
         "qa_prep_max_bytes",
+        "qa_prep_max_lifetime_s",
         "qa_host_dedup_max_groups",
         "qa_host_dedup_max_group_size",
         "qa_host_coverage_max_items",

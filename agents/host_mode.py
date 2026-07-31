@@ -452,13 +452,16 @@ _HOST_DEDUP_INSTRUCTION = (
     "correct and does NOT violate the schema. Per-category objects must NOT carry "
     "it: only `qa_submit_suite` accepts it (cross-category duplicates can only be "
     "judged on the MERGED set), and `qa_submit_category` cannot use it at all.\n"
-    "   ROUTE TRADE-OFF, decide before you start (F11): preferred path is ONE "
-    "merged `suite_json` carrying `duplicate_groups` beside `test_cases`. If "
-    "you already staged categories with `qa_submit_category`, finalize with a "
-    "SIDECAR object that has `duplicate_groups` and empty/omitted `test_cases`, "
-    "using the tc_ids from your category submissions; the server remaps them "
-    "across merge renumbering. An EMPTY `suite_json` with no sidecar forfeits "
-    "this review."
+    "   ROUTE TRADE-OFF, decide before you start (F11): this review rides on "
+    "EITHER finalize route -- what it needs is the FIELD, not one particular "
+    "route -- so take whichever finalize route these instructions tell you to "
+    "take, and carry `duplicate_groups` with it. If you stage categories with "
+    "`qa_submit_category`, finalize with a SIDECAR object that has "
+    "`duplicate_groups` and empty/omitted `test_cases`, using the tc_ids from "
+    "your category submissions; the server remaps them across merge "
+    "renumbering. If you merge in the parent instead, put `duplicate_groups` "
+    "beside `test_cases` in the ONE merged `suite_json`. An EMPTY "
+    "`suite_json` with no sidecar forfeits this review."
 )
 
 
@@ -467,11 +470,18 @@ _HOST_DEDUP_INSTRUCTION = (
 #
 # MCP cannot spawn Cursor Task / chat subagents. When this flag is ON, prepare
 # returns an orchestration contract the PARENT chat executes in the SAME session:
-# one worker per category. Preferred finalize (Path B): merge in parent, then
-# qa_submit_suite with full suite_json (keeps host dedup/coverage review).
-# Fallback (Path A): qa_submit_category per worker, then empty suite_json -- the
+# one worker per category. PRIMARY finalize (Path A, reordered after the
+# 2026-07-31 SHYJ-5645 loss): stage each category via qa_submit_category as its
+# worker returns, then empty suite_json (+ an optional acceptance_criteria /
+# ambiguity_result sidecar) -- staged rows survive a host crash/reload, and the
 # completeness gate in mcp_handlers uses meta.expected_categories stamped at
-# prepare time. Never duplicate full user_context into jobs[] (token bomb).
+# prepare time. ALTERNATIVE (Path B): merge in parent, then qa_submit_suite with
+# full suite_json -- the only route that can carry the coverage review's
+# requirement_matches (checked against the merged suite's global tc_ids; the
+# duplicate review reaches the server on EITHER route, via the sidecar that
+# _review_sidecar / _remap_dup_groups already handle), but a single point of
+# loss if the chat dies before that one call.
+# Never duplicate full user_context into jobs[] (token bomb).
 # Every helper below is pure / sync / never-raise where noted.
 # --------------------------------------------------------------------------- #
 
@@ -488,15 +498,25 @@ _HOST_PARALLEL_INSTRUCTION = (
     "user_context + that job's instruction; emits ONLY a JSON object matching "
     "response_schema for THAT category; sets each case's `category` field to the "
     "job's category_name EXACTLY.\n"
-    "3. PREFERRED finalize (Path B): parent merges all workers' test_cases into "
-    "ONE object (unique tc_ids), runs any post-merge reviews asked elsewhere in "
-    "these instructions (duplicate_groups / requirement_matches), then calls "
-    "`qa_submit_suite` with this prep_id and the merged suite_json.\n"
-    "4. FALLBACK (Path A, if workers can call MCP or parent stages for them): "
-    "call `qa_submit_category` once per category, then `qa_prep_status` until "
-    'ready=true, then `qa_submit_suite` with suite_json="" . Do not finalize '
-    "early -- the server rejects an incomplete Path A finalize when this "
-    "orchestration was requested.\n"
+    "3. PRIMARY finalize (Path A -- stage as you go): call `qa_submit_category` "
+    "for EACH category AS SOON AS its worker returns (from the worker when it "
+    "can call MCP tools, otherwise from the parent). Do NOT hold results only "
+    "in the parent's memory until the end: a chat reload or crash loses "
+    "unstaged work, while staged categories survive on the server and "
+    "`qa_prep_status` shows what is left. When ready=true, finalize with "
+    '`qa_submit_suite` and suite_json="" -- or, to carry post-merge review '
+    "fields, a small JSON SIDECAR holding just `duplicate_groups` and/or "
+    "`acceptance_criteria` / `ambiguity_result` and NO test_cases (the server "
+    "remaps a sidecar's tc_ids across the merge). Do not finalize early -- the "
+    "server rejects an incomplete Path A finalize when this orchestration was "
+    "requested.\n"
+    "4. ALTERNATIVE finalize (Path B -- merge in parent): merge all workers' "
+    "test_cases into ONE object (unique tc_ids), run any post-merge reviews "
+    "asked elsewhere in these instructions (`duplicate_groups` works on either "
+    "route; `requirement_matches` needs THIS one, because it is checked against "
+    "the merged suite's global tc_ids), then call `qa_submit_suite` with this "
+    "prep_id and the merged suite_json. Nothing is saved until that one call, "
+    "so an interrupted chat loses every worker's output.\n"
     "5. Optional: `qa_get_category_job(prep_id, category_name)` returns one "
     "self-contained job packet (system_prompt + user_context + instruction + "
     "schema) so a worker need not re-parse the full prepare blob.\n"
@@ -557,13 +577,17 @@ def build_orchestration(prepared, prep_id: str = "") -> dict | None:
         "expected_categories": list(names),
         "worker_count": len(names),
         "finalize": {
-            "preferred": "merge_then_qa_submit_suite",
-            "fallback": "qa_submit_category_then_empty_suite",
+            "preferred": "qa_submit_category_then_empty_suite",
+            "fallback": "merge_then_qa_submit_suite",
             "require_all_categories": True,
         },
         "parent_instructions": (
-            "Fan out one same-session worker per expected category; prefer Path B "
-            "(merge then qa_submit_suite). Use qa_prep_status before Path A finalize."
+            "Fan out one same-session worker per expected category; stage each "
+            "category via qa_submit_category as it returns (crash-safe), then "
+            "qa_prep_status until ready=true and finalize with an empty "
+            "suite_json (a review sidecar can still carry duplicate_groups). "
+            "Merge-in-parent (Path B) is the fallback and the only route that "
+            "can carry requirement_matches."
         ),
         "worker_instructions": (
             "Emit ONLY one category's TestSuite JSON matching response_schema. "
