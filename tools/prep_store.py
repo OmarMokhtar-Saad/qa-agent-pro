@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TTL_S = 3600
 _DEFAULT_MAX_BYTES = 4_000_000
+# Hard cap on TOTAL prep lifetime under the sliding TTL (see _expired):
+# touch refreshes restart the TTL clock but can never push a prep past
+# created_at + this. 4x the default TTL.
+_DEFAULT_MAX_LIFETIME_S = 14_400
 
 # Seconds a contended write waits before giving up. Host mode means several MCP
 # host processes share this DB file, so a short wait beats an instant failure.
@@ -52,7 +56,8 @@ CREATE TABLE IF NOT EXISTS preps (
     id           TEXT PRIMARY KEY,
     payload_json TEXT NOT NULL,
     created_at   REAL NOT NULL,
-    created_by   TEXT
+    created_by   TEXT,
+    touched_at   REAL
 );
 CREATE TABLE IF NOT EXISTS prep_submissions (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,6 +85,106 @@ def _ttl_seconds() -> float:
     except (TypeError, ValueError):
         return float(_DEFAULT_TTL_S)
     return float(val) if val > 0 else float(_DEFAULT_TTL_S)
+
+
+def _has_touched_at(conn: sqlite3.Connection) -> bool:
+    """Whether preps.touched_at exists on THIS database. Probe, never raises."""
+    try:
+        rows = conn.execute("PRAGMA table_info(preps)").fetchall()
+    except sqlite3.Error:
+        return False
+    return any(r[1] == "touched_at" for r in rows)
+
+
+def _alter_add_touched_at(conn: sqlite3.Connection) -> None:
+    """The single ALTER, isolated so a test can simulate a locked database."""
+    conn.execute("ALTER TABLE preps ADD COLUMN touched_at REAL")
+
+
+def _ensure_touched_at(conn: sqlite3.Connection) -> bool:
+    """Add preps.touched_at to a DB created before the sliding TTL existed.
+
+    PROBE FIRST, and report back whether the column is usable. A bare
+    ``except sqlite3.OperationalError: pass`` around the ALTER would also
+    swallow "database is locked" -- which this module's docstring calls the
+    NORMAL concurrent multi-client case -- and every later
+    ``SELECT ... touched_at`` would then raise "no such column", which
+    load_prep converts to a miss: i.e. every LIVE prep would read as unknown
+    or expired, the exact loss this change exists to prevent. Never raises.
+    """
+    if _has_touched_at(conn):
+        return True
+    try:
+        with conn:  # transaction
+            _alter_add_touched_at(conn)
+    except sqlite3.Error:
+        # Locked/read-only DB, or a racing process won -- re-probe, never guess.
+        logger.debug("prep_store: touched_at migration deferred", exc_info=True)
+        return _has_touched_at(conn)
+    return True
+
+
+def _sliding_ttl_on() -> bool:
+    """QA_PREP_SLIDING_TTL_ENABLED, read never-raise. OFF => fixed TTL, unchanged."""
+    try:
+        return bool(getattr(settings, "qa_prep_sliding_ttl_enabled", False))
+    except Exception:
+        return False
+
+
+def _touch_enabled() -> bool:
+    """Whether an activity touch is RECORDED in preps.touched_at.
+
+    TRUE under EITHER flag, deliberately. The sliding TTL needs the timestamp
+    to enforce a refreshed clock; DISCLOSURE needs it to see the incident at
+    all -- the 2026-07-31 shape was 8 worker packets fetched via
+    qa_get_category_job and ZERO qa_submit_category calls, so staged == 0 and
+    touched_at is the only evidence the run ever existed. Gating the write on
+    the sliding TTL alone made QA_PREP_DISCLOSE_UNFINISHED unable to disclose
+    the very incident it exists for unless a second, unrelated flag was also
+    on. Writing the column costs nothing while TTL enforcement stays off:
+    _expired() reads touched_at only when _sliding_ttl_on(). Never raises."""
+    try:
+        return bool(
+            getattr(settings, "qa_prep_sliding_ttl_enabled", False)
+            or getattr(settings, "qa_prep_disclose_unfinished", False)
+        )
+    except Exception:
+        return False
+
+
+def _max_lifetime_s() -> float:
+    """Hard cap on a prep's TOTAL lifetime under the sliding TTL, so touch
+    refreshes cannot extend a prep forever (the same anti-extension stance
+    update_prep takes for the gap loop). Never raises."""
+    val = getattr(settings, "qa_prep_max_lifetime_s", _DEFAULT_MAX_LIFETIME_S)
+    try:
+        val = int(val)
+    except (TypeError, ValueError):
+        return float(_DEFAULT_MAX_LIFETIME_S)
+    return float(val) if val > 0 else float(_DEFAULT_MAX_LIFETIME_S)
+
+
+def _expired(created_at: float, touched_at: object) -> bool:
+    """TTL decision for one prep row. Fixed TTL from created_at by default;
+    with QA_PREP_SLIDING_TTL_ENABLED the clock restarts at the last touch
+    (qa_get_category_job / qa_submit_category), bounded by _max_lifetime_s()
+    from creation. A NULL/absent touched_at simply degrades to the fixed TTL,
+    so a deferred migration can never expire a live prep. Never raises."""
+    now = time.time()
+    try:
+        anchor = created_at
+        if _sliding_ttl_on():
+            try:
+                t = float(touched_at or 0.0)
+            except (TypeError, ValueError):
+                t = 0.0
+            anchor = max(created_at, t)
+            if (now - created_at) > _max_lifetime_s():
+                return True
+        return (now - anchor) > _ttl_seconds()
+    except Exception:  # pragma: no cover -- arithmetic on floats
+        return (now - created_at) > _ttl_seconds()
 
 
 def _max_bytes() -> int:
@@ -119,6 +224,10 @@ def _connect() -> sqlite3.Connection:
         logger.debug("prep_store: WAL/busy_timeout pragmas unavailable", exc_info=True)
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(_SCHEMA)
+    # Best-effort migration for DBs created before touched_at existed.
+    # Probe-first and non-fatal: readers re-probe and degrade to the
+    # fixed TTL rather than ever selecting a missing column.
+    _ensure_touched_at(conn)
     return conn
 
 
@@ -146,12 +255,16 @@ def _save_prep_sync(payload: dict, created_by: str | None) -> str:
 def _load_prep_sync(prep_id: str) -> dict | None:
     conn = _connect()
     try:
-        row = conn.execute(
-            "SELECT payload_json, created_at FROM preps WHERE id = ?", (prep_id,)
-        ).fetchone()
+        # NEVER assume the migration ran: on a locked DB it is deferred, and
+        # selecting a missing column would raise "no such column" -- which this
+        # function converts into a miss, i.e. a LIVE prep reported as unknown.
+        _sql = "SELECT payload_json, created_at, touched_at FROM preps WHERE id = ?"
+        if not _has_touched_at(conn):
+            _sql = "SELECT payload_json, created_at, NULL FROM preps WHERE id = ?"
+        row = conn.execute(_sql, (prep_id,)).fetchone()
         if row is None:
             return None
-        if (time.time() - float(row[1])) > _ttl_seconds():
+        if _expired(float(row[1]), row[2]):
             # Expired — delete it (and its submissions, via cascade) and miss.
             with conn:
                 conn.execute("DELETE FROM preps WHERE id = ?", (prep_id,))
@@ -219,6 +332,86 @@ def _load_submissions_sync(prep_id: str) -> list[dict]:
             out.append({"category_name": name, "payload": json.loads(payload_json)})
         except (ValueError, TypeError):
             continue
+    return out
+
+
+def _touch_prep_sync(prep_id: str) -> bool:
+    now = time.time()
+    conn = _connect()
+    try:
+        if not _has_touched_at(conn):
+            # Migration deferred (locked DB): skip silently, the caller keeps
+            # the fixed TTL rather than failing the orchestration step.
+            return False
+        with conn:  # transaction
+            cur = conn.execute(
+                "UPDATE preps SET touched_at = ? WHERE id = ?", (now, prep_id)
+            )
+        return (cur.rowcount or 0) > 0
+    finally:
+        conn.close()
+
+
+def _list_unfinished_sync(limit: int) -> list[dict]:
+    """Non-expired preps with real activity (touched or >=1 staged row).
+
+    Newest first. The activity filter runs in SQL; only the TTL decision is
+    left to Python (it depends on the sliding-TTL flag). ACCEPTED BOUND: the
+    query takes 4x limit candidates, so with more than that many recent ACTIVE
+    preps an older still-live one can fall outside the window -- acceptable for
+    a newest-first disclosure that never blocks anything. payload_json is
+    parsed ONLY for rows that survive the filters (bounded by limit) to read
+    meta.expected_categories for the N/8 denominator. ACCEPTED SCOPE: the
+    existing preps.created_by column is deliberately NOT filtered on -- this
+    store is one SQLite file per install/user, so there is no cross-tenant
+    separation to enforce, and the disclosure is flag-gated OFF by default."""
+    lim = max(1, int(limit))
+    conn = _connect()
+    try:
+        touch_col = "p.touched_at" if _has_touched_at(conn) else "NULL"
+        rows = conn.execute(
+            "SELECT p.id, p.created_at, " + touch_col + ", p.payload_json, "
+            "COUNT(s.id) AS staged FROM preps p "
+            "LEFT JOIN prep_submissions s ON s.prep_id = p.id "
+            "GROUP BY p.id "
+            "HAVING staged > 0 OR " + touch_col + " IS NOT NULL "
+            "ORDER BY p.created_at DESC LIMIT ?",
+            (lim * 4,),
+        ).fetchall()
+    finally:
+        conn.close()
+    out: list[dict] = []
+    for pid, created, touched, payload_json, staged in rows:
+        created_f = float(created)
+        if _expired(created_f, touched):
+            continue
+        try:
+            touched_f = float(touched or 0.0)
+        except (TypeError, ValueError):
+            touched_f = 0.0
+        anchor = max(created_f, touched_f)
+        if _sliding_ttl_on():
+            expires = min(anchor + _ttl_seconds(), created_f + _max_lifetime_s())
+        else:
+            expires = created_f + _ttl_seconds()
+        expected = 0
+        try:
+            meta = (json.loads(payload_json) or {}).get("meta") or {}
+            expected = len(meta.get("expected_categories") or [])
+        except (ValueError, TypeError, AttributeError):
+            expected = 0
+        out.append(
+            {
+                "prep_id": pid,
+                "created_at": created_f,
+                "touched_at": touched_f,
+                "staged_count": int(staged or 0),
+                "expected_count": expected,
+                "expires_at": expires,
+            }
+        )
+        if len(out) >= lim:
+            break
     return out
 
 
@@ -328,6 +521,12 @@ async def save_submission(prep_id: str, category_name: str, payload: dict) -> di
         sub_id = await asyncio.to_thread(
             _save_submission_sync, prep_id, category_name, payload or {}
         )
+        if _touch_enabled():
+            # Real orchestration activity: restart the TTL clock so an active
+            # parallel fan-out cannot expire mid-run (2026-07-31 incident), and
+            # mark the prep as ACTIVE for the disclosure listing. Either flag
+            # alone is enough to want the timestamp -- see _touch_enabled.
+            await asyncio.to_thread(_touch_prep_sync, prep_id)
         return {"error": None, "content": {"submission_id": sub_id}}
     except Exception as exc:
         logger.exception("prep_store.save_submission failed")
@@ -343,4 +542,37 @@ async def load_submissions(prep_id: str) -> dict:
         return {"error": None, "content": rows}
     except Exception as exc:
         logger.exception("prep_store.load_submissions failed")
+        return {"error": str(exc), "content": None}
+
+
+async def touch_prep(prep_id: str) -> dict:
+    """Record real orchestration activity (qa_get_category_job /
+    qa_submit_category) on a prep.
+
+    NO-OP unless QA_PREP_SLIDING_TTL_ENABLED **or**
+    QA_PREP_DISCLOSE_UNFINISHED is on (see _touch_enabled: disclosure needs
+    the touch to see a fetched-packet-only run, which is exactly the
+    2026-07-31 incident shape). The TTL clock only actually slides under
+    QA_PREP_SLIDING_TTL_ENABLED, and total lifetime stays bounded by
+    QA_PREP_MAX_LIFETIME_S (see _expired). Never raises."""
+    try:
+        if not prep_id or not _touch_enabled():
+            return {"error": None, "content": None}
+        ok = await asyncio.to_thread(_touch_prep_sync, prep_id)
+        return {"error": None, "content": {"touched": bool(ok)}}
+    except Exception as exc:
+        logger.exception("prep_store.touch_prep failed")
+        return {"error": str(exc), "content": None}
+
+
+async def list_unfinished_preps(limit: int = 3) -> dict:
+    """Non-expired preps showing real activity (a fetched worker packet or
+    >=1 staged category), newest first -- DISCLOSURE data for qa_setup_check /
+    qa_prepare_test_cases so an abandoned run stops evaporating silently
+    (2026-07-31 incident). Read-only; never raises."""
+    try:
+        rows = await asyncio.to_thread(_list_unfinished_sync, int(limit))
+        return {"error": None, "content": rows}
+    except Exception as exc:
+        logger.exception("prep_store.list_unfinished_preps failed")
         return {"error": str(exc), "content": None}
