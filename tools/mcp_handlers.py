@@ -152,12 +152,158 @@ def _boot_version() -> str:
 _BOOT_VERSION = _boot_version()
 
 
-def _schedule_reload() -> None:
+# ops-8: a reload REPLACES this process, so the response that schedules one can
+# never say whether it worked -- that response is already flushed by the time
+# the exit happens. _schedule_reload leaves this breadcrumb behind instead, and
+# the NEXT handle_setup_check (a different process, after the launcher respawn)
+# reads it back and reports the outcome. It lives beside the launcher's existing
+# backups/session-state.json rather than in a new state directory.
+_RELOAD_MARKER_NAME = "reload-marker.json"
+
+# How long a marker stays actionable. A reload is a 2s exit plus a respawn plus
+# an MCP handshake -- seconds, not minutes -- but a boot that reinstalls
+# dependencies can take a couple of minutes, so allow generous slack. Past this
+# the marker is assumed orphaned (the process died, or the editor was closed
+# before anyone re-checked) and is discarded silently: an ancient breadcrumb
+# must never warn "reload did not take effect" on every setup check forever.
+_RELOAD_MARKER_TTL_S = 300.0
+
+
+def _reload_marker_path() -> Path:
+    """Where the reload breadcrumb lives. _INSTALL_DIR is imported lazily like
+    every other use in this module, so tests can repoint the install dir."""
+    from tools.updater import _INSTALL_DIR
+
+    return Path(_INSTALL_DIR) / "backups" / _RELOAD_MARKER_NAME
+
+
+def _write_reload_marker(reason: str) -> None:
+    """Record what this process was running, moments before it exits to reload.
+
+    ``version`` is the RUNNING version (_BOOT_VERSION), never the on-disk one:
+    after an update the on-disk VERSION is ALREADY the new value, so recording
+    it would compare equal in the successor and read as a failed reload.
+
+    Never raises -- an unwritable install dir only costs the confirmation line
+    on the next call, and must never turn a working reload into a failed tool
+    call."""
+    try:
+        path = _reload_marker_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "version": _BOOT_VERSION,
+                    "reason": reason,
+                    "pid": os.getpid(),
+                    "at": time.time(),
+                }
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        logger.debug("could not write the reload marker", exc_info=True)
+
+
+def _consume_reload_marker() -> dict:
+    """Read the reload breadcrumb and DELETE it, so an outcome is reported once.
+
+    Returns ``{}`` when there is nothing to report: no marker, an unreadable or
+    corrupt one, or one outside _RELOAD_MARKER_TTL_S (including a marker dated
+    in the FUTURE, which means a clock change, not a reload). Never raises -- it
+    feeds a report whose contract is "read-only and never raises"."""
+    try:
+        path = _reload_marker_path()
+        raw = path.read_text(encoding="utf-8")
+    except Exception:
+        return {}
+    try:
+        path.unlink()
+    except Exception:
+        # A marker that cannot be removed would repeat its verdict; the TTL
+        # below bounds how long that can go on.
+        logger.debug("could not remove the reload marker", exc_info=True)
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return {}
+        age = time.time() - float(data.get("at") or 0)
+    except Exception:
+        logger.debug("unreadable reload marker ignored", exc_info=True)
+        return {}
+    if age < 0 or age > _RELOAD_MARKER_TTL_S:
+        return {}
+    return data
+
+
+def _reload_outcome(marker: dict) -> tuple[str, str]:
+    """Turn a fresh marker into ``(report_note, action_item)``; both empty when
+    there is nothing to say.
+
+    A reload took effect when a DIFFERENT process is answering now, so the pid
+    is the primary signal. The version is secondary, and only for the reasons
+    that are SUPPOSED to change it: an "update"/"code" reload that came back on
+    the same version means the launcher respawned the same tree. A "config"
+    reload is expected to keep its version, so judging it on the version would
+    report every successful .env reload as a failure."""
+    if not marker:
+        return "", ""
+    now_v = _BOOT_VERSION or ""
+    prev_v = str(marker.get("version") or "")
+    same_process = marker.get("pid") == os.getpid()
+    stuck = (
+        str(marker.get("reason") or "") in ("update", "code")
+        and bool(prev_v)
+        and prev_v == now_v
+    )
+    if same_process or stuck:
+        shown = f"v{now_v}" if now_v else "the version it started with"
+        return (
+            f"⚠️ **Reload did not take effect** — still running {shown}. If this "
+            "persists, restart the editor (quit and reopen it) or reinstall the "
+            "agent.",
+            f"The last reload did not take effect — still running {shown}. Quit "
+            "and reopen the editor; if it still says this, reinstall the agent.",
+        )
+    shift = (
+        f"v{prev_v} → v{now_v}"
+        if prev_v and now_v and prev_v != now_v
+        else f"v{now_v or 'unknown'}"
+    )
+    return f"✅ **Reloaded successfully** ({shift})", ""
+
+
+def _reloading_message(headline: str) -> str:
+    """The ONLY thing a setup check that just scheduled a reload may say.
+
+    Everything the full report renders -- backend, Jira, feature gates -- comes
+    from THIS process's in-memory config, which is seconds from being thrown
+    away. Splicing a note into that report (what this used to do) still showed
+    the tester a complete-looking "✅ Ready" verdict over values that could
+    already be wrong, so say only what is certainly true and stop."""
+    return (
+        "## Setup check\n\n"
+        f"{headline} This takes about 10 seconds — run `qa_setup_check` again "
+        "to see the current status, including whether the reload worked.\n\n"
+        "_Environment, backend, Jira and feature-gate details are deliberately "
+        "not shown here: this process is being replaced, so anything it "
+        "reported could already be out of date._"
+    )
+
+
+def _schedule_reload(reason: str = "") -> None:
     """Exit the server process shortly after the current response flushes.
 
     Distribution installs only, right after an on-demand update: the
     supervising launcher (start.sh) respawns the server on the NEW code and
-    replays the MCP handshake, so the editor session never notices."""
+    replays the MCP handshake, so the editor session never notices.
+
+    *reason* is "update", "code" or "config" and is recorded in the reload
+    marker so the successor can judge the outcome: an update reload must come
+    back on a new version, while a config reload is expected to keep the same
+    one. The marker is written HERE, before the thread starts -- so it is always
+    on disk before the exit, and EVERY caller gets the verification for free."""
+    _write_reload_marker(reason)
 
     def _later() -> None:
         time.sleep(2)
@@ -922,7 +1068,9 @@ async def handle_configure_jira(
         await _audit("mcp_configure_jira", detail={"base_url": base_url})
         note = ""
         if _test_cases_only() and _DIST_UPDATE_REPO:
-            _schedule_reload()
+            # "config": this rewrites the install .env, so the version stays put
+            # and only a fresh pid can prove the reload happened.
+            _schedule_reload("config")
             note = (
                 " The server is reloading to apply them — run `qa_setup_check` "
                 "in ~10 seconds and Jira should show ✅."
@@ -5159,7 +5307,6 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
         from llm import check_backend
         from tools.updater import _INSTALL_DIR, _local_version
 
-        update_note = ""
         if _test_cases_only() and _DIST_UPDATE_REPO:
             from tools.updater import run_update_check
 
@@ -5170,14 +5317,16 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
                 repo_override=_DIST_UPDATE_REPO,
                 lock_override=True,
             )
+            # ops-8: a scheduled reload ends this process within seconds, so
+            # return ONLY the honest headline -- see _reloading_message for why
+            # the old note-spliced-into-the-full-report shape misled testers.
             if update_status in ("updated", "healed"):
-                update_note = (
-                    "> 🔄 **A new version was just installed.** The server is "
-                    "reloading now — run `qa_setup_check` again in ~10 seconds "
-                    "to see it."
+                _schedule_reload("update")
+                return _reloading_message(
+                    "🔄 **A new version was just installed.** The server is "
+                    "reloading now to apply it."
                 )
-                _schedule_reload()
-            elif _code_changed_since_start():
+            if _code_changed_since_start():
                 # ops-6 (bug 2): the reload trigger used to watch ONLY .env, so an
                 # update applied by ANOTHER process sharing this install dir left
                 # this one running stale modules with no signal at all -- and
@@ -5187,25 +5336,28 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
                 # 2026-07-29: 1.10.4 landed on disk at 12:44:51 while a process
                 # from 08:57:43 kept serving 1.10.3, so one host-mode flow ran its
                 # prepare on old code and its submit on new code.
-                update_note = (
-                    "> 🔄 **Newer code is installed than this server is running.** "
-                    "Another process updated this install while this one was "
-                    "already started, so the version below is what is running, "
-                    "not what is on disk. Reloading now: run `qa_setup_check` "
-                    "again in ~10 seconds."
+                _schedule_reload("code")
+                return _reloading_message(
+                    "🔄 **Newer code is installed than this server is "
+                    "running.** Another process updated this install while "
+                    "this one was already started, so it is serving stale "
+                    "modules. Reloading now."
                 )
-                _schedule_reload()
-            elif _env_changed_since_start():
+            if _env_changed_since_start():
                 # The settings rendered below came from the OLD .env, so say so
                 # plainly rather than presenting them as the applied config.
-                update_note = (
-                    "> 🔄 **Configuration changed.** `.env` was edited after this "
-                    "server started, so the settings shown below are the ones it "
-                    "booted with — not what the file says now. The server is "
-                    "reloading to apply them: run `qa_setup_check` again in ~10 "
-                    "seconds to see the live configuration."
+                _schedule_reload("config")
+                return _reloading_message(
+                    "🔄 **Configuration changed.** `.env` was edited after "
+                    "this server started, so the settings this process is "
+                    "using are the ones it booted with — not what the file "
+                    "says now. Reloading to apply them."
                 )
-                _schedule_reload()
+        # Report the PREVIOUS reload's outcome ("" / "" when there was none).
+        # Deliberately AFTER the block above: a call that schedules a new reload
+        # has already returned, and its marker overwrites the old one, so the
+        # next settled call always reports the most recent reload.
+        reload_note, reload_action = _reload_outcome(_consume_reload_marker())
         await _emit(progress, "🔎 Validating the environment…")
         ok, warning = check_backend()
         from llm import describe_backend
@@ -5242,6 +5394,11 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
         blockers: list[str] = []
         recommended: list[str] = []
         optional: list[str] = []
+        # A reload that did not take effect is not passive information: the
+        # server may be serving stale code, so it belongs in the action items.
+        # Recommended, not blocking -- the server still answers.
+        if reload_action:
+            recommended.append(reload_action)
 
         py_version = sys.version.split()[0]
         py_ok = sys.version_info >= (3, 10)
@@ -5348,7 +5505,7 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
             "",
             *([f"**App version:** v{app_version}", ""] if app_version else []),
             *([restart_note, ""] if restart_note else []),
-            *([update_note, ""] if update_note else []),
+            *([reload_note, ""] if reload_note else []),
             "### Environment",
             f"- {'✅' if py_ok else '❌'} **Python** {py_version}"
             + ("" if py_ok else " — 3.10 or newer required"),
