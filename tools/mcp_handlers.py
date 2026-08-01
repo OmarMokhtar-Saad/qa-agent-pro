@@ -1744,13 +1744,17 @@ async def handle_generate_test_cases(
     # fan-out in the tester's OWN chat model. Return the grounded prepare payload
     # instead of generating server-side. Placed BEFORE grounding so host mode
     # grounds exactly ONCE (handle_prepare_test_cases -> _ground_and_gate fetches
-    # + gates on its own). attached_images SUPPRESS host routing: mobile
-    # screenshots / mockups are consumed by a server-side describe_images() vision
-    # call and are NOT forwarded to the host model (PreparePayloadResult.images
-    # carries only Jira ticket images), so that path stays server-mode.
+    # + gates on its own). attached_images SUPPRESS host routing BY DEFAULT:
+    # mobile screenshots / mockups are consumed by a server-side describe_images()
+    # vision call and are NOT forwarded to the host model (PreparePayloadResult
+    # .images then carries only Jira ticket images), so that path stays
+    # server-mode. QA_HOST_IMAGE_DESCRIPTION_ENABLED lifts exactly that
+    # suppression -- and only it: the attachments then ride to the host's own
+    # multimodal model as MCP image content and NO server-side vision call is
+    # made, which is why the reason for the suppression no longer holds.
     # qa_generate_test_cases returns str, so render_prepare_payload's
     # self-contained markdown+JSON block is what even a string-only client relays.
-    if not attached_images:
+    if not attached_images or _host_image_forwarding_on():
         import llm
 
         if llm.resolve_generation_mode() == "host":
@@ -1921,6 +1925,7 @@ async def _ground_and_gate(
     progress: ProgressCb = None,
     audit_source: str = "prepare",
     run_ambiguity_llm: bool = True,
+    defer_vision: bool = False,
 ) -> "str | _Grounding":
     """Run the shared front half: URL/Jira fetch, _jira_preflight, Swagger
     ingest, UI extraction, comment reconciliation, and the (fail-safe) ambiguity
@@ -1966,7 +1971,9 @@ async def _ground_and_gate(
                 ui_content = None
             else:
                 try:
-                    ui_content = await extract_ui_elements(text, prefetched=url_content)
+                    ui_content = await extract_ui_elements(
+                        text, prefetched=url_content, defer_vision=defer_vision
+                    )
                 except Exception:
                     logger.debug(
                         "mcp: UI extraction failed -- continuing", exc_info=True
@@ -2162,7 +2169,28 @@ _SERVER_LLM_FLAGS_SUBMIT: tuple = (
 _SERVER_LLM_FLAGS: tuple = _SERVER_LLM_FLAGS_PREPARE + _SERVER_LLM_FLAGS_SUBMIT
 
 
-def _host_mode_server_llm_notice(*, ac_boomeranged: bool = False) -> str:
+def _host_image_forwarding_on() -> bool:
+    """True when QA_HOST_IMAGE_DESCRIPTION_ENABLED is on AND generation resolves
+    to host -- i.e. when raw screenshots go to the tester's OWN multimodal model
+    as MCP image content instead of through this server's ask_vision.
+
+    Never raises: an unreadable setting or an import failure reads as OFF, which
+    is today's behaviour, so this can only ever fail CLOSED.
+    """
+    try:
+        if not getattr(settings, "qa_host_image_description_enabled", False):
+            return False
+        import llm
+
+        return llm.resolve_generation_mode() == "host"
+    except Exception:
+        logger.debug("_host_image_forwarding_on check failed", exc_info=True)
+        return False
+
+
+def _host_mode_server_llm_notice(
+    *, ac_boomeranged: bool = False, img_boomeranged: bool = False
+) -> str:
     """Disclose the flags that make THIS SERVER call an LLM on the host path.
 
     Returns "" when none are on. Never raises: a setting that cannot be read is
@@ -2191,7 +2219,7 @@ def _host_mode_server_llm_notice(*, ac_boomeranged: bool = False) -> str:
     # ambiguity gate still server-side, a prepare that shipped an AC job to
     # the chat has something the tester must be told, and a notice that
     # misdescribes what this server did is worse than no notice.
-    if not on and not amb_skipped and not ac_boomeranged:
+    if not on and not amb_skipped and not ac_boomeranged and not img_boomeranged:
         return ""
     lines: list = []
     if on:
@@ -2231,6 +2259,16 @@ def _host_mode_server_llm_notice(*, ac_boomeranged: bool = False) -> str:
             "array with your suite; they will be labelled MODEL-DERIVED, and "
             "without them the suite finalizes with no requirements "
             "traceability."
+        )
+    if img_boomeranged:
+        lines.append(
+            "> \u2139\ufe0f  `QA_HOST_IMAGE_DESCRIPTION_ENABLED` is on, so this "
+            "server made **no** vision call for the screenshot(s): they are "
+            "attached to this reply as image content for your OWN multimodal "
+            "model, which needs no `ANTHROPIC_API_KEY` and no backend. Read them "
+            "as step 0c of the payload's `jobs_to_run`, ground your cases in "
+            "them, and return an optional top-level `image_descriptions` array "
+            "so this server can record what they showed."
         )
     return "\n".join(lines)
 
@@ -2277,6 +2315,15 @@ async def handle_prepare_test_cases(
             bool(getattr(settings, "qa_host_ac_review_enabled", False))
             and llm.resolve_generation_mode() == "host"
         )
+        # The LAST two server-side calls on this path, both vision-only and both
+        # api-backend only -- so on cli/cursor they already no-op and the image
+        # grounding is LOST today, not saved. ON, this server makes NEITHER call
+        # and the raw bytes go to the host's OWN multimodal model as MCP image
+        # content. Read defensively (getattr) like every other flag here.
+        _host_img = (
+            bool(getattr(settings, "qa_host_image_description_enabled", False))
+            and llm.resolve_generation_mode() == "host"
+        )
         grounded = await _ground_and_gate(
             text,
             attached_images=attached_images,
@@ -2285,6 +2332,7 @@ async def handle_prepare_test_cases(
             ask_text=ask_text,
             progress=progress,
             run_ambiguity_llm=not _host_amb,
+            defer_vision=_host_img,
         )
         if isinstance(grounded, str):
             return PreparePayloadResult(clarify=grounded)
@@ -2292,6 +2340,35 @@ async def handle_prepare_test_cases(
         async def _on_status(msg: str) -> None:
             await _emit(progress, msg)
 
+        # Pop the DEFERRED Tier-3 screenshot BEFORE _prepare_generation: raw
+        # bytes must never reach serialize_prepared / the prep store, which are
+        # JSON. The key is absent unless defer_vision actually suppressed the
+        # vision call, so this is a no-op with the flag off.
+        page_screenshot = None
+        if isinstance(grounded.ui_content, dict):
+            page_screenshot = grounded.ui_content.pop("vision_screenshot", None)
+        # Everything the host's own multimodal model should see. Jira ticket
+        # images are the pre-existing forwarding (still key-gated inside
+        # jira_fetcher._fetch_jira_images, so a keyless install has none); the
+        # chat attachments and the page screenshot need NO key at all, which is
+        # what makes this useful on a keyless host-mode deployment.
+        host_images: list = []
+        if _host_img:
+            host_images = [
+                i for i in ((grounded.url_content or {}).get("images") or []) if i
+            ]
+            host_images += [i for i in (attached_images or []) if i]
+            if page_screenshot:
+                host_images.append(
+                    {
+                        "filename": "rendered_page.png",
+                        "mime": "image/png",
+                        "data": page_screenshot,
+                    }
+                )
+        # Narrower than the flag, exactly like _ac_job: with nothing to forward
+        # there is no job to ship and nothing to ask the host for.
+        _img_job = bool(_host_img and host_images)
         prepared = await _prepare_generation(
             text,
             grounded.url_content,
@@ -2299,6 +2376,7 @@ async def handle_prepare_test_cases(
             attached_images=attached_images,
             openapi_text=grounded.openapi_text,
             describe_images_server_side=False,
+            describe_attached_images_server_side=not _host_img,
             synthesize_acs=not _host_ac,
             on_status=_on_status,
         )
@@ -2332,6 +2410,10 @@ async def handle_prepare_test_cases(
                 # whether to expect an `acceptance_criteria` field, and a
                 # mid-flow .env flip must not change that for an in-flight prep.
                 "host_ac_job": bool(_ac_job),
+                # Stamped at PREPARE time for the same reason: submit must know
+                # whether to expect an `image_descriptions` field, and a mid-flow
+                # .env flip must not change that for an in-flight prep.
+                "host_image_job": bool(_img_job),
                 # Parallel fan-out contract is stamped at PREPARE time so a mid-flight
                 # .env flip cannot change the finalize gate for an in-flight prep.
                 "parallel_fanout": bool(settings.qa_host_parallel_fanout_enabled),
@@ -2357,13 +2439,17 @@ async def handle_prepare_test_cases(
         # The GENERAL job mechanism. Also indexes the ambiguity job attached
         # just above (host_mode._LEGACY_JOB_KEYS), and is a no-op returning a
         # key-identical payload when neither is on.
-        payload = host_mode.attach_jobs(payload, [host_mode.AC_JOB] if _ac_job else [])
+        _host_jobs = ([host_mode.AC_JOB] if _ac_job else []) + (
+            [host_mode.IMAGE_JOB] if _img_job else []
+        )
+        payload = host_mode.attach_jobs(payload, _host_jobs)
         await _audit(
             "mcp_prepare_test_cases",
             entity_id=prep_id,
             detail={
                 "host_ambiguity_review": bool(_host_amb),
                 "host_ac_job": bool(_ac_job),
+                "host_image_job": bool(_img_job),
             },
         )
         # Item 6: carry the RAW ticket screenshots so the TOOL layer can forward
@@ -2372,8 +2458,19 @@ async def handle_prepare_test_cases(
         # only when JIRA_FETCH_IMAGES + ANTHROPIC_API_KEY let jira_fetcher download
         # them; otherwise empty and the payload's text image_context is the
         # fallback. Bytes are never persisted in the prep store.
-        ticket_images = list((grounded.url_content or {}).get("images") or [])
-        _notice = _host_mode_server_llm_notice(ac_boomeranged=_ac_job)
+        # QA_HOST_IMAGE_DESCRIPTION_ENABLED additionally forwards the tester's
+        # chat attachments and any deferred Tier-3 page screenshot. OFF (or with
+        # nothing extra to send) this is EXACTLY today's ticket-images-only list.
+        # _select_prepare_images still applies the byte budget and discloses any
+        # image it has to drop, so the wider list needs no new cap here.
+        ticket_images = (
+            list(host_images)
+            if _img_job
+            else list((grounded.url_content or {}).get("images") or [])
+        )
+        _notice = _host_mode_server_llm_notice(
+            ac_boomeranged=_ac_job, img_boomeranged=_img_job
+        )
         # Item 2b: disclose any OTHER in-flight prep (fetched worker packets /
         # staged rows) so an interrupted run is resumable instead of silently
         # evaporating. APPEND, never assign -- see PreparePayloadResult.
@@ -2762,6 +2859,30 @@ async def _unfinished_preps_note(exclude_prep_id: str = "") -> str:
 _SIDECAR_KEYS = ("duplicate_groups", "acceptance_criteria", "ambiguity_result")
 
 
+def _sidecar_keys() -> tuple:
+    """The recognised sidecar review fields for THIS request.
+
+    `requirement_matches` joins the tuple ONLY under
+    QA_QUALIFIED_TC_IDS_ENABLED (phase 2): without the qualified-id contract
+    its tc_id values could only be remapped by the first-category-wins guess
+    this flag exists to retire. _SIDECAR_KEYS itself is unchanged (and stays
+    pinned by tests/test_host_ac_review.py) so the flag-OFF surface is
+    byte-identical. Never raises."""
+    try:
+        keys = _SIDECAR_KEYS
+        if getattr(settings, "qa_host_image_description_enabled", False):
+            # The image job's return field is finalize-time review material like
+            # the others, so the staged (crash-safe) route must be able to carry
+            # it in a sidecar. Flag-gated, so the OFF surface is unchanged.
+            keys = keys + ("image_descriptions",)
+        if host_mode.qualified_ids_on():
+            keys = keys + ("requirement_matches",)
+        return keys
+    except Exception:  # pragma: no cover
+        logger.debug("_sidecar_keys flag read failed", exc_info=True)
+    return _SIDECAR_KEYS
+
+
 def _review_sidecar(suite_json) -> "dict | None":
     """Return the parsed object when suite_json is a REVIEW SIDECAR.
 
@@ -2784,7 +2905,7 @@ def _review_sidecar(suite_json) -> "dict | None":
             return None
         if not isinstance(data, dict):
             return None
-        if not any(k in data for k in _SIDECAR_KEYS):
+        if not any(k in data for k in _sidecar_keys()):
             return None
         cases = data.get("test_cases")
         if cases is None or cases == []:
@@ -2841,6 +2962,188 @@ def _remap_dup_groups(groups, id_map: dict) -> list:
         logger.debug("dup group remap failed", exc_info=True)
         return list(groups or [])
     return out
+
+
+_QUAL_REMAP_MAX_NOTES = 20
+
+
+def _qualified_id_maps(rows: list) -> "tuple[dict, set]":
+    """(qualified_id_map, ambiguous_bare_ids) for a staged-row merge.
+
+    Replays _merge_category_rows' iteration EXACTLY (same row/case skip
+    rules, same global renumber sequence) so the qualified map agrees with
+    the id_map that function returns. Kept SEPARATE so the shipped 3-tuple
+    return contract (pinned by tests) is untouched and the flag-OFF path
+    never runs this at all; a consistency test pins the two against each
+    other (tests/test_qualified_tc_ids.py). Keys are "<category>:<old_id>"
+    for BOTH the raw submitted category name and its canonical form;
+    ambiguous_bare_ids is every old_id submitted by more than one staged
+    row -- the set the remap refuses LOUDLY instead of first-match guessing.
+    Never raises."""
+    qual: dict = {}
+    ambiguous: set = set()
+    seen_bare: set = set()
+    try:
+        i = 0
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            name = row.get("category_name", "")
+            if name == "__round__":
+                continue
+            payload = row.get("payload") or {}
+            cases = payload.get("test_cases")
+            if not isinstance(cases, list):
+                continue
+            canon = host_mode.normalize_category(name)
+            raw_name = str(name or "").strip()
+            for c in cases:
+                if not isinstance(c, dict):
+                    continue
+                i += 1
+                old_id = c.get("tc_id")
+                if not (isinstance(old_id, str) and old_id):
+                    continue
+                new_id = f"TC-{i:04d}"
+                for cat_key in {canon, raw_name}:
+                    if cat_key:
+                        qual.setdefault(f"{cat_key}:{old_id}", new_id)
+                if old_id in seen_bare:
+                    ambiguous.add(old_id)
+                else:
+                    seen_bare.add(old_id)
+    except Exception:
+        logger.debug("_qualified_id_maps failed", exc_info=True)
+    return qual, ambiguous
+
+
+def _map_qualified_id(
+    tid: str, id_map: dict, qual_map: dict, ambiguous: set, global_ids: set, note
+) -> str:
+    """Map ONE possibly-qualified UNTRUSTED id onto its post-merge global id.
+
+    Returns "" when the id must be DROPPED: an unknown qualified id, or an
+    ambiguous bare id -- refused loudly via ``note``, never guessed (the
+    latent first-category-wins collision this contract retires). An id that
+    is already a post-merge GLOBAL id (e.g. copied from the server's dup
+    shortlist) passes through untouched. Pure; the note text is sanitised
+    for backtick-span interpolation."""
+    cat, bare = host_mode.split_qualified_tc_id(tid)
+    safe = tid[:48].replace("`", "").replace("\n", " ")
+    if cat:
+        canon = host_mode.normalize_category(cat)
+        hit = qual_map.get(f"{cat}:{bare}")
+        if not hit and canon:
+            hit = qual_map.get(f"{canon}:{bare}")
+        if hit:
+            return hit
+        note(f"`{safe}` does not match any staged category submission -- ignored.")
+        return ""
+    if bare in global_ids:
+        if bare in ambiguous:
+            note(
+                f"`{safe}` matched a post-merge GLOBAL id but is ALSO a tc_id "
+                "submitted by more than one staged category -- interpreted as "
+                "the GLOBAL id. Send `<category>:<tc_id>` if you meant a "
+                "category's own case."
+            )
+        return bare
+    if bare in ambiguous:
+        note(
+            f"`{safe}` is AMBIGUOUS: more than one staged category submitted "
+            "that tc_id, so it was IGNORED rather than guessed. Resend it "
+            "category-qualified as `<category>:<tc_id>`."
+        )
+        return ""
+    return id_map.get(bare, bare)
+
+
+def _remap_sidecar_groups(
+    groups, id_map: dict, qual_map: dict, ambiguous: set
+) -> "tuple[list, list]":
+    """Qualified-id-aware remap of a sidecar's duplicate_groups (phase 2).
+
+    Mirrors _remap_dup_groups but consults the qualified map first, passes a
+    post-merge global id straight through, and REFUSES an ambiguous bare id
+    with a loud note instead of the shipped first-category-wins guess. Runs
+    ONLY under QA_QUALIFIED_TC_IDS_ENABLED -- flag OFF keeps calling
+    _remap_dup_groups, byte-identically. UNTRUSTED input: shape-tolerant,
+    notes bounded, never raises."""
+    out: list = []
+    notes: list = []
+
+    def _note(msg: str) -> None:
+        if len(notes) < _QUAL_REMAP_MAX_NOTES:
+            notes.append(msg)
+
+    try:
+        global_ids = set(id_map.values())
+        for g in groups or []:
+            if not isinstance(g, (list, tuple)):
+                continue
+            mapped: list = []
+            for tid in g:
+                if not isinstance(tid, str):
+                    continue
+                hit = _map_qualified_id(
+                    tid, id_map, qual_map, ambiguous, global_ids, _note
+                )
+                if hit:
+                    mapped.append(hit)
+            if mapped:
+                out.append(mapped)
+        return out, notes
+    except Exception:
+        logger.debug("qualified dup group remap failed", exc_info=True)
+        return list(groups or []), notes
+
+
+def _remap_req_matches(
+    raw, id_map: dict, qual_map: dict, ambiguous: set
+) -> "tuple[object, list]":
+    """Qualified-id-aware remap of a sidecar's requirement_matches VALUES.
+
+    Shape-tolerant on UNTRUSTED input and deliberately MINIMAL: keys are left
+    untouched (they are requirement ids, not tc_ids), a str value is treated
+    as a one-element list exactly as the downstream validator does, any other
+    value shape and any non-str member are passed through UNCHANGED so
+    host_mode.extract_requirement_matches remains the sole screening / shape
+    authority (its never-raise notes still fire on garbage), and a non-dict
+    field is returned as-is for the same reason. Never raises."""
+    notes: list = []
+
+    def _note(msg: str) -> None:
+        if len(notes) < _QUAL_REMAP_MAX_NOTES:
+            notes.append(msg)
+
+    try:
+        if not isinstance(raw, dict):
+            return raw, notes
+        global_ids = set(id_map.values())
+        out: dict = {}
+        for key, value in raw.items():
+            if isinstance(value, str):
+                members = [value]
+            elif isinstance(value, list):
+                members = value
+            else:
+                out[key] = value
+                continue
+            mapped: list = []
+            for m in members:
+                if not isinstance(m, str):
+                    mapped.append(m)
+                    continue
+                hit = _map_qualified_id(
+                    m, id_map, qual_map, ambiguous, global_ids, _note
+                )
+                if hit:
+                    mapped.append(hit)
+            out[key] = mapped
+        return out, notes
+    except Exception:
+        logger.debug("qualified requirement_matches remap failed", exc_info=True)
+        return raw, notes
 
 
 def _fanout_incomplete_note(meta: object, rows: list, prep_id: str) -> str:
@@ -3211,6 +3514,11 @@ async def handle_submit_category(
                 "**ignored** and re-sending the cases costs a round trip and the "
                 "tokens to repeat them."
             )
+        # Phase 2 (QA_DUP_SHORTLIST_ENABLED, default OFF): "" unless THIS
+        # submission completed the expected set and the prescreen found pairs.
+        _shortlist = await _dup_shortlist_note(
+            (loaded.get("content") or {}).get("meta"), rows.get("content") or []
+        )
         return (
             f"{note}## ✅ Recorded {len(cases_json)} case(s) for "
             f"**{category_name}**\n\n"
@@ -3218,12 +3526,54 @@ async def handle_submit_category(
             "(newest wins).\n\n"
             f"**{on_file}** category row(s) staged for prep_id `{prep_id}`"
             f"{staged_names}.\n\n"
-            f"{route}"
+            f"{route}{_shortlist}"
         )
     except Exception as exc:
         logger.exception("handle_submit_category failed")
         _capture_error(exc, "qa_submit_category")
         return f"⚠️ Recording the category failed: {exc}"
+
+
+async def _dup_shortlist_note(meta: object, rows_content: list) -> str:
+    """Server-assisted duplicate shortlist (QA_DUP_SHORTLIST_ENABLED, OFF).
+
+    When THIS submission completed the expected category set, merge the
+    staged rows (pure -- nothing is persisted or deleted) and append
+    lexically prescreened candidate duplicate pairs, printed with POST-MERGE
+    GLOBAL tc_ids so the host confirms a shortlist via the finalize sidecar
+    instead of re-reading the merged suite. Needs
+    QA_HOST_DEDUP_REVIEW_ENABLED (it feeds that review). Returns "" when
+    gated off, not ready, no pairs, or on ANY error -- it must never break or
+    block a category submit. Deliberate F4/F11 carve-out, stated here so it
+    reads as a decision: this section names `duplicate_groups` in a
+    qa_submit_category reply, but only under the OFF-by-default flag and only
+    as the server's OWN prescreen output (a review the server just ran), not
+    as a request to attach the field to a per-category submission."""
+    try:
+        if not host_mode.dup_shortlist_on():
+            return ""
+        if not bool(getattr(settings, "qa_host_dedup_review_enabled", False)):
+            return ""
+        if not isinstance(meta, dict):
+            return ""
+        expected = list(meta.get("expected_categories") or [])
+        if not expected:
+            return ""
+        rows = rows_content
+        staged_names = [
+            str(r.get("category_name") or "") for r in rows if isinstance(r, dict)
+        ]
+        status = host_mode.prep_status_view(
+            expected=expected, staged_raw_names=staged_names
+        )
+        if not status.get("ready"):
+            return ""
+        merged_dict, _used, _id_map = _merge_category_rows(rows)
+        pairs = host_mode.build_dup_shortlist(merged_dict.get("test_cases") or [])
+        return host_mode.build_dup_shortlist_section(pairs)
+    except Exception:
+        logger.debug("dup shortlist prescreen failed", exc_info=True)
+        return ""
 
 
 async def handle_submit_suite(
@@ -3305,10 +3655,10 @@ async def handle_submit_suite(
                 rows_res = await prep_store.load_submissions(prep_id)
                 rows = rows_res.get("content") or []
                 if not rows:
+                    _keys_label = "`" + "` / `".join(_sidecar_keys()) + "`"
                     return (
                         "⚠️ Nothing to finalize: received a review sidecar "
-                        "(`duplicate_groups` / `acceptance_criteria` / "
-                        "`ambiguity_result`) but no per-category rows are staged "
+                        f"({_keys_label}) but no per-category rows are staged "
                         f"for prep_id `{prep_id}`."
                     )
                 # CRITICAL (iteration 5): the SIDECAR finalize merges the same
@@ -3326,10 +3676,28 @@ async def handle_submit_suite(
                 # `duplicate_groups` present-but-empty reads downstream as "the
                 # host reviewed and found none", which an AC-only sidecar
                 # must not claim.
+                # Phase 2 (QA_QUALIFIED_TC_IDS_ENABLED): qualified-id-aware
+                # remap with a LOUD refusal of ambiguous bare ids. Flag OFF
+                # takes the shipped _remap_dup_groups path byte-identically
+                # (including its documented first-category-wins collision).
+                _sidecar_notes: list = []
+                if host_mode.qualified_ids_on():
+                    _qual_map, _amb_bare = _qualified_id_maps(rows)
+                else:
+                    _qual_map, _amb_bare = {}, set()
                 if sidecar_raw is not None:
-                    merged_dict["duplicate_groups"] = _remap_dup_groups(
-                        sidecar_raw, id_map
-                    )
+                    if host_mode.qualified_ids_on():
+                        (
+                            merged_dict["duplicate_groups"],
+                            _dg_notes,
+                        ) = _remap_sidecar_groups(
+                            sidecar_raw, id_map, _qual_map, _amb_bare
+                        )
+                        _sidecar_notes += _dg_notes
+                    else:
+                        merged_dict["duplicate_groups"] = _remap_dup_groups(
+                            sidecar_raw, id_map
+                        )
                 _sidecar_acs = sidecar_obj.get("acceptance_criteria")
                 if _sidecar_acs is not None:
                     merged_dict["acceptance_criteria"] = _sidecar_acs
@@ -3341,14 +3709,37 @@ async def handle_submit_suite(
                 _sidecar_amb = sidecar_obj.get("ambiguity_result")
                 if _sidecar_amb is not None:
                     merged_dict["ambiguity_result"] = _sidecar_amb
+                # Phase 2 (QA_QUALIFIED_TC_IDS_ENABLED): requirement_matches
+                # may ride the sidecar too -- VALUES remapped through the same
+                # qualified-id-aware machinery, keys (requirement ids) left
+                # untouched. host_mode.extract_requirement_matches stays the
+                # sole shape/screening authority downstream, unchanged.
+                if host_mode.qualified_ids_on():
+                    _sidecar_rm = sidecar_obj.get("requirement_matches")
+                    if _sidecar_rm is not None:
+                        _rm_mapped, _rm_notes = _remap_req_matches(
+                            _sidecar_rm, id_map, _qual_map, _amb_bare
+                        )
+                        merged_dict["requirement_matches"] = _rm_mapped
+                        _sidecar_notes += _rm_notes
                 parsed = host_mode.parse_host_suite(merged_dict)
                 has_full = False
+                _keys_label = "`" + "` / `".join(_sidecar_keys()) + "`"
                 conflict_note = (
                     f"> ℹ️  Finalized from {used} accumulated per-category "
-                    "row(s) plus a review sidecar (`duplicate_groups` / "
-                    "`acceptance_criteria` / `ambiguity_result`) (no full "
+                    f"row(s) plus a review sidecar ({_keys_label}) (no full "
                     "suite_json test_cases were submitted).\n\n"
                 )
+                if _sidecar_notes:
+                    conflict_note += (
+                        "> ⚠️  Sidecar id notes (qualified-id contract; "
+                        "UNTRUSTED input, validated server-side):\n"
+                        + "".join(
+                            f">   - {n}\n"
+                            for n in _sidecar_notes[:_QUAL_REMAP_MAX_NOTES]
+                        )
+                        + "\n"
+                    )
             elif has_full:
                 parsed = host_mode.parse_host_suite(suite_json)
                 rows_res = await prep_store.load_submissions(prep_id)
@@ -3473,6 +3864,21 @@ async def handle_submit_suite(
             if ac_result.ran and not getattr(prepared, "acs", None):
                 prepared.acs = list(ac_result.acs)
             ac_note = host_mode.build_host_ac_section(ac_result, all_cases)
+        # The image job's return field. This server described NOTHING itself on
+        # this prep -- no ask_vision at all -- so the host's own multimodal model
+        # is the only thing that read the screenshots. UNTRUSTED (pixels can be
+        # attacker-controlled just like the _GUARD-wrapped ticket text): shape
+        # validated, URL-stripped, newline-collapsed and capped by host_mode
+        # before anything renders it, and it feeds NO prompt and NO exporter
+        # field. Keyed off the prep's meta stamp, so a mid-flow .env flip cannot
+        # change an in-flight prep and a normal submit is byte-identical.
+        img_note = ""
+        if meta.get("host_image_job"):
+            img_note = host_mode.build_host_image_section(
+                host_mode.extract_host_image_descriptions(
+                    getattr(parsed, "raw_image_descriptions", None)
+                )
+            )
         # Piece 1: the host's OPTIONAL cross-category duplicate review. It rode in
         # on THIS submission -- no extra round trip and no server-side LLM call --
         # and its SHAPE was validated against the submitted tc_ids inside
@@ -3674,10 +4080,19 @@ async def handle_submit_suite(
             and not has_full
             and (cov_review is None or not cov_review.ran)
         ):
-            dup_status_note += (
-                "> \u2139\ufe0f  No host coverage review ran either: that also "
-                "needs ONE merged `suite_json`.\n\n"
-            )
+            if host_mode.qualified_ids_on():
+                dup_status_note += (
+                    "> \u2139\ufe0f  No host coverage review ran either: send "
+                    "`requirement_matches` with ONE merged `suite_json`, or "
+                    "on the staged route put it in the finalize review "
+                    "SIDECAR with category-qualified tc_ids (see your "
+                    "preparation instructions).\n\n"
+                )
+            else:
+                dup_status_note += (
+                    "> \u2139\ufe0f  No host coverage review ran either: that also "
+                    "needs ONE merged `suite_json`.\n\n"
+                )
         if cov_review is not None:
             cov_note = host_mode.build_coverage_review_section(
                 cov_review,
@@ -3751,7 +4166,7 @@ async def handle_submit_suite(
                 )
                 return (
                     f"{version_note}{dropped_note}{conflict_note}{cat_source}"
-                    f"{amb_note}{ac_note}{dup_status_note}{dup_note}"
+                    f"{amb_note}{ac_note}{img_note}{dup_status_note}{dup_note}"
                     f"{cov_note}{gap_md}"
                 )
             cap_note = (
@@ -3854,7 +4269,7 @@ async def handle_submit_suite(
         await prep_store.delete_prep(prep_id)
         return (
             f"{version_note}{dropped_note}{conflict_note}{cat_source}"
-            f"{fa_skip_note}{amb_note}{ac_note}{dup_status_note}{dup_note}"
+            f"{fa_skip_note}{amb_note}{ac_note}{img_note}{dup_status_note}{dup_note}"
             f"{cov_note}{result_md}{cap_note}"
         )
     except Exception as exc:

@@ -547,6 +547,34 @@ class Settings(BaseSettings):
     # generation summary. Disable to hide it.
     qa_token_meter_enabled: bool = True
 
+    # Per-phase breakdown on the meter line (opt-in, default OFF). When ON the
+    # summary gains a second "By phase" line splitting the run's tokens across
+    # generation / critic / rewrite / other. Purely presentational: it never
+    # changes what is generated, only what is reported.
+    qa_token_meter_detail_enabled: bool = False
+
+    # $ cost estimate on the meter line (opt-in, default OFF). Priced ONLY from
+    # calls whose REAL API usage was captured (api backend); a char-estimated
+    # call is reported as unpriced rather than silently priced from a guess.
+    qa_token_meter_cost_enabled: bool = False
+
+    # Approximate per-1M-token prices for the two model tiers this codebase
+    # actually configures (qa_llm_model / qa_classifier_model). These are
+    # APPROXIMATE published rates and drift; override via .env rather than
+    # treating them as authoritative. The cost line is always labelled an
+    # estimate and never drives generation behaviour, so a stale default
+    # degrades to a slightly-off dollar figure, nothing more. Coerced by
+    # _coerce_token_price (never raises; negatives clamp to 0.0).
+    qa_token_price_generation_input_per_1m: float = 3.0
+    qa_token_price_generation_output_per_1m: float = 15.0
+    qa_token_price_classifier_input_per_1m: float = 1.0
+    qa_token_price_classifier_output_per_1m: float = 5.0
+    # Anthropic bills cache reads/writes as a fraction/multiple of the SAME
+    # tier's input rate, so these scale that rate rather than adding two more
+    # absolute-rate fields per tier.
+    qa_token_price_cache_read_discount: float = 0.1
+    qa_token_price_cache_write_multiplier: float = 1.25
+
     # Ambiguity pre-pass (T-11): minimum severity ("low"/"medium"/"high") at which
     # the app pauses to offer clarifying questions before generating. "off"
     # disables the pre-pass entirely (no extra LLM call).
@@ -976,6 +1004,27 @@ class Settings(BaseSettings):
     # cannot change an in-flight prep).
     qa_host_ambiguity_require_result: bool = False
 
+    # --- Host-derived image descriptions (opt-in, default OFF) -------------
+    # WHY: the last two server-side LLM calls on the host path are BOTH
+    # vision-only -- tools/ui_extractor's Tier-3 ask_vision (a rendered
+    # screenshot of a non-Jira page) and tools/image_description.describe_images
+    # (screenshots / mockups the tester attached to the chat). llm.ask_vision is
+    # api-backend only, so on QA_LLM_BACKEND=cli/cursor both already no-op with
+    # their "Error: ..." sentinel: image grounding is silently LOST there today,
+    # not saved. When this flag is ON and generation mode resolves to host, the
+    # server makes NEITHER call and instead forwards the RAW bytes to the
+    # tester's OWN multimodal chat model as MCP image content -- the same
+    # mechanism Jira ticket images already use (PreparePayloadResult.images) --
+    # together with an `image_description_job` in the payload. The host describes
+    # them in-chat (no llm.py, no backend, no key, no quota) and returns an
+    # OPTIONAL top-level `image_descriptions` array, which submit validates as
+    # UNTRUSTED input exactly like `acceptance_criteria`. It ALSO lifts the
+    # attached_images host-routing suppression in tools/mcp_handlers, which only
+    # existed because those attachments were consumable server-side alone.
+    # Server mode is untouched: every branch is gated on the flag AND on
+    # llm.resolve_generation_mode() == "host".
+    qa_host_image_description_enabled: bool = False
+
     # --- Host-reviewed duplicate review (Piece 1; opt-in, default OFF) -----
     # qa_semantic_dedup_enabled needs qa_embeddings_backend, and the only KEYLESS
     # embeddings backend is "local" (sentence-transformers, ~2 GB of torch), so on
@@ -1113,6 +1162,27 @@ class Settings(BaseSettings):
     # ._expired() reads touched_at only under qa_prep_sliding_ttl_enabled.
     qa_prep_disclose_unfinished: bool = False
 
+    # --- Phase 2 fan-out follow-ups (2026-07-31; opt-in, default OFF) -------
+    # Category-qualified tc_id contract for finalize-time review sidecars.
+    # Every staged category restarts its tc_ids at TC-001, so a bare
+    # cross-category id is ambiguous until the merge renumbers it. ON:
+    # sidecar ids may be written "<category>:<tc_id>", bare ids stay accepted
+    # where unambiguous, an AMBIGUOUS bare id is refused with a loud note
+    # instead of silently mapping to whichever category merged first (the
+    # latent first-category-wins collision in _remap_dup_groups), and
+    # requirement_matches becomes a valid sidecar field with the same
+    # collision-safe remap. OFF: byte-identical to today, including the
+    # documented latent collision.
+    qa_qualified_tc_ids_enabled: bool = False
+    # Server-assisted duplicate shortlist: when the FINAL expected category is
+    # staged, qa_submit_category's reply appends lexically prescreened
+    # candidate duplicate pairs (stdlib difflib over the merged cases, printed
+    # with POST-MERGE GLOBAL tc_ids -- the phase-1 review settled on global
+    # ids to dodge the per-category TC-001 collision trap) so the host
+    # confirms a shortlist instead of re-reading the merged suite. ADVISORY
+    # only; requires QA_HOST_DEDUP_REVIEW_ENABLED to matter.
+    qa_dup_shortlist_enabled: bool = False
+
     # Append-only audit log (LT-1 ph2). SQLite file recording key events (suite
     # generated, exported, pushed, bug reported) so multi-team deployments have a
     # trail. Never-raise; a failure degrades to no-audit, logged.
@@ -1188,6 +1258,8 @@ class Settings(BaseSettings):
         "qa_web_search_enabled",
         "qa_rag_enabled",
         "qa_token_meter_enabled",
+        "qa_token_meter_detail_enabled",
+        "qa_token_meter_cost_enabled",
         "qa_coverage_regen_enabled",
         "qa_coverage_regen_merge_calls",
         "qa_ac_anchoring_enforce",
@@ -1239,12 +1311,15 @@ class Settings(BaseSettings):
         "qa_host_ambiguity_review_enabled",
         "qa_host_ac_review_enabled",
         "qa_host_ambiguity_require_result",
+        "qa_host_image_description_enabled",
         "qa_host_dedup_review_enabled",
         "qa_host_dedup_apply",
         "qa_host_coverage_review_enabled",
         "qa_host_parallel_fanout_enabled",
         "qa_prep_sliding_ttl_enabled",
         "qa_prep_disclose_unfinished",
+        "qa_qualified_tc_ids_enabled",
+        "qa_dup_shortlist_enabled",
         "qa_atomic_checklist_enabled",
         "qa_checklist_nli_enabled",
         "qa_checklist_adjudicate_enabled",
@@ -1410,6 +1485,47 @@ class Settings(BaseSettings):
                 default,
             )
             return default
+
+    @field_validator(
+        "qa_token_price_generation_input_per_1m",
+        "qa_token_price_generation_output_per_1m",
+        "qa_token_price_classifier_input_per_1m",
+        "qa_token_price_classifier_output_per_1m",
+        "qa_token_price_cache_read_discount",
+        "qa_token_price_cache_write_multiplier",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_token_price(cls, v: object, info) -> float:
+        """Lenient, never-raising float coercion for the token price table.
+
+        Mirrors _coerce_reconcile_threshold's shape, plus a floor: a NEGATIVE
+        rate would make the cost estimate SUBTRACT spend, which is never
+        meaningful, so it is clamped to 0.0 with a WARNING instead of being
+        honoured.
+        """
+        default = cls.model_fields[info.field_name].default
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            parsed = float(v)
+        else:
+            try:
+                parsed = float(str(v).strip())
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid %s=%r — using default %s",
+                    info.field_name.upper(),
+                    v,
+                    default,
+                )
+                return default
+        if parsed < 0:
+            logger.warning(
+                "Invalid %s=%r — a negative price would subtract cost; using 0.0",
+                info.field_name.upper(),
+                v,
+            )
+            return 0.0
+        return parsed
 
     @field_validator("qa_rag_top_k", mode="before")
     @classmethod

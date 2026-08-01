@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import logging
 
+from config.settings import settings
 from llm import ask_vision
+from tools import token_meter
 
 logger = logging.getLogger("qa_agents.image_description")
 
@@ -32,7 +34,9 @@ _DEFAULT_VISION_SYSTEM = (
 )
 
 
-async def describe_images(images: list[dict], system: str | None = None) -> str:
+async def describe_images(
+    images: list[dict], system: str | None = None, meter: object | None = None
+) -> str:
     """Describe each image via ask_vision() and return one merged markdown block.
 
     Each item in *images* is a dict with ``data`` (bytes) and optionally
@@ -57,6 +61,16 @@ async def describe_images(images: list[dict], system: str | None = None) -> str:
                 "Describe this image.",
                 img["data"],
                 media_type=img.get("mime", "image/png"),
+            )
+            # Vision runs on the DEFAULT (generation-tier) model -- this path
+            # never passes a classifier-tier override.
+            token_meter.note(
+                meter,
+                "other",
+                settings.qa_llm_model,
+                system=system or _DEFAULT_VISION_SYSTEM,
+                user="Describe this image.",
+                output_text=result if isinstance(result, str) else "",
             )
             if result and not result.startswith("Error:"):
                 descriptions.append(
