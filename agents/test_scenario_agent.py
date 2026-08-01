@@ -94,6 +94,8 @@ from tools.test_plan_report import (
 )
 from tools.testrail_exporter import generate_testrail_csv
 from tools.token_meter import TokenMeter
+from tools.token_meter import model_text as _meter_model_text
+from tools.token_meter import note as _meter_note
 from tools.untrusted import _GUARD, wrap_untrusted
 from tools.web_search import search_web
 from tools.xlsx_generator import generate_test_case_xlsx
@@ -914,7 +916,9 @@ _JIRA_IMAGE_VISION_SYSTEM = (
 )
 
 
-async def _describe_ticket_images(images: list[dict]) -> str:
+async def _describe_ticket_images(
+    images: list[dict], meter: TokenMeter | None = None
+) -> str:
     """Describe each Jira ticket image attachment via llm.ask_vision() so its
     content can reach the (text-only) generation prompt.
 
@@ -928,12 +932,24 @@ async def _describe_ticket_images(images: list[dict]) -> str:
     descriptions: list[str] = []
     for img in images:
         try:
+            _vision_user = (
+                f"Attachment filename: {img.get('filename', 'attachment')}\n"
+                "Describe this image."
+            )
             result = await ask_vision(
                 _JIRA_IMAGE_VISION_SYSTEM,
-                f"Attachment filename: {img.get('filename', 'attachment')}\n"
-                "Describe this image.",
+                _vision_user,
                 img["data"],
                 media_type=img.get("mime", "image/png"),
+            )
+            # Generation-tier model: this path passes no classifier override.
+            _meter_note(
+                meter,
+                "other",
+                settings.qa_llm_model,
+                system=_JIRA_IMAGE_VISION_SYSTEM,
+                user=_vision_user,
+                output_text=result if isinstance(result, str) else "",
             )
             if result and not result.startswith("Error:"):
                 descriptions.append(
@@ -1489,14 +1505,14 @@ async def _generate_for_category(
             # ONCE, after the quality section below, using whichever `cases`
             # won -- silently under-counting the retry/repair call's own tokens
             # whenever one fired. See plan-surgical-retry.md Risk #5.
-            if meter is not None:
-                try:
-                    meter.record(
-                        input_text=system + user_msg + (user_suffix or ""),
-                        output_text="".join(tc.model_dump_json() for tc in cases),
-                    )
-                except Exception:
-                    logger.debug("token meter record failed", exc_info=True)
+            _meter_note(
+                meter,
+                "generation",
+                model_override or settings.qa_llm_model,
+                system=system,
+                user=user_msg + (user_suffix or ""),
+                output_text="".join(tc.model_dump_json() for tc in cases),
+            )
             try:
                 ratio = quality_ratio(cases)
                 if ratio > _QUALITY_RETRY_THRESHOLD and attempt == 0:
@@ -1531,12 +1547,14 @@ async def _generate_for_category(
                                 cases = _merge_repaired_cases(
                                     cases, repair_batch, flagged
                                 )
-                                if meter is not None:
-                                    meter.record(
-                                        input_text=_CATEGORY_REPAIR_SYSTEM
-                                        + repair_user,
-                                        output_text=repair_batch.model_dump_json(),
-                                    )
+                                _meter_note(
+                                    meter,
+                                    "rewrite",
+                                    settings.qa_llm_model,
+                                    system=_CATEGORY_REPAIR_SYSTEM,
+                                    user=repair_user,
+                                    output_text=_meter_model_text(repair_batch),
+                                )
                         except asyncio.CancelledError:
                             raise
                         except Exception:
@@ -1585,16 +1603,17 @@ async def _generate_for_category(
                             )
                             if quality_ratio(retry_suite.test_cases) < ratio:
                                 cases = retry_suite.test_cases
-                            if meter is not None:
-                                meter.record(
-                                    input_text=retry_system
-                                    + user_msg
-                                    + (retry_user_suffix or ""),
-                                    output_text="".join(
-                                        tc.model_dump_json()
-                                        for tc in retry_suite.test_cases
-                                    ),
-                                )
+                            _meter_note(
+                                meter,
+                                "generation",
+                                settings.qa_llm_model,
+                                system=retry_system,
+                                user=user_msg + (retry_user_suffix or ""),
+                                output_text="".join(
+                                    tc.model_dump_json()
+                                    for tc in retry_suite.test_cases
+                                ),
+                            )
                         except asyncio.CancelledError:
                             raise
                         except Exception:
@@ -1789,6 +1808,7 @@ async def _rewrite_vague_fields(
     cases: list[TestCase],
     feature_text: str,
     on_status: Callable[[str], Awaitable[None]] | None = None,
+    meter: TokenMeter | None = None,
 ) -> list[TestCase]:
     """One LLM pass that rewrites vague step actions / expected results into
     concrete ones, so the quality gate has nothing left to flag.
@@ -1877,6 +1897,14 @@ async def _rewrite_vague_fields(
             model=settings.qa_classifier_model or None,
             max_tokens=resolve_max_tokens_tier("rewrite"),
         )
+        _meter_note(
+            meter,
+            "rewrite",
+            settings.qa_classifier_model or settings.qa_llm_model,
+            system=_REWRITE_SYSTEM,
+            user=user,
+            output_text=_meter_model_text(batch),
+        )
         updates = {
             it.id: it.text.strip()
             for it in batch.items
@@ -1912,6 +1940,7 @@ async def analyze_coverage_gaps(
     feature_text: str,
     test_cases: list[TestCase],
     acs: list[AcceptanceCriterion],
+    meter: TokenMeter | None = None,
 ) -> str:
     """Run a second LLM pass to identify coverage gaps. Never raises."""
     _FALLBACK = "\n\n## Coverage Gaps\n\nCould not complete coverage analysis — please review manually."
@@ -1938,6 +1967,15 @@ async def analyze_coverage_gaps(
             user=user_msg,
             model=resolve_tiered_model(settings.qa_model_tier_coverage_gaps),
             max_tokens=resolve_max_tokens_tier("critic"),
+        )
+        _meter_note(
+            meter,
+            "critic",
+            resolve_tiered_model(settings.qa_model_tier_coverage_gaps)
+            or settings.qa_llm_model,
+            system=_COVERAGE_CRITIC_SYSTEM,
+            user=user_msg,
+            output_text=result if isinstance(result, str) else "",
         )
 
         if result.startswith("Error:"):
@@ -1985,6 +2023,7 @@ async def critique_coverage(
     feature_text: str,
     test_cases: list[TestCase],
     acs: list[AcceptanceCriterion],
+    meter: TokenMeter | None = None,
 ) -> CoverageCritique:
     """Structured coverage critique (T-08). Never raises — returns a 'complete'
     verdict on any failure so remediation simply doesn't run."""
@@ -2010,7 +2049,7 @@ async def critique_coverage(
         # internal timeout, so a CLI holding the pipe open streamed forever. A
         # TimeoutError is an Exception, so the handler below degrades it to
         # verdict="complete" exactly like every other critic failure.
-        return await asyncio.wait_for(
+        _critique: CoverageCritique = await asyncio.wait_for(
             ask_json(
                 system=_STRUCTURED_CRITIC_SYSTEM,
                 user=user_msg,
@@ -2020,6 +2059,15 @@ async def critique_coverage(
             ),
             timeout=_resolve_category_ceiling(),
         )
+        _meter_note(
+            meter,
+            "critic",
+            settings.qa_classifier_model or settings.qa_llm_model,
+            system=_STRUCTURED_CRITIC_SYSTEM,
+            user=user_msg,
+            output_text=_meter_model_text(_critique),
+        )
+        return _critique
     except Exception:
         logger.warning("critique_coverage failed — treating as complete", exc_info=True)
         return CoverageCritique(verdict="complete")
@@ -2075,6 +2123,7 @@ async def critique_and_fill_gaps(
     user_msg: str,
     rtm_hint: str,
     round_num: int,
+    meter: TokenMeter | None = None,
 ) -> _CritiqueAndFillSuite:
     """Merged critique + gap-fill (QA_COVERAGE_REGEN_MERGE_CALLS, P2#5).
 
@@ -2131,7 +2180,7 @@ async def critique_and_fill_gaps(
         )
         # Bounded for the same reason as critique_coverage -- and this is the branch
         # QA_COVERAGE_REGEN_MERGE_CALLS=true actually runs, on every generation.
-        return await asyncio.wait_for(
+        _merged: _CritiqueAndFillSuite = await asyncio.wait_for(
             ask_json(
                 system=system,
                 user=merged_user,
@@ -2139,6 +2188,17 @@ async def critique_and_fill_gaps(
             ),
             timeout=_resolve_category_ceiling(),
         )
+        # Generation tier: this call authors tester-facing cases, not just an
+        # internal critique, and passes no classifier override.
+        _meter_note(
+            meter,
+            "generation",
+            settings.qa_llm_model,
+            system=system,
+            user=merged_user,
+            output_text=_meter_model_text(_merged),
+        )
+        return _merged
     except Exception:
         logger.warning(
             "critique_and_fill_gaps failed — treating as complete", exc_info=True
@@ -2163,6 +2223,7 @@ async def _remediate_gaps(
     presented_item_ids: list | None = None,
     on_status: Callable[[str], Awaitable[None]] | None = None,
     cache_prefix: bool = False,
+    meter: TokenMeter | None = None,
 ) -> tuple[list[TestCase], list[str]]:
     """Bounded critic->generate feedback loop to fill coverage gaps (T-08).
 
@@ -2279,7 +2340,13 @@ async def _remediate_gaps(
                     # to merge (its "critique" is the deterministic external
                     # matcher), so it keeps its loop untouched.
                     merged_result = await critique_and_fill_gaps(
-                        feature_text, merged, acs, user_msg, rtm_hint, round_num
+                        feature_text,
+                        merged,
+                        acs,
+                        user_msg,
+                        rtm_hint,
+                        round_num,
+                        meter=meter,
                     )
                     if (
                         merged_result.verdict != "gaps_found"
@@ -2295,7 +2362,9 @@ async def _remediate_gaps(
                     gap_preview = ", ".join(merged_result.gaps[:3]) or "coverage gaps"
                     new_cases = merged_result.new_cases
                 else:
-                    critique = await critique_coverage(feature_text, merged, acs)
+                    critique = await critique_coverage(
+                        feature_text, merged, acs, meter=meter
+                    )
                     if (
                         critique.verdict != "gaps_found"
                         or not critique.suggested_case_titles
@@ -2328,6 +2397,9 @@ async def _remediate_gaps(
                     rtm_hint=rtm_hint,
                     feature_text=feature_text,
                     complexity_text=complexity_text,
+                    # Previously omitted, so remediation-round generation was
+                    # invisible even to the one path that WAS metered.
+                    meter=meter,
                     # Same stable prefix as the fan-out, and every read
                     # refreshes the 5-minute TTL — so each remediation
                     # round is a 0.10x read, not a fresh full-price call.
@@ -2787,6 +2859,7 @@ async def _prepare_generation(
     single_screen: bool = False,
     on_status: Callable[[str], Awaitable[None]] | None = None,
     describe_images_server_side: bool = True,
+    describe_attached_images_server_side: bool = True,
     synthesize_acs: bool = True,
 ) -> PreparedGeneration | tuple[str, str, str, str, str]:
     """Generate test cases. Returns (message_markdown, xlsx_file_path, csv_file_path, testrail_file_path, status).
@@ -2946,6 +3019,12 @@ async def _prepare_generation(
             :MAX_DESCRIPTION_CHARS
         ]
 
+    # Created HERE, not after the fan-out: AC synthesis and checklist Pass 1
+    # below are real LLM calls that ran BEFORE the meter object existed, so
+    # they were structurally unmeterable. This only widens the window the SAME
+    # object is visible in -- nothing about what runs, or when, changes.
+    meter = TokenMeter()
+
     async def _run_rag() -> None:
         await _enrich_with_rag(feature_text, rag_parts)
 
@@ -2960,7 +3039,7 @@ async def _prepare_generation(
     async def _run_gen_acs() -> list[AcceptanceCriterion]:
         if not _need_acs or not synthesize_acs:
             return []
-        return await generate_acs(feature_text)
+        return await generate_acs(feature_text, meter=meter)
 
     async def _run_checklist() -> list[ChecklistItem]:
         # parent_context rides as BACKGROUND ONLY (SHYJ-7154): the decomposition
@@ -2970,6 +3049,7 @@ async def _prepare_generation(
             acceptance_criteria=_raw_ac_text,
             description_text=_description_text,
             background_text=parent_context,
+            meter=meter,
         )
 
     await _emit_status(
@@ -3022,6 +3102,11 @@ async def _prepare_generation(
     # the tester's own multimodal model receives the raw screenshots as MCP image
     # content. Always False in server mode, so images_present stays byte-identical.
     has_jira_images = False
+    # Same, for the tester's CHAT attachments: host mode with
+    # QA_HOST_IMAGE_DESCRIPTION_ENABLED forwards them as MCP image content and
+    # makes no describe_images() call, but the rule packs must still see that
+    # images exist. Always False in server mode.
+    has_attached_images = False
 
     for rag_part in rag_parts:
         parts.append(wrap_untrusted("rag_similar_past_cases", rag_part))
@@ -3063,7 +3148,7 @@ async def _prepare_generation(
             )
         images = url_content.get("images") or []
         if images and describe_images_server_side:
-            jira_image_text = await _describe_ticket_images(images)
+            jira_image_text = await _describe_ticket_images(images, meter=meter)
             if jira_image_text:
                 parts.append(
                     "## Ticket Images\n"
@@ -3077,8 +3162,16 @@ async def _prepare_generation(
             # images are present so the rule packs still see images_present.
             has_jira_images = True
 
-    if attached_images:
-        attached_image_text = await describe_images(attached_images)
+    if attached_images and not describe_attached_images_server_side:
+        # Host-mode boomerang (QA_HOST_IMAGE_DESCRIPTION_ENABLED): make NO
+        # server-side llm.ask_vision call. The raw screenshots ride to the host's
+        # OWN multimodal model as MCP image content, so there is no description
+        # to embed here and, deliberately, NO image_notice: nothing was lost, and
+        # the "configure ANTHROPIC_API_KEY for vision" line would be a lie on a
+        # path that needs no key at all.
+        has_attached_images = True
+    elif attached_images:
+        attached_image_text = await describe_images(attached_images, meter=meter)
         if attached_image_text:
             parts.append(
                 "## Attached Images\n"
@@ -3130,7 +3223,12 @@ async def _prepare_generation(
         jira_text="\n".join(t for t in (jira_context_text, parent_context) if t),
         ui_content=ui_content,
         openapi_text=openapi_text or "",
-        images_present=bool(jira_image_text or attached_image_text or has_jira_images),
+        images_present=bool(
+            jira_image_text
+            or attached_image_text
+            or has_jira_images
+            or has_attached_images
+        ),
         source_ref=source_url or (feature_text or "")[:80],
     )
     # THE ENFORCEMENT SEAM. `checklist_items` below is a BATCH 2 local
@@ -3297,8 +3395,6 @@ async def _prepare_generation(
     if _host_ac_job:
         rtm_hint = rtm_hint + _HOST_AC_JOB_DIRECTIVE
 
-    meter = TokenMeter()
-
     # Prompt-cache warm-up (QA_PROMPT_CACHE_ENABLED, default OFF). MUST run
     # BEFORE the gather: an Anthropic cache entry only becomes readable once the
     # first request carrying it starts streaming its response, so 8 simultaneous
@@ -3448,6 +3544,7 @@ async def _finalize_generation(
             ),
             on_status=on_status,
             cache_prefix=cache_prefix_warm,
+            meter=meter,
         )
 
     if not all_cases:
@@ -3461,6 +3558,15 @@ async def _finalize_generation(
         if on_progress is not None:
             await on_progress(0)
         markdown_raw = await ask(system=_SYSTEM_PROMPT_MARKDOWN + _GUARD, user=user_msg)
+        # The whole-suite fallback when every category failed -- generation tier.
+        _meter_note(
+            meter,
+            "generation",
+            settings.qa_llm_model,
+            system=_SYSTEM_PROMPT_MARKDOWN,
+            user=user_msg,
+            output_text=markdown_raw if isinstance(markdown_raw, str) else "",
+        )
 
         if markdown_raw.startswith("Error:"):
             reason = _summarize_category_failures(
@@ -3517,7 +3623,9 @@ async def _finalize_generation(
     # untrusted); it falls through to this same heuristic on any failure, so both
     # the app and MCP paths (which share this function) degrade identically.
     if settings.qa_llm_risk_scoring:
-        scored, risk_section = await score_with_llm(all_cases, feature_text)
+        scored, risk_section = await score_with_llm(
+            all_cases, feature_text, meter=meter
+        )
     else:
         scored, risk_section = score_and_sort(all_cases)
 
@@ -3575,7 +3683,9 @@ async def _finalize_generation(
     # other. Server mode never passes it, so the default True keeps every existing
     # caller byte-identical.
     if rewrite_vague:
-        scored = await _rewrite_vague_fields(scored, feature_text, on_status)
+        scored = await _rewrite_vague_fields(
+            scored, feature_text, on_status, meter=meter
+        )
 
     # Jira sub-task scope check (advisory, FLAG-ONLY). When a parent story was
     # injected as BACKGROUND, flag — never drop — cases whose wording tracks the
@@ -3796,7 +3906,9 @@ async def _finalize_generation(
     elif remaining_gaps is not None:
         gaps_section = _format_advisory_gaps(remaining_gaps)
     else:
-        gaps_section = await analyze_coverage_gaps(feature_text, renumbered, acs)
+        gaps_section = await analyze_coverage_gaps(
+            feature_text, renumbered, acs, meter=meter
+        )
 
     # ops-5 (issue 7): the closing funnel line. Deliberately ONE line carrying
     # everything a reader needs to spot a silent change: the count, whether the
@@ -3923,7 +4035,14 @@ async def _finalize_generation(
         )
         risk_line = f"\n\n**Risk:** {risk_summary}" if risk_summary else ""
         rtm_line = rtm_oneline(acs, suite.test_cases)
-        meter_line = meter.summary_line() if settings.qa_token_meter_enabled else ""
+        meter_line = (
+            meter.summary_line(
+                detailed=settings.qa_token_meter_detail_enabled,
+                show_cost=settings.qa_token_meter_cost_enabled,
+            )
+            if settings.qa_token_meter_enabled
+            else ""
+        )
         compact = (
             f"{feature_report}"
             f"Generated **{tc_count} test cases** ({priority_summary})."

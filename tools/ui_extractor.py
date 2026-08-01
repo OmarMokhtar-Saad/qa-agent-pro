@@ -48,7 +48,9 @@ _VISION_SYSTEM_PROMPT = (
 )
 
 
-async def extract_ui_elements(url: str, prefetched: dict | None = None) -> dict:
+async def extract_ui_elements(
+    url: str, prefetched: dict | None = None, *, defer_vision: bool = False
+) -> dict:
     """Fetch a live URL and extract structured UI elements from its HTML.
 
     Returns a dict with keys:
@@ -62,6 +64,16 @@ async def extract_ui_elements(url: str, prefetched: dict | None = None) -> dict:
     ``fetch_url_content(url)`` call, it is reused instead of fetching the URL a
     second time (B-008/D-3). A None or error-bearing *prefetched* falls back to
     the normal internal fetch, so behaviour is identical when it is not supplied.
+
+    When *defer_vision* is True (host mode + QA_HOST_IMAGE_DESCRIPTION_ENABLED)
+    the Tier 3 ``ask_vision`` call is NOT made at all. The rendered screenshot is
+    returned under ``vision_screenshot`` (raw bytes) with
+    ``extraction_method="vision_deferred"`` so the caller can forward it to the
+    tester's OWN multimodal model as MCP image content instead. ``ui_elements``
+    stays empty on that branch -- which is exactly the shape the cli/cursor
+    backends already produce here today, since ask_vision no-ops on them. The
+    default False keeps every existing caller byte-identical, and the
+    ``vision_screenshot`` key is ABSENT (not None) unless deferral happened.
 
     On any failure returns {"error": str, "content": None}.
     Never raises.
@@ -108,6 +120,9 @@ async def extract_ui_elements(url: str, prefetched: dict | None = None) -> dict:
         # timeout, ...) up to the caller so a "no elements" outcome can be
         # explained specifically instead of with a single generic message.
         render_error: str | None = None
+        # Raw Tier 3 screenshot, kept ONLY when defer_vision suppressed the
+        # server-side vision call, so the caller can forward it to the host.
+        deferred_screenshot: bytes | None = None
 
         # Tier 2 renders a page's HTML, so it can only help when HTML was
         # actually fetched. A Jira REST result carries the ticket's TEXT and no
@@ -163,7 +178,15 @@ async def extract_ui_elements(url: str, prefetched: dict | None = None) -> dict:
                 screenshot = (
                     rendered.get("screenshot") if not rendered.get("error") else None
                 )
-                if screenshot:
+                if screenshot and defer_vision:
+                    # Host-mode boomerang: make NO server-side ask_vision call.
+                    # The raw screenshot rides to the host's OWN multimodal model
+                    # as MCP image content; ui_elements stays empty, which is the
+                    # same outcome cli/cursor already reach here (ask_vision
+                    # returns its "Error:" sentinel), so nothing is lost.
+                    deferred_screenshot = screenshot
+                    extraction_method = "vision_deferred"
+                elif screenshot:
                     vision_text = await _describe_via_vision(screenshot, url)
                     if vision_text and not vision_text.startswith("Error:"):
                         ui_elements = {
@@ -193,7 +216,7 @@ async def extract_ui_elements(url: str, prefetched: dict | None = None) -> dict:
             url,
             extraction_method,
         )
-        return {
+        out = {
             "ui_elements": ui_elements,
             "page_title": page_title,
             "content": content_summary,
@@ -201,6 +224,11 @@ async def extract_ui_elements(url: str, prefetched: dict | None = None) -> dict:
             "render_error": render_error,
             "error": None,
         }
+        if deferred_screenshot is not None:
+            # Key ABSENT unless the vision call was actually deferred, so a
+            # flag-OFF result dict stays key-identical to today's.
+            out["vision_screenshot"] = deferred_screenshot
+        return out
     except Exception as exc:
         logger.exception("ui_extractor: unexpected error for %s", url)
         return {"error": str(exc), "content": None}

@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from config.settings import settings
 from llm import ask_json, resolve_max_tokens_tier
+from tools import token_meter
 from tools.models import TestCase
 from tools.untrusted import _GUARD, wrap_untrusted
 
@@ -221,7 +222,7 @@ def _llm_label(score: int) -> str:
 
 
 async def score_with_llm(
-    cases: list[TestCase], feature_text: str = ""
+    cases: list[TestCase], feature_text: str = "", meter: object | None = None
 ) -> tuple[list[TestCase], str]:
     """LLM-judged risk scoring with the heuristic as a never-fail fallback.
 
@@ -266,6 +267,14 @@ async def score_with_llm(
                 max_tokens=resolve_max_tokens_tier("critic"),
             ),
             timeout=min(300, _LLM_RISK_TIMEOUT_S + len(cases)),
+        )
+        token_meter.note(
+            meter,
+            "other",
+            settings.qa_classifier_model or settings.qa_llm_model,
+            system=_LLM_RISK_SYSTEM,
+            user=user,
+            output_text=token_meter.model_text(assessment),
         )
         verdicts = {
             v.index: v

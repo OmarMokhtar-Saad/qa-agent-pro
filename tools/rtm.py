@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from config.settings import settings
 from llm import ask_json
+from tools import token_meter
 from tools.atomic_checklist import (
     HONESTY_BOUNDARY,
     lexical_cosine_matrix,
@@ -59,21 +60,36 @@ Rules:
 """
 
 
-async def generate_acs(feature_text: str) -> list[AcceptanceCriterion]:
+async def generate_acs(
+    feature_text: str, meter: object | None = None
+) -> list[AcceptanceCriterion]:
     """Generate acceptance criteria from a plain-text feature description (T-11).
 
     Lets the RTM light up for the 3-of-4 input types that carry no explicit ACs.
     Returns numbered AcceptanceCriterion items, or [] on empty input / any failure.
     Never raises.
+
+    ``meter`` is an optional tools.token_meter.TokenMeter; when passed, this
+    call's tokens are recorded against it. Purely bookkeeping -- it never
+    changes the prompt, the model, or the result.
     """
     try:
         if not feature_text or not feature_text.strip():
             return []
+        _ac_user = wrap_untrusted("feature_description", feature_text)
         result = await ask_json(
             system=_AC_GEN_SYSTEM + _GUARD,
-            user=wrap_untrusted("feature_description", feature_text),
+            user=_ac_user,
             response_model=_GeneratedACList,
             model=settings.qa_classifier_model or None,
+        )
+        token_meter.note(
+            meter,
+            "other",
+            settings.qa_classifier_model or settings.qa_llm_model,
+            system=_AC_GEN_SYSTEM,
+            user=_ac_user,
+            output_text=token_meter.model_text(result),
         )
         acs = [
             AcceptanceCriterion(ac_id=f"AC-{i:03d}", description=g.description.strip())

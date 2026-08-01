@@ -1786,9 +1786,21 @@ async def _log_cache_usage(stream) -> None:
 
     Never raises: instrumentation must not change generation behaviour.
     """
+    try:
+        _inspect_cache_counters(await stream.get_final_message())
+    except Exception:
+        logger.debug("could not read prompt-cache usage", exc_info=True)
+
+
+def _inspect_cache_counters(final) -> None:
+    """The body of _log_cache_usage, over an ALREADY-fetched final message.
+
+    Split out so the streaming path can fetch ``get_final_message()`` exactly
+    ONCE and feed it to both this canary and ``_record_api_usage`` (see
+    ``_capture_stream_usage``), instead of awaiting it twice. Never raises.
+    """
     global _CACHE_WARM_DISABLED, _CACHE_WRITES_OBSERVED
     try:
-        final = await stream.get_final_message()
         usage = getattr(final, "usage", None)
         written = getattr(usage, "cache_creation_input_tokens", None)
         read = getattr(usage, "cache_read_input_tokens", None)
@@ -1824,6 +1836,30 @@ async def _log_cache_usage(stream) -> None:
             )
     except Exception:
         logger.debug("could not read prompt-cache usage", exc_info=True)
+
+
+async def _capture_stream_usage(stream, cache_prefix: bool) -> None:
+    """Pull ONE final message off an exhausted stream and record its usage.
+
+    Closes a real gap: ``_ask_json_api`` -- the streaming JSON path the entire
+    8-category fan-out uses on the ``api`` backend -- consumed ``text_stream``
+    and returned without ever calling ``_record_api_usage``, so even on ``api``
+    the dominant-cost calls fell back to a ``len//4`` estimate for telemetry.
+
+    Also runs the prompt-cache canary when the request carried a marker, reusing
+    the SAME ``get_final_message()`` result rather than awaiting a second one.
+
+    Never raises: a test double whose fake stream has no ``get_final_message``
+    degrades to exactly the previous no-capture behaviour.
+    """
+    try:
+        final = await stream.get_final_message()
+    except Exception:
+        logger.debug("could not read the final streamed message", exc_info=True)
+        return
+    _record_api_usage(final)
+    if cache_prefix:
+        _inspect_cache_counters(final)
 
 
 async def _ask_api(
@@ -1893,9 +1929,10 @@ async def _ask_json_api(
                     tc_count = min(tc_count + new_hits, _PROGRESS_TC_COUNT_CAP)
                     await on_progress(tc_count)
                 buf = combined[-(len(marker) - 1) :]
-        if cache_prefix:
-            # The only proof the marker hit. Never raises.
-            await _log_cache_usage(stream)
+        # Real token usage for BOTH telemetry and the token meter, plus the
+        # cache canary when a marker was sent -- one get_final_message() for
+        # all of it. Never raises.
+        await _capture_stream_usage(stream, cache_prefix)
     return "".join(parts).strip()
 
 
@@ -2442,16 +2479,55 @@ _API_USAGE: contextvars.ContextVar = contextvars.ContextVar(
 )
 
 
+# The real-or-estimated usage of the most recent public ask*/ask_json call,
+# published by _emit_generation right after it resolves the same numbers for
+# telemetry. tools/token_meter.note() reads it back through last_call_usage().
+# Task-local for the same reason _API_USAGE is: asyncio.gather gives every task
+# its own copy of the context, so the 8 concurrent category calls cannot clobber
+# each other's snapshot.
+_LAST_CALL_USAGE: contextvars.ContextVar = contextvars.ContextVar(
+    "qa_last_call_usage", default=None
+)
+
+
+def last_call_usage() -> tuple[int, int, int, int, bool] | None:
+    """(input, output, cache_read, cache_write, estimated) for the last call.
+
+    ``None`` when no call has completed in this context yet -- e.g. a test
+    double replaced the public wrapper entirely, so nothing here ever ran.
+    Callers must treat ``None`` as "fall back to your own estimate". Never
+    raises.
+    """
+    try:
+        return _LAST_CALL_USAGE.get()
+    except Exception:
+        logger.debug("could not read the last-call usage snapshot", exc_info=True)
+        return None
+
+
 def _record_api_usage(resp) -> None:
-    """Stash (input_tokens, output_tokens) from an Anthropic response so the
-    public wrapper can emit real token counts. Never raises; a non-numeric or
-    mocked usage object is ignored (the wrapper then estimates)."""
+    """Stash (input, output, cache_read, cache_write) from an Anthropic response
+    so the public wrapper can emit real token counts. Never raises; a non-numeric
+    or mocked usage object is ignored (the wrapper then estimates).
+
+    The two cache fields are strictly additive: an SDK/response that carries no
+    ``usage.cache_*`` attribute (older SDK, or a call that never touched the
+    cache) records 0 for them and behaves exactly as before they existed."""
     try:
         usage = getattr(resp, "usage", None)
         in_tok = getattr(usage, "input_tokens", None)
         out_tok = getattr(usage, "output_tokens", None)
+        cache_read = getattr(usage, "cache_read_input_tokens", None)
+        cache_write = getattr(usage, "cache_creation_input_tokens", None)
         if isinstance(in_tok, int) and isinstance(out_tok, int):
-            _API_USAGE.set((in_tok, out_tok))
+            _API_USAGE.set(
+                (
+                    in_tok,
+                    out_tok,
+                    cache_read if isinstance(cache_read, int) else 0,
+                    cache_write if isinstance(cache_write, int) else 0,
+                )
+            )
     except Exception:
         logger.debug("could not read api usage", exc_info=True)
 
@@ -2479,13 +2555,19 @@ def _emit_generation(
             usage = _API_USAGE.get()
         except Exception:
             usage = None
+        cache_read = 0
+        cache_write = 0
         if usage:
-            in_tok, out_tok = usage
+            in_tok, out_tok, cache_read, cache_write = usage
             estimated = False
         else:
             in_tok = (len(system) + len(user)) // 4
             out_tok = (len(result) // 4) if isinstance(result, str) else 0
             estimated = True
+        # Publish the SAME resolved numbers telemetry is about to use, so
+        # tools/token_meter.note() records real usage on `api` and the identical
+        # char estimate on cli/cursor -- one merge rule, not two.
+        _LAST_CALL_USAGE.set((in_tok, out_tok, cache_read, cache_write, estimated))
         resolved = (
             _resolve_cursor_model(model_arg)
             if backend == "cursor"
@@ -2634,6 +2716,7 @@ async def ask(
     on all three backends.
     """
     _API_USAGE.set(None)
+    _LAST_CALL_USAGE.set(None)
     _ask_start = time.monotonic()
     backend = "cli"
     # cli/cursor speak plain text only — flatten the split back into one string.
@@ -2686,6 +2769,7 @@ async def ask_vision(
       gracefully (``result.startswith("Error:")``).
     """
     _API_USAGE.set(None)
+    _LAST_CALL_USAGE.set(None)
     try:
         backend = _backend()
     except LLMBackendUnavailableError as exc:
@@ -2799,6 +2883,7 @@ async def ask_json(
         else _json_system(system, response_model)
     )
     _API_USAGE.set(None)
+    _LAST_CALL_USAGE.set(None)
     _json_start = time.monotonic()
     # cli/cursor speak plain text only — flatten the split back into one string.
     combined_user = f"{user}\n\n{user_suffix}" if user_suffix else user

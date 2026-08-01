@@ -78,6 +78,7 @@ from pydantic import BaseModel, Field
 
 from config.settings import settings
 from llm import ask_json
+from tools import token_meter
 from tools.untrusted import _GUARD, wrap_untrusted
 
 logger = logging.getLogger(__name__)
@@ -462,6 +463,7 @@ async def decompose_to_checklist(
     acceptance_criteria: str = "",
     description_text: str = "",
     background_text: str = "",
+    meter: object | None = None,
 ) -> list[ChecklistItem]:
     """Decompose the ticket into the atomic checklist (Pass 1).
 
@@ -523,11 +525,20 @@ async def decompose_to_checklist(
                 ),
             ]
 
+        _decompose_user = "\n".join(b for b in blocks if b)
         result: _Decomposition = await ask_json(
             system=_DECOMPOSE_SYSTEM + _GUARD,
-            user="\n".join(b for b in blocks if b),
+            user=_decompose_user,
             response_model=_Decomposition,
             model=settings.qa_classifier_model or None,
+        )
+        token_meter.note(
+            meter,
+            "other",
+            settings.qa_classifier_model or settings.qa_llm_model,
+            system=_DECOMPOSE_SYSTEM,
+            user=_decompose_user,
+            output_text=token_meter.model_text(result),
         )
 
         max_items = int(
