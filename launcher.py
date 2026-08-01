@@ -147,6 +147,7 @@ class Supervisor:
 
     def __init__(self) -> None:
         self.child = None
+        self.child_started_at = 0.0  # wall-clock at last spawn() -- see watchdog()
         self.child_lock = threading.RLock()
         self.handshake = []  # client's initialize + initialized lines
         self.swallow_id = None  # drop the child's reply to a REPLAYED initialize
@@ -174,6 +175,7 @@ class Supervisor:
         env = dict(os.environ)
         env["QA_MCP_ENABLED"] = "true"  # the server refuses to start without it
         with self.child_lock:
+            self.child_started_at = time.time()
             self.child = subprocess.Popen(
                 [sys.executable, "mcp_server.py"],
                 stdin=subprocess.PIPE,
@@ -428,6 +430,28 @@ class Supervisor:
         self.release_setup_check()
 
     # -------------------------------------------------- update watchdog
+    def _env_changed_since_child_start(self) -> bool:
+        """True when .env was written after the CURRENT child started.
+
+        Mirrors tools.mcp_handlers._env_changed_since_start, but compares
+        against child_started_at (this Supervisor's own record of when its
+        child last spawned) rather than the child's in-process import time --
+        the two are effectively the same instant, and this avoids importing
+        the full app into the long-lived Supervisor just to read one field.
+        Never raises: an unreadable .env reads as unchanged, so a failure
+        here can only ever SKIP a restart, never trigger a spurious one."""
+        try:
+            env_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), ".env"
+            )
+            return (
+                os.path.isfile(env_path)
+                and os.path.getmtime(env_path) > self.child_started_at
+            )
+        except OSError:
+            log.debug("could not stat .env for the watchdog drift check", exc_info=True)
+            return False
+
     def watchdog(self) -> None:
         from tools.updater import run_update_check
 
@@ -438,7 +462,7 @@ class Supervisor:
                 status = run_update_check(
                     force=True, repo_override=DIST_REPO, lock_override=True
                 )
-                if status != "healed":
+                if status != "healed" and not self._env_changed_since_child_start():
                     # An 'updated' status is handled by the CHILD's
                     # drift check, which can exit BETWEEN requests. This
                     # launcher cannot see in-flight work: last_activity
@@ -447,10 +471,15 @@ class Supervisor:
                     # writes no version stamp, so the child cannot
                     # detect it -- that case stays here.
                     continue
-                log.info("Integrity heal applied — restarting at the next idle minute.")
+                reason = (
+                    "integrity heal"
+                    if status == "healed"
+                    else "config (.env changed)"
+                )
+                log.info("%s applied — restarting at the next idle minute.", reason)
                 while time.time() - self.last_activity < IDLE_SECONDS:
                     time.sleep(5)
-                self.restart_child("integrity heal")
+                self.restart_child(reason)
             except Exception as exc:
                 log.warning("Background update check failed (%s) — will retry.", exc)
 
