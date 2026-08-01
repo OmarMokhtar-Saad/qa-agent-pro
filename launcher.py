@@ -12,6 +12,8 @@ the install current WITHOUT restarting the editor:
    recorded MCP initialize handshake is replayed — the editor keeps its
    session, nothing to do. Set QA_DRIFT_RESTART_ENABLED=false to disable.
 3. If the server ever crashes it is respawned the same way.
+4. qa_setup_check is retried across such a reload automatically: the
+   client makes ONE call and gets the final, post-reload report.
 
 stdout carries the MCP protocol; every log line goes to stderr. A network
 failure never blocks startup — the current version keeps serving."""
@@ -76,6 +78,70 @@ def _self_hash() -> str:
         return ""
 
 
+SETUP_CHECK_TOOL = "qa_setup_check"
+SETUP_CHECK_MAX_RETRIES = 2
+SETUP_CHECK_TIMEOUT_S = 25.0
+# Fragments of the child's 'a reload was scheduled' reply
+# (tools/mcp_handlers._reloading_message). Two ASCII-only pieces on
+# purpose: the real sentence joins them with an em dash, which JSON
+# encoders emit as an escape sequence, so a single literal spanning
+# it would silently stop matching.
+RELOAD_MARKERS = (
+    "This takes about 10 seconds",
+    "qa_setup_check` again",
+)
+
+
+def _as_dict(line):
+    """Parse a JSON-RPC line; {} for anything that is not an object."""
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        return {}
+    return msg if isinstance(msg, dict) else {}
+
+
+def _result_text(msg) -> str:
+    """Every string inside a JSON-RPC result, joined. Shape-agnostic on
+    purpose: the tool-result framing (content blocks, structuredContent)
+    belongs to the child MCP library, not to this launcher."""
+    chunks = []
+
+    def walk(node):
+        if isinstance(node, str):
+            chunks.append(node)
+        elif isinstance(node, dict):
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(msg.get("result"))
+    return " ".join(chunks)
+
+
+def _is_reload_pending(msg) -> bool:
+    """True for the placeholder the child returns when it has just
+    scheduled a reload; false for a real setup report or an error.
+    """
+    if not isinstance(msg, dict) or "result" not in msg:
+        return False
+    text = _result_text(msg)
+    return all(marker in text for marker in RELOAD_MARKERS)
+
+
+def _tool_call_name(msg) -> str:
+    """Tool name of a tools/call request, else an empty string."""
+    if not isinstance(msg, dict) or msg.get("method") != "tools/call":
+        return ""
+    params = msg.get("params")
+    if not isinstance(params, dict):
+        return ""
+    name = params.get("name")
+    return name if isinstance(name, str) else ""
+
+
 class Supervisor:
     """Owns the editor's stdio; proxies to a restartable child MCP server."""
 
@@ -88,6 +154,20 @@ class Supervisor:
         self.closing = False
         self.restarting = False
         self.self_hash = _self_hash()
+        # qa_setup_check reload auto-retry (see maybe_hold_setup_check)
+        self.setup_lock = threading.RLock()
+        self.setup_id = None  # id of the in-flight qa_setup_check call
+        self.setup_request = None  # its raw request line, for the re-send
+        self.setup_held = None  # its withheld 'reloading now' reply
+        self.setup_retries = 0
+        self.setup_deadline = 0.0
+        # Serialises EVERY writer to the client stdio: the output pump,
+        # spawn()'s tools/list_changed notice and release_setup_check()'s
+        # timeout thread. A JSON-RPC line above PIPE_BUF is NOT an atomic
+        # pipe write, so unsynchronised writers could interleave and
+        # corrupt every in-flight call sharing this proxy. Reentrant, and
+        # always the innermost lock -- nothing else is acquired under it.
+        self.stdout_lock = threading.RLock()
 
     # ------------------------------------------------- child lifecycle
     def spawn(self, replay: bool) -> None:
@@ -118,11 +198,13 @@ class Supervisor:
             # schemas until the editor restarts.
             try:
                 out = sys.stdout.buffer
-                out.write(
+                notice = (
                     b'{"jsonrpc": "2.0", '
                     b'"method": "notifications/tools/list_changed"}\n'
                 )
-                out.flush()
+                with self.stdout_lock:
+                    out.write(notice)
+                    out.flush()
                 log.info("Sent tools/list_changed to refresh client schemas.")
             except Exception:
                 log.debug("could not send tools/list_changed", exc_info=True)
@@ -189,23 +271,25 @@ class Supervisor:
                         continue  # reply to the replayed initialize
                 except ValueError:
                     pass
-            out.write(line)
-            out.flush()
+            if self.maybe_hold_setup_check(line):
+                continue  # answered after the reload, in this same call
+            with self.stdout_lock:
+                out.write(line)
+                out.flush()
         # EOF — the child died. Unless this launcher killed it on purpose,
         # bring it back and replay the handshake (crash resilience).
         if self.closing or self.restarting or child is not self.child:
             return
         log.warning("MCP server exited unexpectedly — respawning.")
         self.restart_child("crash recovery")
+        self.resend_setup_check()
 
     def pump_client_in(self) -> None:
         stdin = sys.stdin.buffer
         for line in iter(stdin.readline, b""):
             self.last_activity = time.time()
-            try:
-                method = json.loads(line).get("method")
-            except ValueError:
-                method = None
+            msg = _as_dict(line)
+            method = msg.get("method")
             if method == "initialize":
                 self.handshake = [line]
                 _write_session_state()
@@ -214,6 +298,8 @@ class Supervisor:
             elif method == "tools/list":
                 # The client re-fetched schemas — record the fresh version.
                 _write_session_state()
+            if _tool_call_name(msg) == SETUP_CHECK_TOOL:
+                self.note_setup_check(msg.get("id"), line)
             for _attempt in range(3):
                 with self.child_lock:
                     child = self.child
@@ -228,6 +314,118 @@ class Supervisor:
         with self.child_lock:
             if self.child is not None and self.child.poll() is None:
                 self.child.terminate()
+
+    # ------------------------------ qa_setup_check reload auto-retry
+    def note_setup_check(self, request_id, line) -> None:
+        """Remember an in-flight qa_setup_check call so its reply can be
+        intercepted. Only the newest is tracked: every call carries its own
+        id and the client matches replies itself, so a second call simply
+        supersedes the first."""
+        with self.setup_lock:
+            self._reset_setup_check()
+            self.setup_id = request_id
+            self.setup_request = line
+
+    def _reset_setup_check(self) -> None:
+        self.setup_id = None
+        self.setup_request = None
+        self.setup_held = None
+        self.setup_retries = 0
+        self.setup_deadline = 0.0
+
+    def maybe_hold_setup_check(self, line) -> bool:
+        """True when *line* is the tracked qa_setup_check reply saying a
+        reload was just scheduled. The caller must NOT forward it: the child
+        exits seconds later, the EOF path respawns it and re-sends the same
+        request, so the client makes ONE call and still gets the final,
+        post-reload report. Every other line is left untouched."""
+        with self.setup_lock:
+            if self.setup_id is None:
+                return False
+            msg = _as_dict(line)
+            if not msg or msg.get("id") != self.setup_id:
+                return False
+            if not _is_reload_pending(msg):
+                self._reset_setup_check()  # the real report -- forward it
+                return False
+            if self.setup_retries >= SETUP_CHECK_MAX_RETRIES:
+                log.warning(
+                    "qa_setup_check still reloading after %d retries.",
+                    self.setup_retries,
+                )
+                # Forward the notice; the tester can still retry by hand.
+                self._reset_setup_check()
+                return False
+            self.setup_held = line
+            if self.setup_deadline == 0.0:
+                self.setup_deadline = time.time() + SETUP_CHECK_TIMEOUT_S
+                threading.Thread(
+                    target=self._setup_check_guard, daemon=True
+                ).start()
+            return True
+
+    def resend_setup_check(self) -> None:
+        """After a respawn: re-issue the held qa_setup_check to the new child
+        under the ORIGINAL id, because that is the id the client is waiting
+        on."""
+        with self.setup_lock:
+            if self.setup_held is None or self.setup_request is None:
+                return
+            self.setup_retries += 1
+            line = self.setup_request
+        with self.child_lock:
+            child = self.child
+        try:
+            child.stdin.write(line)
+            child.stdin.flush()
+            log.info("Re-sent qa_setup_check to the reloaded server.")
+        except Exception:
+            log.warning(
+                "Could not re-send qa_setup_check -- releasing the held reply."
+            )
+            self.release_setup_check()
+
+    def release_setup_check(self) -> None:
+        """Hand the client the held reply after all: the fallback whenever the
+        invisible retry cannot finish, so the call is never left hanging and
+        the tester still sees the run-it-again notice."""
+        with self.setup_lock:
+            line = self.setup_held
+            self._reset_setup_check()
+        if line is None:
+            return
+        try:
+            out = sys.stdout.buffer
+            with self.stdout_lock:
+                out.write(line)
+                out.flush()
+        except Exception:
+            # Never silent: a lost release means the client is still
+            # waiting on an id nobody will answer.
+            log.warning(
+                "Could not release the held qa_setup_check reply.",
+                exc_info=True,
+            )
+
+    def _setup_check_guard(self) -> None:
+        """Bound the invisible retry: a client tool call must never hang on us.
+        Releases the held reply when the successor has not answered within
+        SETUP_CHECK_TIMEOUT_S (child exit + respawn + handshake + re-call)."""
+        while True:
+            with self.setup_lock:
+                deadline = self.setup_deadline
+                if self.setup_held is None or deadline == 0.0:
+                    return  # resolved normally
+            if self.closing:
+                return
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.25, remaining))
+        log.warning(
+            "qa_setup_check auto-retry timed out -- returning the notice."
+        )
+        self.release_setup_check()
 
     # -------------------------------------------------- update watchdog
     def watchdog(self) -> None:
