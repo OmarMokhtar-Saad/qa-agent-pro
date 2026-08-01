@@ -324,6 +324,69 @@ def restore_chained_refs_from_stable(cases: list[TestCase]) -> list[TestCase]:
         return cases
 
 
+def normalize_module_names(cases: list[TestCase]) -> list[TestCase]:
+    """Canonicalize `module` casing/whitespace across a merged suite.
+
+    2026-08-01: a real host-mode run (8 parallel category workers, each blind
+    to the others' output) produced ONE feature split across two module
+    labels -- "Cancel order" (60 cases) and "Cancel Order" (36 cases) -- since
+    `TestCase.module` is unconstrained free text (tools/models.py) and nothing
+    merges the workers' independent choices. That fragments every "group by
+    module" view (Jira, TestRail, the XLSX pivot) for a suite that is really
+    one feature.
+
+    Groups modules by a case/whitespace-insensitive key; within each group,
+    rewrites every case's `module` to the single exact spelling used by the
+    MOST cases in that group, so the majority casing wins over a minority
+    worker's variant. Never merges across genuinely different modules (the
+    key is casefolded + whitespace-collapsed, not fuzzy). A no-op whenever
+    every group already has just one exact spelling (the common case: nothing
+    to fix). Never raises: any error returns cases unchanged.
+    """
+    try:
+        if not cases:
+            return cases
+        buckets: dict[str, list[TestCase]] = {}
+        for tc in cases:
+            key = " ".join((tc.module or "").split()).casefold()
+            buckets.setdefault(key, []).append(tc)
+        if all(len({tc.module for tc in members}) <= 1 for members in buckets.values()):
+            return cases
+        # Majority casing per key group: the single spelling used by the most
+        # cases in that group wins over any minority variant sharing the key.
+        canonical: dict[str, str] = {}
+        for key, members in buckets.items():
+            counts: dict[str, int] = {}
+            for tc in members:
+                counts[tc.module] = counts.get(tc.module, 0) + 1
+            canonical[key] = max(counts.items(), key=lambda kv: kv[1])[0]
+        changed = 0
+        out: list[TestCase] = []
+        for tc in cases:
+            key = " ".join((tc.module or "").split()).casefold()
+            target = canonical.get(key, tc.module)
+            if target != tc.module:
+                changed += 1
+                out.append(tc.model_copy(update={"module": target}))
+            else:
+                out.append(tc)
+        if changed:
+            logger.info(
+                "normalize_module_names: canonicalized %d case(s) across %d "
+                "module name variant(s)",
+                changed,
+                sum(
+                    1
+                    for members in buckets.values()
+                    if len({tc.module for tc in members}) > 1
+                ),
+            )
+        return out
+    except Exception:
+        logger.exception("normalize_module_names failed — returning cases unchanged")
+        return cases
+
+
 def data_notes_section(cases: list[TestCase]) -> str:
     """Build a one-line-per-case '## Test Data' markdown note for cases that declare
     a data plan. Returns '' when no case has test_data, so summaries stay

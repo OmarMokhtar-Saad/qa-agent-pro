@@ -53,6 +53,7 @@ from tools.quality_checks import (
     find_placeholder_data,
     find_vague_expected,
     find_vague_steps,
+    normalize_module_names,
     quality_ratio,
     quality_warning_section,
     resolve_chained_refs_to_stable,
@@ -3734,6 +3735,14 @@ async def _finalize_generation(
             tc.model_copy(update={"test_data": []}) if tc.test_data else tc
             for tc in renumbered
         ]
+
+    # Module-name canonicalization (2026-08-01): parallel category workers are
+    # blind to each other's output and `module` is unconstrained free text, so
+    # one feature can land split across casing variants (observed: "Cancel
+    # order" x60 / "Cancel Order" x36 in one real suite). Unconditional and
+    # deterministic, same as the tc_id renumber above -- it only rewrites
+    # casing/whitespace, never drops or reorders a case.
+    renumbered = normalize_module_names(renumbered)
 
     suite = TestSuite(test_cases=renumbered)
     # Step 0: carry the traceability counts OUT as data. build_rtm_summary has
