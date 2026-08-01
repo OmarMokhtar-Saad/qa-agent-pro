@@ -204,7 +204,15 @@ class Settings(BaseSettings):
     # detection (server when the host editor's own backend is usable, host
     # otherwise), which also turns a hard LLMBackendUnavailableError into
     # graceful degradation. Resolved by llm.resolve_generation_mode().
-    qa_generation_mode: str = "server"
+    # 2026-08-01: HARDCODED to "host" by _coerce_generation_mode below --
+    # QA_GENERATION_MODE is no longer read from .env at all. Test-case
+    # generation must never run through a server-side CLI/API/cursor backend;
+    # the 8-category fan-out always runs on the tester's own chat model. This
+    # default is now purely documentation of the effective value, not a
+    # user-configurable one. Does NOT affect the other agents (bug reporter,
+    # exploratory coach, Feature Analysis, mobile healing, RAG, RTM), which
+    # call llm.py directly and never call resolve_generation_mode().
+    qa_generation_mode: str = "host"
 
     # Cheaper/faster model for the intent router's classification pass (T-04 /
     # I-027). Empty string means "use qa_llm_model" (no override). Set to a haiku
@@ -973,7 +981,9 @@ class Settings(BaseSettings):
     # prepare SKIPS the server classifier and returns an ambiguity_job for
     # the chat to run first (prepare-side preflight -- NOT the blocked F12
     # submit-side ambiguities GO/NO-GO). Server mode is untouched.
-    qa_host_ambiguity_review_enabled: bool = False
+    qa_host_ambiguity_review_enabled: bool = (
+        True  # 2026-08-01: hardcoded ON, see _force_host_boomerang_on
+    )
 
     # --- Host-derived acceptance criteria (opt-in, default OFF) -------------
     # WHY: rtm.generate_acs is an UNCONDITIONAL server-side llm.ask_json. It
@@ -989,7 +999,9 @@ class Settings(BaseSettings):
     # validates that field as UNTRUSTED input and labels it MODEL-DERIVED, never
     # ticket-sourced. Server mode is untouched (_prepare_generation's
     # synthesize_acs parameter defaults True and only host prepare passes False).
-    qa_host_ac_review_enabled: bool = False
+    qa_host_ac_review_enabled: bool = (
+        True  # 2026-08-01: hardcoded ON, see _force_host_boomerang_on
+    )
 
     # --- Refuse a host submit with no verified ambiguity preflight (OFF) ----
     # QA_HOST_AMBIGUITY_REVIEW_ENABLED hands the SHYJ-7154 pre-pass to the host,
@@ -1023,7 +1035,9 @@ class Settings(BaseSettings):
     # existed because those attachments were consumable server-side alone.
     # Server mode is untouched: every branch is gated on the flag AND on
     # llm.resolve_generation_mode() == "host".
-    qa_host_image_description_enabled: bool = False
+    qa_host_image_description_enabled: bool = (
+        True  # 2026-08-01: hardcoded ON, see _force_host_boomerang_on
+    )
 
     # --- Host-reviewed duplicate review (Piece 1; opt-in, default OFF) -----
     # qa_semantic_dedup_enabled needs qa_embeddings_backend, and the only KEYLESS
@@ -1131,6 +1145,30 @@ class Settings(BaseSettings):
     # single call, which is exactly how the first live run died.
     # Flag OFF => prepare payload / instructions byte-identical to today.
     qa_host_parallel_fanout_enabled: bool = False
+
+    # --- Host-mode duplicate-prepare guard (opt-in, default OFF) --------------
+    # WHY: host mode's premise is that the tester's own chat model drives
+    # generation end to end, and qa_prepare_test_cases is stateless -- nothing
+    # stops the SAME chat turn from silently re-running an entire ticket a
+    # second time (fresh Jira fetch, fresh 8-category fan-out, fresh submit)
+    # instead of asking the tester first or resubmitting under the existing
+    # prep_id. Observed 2026-08-01: one "create test cases for SHYJ-5645"
+    # request produced two independent finalized suites four minutes apart (68
+    # then 77 cases) even though the first finalize reported zero coverage or
+    # quality gaps -- nothing server-side asked for a redo, so this was the
+    # host model's own unannounced decision. When this flag is ON,
+    # qa_prepare_test_cases checks suite_store.list_recent_suites for a suite
+    # whose source_url matches this request's source_url within
+    # QA_HOST_DUPLICATE_PREP_WINDOW_S and, if found, returns a clarify notice
+    # instead of proceeding -- the host must either pass proceed_anyway=true
+    # (an explicit, visible decision, already a supported parameter) or use the
+    # existing suite instead of starting over. Deliberately keyed on source_url
+    # only (a Jira/issue/web/Swagger URL): free-text feature descriptions have
+    # no stable identity to dedupe against and are never flagged. Best-effort
+    # and fail-open: any suite_store error is treated as "no duplicate found",
+    # since this is a UX guard, not a correctness gate.
+    qa_host_duplicate_prep_guard_enabled: bool = False
+    qa_host_duplicate_prep_window_s: int = 1800
 
     # --- Prep crash-safety (2026-07-31 SHYJ-5645 incident; opt-in, default OFF) --
     # The first live parallel fan-out was silently lost: 8 worker packets fetched
@@ -1308,14 +1346,12 @@ class Settings(BaseSettings):
         "qa_standing_rules",
         "qa_semantic_dedup_enabled",
         "qa_host_feature_report_enabled",
-        "qa_host_ambiguity_review_enabled",
-        "qa_host_ac_review_enabled",
         "qa_host_ambiguity_require_result",
-        "qa_host_image_description_enabled",
         "qa_host_dedup_review_enabled",
         "qa_host_dedup_apply",
         "qa_host_coverage_review_enabled",
         "qa_host_parallel_fanout_enabled",
+        "qa_host_duplicate_prep_guard_enabled",
         "qa_prep_sliding_ttl_enabled",
         "qa_prep_disclose_unfinished",
         "qa_qualified_tc_ids_enabled",
@@ -1371,21 +1407,49 @@ class Settings(BaseSettings):
     @field_validator("qa_generation_mode", mode="before")
     @classmethod
     def _coerce_generation_mode(cls, v: object) -> str:
-        """Lenient enum coercer for QA_GENERATION_MODE (server|host|auto).
+        """QA_GENERATION_MODE is HARDCODED to "host" -- .env is not read.
 
-        Mirrors _coerce_model_tier: an unrecognised value is logged at WARNING
-        and replaced with "server" (the defaults-OFF choice) rather than raising
-        or wedging the setting into a value resolve_generation_mode can't read.
+        2026-08-01: test-case generation must never fall back to a
+        server-side CLI/API/cursor backend, on this install or any other
+        qa-agent-pro install built from this tree. Every input value
+        (server/host/auto, valid or not, including unset) resolves to "host".
+        This only affects resolve_generation_mode()'s three call sites in
+        tools/mcp_handlers.py (test-case generation); it does not touch the
+        other agents, which call llm.py directly and never read this field.
         """
-        token = str(v).strip().lower() if v is not None else "server"
-        if token not in ("server", "host", "auto"):
-            logger.warning(
-                "Invalid QA_GENERATION_MODE=%r -- expected server/host/auto; "
-                "using server",
+        if v not in (None, "host"):
+            logger.info(
+                "QA_GENERATION_MODE=%r ignored -- test-case generation is "
+                "chat-only; always resolving to 'host'",
                 v,
             )
-            return "server"
-        return token
+        return "host"
+
+    @field_validator(
+        "qa_host_ambiguity_review_enabled",
+        "qa_host_ac_review_enabled",
+        "qa_host_image_description_enabled",
+        mode="before",
+    )
+    @classmethod
+    def _force_host_boomerang_on(cls, v: object, info) -> bool:
+        """These three flags are what makes host-mode generation ACTUALLY
+        chat-only (see qa_generation_mode's WHY above): with any one of them
+        OFF, qa_prepare_test_cases still makes a server-side llm.ask_json /
+        ask_vision call for the ambiguity gate, AC synthesis, or image
+        description respectively. 2026-08-01: hardcoded ON, ignoring .env
+        entirely, for the same reason QA_GENERATION_MODE is hardcoded to
+        "host" -- no combination of settings may reintroduce a server-side
+        LLM call on the test-case generation path.
+        """
+        if v not in (None, True, "true", "True", "1", 1):
+            logger.info(
+                "%s=%r ignored -- host-mode generation is chat-only; "
+                "always forcing this flag ON",
+                info.field_name.upper(),
+                v,
+            )
+        return True
 
     @field_validator("qa_rag_similarity_threshold", mode="before")
     @classmethod
@@ -1583,6 +1647,7 @@ class Settings(BaseSettings):
         "qa_category_stall_s",
         "qa_category_stall_strikes",
         "qa_ambiguity_cache_ttl_s",
+        "qa_host_duplicate_prep_window_s",
         mode="before",
     )
     @classmethod

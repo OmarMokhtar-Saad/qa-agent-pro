@@ -2421,6 +2421,34 @@ def _host_mode_server_llm_notice(
     return "\n".join(lines)
 
 
+async def _find_recent_duplicate_suite(source_text: str) -> dict | None:
+    """Best-effort lookup for a recently-finalized suite generated from the
+    SAME source_url. Never raises and never blocks prepare on a store error --
+    this is a UX guard against a silent full re-run, not a correctness gate.
+
+    Keyed on exact source_url match only (a Jira/issue/web/Swagger URL, as
+    stored by handle_submit_suite). Free-text feature descriptions have no
+    stable identity to dedupe against and are never flagged.
+    """
+    if not source_text:
+        return None
+    try:
+        recent = await list_recent_suites(limit=5)
+    except Exception:
+        return None
+    if recent.get("error"):
+        return None
+    window_s = max(0, int(getattr(settings, "qa_host_duplicate_prep_window_s", 1800)))
+    now = time.time()
+    for item in recent.get("content") or []:
+        if item.get("source_url") != source_text:
+            continue
+        created_at = item.get("created_at") or 0
+        if now - created_at <= window_s:
+            return item
+    return None
+
+
 async def handle_prepare_test_cases(
     feature_or_url: str,
     *,
@@ -2442,6 +2470,22 @@ async def handle_prepare_test_cases(
                 "Jira/issue URL, a web page URL, or a Swagger/OpenAPI spec URL."
             )
         )
+    if settings.qa_host_duplicate_prep_guard_enabled and not proceed_anyway:
+        dup = await _find_recent_duplicate_suite(text)
+        if dup is not None:
+            mins_ago = max(0, int((time.time() - (dup.get("created_at") or 0)) / 60))
+            return PreparePayloadResult(
+                clarify=(
+                    "⚠️ A suite was already generated from this exact "
+                    f"source **{mins_ago} minute(s) ago** "
+                    f"({dup.get('case_count', '?')} cases, suite "
+                    f"`{dup.get('suite_id', '?')}`). Re-running now will create a "
+                    "SEPARATE duplicate suite, not continue or replace that one.\n\n"
+                    "Ask the tester whether they actually want a fresh regeneration "
+                    "before proceeding. If they confirm yes, call "
+                    "`qa_prepare_test_cases` again with `proceed_anyway=true`."
+                )
+            )
     try:
         # Evening-ops repair: `llm` is NOT imported at module scope in
         # this file (only locally, inside one other handler), so the
