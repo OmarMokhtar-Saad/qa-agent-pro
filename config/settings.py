@@ -1146,28 +1146,35 @@ class Settings(BaseSettings):
     # Flag OFF => prepare payload / instructions byte-identical to today.
     qa_host_parallel_fanout_enabled: bool = False
 
-    # --- Host-mode duplicate-prepare guard (opt-in, default OFF) --------------
+    # --- Host-mode duplicate-prepare guard (default ON as of 2026-08-01) ------
     # WHY: host mode's premise is that the tester's own chat model drives
     # generation end to end, and qa_prepare_test_cases is stateless -- nothing
     # stops the SAME chat turn from silently re-running an entire ticket a
     # second time (fresh Jira fetch, fresh 8-category fan-out, fresh submit)
     # instead of asking the tester first or resubmitting under the existing
-    # prep_id. Observed 2026-08-01: one "create test cases for SHYJ-5645"
-    # request produced two independent finalized suites four minutes apart (68
-    # then 77 cases) even though the first finalize reported zero coverage or
-    # quality gaps -- nothing server-side asked for a redo, so this was the
-    # host model's own unannounced decision. When this flag is ON,
-    # qa_prepare_test_cases checks suite_store.list_recent_suites for a suite
-    # whose source_url matches this request's source_url within
-    # QA_HOST_DUPLICATE_PREP_WINDOW_S and, if found, returns a clarify notice
-    # instead of proceeding -- the host must either pass proceed_anyway=true
-    # (an explicit, visible decision, already a supported parameter) or use the
-    # existing suite instead of starting over. Deliberately keyed on source_url
-    # only (a Jira/issue/web/Swagger URL): free-text feature descriptions have
-    # no stable identity to dedupe against and are never flagged. Best-effort
-    # and fail-open: any suite_store error is treated as "no duplicate found",
-    # since this is a UX guard, not a correctness gate.
-    qa_host_duplicate_prep_guard_enabled: bool = False
+    # prep_id. Observed 2026-08-01, TWICE: one "create test cases for
+    # SHYJ-5645" request produced two independent finalized suites four
+    # minutes apart (68 then 77 cases) even though the first finalize
+    # reported zero coverage or quality gaps -- and the SAME ticket was
+    # regenerated from scratch again in a later session with the guard
+    # still off, with no warning that a finished suite already existed.
+    # Nothing server-side ever asked for a redo either time -- this is the
+    # host model's own unannounced decision, and a guard against an
+    # already-observed failure mode should not require an operator to
+    # discover and enable it (same reasoning as the prep crash-safety flags
+    # above). When ON, qa_prepare_test_cases checks
+    # suite_store.list_recent_suites for a suite whose source_url matches
+    # this request's source_url within QA_HOST_DUPLICATE_PREP_WINDOW_S and,
+    # if found, returns a clarify notice instead of proceeding -- the host
+    # must either pass proceed_anyway=true (an explicit, visible decision,
+    # already a supported parameter) or use the existing suite instead of
+    # starting over. Deliberately keyed on source_url only (a
+    # Jira/issue/web/Swagger URL): free-text feature descriptions have no
+    # stable identity to dedupe against and are never flagged. Best-effort
+    # and fail-open: any suite_store error is treated as "no duplicate
+    # found", since this is a UX guard, not a correctness gate. An operator
+    # with a real reason can still set this to false in .env.
+    qa_host_duplicate_prep_guard_enabled: bool = True
     qa_host_duplicate_prep_window_s: int = 1800
 
     # --- Prep crash-safety (2026-07-31 SHYJ-5645 incident; default ON as of
