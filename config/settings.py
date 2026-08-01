@@ -1170,18 +1170,24 @@ class Settings(BaseSettings):
     qa_host_duplicate_prep_guard_enabled: bool = False
     qa_host_duplicate_prep_window_s: int = 1800
 
-    # --- Prep crash-safety (2026-07-31 SHYJ-5645 incident; opt-in, default OFF) --
+    # --- Prep crash-safety (2026-07-31 SHYJ-5645 incident; default ON as of
+    # 2026-08-01) --------------------------------------------------------------
     # The first live parallel fan-out was silently lost: 8 worker packets fetched
     # via qa_get_category_job, the host window reloaded, no submit ever arrived,
     # and the prep expired after QA_PREP_TTL_S with no trace and no resume path.
-    # Two independent, disclosure-first mitigations, each behind its own flag:
+    # RECURRED 2026-08-01 on this same install with these flags still off (the
+    # SHYJ-5645 ticket, again) -- confirming "opt-in" was the wrong default for
+    # a crash-safety guard against a failure mode already observed twice. Two
+    # independent, disclosure-first mitigations, each behind its own flag,
+    # BOTH now default ON (an operator with a real reason to revert can still
+    # set either to false in .env):
     #
     # Sliding TTL: qa_get_category_job / qa_submit_category refresh the prep's
     # TTL clock so an ACTIVE orchestration cannot expire mid-run. Bounded by
     # qa_prep_max_lifetime_s from creation (the same anti-extension stance
     # prep_store.update_prep takes for the gap loop), so activity can never
     # extend a prep forever. OFF => the fixed created_at TTL, unchanged.
-    qa_prep_sliding_ttl_enabled: bool = False
+    qa_prep_sliding_ttl_enabled: bool = True
     # Hard ceiling (seconds) on a prep's TOTAL lifetime under the sliding TTL.
     # Lenient never-raise int coercion like the rest; <=0 -> the default.
     qa_prep_max_lifetime_s: int = 14400
@@ -1190,15 +1196,19 @@ class Settings(BaseSettings):
     # "unfinished prep <id> from HH:MM, N/8 staged, expires ~HH:MM -- resume
     # with qa_prep_status / qa_submit_category, or ignore". DISCLOSURE ONLY --
     # it never blocks a new prepare and never auto-resumes anything. The line
-    # PRINTS the prep_id, which is a capability token for that prep, so keep it
-    # OFF where the tool output is shared more widely than the tester's chat.
-    # The "fetched packet" signal is preps.touched_at, which qa_get_category_job
-    # and save_submission write whenever EITHER this flag or
-    # qa_prep_sliding_ttl_enabled is on -- so a run that fetched 8 packets and
-    # staged nothing (the incident) is disclosed even with the sliding TTL off.
-    # Writing the timestamp is free while TTL enforcement stays off: prep_store
-    # ._expired() reads touched_at only under qa_prep_sliding_ttl_enabled.
-    qa_prep_disclose_unfinished: bool = False
+    # PRINTS the prep_id, which is a capability token for that prep -- turn this
+    # back off (or ignore the note) anywhere the tool output is shared more
+    # widely than the tester's own chat; the default-ON tradeoff is deliberate
+    # because a run silently vanishing with zero trace is a worse failure mode
+    # for the intended single-tester use case than a short-lived token in that
+    # tester's own transcript. The "fetched packet" signal is preps.touched_at,
+    # which qa_get_category_job and save_submission write whenever EITHER this
+    # flag or qa_prep_sliding_ttl_enabled is on -- so a run that fetched 8
+    # packets and staged nothing (the incident) is disclosed even with the
+    # sliding TTL off. Writing the timestamp is free while TTL enforcement
+    # stays off: prep_store._expired() reads touched_at only under
+    # qa_prep_sliding_ttl_enabled.
+    qa_prep_disclose_unfinished: bool = True
 
     # --- Phase 2 fan-out follow-ups (2026-07-31; opt-in, default OFF) -------
     # Category-qualified tc_id contract for finalize-time review sidecars.
