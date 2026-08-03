@@ -64,7 +64,7 @@ from tools.device_manager import (
 from tools.gherkin_exporter import generate_feature_file
 from tools.image_description import describe_images
 from tools.jira_fetcher import fetch_url_content, verify_jira_access
-from tools.jira_mcp import connect_steps, not_connected_message
+from tools.jira_mcp import connect_hint_line, connect_steps, not_connected_message
 from tools.playwright_exporter import generate_playwright_script
 from tools.rag_store import add_to_corpus, query_corpus
 from tools.requirement_analyzer import (
@@ -6989,12 +6989,7 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
         # printing "configured" or "verified" here would be a guess, and a
         # confident wrong answer is worse than none. State what is true and
         # point at the one place that gives real guidance.
-        optional.append(
-            "To paste Jira ticket URLs, connect the Atlassian MCP server in "
-            "your editor (Claude Code: `/mcp`; Claude Desktop: Settings > "
-            "Connectors; Cursor: Settings > Features > MCP; Gemini CLI: "
-            "`gemini mcp add`). No API token and no .env entry are needed."
-        )
+        optional.append(connect_hint_line())
         _jira_status_line = (
             "\U0001f517 **Jira** \u2014 read through YOUR Atlassian MCP "
             "connection (OAuth, Jira Cloud). Nothing to configure here; if a "
