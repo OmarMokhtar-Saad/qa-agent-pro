@@ -26,6 +26,7 @@ import uuid
 from pathlib import Path
 
 from config.settings import settings
+from tools.install_paths import resolve_data_path
 from tools.models import TestCase, TestSuite
 
 logger = logging.getLogger(__name__)
@@ -72,7 +73,9 @@ CREATE TABLE IF NOT EXISTS checklists (
 
 
 def _db_path() -> Path:
-    return Path(settings.qa_suite_store_path)
+    # Install-root anchored -- see tools/install_paths. A cwd-relative store meant
+    # qa_export_suite could not find a suite that plainly existed.
+    return resolve_data_path(settings.qa_suite_store_path)
 
 
 def _connect() -> sqlite3.Connection:

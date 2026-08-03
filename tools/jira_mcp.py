@@ -845,9 +845,17 @@ def _extract_sibling_bodies(payload: dict, target_key: str = "") -> list[dict]:
                 continue
             sfields = _issue_fields(item)
             desc = _flatten_table_text(_as_text(sfields.get("description")))[:per_issue]
-            sac = _flatten_table_text(_as_text(sfields.get(settings.jira_ac_field)))[
-                :per_issue
-            ]
+            # SAME gate as the target ticket's own AC (see _usable_ac_text):
+            # JIRA_AC_FIELD is a per-instance GUESS and is a DATE field on this
+            # workspace, so a live 2026-08-03 run rendered SIX sibling entries as
+            # "Acceptance criteria: 2026-05-06T11:27:27.047+0300". Reusing the
+            # gate keeps this path and rtm's downstream judgement in agreement.
+            sac_raw = _as_text(sfields.get(settings.jira_ac_field))
+            sac = (
+                _flatten_table_text(sac_raw)[:per_issue]
+                if _usable_ac_text(sac_raw)
+                else ""
+            )
             if not desc and not sac:
                 # Title-only siblings add nothing _extract_subtasks does not
                 # already list, and each one costs budget.
@@ -1813,6 +1821,17 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
             "images": [],
             "image_attachments": attachments,
             "images_unavailable": bool(attachments),
+            # "The ticket has no images" and "nobody requested the attachment
+            # field" are different facts, and only the first is safe to stay
+            # quiet about. A live 2026-08-03 run had three PNG attachments and an
+            # EMPTY image notice, because the host trimmed `attachment` out of
+            # its getJiraIssue `fields` -- silently reproducing the exact blind
+            # spot the notice exists to close.
+            "attachments_unknown": bool(
+                settings.jira_fetch_images
+                and isinstance(fields, dict)
+                and "attachment" not in fields
+            ),
             "parent": parent,
             "subtasks": subtasks,
             "issuelinks": issuelinks,

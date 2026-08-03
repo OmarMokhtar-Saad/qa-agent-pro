@@ -345,7 +345,9 @@ def split_server_warning(
         found = discover_registrations(home, workspace_roots)
         by_install: dict = {}
         for r in found:
-            key = install_target(r["command"], r.get("base") or r["config"]) or r["name"]
+            key = (
+                install_target(r["command"], r.get("base") or r["config"]) or r["name"]
+            )
             by_install.setdefault(key, []).append(r)
         if len(by_install) < 2:
             return ""

@@ -2662,6 +2662,38 @@ async def handle_prepare_test_cases(
             )
         )
     if settings.qa_host_duplicate_prep_guard_enabled and not proceed_anyway:
+        # 2026-08-03: ALSO check for a recent unfinalized PREP, which is what this
+        # guard is named for and never actually looked at -- it only queried
+        # finished suites. A real run made two preps 43s apart for a byte-identical
+        # source, was told nothing, and discarded a whole preparation. Checked
+        # BEFORE the suite lookup because it is the earlier, cheaper signal: a
+        # second prepare with no suite yet is precisely the wasted-work case.
+        _window = max(
+            0, int(getattr(settings, "qa_host_duplicate_prep_window_s", 1800))
+        )
+        try:
+            _recent = await prep_store.find_recent_prep_by_source(text, _window)
+            _prep = (_recent or {}).get("content")
+        except Exception:
+            logger.debug("recent-prep duplicate check failed", exc_info=True)
+            _prep = None
+        if _prep:
+            _mins = max(0, int(float(_prep.get("age_s") or 0) / 60))
+            _ago = f"{_mins} minute(s)" if _mins else "less than a minute"
+            return PreparePayloadResult(
+                clarify=(
+                    "⚠️ A preparation for this exact source is ALREADY open "
+                    f"(`{_prep.get('prep_id', '?')}`, started {_ago} ago) and has "
+                    "not been finalized. Preparing again starts a SECOND full "
+                    "generation of the same ticket -- 8 categories of cases your "
+                    "chat model has to write twice -- and does not continue or "
+                    "replace the open one.\n\n"
+                    "To CONTINUE the open one, submit its categories against that "
+                    "prep_id (`qa_prep_status` shows what is still missing). To "
+                    "deliberately start over, call `qa_prepare_test_cases` again "
+                    "with `proceed_anyway=true`."
+                )
+            )
         dup = await _find_recent_duplicate_suite(text)
         if dup is not None:
             mins_ago = max(0, int((time.time() - (dup.get("created_at") or 0)) / 60))
@@ -3049,6 +3081,18 @@ async def handle_prepare_test_cases(
                 "metadata but not the image bytes. The test cases below are "
                 "generated from the ticket TEXT only \u2014 attach the "
                 "screenshot(s) to this chat if they matter."
+            )
+            _notice = (_notice + "\n\n" + _img_note) if _notice else _img_note
+        elif _url_content.get("attachments_unknown"):
+            # NOT the same as "no attachments": the payload never carried the
+            # field, so we cannot tell. Say so rather than implying the ticket
+            # had no screenshots.
+            _img_note = (
+                "> \u2139\ufe0f I could not tell whether this ticket has "
+                "screenshots \u2014 the Jira payload came back without the "
+                "`attachment` field. If the ticket has UI images, attach them to "
+                "this chat and I'll read them; otherwise the cases below are from "
+                "the ticket TEXT only."
             )
             _notice = (_notice + "\n\n" + _img_note) if _notice else _img_note
 
