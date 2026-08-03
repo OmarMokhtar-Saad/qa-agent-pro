@@ -567,6 +567,16 @@ def apply_update(new_tree: Path, install_dir: Path, version: str = "update") -> 
             dest.parent.mkdir(parents=True, exist_ok=True)
             _make_writable(dest)
             shutil.copy2(src, dest)
+            if rel.endswith(".sh"):
+                # Zip extraction drops POSIX modes, so a shell script would
+                # otherwise land non-executable for the window between this
+                # copy and the later lock_files() pass (which only runs after
+                # _pip_install()/migrate_env() finish) -- long enough for a
+                # client's spawn attempt to hit EACCES. Restore exec bits now.
+                st_mode = os.stat(dest).st_mode
+                os.chmod(
+                    dest, st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+                )
         logger.info(
             "Applied update: %d file(s) (%d new, %d replaced). Backup at %s",
             len(created) + len(overwritten),
