@@ -286,6 +286,33 @@ def _delete_prep_sync(prep_id: str) -> None:
         conn.close()
 
 
+# Envelope key stamped on a prep whose suite FINALIZED successfully. 2026-08-03
+# (Fix 5b): finalize used to DELETE the prep, so "prep gone" meant three different
+# things -- unknown id, expired TTL, and finished work -- and every reader keyed off
+# that one signal. A host that resubmitted after a successful finalize was told to
+# "start again with qa_prepare_test_cases", i.e. to regenerate a suite that already
+# existed. Keeping the record and stamping it lets each reader answer precisely.
+#
+# RETENTION NOTE: the payload holds the ticket source text, so keeping it until the
+# TTL lengthens how long that content lives here versus deleting at finalize. The
+# stamp itself carries only a suite_id and an export path, and the TTL still reaps
+# the record -- _expired reads created_at/touched_at, and update_prep leaves
+# created_at untouched, so a stamped prep can never become immortal.
+FINALIZED_KEY = "finalized"
+
+
+def is_finalized_record(record: object) -> bool:
+    """Whether a loaded prep envelope belongs to an already-finalized suite.
+
+    Mirrors tools.host_llm.is_host_task_record: a cheap, never-raising shape test
+    the handlers can run at every load site before rehydrating anything.
+    """
+    try:
+        return isinstance(record, dict) and isinstance(record.get(FINALIZED_KEY), dict)
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 def _update_prep_sync(prep_id: str, payload: dict) -> bool:
     now_payload = json.dumps(payload)
     conn = _connect()
@@ -385,6 +412,17 @@ def _list_unfinished_sync(limit: int) -> list[dict]:
         created_f = float(created)
         if _expired(created_f, touched):
             continue
+        # Fix 5b: a FINALIZED prep is finished work, never resumable. Dropping its
+        # staged rows would NOT be enough -- the SQL activity filter also passes on
+        # `touched_at IS NOT NULL`, and handle_get_category_job touches every prep
+        # on the fan-out path, so a finished prep would still be offered here and
+        # _unfinished_preps_note would tell the tester to resume it with
+        # qa_submit_category. Filtered on the stamp instead.
+        try:
+            if is_finalized_record(json.loads(payload_json) or {}):
+                continue
+        except Exception:
+            logger.debug("could not read prep %s for a finalized check", pid)
         try:
             touched_f = float(touched or 0.0)
         except (TypeError, ValueError):

@@ -554,6 +554,11 @@ _MOBILE_MODES = ("export", "run", "heal", "explore")
 
 _SUMMARY_CAP = 4000  # cap the embedded generation summary in the shaped result
 
+# Install root (…/qa-agents), used to anchor a RELATIVE qa_export_dir so the
+# exported deliverable lands in the same folder whichever MCP client launched
+# the server. See _resolved_export_dir.
+_INSTALL_ROOT = Path(__file__).resolve().parent.parent
+
 
 # --------------------------------------------------------------------------- #
 # Internal helpers
@@ -1207,6 +1212,31 @@ async def _jira_preflight(
         return None
 
 
+def _resolved_export_dir() -> str:
+    """``settings.qa_export_dir`` as an ABSOLUTE path.
+
+    The configured default ("data/exports") is RELATIVE, so it used to resolve
+    against whatever working directory the MCP client happened to launch the
+    server with: the same install therefore printed a different path in Claude
+    Desktop, Claude Code and Cursor, and a non-technical tester could not find
+    their own deliverable. Anchor a relative value to the install root instead.
+
+    "" (the legacy secure-temp behavior) stays "". Never raises -- a failure
+    degrades to the configured value as-is, which is exactly today's behavior.
+    """
+    try:
+        raw = (settings.qa_export_dir or "").strip()
+        if not raw:
+            return ""
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = _INSTALL_ROOT / path
+        return str(path)
+    except Exception:
+        logger.debug("resolving qa_export_dir failed -- using it as-is", exc_info=True)
+        return (settings.qa_export_dir or "").strip()
+
+
 async def _auto_export_xlsx(
     suite,
     ask_text: AskCb = None,
@@ -1236,7 +1266,7 @@ async def _auto_export_xlsx(
     try:
         await _emit(progress, "📄 Writing the Excel export…")
         output_path = None
-        export_dir = (settings.qa_export_dir or "").strip()
+        export_dir = _resolved_export_dir()
         reject_note = ""
         if settings.qa_mcp_elicit_enabled and ask_text is not None:
             default_label = export_dir or "a secure temp folder"
@@ -1286,10 +1316,22 @@ async def _auto_export_xlsx(
         except (ValueError, OSError):
             uri = ""
         await _audit("mcp_auto_export_xlsx", detail={"path": path})
-        link = f"\n\n[Open the file]({uri})" if uri else ""
+        link = f"[Open the file]({uri})\n\n" if uri else ""
+        # This path IS the deliverable, and the only channel an MCP tool result
+        # has for it is TEXT -- so it has to survive a chat model that
+        # paraphrases the reply instead of quoting it. Hence the explicit
+        # show-this-verbatim instruction, and hence the callers placing this
+        # block FIRST in their response rather than after the suite body: on
+        # 2026-08-03 a real run generated 98 cases and exported cleanly, and the
+        # tester never saw a path.
         return (
             "### \U0001f4c4 Your Excel file is ready\n\n"
-            f"**Download / open it here:**\n\n`{path}`{link}\n\n"
+            "**\U0001f4c2 SHOW THIS PATH TO THE TESTER, VERBATIM \u2014 it is "
+            "the deliverable they asked for:**\n\n"
+            f"`{path}`\n\n"
+            f"{link}"
+            "Open it (macOS):\n\n"
+            f'```bash\nopen "{path}"\n```\n\n'
             "_That spreadsheet is the finished deliverable — nothing else to "
             "run. Need CSV, Gherkin, Playwright or TestRail instead? Just say "
             "so._" + reject_note
@@ -1401,7 +1443,7 @@ async def _auto_export_zephyr(
         if near_path:
             output_dir = str(Path(near_path).parent)
         else:
-            output_dir = (settings.qa_export_dir or "").strip()
+            output_dir = _resolved_export_dir()
         path = await asyncio.to_thread(
             generate_zephyr_export,
             suite,
@@ -1909,12 +1951,17 @@ async def handle_generate_test_cases(
         )
         xlsx_paths: list[str] = []
         if auto_export:
-            result_md += "\n\n" + await _auto_export_xlsx(
+            _export_note = await _auto_export_xlsx(
                 suite,
                 ask_text=ask_text,
                 on_path=xlsx_paths.append,
                 progress=progress,
             )
+            if _export_note:
+                # PREPENDED (see _auto_export_xlsx): the deliverable path must
+                # not sit behind the suite body, where a host model that
+                # summarises the tool result drops it silently.
+                result_md = f"{_export_note}\n\n---\n\n{result_md}"
         if suite is not None and getattr(suite, "test_cases", None):
             result_md += await _auto_export_zephyr(
                 suite,
@@ -3336,12 +3383,78 @@ def _dropped_note(parsed) -> str:
 def _prep_missing_reply(prep_id: str) -> str:
     """One message covering unknown / TTL-expired / already-finalized prep_ids.
     A finished suite deletes its prep, so a resubmit-after-finalize lands here
-    too -- it must report cleanly, never crash or silently re-run."""
+    too -- it must report cleanly, never crash or silently re-run.
+
+    2026-08-03 (Fix 5a): the advice used to be a bare "Start again with
+    `qa_prepare_test_cases`". Because a FINISHED suite is the most common way to
+    reach here, that told a host whose suite had just been exported to launch a
+    SECOND full generation of it. Observed on run3 (SHYJ-5645): the suite
+    finalized at 14:15:52 and the host kept rebuilding and resubmitting one
+    category's payload until 14:18, three tool calls of which were rejected here.
+    Re-preparing is only correct when the work was genuinely LOST, so the reply
+    now separates the two cases and makes the finished case a stop, not a retry.
+
+    NOTE this deliberately does not distinguish the three causes -- doing that
+    needs the prep record to survive finalize (stamped rather than deleted), which
+    is a prep-lifecycle change with four other readers to satisfy. Tracked
+    separately; this message is correct for all three causes as written.
+    """
     return (
         f"⚠️ No active preparation for prep_id `{prep_id}`. It is unknown, "
         "expired (its TTL elapsed), or was already finalized (a finished suite "
-        "deletes its prep). Start again with `qa_prepare_test_cases`."
+        "deletes its prep).\n\n"
+        "**Do NOT resubmit this prep_id, and do not re-prepare reflexively.** "
+        "Check first:\n"
+        "- **Did this run already finish?** If a suite summary and an export path "
+        "came back for it, the work is DONE and saved -- stop here. Re-preparing "
+        "would generate the whole suite a second time and cost every category "
+        "again. Use `qa_export_suite` with that suite_id if you need another "
+        "format.\n"
+        "- **Only if the work was genuinely lost** (no suite was ever finalized, "
+        "or the id is expired/unknown) start over with `qa_prepare_test_cases`."
     )
+
+
+def _finalized_reply(prep_id: str, record: object) -> str:
+    """Reply for a prep whose suite ALREADY finalized successfully.
+
+    Fix 5b (2026-08-03). Before this, finalize deleted the prep, so a resubmit hit
+    _prep_missing_reply, which could not distinguish finished work from a lost or
+    unknown id. On the observed run (SHYJ-5645) the suite finalized at 14:15:52 and
+    the host went on rebuilding and resubmitting a category's payload until 14:18.
+    Naming the finished suite -- and its export path -- makes "stop" actionable
+    instead of leaving "do not re-prepare" as advice the host has to trust.
+
+    Returns "" when the record is not a finalized prep, so callers can use it as a
+    guard exactly like _host_task_reply. Never raises.
+    """
+    try:
+        if not prep_store.is_finalized_record(record):
+            return ""
+        info = record.get(prep_store.FINALIZED_KEY) or {}
+        suite_id = str(info.get("suite_id") or "").strip()
+        export_path = str(info.get("export_path") or "").strip()
+        lines = [
+            f"✅ Nothing to do: prep `{prep_id}` was ALREADY finalized "
+            "successfully. Its cases are saved."
+        ]
+        if suite_id:
+            lines.append(f"- **suite_id:** `{suite_id}`")
+        if export_path:
+            lines.append(f"- **exported to:** `{export_path}`")
+        lines.append(
+            "\n**Do NOT resubmit and do NOT re-prepare** -- re-preparing would "
+            "generate the whole suite a second time and cost every category again. "
+            + (
+                f"For another format use `qa_export_suite` with suite_id `{suite_id}`."
+                if suite_id
+                else "Use `qa_export_suite` if you need another format."
+            )
+        )
+        return "\n".join(lines)
+    except Exception:
+        logger.exception("_finalized_reply failed")
+        return ""
 
 
 def _host_task_reply(prep_id: str, record: object) -> str:
@@ -3894,6 +4007,39 @@ def _merge_category_rows(rows: list) -> "tuple[dict, int, dict]":
     return {"test_cases": renumbered}, used, id_map
 
 
+def _prep_status_finalize_hint() -> str:
+    """The finalize advice appended to the `qa_prep_status` reply.
+
+    Fix 2 (2026-08-03): with the duplicate review ON, an empty `suite_json` is the
+    call that FORFEITS it, so presenting that as the PRIMARY finalize and the
+    sidecar as an afterthought steered hosts into losing a review the tester had
+    switched on -- observed on run3 (SHYJ-5645), where 98 cases from 8 mutually
+    blind workers got no cross-category review at all. Both routes stage the same
+    rows, so the sidecar is equally crash-safe; only the review differs. With the
+    review OFF this returns the ORIGINAL wording verbatim.
+    """
+    if bool(getattr(settings, "qa_host_dedup_review_enabled", False)):
+        return (
+            "\nPRIMARY finalize (Path A, crash-safe, keeps your review): when "
+            "ready=yes, call `qa_submit_suite` with the small review SIDECAR "
+            "object described in your preparation instructions (no "
+            "`test_cases`). Finalizing with an empty `suite_json` instead is "
+            "equally crash-safe but FORFEITS the duplicate review. ALTERNATIVE "
+            "(Path B, one merged `suite_json`) does not need ready=yes, but "
+            "nothing is saved until that single call, so an interrupted chat "
+            "loses every category."
+        )
+    return (
+        "\nPRIMARY finalize (Path A, crash-safe): when ready=yes, call "
+        "`qa_submit_suite` with an empty `suite_json` -- or, to keep the "
+        "duplicate review, the small review SIDECAR object described in "
+        "your preparation instructions (no `test_cases`). ALTERNATIVE "
+        "(Path B, one merged `suite_json`) does not need ready=yes, but "
+        "nothing is saved until that single call, so an interrupted chat "
+        "loses every category."
+    )
+
+
 async def handle_prep_status(prep_id: str) -> str:
     """Report staged vs expected categories for a prep_id. Never raises."""
     prep_id = (prep_id or "").strip()
@@ -3907,6 +4053,13 @@ async def handle_prep_status(prep_id: str) -> str:
             return _task_note
         if envelope is None:
             return _prep_missing_reply(prep_id)
+        # Fix 5b: a finalized prep now LOADS, so every reader must check the stamp
+        # before rehydrating. Without this, prep_status would report `staged: 0/8`
+        # and then recommend the Path A finalize -- actively instructing a re-stage
+        # of all 8 categories for a suite that is already finished.
+        _final_note = _finalized_reply(prep_id, envelope)
+        if _final_note:
+            return _final_note
         meta = envelope.get("meta") or {}
         expected = list(meta.get("expected_categories") or [])
         if not expected and not meta.get("parallel_fanout"):
@@ -3939,15 +4092,7 @@ async def handle_prep_status(prep_id: str) -> str:
             f"- **ready to finalize (Path A):** {ready}\n"
             f"- **staged:** {status.get('staged_count', 0)}/"
             f"{status.get('expected_count', 0)} — {staged}\n"
-            f"- **missing:** {missing}\n"
-            + unrec_line
-            + "\nPRIMARY finalize (Path A, crash-safe): when ready=yes, call "
-            "`qa_submit_suite` with an empty `suite_json` -- or, to keep the "
-            "duplicate review, the small review SIDECAR object described in "
-            "your preparation instructions (no `test_cases`). ALTERNATIVE "
-            "(Path B, one merged `suite_json`) does not need ready=yes, but "
-            "nothing is saved until that single call, so an interrupted chat "
-            "loses every category."
+            f"- **missing:** {missing}\n" + unrec_line + _prep_status_finalize_hint()
         )
     except Exception as exc:
         logger.exception("handle_prep_status failed")
@@ -3971,6 +4116,12 @@ async def handle_get_category_job(prep_id: str, category_name: str) -> str:
             return _task_note
         if envelope is None:
             return _prep_missing_reply(prep_id)
+        # Fix 5b: without this, a finalized prep would be served a FRESH worker
+        # packet and touch_prep would slide its TTL -- re-arming exactly the
+        # regenerate-after-finish loop this fix exists to stop.
+        _final_note = _finalized_reply(prep_id, envelope)
+        if _final_note:
+            return _final_note
         prepared = host_mode.deserialize_prepared(envelope.get("prepared") or {})
         # 2026-07-31 incident: fetching a worker packet is real orchestration
         # activity -- that run fetched 8 and staged none. prep_store gates the
@@ -4038,6 +4189,11 @@ async def handle_submit_category(
             return _task_note
         if loaded.get("content") is None:
             return _prep_missing_reply(prep_id)
+        # Fix 5b: without this, rows could be staged onto a finalized prep and a
+        # later empty finalize would build a SECOND suite from a subset of them.
+        _final_note = _finalized_reply(prep_id, loaded.get("content"))
+        if _final_note:
+            return _final_note
         try:
             parsed = host_mode.parse_host_suite(suite_json)
         except host_mode.PrepSerdeError as exc:
@@ -4155,13 +4311,42 @@ async def handle_submit_category(
                 if settings.qa_host_coverage_review_enabled
                 else _review_label
             )
+            # 2026-08-03 (Fix 2): when the duplicate review is ON, the EMPTY
+            # finalize is precisely the call that FORFEITS it -- so labelling that
+            # call "recommended" steered hosts into discarding a review the tester
+            # had switched on. Observed on run3 (SHYJ-5645): 8 mutually blind
+            # categories, 98 cases, QA_HOST_DEDUP_REVIEW_ENABLED=true, and zero
+            # cross-category review, because the host took the route this text
+            # recommended. Recommend the SIDECAR instead and name the empty form as
+            # the forfeiting alternative. The review FIELD is still never named
+            # here -- that is taught once at prepare time, pinned by
+            # test_submit_category_is_silent_without_the_field.
+            _primary_bullet = (
+                (
+                    "- **Finalize from these rows, keeping your review "
+                    "(recommended)**: when every category is staged, call "
+                    "`qa_submit_suite` with this prep_id and the small review "
+                    "SIDECAR object described in your preparation instructions "
+                    "(no `test_cases`). No case is re-sent, nothing already "
+                    "staged can be lost, and the review you were asked to run is "
+                    "carried across the merge."
+                    f"{_coverage_line}\n"
+                    "- **Or finalize with an EMPTY `suite_json` "
+                    '(`suite_json=""`)**: the same crash-safe merge, but it '
+                    "FORFEITS that review.\n"
+                )
+                if settings.qa_host_dedup_review_enabled
+                else (
+                    "- **Finalize from these rows (crash-safe, recommended)**: "
+                    "when every category is staged, call `qa_submit_suite` with "
+                    'this prep_id and an EMPTY `suite_json` (`suite_json=""`); '
+                    "no case is re-sent and nothing already staged can be lost."
+                    f"{_sidecar_line}{_coverage_line}\n"
+                )
+            )
             route = (
                 "Choose ONE route -- do not do both:\n\n"
-                "- **Finalize from these rows (crash-safe, recommended)**: "
-                "when every category is staged, call `qa_submit_suite` with "
-                'this prep_id and an EMPTY `suite_json` (`suite_json=""`); '
-                "no case is re-sent and nothing already staged can be lost."
-                f"{_sidecar_line}{_coverage_line}\n"
+                f"{_primary_bullet}"
                 f"- **Or send one merged `suite_json`**: the {_merged_label} "
                 "runs on it, and the rows staged here are ignored -- but "
                 "nothing at all is saved until that single call, so an "
@@ -4267,6 +4452,11 @@ async def handle_submit_suite(
             return _task_note
         if not isinstance(envelope, dict):
             return _prep_missing_reply(prep_id)
+        # Fix 5b: without this, a resubmit would reach the sidecar/merge branches
+        # and finalize the same prep twice.
+        _final_note = _finalized_reply(prep_id, envelope)
+        if _final_note:
+            return _final_note
 
         try:
             prepared = host_mode.deserialize_prepared(envelope.get("prepared") or {})
@@ -4309,6 +4499,27 @@ async def handle_submit_suite(
             has_full = bool(suite_json.strip())
         elif suite_json is None:
             has_full = False
+        elif isinstance(suite_json, dict):
+            # 2026-08-03 (Fix 1 follow-up): the MCP tool signature now accepts an
+            # OBJECT, so a host on the RECOMMENDED Path A route can send {} where
+            # it previously had to send "". The old `else: has_full = True` treated
+            # that as a full submission, which skipped the staged-row merge and
+            # then failed validation outright (TestSuite.test_cases carries
+            # min_length=1) -- turning the recommended finalize into a hard error
+            # and stranding every staged category. An empty object, or one whose
+            # only content is an empty `test_cases`, means exactly what "" means:
+            # merge the rows staged for this prep.
+            #
+            # A review SIDECAR is NOT empty -- it carries duplicate_groups /
+            # acceptance_criteria / ambiguity_result -- so it still takes
+            # has_full=True here and reaches _review_sidecar below, which is what
+            # keeps the Fix 2 route working.
+            if not suite_json:
+                has_full = False
+            elif set(suite_json) <= {"test_cases"} and not suite_json.get("test_cases"):
+                has_full = False
+            else:
+                has_full = True
         else:
             has_full = True
 
@@ -4782,14 +4993,33 @@ async def handle_submit_suite(
             # _merge_category_rows copies only test_cases. Saying nothing here read
             # as "reviewed, found none"; blaming the host would be wrong, because
             # the SERVER discards the field on this path. Name the route instead.
-            dup_status_note = (
-                "> \u2139\ufe0f  No duplicate review ran: this suite was finalized "
-                "from per-category rows with no `duplicate_groups` sidecar. "
-                "Either submit ONE merged `suite_json`, or finalize with "
-                '`suite_json={"duplicate_groups":[[...]]}` (empty/absent '
-                "`test_cases`) after staging categories. Any cross-category "
-                "duplicates are still present.\n\n"
-            )
+            #
+            # 2026-08-03 (Fix 2 / H4): an HONEST EMPTY SIDECAR lands here too, and
+            # for it this message is a FALSEHOOD. A host that staged categories,
+            # reviewed the merged set and found no duplicates reports that by
+            # sending a sidecar whose `duplicate_groups` is []. The sidecar branch
+            # sets has_full=False (see the merge branch above), so gating only on
+            # has_full told that host "No duplicate review ran ... duplicates are
+            # still present" -- the opposite of what it just did. It copies the
+            # field into the merged dict EVEN WHEN EMPTY (`sidecar_raw is not
+            # None`), so parse_host_suite sets duplicate_review_offered and the two
+            # cases are distinguishable. This mattered little while the empty
+            # finalize was the recommended route; it is the COMMON case now that
+            # the sidecar is recommended whenever this review is on.
+            if getattr(parsed, "duplicate_review_offered", False):
+                dup_status_note = (
+                    "> \u267b\ufe0f  Duplicate review ran and reported no "
+                    "cross-category duplicates.\n\n"
+                )
+            else:
+                dup_status_note = (
+                    "> \u2139\ufe0f  No duplicate review ran: this suite was "
+                    "finalized from per-category rows with no `duplicate_groups` "
+                    "sidecar. Either submit ONE merged `suite_json`, or finalize with "
+                    '`suite_json={"duplicate_groups":[[...]]}` (empty/absent '
+                    "`test_cases`) after staging categories. Any cross-category "
+                    "duplicates are still present.\n\n"
+                )
         elif dup_review_on and has_full and not dup_groups:
             if getattr(parsed, "duplicate_review_offered", False):
                 dup_status_note = (
@@ -5175,21 +5405,49 @@ async def handle_submit_suite(
             summary, suite, suite_id, status, auto_export=auto_export
         )
         xlsx_paths: list[str] = []
+        # FRONT-loaded, not appended (see _auto_export_xlsx): export_note goes at
+        # the HEAD of the returned string below, ahead of every note and the
+        # suite body, so a paraphrasing host model cannot drop the deliverable.
+        export_note = ""
         if auto_export:
-            result_md += "\n\n" + await _auto_export_xlsx(
+            export_note = await _auto_export_xlsx(
                 suite,
                 ask_text=ask_text,
                 on_path=xlsx_paths.append,
                 progress=progress,
             )
+            if export_note:
+                export_note += "\n\n---\n\n"
         result_md += await _auto_export_zephyr(
             suite,
             source_text=source_text,
             near_path=xlsx_paths[0] if xlsx_paths else "",
             progress=progress,
         )
-        await prep_store.delete_prep(prep_id)
+        # Fix 5b: STAMP instead of DELETE. Deleting made "prep gone" mean three
+        # different things at once, so a resubmit after a SUCCESSFUL finalize was
+        # told to re-prepare -- i.e. to regenerate a suite that already existed.
+        # Only the success path is stamped: the failure branch above ("produced no
+        # usable test cases") still DELETES, because stamping a finalized_suite_id
+        # there would record a suite that was never created.
+        _final_stamp = {
+            "suite_id": str(getattr(suite, "suite_id", "") or ""),
+            "export_path": str(xlsx_paths[0]) if xlsx_paths else "",
+        }
+        _stamped = await prep_store.update_prep(
+            prep_id, {**envelope, prep_store.FINALIZED_KEY: _final_stamp}
+        )
+        if _stamped.get("error"):
+            # Fall back to today's behaviour rather than leave an unstamped prep
+            # live: an unstamped prep would be offered as resumable.
+            logger.warning(
+                "prep %s could not be stamped finalized (%s) - deleting instead",
+                prep_id,
+                _stamped.get("error"),
+            )
+            await prep_store.delete_prep(prep_id)
         return (
+            f"{export_note}"
             f"{version_note}{dropped_note}{conflict_note}{cat_source}"
             f"{fa_skip_note}{amb_note}{ac_note}{checklist_note}{img_note}{risk_note}{plan_note}"
             f"{nli_note}{comment_note}"
@@ -7117,6 +7375,21 @@ async def handle_setup_check(
         # confident wrong answer is worse than none. State what is true and
         # point at the one place that gives real guidance.
         optional.append(connect_hint_line(workspace_roots=workspace_roots))
+        # Fix 7 / M3 (2026-08-03): the ONLY discoverable path to registration.
+        # QA_AUTO_REGISTER_CLIENTS defaults OFF (it writes outside the install
+        # dir), and even ON it cannot bootstrap the FIRST client -- if no editor is
+        # registered, nothing launches this server, so no startup pass ever runs.
+        # Without this line a tester who installs another editor has no way to
+        # learn that connect.sh needs re-running, which is the whole gap Fix 7 is
+        # about. Optional, not a blocker: the reader is, by definition, running in
+        # a client that IS already registered.
+        optional.append(
+            "Installed another editor since setting this up? Run "
+            "`~/qa-agent-pro/connect.sh` to register this server with it -- "
+            "registration otherwise happens only once, during install. It is "
+            "idempotent, preserves your other MCP servers, and backs up any file "
+            "it changes."
+        )
         _jira_status_line = (
             "\U0001f517 **Jira** \u2014 read through YOUR Atlassian MCP "
             "connection (OAuth, Jira Cloud). Nothing to configure here; if a "
@@ -7126,7 +7399,7 @@ async def handle_setup_check(
 
         export_line = ""
         if settings.qa_auto_export_xlsx:
-            export_dir = (settings.qa_export_dir or "").strip()
+            export_dir = _resolved_export_dir()
             if export_dir:
                 dest = Path(export_dir).expanduser()
                 probe = dest if dest.is_absolute() else Path.cwd() / dest

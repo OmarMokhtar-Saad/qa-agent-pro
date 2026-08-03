@@ -156,6 +156,59 @@ def normalize_ac_id(raw: str | None) -> str:
     return s
 
 
+# Values that are NOT acceptance criteria even when a configured field returns
+# them. `settings.jira_ac_field` defaults to customfield_10016, which is a DATE
+# field on some Jira instances: SHYJ-5645 returned
+# "2025-09-11T09:07:21.362+0300", that truthy value suppressed description
+# scanning, and the generator was handed a timestamp as its only requirement to
+# trace against -- so nothing downstream could tell a grounded case from an
+# invented one.
+_ISO_DATEISH_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?"
+    r"(?:Z|[+-]\d{2}:?\d{2})?)?$"
+)
+_SLASH_DATEISH_RE = re.compile(r"^\d{1,4}[/.]\d{1,2}[/.]\d{1,4}$")
+_NUMERIC_RE = re.compile(r"^[\d.,%+-]+$")
+
+
+def looks_like_requirement_text(text: object) -> bool:
+    """True when a string could be a testable acceptance criterion.
+
+    Deliberately NARROW -- it rejects only what cannot possibly be a
+    requirement, because a false rejection silently discards a real criterion:
+
+    * a date or ISO-8601 timestamp (the observed failure);
+    * a value with no whitespace at all -- a requirement is a sentence, and this
+      is what separates a timestamp or a field id from prose;
+    * a purely numeric/punctuation value;
+    * a value with no letters in any script.
+
+    Multi-word criteria that merely START with a number are UNAFFECTED, so
+    NB-005 behaviour ("200ms response time", "3 failed logins locks the
+    account") is preserved. Never raises.
+    """
+    try:
+        if not isinstance(text, str):
+            return False
+        value = text.strip()
+        if not value:
+            return False
+        if _ISO_DATEISH_RE.match(value) or _SLASH_DATEISH_RE.match(value):
+            return False
+        if _NUMERIC_RE.match(value):
+            return False
+        if not re.search(r"[^\W\d_]", value, re.UNICODE):
+            return False
+        # A requirement is a sentence; a single unbroken token is an id, a date,
+        # or a label -- never a testable condition.
+        return bool(re.search(r"\s", value))
+    except Exception:
+        logger.exception(
+            "looks_like_requirement_text failed - treating as non-requirement"
+        )
+        return False
+
+
 def parse_acceptance_criteria(raw: str) -> list[AcceptanceCriterion]:
     """Parse raw acceptance criteria text into numbered AcceptanceCriterion items.
 
@@ -189,6 +242,13 @@ def parse_acceptance_criteria(raw: str) -> list[AcceptanceCriterion]:
             # immediately followed by a delimiter (./)/]) AND whitespace.
             line = re.sub(r"^\s*(?:[-*•]|\d+[.)\]])\s+", "", line).strip()
             if len(line) < 5:
+                continue
+            # A configured AC field can return something that is not a
+            # requirement at all (a date, an id, a number). Letting it
+            # through creates a bogus AC that every downstream anchoring
+            # check then treats as ground truth.
+            if not looks_like_requirement_text(line):
+                logger.debug("Dropping non-requirement AC candidate: %.60r", line)
                 continue
             items.append(line)
 

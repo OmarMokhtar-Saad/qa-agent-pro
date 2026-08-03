@@ -61,6 +61,12 @@ from tools.quality_checks import (
     restore_chained_refs_from_stable,
 )
 from tools.rag_store import query_corpus
+from tools.requirement_units import (
+    enum_warning_section,
+    enumerations,
+    find_unknown_enum_values,
+    source_ambiguity_issues,
+)
 from tools.risk_scorer import (
     apply_host_risk,
     build_risk_section,
@@ -93,6 +99,7 @@ from tools.rule_packs import (
     rule_pack_notes,
     rule_pack_section,
 )
+from tools.suite_consistency import consistency_warning_section
 from tools.test_plan_report import (
     build_test_plan_artifacts,
 )
@@ -3651,6 +3658,71 @@ def _host_suppression_section(
         return ""
 
 
+# The prompt's user message carries the target ticket AND, when the issue has a
+# parent, a "## Parent Story (BACKGROUND ONLY ...)" block appended after it. The
+# grounding checks must read the TARGET only: parsing the whole message would let
+# a parent's own tables define what counts as an in-scope option, which is the
+# provenance rule tools/requirement_units exists to enforce.
+_PARENT_BLOCK_MARKER = "## Parent Story (BACKGROUND ONLY"
+
+
+def target_source_text(user_msg: str) -> str:
+    """The portion of the user message describing the TARGET ticket.
+
+    Truncates at the parent-story background heading when present. Returns the
+    message unchanged when there is no parent block. Never raises.
+    """
+    try:
+        text = user_msg or ""
+        index = text.find(_PARENT_BLOCK_MARKER)
+        return text[:index] if index != -1 else text
+    except Exception:
+        logger.exception("target_source_text failed - using the whole message")
+        return user_msg or ""
+
+
+def grounding_sections(cases: list[TestCase], user_msg: str) -> tuple[str, str]:
+    """(consistency_section, grounding_section) for the finalize summary.
+
+    * consistency_section -- unfalsifiable oracles and contradictory state
+      assumptions across the suite (tools/suite_consistency).
+    * grounding_section -- options a case selects that the ticket never defines,
+      plus defects found in the SOURCE ticket itself (duplicate rule/table ids,
+      one English label used for two different controls).
+
+    Both are ADVISORY and deterministic: no model call, no case is dropped or
+    reordered, and each returns "" when it finds nothing -- so a clean suite's
+    summary is byte-identical to before. This mirrors quality_warning_section,
+    which likewise runs unconditionally rather than behind a flag, because an
+    empty-when-clean advisory block has no behaviour to opt out of.
+
+    Never raises: any failure yields two empty strings.
+    """
+    try:
+        source = target_source_text(user_msg)
+        consistency = consistency_warning_section(cases)
+        enum_values = enumerations(source)
+        violations = find_unknown_enum_values(cases, enum_values)
+        grounding = enum_warning_section(violations, enum_values)
+        issues = source_ambiguity_issues(source)
+        if issues:
+            lines = [
+                "\n\n## Source Ticket Defects (advisory)",
+                "",
+                "Found in the ticket itself, not in the generated cases. These make "
+                "requirements ambiguous to trace and should go back to whoever wrote "
+                "the ticket:",
+            ]
+            lines.extend(f"- {issue}" for issue in issues[:10])
+            if len(issues) > 10:
+                lines.append(f"- ... and {len(issues) - 10} more")
+            grounding += "\n".join(lines)
+        return consistency, grounding
+    except Exception:
+        logger.exception("grounding_sections failed - returning empty sections")
+        return "", ""
+
+
 async def _finalize_generation(
     prepared: PreparedGeneration,
     all_cases: list[TestCase],
@@ -3974,7 +4046,19 @@ async def _finalize_generation(
     # order" x60 / "Cancel Order" x36 in one real suite). Unconditional and
     # deterministic, same as the tc_id renumber above -- it only rewrites
     # casing/whitespace, never drops or reorders a case.
-    renumbered = normalize_module_names(renumbered)
+    # Second pass (2026-08-03, QA_MODULE_PREFIX_NORMALIZE_ENABLED, default OFF):
+    # the casing pass above cannot merge a QUALIFIER-PREFIXED variant, because
+    # "Sehhaty Store - Cancel Order" and "Cancel Order" are different bucket keys.
+    # A real suite shipped 12 + 86 cases of ONE feature under those two labels.
+    # Read with getattr so an install whose .env predates the flag behaves exactly
+    # as before; see tools/quality_checks._qualifier_prefix_merges for why the rule
+    # merges only on TAIL containment and refuses head containment outright.
+    renumbered = normalize_module_names(
+        renumbered,
+        merge_qualifier_prefixes=bool(
+            getattr(settings, "qa_module_prefix_normalize_enabled", False)
+        ),
+    )
 
     suite = TestSuite(test_cases=renumbered)
     # Step 0: carry the traceability counts OUT as data. build_rtm_summary has
@@ -4112,6 +4196,11 @@ async def _finalize_generation(
     # story's background instead of the target. FLAG ONLY: nothing was dropped,
     # and the ids are the FINAL post-renumber tc_ids (matched by stable_id).
     scope_section = scope_warning_section(renumbered, out_of_scope_ids)
+
+    # Grounding + consistency advisories (Batch A modules). Deterministic and
+    # model-free; "" when the suite and ticket are clean, so an unaffected run's
+    # summary does not change by a byte.
+    consistency_section, grounding_section = grounding_sections(renumbered, user_msg)
 
     # Test-plan artifacts (QA_TEST_PLAN_ARTIFACTS, house-rule opt-in, default
     # OFF -> zero extra LLM calls). When ON, build the AC-Validation report
@@ -4345,6 +4434,8 @@ async def _finalize_generation(
             # (rewrite_vague=False) that block is the ONLY report that a step is
             # too vague to execute. Advisory prose gets truncated instead.
             f"{quality_section}"
+            f"{consistency_section}"
+            f"{grounding_section}"
             f"{host_suppress_section}"
             f"{checklist_section}"
             f"{gaps_section}"
@@ -4424,6 +4515,8 @@ async def _finalize_generation(
         # warnings must precede the variable-length checklist / gap sections so
         # the 4000-char reply cap can never delete them.
         f"{quality_section}"
+        f"{consistency_section}"
+        f"{grounding_section}"
         f"{host_suppress_section}"
         f"{checklist_section}"
         f"{gaps_section}"

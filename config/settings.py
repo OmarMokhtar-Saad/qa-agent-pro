@@ -332,13 +332,35 @@ class Settings(BaseSettings):
     # huge epic description can never crowd out the sub-task under test. 0
     # means "emit no background block" (same convention as jira_max_comments),
     # which is why this field is deliberately NOT in _POSITIVE_INT_FIELDS.
-    jira_max_parent_chars: int = 1500
+    jira_max_parent_chars: int = 2500
 
-    # Ticket comments are a second REST call (/issue/{key}/comment). Off by
-    # default, same as this file's other opt-in fetches — flip on in .env once
-    # validated, so the base issue fetch's existing behaviour (and every test
-    # exercising it) is unaffected until an operator explicitly wants it.
-    jira_fetch_comments: bool = False
+    # 2026-08-03 (user-approved) -- the sibling USER STORIES under the same
+    # parent, WITH their bodies. _extract_subtasks / _extract_issuelinks only
+    # ever see {key, summary, status} from arrays that ride along with the issue
+    # fetch, so the requirements WRITTEN IN a sibling story were invisible: a
+    # sub-task inherits them and a tester reading the board sees them. ON by
+    # default for the same reason as jira_fetch_parent (a default-OFF switch
+    # leaves the generator guessing), and a deliberate exception to the
+    # defaults-OFF rule, documented in docs/FEATURE_FLAGS.md. Costs ONE extra
+    # host-side searchJiraIssuesUsingJql call, and only when a parent exists.
+    jira_fetch_sibling_stories: bool = True
+    # Total character budget for the sibling block, ON TOP of
+    # jira_max_parent_chars (the composed background block is capped at the sum,
+    # so sibling prose can never displace the parent's own description). 0 means
+    # "emit no sibling block", which is why this is deliberately NOT in
+    # _POSITIVE_INT_FIELDS -- same convention as jira_max_parent_chars.
+    jira_max_sibling_chars: int = 3000
+
+    # Ticket comments. 2026-08-03 (user-approved): ON by default. The extra
+    # REST call (/issue/{key}/comment) that justified defaulting OFF is GONE --
+    # Jira is read through the calling agent's own Atlassian MCP connection,
+    # where `comment` is one more entry in the `fields` list of the SAME
+    # getJiraIssue call, so there is no second network call to avoid any more.
+    # A Jira description is a snapshot taken at refinement while the CURRENT
+    # requirements accumulate in the thread, which is exactly what a tester
+    # needs. Deliberate exception to the defaults-OFF rule (see
+    # docs/FEATURE_FLAGS.md); JIRA_FETCH_COMMENTS=false is the kill-switch.
+    jira_fetch_comments: bool = True
     jira_max_comments: int = 5
 
     # --- Comment reconciliation (Batch 1) — opt-in, default OFF. -----------
@@ -382,12 +404,19 @@ class Settings(BaseSettings):
     # deliberately NOT in _POSITIVE_INT_FIELDS.
     qa_comment_reconcile_max_chars: int = 1500
 
-    # Image attachments require a second, authenticated download per image
-    # PLUS a vision-capable LLM call (llm.ask_vision(), api backend only) to
-    # turn them into text before they can reach the (text-only) cli/cursor
-    # generation backends. Off by default: it's the most expensive/slowest
-    # addition here and needs ANTHROPIC_API_KEY regardless of QA_LLM_BACKEND.
-    jira_fetch_images: bool = False
+    # Image attachments. 2026-08-03 (user-approved): ON by default -- but read
+    # what it does and does NOT buy. On the MCP Jira path this yields attachment
+    # METADATA ONLY ({filename, mime, size}): tools/jira_mcp.py makes no
+    # outbound HTTP request by hard rule, the Atlassian MCP server returns no
+    # attachment bytes, and the byte-fetching REST path
+    # (jira_fetcher._fetch_jira_images) is ANTHROPIC_API_KEY-gated. So ON buys
+    # two real things and NOT vision: the filenames themselves become grounding
+    # ("the ticket has error_state.png"), and images_unavailable fires the
+    # existing handler notice that NAMES them and asks the tester to attach the
+    # screenshots to the chat -- where they ARE analysed, via IMAGE_JOB. That
+    # notice is the point: OFF meant silently generating a suite that never saw
+    # the screenshots and never saying so.
+    jira_fetch_images: bool = True
     jira_max_images: int = 3
     jira_max_image_bytes: int = 5_000_000  # Anthropic's own per-image vision cap
 
@@ -670,6 +699,55 @@ class Settings(BaseSettings):
     # object itself and every prompt byte is unchanged.
     qa_edge_cases_functional_type: bool = False
 
+    # Merge a QUALIFIER-PREFIXED module label onto the bare label it qualifies
+    # (opt-in, default OFF). tools/quality_checks.normalize_module_names has always
+    # merged CASING/whitespace variants, but it buckets on a casefolded key, so
+    # "Sehhaty Store - Cancel Order" and "Cancel Order" are different keys and never
+    # merged: a real 2026-08-03 run shipped ONE feature split 12 / 86 across exactly
+    # those two labels, fragmenting every group-by-module view (Jira, TestRail, the
+    # XLSX pivot). ON, a second pass merges the qualified label into the bare one.
+    #
+    # Flag-gated because a WRONG merge silently destroys a real distinction, which
+    # is worse than the split it fixes. The rule merges ONLY on TAIL containment and
+    # REFUSES head containment -- "Store Wallet - Top Up" is a sub-module of "Store
+    # Wallet", not a variant of it -- and refuses a tail claimed by more than one
+    # qualifier ("Admin - Login" + "User - Login"). Read at the CALL SITE via
+    # getattr, so an install whose .env predates this field is byte-identical.
+    # See tools/quality_checks._qualifier_prefix_merges for the full rationale.
+    qa_module_prefix_normalize_enabled: bool = False
+
+    # Extract acceptance criteria from a USE-CASE TABLE description (opt-in,
+    # default OFF). The AC fallback in tools/jira_mcp only understands an
+    # "Acceptance Criteria" heading followed by a block. A whole ticket family
+    # writes requirements as a markdown UC table instead -- rows labelled Basic
+    # Flow / Alternative Flow / Business Rules / Post-condition -- with no such
+    # heading anywhere. On the 2026-08-03 run that produced ZERO criteria, so the
+    # RTM was empty and 61 of 98 cases carried no requirement_id (the other 37
+    # traced to a bogus criterion parsed out of a DATE custom field).
+    # ON, those rows become one criterion each, so the suite gets real
+    # traceability. Flag-gated because it adds ticket text to the generation
+    # prompt: it changes what the model sees, and a mis-parse would introduce
+    # requirements the ticket never stated.
+    qa_jira_uc_table_ac_enabled: bool = False
+
+    # Re-register this server in editor MCP configs on startup (opt-in, OFF).
+    # Registration otherwise happens exactly ONCE, at install: connect.sh skips a
+    # client whose config dir does not exist yet, install.sh refuses to re-run
+    # without QA_FORCE, and the launcher never called connect.sh -- so an editor
+    # installed AFTER qa-agent-pro is never picked up and the tester has no way to
+    # know connect.sh needs re-running.
+    #
+    # OFF by default, deliberately, even though that limits reach: this WRITES to
+    # files outside the install dir (~/.cursor/mcp.json, Claude Desktop's config),
+    # and a server that inserts itself into other editors' configs whenever it
+    # starts is a shape worth requiring consent for. The write is bounded to
+    # INSERTING one absent key -- an existing entry is never rewritten -- and is
+    # atomic + locked (tools/client_registry). Note the limit this cannot escape:
+    # if NO client is registered, nothing launches the server, so a startup pass
+    # can never bootstrap the very first client. Running connect.sh remains the
+    # answer for that case, and qa_setup_check points at it.
+    qa_auto_register_clients: bool = False
+
     # Surgical quality retry (opt-in, both default OFF -- see
     # .claude/plans/plan-surgical-retry.md). The per-category quality gate
     # (tools/quality_checks.quality_ratio) flags a category whose steps are
@@ -905,14 +983,19 @@ class Settings(BaseSettings):
     # byte-identical to today.
     qa_xlsx_risk_notes: bool = False
 
-    # Directory the auto-exported .xlsx is written to, relative to the working
-    # directory (the install dir the MCP server chdirs into). Defaults to the
+    # Directory the auto-exported .xlsx is written to. A RELATIVE value is
+    # resolved against the INSTALL ROOT by mcp_handlers._resolved_export_dir --
+    # NOT against the process working directory, which is whatever the MCP
+    # client happened to launch the server with, so one install printed a
+    # different path per client (Claude Desktop / Code / Cursor) and a tester
+    # could not reliably find their own file (2026-08-03). Defaults to the
     # gitignored data/exports so the file lands in a stable folder a
     # non-technical tester can find and re-open -- their own deliverable, never
     # auto-deleted. Set to "" for the legacy secure-temp behavior
     # (<tempdir>/qa_agents_exports/, 0600); an unusable value degrades to that
     # same temp path rather than failing the export. A plain string field: no
-    # bool coercer, and it adds no internal import.
+    # bool coercer, and it adds no internal import -- the resolution lives in
+    # mcp_handlers for exactly that reason.
     qa_export_dir: str = "data/exports"
 
     # Zephyr for Jira import export (Batch 4 -- tools/zephyr_exporter.py).
@@ -1512,6 +1595,9 @@ class Settings(BaseSettings):
         "qa_llm_risk_scoring",
         "qa_test_data_strategy",
         "qa_edge_cases_functional_type",
+        "qa_module_prefix_normalize_enabled",
+        "qa_jira_uc_table_ac_enabled",
+        "qa_auto_register_clients",
         "qa_quality_reminder_upfront",
         "qa_surgical_quality_retry",
         "testrail_dry_run",
@@ -1519,6 +1605,7 @@ class Settings(BaseSettings):
         "qa_comment_reconcile_enabled",
         "jira_fetch_images",
         "jira_fetch_parent",
+        "jira_fetch_sibling_stories",
         "qa_mobile_capture",
         "qa_maestro_enabled",
         "qa_maestro_dry_run",
@@ -1821,6 +1908,7 @@ class Settings(BaseSettings):
         "jira_max_images",
         "jira_max_image_bytes",
         "jira_max_parent_chars",
+        "jira_max_sibling_chars",
         "qa_max_chat_images",
         "qa_max_chat_image_bytes",
         "qa_device_command_timeout",

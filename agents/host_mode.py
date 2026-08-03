@@ -534,6 +534,33 @@ _HOST_DEDUP_INSTRUCTION = (
 # Every helper below is pure / sync / never-raise where noted.
 # --------------------------------------------------------------------------- #
 
+# Fix 2 (2026-08-03): step 3's finalize sentence has to differ by flag, but this
+# is ONE module-level constant and it already contains JSON braces, so str.format
+# is not usable on it. Substitute a sentinel in _parallel_instruction() instead.
+# Defined BEFORE the constant on purpose -- module-level constants evaluate in
+# order, so referencing it from inside the constant below requires it to exist.
+# WHY it must differ: with the duplicate review ON, `suite_json=""` is the call
+# that FORFEITS it, and this instruction is the FIRST and most authoritative text
+# the host reads. run3 (SHYJ-5645) took the empty route it led with and lost the
+# review across 98 cases from 8 mutually blind workers.
+_FINALIZE_SENTINEL = "@@PARALLEL_FINALIZE@@"
+
+_FINALIZE_SIDECAR_FIRST = (
+    "When ready=true, finalize with `qa_submit_suite` and a small JSON SIDECAR "
+    "holding just `duplicate_groups` and/or `acceptance_criteria` / "
+    "`ambiguity_result` and NO test_cases (the server remaps a sidecar's tc_ids "
+    "across the merge) -- this KEEPS the duplicate review you were asked to run. "
+    'Finalizing with suite_json="" also works and is equally crash-safe, but it '
+    "FORFEITS that review."
+)
+
+_FINALIZE_EMPTY_FIRST = (
+    'When ready=true, finalize with `qa_submit_suite` and suite_json="" -- or, '
+    "to carry post-merge review fields, a small JSON SIDECAR holding just "
+    "`duplicate_groups` and/or `acceptance_criteria` / `ambiguity_result` and NO "
+    "test_cases (the server remaps a sidecar's tc_ids across the merge)."
+)
+
 _HOST_PARALLEL_INSTRUCTION = (
     "\n"
     "PARALLEL FAN-OUT (same chat session) -- when your host can run parallel "
@@ -546,17 +573,17 @@ _HOST_PARALLEL_INSTRUCTION = (
     "`jobs[]` in the SAME session, in parallel. Each worker uses system_prompt + "
     "user_context + that job's instruction; emits ONLY a JSON object matching "
     "response_schema for THAT category; sets each case's `category` field to the "
-    "job's category_name EXACTLY.\n"
+    "job's category_name EXACTLY. Submit each `suite_json` as a JSON OBJECT if "
+    "your client can send one -- serialising it into a string argument is "
+    "accepted but unnecessary.\n"
     "3. PRIMARY finalize (Path A -- stage as you go): call `qa_submit_category` "
     "for EACH category AS SOON AS its worker returns (from the worker when it "
     "can call MCP tools, otherwise from the parent). Do NOT hold results only "
     "in the parent's memory until the end: a chat reload or crash loses "
     "unstaged work, while staged categories survive on the server and "
-    "`qa_prep_status` shows what is left. When ready=true, finalize with "
-    '`qa_submit_suite` and suite_json="" -- or, to carry post-merge review '
-    "fields, a small JSON SIDECAR holding just `duplicate_groups` and/or "
-    "`acceptance_criteria` / `ambiguity_result` and NO test_cases (the server "
-    "remaps a sidecar's tc_ids across the merge). Do not finalize early -- the "
+    "`qa_prep_status` shows what is left. "
+    + _FINALIZE_SENTINEL
+    + " Do not finalize early -- the "
     "server rejects an incomplete Path A finalize when this orchestration was "
     "requested.\n"
     "4. ALTERNATIVE finalize (Path B -- merge in parent): merge all workers' "
@@ -591,9 +618,32 @@ def _parallel_fanout_on() -> bool:
         return False
 
 
+def _dedup_review_on() -> bool:
+    """Never-raise read of QA_HOST_DEDUP_REVIEW_ENABLED.
+
+    Mirrors _parallel_fanout_on. Used by the orchestration contract (Fix 2,
+    2026-08-03) so the finalize route it names as `preferred` is the one that
+    KEEPS this review rather than the one that forfeits it.
+    """
+    try:
+        return bool(getattr(settings, "qa_host_dedup_review_enabled", False))
+    except Exception:  # pragma: no cover
+        logger.debug("could not read qa_host_dedup_review_enabled", exc_info=True)
+        return False
+
+
 def _parallel_instruction() -> str:
-    """Appendix for prepare instructions, or "" when the flag is OFF."""
-    return _HOST_PARALLEL_INSTRUCTION if _parallel_fanout_on() else ""
+    """Appendix for prepare instructions, or "" when the flag is OFF.
+
+    Resolves the finalize sentinel so step 3 recommends the route that KEEPS the
+    duplicate review whenever that review is enabled (Fix 2).
+    """
+    if not _parallel_fanout_on():
+        return ""
+    return _HOST_PARALLEL_INSTRUCTION.replace(
+        _FINALIZE_SENTINEL,
+        _FINALIZE_SIDECAR_FIRST if _dedup_review_on() else _FINALIZE_EMPTY_FIRST,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -691,18 +741,35 @@ def build_orchestration(prepared, prep_id: str = "") -> dict | None:
         "mode": "parallel_chat_workers",
         "expected_categories": list(names),
         "worker_count": len(names),
+        # 2026-08-03 (Fix 2): this is MACHINE-READABLE guidance, and naming the
+        # empty finalize as `preferred` while the duplicate review is ON told the
+        # host to take the one route that DISCARDS that review. run3 followed it
+        # exactly: 98 cases from 8 blind workers, review enabled, none performed.
+        # When the review is on, the preferred finalize is the sidecar -- which is
+        # equally crash-safe, since the categories are already staged either way.
         "finalize": {
-            "preferred": "qa_submit_category_then_empty_suite",
+            "preferred": (
+                "qa_submit_category_then_review_sidecar"
+                if _dedup_review_on()
+                else "qa_submit_category_then_empty_suite"
+            ),
             "fallback": "merge_then_qa_submit_suite",
             "require_all_categories": True,
         },
         "parent_instructions": (
             "Fan out one same-session worker per expected category; stage each "
             "category via qa_submit_category as it returns (crash-safe), then "
-            "qa_prep_status until ready=true and finalize with an empty "
-            "suite_json (a review sidecar can still carry duplicate_groups). "
+            "qa_prep_status until ready=true and finalize with a review sidecar "
+            "carrying duplicate_groups (an empty suite_json also finalizes, but "
+            "FORFEITS the duplicate review you were asked to run). "
             "Merge-in-parent (Path B) is the fallback and the only route that "
             "can carry requirement_matches."
+            if _dedup_review_on()
+            else "Fan out one same-session worker per expected category; stage "
+            "each category via qa_submit_category as it returns (crash-safe), "
+            "then qa_prep_status until ready=true and finalize with an empty "
+            "suite_json. Merge-in-parent (Path B) is the fallback and the only "
+            "route that can carry requirement_matches."
         ),
         "worker_instructions": (
             "Emit ONLY one category's TestSuite JSON matching response_schema. "
@@ -1030,8 +1097,13 @@ _HOST_GENERATION_INSTRUCTIONS = (
     "1b. Generate FROM this payload (system_prompt + user_context + each "
     "category instruction). Do NOT invent the suite with a local script that "
     "ignores those fields -- that is how thin 2-step cases and empty Test "
-    "Data appear. After auto-export succeeds, relay the .xlsx path; do not "
-    "offer alternate export formats unless the tester asks.\n"
+    "Data appear. When the submit reply contains an Excel path, you MUST quote "
+    "that path line VERBATIM in your own reply -- it is the deliverable the "
+    "tester asked for, and a summary that omits it reads as a finished run "
+    "with no file (exactly what happened on 2026-08-03: 98 cases generated, "
+    "exported cleanly, path never shown). Never report the suite as delivered "
+    "without showing the path. Do not offer alternate export formats unless "
+    "the tester asks.\n"
     "2. For EACH of the entries in `categories`, produce test cases using "
     "`system_prompt` as your system instruction, `user_context` as the feature "
     "material, and that entry's `instruction` (its FOCUS, case-count range and "
@@ -4123,6 +4195,27 @@ def parse_host_suite(text_or_obj) -> ParsedSubmission:
     bad submission into a tester-readable message.
     """
     if isinstance(text_or_obj, dict):
+        # 2026-08-03 (Fix 1): the MCP tool signatures now accept an OBJECT for
+        # suite_json, so this branch is reachable from a real submission for the
+        # first time. It MUST honour the same size cap as the string branch
+        # below -- otherwise widening the annotation would have silently removed
+        # the only bound on submission size, since the cap sits after this early
+        # return. Serialising to measure costs the same order of memory as the
+        # string path already does.
+        cap = int(getattr(settings, "qa_prep_max_bytes", 0) or 0)
+        if cap:
+            try:
+                size = len(
+                    json.dumps(text_or_obj, ensure_ascii=False).encode(
+                        "utf-8", "ignore"
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                raise PrepParseError(
+                    f"submitted object is not JSON-serialisable: {exc}"
+                ) from exc
+            if size > cap:
+                raise PrepParseError(f"submitted JSON exceeds the {cap}-byte cap")
         return _validate_suite(text_or_obj)
     if not isinstance(text_or_obj, str):
         raise PrepParseError(

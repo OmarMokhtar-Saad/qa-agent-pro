@@ -324,7 +324,78 @@ def restore_chained_refs_from_stable(cases: list[TestCase]) -> list[TestCase]:
         return cases
 
 
-def normalize_module_names(cases: list[TestCase]) -> list[TestCase]:
+_MODULE_SEPARATORS = ("-", "\u2013", "\u2014", ":", ">", "/", "|")
+
+
+def _qualifier_prefix_merges(counts: dict[str, int]) -> dict[str, str]:
+    """Map a QUALIFIER-PREFIXED module label onto the bare label it qualifies.
+
+    ``counts`` is {exact module label: number of cases}. Returns
+    {qualified_label: bare_label} for the safe subset only; every other pair is
+    left alone.
+
+    2026-08-03. normalize_module_names' first pass merges only CASING/whitespace
+    variants, so a real suite shipped one feature under two labels:
+    "Cancel Order" (86 cases) and "Sehhaty Store - Cancel Order" (12) --
+    different bucket keys, never merged, and every "group by module" view (Jira,
+    TestRail, the XLSX pivot) fragmented for what is one feature.
+
+    Merges ONLY on TAIL containment -- the bare label must be the TRAILING segment
+    of the qualified one, after a separator:
+
+        "Cancel Order"  <- "Sehhaty Store - Cancel Order"   MERGE
+
+    and NEVER on HEAD containment, which is how a genuine SUB-module is named:
+
+        "Store Wallet"  <- "Store Wallet - Top Up"          REFUSE
+        "Checkout"      <- "Checkout - Guest"               REFUSE
+        "Profile"       <- "Profile: Addresses"             REFUSE
+
+    That asymmetry IS the rule, and it is why plain containment (or a token-count
+    threshold) cannot work: in "<qualifier> - <thing>" naming the trailing segment
+    is the thing and the leading segment is its scope (product, app, area). Two
+    labels sharing a TAIL are one thing at two qualification depths; two labels
+    sharing a HEAD are different things inside one area.
+
+    Second guard -- refuse when TWO OR MORE distinct qualified labels share one
+    tail. "Admin - Login" and "User - Login" both tail-match "Login", and
+    collapsing them would destroy precisely the distinction those labels encode.
+    Only a 1:1 qualified->bare mapping merges.
+
+    Script-agnostic on purpose: matching is on separator-delimited segments, never
+    on casing, so it behaves identically for the Arabic labels that make up a
+    large share of real suites (``str.casefold()`` is a no-op for Arabic, which
+    the first pass silently depends on).
+    """
+    bare_by_text: dict[str, str] = {}
+    for label in counts:
+        bare_by_text[" ".join((label or "").split())] = label
+    tails: dict[str, set[str]] = {}
+    for label in counts:
+        norm = " ".join((label or "").split())
+        for sep in _MODULE_SEPARATORS:
+            token = f" {sep} "
+            idx = norm.find(token)
+            while idx != -1:
+                tail = norm[idx + len(token) :].strip()
+                if tail and tail != norm:
+                    tails.setdefault(tail, set()).add(label)
+                idx = norm.find(token, idx + 1)
+    merges: dict[str, str] = {}
+    for tail, qualified in tails.items():
+        target = bare_by_text.get(tail)
+        if target is None:
+            continue
+        others = {q for q in qualified if q != target}
+        if len(others) != 1:
+            continue
+        merges[next(iter(others))] = target
+    return merges
+
+
+def normalize_module_names(
+    cases: list[TestCase], merge_qualifier_prefixes: bool = False
+) -> list[TestCase]:
     """Canonicalize `module` casing/whitespace across a merged suite.
 
     2026-08-01: a real host-mode run (8 parallel category workers, each blind
@@ -350,16 +421,23 @@ def normalize_module_names(cases: list[TestCase]) -> list[TestCase]:
         for tc in cases:
             key = " ".join((tc.module or "").split()).casefold()
             buckets.setdefault(key, []).append(tc)
-        if all(len({tc.module for tc in members}) <= 1 for members in buckets.values()):
+        needs_case_pass = not all(
+            len({tc.module for tc in members}) <= 1 for members in buckets.values()
+        )
+        # The early return must NOT skip the qualifier pass: a suite can carry a
+        # qualifier-prefixed variant with NO casing variant at all, and returning
+        # here would leave it split (the 2026-08-03 bug this parameter fixes).
+        if not needs_case_pass and not merge_qualifier_prefixes:
             return cases
         # Majority casing per key group: the single spelling used by the most
         # cases in that group wins over any minority variant sharing the key.
         canonical: dict[str, str] = {}
-        for key, members in buckets.items():
-            counts: dict[str, int] = {}
-            for tc in members:
-                counts[tc.module] = counts.get(tc.module, 0) + 1
-            canonical[key] = max(counts.items(), key=lambda kv: kv[1])[0]
+        if needs_case_pass:
+            for key, members in buckets.items():
+                counts: dict[str, int] = {}
+                for tc in members:
+                    counts[tc.module] = counts.get(tc.module, 0) + 1
+                canonical[key] = max(counts.items(), key=lambda kv: kv[1])[0]
         changed = 0
         out: list[TestCase] = []
         for tc in cases:
@@ -381,6 +459,25 @@ def normalize_module_names(cases: list[TestCase]) -> list[TestCase]:
                     if len({tc.module for tc in members}) > 1
                 ),
             )
+        if merge_qualifier_prefixes:
+            label_counts: dict[str, int] = {}
+            for tc in out:
+                label_counts[tc.module] = label_counts.get(tc.module, 0) + 1
+            merges = _qualifier_prefix_merges(label_counts)
+            if merges:
+                out = [
+                    (
+                        tc.model_copy(update={"module": merges[tc.module]})
+                        if tc.module in merges
+                        else tc
+                    )
+                    for tc in out
+                ]
+                logger.info(
+                    "normalize_module_names: merged %d qualifier-prefixed label(s): %s",
+                    len(merges),
+                    "; ".join(f"{k!r} -> {v!r}" for k, v in sorted(merges.items())),
+                )
         return out
     except Exception:
         logger.exception("normalize_module_names failed — returning cases unchanged")

@@ -25,47 +25,27 @@ else
 fi
 
 # Cursor + Claude Desktop — merge JSON configs, preserving other servers.
+# Delegates to tools/client_registry so this script and the launcher's
+# startup pass share ONE implementation. This caller runs in REPAIR mode
+# (insert_only=False) on purpose: re-running connect.sh after the install
+# moves must fix a stale command, while the startup pass must never rewrite
+# an entry the tester edited by hand.
 "$PY" - "$START" <<'PYEOF'
-import json, sys
-from pathlib import Path
+import sys
 
-start = sys.argv[1]
-home = Path.home()
+from tools.client_registry import register_all
 
-
-def register(path, label, requires_dir):
-    if not requires_dir.is_dir():
+for label, status, detail in register_all(sys.argv[1], insert_only=False):
+    if status == "skipped":
         print(f"  - {label}: not detected — skipped")
-        return
-    try:
-        cfg = {}
-        if path.is_file():
-            text = path.read_text(encoding="utf-8").strip()
-            cfg = json.loads(text) if text else {}
-            if not isinstance(cfg, dict):
-                raise ValueError("config root is not a JSON object")
-        servers = cfg.setdefault("mcpServers", {})
-        existed = "qa-agent-pro" in servers
-        servers["qa-agent-pro"] = {"command": start}
-        if path.is_file():
-            Path(str(path) + ".bak").write_text(
-                path.read_text(encoding="utf-8"), encoding="utf-8"
-            )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
-        verb = 'updated' if existed else 'added'
-        print(f"  + {label}: {verb} in {path}")
-    except Exception as exc:
-        print(f"  ! {label}: could not update {path} ({exc}) — add manually:")
-        print('      {"mcpServers": {"qa-agent-pro": {"command": "%s"}}}' % start)
-
-
-register(home / ".cursor" / "mcp.json", "Cursor", home / ".cursor")
-if sys.platform == "darwin":
-    app = home / "Library" / "Application Support" / "Claude"
-else:
-    app = home / ".config" / "Claude"
-register(app / "claude_desktop_config.json", "Claude Desktop", app)
+    elif status == "error":
+        print(f"  ! {label}: could not update ({detail}) — add manually:")
+        print(
+            '      {"mcpServers": {"qa-agent-pro": {"command": "%s"}}}'
+            % sys.argv[1]
+        )
+    else:
+        print(f"  + {label}: {status} ({detail})")
 PYEOF
 
 echo "Done. Restart your editor(s) to pick up the server."

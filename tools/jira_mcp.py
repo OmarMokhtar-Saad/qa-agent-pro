@@ -255,6 +255,124 @@ def _as_text(value: object) -> str:
         return ""
 
 
+# A use-case table row: "| **Basic Flow** | user clicks cancel ... |". The label
+# is bounded and the body is whatever remains up to the trailing pipe.
+_UC_ROW_RE = re.compile(r"^\|\s*\**\s*([A-Za-z][A-Za-z /_-]{2,40}?)\s*\**\s*\|(.*)$")
+
+# Only rows that carry a REQUIREMENT. Description/Actor/Pre-condition are context,
+# not testable criteria, and including them produced restatements of the feature
+# rather than things a case can verify.
+_UC_AC_LABELS = frozenset(
+    {
+        "basic flow",
+        "alternative flow",
+        "alternate flow",
+        "exception flow",
+        "business rules",
+        "business rule",
+        "post-condition",
+        "postcondition",
+        "post condition",
+        "acceptance criteria",
+    }
+)
+
+# Confluence/Jira rich-text leaves these inline nodes in the markdown export.
+_UC_CUSTOM_TAG_RE = re.compile(r"<custom\b[^>]*>.*?</custom>|<custom\b[^>]*/?>", re.S)
+_UC_MAX_CRITERIA = 12
+_UC_MAX_CRITERION_CHARS = 600
+
+
+def _extract_ac_from_uc_table(description: str) -> str:
+    """Pull acceptance criteria out of a USE-CASE TABLE description.
+
+    2026-08-03. ``_extract_ac_from_description`` only understands an "Acceptance
+    Criteria" heading. A whole ticket family writes the requirements as a markdown
+    UC table and has no such heading at all:
+
+        | **UC**              | **Cancel order**                          |
+        | **Basic Flow**      | User clicks cancel ... System displays ... |
+        | **Alternative Flow**| In Step 2, if the user clicks Keep ...     |
+        | **Business Rules**  | **BR02**: Not all products have ...       |
+
+    That returned "" on the observed run, so the suite finalized with NO acceptance
+    criteria and 61 of 98 cases had no ``requirement_id``.
+
+    Emits ONE criterion per requirement-bearing row rather than trying to split a
+    row into steps: the real rows are run-on prose ("User clicks on cancel order
+    option System displays cancelation reason **DF01** User select a reason"), so
+    sentence-splitting invents boundaries that are not in the ticket. One row per
+    criterion is coarser but is actually what the ticket asserts.
+
+    Context-only rows (Description / Actor / Pre-condition) are deliberately
+    skipped -- they restate the feature instead of stating something checkable.
+
+    Bounded and never raises: at most ``_UC_MAX_CRITERIA`` rows, each truncated to
+    ``_UC_MAX_CRITERION_CHARS``. The caller still routes the result through the
+    normal untrusted-text path.
+    """
+    try:
+        if not description:
+            return ""
+        out: list[str] = []
+        for line in description.splitlines():
+            m = _UC_ROW_RE.match(line.strip())
+            if not m:
+                continue
+            label = " ".join(m.group(1).split()).strip("*: ").casefold()
+            if label not in _UC_AC_LABELS:
+                continue
+            body = m.group(2)
+            body = _UC_CUSTOM_TAG_RE.sub(" ", body)
+            body = body.replace("|", " ").replace("*", "").replace("\\", "")
+            body = " ".join(body.split())
+            if not body:
+                continue
+            out.append(
+                f"{m.group(1).strip('*: ').strip()}: {body[:_UC_MAX_CRITERION_CHARS]}"
+            )
+            if len(out) >= _UC_MAX_CRITERIA:
+                break
+        return "\n".join(out)
+    except Exception:
+        logger.exception("_extract_ac_from_uc_table failed - returning empty")
+        return ""
+
+
+def _usable_ac_text(raw: object) -> bool:
+    """Whether the configured AC custom field actually holds acceptance criteria.
+
+    2026-08-03. ``settings.jira_ac_field`` is a per-instance GUESS (default
+    ``customfield_10016``). On a real workspace that id is a DATE field, so the AC
+    block arrived as ``2025-09-11T09:07:21.362+0300``. Because the fallback was
+    written as ``ac_src or _extract_ac_from_description(description)``, a non-empty
+    timestamp WON the ``or`` and the ticket's real criteria -- which lived in the
+    description -- were never parsed. Downstream, ``tools/rtm`` turned that
+    timestamp into ``AC-001`` and 37 of 98 cases "traced" to it.
+
+    ``rtm.looks_like_requirement_text`` now rejects that value, which stops the fake
+    criterion, but on its own it only converts a WRONG AC into NO AC: the ``or``
+    still suppresses the description. Truthiness is the wrong test, so ask the same
+    question rtm asks downstream -- does any line look like a requirement? -- so the
+    two cannot disagree about what counts as usable.
+
+    Multi-line AC fields are common, and one junk line must not veto a real block,
+    so ANY plausible line makes the field usable. On an unexpected error this
+    returns today's truthiness answer: preferring a possibly-odd AC field is
+    recoverable, silently discarding a real one is not.
+    """
+    text = "" if raw is None else str(raw)
+    try:
+        from tools.rtm import looks_like_requirement_text
+
+        if not text.strip():
+            return False
+        return any(looks_like_requirement_text(ln) for ln in text.splitlines())
+    except Exception:
+        logger.exception("_usable_ac_text failed - treating the field as usable")
+        return bool(text.strip())
+
+
 def _extract_ac_from_description(description: str) -> str:
     """Fallback AC extraction: scan a ticket description for an 'Acceptance
     Criteria' heading and return the block beneath it (QW-11 / I-023).
@@ -266,6 +384,11 @@ def _extract_ac_from_description(description: str) -> str:
             return ""
         m = _AC_HEADING_RE.search(description)
         if not m:
+            # No "Acceptance Criteria" heading. Before giving up, try the use-case
+            # table shape (opt-in) -- a whole ticket family has its requirements
+            # only there, and returning "" left those suites with no traceability.
+            if bool(getattr(settings, "qa_jira_uc_table_ac_enabled", False)):
+                return _extract_ac_from_uc_table(description)
             return ""
         rest = description[m.end() :].lstrip("\n")
         collected: list[str] = []
@@ -527,8 +650,76 @@ def _extract_issuelinks(fields: dict) -> list[dict]:
         return []
 
 
+def _extract_sibling_bodies(payload: dict, target_key: str = "") -> list[dict]:
+    """[{key, issuetype, summary, description, acceptance_criteria}] for the user
+    stories under the same parent.
+
+    Read from an OPTIONAL third host call (``searchJiraIssuesUsingJql``) handed
+    back as ``sibling_issues``: those child issues' BODIES carry the
+    requirements a sub-task inherits, while ``_extract_subtasks`` only ever sees
+    key/summary/status. Gated by ``settings.jira_fetch_sibling_stories``,
+    count-capped by ``_MAX_RELATED_ISSUES`` and char-capped PER ISSUE so one
+    huge story cannot crowd out the rest.
+
+    UNTRUSTED third-party text -- strictly higher injection risk than the target
+    ticket, because it is authored by other people for another purpose. Keys are
+    regex-gated here, every URL is stripped by :func:`_build_parent_context`, and
+    the result stays in ``parent_context`` (BACKGROUND) instead of ``raw_text``.
+    Never raises.
+    """
+    try:
+        if not settings.jira_fetch_sibling_stories:
+            return []
+        items = payload.get("sibling_issues") if isinstance(payload, dict) else None
+        if isinstance(items, dict):
+            # Accept the RAW JQL response shape ({"issues": [...]}) as well as a
+            # bare list, so a host that pastes the tool result unmodified works.
+            items = items.get("issues")
+        if not isinstance(items, list):
+            return []
+        target = _valid_issue_key(target_key)
+        per_issue = max(1, settings.jira_max_sibling_chars // _MAX_RELATED_ISSUES)
+        out: list[dict] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key = _valid_issue_key(item.get("key"))
+            if not key or key == target:
+                continue
+            sfields = _issue_fields(item)
+            desc = _as_text(sfields.get("description")).strip()[:per_issue]
+            sac = _as_text(sfields.get(settings.jira_ac_field)).strip()[:per_issue]
+            if not desc and not sac:
+                # Title-only siblings add nothing _extract_subtasks does not
+                # already list, and each one costs budget.
+                continue
+            itype = sfields.get("issuetype")
+            out.append(
+                {
+                    "key": key,
+                    "issuetype": (
+                        str(itype.get("name") or "").strip()
+                        if isinstance(itype, dict)
+                        else ""
+                    ),
+                    "summary": str(sfields.get("summary") or "").strip(),
+                    "description": desc,
+                    "acceptance_criteria": sac,
+                }
+            )
+            if len(out) >= _MAX_RELATED_ISSUES:
+                break
+        return out
+    except Exception:
+        logger.exception("Extracting sibling user stories failed")
+        return []
+
+
 def _build_parent_context(
-    parent: dict | None, subtasks: list[dict], issuelinks: list[dict]
+    parent: dict | None,
+    subtasks: list[dict],
+    issuelinks: list[dict],
+    siblings: list[dict] | None = None,
 ) -> str:
     """Compose the BACKGROUND block for a ticket whose requirements live
     elsewhere.
@@ -572,11 +763,48 @@ def _build_parent_context(
                 f"{ln.get('summary', '')}".rstrip()
                 for ln in issuelinks
             ]
+        if siblings:
+            lines += [
+                "",
+                "Sibling user stories under the same parent (context only -- "
+                "requirements they state can apply to this ticket, but they are "
+                "NOT the thing under test):",
+            ]
+            budget = max(0, settings.jira_max_sibling_chars)
+            for sib in siblings:
+                if budget <= 0:
+                    break
+                head = f"- {sib['key']}"
+                itype = str(sib.get("issuetype") or "").strip()
+                if itype:
+                    head += f" ({itype})"
+                sib_summary = str(sib.get("summary") or "").strip()
+                if sib_summary:
+                    head += f": {sib_summary}"
+                block = [head.rstrip()]
+                sib_desc = str(sib.get("description") or "").strip()
+                if sib_desc:
+                    block.append(f"    {sib_desc}")
+                sib_ac = str(sib.get("acceptance_criteria") or "").strip()
+                if sib_ac:
+                    block += ["    Acceptance criteria:", f"    {sib_ac}"]
+                chunk = "\n".join(block)
+                if len(chunk) > budget:
+                    chunk = chunk[:budget]
+                budget -= len(chunk)
+                lines.append(chunk)
         text = "\n".join(lines).strip()
         if not text:
             return ""
         cap = settings.jira_max_parent_chars
-        return _strip_urls(text)[: cap if cap > 0 else 0]
+        if cap <= 0:
+            return ""
+        # The sibling budget is ADDITIVE. Capping the composed block at
+        # jira_max_parent_chars alone would let sibling prose truncate away the
+        # parent's own description -- the very thing this block exists to carry.
+        if siblings:
+            cap += max(0, settings.jira_max_sibling_chars)
+        return _strip_urls(text)[:cap]
     except Exception:
         logger.exception("Building the Jira parent context failed - omitting it")
         return ""
@@ -596,7 +824,9 @@ def _parent_body(parent_issue: object) -> dict:
         return {
             "description": description,
             "acceptance_criteria": (
-                ac_raw or _extract_ac_from_description(description)
+                ac_raw
+                if _usable_ac_text(ac_raw)
+                else _extract_ac_from_description(description)
             ),
         }
     except Exception:
@@ -1175,6 +1405,19 @@ def build_fetch_directive(url: str, issue_key: str = "") -> str:
                 "(its description usually holds the real requirements)."
             )
             step += 1
+        if want_parent and settings.jira_fetch_sibling_stories:
+            lines.append(
+                f"{step}. If there WAS a parent, also call "
+                f"`{prefix}searchJiraIssuesUsingJql` with `jql` = "
+                '"parent = <THAT PARENT KEY> ORDER BY key", `fields` = '
+                "[`summary`, `description`, `issuetype`, `status`, "
+                f"`{settings.jira_ac_field}`], `responseContentFormat` = "
+                f'"markdown" and `maxResults` = {_MAX_RELATED_ISSUES}. The '
+                "sibling user stories under that parent carry requirements this "
+                "ticket inherits, and their one-line titles alone are not "
+                "enough. Skip this step when there is no parent."
+            )
+            step += 1
         lines += [
             f"{step}. Call `qa_prepare_test_cases` again with the SAME "
             "`feature_or_url`, plus `jira_content_json` set to a JSON object "
@@ -1184,11 +1427,14 @@ def build_fetch_directive(url: str, issue_key: str = "") -> str:
             "```json",
             "{",
             '  "issue": { "key": "...", "fields": { ... } },',
-            '  "parent_issue": { "key": "...", "fields": { ... } }',
+            '  "parent_issue": { "key": "...", "fields": { ... } },',
+            '  "sibling_issues": [ { "key": "...", "fields": { ... } } ]',
             "}",
             "```",
             "",
-            "`parent_issue` is optional - omit it when there is no parent.",
+            "`parent_issue` is optional - omit it when there is no parent. "
+            "`sibling_issues` is optional too: pass the `issues` array from the "
+            "JQL result (or the whole result object) when you ran that step.",
             "",
             "**If you have no `atlassian` MCP server connected** (the tools above "
             "do not exist in your tool list), do NOT guess the ticket contents and "
@@ -1338,6 +1584,7 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
         parent: dict | None = None
         subtasks: list[dict] = []
         issuelinks: list[dict] = []
+        siblings: list[dict] = []
         parent_context = ""
         if settings.jira_fetch_parent:
             parent = _extract_parent_ref(fields)
@@ -1345,7 +1592,10 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
             issuelinks = _extract_issuelinks(fields)
             if parent:
                 parent = {**parent, **_parent_body(payload.get("parent_issue"))}
-            parent_context = _build_parent_context(parent, subtasks, issuelinks)
+            siblings = _extract_sibling_bodies(payload, key)
+            parent_context = _build_parent_context(
+                parent, subtasks, issuelinks, siblings
+            )
 
         meta_lines = []
         if priority:
@@ -1365,7 +1615,11 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
         if comments and not settings.qa_comment_reconcile_enabled:
             raw_text += "\n\n## Comments\n" + "\n".join(f"- {c}" for c in comments)
 
-        acceptance_criteria = ac_src or _extract_ac_from_description(description)
+        acceptance_criteria = (
+            ac_src
+            if _usable_ac_text(ac_src)
+            else _extract_ac_from_description(description)
+        )
 
         attachments = _extract_image_attachments(fields)
         result = {
@@ -1387,6 +1641,10 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
             "parent": parent,
             "subtasks": subtasks,
             "issuelinks": issuelinks,
+            # Additive key (2026-08-03). Downstream consumers read the historical
+            # set and ignore this; it exists so a caller can see WHICH sibling
+            # stories were folded into parent_context.
+            "sibling_stories": siblings,
             "parent_context": parent_context,
             "raw_text": raw_text,
             "content": raw_text,

@@ -1,0 +1,783 @@
+"""Requirement units for use-case-table stories (grounding Phase 2).
+
+A Jira story does not have to carry an "Acceptance Criteria" heading to be fully
+specified. The Sehhaty Store tickets express their requirements as a use-case
+TABLE -- UC / Description / Actor / Pre-condition / Post-condition / Basic Flow /
+Alternative Flow / Business Rules -- followed by data-field tables (DF01, DF02,
+...) that pin the exact on-screen strings. Nothing in that layout reaches
+``rtm.parse_acceptance_criteria``, so a story like SHYJ-5645 produced ZERO
+anchorable requirements and every grounding gate downstream went inert: cases
+asserting refunds, stock release and push notifications -- none of which the
+story mentions -- had nothing to fail against.
+
+This module turns that layout into atomic, addressable REQUIREMENT UNITS so a
+generated case can cite what it validates, and so the deterministic source
+checks below can report defects in the TICKET itself (duplicate rule ids,
+duplicate table ids, a label repeated across two buttons) without any model
+call.
+
+Relationship to ``jira_mcp._extract_ac_from_uc_table`` (read before merging them)
+--------------------------------------------------------------------------------
+Two parsers read the same UC table on purpose. They are NOT duplicates and
+neither supersedes the other:
+
+* ``jira_mcp._extract_ac_from_uc_table`` emits ONE criterion per
+  requirement-bearing ROW and feeds the existing acceptance-criteria / RTM path
+  (``requirement_id`` tagging). Its docstring argues the case for staying coarse:
+  the rows are run-on prose, so splitting them invents boundaries the ticket does
+  not state.
+* THIS module splits those same rows into individually addressable units
+  (``BF-1`` … ``BF-6``, ``AF-n``, ``BR-n``, ``DFnn-n``) because the gates built on
+  it need that granularity. The Alternative Flow of SHYJ-5645 literally says "In
+  Step 2", so "step 2 of the Basic Flow" has to be a citable thing before a case
+  that exercises the wrong screen can be caught mechanically. It also carries
+  provenance and the data-field tables, which the row-level parser does not model.
+
+The shared piece is already unified: ``jira_mcp._usable_ac_text`` delegates to
+``rtm.looks_like_requirement_text``, so the two paths cannot disagree about what
+counts as requirement text. Collapsing the two PARSERS, by contrast, would cost
+either the coarse-and-safe criteria the RTM path wants or the step-level ids the
+gates need -- so do it only as a deliberate decision, not as a cleanup.
+
+Design rules, same as the rest of ``tools/``:
+* Never raises to callers -- every helper degrades to a benign empty result.
+* No LLM call, no I/O, no internal imports beyond ``tools.models``.
+* Bounded: unit count and per-unit length are capped so a hostile or runaway
+  description cannot blow up the payload.
+* Provenance-tagged: units parsed from the TARGET issue are ``"target"``; units
+  derived from parent / sibling / linked-issue background are ``"background"``
+  and must never be offered to a generator as something to cover.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from dataclasses import dataclass
+
+from tools.models import TestCase
+
+logger = logging.getLogger(__name__)
+
+# Bounds. A description is untrusted external content; these keep a runaway or
+# hostile table from producing an unbounded unit list.
+_MAX_UNITS = 200
+_MAX_UNIT_CHARS = 400
+_MIN_UNIT_CHARS = 8
+# Caps on the INTERMEDIATE parse, not just on the emitted units. Without these,
+# a description carrying thousands of fake `**DF9999**` markers or table rows is
+# parsed in full before _MAX_UNITS truncates anything -- and enumerations() /
+# source_ambiguity_issues() call parse_data_field_tables directly, so they would
+# inherit the unbounded intermediate list. Parsing stays linear either way (no
+# ReDoS), but the bound should be structural for untrusted ticket content.
+_MAX_SOURCE_LINES = 2000
+_MAX_TABLES = 40
+_MAX_ROWS_PER_TABLE = 120
+_MAX_UC_ROWS = 200
+
+# Row labels in the use-case table, mapped to the unit kind they produce. Keys
+# are matched case-insensitively after stripping markdown emphasis/whitespace.
+_UC_LABEL_KINDS: dict[str, str] = {
+    "pre-condition": "precondition",
+    "precondition": "precondition",
+    "pre conditions": "precondition",
+    "post-condition": "postcondition",
+    "postcondition": "postcondition",
+    "basic flow": "basic_flow",
+    "main flow": "basic_flow",
+    "alternative flow": "alternative_flow",
+    "alternate flow": "alternative_flow",
+    "exception flow": "alternative_flow",
+    "business rules": "business_rule",
+    "business rule": "business_rule",
+}
+
+# Prefix for each kind's unit id.
+_KIND_PREFIX: dict[str, str] = {
+    "precondition": "PRE",
+    "postcondition": "POST",
+    "basic_flow": "BF",
+    "alternative_flow": "AF",
+    "business_rule": "BR",
+    "data_field": "DF",
+}
+
+# A markdown pipe-table row: | cell | cell | ...
+_TABLE_ROW_RE = re.compile(r"^\s*\|(?P<body>.+)\|\s*$")
+# A separator row: | --- | --- |
+_TABLE_SEP_RE = re.compile(r"^\s*\|[\s:|-]+\|\s*$")
+# A standalone data-field / UI section marker, e.g. **DF01** or **UI#02**
+_SECTION_ID_RE = re.compile(r"^\s*\**\s*(?P<id>(?:DF|UI#?)\s*\d+)\s*\**\s*$", re.I)
+# A declared business-rule id inside prose, e.g. **BR02**: or BR2.
+_RULE_ID_RE = re.compile(r"\*{0,2}(?P<id>BR\s*\d+)\*{0,2}\s*[:.\)-]?", re.I)
+# A numbered / bulleted flow, which is the conventional way to write one and is
+# preferred over the actor-based fallback in _split_on_actors.
+_ENUM_SPLIT_RE = re.compile(r"(?m)^\s*(?:\d+[.)\]]|[-*•])\s+")
+# Markdown emphasis and Jira smart-link / emoji wrappers to strip from a cell.
+_EMPHASIS_RE = re.compile(r"\*{1,3}|_{2,}|`+")
+_CUSTOM_TAG_RE = re.compile(r"</?custom[^>]*>", re.I)
+# Only a KNOWN html/adf tag is stripped. A generic `<[^>]+>` would eat the
+# placeholder cells these tables are built from -- `<I no longer need the
+# product>` is a DF01 checkbox LABEL, not markup, and swallowing it left
+# `enumerations()` empty, disabling the undefined-option check entirely.
+# Multi-letter tags may carry attributes; single-letter tags must be BARE. A
+# permissive `<i ...>` swallowed the DF01 label `<I no longer need the product>`
+# whole, which is why the English enum values went missing.
+_HTML_TAG_RE = re.compile(
+    r"</?(?:custom|strong|span|div|img|code|pre|table|thead|tbody|tr|td|th|"
+    r"ul|ol|li|blockquote|br|hr|h[1-6]|sub|sup|em)(?:\s[^>]{0,200})?/?>"
+    r"|</?(?:i|u|s|b|a|p)\s*/?>",
+    re.I,
+)
+_STRAY_BACKSLASH_RE = re.compile(r"\\+")
+_WS_RE = re.compile(r"\s+")
+
+# Words that may precede "user"/"system" WITHOUT starting a new flow step --
+# "the user", "directs user to", "if the user". Without this, the Alternative
+# Flow "In Step 2, If the user clicks on Keep the order System directs user to
+# the same order page" shattered into four fragments instead of one unit.
+_NON_ACTOR_PRECEDERS = {
+    "the",
+    "a",
+    "an",
+    "to",
+    "by",
+    "for",
+    "of",
+    "if",
+    "and",
+    "or",
+    "that",
+    "which",
+    "directs",
+    "notifies",
+    "informs",
+    "allows",
+    "shows",
+    "asks",
+    "prompts",
+    "lets",
+    "redirects",
+    "returns",
+    "sends",
+    "tells",
+    "warns",
+    "same",
+    "each",
+    "every",
+    "another",
+    "this",
+}
+_ACTORS = {"user", "system", "actor"}
+_WORD_RE = re.compile(r"\S+")
+
+
+@dataclass(frozen=True)
+class RequirementUnit:
+    """One atomic, citable requirement.
+
+    ``unit_id`` is what a generated test case puts in ``requirement_id``.
+    ``provenance`` is ``"target"`` for the issue under test and ``"background"``
+    for anything derived from parent / sibling / linked issues -- a case may
+    only ever be anchored to a ``"target"`` unit.
+    """
+
+    unit_id: str
+    text: str
+    kind: str
+    provenance: str = "target"
+
+    @property
+    def is_assignable(self) -> bool:
+        """True when a test case may cite this unit as its requirement."""
+        return self.provenance == "target"
+
+
+def _clean_cell(raw: str) -> str:
+    """Strip markdown emphasis, known HTML/ADF tags and collapse whitespace."""
+    try:
+        text = _CUSTOM_TAG_RE.sub(" ", raw or "")
+        text = _HTML_TAG_RE.sub(" ", text)
+        text = _EMPHASIS_RE.sub("", text)
+        text = _STRAY_BACKSLASH_RE.sub("", text)
+        return _WS_RE.sub(" ", text).strip()
+    except Exception:
+        logger.exception("_clean_cell failed - returning empty string")
+        return ""
+
+
+def _join_wrapped_rows(description: str) -> list[str]:
+    """Lines of the description with wrapped table rows re-joined.
+
+    A Jira-rendered table cell can carry a hard newline, which splits ONE row
+    across two lines (`| <cell` / ` | <cell> | Checkbox |`). Parsing those
+    separately shifted every later cell by one column and silently dropped the
+    DF01 checkbox labels, so rows are re-assembled before anything else looks at
+    them: a line that opens a row but does not close it absorbs the next line.
+    """
+    out: list[str] = []
+    try:
+        pending: str | None = None
+        for raw in (description or "").splitlines()[:_MAX_SOURCE_LINES]:
+            line = raw.rstrip()
+            if pending is not None:
+                # Keep the continuation line's leading pipe: it is a real column
+                # separator, and stripping it merged two columns into one.
+                merged = pending + " " + line.lstrip()
+                if merged.rstrip().endswith("|"):
+                    out.append(merged)
+                    pending = None
+                else:
+                    pending = merged
+                continue
+            stripped = line.strip()
+            if stripped.startswith("|") and not stripped.endswith("|"):
+                pending = line
+                continue
+            out.append(line)
+        if pending is not None:
+            out.append(pending)
+    except Exception:
+        logger.exception("_join_wrapped_rows failed - using raw lines")
+        return (description or "").splitlines()
+    return out
+
+
+def _split_row(line: str) -> list[str]:
+    """Cells of a markdown pipe-table row, or [] when the line is not one."""
+    try:
+        if _TABLE_SEP_RE.match(line):
+            return []
+        match = _TABLE_ROW_RE.match(line)
+        if not match:
+            return []
+        return [_clean_cell(cell) for cell in match.group("body").split("|")]
+    except Exception:
+        return []
+
+
+def _label_kind(label: str) -> str | None:
+    """The unit kind a use-case table row label maps to, or None."""
+    key = _clean_cell(label).lower().rstrip(":").strip()
+    return _UC_LABEL_KINDS.get(key)
+
+
+def _split_on_actors(text: str) -> list[str]:
+    """Split a run-on flow cell where a fresh ACTOR begins a new step.
+
+    A bare lookahead on "user"/"system" is not enough: those words also appear
+    mid-clause ("the user", "directs user to"), which shredded the Alternative
+    Flow into fragments. A new step therefore starts only when the actor word is
+    at the very beginning or follows a word that cannot precede a subject
+    (:data:`_NON_ACTOR_PRECEDERS`), or follows sentence punctuation.
+    """
+    try:
+        words = _WORD_RE.findall(text or "")
+        if not words:
+            return []
+        steps: list[str] = []
+        current: list[str] = []
+        for index, word in enumerate(words):
+            bare = word.strip(".,;:!?\"'()").lower()
+            starts_step = False
+            if bare in _ACTORS and current:
+                previous = words[index - 1].strip("\"'()").lower()
+                previous_bare = previous.strip(".,;:!?")
+                if previous.endswith((".", ";", ":")):
+                    starts_step = True
+                elif previous_bare not in _NON_ACTOR_PRECEDERS:
+                    starts_step = True
+            if starts_step:
+                steps.append(" ".join(current).strip(" .;"))
+                current = [word]
+            else:
+                current.append(word)
+        if current:
+            steps.append(" ".join(current).strip(" .;"))
+        return [s for s in steps if s]
+    except Exception:
+        logger.exception("_split_on_actors failed - treating the cell as one step")
+        return [text] if text else []
+
+
+def _split_flow(cell: str) -> list[str]:
+    """Split a flow cell into individual steps.
+
+    Prefers an explicit numbered/bulleted list; falls back to splitting on
+    actor-led sentence starts, which is how the use-case tables in this project
+    are actually written (one run-on cell, no separators).
+    """
+    try:
+        text = (cell or "").strip()
+        if not text:
+            return []
+        parts = [p.strip() for p in _ENUM_SPLIT_RE.split(text) if p.strip()]
+        if len(parts) > 1:
+            return parts
+        parts = _split_on_actors(text)
+        if len(parts) > 1:
+            return parts
+        return [text]
+    except Exception:
+        logger.exception("_split_flow failed - treating the cell as one step")
+        return [cell] if cell else []
+
+
+def _split_rules(cell: str) -> list[tuple[str | None, str]]:
+    """Split a Business Rules cell into (declared_id, text) pairs.
+
+    The declared id is kept verbatim when the ticket states one (``BR02``) so
+    duplicate-id detection can report the ticket's own numbering defect; the
+    caller still assigns a unique sequential unit id.
+    """
+    try:
+        text = (cell or "").strip()
+        if not text:
+            return []
+        matches = list(_RULE_ID_RE.finditer(text))
+        if not matches:
+            return [(None, part) for part in _split_flow(text)]
+        out: list[tuple[str | None, str]] = []
+        for i, match in enumerate(matches):
+            start = match.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            body = text[start:end].strip(" .;:-")
+            declared = _WS_RE.sub("", match.group("id")).upper()
+            if body:
+                out.append((declared, body))
+        return out
+    except Exception:
+        logger.exception("_split_rules failed - returning no rules")
+        return []
+
+
+def _uc_rows(description: str) -> list[tuple[str, str]]:
+    """(label, value) pairs from the leading use-case table."""
+    rows: list[tuple[str, str]] = []
+    try:
+        for line in _join_wrapped_rows(description):
+            cells = _split_row(line)
+            if len(cells) >= 2 and cells[0]:
+                rows.append((cells[0], " ".join(c for c in cells[1:] if c)))
+            if len(rows) >= _MAX_UC_ROWS:
+                logger.info("_uc_rows hit the %d-row cap - truncating", _MAX_UC_ROWS)
+                break
+    except Exception:
+        logger.exception("_uc_rows failed - returning what was parsed")
+    return rows
+
+
+@dataclass(frozen=True)
+class DataFieldTable:
+    """One DF table: its declared id and its rows.
+
+    ``rows`` are (content_ar, content_en, type) triples as they appear. A table
+    whose header could not be understood keeps whatever cells were present, so a
+    malformed table degrades to fewer units rather than to an exception.
+    """
+
+    table_id: str
+    rows: tuple[tuple[str, str, str], ...]
+
+    def enum_values(self) -> set[str]:
+        """English labels of the selectable (Checkbox / Radio) rows."""
+        out: set[str] = set()
+        for ar, en, kind in self.rows:
+            if kind.lower().strip() in {"checkbox", "radio", "radio button"}:
+                label = _strip_placeholder_brackets(en) or _strip_placeholder_brackets(
+                    ar
+                )
+                if label:
+                    out.add(label)
+        return out
+
+    def allows_free_text(self) -> bool:
+        """True when the table has a free-text row (an 'Other reason' escape)."""
+        return any(
+            k.lower().strip() in {"text", "textarea", "free text"}
+            for _, _, k in self.rows
+        )
+
+
+def _strip_placeholder_brackets(text: str) -> str:
+    """``<I no longer need the product>`` -> ``I no longer need the product``."""
+    return (text or "").strip().strip("<>").strip()
+
+
+def parse_data_field_tables(description: str) -> list[DataFieldTable]:
+    """Every DF table in the description, in order of appearance.
+
+    A table is attributed to the most recent ``**DFnn**`` marker above it. The
+    SAME declared id may appear twice -- that is a ticket defect, reported by
+    :func:`source_ambiguity_issues`, not silently merged here.
+    """
+    tables: list[DataFieldTable] = []
+    try:
+        current_id: str | None = None
+        rows: list[tuple[str, str, str]] = []
+
+        def flush() -> None:
+            if current_id and rows:
+                tables.append(DataFieldTable(table_id=current_id, rows=tuple(rows)))
+
+        for line in _join_wrapped_rows(description):
+            if len(tables) >= _MAX_TABLES:
+                logger.info(
+                    "parse_data_field_tables hit the %d-table cap - truncating",
+                    _MAX_TABLES,
+                )
+                break
+            section = _SECTION_ID_RE.match(line)
+            if section:
+                flush()
+                rows = []
+                raw_id = _WS_RE.sub("", section.group("id")).upper()
+                current_id = raw_id if raw_id.startswith("DF") else None
+                continue
+            cells = _split_row(line)
+            if not cells:
+                continue
+            if current_id is None:
+                continue
+            if len(rows) >= _MAX_ROWS_PER_TABLE:
+                continue
+            meaningful = [c for c in cells if c]
+            if not meaningful:
+                continue
+            head = meaningful[0].lower()
+            if head.startswith("content") or head in {"type", "bottom sheet"}:
+                continue  # header row / spanning title
+            ar = cells[0] if len(cells) > 0 else ""
+            en = cells[1] if len(cells) > 1 else ""
+            kind = cells[2] if len(cells) > 2 else ""
+            rows.append((ar, en, kind))
+        flush()
+    except Exception:
+        logger.exception("parse_data_field_tables failed - returning what was parsed")
+    return tables
+
+
+def parse_requirement_units(
+    description: str, provenance: str = "target"
+) -> list[RequirementUnit]:
+    """Atomic requirement units parsed from a use-case-table description.
+
+    Produces ``PRE-n`` / ``POST-n`` / ``BF-n`` / ``AF-n`` / ``BR-n`` from the
+    use-case table and ``DFnn-n`` from each data-field table row. Returns [] for
+    an empty or unparseable description -- callers treat an empty result as "no
+    anchorable requirements", exactly as they do for an absent AC field.
+
+    Never raises.
+    """
+    units: list[RequirementUnit] = []
+    try:
+        if not description or not description.strip():
+            return []
+        prov = "background" if provenance == "background" else "target"
+        counters: dict[str, int] = {}
+
+        def add(kind: str, text: str, explicit_id: str | None = None) -> None:
+            body = _clean_cell(text)
+            if len(body) < _MIN_UNIT_CHARS or len(units) >= _MAX_UNITS:
+                return
+            if explicit_id:
+                unit_id = explicit_id
+            else:
+                counters[kind] = counters.get(kind, 0) + 1
+                unit_id = f"{_KIND_PREFIX.get(kind, 'REQ')}-{counters[kind]}"
+            units.append(
+                RequirementUnit(
+                    unit_id=unit_id,
+                    text=body[:_MAX_UNIT_CHARS],
+                    kind=kind,
+                    provenance=prov,
+                )
+            )
+
+        for label, value in _uc_rows(description):
+            kind = _label_kind(label)
+            if not kind or not value:
+                continue
+            if kind in {"basic_flow", "alternative_flow"}:
+                for step in _split_flow(value):
+                    add(kind, step)
+            elif kind == "business_rule":
+                for _declared, body in _split_rules(value):
+                    add(kind, body)
+            else:
+                add(kind, value)
+
+        # A ticket may reuse a table id for two different screens (SHYJ-5645
+        # labels both the confirmation dialog and the success screen DF02). That
+        # is reported by source_ambiguity_issues; here the SECOND occurrence is
+        # suffixed so every unit id stays unique and therefore citable.
+        seen_tables: dict[str, int] = {}
+        for table in parse_data_field_tables(description):
+            seen_tables[table.table_id] = seen_tables.get(table.table_id, 0) + 1
+            occurrence = seen_tables[table.table_id]
+            table_key = table.table_id
+            if occurrence > 1:
+                table_key = f"{table.table_id}{chr(ord('a') + occurrence - 1)}"
+            for index, (ar, en, kind_label) in enumerate(table.rows, 1):
+                text = " / ".join(p for p in (en, ar) if p)
+                if kind_label:
+                    text = f"{text} [{kind_label}]"
+                add("data_field", text, explicit_id=f"{table_key}-{index}")
+    except Exception:
+        logger.exception("parse_requirement_units failed - returning what was parsed")
+    return units
+
+
+def assignable_unit_ids(units: list[RequirementUnit]) -> set[str]:
+    """Unit ids a test case is allowed to cite (target provenance only)."""
+    try:
+        return {u.unit_id for u in units if u.is_assignable}
+    except Exception:
+        logger.exception("assignable_unit_ids failed - returning empty set")
+        return set()
+
+
+def source_ambiguity_issues(description: str) -> list[str]:
+    """Defects in the SOURCE ticket, found deterministically -- no model call.
+
+    Each returned string is a reviewer-facing issue suitable for the step-zero
+    ambiguity result. These are ticket defects, not suite defects, and they are
+    reported rather than resolved: guessing which of two identically-numbered
+    rules a case traces to is the behaviour this whole batch removes.
+
+    Detects:
+      * the same business-rule id declared twice (SHYJ-5645 numbers two
+        different rules ``BR02``);
+      * the same data-field table id used twice (SHYJ-5645 labels both the
+        confirmation dialog and the success screen ``DF02``);
+      * two rows of one table sharing an English label while their Arabic
+        differs (SHYJ-5645's DF01 labels BOTH buttons "Keep the order", so the
+        primary button's English string is wrong).
+
+    Never raises.
+    """
+    issues: list[str] = []
+    try:
+        if not description or not description.strip():
+            return []
+
+        declared: list[str] = []
+        for label, value in _uc_rows(description):
+            if _label_kind(label) == "business_rule":
+                declared.extend(d for d, _ in _split_rules(value) if d)
+        for rule_id in sorted({d for d in declared if declared.count(d) > 1}):
+            issues.append(
+                f"Business rule id {rule_id} is declared {declared.count(rule_id)} times "
+                f"for different rules - renumber them so each rule is citable."
+            )
+
+        tables = parse_data_field_tables(description)
+        table_ids = [t.table_id for t in tables]
+        for table_id in sorted({t for t in table_ids if table_ids.count(t) > 1}):
+            issues.append(
+                f"Data-field table id {table_id} is used {table_ids.count(table_id)} times "
+                f"for different screens - give each table its own id."
+            )
+
+        for table in tables:
+            by_en: dict[str, list[str]] = {}
+            for ar, en, _kind in table.rows:
+                key = _strip_placeholder_brackets(en).lower()
+                if key:
+                    by_en.setdefault(key, []).append(_strip_placeholder_brackets(ar))
+            for en_label, ar_labels in sorted(by_en.items()):
+                if len(ar_labels) > 1 and len({a for a in ar_labels if a}) > 1:
+                    issues.append(
+                        f"{table.table_id}: the English label "
+                        f'"{en_label}" is used for {len(ar_labels)} different rows '
+                        f"({', '.join(a for a in ar_labels if a)}) - one of the "
+                        f"English strings is wrong."
+                    )
+    except Exception:
+        logger.exception("source_ambiguity_issues failed - returning what was found")
+    return issues
+
+
+def enumerations(description: str) -> dict[str, set[str]]:
+    """{table_id: {selectable English labels}} for every DF table that has any.
+
+    This is the authoritative list a test case may select from, which is how
+    :func:`find_unknown_enum_values` catches a case built around a reason label
+    the ticket never defines.
+    """
+    out: dict[str, set[str]] = {}
+    try:
+        for table in parse_data_field_tables(description):
+            values = table.enum_values()
+            if values:
+                out.setdefault(table.table_id, set()).update(values)
+    except Exception:
+        logger.exception("enumerations failed - returning what was parsed")
+    return out
+
+
+def free_text_tables(description: str) -> set[str]:
+    """Ids of DF tables that also offer a free-text row (an 'Other' escape)."""
+    try:
+        return {
+            t.table_id
+            for t in parse_data_field_tables(description)
+            if t.allows_free_text()
+        }
+    except Exception:
+        logger.exception("free_text_tables failed - returning empty set")
+        return set()
+
+
+# Field names whose value is expected to come from a DF enumeration. Kept small
+# and explicit: a broad match would flag legitimate free-text data.
+_ENUM_FIELD_HINTS = (
+    "reason",
+    "cancel_reason",
+    "cancelation_reason",
+    "cancellation_reason",
+)
+# Field-name fragments that mean the value is a QUANTITY or a selector, not a
+# label from the enumeration -- `reason_checkbox_count: 2` matched the "reason"
+# hint and was flagged as an undefined option before this filter existed.
+_NON_LABEL_FIELD_FRAGMENTS = (
+    "count",
+    "length",
+    "len",
+    "index",
+    "num",
+    "qty",
+    "quantity",
+    "total",
+    "size",
+    "id",
+    "position",
+    "order_number",
+)
+# Evidence in the case that the tester is going through the free-text escape
+# rather than picking a predefined option -- such a value is NOT an enum member
+# and must not be flagged.
+_FREE_TEXT_EVIDENCE_RE = re.compile(r"other\s+reason|free[-\s]?text|سبب\s*اخر", re.I)
+# A value that names a CONTROL TYPE or points at "whatever the build lists" is
+# not a claim that a specific label exists, so it must not be flagged.
+_GENERIC_POINTER_RE = re.compile(
+    r"\b(?:first|second|third|last|any|each|all|every|some|predefined|preset|"
+    r"listed|visible|available|default|valid|selected|chosen|applicable)\b"
+    r"|^(?:checkbox(?:es)?|radio|button|text|option(?:s)?|reason(?:s)?)$",
+    re.I,
+)
+
+
+def _case_text(tc: TestCase) -> str:
+    """Title + preconditions + every step's action/data/expected, as one string."""
+    chunks: list[str] = [
+        getattr(tc, "title", "") or "",
+        getattr(tc, "preconditions", "") or "",
+    ]
+    for step in getattr(tc, "steps", None) or []:
+        chunks.append(getattr(step, "action", "") or "")
+        chunks.append(getattr(step, "test_data", "") or "")
+        chunks.append(getattr(step, "expected_result", "") or "")
+    for item in getattr(tc, "test_data", None) or []:
+        chunks.append(getattr(item, "notes", "") or "")
+    return " ".join(chunks)
+
+
+def _normalize_label(text: str) -> str:
+    return _WS_RE.sub(" ", (text or "").strip().strip("<>").strip().lower())
+
+
+def find_unknown_enum_values(
+    cases: list[TestCase],
+    enum_values: dict[str, set[str]],
+    allow_free_text: bool = True,
+) -> list[tuple[str, str, str]]:
+    """(tc_id, field, value) for cases selecting an option the ticket never defines.
+
+    A case is flagged only when ALL of these hold, which keeps the check free of
+    the false positives that would make it useless:
+
+      1. it carries a ``test_data`` item whose field name is enum-ish
+         (``cancel_reason``, ``reason``, ...);
+      2. that item's ``example_value`` is not one of the ticket's defined
+         labels; and
+      3. the case shows NO evidence of taking the free-text escape -- it never
+         mentions "Other reason" anywhere in its title, preconditions, steps or
+         notes. A case that legitimately types free text into Other reason
+         always names it, so it is spared.
+
+    On the SHYJ-5645 suite this is exactly the four unexecutable cases -- values
+    "Delayed delivery", "Changed my mind" and "Wrong item" against a DF01 that
+    defines three reasons -- while the case that genuinely uses Other reason
+    free text is not flagged.
+
+    Never raises.
+    """
+    out: list[tuple[str, str, str]] = []
+    try:
+        if not cases or not enum_values:
+            return []
+        allowed = {_normalize_label(v) for vals in enum_values.values() for v in vals}
+        if not allowed:
+            return []
+        for tc in cases:
+            items = getattr(tc, "test_data", None) or []
+            if not items:
+                continue
+            if allow_free_text and _FREE_TEXT_EVIDENCE_RE.search(_case_text(tc)):
+                continue
+            for item in items:
+                field = (getattr(item, "field", "") or "").lower()
+                if not any(hint in field for hint in _ENUM_FIELD_HINTS):
+                    continue
+                if any(frag in field for frag in _NON_LABEL_FIELD_FRAGMENTS):
+                    continue
+                value = getattr(item, "example_value", "") or ""
+                normalized = _normalize_label(value)
+                if not normalized or normalized in allowed:
+                    continue
+                # A bare number/short token is a count or a selector, never an
+                # option label the ticket was supposed to define.
+                if len(normalized) < 4 or not re.search(r"[a-z؀-ۿ]", normalized):
+                    continue
+                if normalized[0].isdigit():
+                    continue  # "2 checkboxes" is a count, not a label
+                # A generic instruction ("first listed reason",
+                # "first_checkbox_reason") points at whatever the build shows
+                # rather than claiming a specific label. Underscores are folded
+                # to spaces first: `\bfirst\b` does not match "first_checkbox"
+                # because `_` is itself a word character.
+                spaced = normalized.replace("_", " ").replace("-", " ")
+                if _GENERIC_POINTER_RE.search(spaced):
+                    continue
+                out.append((getattr(tc, "tc_id", "") or "", field, value))
+    except Exception:
+        logger.exception("find_unknown_enum_values failed - returning what was found")
+    return out
+
+
+def enum_warning_section(
+    violations: list[tuple[str, str, str]], enum_values: dict[str, set[str]]
+) -> str:
+    """Advisory markdown listing enum-value violations. '' when there are none."""
+    try:
+        if not violations:
+            return ""
+        defined = sorted({v for vals in enum_values.values() for v in vals})
+        lines = [
+            "\n\n## Undefined Option Values (advisory)",
+            "",
+            "These cases select an option the ticket does not define, so a tester "
+            "cannot execute them as written:",
+        ]
+        for tc_id, field, value in violations[:20]:
+            lines.append(f'- **{tc_id}** - `{field}` = "{value}"')
+        if len(violations) > 20:
+            lines.append(f"- ... and {len(violations) - 20} more")
+        if defined:
+            lines.append("")
+            lines.append("Defined options: " + ", ".join(f'"{d}"' for d in defined))
+        return "\n".join(lines)
+    except Exception:
+        logger.exception("enum_warning_section failed - returning empty string")
+        return ""
