@@ -373,6 +373,83 @@ def _usable_ac_text(raw: object) -> bool:
         return bool(text.strip())
 
 
+# Upper bound on how many custom fields discovery will consider, and the size of
+# a value it will look at. Field maps on a mature Jira project run to hundreds of
+# entries, all of it untrusted external content.
+_AC_DISCOVERY_MAX_FIELDS = 200
+_AC_DISCOVERY_MAX_CHARS = 20000
+_AC_DISCOVERY_MIN_CHARS = 40
+
+
+def resolve_ac_field(fields: object) -> tuple[str, str, str]:
+    """(field_id, raw_value, reason) for the acceptance-criteria source.
+
+    ``settings.jira_ac_field`` is a per-instance GUESS -- its default,
+    ``customfield_10016``, is a DATE field on the workspace this was found on, and
+    the timestamp it returned became the suite's only "acceptance criterion".
+    The configured field therefore wins ONLY when its value survives
+    :func:`_usable_ac_text`.
+
+    When it does not, and ``QA_JIRA_AC_FIELD_DISCOVERY`` is on, the other custom
+    fields are searched for one whose VALUE looks like requirement prose. Display
+    names are not available to match on: the Atlassian MCP ``getJiraIssue``
+    response carries no ``names`` map, verified against a real payload. The
+    longest plausible candidate wins, and the choice is logged.
+
+    Discovery is OFF by default on purpose -- silently adopting the wrong field is
+    the exact failure this whole change set exists to remove, so an operator opts
+    in, and :func:`qa_setup_check` shows what was resolved either way.
+
+    Never raises: degrades to (configured_id, "", reason).
+    """
+    configured = str(getattr(settings, "jira_ac_field", "") or "")
+    try:
+        if not isinstance(fields, dict):
+            return configured, "", "no fields in the payload"
+        raw = _as_text(fields.get(configured)).strip()
+        if _usable_ac_text(raw):
+            return configured, raw, "configured field"
+        rejected = bool(raw)
+        if not bool(getattr(settings, "qa_jira_ac_field_discovery", False)):
+            return (
+                configured,
+                "",
+                (
+                    "configured field holds no requirement text "
+                    f"({raw[:40]!r}); discovery is off"
+                )
+                if rejected
+                else "configured field is empty; discovery is off",
+            )
+        best_id = ""
+        best_val = ""
+        for index, (key, value) in enumerate(fields.items()):
+            if index >= _AC_DISCOVERY_MAX_FIELDS:
+                break
+            if not isinstance(key, str) or not key.startswith("customfield_"):
+                continue
+            if key == configured:
+                continue
+            candidate = _as_text(value).strip()[:_AC_DISCOVERY_MAX_CHARS]
+            if len(candidate) < _AC_DISCOVERY_MIN_CHARS:
+                continue
+            if not _usable_ac_text(candidate):
+                continue
+            if len(candidate) > len(best_val):
+                best_id, best_val = key, candidate
+        if best_val:
+            logger.info(
+                "AC-field discovery chose %s over the configured %s",
+                best_id,
+                configured,
+            )
+            return best_id, best_val, f"discovered (configured {configured} unusable)"
+        return configured, "", "no field holds requirement text"
+    except Exception:
+        logger.exception("resolve_ac_field failed - reporting no AC field")
+        return configured, "", "resolution failed"
+
+
 def _extract_ac_from_description(description: str) -> str:
     """Fallback AC extraction: scan a ticket description for an 'Acceptance
     Criteria' heading and return the block beneath it (QW-11 / I-023).
@@ -387,7 +464,13 @@ def _extract_ac_from_description(description: str) -> str:
             # No "Acceptance Criteria" heading. Before giving up, try the use-case
             # table shape (opt-in) -- a whole ticket family has its requirements
             # only there, and returning "" left those suites with no traceability.
-            if bool(getattr(settings, "qa_jira_uc_table_ac_enabled", False)):
+            # Fallback matches the DECLARED default (True since 2026-08-03) on
+            # purpose: a mismatch would make the feature behave differently on an
+            # install whose settings object somehow lacks the field than on one
+            # where it is present and defaulted, which is a difference nobody would
+            # think to look for. Failing toward the old behaviour is not the safe
+            # choice here either -- the old behaviour is model-INVENTED criteria.
+            if bool(getattr(settings, "qa_jira_uc_table_ac_enabled", True)):
                 return _extract_ac_from_uc_table(description)
             return ""
         rest = description[m.end() :].lstrip("\n")
@@ -650,6 +733,77 @@ def _extract_issuelinks(fields: dict) -> list[dict]:
         return []
 
 
+def _flatten_table_text(text: str) -> str:
+    """Markdown table rows -> readable prose lines. Never raises.
+
+    Jira use-case descriptions here are almost entirely tables, and truncating
+    one to a few hundred characters yields cut-off pipe syntax that grounds
+    nothing ("| **Post-condition** | User view store"). Collapsing each row to
+    "cell - cell" first means the SAME budget carries real requirement text.
+    Separator rows (|---|---|) are dropped; non-table text passes through.
+    """
+    try:
+        out: list[str] = []
+        for line in str(text or "").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("|"):
+                cells = [c.strip(" *_\t") for c in stripped.strip("|").split("|")]
+                cells = [c for c in cells if c and set(c) - set("-: ")]
+                if not cells:
+                    continue  # a |---|---| separator row
+                out.append(" - ".join(cells))
+                continue
+            out.append(stripped)
+        return "\n".join(out).strip()
+    except Exception:
+        logger.exception("Flattening markdown tables failed - using raw text")
+        return str(text or "")
+
+
+def _count_sibling_candidates(payload: dict, target_key: str = "") -> int:
+    """How many sibling stories EXIST, for the "showing N of M" disclosure.
+
+    Prefers the JQL response's own ``total`` (present when the host passed the
+    whole result object, which the directive asks for with
+    ``searchResultMode="all"``) and falls back to counting what was sent. That
+    distinction matters: the directive caps ``maxResults`` at the number we can
+    actually use, so counting only the delivered issues would report "5 of 5"
+    for an epic holding 30 stories -- a silent cap dressed as a disclosure.
+    Never raises.
+    """
+    try:
+        container = payload.get("sibling_issues") if isinstance(payload, dict) else None
+        items = container
+        total_hint = 0
+        if isinstance(container, dict):
+            items = container.get("issues")
+            # The live Atlassian MCP server returns `totalCount`; REST v3 and
+            # older tool versions return `total`. Accept either rather than
+            # silently falling back to "however many you sent me".
+            for field in ("totalCount", "total"):
+                raw_total = container.get(field)
+                if isinstance(raw_total, int) and not isinstance(raw_total, bool):
+                    total_hint = max(total_hint, raw_total)
+        if not isinstance(items, list):
+            return total_hint
+        target = _valid_issue_key(target_key)
+        sent = sum(
+            1
+            for i in items
+            if isinstance(i, dict)
+            and _valid_issue_key(i.get("key"))
+            and _valid_issue_key(i.get("key")) != target
+        )
+        # `total` counts the target issue too when it is a child of the same
+        # parent, so never let the hint fall BELOW what we actually counted.
+        return max(sent, total_hint - 1 if total_hint > sent else sent)
+    except Exception:
+        logger.exception("Counting sibling candidates failed")
+        return 0
+
+
 def _extract_sibling_bodies(payload: dict, target_key: str = "") -> list[dict]:
     """[{key, issuetype, summary, description, acceptance_criteria}] for the user
     stories under the same parent.
@@ -678,7 +832,10 @@ def _extract_sibling_bodies(payload: dict, target_key: str = "") -> list[dict]:
         if not isinstance(items, list):
             return []
         target = _valid_issue_key(target_key)
-        per_issue = max(1, settings.jira_max_sibling_chars // _MAX_RELATED_ISSUES)
+        max_stories = max(0, int(settings.jira_max_sibling_stories or 0))
+        if max_stories <= 0:
+            return []
+        per_issue = max(1, settings.jira_max_sibling_chars // max_stories)
         out: list[dict] = []
         for item in items:
             if not isinstance(item, dict):
@@ -687,8 +844,10 @@ def _extract_sibling_bodies(payload: dict, target_key: str = "") -> list[dict]:
             if not key or key == target:
                 continue
             sfields = _issue_fields(item)
-            desc = _as_text(sfields.get("description")).strip()[:per_issue]
-            sac = _as_text(sfields.get(settings.jira_ac_field)).strip()[:per_issue]
+            desc = _flatten_table_text(_as_text(sfields.get("description")))[:per_issue]
+            sac = _flatten_table_text(_as_text(sfields.get(settings.jira_ac_field)))[
+                :per_issue
+            ]
             if not desc and not sac:
                 # Title-only siblings add nothing _extract_subtasks does not
                 # already list, and each one costs budget.
@@ -707,7 +866,7 @@ def _extract_sibling_bodies(payload: dict, target_key: str = "") -> list[dict]:
                     "acceptance_criteria": sac,
                 }
             )
-            if len(out) >= _MAX_RELATED_ISSUES:
+            if len(out) >= max_stories:
                 break
         return out
     except Exception:
@@ -720,6 +879,7 @@ def _build_parent_context(
     subtasks: list[dict],
     issuelinks: list[dict],
     siblings: list[dict] | None = None,
+    sibling_total: int = 0,
 ) -> str:
     """Compose the BACKGROUND block for a ticket whose requirements live
     elsewhere.
@@ -764,11 +924,19 @@ def _build_parent_context(
                 for ln in issuelinks
             ]
         if siblings:
+            # A dropped story is disclosed, never silent: the tester has to know
+            # the background is a SAMPLE before trusting its coverage.
+            shown = len(siblings)
+            scope = (
+                f" -- showing {shown} of {sibling_total}"
+                if sibling_total > shown
+                else ""
+            )
             lines += [
                 "",
-                "Sibling user stories under the same parent (context only -- "
-                "requirements they state can apply to this ticket, but they are "
-                "NOT the thing under test):",
+                f"Sibling user stories under the same parent{scope} (context only "
+                "-- requirements they state can apply to this ticket, but they "
+                "are NOT the thing under test):",
             ]
             budget = max(0, settings.jira_max_sibling_chars)
             for sib in siblings:
@@ -1412,7 +1580,11 @@ def build_fetch_directive(url: str, issue_key: str = "") -> str:
                 '"parent = <THAT PARENT KEY> ORDER BY key", `fields` = '
                 "[`summary`, `description`, `issuetype`, `status`, "
                 f"`{settings.jira_ac_field}`], `responseContentFormat` = "
-                f'"markdown" and `maxResults` = {_MAX_RELATED_ISSUES}. The '
+                f'"markdown", `searchResultMode` = "all" '
+                f"and `maxResults` = "
+                f"{settings.jira_max_sibling_stories}. Pass the "
+                f"whole result object back (its `total` lets me "
+                f"say how many stories I did NOT read). The "
                 "sibling user stories under that parent carry requirements this "
                 "ticket inherits, and their one-line titles alone are not "
                 "enough. Skip this step when there is no parent."
@@ -1594,7 +1766,11 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
                 parent = {**parent, **_parent_body(payload.get("parent_issue"))}
             siblings = _extract_sibling_bodies(payload, key)
             parent_context = _build_parent_context(
-                parent, subtasks, issuelinks, siblings
+                parent,
+                subtasks,
+                issuelinks,
+                siblings,
+                sibling_total=_count_sibling_candidates(payload, key),
             )
 
         meta_lines = []
@@ -1615,11 +1791,10 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
         if comments and not settings.qa_comment_reconcile_enabled:
             raw_text += "\n\n## Comments\n" + "\n".join(f"- {c}" for c in comments)
 
-        acceptance_criteria = (
-            ac_src
-            if _usable_ac_text(ac_src)
-            else _extract_ac_from_description(description)
-        )
+        # resolve_ac_field re-checks usability and, when enabled, looks for a
+        # custom field whose value actually reads like requirements.
+        _ac_field_id, _ac_value, _ac_reason = resolve_ac_field(fields)
+        acceptance_criteria = _ac_value or _extract_ac_from_description(description)
 
         attachments = _extract_image_attachments(fields)
         result = {

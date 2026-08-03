@@ -315,6 +315,44 @@ class Settings(BaseSettings):
     # configurable (QW-11 / I-023 / B-015). When empty on a ticket, jira_fetcher
     # falls back to scanning the description for an "Acceptance Criteria" heading.
     jira_ac_field: str = "customfield_10016"
+
+    # Search the OTHER custom fields for one whose value reads like requirements
+    # when the configured `jira_ac_field` does not. OFF by default and staying
+    # that way until an operator asks: adopting the wrong field is exactly the
+    # failure that made a date field's timestamp the only "acceptance criterion"
+    # on a real run. `qa_setup_check` discloses what was resolved either way, so
+    # a mis-configured field is visible without this being on.
+    qa_jira_ac_field_discovery: bool = False
+
+    # Kill switch for the deterministic grounding/consistency advisories on the
+    # finalize summary (undefined option values, requirements no case mentions,
+    # defects in the ticket itself, unfalsifiable oracles, contradictory state
+    # assumptions). Default ON is a DELIBERATE exception to the defaults-OFF
+    # rule, documented in docs/FEATURE_FLAGS.md: these run no model, mutate no
+    # case, and render "" when they find nothing, so an unaffected run's summary
+    # is byte-identical -- the same reasoning that leaves quality_warning_section
+    # unflagged. The switch exists because a code review noted there was no way
+    # to turn them off if a heuristic ever misfires on a particular team's style.
+    qa_grounding_advisories_enabled: bool = True
+
+    # Ask the tester's own chat model to classify every generated case as
+    # entailed / ungrounded / unspecified against the ticket, and route the
+    # ungrounded ones onto their own export sheet instead of the executable
+    # suite. This is the ONE judgement none of the deterministic checks can make:
+    # they are all lexical, so a fabricated-but-fluent case ("a refund status
+    # appears") passes every one of them. Zero extra round trips -- the
+    # instruction rides the existing prepare payload and the verdicts ride the
+    # existing submission, exactly like the duplicate review.
+    #
+    # OFF by default, and genuinely opt-in rather than a documented exception:
+    # unlike the deterministic advisories this changes what the host is ASKED to
+    # do, spends the tester's tokens on one judgement per case, and its output is
+    # model-authored. tools/grounding_verdicts.py bounds what that output may do
+    # -- ids matched against the suite's own, verdicts enum-gated, notes capped,
+    # a 40% proportional ceiling mirroring screen_duplicate_groups, and cases
+    # MOVED rather than deleted -- so the worst a hostile verdict list achieves
+    # is reviewer noise.
+    qa_host_grounding_review_enabled: bool = False
     # Parent-story context (JIRA_FETCH_PARENT). Default **ON** — the THIRD
     # deliberate exception to the constitution's defaults-OFF rule, alongside
     # QA_AUTO_EXPORT_XLSX and QA_AMBIGUITY_GATE_SEVERITY / QA_JIRA_PREFLIGHT.
@@ -344,6 +382,14 @@ class Settings(BaseSettings):
     # defaults-OFF rule, documented in docs/FEATURE_FLAGS.md. Costs ONE extra
     # host-side searchJiraIssuesUsingJql call, and only when a parent exists.
     jira_fetch_sibling_stories: bool = True
+    # How many sibling stories may contribute a BODY. Deliberately its own knob
+    # rather than reusing the 10-issue _MAX_RELATED_ISSUES list cap: listing ten
+    # keys costs a line each, but ten BODIES split the character budget ten ways.
+    # A live SHYJ-5645 run made the difference concrete -- 3000/10 = 300 chars per
+    # story cut every markdown table mid-row and grounded nothing, while the host
+    # had to ship 83k characters so 3k could be kept. Five stories at ~600 chars
+    # each carry a readable use-case instead. 0 disables the block.
+    jira_max_sibling_stories: int = 5
     # Total character budget for the sibling block, ON TOP of
     # jira_max_parent_chars (the composed background block is capped at the sum,
     # so sibling prose can never displace the parent's own description). 0 means
@@ -716,19 +762,35 @@ class Settings(BaseSettings):
     # See tools/quality_checks._qualifier_prefix_merges for the full rationale.
     qa_module_prefix_normalize_enabled: bool = False
 
-    # Extract acceptance criteria from a USE-CASE TABLE description (opt-in,
-    # default OFF). The AC fallback in tools/jira_mcp only understands an
-    # "Acceptance Criteria" heading followed by a block. A whole ticket family
-    # writes requirements as a markdown UC table instead -- rows labelled Basic
-    # Flow / Alternative Flow / Business Rules / Post-condition -- with no such
-    # heading anywhere. On the 2026-08-03 run that produced ZERO criteria, so the
-    # RTM was empty and 61 of 98 cases carried no requirement_id (the other 37
-    # traced to a bogus criterion parsed out of a DATE custom field).
-    # ON, those rows become one criterion each, so the suite gets real
-    # traceability. Flag-gated because it adds ticket text to the generation
-    # prompt: it changes what the model sees, and a mis-parse would introduce
-    # requirements the ticket never stated.
-    qa_jira_uc_table_ac_enabled: bool = False
+    # Extract acceptance criteria from a USE-CASE TABLE description.
+    # Default **ON** since 2026-08-03, user-approved -- a deliberate exception to
+    # the defaults-OFF rule, in the same family as JIRA_FETCH_PARENT /
+    # JIRA_FETCH_COMMENTS / JIRA_FETCH_SIBLING_STORIES.
+    #
+    # The AC fallback in tools/jira_mcp only understands an "Acceptance Criteria"
+    # heading followed by a block. A whole ticket family writes its requirements as
+    # a markdown UC table instead -- rows labelled Basic Flow / Alternative Flow /
+    # Business Rules / Post-condition -- with no such heading anywhere.
+    #
+    # WHY THE DEFAULT FLIPPED. This shipped OFF on the reasoning that it adds
+    # ticket text to the generation prompt, and a mis-parse could introduce
+    # requirements the ticket never stated. That weighed the risk against the wrong
+    # baseline. With this OFF the run does not get NO acceptance criteria -- the
+    # host's AC_JOB SYNTHESIZES them, and the first production v1.34.0 run
+    # finalized with SIX model-invented criteria and a "6/6 traced, all covered"
+    # RTM built on them. Measured on that same ticket, ON yields FOUR criteria read
+    # out of the ticket's own table. So the real choice is not "extra text vs no
+    # extra text", it is "criteria read from the ticket vs criteria invented by a
+    # model", and reading them is plainly safer.
+    #
+    # The mis-parse risk is bounded and disclosed rather than hidden: the extractor
+    # takes only requirement-bearing rows (context rows like Description / Actor /
+    # Pre-condition are skipped), caps at 12 rows x 600 chars, an explicit
+    # "Acceptance Criteria" heading still wins, and anything it produces still
+    # flows through the untrusted-text path. Set to false to restore the previous
+    # behaviour -- note that this means going back to model-synthesized criteria on
+    # this ticket family, not to none.
+    qa_jira_uc_table_ac_enabled: bool = True
 
     # Re-register this server in editor MCP configs on startup (opt-in, OFF).
     # Registration otherwise happens exactly ONCE, at install: connect.sh skips a
@@ -1149,7 +1211,18 @@ class Settings(BaseSettings):
     # top-level `duplicate_groups` alongside the suite, and qa_submit_suite
     # validates and acts on it in pure Python. Zero extra round trips (the field
     # rides the existing submission), zero extra server-side LLM calls, no API key.
-    qa_host_dedup_review_enabled: bool = False
+    # 2026-08-03: default flipped OFF -> ON. Report-only, and the evidence is two
+    # runs: the 2026-07-29 run above kept all 64 of 8x8 submitted cases, and the
+    # 2026-08-03 SHYJ-5645 run shipped 18 duplicates across 12 clusters. With this
+    # OFF the only thing that collapses anything on a keyless install is an exact
+    # content hash (qa_semantic_dedup_enabled is also OFF and additionally needs an
+    # embeddings backend), so step 5 of the host instructions was a politely-worded
+    # request that nothing verified. ON, the host is asked for `duplicate_groups`
+    # and the server validates what comes back in pure Python. REMOVAL is a
+    # separate decision and stays OFF -- see qa_host_dedup_apply below, whose
+    # reasoning (host output is attacker-influenceable through the _GUARD-wrapped
+    # ticket text) is unchanged by this flip.
+    qa_host_dedup_review_enabled: bool = True
     # Sub-flag: actually REMOVE the non-keeper members of each reported group.
     # Default OFF, and deliberately ASYMMETRIC with qa_semantic_dedup_enabled
     # (which does remove): that path drops on a NUMERIC cosine >=
@@ -1605,6 +1678,9 @@ class Settings(BaseSettings):
         "qa_comment_reconcile_enabled",
         "jira_fetch_images",
         "jira_fetch_parent",
+        "qa_jira_ac_field_discovery",
+        "qa_grounding_advisories_enabled",
+        "qa_host_grounding_review_enabled",
         "jira_fetch_sibling_stories",
         "qa_mobile_capture",
         "qa_maestro_enabled",
@@ -1909,6 +1985,7 @@ class Settings(BaseSettings):
         "jira_max_image_bytes",
         "jira_max_parent_chars",
         "jira_max_sibling_chars",
+        "jira_max_sibling_stories",
         "qa_max_chat_images",
         "qa_max_chat_image_bytes",
         "qa_device_command_timeout",

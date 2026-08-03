@@ -159,6 +159,7 @@ def generate_test_case_xlsx(suite: TestSuite, output_path: str | None = None) ->
         _write_workbook(workbook, suite)
         _write_report_sheets(workbook, suite)
         _write_checklist_sheets(workbook, suite)
+        _write_assumed_sheet(workbook, suite)
     finally:
         workbook.close()
 
@@ -244,6 +245,50 @@ def _write_checklist_sheets(workbook: xlsxwriter.Workbook, suite: TestSuite) -> 
                 )
     except Exception:
         logger.warning("checklist-sheet generation failed — skipping", exc_info=True)
+
+
+def _write_assumed_sheet(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
+    """Write the "Assumed Requirements" sheet, if an entailment review produced one.
+
+    These cases assert behaviour the ticket never states. They are kept -- one may
+    be a real requirement nobody wrote down -- but off the executable sheet, where
+    they would file defects against a team that never agreed to the behaviour.
+
+    No-op when absent, so the workbook is byte-identical on the flag-off path.
+    Never raises: a failure here must never break the core workbook.
+    """
+    artifacts = getattr(suite, "_assumed_artifacts", None)
+    if not artifacts:
+        return
+    try:
+        rows = artifacts.get("rows") or []
+        if not rows:
+            return
+        header_fmt = workbook.add_format(
+            {
+                "bold": True,
+                "font_color": "#FFFFFF",
+                "bg_color": "#8B5E00",
+                "border": 1,
+                "valign": "vcenter",
+                "text_wrap": True,
+            }
+        )
+        cell_fmt = workbook.add_format(
+            {"border": 1, "valign": "top", "text_wrap": True}
+        )
+        ws = workbook.add_worksheet("Assumed Requirements")
+        ws.set_column(0, 1, 14)
+        ws.set_column(2, max(2, len(rows[0]) - 1), 42)
+        for r, row in enumerate(rows):
+            fmt = header_fmt if r == 0 else cell_fmt
+            for c, value in enumerate(row):
+                ws.write(r, c, sanitize_cell(str(value)), fmt)
+    except Exception:
+        logger.warning(
+            "Failed writing the Assumed Requirements sheet - skipping it",
+            exc_info=True,
+        )
 
 
 def _write_report_sheets(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:

@@ -415,10 +415,24 @@ def build_rtm_summary(
     return table + coverage_line + orphan_tc_line
 
 
-def rtm_oneline(acs: list[AcceptanceCriterion], test_cases: list[TestCase]) -> str:
+def rtm_oneline(
+    acs: list[AcceptanceCriterion],
+    test_cases: list[TestCase],
+    derived: bool = False,
+) -> str:
     """Return a single-line RTM coverage stat (no table) for compact summaries.
 
     Returns empty string when acs is empty. Never raises.
+
+    ``derived=True`` means the criteria were NOT read from the ticket -- the host's
+    chat model synthesized them as scaffolding. 2026-08-03: a real run finalized
+    with this line reading "6/6 acceptance criteria traced, all covered" against
+    six criteria the model had invented, because the ticket carried none. The
+    honest disclosure did exist, but in a separate block ABOVE; this line sits in
+    the headline stats next to Risk, and on its own it reads as verified
+    traceability. 100% coverage of invented requirements is not evidence of
+    anything, so the provenance has to travel WITH the number rather than near it.
+    Defaults False, so a ticket that really carried criteria is unchanged.
     """
     try:
         if not acs:
@@ -432,8 +446,14 @@ def rtm_oneline(acs: list[AcceptanceCriterion], test_cases: list[TestCase]) -> s
         covered = len(covered_ids)
         total = len(acs)
         orphans = total - covered
-        line = f"\n\n**Requirements:** {covered}/{total} acceptance criteria traced"
+        kind = "MODEL-DERIVED acceptance criteria" if derived else "acceptance criteria"
+        line = f"\n\n**Requirements:** {covered}/{total} {kind} traced"
         line += f", {orphans} orphan(s)." if orphans else ", all covered."
+        if derived:
+            line += (
+                " They were synthesized because the ticket carried none, so this "
+                "measures self-consistency, NOT coverage of stated requirements."
+            )
         return line
     except Exception:  # pragma: no cover - defensive, never break the summary
         logger.exception("rtm_oneline failed — returning empty string")

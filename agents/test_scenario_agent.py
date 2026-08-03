@@ -62,9 +62,14 @@ from tools.quality_checks import (
 )
 from tools.rag_store import query_corpus
 from tools.requirement_units import (
+    assignable_unit_ids,
+    coverage_warning_section,
     enum_warning_section,
     enumerations,
+    find_unaddressed_requirements,
     find_unknown_enum_values,
+    free_text_tables,
+    parse_requirement_units,
     source_ambiguity_issues,
 )
 from tools.risk_scorer import (
@@ -2846,6 +2851,13 @@ class PreparedGeneration:
     # mode reads neither -- its fan-out uses the CATEGORIES global directly.
     categories: list[tuple[str, str, str]]
     category_response_schema: dict
+    # The TARGET ticket's own description -- no comment thread, no parent story,
+    # no RAG or web-search blocks. Carried explicitly because the grounding checks
+    # used to re-derive their source by slicing the assembled prompt, which (a)
+    # handed them Jira COMMENT text, so a commenter could plant data-field rows or
+    # fake ticket defects, and (b) discarded every prompt block that follows the
+    # parent-story heading. Defaults to "" so an older prep record still loads.
+    target_description: str = ""
 
 
 async def generate_test_scenarios(
@@ -3222,6 +3234,9 @@ async def _prepare_generation(
     attached_image_text = ""
     jira_context_text = ""
     image_notice = ""
+    # Falls back to the tester's own feature text on the pasted-description path,
+    # where there is no ticket to read a description from.
+    target_description = feature_text or ""
     # Host mode passes describe_images_server_side=False: it skips the server-side
     # vision call below but MUST still tell the rule packs that images exist --
     # the tester's own multimodal model receives the raw screenshots as MCP image
@@ -3243,6 +3258,9 @@ async def _prepare_generation(
         jira_context_text = _strip_html(
             url_content.get("raw_text", "") or url_content.get("description", "")
         )
+        # DESCRIPTION only -- deliberately not raw_text, which has the comment
+        # thread appended to it. The grounding checks read this.
+        target_description = _strip_html(url_content.get("description", "") or "")
         if jira_context_text:
             parts.append(
                 "## Feature Documentation\n"
@@ -3565,6 +3583,7 @@ async def _prepare_generation(
         image_notice=image_notice,
         categories=effective_categories(),
         category_response_schema=_category_response_model().model_json_schema(),
+        target_description=target_description,
     )
 
 
@@ -3681,14 +3700,25 @@ def target_source_text(user_msg: str) -> str:
         return user_msg or ""
 
 
-def grounding_sections(cases: list[TestCase], user_msg: str) -> tuple[str, str]:
+def grounding_sections(
+    cases: list[TestCase], source_text: str, *, user_msg: str = ""
+) -> tuple[str, str]:
     """(consistency_section, grounding_section) for the finalize summary.
 
     * consistency_section -- unfalsifiable oracles and contradictory state
       assumptions across the suite (tools/suite_consistency).
     * grounding_section -- options a case selects that the ticket never defines,
-      plus defects found in the SOURCE ticket itself (duplicate rule/table ids,
-      one English label used for two different controls).
+      requirements no case appears to exercise, and defects found in the SOURCE
+      ticket itself (duplicate rule/table ids, one English label used for two
+      different controls).
+
+    ``source_text`` MUST be the target ticket's own description. It used to be
+    re-derived by slicing ``user_msg`` at the parent-story heading, which fed the
+    checks Jira COMMENT text -- letting a commenter define what counts as an
+    in-scope option, or plant duplicate ids that produce ticket defects addressed
+    to somebody else -- and simultaneously threw away every prompt block after
+    that heading. ``user_msg`` remains only as a fallback for a prep record from
+    an older build that carries no description.
 
     Both are ADVISORY and deterministic: no model call, no case is dropped or
     reordered, and each returns "" when it finds nothing -- so a clean suite's
@@ -3699,11 +3729,23 @@ def grounding_sections(cases: list[TestCase], user_msg: str) -> tuple[str, str]:
     Never raises: any failure yields two empty strings.
     """
     try:
-        source = target_source_text(user_msg)
+        if not bool(getattr(settings, "qa_grounding_advisories_enabled", True)):
+            return "", ""
+        source = source_text or target_source_text(user_msg)
         consistency = consistency_warning_section(cases)
         enum_values = enumerations(source)
-        violations = find_unknown_enum_values(cases, enum_values)
+        # Honour the ticket's own free-text escape: when a data-field table
+        # declares a free-text row ("Other reason"), a value outside the
+        # enumeration is legitimate; when it declares none, it is not.
+        violations = find_unknown_enum_values(
+            cases, enum_values, allow_free_text=bool(free_text_tables(source))
+        )
         grounding = enum_warning_section(violations, enum_values)
+        units = parse_requirement_units(source)
+        if assignable_unit_ids(units):
+            grounding += coverage_warning_section(
+                find_unaddressed_requirements(units, cases)
+            )
         issues = source_ambiguity_issues(source)
         if issues:
             lines = [
@@ -4200,7 +4242,11 @@ async def _finalize_generation(
     # Grounding + consistency advisories (Batch A modules). Deterministic and
     # model-free; "" when the suite and ticket are clean, so an unaffected run's
     # summary does not change by a byte.
-    consistency_section, grounding_section = grounding_sections(renumbered, user_msg)
+    consistency_section, grounding_section = grounding_sections(
+        renumbered,
+        getattr(prepared, "target_description", "") or "",
+        user_msg=user_msg,
+    )
 
     # Test-plan artifacts (QA_TEST_PLAN_ARTIFACTS, house-rule opt-in, default
     # OFF -> zero extra LLM calls). When ON, build the AC-Validation report
@@ -4410,7 +4456,15 @@ async def _finalize_generation(
             if label in risk_counts
         )
         risk_line = f"\n\n**Risk:** {risk_summary}" if risk_summary else ""
-        rtm_line = rtm_oneline(acs, suite.test_cases)
+        # 2026-08-03: `acs` may be MODEL-DERIVED rather than read from the ticket.
+        # tools/mcp_handlers sets prepared.acs from the host's AC_JOB when the
+        # ticket carried none, and deliberately leaves source_acs empty, so the two
+        # fields together ARE the provenance -- no extra plumbing needed. Without
+        # this the headline line claimed "6/6 acceptance criteria traced, all
+        # covered" for six criteria the model had invented.
+        rtm_line = rtm_oneline(
+            acs, suite.test_cases, derived=bool(acs) and not source_acs
+        )
         meter_line = (
             meter.summary_line(
                 detailed=settings.qa_token_meter_detail_enabled,

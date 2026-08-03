@@ -208,6 +208,168 @@ def default_targets(home: Path | None = None) -> list[tuple[str, Path, Path]]:
     return out
 
 
+# A project-scope MCP config registers a server only while that folder is open,
+# which is how a SECOND qa server appears without anyone editing a user config.
+_PROJECT_CONFIG_RELPATHS = (".mcp.json", ".cursor/mcp.json", ".vscode/mcp.json")
+
+
+def _looks_like_qa_server(name: str) -> bool:
+    """Whether an MCP server entry name is one of ours.
+
+    Deliberately name-based and generous (`qa-agents`, `qa-agent-pro`,
+    `qa_agent_dev`, ...): the point is to notice a SECOND one, so a false positive
+    costs an informational line while a false negative hides the split entirely.
+    """
+    low = (name or "").lower()
+    return "qa" in low and ("agent" in low or "agents" in low)
+
+
+def discover_registrations(
+    home: Path | None = None,
+    workspace_roots: list | None = None,
+) -> list[dict]:
+    """Every qa-server MCP registration visible on this machine. READ-ONLY.
+
+    2026-08-03. A real run staged its prep on one install and finalized it on
+    another, because the packaged install is registered in the USER configs while
+    this project's own `.mcp.json` / `.cursor/mcp.json` register a DEV checkout --
+    so anyone who opens the repo has two qa servers live at once and an agent can
+    pick a different one per call. The version-skew warning catches it after the
+    fact; this is how `qa_setup_check` can warn BEFORE a suite is built.
+
+    Returns dicts of {scope, name, command, config}. Never raises: a missing or
+    malformed config is skipped, because this only produces an advisory line.
+    """
+    out: list[dict] = []
+    home = Path(home) if home is not None else Path.home()
+    seen_paths: set = set()
+
+    def _scan(path: Path, scope: str, base: object = None) -> None:
+        try:
+            rp = path.resolve()
+            if rp in seen_paths or not path.is_file():
+                return
+            seen_paths.add(rp)
+            data = json.loads(path.read_text(encoding="utf-8") or "{}")
+            servers = (data or {}).get("mcpServers") or {}
+            if not isinstance(servers, dict):
+                return
+            for name, entry in servers.items():
+                if not _looks_like_qa_server(str(name)):
+                    continue
+                cmd = ""
+                if isinstance(entry, dict):
+                    cmd = str(entry.get("command") or entry.get("url") or "")
+                    args = entry.get("args")
+                    if isinstance(args, list) and args:
+                        cmd = (cmd + " " + " ".join(str(a) for a in args)).strip()
+                out.append(
+                    {
+                        "scope": scope,
+                        "name": str(name),
+                        "command": cmd,
+                        "config": str(path),
+                        # A relative path in a PROJECT config is workspace-relative,
+                        # not config-relative -- `${workspaceFolder}` means the
+                        # workspace ROOT. Resolving against the config's own folder
+                        # made `.cursor/mcp.json` look like a third install living in
+                        # `<root>/.cursor`. Carry the correct base with the row.
+                        "base": str(base or path.parent),
+                    }
+                )
+        except Exception:
+            logger.debug("could not scan %s for MCP registrations", path, exc_info=True)
+
+    _scan(home / ".claude.json", "user")
+    for _label, cfg, _need in default_targets(home):
+        _scan(cfg, "user")
+    for root in list(workspace_roots or []):
+        for rel in _PROJECT_CONFIG_RELPATHS:
+            _scan(Path(root) / rel, "project", base=Path(root))
+    return out
+
+
+def install_target(command: str, base: str | Path) -> str:
+    """The install DIRECTORY a registration points at, for grouping.
+
+    Grouping on the raw command over-counts, and a warning that inflates its own
+    number is worse than none: the same dev checkout is spelled
+    ``.venv/bin/python mcp_server.py`` in one config and
+    ``${workspaceFolder}/.venv/bin/python ${workspaceFolder}/mcp_server.py`` in
+    another, which naive grouping reports as two separate servers.
+
+    So resolve to the directory: take the last `.py`/`.sh` token (the server
+    script, not the interpreter), strip `${workspaceFolder}` placeholders, resolve
+    a relative path against the CONFIG's own directory -- which is what a
+    project-scope relative path actually means -- and return its parent. Falls back
+    to the raw command when no script token is present, so unrelated servers are
+    never silently merged. Never raises.
+    """
+    try:
+        raw = str(command or "").strip()
+        if not raw:
+            return ""
+        cleaned = raw.replace("${workspaceFolder}/", "").replace(
+            "${workspaceFolder}", ""
+        )
+        tokens = [t for t in cleaned.split() if t]
+        script = next(
+            (t for t in reversed(tokens) if t.endswith((".py", ".sh"))),
+            "",
+        )
+        if not script:
+            return raw
+        p = Path(script)
+        if not p.is_absolute():
+            p = Path(base) / p
+        return str(p.resolve().parent)
+    except Exception:
+        logger.debug("install_target failed for %r", command, exc_info=True)
+        return str(command or "")
+
+
+def split_server_warning(
+    home: Path | None = None,
+    workspace_roots: list | None = None,
+) -> str:
+    """One advisory line when MORE THAN ONE distinct qa INSTALL is registered.
+
+    Grouped by resolved install directory, not by name or raw command: three
+    clients all pointing at the same packaged install is normal and silent. Two
+    different installs is the hazard -- an agent can prepare against one and
+    submit against the other, and they have separate `.env` files, so the suite is
+    prepared under one set of feature flags and finalized under another. Returns
+    "" when there is nothing to say. Never raises.
+    """
+    try:
+        found = discover_registrations(home, workspace_roots)
+        by_install: dict = {}
+        for r in found:
+            key = install_target(r["command"], r.get("base") or r["config"]) or r["name"]
+            by_install.setdefault(key, []).append(r)
+        if len(by_install) < 2:
+            return ""
+        lines = []
+        for target, rows in sorted(by_install.items()):
+            names = ", ".join(sorted({r["name"] for r in rows}))
+            scopes = ",".join(sorted({r["scope"] for r in rows}))
+            lines.append(f"`{names}` ({scopes}) at `{target}`")
+        return (
+            f"**{len(by_install)} DIFFERENT qa-agents installs are registered** "
+            "in your MCP configs: "
+            + "; ".join(lines)
+            + ". Run one whole flow against ONE of them. An agent that prepares "
+            "against one and submits to the other is mixing two installs, which "
+            "have separate `.env` files and therefore different feature flags -- "
+            "the suite then gets prepared under one configuration and finalized "
+            "under another. A project-scope entry only exists while that folder is "
+            "open, so this is easy to hit without having changed anything."
+        )
+    except Exception:
+        logger.debug("split_server_warning failed", exc_info=True)
+        return ""
+
+
 def register_all(
     start_command: str,
     *,

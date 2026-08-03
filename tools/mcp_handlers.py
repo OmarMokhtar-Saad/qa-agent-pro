@@ -4007,6 +4007,58 @@ def _merge_category_rows(rows: list) -> "tuple[dict, int, dict]":
     return {"test_cases": renumbered}, used, id_map
 
 
+def _version_skew_note(staged: str, running: str) -> str:
+    """Warning for a prep staged by one build and submitted to another.
+
+    Returns "" when the versions match or either is unknown, so callers can use it
+    unconditionally. Never raises.
+
+    2026-08-03: the previous wording asserted ONE cause -- "the server updated
+    mid-flow" -- for a condition that has two, and the unstated one is worse. The
+    first production run of v1.34.0 staged its prep on a SEPARATE install (a dev
+    checkout reporting v0.1.0) and submitted it to the packaged v1.34.0 server,
+    because both were registered in the same client and the agent split the flow
+    across them. Two installs mean two `.env` files and two sets of feature flags,
+    so the suite was prepared under one configuration and finalized under another.
+    The old closing line -- "the suite below is fine unless something looks wrong"
+    -- waved exactly that through.
+
+    So: state the observed fact, name BOTH causes, mark which one is harmful, and
+    let the version SHAPE point at the likely one. A self-update moves between
+    released versions; a dev checkout reports 0.x, which is the strong hint that a
+    second install is involved. Extracted from handle_submit_suite so the wording
+    is directly testable rather than only reachable through a full submit.
+    """
+    try:
+        staged = str(staged or "").strip()
+        running = str(running or "").strip()
+        if not staged or not running or staged == running:
+            return ""
+        note = (
+            f"\n> \u26a0\ufe0f  Version mismatch: this prep was staged by "
+            f"v{staged} and is being submitted to v{running}. Either this install "
+            "self-updated between the two calls (harmless), or the prep came from "
+            "a DIFFERENT install of this server (not harmless: a second install "
+            "has its own `.env`, so the suite was prepared under one set of "
+            "feature flags and finalized under another)."
+        )
+        if staged.startswith("0."):
+            note += (
+                " The staging version looks like a development checkout rather "
+                "than a release, which points at the second case: check whether "
+                "more than one qa-agents server is registered in your client, and "
+                "run the whole flow against ONE of them."
+            )
+        return note + (
+            " The suite below was still built from the cases you submitted; "
+            "re-run `qa_generate_test_cases` end to end on a single install if "
+            "anything looks inconsistent.\n"
+        )
+    except Exception:  # pragma: no cover - defensive; must never break a submit
+        logger.exception("_version_skew_note failed")
+        return ""
+
+
 def _prep_status_finalize_hint() -> str:
     """The finalize advice appended to the `qa_prep_status` reply.
 
@@ -4479,12 +4531,19 @@ async def handle_submit_suite(
         try:
             _wrote = str(meta.get("app_version") or "")
             if _wrote and _BOOT_VERSION and _wrote != _BOOT_VERSION:
-                version_note = (
-                    f"\n> ⚠️  This prep was staged by v{_wrote} but is being "
-                    f"submitted to v{_BOOT_VERSION} -- the server updated "
-                    "mid-flow. The suite below is fine unless something looks "
-                    "wrong; if it does, re-run `qa_generate_test_cases`.\n"
-                )
+                # 2026-08-03: this used to assert ONE cause -- "the server updated
+                # mid-flow" -- for a condition that has two, and the other one is
+                # worse. A real run staged its prep on a SEPARATE install (a dev
+                # checkout reporting v0.1.0) and submitted it to the packaged
+                # v1.34.0 server, because both were registered in one client and
+                # the agent split the flow across them. Two installs mean two
+                # `.env` files and two sets of feature flags, so the suite was
+                # prepared under one configuration and finalized under another --
+                # which "the suite below is fine unless something looks wrong"
+                # wrongly waves through. State the observed fact, name both causes,
+                # and let the version SHAPE hint at which: a self-update moves
+                # between released versions, while a dev checkout reports 0.x.
+                version_note = _version_skew_note(_wrote, _BOOT_VERSION)
         except Exception:
             logger.debug("prep version check failed", exc_info=True)
         try:
@@ -4811,6 +4870,38 @@ async def handle_submit_suite(
             if ac_result.ran and not getattr(prepared, "acs", None):
                 prepared.acs = list(ac_result.acs)
             ac_note = host_mode.build_host_ac_section(ac_result, all_cases)
+        # The entailment review's verdicts rode in on THIS submission -- no extra
+        # round trip and no server-side LLM call -- and are UNTRUSTED, so
+        # tools.grounding_verdicts matches every id against the submitted suite,
+        # enum-gates the verdicts, caps the notes and refuses a batch that marks
+        # more than 40% of the suite ungrounded. It never removes a case: an
+        # ungrounded one is REPORTED for a human to confirm or delete, because it
+        # may be a real requirement nobody wrote down. "" when the optional field
+        # is absent, so a normal submit is byte-identical.
+        grounding_note = host_mode.build_grounding_section(
+            getattr(parsed, "raw_grounding_verdicts", None), all_cases
+        )
+        # Re-file the cases that review judged ungrounded. This must happen BEFORE
+        # _finalize_generation for exactly the reason the duplicate review does:
+        # finalize RENUMBERS every tc_id, so anything keyed to the ids the host
+        # submitted has to act first. The removed cases are NOT deleted -- they go
+        # to their own workbook sheet with their own AR-nnn ids (a retained TC-nnn
+        # would collide with an unrelated case that inherited that number), so a
+        # requirement nobody wrote down is still in front of a human.
+        assumed_rows: list = []
+        if grounding_note:
+            routing = host_mode.route_ungrounded_cases(
+                getattr(parsed, "raw_grounding_verdicts", None), all_cases
+            )
+            if routing is not None and routing.routed:
+                assumed_rows = routing.rows
+                removed = {c.tc_id for c in routing.routed}
+                all_cases = [c for c in all_cases if c.tc_id not in removed]
+                logger.info(
+                    "Grounding review moved %d case(s) to the Assumed Requirements "
+                    "sheet",
+                    len(routing.routed),
+                )
         # Residue R4: the checklist boomerang's return field. It rode in on THIS
         # submission -- no extra round trip and no server-side LLM call -- and
         # is UNTRUSTED, so host_mode.extract_host_checklist shape-validates it,
@@ -5077,6 +5168,15 @@ async def handle_submit_suite(
 
         def _on_ready(s) -> None:
             captured["suite"] = s
+            # The exporter reads this PrivateAttr to add the sheet; absent means
+            # no sheet, so a run with the review off is byte-identical.
+            if assumed_rows:
+                try:
+                    s._assumed_artifacts = {"rows": assumed_rows}
+                except Exception:
+                    logger.warning(
+                        "Could not attach the Assumed Requirements rows", exc_info=True
+                    )
 
         async def _on_status(msg: str) -> None:
             await _emit(progress, msg)
@@ -5318,7 +5418,7 @@ async def handle_submit_suite(
                 )
                 return (
                     f"{version_note}{dropped_note}{conflict_note}{cat_source}"
-                    f"{amb_note}{ac_note}{checklist_note}{img_note}{dup_status_note}{dup_note}"
+                    f"{amb_note}{ac_note}{grounding_note}{checklist_note}{img_note}{dup_status_note}{dup_note}"
                     f"{cov_note}{gap_md}"
                 )
             cap_note = (
@@ -5449,7 +5549,7 @@ async def handle_submit_suite(
         return (
             f"{export_note}"
             f"{version_note}{dropped_note}{conflict_note}{cat_source}"
-            f"{fa_skip_note}{amb_note}{ac_note}{checklist_note}{img_note}{risk_note}{plan_note}"
+            f"{fa_skip_note}{amb_note}{ac_note}{grounding_note}{checklist_note}{img_note}{risk_note}{plan_note}"
             f"{nli_note}{comment_note}"
             f"{dup_status_note}{dup_note}"
             f"{cov_note}{result_md}{cap_note}"
@@ -7045,6 +7145,57 @@ def _binary_line(name: str) -> str:
     )
 
 
+def _ac_field_section() -> list[str]:
+    """Disclose which Jira field is configured as the acceptance-criteria source.
+
+    ``settings.jira_ac_field`` is a per-instance GUESS. Its default,
+    ``customfield_10016``, is a DATE field on at least one real workspace, and the
+    timestamp it returned became a suite's only "acceptance criterion" -- which
+    also suppressed the host job that would otherwise have derived real ones. The
+    failure was invisible until someone read 98 generated cases.
+
+    So the field id is now printed on every setup check, alongside what happens
+    when it holds nothing usable. Static text only: no ticket is fetched here, so
+    this cannot fail or slow the report down.
+    """
+    try:
+        field = str(getattr(settings, "jira_ac_field", "") or "(unset)")
+        discovery = bool(getattr(settings, "qa_jira_ac_field_discovery", False))
+        out = [
+            "### Acceptance-criteria field",
+            "",
+            f"- Configured field: `{field}` (`JIRA_AC_FIELD`)",
+            "- This id differs per Jira instance. It is used ONLY when its value "
+            "reads like requirement text -- a date, a bare number or a single "
+            "token is rejected, because on one workspace this default is a DATE "
+            "field and the timestamp became the suite's only acceptance criterion.",
+        ]
+        if discovery:
+            out.append(
+                "- `QA_JIRA_AC_FIELD_DISCOVERY` is **on**: when the configured "
+                "field holds nothing usable, other custom fields are searched for "
+                "one whose value reads like requirements. The choice is logged."
+            )
+        else:
+            out.append(
+                "- `QA_JIRA_AC_FIELD_DISCOVERY` is off (default). When the "
+                "configured field holds nothing usable, the ticket description is "
+                "parsed instead -- an 'Acceptance Criteria' heading, or a "
+                "use-case table when `QA_JIRA_UC_TABLE_AC_ENABLED` is on. If "
+                "neither yields anything, your chat model is asked to derive the "
+                "criteria, so traceability still works."
+            )
+        out.append(
+            "- To check the id for your instance, open a ticket's field list in "
+            "Jira admin and set `JIRA_AC_FIELD` in `.env` to the Acceptance "
+            "Criteria field."
+        )
+        return out
+    except Exception:
+        logger.exception("_ac_field_section failed - omitting it")
+        return []
+
+
 async def handle_setup_check(
     *, progress: ProgressCb = None, workspace_roots: list[Path] | None = None
 ) -> str:
@@ -7374,6 +7525,22 @@ async def handle_setup_check(
         # printing "configured" or "verified" here would be a guess, and a
         # confident wrong answer is worse than none. State what is true and
         # point at the one place that gives real guidance.
+        # 2026-08-03: warn BEFORE a suite is built when more than one qa server is
+        # registered. The packaged install sits in the USER configs while the
+        # project's own .mcp.json registers a DEV checkout, so opening the repo puts
+        # two live servers in front of the agent -- which is how one real run
+        # prepared on v0.1.0 and finalized on v1.34.0. Recommended, not optional:
+        # the two installs have separate .env files, so the flags the suite was
+        # prepared under are not the flags it was finalized under. Silent when every
+        # client points at the SAME install, which is the normal case.
+        try:
+            from tools.client_registry import split_server_warning
+
+            _split = split_server_warning(workspace_roots=workspace_roots)
+            if _split:
+                recommended.append(_split)
+        except Exception:
+            logger.debug("split-server check failed", exc_info=True)
         optional.append(connect_hint_line(workspace_roots=workspace_roots))
         # Fix 7 / M3 (2026-08-03): the ONLY discoverable path to registration.
         # QA_AUTO_REGISTER_CLIENTS defaults OFF (it writes outside the install
@@ -7513,6 +7680,7 @@ async def handle_setup_check(
         # the guess into a verified yes/no. Unconditional on purpose: a missing
         # local config entry is not evidence of absence, and a present one is
         # not evidence of authorization. Additive -- the optional hint stays.
+        lines += ["", *_ac_field_section()]
         lines += [
             "",
             "### Verify the Jira (Atlassian) connection",
