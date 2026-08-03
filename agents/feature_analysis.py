@@ -25,10 +25,34 @@ import logging
 from pydantic import BaseModel, Field
 
 from config.settings import settings
-from llm import ask_json
+from llm import ask_json, server_llm_scope
+from tools.host_llm import open_task
 from tools.untrusted import _GUARD, wrap_untrusted
 
 logger = logging.getLogger(__name__)
+
+# This module's row in docs/LLM_MIGRATION_INVENTORY.md. The STANDALONE
+# qa_feature_analysis tool is CHAT-ONLY as of 2026-08-02 (qa_feature_analysis ->
+# qa_submit_feature_analysis via tools/host_llm) and never reaches a backend.
+# The LEGACY analyze_feature below survives for _finalize_generation's opt-in
+# in-prep report and tags its call with this id.
+_LEDGER_ID = "feature_analysis.report"
+
+# Cap on each prompt input carried in the task record's meta, so a resubmit round
+# can rebuild the prompt WITHOUT re-driving the mobile capture-another loop, and
+# without the record growing unbounded (host_llm._cap re-applies its own cap).
+_MAX_META_TEXT_CHARS = 20_000
+
+# Inserted between the rubric and _GUARD on a resubmit round.
+_RESUBMIT_REMINDER = (
+    "\n\nYour previous submission carried no usable Feature Analysis object. "
+    "Re-emit it as a SINGLE JSON object matching the response schema, with no "
+    "prose outside the JSON."
+)
+
+# The two plain-string fields; every other field of FeatureAnalysisReport is a
+# list[str]. Used by finalize_feature_report to coerce an UNTRUSTED submission.
+_STR_FIELDS = ("feature_summary", "business_objective")
 
 
 class FeatureAnalysisReport(BaseModel):
@@ -93,6 +117,65 @@ fill it.
 """
 
 
+def build_feature_analysis_prompt(
+    feature_text: str,
+    jira_text: str,
+    screenshot_descriptions: str,
+    ui_content: dict | None,
+    acs: list,
+    *,
+    reminder: str = "",
+) -> tuple[str, str]:
+    """Return ``(system_prompt, user_message)`` for ONE Feature Analysis pass.
+
+    Extracted VERBATIM from the former ``analyze_feature`` body so the chat-only
+    host path and the legacy coroutine below share ONE prompt and cannot drift --
+    the same discipline as ``build_bug_report_prompt`` / ``build_coach_prompt``.
+    ``reminder`` is the resubmit instruction inserted between the rubric and
+    ``_GUARD`` on a retry round. Pure and never raises.
+
+    PROVENANCE NOTE for the host path: the blocks below are each wrapped
+    individually, but ``host_llm.build_envelope`` re-wraps the whole context and
+    COLLAPSES them into ONE block, stripping the per-source labels (documented
+    consequence #1 of the unconditional wrap). The plain markdown headings
+    (``## Feature / Ticket Text``, ``## Parsed Acceptance Criteria``, ...) live in
+    the BODY precisely so the host can still tell the sources apart.
+    """
+    # Bound token cost: cap the primary text before wrapping (reviewer note 1).
+    primary = (jira_text or feature_text or "").strip() or "(none provided)"
+
+    ac_block = ""
+    if acs:
+        ac_lines = "\n".join(
+            f"- {getattr(ac, 'ac_id', '') or 'AC'}: {getattr(ac, 'description', '')}"
+            for ac in acs
+        )
+        ac_block = "\n\n## Parsed Acceptance Criteria\n" + wrap_untrusted(
+            "jira_acceptance_criteria", ac_lines
+        )
+
+    ui_block = ""
+    if ui_content and not ui_content.get("error"):
+        content = (ui_content.get("content") or "").strip()
+        if content:
+            ui_block = "\n\n## Live UI Structure\n" + wrap_untrusted(
+                "live_ui_structure", content[:3000]
+            )
+
+    user_msg = (
+        "## Feature / Ticket Text\n"
+        + wrap_untrusted("jira_or_web_content", primary)
+        + ac_block
+        + "\n\n## Screenshot Descriptions (treat as one connected flow)\n"
+        + wrap_untrusted(
+            "screenshot_descriptions",
+            screenshot_descriptions or "(no screenshots provided)",
+        )
+        + ui_block
+    )
+    return _SYSTEM_PROMPT + (reminder or "") + _GUARD, user_msg
+
+
 async def analyze_feature(
     feature_text: str,
     jira_text: str,
@@ -109,49 +192,128 @@ async def analyze_feature(
     report, exactly like ``critique_coverage``'s never-raise contract.
     """
     try:
-        # Bound token cost: cap the primary text before wrapping (reviewer note 1).
-        primary = (jira_text or feature_text or "").strip() or "(none provided)"
-
-        ac_block = ""
-        if acs:
-            ac_lines = "\n".join(
-                f"- {getattr(ac, 'ac_id', '') or 'AC'}: {getattr(ac, 'description', '')}"
-                for ac in acs
-            )
-            ac_block = "\n\n## Parsed Acceptance Criteria\n" + wrap_untrusted(
-                "jira_acceptance_criteria", ac_lines
-            )
-
-        ui_block = ""
-        if ui_content and not ui_content.get("error"):
-            content = (ui_content.get("content") or "").strip()
-            if content:
-                ui_block = "\n\n## Live UI Structure\n" + wrap_untrusted(
-                    "live_ui_structure", content[:3000]
-                )
-
-        user_msg = (
-            "## Feature / Ticket Text\n"
-            + wrap_untrusted("jira_or_web_content", primary)
-            + ac_block
-            + "\n\n## Screenshot Descriptions (treat as one connected flow)\n"
-            + wrap_untrusted(
-                "screenshot_descriptions",
-                screenshot_descriptions or "(no screenshots provided)",
-            )
-            + ui_block
+        system, user_msg = build_feature_analysis_prompt(
+            feature_text, jira_text, screenshot_descriptions, ui_content, acs
         )
-        return await ask_json(
-            system=_SYSTEM_PROMPT + _GUARD,
-            user=user_msg,
-            response_model=FeatureAnalysisReport,
-            model=settings.qa_classifier_model or None,
-        )
+        # LEGACY server-side call, KEPT deliberately. Its only remaining caller
+        # is _finalize_generation's opt-in in-prep report
+        # (agents/test_scenario_agent.py, gated by QA_HOST_FEATURE_REPORT_ENABLED
+        # AND QA_FEATURE_ANALYSIS_ENABLED, both default OFF); the STANDALONE
+        # qa_feature_analysis tool no longer reaches it -- it goes through
+        # prepare_feature_analysis below. Tagged with this row's ledger id so
+        # QA_SERVER_LLM_ENABLED governs it and
+        # QA_SERVER_LLM_ALLOW=feature_analysis.report can revive exactly this one
+        # path after the Phase-6 flip; untagged it would silently degrade to an
+        # empty report instead.
+        with server_llm_scope(_LEDGER_ID):
+            return await ask_json(
+                system=system,
+                user=user_msg,
+                response_model=FeatureAnalysisReport,
+                model=settings.qa_classifier_model or None,
+            )
     except Exception:
         logger.warning(
             "analyze_feature failed -- returning an empty report", exc_info=True
         )
         return FeatureAnalysisReport()
+
+
+async def prepare_feature_analysis(
+    feature_text: str,
+    jira_text: str,
+    screenshot_descriptions: str,
+    *,
+    ui_content: dict | None = None,
+    acs: list | None = None,
+    mode: str = "",
+    screens: int = 0,
+    source: str = "",
+    round_no: int = 1,
+    submit_tool: str = "qa_submit_feature_analysis",
+) -> dict:
+    """Open a host task asking the TESTER'S OWN chat model to write the report.
+
+    No backend is contacted. The server still does everything only it can do --
+    hardened Jira fetching, device capture, untrusted wrapping -- and, in the
+    submit half, the coercion and the rendering. The prompt INPUTS ride on the
+    task RECORD, never in the envelope, so a resubmit round can rebuild the
+    prompt without re-driving the mobile capture loop and a host cannot alter
+    them. Returns the house ``{"error", "content": {"task_id", "envelope"}}``
+    dict; never raises.
+    """
+    try:
+        system, user = build_feature_analysis_prompt(
+            feature_text,
+            jira_text,
+            screenshot_descriptions,
+            ui_content,
+            list(acs or []),
+            reminder=_RESUBMIT_REMINDER if int(round_no) > 1 else "",
+        )
+        return await open_task(
+            "feature_analysis",
+            system,
+            user,
+            return_field="report",
+            response_schema=FeatureAnalysisReport.model_json_schema(),
+            meta={
+                "feature_text": (feature_text or "")[:_MAX_META_TEXT_CHARS],
+                "jira_text": (jira_text or "")[:_MAX_META_TEXT_CHARS],
+                "screen_descriptions": (screenshot_descriptions or "")[
+                    :_MAX_META_TEXT_CHARS
+                ],
+                "mode": str(mode or ""),
+                "screens": int(screens or 0),
+                "source": str(source or ""),
+                "round": int(round_no),
+            },
+            submit_tool=submit_tool,
+        )
+    except Exception as exc:
+        logger.exception("prepare_feature_analysis failed")
+        return {"error": str(exc), "content": None}
+
+
+def finalize_feature_report(payload: object) -> tuple[FeatureAnalysisReport, bool]:
+    """``(report, usable)`` from an UNTRUSTED host submission. Never raises.
+
+    ``model_config = {"extra": "forbid"}`` would make a STRICT parse reject an
+    otherwise perfect report just because the host volunteered one extra key, so
+    unknown keys are DROPPED and known ones coerced field by field (a bare string
+    where a list belongs becomes a one-item list; blanks are discarded).
+    ``usable`` is False when nothing at all could be read -- the caller decides
+    whether that earns a resubmit round. This never fabricates content to fill a
+    section, which is the same rule ``_bullets`` follows when it renders
+    ``_None identified._``.
+    """
+    if not isinstance(payload, dict):
+        return FeatureAnalysisReport(), False
+    data: dict = {}
+    for name in FeatureAnalysisReport.model_fields:
+        if name not in payload:
+            continue
+        value = payload[name]
+        if name in _STR_FIELDS:
+            if isinstance(value, str) and value.strip():
+                data[name] = value.strip()
+            continue
+        if isinstance(value, str):
+            value = [value]
+        if isinstance(value, (list, tuple)):
+            items = [str(i).strip() for i in value if str(i).strip()]
+            if items:
+                data[name] = items
+    if not data:
+        return FeatureAnalysisReport(), False
+    try:
+        return FeatureAnalysisReport(**data), True
+    except Exception:
+        logger.warning(
+            "finalize_feature_report: could not coerce the host submission",
+            exc_info=True,
+        )
+        return FeatureAnalysisReport(), False
 
 
 _EMPTY_NOTE = "_None identified._"

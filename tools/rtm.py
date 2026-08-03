@@ -17,7 +17,7 @@ from dataclasses import field as dc_field
 from pydantic import BaseModel, Field
 
 from config.settings import settings
-from llm import ask_json
+from llm import ask_json, server_llm_scope
 from tools import token_meter
 from tools.atomic_checklist import (
     HONESTY_BOUNDARY,
@@ -29,6 +29,23 @@ from tools.models import TestCase
 from tools.untrusted import _GUARD, wrap_untrusted
 
 logger = logging.getLogger(__name__)
+
+# docs/LLM_MIGRATION_INVENTORY.md ledger id for the OPTIONAL entailment (b) and
+# adjudication (c) tiers below. Named _NLI_ rather than generically, because
+# this module owns a SECOND ledger call site
+# (`rtm.acceptance_criteria`, the AC synthesis near the top of the file),
+# tagged `_AC_LEDGER_ID` -- deliberately a different constant, since a bare
+# _LEDGER_ID here would invite that call site to reuse the wrong tag.
+#
+# Ledger rule 4: the surviving direct call sites -- still reachable from
+# graph.py, from evals/, and from any install that sets
+# QA_HOST_CHECKLIST_NLI_SUPPRESS_ENABLED=false -- must TAG themselves, or the
+# Phase-6 kill switch refuses them as UNTAGGED calls and the documented rollback
+# ("set the flag false and the tiers come back") would silently degrade to tier
+# (a) instead of restoring anything. Tagged, QA_SERVER_LLM_ALLOW=rtm.nli_verdicts
+# keeps exactly this one path alive. No behavioural change while
+# QA_SERVER_LLM_ENABLED is on (its default).
+_NLI_LEDGER_ID = "rtm.nli_verdicts"
 
 
 @dataclass
@@ -45,6 +62,23 @@ class _GeneratedAC(BaseModel):
 
 class _GeneratedACList(BaseModel):
     acceptance_criteria: list[_GeneratedAC] = Field(default_factory=list)
+
+
+# Ledger id for the AC-synthesis call below (`rtm.acceptance_criteria`), the
+# SECOND of this module's two ledger rows and deliberately a DISTINCT constant
+# from _NLI_LEDGER_ID -- exactly as that constant's own comment instructs. The
+# two rows migrate and are allow-listed independently.
+#
+# Ledger rule 4. The host route never reaches this call: handle_prepare_test_cases
+# passes synthesize_acs=False (its `_host_ac` decision), so _run_gen_acs returns
+# [] and agents/host_mode.AC_JOB derives the criteria on the tester's OWN model.
+# What survives is the LEGACY route -- graph.py -> generate_test_scenarios ->
+# _prepare_generation(synthesize_acs=True), plus evals/ -- and it is NOT deleted
+# (Phase 3a's precedent). A surviving call must TAG itself or the Phase-6 kill
+# switch refuses it as UNTAGGED, and QA_SERVER_LLM_ALLOW=rtm.acceptance_criteria
+# would then allow nothing at all. Inert while QA_SERVER_LLM_ENABLED is on (its
+# default): the scope only sets a ContextVar the guard reads when the flag is off.
+_AC_LEDGER_ID = "rtm.acceptance_criteria"
 
 
 _AC_GEN_SYSTEM = """\
@@ -77,12 +111,13 @@ async def generate_acs(
         if not feature_text or not feature_text.strip():
             return []
         _ac_user = wrap_untrusted("feature_description", feature_text)
-        result = await ask_json(
-            system=_AC_GEN_SYSTEM + _GUARD,
-            user=_ac_user,
-            response_model=_GeneratedACList,
-            model=settings.qa_classifier_model or None,
-        )
+        with server_llm_scope(_AC_LEDGER_ID):
+            result = await ask_json(
+                system=_AC_GEN_SYSTEM + _GUARD,
+                user=_ac_user,
+                response_model=_GeneratedACList,
+                model=settings.qa_classifier_model or None,
+            )
         token_meter.note(
             meter,
             "other",
@@ -602,12 +637,13 @@ async def _entailment_pass(pairs: list[tuple]) -> dict:
         body = "\n\n".join(
             f"PAIR {pid}\nREQUIREMENT: {req}\nTEST: {case}" for pid, req, case in pairs
         )
-        result: _PairVerdicts = await ask_json(
-            system=_ENTAILMENT_SYSTEM + _GUARD,
-            user=wrap_untrusted("requirement_test_pairs", body, limit=20000),
-            response_model=_PairVerdicts,
-            model=settings.qa_classifier_model or None,
-        )
+        with server_llm_scope(_NLI_LEDGER_ID):
+            result: _PairVerdicts = await ask_json(
+                system=_ENTAILMENT_SYSTEM + _GUARD,
+                user=wrap_untrusted("requirement_test_pairs", body, limit=20000),
+                response_model=_PairVerdicts,
+                model=settings.qa_classifier_model or None,
+            )
         out: dict = {}
         for v in result.verdicts:
             verdict = (v.verdict or "").strip().lower()
@@ -632,12 +668,13 @@ async def _adjudication_pass(pairs: list[tuple]) -> dict:
         body = "\n\n".join(
             f"PAIR {pid}\nREQUIREMENT: {req}\nTEST: {case}" for pid, req, case in pairs
         )
-        result: _Adjudications = await ask_json(
-            system=_ADJUDICATION_SYSTEM + _GUARD,
-            user=wrap_untrusted("requirement_test_pairs", body, limit=20000),
-            response_model=_Adjudications,
-            model=settings.qa_classifier_model or None,
-        )
+        with server_llm_scope(_NLI_LEDGER_ID):
+            result: _Adjudications = await ask_json(
+                system=_ADJUDICATION_SYSTEM + _GUARD,
+                user=wrap_untrusted("requirement_test_pairs", body, limit=20000),
+                response_model=_Adjudications,
+                model=settings.qa_classifier_model or None,
+            )
         return {int(d.pair_id): bool(d.covered) for d in result.decisions}
     except Exception:
         logger.warning(
@@ -738,6 +775,29 @@ async def match_checklist(
         pair_id = 0
         max_pairs = int(getattr(settings, "qa_checklist_max_pairs", 40) or 40)
         tiers_on = bool(allow_llm_tiers)
+        # Phase 3b: `notes` is this module's OWN established channel for "this
+        # measurement was degraded" (see _DEGRADED_NOTE) and is the only one
+        # that survives into render_checklist_section, coverage_to_dict, the
+        # XLSX checklist sheets and the suite_store payload. Without this the
+        # suppression would exist only in the ephemeral chat reply and the
+        # EXPORTED artifact would silently look like a full-strength
+        # measurement. Only emitted when a tier was genuinely turned off, i.e.
+        # when it would otherwise have run.
+        if not tiers_on and (
+            getattr(settings, "qa_checklist_nli_enabled", False)
+            or getattr(settings, "qa_checklist_adjudicate_enabled", False)
+        ):
+            cov.notes.append(
+                "The OPTIONAL entailment / adjudication tiers were NOT run for "
+                "this measurement, so the ambiguous similarity band is reported "
+                "as uncovered instead of being re-judged and the coverage "
+                "figure may UNDERSTATE real coverage. On a host-mode submit "
+                "this is deliberate (QA_HOST_CHECKLIST_NLI_SUPPRESS_ENABLED, "
+                "default on): those tiers are only worth something when a model "
+                "OTHER than the one that wrote the cases re-judges them, and in "
+                "host mode the generator is the chat model itself. Set "
+                "QA_HOST_CHECKLIST_NLI_SUPPRESS_ENABLED=false to restore them."
+            )
 
         for i, row in enumerate(matrix):
             for j, score in enumerate(row):

@@ -359,7 +359,10 @@ def build_server():
 
     @mcp.tool()
     async def qa_generate_test_cases(
-        ctx: Context, feature_or_url: str = "", proceed_anyway: bool = False
+        ctx: Context,
+        feature_or_url: str = "",
+        proceed_anyway: bool = False,
+        jira_content_json: str = "",
     ) -> str:
         """Generate a structured test suite. feature_or_url can be a feature
         description, a Jira/issue URL, a web page URL, or a Swagger/OpenAPI
@@ -391,12 +394,16 @@ def build_server():
                 choose=_make_chooser(ctx),
                 ask_text=_make_asker(ctx),
                 progress=_make_progress(ctx),
+                jira_content_json=jira_content_json,
             ),
         )
 
     @mcp.tool()
     async def qa_prepare_test_cases(
-        ctx: Context, feature_or_url: str = "", proceed_anyway: bool = False
+        ctx: Context,
+        feature_or_url: str = "",
+        proceed_anyway: bool = False,
+        jira_content_json: str = "",
     ) -> list[ContentBlock]:
         """HOST-MODE generation. Instead of the server calling an LLM, THIS tool
         returns a grounded generation payload (a system prompt, the grounded
@@ -405,6 +412,15 @@ def build_server():
 
         feature_or_url can be a feature description, a Jira/issue URL, a web page
         URL, or a Swagger/OpenAPI spec URL -- exactly like qa_generate_test_cases.
+
+        JIRA URLS ARE A TWO-STEP BOOMERANG. This server holds no Jira
+        credentials. For a Jira URL the FIRST reply is a DIRECTIVE telling you to
+        call your OWN `mcp__atlassian__getJiraIssue` (and once more for the
+        parent issue, when there is one), then call this tool AGAIN with the same
+        feature_or_url plus `jira_content_json` set to the RAW JSON result. Do
+        not summarise, translate or invent ticket content, and do not generate
+        from the URL alone. If you have no `atlassian` MCP server connected, show
+        the user the connection steps the directive includes.
 
         WHAT TO DO WITH THE RESULT: when the payload includes `orchestration`
         with mode `parallel_chat_workers`, fan out ONE same-session worker per
@@ -431,6 +447,7 @@ def build_server():
                 choose=_make_chooser(ctx),
                 ask_text=_make_asker(ctx),
                 progress=_make_progress(ctx),
+                jira_content_json=jira_content_json,
             ),
         )
         return _prepare_payload_to_content(result)
@@ -553,7 +570,12 @@ def build_server():
 
         @mcp.tool()
         async def qa_bug_report(description: str, ctx: Context) -> str:
-            """Turn a plain-language bug description into a structured bug report (markdown)."""
+            """Start a structured bug report from a plain-language description.
+
+            Chat-only: the server makes NO model call. It returns a task envelope
+            (system_prompt + untrusted-wrapped context) that YOU answer, then you
+            call qa_submit_bug_report with the task_id and your markdown report.
+            """
             return await _tracked(
                 "qa_bug_report",
                 ctx,
@@ -566,7 +588,10 @@ def build_server():
         async def qa_explore_step(
             feature: str, session_id: str, ctx: Context, tester_response: str = ""
         ) -> str:
-            """Advance an exploratory-testing coaching session one step at a time.
+            """Start the next step of an exploratory-testing coaching session.
+
+            Chat-only: the server returns a task envelope that YOU answer, then you
+            call qa_submit_explore_step with the task_id and your coaching step.
 
             Pass a stable session_id to keep coverage memory across calls; include
             tester_response with what you observed after the previous step.
@@ -576,6 +601,40 @@ def build_server():
                 ctx,
                 mcp_handlers.handle_explore_step(
                     feature, session_id, tester_response, progress=_make_progress(ctx)
+                ),
+            )
+
+        @mcp.tool()
+        async def qa_submit_bug_report(task_id: str, report: str, ctx: Context) -> str:
+            """Submit the bug report YOU wrote for a task opened by qa_bug_report.
+
+            qa_bug_report makes no model call: it hands you a task envelope. Write
+            the report exactly as its system_prompt specifies, then call this with
+            that task_id and the full markdown as `report`. The server validates
+            the required sections, saves it to the corpus, and either returns the
+            finished report or asks you to re-emit it against a NEW task id.
+            """
+            return await _tracked(
+                "qa_submit_bug_report",
+                ctx,
+                mcp_handlers.handle_submit_bug_report(
+                    task_id, report, progress=_make_progress(ctx)
+                ),
+            )
+
+        @mcp.tool()
+        async def qa_submit_explore_step(task_id: str, step: str, ctx: Context) -> str:
+            """Submit the coaching step YOU wrote for a task opened by qa_explore_step.
+
+            Include the trailing <meta>area: …; phase: …</meta> line the task's
+            system_prompt asks for: the server parses it to track coverage, then
+            strips it before the tester sees the step.
+            """
+            return await _tracked(
+                "qa_submit_explore_step",
+                ctx,
+                mcp_handlers.handle_submit_explore_step(
+                    task_id, step, progress=_make_progress(ctx)
                 ),
             )
 
@@ -598,13 +657,13 @@ def build_server():
     async def qa_configure_jira(
         ctx: Context, base_url: str = "", email: str = "", api_token: str = ""
     ) -> str:
-        """Save Jira credentials into the agent's local .env so pasted ticket
-        URLs work. Collect from the user: base_url (their Jira, e.g.
-        https://company.atlassian.net), email (their Atlassian login), and
-        api_token — the USER creates it at
-        https://id.atlassian.com/manage-profile/security/api-tokens; never
-        invent or reuse one. Values are stored locally only and never shown
-        back. Afterwards run qa_setup_check to verify Jira shows configured."""
+        """DEPRECATED as of 2026-08-01 — Jira needs no credentials here any more.
+
+        Jira tickets are read through YOUR OWN Atlassian MCP connection
+        (mcp.atlassian.com, OAuth, Jira Cloud). This tool now returns the
+        per-client connection steps and stores NOTHING. Do not ask the user for
+        an API token, and never invent one. If a ticket URL fails, call
+        qa_prepare_test_cases and follow the directive it returns."""
         return await _tracked(
             "qa_configure_jira",
             ctx,
@@ -662,11 +721,17 @@ def build_server():
             base_url: str = "",
             suite_id: str = "",
         ) -> str:
-            """Run a generated suite step-by-step against a live web app in a
-            real browser and report pass/fail per TC-ID (requires
-            QA_WEB_RUN_ENABLED). Dry-run default previews the planned browser
-            actions without launching a browser. Pass the base_url of the app
-            under test and the suite_id from qa_generate_test_cases."""
+            """Start a run of a generated suite against a live web app in a
+            real browser (requires QA_WEB_RUN_ENABLED).
+
+            Chat-only: the server makes NO model call. It returns a task
+            envelope carrying the suite's steps and a response_schema; YOU
+            translate every case into whitelisted browser actions and call
+            qa_submit_web_run with the task_id and that JSON — the browser run,
+            the SSRF checks and the pass/fail report all happen there. Dry-run
+            default previews the planned actions without launching a browser.
+            Pass the base_url of the app under test and the suite_id from
+            qa_generate_test_cases."""
             return await _tracked(
                 "qa_run_web_suite",
                 ctx,
@@ -675,6 +740,33 @@ def build_server():
                     suite_id=suite_id,
                     choose=_make_chooser(ctx),
                     progress=_make_progress(ctx),
+                ),
+            )
+
+        @mcp.tool()
+        async def qa_submit_web_run(
+            task_id: str, translations_json: str, ctx: Context
+        ) -> str:
+            """Submit the browser actions YOU translated for a task opened by
+            qa_run_web_suite, and run the suite.
+
+            qa_run_web_suite makes no model call: it hands you a task envelope
+            with a system_prompt, the untrusted-wrapped test cases and a
+            response_schema. Produce a SINGLE JSON object matching that schema —
+            one entry per case in `translations`, echoing that case's tc_id
+            EXACTLY, whose `actions` list is FLAT: every action carries the
+            positive `step_number` of the step it belongs to, and there is NO
+            per-step `steps` object (an entry with one is rejected and that case
+            is not run) — then call this with the task_id and that JSON as
+            `translations_json`. The server validates every action against its
+            8-verb whitelist, re-validates the target URL, launches the browser
+            (or previews the plan when dry-run is on) and reports pass/fail per
+            TC-ID."""
+            return await _tracked(
+                "qa_submit_web_run",
+                ctx,
+                mcp_handlers.handle_submit_web_run(
+                    task_id, translations_json, progress=_make_progress(ctx)
                 ),
             )
 
@@ -717,14 +809,26 @@ def build_server():
             feature_or_url: str = "",
             mode: str = "",
             device_id: str = "",
+            jira_content_json: str = "",
         ) -> str:
-            """Produce a compact enterprise Feature Analysis Report (requires
-            QA_FEATURE_ANALYSIS_ENABLED). mode is one of: jira (analyse a feature
-            description or Jira/issue URL), mobile (capture screens from a
-            connected device, needs QA_MOBILE_CAPTURE), or jira_mobile (merge the
-            ticket with captured screens). Omit mode and I'll ask; the mobile
-            modes also ask for the device and offer a capture-another-screen
-            loop."""
+            """Start a compact enterprise Feature Analysis Report (requires
+            QA_FEATURE_ANALYSIS_ENABLED).
+
+            Chat-only: the server makes NO model call. It returns a task envelope
+            (system_prompt + untrusted-wrapped context + a response_schema) that
+            YOU answer, then you call qa_submit_feature_analysis with the task_id
+            and your JSON report.
+
+            mode is one of: jira (analyse a feature description or Jira/issue
+            URL), mobile (capture screens from a connected device, needs
+            QA_MOBILE_CAPTURE), or jira_mobile (merge the ticket with captured
+            screens). Omit mode and I'll ask; the mobile modes also ask for the
+            device and offer a capture-another-screen loop, and their screenshot
+            descriptions are still produced by this server's own vision call.
+
+            For a Jira URL the reply may be a DIRECTIVE asking you to fetch the
+            issue with your own mcp__atlassian__getJiraIssue tool and call again
+            with jira_content_json set to its raw JSON result."""
             return await _tracked(
                 "qa_feature_analysis",
                 ctx,
@@ -734,6 +838,29 @@ def build_server():
                     device_id=device_id,
                     choose=_make_chooser(ctx),
                     progress=_make_progress(ctx),
+                    jira_content_json=jira_content_json,
+                ),
+            )
+
+        @mcp.tool()
+        async def qa_submit_feature_analysis(
+            task_id: str, report_json: str, ctx: Context
+        ) -> str:
+            """Submit the Feature Analysis JSON YOU wrote for a task opened by
+            qa_feature_analysis.
+
+            qa_feature_analysis makes no model call: it hands you a task envelope
+            carrying a system_prompt, an untrusted-wrapped user_context and a
+            response_schema. Produce a SINGLE JSON object matching that schema,
+            then call this with the task_id and the JSON as `report_json`. The
+            server validates it, renders the report, and — if the submission
+            carried no usable object — hands you ONE resubmit round against a new
+            task_id."""
+            return await _tracked(
+                "qa_submit_feature_analysis",
+                ctx,
+                mcp_handlers.handle_submit_feature_analysis(
+                    task_id, report_json, progress=_make_progress(ctx)
                 ),
             )
 
@@ -750,6 +877,16 @@ def main() -> None:
             "Set QA_MCP_ENABLED=true in .env to enable it."
         )
         return
+    # Host-boomerang migration: if an operator flipped QA_SERVER_LLM_ENABLED off
+    # while ledger rows are still unmigrated, those features are OFF rather than
+    # boomeranged. Say so once, at startup, instead of letting it surface as the
+    # ambiguity gate quietly stopping. No-op (and silent) with the flag ON.
+    try:
+        from tools.host_llm import warn_once_if_degraded
+
+        warn_once_if_degraded()
+    except Exception:  # pragma: no cover - a disclosure must never block boot
+        logger.debug("server-LLM disclosure failed", exc_info=True)
     telemetry.startup_notice()
     server = build_server()
     telemetry.server_start()

@@ -15,7 +15,13 @@ JavaScript single-page apps (React/Vue/Angular, e.g. SauceDemo):
   Tier 3 -- llm.ask_vision() (api backend only). Only used when Tier 2's
             rendered HTML still yields zero elements (e.g. a canvas-only UI).
             Cleanly skipped (no crash, no user-facing error) when
-            QA_LLM_BACKEND=cli.
+            QA_LLM_BACKEND=cli. MIGRATED (ledger row
+            `ui_extractor.describe_via_vision`, residue sub-phase R3): the only
+            production caller of extract_ui_elements passes defer_vision=True,
+            so the rendered screenshot is handed to the tester's OWN multimodal
+            model through agents/host_mode.IMAGE_JOB instead. The server-side
+            call survives for defer_vision=False -- this function's public
+            default -- and is scope-tagged, never deleted.
 
 Contract:
 - Never raises -- always returns a dict.
@@ -31,11 +37,21 @@ import logging
 
 from bs4 import BeautifulSoup
 
-from llm import ask_vision
+from llm import ask_vision, server_llm_scope
 from tools.browser_renderer import render_page
 from tools.jira_fetcher import fetch_url_content
 
 logger = logging.getLogger(__name__)
+
+# docs/LLM_MIGRATION_INVENTORY.md ledger id for the Tier-3 ask_vision call below.
+# Ledger rule 4: the call is NOT deleted. defer_vision=False is
+# extract_ui_elements' public default and documented contract, so the branch
+# stays reachable by API even though no production caller takes it any more, and
+# an UNTAGGED call is always refused once QA_SERVER_LLM_ENABLED flips --
+# QA_SERVER_LLM_ALLOW=ui_extractor.describe_via_vision would then allow nothing.
+# Entering the scope changes nothing while the switch is on (its default).
+_LEDGER_ID = "ui_extractor.describe_via_vision"
+
 
 _VISION_SYSTEM_PROMPT = (
     "You are inspecting a screenshot of a web page for a QA test-case generator. "
@@ -254,13 +270,17 @@ async def _describe_via_vision(screenshot_bytes: bytes, url: str) -> str:
     """Tier 3 -- ask Claude to describe UI elements visible in a screenshot.
 
     Returns llm.ask_vision()'s raw string result, including its "Error: ..."
-    sentinel on failure/unavailability. Never raises.
+    sentinel on failure/unavailability. Never raises -- including when the
+    Phase-6 kill switch refuses the tagged call, which returns that same
+    sentinel and makes extract_ui_elements report extraction_method="unavailable"
+    exactly as a keyless api backend already does today.
     """
     user = (
         f"Page URL: {url}\nDescribe the UI elements visible in the attached screenshot."
     )
     try:
-        return await ask_vision(_VISION_SYSTEM_PROMPT, user, screenshot_bytes)
+        with server_llm_scope(_LEDGER_ID):
+            return await ask_vision(_VISION_SYSTEM_PROMPT, user, screenshot_bytes)
     except Exception:
         logger.exception("ui_extractor: vision fallback call failed for %s", url)
         return "Error: vision call failed"
