@@ -43,6 +43,7 @@ Switching backends is a pure config change; callers are backend-agnostic.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import json
 import logging
@@ -1700,6 +1701,16 @@ async def warm_cache_prefix(
     global _CACHE_WARM_DISABLED, _CACHE_WRITES_OBSERVED
     if _CACHE_WARM_DISABLED:
         return False
+    if not server_llm_enabled():
+        # The FOURTH public coroutine that reaches a backend: the warm-up below
+        # is a real, billable client.messages.create. Guarding it here (before
+        # _get_client) is what makes QA_SERVER_LLM_ENABLED an actual chokepoint
+        # rather than a three-quarters one. False is this function's documented
+        # "caller MUST send UNMARKED prompts" value, so a run degrades to
+        # today's cost -- and _CACHE_WARM_DISABLED is deliberately NOT set,
+        # because this is a policy decision, not a warm-up failure.
+        logger.info("llm.warm_cache_prefix suppressed: %s", _SERVER_LLM_OFF_MSG)
+        return False
     try:
         if not getattr(settings, "qa_prompt_cache_enabled", False):
             return False
@@ -2691,6 +2702,109 @@ def check_backend() -> tuple[bool, str]:
     return (True, "")
 
 
+# --------------------------------------------------------------------------- #
+# Server-LLM kill switch + per-path escape hatch (host-boomerang migration,
+# 2026-08-01)
+#
+# QA_SERVER_LLM_ENABLED=false retires every DIRECT server-side LLM call: the
+# work belongs to the tester's own chat model, reached either as a HostJob
+# folded into a prepare/submit boomerang (agents/host_mode.attach_jobs) or via
+# tools/host_llm.py. FOUR public coroutines in this module reach a backend --
+# ask, ask_vision, ask_json and warm_cache_prefix (which issues its own billable
+# messages.create) -- and each carries the guard at the TOP, BEFORE any backend
+# resolution, subprocess spawn or API call, preserving that entry point's
+# documented error contract so no caller needs to change: ask / ask_vision
+# return the never-raising "Error: ..." sentinel, ask_json raises
+# LLMBackendUnavailableError, warm_cache_prefix returns False (its "send
+# unmarked prompts" value). Nothing fabricates a substitute result.
+#
+# QA_SERVER_LLM_ALLOW is the per-path escape hatch: the loop-bound paths that
+# CANNOT boomerang (mobile healer/explorer, web vision-verify, eval judges) wrap
+# their call in server_llm_scope("<ledger id>") and stay alive when their id is
+# listed, WITHOUT re-enabling the paths that did migrate. An UNTAGGED call is
+# always refused while the master flag is off, so the list cannot widen a path
+# by accident. Ids come from docs/LLM_MIGRATION_INVENTORY.md.
+#
+# Default is qa_server_llm_enabled=True, so introducing this is a runtime no-op.
+# --------------------------------------------------------------------------- #
+
+_SERVER_LLM_OFF_MSG = (
+    "server-side LLM calls are retired on this install "
+    "(QA_SERVER_LLM_ENABLED=false) -- this step is handed to the tester's own "
+    "chat model through the host boomerang; see docs/LLM_MIGRATION_INVENTORY.md"
+)
+
+# The ledger id of the call currently in flight, set by server_llm_scope. A
+# ContextVar (not a module global) so concurrent gather()'d calls cannot read
+# each other's tag; children copy the context at creation, so a scope entered
+# before a gather still covers the calls inside it.
+_SERVER_LLM_CALLER: contextvars.ContextVar = contextvars.ContextVar(
+    "qa_server_llm_caller", default=""
+)
+
+
+@contextlib.contextmanager
+def server_llm_scope(tag: str):
+    """Tag every llm.* call made inside this block with a ledger call-site id.
+
+    Only meaningful while QA_SERVER_LLM_ENABLED is false: a tag listed in
+    QA_SERVER_LLM_ALLOW keeps that ONE path calling a backend directly. Entering
+    a scope never changes behaviour on its own and never raises.
+    """
+    token = _SERVER_LLM_CALLER.set(str(tag or ""))
+    try:
+        yield
+    finally:
+        _SERVER_LLM_CALLER.reset(token)
+
+
+def server_llm_allow_list() -> frozenset:
+    """Parsed QA_SERVER_LLM_ALLOW ids. Never raises; empty means "allow none"."""
+    try:
+        raw = str(getattr(settings, "qa_server_llm_allow", "") or "")
+    except Exception:  # pragma: no cover - settings is never-raising by contract
+        return frozenset()
+    parts = raw.replace(";", ",").replace("\n", ",").split(",")
+    return frozenset(p.strip() for p in parts if p.strip())
+
+
+def server_llm_enabled(tag: str | None = None) -> bool:
+    """True when a DIRECT server-side LLM call is permitted for this caller.
+
+    Never raises. With the master flag off, only a call tagged (via ``tag`` or an
+    enclosing ``server_llm_scope``) with an id present in QA_SERVER_LLM_ALLOW --
+    or the wildcard ``*``, which is debug-only and unsupported -- is still
+    allowed through.
+
+    FAIL-OPEN, deliberately and by exception. Everywhere else in this migration
+    an unreadable/absent input fails SAFE (the ambiguity gate returns
+    severity="unknown"; a missing marker rejects a record). Here an absent field
+    or an unreadable ``settings`` returns True, i.e. keeps calling the backend
+    and keeps BILLING. The reasons: (1) ``config/settings.py`` is never-raising
+    by contract, so this branch is unreachable in practice; (2) the failure mode
+    we must not have is a settings hiccup silently disabling generation,
+    coaching, bug reports and the ambiguity gate on an install that never opted
+    in -- an unexpected charge is recoverable, an unexplained platform-wide
+    outage on someone else's install is not; (3) an absent field means an older
+    .env, which must keep today's behaviour exactly. Documented in
+    docs/FEATURE_FLAGS.md under QA_SERVER_LLM_ENABLED so the asymmetry is a
+    stated choice, not an oversight.
+    """
+    try:
+        if bool(getattr(settings, "qa_server_llm_enabled", True)):
+            return True
+    except Exception:  # pragma: no cover - settings is never-raising by contract
+        return True
+    try:
+        caller = str(tag or _SERVER_LLM_CALLER.get() or "")
+    except Exception:  # pragma: no cover - defensive
+        caller = str(tag or "")
+    if not caller:
+        return False
+    allow = server_llm_allow_list()
+    return "*" in allow or caller in allow
+
+
 async def ask(
     system: str,
     user: str,
@@ -2715,6 +2829,9 @@ async def ask(
     their defaults the assembled prompt is byte-identical to the pre-cache path
     on all three backends.
     """
+    if not server_llm_enabled():
+        logger.info("llm.ask suppressed: %s", _SERVER_LLM_OFF_MSG)
+        return f"Error: {_SERVER_LLM_OFF_MSG}"
     _API_USAGE.set(None)
     _LAST_CALL_USAGE.set(None)
     _ask_start = time.monotonic()
@@ -2768,6 +2885,9 @@ async def ask_vision(
     * otherwise -> a never-raising ``"Error: ..."`` string so callers degrade
       gracefully (``result.startswith("Error:")``).
     """
+    if not server_llm_enabled():
+        logger.info("llm.ask_vision suppressed: %s", _SERVER_LLM_OFF_MSG)
+        return f"Error: {_SERVER_LLM_OFF_MSG}"
     _API_USAGE.set(None)
     _LAST_CALL_USAGE.set(None)
     try:
@@ -2873,6 +2993,10 @@ async def ask_json(
     into a plain string. With both at their defaults the assembled prompt is
     byte-identical to the pre-cache path on all three backends.
     """
+    if not server_llm_enabled():
+        # ask_json's documented contract RAISES on failure; every caller already
+        # catches this exact type and degrades, so the retired path reuses it.
+        raise LLMBackendUnavailableError(_SERVER_LLM_OFF_MSG)
     backend = _backend()
     # Forced tool use (QA_STRUCTURED_JSON_ENABLED, api backend only). None keeps
     # today's JSON-in-prompt path, so the OFF path is byte-identical.

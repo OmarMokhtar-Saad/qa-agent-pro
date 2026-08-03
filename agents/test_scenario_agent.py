@@ -24,6 +24,7 @@ from llm import (
     backend_unavailable_reason,
     resolve_max_tokens_tier,
     resolve_tiered_model,
+    server_llm_scope,
     warm_cache_prefix,
 )
 from tools.ac_anchor import (
@@ -60,7 +61,12 @@ from tools.quality_checks import (
     restore_chained_refs_from_stable,
 )
 from tools.rag_store import query_corpus
-from tools.risk_scorer import build_risk_section, score_and_sort, score_with_llm
+from tools.risk_scorer import (
+    apply_host_risk,
+    build_risk_section,
+    score_and_sort,
+    score_with_llm,
+)
 from tools.rtm import (
     AcceptanceCriterion,
     build_rtm_summary,
@@ -907,6 +913,99 @@ def _strip_html(text: str) -> str:
     return text.strip()
 
 
+# Ledger id for the Jira ticket-image vision call below.
+#
+# Ledger rule 4. The host route never reaches it: handle_prepare_test_cases calls
+# _prepare_generation(describe_images_server_side=False) UNCONDITIONALLY -- not
+# flag-gated, so no .env value can reintroduce it -- the `elif images:` arm below
+# records only that images exist, and the raw bytes ride to the tester's OWN
+# multimodal model through agents/host_mode.IMAGE_JOB. That fold is strictly
+# better than this call, which is api-backend only and returns nothing at all on
+# cli/cursor. What survives is the LEGACY route: graph.py ->
+# generate_test_scenarios, plus evals/. Nothing is deleted (Phase 3a's
+# precedent), so the surviving call must TAG itself or the Phase-6 kill switch
+# refuses it as UNTAGGED and QA_SERVER_LLM_ALLOW=test_scenario_agent.jira_images
+# would allow nothing. Inert while QA_SERVER_LLM_ENABLED is on (its default).
+_JIRA_IMAGE_LEDGER_ID = "test_scenario_agent.jira_images"
+
+# --------------------------------------------------------------------------- #
+# Residue sub-phase R2 (host-boomerang migration): the three remaining
+# test_scenario_agent ledger rows. Ledger rule 4 -- these ids left
+# tools/host_llm.UNMIGRATED_PATHS in the SAME ops file that wrote them here.
+#
+#   server_fanout  -- the 8-category fan-out (3 sites in _generate_for_category)
+#                     plus the coverage critic pair (critique_coverage,
+#                     critique_and_fill_gaps). MIGRATED: the host performs the
+#                     whole fan-out (v1.10.0), handle_generate_test_cases
+#                     re-routes into handle_prepare_test_cases unconditionally
+#                     (resolve_generation_mode() and the image-forwarding flag
+#                     are both HARDCODED), and the critic pair is reachable only
+#                     from _remediate_gaps, whose entry condition begins with
+#                     `remediate` -- passed False by the host submit. Surviving
+#                     legacy callers: graph.py, evals/test_eval_goldens.py and
+#                     evals/test_terse_schemas_goldens.py, which calls
+#                     _generate_for_category DIRECTLY (which is why the tag lives
+#                     at the CALL SITE and not around generate_test_scenarios'
+#                     asyncio.gather -- a gather-level tag would leave that eval
+#                     caller untagged and refused after the Phase-6 flip).
+#   rewrite_vague  -- _rewrite_vague_fields. DISABLED (disclosed), not folded: no
+#                     host job rewrites vague steps. The deterministic FLAGGING
+#                     survives (quality_warning_section runs unconditionally), so
+#                     what is lost is the automatic fix, not the detection --
+#                     which is what _host_suppression_section below tells the
+#                     tester.
+#   markdown       -- TWO different calls under one id: the advisory coverage-gap
+#                     prose in analyze_coverage_gaps (suppressed by
+#                     advisory_gaps=False) and the whole-suite markdown fallback
+#                     in _finalize_generation, which is unreachable on a host
+#                     submit because all_cases there is provably non-empty
+#                     (TestSuite.test_cases has min_length=1, host_mode
+#                     ._validate_suite raises when nothing valid remains,
+#                     apply_duplicate_groups never empties and
+#                     filter_unanchored_cases never empties).
+#
+# Nothing is deleted (Phase 3a's precedent). Each surviving call must TAG itself
+# or the Phase-6 kill switch refuses it as UNTAGGED and
+# QA_SERVER_LLM_ALLOW=<id> allows nothing at all. Inert while
+# QA_SERVER_LLM_ENABLED is on (its default).
+# --------------------------------------------------------------------------- #
+_FANOUT_LEDGER_ID = "test_scenario_agent.server_fanout"
+_REWRITE_LEDGER_ID = "test_scenario_agent.rewrite_vague"
+_MARKDOWN_LEDGER_ID = "test_scenario_agent.markdown"
+
+
+async def _tagged_ask_json(_ledger_id: str, /, **kwargs):
+    """``llm.ask_json`` inside ``llm.server_llm_scope(_ledger_id)``.
+
+    A wrapper rather than a ``with`` block at each call site, deliberately: three
+    of the five fan-out sites sit 32-44 columns deep inside
+    ``_generate_for_category``'s retry ladder, and wrapping them in place would
+    re-indent 13-line statements in a 4000+ line file -- the highest-risk edit
+    shape here, and one a formatter may then reflow, turning a behaviour-free tag
+    into an unreviewable diff. This keeps every site a one-token retarget.
+
+    It is also the CORRECT place for the scope: ``server_llm_scope`` sets a
+    ``ContextVar``, and entering it INSIDE the coroutine that reads it makes the
+    tag visible no matter how the call is wrapped (``asyncio.wait_for``,
+    ``asyncio.gather``, or a bare await) -- whereas a scope entered around a list
+    comprehension that merely BUILDS coroutines would cover none of them.
+
+    ``ask_json`` / ``server_llm_scope`` are resolved as module globals at call
+    time, so every existing test that patches ``tsa.ask_json`` still intercepts.
+    ``_ledger_id`` is positional-only so it can never collide with a keyword the
+    callee takes. Never changes behaviour on its own.
+    """
+    with server_llm_scope(_ledger_id):
+        return await ask_json(**kwargs)
+
+
+async def _tagged_ask(_ledger_id: str, /, **kwargs):
+    """``llm.ask`` inside ``llm.server_llm_scope(_ledger_id)``. See
+    ``_tagged_ask_json`` for why this is a wrapper and not an inline block."""
+    with server_llm_scope(_ledger_id):
+        return await ask(**kwargs)
+
+
 _JIRA_IMAGE_VISION_SYSTEM = (
     "You are inspecting an image attached to a QA ticket, for a test-case "
     "generator. Describe what is shown, focusing on details relevant to "
@@ -937,12 +1036,13 @@ async def _describe_ticket_images(
                 f"Attachment filename: {img.get('filename', 'attachment')}\n"
                 "Describe this image."
             )
-            result = await ask_vision(
-                _JIRA_IMAGE_VISION_SYSTEM,
-                _vision_user,
-                img["data"],
-                media_type=img.get("mime", "image/png"),
-            )
+            with server_llm_scope(_JIRA_IMAGE_LEDGER_ID):
+                result = await ask_vision(
+                    _JIRA_IMAGE_VISION_SYSTEM,
+                    _vision_user,
+                    img["data"],
+                    media_type=img.get("mime", "image/png"),
+                )
             # Generation-tier model: this path passes no classifier override.
             _meter_note(
                 meter,
@@ -1462,7 +1562,8 @@ async def _generate_for_category(
             _t0 = time.monotonic()
             try:
                 suite: TestSuite = await asyncio.wait_for(
-                    ask_json(
+                    _tagged_ask_json(
+                        _FANOUT_LEDGER_ID,
                         system=system,
                         user=user_msg,
                         response_model=response_model,
@@ -1534,7 +1635,8 @@ async def _generate_for_category(
                                 )
                                 repair_batch: _QualityRepairBatch = (
                                     await asyncio.wait_for(
-                                        ask_json(
+                                        _tagged_ask_json(
+                                            _FANOUT_LEDGER_ID,
                                             system=_CATEGORY_REPAIR_SYSTEM,
                                             user=repair_user,
                                             response_model=_QualityRepairBatch,
@@ -1591,7 +1693,8 @@ async def _generate_for_category(
                                     user_suffix or ""
                                 ) + _QUALITY_RETRY_REMINDER
                             retry_suite: TestSuite = await asyncio.wait_for(
-                                ask_json(
+                                _tagged_ask_json(
+                                    _FANOUT_LEDGER_ID,
                                     system=retry_system,
                                     user=user_msg,
                                     response_model=response_model,
@@ -1891,7 +1994,8 @@ async def _rewrite_vague_fields(
         # `user` above embeds that step text. Without the guard + wrapper this
         # was the one ask_json call in the pipeline receiving externally
         # sourced text with no containment boundary at all.
-        batch: _RewriteBatch = await ask_json(
+        batch: _RewriteBatch = await _tagged_ask_json(
+            _REWRITE_LEDGER_ID,
             system=_REWRITE_SYSTEM + _GUARD,
             user=user,
             response_model=_RewriteBatch,
@@ -1963,7 +2067,8 @@ async def analyze_coverage_gaps(
             f"Feature: {feature_text}\n\nGenerated Test Cases:\n{tc_lines}{ac_lines}"
         )
 
-        result = await ask(
+        result = await _tagged_ask(
+            _MARKDOWN_LEDGER_ID,
             system=_COVERAGE_CRITIC_SYSTEM,
             user=user_msg,
             model=resolve_tiered_model(settings.qa_model_tier_coverage_gaps),
@@ -2051,7 +2156,8 @@ async def critique_coverage(
         # TimeoutError is an Exception, so the handler below degrades it to
         # verdict="complete" exactly like every other critic failure.
         _critique: CoverageCritique = await asyncio.wait_for(
-            ask_json(
+            _tagged_ask_json(
+                _FANOUT_LEDGER_ID,
                 system=_STRUCTURED_CRITIC_SYSTEM,
                 user=user_msg,
                 response_model=CoverageCritique,
@@ -2182,7 +2288,8 @@ async def critique_and_fill_gaps(
         # Bounded for the same reason as critique_coverage -- and this is the branch
         # QA_COVERAGE_REGEN_MERGE_CALLS=true actually runs, on every generation.
         _merged: _CritiqueAndFillSuite = await asyncio.wait_for(
-            ask_json(
+            _tagged_ask_json(
+                _FANOUT_LEDGER_ID,
                 system=system,
                 user=merged_user,
                 response_model=_CritiqueAndFillSuite,
@@ -2862,6 +2969,8 @@ async def _prepare_generation(
     describe_images_server_side: bool = True,
     describe_attached_images_server_side: bool = True,
     synthesize_acs: bool = True,
+    decompose_checklist: bool = True,
+    warm_cache: bool = True,
 ) -> PreparedGeneration | tuple[str, str, str, str, str]:
     """Generate test cases. Returns (message_markdown, xlsx_file_path, csv_file_path, testrail_file_path, status).
 
@@ -3042,7 +3151,15 @@ async def _prepare_generation(
             return []
         return await generate_acs(feature_text, meter=meter)
 
+    # decompose_checklist=False (host mode + QA_HOST_CHECKLIST_REVIEW_ENABLED):
+    # do NOT make this call. It is the LAST server-side ask_json left on the
+    # prepare path, and the tester's own model derives the atomic checklist
+    # instead (agents.host_mode.CHECKLIST_JOB, stage step_zero). The default is
+    # True, so generate_test_scenarios, graph.py and evals/ are byte-identical.
+
     async def _run_checklist() -> list[ChecklistItem]:
+        if not decompose_checklist:
+            return []
         # parent_context rides as BACKGROUND ONLY (SHYJ-7154): the decomposition
         # prompt is told not to derive requirements from it.
         return await decompose_to_checklist(
@@ -3403,8 +3520,16 @@ async def _prepare_generation(
     # instead of 1 write + 8 x 0.10x reads (~2.05x). warm_cache_prefix never
     # raises; False means "send plain unmarked prompts", i.e. exactly today's
     # cost, never worse.
+    # warm_cache=False (host-mode prepare, tools/mcp_handlers.py): the eight
+    # fan-out calls that would READ this prefix run in the tester's OWN chat
+    # model, so the warm-up here is a real, billable client.messages.create
+    # writing a cache nothing on that path ever reads. Default True keeps every
+    # other caller byte-identical -- generate_test_scenarios, and through it
+    # graph.py and evals/, still warm the prefix they genuinely use.
+    # cache_prefix_warm=False is warm_cache_prefix's own documented value
+    # meaning "send UNMARKED prompts", i.e. today's cost, never worse.
     cache_prefix_warm = False
-    if settings.qa_prompt_cache_enabled:
+    if warm_cache and settings.qa_prompt_cache_enabled:
         cache_prefix_warm = await warm_cache_prefix(
             system=_category_shared_system(rtm_hint),
             user=user_msg,
@@ -3436,6 +3561,96 @@ async def _prepare_generation(
     )
 
 
+def _host_suppression_section(
+    cases: list[TestCase],
+    *,
+    rewrite_vague: bool,
+    advisory_gaps: bool,
+    deterministic_coverage: bool,
+) -> str:
+    """Disclose the SERVER-SIDE review steps a host-mode submit suppressed.
+
+    Residue R2. Ledger rows ``test_scenario_agent.rewrite_vague`` and
+    ``test_scenario_agent.markdown`` are both DISABLED on the host submit path --
+    no host job replaces either -- and until R2 the suppression was completely
+    SILENT. A suppression that is disclosed nowhere is itself a defect (Phase 3b's
+    review finding): `disabled (disclosed)` is only true if something discloses.
+    This is that something, and it is deliberately on the SUBMIT reply rather
+    than in ``_host_mode_server_llm_notice``: neither loss is knowable at prepare
+    time, because whether any field is vague depends on a suite the host has not
+    written yet, and announcing a loss before the fact is the same class of
+    dishonesty as never announcing it.
+
+    Each line is NARROWED to what actually happened (Phase 3b/3c discipline):
+
+    * The vague-field line needs an actually-vague field, judged by the SAME two
+      detectors ``_rewrite_vague_fields`` itself uses -- not by
+      ``quality_warning_section``'s broader output. With nothing vague that
+      function returns at its ``if not prompt_items`` early exit WITHOUT calling a
+      backend, so nothing was suppressed and reporting a loss would fabricate one.
+      (A pathological case survives both detectors firing but ``prompt_items``
+      resolving empty via exact-text matching -- the same early exit, same
+      no-loss conclusion, just reached one layer deeper.)
+      Note what is NOT lost: ``quality_warning_section`` runs unconditionally, so
+      the vague fields are still FLAGGED in the Data Quality Notes above. Only the
+      automatic rewrite is gone.
+    * The coverage-gap line fires whenever ``advisory_gaps`` is off, because that
+      prose is never produced on this path and there is no "nothing happened"
+      case -- but its closing clause names the deterministic requirement-coverage
+      table when there IS one, so a run that still carries a coverage report is
+      never told it lost its only coverage view.
+
+    Returns "" whenever both keywords are at their server-mode defaults, so every
+    non-host caller's summary stays BYTE-IDENTICAL (the property
+    tests/test_server_mode_equivalence.py's golden fixtures pin).
+
+    Deliberately avoids the literal string "Coverage Gaps":
+    tests/test_host_mode_submit.py asserts on ``summary.index("Coverage Gaps")``
+    to prove the reply cap cannot delete the quality block, and a second
+    occurrence upstream of that heading would silently change what that index
+    measures. Never raises -- a disclosure must not be able to break a submit.
+    """
+    try:
+        lines: list[str] = []
+        if not rewrite_vague and (
+            find_vague_steps(cases) or find_vague_expected(cases)
+        ):
+            lines.append(
+                "- **Vague step text was flagged, not rewritten.** The pass that "
+                "rewrites 'an appropriate error message' into a concrete, "
+                "checkable outcome is a server-side LLM call, and host mode does "
+                "not make it. The Data Quality Notes above count every one and "
+                "list examples -- tighten those steps (or ask me to) before "
+                "anyone executes the suite."
+            )
+        if not advisory_gaps:
+            tail = (
+                "the requirement-coverage table above is this run's coverage report"
+                if deterministic_coverage
+                else "nothing else in this reply reports coverage-gap findings"
+            )
+            lines.append(
+                "- **No LLM coverage-gap review ran on this server.** Neither "
+                "the advisory coverage-gap critique nor the bounded "
+                "critic/regeneration loop is a host-mode step, so "
+                f"{tail}. Ask me to re-read the finished suite against the "
+                "requirements if you want a second opinion."
+            )
+        if not lines:
+            return ""
+        return (
+            "\n\n## Server-Side Review Steps Not Run\n\n"
+            + "\n".join(lines)
+            + "\n\n> These are host mode's deliberate cost/latency tradeoff, "
+            "not a failure. See docs/LLM_MIGRATION_INVENTORY.md rows "
+            "`test_scenario_agent.rewrite_vague` and "
+            "`test_scenario_agent.markdown`."
+        )
+    except Exception:  # pragma: no cover - defensive; disclosure must never break
+        logger.debug("_host_suppression_section failed", exc_info=True)
+        return ""
+
+
 async def _finalize_generation(
     prepared: PreparedGeneration,
     all_cases: list[TestCase],
@@ -3453,6 +3668,9 @@ async def _finalize_generation(
     rewrite_vague: bool = True,
     advisory_gaps: bool = True,
     feature_report_enabled: bool = True,
+    host_risk_scores: dict | None = None,
+    host_test_plan: dict | None = None,
+    host_suppress_llm_tiers: bool = False,
 ) -> tuple[str, str, str, str, str]:
     """Finalize a generated suite: dedupe -> remediation -> risk -> semantic
     dedup -> rule packs -> vague-field rewrite -> renumber -> RTM -> checklist
@@ -3558,7 +3776,11 @@ async def _finalize_generation(
         # single markdown-fallback call (which doesn't report granular progress).
         if on_progress is not None:
             await on_progress(0)
-        markdown_raw = await ask(system=_SYSTEM_PROMPT_MARKDOWN + _GUARD, user=user_msg)
+        markdown_raw = await _tagged_ask(
+            _MARKDOWN_LEDGER_ID,
+            system=_SYSTEM_PROMPT_MARKDOWN + _GUARD,
+            user=user_msg,
+        )
         # The whole-suite fallback when every category failed -- generation tier.
         _meter_note(
             meter,
@@ -3623,7 +3845,17 @@ async def _finalize_generation(
     # ON, an LLM judges business risk in ONE batched call (feature text wrapped as
     # untrusted); it falls through to this same heuristic on any failure, so both
     # the app and MCP paths (which share this function) degrade identically.
-    if settings.qa_llm_risk_scoring:
+    # Phase 3a (host boomerang): ``host_risk_scores`` is None when the RISK_JOB
+    # was not requested -- every existing caller then behaves byte-identically.
+    # A dict (possibly EMPTY) means it WAS requested, so the server must not make
+    # the scoring call: an empty dict is "the host returned nothing usable",
+    # already disclosed by build_host_risk_section, and apply_host_risk returns
+    # the pure heuristic result rather than inventing a substitute. Note this is
+    # deliberately NOT ANDed with settings.qa_llm_risk_scoring: a mid-flow flag
+    # flip must not silently discard verdicts the reply already announced.
+    if host_risk_scores is not None:
+        scored, risk_section = apply_host_risk(all_cases, host_risk_scores)
+    elif settings.qa_llm_risk_scoring:
         scored, risk_section = await score_with_llm(
             all_cases, feature_text, meter=meter
         )
@@ -3761,6 +3993,13 @@ async def _finalize_generation(
     # the exported file exactly. Only when scoring actually produced a section
     # (on a scoring failure it is empty and must stay empty); the LLM-judged note
     # is preserved.
+    # REBUILD-STRING DEPENDENCY (named explicitly, review round 2 MINOR 6): the
+    # provenance line survives this rebuild ONLY because the note that
+    # tools/risk_scorer.score_with_llm and tools/risk_scorer.apply_host_risk
+    # generate contains the literal "LLM-judged" AND starts with "_Risk scores".
+    # Reword either producer without updating this reader and the delivered
+    # summary silently loses the "who judged this" line while the table stays
+    # model-derived. tests/test_host_risk_test_plan_jobs.py pins both halves.
     if risk_section:
         risk_note = ""
         if "LLM-judged" in risk_section:
@@ -3791,6 +4030,19 @@ async def _finalize_generation(
             checklist_items,
             renumbered,
             presented_item_ids=checklist_presented_ids or None,
+            # Phase 3b (host boomerang, ledger id `rtm.nli_verdicts`): this is
+            # the ONE remaining site where the OPTIONAL entailment (b) /
+            # adjudication (c) tiers can still fire -- the remediation loop
+            # already passes allow_llm_tiers=False, and it is suppressed on the
+            # host path anyway (remediate=False). A host-mode submit passes
+            # host_suppress_llm_tiers=True, so those two ask_json calls are not
+            # made at all. They are NOT boomeranged: their entire value is that
+            # a model OTHER than the generator re-judges the shortlist, and in
+            # host mode the generator is the host. match_checklist records the
+            # suppression in ChecklistCoverage.notes so the EXPORTED artifact
+            # says so too. DEFAULT False, so server mode, graph.py and evals/
+            # are byte-identical.
+            allow_llm_tiers=not host_suppress_llm_tiers,
         )
         checklist_section = granularity_warning_section(
             checklist_audit
@@ -3834,6 +4086,18 @@ async def _finalize_generation(
     # that survived generation + the per-category retry, so drift can't reach
     # the exported files silently. Never raises.
     quality_section = quality_warning_section(renumbered)
+    # Residue R2: the two server-side review steps a HOST submit suppressed,
+    # disclosed next to the deterministic quality block they relate to and
+    # AHEAD of the two variable-length sections -- the same reply-cap reason
+    # ops-4c moved quality_section here. "" on every server route, so no
+    # non-host caller's summary changes by a byte (pinned by
+    # tests/test_server_mode_equivalence.py's golden fixtures).
+    host_suppress_section = _host_suppression_section(
+        renumbered,
+        rewrite_vague=rewrite_vague,
+        advisory_gaps=advisory_gaps,
+        deterministic_coverage=bool(checklist_section),
+    )
 
     # One-line-per-case test-data note (QA_TEST_DATA_STRATEGY). Empty string when
     # no case declares a data plan, so the summary is byte-identical when unused.
@@ -3857,7 +4121,14 @@ async def _finalize_generation(
     # matching sheets. Never raises: any failure yields empty artifacts and an
     # empty section, leaving generation untouched.
     test_plan_section = ""
-    if settings.qa_test_plan_artifacts and all_cases:
+    # Phase 3a (host boomerang), review round 2 MINOR 5: a non-None
+    # ``host_test_plan`` is sufficient to enter this branch ON ITS OWN. Gating
+    # entry on the LIVE feature flag alone meant a QA_TEST_PLAN_ARTIFACTS flip
+    # between prepare and submit silently DISCARDED artifacts the host had
+    # already produced and the submit reply had already announced as
+    # MODEL-DERIVED -- the same mid-flow-flip class of bug the prepare-time meta
+    # stamps exist to prevent.
+    if (settings.qa_test_plan_artifacts or host_test_plan is not None) and all_cases:
         by_type: dict[str, int] = {}
         by_priority: dict[str, int] = {}
         for tc in renumbered:
@@ -3868,11 +4139,18 @@ async def _finalize_generation(
             "types": ", ".join(f"{k}={v}" for k, v in by_type.items()),
             "priorities": ", ".join(f"{k}={v}" for k, v in by_priority.items()),
         }
-        report_artifacts = await build_test_plan_artifacts(
-            feature_text=feature_text,
-            suite_stats=suite_stats,
-            source_acs=source_acs,
-        )
+        # Phase 3a (host boomerang): same three-state contract as the risk fold
+        # above. None = the TEST_PLAN_JOB was not requested (server behaviour
+        # unchanged); a dict = it was, so the two server-side ask_json calls are
+        # skipped and the host's already-validated artifacts are used verbatim.
+        if host_test_plan is not None:
+            report_artifacts = dict(host_test_plan)
+        else:
+            report_artifacts = await build_test_plan_artifacts(
+                feature_text=feature_text,
+                suite_stats=suite_stats,
+                source_acs=source_acs,
+            )
         if report_artifacts:
             try:
                 suite._report_artifacts = report_artifacts
@@ -4067,6 +4345,7 @@ async def _finalize_generation(
             # (rewrite_vague=False) that block is the ONLY report that a step is
             # too vague to execute. Advisory prose gets truncated instead.
             f"{quality_section}"
+            f"{host_suppress_section}"
             f"{checklist_section}"
             f"{gaps_section}"
             f"{test_data_section}"
@@ -4145,6 +4424,7 @@ async def _finalize_generation(
         # warnings must precede the variable-length checklist / gap sections so
         # the 4000-char reply cap can never delete them.
         f"{quality_section}"
+        f"{host_suppress_section}"
         f"{checklist_section}"
         f"{gaps_section}"
         f"{risk_section}"

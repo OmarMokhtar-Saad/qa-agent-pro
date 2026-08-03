@@ -1,10 +1,27 @@
 """Describe image attachments via llm.ask_vision() so their content can reach
 the (text-only) generation/report prompts.
 
-Shared by two callers:
+Two callers today, and they have DIFFERENT migration fates (ledger row
+``image_description.describe_images``, terminal status ``disabled (disclosed)``,
+residue sub-phase R3):
+
 - ``agents/test_scenario_agent.py`` for chat-attached screenshots/mockups
-  (``attached_images`` param on ``generate_test_scenarios``).
-- ``app.py`` for a bug report's attached screenshot.
+  (``attached_images`` param on ``generate_test_scenarios``). MIGRATED: the host
+  prepare passes ``describe_attached_images_server_side=False`` unconditionally
+  and the raw attachments ride to the tester's own multimodal model through
+  ``agents/host_mode.IMAGE_JOB``. The branch survives only for ``graph.py`` and
+  ``evals/``, which is why the call below is scope-tagged rather than deleted.
+- ``tools/mcp_handlers.handle_feature_analysis`` (modes ``mobile`` /
+  ``jira_mobile``) for screens just captured from a device. LIVE and
+  TESTER-FACING, and it has NO host analog: ``qa_feature_analysis`` runs on the
+  generic ``tools/host_llm`` broker, whose envelope is text and whose tool
+  returns a ``str``, so raw screens cannot become MCP image content there.
+  Building one would be new capability wearing a migration's name, so that half
+  is DISABLED at the Phase-6 flip and DISCLOSED instead (the prepare reply and a
+  ``qa_setup_check`` per-mode item both say so).
+
+The old third caller, ``app.py`` (the Chainlit bug-report screenshot), was
+retired with the web UI in July 2026 and no longer exists.
 
 Jira ticket images (``tools/jira_fetcher.py`` -> ``agents/test_scenario_agent.py``'s
 ``_describe_ticket_images``) intentionally keep their own copy rather than being
@@ -18,10 +35,22 @@ from __future__ import annotations
 import logging
 
 from config.settings import settings
-from llm import ask_vision
+from llm import ask_vision, server_llm_scope
 from tools import token_meter
 
 logger = logging.getLogger("qa_agents.image_description")
+
+# docs/LLM_MIGRATION_INVENTORY.md ledger id for the ask_vision call below.
+# Ledger rule 4: the call is NOT deleted -- one of its two callers (the mobile
+# Feature-Analysis branch) is live and tester-facing and has no host analog, and
+# the other (the chat-attachment branch, folded onto IMAGE_JOB) still runs from
+# graph.py and evals/. An UNTAGGED call is always refused once
+# QA_SERVER_LLM_ENABLED flips, so without this tag
+# QA_SERVER_LLM_ALLOW=image_description.describe_images would allow NOTHING and
+# the documented rollback would silently degrade to "no descriptions". Entering
+# the scope changes nothing while the switch is on (its default).
+_LEDGER_ID = "image_description.describe_images"
+
 
 _DEFAULT_VISION_SYSTEM = (
     "You are inspecting an image attached to a QA task (bug report, feature "
@@ -56,12 +85,13 @@ async def describe_images(
             # prompt — the cursor vision provider materialises the image under
             # its own on-disk name, and a mismatched name makes the model hunt
             # for a nonexistent file instead of describing the one provided.
-            result = await ask_vision(
-                system or _DEFAULT_VISION_SYSTEM,
-                "Describe this image.",
-                img["data"],
-                media_type=img.get("mime", "image/png"),
-            )
+            with server_llm_scope(_LEDGER_ID):
+                result = await ask_vision(
+                    system or _DEFAULT_VISION_SYSTEM,
+                    "Describe this image.",
+                    img["data"],
+                    media_type=img.get("mime", "image/png"),
+                )
             # Vision runs on the DEFAULT (generation-tier) model -- this path
             # never passes a classifier-tier override.
             token_meter.note(

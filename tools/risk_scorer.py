@@ -13,12 +13,22 @@ import logging
 from pydantic import BaseModel, Field
 
 from config.settings import settings
-from llm import ask_json, resolve_max_tokens_tier
+from llm import ask_json, resolve_max_tokens_tier, server_llm_scope
 from tools import token_meter
 from tools.models import TestCase
 from tools.untrusted import _GUARD, wrap_untrusted
 
 logger = logging.getLogger(__name__)
+
+# Host-boomerang ledger id for the ONE server-side LLM call in this module.
+# The MCP host path no longer reaches it (QA_HOST_RISK_REVIEW_ENABLED folds
+# the scoring into the submission), but graph.py, the eval harness and the
+# documented rollback -- QA_HOST_RISK_REVIEW_ENABLED=false -- still do. An
+# UNTAGGED call is refused outright once QA_SERVER_LLM_ENABLED is false, which
+# would silently DEGRADE the rollback to the heuristic instead of restoring
+# the old behaviour; tagged, QA_SERVER_LLM_ALLOW can keep exactly this path
+# alive on a keyed install.
+_LEDGER_ID = "risk_scorer.llm_risk"
 
 # Priority weights (higher = riskier)
 _PRIORITY_WEIGHT: dict[str, int] = {
@@ -221,6 +231,90 @@ def _llm_label(score: int) -> str:
     return "LOW"
 
 
+def apply_host_risk(
+    cases: list[TestCase], host_scores: dict
+) -> tuple[list[TestCase], str]:
+    """Overlay the HOST model's validated risk verdicts onto the heuristic score.
+
+    The chat-only ("boomerang") counterpart of ``score_with_llm``: identical
+    output shape and identical fallback behaviour, with the ``ask_json`` removed.
+    ``host_scores`` is ``{tc_id: {"risk_score": int, "rationale": str}}``, already
+    SHAPE-validated, id-checked, URL-stripped and clamped by
+    ``agents.host_mode.extract_host_risk_scores`` -- this function trusts the
+    SHAPE, never the source, and re-clamps anyway.
+
+    Keyed by tc_id rather than by the row index ``score_with_llm`` uses, because
+    the host submits ids and they were already checked against the submitted
+    suite. Any case the host did not score keeps its heuristic score. Never
+    raises: on any failure the pure heuristic result is returned unchanged.
+    """
+    baseline, heuristic_section = score_and_sort(cases)
+    if not host_scores:
+        return baseline, heuristic_section
+    try:
+        rescored: list[TestCase] = []
+        host_count = 0
+        for tc in baseline:
+            verdict = host_scores.get(getattr(tc, "tc_id", "") or "")
+            if not isinstance(verdict, dict):
+                rescored.append(tc)
+                continue
+            try:
+                score = max(0, min(100, int(verdict.get("risk_score", 0))))
+            except (TypeError, ValueError):
+                rescored.append(tc)
+                continue
+            host_count += 1
+            label = _llm_label(score)
+            rationale = str(verdict.get("rationale") or "").strip() or label
+            rescored.append(
+                tc.model_copy(
+                    update={
+                        "risk_score": score,
+                        "risk_label": label,
+                        "risk_rationale": rationale[:300],
+                    }
+                )
+            )
+        if not host_count:
+            return baseline, heuristic_section
+        rescored.sort(key=lambda tc: tc.risk_score, reverse=True)
+        total = len(rescored)
+        # REBUILD-STRING DEPENDENCY -- do NOT reword either note blindly.
+        # agents/test_scenario_agent._finalize_generation rebuilds risk_section
+        # from the FINAL renumbered suite and preserves this provenance line ONLY
+        # by (a) finding the literal substring "LLM-judged" anywhere in the
+        # section and (b) taking the first line whose lstrip() starts with
+        # "_Risk scores". Break either and the provenance silently disappears
+        # from the delivered summary while the scores stay model-derived.
+        # tests/test_host_risk_test_plan_jobs.py pins both halves.
+        if host_count < total:
+            note = (
+                "_Risk scores are **LLM-judged by your own chat model** (this "
+                f"server made no scoring call) for {host_count} of {total} "
+                f"cases; the remaining {total - host_count} keep the heuristic "
+                "score._"
+            )
+        else:
+            note = (
+                "_Risk scores are **LLM-judged by your own chat model** -- this "
+                "server made no scoring call._"
+            )
+        logger.info(
+            "host risk overlay applied to %d/%d cases; top=%s",
+            host_count,
+            total,
+            rescored[0].risk_label if rescored else "N/A",
+        )
+        return rescored, _build_risk_section(rescored, note=note)
+    except Exception:
+        logger.warning(
+            "host risk overlay failed -- keeping the heuristic scores",
+            exc_info=True,
+        )
+        return baseline, heuristic_section
+
+
 async def score_with_llm(
     cases: list[TestCase], feature_text: str = "", meter: object | None = None
 ) -> tuple[list[TestCase], str]:
@@ -258,16 +352,19 @@ async def score_with_llm(
                 "LLM risk scoring %d cases; may hit output-token limits and degrade to heuristic",
                 len(cases),
             )
-        assessment: _RiskAssessment = await asyncio.wait_for(
-            ask_json(
-                system=_LLM_RISK_SYSTEM + _GUARD,
-                user=user,
-                response_model=_RiskAssessment,
-                model=settings.qa_classifier_model or None,
-                max_tokens=resolve_max_tokens_tier("critic"),
-            ),
-            timeout=min(300, _LLM_RISK_TIMEOUT_S + len(cases)),
-        )
+        # Ledger rule 4: the scope is entered BEFORE wait_for creates its
+        # task, so the task inherits the tagged context.
+        with server_llm_scope(_LEDGER_ID):
+            assessment: _RiskAssessment = await asyncio.wait_for(
+                ask_json(
+                    system=_LLM_RISK_SYSTEM + _GUARD,
+                    user=user,
+                    response_model=_RiskAssessment,
+                    model=settings.qa_classifier_model or None,
+                    max_tokens=resolve_max_tokens_tier("critic"),
+                ),
+                timeout=min(300, _LLM_RISK_TIMEOUT_S + len(cases)),
+            )
         token_meter.note(
             meter,
             "other",

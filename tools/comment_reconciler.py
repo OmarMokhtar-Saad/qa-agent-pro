@@ -30,7 +30,7 @@ kind="question" candidates are NEVER resolved into an amendment: they surface
 as FLAGGED_FOR_CLARIFICATION strings that the MCP handler feeds into the
 existing QA_AMBIGUITY_GATE_SEVERITY gate.
 
-When the flag is ON, ``tools/jira_fetcher`` STOPS appending the raw
+When the flag is ON, ``tools/jira_mcp`` STOPS appending the raw
 "## Comments" dump to ``raw_text``: the fenced amendments block below becomes
 the ONLY comment-derived input the privileged generation model ever sees. That
 is what makes the separation-of-duties defence real rather than aspirational,
@@ -39,14 +39,14 @@ and it also removes a truncation hazard — ``raw_text`` is head-capped
 comment dump would be cut on exactly the long tickets this feature targets.
 
 Thread depth is bounded by TWO caps that interact:
-``tools/jira_fetcher._effective_comment_cap`` requests
+``tools/jira_mcp._effective_comment_cap`` requests
 ``max(JIRA_MAX_COMMENTS, QA_COMMENT_RECONCILE_MAX_COMMENTS)`` comments while
 this feature is on (JIRA_MAX_COMMENTS alone — default 5 — when it is off), and
 Stage 1a then keeps the newest ``QA_COMMENT_RECONCILE_MAX_COMMENTS`` of them.
 
 Every string that leaves this module has been through ``_sanitize``, which also
 collapses markdown/Jira link syntax to its label text and replaces every URL
-with ``[link removed]`` — the same defence ``tools/jira_fetcher._strip_urls``
+with ``[link removed]`` — the same defence ``tools/jira_mcp._strip_urls``
 applies to the parent BACKGROUND block, for the same SHYJ-7154 reason: a
 commenter must never be able to plant a navigation target inside a block that
 claims supersede authority over the description.
@@ -69,11 +69,22 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from config.settings import settings
-from llm import ask_json
+from llm import ask_json, server_llm_scope
 from tools.embeddings import backend_enabled, cosine_similarity, embed_texts
 from tools.untrusted import _GUARD, wrap_untrusted
 
 logger = logging.getLogger(__name__)
+
+# Ledger rule 4 (docs/LLM_MIGRATION_INVENTORY.md). Stage 1b is DISABLED on the
+# host path rather than boomeranged (see QA_HOST_COMMENT_RECONCILE_SUPPRESS_ENABLED
+# in config/settings.py for why a fold is not honestly available), but the call
+# is NOT deleted -- it still serves server mode, graph.py and an operator who
+# sets that flag to false. Tagging it is what keeps that documented rollback
+# working after Phase 6 sets QA_SERVER_LLM_ENABLED=false: an UNTAGGED call is
+# refused outright, so the rollback would silently degrade to "no amendments"
+# instead of restoring the old behaviour. With the tag, the operator adds
+# QA_SERVER_LLM_ALLOW=comment_reconciler.candidates and it works.
+_LEDGER_ID = "comment_reconciler.candidates"
 
 # Unambiguous fence around the amendments block. Natural language cannot
 # accidentally produce it, and _sanitize strips any occurrence out of
@@ -148,7 +159,7 @@ _UNTRUSTED_TAG_RE = re.compile(r"</?untrusted_content\b[^>]*>", re.IGNORECASE)
 # URL neutralisation. The amendments block carries SUPERSEDE authority ("this is
 # the current truth, your test cases must assert it"), so a URL inside it is
 # strictly MORE dangerous than one in the parent BACKGROUND block that
-# tools/jira_fetcher._strip_urls already removes (SHYJ-7154) — and its author is
+# tools/jira_mcp._strip_urls already removes (SHYJ-7154) — and its author is
 # lower-trust than a parent story's. Link syntax is collapsed to its LABEL first
 # so "[pay now](https://attacker.example/pay)" degrades to "pay now" instead of
 # leaving a dangling "[pay now]([link removed])".
@@ -361,7 +372,7 @@ def filter_comments(records: list[dict]) -> tuple[list[dict], dict]:
     """Stage 1a — pure-Python noise filter.
 
     ``records`` are the chronological (oldest -> newest) comment records
-    produced by ``tools/jira_fetcher._fetch_jira_comments``. Returns
+    produced by ``tools/jira_mcp._extract_comment_records``. Returns
     ``(kept, stats)`` where each kept record is re-indexed 1..N so every later
     stage — the numbers the extractor sees and the numbers baked into
     provenance alike — refers to the same position. Never raises.
@@ -544,14 +555,15 @@ async def extract_candidates(kept: list[dict]) -> list[CommentCandidate]:
         numbered = "\n\n".join(
             f"[{rec['index']}] {rec['author']}: {rec['body']}" for rec in kept
         )
-        result: CommentCandidates = await ask_json(
-            system=_EXTRACT_SYSTEM + _GUARD,
-            user=wrap_untrusted(
-                "jira_comment_thread", numbered, limit=_MAX_THREAD_CHARS
-            ),
-            response_model=CommentCandidates,
-            model=settings.qa_classifier_model or None,
-        )
+        with server_llm_scope(_LEDGER_ID):
+            result: CommentCandidates = await ask_json(
+                system=_EXTRACT_SYSTEM + _GUARD,
+                user=wrap_untrusted(
+                    "jira_comment_thread", numbered, limit=_MAX_THREAD_CHARS
+                ),
+                response_model=CommentCandidates,
+                model=settings.qa_classifier_model or None,
+            )
         valid = {rec["index"] for rec in kept}
         out: list[CommentCandidate] = []
         for cand in list(result.candidates)[:_MAX_CANDIDATES]:
@@ -831,12 +843,15 @@ def render_amendments_block(amendments: list[dict]) -> str:
 
 
 async def reconcile_comments(
-    records: list[dict], *, field_vocabulary_text: str = ""
+    records: list[dict],
+    *,
+    field_vocabulary_text: str = "",
+    suppress_llm_extraction: bool = False,
 ) -> dict:
     """Public, never-raise boundary for the whole three-stage pipeline.
 
     ``records`` is ``url_content["comments_meta"]`` — chronological comment
-    records from tools/jira_fetcher. Returns
+    records from tools/jira_mcp. Returns
     ``{"error": None, "content": {"amendments", "flagged", "block", "stats",
     "audit"}}`` and NEVER raises; a disabled flag, an empty thread or any
     internal failure yields the benign empty content so generation proceeds
@@ -855,6 +870,31 @@ async def reconcile_comments(
         kept, stats = filter_comments(records or [])
         if not kept:
             return {"error": None, "content": {**empty, "stats": stats}}
+        if suppress_llm_extraction:
+            # Phase 3c (ledger id `comment_reconciler.candidates`). The caller is
+            # a host-mode prepare: the ONE quarantined ask_json below would be a
+            # server-side LLM call on a path whose premise is that the tester's
+            # own model does the reasoning, and it CANNOT be handed to that model
+            # without destroying the quarantine that makes this module safe (the
+            # host is the privileged generator; giving it the raw thread is the
+            # exact thing tools/jira_mcp stops doing when this feature is on).
+            # Stage 1a above still ran, deliberately: `stats` is the only honest
+            # thing left to report -- how many comments were present and were NOT
+            # reconciled -- and it is what the prepare notice, the submit reply
+            # and the audit row are built from. Stages 2 and 3 produce nothing;
+            # no amendments, no FLAGGED_FOR_CLARIFICATION questions, no block.
+            logger.info(
+                "comment_reconciler: Stage 1b SUPPRESSED (host mode) -- %d "
+                "comment(s) kept by the noise filter were NOT reconciled",
+                stats.get("kept", 0),
+            )
+            return {
+                "error": None,
+                "content": {
+                    **empty,
+                    "stats": {**stats, "llm_extraction_suppressed": True},
+                },
+            }
         candidates = await extract_candidates(kept)
         if not candidates:
             return {"error": None, "content": {**empty, "stats": stats}}

@@ -77,7 +77,7 @@ from collections import Counter
 from pydantic import BaseModel, Field
 
 from config.settings import settings
-from llm import ask_json
+from llm import ask_json, server_llm_scope
 from tools import token_meter
 from tools.untrusted import _GUARD, wrap_untrusted
 
@@ -323,6 +323,20 @@ class _Decomposition(BaseModel):
     items: list[_DecomposedItem] = Field(default_factory=list)
 
 
+# Ledger id for the ONE ask_json below (docs/LLM_MIGRATION_INVENTORY.md).
+# Residue sub-phase R4 flipped that row to `migrated`: the host analog is
+# agents/host_mode.CHECKLIST_JOB (mechanism A, stage step_zero), shipped with
+# QA_HOST_CHECKLIST_REVIEW_ENABLED, and the host prepare passes
+# decompose_checklist=False so no MCP route reaches this call. The call is NOT
+# deleted -- generate_test_scenarios still reaches it from graph.py and
+# evals/test_eval_goldens.py, and evals/test_terse_schemas_goldens.py calls
+# decompose_to_checklist DIRECTLY -- so it is TAGGED instead: after the Phase-6
+# flip, QA_SERVER_LLM_ALLOW=atomic_checklist.decompose revives exactly this one
+# path. Untagged it would revive nothing, which is the silent failure this
+# constant exists to prevent. The tag is inert while QA_SERVER_LLM_ENABLED is
+# on: server_llm_scope only sets a ContextVar the guard reads when it is off.
+_CHECKLIST_LEDGER_ID = "atomic_checklist.decompose"
+
 _DECOMPOSE_SYSTEM = """\
 You are a requirements engineer decomposing a ticket into an ATOMIC requirements
 checklist that a manual QA team will be audited against.
@@ -526,12 +540,17 @@ async def decompose_to_checklist(
             ]
 
         _decompose_user = "\n".join(b for b in blocks if b)
-        result: _Decomposition = await ask_json(
-            system=_DECOMPOSE_SYSTEM + _GUARD,
-            user=_decompose_user,
-            response_model=_Decomposition,
-            model=settings.qa_classifier_model or None,
-        )
+        # The scope MUST enclose the await, not merely the construction of a
+        # coroutine: server_llm_scope sets a ContextVar and a context copy at
+        # task-creation time would leave the call untagged. This is a bare
+        # await, so the `with` below is the whole call.
+        with server_llm_scope(_CHECKLIST_LEDGER_ID):
+            result: _Decomposition = await ask_json(
+                system=_DECOMPOSE_SYSTEM + _GUARD,
+                user=_decompose_user,
+                response_model=_Decomposition,
+                model=settings.qa_classifier_model or None,
+            )
         token_meter.note(
             meter,
             "other",

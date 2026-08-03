@@ -26,10 +26,17 @@ import logging
 from pydantic import BaseModel, Field
 
 from config.settings import settings
-from llm import ask_json
+from llm import ask_json, server_llm_scope
 from tools.untrusted import _GUARD, wrap_untrusted
 
 logger = logging.getLogger(__name__)
+
+# Host-boomerang ledger id covering BOTH ask_json calls in this module (they
+# only ever run through build_test_plan_artifacts). The MCP host path no
+# longer reaches them, but graph.py, the eval harness and the documented
+# rollback -- QA_HOST_TEST_PLAN_REVIEW_ENABLED=false -- still do, and an
+# UNTAGGED call is refused once QA_SERVER_LLM_ENABLED is false.
+_LEDGER_ID = "test_plan_report.build"
 
 
 # --------------------------------------------------------------------------- #
@@ -245,10 +252,13 @@ async def build_test_plan_artifacts(
     try:
         if not settings.qa_test_plan_artifacts:
             return {}
-        ac_result, plan_result = await asyncio.gather(
-            build_ac_validation(source_acs or [], feature_text, open_questions),
-            build_test_plan(feature_text, suite_stats, source_acs),
-        )
+        # Ledger rule 4: entered BEFORE gather schedules the two tasks, which
+        # copy this context at creation, so both inner calls are tagged.
+        with server_llm_scope(_LEDGER_ID):
+            ac_result, plan_result = await asyncio.gather(
+                build_ac_validation(source_acs or [], feature_text, open_questions),
+                build_test_plan(feature_text, suite_stats, source_acs),
+            )
         artifacts: dict = {}
         if ac_result:
             artifacts["ac_validation"] = ac_result

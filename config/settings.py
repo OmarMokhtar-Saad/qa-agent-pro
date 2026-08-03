@@ -285,9 +285,23 @@ class Settings(BaseSettings):
     qa_model_tier_coverage_gaps: str = "default"
     qa_model_tier_maestro_translate: str = "default"
 
+    # Still read: used ONLY to recognise a self-hosted Jira on a custom domain
+    # (tickets.example.com) as a ticket URL rather than a generic web page.
     jira_base_url: str = ""
+    # DEPRECATED 2026-08-01, retained as inert fields. The REST/Basic-Auth Jira
+    # path was removed in favour of the calling agent's own Atlassian MCP
+    # connection (OAuth 2.1, Jira Cloud), so nothing reads these any more. They
+    # are kept so an existing .env carrying JIRA_EMAIL / JIRA_API_TOKEN still
+    # loads cleanly instead of tripping validation on upgrade -- and, because
+    # nothing reads them, a stale token cannot silently be used either.
     jira_api_token: str = ""
     jira_email: str = ""
+    # Tool-name prefix the CALLING agent uses for its Atlassian MCP tools.
+    # Claude Code / Desktop expose them as `mcp__atlassian__getJiraIssue`;
+    # other clients namespace differently, so the directive this server returns
+    # must be adjustable rather than hardcoded. Empty falls back to the Claude
+    # form. Not a feature flag -- it changes wording, never behaviour.
+    qa_jira_mcp_tool_prefix: str = "mcp__atlassian__"
     # Jira access pre-flight (QA_JIRA_PREFLIGHT). Default **ON** — a deliberate
     # exception to the constitution's defaults-OFF rule, with the same
     # precedent as the ambiguity gate and QA_AUTO_EXPORT_XLSX: before fetching a
@@ -1177,6 +1191,179 @@ class Settings(BaseSettings):
     qa_host_duplicate_prep_guard_enabled: bool = True
     qa_host_duplicate_prep_window_s: int = 1800
 
+    # --- Host-boomerang migration of ALL remaining LLM call paths (2026-08-01)
+    # ------------------------------------------------------------------------
+    # QA_GENERATION_MODE made test-case generation chat-only. ~30 OTHER call
+    # sites still reach a server-side cli/api/cursor backend, so a keyless
+    # install silently degrades (bug reports, coaching, vision grounding, the
+    # ambiguity gate) and a keyed install burns a second quota for work the
+    # tester's own chat model could do. qa_server_llm_enabled is the single
+    # chokepoint that retires those calls; it defaults to True so introducing
+    # it is a runtime NO-OP, and flipping it False is the LAST step of the
+    # migration (gated on docs/LLM_MIGRATION_INVENTORY.md). OFF, llm.ask /
+    # ask_vision return their existing never-raising "Error: ..." sentinel,
+    # llm.ask_json raises LLMBackendUnavailableError and llm.warm_cache_prefix
+    # returns False -- each path's documented contract, so every caller degrades
+    # exactly as it already does when no backend is usable. Nothing invents a
+    # substitute result. While any ledger row is still unmigrated, turning this
+    # OFF DISABLES that feature rather than boomeranging it, so qa_setup_check
+    # and a one-time startup WARNING name the affected features out loud.
+    qa_server_llm_enabled: bool = True
+    # Per-path escape hatch for the paths that CANNOT boomerang (a completion is
+    # needed mid-loop, inside a tool call): comma-separated ledger call-site ids
+    # -- e.g. "maestro_healer.classify,eval_runner.judge", or "*" for all --
+    # that may still call a backend directly while qa_server_llm_enabled is
+    # False. Without this, one boolean conflates "retired because migrated" with
+    # "disabled because unmigratable", and an operator with a working key could
+    # not keep the mobile healer/explorer, web vision-verify or the eval harness
+    # alive without also re-enabling every already-migrated path. Callers tag
+    # themselves via llm.server_llm_scope(<id>); an UNTAGGED call is always
+    # refused when the master flag is off, so the list cannot widen by accident.
+    # A plain str field: any .env value is already a valid str, so no coercer is
+    # needed and it can never raise at load time.
+    qa_server_llm_allow: str = ""
+    # Opportunistic MCP sampling (fastmcp Context.sample) for the calls that
+    # cannot boomerang because the host is blocked waiting for the tool call
+    # that needs the completion (maestro heal/explore, web-runner step verify,
+    # eval judges, router). Default OFF: Claude Desktop/Code and Cursor do not
+    # advertise the sampling capability today, so ON is a no-op there --
+    # tools.host_llm.maybe_sample() returns None (never raises) and the caller
+    # uses its deterministic fallback or disables the feature out loud.
+    qa_host_llm_sampling_enabled: bool = False
+
+    # --- Phase 3a of the host-boomerang migration: generation-pipeline folds --
+    # Both default TRUE, deliberately, and that is NOT a defaults-OFF violation:
+    # these are MIGRATION flags, not features. They add no behaviour -- they
+    # REMOVE a server-side LLM call from the host path and hand the same work to
+    # the tester's own chat model as one more field on the submission it was
+    # already going to send (ZERO extra round trips). Same reasoning and same
+    # precedent as QA_HOST_AC_REVIEW_ENABLED / QA_HOST_IMAGE_DESCRIPTION_ENABLED
+    # (2026-08-01). Each is ALSO an AND with the pre-existing, default-OFF
+    # feature flag it rides on, so on a default install nothing new runs at all
+    # and the prepare payload stays key-identical. Setting either to false
+    # restores the server-side call with no code change -- which is what makes
+    # the migration's Rollback Plan true for these two rows.
+    #
+    # ON + QA_LLM_RISK_SCORING: the host returns a top-level `risk_scores` field
+    # on its submission and tools/risk_scorer.score_with_llm is never called. The
+    # deterministic score_and_sort heuristic remains the baseline and the
+    # fallback for every case the host omits, and for an absent/unusable field.
+    qa_host_risk_review_enabled: bool = True
+    # ON + QA_TEST_PLAN_ARTIFACTS: the host returns a top-level
+    # `test_plan_report` field carrying BOTH artifacts (ac_validation +
+    # test_plan) and tools/test_plan_report.build_test_plan_artifacts is never
+    # called. An absent or unusable field yields NO artifacts plus a disclosed
+    # UNVERIFIED note -- the server does NOT fall back to making the call.
+    qa_host_test_plan_review_enabled: bool = True
+    # --- Residue R4: requirement decomposition on the host path -------------
+    # ledger id `atomic_checklist.decompose`, the LAST row of the
+    # host-boomerang migration. A MIGRATION flag, not a new feature, so it
+    # defaults ON for the same reason the three above do: `migrated` may only
+    # be claimed when the host path genuinely cannot reach the backend, and a
+    # default of False would leave an operator with QA_ATOMIC_CHECKLIST_ENABLED
+    # on still making the server-side ask_json.
+    #
+    # AND-ed with QA_ATOMIC_CHECKLIST_ENABLED (default OFF) AND host mode, so a
+    # default install ships a key-identical prepare payload and nothing changes.
+    #
+    # ON + QA_ATOMIC_CHECKLIST_ENABLED + host mode: _prepare_generation is
+    # called with decompose_checklist=False and makes NO decomposition call;
+    # agents/host_mode.CHECKLIST_JOB (stage step_zero) asks the host to derive
+    # the atomic checklist BEFORE generating and to return it as a top-level
+    # `checklist_items` field. The server re-assigns every CL-NNN id, runs the
+    # pure-Python audit_granularity over the result, and feeds the DETERMINISTIC
+    # Pass-3 matcher unchanged. An absent or unusable field means NO checklist:
+    # the server does NOT fall back to making the call it just skipped.
+    #
+    # Two knock-on gates are widened for this flag rather than left to break
+    # silently -- tools/mcp_handlers._nli_suppress (Phase 3b) and
+    # agents/host_mode._coverage_instruction -- because both are AND-ed with
+    # "the prep produced checklist items", which is False at prepare time once
+    # the decomposition is boomeranged. See docs/FEATURE_FLAGS.md.
+    qa_host_checklist_review_enabled: bool = True
+
+    # --- Phase 3b: the checklist NLI / adjudication tiers on the host path ----
+    # A MIGRATION flag with the same default-ON rationale as the two above, and
+    # the same AND with the (default-OFF) feature flags it rides on
+    # (QA_CHECKLIST_NLI_ENABLED / QA_CHECKLIST_ADJUDICATE_ENABLED), so on a
+    # default install nothing changes at all. It is additionally AND-ed with
+    # QA_ATOMIC_CHECKLIST_ENABLED *and* with the prep actually carrying
+    # checklist items, because both tiers only ever run over a checklist -- see
+    # tools/mcp_handlers.py's _nli_suppress.
+    #
+    # ON + either tier flag + a real checklist + host generation:
+    # _finalize_generation passes allow_llm_tiers=False into
+    # tools.rtm.match_checklist, so tiers (b) and (c) make NO server-side
+    # ask_json call on a host submit.
+    #
+    # There is deliberately NO host job replacing them, and that is the whole
+    # finding of this sub-phase (see docs/LLM_MIGRATION_INVENTORY.md, ledger id
+    # `rtm.nli_verdicts`). Both tiers exist precisely so a model OTHER than the
+    # generator re-judges the deterministic shortlist -- tools/rtm.py says so in
+    # source: "a DIFFERENT system prompt from the generator, so the generating
+    # model still never marks its own homework". In host mode the generator IS
+    # the host, so folding the tiers would (a) have the suite's own author grade
+    # it and (b) feed that judgement into ChecklistCoverage, i.e. into the
+    # coverage percentage, the XLSX sheets and the remediation loop -- exactly
+    # what agents/host_mode.py's host-reviewed coverage block refuses to do
+    # ("NOTHING IS MERGED OR AVERAGED... IT NEVER DRIVES THE GAP LOOP"). The
+    # DISCLOSED host analog is QA_HOST_COVERAGE_REVIEW_ENABLED's
+    # `requirement_matches`, reported as a separate, explicitly labelled tier.
+    #
+    # Consequence, disclosed in the submit reply, the prepare notice AND in
+    # ChecklistCoverage.notes (so it survives into the exported artifact): the
+    # ambiguous similarity band is reported as UNCOVERED instead of being
+    # re-judged, so a run with QA_CHECKLIST_NLI_ENABLED on can show MORE gaps
+    # than before. Set this to false to restore the server-side tiers with no
+    # code change.
+    qa_host_checklist_nli_suppress_enabled: bool = True
+
+    # --- Phase 3c: Jira comment reconciliation on the host path ---------------
+    # ledger id `comment_reconciler.candidates`. Default ON for the same reason
+    # as the three flags above: this is a MIGRATION flag, not a new feature.
+    # `migrated` / `disabled (disclosed)` may only be claimed when the host path
+    # genuinely cannot reach the backend, so a default of False would leave an
+    # operator with QA_COMMENT_RECONCILE_ENABLED=true still making the Stage 1b
+    # ask_json call on every host prepare and the ledger flip would over-claim.
+    # It is still an AND with the pre-existing, default-OFF
+    # QA_COMMENT_RECONCILE_ENABLED, so a default install is byte-identical.
+    #
+    # WHY THERE IS NO HOST JOB (the load-bearing finding of Phase 3c).
+    # tools/comment_reconciler.py Stage 1b is a QUARANTINED extractor: its
+    # entire security value is that the model reading the raw comment thread has
+    # a system prompt containing ONLY extraction instructions -- no generation
+    # prompt, no test-case instructions, no tools -- so a directive injected into
+    # a Jira comment has nothing privileged to target. The module docstring
+    # states the resulting invariant outright: when the flag is on, tools/jira_mcp
+    # STOPS appending the raw "## Comments" dump to raw_text and "the fenced
+    # amendments block becomes the ONLY comment-derived input the privileged
+    # generation model ever sees". In host mode the privileged generation model
+    # IS the host, so ANY boomerang -- a folded HostJob or a separate
+    # tools/host_llm task -- would put the raw thread into the context of the
+    # model that is about to write the tests and hold the tool handles. That is
+    # not a migration of the capability, it is the deletion of the defence.
+    # Two further blockers, either sufficient on its own:
+    #   * ORDERING. The rendered amendments block enters url_content
+    #     ["amendments_context"] BEFORE _prepare_generation, i.e. it shapes the
+    #     generation prompt. A HostJob return field arrives on the SUBMIT, which
+    #     is far too late for a prompt-side consumer (`step_zero` is only an
+    #     instruction-ordering rank inside ONE host turn, not a round trip).
+    #   * A SAFETY GATE. kind="question" candidates become
+    #     FLAGGED_FOR_CLARIFICATION strings that tools/mcp_handlers feeds into the
+    #     QA_AMBIGUITY_GATE_SEVERITY gate, which can RETURN EARLY and refuse to
+    #     prepare at all. A gate cannot be answered after the thing it gates.
+    # So on the host path Stage 1b is DISABLED, not delegated: Stage 1a (the
+    # pure-Python noise filter) still runs so the tester is told how many
+    # comments went unreconciled, Stages 2 and 3 produce nothing, and the
+    # prepare notice, the submit reply and the audit log all say so.
+    #
+    # Consequence, disclosed on all three surfaces: no AMENDMENTS block reaches
+    # the generation prompt and no comment-derived clarification question can
+    # gate the prepare, so a ticket whose current truth lives in its comment
+    # thread generates from the description alone. Set this to false to restore
+    # the server-side extractor with no code change.
+    qa_host_comment_reconcile_suppress_enabled: bool = True
+
     # --- Prep crash-safety (2026-07-31 SHYJ-5645 incident; default ON as of
     # 2026-08-01) --------------------------------------------------------------
     # The first live parallel fan-out was silently lost: 8 worker packets fetched
@@ -1369,6 +1556,13 @@ class Settings(BaseSettings):
         "qa_host_coverage_review_enabled",
         "qa_host_parallel_fanout_enabled",
         "qa_host_duplicate_prep_guard_enabled",
+        "qa_server_llm_enabled",
+        "qa_host_llm_sampling_enabled",
+        "qa_host_risk_review_enabled",
+        "qa_host_test_plan_review_enabled",
+        "qa_host_checklist_review_enabled",
+        "qa_host_checklist_nli_suppress_enabled",
+        "qa_host_comment_reconcile_suppress_enabled",
         "qa_prep_sliding_ttl_enabled",
         "qa_prep_disclose_unfinished",
         "qa_qualified_tc_ids_enabled",

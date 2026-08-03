@@ -18,12 +18,32 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from config.settings import settings
-from llm import LLMBackendUnavailableError, ask_json
+from llm import LLMBackendUnavailableError, ask_json, server_llm_scope
 from tools.untrusted import _GUARD, wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
 Severity = Literal["none", "low", "medium", "high"]
+
+# Ledger id for this call site (docs/LLM_MIGRATION_INVENTORY.md, host-boomerang
+# migration rule 4). The ask_json below is wrapped in
+# llm.server_llm_scope(_LEDGER_ID) so that, once Phase 6 sets
+# QA_SERVER_LLM_ENABLED=false, an operator can revive THIS one path with
+# QA_SERVER_LLM_ALLOW=requirement_analyzer.ambiguity_gate.
+#
+# Load-bearing, because this call is no longer on the host path at all:
+# handle_prepare_test_cases passes run_ambiguity_llm=False (QA_HOST_AMBIGUITY_
+# REVIEW_ENABLED and QA_GENERATION_MODE are both hardcoded) and the host runs
+# `ambiguity_job` from the prepare payload instead. What survives HERE is the
+# DEFENSIVE fallback taken when those conditions cannot be read -- i.e. exactly
+# the case in which the SHYJ-7154 gate most needs to still work.
+#
+# A refusal is SAFE either way: the guard raises LLMBackendUnavailableError,
+# which the handler below turns into _DEGRADED_DEFAULT (severity "unknown",
+# degraded True), and mcp_handlers._maybe_ambiguity_clarify reads `degraded`
+# EXPLICITLY and returns clarifying questions. It can never read as
+# "classified and clear".
+_LEDGER_ID = "requirement_analyzer.ambiguity_gate"
 
 
 class RequirementIssues(BaseModel):
@@ -120,12 +140,17 @@ async def analyze_requirements(text: str) -> dict:
     try:
         if not text or not text.strip():
             return dict(_SAFE_DEFAULT)
-        result: RequirementIssues = await ask_json(
-            system=_SYSTEM + _GUARD,
-            user=wrap_untrusted("feature_description", text),
-            response_model=RequirementIssues,
-            model=settings.qa_classifier_model or None,
-        )
+        # Ledger rule 4: tag the call so the Phase-6 kill switch can be
+        # bypassed for this ONE path via QA_SERVER_LLM_ALLOW. Inert today --
+        # llm.server_llm_enabled() consults the tag only when the master flag
+        # is off.
+        with server_llm_scope(_LEDGER_ID):
+            result: RequirementIssues = await ask_json(
+                system=_SYSTEM + _GUARD,
+                user=wrap_untrusted("feature_description", text),
+                response_model=RequirementIssues,
+                model=settings.qa_classifier_model or None,
+            )
         return {
             "severity": result.severity,
             "issues": list(result.issues),

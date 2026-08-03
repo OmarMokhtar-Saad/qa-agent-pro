@@ -38,7 +38,8 @@ and the RAG corpus (`corpus/`) are protected paths.
 |---|---|
 | `qa_generate_test_cases` | Feature text, Jira/issue URL, web page URL, or Swagger/OpenAPI link → structured test suite (steps, expected results, priority, risk) with a persisted `suite_id` |
 | `qa_export_suite` | Export a suite by `suite_id`: `csv`, `xlsx`, `testrail`, `gherkin`, or `playwright` |
-| `qa_feature_analysis` | Enterprise Feature Analysis report from a Jira ticket, captured mobile screens, or both merged |
+| `qa_feature_analysis` | Enterprise Feature Analysis report from a Jira ticket, captured mobile screens, or both merged — returns a task your chat model answers |
+| `qa_submit_feature_analysis` | Hand back the Feature Analysis JSON your chat model wrote for a `qa_feature_analysis` task; the server validates and renders it |
 | `qa_list_devices` | List connected Android/iOS devices, emulators and simulators |
 | `qa_search_corpus` | Search past generated suites (requires `QA_RAG_ENABLED`) |
 | `qa_setup_check` | Verify this machine: LLM auth, mobile tooling, devices, enabled features |
@@ -129,7 +130,7 @@ Edit `~/qa-agent-pro/.env` (created from `.env.example`):
 | Variable | Purpose |
 |---|---|
 | `QA_LLM_BACKEND` | `cli` (claude CLI login), `api` (`ANTHROPIC_API_KEY`), or `cursor` |
-| `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN` | Lets you paste Jira ticket URLs |
+| _(none)_ | Jira ticket URLs work via your own Atlassian MCP connection -- no `.env` entry needed |
 | `QA_SWAGGER_ENABLED` | Swagger/OpenAPI link → API test cases |
 | `QA_MOBILE_CAPTURE` | Mobile-screen capture (Android via adb; vision needs `ANTHROPIC_API_KEY`) |
 | `QA_RAG_ENABLED` | Learn from your past suites: grounding + duplicate flagging (on by default) |
@@ -139,30 +140,21 @@ Edit `~/qa-agent-pro/.env` (created from `.env.example`):
 
 ## Connect Jira (to paste ticket URLs)
 
-Each user connects with their own Atlassian account once.
+No API token, no `.env` entry -- Jira is read through your own
+Atlassian MCP connection (OAuth, Jira Cloud only), the same way this
+tool itself is connected to your editor.
 
-**Easiest — in chat:** create an API token at
-<https://id.atlassian.com/manage-profile/security/api-tokens>, then
-tell the agent: *"configure Jira"* and give it your Jira URL, email
-and the token — it saves them into the local `.env` for you and
-reloads (the token never leaves your machine).
+1. Add the Atlassian MCP server in your client's MCP settings
+   (`https://mcp.atlassian.com/v1/mcp/authv2`) -- Claude Code / Desktop:
+   `.mcp.json` or Settings > Connectors; Cursor: Settings > Features >
+   MCP; Gemini CLI: `gemini mcp add --transport http`.
+2. Approve the one-time OAuth consent in the browser tab it opens.
+3. Paste a ticket URL -- the agent fetches it through that connection
+   and nothing is stored on this machine.
 
-**Or manually:**
-
-1. Create an API token: <https://id.atlassian.com/manage-profile/security/api-tokens>
-2. Add to `~/qa-agent-pro/.env`:
-
-```
-JIRA_BASE_URL=https://yourcompany.atlassian.net
-JIRA_EMAIL=you@company.com
-JIRA_API_TOKEN=<your token>
-```
-
-3. Run `qa_setup_check` — it reloads and shows Jira as configured.
-
-If a pasted ticket needs credentials that are missing, the agent
-replies with these exact steps (including your Jira host) instead of
-failing silently.
+If your client has no Atlassian MCP connection yet, the agent replies
+with these exact steps instead of failing silently or inventing
+ticket content.
 
 ## Example prompts
 
