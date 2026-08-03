@@ -20,9 +20,9 @@ import json
 import logging
 import sqlite3
 import time
-from pathlib import Path
 
 from config.settings import settings
+from tools.install_paths import resolve_data_path
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,9 @@ CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
 
 
 def _connect() -> sqlite3.Connection:
-    path = Path(settings.qa_audit_log_path)
+    # Install-root anchored -- see tools/install_paths. A cwd-relative audit log
+    # split the trail across databases, so "what happened" needed archaeology.
+    path = resolve_data_path(settings.qa_audit_log_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.executescript(_SCHEMA)

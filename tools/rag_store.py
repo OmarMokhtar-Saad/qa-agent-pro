@@ -22,6 +22,7 @@ from pathlib import Path
 
 from config.settings import settings
 from tools.embeddings import backend_enabled, cosine_similarity, embed_texts
+from tools.install_paths import resolve_data_path
 
 logger = logging.getLogger(__name__)
 
@@ -264,7 +265,10 @@ def _corpus_path(entry_type: str) -> Path:
     identifier (path separators, ``..``, other punctuation) is rejected as a
     path-traversal attempt and coerced to the default ``test_cases`` corpus
     rather than escaping ``qa_rag_storage_path``."""
-    base = Path(settings.qa_rag_storage_path)
+    # Install-root anchored -- see tools/install_paths. A cwd-relative corpus split
+    # the history, so grounding saw a fraction of it, and one copy reached the
+    # entry cap where every write rewrites the whole file.
+    base = resolve_data_path(settings.qa_rag_storage_path)
     if entry_type == "test_case":
         return base / "test_cases.jsonl"
     if entry_type == "bug_report":

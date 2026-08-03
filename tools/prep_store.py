@@ -36,6 +36,7 @@ import uuid
 from pathlib import Path
 
 from config.settings import settings
+from tools.install_paths import resolve_data_path
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +75,10 @@ CREATE INDEX IF NOT EXISTS idx_prep_submissions_prep_id
 
 
 def _db_path() -> Path:
-    return Path(settings.qa_suite_store_path)
+    # Anchored to the install root, not the process cwd: a prep written while one
+    # project was open used to be invisible when another was, which the host reads
+    # as "prep not found -- start again" and answers with a full re-generation.
+    return resolve_data_path(settings.qa_suite_store_path)
 
 
 def _ttl_seconds() -> float:
@@ -600,6 +604,71 @@ async def touch_prep(prep_id: str) -> dict:
         return {"error": None, "content": {"touched": bool(ok)}}
     except Exception as exc:
         logger.exception("prep_store.touch_prep failed")
+        return {"error": str(exc), "content": None}
+
+
+def _find_recent_prep_sync(source_url: str, window_s: float) -> dict | None:
+    now = time.time()
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, payload_json, created_at FROM preps "
+            "ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+    finally:
+        conn.close()
+    for pid, payload_json, created in rows:
+        try:
+            created_f = float(created)
+        except (TypeError, ValueError):
+            continue
+        if window_s and (now - created_f) > window_s:
+            break  # ordered DESC, so everything older is out of the window too
+        try:
+            env = json.loads(payload_json) or {}
+        except (ValueError, TypeError):
+            continue
+        if is_finalized_record(env):
+            continue  # finished work is the SUITE guard's business, not this one
+        meta = env.get("meta") or {}
+        if str(meta.get("source_url") or "") != source_url:
+            continue
+        return {
+            "prep_id": pid,
+            "created_at": created_f,
+            "age_s": max(0.0, now - created_f),
+        }
+    return None
+
+
+async def find_recent_prep_by_source(source_url: str, window_s: float = 1800) -> dict:
+    """A recent, still-unfinalized prep for the SAME source_url, or None content.
+
+    2026-08-03. The duplicate-prep guard was named for preps but only ever looked
+    at finished SUITES (``_find_recent_duplicate_suite``). So the exact case it
+    exists for -- two `qa_prepare_test_cases` calls in a row for one source, before
+    any suite exists -- was invisible to it. A real run made two preps 43 seconds
+    apart with byte-identical source_url and source_text, got no warning, and threw
+    away a full preparation.
+
+    Deliberately keyed on exact ``meta.source_url`` (same rule the suite guard
+    uses), so free-text descriptions -- which have no stable identity -- are never
+    flagged. FINALIZED preps are skipped: those are a completed generation and
+    belong to the suite guard, which can report the suite id and case count.
+
+    Scans at most the 20 newest preps and stops at the first one outside the
+    window, so cost does not grow with history. Never raises.
+    """
+    try:
+        url = str(source_url or "").strip()
+        if not url:
+            return {"error": None, "content": None}
+        hit = await asyncio.to_thread(
+            _find_recent_prep_sync, url, float(max(0, window_s))
+        )
+        return {"error": None, "content": hit}
+    except Exception as exc:
+        logger.exception("prep_store.find_recent_prep_by_source failed")
         return {"error": str(exc), "content": None}
 
 
