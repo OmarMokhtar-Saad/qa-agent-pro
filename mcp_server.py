@@ -18,11 +18,13 @@ at real FastMCP tool registration). Eager annotations resolve ``Context`` at
 decoration time inside ``build_server``, where it is in scope.
 """
 
+import asyncio
 import logging
 import os
 import threading
 import time
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 # Anchor the working directory to the repo root BEFORE importing settings:
 # config.settings loads the project .env from the cwd, and the data paths
@@ -58,6 +60,66 @@ def _note_client(ctx) -> None:
         _CLIENT["version"] = str(getattr(info, "version", "") or "")
     except Exception:
         logger.debug("could not read clientInfo", exc_info=True)
+
+
+# The tester's OPEN workspace, per the MCP `roots` capability -- the only
+# authoritative answer to "where is the project-scoped mcp.json?". Bounded on
+# both axes: a client may legitimately report several folders, and the request is
+# a round trip to a client that could accept it and never reply.
+_MAX_WORKSPACE_ROOTS = 8
+_ROOTS_TIMEOUT_S = 5.0
+
+
+async def _workspace_roots(ctx) -> list[Path]:
+    """The client's open workspace folder(s) as local filesystem paths.
+
+    Needed because the project-scoped `.cursor/mcp.json` / `.mcp.json` a tester
+    would actually edit lives in their editor workspace, which this stdio
+    subprocess cannot otherwise locate: a dist install sits in a fixed
+    directory, and `Path.cwd()` is useless here because this module chdir()s to
+    its own install root at import time (see the top of the file). Two guesses
+    shipped on that reasoning and BOTH were wrong in production (v1.31.0,
+    v1.32.0); `roots` is the protocol's own answer.
+
+    Best-effort and NEVER raises: `roots` is an OPTIONAL client capability, so an
+    unsupported client can surface anything from a protocol error to an
+    AttributeError to silence. Any failure returns [] and every caller degrades
+    to its previous behaviour.
+    """
+    try:
+        roots = await asyncio.wait_for(ctx.list_roots(), timeout=_ROOTS_TIMEOUT_S)
+    except Exception:
+        logger.debug("mcp list_roots unavailable", exc_info=True)
+        return []
+    try:
+        reported = list(roots or [])[:_MAX_WORKSPACE_ROOTS]
+    except Exception:
+        logger.debug("mcp list_roots returned an unusable result", exc_info=True)
+        return []
+
+    out: list[Path] = []
+    seen: set[str] = set()
+    for root in reported:
+        try:
+            parsed = urlparse(str(getattr(root, "uri", "") or ""))
+            # The MCP spec allows file:// only, and a host component other than
+            # localhost is a remote/UNC location this process must not read.
+            if parsed.scheme != "file":
+                continue
+            if (parsed.netloc or "").lower() not in ("", "localhost"):
+                continue
+            raw = unquote(parsed.path)  # %20 and friends
+            if not raw:
+                continue
+            path = Path(raw)
+        except Exception:
+            logger.debug("skipping unusable MCP root %r", root, exc_info=True)
+            continue
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            out.append(path)
+    return out
 
 
 # ---- in-flight accounting for the drift restart (F1) -----------------------
@@ -811,10 +873,15 @@ def build_server():
         """Check whether THIS machine is ready: overall verdict, LLM backend
         auth, integrations, CLI tooling (adb/xcrun), enabled features and
         action items. Fast and read-only. Run this first on a new machine."""
+        progress = _make_progress(ctx)
+        # Resolved BEFORE entering _tracked: this is a round trip back to the
+        # client, not part of the report's own work, and _tracked owns the
+        # in-flight counter that gates the drift restart.
+        roots = await _workspace_roots(ctx)
         return await _tracked(
             "qa_setup_check",
             ctx,
-            mcp_handlers.handle_setup_check(progress=_make_progress(ctx)),
+            mcp_handlers.handle_setup_check(progress=progress, workspace_roots=roots),
         )
 
     # Optional tool — only in the FULL edition, and only when the Feature
