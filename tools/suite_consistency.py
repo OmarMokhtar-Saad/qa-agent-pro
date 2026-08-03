@@ -43,14 +43,27 @@ _MAX_REPORTED = 20
 _NONDETERMINISTIC_PATTERNS: list[re.Pattern] = [
     # "Either X or Y" spanning a bounded window.
     re.compile(r"\beither\b[^.]{0,160}?\bor\b", re.IGNORECASE),
-    # "..., or if <condition> ..." — a second, conditional outcome.
-    re.compile(r",?\s*\bor\s+if\b", re.IGNORECASE),
+    # "..., or if <condition> <second OUTCOME>" — a genuinely alternative result.
+    # The outcome noun is required: "an error is shown if the field is empty or if
+    # it exceeds 50 characters" is ONE outcome with two conditions, and matching a
+    # bare "or if" reported every such validation case as unfalsifiable.
+    re.compile(
+        r"\bor\s+if\b[^.]{0,120}?\b(?:message|validation|error|screen|dialog|"
+        r"banner|toast|success|sheet|state|status|popup|alert|warning|result)\b",
+        re.IGNORECASE,
+    ),
     # "note the exception and stop" / "note exception and stop"
     re.compile(r"\bnote\b[^.]{0,60}?\bexception\b[^.]{0,40}?\bstop\b", re.IGNORECASE),
     # "record as blocked" / "record it as blocked"
     re.compile(r"\brecord\b[^.]{0,30}?\bas\s+blocked\b", re.IGNORECASE),
-    # "if <no channel/not instrumented> ... record/note ..." — self-voiding.
-    re.compile(r"\bif\s+no\b[^.]{0,90}?\b(?:record|note)\b", re.IGNORECASE),
+    # "if <no channel/not instrumented> ... record it as ..." — self-voiding.
+    # record/note must be a VERB: "the note field is unchanged" is a perfectly
+    # deterministic assertion and was being flagged on the noun.
+    re.compile(
+        r"\bif\s+no\b[^.]{0,90}?\b(?:record|note)\s+"
+        r"(?:it|this|that|as|the\s+actual|which|whichever)\b",
+        re.IGNORECASE,
+    ),
     # "X is accepted, or a lower cap is enforced" — an outcome pair on a
     # boundary probe, where the case declares both results acceptable.
     re.compile(
@@ -71,7 +84,11 @@ _NONDETERMINISTIC_PATTERNS: list[re.Pattern] = [
 _EQUIVALENT_RENDERING_RE = re.compile(
     r"\b(?:hidden|disabled|greyed|grayed)\s+or\s+(?:hidden|disabled|greyed|grayed)\b"
     r"|\b\d{3}\s*(?:/|or)\s*\d{3}\b"
-    r"|\b(?:AR|EN|Arabic|English)\s+equivalent\b",
+    r"|\b(?:AR|EN|Arabic|English)\s+equivalent\b"
+    # "in either Arabic or English" is ONE outcome rendered per locale, not two
+    # outcomes. This project mandates bilingual cases, so without this the
+    # advisory fired on ordinary expected results.
+    r"|\b(?:in\s+)?either\s+(?:AR|EN|Arabic|English)\s+or\s+(?:AR|EN|Arabic|English)\b",
     re.IGNORECASE,
 )
 
@@ -188,13 +205,112 @@ def _seeded_states(tc: TestCase) -> set[str]:
     return out
 
 
-def _polarity_of(text: str) -> str | None:
-    blocked = bool(_ACTION_BLOCKED_RE.search(text))
-    available = bool(_ACTION_AVAILABLE_RE.search(text))
+# Words that carry no identity when comparing which control a sentence is about.
+_SUBJECT_STOPWORDS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "no",
+        "not",
+        "and",
+        "or",
+        "but",
+        "for",
+        "this",
+        "that",
+        "these",
+        "those",
+        "it",
+        "its",
+        "on",
+        "in",
+        "at",
+        "to",
+        "of",
+        "with",
+        "from",
+        "still",
+        "remains",
+        "stays",
+        "longer",
+        "any",
+        "all",
+        "user",
+        "users",
+        "screen",
+        "page",
+        "app",
+        # Structural words that appear in almost every expected result here, so
+        # an overlap on them says nothing about the two cases being related --
+        # "status" alone was matching a pair that shared no control at all.
+        "status",
+        "state",
+        "step",
+        "current",
+        "per",
+        "rules",
+        "rule",
+        "build",
+        "equivalent",
+        "shown",
+        "unchanged",
+        "detail",
+        "details",
+        "option",
+    }
+)
+# NOTE: the apostrophe is deliberately NOT part of a word. Quoted control names
+# are the norm in these expected results ("'Cancel order' is still visible"), and
+# including the quote produced tokens like "'cancel" / "order'" that could never
+# match the same words written unquoted -- silently disabling the whole check.
+_SUBJECT_WORD_RE = re.compile(r"[A-Za-z\u0600-\u06ff]+")
+
+
+def _subject_terms(text: str, match: re.Match) -> set[str]:
+    """Identity words of the control a polarity phrase is talking about.
+
+    Taken from the words immediately BEFORE the match, which in practice is the
+    subject noun phrase ("the 'Cancel order' option is visible" -> cancel,
+    order, option).
+    """
+    prefix = text[max(0, match.start() - 90) : match.start()]
+    words = [w.lower().strip("'\"") for w in _SUBJECT_WORD_RE.findall(prefix)]
+    return {w for w in words[-6:] if w and w not in _SUBJECT_STOPWORDS and len(w) > 2}
+
+
+def _polarity_of(text: str) -> tuple[str, set[str]] | None:
+    """(polarity, subject terms), or None when the text asserts neither/both.
+
+    The subject terms exist because polarity ALONE is not a contradiction: a
+    suite that says "a success toast is visible" in one case and "the refund
+    banner is not shown" in another was reported as disagreeing about whether the
+    seeded status permits the action, which it plainly was not. Two cases now
+    only conflict when they speak about the same control.
+    """
+    blocked = list(_ACTION_BLOCKED_RE.finditer(text))
+    available = list(_ACTION_AVAILABLE_RE.finditer(text))
+
+    def subjects(matches: list[re.Match]) -> set[str]:
+        # EVERY match contributes, not just the first: a case that says both
+        # "success screen is not shown" and "Cancel is unavailable" is about the
+        # cancel control too, and reading only the first match dropped two of the
+        # three cases in the real Processing contradiction.
+        out: set[str] = set()
+        for match in matches:
+            out |= _subject_terms(text, match)
+        return out
+
     if blocked and not available:
-        return "blocked"
+        return "blocked", subjects(blocked)
     if available and not blocked:
-        return "available"
+        return "available", subjects(available)
     return None
 
 
@@ -237,20 +353,40 @@ def find_contradictory_state_assumptions(
     """
     out: list[tuple[str, list[str], list[str]]] = []
     try:
-        available: dict[str, list[str]] = defaultdict(list)
-        blocked: dict[str, list[str]] = defaultdict(list)
+        available: dict[str, list[tuple[str, frozenset[str]]]] = defaultdict(list)
+        blocked: dict[str, list[tuple[str, frozenset[str]]]] = defaultdict(list)
         for tc in cases or []:
-            polarity = _expected_polarity(tc)
-            if polarity is None:
+            resolved = _expected_polarity(tc)
+            if resolved is None:
                 continue
+            polarity, subject = resolved
+            if not subject:
+                continue
+            tc_id = getattr(tc, "tc_id", "") or ""
             for state in _seeded_states(tc):
                 if any(token in state for token in _TERMINAL_STATE_TOKENS):
                     continue
-                (available if polarity == "available" else blocked)[state].append(
-                    getattr(tc, "tc_id", "") or ""
-                )
+                bucket = available if polarity == "available" else blocked
+                bucket[state].append((tc_id, frozenset(subject)))
         for state in sorted(set(available) & set(blocked)):
-            out.append((state, sorted(available[state]), sorted(blocked[state])))
+            # Only a shared subject makes this a contradiction rather than two
+            # unrelated assertions that happen to seed the same status.
+            yes = sorted(
+                {
+                    tc_id
+                    for tc_id, subj in available[state]
+                    if any(subj & other for _o, other in blocked[state])
+                }
+            )
+            no = sorted(
+                {
+                    tc_id
+                    for tc_id, subj in blocked[state]
+                    if any(subj & other for _o, other in available[state])
+                }
+            )
+            if yes and no:
+                out.append((state, yes, no))
     except Exception:
         logger.exception(
             "find_contradictory_state_assumptions failed - returning what was found"

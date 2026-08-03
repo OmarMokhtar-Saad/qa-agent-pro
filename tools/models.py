@@ -273,6 +273,12 @@ class TestSuite(BaseModel):
     # it via getattr.
     _rule_pack_notes: Optional[dict] = PrivateAttr(default=None)
 
+    # Rows for the "Assumed Requirements" sheet: the cases an entailment review
+    # judged ungrounded, moved OFF the executable suite rather than deleted
+    # (QA_HOST_GROUNDING_REVIEW_ENABLED). A PrivateAttr for the same reasons as
+    # the two above -- it must not appear in the JSON schema handed to a model.
+    _assumed_artifacts: Optional[dict] = PrivateAttr(default=None)
+
     @field_validator("test_cases", mode="after")
     @classmethod
     def validate_unique_ids(cls, cases: list[TestCase]) -> list[TestCase]:

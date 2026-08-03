@@ -71,6 +71,10 @@ _MIN_UNIT_CHARS = 8
 # inherit the unbounded intermediate list. Parsing stays linear either way (no
 # ReDoS), but the bound should be structural for untrusted ticket content.
 _MAX_SOURCE_LINES = 2000
+# How many continuation lines a single unterminated table row may absorb. Two
+# covers a hard-wrapped cell; more than that and the "row" is really unrelated
+# content being spliced together (see _join_wrapped_rows).
+_MAX_WRAP_ABSORB = 2
 _MAX_TABLES = 40
 _MAX_ROWS_PER_TABLE = 120
 _MAX_UC_ROWS = 200
@@ -211,47 +215,96 @@ def _join_wrapped_rows(description: str) -> list[str]:
 
     A Jira-rendered table cell can carry a hard newline, which splits ONE row
     across two lines (`| <cell` / ` | <cell> | Checkbox |`). Parsing those
-    separately shifted every later cell by one column and silently dropped the
-    DF01 checkbox labels, so rows are re-assembled before anything else looks at
-    them: a line that opens a row but does not close it absorbs the next line.
+    separately shifts every later cell by one column and silently drops the DF01
+    checkbox labels, so such rows are re-assembled first.
+
+    Joining is BOUNDED and REVERSIBLE, because the naive version ("absorb lines
+    until one ends in a pipe") had two failure modes, both found in review:
+
+    * A table written WITHOUT trailing pipes -- legal GFM, and a common style --
+      made every row look unterminated, so the whole description collapsed into a
+      single line and unit parsing, the enumerations and the source-defect checks
+      all silently returned nothing.
+    * An unterminated row absorbed unrelated later rows, splicing them into one
+      fabricated "requirement" and hiding the very duplicate-id defects this
+      module exists to report.
+
+    So: at most :data:`_MAX_WRAP_ABSORB` continuation lines are absorbed, a line
+    that is itself a complete row or a section marker is never absorbed, and if
+    the row still does not close the ORIGINAL lines are emitted unchanged. A row
+    that legitimately has no trailing pipe is then parsed by
+    :func:`_split_row`, which treats the trailing pipe as optional.
     """
     out: list[str] = []
     try:
-        pending: str | None = None
-        for raw in (description or "").splitlines()[:_MAX_SOURCE_LINES]:
-            line = raw.rstrip()
-            if pending is not None:
-                # Keep the continuation line's leading pipe: it is a real column
-                # separator, and stripping it merged two columns into one.
-                merged = pending + " " + line.lstrip()
-                if merged.rstrip().endswith("|"):
-                    out.append(merged)
-                    pending = None
-                else:
-                    pending = merged
-                continue
+        lines = (description or "").splitlines()[:_MAX_SOURCE_LINES]
+        index = 0
+        while index < len(lines):
+            line = lines[index].rstrip()
             stripped = line.strip()
-            if stripped.startswith("|") and not stripped.endswith("|"):
-                pending = line
+            if not (stripped.startswith("|") and not stripped.endswith("|")):
+                out.append(line)
+                index += 1
                 continue
-            out.append(line)
-        if pending is not None:
-            out.append(pending)
+            # Only a LONE OPENING CELL is a wrapped row. A line with two or
+            # more cells is a complete record written without a trailing pipe,
+            # and treating it as unterminated is what collapsed whole
+            # descriptions. The real Jira wrapping looks like
+            #     | < خطأ في معلومات الطلب>
+            #      | <Incorrect order information > | Checkbox |
+            # so the fragment has ONE cell and its continuation legitimately
+            # looks like a complete row -- which means the continuation cannot be
+            # rejected for looking complete, only the fragment can be rejected
+            # for looking complete.
+            if len(_split_row(line)) != 1:
+                out.append(line)
+                index += 1
+                continue
+            merged = line
+            consumed = 0
+            closed = False
+            while consumed < _MAX_WRAP_ABSORB and index + 1 + consumed < len(lines):
+                nxt = lines[index + 1 + consumed].rstrip()
+                # A "**DF01**"-style marker starts a new table; never absorb it.
+                if _SECTION_ID_RE.match(nxt) or not nxt.strip():
+                    break
+                merged = merged + " " + nxt.lstrip()
+                consumed += 1
+                if merged.rstrip().endswith("|"):
+                    closed = True
+                    break
+            if closed:
+                out.append(merged)
+                index += 1 + consumed
+            else:
+                # Leave it alone -- _split_row tolerates the missing pipe.
+                out.append(line)
+                index += 1
     except Exception:
         logger.exception("_join_wrapped_rows failed - using raw lines")
-        return (description or "").splitlines()
+        return (description or "").splitlines()[:_MAX_SOURCE_LINES]
     return out
 
 
 def _split_row(line: str) -> list[str]:
-    """Cells of a markdown pipe-table row, or [] when the line is not one."""
+    """Cells of a markdown pipe-table row, or [] when the line is not one.
+
+    The trailing pipe is OPTIONAL: `| a | b | c` is as legal in GFM as
+    `| a | b | c |`, and requiring it meant a table in that style produced no
+    rows at all -- which silently disabled every check built on this module.
+    """
     try:
         if _TABLE_SEP_RE.match(line):
             return []
-        match = _TABLE_ROW_RE.match(line)
-        if not match:
+        stripped = (line or "").strip()
+        if not stripped.startswith("|"):
             return []
-        return [_clean_cell(cell) for cell in match.group("body").split("|")]
+        body = stripped[1:]
+        if body.endswith("|"):
+            body = body[:-1]
+        if not body.strip():
+            return []
+        return [_clean_cell(cell) for cell in body.split("|")]
     except Exception:
         return []
 
@@ -380,15 +433,22 @@ class DataFieldTable:
     rows: tuple[tuple[str, str, str], ...]
 
     def enum_values(self) -> set[str]:
-        """English labels of the selectable (Checkbox / Radio) rows."""
+        """Labels of the selectable (Checkbox / Radio) rows, in BOTH languages.
+
+        Both columns count as defined options. Keeping only the English label
+        meant an Arabic-valued case was reported as selecting "an option the
+        ticket does not define" while that exact label sat in the ticket's own
+        Arabic column on the same row -- and bilingual cases are the norm here
+        (``QA_BILINGUAL_RULES``), so that single omission would have fired on
+        most real Arabic suites.
+        """
         out: set[str] = set()
         for ar, en, kind in self.rows:
             if kind.lower().strip() in {"checkbox", "radio", "radio button"}:
-                label = _strip_placeholder_brackets(en) or _strip_placeholder_brackets(
-                    ar
-                )
-                if label:
-                    out.add(label)
+                for raw in (en, ar):
+                    label = _strip_placeholder_brackets(raw)
+                    if label:
+                        out.add(label)
         return out
 
     def allows_free_text(self) -> bool:
@@ -478,7 +538,15 @@ def parse_requirement_units(
 
         def add(kind: str, text: str, explicit_id: str | None = None) -> None:
             body = _clean_cell(text)
-            if len(body) < _MIN_UNIT_CHARS or len(units) >= _MAX_UNITS:
+            if len(body) < _MIN_UNIT_CHARS:
+                return
+            if len(units) >= _MAX_UNITS:
+                if len(units) == _MAX_UNITS:
+                    logger.info(
+                        "parse_requirement_units hit the %d-unit cap - "
+                        "later requirements are not emitted",
+                        _MAX_UNITS,
+                    )
                 return
             if explicit_id:
                 unit_id = explicit_id
@@ -517,7 +585,10 @@ def parse_requirement_units(
             occurrence = seen_tables[table.table_id]
             table_key = table.table_id
             if occurrence > 1:
-                table_key = f"{table.table_id}{chr(ord('a') + occurrence - 1)}"
+                # Numeric, not chr(ord('a') + n): past the 26th occurrence that
+                # produced ids like "DF02|-1", and a pipe inside a unit id
+                # corrupts any pipe-delimited rendering of the traceability matrix.
+                table_key = f"{table.table_id}#{occurrence}"
             for index, (ar, en, kind_label) in enumerate(table.rows, 1):
                 text = " / ".join(p for p in (en, ar) if p)
                 if kind_label:
@@ -680,6 +751,9 @@ def _case_text(tc: TestCase) -> str:
         chunks.append(getattr(step, "expected_result", "") or "")
     for item in getattr(tc, "test_data", None) or []:
         chunks.append(getattr(item, "notes", "") or "")
+        # example_value too: a case whose only mention of the free-text escape
+        # lives in the value itself was still being flagged.
+        chunks.append(getattr(item, "example_value", "") or "")
     return " ".join(chunks)
 
 
@@ -754,6 +828,83 @@ def find_unknown_enum_values(
     except Exception:
         logger.exception("find_unknown_enum_values failed - returning what was found")
     return out
+
+
+# Requirement kinds worth reporting as unaddressed. Flow steps and data-field
+# rows are deliberately EXCLUDED: a single case legitimately covers several steps
+# at once, so listing them produces noise rather than a gap. Business rules and
+# alternative flows are the opposite -- each is a distinct branch a suite can
+# simply forget, and BR-1 ("not all products have cancelation service") is
+# exactly the kind of high-risk rule that went untested on the observed run.
+_COVERAGE_KINDS = frozenset({"business_rule", "alternative_flow"})
+# Suppress the whole report if it would flag more than this share of the eligible
+# units: that means the suite and the ticket use different vocabulary, not that
+# the requirements are untested. Same reasoning as ac_anchor's _MAX_FLAG_RATIO.
+_MAX_UNCOVERED_RATIO = 0.75
+
+
+def find_unaddressed_requirements(
+    units: list[RequirementUnit], cases: list[TestCase]
+) -> list[RequirementUnit]:
+    """Target units of a reportable kind that NO case shares a content word with.
+
+    Deliberately conservative -- a unit is reported only when the overlap with
+    every case is EMPTY -- because this is advisory text a human reads, and a
+    gap report that cries wolf is worse than no gap report. Never raises.
+    """
+    try:
+        eligible = [
+            u
+            for u in units or []
+            if u.is_assignable and u.kind in _COVERAGE_KINDS and u.text
+        ]
+        if not eligible or not cases:
+            return []
+        case_terms: set[str] = set()
+        for tc in cases:
+            case_terms |= {
+                w for w in _WORD_RE.findall(_case_text(tc).lower()) if len(w) > 3
+            }
+        if not case_terms:
+            return []
+        uncovered = []
+        for unit in eligible:
+            terms = {w for w in _WORD_RE.findall(unit.text.lower()) if len(w) > 3}
+            if terms and not (terms & case_terms):
+                uncovered.append(unit)
+        if len(uncovered) > len(eligible) * _MAX_UNCOVERED_RATIO:
+            logger.info(
+                "Uncovered-requirement heuristic flagged %d/%d units - suppressing "
+                "as a vocabulary mismatch rather than a real gap",
+                len(uncovered),
+                len(eligible),
+            )
+            return []
+        return uncovered
+    except Exception:
+        logger.exception("find_unaddressed_requirements failed - reporting none")
+        return []
+
+
+def coverage_warning_section(uncovered: list[RequirementUnit]) -> str:
+    """Advisory markdown listing requirements no case appears to exercise."""
+    try:
+        if not uncovered:
+            return ""
+        lines = [
+            "\n\n## Requirements With No Matching Case (advisory)",
+            "",
+            "Parsed from the ticket, but no generated case mentions them. Confirm "
+            "they are covered or add cases:",
+        ]
+        for unit in uncovered[:10]:
+            lines.append(f"- **{unit.unit_id}**: {unit.text[:160]}")
+        if len(uncovered) > 10:
+            lines.append(f"- ... and {len(uncovered) - 10} more")
+        return "\n".join(lines)
+    except Exception:
+        logger.exception("coverage_warning_section failed - returning empty string")
+        return ""
 
 
 def enum_warning_section(
