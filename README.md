@@ -8,7 +8,9 @@ into professional test-case suites — for both manual and automated
 testing (Excel / CSV / TestRail for manual teams, Gherkin / Playwright
 skeletons for automation).
 
-There is no web UI to run — your AI editor is the interface.
+There is no web UI to run — your AI editor is the interface. There is
+also **no API key to buy and nothing to log in to**: the test cases are
+written by the model you are already chatting with.
 
 ## How it works
 
@@ -38,16 +40,24 @@ and the RAG corpus (`corpus/`) are protected paths.
 |---|---|
 | `qa_generate_test_cases` | Feature text, Jira/issue URL, web page URL, or Swagger/OpenAPI link → structured test suite (steps, expected results, priority, risk) with a persisted `suite_id` |
 | `qa_export_suite` | Export a suite by `suite_id`: `csv`, `xlsx`, `testrail`, `gherkin`, or `playwright` |
-| `qa_feature_analysis` | Enterprise Feature Analysis report from a Jira ticket, captured mobile screens, or both merged — returns a task your chat model answers |
-| `qa_submit_feature_analysis` | Hand back the Feature Analysis JSON your chat model wrote for a `qa_feature_analysis` task; the server validates and renders it |
 | `qa_list_devices` | List connected Android/iOS devices, emulators and simulators |
 | `qa_search_corpus` | Search past generated suites (requires `QA_RAG_ENABLED`) |
-| `qa_setup_check` | Verify this machine: LLM auth, mobile tooling, devices, enabled features |
+| `qa_setup_check` | Verify this machine: version, mobile tooling, devices, enabled features — no credentials to check |
 
 ## Quick start
 
 Requires **Python 3.10+** and `curl` (the installer picks the newest
-suitable `python3.x` on your PATH automatically).
+suitable `python3.x` on your PATH automatically). Check with
+`python3 --version`. If that fails or shows an older version, install
+Python first:
+
+```bash
+# macOS (installs Homebrew first if you don't have it: https://brew.sh)
+brew install python@3.12
+
+# Ubuntu / Debian (incl. WSL)
+sudo apt-get update && sudo apt-get install -y python3.12
+```
 
 **Step 1 — Install.** Run this one command in your terminal:
 
@@ -61,26 +71,18 @@ locks the code files read-only, **and registers the server with Claude
 Code, Cursor, and Claude Desktop automatically** — there is no JSON
 config to copy-paste.
 
-**Step 2 — Add your LLM credentials.** `.env` is a settings file — open
-it in a text editor (don't type its path as a command):
-
-```bash
-nano ~/qa-agent-pro/.env        # or on macOS: open -e ~/qa-agent-pro/.env
-```
-
-Then pick a backend:
-
-- `QA_LLM_BACKEND=cli` (default) — uses your `claude` CLI login; run
-  `claude login` once if you haven't.
-- `QA_LLM_BACKEND=api` — set `ANTHROPIC_API_KEY=sk-ant-...`.
-- `QA_LLM_BACKEND=cursor` — set `CURSOR_API_KEY=...`.
-
-**Step 3 — Restart your editor** (Cursor / Claude Code / Claude
+**Step 2 — Restart your editor** (Cursor / Claude Code / Claude
 Desktop) and try:
 
 > run qa_setup_check
 
 > generate test cases for our new login page
+
+**There is no third step.** No API key, no `claude login`, nothing to
+paste into `.env`. This server does the grounding, the quality checks
+and the exports; the test cases themselves are written by the model in
+your editor, on the plan and schema the server hands it — which is also
+why nothing here is billed to you twice.
 
 ## Connect your editor
 
@@ -129,10 +131,10 @@ Edit `~/qa-agent-pro/.env` (created from `.env.example`):
 
 | Variable | Purpose |
 |---|---|
-| `QA_LLM_BACKEND` | `cli` (claude CLI login), `api` (`ANTHROPIC_API_KEY`), or `cursor` |
+| _(none)_ | No LLM credentials: generation runs in your own chat model, so there is no API key or backend to set |
 | _(none)_ | Jira ticket URLs work via your own Atlassian MCP connection -- no `.env` entry needed |
 | `QA_SWAGGER_ENABLED` | Swagger/OpenAPI link → API test cases |
-| `QA_MOBILE_CAPTURE` | Mobile-screen capture (Android via adb; vision needs `ANTHROPIC_API_KEY`) |
+| `QA_MOBILE_CAPTURE` | Mobile-screen capture (Android via adb). The screenshots are handed to your own chat model, so no API key is involved |
 | `QA_RAG_ENABLED` | Learn from your past suites: grounding + duplicate flagging (on by default) |
 | `QA_MCP_ELICIT_ENABLED` | Interactive pickers in Cursor / Claude Code (on by default; automatic text-menu fallback on clients without dialog support) |
 | `QA_AUTO_EXPORT_XLSX` | Auto-build the Excel file the instant generation finishes; the reply tells you exactly where the `.xlsx` is (on by default) |
@@ -164,8 +166,8 @@ ticket content.
 
 > Generate API test cases from https://api.example.com/v3/api-docs
 
-> Run a feature analysis on the connected Android device together with
-> ticket SHOP-123, then export the suite to xlsx
+> Generate test cases from the screens on my connected Android device,
+> then export the suite to xlsx
 
 ## Updates, versioning & integrity
 
