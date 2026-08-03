@@ -6787,11 +6787,21 @@ def _binary_line(name: str) -> str:
     )
 
 
-async def handle_setup_check(*, progress: ProgressCb = None) -> str:
+async def handle_setup_check(
+    *, progress: ProgressCb = None, workspace_roots: list[Path] | None = None
+) -> str:
     """Machine-readiness report for tester onboarding: environment, LLM
     backend auth, integrations, CLI tooling, and feature gates — summarised
     into an overall verdict plus concrete action items. Read-only and
-    never raises."""
+    never raises.
+
+    ``workspace_roots`` is the tester's OPEN workspace folder(s) as reported by
+    the MCP ``roots`` capability. It is resolved in ``mcp_server.qa_setup_check``
+    (that is where the client Context lives, and tools/jira_mcp.py makes no
+    protocol call of its own) and is forwarded ONLY to ``connect_hint_line``, so
+    the on-disk `atlassian` check looks in the project the tester actually has
+    open instead of guessing. ``None`` = a client without ``roots`` support: the
+    hint falls back to its previous candidate chain."""
     await _audit("mcp_setup_check")
     try:
         from llm import check_backend
@@ -7106,7 +7116,7 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
         # printing "configured" or "verified" here would be a guess, and a
         # confident wrong answer is worse than none. State what is true and
         # point at the one place that gives real guidance.
-        optional.append(connect_hint_line())
+        optional.append(connect_hint_line(workspace_roots=workspace_roots))
         _jira_status_line = (
             "\U0001f517 **Jira** \u2014 read through YOUR Atlassian MCP "
             "connection (OAuth, Jira Cloud). Nothing to configure here; if a "

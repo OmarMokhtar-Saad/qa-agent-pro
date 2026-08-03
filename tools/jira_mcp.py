@@ -707,21 +707,58 @@ def connect_steps() -> str:
     return _CONNECT_STEPS
 
 
-def _local_config_paths(client_key: str) -> list[Path]:
-    """Known on-disk MCP config locations for a client, project-scoped first.
+# Where THIS server's own files live. A module constant rather than an inline
+# expression so tests can point it somewhere harmless -- the same seam
+# tools/updater._INSTALL_DIR already provides.
+_INSTALL_ROOT = Path(__file__).resolve().parent.parent
 
-    Project-scoped config lives in the tester's OPEN EDITOR WORKSPACE, not
-    necessarily where this server's own files are installed -- a dist install
-    lives in a fixed directory (e.g. ~/.qa-agents/), while the tester can have
-    ANY project open in their editor. `Path.cwd()` is checked first because an
-    editor-launched MCP subprocess's working directory is the workspace root;
-    this server's own install directory is checked too since a dev checkout
-    runs the server FROM the workspace, making the two coincide there. Never
-    raises -- an unreadable cwd just drops that candidate.
+# A local mcp.json is a hand-written config file; anything larger than this is
+# not one, and must not be read into memory just to be rejected.
+_MAX_LOCAL_CONFIG_BYTES = 1_000_000
+
+
+def _home_dir() -> Path | None:
+    """The user's home directory, or None when it cannot be determined.
+    Never raises (Path.home() can raise on an environment with no HOME)."""
+    try:
+        return Path.home()
+    except Exception:
+        return None
+
+
+def _local_config_paths(
+    client_key: str, workspace_roots: list[Path] | None = None
+) -> list[Path]:
+    """Known on-disk MCP config locations for a client, most authoritative first.
+
+    Project-scoped config lives in the tester's OPEN EDITOR WORKSPACE, which a
+    stdio subprocess cannot infer on its own. Two guesses shipped on that
+    reasoning and BOTH were confirmed wrong against live qa-agent-pro sessions:
+
+    * this server's own install directory (v1.31.0) -- a dist install lives in a
+      fixed place (e.g. ~/.qa-agents/) while the tester can have ANY project
+      open in their editor;
+    * ``Path.cwd()`` (v1.32.0) -- an editor does NOT reliably spawn the MCP
+      subprocess with the workspace as its working directory, and inside THIS
+      server it is provably useless: mcp_server chdir()s to its own install root
+      at import time, so cwd collapses onto the candidate above.
+
+    The MCP protocol carries the real signal: the client's ``roots`` capability
+    reports the open workspace folder(s). ``mcp_server.qa_setup_check`` resolves
+    it (``ctx.list_roots()``) and threads the result down as ``workspace_roots``,
+    which is checked FIRST. The two guesses stay on as low-priority candidates --
+    a dev checkout runs the server FROM the workspace, so they are right there --
+    and a client with no ``roots`` support passes ``None``, degrading to exactly
+    the previously shipped chain. Never raises: an unreadable cwd, an
+    unknowable home, or a garbage roots entry just drops that candidate.
 
     Only clients with a well-defined local JSON config are covered here --
     Claude Desktop's Atlassian connection is a hosted claude.ai Connector
     with no local file, so it is intentionally absent."""
+    if client_key not in ("cursor", "claude-code"):
+        return []
+
+    parts = (".cursor", "mcp.json") if client_key == "cursor" else (".mcp.json",)
     candidates: list[Path] = []
     seen: set[str] = set()
 
@@ -731,45 +768,66 @@ def _local_config_paths(client_key: str) -> list[Path]:
             seen.add(key)
             candidates.append(path)
 
+    for root in workspace_roots or []:
+        try:
+            _add(Path(root).joinpath(*parts))
+        except Exception:
+            logger.debug("ignoring unusable workspace root %r", root, exc_info=True)
+            continue
+
+    _add(_INSTALL_ROOT.joinpath(*parts))
     try:
-        cwd = Path.cwd()
+        _add(Path.cwd().joinpath(*parts))
     except OSError:
-        cwd = None
-    install_root = Path(__file__).resolve().parent.parent
+        pass
 
     if client_key == "cursor":
-        if cwd is not None:
-            _add(cwd / ".cursor" / "mcp.json")
-        _add(install_root / ".cursor" / "mcp.json")
-        _add(Path.home() / ".cursor" / "mcp.json")
-    elif client_key == "claude-code":
-        if cwd is not None:
-            _add(cwd / ".mcp.json")
-        _add(install_root / ".mcp.json")
+        home = _home_dir()
+        if home is not None:
+            _add(home / ".cursor" / "mcp.json")
     return candidates
 
 
-def _local_atlassian_entry_exists(client_key: str) -> bool:
+def _local_atlassian_entry_exists(
+    client_key: str, workspace_roots: list[Path] | None = None
+) -> bool:
     """Best-effort, read-only check for an 'atlassian' MCP server entry
     already present in a known on-disk config file for this client.
+
+    ``workspace_roots`` (the tester's OPEN workspace, from the MCP ``roots``
+    capability) is searched before the local fallbacks -- see
+    ``_local_config_paths`` for why nothing else on disk can be trusted to be
+    the tester's project.
 
     This can only prove the entry is CONFIGURED, never that it is actually
     CONNECTED/AUTHORIZED -- that live OAuth state lives inside the editor's
     own MCP client runtime, which a sibling stdio process cannot observe.
-    Callers must phrase around that gap. Never raises."""
-    for path in _local_config_paths(client_key):
+    Callers must phrase around that gap. Never raises: an oversized, absent,
+    unreadable or non-object config is skipped, not fatal."""
+    for path in _local_config_paths(client_key, workspace_roots):
         try:
+            if path.stat().st_size > _MAX_LOCAL_CONFIG_BYTES:
+                continue
             data = json.loads(path.read_text(encoding="utf-8"))
             if "atlassian" in (data.get("mcpServers") or {}):
                 return True
-        except (OSError, ValueError, AttributeError):
+        except Exception:
             continue
     return False
 
 
-def connect_hint_line() -> str:
+def connect_hint_line(workspace_roots: list[Path] | None = None) -> str:
     """One-line, client-aware Jira-connect hint for compact reports (e.g.
-    qa_setup_check's optional-items list). Detects the connected MCP client
+    qa_setup_check's optional-items list).
+
+    ``workspace_roots`` are the tester's OPEN workspace folder(s), resolved from
+    the MCP ``roots`` capability by ``mcp_server.qa_setup_check`` and passed
+    straight through to the on-disk lookup -- the only authoritative way to find
+    the project-scoped config a tester would actually edit. ``None`` (a client
+    without ``roots`` support, or a failed lookup) degrades to the
+    install-dir / cwd / global candidate chain exactly as before.
+
+    Detects the connected MCP client
     the same way connect_steps() does and reuses the SAME per-client detail
     text (exact JSON/URL/restart step) as one inline sentence instead of a
     bulleted block, so a tester gets full actionable steps without first
@@ -787,7 +845,9 @@ def connect_hint_line() -> str:
     base = "To paste Jira ticket URLs, connect the Atlassian MCP server"
     if key:
         try:
-            already_configured = _local_atlassian_entry_exists(key)
+            already_configured = _local_atlassian_entry_exists(
+                key, workspace_roots=workspace_roots
+            )
         except Exception:
             already_configured = False
         if already_configured:
