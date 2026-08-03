@@ -709,18 +709,44 @@ def connect_steps() -> str:
 
 def _local_config_paths(client_key: str) -> list[Path]:
     """Known on-disk MCP config locations for a client, project-scoped first.
+
+    Project-scoped config lives in the tester's OPEN EDITOR WORKSPACE, not
+    necessarily where this server's own files are installed -- a dist install
+    lives in a fixed directory (e.g. ~/.qa-agents/), while the tester can have
+    ANY project open in their editor. `Path.cwd()` is checked first because an
+    editor-launched MCP subprocess's working directory is the workspace root;
+    this server's own install directory is checked too since a dev checkout
+    runs the server FROM the workspace, making the two coincide there. Never
+    raises -- an unreadable cwd just drops that candidate.
+
     Only clients with a well-defined local JSON config are covered here --
     Claude Desktop's Atlassian connection is a hosted claude.ai Connector
     with no local file, so it is intentionally absent."""
-    project_root = Path(__file__).resolve().parent.parent
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(path: Path) -> None:
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            candidates.append(path)
+
+    try:
+        cwd = Path.cwd()
+    except OSError:
+        cwd = None
+    install_root = Path(__file__).resolve().parent.parent
+
     if client_key == "cursor":
-        return [
-            project_root / ".cursor" / "mcp.json",
-            Path.home() / ".cursor" / "mcp.json",
-        ]
-    if client_key == "claude-code":
-        return [project_root / ".mcp.json"]
-    return []
+        if cwd is not None:
+            _add(cwd / ".cursor" / "mcp.json")
+        _add(install_root / ".cursor" / "mcp.json")
+        _add(Path.home() / ".cursor" / "mcp.json")
+    elif client_key == "claude-code":
+        if cwd is not None:
+            _add(cwd / ".mcp.json")
+        _add(install_root / ".mcp.json")
+    return candidates
 
 
 def _local_atlassian_entry_exists(client_key: str) -> bool:
