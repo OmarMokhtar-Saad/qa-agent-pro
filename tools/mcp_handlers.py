@@ -64,7 +64,13 @@ from tools.device_manager import (
 from tools.gherkin_exporter import generate_feature_file
 from tools.image_description import describe_images
 from tools.jira_fetcher import fetch_url_content, verify_jira_access
-from tools.jira_mcp import connect_hint_line, connect_steps, not_connected_message
+from tools.jira_mcp import (
+    connect_hint_line,
+    connect_steps,
+    not_connected_message,
+    verify_directive,
+    verify_result_message,
+)
 from tools.playwright_exporter import generate_playwright_script
 from tools.rag_store import add_to_corpus, query_corpus
 from tools.requirement_analyzer import (
@@ -454,7 +460,7 @@ def _test_cases_only() -> bool:
 
 _TEST_CASES_ONLY_NOTICE = (
     "⚠️ This edition generates test cases only — this tool is not available. "
-    "Use qa_generate_test_cases, qa_feature_analysis or qa_export_suite."
+    "Use qa_generate_test_cases or qa_export_suite."
 )
 
 ProgressCb = Optional[Callable[[str], Awaitable[None]]]
@@ -988,6 +994,7 @@ async def handle_configure_jira(
     base_url: str = "",
     email: str = "",
     api_token: str = "",
+    atlassian_verify_json: str = "",
     *,
     verify: bool = True,
     progress: ProgressCb = None,
@@ -1004,6 +1011,14 @@ async def handle_configure_jira(
     no longer use would be the worst outcome: the tester would believe Jira was
     wired up and then get an empty ticket. The arguments are accepted, ignored,
     and never logged or echoed. Never raises.
+
+    2026-08-03 -- this is ALSO the return half of the live connection check.
+    Called with no arguments it now hands the agent a directive to make one
+    read-only ``atlassianUserInfo`` call; called back with that call's raw JSON
+    in ``atlassian_verify_json`` it parses the blob defensively (size-capped,
+    ``json.loads`` only, never eval, no assumed schema) and reports a REAL
+    verified / not-connected verdict. That blob is read once, never persisted
+    and never logged -- only its PRESENCE reaches the audit record.
     """
     try:
         host = ""
@@ -1023,9 +1038,22 @@ async def handle_configure_jira(
                 candidate = base_url if "://" in base_url else "https://" + base_url
                 host = (urlparse(candidate).hostname or "").lower()
         await _emit(progress, "\U0001f517 Checking how Jira is connected\u2026")
+        verification = str(atlassian_verify_json or "").strip()
         await _audit(
-            "mcp_configure_jira", detail={"mode": "mcp", "credentials_stored": False}
+            "mcp_configure_jira",
+            detail={
+                "mode": "mcp",
+                "credentials_stored": False,
+                # PRESENCE only -- the payload itself is never logged.
+                "verification_supplied": bool(verification),
+            },
         )
+        if verification:
+            # Return half of the live check: the AGENT already made the
+            # read-only atlassianUserInfo call with its OWN Atlassian MCP
+            # connection, so all that is left here is parsing what it handed
+            # back. No LLM call, no HTTP request, nothing stored.
+            return verify_result_message(verification)
         preamble = (
             "\u2139\ufe0f **Nothing was saved -- and nothing needs to be.**\n\n"
             if (email or api_token)
@@ -1041,7 +1069,10 @@ async def handle_configure_jira(
             preamble + f"Jira access{where} no longer uses an API token stored on this "
             "machine. It runs through **your own Atlassian MCP connection** "
             "(OAuth, in your editor), so there is nothing to copy, nothing to "
-            "rotate, and your own Jira permissions apply.\n\n" + connect_steps()
+            "rotate, and your own Jira permissions apply.\n\n"
+            + connect_steps()
+            + "\n\n"
+            + verify_directive()
         )
     except Exception as exc:
         logger.exception("handle_configure_jira failed")
@@ -2225,6 +2256,39 @@ _SERVER_LLM_FLAGS_SUBMIT: tuple = (
     ),
 )
 _SERVER_LLM_FLAGS: tuple = _SERVER_LLM_FLAGS_PREPARE + _SERVER_LLM_FLAGS_SUBMIT
+
+def _dist_needs_no_backend() -> bool:
+    """True when NOTHING on this install can reach a server-side LLM backend.
+
+    The test-cases-only (public dist) edition: generation is hardcoded host mode
+    (``_coerce_generation_mode``), the three boomerang gates are hardcoded ON, and
+    since 2026-08-03 the ``qa_feature_analysis`` pair -- whose mobile modes were
+    the last tester-facing ``ask_vision`` caller here -- is not registered. What
+    is left that could still call a backend is exactly ``_SERVER_LLM_FLAGS``,
+    every one of them opt-in and absent from the shipped ``.env``; ANDing them in
+    (rather than hardcoding a second list) means an operator who turns one ON is
+    correctly told the backend matters again.
+
+    Used ONLY to decide whether an unusable backend is a BLOCKER in
+    ``qa_setup_check`` -- the same judgement ``host_llm.server_llm_retired()``
+    already encodes for the kill switch. Deliberately NOT a claim about the
+    kill switch: this does not flip, imply or substitute for
+    QA_SERVER_LLM_ENABLED, whose default flip is gated on a release soak
+    (operations/runbook.md -> Server-LLM retirement rollout gate).
+
+    Never raises, and fails toward reporting the blocker. Always False in the
+    full edition, so the private checkout is byte-identical.
+    """
+    try:
+        if not _test_cases_only():
+            return False
+        return not any(
+            bool(getattr(settings, attr, False))
+            for attr, _env, _what in _SERVER_LLM_FLAGS
+        )
+    except Exception:  # pragma: no cover - a verdict helper must never raise
+        logger.debug("dist backend-optional check failed", exc_info=True)
+        return False
 
 
 def _host_image_forwarding_on() -> bool:
@@ -4797,6 +4861,11 @@ async def handle_submit_suite(
         if (
             settings.qa_feature_analysis_enabled
             and not settings.qa_host_feature_report_enabled
+            # 2026-08-03: the test-cases-only edition no longer registers
+            # qa_feature_analysis, so "call it on demand" would name a tool the
+            # tester's client cannot see. A stale QA_FEATURE_ANALYSIS_ENABLED=true
+            # left in an already-installed .env is exactly how that would happen.
+            and not _test_cases_only()
         ):
             fa_skip_note = (
                 "> \u2139\ufe0f  Feature Analysis report SKIPPED for this "
@@ -6292,6 +6361,14 @@ async def handle_feature_analysis(
     payload, renders it and records the delivered-artifact audit row. A plain
     call with only feature_or_url (no mode, no elicitation) still covers the
     original single-shot text/Jira analysis, now in two steps. Never raises."""
+    # Defence in depth (2026-08-03): mcp_server.py does not REGISTER this tool
+    # in the test-cases-only edition, so this handler is unreachable over MCP
+    # there -- but that edition is credential-free by design and the mobile
+    # modes below call this server's own vision, so the handler refuses on its
+    # own too rather than depending on one registration gate. Same shape as
+    # handle_bug_report / handle_explore_step.
+    if _test_cases_only():
+        return _TEST_CASES_ONLY_NOTICE
     if not settings.qa_feature_analysis_enabled:
         return "ℹ️ Feature Analysis is disabled (set QA_FEATURE_ANALYSIS_ENABLED=true)."
     text = (feature_or_url or "").strip()
@@ -6460,6 +6537,9 @@ async def handle_submit_feature_analysis(
     ``FeatureAnalysisReport`` (unknown keys dropped, no fabrication), renders it
     and records the audit row -- the same side effects the server always owned.
     """
+    # Defence in depth -- see handle_feature_analysis above (2026-08-03).
+    if _test_cases_only():
+        return _TEST_CASES_ONLY_NOTICE
     if not settings.qa_feature_analysis_enabled:
         return "ℹ️ Feature Analysis is disabled (set QA_FEATURE_ANALYSIS_ENABLED=true)."
     task_id = (task_id or "").strip()
@@ -6903,13 +6983,24 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
         # server's own ask_vision), so the 5b/5c convention applies: name the
         # mode and the exact allow-list id HERE rather than let a tester discover
         # it standing at a device. Deliberately NOT inside the
-        # `not _test_cases_only()` block above -- the dist edition ships
-        # feature_analysis.py AND device_manager.py, so this loss is just as real
-        # there. The sibling vision row `ui_extractor.describe_via_vision` gets
-        # NO item, deliberately: it is `migrated` (the rendered page screenshot
-        # rides to the host's own model through IMAGE_JOB on the only route that
-        # reaches it), so an item would invent a loss no tester suffers.
-        if settings.qa_feature_analysis_enabled and settings.qa_mobile_capture:
+        # `not _test_cases_only()` block above, on the grounds that the dist
+        # edition ships feature_analysis.py AND device_manager.py so the loss was
+        # just as real there.
+        # CORRECTION (2026-08-03): that rationale no longer holds. The dist does
+        # not REGISTER qa_feature_analysis / qa_submit_feature_analysis at all,
+        # so naming a mode a dist tester cannot invoke would invent a loss nobody
+        # suffers -- the precise thing this module's disclosure discipline
+        # forbids. It therefore moves INSIDE the edition gate; the full edition
+        # is byte-identical. The sibling vision row
+        # `ui_extractor.describe_via_vision` still gets NO item, deliberately:
+        # it is `migrated` (the rendered page screenshot rides to the host's own
+        # model through IMAGE_JOB on the only route that reaches it), so an item
+        # would invent a loss no tester suffers.
+        if (
+            not _test_cases_only()
+            and settings.qa_feature_analysis_enabled
+            and settings.qa_mobile_capture
+        ):
             from llm import server_llm_enabled as _fa_vision_allowed
 
             if not _fa_vision_allowed("image_description.describe_images"):
@@ -6941,11 +7032,19 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
                 "retired Chainlit UI). Leave it off until the export path is "
                 "re-wired — see docs/FEATURE_FLAGS.md."
             )
-        if not ok and not _host_llm.server_llm_retired():
+        # 2026-08-03: the public dist edition is credential-free by design (see
+        # _dist_needs_no_backend). "Fix the LLM backend -- nothing generates
+        # without it" is then simply FALSE there, and contradicts that build's
+        # own README. So the blocker becomes conditional on BOTH escapes, for
+        # exactly the reason the kill-switch one is already conditional. The
+        # full edition is byte-identical: _dist_needs_no_backend() is always
+        # False there.
+        _backend_optional = _host_llm.server_llm_retired() or _dist_needs_no_backend()
+        if not ok and not _backend_optional:
             blockers.append(
                 "Fix the LLM backend — nothing generates without it. " + warning
             )
-        elif not ok and _host_llm.allowed_paths():
+        elif not ok and _host_llm.server_llm_retired() and _host_llm.allowed_paths():
             # Retired AND allow-listed AND the backend is broken: no longer a
             # blocker (generation runs on the host model), but the allow-listed
             # paths DO still call this backend and will fail, so the diagnostic
@@ -6968,15 +7067,32 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
         # Byte-identical whenever the kill switch is at its default ON.
         if ok:
             _backend_icon, _backend_desc = "\u2705", "ready"
-        elif _host_llm.server_llm_retired():
+        elif _backend_optional:
             _backend_icon = "\u2b1c"
             _backend_desc = (
-                "not required \u2014 server-side LLM calls are retired "
-                "(QA_SERVER_LLM_ENABLED=false) and the tester's own chat "
-                "model does the generation"
+                (
+                    "not required \u2014 server-side LLM calls are retired "
+                    "(QA_SERVER_LLM_ENABLED=false) and the tester's own chat "
+                    "model does the generation"
+                )
+                if _host_llm.server_llm_retired()
+                else (
+                    "not required \u2014 this edition generates test cases "
+                    "only, and your own chat model writes them"
+                )
             )
         else:
             _backend_icon, _backend_desc = "\u274c", warning
+        if not ok and _dist_needs_no_backend() and not _host_llm.server_llm_retired():
+            # Informational, NOT an action item: the verdict is derived from
+            # `recommended` being non-empty, and a correctly credential-free
+            # install must not report "Ready, with warnings" forever.
+            optional.append(
+                "No LLM backend is configured — and this edition does not need "
+                "one. Test cases are written by your own chat model; nothing "
+                "here calls an LLM API on its own. Probe result, for reference: "
+                + warning
+            )
         if restart_note:
             recommended.append(
                 "Quit and reopen the editor once so it reloads the agent's "
@@ -7060,9 +7176,20 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
             "### Feature gates",
         ]
         gates = [
-            (
-                "Feature Analysis (QA_FEATURE_ANALYSIS_ENABLED)",
-                settings.qa_feature_analysis_enabled,
+            # Feature Analysis is a FULL-edition gate only: the test-cases-only
+            # edition does not register its tools (2026-08-03), so listing the
+            # flag there advertises a capability the tester cannot reach -- and
+            # would report a stale QA_FEATURE_ANALYSIS_ENABLED=true as though it
+            # still did something.
+            *(
+                []
+                if _test_cases_only()
+                else [
+                    (
+                        "Feature Analysis (QA_FEATURE_ANALYSIS_ENABLED)",
+                        settings.qa_feature_analysis_enabled,
+                    )
+                ]
             ),
             ("Mobile capture (QA_MOBILE_CAPTURE)", settings.qa_mobile_capture),
             (
@@ -7094,6 +7221,19 @@ async def handle_setup_check(*, progress: ProgressCb = None) -> str:
         _unfinished = await _unfinished_preps_note()
         if _unfinished:
             lines += ["", "### Unfinished host-mode preps", _unfinished.rstrip()]
+        # 2026-08-03: everything Jira-shaped above is this server's BEST GUESS
+        # -- an `atlassian` entry found on disk at most, and nothing at all for
+        # Claude Desktop's hosted Connector. So every report also carries a
+        # directive asking the AGENT to make ONE read-only atlassianUserInfo
+        # call and hand the result back through qa_configure_jira, which turns
+        # the guess into a verified yes/no. Unconditional on purpose: a missing
+        # local config entry is not evidence of absence, and a present one is
+        # not evidence of authorization. Additive -- the optional hint stays.
+        lines += [
+            "",
+            "### Verify the Jira (Atlassian) connection",
+            verify_directive(),
+        ]
         items = (
             [("Fix now", item) for item in blockers]
             + [("Recommended", item) for item in recommended]

@@ -655,7 +655,11 @@ def build_server():
 
     @mcp.tool()
     async def qa_configure_jira(
-        ctx: Context, base_url: str = "", email: str = "", api_token: str = ""
+        ctx: Context,
+        base_url: str = "",
+        email: str = "",
+        api_token: str = "",
+        atlassian_verify_json: str = "",
     ) -> str:
         """DEPRECATED as of 2026-08-01 — Jira needs no credentials here any more.
 
@@ -663,12 +667,25 @@ def build_server():
         (mcp.atlassian.com, OAuth, Jira Cloud). This tool now returns the
         per-client connection steps and stores NOTHING. Do not ask the user for
         an API token, and never invent one. If a ticket URL fails, call
-        qa_prepare_test_cases and follow the directive it returns."""
+        qa_prepare_test_cases and follow the directive it returns.
+
+        It IS still useful for one thing: VERIFYING that connection. Called with
+        no arguments it returns a directive telling you to call
+        mcp__atlassian__atlassianUserInfo (read-only, no parameters). Call it
+        again with atlassian_verify_json set to that call's RAW JSON result — or
+        to {"error": "<what happened>"} when the call fails or the tool does not
+        exist — and the server reports a real verified / not-connected verdict
+        plus the exact connection steps for this editor. The result is read once
+        and discarded; nothing is stored."""
         return await _tracked(
             "qa_configure_jira",
             ctx,
             mcp_handlers.handle_configure_jira(
-                base_url, email, api_token, progress=_make_progress(ctx)
+                base_url,
+                email,
+                api_token,
+                atlassian_verify_json=atlassian_verify_json,
+                progress=_make_progress(ctx),
             ),
         )
 
@@ -800,8 +817,18 @@ def build_server():
             mcp_handlers.handle_setup_check(progress=_make_progress(ctx)),
         )
 
-    # Optional tool — only registered when the Feature Analysis feature is on.
-    if settings.qa_feature_analysis_enabled:
+    # Optional tool — only in the FULL edition, and only when the Feature
+    # Analysis feature is on. 2026-08-03: the public qa-agent-pro build is
+    # deliberately test-cases-only AND credential-free, and this PAIR was the
+    # last tester-facing path there that could reach a server-side LLM backend
+    # (its `mobile` / `jira_mobile` modes describe captured screens through
+    # this server's own ask_vision, tools/image_description.py). The edition
+    # gate outranks the flag on purpose: install.sh seeds .env only when the
+    # file is absent and updates never rewrite it, so every ALREADY-installed
+    # dist still carries QA_FEATURE_ANALYSIS_ENABLED=true from an older
+    # .env.example. Dropping the key from the template alone would leave those
+    # installs exposing both tools.
+    if settings.qa_feature_analysis_enabled and not mcp_handlers._test_cases_only():
 
         @mcp.tool()
         async def qa_feature_analysis(

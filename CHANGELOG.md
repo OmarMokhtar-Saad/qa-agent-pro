@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.29.0] - 2026-08-03
+## [1.30.0] - 2026-08-03
 
 ### Added
 
@@ -13,7 +13,6 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Test-case generation from a feature description, Jira ticket URL, web
   page URL, Swagger/OpenAPI link, or live mobile screens.
 - Suite exports: Excel, CSV, TestRail, Gherkin, Playwright.
-- Feature Analysis report (Jira, mobile screens, or both merged).
 - Live background updates: new releases apply while the editor is
   running — no editor restart needed (GitHub Releases).
 - One-command editor registration (`connect.sh`) for Cursor, Claude Code

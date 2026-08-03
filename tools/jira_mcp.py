@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import llm
@@ -706,15 +707,49 @@ def connect_steps() -> str:
     return _CONNECT_STEPS
 
 
+def _local_config_paths(client_key: str) -> list[Path]:
+    """Known on-disk MCP config locations for a client, project-scoped first.
+    Only clients with a well-defined local JSON config are covered here --
+    Claude Desktop's Atlassian connection is a hosted claude.ai Connector
+    with no local file, so it is intentionally absent."""
+    project_root = Path(__file__).resolve().parent.parent
+    if client_key == "cursor":
+        return [project_root / ".cursor" / "mcp.json", Path.home() / ".cursor" / "mcp.json"]
+    if client_key == "claude-code":
+        return [project_root / ".mcp.json"]
+    return []
+
+
+def _local_atlassian_entry_exists(client_key: str) -> bool:
+    """Best-effort, read-only check for an 'atlassian' MCP server entry
+    already present in a known on-disk config file for this client.
+
+    This can only prove the entry is CONFIGURED, never that it is actually
+    CONNECTED/AUTHORIZED -- that live OAuth state lives inside the editor's
+    own MCP client runtime, which a sibling stdio process cannot observe.
+    Callers must phrase around that gap. Never raises."""
+    for path in _local_config_paths(client_key):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if "atlassian" in (data.get("mcpServers") or {}):
+                return True
+        except (OSError, ValueError, AttributeError):
+            continue
+    return False
+
+
 def connect_hint_line() -> str:
     """One-line, client-aware Jira-connect hint for compact reports (e.g.
     qa_setup_check's optional-items list). Detects the connected MCP client
     the same way connect_steps() does and reuses the SAME per-client detail
     text (exact JSON/URL/restart step) as one inline sentence instead of a
     bulleted block, so a tester gets full actionable steps without first
-    having to paste a Jira URL to trigger connect_steps(). Falls back to a
-    short all-clients summary when the host is empty/unrecognized. Never
-    raises.
+    having to paste a Jira URL to trigger connect_steps(). When an
+    'atlassian' entry is already found on disk, says so instead of telling
+    the tester to add something that is already there -- but never claims
+    it is actually connected, since that cannot be observed from here.
+    Falls back to a short all-clients summary when the host is
+    empty/unrecognized. Never raises.
     """
     try:
         key = _detect_client_key(llm.get_host_client())
@@ -722,6 +757,18 @@ def connect_hint_line() -> str:
         key = ""
     base = "To paste Jira ticket URLs, connect the Atlassian MCP server"
     if key:
+        try:
+            already_configured = _local_atlassian_entry_exists(key)
+        except Exception:
+            already_configured = False
+        if already_configured:
+            return (
+                "An `atlassian` MCP entry is already configured on disk for "
+                f"{key.replace('-', ' ').title()}. I can't tell from here whether "
+                "it's actually authorized - if pasting a Jira ticket URL doesn't "
+                "work, restart your editor (OAuth sessions can also expire and "
+                "need re-authenticating)."
+            )
         detail = _CONNECT_STEPS_BY_CLIENT[key].strip()
         detail = detail.split(" - ", 1)[1] if " - " in detail else detail
         return f"{base} - {detail}"
@@ -743,6 +790,264 @@ def not_connected_message(host: str = "") -> str:
         "I could not find a connected `atlassian` MCP server in this session.\n\n"
         + _CONNECT_STEPS
     )
+
+
+# --------------------------------------------------------------------------- #
+# Live connection verification (the AGENT calls; this server only parses)      #
+# --------------------------------------------------------------------------- #
+
+# 2026-08-03. _local_atlassian_entry_exists() can prove at most that an
+# `atlassian` entry is CONFIGURED in a local mcp.json -- never that it is
+# authorized -- and Claude Desktop's hosted Connector has no local file at all.
+# So "will Jira actually work?" stayed unanswerable from inside this stdio
+# subprocess. The answer is the same boomerang the rest of the codebase uses:
+# hand the CALLING AGENT a directive to make ONE read-only call with its own
+# Atlassian MCP connection, then parse the raw result it hands back. No LLM
+# call, no outbound HTTP from this module, and nothing is persisted.
+
+# The verification blob is UNTRUSTED, but tiny by nature (an identity object or
+# a one-line error marker), so it is capped far below _MAX_PAYLOAD_BYTES before
+# json.loads ever sees it.
+_MAX_VERIFY_CHARS = 4000
+
+# Only short, sanitized FRAGMENTS of that blob are ever echoed to a tester.
+_MAX_ECHO_CHARS = 200
+_MAX_ERROR_ECHO_CHARS = 300
+
+# Read-only, takes no parameters, and cannot fail for "wrong project" reasons --
+# so a failure here really does mean "not connected".
+_VERIFY_TOOL = "atlassianUserInfo"
+
+# The real response shape is not confirmed in this repo and varies by client and
+# by Atlassian MCP version, so every lookup below is best-effort and
+# STRING-only: an unfamiliar payload must yield "" (and the honest "identity
+# payload received") rather than a fabricated name.
+_IDENTITY_NAME_KEYS = ("name", "displayName", "display_name", "nickname")
+_IDENTITY_EMAIL_KEYS = ("email", "emailAddress", "email_address")
+_ERROR_KEYS = ("error", "errors", "errorMessages", "errorMessage", "isError")
+
+
+def verify_tool_name() -> str:
+    """Fully-qualified name of the read-only probe tool the AGENT must call.
+
+    Uses the same client-configurable prefix as every other directive, so the
+    default is exactly ``mcp__atlassian__atlassianUserInfo``.
+    """
+    return f"{_tool_prefix()}{_VERIFY_TOOL}"
+
+
+def verify_directive() -> str:
+    """Directive asking the calling agent to PROVE the Atlassian connection.
+
+    Appended to EVERY qa_setup_check report and to qa_configure_jira's
+    no-argument reply, so the flow is reachable from either entry point.
+    Additive by design: the on-disk best guess (connect_hint_line) still stands
+    beside it, because this only becomes a real status once the agent calls
+    back. Never raises.
+    """
+    try:
+        tool = verify_tool_name()
+        return "\n".join(
+            [
+                "\U0001f9ea **Want a verified answer instead of a guess?** "
+                "Agent: do this now, yourself, without asking the user anything.",
+                "",
+                f"1. Call `{tool}` (no parameters). It is read-only and only "
+                "reports who your Atlassian connection is authenticated as.",
+                "2. Call `qa_configure_jira` again with `atlassian_verify_json` "
+                "set to that call's RAW JSON result (do not summarise, reword "
+                "or truncate it).",
+                f"3. If `{tool}` is not in your tool list, or the call fails, "
+                "call `qa_configure_jira` with "
+                '`atlassian_verify_json={"error": "<what happened>"}` instead '
+                "-- I'll turn that into the exact connection steps for this "
+                "editor.",
+                "",
+                "Nothing from that result is stored: it is read once, reported "
+                "back in the same turn, and discarded.",
+            ]
+        )
+    except Exception:
+        logger.exception("verify_directive failed - falling back to connect steps")
+        return connect_steps()
+
+
+def _sanitize_echo(value: object, limit: int) -> str:
+    """One-line, URL-free, backtick-free, length-capped rendering of an
+    untrusted fragment before it is shown to a tester. Never raises."""
+    try:
+        text = "".join(
+            ch
+            for ch in str(value or "")
+            if ch == " " or (ch.isprintable() and ch != "`")
+        )
+        return _strip_urls(text).strip()[:limit]
+    except Exception:
+        logger.exception("_sanitize_echo failed - dropping the value")
+        return ""
+
+
+def _unwrap_mcp_content(payload: dict) -> dict:
+    """Unwrap ONE level of the MCP tool envelope
+    (``{"content": [{"type": "text", "text": "{...}"}]}``) when that is what
+    the agent handed back instead of the tool's own JSON. Returns the payload
+    unchanged when it is not that shape. Never raises."""
+    try:
+        parts = payload.get("content")
+        if not isinstance(parts, list):
+            return payload
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            inner = json.loads(text)
+            if isinstance(inner, dict):
+                return inner
+        return payload
+    except Exception:
+        logger.debug("_unwrap_mcp_content: not an MCP envelope", exc_info=True)
+        return payload
+
+
+def _identity_label(payload: dict) -> str:
+    """Best-effort ``Name (email)`` for an identity payload, or "".
+
+    STRING fields only, each sanitized, so an unfamiliar shape produces "" and
+    the caller reports "identity payload received" instead of inventing a name.
+    Never raises."""
+    try:
+
+        def _first(keys: tuple[str, ...]) -> str:
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    cleaned = _sanitize_echo(value, _MAX_ECHO_CHARS)
+                    if cleaned:
+                        return cleaned
+            return ""
+
+        name = _first(_IDENTITY_NAME_KEYS)
+        email = _first(_IDENTITY_EMAIL_KEYS)
+        if name and email:
+            return f"{name} ({email})"
+        return name or email
+    except Exception:
+        logger.exception("_identity_label failed - omitting the identity")
+        return ""
+
+
+def _error_text(payload: dict) -> str:
+    """Sanitized failure reason when the payload looks like a failure, else "".
+
+    Recognizes the marker this server ASKS the agent for
+    (``{"error": "..."}``) plus the shapes Jira / MCP themselves use
+    (``errorMessages``, ``isError``). Never raises."""
+    try:
+        for key in _ERROR_KEYS:
+            if key not in payload:
+                continue
+            value = payload.get(key)
+            if value is None or value is False:
+                continue
+            if isinstance(value, (str, list, dict)) and not value:
+                continue
+            if isinstance(value, bool):
+                text = ""
+            elif isinstance(value, list):
+                text = "; ".join(
+                    part
+                    for part in (
+                        _sanitize_echo(item, _MAX_ECHO_CHARS)
+                        for item in value
+                        if isinstance(item, str)
+                    )
+                    if part
+                )
+            elif isinstance(value, dict):
+                text = _sanitize_echo(value.get("message"), _MAX_ERROR_ECHO_CHARS)
+            else:
+                text = _sanitize_echo(value, _MAX_ERROR_ECHO_CHARS)
+            return text or "the call did not come back with an identity"
+        return ""
+    except Exception:
+        logger.exception("_error_text failed - reporting a generic failure")
+        return "the call did not come back with an identity"
+
+
+def verify_result_message(raw: object) -> str:
+    """Turn the agent's raw ``atlassianUserInfo`` result into a verdict.
+
+    Five outcomes, none of which raises and none of which is a dead end:
+
+    * nothing supplied -> the directive again (nothing was actually checked);
+    * an identity payload -> VERIFIED, with a best-effort identity;
+    * an error marker -> NOT CONNECTED, plus this client's connect steps;
+    * an empty object -> an honest "couldn't confirm", plus the hint line;
+    * anything unreadable -> an honest "couldn't read that", plus the hint line.
+
+    The payload is UNTRUSTED: size-capped BEFORE parsing, ``json.loads`` only
+    (never eval), no assumed schema, and every echoed fragment sanitized.
+    Nothing from it is stored or logged. Never raises.
+    """
+    try:
+        text = str(raw or "").strip()
+        if not text:
+            return verify_directive()
+        if len(text) > _MAX_VERIFY_CHARS:
+            return (
+                "\u26a0\ufe0f **That verification result was too long to "
+                f"read** (over {_MAX_VERIFY_CHARS} characters). "
+                f"`{verify_tool_name()}` returns a small identity object -- "
+                "re-run it and pass its raw result, or pass "
+                '`atlassian_verify_json={"error": "<what happened>"}` if the '
+                "call failed.\n\n" + connect_hint_line()
+            )
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1]
+            if text.rstrip().endswith("```"):
+                text = text.rstrip()[:-3]
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict):
+            return (
+                "\u26a0\ufe0f **I couldn't read that verification result**, so "
+                "I still can't confirm the Atlassian connection either way. "
+                f"Re-run `{verify_tool_name()}` and pass its RAW JSON result "
+                "as `atlassian_verify_json`, or pass "
+                '`{"error": "<what happened>"}` if the call failed.\n\n'
+                + connect_hint_line()
+            )
+        payload = _unwrap_mcp_content(payload)
+        failure = _error_text(payload)
+        if failure:
+            return (
+                "\u274c **Not connected** -- that Atlassian call did not "
+                f"return an identity: {failure}\n\n" + connect_steps()
+            )
+        if not payload:
+            return (
+                "\u26a0\ufe0f **That verification result was empty**, so I "
+                "still can't confirm the Atlassian connection. Re-run "
+                f"`{verify_tool_name()}` and pass its RAW JSON result as "
+                "`atlassian_verify_json`.\n\n" + connect_hint_line()
+            )
+        who = _identity_label(payload) or "connected (identity payload received)"
+        return (
+            f"\u2705 **Atlassian verified** -- connected as {who}.\n\n"
+            "Jira ticket URLs will be read through this connection, with your "
+            "own Jira permissions. Nothing was stored: this server holds no "
+            "Jira credential, and it did not keep that identity either."
+        )
+    except Exception:
+        logger.exception("verify_result_message failed - falling back")
+        return (
+            "\u26a0\ufe0f I couldn't read that verification result.\n\n"
+            + connect_steps()
+        )
 
 
 def build_fetch_directive(url: str, issue_key: str = "") -> str:
