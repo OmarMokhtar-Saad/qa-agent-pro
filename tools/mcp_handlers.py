@@ -2257,6 +2257,7 @@ _SERVER_LLM_FLAGS_SUBMIT: tuple = (
 )
 _SERVER_LLM_FLAGS: tuple = _SERVER_LLM_FLAGS_PREPARE + _SERVER_LLM_FLAGS_SUBMIT
 
+
 def _dist_needs_no_backend() -> bool:
     """True when NOTHING on this install can reach a server-side LLM backend.
 

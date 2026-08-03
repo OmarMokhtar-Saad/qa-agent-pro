@@ -714,7 +714,10 @@ def _local_config_paths(client_key: str) -> list[Path]:
     with no local file, so it is intentionally absent."""
     project_root = Path(__file__).resolve().parent.parent
     if client_key == "cursor":
-        return [project_root / ".cursor" / "mcp.json", Path.home() / ".cursor" / "mcp.json"]
+        return [
+            project_root / ".cursor" / "mcp.json",
+            Path.home() / ".cursor" / "mcp.json",
+        ]
     if client_key == "claude-code":
         return [project_root / ".mcp.json"]
     return []
