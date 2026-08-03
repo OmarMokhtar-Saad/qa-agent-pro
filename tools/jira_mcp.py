@@ -706,21 +706,15 @@ def connect_steps() -> str:
     return _CONNECT_STEPS
 
 
-_CONNECT_HINT_SHORT = {
-    "claude-code": "run `/mcp` and authenticate `atlassian`",
-    "claude-desktop": "claude.ai -> Settings -> Connectors -> Atlassian -> Connect",
-    "cursor": "add it to `.cursor/mcp.json` (paste a ticket URL for the exact steps)",
-    "gemini-cli": "`gemini mcp add --transport http atlassian "
-    "https://mcp.atlassian.com/v1/mcp/authv2`",
-}
-
-
 def connect_hint_line() -> str:
     """One-line, client-aware Jira-connect hint for compact reports (e.g.
     qa_setup_check's optional-items list). Detects the connected MCP client
-    the same way connect_steps() does and names only its method; falls back
-    to a short all-clients summary when the host is empty/unrecognized.
-    Never raises.
+    the same way connect_steps() does and reuses the SAME per-client detail
+    text (exact JSON/URL/restart step) as one inline sentence instead of a
+    bulleted block, so a tester gets full actionable steps without first
+    having to paste a Jira URL to trigger connect_steps(). Falls back to a
+    short all-clients summary when the host is empty/unrecognized. Never
+    raises.
     """
     try:
         key = _detect_client_key(llm.get_host_client())
@@ -728,7 +722,9 @@ def connect_hint_line() -> str:
         key = ""
     base = "To paste Jira ticket URLs, connect the Atlassian MCP server"
     if key:
-        return f"{base} - {_CONNECT_HINT_SHORT[key]}. No API token and no .env entry are needed."
+        detail = _CONNECT_STEPS_BY_CLIENT[key].strip()
+        detail = detail.split(" - ", 1)[1] if " - " in detail else detail
+        return f"{base} - {detail}"
     return (
         f"{base} in your editor (Claude Code: `/mcp`; Claude Desktop: Settings > "
         "Connectors; Cursor: edit `.cursor/mcp.json`; Gemini CLI: `gemini mcp add`). "
