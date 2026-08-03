@@ -516,7 +516,7 @@ def build_server():
 
     @mcp.tool()
     async def qa_submit_suite(
-        ctx: Context, prep_id: str = "", suite_json: str = ""
+        ctx: Context, prep_id: str = "", suite_json: str | dict = ""
     ) -> str:
         """Submit a host-generated test suite back to the server to be validated,
         finalized, exported and persisted (the BACK half of host mode).
@@ -524,7 +524,10 @@ def build_server():
         Call this AFTER qa_prepare_test_cases: pass the `prep_id` it returned and
         `suite_json` -- the ONE JSON object you generated from the payload (a
         single merged `test_cases` array conforming to the payload's
-        response_schema). The reply is EITHER the finished suite summary plus the
+        response_schema). Pass it as a JSON OBJECT when your client can send one
+        -- there is no need to serialise it into a string first. A JSON string is
+        still accepted unchanged, so either form works. The reply is EITHER the
+        finished suite summary plus the
         exported file path, OR a short structured list of coverage gaps and vague
         cases to fix; if so, regenerate just those and call this again with the
         SAME prep_id. Relay the file path to the user as the deliverable; do not
@@ -577,14 +580,16 @@ def build_server():
         ctx: Context,
         prep_id: str = "",
         category_name: str = "",
-        suite_json: str = "",
+        suite_json: str | dict = "",
     ) -> str:
         """Submit ONE category's cases for a host that generates incrementally.
 
         Use this for Path A / incremental hosts (including parallel workers that
         stage one category each): pass the `prep_id` from qa_prepare_test_cases,
         the category name (canonical or known alias), and `suite_json` for THAT
-        category. Names are normalized server-side. Re-submitting REPLACES that
+        category -- as a JSON OBJECT when your client can send one, which avoids
+        serialising a large payload into a string argument; a JSON string is still
+        accepted unchanged. Names are normalized server-side. Re-submitting REPLACES that
         category (newest wins). When every expected category is staged, call
         qa_submit_suite with the same prep_id and an EMPTY suite_json. Prefer
         Path B (parent merge + full suite_json) when host dedup/coverage review

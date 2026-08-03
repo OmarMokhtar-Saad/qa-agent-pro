@@ -506,6 +506,25 @@ def main() -> int:
             log.info("Startup update check: %s", status)
         except Exception as exc:  # never block startup
             log.warning("Update check failed (%s) — starting current version.", exc)
+        # Fix 7: pick up an editor installed AFTER this server was. A
+        # SEPARATE step from the update check on purpose -- code integrity
+        # and editor registration must not gate one another through
+        # QA_AUTO_UPDATE_ENABLED. insert_only, so an entry a tester edited
+        # by hand is never rewritten. Never blocks startup.
+        try:
+            from config.settings import settings as _s
+
+            if bool(getattr(_s, "qa_auto_register_clients", False)):
+                from tools.client_registry import register_all
+
+                _start = str(INSTALL_DIR / "start.sh")
+                for _label, _status, _detail in register_all(
+                    _start, insert_only=True
+                ):
+                    if _status in ("added", "error"):
+                        log.info("MCP registration: %s: %s (%s)", _label, _status, _detail)
+        except Exception as exc:  # never block startup
+            log.warning("Client registration pass failed (%s).", exc)
     sup = Supervisor()
     if resume_path:
         try:
