@@ -45,6 +45,7 @@ import logging
 import re
 from urllib.parse import parse_qs, urlparse
 
+import llm
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -623,32 +624,85 @@ def _issue_fields(issue: object) -> dict:
 # Tester-facing messages                                                       #
 # --------------------------------------------------------------------------- #
 
-_CONNECT_STEPS = (
-    "**How to connect Atlassian (one time, ~1 minute):**\n"
+_CONNECT_PREAMBLE = "**How to connect Atlassian (one time, ~1 minute):**\n"
+
+_CONNECT_STEP_CLAUDE_CODE = (
     "- **Claude Code** - make sure `.mcp.json` has the `atlassian` entry "
     '(`{"type": "http", "url": "https://mcp.atlassian.com/v1/mcp/authv2"}`), '
     "then run `/mcp` and authenticate `atlassian` in the browser window it opens.\n"
+)
+_CONNECT_STEP_CLAUDE_DESKTOP = (
     "- **Claude Desktop** - claude.ai -> **Settings -> Connectors -> Atlassian -> "
     "Connect**, then reopen the desktop app.\n"
-    "- **Cursor** - **Settings -> Features -> MCP -> Add Server**, type `http`, URL "
-    "`https://mcp.atlassian.com/v1/mcp/authv2`; Cursor completes OAuth automatically "
-    "on the first 401/`WWW-Authenticate` challenge.\n"
+)
+_CONNECT_STEP_CURSOR = (
+    "- **Cursor** - Cursor's settings menu path for this moves between versions, so "
+    "edit the config file directly: add to `.cursor/mcp.json` (project) or "
+    "`~/.cursor/mcp.json` (global) under `mcpServers`: "
+    '`"atlassian": {"type": "http", "url": "https://mcp.atlassian.com/v1/mcp/authv2"}`, '
+    "then restart Cursor - it completes OAuth automatically on the first "
+    "401/`WWW-Authenticate` challenge. (Newer versions also expose this under "
+    "**Settings -> Tools & MCP** or the **Customize** page.)\n"
+)
+_CONNECT_STEP_GEMINI_CLI = (
     "- **Gemini CLI** - `gemini mcp add --transport http atlassian "
     "https://mcp.atlassian.com/v1/mcp/authv2`, then re-run and approve the browser "
-    "consent screen.\n\n"
-    "Jira **Cloud** only. Once `atlassian` shows as connected, paste the ticket URL "
+    "consent screen.\n"
+)
+_CONNECT_CLOSING = (
+    "\nJira **Cloud** only. Once `atlassian` shows as connected, paste the ticket URL "
     "again and I'll read it through your own connection - no API token, and nothing "
     "is stored on this machine."
 )
+
+_CONNECT_STEPS_BY_CLIENT = {
+    "claude-code": _CONNECT_STEP_CLAUDE_CODE,
+    "claude-desktop": _CONNECT_STEP_CLAUDE_DESKTOP,
+    "cursor": _CONNECT_STEP_CURSOR,
+    "gemini-cli": _CONNECT_STEP_GEMINI_CLI,
+}
+
+_CONNECT_STEPS = (
+    _CONNECT_PREAMBLE
+    + _CONNECT_STEP_CLAUDE_CODE
+    + _CONNECT_STEP_CLAUDE_DESKTOP
+    + _CONNECT_STEP_CURSOR
+    + _CONNECT_STEP_GEMINI_CLI
+    + _CONNECT_CLOSING
+)
+
+
+def _detect_client_key(host: str) -> str:
+    """Best-effort match of an MCP clientInfo.name to one of the 4 documented
+    clients. Returns '' when the host is empty/unrecognized (caller should
+    fall back to showing all four)."""
+    h = (host or "").strip().lower()
+    if "cursor" in h:
+        return "cursor"
+    if "gemini" in h:
+        return "gemini-cli"
+    if "desktop" in h:
+        return "claude-desktop"
+    if "claude" in h:
+        return "claude-code"
+    return ""
 
 
 def connect_steps() -> str:
     """Per-client Atlassian MCP connection instructions, with no error framing.
 
-    Single source of truth shared by the fetch directive, the not-connected
-    message and ``qa_configure_jira``'s migration notice, so the four supported
-    clients are documented in exactly ONE place. Never raises.
+    Detects the connected MCP client (forwarded from the initialize handshake
+    via llm.set_host_client) and returns ONLY that client's steps when
+    recognized, so testers aren't shown instructions for editors they don't
+    use. Falls back to all four clients when the host is empty/unrecognized.
+    Never raises.
     """
+    try:
+        key = _detect_client_key(llm.get_host_client())
+    except Exception:
+        key = ""
+    if key:
+        return _CONNECT_PREAMBLE + _CONNECT_STEPS_BY_CLIENT[key] + _CONNECT_CLOSING
     return _CONNECT_STEPS
 
 

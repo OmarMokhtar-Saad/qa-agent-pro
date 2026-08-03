@@ -306,6 +306,15 @@ def set_host_client(name: str) -> None:
     _HOST_CLIENT["name"] = (name or "").strip().lower()
 
 
+def get_host_client() -> str:
+    """Return the connected MCP client's name (lowercased), or '' if unknown.
+
+    Read-only counterpart to set_host_client; lets other modules (e.g.
+    tools/jira_mcp.py's connect instructions) tailor tester-facing text to
+    the actual editor in use. Never raises."""
+    return _HOST_CLIENT["name"]
+
+
 def _cli_available() -> bool:
     """Claude CLI binary resolvable? Never raises (unlike _get_cli, which raises
     when it cannot resolve) so the usability probes below can call it safely.
