@@ -1278,8 +1278,7 @@ async def _elicit_source_plan(choose: ChooseCb, ask_text: AskCb) -> str:
     dead-ends."""
     picked = await _elicit_choice(
         choose,
-        "I cannot read images out of Jira -- where do this ticket's screens "
-        "come from?",
+        "I cannot read images out of Jira -- where do this ticket's screens come from?",
         list(_IMAGE_SOURCE_LABELS),
     )
     if picked.status == CHOSEN:
@@ -1396,8 +1395,7 @@ def _image_gate_second_beat(
         promised = ""
         if plan in ("jira_attach", "jira_device", "jira_both", "device"):
             promised = (
-                " You picked a plan that included images, but none of them "
-                "reached me."
+                " You picked a plan that included images, but none of them reached me."
             )
         return (
             "## ⏸️ One decision before I generate: the ticket's screens\n\n"
@@ -3234,9 +3232,7 @@ async def handle_prepare_test_cases(
         # The captures are still in the tray (peeked, not popped), so re-sending
         # the same capture_ids works.
         if getattr(settings, "qa_image_gate_enabled", True) and not image_gate_ack:
-            _img_n, _img_names, _img_kind = _ticket_image_evidence(
-                grounded.url_content
-            )
+            _img_n, _img_names, _img_kind = _ticket_image_evidence(grounded.url_content)
             _beat2 = _image_gate_second_beat(
                 count=_img_n,
                 names=_img_names,
@@ -3683,9 +3679,7 @@ async def handle_prepare_test_cases(
         logger.exception("handle_prepare_test_cases failed")
         _capture_error(exc, "qa_prepare_test_cases")
         return PreparePayloadResult(
-            clarify=(
-                f"⚠️ Preparation failed: {exc}" + _capture_retry_hint(capture_ids)
-            )
+            clarify=(f"⚠️ Preparation failed: {exc}" + _capture_retry_hint(capture_ids))
         )
 
 
@@ -6993,9 +6987,7 @@ async def handle_capture_screens(
             "`qa_generate_test_cases`) with the feature description or Jira URL "
             f"plus `capture_ids=[{id_list}]`. The ids stay valid until a "
             "preparation actually uses them and expire in "
-            f"{_CAPTURE_TRAY_TTL_S // 60} minutes."
-            + clamp_note
-            + note,
+            f"{_CAPTURE_TRAY_TTL_S // 60} minutes." + clamp_note + note,
             specs,
         )
     except Exception as exc:
@@ -8318,13 +8310,98 @@ def _ac_field_section() -> list[str]:
         return []
 
 
+async def _atlassian_autofix() -> tuple[list[str], list[str]]:
+    """Write the hosted `atlassian` MCP entry when missing. (report_lines, advisories).
+
+    WHY THIS LIVES IN THE SETUP CHECK AT ALL. v1.42.0 taught connect.sh/.ps1 to
+    write the entry, but connect runs only from install.ps1 or by hand, the
+    launcher's startup pass registers THIS server and nothing else, and the updater
+    never calls connect -- so an install that AUTO-UPDATED into v1.42.0 received
+    the code and none of the behaviour. Observed on a Windows machine that went
+    1.41.2 -> 1.42.0 and still reported "Not connected" while telling the tester to
+    hand-edit ~/.cursor/mcp.json. Every UPGRADING install was unreachable; only
+    fresh ones were fixed, which is the opposite of where the users are.
+
+    WHY THIS IS ALLOWED TO WRITE OUTSIDE THE INSTALL DIR, when
+    QA_AUTO_REGISTER_CLIENTS defaults OFF for doing the same class of thing: that
+    flag guards an UNATTENDED startup pass -- "a server that inserts itself into
+    other editors' configs whenever it starts" -- and that pass is untouched here.
+    This runs only because a tester invoked this tool BY NAME, and the write is
+    disclosed in the very response they are already reading. Secondarily it is the
+    same disclosure shape QA_ENV_SELFHEAL_ENABLED already uses when this tool
+    repairs the install's own .env, though that file is INSIDE the install dir, so
+    that precedent supports the shape, not the location.
+
+    It writes the entry; it does NOT authorize it. OAuth is the tester's click and
+    cannot be observed from a stdio subprocess, so nothing here may report Jira as
+    connected -- the same line tools/jira_mcp.connect_hint_line() already walks.
+
+    No pre-check on purpose: register_atlassian() already returns PRESENT for an
+    existing entry, so calling it unconditionally is both idempotent and free of a
+    check-then-act race. Never raises -- a failure costs one advisory line, never
+    the report.
+
+    An advisory is NOT verdict-neutral: the verdict below reads "Ready, with
+    warnings" whenever `recommended` is non-empty. That is intended here, because
+    an unwritable entry costs the tester Jira grounding and comes with a concrete
+    paste-this action. It is never a BLOCKER -- a Jira convenience cannot make an
+    otherwise healthy install report "Not ready".
+    """
+    try:
+        if not getattr(settings, "qa_register_atlassian_mcp", False):
+            return [], []
+        from tools.client_registry import ADDED, ERROR, register_atlassian
+
+        # to_thread because it takes a file lock, exactly as heal_env is called.
+        results = await asyncio.to_thread(register_atlassian)
+        lines: list[str] = []
+        advisories: list[str] = []
+        for label, status, detail in results:
+            if status == ADDED:
+                if not lines:
+                    # Header hoisted out of the per-client body: one target exists
+                    # today, but a second would otherwise repeat the heading.
+                    lines.append("### Jira connection configured")
+                    lines.append("")
+                lines.append(
+                    f"- Added the `atlassian` MCP entry for {label} \u2014 "
+                    f"`{detail}`. Your previous file was backed up alongside it "
+                    "as `.bak`, and any other MCP servers in it were left alone."
+                )
+            elif status == ERROR:
+                advisories.append(
+                    f"Could not add the `atlassian` MCP entry for {label} "
+                    f"({detail}). Add it under `mcpServers` yourself, then restart: "
+                    '`"atlassian": {"type": "http", "url": '
+                    '"https://mcp.atlassian.com/v1/mcp/authv2"}`'
+                )
+        if lines:
+            lines.append("")
+            lines.append(
+                "_One step is still yours: **restart your editor**, then paste "
+                "a ticket URL \u2014 the first one opens the Atlassian sign-in "
+                "prompt. I can write the entry, but I cannot sign you in, and "
+                "I cannot see from here whether it worked._"
+            )
+            lines.append("")
+        return lines, advisories
+    except Exception:
+        logger.debug("atlassian autofix failed - skipping it", exc_info=True)
+        return [], []
+
+
 async def handle_setup_check(
     *, progress: ProgressCb = None, workspace_roots: list[Path] | None = None
 ) -> str:
     """Machine-readiness report for tester onboarding: environment, LLM
     backend auth, integrations, CLI tooling, and feature gates — summarised
-    into an overall verdict plus concrete action items. Read-only and
-    never raises.
+    into an overall verdict plus concrete action items. Never raises.
+
+    **Not read-only**, since 2026-08-04: it repairs superseded defaults in the
+    install's own `.env` (`QA_ENV_SELFHEAL_ENABLED`) and writes a missing
+    `atlassian` MCP entry to the editor's config (`QA_REGISTER_ATLASSIAN_MCP`).
+    Both are disclosed in the report rather than done silently, both are gated by a
+    flag, and neither touches the unattended startup pass.
 
     ``workspace_roots`` is the tester's OPEN workspace folder(s) as reported by
     the MCP ``roots`` capability. It is resolved in ``mcp_server.qa-doctor``
@@ -8663,6 +8740,11 @@ async def handle_setup_check(
                 recommended.append(_split)
         except Exception:
             logger.debug("split-server check failed", exc_info=True)
+        # BEFORE connect_hint_line, deliberately: that helper re-reads the config
+        # from disk, so a fresh write flips its message to "already configured on
+        # disk" instead of telling the tester to add what was just added.
+        _atlassian_lines, _atlassian_advisories = await _atlassian_autofix()
+        recommended.extend(_atlassian_advisories)
         optional.append(connect_hint_line(workspace_roots=workspace_roots))
         # Fix 7 / M3 (2026-08-03): the ONLY discoverable path to registration.
         # QA_AUTO_REGISTER_CLIENTS defaults OFF (it writes outside the install
@@ -8761,6 +8843,7 @@ async def handle_setup_check(
             *([restart_note, ""] if restart_note else []),
             *([reload_note, ""] if reload_note else []),
             *heal_lines,
+            *_atlassian_lines,
             "### Environment",
             f"- {'✅' if py_ok else '❌'} **Python** {py_version}"
             + ("" if py_ok else " — 3.10 or newer required"),

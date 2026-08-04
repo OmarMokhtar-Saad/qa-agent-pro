@@ -847,6 +847,22 @@ class Settings(BaseSettings):
     #
     # It authorizes NOTHING: OAuth still needs one click in the editor, and
     # Claude Desktop's hosted Connector has no file to write at all.
+    #
+    # 2026-08-04, same day: this ALSO governs qa-doctor, which now writes the entry
+    # itself when it is missing. Not scope creep -- v1.42.0 could not reach the
+    # installs that needed it. connect.sh/.ps1 run only from the installer or by
+    # hand, the startup pass above registers THIS server and nothing else, and the
+    # updater never calls connect, so an install that auto-updated into v1.42.0 got
+    # the code and none of the behaviour. A Windows machine on 1.42.0 still read
+    # "Not connected -- add this to ~/.cursor/mcp.json". Only fresh installs were
+    # fixed, which is the opposite of where the users are.
+    #
+    # Note the apparent contradiction with qa_auto_register_clients above, which
+    # defaults OFF for writing outside the install dir. The distinguishing line is
+    # INVOKED vs SILENT, not the file's location: that flag guards a pass that runs
+    # "whenever it starts", unattended; this one runs because a tester asked this
+    # tool for a report, and the write is disclosed in that same report. The
+    # startup pass is still untouched.
     qa_register_atlassian_mcp: bool = True
 
     # Surgical quality retry (opt-in, both default OFF -- see
