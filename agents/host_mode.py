@@ -607,9 +607,10 @@ _HOST_PARALLEL_INSTRUCTION = (
     "the merged suite's global tc_ids), then call `qa_submit_suite` with this "
     "prep_id and the merged suite_json. Nothing is saved until that one call, "
     "so an interrupted chat loses every worker's output.\n"
-    "5. Optional: `qa_get_category_job(prep_id, category_name)` returns one "
-    "self-contained job packet (system_prompt + user_context + instruction + "
-    "schema) so a worker need not re-parse the full prepare blob.\n"
+    "5. Optional: `qa_get_category_job(prep_id, \"all\")` returns EVERY job "
+    "packet in ONE call, with the shared prompt blocks hoisted once; a "
+    "single category_name returns one packet. NEVER fetch packets one "
+    "call per category -- an observed run spent 8 round trips on that.\n"
     "6. STEP-ZERO JOBS COME FIRST, AND ONLY IN THE PARENT. If this payload "
     "carries `jobs_to_run`, run every entry whose stage is `step_zero` "
     "YOURSELF, in the parent turn, in `order`, BEFORE launching any worker -- "
@@ -870,6 +871,51 @@ def build_category_job(prepared, prep_id: str, category_name: str) -> dict | Non
         }
     except Exception:
         logger.warning("build_category_job failed", exc_info=True)
+        return None
+
+
+def build_category_jobs_batch(prepared, prep_id: str) -> dict | None:
+    """EVERY category job in ONE packet, shared fields hoisted once.
+
+    2026-08-04: the 22:11 Cursor run made 8 sequential qa_get_category_job
+    calls (22:19:58-22:20:14) after a 2-minute re-read of the prepare blob.
+    One fetch carries the same information with the big shared blocks
+    (system_prompt, user_context, response_schema, worker_instructions)
+    stated ONCE instead of 8 times: ``shared`` + one ``jobs[]`` entry is
+    byte-equivalent to the single-category packet. Never raises; None when
+    the prep carries no usable categories."""
+    try:
+        names = [c[0] for c in getattr(prepared, "categories", None) or []]
+        shared = None
+        jobs = []
+        for name in names:
+            job = build_category_job(prepared, prep_id, name)
+            if job is None:
+                continue
+            if shared is None:
+                shared = {
+                    "prep_id": job["prep_id"],
+                    "system_prompt": job["system_prompt"],
+                    "user_context": job["user_context"],
+                    "untrusted_data_notice": job["untrusted_data_notice"],
+                    "response_schema": job["response_schema"],
+                    "min_cases": job["min_cases"],
+                    "max_cases": job["max_cases"],
+                    "acceptance_criteria": job["acceptance_criteria"],
+                    "worker_instructions": job["worker_instructions"],
+                }
+            jobs.append(
+                {
+                    "category_name": job["category_name"],
+                    "instruction": job["instruction"],
+                    "preferred_type": job["preferred_type"],
+                }
+            )
+        if shared is None or not jobs:
+            return None
+        return {"shared": shared, "jobs": jobs}
+    except Exception:
+        logger.warning("build_category_jobs_batch failed", exc_info=True)
         return None
 
 

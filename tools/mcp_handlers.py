@@ -4240,6 +4240,24 @@ async def handle_get_category_job(prep_id: str, category_name: str) -> str:
         # disclosure needs it to SEE this exact shape) and never raises, so the
         # fetch is never blocked by it.
         await prep_store.touch_prep(prep_id)
+        if category_name.lower() in ("all", "*"):
+            import json as _json
+
+            batch = host_mode.build_category_jobs_batch(prepared, prep_id)
+            if batch is None:
+                return f"⚠️ No category jobs available for prep_id `{prep_id}`."
+            _n = len(batch["jobs"])
+            return (
+                f"## Category jobs — ALL {_n} categories (one fetch)\n\n"
+                f"`prep_id`: `{prep_id}`\n\n"
+                "`shared` applies to EVERY job; `shared` plus one `jobs[]` "
+                "entry is the same packet the single-category form returns. "
+                "Launch ONE worker per `jobs[]` entry IN PARALLEL now — do "
+                "not fetch categories one call at a time.\n\n"
+                "```json\n"
+                + _json.dumps(batch, ensure_ascii=False, indent=2)
+                + "\n```\n"
+            )
         job = host_mode.build_category_job(prepared, prep_id, category_name)
         if job is None:
             return (
