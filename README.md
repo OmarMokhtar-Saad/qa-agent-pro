@@ -116,17 +116,67 @@ why nothing here is billed to you twice.
 
 ## Windows
 
-**Native Windows, no WSL, no administrator rights.** Run this in
-PowerShell:
+**Native Windows. No WSL, no administrator rights, and no Python needed
+up front.** Two commands in PowerShell -- this exact sequence is verified
+end to end on Windows 11 (build 22631) with a non-admin account and no
+Python installed:
+
+**1. Install `uv`** -- per-user, and it is how the installer gets Python:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+uv finishes by warning that `C:\Users\YOU\.local\bin` is not on your PATH.
+**Ignore that.** You do NOT need to run `uv python install`, and you do NOT
+need to open a new window: the installer looks for uv there directly and
+fetches Python 3.12 itself. Already have Python 3.10+? Skip this step.
+
+**2. Install QA Agent Pro:**
 
 ```powershell
 powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/OmarMokhtar-Saad/qa-agent-pro/main/install.ps1 | iex"
 ```
 
-It installs to `%USERPROFILE%\qa-agent-pro` (override with
-`QA_INSTALL_DIR`), creates a private virtualenv, and registers Claude
-Code, Cursor and Claude Desktop for you -- writing nothing outside your
-own profile. Then restart your editor and ask `run qa_setup_check`.
+A successful run looks like this:
+
+```text
+No Python found, but uv is installed -- fetching Python 3.12 ...
+Installed Python 3.12.13 in 17.03s
+Using Python interpreter: C:\Users\YOU\AppData\Roaming\uv\python\...\python.exe
+Fetching the latest release of OmarMokhtar-Saad/qa-agent-pro ...
+Creating virtualenv + installing dependencies (a few minutes) ...
+
+Installed QA Agent Pro vX.Y.Z to C:\Users\YOU\qa-agent-pro
+
+Registering with your AI editors ...
+  - Claude Code: 'claude' CLI not found - skipped
+  + Cursor: added (C:\Users\YOU\.cursor\mcp.json)
+  + Claude Desktop: added (C:\Users\YOU\AppData\Roaming\Claude\claude_desktop_config.json)
+```
+
+`Claude Code: ... skipped` is normal unless you use the Claude CLI.
+Everything lands in `%USERPROFILE%\qa-agent-pro` (override with
+`QA_INSTALL_DIR`); nothing is written outside your own user profile, and
+you are never prompted to elevate.
+
+**3. Restart Cursor / Claude Desktop**, then ask it:
+
+> run qa_setup_check
+
+> generate test cases for our new login page
+
+### Windows troubleshooting
+
+Every row here is an error a real tester hit, in order:
+
+| What you see | What it means |
+|---|---|
+| `'sh' is not recognized ...` | You ran a macOS/Linux command in CMD. Use the PowerShell one-liners above. |
+| `The requested operation requires elevation` | That is `wsl --install`, and it is the ONE thing here needing admin. You do not need WSL at all -- use the native path above. |
+| `Python was not found; run without arguments to install from the Microsoft Store` | That is the App Execution Alias, not a real Python. Do step 1. |
+| `'uv' is not recognized ...` right after uv installed fine | uv's installer does not update the PATH of the window you are already in. You do not need uv on PATH -- just run step 2. |
+| `... already exists` | An install is already there. Updates are automatic, so nothing to do; `QA_FORCE=1` reinstalls from scratch. |
 
 Windows entry points, if you ever need them by hand:
 
@@ -136,20 +186,9 @@ Windows entry points, if you ever need them by hand:
 | `install.ps1` | The installer above |
 | `connect.ps1` | Re-register your editors (`powershell -ExecutionPolicy Bypass -File %USERPROFILE%\qa-agent-pro\connect.ps1`) |
 
-**Python first, if you don't have 3.10+.** All three of these are
-per-user and need NO admin: the python.org installer with *Install for
-all users* unchecked, the Microsoft Store build, or `uv`:
-
-```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://astral.sh/uv/install.ps1 | iex"
-uv python install 3.12
-```
-
-You can stop after the first line: if `uv` is present but has no
-interpreter yet, the installer fetches Python 3.12 through it for you. It
-also finds an already-installed uv Python, which nothing else does -- uv
-keeps those where neither `PATH` nor the `py` launcher looks, and uv's own
-installer does not touch the PATH of the window you are typing in.
+Other no-admin ways to get Python, if you would rather not use uv: the
+python.org installer with *Install for all users* unchecked, or the
+Microsoft Store build. Both are per-user and the installer finds either.
 
 One Windows-only caveat: a launcher update applies on your next editor
 start rather than live. Windows cannot re-exec a process in place, and
