@@ -485,11 +485,38 @@ class Supervisor:
 
 
 def main() -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(levelname)s %(name)s: %(message)s",
-        stream=sys.stderr,
-    )
+    # stderr is rendered as '[error] ...' by MCP clients (Cursor showed
+    # every updater INFO line as an error on the v1.38.0 validation run),
+    # so stderr carries WARNING+ only and the INFO trail goes to
+    # data/logs/launcher.log. The threshold must sit on the HANDLER: a
+    # root-level threshold alone re-leaks INFO the moment the root drops
+    # to INFO for the file handler.
+    _stderr = logging.StreamHandler(sys.stderr)
+    _stderr.setLevel(logging.WARNING)
+    _stderr.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    _root = logging.getLogger()
+    _root.setLevel(logging.INFO)
+    _root.addHandler(_stderr)
+    try:
+        from logging.handlers import RotatingFileHandler
+
+        _log_dir = INSTALL_DIR / "data" / "logs"
+        _log_dir.mkdir(parents=True, exist_ok=True)
+        _fh = RotatingFileHandler(
+            str(_log_dir / "launcher.log"),
+            maxBytes=1024 * 1024,
+            backupCount=2,
+            encoding="utf-8",
+        )
+        _fh.setLevel(logging.INFO)
+        _fh.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        _root.addHandler(_fh)
+    except Exception:  # a log-file failure must never block startup
+        _stderr.setLevel(logging.INFO)
+    for _noisy in ("httpx", "httpcore"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
     resume_path = ""
     if "--resume" in sys.argv:
         try:

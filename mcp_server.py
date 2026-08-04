@@ -1008,8 +1008,11 @@ def _configure_logging() -> None:
             "Could not open data/logs/qa-agents.log -- keeping INFO on stderr."
         )
     # Third-party request logging is diagnostic noise at INFO (one line per
-    # telemetry POST); real problems still surface at WARNING+.
-    for noisy in ("httpx", "httpcore"):
+    # telemetry POST); real problems still surface at WARNING+. FastMCP is in
+    # the list because it attaches its OWN rich handler (bypassing the root
+    # config above), so its INFO transport banner still reached stderr on the
+    # v1.38.0 validation run.
+    for noisy in ("httpx", "httpcore", "FastMCP"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
