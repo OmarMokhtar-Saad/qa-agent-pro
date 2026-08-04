@@ -1034,6 +1034,19 @@ class Settings(BaseSettings):
     # export error only appends a warning note.
     qa_auto_export_xlsx: bool = True
 
+    # 2026-08-04 (user-approved): qa_setup_check repairs values in the install's
+    # own .env that are still EXACTLY a default this project shipped and later
+    # superseded (tools/env_heal.HEAL_RULES). ON by default, and a deliberate
+    # exception to the defaults-OFF rule for the same reason as
+    # qa_auto_export_xlsx: a default-OFF switch would never be found by the
+    # non-technical testers it exists for, and updater.migrate_env cannot do this
+    # job -- it only APPENDS missing keys and never rewrites a line, so a stale
+    # 1500 or an inherited `false` outlives every release. A value the operator
+    # chose is never touched, a commented-out key is treated as a deliberate
+    # opt-out, and the file is backed up before any write.
+    # Set QA_ENV_SELFHEAL_ENABLED=false to disable.
+    qa_env_selfheal_enabled: bool = True
+
     # Export the computed risk label/score into the XLSX Notes column (opt-in,
     # default OFF). tools/risk_scorer.py scores EVERY suite and the sheet's row
     # order IS the risk order (TC-001 = highest risk), but risk_label /
@@ -1579,7 +1592,10 @@ class Settings(BaseSettings):
     # ids to dodge the per-category TC-001 collision trap) so the host
     # confirms a shortlist instead of re-reading the merged suite. ADVISORY
     # only; requires QA_HOST_DEDUP_REVIEW_ENABLED to matter.
-    qa_dup_shortlist_enabled: bool = False
+    # Default ON since 2026-08-04 (documented default-OFF exception): the
+    # 22:33 live finalize spent ~4.7 minutes re-reading 79 cases to remove 0;
+    # the prescreen turns that into a confirm/deny of a short list.
+    qa_dup_shortlist_enabled: bool = True
 
     # Append-only audit log (LT-1 ph2). SQLite file recording key events (suite
     # generated, exported, pushed, bug reported) so multi-team deployments have a
@@ -1693,6 +1709,7 @@ class Settings(BaseSettings):
         "qa_finetune_export_enabled",
         "qa_swagger_enabled",
         "qa_auto_export_xlsx",
+        "qa_env_selfheal_enabled",
         "qa_xlsx_risk_notes",
         "qa_zephyr_export_enabled",
         "qa_zephyr_dry_run",

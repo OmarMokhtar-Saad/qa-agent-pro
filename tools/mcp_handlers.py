@@ -3083,6 +3083,20 @@ async def handle_prepare_test_cases(
                 "screenshot(s) to this chat if they matter."
             )
             _notice = (_notice + "\n\n" + _img_note) if _notice else _img_note
+        elif _url_content.get("description_image_refs"):
+            # Ahead of attachments_unknown on purpose: when the description
+            # embeds images we KNOW the ticket has them, so "I could not tell"
+            # would understate it.
+            _n = int(_url_content.get("description_image_refs") or 0)
+            _img_note = (
+                "> \u2139\ufe0f This ticket's description embeds "
+                f"{_n} image(s) \u2014 UI mockups or screens \u2014 that I could "
+                "NOT read: Jira is read through your own Atlassian MCP "
+                "connection, which returns text, not image bytes. The cases below "
+                "come from the ticket TEXT only \u2014 attach those screens to "
+                "this chat and I'll read them."
+            )
+            _notice = (_notice + "\n\n" + _img_note) if _notice else _img_note
         elif _url_content.get("attachments_unknown"):
             # NOT the same as "no attachments": the payload never carried the
             # field, so we cannot tell. Say so rather than implying the ticket
@@ -4466,8 +4480,12 @@ async def handle_submit_category(
         _shortlist = await _dup_shortlist_note(
             (loaded.get("content") or {}).get("meta"), rows.get("content") or []
         )
+        # 2026-08-04: say COMPLETE out loud -- see _all_staged_banner.
+        _staged_all = _all_staged_banner(
+            (loaded.get("content") or {}).get("meta"), rows.get("content") or []
+        )
         return (
-            f"{note}## ✅ Recorded {len(cases_json)} case(s) for "
+            f"{_staged_all}{note}## ✅ Recorded {len(cases_json)} case(s) for "
             f"**{category_name}**\n\n"
             f"Re-submitting **{category_name}** REPLACES its previous rows "
             "(newest wins).\n\n"
@@ -4479,6 +4497,47 @@ async def handle_submit_category(
         logger.exception("handle_submit_category failed")
         _capture_error(exc, "qa_submit_category")
         return f"⚠️ Recording the category failed: {exc}"
+
+
+def _all_staged_banner(meta: object, rows_content: list) -> str:
+    """STOP banner once every expected category has a staged row.
+
+    The 2026-08-03 22:17 live run (prep ea258c02) staged all 8 categories by
+    22:23 and then REGENERATED four of them anyway -- ~5 minutes and thousands
+    of host-model tokens for zero net change, because no reply ever said the
+    set was complete. Returns "" unless meta carries expected_categories and
+    every one of them is staged. Advisory only; never raises."""
+    try:
+        if not isinstance(meta, dict):
+            return ""
+        expected = [
+            str(x) for x in (meta.get("expected_categories") or []) if str(x).strip()
+        ]
+        if not expected:
+            return ""
+        staged_names = [
+            str(r.get("category_name") or "")
+            for r in rows_content
+            if isinstance(r, dict)
+        ]
+        status = host_mode.prep_status_view(
+            expected=expected, staged_raw_names=staged_names
+        )
+        if not status.get("ready"):
+            return ""
+        n = len(expected)
+        return (
+            f"## \U0001f3c1 All {n}/{n} expected categories are staged -- "
+            "STOP generating\n\n"
+            "**Do NOT regenerate, rewrite, or re-submit any category.** The set "
+            "is complete; a re-submission only replaces near-identical rows and "
+            "costs minutes of chat time. The single remaining step is to "
+            "finalize: call `qa_submit_suite` with this prep_id now, using ONE "
+            "of the routes described below.\n\n"
+        )
+    except Exception:
+        logger.debug("all-staged banner failed", exc_info=True)
+        return ""
 
 
 async def _dup_shortlist_note(meta: object, rows_content: list) -> str:
@@ -4829,6 +4888,14 @@ async def handle_submit_suite(
             )
 
         all_cases = list(parsed.suite.test_cases)
+        # Snapshot of what the HOST actually sent, taken before anything narrows
+        # `all_cases`. The duplicate and coverage reviews resolve the ids they were
+        # given against this list, so it has to keep meaning "the submission" even
+        # after the grounding review re-files a case out of the executable suite --
+        # otherwise a group or a coverage claim naming a re-filed case silently
+        # stops resolving and the tester is told something untrue about their own
+        # submission.
+        submitted_cases = list(all_cases)
         # F6: on the FULL-suite path the per-case `category` is host self-report --
         # the server has no grouping of its own there. Normalise onto a canonical
         # name, blank anything unresolvable, and TAG the provenance so a later
@@ -5109,7 +5176,9 @@ async def handle_submit_suite(
         # shows exactly what the server would act on, and every refusal is
         # disclosed. Removal additionally needs QA_HOST_DEDUP_APPLY and MUST happen
         # here, BEFORE _finalize_generation, because that renumbers every tc_id.
-        submitted_cases = list(all_cases)
+        # `submitted_cases` was captured where the submission was read, NOT here:
+        # by this point the grounding review may have narrowed `all_cases`, and the
+        # reviews below need the ids the host actually sent.
         dup_review_on = bool(settings.qa_host_dedup_review_enabled)
         dup_apply = bool(settings.qa_host_dedup_apply)
         dup_groups = list(getattr(parsed, "duplicate_groups", None) or [])
@@ -7634,6 +7703,38 @@ async def handle_setup_check(
                     "is saved (fallback: secure temp directory)"
                 )
 
+        # Repair superseded .env defaults BEFORE the verdict, so the report
+        # reflects the file as it now stands. Never fatal: a failure is reported
+        # as a recommendation and the rest of the check proceeds.
+        heal_lines: list[str] = []
+        try:
+            from tools.env_heal import heal_env
+
+            _heal = await asyncio.to_thread(heal_env, Path(_INSTALL_DIR))
+            if _heal.get("changed"):
+                heal_lines.append("### Configuration repaired")
+                heal_lines.append("")
+                for _key, _old, _new, _why in _heal["changed"]:
+                    heal_lines.append(
+                        f"- `{_key}`: `{_old}` → `{_new}` — {_why}"
+                    )
+                heal_lines.append("")
+                heal_lines.append(
+                    f"_Backup: `{_heal.get('backup') or 'n/a'}`. These take effect "
+                    "when the MCP server restarts — quit and reopen your editor._"
+                )
+                heal_lines.append("")
+                recommended.append(
+                    "Restart the MCP server (quit + reopen your editor) so the "
+                    f"{len(_heal['changed'])} repaired setting(s) take effect."
+                )
+            elif _heal.get("error"):
+                recommended.append(
+                    f"Could not check the .env for stale settings: {_heal['error']}"
+                )
+        except Exception:
+            logger.debug("env self-heal step skipped", exc_info=True)
+
         if blockers:
             verdict = (
                 f"❌ **Not ready** — {len(blockers)} blocking issue(s), "
@@ -7652,6 +7753,7 @@ async def handle_setup_check(
             *([f"**App version:** v{app_version}", ""] if app_version else []),
             *([restart_note, ""] if restart_note else []),
             *([reload_note, ""] if reload_note else []),
+            *heal_lines,
             "### Environment",
             f"- {'✅' if py_ok else '❌'} **Python** {py_version}"
             + ("" if py_ok else " — 3.10 or newer required"),

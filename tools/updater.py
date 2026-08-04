@@ -39,6 +39,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -451,7 +453,37 @@ def _local_version(install_dir: Path) -> Optional[str]:
     return None
 
 
+# One GET per process per TTL: startup, qa_setup_check and the periodic drift
+# watch each hit /releases/latest, so a single session made three identical
+# calls within 11 seconds (observed 2026-08-03 22:11:14-22:11:25). 300s keeps
+# "publish a release, run qa_setup_check" responsive while collapsing the
+# burst -- and keeps the network off the qa_setup_check hot path within the
+# TTL. Only SUCCESS is cached; errors keep raising so callers degrade as
+# before and the next call retries for real.
+_RELEASE_CACHE_TTL_S = 300.0
+_release_cache: dict[str, tuple[float, dict]] = {}
+_release_cache_lock = threading.Lock()
+
+
 def fetch_latest_release(repo: str, token: str, timeout: float) -> Optional[dict]:
+    """TTL-cached wrapper over the GitHub release lookup (cache note above).
+    Same contract as the uncached fetch: returns the release dict or raises on
+    a network/HTTP error (the caller catches and degrades)."""
+    now = time.monotonic()
+    with _release_cache_lock:
+        hit = _release_cache.get(repo)
+        if hit and (now - hit[0]) < _RELEASE_CACHE_TTL_S:
+            return dict(hit[1])
+    data = _fetch_latest_release_uncached(repo, token, timeout)
+    if data:
+        with _release_cache_lock:
+            _release_cache[repo] = (now, dict(data))
+    return data
+
+
+def _fetch_latest_release_uncached(
+    repo: str, token: str, timeout: float
+) -> Optional[dict]:
     """GET /repos/{repo}/releases/latest. Returns ``{tag_name, zipball_url}`` or
     raises on a network/HTTP error (the caller catches and degrades)."""
     url = f"{_GITHUB_API}/repos/{repo}/releases/latest"

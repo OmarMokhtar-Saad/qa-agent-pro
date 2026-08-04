@@ -568,9 +568,14 @@ _FINALIZE_EMPTY_FIRST = (
 
 _HOST_PARALLEL_INSTRUCTION = (
     "\n"
-    "PARALLEL FAN-OUT (same chat session) -- when your host can run parallel "
-    "workers (e.g. Cursor Task / subagents), do NOT generate all 8 categories in "
-    "the parent turn:\n"
+    "PARALLEL FAN-OUT -- DECIDE THIS BEFORE YOU GENERATE ANYTHING. If your host "
+    "can run parallel workers (Cursor Task / subagents / equivalent), launch ONE "
+    "PER CATEGORY NOW and do NOT generate all 8 in this turn. This is the single "
+    "biggest lever on how long the tester waits: a measured run that fanned out "
+    "landed 7 categories inside ONE SECOND and finished in under 5 minutes, while "
+    "one that generated them sequentially in the parent turn took 26 minutes for "
+    "the same ticket. If your host genuinely cannot run parallel workers, generate "
+    "sequentially and ignore the numbered steps below.\n"
     "1. Keep prep_id, system_prompt, user_context, and response_schema from this "
     "payload (shared once -- copy them into each worker prompt; do not rely on "
     "jobs[] for user_context).\n"
@@ -578,9 +583,13 @@ _HOST_PARALLEL_INSTRUCTION = (
     "`jobs[]` in the SAME session, in parallel. Each worker uses system_prompt + "
     "user_context + that job's instruction; emits ONLY a JSON object matching "
     "response_schema for THAT category; sets each case's `category` field to the "
-    "job's category_name EXACTLY. Submit each `suite_json` as a JSON OBJECT if "
-    "your client can send one -- serialising it into a string argument is "
-    "accepted but unnecessary.\n"
+    "job's category_name EXACTLY. Pass `suite_json` STRAIGHT THROUGH as a JSON "
+    "OBJECT: do NOT serialise it into a string, and do NOT write it to a file or "
+    "build a script to assemble it. Measured on real payloads, a 20 KB category "
+    "object and a 150 KB merged 80-case object both arrive byte-identical, so "
+    "size is not a reason to stage through files -- observed runs spent minutes "
+    "re-encoding payloads that would have transferred as-is. A JSON string is "
+    "still accepted if your client genuinely cannot send an object.\n"
     "3. PRIMARY finalize (Path A -- stage as you go): call `qa_submit_category` "
     "for EACH category AS SOON AS its worker returns (from the worker when it "
     "can call MCP tools, otherwise from the parent). Do NOT hold results only "
@@ -3262,10 +3271,26 @@ def build_prepare_payload(
         "categories": categories,
         "response_schema": prepared.category_response_schema,
         "image_context": image_context,
+        # 2026-08-03: _parallel_instruction() moved from FOURTH to FIRST of the
+        # optional blocks. Measured on a real payload, it previously began at char
+        # 4853 of 7925 -- 61% of the way through -- while the very first thing the
+        # host reads is "You will generate a professional manual-testing suite
+        # yourself", which reads as "do it in this turn". The correction arrived 61%
+        # later, hedged as a conditional aside, and a v1.36.0 run duly generated all
+        # 8 categories sequentially: 26 minutes against under 5 for a run that
+        # fanned out. The server had asked correctly -- orchestration.mode was
+        # parallel_chat_workers with 8 job packets -- so this is a PROMINENCE fix,
+        # the same class as demoting the review-forfeiting finalize in Fix 2.
+        #
+        # _HOST_GENERATION_INSTRUCTIONS stays FIRST: two tests assert
+        # instructions.startswith(...) on it, and a third asserts exact equality
+        # when every optional block is empty. Ordering among the optional blocks is
+        # not pinned, EXCEPT that _grounding_instruction() must stay last (it reads
+        # after the numbered steps and after the duplicate review it references).
         "instructions": _HOST_GENERATION_INSTRUCTIONS
+        + _parallel_instruction()
         + _dedup_instruction()
         + _coverage_instruction(prepared, checklist_job)
-        + _parallel_instruction()
         + _qualified_instruction()
         # LAST on purpose: it must read after the numbered generation steps and
         # after the duplicate review it tells the host to follow.
@@ -3562,7 +3587,9 @@ _DUP_SHORTLIST_TITLE_CHARS = 80
 
 
 def dup_shortlist_on() -> bool:
-    """Never-raise read of QA_DUP_SHORTLIST_ENABLED (default OFF)."""
+    """Never-raise read of QA_DUP_SHORTLIST_ENABLED (default ON since
+    2026-08-04; the getattr fallback stays False so a missing setting is
+    conservative)."""
     try:
         return bool(getattr(settings, "qa_dup_shortlist_enabled", False))
     except Exception:  # pragma: no cover
