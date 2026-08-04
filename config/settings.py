@@ -320,7 +320,7 @@ class Settings(BaseSettings):
     # when the configured `jira_ac_field` does not. OFF by default and staying
     # that way until an operator asks: adopting the wrong field is exactly the
     # failure that made a date field's timestamp the only "acceptance criterion"
-    # on a real run. `qa_setup_check` discloses what was resolved either way, so
+    # on a real run. `qa-doctor` discloses what was resolved either way, so
     # a mis-configured field is visible without this being on.
     qa_jira_ac_field_discovery: bool = False
 
@@ -479,6 +479,23 @@ class Settings(BaseSettings):
     # ANTHROPIC_API_KEY regardless of QA_LLM_BACKEND (vision is decoupled from
     # the text backend -- see llm.ask_vision).
     qa_mobile_capture: bool = False
+
+    # --- Jira image gate (QA_IMAGE_GATE_ENABLED) -- default ON. ------------
+    # A DISCLOSURE, not a feature. Jira is read through the calling agent's own
+    # Atlassian MCP connection, which returns attachment METADATA and never the
+    # image bytes (tools/jira_mcp makes no outbound HTTP request, by hard rule),
+    # so a ticket whose requirements live in mockups silently produced a suite
+    # written from ticket TEXT alone. ON, qa_prepare_test_cases says so BEFORE
+    # the fetch (beat 1, collecting a source plan: attach / capture / both /
+    # text-only) and again -- naming the ticket's OWN screens -- once the
+    # fetched ticket reveals images the chosen plan did not supply (beat 2).
+    # Default ON is the SAME deliberate exception the honest-disclosure family
+    # already carries (JIRA_FETCH_IMAGES, QA_GROUNDING_ADVISORIES_ENABLED,
+    # QA_AMBIGUITY_GATE_SEVERITY on the MCP path): defaulting a disclosure OFF
+    # means a fresh install keeps shipping exactly the suite the gate exists to
+    # flag. false restores the pre-gate flow exactly -- the post-hoc "could not
+    # read images" notice on the finished payload, and nothing else.
+    qa_image_gate_enabled: bool = True
     # Timeout (seconds) for device-discovery commands (adb devices / simctl list).
     qa_device_command_timeout: int = 20
     # Timeout (seconds) for a single screenshot capture (larger -- image transfer).
@@ -807,8 +824,30 @@ class Settings(BaseSettings):
     # atomic + locked (tools/client_registry). Note the limit this cannot escape:
     # if NO client is registered, nothing launches the server, so a startup pass
     # can never bootstrap the very first client. Running connect.sh remains the
-    # answer for that case, and qa_setup_check points at it.
+    # answer for that case, and qa-doctor points at it.
     qa_auto_register_clients: bool = False
+
+    # Write the hosted Atlassian MCP entry (Jira Cloud, OAuth) into the clients
+    # that keep it in a FILE -- Cursor today -- when the tester runs connect.sh or
+    # connect.ps1. Until 2026-08-04 nothing in this tree could write that entry at
+    # all: tools/client_registry hardcoded the stdio shape, so every tester was
+    # told to hand-edit mcpServers JSON, and that is the step they fail at.
+    #
+    # ON by default, which is a deliberate exception to "new features default
+    # OFF", justified narrowly:
+    #
+    # * it runs ONLY from a script the tester invoked by hand -- never from the
+    #   launcher's startup pass, which still registers this server and nothing
+    #   else (QA_AUTO_REGISTER_CLIENTS governs that, separately and still OFF);
+    # * the write is insert-only, atomic, locked and backed up, and never rewrites
+    #   an existing `atlassian` entry (client_registry.register_atlassian);
+    # * the failure mode of OFF is worse than the failure mode of ON: OFF means a
+    #   non-technical tester edits JSON by hand, ON means one extra key in a file
+    #   they can delete.
+    #
+    # It authorizes NOTHING: OAuth still needs one click in the editor, and
+    # Claude Desktop's hosted Connector has no file to write at all.
+    qa_register_atlassian_mcp: bool = True
 
     # Surgical quality retry (opt-in, both default OFF -- see
     # .claude/plans/plan-surgical-retry.md). The per-category quality gate
@@ -1034,7 +1073,7 @@ class Settings(BaseSettings):
     # export error only appends a warning note.
     qa_auto_export_xlsx: bool = True
 
-    # 2026-08-04 (user-approved): qa_setup_check repairs values in the install's
+    # 2026-08-04 (user-approved): qa-doctor repairs values in the install's
     # own .env that are still EXACTLY a default this project shipped and later
     # superseded (tools/env_heal.HEAL_RULES). ON by default, and a deliberate
     # exception to the defaults-OFF rule for the same reason as
@@ -1377,7 +1416,7 @@ class Settings(BaseSettings):
     # returns False -- each path's documented contract, so every caller degrades
     # exactly as it already does when no backend is usable. Nothing invents a
     # substitute result. While any ledger row is still unmigrated, turning this
-    # OFF DISABLES that feature rather than boomeranging it, so qa_setup_check
+    # OFF DISABLES that feature rather than boomeranging it, so qa-doctor
     # and a one-time startup WARNING name the affected features out loud.
     qa_server_llm_enabled: bool = True
     # Per-path escape hatch for the paths that CANNOT boomerang (a completion is
@@ -1557,7 +1596,7 @@ class Settings(BaseSettings):
     # Lenient never-raise int coercion like the rest; <=0 -> the default.
     qa_prep_max_lifetime_s: int = 14400
     # Disclose unfinished preps (a fetched worker packet or >=1 staged category
-    # row, not yet expired) on qa_setup_check and qa_prepare_test_cases:
+    # row, not yet expired) on qa-doctor and qa_prepare_test_cases:
     # "unfinished prep <id> from HH:MM, N/8 staged, expires ~HH:MM -- resume
     # with qa_prep_status / qa_submit_category, or ignore". DISCLOSURE ONLY --
     # it never blocks a new prepare and never auto-resumes anything. The line
@@ -1689,6 +1728,7 @@ class Settings(BaseSettings):
         "qa_module_prefix_normalize_enabled",
         "qa_jira_uc_table_ac_enabled",
         "qa_auto_register_clients",
+        "qa_register_atlassian_mcp",
         "qa_quality_reminder_upfront",
         "qa_surgical_quality_retry",
         "testrail_dry_run",
@@ -1701,6 +1741,7 @@ class Settings(BaseSettings):
         "qa_host_grounding_review_enabled",
         "jira_fetch_sibling_stories",
         "qa_mobile_capture",
+        "qa_image_gate_enabled",
         "qa_maestro_enabled",
         "qa_maestro_dry_run",
         "qa_maestro_heal_enabled",

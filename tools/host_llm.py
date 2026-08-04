@@ -47,7 +47,7 @@ Two mechanisms live here:
 It also owns the migration's DISCLOSURE surface (``UNMIGRATED_PATHS``,
 ``disclosure``, ``warn_once_if_degraded``): with ``QA_SERVER_LLM_ENABLED=false``
 and ledger rows still unmigrated, those features are OFF, and an operator learns
-that from ``qa_setup_check`` and a one-time startup WARNING -- never from
+that from ``qa-doctor`` and a one-time startup WARNING -- never from
 behaviour. Phases 2-6 shrink ``UNMIGRATED_PATHS`` as each row migrates.
 
 Note for readers coming from the plan brief: MCP *elicitation* (``ctx.elicit``,
@@ -176,7 +176,7 @@ UNMIGRATED_PATHS: tuple[tuple[str, str], ...] = (
     # evals/ still call generate_test_scenarios) and is now scope-tagged, so
     # QA_SERVER_LLM_ALLOW=test_scenario_agent.jira_images revives exactly that one
     # path after the Phase-6 flip. Leaving this tuple also removes the id from the
-    # qa_setup_check / startup disclosure -- the standing convention for a terminal
+    # qa-doctor / startup disclosure -- the standing convention for a terminal
     # row -- which is correct here: the tester-facing route makes no such call.
     # The three test_scenario_agent.* rows left this tuple in the residue-cleanup
     # R2 ops file that flipped their ledger rows to terminal statuses (ledger rule
@@ -216,7 +216,7 @@ UNMIGRATED_PATHS: tuple[tuple[str, str], ...] = (
     #   denominator the "N of 24" disclosure and three tests read.
     #
     # As for every terminal row, leaving this tuple also removes these ids from the
-    # qa_setup_check / startup disclosure. No per-mode setup_check item was added
+    # qa-doctor / startup disclosure. No per-mode setup_check item was added
     # (R1's precedent): no tester-selectable mode loses anything at the flip,
     # because the host route already makes none of these calls.
     # The two VISION rows left this tuple in the residue-cleanup R3 ops file that
@@ -252,7 +252,7 @@ UNMIGRATED_PATHS: tuple[tuple[str, str], ...] = (
     #   str, so raw device screens cannot become MCP image content there. R3
     #   therefore built the disclosure instead of claiming a fold: the prepare
     #   reply gains a capture-but-not-described line (with distinct wording for
-    #   the kill-switch cause and the api-backend-only cause) and qa_setup_check
+    #   the kill-switch cause and the api-backend-only cause) and qa-doctor
     #   gains a per-mode item naming
     #   QA_SERVER_LLM_ALLOW=image_description.describe_images -- the 5b/5c
     #   convention for a TESTER-FACING terminal row, and the only thing that makes
@@ -308,7 +308,7 @@ UNMIGRATED_PATHS: tuple[tuple[str, str], ...] = (
     # boomerang for it would have been new tester-facing capability disguised as
     # a migration. It stays in LEDGER_IDS and is scope-tagged, so
     # QA_SERVER_LLM_ALLOW=maestro_exporter.translate still revives it for the
-    # eval harness. qa_setup_check gained no allow-list item for it (no tester can
+    # eval harness. qa-doctor gained no allow-list item for it (no tester can
     # reach it) but DOES now report QA_MAESTRO_TRANSLATE_ENABLED as inert.
     # maestro_healer.classify and maestro_explorer.decide left this tuple in the
     # Phase-5b ops file that flipped both ledger rows to `disabled (disclosed)`
@@ -316,7 +316,7 @@ UNMIGRATED_PATHS: tuple[tuple[str, str], ...] = (
     # LEDGER_IDS, so an allow-list typo on either is still detectable -- and they
     # are now ids operators actually type. Because a terminal row also leaves the
     # kill-switch disclosure, and because these two are TESTER-FACING (unlike
-    # Phase 5a's rows), qa_setup_check gained an explicit per-mode warning for
+    # Phase 5a's rows), qa-doctor gained an explicit per-mode warning for
     # them in that same op.
     # web_runner.translate left this tuple in the Phase-5d ops file that flipped
     # its ledger row to `migrated` -- the ONLY genuinely migrated row in Phase 5.
@@ -333,7 +333,7 @@ UNMIGRATED_PATHS: tuple[tuple[str, str], ...] = (
     # web_runner.verify left this tuple in the Phase-5c ops file that flipped its
     # ledger row to `disabled (disclosed)` (ledger rule 4: same op, or the drift
     # test fails). It remains in LEDGER_IDS, so an allow-list typo on it is still
-    # detectable -- and it is now an id operators actually type. qa_setup_check
+    # detectable -- and it is now an id operators actually type. qa-doctor
     # gained a third per-mode item for it, guarded on web-run enabled AND dry-run
     # off AND a non-zero vision budget, because only that combination loses
     # anything. The sibling row web_runner.translate was still here when 5c
@@ -540,7 +540,7 @@ def disclosure_state() -> tuple[str, bool]:
             # Five shipped tests encode exactly that property
             # (tests/test_host_boomerang_phase5b_mobile_loops.py and
             # tests/test_host_boomerang_phase5c_web_verify.py assert the
-            # ABSENCE of those ids from qa_setup_check output on installs that
+            # ABSENCE of those ids from qa-doctor output on installs that
             # do not need them), so the concrete recipes live in the two docs
             # this line points at instead.
             #
@@ -562,7 +562,7 @@ def disclosure_state() -> tuple[str, bool]:
                 "judges, LangGraph intent classification, and the inert "
                 "Maestro step translation stay OFF unless "
                 "that specific row is named in QA_SERVER_LLM_ALLOW. This line "
-                "lists no ids on purpose \u2014 qa_setup_check names one only "
+                "lists no ids on purpose \u2014 qa-doctor names one only "
                 "where THIS install really loses the capability. For the "
                 "per-row ids and the copy-paste recipes see "
                 "docs/LLM_MIGRATION_INVENTORY.md \u2192 Phase 6 sign-off "
@@ -614,7 +614,7 @@ def disclosure_state() -> tuple[str, bool]:
 
 
 def disclosure() -> str:
-    """The disclosure line for qa_setup_check, without the degraded flag.
+    """The disclosure line for qa-doctor, without the degraded flag.
 
     Empty string when there is nothing to disclose (the flag is ON, i.e. today's
     behaviour). See ``disclosure_state`` for the four states. Never raises.

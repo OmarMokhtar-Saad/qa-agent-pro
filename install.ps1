@@ -179,7 +179,7 @@ Invoke-QaNative "powershell" @("-ExecutionPolicy", "Bypass", "-File",
                               (Join-Path $InstallDir "connect.ps1")) | Out-Null
 Write-Host ""
 Write-Host "Next steps:"
-Write-Host "  1. Restart Cursor / Claude, then ask it: run qa_setup_check"
+Write-Host "  1. Restart Cursor / Claude, then ask it: run qa-doctor"
 Write-Host ""
 Write-Host "No API key and no login are needed - your own chat model writes the"
 Write-Host "test cases. Optional settings live in: $InstallDir\.env"

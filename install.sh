@@ -63,7 +63,7 @@ echo "Registering with your AI editors ..."
 "$INSTALL_DIR/connect.sh" || true
 echo ""
 echo "Next steps:"
-echo "  1. Restart Cursor / Claude, then ask it: run qa_setup_check"
+echo "  1. Restart Cursor / Claude, then ask it: run qa-doctor"
 echo ""
 echo "No API key and no login are needed - your own chat model writes the"
 echo "test cases. Optional settings live in: $INSTALL_DIR/.env"

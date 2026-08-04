@@ -674,7 +674,7 @@ async def find_recent_prep_by_source(source_url: str, window_s: float = 1800) ->
 
 async def list_unfinished_preps(limit: int = 3) -> dict:
     """Non-expired preps showing real activity (a fetched worker packet or
-    >=1 staged category), newest first -- DISCLOSURE data for qa_setup_check /
+    >=1 staged category), newest first -- DISCLOSURE data for qa-doctor /
     qa_prepare_test_cases so an abandoned run stops evaporating silently
     (2026-07-31 incident). Read-only; never raises."""
     try:
