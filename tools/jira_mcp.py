@@ -626,6 +626,46 @@ def _count_image_refs(text: object) -> int:
         return 0
 
 
+# A short bold/heading label on the line directly above an embedded image
+# ("**UI#01**", "## Screen 2"), captured so the disclosure can NAME the
+# screens the tester should attach instead of a bare count. Untrusted text:
+# each label is charset-gated (no ':', '&' or '=' -- a URL can never pass)
+# and length-capped, and at most _MAX_IMAGE_LABELS are kept.
+_IMAGE_LABEL_RE = re.compile(r"(?:\*\*|#+\s*)([^*\n]{1,48}?)\s*(?:\*\*)?\s*$")
+_LABEL_SAFE_RE = re.compile(r"^[\w #.\-/()\[\]]{1,32}$")
+_MAX_IMAGE_LABELS = 8
+
+
+def _image_ref_labels(text: object) -> list:
+    """Short labels the DESCRIPTION gives its embedded images ("UI#01"), in
+    document order, deduped, gated and capped. Empty when the flag is off,
+    nothing is labelled, or on ANY error. Never raises."""
+    try:
+        if not settings.jira_fetch_images:
+            return []
+        body = str(text or "")
+        if not body:
+            return []
+        labels: list = []
+        for m in _IMAGE_REF_RE.finditer(body):
+            window = body[: m.start()].rstrip()[-120:]
+            last_line = window.splitlines()[-1].strip() if window else ""
+            lm = _IMAGE_LABEL_RE.search(last_line)
+            if not lm:
+                continue
+            label = lm.group(1).strip()
+            if not _LABEL_SAFE_RE.fullmatch(label):
+                continue
+            if label not in labels:
+                labels.append(label)
+            if len(labels) >= _MAX_IMAGE_LABELS:
+                break
+        return labels
+    except Exception:
+        logger.exception("Extracting embedded image labels failed")
+        return []
+
+
 def _extract_image_attachments(fields: dict) -> list[dict]:
     """Image attachment METADATA ({filename, mime, size}) from an issue payload.
 
@@ -1864,6 +1904,7 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
             # host that trims the issue JSON cannot silence the disclosure -- the
             # 22:17 live run had three UI screens and said nothing.
             "description_image_refs": _count_image_refs(description),
+            "description_image_labels": _image_ref_labels(description),
             # "The ticket has no images" and "nobody requested the attachment
             # field" are different facts, and only the first is safe to stay
             # quiet about. A live 2026-08-03 run had three PNG attachments and an

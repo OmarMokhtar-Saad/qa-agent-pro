@@ -3088,13 +3088,28 @@ async def handle_prepare_test_cases(
             # embeds images we KNOW the ticket has them, so "I could not tell"
             # would understate it.
             _n = int(_url_content.get("description_image_refs") or 0)
+            # Name the screens with the ticket's OWN labels so the tester
+            # knows exactly which screenshots to attach. Already charset-gated
+            # and capped by jira_mcp._image_ref_labels (untrusted text).
+            _img_labels = [
+                str(x).strip()
+                for x in (_url_content.get("description_image_labels") or [])[:8]
+                if str(x).strip()
+            ]
+            _label_note = (
+                " The ticket labels them: "
+                + ", ".join(f"`{x}`" for x in _img_labels)
+                + "."
+                if _img_labels
+                else ""
+            )
             _img_note = (
                 "> \u2139\ufe0f This ticket's description embeds "
                 f"{_n} image(s) \u2014 UI mockups or screens \u2014 that I could "
                 "NOT read: Jira is read through your own Atlassian MCP "
                 "connection, which returns text, not image bytes. The cases below "
                 "come from the ticket TEXT only \u2014 attach those screens to "
-                "this chat and I'll read them."
+                f"this chat and I'll read them.{_label_note}"
             )
             _notice = (_notice + "\n\n" + _img_note) if _notice else _img_note
         elif _url_content.get("attachments_unknown"):
