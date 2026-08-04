@@ -55,22 +55,32 @@ def _col_letter(index: int) -> str:
             return letters
 
 
+# 2026-08-04: "Type" and "Category" read as duplicates to testers -- 25/97 rows
+# of that day's run were literally equal and 24 more were the same value under a
+# longer name. They are NOT duplicates: four generation categories (Positive /
+# Happy Path, Edge Cases, State Transitions, UI/UX Validation) all collapse to
+# the Functional TestType, so 48/97 rows carry category detail the type cannot
+# express. The fix is naming, not data -- "Test Type" is the TestCase.type enum,
+# "Coverage Category" is which of the 8 generation categories produced the case.
 _HEADERS = [
     "TC ID",
     "Module",
     "Title",
     "Priority",
-    "Type",
+    "Test Type",
     "Preconditions",
     "Steps / Actions",
     "Test Data",
     "Expected Results",
     "Status",
     "Notes",
-    "Category",
+    "Coverage Category",
 ]
 
-_COL_WIDTHS = [10, 18, 30, 12, 14, 28, 45, 28, 45, 12, 20, 22]
+# Index-parallel to _HEADERS (test_column_constants_stay_in_lockstep) and also
+# the row-height autofit input. Column L went 22 -> 24: "Coverage Category" is 17
+# chars and the widest value, "Negative / Error Flows", is 22.
+_COL_WIDTHS = [10, 18, 30, 12, 14, 28, 45, 28, 45, 12, 20, 24]
 
 
 def _prepare(text: str) -> str:
@@ -130,6 +140,12 @@ def _notes_cell(tc: object, rule_pack_note: str) -> str:
     A rule-pack note ALWAYS wins, so no information is ever displaced, and any
     problem degrades to the rule-pack note -- i.e. exactly today's output. Pure
     and never raises.
+
+    2026-08-04: the cell used to read "Risk: <label> (<score>)", and the LABEL
+    duplicated the Priority column -- contradicting it in 10/97 rows of that
+    day's run (Priority=High vs "Risk: CRITICAL (34)"), because the label mixes
+    in type weight and Priority does not. Only the SCORE is written now: it is
+    the sheet's row-order key and appears in no other column.
     """
     note = rule_pack_note or ""
     if note:
@@ -137,11 +153,16 @@ def _notes_cell(tc: object, rule_pack_note: str) -> str:
     try:
         if not settings.qa_xlsx_risk_notes:
             return note
+        # The gate stays on risk_label: an UNSCORED suite has risk_label == ""
+        # and risk_score == 0, and must keep producing an empty Notes cell rather
+        # than a meaningless "Risk 0".
         label = str(getattr(tc, "risk_label", "") or "").strip()
         if not label:
             return note
         score = getattr(tc, "risk_score", None)
-        return f"Risk: {label} ({score})" if score is not None else f"Risk: {label}"
+        # No score means nothing is left to show once the label is dropped, so
+        # degrade to the rule-pack note (empty in practice) rather than invent one.
+        return f"Risk {score}" if score is not None else note
     except Exception:  # pragma: no cover - defensive
         logger.debug("risk note rendering failed -- Notes left as-is", exc_info=True)
         return note
@@ -760,7 +781,7 @@ def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
 
     _type_col = _col_letter(_COL_TYPE)
     type_range = f"'Test Cases'!{_type_col}2:{_type_col}{last_data_row}"
-    summary_ws.write("A17", "Type", label_fmt)
+    summary_ws.write("A17", "Test Type", label_fmt)
     summary_ws.write("B17", "Count", label_fmt)
     for j, ttype in enumerate(
         [

@@ -16,19 +16,23 @@ logger = logging.getLogger(__name__)
 
 # Requirement ID / Risk Score / Risk Label / Risk Rationale / Stable ID are
 # intentionally NOT exported here — see the matching comment in xlsx_generator.py.
+# Kept in lockstep with xlsx_generator._HEADERS -- an invariant asserted by
+# tests/test_csv_exporter.test_csv_headers_match_xlsx_headers. "Test Type" /
+# "Coverage Category" renamed 2026-08-04 with the xlsx; nothing external reads
+# these names (TestRail and Zephyr each carry their own header set).
 _HEADERS = [
     "TC ID",
     "Module",
     "Title",
     "Priority",
-    "Type",
+    "Test Type",
     "Preconditions",
     "Steps / Actions",
     "Test Data",
     "Expected Results",
     "Status",
     "Notes",
-    "Category",
+    "Coverage Category",
 ]
 
 

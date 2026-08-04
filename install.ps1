@@ -49,14 +49,69 @@ function Test-QaPython {
   $probe = "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
   return ((Invoke-QaNative $Exe @($Pre + @("-c", $probe)) -Quiet) -eq 0)
 }
+# uv is what this project recommends for a NON-ADMIN Windows install, and
+# it is the one interpreter neither PATH nor the py launcher can see: uv
+# keeps managed CPythons under %LOCALAPPDATA%\uv\python\..., and uv's own
+# installer does not touch the PATH of the shell you are standing in. So ask
+# uv itself, and look for uv in ~/.local/bin even when it is not on PATH --
+# that exact combination dead-ended the recommended route on a real machine.
+function Find-QaUvPython {
+  $uv = $null
+  if (Get-Command uv -ErrorAction SilentlyContinue) { $uv = "uv" }
+  else {
+    $cand = Join-Path $env:USERPROFILE ".local\bin\uv.exe"
+    if (Test-Path $cand) { $uv = $cand }
+  }
+  if (-not $uv) { return $null }
+  foreach ($v in @("3.13", "3.12", "3.11", "3.10")) {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { $found = & $uv python find $v 2>&1 } catch { $found = $null }
+    finally { $ErrorActionPreference = $prev }
+    if ($LASTEXITCODE -eq 0 -and $found) {
+      $exe = ($found | Select-Object -First 1).ToString().Trim()
+      if (Test-Path $exe) { return $exe }
+    }
+  }
+  return $null
+}
+
 $PyExe = $null
 $PyPre = @()
 foreach ($v in @("3.13", "3.12", "3.11", "3.10")) {
   if (Test-QaPython "py" @("-$v")) { $PyExe = "py"; $PyPre = @("-$v"); break }
 }
 if (-not $PyExe) {
-  foreach ($n in @("python3", "python")) {
+  # python3.12-style names cover uv shims and several per-user layouts;
+  # bare python3/python last, since that is where the Store alias sits.
+  foreach ($n in @("python3.13", "python3.12", "python3.11", "python3.10",
+                   "python3", "python")) {
     if (Test-QaPython $n @()) { $PyExe = $n; break }
+  }
+}
+if (-not $PyExe) {
+  $uvPy = Find-QaUvPython
+  if ($uvPy -and (Test-QaPython $uvPy @())) {
+    $PyExe = $uvPy
+    Write-Host "Found a uv-managed interpreter: $uvPy"
+  }
+}
+# Last resort before failing: if uv IS here but has no interpreter yet, use
+# it. The tester already opted into installing this server, uv is already on
+# their machine, and the download is per-user -- so the alternative is
+# failing with instructions to run a command we could just run.
+if (-not $PyExe) {
+  $uv = $null
+  if (Get-Command uv -ErrorAction SilentlyContinue) { $uv = "uv" }
+  else {
+    $cand = Join-Path $env:USERPROFILE ".local\bin\uv.exe"
+    if (Test-Path $cand) { $uv = $cand }
+  }
+  if ($uv) {
+    Write-Host "No Python found, but uv is installed -- fetching Python 3.12 ..."
+    Invoke-QaNative $uv @("python", "install", "3.12") | Out-Null
+    $uvPy = Find-QaUvPython
+    if ($uvPy -and (Test-QaPython $uvPy @())) { $PyExe = $uvPy }
   }
 }
 if (-not $PyExe) {
