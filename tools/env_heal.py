@@ -25,6 +25,14 @@ logger = logging.getLogger(__name__)
 # Every entry must name values THIS PROJECT once shipped. Anything else is an
 # operator decision and is out of scope by construction.
 HEAL_RULES: dict[str, tuple[tuple[str, ...], str, str]] = {
+    "QA_MODULE_PREFIX_NORMALIZE_ENABLED": (
+        ("false", "0", "no", "off"),
+        "true",
+        "merges a qualifier-prefixed module label onto its bare variant -- the "
+        "2026-08-04 SHYJ-5645 run shipped one feature split 12/85 across "
+        "'Cancel order' and 'Sehhaty Store - Cancel order', which breaks "
+        "module-based filtering in TestRail/Xray pushes",
+    ),
     "JIRA_MAX_PARENT_CHARS": (
         ("1500",),
         "2500",
