@@ -317,7 +317,9 @@ def traceability_warning_section(acs: list, test_cases: list) -> str:
     2026-07-29 and 2026-07-30 runs it did exactly that and nobody read it -- a
     percentage reads as a metric, not as a defect. This names it.
 
-    Fires when more than one AC exists but at most ONE of them is cited.
+    Fires when more than one AC exists but at most ONE of them is cited --
+    and also when exactly ONE AC was parsed yet most cases trace to nothing
+    (the misparsed-AC-source signature, e.g. a date-valued JIRA_AC_FIELD).
     ``covered_count <= 1``, not ``== 1``: zero is strictly WORSE and is silent
     under an equality test -- and it has happened, when cases were tagged with
     checklist ids instead of AC ids.
@@ -334,6 +336,26 @@ def traceability_warning_section(acs: list, test_cases: list) -> str:
         ac_to_tcs, orphan_tc_ids = _trace_map(acs, test_cases)
         total = len(acs)
         covered = sum(1 for tcs in ac_to_tcs.values() if tcs)
+        if total == 1:
+            # The lone-AC + orphan-majority signature: on 2026-08-03 (run
+            # f9094582) a DATE-valued custom field was parsed as the only
+            # "AC", 61/98 cases traced to nothing, and this advisory stayed
+            # silent behind `total <= 1` while the RTM read as covered.
+            share = len(orphan_tc_ids) / len(test_cases)
+            if share <= 0.5:
+                return ""
+            only_id = next(iter(ac_to_tcs), "AC-001")
+            return (
+                "\n\n> \u26a0\ufe0f  **Requirement traceability looks degenerate.** "
+                f"Only ONE acceptance criterion (`{only_id}`) was parsed from "
+                f"the source, and {len(orphan_tc_ids)} of {len(test_cases)} "
+                "case(s) trace to nothing. A single AC with an orphan majority "
+                "usually means the AC source field is misconfigured (for "
+                "example `JIRA_AC_FIELD` pointing at a non-AC custom field), "
+                "so the RTM cannot tell you which requirements are actually "
+                "tested. Verify the AC field before trusting this suite's "
+                "coverage numbers."
+            )
         if total <= 1 or covered > 1:
             return ""
         head = "\n\n> \u26a0\ufe0f  **Requirement traceability looks degenerate.** "

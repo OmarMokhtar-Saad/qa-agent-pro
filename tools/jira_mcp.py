@@ -596,6 +596,36 @@ def _extract_comment_records(fields: dict) -> list[dict]:
         return []
 
 
+# Images embedded IN the description rather than uploaded as attachments:
+# markdown/ADF renderings (![](blob:...) / ![alt](url)) and Jira wiki syntax
+# (!screen.png!). SHYJ-5645 carries its three UI screens this way, and a host
+# that reshapes the issue JSON can drop `attachment` while the description
+# survives -- so this is the signal that cannot be trimmed away.
+_IMAGE_REF_RE = re.compile(
+    r"!\[[^\]]*\]\([^)]*\)"  # markdown image, incl. ![](blob:...)
+    r"|blob:https?://"  # a bare Atlassian media blob URL
+    r"|!\S+\.(?:png|jpe?g|gif|webp|bmp)[|!]",  # Jira wiki !file.png! / !f.png|x!
+    re.IGNORECASE,
+)
+
+# Absurd inputs are untrusted text; stop counting well before it matters.
+_MAX_IMAGE_REFS = 50
+
+
+def _count_image_refs(text: object) -> int:
+    """How many images the DESCRIPTION embeds. 0 when the flag is off. Never raises."""
+    try:
+        if not settings.jira_fetch_images:
+            return 0
+        body = str(text or "")
+        if not body:
+            return 0
+        return min(_MAX_IMAGE_REFS, len(_IMAGE_REF_RE.findall(body)))
+    except Exception:
+        logger.exception("Counting embedded image references failed")
+        return 0
+
+
 def _extract_image_attachments(fields: dict) -> list[dict]:
     """Image attachment METADATA ({filename, mime, size}) from an issue payload.
 
@@ -1560,6 +1590,13 @@ def build_fetch_directive(url: str, issue_key: str = "") -> str:
         target = f"`{key}`" if key else f"the issue at {url}"
         want_comments = bool(settings.jira_fetch_comments)
         want_parent = bool(settings.jira_fetch_parent)
+        # An EMPTY JIRA_AC_FIELD is a legitimate configuration -- a project may
+        # simply have no Acceptance Criteria field (verified on the live SHYJ
+        # project: 21 fields on its Story type, none of them AC), in which case
+        # criteria come from description parsing plus AC_JOB. Asking for it
+        # anyway produced `...,comment,`.` -- a trailing comma and an empty field
+        # name -- so the request has to drop it instead.
+        ac_field = str(getattr(settings, "jira_ac_field", "") or "").strip()
         lines = [
             "\U0001f517 **Fetch this Jira ticket with your own Atlassian MCP "
             "connection, then call me back.**",
@@ -1571,7 +1608,8 @@ def build_fetch_directive(url: str, issue_key: str = "") -> str:
             "including `summary,description,priority,labels,components,"
             "issuetype,status,parent,subtasks,issuelinks,attachment"
             + (",comment" if want_comments else "")
-            + f",{settings.jira_ac_field}`.",
+            + (f",{ac_field}" if ac_field else "")
+            + "`.",
         ]
         step = 2
         if want_parent:
@@ -1586,8 +1624,9 @@ def build_fetch_directive(url: str, issue_key: str = "") -> str:
                 f"{step}. If there WAS a parent, also call "
                 f"`{prefix}searchJiraIssuesUsingJql` with `jql` = "
                 '"parent = <THAT PARENT KEY> ORDER BY key", `fields` = '
-                "[`summary`, `description`, `issuetype`, `status`, "
-                f"`{settings.jira_ac_field}`], `responseContentFormat` = "
+                "[`summary`, `description`, `issuetype`, `status`"
+                + (f", `{ac_field}`" if ac_field else "")
+                + "], `responseContentFormat` = "
                 f'"markdown", `searchResultMode` = "all" '
                 f"and `maxResults` = "
                 f"{settings.jira_max_sibling_stories}. Pass the "
@@ -1821,6 +1860,10 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
             "images": [],
             "image_attachments": attachments,
             "images_unavailable": bool(attachments),
+            # Embedded-in-description images. Independent of `attachment`, so a
+            # host that trims the issue JSON cannot silence the disclosure -- the
+            # 22:17 live run had three UI screens and said nothing.
+            "description_image_refs": _count_image_refs(description),
             # "The ticket has no images" and "nobody requested the attachment
             # field" are different facts, and only the first is safe to stay
             # quiet about. A live 2026-08-03 run had three PNG attachments and an

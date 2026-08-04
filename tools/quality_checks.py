@@ -367,29 +367,92 @@ def _qualifier_prefix_merges(counts: dict[str, int]) -> dict[str, str]:
     large share of real suites (``str.casefold()`` is a no-op for Arabic, which
     the first pass silently depends on).
     """
-    bare_by_text: dict[str, str] = {}
+
+    def _norm(label: object) -> str:
+        return " ".join(str(label or "").split())
+
+    # Keyed CASEFOLDED, and the winner within a key is the spelling used by the
+    # MOST cases. 2026-08-03: this lookup used to be exact-text, which silently
+    # defeated the whole rule the first time a real suite disagreed on case. The
+    # observed split was "Cancel Order" (49) + "Sehhaty Cancel Order" (10) +
+    # "Sehhaty Store - Cancel order" (20): the qualified label's tail is
+    # "Cancel order" but the bare label present is "Cancel Order", so the exact
+    # match failed and _qualifier_prefix_merges returned {} for exactly the
+    # three-way split it exists to close. Majority spelling matches what the
+    # casing pass already does, so the two passes cannot disagree on the winner.
+    bare_by_key: dict[str, str] = {}
     for label in counts:
-        bare_by_text[" ".join((label or "").split())] = label
-    tails: dict[str, set[str]] = {}
+        key = _norm(label).casefold()
+        cur = bare_by_key.get(key)
+        if cur is None or counts.get(label, 0) > counts.get(cur, 0):
+            bare_by_key[key] = label
+
+    # Qualifier tokens seen in SEPARATOR-qualified labels, e.g. "Sehhaty Store - X"
+    # contributes {sehhaty, store}. Used only to decide whether a SEPARATOR-LESS
+    # label is a product-qualified variant; see the guard below.
+    known_qualifiers: set = set()
+    # tail_key -> {qualified label: the token set that was REMOVED to reach the tail}.
+    # The removed tokens are what tell one product family from rival qualifiers.
+    tails: dict[str, dict[str, frozenset]] = {}
     for label in counts:
-        norm = " ".join((label or "").split())
+        norm = _norm(label)
         for sep in _MODULE_SEPARATORS:
             token = f" {sep} "
             idx = norm.find(token)
             while idx != -1:
+                head = norm[:idx].strip()
                 tail = norm[idx + len(token) :].strip()
                 if tail and tail != norm:
-                    tails.setdefault(tail, set()).add(label)
+                    toks = frozenset(t.casefold() for t in head.split() if t)
+                    tails.setdefault(tail.casefold(), {})[label] = toks
+                    known_qualifiers.update(toks)
                 idx = norm.find(token, idx + 1)
+
+    # A SEPARATOR-LESS label can still be a product-qualified variant:
+    # "Sehhaty Cancel Order" is "Cancel Order" with a product name glued on. But
+    # plain suffix containment is exactly the dangerous rule -- "Order" is a suffix
+    # of "Cancel Order" and merging those would be wrong. The discriminator is
+    # WHAT was removed: allow it only when every removed prefix token is already a
+    # known qualifier token from a separator-qualified label in this same suite.
+    # "Sehhaty" qualifies via "Sehhaty Store - ...", so it is allowed; "Cancel"
+    # never appears as a qualifier, so "Order" <- "Cancel Order" stays refused.
+    for label in counts:
+        norm = _norm(label)
+        toks = norm.split()
+        for cut in range(1, len(toks)):
+            prefix = toks[:cut]
+            tail = " ".join(toks[cut:])
+            if not tail:
+                continue
+            if not all(t.casefold() in known_qualifiers for t in prefix):
+                continue
+            tails.setdefault(tail.casefold(), {})[label] = frozenset(
+                t.casefold() for t in prefix
+            )
+
     merges: dict[str, str] = {}
-    for tail, qualified in tails.items():
-        target = bare_by_text.get(tail)
+    for tail_key, qualified in tails.items():
+        target = bare_by_key.get(tail_key)
         if target is None:
             continue
-        others = {q for q in qualified if q != target}
-        if len(others) != 1:
+        others = {q: toks for q, toks in qualified.items() if q != target}
+        if not others:
             continue
-        merges[next(iter(others))] = target
+        # ONE qualifier family, or rivals? 2026-08-03: the previous rule refused any
+        # tail claimed by more than one qualified label, which correctly rejects
+        # "Admin - Login" + "User - Login" but ALSO rejected the real observed
+        # split -- "Sehhaty Cancel Order" + "Sehhaty Store - Cancel order" both
+        # point at "Cancel Order", and those are three spellings of ONE module, not
+        # two sub-modules. The discriminator is the REMOVED tokens: a shared token
+        # across every claimant means one product prefix spelled at different
+        # depths (sehhaty / sehhaty+store), while disjoint tokens (admin vs user)
+        # encode a distinction that merging would destroy.
+        if len(others) > 1:
+            common = frozenset.intersection(*others.values()) if others else frozenset()
+            if not common:
+                continue
+        for q in others:
+            merges[q] = target
     return merges
 
 

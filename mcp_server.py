@@ -966,10 +966,53 @@ def build_server():
     return mcp
 
 
+def _configure_logging() -> None:
+    """INFO+ to a rotating file under data/logs/; WARNING+ to stderr.
+
+    Over stdio, MCP clients render EVERY stderr line as an error (Cursor logs
+    "[error] INFO ..." for each httpx/telemetry line), which buries real
+    failures in noise. Errors stay on stderr; the full INFO trail moves to a
+    file an operator can tail. Never raises -- if the file handler cannot be
+    created, stderr keeps INFO so nothing is lost."""
+    from logging.handlers import RotatingFileHandler
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    stderr_handler = logging.StreamHandler()
+    stderr_handler.setLevel(logging.WARNING)
+    stderr_handler.setFormatter(
+        logging.Formatter("%(levelname)s:%(name)s:%(message)s")
+    )
+    root.addHandler(stderr_handler)
+    try:
+        log_dir = Path(__file__).resolve().parent / "data" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_dir / "qa-agents.log",
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        root.addHandler(file_handler)
+    except Exception:
+        stderr_handler.setLevel(logging.INFO)
+        logger.warning(
+            "Could not open data/logs/qa-agents.log -- keeping INFO on stderr."
+        )
+    # Third-party request logging is diagnostic noise at INFO (one line per
+    # telemetry POST); real problems still surface at WARNING+.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
 def main() -> None:
     """Entry point. Gated behind QA_MCP_ENABLED (default OFF) — with the flag off
     the server refuses to start rather than silently exposing the tools."""
-    logging.basicConfig(level=logging.INFO)
+    _configure_logging()
     if not settings.qa_mcp_enabled:
         logger.warning(
             "QA_MCP_ENABLED is off — the MCP server will not start. "
@@ -1003,7 +1046,7 @@ def main() -> None:
     threading.Thread(target=_prewarm_backend, daemon=True).start()
     threading.Thread(target=_drift_watch, daemon=True).start()
     logger.info("Starting the qa-agents MCP server over stdio…")
-    server.run()
+    server.run(show_banner=False)
 
 
 if __name__ == "__main__":

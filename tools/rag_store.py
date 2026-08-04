@@ -227,11 +227,50 @@ def _save_entry_sync(path: Path, entry: dict) -> None:
         fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def _count_entries_sync(path: Path) -> int:
+    """Entry count by counting NEWLINES, without parsing any JSON.
+
+    The gate below only needs to know "roughly how many", and parsing was the
+    expensive half: measured on a real 5033-entry / 2.0 MB corpus, one add cost
+    112 ms against 1.4 ms on a 178-entry one -- almost all of it
+    ``_load_corpus_sync`` deserialising every entry just to compare a length, on
+    every write, including the overwhelming majority that were nowhere near the
+    cap. A byte scan is orders of magnitude cheaper and cannot raise on a
+    malformed line. Returns 0 on any error, which makes the caller skip pruning --
+    the safe direction, since an unpruned corpus only costs disk.
+    """
+    try:
+        if not path.is_file():
+            return 0
+        total = 0
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                total += chunk.count(b"\n")
+        return total
+    except OSError:
+        logger.debug("rag_store: could not count %s", path, exc_info=True)
+        return 0
+
+
 def _prune_sync(path: Path, cap: int) -> None:
     """Keep only the newest ``cap`` entries of a JSONL corpus file (append
     order is chronological). Atomic rewrite; failures are logged, never
     raised — a failed prune just leaves the corpus slightly over cap."""
     try:
+        # Cheap gate FIRST: a newline count, not a full parse. Without this the
+        # function parsed the entire corpus on every add merely to discover it had
+        # nothing to do.
+        #
+        # The gate is EXACTLY the cap, deliberately. An earlier version of this fix
+        # added slack so a corpus sitting AT the cap would not rewrite on every
+        # add -- but any slack turns QA_RAG_MAX_ENTRIES into a soft cap, and the
+        # existing tests are right to forbid that: an operator who caps a corpus at
+        # 5 should get 5, not 5-plus-whatever. It also bought little in practice,
+        # since the steady-state-at-cap cost only bites once a corpus is full, while
+        # the cost this fix actually removes -- parsing the whole file on writes
+        # that are nowhere near the cap -- is what every real corpus was paying.
+        if _count_entries_sync(path) <= cap:
+            return
         entries = _load_corpus_sync(path)
         if len(entries) <= cap:
             return
