@@ -309,7 +309,7 @@ def assumed_requirements_rows(
                 "AR ID",
                 "Submitted as",
                 "Title",
-                "Category",
+                "Coverage Category",
                 "Assumed requirement",
                 "Why it is here",
             ]

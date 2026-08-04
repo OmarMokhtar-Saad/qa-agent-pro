@@ -145,6 +145,12 @@ powershell -ExecutionPolicy Bypass -c "irm https://astral.sh/uv/install.ps1 | ie
 uv python install 3.12
 ```
 
+You can stop after the first line: if `uv` is present but has no
+interpreter yet, the installer fetches Python 3.12 through it for you. It
+also finds an already-installed uv Python, which nothing else does -- uv
+keeps those where neither `PATH` nor the `py` launcher looks, and uv's own
+installer does not touch the PATH of the window you are typing in.
+
 One Windows-only caveat: a launcher update applies on your next editor
 start rather than live. Windows cannot re-exec a process in place, and
 pretending otherwise would drop your session mid-run. Server updates

@@ -1047,15 +1047,17 @@ class Settings(BaseSettings):
     # Set QA_ENV_SELFHEAL_ENABLED=false to disable.
     qa_env_selfheal_enabled: bool = True
 
-    # Export the computed risk label/score into the XLSX Notes column (opt-in,
+    # Export the computed risk SCORE into the XLSX Notes column (opt-in,
     # default OFF). tools/risk_scorer.py scores EVERY suite and the sheet's row
     # order IS the risk order (TC-001 = highest risk), but risk_label /
     # risk_score were never exported -- while the Notes column was empty in
     # 65/65 rows of the 2026-07-30 run, because it only ever carried a Batch-3
     # rule-pack note and the rule packs are off in that deployment. When ON, a
-    # case with NO rule-pack note gets "Risk: CRITICAL (78)"; a rule-pack note
-    # ALWAYS wins, so nothing is ever displaced. OFF = every exported workbook is
-    # byte-identical to today.
+    # case with NO rule-pack note gets "Risk 78"; a rule-pack note ALWAYS wins,
+    # so nothing is ever displaced. OFF = every exported workbook is
+    # byte-identical to today. 2026-08-04: the risk LABEL left that cell -- it
+    # duplicated the Priority column and contradicted it on 10/97 rows of that
+    # day's run; only the SCORE, the sheet's row-order key, is written now.
     qa_xlsx_risk_notes: bool = False
 
     # Directory the auto-exported .xlsx is written to. A RELATIVE value is
