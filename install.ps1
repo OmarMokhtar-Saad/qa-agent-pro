@@ -15,16 +15,39 @@ try {
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 } catch {}
 
+# Native commands are the trap on Windows: PowerShell converts anything a
+# native exe writes to STDERR into a NativeCommandError record, and under
+# $ErrorActionPreference='Stop' that record is TERMINATING. The Microsoft
+# Store python3 stub ALWAYS writes its 'Python was not found' notice to
+# stderr, so merely PROBING it aborted the whole installer -- v1.41.0 died
+# exactly there on a real Windows 11 box, printing a NativeCommandError
+# instead of the friendly 'install Python' message ten lines below.
+#
+# 2>$null does NOT prevent this; merging 2>&1 does, because the stderr text
+# arrives as plain strings. The exit code stays the thing we judge on.
+function Invoke-QaNative {
+  param([string]$Exe, [string[]]$Argv, [switch]$Quiet)
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    $out = & $Exe @Argv 2>&1
+    if (-not $Quiet) { $out | ForEach-Object { Write-Host $_ } }
+  } catch {
+    return 1
+  } finally {
+    $ErrorActionPreference = $prev
+  }
+  return $LASTEXITCODE
+}
+
 # fastmcp needs Python 3.10+. Prefer the py launcher (it knows every
-# per-user install), then a bare python3/python. A machine with no Python at
-# all answers `python` with the Store stub, which exits non-zero -- so the
-# probe below rejects it rather than believing it.
+# per-user install), then a bare python3/python -- the Store alias included,
+# probed like any other candidate and rejected on its non-zero exit.
 function Test-QaPython {
   param([string]$Exe, [string[]]$Pre)
   if (-not (Get-Command $Exe -ErrorAction SilentlyContinue)) { return $false }
   $probe = "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
-  & $Exe @($Pre + @("-c", $probe)) 2>$null | Out-Null
-  return ($LASTEXITCODE -eq 0)
+  return ((Invoke-QaNative $Exe @($Pre + @("-c", $probe)) -Quiet) -eq 0)
 }
 $PyExe = $null
 $PyPre = @()
@@ -38,13 +61,16 @@ if (-not $PyExe) {
 }
 if (-not $PyExe) {
   Write-Host "ERROR: Python 3.10 or newer is required (none found on PATH)."
-  Write-Host "Install it WITHOUT admin rights, either way:"
+  Write-Host "A bare python3/python that offers to open the Microsoft Store"
+  Write-Host "is the App Execution Alias, not a real install -- it does not count."
+  Write-Host "Install Python WITHOUT admin rights, either way:"
   Write-Host "  * python.org installer, leave 'Install for all users' UNCHECKED"
   Write-Host "  * or: powershell -ExecutionPolicy Bypass -c \"irm https://astral.sh/uv/install.ps1 | iex\""
   Write-Host "       then: uv python install 3.12"
   exit 1
 }
-Write-Host ("Using " + (& $PyExe @($PyPre + @("--version")) 2>&1))
+$PyLabel = (@($PyExe) + $PyPre) -join ' '
+Write-Host "Using Python interpreter: $PyLabel"
 
 if ((Test-Path $InstallDir) -and (-not $env:QA_FORCE)) {
   Write-Host "$InstallDir already exists."
@@ -70,22 +96,32 @@ try {
 
 Set-Location $InstallDir
 Write-Host "Creating virtualenv + installing dependencies (a few minutes) ..."
-& $PyExe @($PyPre + @("-m", "venv", ".venv"))
+if ((Invoke-QaNative $PyExe @($PyPre + @("-m", "venv", ".venv"))) -ne 0) {
+  Write-Host "ERROR: could not create the virtualenv."
+  exit 1
+}
 $VenvPy = Join-Path $InstallDir ".venv\Scripts\python.exe"
 if (-not (Test-Path $VenvPy)) {
   Write-Host "ERROR: virtualenv creation failed ($VenvPy is missing)."
   exit 1
 }
-& $VenvPy -m pip install --quiet --upgrade pip
-& $VenvPy -m pip install --quiet -e .
+# pip upgrade is best-effort; the dependency install is not. pip routinely
+# writes notices to stderr, which is the same NativeCommandError trap.
+Invoke-QaNative $VenvPy @("-m", "pip", "install", "--quiet", "--upgrade", "pip") -Quiet | Out-Null
+if ((Invoke-QaNative $VenvPy @("-m", "pip", "install", "--quiet", "-e", ".")) -ne 0) {
+  Write-Host "ERROR: dependency install failed (pip output above)."
+  exit 1
+}
 if (-not (Test-Path ".env")) { Copy-Item ".env.example" ".env" }
 # Lock code files read-only (the launcher re-locks + self-heals each start).
-& $VenvPy -c "from pathlib import Path; from tools.updater import lock_files; lock_files(Path('.'))"
+$LockCode = "from pathlib import Path; from tools.updater import lock_files; lock_files(Path('.'))"
+Invoke-QaNative $VenvPy @("-c", $LockCode) -Quiet | Out-Null
 Write-Host ""
 Write-Host "Installed QA Agent Pro $tag to $InstallDir"
 Write-Host ""
 Write-Host "Registering with your AI editors ..."
-& powershell -ExecutionPolicy Bypass -File (Join-Path $InstallDir "connect.ps1")
+Invoke-QaNative "powershell" @("-ExecutionPolicy", "Bypass", "-File",
+                              (Join-Path $InstallDir "connect.ps1")) | Out-Null
 Write-Host ""
 Write-Host "Next steps:"
 Write-Host "  1. Restart Cursor / Claude, then ask it: run qa_setup_check"
