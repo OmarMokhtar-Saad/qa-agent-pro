@@ -15,7 +15,7 @@ written by the model you are already chatting with.
 ## How it works
 
 ```
-Cursor / Claude ──(stdio, MCP)──> start.sh
+Cursor / Claude ──(stdio, MCP)──> start.sh / start.cmd
                                     │ 1. check GitHub for a newer release → auto-update
                                     │ 2. verify MANIFEST.sha256 → self-heal edited files
                                     │ 3. chmod code files read-only
@@ -23,7 +23,8 @@ Cursor / Claude ──(stdio, MCP)──> start.sh
                                 mcp_server.py  →  qa_* tools
 ```
 
-1. Your editor launches `start.sh` and talks MCP over stdio.
+1. Your editor launches `start.sh` (`start.cmd` on Windows) and talks
+   MCP over stdio.
 2. Before serving, the launcher **updates itself** from the latest GitHub
    release, **verifies every code file** against the release manifest
    (locally-edited files are restored automatically), and **locks the
@@ -46,12 +47,20 @@ and the RAG corpus (`corpus/`) are protected paths.
 
 ## Quick start
 
+> **On Windows? Use [the Windows quick start](#windows) instead.**
+> The commands on this page are macOS / Linux / *inside* WSL: `sh`,
+> `bash` and `curl ... | bash` are not Windows commands. Windows has
+> its own one-liner -- PowerShell, no WSL, and **no administrator
+> rights**.
+
 Requires **Python 3.10+** and `curl` (the installer picks the newest
 suitable `python3.x` on your PATH automatically). Check with
 `python3 --version`. If that fails or shows an older version, install
 Python first:
 
 ```bash
+# Run these in a macOS/Linux terminal or the WSL shell -- NOT in CMD.
+
 # macOS (installs Homebrew first if you don't have it: https://brew.sh)
 brew install python@3.12
 
@@ -73,8 +82,12 @@ above can require admin, which is exactly what the `uv` route avoids.
 On Windows, the per-user Python from python.org (leave *Install for all
 users* unchecked) needs no admin either.
 
-**On Windows?** Native Windows is not supported -- see
-[Windows (WSL2)](#windows-wsl2) below.
+The same holds on Windows: the native installer writes only under your
+user profile, and every Windows Python option is per-user (python.org
+with *Install for all users* unchecked, the Microsoft Store build, or
+`uv`). Nothing in the Windows path needs administrator rights -- see
+[the Windows quick start](#windows). WSL is only an ALTERNATIVE there,
+and `wsl --install` is the one thing that WOULD need admin.
 
 **Step 1 — Install.** Run this one command in your terminal:
 
@@ -101,23 +114,64 @@ and the exports; the test cases themselves are written by the model in
 your editor, on the plan and schema the server hands it — which is also
 why nothing here is billed to you twice.
 
-## Windows (WSL2)
+## Windows
 
-`install.sh`, `start.sh` and `connect.sh` are bash scripts that build a
-POSIX virtualenv (`.venv/bin/python`), so they do **not** run on native
-Windows -- not in PowerShell, and not in Git Bash either (a Windows
-virtualenv puts its interpreter in `.venv\Scripts\` instead). Windows
-is supported through **WSL2**, where every instruction above applies
-unchanged:
+**Native Windows, no WSL, no administrator rights.** Run this in
+PowerShell:
 
-**1. Install WSL2** (skip if you already have it), then open the Linux
-shell it sets up:
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/OmarMokhtar-Saad/qa-agent-pro/main/install.ps1 | iex"
+```
+
+It installs to `%USERPROFILE%\qa-agent-pro` (override with
+`QA_INSTALL_DIR`), creates a private virtualenv, and registers Claude
+Code, Cursor and Claude Desktop for you -- writing nothing outside your
+own profile. Then restart your editor and ask `run qa_setup_check`.
+
+Windows entry points, if you ever need them by hand:
+
+| File | Use |
+|---|---|
+| `start.cmd` | The MCP command your editor runs (the Windows `start.sh`) |
+| `install.ps1` | The installer above |
+| `connect.ps1` | Re-register your editors (`powershell -ExecutionPolicy Bypass -File %USERPROFILE%\qa-agent-pro\connect.ps1`) |
+
+**Python first, if you don't have 3.10+.** All three of these are
+per-user and need NO admin: the python.org installer with *Install for
+all users* unchecked, the Microsoft Store build, or `uv`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://astral.sh/uv/install.ps1 | iex"
+uv python install 3.12
+```
+
+One Windows-only caveat: a launcher update applies on your next editor
+start rather than live. Windows cannot re-exec a process in place, and
+pretending otherwise would drop your session mid-run. Server updates
+still apply live, exactly as on macOS.
+
+### Alternative: WSL2
+
+If you already run WSL2 -- or want the Linux tooling (`adb`, POSIX
+paths) -- the bash installer works there unchanged. Note `wsl --install`
+itself needs **administrator** rights, which the native path above does
+not:
+
+**1. Install WSL2** if you don't have it -- check with `wsl -l -v`.
+This needs **administrator** rights (it enables a machine-wide Windows
+feature): open PowerShell or Terminal via *Run as administrator*, run
+the command below, reboot, then pick an Ubuntu username + password when
+it first launches. No admin? Use the native path above instead.
 
 ```powershell
 wsl --install
 ```
 
-**2. Run the Step 1 installer INSIDE WSL** -- not in PowerShell:
+Nothing after this point needs admin.
+
+**2. Run the Step 1 installer INSIDE the Ubuntu shell** -- not in CMD
+or PowerShell. Recent Ubuntu images already ship Python 3.12, so
+`python3 --version` is usually all the prerequisite check you need:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/OmarMokhtar-Saad/qa-agent-pro/main/install.sh | bash
@@ -200,9 +254,9 @@ claude mcp add qa-agent-pro -- ~/qa-agent-pro/start.sh
 `~/Library/Application Support/Claude/claude_desktop_config.json`
 (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows).
 
-On Windows that path is right but the `command` is not: a Windows editor
-cannot run `start.sh` directly -- use the `wsl.exe` form from
-[Windows (WSL2)](#windows-wsl2).
+On Windows the `command` is `%USERPROFILE%\qa-agent-pro\start.cmd`
+(native) -- or the `wsl.exe` form if you installed inside WSL. See
+[Windows](#windows).
 
 Restart the editor afterwards. Ask `run qa_setup_check` first to confirm
 the machine is ready.

@@ -244,6 +244,22 @@ class Supervisor:
         needs a restart, even for launcher changes."""
         if self.closing or _self_hash() == self.self_hash:
             return
+        if sys.platform == "win32":
+            # os.execv does NOT replace the process on Windows: it starts a
+            # NEW pid and this one exits, so the editor sees the child it
+            # spawned die and drops the session. Losing a tester's session
+            # is worse than a delayed launcher update, so the new code
+            # applies on the next start instead -- the README's documented
+            # 'one editor restart' case. The SERVER half still updates
+            # live: restart_child() respawns via subprocess, which is fine
+            # here. Stamping the hash keeps this to one log line, not one
+            # per 15-minute update tick.
+            self.self_hash = _self_hash()
+            log.info(
+                "Launcher code changed on disk; it applies on the next "
+                "start (Windows cannot re-exec in place)."
+            )
+            return
         log.info("Launcher code changed on disk — re-exec (%s).", reason)
         with self.child_lock:
             self.restarting = True
@@ -553,7 +569,8 @@ def main() -> int:
             if bool(getattr(_s, "qa_auto_register_clients", False)):
                 from tools.client_registry import register_all
 
-                _start = str(INSTALL_DIR / "start.sh")
+                _entry = "start.cmd" if sys.platform == "win32" else "start.sh"
+                _start = str(INSTALL_DIR / _entry)
                 for _label, _status, _detail in register_all(
                     _start, insert_only=True
                 ):

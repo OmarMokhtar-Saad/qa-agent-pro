@@ -32,7 +32,9 @@ HOUSE RULES THIS MODULE OBEYS:
   writes nothing: losing a tester's other MCP servers is far worse than not
   registering.
 
-POSIX only (``fcntl``). Windows registration stays manual -- a documented gap, not
+Advisory locking is POSIX only (``fcntl``) and simply degrades on Windows; the
+CONFIG PATHS are cross-platform, so native-Windows installs register the same
+way. What remains Windows-specific is only the lock -- a narrow gap, not
 an oversight.
 """
 
@@ -196,12 +198,20 @@ def default_targets(home: Path | None = None) -> list[tuple[str, Path, Path]]:
 
     Claude Code is NOT here: it is registered through ``claude mcp add`` rather
     than by editing a file, and shelling out to a CLI does not belong in a startup
-    pass. Windows paths are absent -- see the module docstring.
+    pass. Windows IS covered (``%APPDATA%\\Claude``) as of native-Windows
+    support; only the advisory lock degrades there -- see the module docstring.
     """
     home = Path(home) if home is not None else Path.home()
     out = [("Cursor", home / ".cursor" / "mcp.json", home / ".cursor")]
     if sys.platform == "darwin":
         app = home / "Library" / "Application Support" / "Claude"
+    elif sys.platform == "win32":
+        # %APPDATA% by its conventional path rather than the env
+        # var, so a caller-supplied ``home`` still governs (tests, and
+        # an install
+        # driven for another profile). Cursor needs no branch at all:
+        # ``~/.cursor`` is already correct on Windows.
+        app = home / "AppData" / "Roaming" / "Claude"
     else:
         app = home / ".config" / "Claude"
     out.append(("Claude Desktop", app / "claude_desktop_config.json", app))

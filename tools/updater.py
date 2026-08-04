@@ -202,7 +202,15 @@ def lock_files(install_dir: Path) -> int:
                 # file that drifted writable (editor, stray chmod, partial
                 # extraction) must still be re-locked on the very next pass.
                 st_mode = os.stat(path).st_mode
-                desired = 0o555 if rel.endswith(".sh") else 0o444 | (st_mode & 0o111)
+                # The .sh exec-bit rule is POSIX-only. Windows synthesizes the
+                # mode from the read-only ATTRIBUTE, so a locked .sh reports
+                # 0o444 and could never equal 0o555 -- the guard above would
+                # miss every time and re-chmod the shell scripts on every
+                # 15-minute pass, logging each as if it were work.
+                if rel.endswith(".sh") and os.name != "nt":
+                    desired = 0o555
+                else:
+                    desired = 0o444 | (st_mode & 0o111)
                 if stat.S_IMODE(st_mode) != desired:
                     os.chmod(path, desired)
                     locked += 1
