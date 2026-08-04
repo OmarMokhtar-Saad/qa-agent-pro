@@ -186,13 +186,20 @@ def _drift_watch() -> None:
         return
     if not (_test_cases_only() and _DIST_UPDATE_REPO and _drift_restart_enabled()):
         return
+    # 2026-08-04: the drift TICK no longer shares QA_UPDATE_INTERVAL_MINUTES'
+    # 15-minute clock. This loop's steady-state cost is reading the local
+    # VERSION/pyproject (no network; the manifest verify below runs only AFTER
+    # a change is detected), so a fast tick is essentially free -- while it
+    # rode the network cadence, a peer-applied release took up to 15 minutes
+    # to reach the other clients' servers (v1.39.0 rollout: applied 09:04:30,
+    # the two stale Cursor servers restarted only at their 09:07 marks). The
+    # NETWORK check keeps its own 15-minute clock in the launcher's watchdog.
     try:
         interval = max(
-            60.0,
-            float(os.environ.get("QA_UPDATE_INTERVAL_MINUTES", "15")) * 60.0,
+            5.0, float(os.environ.get("QA_DRIFT_CHECK_SECONDS", "30"))
         )
     except (TypeError, ValueError):
-        interval = 900.0
+        interval = 30.0
     deferrals = 0
     blocked = 0
     while True:
@@ -1014,6 +1021,12 @@ def _configure_logging() -> None:
     # v1.38.0 validation run.
     for noisy in ("httpx", "httpcore", "FastMCP"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    # The setLevel above is NOT enough for FastMCP: it (re)configures its own
+    # handler and level during server.run(), which overrode this on the
+    # v1.39.0 validation (the INFO transport banner still hit stderr at
+    # 09:09:36). Its level is read from the environment, so pin it there --
+    # setdefault keeps an operator's explicit choice.
+    os.environ.setdefault("FASTMCP_LOG_LEVEL", "WARNING")
 
 
 def main() -> None:
