@@ -493,7 +493,8 @@ def build_server():
         the full merged suite yourself and call `qa_submit_suite`. The server
         validates, de-duplicates, scores, exports and persists it, and replies
         with the finished suite + file path OR gaps to regenerate under the SAME
-        prep_id. Use `qa_get_category_job` for a single-category packet.
+        prep_id. Use `qa_get_category_job` with category_name="all" for every
+        worker packet in ONE call (or one name for a single packet).
 
         If any ticket screenshots were available they are attached as image
         content -- inspect them directly. For an under-specified or no-UI ticket
@@ -568,6 +569,9 @@ def build_server():
 
         Use when a same-session worker should not re-parse the full prepare
         payload. category_name should match orchestration.expected_categories.
+        Pass category_name="all" (or "*") to get EVERY job in ONE call with
+        the shared prompt blocks hoisted once -- preferred when dispatching
+        parallel workers; never fetch packets one call per category.
         """
         return await _tracked(
             "qa_get_category_job",
