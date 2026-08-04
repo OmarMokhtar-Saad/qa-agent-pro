@@ -30,6 +30,15 @@ import time
 DIST_REPO = "OmarMokhtar-Saad/qa-agent-pro"
 IDLE_SECONDS = 60
 
+# Used by the log-file dir below and the client-registration pass.
+# Was referenced without being defined until 2026-08-04: both call
+# sites are inside never-raise try blocks, so the NameError silently
+# degraded launcher logging to INFO-on-stderr on every start and made
+# QA_AUTO_REGISTER_CLIENTS a no-op.
+from pathlib import Path as _PathLib
+
+INSTALL_DIR = _PathLib(os.path.dirname(os.path.abspath(__file__)))
+
 log = logging.getLogger("qa_agent_pro.launcher")
 
 
