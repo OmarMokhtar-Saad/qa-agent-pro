@@ -14,8 +14,10 @@ Write-Host "QA Agent Pro - registering MCP server at: $Start"
 
 # Claude Code (CLI) -- user scope so it is available in every project.
 if (Get-Command claude -ErrorAction SilentlyContinue) {
-  & claude mcp remove --scope user qa-agent-pro 2>$null | Out-Null
-  & claude mcp add --scope user qa-agent-pro -- "$Start" 2>$null | Out-Null
+  # 2>&1 not 2>$null: a native exe writing to stderr becomes a
+  # NativeCommandError, and merging is what actually defuses it.
+  & claude mcp remove --scope user qa-agent-pro 2>&1 | Out-Null
+  & claude mcp add --scope user qa-agent-pro -- "$Start" 2>&1 | Out-Null
   if ($LASTEXITCODE -eq 0) {
     Write-Host "  + Claude Code: registered (user scope)"
   } else {
@@ -52,7 +54,7 @@ $PyFile = Join-Path $env:TEMP ("qa-connect-" + [guid]::NewGuid().ToString("N") +
 # ASCII on purpose: Set-Content -Encoding UTF8 writes a BOM on PowerShell 5.1.
 Set-Content -Path $PyFile -Value $PyBody -Encoding ASCII
 try {
-  & $Py $PyFile "$Start"
+  & $Py $PyFile "$Start" 2>&1
 } finally {
   Remove-Item $PyFile -Force -ErrorAction SilentlyContinue
 }
