@@ -398,7 +398,7 @@ def resolve_ac_field(fields: object) -> tuple[str, str, str]:
 
     Discovery is OFF by default on purpose -- silently adopting the wrong field is
     the exact failure this whole change set exists to remove, so an operator opts
-    in, and :func:`qa_setup_check` shows what was resolved either way.
+    in, and :func:`qa-doctor` shows what was resolved either way.
 
     Never raises: degrades to (configured_id, "", reason).
     """
@@ -1220,7 +1220,7 @@ def _local_config_paths(
       at import time, so cwd collapses onto the candidate above.
 
     The MCP protocol carries the real signal: the client's ``roots`` capability
-    reports the open workspace folder(s). ``mcp_server.qa_setup_check`` resolves
+    reports the open workspace folder(s). ``mcp_server.qa-doctor`` resolves
     it (``ctx.list_roots()``) and threads the result down as ``workspace_roots``,
     which is checked FIRST. The two guesses stay on as low-priority candidates --
     a dev checkout runs the server FROM the workspace, so they are right there --
@@ -1294,10 +1294,10 @@ def _local_atlassian_entry_exists(
 
 def connect_hint_line(workspace_roots: list[Path] | None = None) -> str:
     """One-line, client-aware Jira-connect hint for compact reports (e.g.
-    qa_setup_check's optional-items list).
+    qa-doctor's optional-items list).
 
     ``workspace_roots`` are the tester's OPEN workspace folder(s), resolved from
-    the MCP ``roots`` capability by ``mcp_server.qa_setup_check`` and passed
+    the MCP ``roots`` capability by ``mcp_server.qa-doctor`` and passed
     straight through to the on-disk lookup -- the only authoritative way to find
     the project-scoped config a tester would actually edit. ``None`` (a client
     without ``roots`` support, or a failed lookup) degrades to the
@@ -1404,7 +1404,7 @@ def verify_tool_name() -> str:
 def verify_directive() -> str:
     """Directive asking the calling agent to PROVE the Atlassian connection.
 
-    Appended to EVERY qa_setup_check report and to qa_configure_jira's
+    Appended to EVERY qa-doctor report and to qa_configure_jira's
     no-argument reply, so the flow is reachable from either entry point.
     Additive by design: the on-disk best guess (connect_hint_line) still stands
     beside it, because this only becomes a real status once the agent calls

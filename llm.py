@@ -415,12 +415,12 @@ def _unavailable_message(backend: str) -> str:
         return (
             "Your MCP client is Cursor, but cursor-agent is not authenticated on "
             "this machine. Set CURSOR_API_KEY in ~/qa-agent-pro/.env or run "
-            "`cursor-agent login`, then run qa_setup_check."
+            "`cursor-agent login`, then run qa-doctor."
         )
     return (
         "Your MCP client is Claude Code/Desktop, but the claude CLI is not "
         "available or signed in on this machine. Install the Claude Code CLI (or "
-        "set CLAUDE_CLI_PATH) and sign in, then run qa_setup_check. If you are "
+        "set CLAUDE_CLI_PATH) and sign in, then run qa-doctor. If you are "
         "authenticated another way, set QA_LLM_STRICT_HOST=false in .env to "
         "allow fallback."
     )
@@ -461,7 +461,7 @@ def _auto_backend() -> str:
         raise LLMBackendUnavailableError(
             "No usable LLM backend was found. Install and sign in to the claude "
             "CLI or cursor-agent, or set ANTHROPIC_API_KEY, then run "
-            "qa_setup_check."
+            "qa-doctor."
         )
     return "cli"
 

@@ -1,4 +1,4 @@
-"""Repair known-stale values in an install's .env (see qa_setup_check).
+"""Repair known-stale values in an install's .env (see qa-doctor).
 
 ``updater.migrate_env`` appends missing keys but never rewrites an existing line,
 which is the right default for operator config and the reason a stale value can

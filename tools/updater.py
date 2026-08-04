@@ -461,11 +461,11 @@ def _local_version(install_dir: Path) -> Optional[str]:
     return None
 
 
-# One GET per process per TTL: startup, qa_setup_check and the periodic drift
+# One GET per process per TTL: startup, qa-doctor and the periodic drift
 # watch each hit /releases/latest, so a single session made three identical
 # calls within 11 seconds (observed 2026-08-03 22:11:14-22:11:25). 300s keeps
-# "publish a release, run qa_setup_check" responsive while collapsing the
-# burst -- and keeps the network off the qa_setup_check hot path within the
+# "publish a release, run qa-doctor" responsive while collapsing the
+# burst -- and keeps the network off the qa-doctor hot path within the
 # TTL. Only SUCCESS is cached; errors keep raising so callers degrade as
 # before and the next call retries for real.
 _RELEASE_CACHE_TTL_S = 300.0

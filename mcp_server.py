@@ -373,6 +373,41 @@ def _make_asker(ctx):
     return ask_text
 
 
+def _image_content_blocks(image_specs):
+    """Convert {filename, mime, data} specs into MCP image content blocks.
+
+    Same lazy fastmcp import and the same NEVER-silent text fallback as
+    _prepare_payload_to_content, which is deliberately left untouched so the
+    prepare path stays byte-identical. Used by qa_capture_screens."""
+    from mcp.types import TextContent
+
+    blocks: list = []
+    for spec in image_specs or []:
+        try:
+            from fastmcp.utilities.types import Image
+
+            mime = spec.get("mime") or "image/png"
+            image = Image(data=spec["data"], format=(mime.split("/")[-1] or "png"))
+            blocks.append(image.to_image_content(mime_type=mime))
+        except Exception:
+            logger.warning(
+                "could not attach captured screen %r as MCP image content",
+                spec.get("filename", "screen"),
+                exc_info=True,
+            )
+            blocks.append(
+                TextContent(
+                    type="text",
+                    text=(
+                        "> ℹ️  Captured screen "
+                        f"'{spec.get('filename', 'screen')}' could not be "
+                        "attached as image content."
+                    ),
+                )
+            )
+    return blocks
+
+
 def _prepare_payload_to_content(result):
     """Convert a PreparePayloadResult into the content list qa_prepare_test_cases
     returns: one or more TEXT blocks (the grounded payload -- split across blocks
@@ -432,6 +467,10 @@ def build_server():
         feature_or_url: str = "",
         proceed_anyway: bool = False,
         jira_content_json: str = "",
+        source_plan: str = "",
+        attached_image_count: int = 0,
+        capture_ids: list[str] | None = None,
+        image_gate_ack: bool = False,
     ) -> str:
         """Generate a structured test suite. feature_or_url can be a feature
         description, a Jira/issue URL, a web page URL, or a Swagger/OpenAPI
@@ -453,6 +492,18 @@ def build_server():
         list of clarifying questions (no suite is generated) — relay them to the
         user. Once they answer, call again with the fuller text, or set
         proceed_anyway=true to generate anyway with whatever is available.
+
+        IMAGE GATE (QA_IMAGE_GATE_ENABLED, ON by default). This tool runs the
+        generation in YOUR chat model, so for a Jira URL the FIRST reply may be
+        a question about where the ticket's SCREENS come from -- this server
+        cannot read images out of Jira, only text. Relay it, then call again with
+        the SAME feature_or_url plus `source_plan` (`jira` = ticket text only,
+        `jira_attach`, `jira_device`, `jira_both`, `device`); with `jira_attach`
+        also pass `attached_image_count`, and with `jira_device` call
+        `qa_capture_screens` first and pass its `capture_ids`. A second, informed
+        reply may NAME the screens the fetched ticket has; supply them or pass
+        `image_gate_ack=true` (send it together with `source_plan='jira'` up
+        front when the user has already said the screens do not matter).
         """
         return await _tracked(
             "qa_generate_test_cases",
@@ -464,6 +515,10 @@ def build_server():
                 ask_text=_make_asker(ctx),
                 progress=_make_progress(ctx),
                 jira_content_json=jira_content_json,
+                source_plan=source_plan,
+                attached_image_count=attached_image_count,
+                capture_ids=list(capture_ids or []),
+                image_gate_ack=image_gate_ack,
             ),
         )
 
@@ -473,6 +528,10 @@ def build_server():
         feature_or_url: str = "",
         proceed_anyway: bool = False,
         jira_content_json: str = "",
+        source_plan: str = "",
+        attached_image_count: int = 0,
+        capture_ids: list[str] | None = None,
+        image_gate_ack: bool = False,
     ) -> list[ContentBlock]:
         """HOST-MODE generation. Instead of the server calling an LLM, THIS tool
         returns a grounded generation payload (a system prompt, the grounded
@@ -503,6 +562,23 @@ def build_server():
         prep_id. Use `qa_get_category_job` with category_name="all" for every
         worker packet in ONE call (or one name for a single packet).
 
+        IMAGE GATE (QA_IMAGE_GATE_ENABLED, ON by default). For a Jira URL the
+        FIRST reply may instead ask where the ticket's SCREENS come from -- this
+        server cannot read images out of Jira, only text. Relay that question,
+        then call again with the SAME feature_or_url plus `source_plan` (`jira` =
+        ticket text only, `jira_attach`, `jira_device`, `jira_both`, `device`).
+        For `jira_attach` also pass `attached_image_count` = how many images the
+        user attached to THIS chat (the bytes stay with you; the payload then
+        asks you to describe them and return `image_descriptions`). For
+        `jira_device` call `qa_capture_screens` first and pass its `capture_ids`
+        -- many screens are fine, and the ids stay valid across the Jira fetch
+        directive and any failed attempt, so re-send them unchanged. Once the
+        ticket is fetched a SECOND short reply may NAME the screens the ticket
+        actually has and ask again; supply them, or pass `image_gate_ack=true` to
+        generate from the ticket text anyway. If the user already said the
+        screens do not matter, send `source_plan='jira'` AND
+        `image_gate_ack=true` together and neither ask appears.
+
         If any ticket screenshots were available they are attached as image
         content -- inspect them directly. For an under-specified or no-UI ticket
         the reply may instead be clarifying questions (no payload); relay them, or
@@ -518,6 +594,10 @@ def build_server():
                 ask_text=_make_asker(ctx),
                 progress=_make_progress(ctx),
                 jira_content_json=jira_content_json,
+                source_plan=source_plan,
+                attached_image_count=attached_image_count,
+                capture_ids=list(capture_ids or []),
+                image_gate_ack=image_gate_ack,
             ),
         )
         return _prepare_payload_to_content(result)
@@ -776,6 +856,55 @@ def build_server():
             mcp_handlers.handle_list_devices(progress=_make_progress(ctx)),
         )
 
+    # Registered UNCONDITIONALLY (not inside the full-edition block below):
+    # tools/device_manager IS shipped in the test-cases-only edition, capturing
+    # app screens GROUNDS test-case generation -- that edition's one job -- and
+    # this tool makes no server-side vision call and needs no credentials, so
+    # the credential-free promise holds. It is gated on QA_MOBILE_CAPTURE inside
+    # the handler, and note that the dist .env.example SHIPS
+    # QA_MOBILE_CAPTURE=true (scripts/build_dist.py), so this tool is LIVE by
+    # default on that edition -- a deliberate decision, documented in
+    # docs/FEATURE_FLAGS.md and in the dist README's tool table.
+    @mcp.tool()
+    async def qa_capture_screens(
+        ctx: Context,
+        device_id: str = "",
+        count: int = 1,
+        rescan: bool = False,
+    ) -> list[ContentBlock]:
+        """Capture screenshots from a connected phone / emulator / simulator and
+        return them as image content PLUS one capture_id per screen (requires
+        QA_MOBILE_CAPTURE).
+
+        Use this when the user wants test cases grounded in the REAL screens --
+        especially for a Jira ticket, because this server cannot read images out
+        of Jira (the Atlassian MCP connection returns attachment metadata, never
+        image bytes). Capture as many screens as you need with `count`, name them
+        when asked, then call `qa_prepare_test_cases` (or
+        `qa_generate_test_cases`) with the returned `capture_ids` so the
+        generated cases can reference each screen BY NAME.
+
+        Omit device_id to get a device picker (it includes a Rescan option for a
+        phone plugged in after the list was built); pass rescan=true to force a
+        fresh scan. The capture_ids stay valid until a preparation actually uses
+        them, and expire after 30 minutes.
+        """
+        from mcp.types import TextContent
+
+        text, specs = await _tracked(
+            "qa_capture_screens",
+            ctx,
+            mcp_handlers.handle_capture_screens(
+                device_id=device_id,
+                count=count,
+                rescan=rescan,
+                choose=_make_chooser(ctx),
+                ask_text=_make_asker(ctx),
+                progress=_make_progress(ctx),
+            ),
+        )
+        return [TextContent(type="text", text=text), *_image_content_blocks(specs)]
+
     # Full edition only — Maestro runs + the multi-workflow wizard reference
     # modules the distribution build does not ship.
     if not mcp_handlers._test_cases_only():
@@ -884,8 +1013,8 @@ def build_server():
                 ),
             )
 
-    @mcp.tool()
-    async def qa_setup_check(ctx: Context) -> str:
+    @mcp.tool(name="qa-doctor")
+    async def qa_doctor(ctx: Context) -> str:
         """Check whether THIS machine is ready: overall verdict, LLM backend
         auth, integrations, CLI tooling (adb/xcrun), enabled features and
         action items. Fast and read-only. Run this first on a new machine."""
@@ -895,7 +1024,7 @@ def build_server():
         # in-flight counter that gates the drift restart.
         roots = await _workspace_roots(ctx)
         return await _tracked(
-            "qa_setup_check",
+            "qa-doctor",
             ctx,
             mcp_handlers.handle_setup_check(progress=progress, workspace_roots=roots),
         )

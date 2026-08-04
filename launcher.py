@@ -12,7 +12,7 @@ the install current WITHOUT restarting the editor:
    recorded MCP initialize handshake is replayed — the editor keeps its
    session, nothing to do. Set QA_DRIFT_RESTART_ENABLED=false to disable.
 3. If the server ever crashes it is respawned the same way.
-4. qa_setup_check is retried across such a reload automatically: the
+4. qa-doctor is retried across such a reload automatically: the
    client makes ONE call and gets the final, post-reload report.
 
 stdout carries the MCP protocol; every log line goes to stderr. A network
@@ -63,7 +63,7 @@ def _disk_version() -> str:
 
 def _write_session_state() -> None:
     """Record which app version's tool schemas the client last loaded
-    (observed initialize / tools-list requests). qa_setup_check compares
+    (observed initialize / tools-list requests). qa-doctor compares
     this to the release that last changed the schemas and tells the user
     when a one-time editor restart is needed (editors ignore list_changed)."""
     try:
@@ -87,7 +87,7 @@ def _self_hash() -> str:
         return ""
 
 
-SETUP_CHECK_TOOL = "qa_setup_check"
+SETUP_CHECK_TOOL = "qa-doctor"
 SETUP_CHECK_MAX_RETRIES = 2
 SETUP_CHECK_TIMEOUT_S = 25.0
 # Fragments of the child's 'a reload was scheduled' reply
@@ -97,7 +97,7 @@ SETUP_CHECK_TIMEOUT_S = 25.0
 # it would silently stop matching.
 RELOAD_MARKERS = (
     "This takes about 10 seconds",
-    "qa_setup_check` again",
+    "qa-doctor` again",
 )
 
 
@@ -164,9 +164,9 @@ class Supervisor:
         self.closing = False
         self.restarting = False
         self.self_hash = _self_hash()
-        # qa_setup_check reload auto-retry (see maybe_hold_setup_check)
+        # qa-doctor reload auto-retry (see maybe_hold_setup_check)
         self.setup_lock = threading.RLock()
-        self.setup_id = None  # id of the in-flight qa_setup_check call
+        self.setup_id = None  # id of the in-flight qa-doctor call
         self.setup_request = None  # its raw request line, for the re-send
         self.setup_held = None  # its withheld 'reloading now' reply
         self.setup_retries = 0
@@ -342,9 +342,9 @@ class Supervisor:
             if self.child is not None and self.child.poll() is None:
                 self.child.terminate()
 
-    # ------------------------------ qa_setup_check reload auto-retry
+    # ------------------------------ qa-doctor reload auto-retry
     def note_setup_check(self, request_id, line) -> None:
-        """Remember an in-flight qa_setup_check call so its reply can be
+        """Remember an in-flight qa-doctor call so its reply can be
         intercepted. Only the newest is tracked: every call carries its own
         id and the client matches replies itself, so a second call simply
         supersedes the first."""
@@ -361,7 +361,7 @@ class Supervisor:
         self.setup_deadline = 0.0
 
     def maybe_hold_setup_check(self, line) -> bool:
-        """True when *line* is the tracked qa_setup_check reply saying a
+        """True when *line* is the tracked qa-doctor reply saying a
         reload was just scheduled. The caller must NOT forward it: the child
         exits seconds later, the EOF path respawns it and re-sends the same
         request, so the client makes ONE call and still gets the final,
@@ -377,7 +377,7 @@ class Supervisor:
                 return False
             if self.setup_retries >= SETUP_CHECK_MAX_RETRIES:
                 log.warning(
-                    "qa_setup_check still reloading after %d retries.",
+                    "qa-doctor still reloading after %d retries.",
                     self.setup_retries,
                 )
                 # Forward the notice; the tester can still retry by hand.
@@ -392,7 +392,7 @@ class Supervisor:
             return True
 
     def resend_setup_check(self) -> None:
-        """After a respawn: re-issue the held qa_setup_check to the new child
+        """After a respawn: re-issue the held qa-doctor to the new child
         under the ORIGINAL id, because that is the id the client is waiting
         on."""
         with self.setup_lock:
@@ -405,10 +405,10 @@ class Supervisor:
         try:
             child.stdin.write(line)
             child.stdin.flush()
-            log.info("Re-sent qa_setup_check to the reloaded server.")
+            log.info("Re-sent qa-doctor to the reloaded server.")
         except Exception:
             log.warning(
-                "Could not re-send qa_setup_check -- releasing the held reply."
+                "Could not re-send qa-doctor -- releasing the held reply."
             )
             self.release_setup_check()
 
@@ -430,7 +430,7 @@ class Supervisor:
             # Never silent: a lost release means the client is still
             # waiting on an id nobody will answer.
             log.warning(
-                "Could not release the held qa_setup_check reply.",
+                "Could not release the held qa-doctor reply.",
                 exc_info=True,
             )
 
@@ -450,7 +450,7 @@ class Supervisor:
                 break
             time.sleep(min(0.25, remaining))
         log.warning(
-            "qa_setup_check auto-retry timed out -- returning the notice."
+            "qa-doctor auto-retry timed out -- returning the notice."
         )
         self.release_setup_check()
 

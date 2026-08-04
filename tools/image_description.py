@@ -18,7 +18,7 @@ residue sub-phase R3):
   returns a ``str``, so raw screens cannot become MCP image content there.
   Building one would be new capability wearing a migration's name, so that half
   is DISABLED at the Phase-6 flip and DISCLOSED instead (the prepare reply and a
-  ``qa_setup_check`` per-mode item both say so).
+  ``qa-doctor`` per-mode item both say so).
 
 The old third caller, ``app.py`` (the Chainlit bug-report screenshot), was
 retired with the web UI in July 2026 and no longer exists.

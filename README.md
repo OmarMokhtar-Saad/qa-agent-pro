@@ -42,8 +42,9 @@ and the RAG corpus (`corpus/`) are protected paths.
 | `qa_generate_test_cases` | Feature text, Jira/issue URL, web page URL, or Swagger/OpenAPI link → structured test suite (steps, expected results, priority, risk) with a persisted `suite_id` |
 | `qa_export_suite` | Export a suite by `suite_id`: `csv`, `xlsx`, `testrail`, `gherkin`, or `playwright` |
 | `qa_list_devices` | List connected Android/iOS devices, emulators and simulators |
+| `qa_capture_screens` | Capture phone / emulator screens as image content + reusable `capture_ids` for grounded generation (needs `QA_MOBILE_CAPTURE`, shipped on in this edition) |
 | `qa_search_corpus` | Search past generated suites (requires `QA_RAG_ENABLED`) |
-| `qa_setup_check` | Verify this machine: version, mobile tooling, devices, enabled features — no credentials to check |
+| `qa-doctor` | Verify this machine: version, mobile tooling, devices, enabled features — no credentials to check |
 
 ## Quick start
 
@@ -104,7 +105,7 @@ config to copy-paste.
 **Step 2 — Restart your editor** (Cursor / Claude Code / Claude
 Desktop) and try:
 
-> run qa_setup_check
+> run qa-doctor
 
 > generate test cases for our new login page
 
@@ -162,9 +163,23 @@ you are never prompted to elevate.
 
 **3. Restart Cursor / Claude Desktop**, then ask it:
 
-> run qa_setup_check
+> run qa-doctor
 
 > generate test cases for our new login page
+
+### Optional: `adb`, for mobile testing only
+
+Nothing above needs it. Test-case generation, Excel export and Jira
+reading all work without it -- `adb` is only for listing Android devices
+and capturing their screens. If you want that:
+
+```powershell
+winget install --id Google.PlatformTools -e
+```
+
+`run qa-doctor` lists the optional tools and prints the exact install
+command for whatever is missing **on your OS** -- it no longer reports
+macOS-only tooling as missing on Windows.
 
 ### Windows troubleshooting
 
@@ -247,7 +262,7 @@ as a command + args pair:
 }
 ```
 
-Then restart the editor and ask `run qa_setup_check`.
+Then restart the editor and ask `run qa-doctor`.
 
 Two things behave differently on a WSL install:
 
@@ -255,7 +270,9 @@ Two things behave differently on a WSL install:
   Windows Explorer at
   `\\wsl$\Ubuntu\home\YOU\qa-agent-pro\data\exports`.
 - Mobile testing (`qa_list_devices`) needs `adb` reachable from *inside*
-  WSL; a Windows-side adb server is not visible there by default.
+  WSL; a Windows-side adb server is not visible there by default. Install
+  it in WSL with `sudo apt install android-tools-adb` -- the Windows
+  `winget` package does not help here.
 
 If you run Cursor or Claude Code **inside** WSL (Remote-WSL / the Linux
 build), none of this applies -- skip step 3, `connect.sh` registered them
@@ -303,7 +320,7 @@ On Windows the `command` is `%USERPROFILE%\qa-agent-pro\start.cmd`
 (native) -- or the `wsl.exe` form if you installed inside WSL. See
 [Windows](#windows).
 
-Restart the editor afterwards. Ask `run qa_setup_check` first to confirm
+Restart the editor afterwards. Ask `run qa-doctor` first to confirm
 the machine is ready.
 
 ## Configure
@@ -354,7 +371,7 @@ ticket content.
 
 - **Versioning**: [Semantic Versioning](https://semver.org/); every release
   is a git tag (`vX.Y.Z`) with notes in [CHANGELOG.md](CHANGELOG.md).
-- **Updates on demand**: running `qa_setup_check` always checks for and
+- **Updates on demand**: running `qa-doctor` always checks for and
   installs the newest release immediately, then reloads seamlessly.
 - **Updates are automatic and live**: releases are checked at startup
   AND every 15 minutes while the server runs (tune with
@@ -367,7 +384,7 @@ ticket content.
   respawns it and your editor session continues.
 - **Rare exception**: releases that change tool *definitions* need one
   editor restart (editors cache definitions and ignore refresh
-  notifications) — `qa_setup_check` tells you explicitly when that is
+  notifications) — `qa-doctor` tells you explicitly when that is
   the case; otherwise never restart.
 - **The install is read-only by design**: code files are hash-verified
   against `MANIFEST.sha256` and chmod'ed read-only on every start. Manual

@@ -51,6 +51,20 @@ logger = logging.getLogger("qa_agents.client_registry")
 
 SERVER_NAME = "qa-agent-pro"
 
+# The HOSTED Atlassian MCP server (Jira Cloud, OAuth 2.1). Jira is read through
+# the tester's OWN connection, so this entry has to exist in THEIR client config
+# -- and writing it is the difference between "paste a ticket URL" and "hand-edit
+# a JSON file", which is where non-technical testers stop.
+#
+# It only CONFIGURES the server. The OAuth click still happens inside the editor,
+# and no caller may report Jira as connected on the strength of this write.
+#
+# The same URL appears in tools/jira_mcp.py's instruction text. It is duplicated
+# on purpose: this module imports no project module by house rule (see the module
+# docstring), so the two are kept in step by hand.
+ATLASSIAN_NAME = "atlassian"
+ATLASSIAN_ENTRY = {"type": "http", "url": "https://mcp.atlassian.com/v1/mcp/authv2"}
+
 # Status strings, so callers can report without re-deriving intent.
 ADDED = "added"
 UPDATED = "updated"
@@ -115,20 +129,28 @@ def _atomic_write(path: Path, text: str) -> None:
         raise
 
 
-def register_client(
+def register_entry(
     config_path: Path,
-    start_command: str,
+    server_name: str,
+    entry: dict,
     *,
-    server_name: str = SERVER_NAME,
     insert_only: bool = False,
     require_dir: Path | None = None,
 ) -> tuple[str, str]:
-    """Ensure ``server_name`` is present in an MCP config. Returns (status, detail).
+    """Ensure ``server_name`` maps to ``entry`` in an MCP config. (status, detail).
 
-    ``insert_only=True`` (the startup pass): add the entry when absent and leave an
-    existing one EXACTLY as the tester left it. ``insert_only=False``
-    (``connect.sh``): also repair an entry whose command no longer matches, which
-    is what makes re-running it useful after the install moves.
+    ``entry`` is the server object installed verbatim: a stdio
+    ``{"command": ...}`` for this server, or a remote
+    ``{"type": "http", "url": ...}`` for a hosted one such as Atlassian.
+    Generalized 2026-08-04 -- the body hardcoded the stdio shape, so NO caller
+    could add the Atlassian entry and every tester was told to hand-edit
+    ``mcpServers`` JSON, which is the step non-technical testers fail at.
+
+    ``insert_only=True`` (the startup pass, and every THIRD-PARTY entry): add the
+    entry when absent and leave an existing one EXACTLY as the tester left it.
+    ``insert_only=False`` (``connect.sh``, for OUR OWN entry): also repair an entry
+    whose value no longer matches, which is what makes re-running it useful after
+    the install moves.
 
     ``require_dir`` is the client's own directory. When given and missing, this is
     a skip, not an error -- writing a config for an editor the tester does not have
@@ -137,7 +159,13 @@ def register_client(
     Never raises.
     """
     config_path = Path(config_path)
-    desired = {"command": str(start_command)}
+    if not isinstance(entry, dict):
+        # "Never raises" is a CONTRACT here -- the launcher's startup pass calls
+        # through this function, and the shape it replaced
+        # (``{"command": str(start_command)}``) could not fail. So a bad entry is
+        # an error RETURN, not a TypeError escaping into startup.
+        return ERROR, "entry must be a JSON object"
+    desired = dict(entry)
     if require_dir is not None and not Path(require_dir).is_dir():
         return SKIPPED, "client not detected"
 
@@ -187,10 +215,33 @@ def register_client(
         _atomic_write(config_path, payload)
         return status, str(config_path)
     except Exception as exc:
-        logger.debug("register_client failed for %s", config_path, exc_info=True)
+        logger.debug("register_entry failed for %s", config_path, exc_info=True)
         return ERROR, str(exc)
     finally:
         _unlock(fd)
+
+
+def register_client(
+    config_path: Path,
+    start_command: str,
+    *,
+    server_name: str = SERVER_NAME,
+    insert_only: bool = False,
+    require_dir: Path | None = None,
+) -> tuple[str, str]:
+    """Ensure THIS server (a stdio ``command`` entry) is registered.
+
+    A thin delegate to ``register_entry`` so the merge/lock/backup logic has
+    exactly one implementation. Signature and semantics are unchanged from when
+    this function held that logic itself. Never raises.
+    """
+    return register_entry(
+        config_path,
+        server_name,
+        {"command": str(start_command)},
+        insert_only=insert_only,
+        require_dir=require_dir,
+    )
 
 
 def default_targets(home: Path | None = None) -> list[tuple[str, Path, Path]]:
@@ -245,7 +296,7 @@ def discover_registrations(
     this project's own `.mcp.json` / `.cursor/mcp.json` register a DEV checkout --
     so anyone who opens the repo has two qa servers live at once and an agent can
     pick a different one per call. The version-skew warning catches it after the
-    fact; this is how `qa_setup_check` can warn BEFORE a suite is built.
+    fact; this is how `qa-doctor` can warn BEFORE a suite is built.
 
     Returns dicts of {scope, name, command, config}. Never raises: a missing or
     malformed config is skipped, because this only produces an advisory line.
@@ -400,6 +451,57 @@ def register_all(
                 path, start_command, insert_only=insert_only, require_dir=need
             )
         except Exception as exc:  # pragma: no cover - register_client never raises
+            status, detail = ERROR, str(exc)
+        results.append((label, status, detail))
+    return results
+
+
+def atlassian_targets(home: Path | None = None) -> list[tuple[str, Path, Path]]:
+    """(label, config_path, require_dir) for clients whose Atlassian entry is a FILE.
+
+    Cursor only -- and the omissions are deliberate, not partial work:
+
+    * **Claude Desktop** reaches Atlassian through a HOSTED Connector
+      (Settings -> Connectors). There is no local entry to merge, and writing an
+      ``atlassian`` object into ``claude_desktop_config.json`` would connect
+      nothing while looking like it had.
+    * **Claude Code** and **Gemini CLI** register through their own CLIs
+      (``claude mcp add --scope user --transport http`` / ``gemini mcp add``).
+      Shelling out to a CLI does not belong in this module -- the connect scripts
+      do that half, and the SCOPE argument is the reason it cannot be inferred
+      here: only the caller knows whether this is a user-wide install.
+    """
+    home = Path(home) if home is not None else Path.home()
+    return [("Cursor", home / ".cursor" / "mcp.json", home / ".cursor")]
+
+
+def register_atlassian(
+    *, home: Path | None = None, insert_only: bool = True
+) -> list[tuple[str, str, str]]:
+    """Insert the hosted Atlassian entry for each file-configured client.
+
+    ``insert_only`` defaults to **True**, unlike ``register_all``: this is a THIRD
+    PARTY's entry and an existing one may be authorized or hand-tuned. Repairing
+    our own stale command is a different situation from rewriting someone else's.
+
+    This writes the entry; it does NOT authorize it. OAuth happens in the editor,
+    so callers must phrase the result as "configured, one click left" and never as
+    "Jira is connected" -- the same gap tools/jira_mcp.connect_hint_line() is
+    already careful about.
+
+    Never raises: one client's failure must not stop the others.
+    """
+    results: list[tuple[str, str, str]] = []
+    for label, path, need in atlassian_targets(home):
+        try:
+            status, detail = register_entry(
+                path,
+                ATLASSIAN_NAME,
+                ATLASSIAN_ENTRY,
+                insert_only=insert_only,
+                require_dir=need,
+            )
+        except Exception as exc:  # pragma: no cover - register_entry never raises
             status, detail = ERROR, str(exc)
         results.append((label, status, detail))
     return results
