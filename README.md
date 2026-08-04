@@ -57,7 +57,24 @@ brew install python@3.12
 
 # Ubuntu / Debian (incl. WSL)
 sudo apt-get update && sudo apt-get install -y python3.12
+
+# No admin rights? Both commands above need them -- uv does not:
+curl -LsSf https://astral.sh/uv/install.sh | sh   # installs into ~/.local
+uv python install 3.12
+# ...then, ONLY if `python3.12 --version` still fails, add it to PATH:
+export PATH="$HOME/.local/bin:$PATH"
 ```
+
+**No admin rights?** The install itself never needs any: everything lands
+under your home folder (`~/qa-agent-pro`, override with `QA_INSTALL_DIR`)
+in a private virtualenv -- no `sudo`, no system Python, nothing written
+outside `$HOME`, and no elevation prompt. Only the Python prerequisite
+above can require admin, which is exactly what the `uv` route avoids.
+On Windows, the per-user Python from python.org (leave *Install for all
+users* unchecked) needs no admin either.
+
+**On Windows?** Native Windows is not supported -- see
+[Windows (WSL2)](#windows-wsl2) below.
 
 **Step 1 — Install.** Run this one command in your terminal:
 
@@ -83,6 +100,67 @@ paste into `.env`. This server does the grounding, the quality checks
 and the exports; the test cases themselves are written by the model in
 your editor, on the plan and schema the server hands it — which is also
 why nothing here is billed to you twice.
+
+## Windows (WSL2)
+
+`install.sh`, `start.sh` and `connect.sh` are bash scripts that build a
+POSIX virtualenv (`.venv/bin/python`), so they do **not** run on native
+Windows -- not in PowerShell, and not in Git Bash either (a Windows
+virtualenv puts its interpreter in `.venv\Scripts\` instead). Windows
+is supported through **WSL2**, where every instruction above applies
+unchanged:
+
+**1. Install WSL2** (skip if you already have it), then open the Linux
+shell it sets up:
+
+```powershell
+wsl --install
+```
+
+**2. Run the Step 1 installer INSIDE WSL** -- not in PowerShell:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/OmarMokhtar-Saad/qa-agent-pro/main/install.sh | bash
+```
+
+**3. Register your Windows editor by hand.** This is the one step WSL
+changes: `connect.sh` writes to the MCP configs it can see *inside* WSL,
+which are not the ones a Windows-side Cursor / Claude reads. Point the
+Windows editor at the WSL script through `wsl.exe` (replace `YOU` with
+your WSL username):
+
+```powershell
+claude mcp add qa-agent-pro -- wsl.exe -e /home/YOU/qa-agent-pro/start.sh
+```
+
+Cursor (`%USERPROFILE%\.cursor\mcp.json`) and Claude Desktop
+(`%APPDATA%\Claude\claude_desktop_config.json`) take the same target
+as a command + args pair:
+
+```json
+{
+  "mcpServers": {
+    "qa-agent-pro": {
+      "command": "wsl.exe",
+      "args": ["-e", "/home/YOU/qa-agent-pro/start.sh"]
+    }
+  }
+}
+```
+
+Then restart the editor and ask `run qa_setup_check`.
+
+Two things behave differently on a WSL install:
+
+- Exported Excel/CSV files land in the WSL filesystem. Open them from
+  Windows Explorer at
+  `\\wsl$\Ubuntu\home\YOU\qa-agent-pro\data\exports`.
+- Mobile testing (`qa_list_devices`) needs `adb` reachable from *inside*
+  WSL; a Windows-side adb server is not visible there by default.
+
+If you run Cursor or Claude Code **inside** WSL (Remote-WSL / the Linux
+build), none of this applies -- skip step 3, `connect.sh` registered them
+already.
 
 ## Connect your editor
 
@@ -121,6 +199,10 @@ claude mcp add qa-agent-pro -- ~/qa-agent-pro/start.sh
 **Claude Desktop** — add the same block to
 `~/Library/Application Support/Claude/claude_desktop_config.json`
 (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows).
+
+On Windows that path is right but the `command` is not: a Windows editor
+cannot run `start.sh` directly -- use the `wsl.exe` form from
+[Windows (WSL2)](#windows-wsl2).
 
 Restart the editor afterwards. Ask `run qa_setup_check` first to confirm
 the machine is ready.
