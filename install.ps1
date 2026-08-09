@@ -130,7 +130,7 @@ Write-Host "Using Python interpreter: $PyLabel"
 if ((Test-Path $InstallDir) -and (-not $env:QA_FORCE)) {
   Write-Host "$InstallDir already exists."
   Write-Host "Updates are automatic every time your MCP client starts the server."
-  Write-Host "Set QA_FORCE=1 to reinstall from scratch."
+  Write-Host 'Set $env:QA_FORCE=1 to reinstall from scratch.'
   exit 1
 }
 
