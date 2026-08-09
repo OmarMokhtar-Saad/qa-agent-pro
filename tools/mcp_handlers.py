@@ -1632,15 +1632,24 @@ def _unreadable_images_note(
     are ticket-supplied and untrusted, so they go through _safe_image_name
     exactly as beat 2's do (the inline version interpolated them raw).
 
-    2026-08-09 (review M2/W2): the OTHER two intake channels are subtracted from
-    the remainder, because a note calling a screen unreadable while it rides on
-    the very same request is simply false. They are NOT equivalent evidence and
-    are not treated as such: ``captured`` is this server's own observation (it
-    handed those bytes to the chat client) and can therefore rebut the "TEXT
-    only" claim outright, while ``attested`` is host-ASSERTED with no
-    server-side evidence at all and may only suppress the stronger "generated
-    WITHOUT the remaining screen(s)" clause on a partial fetch. Either way the
-    screens the fetch could not get are still NAMED. Never raises."""
+    2026-08-09 (review M2/W2, NARROWED the same day by review L2): the OTHER two
+    intake channels are subtracted from the remainder, because a note calling a
+    screen unreadable while it rides on the very same request is simply false.
+    They are NOT equivalent evidence and are still not treated as such:
+    ``captured`` is this server's own observation (it handed those bytes to the
+    chat client) and rebuts the "TEXT only" claim on EVIDENCE, while ``attested``
+    is host-ASSERTED with no server-side evidence at all -- it can never claim
+    the ticket's own screens arrived, and never upgrades the wording to say they
+    did.
+
+    What L2 changed is only what this server may ASSERT AGAINST ITSELF. A flat
+    "generated from the ticket TEXT only" is a claim about the WHOLE payload, and
+    it is false the moment ANY image rides on the request -- so on the zero-fetch
+    arm an attestation now retires that sentence too, exactly as it already
+    retired the "generated WITHOUT the remaining screen(s)" clause on the partial
+    arm. The weaker/stronger ordering is unchanged; the stronger claim simply no
+    longer survives on the weaker branch. On EVERY arm the screens the fetch
+    could not get are still NAMED. Never raises."""
     try:
         uc = url_content if isinstance(url_content, dict) else {}
         names = [
@@ -1654,9 +1663,15 @@ def _unreadable_images_note(
             # non-empty attachment list, and a "0 image attachment(s)" paragraph
             # would be a fresh falsehood.
             return ""
-        # SERVER-OBSERVED vs HOST-ASSERTED (review W2): only `captured` may
-        # rebut a TEXT-only claim, because only those bytes demonstrably left
-        # this server. `attested` joins it just for the partial-fetch remainder.
+        # SERVER-OBSERVED vs HOST-ASSERTED (review W2, narrowed by L2 on
+        # 2026-08-09): only `captured` REBUTS a TEXT-only claim on evidence --
+        # only those bytes demonstrably left this server, so only they earn the
+        # "check they cover the same ground" wording. `attested` cannot claim
+        # equivalence and never will; it only stops this server ASSERTING the
+        # stronger negative -- that no image reached the model at all -- about a
+        # request whose own IMAGE_JOB describes the attachments. It joins
+        # `_other` for the partial-fetch remainder AND for the zero-fetch
+        # narrowing below.
         _observed = _clamped_count(captured, hi=99)
         _other = _clamped_count(attested, hi=99) + _observed
         fetched = _clamped_count(uc.get("images_fetched_server_side"), hi=999)
@@ -1670,6 +1685,28 @@ def _unreadable_images_note(
                     "this same request \u2014 so this is NOT a TEXT-only "
                     "generation. Check they cover the same ground, and attach "
                     "the ticket's own screenshots if they matter."
+                )
+            if _other:
+                # 2026-08-09 (review L2). The STRONGER claim must not survive
+                # on the WEAKER branch: the partial-fetch arm below already lets
+                # an ATTESTED image retire "generated WITHOUT the remaining
+                # screen(s)", so leaving the flat "TEXT only" standing here
+                # asserted something stronger still -- that no image reached the
+                # model at all -- while this very payload's IMAGE_JOB describes
+                # the attached screenshots. The unread attachments stay NAMED
+                # and the explanation is unchanged; only the claim narrows to
+                # what this server can actually stand behind.
+                return (
+                    "> \u2139\ufe0f This ticket has "
+                    f"{len(names)} image attachment(s) that could NOT be read "
+                    f"({', '.join(names) or 'unnamed'}): Jira is now read "
+                    "through your own Atlassian MCP connection, which returns "
+                    f"attachment metadata but not the image bytes. {_other} "
+                    "image(s) from the other intake channels (chat attachments "
+                    "and/or captured device screens) ride on this same request, "
+                    "so this is NOT a TEXT-only generation \u2014 check they "
+                    "cover the same ground, and attach the ticket's own "
+                    "screenshot(s) if they matter."
                 )
             return (
                 "> \u2139\ufe0f This ticket has "
@@ -1815,6 +1852,8 @@ def _reprep_image_loss_refusal(
     carries_captured: int = 0,
     carries_attested: int = 0,
     shortfall: int = 0,
+    prior_captured: int | None = None,
+    prior_attested: int | None = None,
 ) -> str:
     """REFUSE a re-prepare that would generate without screens the last one had.
 
@@ -1834,16 +1873,35 @@ def _reprep_image_loss_refusal(
     returns a SHORTER refusal rather than "": a disclosure that cannot be
     rendered must never become a silent proceed."""
     try:
-        _cap = _clamped_count(captured, hi=99)
-        _att = _clamped_count(attested, hi=99)
-        _rec = _clamped_count(recovered, hi=99)
-        _promised = _cap + _att
+        # UNITS (2026-08-09, adversarial review of 2dcdc73). Every count here
+        # carries what it MEASURES in its own name, because the five bugs that
+        # review found were all ONE variable silently changing meaning between
+        # the arithmetic and the prose:
+        #   gap_*      -- screens the prior prep had that this call does NOT
+        #   prior_*    -- what the prior prep was grounded on, in TOTAL
+        #   carries_*  -- what THIS call carries
+        #   short_*    -- the residual after recovery and any surplus credit
+        # `captured`/`attested` arrive as GAPS (kept for the existing call
+        # sites); the prior TOTALS arrive separately and fall back to the gaps
+        # for a direct caller that only has those.
+        gap_cap = _clamped_count(captured, hi=99)
+        gap_att = _clamped_count(attested, hi=99)
+        recovered_cap = _clamped_count(recovered, hi=99)
+        gap_total = gap_cap + gap_att
+        prior_cap = _clamped_count(
+            gap_cap if prior_captured is None else prior_captured, hi=99
+        )
+        prior_att = _clamped_count(
+            gap_att if prior_attested is None else prior_attested, hi=99
+        )
         # 2026-08-09 (review C1): the caller may have credited a channel SURPLUS
         # (screens this call carries beyond what the prior prep had on that
         # channel) that this helper cannot see, so it passes the authoritative
         # shortfall in. 0 means "work it out", which is the original behaviour
         # and what the direct-call tests exercise.
-        _short = _clamped_count(shortfall, hi=99) or max(1, _promised - _rec)
+        short_total = _clamped_count(shortfall, hi=99) or max(
+            1, gap_total - recovered_cap
+        )
         try:
             _mins = max(0, int(float(age_s or 0) / 60))
         except (TypeError, ValueError):
@@ -1856,15 +1914,26 @@ def _reprep_image_loss_refusal(
             if _named
             else ""
         )
+        # 2026-08-09 (review M2): the "was grounded on" clause describes the
+        # PRIOR PREP, so it renders prior TOTALS. It used to render the GAPS
+        # handed in for the headline, so a prep grounded on 2 + 2 was reported
+        # as having had 1 + 1 -- the shortfall arithmetic leaking into a
+        # sentence about a different quantity.
         _channels = []
-        if _cap:
-            _channels.append(f"{_cap} device screen(s) captured on this server")
-        if _att:
-            _channels.append(f"{_att} screenshot(s) you attached to the chat")
+        if prior_cap:
+            _channels.append(f"{prior_cap} device screen(s) captured on this server")
+        if prior_att:
+            _channels.append(f"{prior_att} screenshot(s) you attached to the chat")
+        if not _channels:
+            # A degenerate direct call must not render "was grounded on .".
+            _channels.append("screens it did not record")
+        # "of the MISSING screen(s)", same review: now that the clause above
+        # counts the prior TOTALS, a bare "of them" would read as a recovery out
+        # of that total rather than out of the shortfall.
         _recovered_line = (
-            f" I recovered {_rec} of them from that preparation, so {_short} "
-            "would still be missing."
-            if _rec
+            f" I recovered {recovered_cap} of the missing screen(s) from that "
+            f"preparation, so {short_total} would still be missing."
+            if recovered_cap
             else ""
         )
         # 2026-08-09 (review C1): this used to hardcode "THIS call carries no
@@ -1873,32 +1942,38 @@ def _reprep_image_loss_refusal(
         # chat attachments carries plenty of images, just not the missing ones.
         # Say what the call actually carries, so the tester can see the
         # substitution the server saw.
+        carries_cap = _clamped_count(carries_captured, hi=99)
+        carries_att = _clamped_count(carries_attested, hi=99)
         _has = []
-        if _clamped_count(carries_captured, hi=99):
-            _has.append(
-                f"{_clamped_count(carries_captured, hi=99)} captured device "
-                "screen(s)"
-            )
-        if _clamped_count(carries_attested, hi=99):
-            _has.append(
-                f"{_clamped_count(carries_attested, hi=99)} attached "
-                "screenshot(s)"
-            )
+        if carries_cap:
+            _has.append(f"{carries_cap} captured device screen(s)")
+        if carries_att:
+            _has.append(f"{carries_att} attached screenshot(s)")
         _carries_line = (
             " THIS call carries " + " and ".join(_has) + ", which does not cover "
             "them."
             if _has
             else " THIS call carries no images at all."
         )
+        # 2026-08-09 (review M2): the TEXT-alone claim is CONDITIONAL now. It
+        # sat two clauses after _carries_line had just listed the images this
+        # call DOES carry, so the refusal contradicted itself on every partial
+        # substitution.
+        _consequence = (
+            " Generating now writes those cases WITHOUT them -- that is the "
+            "silent regression this guard exists to prevent, and "
+            "`proceed_anyway=true` does NOT dismiss it."
+            if _has
+            else " Generating now writes those cases from the ticket TEXT alone "
+            "-- that is the silent regression this guard exists to prevent, and "
+            "`proceed_anyway=true` does NOT dismiss it."
+        )
         return (
-            f"## \u26d4 This would generate WITHOUT {_short} of the screens the "
-            "last preparation had\n\n"
+            f"## \u26d4 This would generate WITHOUT {short_total} of the screens "
+            "the last preparation had\n\n"
             f"A preparation for this exact source (`{prep_id}`, started {_ago}) "
             "was grounded on " + " and ".join(_channels) + "." + _carries_line
-            + _recovered_line + " Generating now "
-            "writes those cases from the ticket TEXT alone -- that is the silent "
-            "regression this guard exists to prevent, and `proceed_anyway=true` "
-            "does NOT dismiss it."
+            + _recovered_line + _consequence
             + _label_block
             + "\n\nCall the SAME tool again with the SAME `feature_or_url` (and "
             "the SAME `jira_content_json` if you already fetched the ticket -- do "
@@ -1948,10 +2023,17 @@ def _carry_forward_or_refuse(
     any internal error every element comes back empty and the prepare proceeds
     exactly as it does today, because a guard must fail OPEN."""
     try:
+        # UNITS (2026-08-09, adversarial review of 2dcdc73) -- see the same block
+        # in _reprep_image_loss_refusal. `prior_shipped_cap` is the prior prep's
+        # SHIPPED captured count (post jira_max_images / byte budget, which is
+        # what review M1 made that stamp mean), while `prior_ids` below is EVERY
+        # id that prep was CALLED with, pre-budget. Conflating those two is
+        # exactly what H1 was, so each now says which one it is in its own name.
         _prep = prep or {}
-        _cap = _clamped_count(_prep.get("captured_image_count"))
-        _att = _clamped_count(_prep.get("attached_image_count"))
-        if (_cap + _att) <= 0:
+        prior_shipped_cap = _clamped_count(_prep.get("captured_image_count"))
+        prior_att = _clamped_count(_prep.get("attached_image_count"))
+        prior_total = prior_shipped_cap + prior_att
+        if prior_total <= 0:
             return ([], [], "", "", "")
         # PER-CHANNEL (2026-08-09, review H1). This used to be reached only when
         # an all-or-nothing "does this call carry images?" boolean said NO, and
@@ -1980,45 +2062,74 @@ def _carry_forward_or_refuse(
         # nothing resolvable), which is the deliberate direction for a guard
         # against a silent loss: the cost is one dismissible refusal, and the
         # reply names the exact ack that clears it.
-        _have_ids = [
-            str(x or "").strip()
-            for x in list(capture_ids or [])
-            if str(x or "").strip()
-        ]
-        _has_cap = len(_resolvable_captures(_have_ids))
-        _has_att = _clamped_count(have_attested)
-        _cap_gap = max(0, _cap - _has_cap)
-        _att_gap = max(0, _att - _has_att)
-        _surplus = max(0, _has_cap - _cap)
-        _promised = _cap_gap + _att_gap
-        _from = str(_prep.get("prep_id") or "")
-        _prior_ids = [
-            str(x or "").strip()
-            for x in list(_prep.get("capture_ids") or [])
-            if str(x or "").strip()
-        ]
+        # DEDUPED (2026-08-09, review M1): capture_ids=["cap_A", "cap_A"] used to
+        # resolve to TWO screens, which satisfied a two-screen prior prep with
+        # one screen and defeated the whole per-channel check.
+        call_ids = list(
+            dict.fromkeys(
+                str(x or "").strip()
+                for x in list(capture_ids or [])
+                if str(x or "").strip()
+            )
+        )
+        prior_ids = list(
+            dict.fromkeys(
+                str(x or "").strip()
+                for x in list(_prep.get("capture_ids") or [])
+                if str(x or "").strip()
+            )
+        )
+        resolved_ids = _resolvable_captures(call_ids)
+        resolved_cap = len(resolved_ids)
+        resolved_att = _clamped_count(have_attested)
+        gap_cap = max(0, prior_shipped_cap - resolved_cap)
+        gap_att = max(0, prior_att - resolved_att)
+        # SURPLUS, ON BOTH AXES (2026-08-09, review H1 and its follow-up). This
+        # was `max(0, resolved_cap - prior_shipped_cap)`, which compared two
+        # different units: the prior prep stamped what it SHIPPED (3, post
+        # jira_max_images) beside ALL 5 ids it was called with, so a faithful
+        # re-send of those same 5 ids scored a phantom surplus of 2 -- screens
+        # the very same budget will drop again -- and that phantom silently
+        # cancelled a GENUINE loss of 2 chat-attested screenshots.
+        #
+        # IDENTITY alone is not enough either: a screen that is NEW to this call
+        # may CLOSE the captured gap or PAY a surplus, never both. Two expired
+        # captured screens replaced by one fresh one is a real loss of one, and
+        # crediting that fresh screen on both axes made it silent. So the
+        # surplus is the SMALLER of the two readings -- how many resolved screens
+        # the prior prep did not have, and how many this call holds beyond what
+        # that prep actually shipped.
+        #
+        # Recorded residual: a pre-carry-forward prep row with a captured count
+        # but NO `capture_ids` credits by count alone, exactly as today -- with
+        # no ids there is nothing to compare, and that case fails in the
+        # pre-existing direction.
+        _new_cap = len([c for c in resolved_ids if c not in prior_ids])
+        surplus_cap = min(_new_cap, max(0, resolved_cap - prior_shipped_cap))
+        gap_total = gap_cap + gap_att
+        from_prep = str(_prep.get("prep_id") or "")
         # Only ids this call does NOT already hold can close the captured gap:
         # counting a screen the call already resolved would "recover" it twice
         # and hide a real shortfall behind its own input.
-        _wanted = [c for c in _prior_ids if c not in _have_ids]
-        _revived = _revive_captures(_wanted) if (_wanted and _cap_gap) else []
-        _recovered = min(len(_revived), _cap_gap)
-        _short = max(0, _promised - _recovered - _surplus)
+        wanted_ids = [c for c in prior_ids if c not in call_ids]
+        revived_ids = _revive_captures(wanted_ids) if (wanted_ids and gap_cap) else []
+        recovered_cap = min(len(revived_ids), gap_cap)
+        short_total = max(0, gap_total - recovered_cap - surplus_cap)
         # MERGED, never replaced -- this call's own ids (including unknown ones,
         # which must survive to be DISCLOSED through _cap_missing) come first.
-        _merged = _have_ids + [c for c in _revived if c not in _have_ids]
+        merged_ids = call_ids + [c for c in revived_ids if c not in call_ids]
         try:
             _age = float(_prep.get("age_s") or 0)
         except (TypeError, ValueError):
             _age = 0.0
-        if _short <= 0:
-            if not _recovered:
+        if short_total <= 0:
+            if not recovered_cap:
                 # Nothing was carried forward and nothing is missing: this call
                 # simply carries the screens on a different channel (review C1).
                 # Silent by design -- there is no loss to disclose, and a note
                 # about a substitution the tester made deliberately is noise.
                 return ([], [], "", "", "")
-            # W4: _recovered counts screens RESTORED to the tray, not screens
+            # W4: recovered_cap counts screens RESTORED to the tray, not screens
             # that will fit the reply. _select_prepare_images applies the
             # jira_max_images / byte budget afterwards and NAMES every image it
             # drops in this same reply, so an above-cap revival reads as
@@ -2027,12 +2138,13 @@ def _carry_forward_or_refuse(
             # silent; the count here is deliberately the RECOVERY, not the
             # shipment, because that is the fact this note is about.
             return (
-                _merged,
-                list(_revived),
-                _from,
+                merged_ids,
+                list(revived_ids),
+                from_prep,
                 (
-                    f"> \U0001f4f8 Carried forward {_recovered} device screen(s) "
-                    f"from the previous preparation `{_from}` for this same "
+                    f"> \U0001f4f8 Carried forward {recovered_cap} device "
+                    f"screen(s) from the previous preparation `{from_prep}` for "
+                    "this same "
                     "source: this call did not carry them, and generating "
                     "without them would have silently dropped the grounding. "
                     "Pass `image_carry_ack=true` to generate WITHOUT them "
@@ -2042,39 +2154,49 @@ def _carry_forward_or_refuse(
             )
         if not image_carry_ack:
             return (
-                _merged,
-                list(_revived),
-                _from,
+                merged_ids,
+                list(revived_ids),
+                from_prep,
                 "",
                 _reprep_image_loss_refusal(
-                    prep_id=_from or "?",
+                    prep_id=from_prep or "?",
                     age_s=_age,
                     # The per-channel SHORTFALL, not the prior prep's totals: the
                     # refusal must describe what would go missing on this call.
-                    captured=_cap_gap,
-                    attested=_att_gap,
-                    recovered=_recovered,
+                    captured=gap_cap,
+                    attested=gap_att,
+                    recovered=recovered_cap,
+                    # ... and the prior prep's TOTALS separately (review M2), for
+                    # the "was grounded on" clause, which is about that prep and
+                    # was rendering these same GAPS.
+                    prior_captured=prior_shipped_cap,
+                    prior_attested=prior_att,
                     # What this call DOES carry, so the refusal can stop claiming
                     # "no images at all" (review C1), plus the surplus-credited
                     # shortfall it must actually report.
-                    carries_captured=_has_cap,
-                    carries_attested=_has_att,
-                    shortfall=_short,
+                    carries_captured=resolved_cap,
+                    carries_attested=resolved_att,
+                    shortfall=short_total,
                     labels=list(_prep.get("captured_image_labels") or []),
                 ),
             )
+        # L1 (2026-08-09): "the screen(s) the previous preparation had" is a
+        # PRIOR TOTAL. It used to interpolate the sum of the two GAPS, so a prep
+        # grounded on 3 + 2 with one screen still in hand reported that it had
+        # had 4. What is generated WITH is the prior total minus the residual;
+        # what is missing stays short_total.
         return (
-            _merged,
-            list(_revived),
-            _from,
+            merged_ids,
+            list(revived_ids),
+            from_prep,
             (
-                f"> \u26a0\ufe0f Generating with {_recovered} of the {_promised} "
-                f"screen(s) the previous preparation `{_from}` for this same "
-                f"source had: `image_carry_ack=true` was sent and {_short} "
-                "could not be recovered (chat attachments never reach this "
-                "server, and captured screens expire). Anything that exists "
-                f"only in those {_short} screen(s) is NOT reflected in the "
-                "cases below."
+                f"> \u26a0\ufe0f Generating with {prior_total - short_total} of "
+                f"the {prior_total} screen(s) the previous preparation "
+                f"`{from_prep}` for this same source had: `image_carry_ack=true` "
+                f"was sent and {short_total} could not be recovered (chat "
+                "attachments never reach this server, and captured screens "
+                "expire). Anything that exists only in those "
+                f"{short_total} screen(s) is NOT reflected in the cases below."
             ),
             "",
         )
@@ -9135,13 +9257,23 @@ def _peek_captures(capture_ids: list | None) -> tuple:
     expired, or beyond-the-cap id comes back in *missing* so the reply can
     disclose it: never a silent drop, and never a silent slice either. Also
     sweeps, which is what enforces the TTL on a process that has no timer.
+
+    DUPLICATE ids are reported ONCE (2026-08-09, review M1): a repeated id used
+    to ship the SAME screen twice and burn two of the per-call cap slots. The
+    same collapsing applies to repeated BLANKS, so a list of several blank ids
+    names "(blank)" once rather than once per occurrence -- deliberate, and
+    stated here rather than left to be rediscovered.
     Never raises."""
     images: list = []
     labels: list = []
     missing: list = []
     try:
         _sweep_capture_tray()
-        wanted = [str(raw or "").strip() for raw in list(capture_ids or [])]
+        # DEDUPED before the cap slice: a duplicate must not consume a slot a
+        # real screen needs.
+        wanted = list(
+            dict.fromkeys(str(raw or "").strip() for raw in list(capture_ids or []))
+        )
         for cid in wanted[:_CAPTURE_TRAY_MAX]:
             item = _CAPTURE_TRAY.get(cid) if cid else None
             if not item:
@@ -9276,8 +9408,13 @@ def _resolvable_captures(capture_ids: list | None) -> list:
     out: list = []
     try:
         _sweep_capture_tray()
-        for raw in list(capture_ids or [])[:_CAPTURE_TRAY_MAX]:
-            cid = str(raw or "").strip()
+        # DEDUPED before the cap slice (2026-08-09, review M1): counting the same
+        # id twice told the re-prepare precondition this call carried two screens
+        # when it carried one -- a silent loss by arithmetic.
+        wanted = list(
+            dict.fromkeys(str(raw or "").strip() for raw in list(capture_ids or []))
+        )
+        for cid in wanted[:_CAPTURE_TRAY_MAX]:
             if cid and (cid in _CAPTURE_TRAY or cid in _CARRY_SHELF):
                 out.append(cid)
     except Exception:
