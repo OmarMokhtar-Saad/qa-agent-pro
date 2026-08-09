@@ -288,21 +288,12 @@ class Settings(BaseSettings):
     # Still read: used ONLY to recognise a self-hosted Jira on a custom domain
     # (tickets.example.com) as a ticket URL rather than a generic web page.
     jira_base_url: str = ""
-    # DEPRECATED 2026-08-01 for TICKET TEXT, and still inert for it. The
-    # REST/Basic-Auth Jira path was removed in favour of the calling agent's own
-    # Atlassian MCP connection (OAuth 2.1, Jira Cloud), so no text path reads
-    # these. They are also kept so an existing .env carrying JIRA_EMAIL /
-    # JIRA_API_TOKEN still loads cleanly instead of tripping validation on
-    # upgrade.
-    #
-    # 2026-08-09 -- ONE reader again, and only one: with
-    # QA_JIRA_ATTACHMENT_FETCH_ENABLED (default OFF) turned ON,
-    # tools/jira_attachments.py uses this pair as HTTP Basic auth to download
-    # attachment BYTES from /rest/api/3/attachment/content/{id}. So the old
-    # sentence "a stale token cannot silently be used" holds only while that
-    # flag is OFF, which is the default; with it ON an expired token produces a
-    # NAMED 401 failure in the prepare reply rather than anything silent. The
-    # credential is sent over HTTPS to the configured JIRA_BASE_URL host only.
+    # DEPRECATED 2026-08-01, retained as inert fields. The REST/Basic-Auth Jira
+    # path was removed in favour of the calling agent's own Atlassian MCP
+    # connection (OAuth 2.1, Jira Cloud), so nothing reads these any more. They
+    # are kept so an existing .env carrying JIRA_EMAIL / JIRA_API_TOKEN still
+    # loads cleanly instead of tripping validation on upgrade -- and, because
+    # nothing reads them, a stale token cannot silently be used either.
     jira_api_token: str = ""
     jira_email: str = ""
     # Tool-name prefix the CALLING agent uses for its Atlassian MCP tools.
@@ -474,23 +465,6 @@ class Settings(BaseSettings):
     jira_fetch_images: bool = True
     jira_max_images: int = 3
     jira_max_image_bytes: int = 5_000_000  # Anthropic's own per-image vision cap
-
-    # --- Jira attachment BYTE retrieval -- opt-in, default OFF. ------------
-    # QA_JIRA_ATTACHMENT_FETCH_ENABLED. Jira is read through the calling agent's
-    # own Atlassian MCP connection, which returns attachment METADATA only
-    # (tools/jira_mcp.py makes no outbound HTTP request, by hard rule), so a
-    # ticket whose requirements live in mockups produced a suite written from the
-    # ticket TEXT alone unless a tester re-attached the screenshots by hand.
-    # ON, tools/jira_attachments.py downloads those bytes from
-    # /rest/api/3/attachment/content/{id} with this install's own JIRA_EMAIL +
-    # JIRA_API_TOKEN and hands them to the tester's OWN multimodal model on the
-    # existing IMAGE_JOB path -- no new LLM call, no new round trip.
-    # DEFAULT OFF, per the defaults-OFF hard rule and for a specific reason: it
-    # deliberately re-introduces the credentialed REST path the 2026-08-01
-    # migration removed, so an operator has to choose to store a Jira token
-    # again. With it off, nothing in this tree makes that request and the
-    # behaviour is byte-identical to today. See docs/FEATURE_FLAGS.md.
-    qa_jira_attachment_fetch_enabled: bool = False
 
     # Direct chat image uploads (screenshots/mockups attached to a message,
     # independent of Jira) — see tools/image_description.py -> llm.ask_vision()
@@ -1982,7 +1956,6 @@ class Settings(BaseSettings):
         "jira_fetch_comments",
         "qa_comment_reconcile_enabled",
         "jira_fetch_images",
-        "qa_jira_attachment_fetch_enabled",
         "jira_fetch_parent",
         "qa_jira_ac_field_discovery",
         "qa_grounding_advisories_enabled",
