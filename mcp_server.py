@@ -623,6 +623,7 @@ def build_server():
         prep_id: str = "",
         suite_json: str | dict = "",
         volume_floor_ack: bool = False,
+        image_relevance_ack: bool = False,
     ) -> str:
         """Submit a host-generated test suite back to the server to be validated,
         finalized, exported and persisted (the BACK half of host mode).
@@ -645,6 +646,13 @@ def build_server():
         is IGNORED on the first submit by design: it only works after that
         refusal, and only the USER may decide it -- show them the numbers and
         pass it on the retry if they confirm, never on your own judgement.
+
+        If the reply refuses the submission because an attached screen was
+        judged `relevant: "no"` (or no verdict came back at all), capture or
+        attach the correct screen and prepare again, or resubmit the same suite
+        with the per-image verdicts filled in. `image_relevance_ack` follows the
+        SAME two-beat rule as `volume_floor_ack`: ignored on the first submit,
+        honoured only after that refusal, and only ever on the USER's word.
         """
         return await _tracked(
             "qa_submit_suite",
@@ -653,6 +661,7 @@ def build_server():
                 prep_id,
                 suite_json,
                 volume_floor_ack=volume_floor_ack,
+                image_relevance_ack=image_relevance_ack,
                 ask_text=_make_asker(ctx),
                 progress=_make_progress(ctx),
             ),
