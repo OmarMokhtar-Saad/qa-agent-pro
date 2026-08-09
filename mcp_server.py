@@ -21,6 +21,7 @@ decoration time inside ``build_server``, where it is in scope.
 import asyncio
 import logging
 import os
+import random
 import threading
 import time
 from pathlib import Path
@@ -58,6 +59,11 @@ def _note_client(ctx) -> None:
         llm.set_host_client(name)
         _CLIENT["name"] = (name or "").strip().lower()
         _CLIENT["version"] = str(getattr(info, "version", "") or "")
+        # Tag this process's log lines with the editor that owns it: on an
+        # install shared by three clients, the pid alone does not say WHICH.
+        from tools.log_setup import set_client
+
+        set_client(name, Path(__file__).resolve().parent / "data" / "logs")
     except Exception:
         logger.debug("could not read clientInfo", exc_info=True)
 
@@ -134,6 +140,24 @@ async def _workspace_roots(ctx) -> list[Path]:
 # deferral against the 15-minute tick.
 _DRAIN_IDLE_S = 120.0
 _DEFER_WARN_EVERY = 20
+
+# Exit code for a DELIBERATE drift restart. The dist launcher's supervisor
+# matches this exact number in _pump_child_out to tell a version reload apart
+# from a crash (LAUNCHER_TEMPLATE.DRIFT_EXIT_CODE in scripts/build_dist.py --
+# the two literals MUST stay equal; tests/test_launcher_drift_exit.py asserts
+# it, because the launcher is generated source and cannot import from here).
+# 2026-08-09: without that match every release logged one
+# "MCP server exited unexpectedly" per connected client, which MCP clients
+# render as an error.
+#
+# 0 is deliberately NOT used: under the dist the editor never sees THIS
+# process's exit code -- it sees the launcher's. This code is a private
+# protocol with the supervising launcher, which must respawn and replay the
+# handshake here, and 0 is indistinguishable from a normal shutdown.
+DRIFT_RESTART_EXIT_CODE = 86
+# Every client sharing one install detects the same peer update on the same
+# tick, so they would otherwise all exit and respawn in the same second.
+_DRIFT_EXIT_JITTER_S = 3.0
 _INFLIGHT: dict = {"n": 0, "last_finish": 0.0}
 _INFLIGHT_LOCK = threading.Lock()
 
@@ -195,9 +219,7 @@ def _drift_watch() -> None:
     # the two stale Cursor servers restarted only at their 09:07 marks). The
     # NETWORK check keeps its own 15-minute clock in the launcher's watchdog.
     try:
-        interval = max(
-            5.0, float(os.environ.get("QA_DRIFT_CHECK_SECONDS", "30"))
-        )
+        interval = max(5.0, float(os.environ.get("QA_DRIFT_CHECK_SECONDS", "30")))
     except (TypeError, ValueError):
         interval = 30.0
     deferrals = 0
@@ -240,13 +262,29 @@ def _drift_watch() -> None:
                 "drift: installed version changed since this process loaded — "
                 "restarting as soon as no tool is running."
             )
+            # Jitter ONCE -- on the first tick that sees this drift (deferrals
+            # is still 0) -- and OUTSIDE the lock. Under the lock a blocking
+            # sleep would stall every _inflight_enter, i.e. every tool call; and
+            # re-sleeping on each later deferral tick would only add latency to
+            # a restart that is already waiting. One sleep is enough: its whole
+            # job is to de-synchronise the peer clients that share this install
+            # and detect the same update on the same tick.
+            if deferrals == 0:
+                try:
+                    _jitter = random.uniform(0.0, _DRIFT_EXIT_JITTER_S)
+                    # Guarded so a zero jitter never calls sleep: the drift-watch
+                    # tests pin random.uniform to 0.0 and count sleep ticks.
+                    if _jitter > 0:
+                        time.sleep(_jitter)
+                except Exception:  # a jitter failure must never skip the restart
+                    logger.debug("drift exit jitter failed", exc_info=True)
             # The exit happens UNDER the lock _inflight_enter also takes, so a
             # tool cannot slip in between the check and the exit.
             with _INFLIGHT_LOCK:
                 busy = _INFLIGHT["n"]
                 idle = time.monotonic() - _INFLIGHT["last_finish"]
                 if not busy and idle >= _DRAIN_IDLE_S:
-                    os._exit(86)
+                    os._exit(DRIFT_RESTART_EXIT_CODE)
             deferrals += 1
             if deferrals % _DEFER_WARN_EVERY == 0:
                 logger.warning(
@@ -471,6 +509,7 @@ def build_server():
         attached_image_count: int = 0,
         capture_ids: list[str] | None = None,
         image_gate_ack: bool = False,
+        image_carry_ack: bool = False,
     ) -> str:
         """Generate a structured test suite. feature_or_url can be a feature
         description, a Jira/issue URL, a web page URL, or a Swagger/OpenAPI
@@ -511,6 +550,13 @@ def build_server():
         reply may NAME the screens the fetched ticket has; supply them or pass
         `image_gate_ack=true` (send it together with `source_plan='jira'` up
         front when the user has already said the screens do not matter).
+
+        RE-RUNNING THE SAME SOURCE: if a recent preparation for this source was
+        grounded on screens and your new call carries none, this server either
+        carries those screens forward itself or REFUSES and names them.
+        `proceed_anyway=true` does NOT dismiss that -- re-send the screens, or
+        pass `image_carry_ack=true` if the user really wants the cases written
+        without them.
         """
         return await _tracked(
             "qa_generate_test_cases",
@@ -526,6 +572,7 @@ def build_server():
                 attached_image_count=attached_image_count,
                 capture_ids=list(capture_ids or []),
                 image_gate_ack=image_gate_ack,
+                image_carry_ack=image_carry_ack,
             ),
         )
 
@@ -539,6 +586,7 @@ def build_server():
         attached_image_count: int = 0,
         capture_ids: list[str] | None = None,
         image_gate_ack: bool = False,
+        image_carry_ack: bool = False,
     ) -> list[ContentBlock]:
         """HOST-MODE generation. Instead of the server calling an LLM, THIS tool
         returns a grounded generation payload (a system prompt, the grounded
@@ -594,6 +642,15 @@ def build_server():
         screens do not matter, send `source_plan='jira'` AND
         `image_gate_ack=true` together and neither ask appears.
 
+        RE-PREPARING THE SAME SOURCE: if a recent preparation for this source was
+        grounded on screens and your new call carries none, this server either
+        CARRIES THEM FORWARD (device captures it still holds -- re-sending the
+        same `capture_ids` also still works) or REFUSES and names them.
+        `proceed_anyway=true` does NOT dismiss that refusal -- either re-send the
+        screens (`qa_capture_screens` again, or re-attach them with
+        `attached_image_count`), or pass `image_carry_ack=true` once the user has
+        agreed to generate without them.
+
         If any ticket screenshots were available they are attached as image
         content -- inspect them directly. For an under-specified or no-UI ticket
         the reply may instead be clarifying questions (no payload); relay them, or
@@ -613,6 +670,7 @@ def build_server():
                 attached_image_count=attached_image_count,
                 capture_ids=list(capture_ids or []),
                 image_gate_ack=image_gate_ack,
+                image_carry_ack=image_carry_ack,
             ),
         )
         return _prepare_payload_to_content(result)
@@ -1150,42 +1208,46 @@ def build_server():
 
 
 def _configure_logging() -> None:
-    """INFO+ to a rotating file under data/logs/; WARNING+ to stderr.
+    """INFO+ to THIS PROCESS's own file under data/logs/; WARNING+ to stderr.
 
     Over stdio, MCP clients render EVERY stderr line as an error (Cursor logs
     "[error] INFO ..." for each httpx/telemetry line), which buries real
     failures in noise. Errors stay on stderr; the full INFO trail moves to a
     file an operator can tail. Never raises -- if the file handler cannot be
-    created, stderr keeps INFO so nothing is lost."""
-    from logging.handlers import RotatingFileHandler
+    created, stderr keeps INFO so nothing is lost.
 
+    2026-08-09: the file is PER-PROCESS (``qa-agents-<pid>.log``). One install
+    is shared by up to three MCP clients, and a shared RotatingFileHandler had
+    three processes rotating one name -- each rollover stranded the other two on
+    a rotated-away inode, so a 15:08 finalize wrote its audit rows and its xlsx
+    while the log's entries stopped at 15:04. Every line now carries the pid and
+    (once the initialize handshake has happened) the client name, so a diagnoser
+    can attribute it. See tools/log_setup.py for the full mechanism."""
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     stderr_handler = logging.StreamHandler()
     stderr_handler.setLevel(logging.WARNING)
-    stderr_handler.setFormatter(
-        logging.Formatter("%(levelname)s:%(name)s:%(message)s")
-    )
+    stderr_handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
     root.addHandler(stderr_handler)
+    log_dir = Path(__file__).resolve().parent / "data" / "logs"
+    handler = None
     try:
-        log_dir = Path(__file__).resolve().parent / "data" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        file_handler = RotatingFileHandler(
-            log_dir / "qa-agents.log",
-            maxBytes=5 * 1024 * 1024,
-            backupCount=3,
-            encoding="utf-8",
-        )
-        file_handler.setLevel(logging.INFO)
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-        )
-        root.addHandler(file_handler)
+        # The IMPORT is inside the guard on purpose: this function is the first
+        # statement of main(), so a whitelist regression in the dist build or a
+        # shadowed module would otherwise kill the server before a single line
+        # could say why -- which is exactly the class of silence being fixed.
+        from tools.log_setup import configure_file_logging, process_log_path
+
+        handler = configure_file_logging(log_dir)
     except Exception:
+        handler = None
+    if handler is None:
         stderr_handler.setLevel(logging.INFO)
         logger.warning(
-            "Could not open data/logs/qa-agents.log -- keeping INFO on stderr."
+            "Could not open a log file under data/logs -- keeping INFO on stderr."
         )
+    else:
+        logger.info("logging to %s", process_log_path(log_dir))
     # Third-party request logging is diagnostic noise at INFO (one line per
     # telemetry POST); real problems still surface at WARNING+. FastMCP is in
     # the list because it attaches its OWN rich handler (bypassing the root

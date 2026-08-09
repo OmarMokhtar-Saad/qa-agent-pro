@@ -633,10 +633,43 @@ def _find_recent_prep_sync(source_url: str, window_s: float) -> dict | None:
         meta = env.get("meta") or {}
         if str(meta.get("source_url") or "") != source_url:
             continue
+        # 2026-08-09: the IMAGE state of that open prep travels with the hit,
+        # so tools/mcp_handlers.py can carry its screens forward into a
+        # re-prepare -- or refuse and NAME them -- instead of silently
+        # generating ungrounded. IDS AND COUNTS ONLY: image bytes are never
+        # persisted here. Every field is coerced defensively, because this whole
+        # lookup is a best-effort guard: a malformed meta must degrade to "no
+        # images", never raise. The isinstance checks matter -- a stray STRING
+        # would otherwise iterate into a list of characters.
+        raw_ids = meta.get("capture_ids")
+        cap_ids = [
+            str(x or "").strip()[:64]
+            for x in (raw_ids if isinstance(raw_ids, (list, tuple)) else [])
+            if str(x or "").strip()
+        ][:24]
+        raw_labels = meta.get("captured_image_labels")
+        cap_labels = [
+            str(x or "").strip()
+            for x in (raw_labels if isinstance(raw_labels, (list, tuple)) else [])
+            if str(x or "").strip()
+        ][:8]
+        try:
+            captured_n = max(0, min(99, int(meta.get("captured_image_count") or 0)))
+        except (TypeError, ValueError):
+            captured_n = 0
+        try:
+            attached_n = max(0, min(99, int(meta.get("attached_image_count") or 0)))
+        except (TypeError, ValueError):
+            attached_n = 0
         return {
             "prep_id": pid,
             "created_at": created_f,
             "age_s": max(0.0, now - created_f),
+            "captured_image_count": captured_n,
+            "attached_image_count": attached_n,
+            "capture_ids": cap_ids,
+            "captured_image_labels": cap_labels,
+            "host_image_job": bool(meta.get("host_image_job")),
         }
     return None
 
@@ -658,6 +691,13 @@ async def find_recent_prep_by_source(source_url: str, window_s: float = 1800) ->
 
     Scans at most the 20 newest preps and stops at the first one outside the
     window, so cost does not grow with history. Never raises.
+
+    2026-08-09: the hit also carries that prep's IMAGE state --
+    ``captured_image_count`` / ``attached_image_count`` / ``capture_ids`` /
+    ``captured_image_labels`` / ``host_image_job`` -- so the caller can carry
+    device screens forward into a re-prepare, or refuse and name what would
+    otherwise vanish. Ids and counts only: no image bytes are stored here, and
+    an OLD envelope that predates those keys simply reports zeros and empties.
     """
     try:
         url = str(source_url or "").strip()
