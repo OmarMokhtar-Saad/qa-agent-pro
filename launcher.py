@@ -54,8 +54,17 @@ RESPAWN_JITTER_S = 1.0
 RESPAWN_BACKOFF_BASE_S = 0.5
 RESPAWN_BACKOFF_MAX_S = 1.0
 RESPAWN_HEALTHY_S = 60.0
+# How long the EOF path waits for the child's exit status. poll() alone
+# RACES the reap and can still return None, which mis-classified a
+# DELIBERATE drift exit as a crash (2026-08-09, review M5). This wait is
+# spent on the pump thread BEFORE the respawn, so it is part of the
+# budget below and is deliberately small;
+# tests/test_launcher_drift_exit.py asserts
+# CHILD_REAP_WAIT_S + RESPAWN_BACKOFF_MAX_S + RESPAWN_JITTER_S stays
+# inside the client write-retry budget.
+CHILD_REAP_WAIT_S = 1.0
 # Write-retry budget for a client line that arrives mid-restart. MUST
-# outlast RESPAWN_BACKOFF_MAX_S + RESPAWN_JITTER_S.
+# outlast CHILD_REAP_WAIT_S + RESPAWN_BACKOFF_MAX_S + RESPAWN_JITTER_S.
 CHILD_WRITE_RETRIES = 8
 CHILD_WRITE_RETRY_SLEEP_S = 1.0
 
@@ -388,9 +397,22 @@ class Supervisor:
         if self.closing or self.restarting or child is not self.child:
             return
         try:
-            code = child.poll()
+            # 2026-08-09 (review M5): poll() right after stdout EOF
+            # RACES the reap and can still return None, so a deliberate
+            # drift exit (86) was intermittently classified as a crash
+            # and logged at WARNING -- i.e. stderr, i.e. an error badge
+            # in the editor, which is the exact regression the drift
+            # exit code exists to prevent. wait() blocks briefly for the
+            # status the child is about to have; the bound is part of
+            # the respawn budget (see CHILD_REAP_WAIT_S).
+            code = child.wait(timeout=CHILD_REAP_WAIT_S)
         except Exception:
-            code = None
+            # Includes TimeoutExpired: fall back to the old read rather
+            # than block the supervisor's respawn any longer.
+            try:
+                code = child.poll()
+            except Exception:
+                code = None
         deliberate = code == DRIFT_EXIT_CODE
         if deliberate:
             # NOT a crash: mcp_server._drift_watch exits with exactly this

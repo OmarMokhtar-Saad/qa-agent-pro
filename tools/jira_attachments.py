@@ -134,12 +134,32 @@ def _per_image_cap() -> int:
         return 5_000_000
 
 
+# The SAME window mcp_handlers._jira_image_cap applies (2026-08-09, review L4).
+# That module must NOT be imported here, so the two literals are duplicated and
+# tests/test_genquality_batch_c.py pins them equal. Unclamped, JIRA_MAX_IMAGES=25
+# let a fetch of 22 satisfy the gate's own min(25, 20) = 20 and the completeness
+# gate went silent on three missing screens. lo=1 because a cap of zero makes
+# "complete" vacuous -- the way to fetch nothing is
+# QA_JIRA_ATTACHMENT_FETCH_ENABLED=false, and _total_cap already did max(1, ...).
+_MAX_IMAGES_LO = 1
+_MAX_IMAGES_HI = 20
+
+
 def _max_images() -> int:
-    """How many attachments may be downloaded (JIRA_MAX_IMAGES). Never raises."""
+    """How many attachments may be downloaded (JIRA_MAX_IMAGES). Never raises.
+
+    Clamped to [_MAX_IMAGES_LO, _MAX_IMAGES_HI], the same window the
+    completeness gate uses, so the downloader and the gate can never disagree
+    about how many screens this server will ever carry. The coercion mirrors
+    _clamped_count EXACTLY (review C2): a bare int() whose failure defaults to 3,
+    and NO ``or 0`` -- that idiom turned a None or 0 setting into 1 here while
+    the gate read 3, which is precisely the drift this pairing exists to
+    prevent."""
     try:
-        return max(0, int(getattr(settings, "jira_max_images", 3) or 0))
+        n = int(getattr(settings, "jira_max_images", 3))
     except Exception:  # pragma: no cover - settings is lenient by contract
-        return 3
+        n = 3
+    return max(_MAX_IMAGES_LO, min(_MAX_IMAGES_HI, n))
 
 
 def _total_cap() -> int:

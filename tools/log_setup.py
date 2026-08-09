@@ -85,7 +85,14 @@ def _env_file_values() -> dict[str, str]:
             if not text or text.startswith("#") or "=" not in text:
                 continue
             key, _, value = text.partition("=")
-            _env_cache[key.strip().upper()] = value.split("#")[0].strip().strip("\"'")
+            name = key.strip().upper()
+            # 2026-08-09 (review L1): cache ONLY the knobs this module reads. The
+            # scan used to keep every .env value -- including five API secrets --
+            # resident for the whole process lifetime in order to answer three
+            # QA_LOG_* lookups.
+            if not name.startswith("QA_LOG_"):
+                continue
+            _env_cache[name] = value.split("#")[0].strip().strip("\"'")
     except Exception:
         logger.debug("could not read .env for the log settings", exc_info=True)
     return _env_cache
@@ -208,6 +215,25 @@ def _pid_from_name(name: str, prefix: str) -> int | None:
         return None
 
 
+# 2026-08-09 (review L2): off POSIX _pid_is_alive is ALWAYS False, so every
+# peer's file looks dead and a startup sweep past RETENTION_MAX_FILES could
+# delete a LIVE peer's already-rotated .log.1 / .log.2 -- Windows' open-file
+# protection covers only the file the peer currently has open. A backup touched
+# inside this window almost certainly belongs to a running process, so it is
+# skipped. POSIX is unaffected: there the pid check is authoritative.
+_NON_POSIX_GRACE_S = 3600.0
+
+
+def _off_posix() -> bool:
+    """Is this a non-POSIX platform? Read through ONE helper (review W5) so a
+    test can exercise the Windows branch by patching THIS module, instead of
+    monkeypatching the stdlib's ``os.name`` process-wide. Never raises."""
+    try:
+        return os.name != "posix"
+    except Exception:  # pragma: no cover - defensive
+        return True
+
+
 def _pid_is_alive(pid: int | None) -> bool:
     """Is a process with this pid running? Unknown counts as ALIVE (keep the file).
 
@@ -224,7 +250,7 @@ def _pid_is_alive(pid: int | None) -> bool:
     """
     if pid is None:
         return True
-    if os.name != "posix":
+    if _off_posix():
         return False
     try:
         os.kill(pid, 0)
@@ -268,7 +294,8 @@ def sweep_old_logs(
             return removed
         keep_n = RETENTION_MAX_FILES if keep is None else int(keep)
         max_age = RETENTION_DAYS if days is None else float(days)
-        cutoff = (time.time() if now is None else float(now)) - max_age * 86400.0
+        now_ts = time.time() if now is None else float(now)
+        cutoff = now_ts - max_age * 86400.0
         active = Path(skip).name if skip else ""
         entries: list[tuple[float, Path]] = []
         for path in Path(log_dir).glob(f"{prefix}-*.log*"):
@@ -277,7 +304,11 @@ def sweep_old_logs(
                     continue
                 if _pid_is_alive(_pid_from_name(path.name, prefix)):
                     continue
-                entries.append((path.stat().st_mtime, path))
+                mtime = path.stat().st_mtime
+                # See _NON_POSIX_GRACE_S: off POSIX the pid check cannot help.
+                if _off_posix() and (now_ts - mtime) < _NON_POSIX_GRACE_S:
+                    continue
+                entries.append((mtime, path))
             except OSError:
                 continue
         entries.sort(key=lambda item: item[0], reverse=True)
