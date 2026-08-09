@@ -666,165 +666,15 @@ def _image_ref_labels(text: object) -> list:
         return []
 
 
-# ADF MEDIA NODES (2026-08-09). An image pasted INTO a description or a comment
-# is not only an `attachment` row: the ADF document carries a `mediaSingle` /
-# `mediaInline` wrapper around a `media` node whose attrs identify the blob.
-# _extract_adf_text drops those nodes entirely (it only walks `text`), so an
-# inline screenshot was invisible to everything except the regex-based
-# _count_image_refs, which cannot say WHICH attachment it is.
-#
-# WHY IT MATTERS DOWNSTREAM: an inline image is far likelier to be the mockup the
-# requirements live in than a stray upload at the bottom of the ticket, so
-# tools/jira_attachments._ordered gives the ones marked `inline` the
-# JIRA_MAX_IMAGES budget first.
-#
-# Ids here are Media-API identifiers and are NOT attachment ids -- the two id
-# spaces are different, which is why the join back to `fields.attachment[]` is
-# done on the media node's `alt` (Jira sets it to the uploaded FILENAME) rather
-# than on the id. A media node that matches nothing is still reported; it just
-# cannot be downloaded.
-_MEDIA_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_:.-]{0,127}\Z")
-_MAX_MEDIA_NODES = 50
-_MAX_MEDIA_ALT_CHARS = 120
-# Both come from UNTRUSTED host-submitted JSON and are stored, so they are
-# length-capped at the point of extraction (the CONSUMER additionally
-# syntax-gates the id before it may enter a URL path).
-_MAX_ATTACHMENT_ID_CHARS = 128
-_MAX_ATTACHMENT_URL_CHARS = 512
-
-
-def _extract_adf_media(node: object, depth: int = 0) -> list[dict]:
-    """Every ADF media node under *node*: [{id, alt, media_type, collection}].
-
-    Recursion is capped at _MAX_ADF_DEPTH exactly like _extract_adf_text, the
-    node count at _MAX_MEDIA_NODES, and every echoed string is length-capped --
-    this walks UNTRUSTED host-submitted JSON. Never raises: whatever was
-    collected before a failure is returned.
-    """
-    out: list[dict] = []
-    try:
-        if depth > _MAX_ADF_DEPTH or not isinstance(node, dict):
-            return out
-        if str(node.get("type") or "") in ("media", "mediaInline"):
-            attrs = node.get("attrs")
-            attrs = attrs if isinstance(attrs, dict) else {}
-            media_id = str(attrs.get("id") or "").strip()
-            if not _MEDIA_ID_RE.match(media_id):
-                media_id = ""
-            out.append(
-                {
-                    "id": media_id,
-                    "alt": str(attrs.get("alt") or "").strip()[:_MAX_MEDIA_ALT_CHARS],
-                    "media_type": str(attrs.get("type") or "").strip()[:32],
-                    "collection": str(attrs.get("collection") or "").strip()[:128],
-                }
-            )
-        content = node.get("content")
-        if isinstance(content, list):
-            for child in content:
-                if len(out) >= _MAX_MEDIA_NODES:
-                    break
-                out.extend(_extract_adf_media(child, depth + 1))
-        return out[:_MAX_MEDIA_NODES]
-    except Exception:
-        logger.exception("_extract_adf_media failed - keeping what was collected")
-        return out[:_MAX_MEDIA_NODES]
-
-
-def extract_media_refs(fields: object) -> list[dict]:
-    """ADF media refs from the DESCRIPTION and from every COMMENT body.
-
-    Comments matter as much as the description: a screenshot of the behaviour
-    being described is nearly always pasted into the thread, not into the
-    original ticket. Gated on JIRA_FETCH_IMAGES **and** JIRA_MAX_IMAGES > 0, the
-    same pair _extract_image_attachments uses -- an install that asked for zero
-    ticket images must not get inline ones by another door. Capped at
-    _MAX_MEDIA_NODES overall. Never raises; makes no network request -- this is
-    pure parsing of the payload already in hand.
-    """
-    try:
-        if not settings.jira_fetch_images or settings.jira_max_images <= 0:
-            return []
-        if not isinstance(fields, dict):
-            return []
-        refs: list[dict] = []
-        for ref in _extract_adf_media(fields.get("description")):
-            ref["source"] = "description"
-            refs.append(ref)
-        container = fields.get("comment")
-        raw = container.get("comments") if isinstance(container, dict) else container
-        if isinstance(raw, list):
-            for comment in raw:
-                if len(refs) >= _MAX_MEDIA_NODES:
-                    break
-                if not isinstance(comment, dict):
-                    continue
-                for ref in _extract_adf_media(comment.get("body")):
-                    ref["source"] = "comment"
-                    ref["comment_id"] = str(comment.get("id") or "")[:32]
-                    refs.append(ref)
-        return refs[:_MAX_MEDIA_NODES]
-    except Exception:
-        logger.exception("extract_media_refs failed - reporting no inline media")
-        return []
-
-
-def _match_media_to_attachments(media: object, attachments: object) -> None:
-    """Join inline media nodes onto attachment records IN PLACE.
-
-    Matched attachments gain ``inline: True`` (and the media id, for diagnosis);
-    matched refs gain ``attachment_filename``. The join is on the media node's
-    ``alt`` against the attachment ``filename`` -- exact, case-insensitive, with
-    a stem fallback for the case where Jira drops the extension from alt. An
-    unmatched ref changes nothing at all, which is the safe direction: a wrong
-    join would credit a screenshot the ticket does not have, and ``inline``
-    decides which images win the download budget. Never raises.
-    """
-    try:
-        by_name: dict = {}
-        for att in attachments or []:
-            if not isinstance(att, dict):
-                continue
-            name = str(att.get("filename") or "").strip().lower()
-            if not name:
-                continue
-            by_name.setdefault(name, att)
-            by_name.setdefault(name.rsplit(".", 1)[0], att)
-        for ref in media or []:
-            if not isinstance(ref, dict):
-                continue
-            alt = str(ref.get("alt") or "").strip().lower()
-            if not alt:
-                continue
-            att = by_name.get(alt) or by_name.get(alt.rsplit(".", 1)[0])
-            if att is None:
-                continue
-            att["inline"] = True
-            if ref.get("id"):
-                att.setdefault("media_id", ref["id"])
-            ref["attachment_filename"] = att.get("filename")
-    except Exception:
-        logger.exception("_match_media_to_attachments failed - leaving both lists")
-
-
 def _extract_image_attachments(fields: dict) -> list[dict]:
-    """Image attachment METADATA from an issue payload.
+    """Image attachment METADATA ({filename, mime, size}) from an issue payload.
 
-    ``{filename, mime, size, id, content}``. THIS MODULE STILL MAKES NO OUTBOUND
-    HTTP REQUEST -- that hard rule is unchanged and unchangeable here. The ``id``
-    and ``content`` fields are METADATA the Atlassian MCP server already
-    returned; carrying them lets a SEPARATE, opt-in module
-    (``tools/jira_attachments.py``, QA_JIRA_ATTACHMENT_FETCH_ENABLED, default
-    OFF) download the bytes with the install's own credential. With that flag off
-    nothing reads them and the behaviour is exactly what it was: metadata only,
-    ``images_unavailable`` set by the caller, and the tester asked to attach the
-    screenshots to the chat.
-
-    Both new fields are echoed from UNTRUSTED host-submitted JSON, so they are
-    length-capped here and the CONSUMER -- not this function -- syntax-gates the
-    id before it may enter a URL path (``jira_attachments._ATTACHMENT_ID_RE``); a
-    payload-supplied ``content`` URL is used only when its host matches the
-    configured JIRA_BASE_URL. Never raises.
+    Deliberately no ``url`` and no bytes: the Atlassian MCP server returns
+    attachment metadata only, and this module makes NO outbound HTTP requests of
+    its own (that is the whole point of the migration). Attachment BYTES are
+    therefore unavailable on the MCP path -- the caller reports that to the
+    tester rather than silently pretending the ticket had no screenshots.
+    Never raises.
     """
     if not settings.jira_fetch_images or settings.jira_max_images <= 0:
         return []
@@ -844,13 +694,6 @@ def _extract_image_attachments(fields: dict) -> list[dict]:
                     "filename": str(att.get("filename") or "attachment"),
                     "mime": mime,
                     "size": att.get("size") or 0,
-                    # Metadata only -- see the docstring. Both are inert unless
-                    # QA_JIRA_ATTACHMENT_FETCH_ENABLED is on, and both are
-                    # length-capped because they are untrusted stored strings.
-                    "id": str(att.get("id") or "")[:_MAX_ATTACHMENT_ID_CHARS],
-                    "content": str(att.get("content") or "")[
-                        :_MAX_ATTACHMENT_URL_CHARS
-                    ],
                 }
             )
             if len(out) >= settings.jira_max_images:
@@ -2041,12 +1884,6 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
         acceptance_criteria = _ac_value or _extract_ac_from_description(description)
 
         attachments = _extract_image_attachments(fields)
-        # Inline (pasted-into-the-body) images, from the description AND the
-        # comment thread, joined onto the attachment records by filename. The
-        # `inline` marker decides which images win the download budget when
-        # QA_JIRA_ATTACHMENT_FETCH_ENABLED is on (jira_attachments._ordered).
-        media_refs = extract_media_refs(fields)
-        _match_media_to_attachments(media_refs, attachments)
         result = {
             "title": title,
             "description": description,
@@ -2068,10 +1905,6 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
             # 22:17 live run had three UI screens and said nothing.
             "description_image_refs": _count_image_refs(description),
             "description_image_labels": _image_ref_labels(description),
-            # Additive key (2026-08-09): ADF media nodes found in the
-            # description and the comment bodies. Downstream consumers that do
-            # not know about it are unaffected.
-            "media_refs": media_refs,
             # "The ticket has no images" and "nobody requested the attachment
             # field" are different facts, and only the first is safe to stay
             # quiet about. A live 2026-08-03 run had three PNG attachments and an
