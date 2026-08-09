@@ -501,6 +501,54 @@ class Settings(BaseSettings):
     # Timeout (seconds) for a single screenshot capture (larger -- image transfer).
     qa_device_screenshot_timeout: int = 60
 
+    # --- Image RELEVANCE verdict (QA_IMAGE_RELEVANCE_ENABLED) -- default ON. -
+    # 2026-08-09, from a live run (prep dade2abd..., SHYJ-5646, device
+    # R5CR207KY7H): the tester captured ONE mobile screen, it was forwarded to
+    # their own multimodal model as MCP image content, and NOTHING ever told them
+    # it had nothing to do with the user story. IMAGE_JOB asked for a
+    # description and never for a relevance judgement, so an off-topic screen was
+    # either silently used as grounding or silently dropped.
+    # ON, the SAME job (agents.host_mode.IMAGE_RELEVANCE_JOB -- same job_id, same
+    # payload_key, same step, still NON-BLOCKING, ZERO extra round trips and NO
+    # server-side LLM call) also asks for a per-image `relevant`: yes|no|unsure
+    # plus a one-line reason, and any no/unsure verdict is surfaced PROMINENTLY at
+    # the head of the submit reply.
+    # SCOPE OF THE ON PATH, deliberately narrow (review finding H2): it adds a
+    # REPORTING request only. Step 0c's grounding instruction is left exactly as
+    # it ships -- this server does NOT tell the host to discard a screen it
+    # judged off-topic, because a host that misjudges a RELEVANT screen would
+    # then silently drop legitimate grounding, a generation-quality regression on
+    # the DEFAULT path. The host is asked instead to say so in
+    # `relevance_reason` if it did rely on a screen it judged no/unsure.
+    # Default ON is the same deliberate exception the honest-disclosure family
+    # already carries (QA_IMAGE_GATE_ENABLED above, JIRA_FETCH_IMAGES,
+    # QA_GROUNDING_ADVISORIES_ENABLED), and it is defensible precisely BECAUSE
+    # the ON path changes no generation instruction: the whole symptom of the
+    # reported defect is that the tester heard NOTHING, so a disclosure defaulted
+    # OFF ships exactly the run this flag exists to flag -- and qa-agent-pro
+    # installs never edit .env.
+    # UNTRUSTED host output (pixels are as attacker-influenceable as
+    # _GUARD-wrapped ticket text): `relevant` must be a bare STRING in
+    # {yes, no, unsure} -- non-strings are rejected before any coercion and every
+    # other token records NO VERDICT rather than an answer, so nothing (including
+    # a JSON `true`) can ever read as `yes`. The reason is URL-stripped,
+    # control-char-stripped, newline-collapsed and capped. Neither feeds a prompt
+    # or an exporter field.
+    # It NEVER blocks, and that is a DEFAULT, not a limitation of the
+    # architecture: a submit-time refusal is available and precedented
+    # (QA_HOST_AMBIGUITY_REQUIRE_RESULT refuses at submit and keeps the prep and
+    # the staged rows -- "Nothing was discarded."). It is deliberately NOT used
+    # here because the verdict is untrusted self-report and the ticket TEXT still
+    # grounds the suite; an opt-in QA_HOST_IMAGE_REQUIRE_RELEVANT is a named
+    # follow-up, not an impossibility.
+    # false restores today's host-facing contract byte-for-byte (base IMAGE_JOB,
+    # no verdict requested, none parsed, none rendered). It does NOT revert the
+    # two new prep meta keys (`captured_image_count`, `host_image_relevance`) or
+    # the widened image-evidence gap note: those are a correctness fix to a
+    # disclosure that already ships under QA_IMAGE_GATE_ENABLED, whose own
+    # `false` remains their kill switch.
+    qa_image_relevance_enabled: bool = True
+
     # --- Mobile Device Testing (Maestro) — opt-in, all default OFF / dry-run ON. ---
     # Gates the "📱 Mobile Testing" starter chip, the guided wizard, and the
     # "maestro" export keyword/button. Off by default per the constitution.
@@ -1245,6 +1293,49 @@ class Settings(BaseSettings):
     # cannot change an in-flight prep).
     qa_host_ambiguity_require_result: bool = False
 
+    # --- Duplicate / SHRINKING category re-submission (both default ON) -----
+    # 2026-08-09 (Batch 3, FIX 1). EVIDENCE, ~/qa-agent-pro/data/audit.db, prep
+    # 59ab1c492ef242228d97ccd6c673fed1 on 2026-08-04: mcp_submit_category fired
+    # for "Boundary Values" THREE times -- 12 cases, then 1, then 12 -- and twice
+    # each for "Integration" and "UI/UX Validation": ~67 seconds of pure rework.
+    # prep_submissions is UNIQUE(prep_id, category_name) and the write is INSERT
+    # OR REPLACE (tools/prep_store.py:334-347), so the `cases: 1` row SILENTLY
+    # REPLACED a good 12-case row. The existing stop banner cannot help: it
+    # returns "" unless EVERY expected category is staged, which is exactly the
+    # window all of that rework landed in.
+    #
+    # NOTE-only flag: prepends a warning naming both counts; the save proceeds
+    # exactly as today. Default ON for the same reason _all_staged_banner -- the
+    # 2026-08-04 sibling disclosure for this same incident class -- ships with no
+    # flag at all: it only prevents wasted minutes and can never refuse work.
+    # It does NOT gate the override note: a replace_smaller=true call that really
+    # dropped cases is disclosed whatever this flag says (review C1), because
+    # that note is a consequence of the GUARD below, not of this disclosure.
+    qa_host_category_resubmit_note_enabled: bool = True
+    # GUARD flag: REFUSES a re-submission carrying FEWER cases than the row it
+    # would replace, unless the caller passes replace_smaller=true. Refusing
+    # costs ONE round trip and keeps the good row; accepting deletes accepted
+    # cases and tells nobody, so the fail-safe direction is to refuse. Never a
+    # dead end -- the reply names the override and states that nothing was
+    # discarded. Default ON on the same argument that moved
+    # QA_HOST_DUPLICATE_PREP_GUARD_ENABLED to ON on 2026-08-01: opt-in is the
+    # wrong default for a guard against an already-OBSERVED loss. BOTH flags are
+    # stamped into the prep envelope's meta at PREPARE time and read from the
+    # STAMP at submit, so a mid-flow .env flip or a launcher auto-update between
+    # prepare and submit cannot change an in-flight prep, and an OLD envelope
+    # (which carries neither key) behaves exactly as before.
+    #
+    # KNOWN LIMIT (review M3): the read->compare->write window is NOT atomic.
+    # prep_store has no application lock and load_submissions / save_submission
+    # are separate to_thread hops, so two CONCURRENT submits of the SAME category
+    # can both read the prior count before either writes. It fails OPEN (worst
+    # case is today's behaviour). An in-process asyncio.Lock is deliberately not
+    # used: this store is shared by several MCP server PROCESSES (see
+    # prep_store._connect), so a lock would close only half the race while making
+    # the code look serialized. Real serialization needs a compare-and-set inside
+    # prep_store and is a separate change.
+    qa_host_category_shrink_guard_enabled: bool = True
+
     # --- Host-derived image descriptions (opt-in, default OFF) -------------
     # WHY: the last two server-side LLM calls on the host path are BOTH
     # vision-only -- tools/ui_extractor's Tier-3 ask_vision (a rendered
@@ -1385,6 +1476,61 @@ class Settings(BaseSettings):
     # single call, which is exactly how the first live run died.
     # Flag OFF => prepare payload / instructions byte-identical to today.
     qa_host_parallel_fanout_enabled: bool = False
+
+    # --- Host-mode generation-VOLUME floor (opt-in, default OFF) --------------
+    # WHY: the prepare payload TELLS the host a per-category floor -- every
+    # `categories[]` entry and every job packet carries `min_cases` /
+    # `max_cases`, derived from THIS feature's own complexity by
+    # agents.test_scenario_agent._case_count_bounds (bands 8-10 / 10-13 /
+    # 12-15) -- and until 2026-08-09 nothing on the submit side ever read it
+    # (`grep -n min_cases tools/mcp_handlers.py` returned nothing). Observed
+    # that morning (prep dade2abd..., suite 7bc2af95...): the host ignored the
+    # parallel fan-out contract, generated ONE case per category inline in the
+    # parent turn and finalized a merged 8-case suite 28 seconds after
+    # prepare. It was accepted in silence and exported as if normal, while two
+    # comparable runs on the sibling ticket produced 99 and 97 cases whose
+    # per-category counts never dropped below 12 (measured out of suites.db).
+    # MECHANISM: prepare stamps the contract into the prep envelope
+    # (`volume_floor`, `volume_min_cases`, `volume_categories`) and
+    # tools.mcp_handlers._volume_floor_note checks the finalizing suite against
+    # THAT prep's own stamps -- never a live flag, so neither a mid-flow .env
+    # flip nor a launcher auto-update between prepare and submit can change an
+    # in-flight prep. BOTH finalize routes are covered: the merged Path B blob
+    # AND the staged Path A set (which is the route the payload actually
+    # RECOMMENDS, so gating only Path B would have left a free bypass).
+    # Below 50% of the summed floor the finalize is REFUSED; a materially
+    # short category, or a total under the summed floor, is a loud WARNING;
+    # and a prep that stamped `parallel_fanout` whose suite has an ENTIRELY
+    # ABSENT expected category (with too few unlabelled cases to account for
+    # it) is refused too -- the fan-out completeness gate finally reaching the
+    # route it never covered ("Path B (non-empty suite_json) is unaffected",
+    # as handle_submit_suite's own comment put it).
+    # SAFETY: the floor is always the prep's OWN stamped value, so a genuinely
+    # small feature that legitimately lands at 8 per category passes
+    # untouched, and one category sitting a single case under the floor is
+    # within slack -- measured: replayed against the two known-good
+    # distributions above, neither would have warned. The gate never raises
+    # and fails OPEN, a refusal deletes no prep, discards no staged row and
+    # consumes no remediation round, and `volume_floor_ack=true` on
+    # qa_submit_suite is honoured only on a prep this gate has ALREADY refused
+    # once, so the tester really has seen the numbers before their host waves
+    # them through.
+    # DEFAULT ON since 2026-08-09 (owner decision, same day it shipped). It was
+    # authored default-OFF with a one-release soak, and that soak was
+    # deliberately WAIVED: OFF costs exactly the silent 8-case run this gate
+    # exists to stop -- accepted without a word and exported as if normal --
+    # and a tester cannot tell 8 cases from 97 without comparing runs, so the
+    # failure is invisible precisely to the people it hurts. The residual risk
+    # is the opposite error, a FALSE refusal on a legitimately small suite;
+    # that is bounded by construction (the floor is the prep's OWN stamped
+    # value, the refusal costs a round trip and destroys nothing, and
+    # volume_floor_ack=true clears it on the second submit), which is what
+    # made waiving the soak defensible rather than merely faster.
+    # `false` still restores the pre-2026-08-09 flow exactly: reply and submit
+    # behaviour byte-identical (the three meta keys are still stamped, which
+    # costs ~200 bytes of envelope and one pure _case_count_bounds call;
+    # nothing reads them while this is false).
+    qa_host_volume_floor_enabled: bool = True
 
     # --- Host-mode duplicate-prepare guard (default ON as of 2026-08-01) ------
     # WHY: host mode's premise is that the tester's own chat model drives
@@ -1758,6 +1904,7 @@ class Settings(BaseSettings):
         "jira_fetch_sibling_stories",
         "qa_mobile_capture",
         "qa_image_gate_enabled",
+        "qa_image_relevance_enabled",
         "qa_maestro_enabled",
         "qa_maestro_dry_run",
         "qa_maestro_heal_enabled",
@@ -1790,10 +1937,13 @@ class Settings(BaseSettings):
         "qa_semantic_dedup_enabled",
         "qa_host_feature_report_enabled",
         "qa_host_ambiguity_require_result",
+        "qa_host_category_resubmit_note_enabled",
+        "qa_host_category_shrink_guard_enabled",
         "qa_host_dedup_review_enabled",
         "qa_host_dedup_apply",
         "qa_host_coverage_review_enabled",
         "qa_host_parallel_fanout_enabled",
+        "qa_host_volume_floor_enabled",
         "qa_host_duplicate_prep_guard_enabled",
         "qa_server_llm_enabled",
         "qa_host_llm_sampling_enabled",

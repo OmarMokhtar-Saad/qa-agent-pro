@@ -494,9 +494,16 @@ def build_server():
         proceed_anyway=true to generate anyway with whatever is available.
 
         IMAGE GATE (QA_IMAGE_GATE_ENABLED, ON by default). This tool runs the
-        generation in YOUR chat model, so for a Jira URL the FIRST reply may be
-        a question about where the ticket's SCREENS come from -- this server
-        cannot read images out of Jira, only text. Relay it, then call again with
+        generation in YOUR chat model. ASK FIRST: for a Jira URL, ask the USER
+        where the ticket's SCREENS come from BEFORE your first call and pass
+        `source_plan` on it -- this server cannot read images out of Jira, only
+        text, and asking up front costs ZERO extra tool calls. Only pass
+        `source_plan` if the user ANSWERED -- never guess it, and never send
+        `image_gate_ack=true` unless the user explicitly said the screens do not
+        matter: that pair skips BOTH asks, including the informed one that names
+        the screens the fetched ticket really has. Without a plan the FIRST reply
+        is ONLY that question (nothing fetched, nothing prepared) and you must
+        call again with
         the SAME feature_or_url plus `source_plan` (`jira` = ticket text only,
         `jira_attach`, `jira_device`, `jira_both`, `device`); with `jira_attach`
         also pass `attached_image_count`, and with `jira_device` call
@@ -562,10 +569,18 @@ def build_server():
         prep_id. Use `qa_get_category_job` with category_name="all" for every
         worker packet in ONE call (or one name for a single packet).
 
-        IMAGE GATE (QA_IMAGE_GATE_ENABLED, ON by default). For a Jira URL the
-        FIRST reply may instead ask where the ticket's SCREENS come from -- this
-        server cannot read images out of Jira, only text. Relay that question,
-        then call again with the SAME feature_or_url plus `source_plan` (`jira` =
+        IMAGE GATE (QA_IMAGE_GATE_ENABLED, ON by default). ASK FIRST: for a Jira
+        URL, ask the USER where the ticket's SCREENS come from BEFORE your first
+        call and pass `source_plan` on it -- this server cannot read images out of
+        Jira, only text, so it has to know, and asking up front costs ZERO extra
+        tool calls. Only pass `source_plan` if the user ANSWERED -- never guess it,
+        and never send `image_gate_ack=true` unless the user explicitly said the
+        screens do not matter: that pair skips BOTH asks, including the informed
+        one that names the screens the fetched ticket really has, which makes the
+        gate quieter rather than cheaper. If you call without a plan, the FIRST
+        reply is ONLY that question (nothing is fetched and nothing is prepared)
+        and you must call again with
+        the SAME feature_or_url plus `source_plan` (`jira` =
         ticket text only, `jira_attach`, `jira_device`, `jira_both`, `device`).
         For `jira_attach` also pass `attached_image_count` = how many images the
         user attached to THIS chat (the bytes stay with you; the payload then
@@ -604,7 +619,10 @@ def build_server():
 
     @mcp.tool()
     async def qa_submit_suite(
-        ctx: Context, prep_id: str = "", suite_json: str | dict = ""
+        ctx: Context,
+        prep_id: str = "",
+        suite_json: str | dict = "",
+        volume_floor_ack: bool = False,
     ) -> str:
         """Submit a host-generated test suite back to the server to be validated,
         finalized, exported and persisted (the BACK half of host mode).
@@ -620,6 +638,13 @@ def build_server():
         cases to fix; if so, regenerate just those and call this again with the
         SAME prep_id. Relay the file path to the user as the deliverable; do not
         ask which export format they want.
+
+        If the reply refuses the submission for being below the per-category
+        volume this prep's payload asked for, generate the missing cases and
+        resubmit the COMPLETE suite under the same prep_id. `volume_floor_ack`
+        is IGNORED on the first submit by design: it only works after that
+        refusal, and only the USER may decide it -- show them the numbers and
+        pass it on the retry if they confirm, never on your own judgement.
         """
         return await _tracked(
             "qa_submit_suite",
@@ -627,6 +652,7 @@ def build_server():
             mcp_handlers.handle_submit_suite(
                 prep_id,
                 suite_json,
+                volume_floor_ack=volume_floor_ack,
                 ask_text=_make_asker(ctx),
                 progress=_make_progress(ctx),
             ),
@@ -672,6 +698,7 @@ def build_server():
         prep_id: str = "",
         category_name: str = "",
         suite_json: str | dict = "",
+        replace_smaller: bool = False,
     ) -> str:
         """Submit ONE category's cases for a host that generates incrementally.
 
@@ -681,7 +708,13 @@ def build_server():
         category -- as a JSON OBJECT when your client can send one, which avoids
         serialising a large payload into a string argument; a JSON string is still
         accepted unchanged. Names are normalized server-side. Re-submitting REPLACES that
-        category (newest wins). When every expected category is staged, call
+        category (newest wins) and the reply SAYS SO -- do NOT re-submit a
+        category that is already staged unless a reply asked you to; check
+        `qa_prep_status` first. A re-submission carrying FEWER cases than the
+        staged row is REFUSED (nothing is saved, the staged row survives) because
+        that is usually a truncated worker output; pass `replace_smaller=true`
+        only when dropping those cases is deliberate -- it is always reported.
+        When every expected category is staged, call
         qa_submit_suite with the same prep_id and an EMPTY suite_json. Prefer
         Path B (parent merge + full suite_json) when host dedup/coverage review
         matters. Check progress with qa_prep_status.
@@ -694,6 +727,7 @@ def build_server():
                 category_name,
                 suite_json,
                 progress=_make_progress(ctx),
+                replace_smaller=replace_smaller,
             ),
         )
 

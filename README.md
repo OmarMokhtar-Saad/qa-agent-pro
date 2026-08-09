@@ -158,7 +158,7 @@ Registering with your AI editors ...
 
 `Claude Code: ... skipped` is normal unless you use the Claude CLI.
 Everything lands in `%USERPROFILE%\qa-agent-pro` (override with
-`QA_INSTALL_DIR`); nothing is written outside your own user profile, and
+`$env:QA_INSTALL_DIR`); nothing is written outside your own user profile, and
 you are never prompted to elevate.
 
 **3. Restart Cursor / Claude Desktop**, then ask it:
@@ -191,7 +191,7 @@ Every row here is an error a real tester hit, in order:
 | `The requested operation requires elevation` | That is `wsl --install`, and it is the ONE thing here needing admin. You do not need WSL at all -- use the native path above. |
 | `Python was not found; run without arguments to install from the Microsoft Store` | That is the App Execution Alias, not a real Python. Do step 1. |
 | `'uv' is not recognized ...` right after uv installed fine | uv's installer does not update the PATH of the window you are already in. You do not need uv on PATH -- just run step 2. |
-| `... already exists` | An install is already there. Updates are automatic, so nothing to do; `QA_FORCE=1` reinstalls from scratch. |
+| `... already exists` | An install is already there. Updates are automatic, so nothing to do; `$env:QA_FORCE=1` reinstalls from scratch. |
 
 Windows entry points, if you ever need them by hand:
 
@@ -244,7 +244,7 @@ Windows editor at the WSL script through `wsl.exe` (replace `YOU` with
 your WSL username):
 
 ```powershell
-claude mcp add qa-agent-pro -- wsl.exe -e /home/YOU/qa-agent-pro/start.sh
+claude mcp add --scope user qa-agent-pro -- wsl.exe -e /home/YOU/qa-agent-pro/start.sh
 ```
 
 Cursor (`%USERPROFILE%\.cursor\mcp.json`) and Claude Desktop
@@ -299,7 +299,7 @@ file it touches.
 **Claude Code**
 
 ```bash
-claude mcp add qa-agent-pro -- ~/qa-agent-pro/start.sh
+claude mcp add --scope user qa-agent-pro -- ~/qa-agent-pro/start.sh
 ```
 
 **Cursor** — add to `~/.cursor/mcp.json` (Settings → MCP):
