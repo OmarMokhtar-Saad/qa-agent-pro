@@ -74,7 +74,11 @@ from tools.jira_mcp import (
     verify_result_message,
 )
 from tools.playwright_exporter import generate_playwright_script
-from tools.rag_store import add_to_corpus, query_corpus
+from tools.rag_store import (
+    add_to_corpus,
+    query_corpus,
+    replace_source_entries,
+)
 from tools.requirement_analyzer import (
     SEVERITY_ORDER,
     analyze_requirements,
@@ -434,24 +438,80 @@ def _code_changed_since_start() -> bool:
         return False
 
 
+def _env_semantic_lines(text: str) -> list[str]:
+    """The SETTING lines of a .env: blank lines, full-line comments and
+    surrounding whitespace removed."""
+    out: list[str] = []
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        out.append(line)
+    return out
+
+
+def _env_semantic_fingerprint(text: str) -> str:
+    """sha256 over a .env's semantic lines. Never raises ("" on failure)."""
+    try:
+        digest = hashlib.sha256()
+        for line in _env_semantic_lines(text):
+            digest.update(line.encode("utf-8"))
+            digest.update(b"|")
+        return digest.hexdigest()
+    except Exception:
+        logger.debug("could not fingerprint .env content", exc_info=True)
+        return ""
+
+
+def _env_fingerprint() -> str:
+    """Fingerprint of the install's .env ("" when absent or unreadable)."""
+    try:
+        from tools.updater import _INSTALL_DIR
+
+        env_path = _INSTALL_DIR / ".env"
+        if not env_path.is_file():
+            return ""
+        with env_path.open("r", encoding="utf-8", errors="replace") as handle:
+            # Capped: a .env is a few KiB, and this runs on a tool call.
+            raw = handle.read(1024 * 1024)
+        return _env_semantic_fingerprint(raw)
+    except Exception:
+        logger.debug("could not read .env for the reload check", exc_info=True)
+        return ""
+
+
 def _env_changed_since_start() -> bool:
-    """True when the install's .env was written after this process read it.
+    """True when the install's .env carries DIFFERENT settings than this process
+    booted with.
 
     config/settings parses .env exactly once at startup, so an edit made while
     the server is running has NO effect until the process is replaced. Callers
     use this to schedule the reload that applies it.
 
-    Never raises: a missing or unreadable .env reads as unchanged, so a failure
-    here can only ever SKIP a reload, never trigger a spurious one.
-    """
-    try:
-        from tools.updater import _INSTALL_DIR
+    CONTENT, not mtime (2026-08-09). Two things rewrite a running install's .env
+    without changing a single setting: updater.migrate_env(), which appends a
+    dated banner of newly shipped keys after an update, and env_heal.heal_env(),
+    which qa-doctor runs. Under the mtime check EITHER rewrite looked like a
+    tester edit, so the server scheduled a reload for work it had just done to
+    itself. This is the same fix Batch A applied to the dist launcher's watchdog
+    (`_env_fingerprint` in scripts/build_dist.LAUNCHER_TEMPLATE) and the rule
+    `_code_changed_since_start` already applies to VERSION.
 
-        env_path = _INSTALL_DIR / ".env"
-        return env_path.is_file() and env_path.stat().st_mtime > _PROCESS_START
-    except Exception:
-        logger.debug("could not stat .env for the reload check", exc_info=True)
+    Never raises: a missing or unreadable .env fingerprints as "" and reads as
+    unchanged, so a failure here can only ever SKIP a reload, never trigger a
+    spurious one.
+    """
+    current = _env_fingerprint()
+    if not current:
         return False
+    return current != _BOOT_ENV_FINGERPRINT
+
+
+# The .env this process actually booted with. Compared against, never re-read.
+# NOTE: _PROCESS_START above is no longer read by THIS function -- do not delete
+# it. tests/test_setup_check_env_reload.py and tests/test_setup_check_reload_marker.py
+# still build their fixtures around it.
+_BOOT_ENV_FINGERPRINT = _env_fingerprint()
 
 
 def _test_cases_only() -> bool:
@@ -1450,10 +1510,27 @@ async def _fetch_jira_attachment_bytes(url_content: dict | None) -> int:
             return 0
         url_content["images"] = images
         url_content["images_fetched_server_side"] = len(images)
-        # Some screens DID arrive, so the blanket "no image bytes are available"
-        # notice would now be FALSE. Anything that failed is named by
-        # _server_fetched_image_note instead, which is strictly more informative.
-        url_content["images_unavailable"] = False
+        # Batch C item 5 / R3 (2026-08-09): COMPLETENESS, not presence.
+        #
+        # This used to clear the flag on ANY non-empty fetch, under a comment
+        # reading "Some screens DID arrive, so the blanket notice would now be
+        # FALSE" -- true only when ALL of them arrived. With one screenshot of
+        # three, _ticket_image_evidence returned kind == "" and the completeness
+        # arm of _image_gate_second_beat never saw the un-fetched remainder, so
+        # generation started on a SUBSET of the screens, silently.
+        #
+        # Clear it only when the fetch got everything it should have. The cap is
+        # what bounds how many screens this server will ever carry, so the target
+        # is min(disclosed attachments, JIRA_MAX_IMAGES) -- read through the
+        # SHARED _jira_image_cap so this and the gate cannot drift apart. On a
+        # PARTIAL fetch the flag STAYS SET on purpose: that is what keeps the
+        # gate armed, and BOTH readers of the flag are partial-aware --
+        # _server_fetched_image_note names what arrived and what did not, and
+        # _unreadable_images_note narrows its count, its names and its wording to
+        # the remainder instead of claiming a TEXT-only generation.
+        _img_expected = min(len(attachments), _jira_image_cap())
+        if _img_expected and len(images) >= _img_expected:
+            url_content["images_unavailable"] = False
         return len(images)
     except Exception:
         logger.debug("server-side Jira attachment fetch failed", exc_info=True)
@@ -1472,9 +1549,9 @@ _FETCH_REASON_ALLOWED = set(
 def _safe_fetch_reason(raw) -> str:
     """Sanitized, capped rendering of ONE fetch-failure reason. Never raises."""
     try:
-        return "".join(
-            ch for ch in str(raw or "") if ch in _FETCH_REASON_ALLOWED
-        )[:200].strip()
+        return "".join(ch for ch in str(raw or "") if ch in _FETCH_REASON_ALLOWED)[
+            :200
+        ].strip()
     except Exception:
         return ""
 
@@ -1530,6 +1607,84 @@ def _server_fetched_image_note(url_content) -> str:
         return ""
 
 
+def _unreadable_images_note(url_content: object) -> str:
+    """The prepare-reply notice for ticket images this server could NOT read.
+
+    Returns "" when there is nothing left to say. Split out of
+    handle_prepare_test_cases (Batch C, C1) for two reasons: it is now
+    CONDITIONAL prose rather than one fixed string, and inline it was reachable
+    only through a whole prepare, so the falsehood below shipped untested.
+
+    Since the R3 completeness fix a PARTIAL server-side fetch leaves
+    ``images_unavailable`` SET on purpose -- that is what keeps the image gate's
+    completeness arm armed -- and the old blanket wording then stated two
+    falsehoods in the SAME reply: it counted every attachment as unread when some
+    had just been fetched, and it promised a "TEXT only" generation directly
+    under _server_fetched_image_note, which lists the screens attached to that
+    very reply. So on a partial fetch the count, the names and the wording narrow
+    to the REMAINDER -- matched by FILENAME against what actually arrived, not by
+    position, because jira_attachments._ordered gives inline images the budget
+    first and the ticket's order is therefore not the fetch order.
+
+    With nothing fetched the original wording is returned unchanged. Filenames
+    are ticket-supplied and untrusted, so they go through _safe_image_name
+    exactly as beat 2's do (the inline version interpolated them raw). Never
+    raises."""
+    try:
+        uc = url_content if isinstance(url_content, dict) else {}
+        names = [
+            _safe_image_name(a.get("filename")) or "attachment"
+            for a in (uc.get("image_attachments") or [])
+            if isinstance(a, dict)
+        ]
+        if not names:
+            # Nothing was ever disclosed, so there is no unreadable image to
+            # report (review N2): the old inline version could only run with a
+            # non-empty attachment list, and a "0 image attachment(s)" paragraph
+            # would be a fresh falsehood.
+            return ""
+        fetched = _clamped_count(uc.get("images_fetched_server_side"), hi=999)
+        if not fetched:
+            return (
+                "> \u2139\ufe0f This ticket has "
+                f"{len(names)} image attachment(s) that could NOT be read "
+                f"({', '.join(names) or 'unnamed'}): Jira is now read through "
+                "your own Atlassian MCP connection, which returns attachment "
+                "metadata but not the image bytes. The test cases below are "
+                "generated from the ticket TEXT only \u2014 attach the "
+                "screenshot(s) to this chat if they matter."
+            )
+        # Both sides normalise IDENTICALLY (review N3): a filename that
+        # sanitizes to "" becomes "attachment" in `names`, so it must do the same
+        # here or a screen that DID arrive would be reported as outstanding.
+        got = {
+            _safe_image_name((i or {}).get("filename")) or "attachment"
+            for i in (uc.get("images") or [])
+            if isinstance(i, dict)
+        }
+        rest = [n for n in names if n not in got] or names[fetched:]
+        if len(rest) > len(names) - fetched:
+            # Under-matching (duplicate or unrecognisable filenames) must never
+            # let the reported remainder exceed what is actually outstanding.
+            rest = names[fetched:]
+        if not rest:
+            # Everything the ticket named is attached to this reply. The fetch
+            # note above already said so, and a second paragraph claiming
+            # unreadable images would contradict it.
+            return ""
+        return (
+            "> \u2139\ufe0f "
+            f"{len(rest)} of this ticket's {len(names)} image attachment(s) "
+            f"could NOT be read ({', '.join(rest)}) \u2014 this server fetched "
+            f"{fetched} of them (named above) and could not get the rest. The "
+            "test cases below are generated WITHOUT the remaining screen(s) "
+            "\u2014 attach those to this chat if they matter."
+        )
+    except Exception:
+        logger.debug("_unreadable_images_note failed", exc_info=True)
+        return ""
+
+
 def _ticket_image_evidence(url_content: dict | None) -> tuple:
     """What the FETCHED ticket reveals about images: ``(count, names, kind)``.
 
@@ -1567,6 +1722,222 @@ def _ticket_image_evidence(url_content: dict | None) -> tuple:
         return (0, [], "")
 
 
+def _clamped_count(raw, *, lo: int = 0, hi: int = 99, default: int = 0) -> int:
+    """Coerce an UNTRUSTED count to a sane int inside [lo, hi]. Never raises.
+
+    Both image gates read counts they did not produce -- `attached_image_count`
+    is HOST-supplied and the prepare stamps are envelope data -- and both
+    interpolate them into tester-facing prose. A string, None, a float or an
+    absurd 2**40 must degrade to a number the wording can safely carry rather
+    than raise inside a disclosure helper. Plain arithmetic, in the same spirit
+    as the set-based sanitizers above: `re` is deliberately not imported here.
+    """
+    try:
+        n = int(raw)
+    except Exception:
+        n = int(default)
+    return max(lo, min(hi, n))
+
+
+def _jira_image_cap() -> int:
+    """The ONE reading of JIRA_MAX_IMAGES shared by the two halves of the
+    image-COMPLETENESS contract.
+
+    Scope, precisely (review N5): this covers _fetch_jira_attachment_bytes and
+    _image_gate_second_beat, the two places that decide whether the screens on
+    hand are "all of them". Other readers of the same setting -- the prepare
+    payload's own image budget below, and jira_attachments._max_images, which
+    caps what is downloaded -- are deliberately NOT rewired here; they answer
+    different questions and folding them in would widen this batch.
+
+    Batch C, M1 (2026-08-09): the fetch-completeness check in
+    _fetch_jira_attachment_bytes and the beat-2 arithmetic in
+    _image_gate_second_beat are two halves of ONE contract -- "how many screens
+    will this server ever carry" -- and clamping the same setting differently in
+    each would let a misconfigured install fetch a number the gate then refuses
+    to call complete, or the reverse. lo=1 because a cap of zero makes
+    "complete" vacuous; hi=20 because that is the bound the gate has always
+    applied to a tester-facing demand. Never raises (see _clamped_count)."""
+    return _clamped_count(
+        getattr(settings, "jira_max_images", 3), lo=1, hi=20, default=3
+    )
+
+
+def _reprep_image_loss_refusal(
+    *,
+    prep_id: str,
+    age_s: float,
+    captured: int,
+    attested: int,
+    labels: list,
+    recovered: int = 0,
+) -> str:
+    """REFUSE a re-prepare that would generate without screens the last one had.
+
+    2026-08-09, from a live run: a prep carrying 2 captured device screens was
+    followed 3 minutes later by a second prep for the SAME source with none, and
+    all 8 categories were written from the imageless one. The generic
+    duplicate-prep warning is dismissed by ``proceed_anyway=true`` -- which that
+    host model sent -- so this refusal takes its OWN, SPECIFIC ack
+    (``image_carry_ack=true``), exactly like ``volume_floor_ack`` on the submit
+    side, and NAMES both flags together so a deliberate restart still costs one
+    call rather than two refusals in a row.
+
+    Describes the SHORTFALL, not the whole prior prep: anything this server
+    already recovered off the carry-forward shelf is counted and excluded, so a
+    partial recovery never reads as a total loss. The labels are the tester's own
+    words -- UNTRUSTED text -- so they ride inside wrap_untrusted. The except
+    returns a SHORTER refusal rather than "": a disclosure that cannot be
+    rendered must never become a silent proceed."""
+    try:
+        _cap = _clamped_count(captured, hi=99)
+        _att = _clamped_count(attested, hi=99)
+        _rec = _clamped_count(recovered, hi=99)
+        _promised = _cap + _att
+        _short = max(1, _promised - _rec)
+        try:
+            _mins = max(0, int(float(age_s or 0) / 60))
+        except (TypeError, ValueError):
+            _mins = 0
+        _ago = f"{_mins} minute(s) ago" if _mins else "less than a minute ago"
+        _named = [str(x).strip() for x in list(labels or [])[:8] if str(x).strip()]
+        _label_block = (
+            "\n\nThe previous preparation named its screens:\n\n"
+            + wrap_untrusted("prior_screen_labels", "\n".join(_named), limit=800)
+            if _named
+            else ""
+        )
+        _channels = []
+        if _cap:
+            _channels.append(f"{_cap} device screen(s) captured on this server")
+        if _att:
+            _channels.append(f"{_att} screenshot(s) you attached to the chat")
+        _recovered_line = (
+            f" I recovered {_rec} of them from that preparation, so {_short} "
+            "would still be missing."
+            if _rec
+            else ""
+        )
+        return (
+            f"## \u26d4 This would generate WITHOUT {_short} of the screens the "
+            "last preparation had\n\n"
+            f"A preparation for this exact source (`{prep_id}`, started {_ago}) "
+            "was grounded on " + " and ".join(_channels) + ", and THIS call "
+            "carries no images at all." + _recovered_line + " Generating now "
+            "writes those cases from the ticket TEXT alone -- that is the silent "
+            "regression this guard exists to prevent, and `proceed_anyway=true` "
+            "does NOT dismiss it."
+            + _label_block
+            + "\n\nCall the SAME tool again with the SAME `feature_or_url` (and "
+            "the SAME `jira_content_json` if you already fetched the ticket -- do "
+            "NOT fetch it twice) plus ONE of:\n\n"
+            "1. **The missing screens** -- re-run `qa_capture_screens` and pass "
+            "the new `capture_ids`, and/or re-attach the screenshots and pass "
+            "`attached_image_count=<how many>`.\n"
+            "2. **Generate with what is available, deliberately** -- pass "
+            "`image_carry_ack=true` (add `proceed_anyway=true` if this is also a "
+            "deliberate restart of the open preparation). Ask the user first: "
+            "the cases will not reflect anything that exists only in those "
+            "screens, and the reply will say so.\n\n"
+            "Nothing has been prepared yet, so this costs no generation."
+        )
+    except Exception:
+        logger.debug("_reprep_image_loss_refusal failed", exc_info=True)
+        return (
+            "\u26d4 A recent preparation for this exact source was grounded on "
+            "screens that this call does not carry. Re-send them, or pass "
+            "`image_carry_ack=true` to generate from the ticket text alone "
+            "(`proceed_anyway=true` does not dismiss this)."
+        )
+
+
+def _carry_forward_or_refuse(prep: dict | None, *, image_carry_ack: bool) -> tuple:
+    """Decide what a re-prepare carrying NO images does about the previous prep's
+    screens: ``(capture_ids, carried_ids, carried_from, note, refusal)``.
+
+    Three outcomes, and the PARTIAL one is why this is a function rather than a
+    boolean: whatever came back off the carry-forward shelf is ALWAYS kept (an
+    unassigned revival would sit orphaned in the tray with a stale created_at,
+    first in line for eviction, while the reply claimed every screen was lost).
+
+      * full recovery     -> ids + a carry-forward note, no refusal
+      * shortfall, no ack -> ids + a refusal describing ONLY the shortfall
+      * shortfall, acked  -> ids + a note naming what could not be recovered
+
+    The chat-ATTESTED channel is never recoverable -- those bytes never reached
+    this server -- so it always contributes to the shortfall. Never raises: on
+    any internal error every element comes back empty and the prepare proceeds
+    exactly as it does today, because a guard must fail OPEN."""
+    try:
+        _prep = prep or {}
+        _cap = _clamped_count(_prep.get("captured_image_count"))
+        _att = _clamped_count(_prep.get("attached_image_count"))
+        _promised = _cap + _att
+        if _promised <= 0:
+            return ([], [], "", "", "")
+        _from = str(_prep.get("prep_id") or "")
+        _prior_ids = [
+            str(x or "").strip()
+            for x in list(_prep.get("capture_ids") or [])
+            if str(x or "").strip()
+        ]
+        _revived = _revive_captures(_prior_ids) if _prior_ids else []
+        _recovered = min(len(_revived), _cap)
+        _short = max(0, _promised - _recovered)
+        try:
+            _age = float(_prep.get("age_s") or 0)
+        except (TypeError, ValueError):
+            _age = 0.0
+        if _short <= 0:
+            return (
+                list(_revived),
+                list(_revived),
+                _from,
+                (
+                    f"> \U0001f4f8 Carried forward {_recovered} device screen(s) "
+                    f"from the previous preparation `{_from}` for this same "
+                    "source: this call supplied no images, and generating "
+                    "without them would have silently dropped the grounding. "
+                    "Pass `image_carry_ack=true` to generate WITHOUT them "
+                    "instead."
+                ),
+                "",
+            )
+        if not image_carry_ack:
+            return (
+                list(_revived),
+                list(_revived),
+                _from,
+                "",
+                _reprep_image_loss_refusal(
+                    prep_id=_from or "?",
+                    age_s=_age,
+                    captured=_cap,
+                    attested=_att,
+                    recovered=_recovered,
+                    labels=list(_prep.get("captured_image_labels") or []),
+                ),
+            )
+        return (
+            list(_revived),
+            list(_revived),
+            _from,
+            (
+                f"> \u26a0\ufe0f Generating with {_recovered} of the {_promised} "
+                f"screen(s) the previous preparation `{_from}` for this same "
+                f"source had: `image_carry_ack=true` was sent and {_short} "
+                "could not be recovered (chat attachments never reach this "
+                "server, and captured screens expire). Anything that exists "
+                f"only in those {_short} screen(s) is NOT reflected in the "
+                "cases below."
+            ),
+            "",
+        )
+    except Exception:
+        logger.debug("_carry_forward_or_refuse failed", exc_info=True)
+        return ([], [], "", "", "")
+
+
 def _image_gate_second_beat(
     *, count: int, names: list, kind: str, plan: str, have_images: int
 ) -> str:
@@ -1587,13 +1958,64 @@ def _image_gate_second_beat(
     `image_gate_ack=true` alongside `source_plan='jira'` to skip it. Never
     raises."""
     try:
-        if kind not in ("attachments", "embedded") or have_images > 0:
+        if kind not in ("attachments", "embedded"):
+            return ""
+        # COMPLETENESS, not presence (2026-08-09): ONE image out of three used
+        # to silence this gate, so generation started on a SUBSET of the
+        # screens. `count` is the ticket's OWN claim and is clamped to
+        # settings.jira_max_images -- that cap bounds how many screens this
+        # server will ever carry, so an unclamped N could demand images the
+        # tester can never supply. `image_gate_ack=true` is still an ABSOLUTE
+        # override at any ratio: the CALLER checks it before reaching here.
+        _cap = _jira_image_cap()
+        _want = min(max(_clamped_count(count), 1), _cap)
+        _have = _clamped_count(have_images, hi=999)
+        if _have >= _want:
             return ""
         named = (
             " The ticket names them: " + ", ".join(f"`{n}`" for n in names) + "."
             if names
             else ""
         )
+        if _have > 0:
+            # PARTIAL intake: say the ratio out loud and name what is still
+            # outstanding. WHICH screens arrived is unknowable -- the chat
+            # channel is a COUNT, not a manifest -- so the missing list is
+            # offered in the ticket's own order with that caveat attached.
+            # Names already came through _safe_image_name in
+            # _ticket_image_evidence and are capped there at 8.
+            _missing = [n for n in (names or []) if n][_have:][:8]
+            _which = (
+                " In the ticket's own order that leaves "
+                + ", ".join(f"`{n}`" for n in _missing)
+                + " -- if the ones you have are different, say so."
+                if _missing
+                else ""
+            )
+            return (
+                "## ⏸️ One decision before I generate: the REST of the "
+                "ticket's screens\n\n"
+                f"> ℹ️ This ticket has {_want} image(s) I could NOT read, and "
+                f"you gave me {_have} of {_want}."
+                + named
+                + _which
+                + " "
+                + _IMAGE_GATE_LINE
+                + "\n\n"
+                "Ask the user, then call the SAME tool again with the SAME "
+                "`feature_or_url` AND the SAME `jira_content_json` (do NOT "
+                "fetch the ticket again) plus ONE of:\n\n"
+                "1. **Attach the missing screens** -- attach them, then pass "
+                "`attached_image_count=<the TOTAL now attached, not just the "
+                "new ones>`. They stay in YOUR context: no image bytes are "
+                "sent to this server, and the generation payload will ask you "
+                "to describe them.\n"
+                "2. **Generate from the screens I already have** -- pass "
+                "`image_gate_ack=true`. The cases will reflect only those "
+                f"{_have}, and the reply will say so.\n\n"
+                "Nothing has been prepared yet, so this costs no re-fetch and "
+                "no second generation."
+            )
         if kind == "attachments":
             head = f"This ticket has {count} image attachment(s) I could NOT read."
         else:
@@ -2289,7 +2711,29 @@ async def _maybe_ambiguity_clarify(
 _FEATURE_TEXT_METADATA_CAP = 2000
 
 
-async def _persist_suite_to_corpus(suite: object, feature_text: str = "") -> None:
+_CORPUS_SOURCE_KEY_CAP = 300
+
+
+def _corpus_source_key(source_url: object) -> str:
+    """Stable corpus identity for the SOURCE a suite was generated from.
+
+    The trimmed, trailing-slash-stripped source URL -- the only identity a stored
+    corpus entry can carry here, and the one a re-generation of the same Jira
+    ticket reproduces exactly. Anything that is not an http(s) URL (a plain
+    feature description, an empty string, None) yields "", which the caller reads
+    as "no key" and falls back to today's append. Pure; never raises."""
+    try:
+        raw = str(source_url or "").strip().rstrip("/")
+        if not raw.lower().startswith(("http://", "https://")):
+            return ""
+        return raw[:_CORPUS_SOURCE_KEY_CAP]
+    except Exception:  # pragma: no cover - defensive
+        return ""
+
+
+async def _persist_suite_to_corpus(
+    suite: object, feature_text: str = "", source_url: str = ""
+) -> None:
     """Write each generated test case into the RAG corpus (QW-6 / I-014 / F7).
 
     This is the *write* half of the RAG loop; query_corpus in
@@ -2299,7 +2743,34 @@ async def _persist_suite_to_corpus(suite: object, feature_text: str = "") -> Non
     """
     cases = getattr(suite, "test_cases", None) or []
     feature_text_capped = (feature_text or "").strip()[:_FEATURE_TEXT_METADATA_CAP]
+    # Batch C item 2 (2026-08-09): REPLACE, do not append. Re-generating the same
+    # ticket used to add a whole second copy of its cases: the corpus grew
+    # 571 -> 676 docs in ONE day of re-runs, and a later prepare saw 5/5 RAG hits
+    # flagged as duplicate risk -- i.e. the retrieval half had started grounding
+    # new generations on its own echoes, and the only bound on the store was
+    # QA_RAG_MAX_ENTRIES pruning the OLDEST entries, which is a cap, not
+    # de-duplication.
+    #
+    # ORDER MATTERS (review C2): the fresh rows are written FIRST and the
+    # superseded ones are pruned AFTER, keyed on this source and always sparing
+    # the ids just written. A delete-then-write would have destroyed the previous
+    # good suite whenever the new one turned out to be empty or entirely
+    # unserializable -- i.e. exactly when the tester still needs the old one. In
+    # the worst case this order leaves BOTH copies (a prune failure is logged,
+    # never raised), which is the pre-2026-08-09 behaviour and so never a
+    # regression.
+    #
+    # PARTIAL WRITES: NEWEST WINS (review N4). If some cases serialized and
+    # others did not, the prune still runs, so this source keeps the cases that
+    # were written NOW and loses the older copy of the ones that were not. The
+    # alternative -- prune only on a complete write -- was rejected: a single
+    # unserializable case would then leave the duplicate pair in place forever,
+    # which is the very defect this change exists to end, and the corpus is a
+    # grounding aid, not a system of record (the suite itself lives in
+    # suite_store and the .xlsx export).
+    source_key = _corpus_source_key(source_url)
     written = 0
+    fresh_ids: list = []
     for tc in cases:
         try:
             steps_text = "\n".join(
@@ -2312,6 +2783,10 @@ async def _persist_suite_to_corpus(suite: object, feature_text: str = "") -> Non
                 "tc_id": tc.tc_id,
                 "stable_id": tc.stable_id,
             }
+            if source_key:
+                # The identity replace_source_entries matches on the next
+                # generation of this same source.
+                metadata["source_key"] = source_key
             if feature_text_capped:
                 metadata["feature_text"] = feature_text_capped
         except Exception:
@@ -2321,10 +2796,32 @@ async def _persist_suite_to_corpus(suite: object, feature_text: str = "") -> Non
             result = await add_to_corpus("test_case", content, metadata)
             if not result.get("error"):
                 written += 1
+                # Keep the id so the prune below spares the row it just wrote.
+                _new_id = str((result.get("content") or {}).get("id") or "")
+                if _new_id:
+                    fresh_ids.append(_new_id)
         except Exception:
             logger.warning("RAG: add_to_corpus failed for a test case — ignoring")
     if written:
         logger.info("RAG: persisted %d test case(s) to corpus", written)
+    if source_key and fresh_ids:
+        _replaced = await replace_source_entries(
+            "test_case", source_key, keep_ids=fresh_ids
+        )
+        _removed = int(((_replaced or {}).get("content") or {}).get("removed") or 0)
+        if _removed:
+            logger.info("RAG: removed %d superseded case(s) for this source", _removed)
+    elif source_key:
+        logger.debug(
+            "RAG: nothing was persisted for this source -- the previously stored "
+            "cases were left exactly as they were"
+        )
+    else:
+        logger.debug(
+            "RAG: this suite has no source key (no http(s) source URL) -- "
+            "appending, since the corpus cannot de-duplicate a source it "
+            "cannot name"
+        )
 
 
 async def handle_generate_test_cases(
@@ -2337,6 +2834,7 @@ async def handle_generate_test_cases(
     attached_image_count: int = 0,
     capture_ids: list | None = None,
     image_gate_ack: bool = False,
+    image_carry_ack: bool = False,
     choose: ChooseCb = None,
     ask_text: AskCb = None,
     progress: ProgressCb = None,
@@ -2394,6 +2892,7 @@ async def handle_generate_test_cases(
                     attached_image_count=attached_image_count,
                     capture_ids=list(capture_ids or []),
                     image_gate_ack=image_gate_ack,
+                    image_carry_ack=image_carry_ack,
                 )
             )
     try:
@@ -2467,7 +2966,11 @@ async def handle_generate_test_cases(
                 await save_checklist(suite_id, _checklist_artifacts)
             # QW-6: seed the RAG corpus with the fresh cases — the write
             # half of the RAG loop (query_corpus grounding is the read half).
-            await _persist_suite_to_corpus(suite, feature_text=text)
+            await _persist_suite_to_corpus(
+                suite,
+                feature_text=text,
+                source_url=(text if url_content else ""),
+            )
         case_count = len(getattr(suite, "test_cases", []) or [])
         if openapi_text:
             source = "swagger"
@@ -3197,6 +3700,7 @@ async def handle_prepare_test_cases(
     attached_image_count: int = 0,
     capture_ids: list | None = None,
     image_gate_ack: bool = False,
+    image_carry_ack: bool = False,
     choose: ChooseCb = None,
     ask_text: AskCb = None,
     progress: ProgressCb = None,
@@ -3214,7 +3718,27 @@ async def handle_prepare_test_cases(
                 "Jira/issue URL, a web page URL, or a Swagger/OpenAPI spec URL."
             )
         )
-    if settings.qa_host_duplicate_prep_guard_enabled and not proceed_anyway:
+    _carry_note = ""
+    _carried_ids: list = []
+    _carried_from = ""
+    if settings.qa_host_duplicate_prep_guard_enabled:
+        # RE-SENT ids first (2026-08-09). Both tool docstrings ask the host to
+        # re-send the SAME capture_ids, and after a prepare ships them they are
+        # on the carry-forward shelf, not in the tray -- so this must run BEFORE
+        # the "does this call carry images?" test below, which they would
+        # otherwise satisfy while resolving to nothing.
+        capture_ids, _carried_ids, _carry_note = _revive_resent_captures(capture_ids)
+        # Fail-OPEN on a coercion error (treated as "has images"), because a
+        # refusal must never be triggered by a bug in its own precondition.
+        try:
+            _incoming_images = bool(
+                list(attached_images or [])
+                or list(capture_ids or [])
+                or _clamped_count(attached_image_count, hi=99) > 0
+            )
+        except Exception:  # pragma: no cover - a coercion never breaks a prepare
+            logger.debug("incoming-image check failed", exc_info=True)
+            _incoming_images = True
         # 2026-08-03: ALSO check for a recent unfinalized PREP, which is what this
         # guard is named for and never actually looked at -- it only queried
         # finished suites. A real run made two preps 43s apart for a byte-identical
@@ -3230,7 +3754,38 @@ async def handle_prepare_test_cases(
         except Exception:
             logger.debug("recent-prep duplicate check failed", exc_info=True)
             _prep = None
-        if _prep:
+        # 2026-08-09 (live re-prepare defect): the IMAGE-GROUNDING half of this
+        # guard's advertised purpose -- "warns instead of silently starting a
+        # second full generation for the same source". Losing the previous
+        # prep's screens IS the silent harm it exists to prevent, so it rides
+        # this same default-ON flag and needs no new one. Unlike the two
+        # clarifies below it runs REGARDLESS of `proceed_anyway`, which the host
+        # model in the live run sent: a generic dismissal must not answer a
+        # specific loss, so this takes its own `image_carry_ack=true` (the
+        # volume_floor_ack pattern). The decision itself is in
+        # _carry_forward_or_refuse, which never raises.
+        if _prep and not _incoming_images:
+            (
+                _ids,
+                _more_carried,
+                _from,
+                _note,
+                _refusal,
+            ) = _carry_forward_or_refuse(_prep, image_carry_ack=image_carry_ack)
+            if _ids:
+                capture_ids = list(_ids)
+            if _more_carried:
+                _carried_ids = list(_more_carried)
+                _carried_from = _from
+            if _note:
+                _carry_note = (_carry_note + "\n\n" + _note) if _carry_note else _note
+            if _refusal:
+                return PreparePayloadResult(clarify=_refusal)
+        if _prep and _carried_ids and not _carried_from:
+            # Re-sent ids revived above: attribute them to the prep they came
+            # from, so the stamp and the audit row say where the screens began.
+            _carried_from = str(_prep.get("prep_id") or "")
+        if _prep and not proceed_anyway:
             _mins = max(0, int(float(_prep.get("age_s") or 0) / 60))
             _ago = f"{_mins} minute(s)" if _mins else "less than a minute"
             return PreparePayloadResult(
@@ -3247,7 +3802,9 @@ async def handle_prepare_test_cases(
                     "with `proceed_anyway=true`."
                 )
             )
-        dup = await _find_recent_duplicate_suite(text)
+        # The two clarifies here stay dismissible by `proceed_anyway=true`; only
+        # the IMAGE-loss refusal above is not, because it has its own ack.
+        dup = None if proceed_anyway else await _find_recent_duplicate_suite(text)
         if dup is not None:
             mins_ago = max(0, int((time.time() - (dup.get("created_at") or 0)) / 60))
             return PreparePayloadResult(
@@ -3490,9 +4047,7 @@ async def handle_prepare_test_cases(
                 names=_img_names,
                 kind=_img_kind,
                 plan=_plan,
-                have_images=len(attached_images or [])
-                + _attested
-                + _fetched_images,
+                have_images=len(attached_images or []) + _attested + _fetched_images,
             )
             if _beat2:
                 await _audit(
@@ -3741,6 +4296,23 @@ async def handle_prepare_test_cases(
                 # _select_prepare_images byte/count budget: that runs later and
                 # names anything it drops.
                 "captured_image_count": _captured,
+                # 2026-08-09 (re-prepare carry-forward): the capture ids this
+                # prep shipped and their tester-typed labels. IDS ONLY -- never
+                # bytes, which must not enter the JSON prep store -- so a
+                # RE-PREPARE of the same source inside the duplicate-prep window
+                # can revive the exact screens off _CARRY_SHELF, and the refusal
+                # can NAME what would otherwise vanish. Host-supplied strings, so
+                # both the count and each id's LENGTH are capped before they are
+                # persisted; tiny against QA_PREP_MAX_BYTES either way.
+                "capture_ids": [str(c)[:64] for c in (capture_ids or [])][:24],
+                "captured_image_labels": [str(x) for x in (_cap_labels or [])][:8],
+                # Carry-forward provenance, stamped for the same mid-flow-flip
+                # reason as every field here: which prep these screens came from,
+                # how many were revived, and whether the tester ACKed generating
+                # without them.
+                "carried_forward_capture_count": len(_carried_ids),
+                "carried_forward_from_prep": _carried_from,
+                "image_carry_ack": bool(image_carry_ack),
                 # Whether THIS prep asked IMAGE_JOB for a per-image relevance
                 # verdict. Submit reads this stamp, never the live flag, so an
                 # OLD envelope (no stamp) parses no verdict and warns about
@@ -3874,6 +4446,8 @@ async def handle_prepare_test_cases(
                 "host_image_preflight": bool(_img_preflight),
                 "host_image_require_relevant": bool(_img_require),
                 "captured_image_count": _captured,
+                "carried_forward_capture_count": len(_carried_ids),
+                "image_carry_ack": bool(image_carry_ack),
                 "host_risk_job": bool(_risk_job),
                 "host_test_plan_job": bool(_plan_job),
                 "host_nli_suppressed": bool(_nli_suppress),
@@ -3930,21 +4504,12 @@ async def handle_prepare_test_cases(
         if _fetch_note:
             _notice = (_notice + "\n\n" + _fetch_note) if _notice else _fetch_note
         if _url_content.get("images_unavailable"):
-            _names = [
-                str(a.get("filename") or "attachment")
-                for a in (_url_content.get("image_attachments") or [])
-                if isinstance(a, dict)
-            ]
-            _img_note = (
-                "> \u2139\ufe0f This ticket has "
-                f"{len(_names)} image attachment(s) that could NOT be read "
-                f"({', '.join(_names) or 'unnamed'}): Jira is now read through "
-                "your own Atlassian MCP connection, which returns attachment "
-                "metadata but not the image bytes. The test cases below are "
-                "generated from the ticket TEXT only \u2014 attach the "
-                "screenshot(s) to this chat if they matter."
-            )
-            _notice = (_notice + "\n\n" + _img_note) if _notice else _img_note
+            # Batch C, C1: partial-fetch aware, and testable on its own -- see
+            # _unreadable_images_note. "" means the fetch note above already told
+            # the whole truth, so nothing is appended here.
+            _img_note = _unreadable_images_note(_url_content)
+            if _img_note:
+                _notice = (_notice + "\n\n" + _img_note) if _notice else _img_note
         elif _url_content.get("description_image_refs") and not _url_content.get(
             "images_fetched_server_side"
         ):
@@ -4018,6 +4583,10 @@ async def handle_prepare_test_cases(
                 "NOT reflected in the cases below."
             )
             _notice = (_notice + "\n\n" + _cap_note) if _notice else _cap_note
+        # Revive / carry-forward / acked-loss disclosure. APPEND, never assign
+        # -- see PreparePayloadResult.
+        if _carry_note:
+            _notice = (_notice + "\n\n" + _carry_note) if _notice else _carry_note
         if _cap_missing:
             _miss_note = (
                 f"> ⚠️ {len(_cap_missing)} capture id(s) were unknown, expired or "
@@ -4157,6 +4726,13 @@ def _select_prepare_images(result: PreparePayloadResult) -> tuple[list[dict], st
 def _attested_image_gap_note(attested, result, *, captured=0) -> str:
     """Disclose IMAGE evidence that never came back -- on EITHER intake channel.
 
+    2026-08-09 (multi-image intake): "some came back" is not the same fact as
+    "all of them came back". A NUMERIC shortfall -- fewer readable
+    `image_descriptions` than this prep's own stamps promised -- now gets its
+    own, milder note, so a 3-image prep that returned 1 description no longer
+    reads as a clean submit. It is a NOTE only: nothing here refuses, and the
+    QA_HOST_IMAGE_REQUIRE_RELEVANT machinery is deliberately untouched.
+
     The two channels are deliberately kept DISTINGUISHABLE in the text, because
     they carry different evidence:
 
@@ -4183,17 +4759,22 @@ def _attested_image_gap_note(attested, result, *, captured=0) -> str:
     INSIDE this try, so a garbage stamp cannot raise at the call site. Never
     raises."""
     try:
-        try:
-            _att = max(0, int(attested or 0))
-        except (TypeError, ValueError):
-            _att = 0
-        try:
-            _cap = max(0, int(captured or 0))
-        except (TypeError, ValueError):
-            _cap = 0
+        _att = _clamped_count(attested, lo=0, hi=99)
+        _cap = _clamped_count(captured, lo=0, hi=99)
         if (_att + _cap) <= 0 or result is None:
             return ""
-        if getattr(result, "ran", False) and list(getattr(result, "images", []) or []):
+        _readable = (
+            len(list(getattr(result, "images", []) or []))
+            if getattr(result, "ran", False)
+            else 0
+        )
+        # NUMERIC reconciliation (2026-08-09). Both sides are UNTRUSTED -- a
+        # host-authored list and a prep stamp -- so the counts are clamped
+        # before any wording sees them. _promised is at least 1 because the
+        # guard above already established that something was attested or
+        # captured.
+        _promised = _clamped_count(_att + _cap, lo=1, hi=99, default=1)
+        if _readable >= _promised:
             return ""
         _budget = " Any captured screen dropped for size is named in the prepare reply."
         if _att and _cap:
@@ -4213,6 +4794,15 @@ def _attested_image_gap_note(attested, result, *, captured=0) -> str:
         else:
             _what = f"You told me {_att} screenshot(s) were attached to the chat"
             _budget = ""
+        if _readable:
+            return (
+                f"> ⚠️  {_what}, but readable `image_descriptions` came back "
+                f"for only {_readable} of {_promised} -- so this suite may be "
+                "grounded on a SUBSET of the screens, and this server made no "
+                "vision call of its own. If the screens with no description "
+                "carry requirements, supply them again and prepare again."
+                f"{_budget}\n\n"
+            )
         return (
             f"> ⚠️  {_what}, but the submission came back with NO readable "
             "`image_descriptions` -- so there is NO evidence any image was "
@@ -4418,6 +5008,152 @@ def _rtm_trace_detail(suite) -> dict:
     except Exception:
         logger.debug("could not read _rtm_trace", exc_info=True)
         return {}
+
+
+# Batch C item 1 (2026-08-09): a live 97-case suite carried
+# rtm_orphan_cases: 13 -- thirteen cases mapping to no acceptance criterion --
+# and was accepted in silence, because the count only ever reached the audit DB
+# (_rtm_trace_detail above). These render it as a NOTE. Never a refusal: extra
+# cases beyond the ACs are legitimate and common, so the failure being fixed is
+# the SILENCE, not the orphans.
+_RTM_ORPHAN_MAX_NAMED = 5
+_RTM_ORPHAN_TITLE_CAP = 80
+_RTM_ORPHAN_ID_CAP = 16
+# tc_ids reach this note from a HOST-authored suite, so they are untrusted text
+# in exactly the way titles are (review M3). `re` is deliberately not imported by
+# this module, hence a set -- the same shape as _IMAGE_NAME_ALLOWED above.
+_CASE_ID_ALLOWED = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+
+
+def _safe_case_id(raw: object) -> str:
+    """Sanitize ONE tc_id before a note interpolates it into a backtick span.
+
+    Allowlist + cap, because the note writes the id inside backticks and a
+    backtick or a newline in a host-authored id would break out of the span.
+    Never raises."""
+    try:
+        return "".join(ch for ch in str(raw or "") if ch in _CASE_ID_ALLOWED)[
+            :_RTM_ORPHAN_ID_CAP
+        ]
+    except Exception:  # pragma: no cover - a sanitizer must never raise
+        return ""
+
+
+def _safe_case_title(raw: object) -> str:
+    """Sanitize ONE case title before a note interpolates it.
+
+    Titles are HOST-authored on this path, and the note puts them inside a
+    backtick-and-quote span, so backticks (span breakout) and newlines (list
+    breakout) are stripped and the length is capped -- the same discipline as
+    agents/host_mode._shortlist_safe, kept local so this module does not reach
+    into another module's private helper. Never raises."""
+    try:
+        return (str(raw or "").replace("`", "").replace("\n", " ").strip())[
+            :_RTM_ORPHAN_TITLE_CAP
+        ]
+    except Exception:  # pragma: no cover - a sanitizer must never raise
+        return ""
+
+
+def _rtm_orphan_note(suite: object) -> str:
+    """Submit-time disclosure of cases that trace to NO acceptance criterion.
+
+    "" whenever the suite carries no traceability data, no ACs, or no orphans --
+    so a run without the data produces a byte-identical reply. Names the count
+    out of the total plus the FIRST _RTM_ORPHAN_MAX_NAMED ids (with sanitized
+    titles where they resolve) and a (+N more) marker, and asks for either a
+    mapping or a confirmation that they are deliberate additions.
+
+    NOTHING is dropped, rewritten or refused. Never raises -- a disclosure must
+    not be able to break a finalize."""
+    try:
+        trace = getattr(suite, "_rtm_trace", None)
+        if not isinstance(trace, dict) or not trace.get("acs"):
+            return ""
+        try:
+            orphans = int(trace.get("orphan_cases", 0) or 0)
+        except (TypeError, ValueError):
+            return ""
+        if orphans <= 0:
+            return ""
+        cases = list(getattr(suite, "test_cases", None) or [])
+        total = len(cases)
+        ids = [
+            i
+            for i in (
+                _safe_case_id(x)
+                for x in (getattr(suite, "_rtm_orphan_ids", None) or [])
+            )
+            if i
+        ][:_RTM_ORPHAN_MAX_NAMED]
+        titles: dict = {}
+        for tc in cases:
+            try:
+                titles[_safe_case_id(getattr(tc, "tc_id", ""))] = _safe_case_title(
+                    getattr(tc, "title", "")
+                )
+            except Exception:  # pragma: no cover - defensive
+                continue
+        named = ", ".join(
+            (f'`{i}` "{titles[i]}"' if titles.get(i) else f"`{i}`") for i in ids
+        )
+        more = f" (+{orphans - len(ids)} more)" if orphans > len(ids) else ""
+        return (
+            "> \u2139\ufe0f  **Requirement mapping: "
+            f"{orphans} of {total} case(s) trace to NO acceptance criterion.**"
+            + (f" First: {named}{more}." if named else "")
+            + " Either set each one's `requirement_id` to the AC it verifies, or "
+            "confirm they are deliberate additions -- extra cases are perfectly "
+            "legitimate, but an untraced case is invisible to the requirement "
+            "coverage report, so nobody can tell the two apart. Nothing was "
+            "changed or dropped.\n\n"
+        )
+    except Exception:
+        logger.debug("_rtm_orphan_note failed", exc_info=True)
+        return ""
+
+
+def _no_coverage_signal_note(view: object, cov_review: object) -> str:
+    """Disclosure for a finalize that computed NO coverage signal at all.
+
+    Batch C item 4 (2026-08-09): a real finalize logged
+    "coverage tier=none | quality flags=no". The server-side coverage critic is
+    a model call this chat-only path deliberately does not make
+    (agents/test_scenario_agent, advisory_gaps=False), which is CORRECT -- but it
+    left an 8-case suite able to pass with zero quality signal AND zero
+    disclosure. This does not run the critic; it says that none ran.
+
+    SILENT whenever anything DID run: a deterministic matcher coverage view
+    (`view is not None` -- _coverage_view only builds one when the matcher
+    actually produced coverage), or a host coverage review that reports `ran`.
+
+    ALWAYS-ON IS THE INTENT, not an oversight (review W2). On a default install
+    QA_ATOMIC_CHECKLIST_ENABLED is off, so NO coverage signal is ever computed on
+    this path and this note is the standing truth about every suite that install
+    produces. A disclosure that fired only on small suites would be worse than
+    none: its ABSENCE would then read as "coverage WAS checked", which is exactly
+    the inference this batch exists to stop. Operators who do run the atomic
+    checklist (or the host coverage review) never see it. Never raises."""
+    try:
+        if view is not None:
+            return ""
+        if cov_review is not None and getattr(cov_review, "ran", False):
+            return ""
+        return (
+            "> \u2139\ufe0f  **No automated coverage critique ran on this "
+            "suite.** The server-side critic is a model call this chat-only path "
+            "does not make, and no deterministic requirement checklist was "
+            "matched either -- so the generation-volume floor is the ONLY "
+            "quantitative gate this suite passed. Read the cases against the "
+            "requirements yourself before signing them off. (Turn on "
+            "`QA_ATOMIC_CHECKLIST_ENABLED` for a deterministic requirement "
+            "coverage tally.)\n\n"
+        )
+    except Exception:  # pragma: no cover - a disclosure must never raise
+        logger.debug("_no_coverage_signal_note failed", exc_info=True)
+        return ""
 
 
 def _dropped_note(parsed) -> str:
@@ -7401,7 +8137,9 @@ async def handle_submit_suite(
         if _checklist_artifacts and suite_id:
             await save_checklist(suite_id, _checklist_artifacts)
         _t_corpus = time.monotonic()
-        await _persist_suite_to_corpus(suite, feature_text=source_text)
+        await _persist_suite_to_corpus(
+            suite, feature_text=source_text, source_url=(source_url or "")
+        )
         logger.info("submit tail: corpus persist %.1fs", time.monotonic() - _t_corpus)
         case_count = len(getattr(suite, "test_cases", []) or [])
         telemetry.add_tool_properties(case_count=case_count, source="host")
@@ -7555,6 +8293,17 @@ async def handle_submit_suite(
         # Only the success path is stamped: the failure branch above ("produced no
         # usable test cases") still DELETES, because stamping a finalized_suite_id
         # there would record a suite that was never created.
+        # Batch C items 1 + 4 (2026-08-09): two NOTES, never refusals, computed
+        # once HERE so they cover BOTH finalize routes -- the merged suite_json
+        # (Path B) and the accumulated per-category rows (Path A) converge on
+        # this one tail, exactly as _volume_floor_note does. Deliberately NOT
+        # added to the gap-round early return above: that reply is a request for
+        # more work, and the suite is not final there. The orphan note is "" for
+        # a suite carrying no traceability data, so those runs stay
+        # byte-identical; the coverage note is expected to be always-on on a
+        # default install, which is the point (see its docstring).
+        rtm_note = _rtm_orphan_note(suite)
+        cov_signal_note = _no_coverage_signal_note(view, cov_review)
         _final_stamp = {
             "suite_id": str(getattr(suite, "suite_id", "") or ""),
             "export_path": str(xlsx_paths[0]) if xlsx_paths else "",
@@ -7587,7 +8336,7 @@ async def handle_submit_suite(
             f"{fa_skip_note}{ac_note}{grounding_note}{checklist_note}{img_note}{risk_note}{plan_note}"
             f"{nli_note}{comment_note}"
             f"{dup_status_note}{dup_note}"
-            f"{cov_note}{result_md}{cap_note}"
+            f"{cov_note}{rtm_note}{cov_signal_note}{result_md}{cap_note}"
         )
     except Exception as exc:
         logger.exception("handle_submit_suite failed")
@@ -8067,6 +8816,10 @@ def _sweep_capture_tray() -> None:
             )[:overflow]
             for cid, _item in oldest:
                 _CAPTURE_TRAY.pop(cid, None)
+        # The carry-forward shelf has no timer either, so it inherits this
+        # sweep's cadence -- which runs on EVERY prepare, capture_ids or not --
+        # instead of being swept only when something is shelved or revived.
+        _sweep_carry_shelf()
     except Exception:
         logger.debug("capture tray sweep failed", exc_info=True)
 
@@ -8140,6 +8893,140 @@ def _peek_captures(capture_ids: list | None) -> tuple:
     return images, labels, missing
 
 
+# --------------------------------------------------------------------------- #
+# Carry-forward shelf (2026-08-09)
+#
+# A prepare that SHIPS its screens drops them from the tray, so BOTH ways a
+# tester can come back for the same source lost the grounding silently:
+#
+#   * a RE-PREPARE with no images (observed live 2026-08-09 -- a prep with 2
+#     captured screens at 15:01, a second prep for the SAME source with 0 at
+#     15:04, 88 cases written from the imageless one), and
+#   * the RE-SENT ids the tool docstrings explicitly ask for, which resolved to
+#     nothing and produced only a generic "unknown or expired id" note.
+#
+# Dropped entries are therefore MOVED here rather than freed, and can be revived
+# under their ORIGINAL ids. The tray's own contract is unchanged: a dropped id no
+# longer resolves through _peek_captures. Bounded on BOTH axes (count and total
+# bytes, evicted oldest-first) and swept from _sweep_capture_tray, i.e. on every
+# prepare.
+# --------------------------------------------------------------------------- #
+
+_CARRY_SHELF: dict = {}
+_CARRY_SHELF_MAX = 24
+_CARRY_SHELF_MAX_BYTES = 32 * 1024 * 1024
+
+
+def _sweep_carry_shelf() -> None:
+    """Expire old shelf entries and bound the shelf by COUNT and by BYTES.
+
+    A count cap alone is not a memory bound -- 24 full-resolution screenshots
+    are worth far more than 24 thumbnails -- so the byte cap evicts oldest-first
+    until the total fits. Never raises."""
+    try:
+        now = time.time()
+        for cid, item in list(_CARRY_SHELF.items()):
+            if now - float(item.get("created_at") or 0) > _CAPTURE_TRAY_TTL_S:
+                _CARRY_SHELF.pop(cid, None)
+        overflow = len(_CARRY_SHELF) - _CARRY_SHELF_MAX
+        if overflow > 0:
+            oldest = sorted(
+                _CARRY_SHELF.items(), key=lambda kv: kv[1].get("created_at") or 0
+            )[:overflow]
+            for cid, _item in oldest:
+                _CARRY_SHELF.pop(cid, None)
+        total = 0
+        for item in _CARRY_SHELF.values():
+            total += len(item.get("data") or b"")
+        if total > _CARRY_SHELF_MAX_BYTES:
+            for cid, item in sorted(
+                _CARRY_SHELF.items(), key=lambda kv: kv[1].get("created_at") or 0
+            ):
+                if total <= _CARRY_SHELF_MAX_BYTES:
+                    break
+                total -= len(item.get("data") or b"")
+                _CARRY_SHELF.pop(cid, None)
+    except Exception:
+        logger.debug("carry shelf sweep failed", exc_info=True)
+
+
+def _shelve_capture(cid: str, item: dict) -> None:
+    """Park ONE shipped tray entry on the carry-forward shelf. Never raises."""
+    try:
+        if cid and isinstance(item, dict) and item.get("data"):
+            _CARRY_SHELF[cid] = item
+        _sweep_carry_shelf()
+    except Exception:
+        logger.debug("shelving a captured screen failed", exc_info=True)
+
+
+def _revive_captures(capture_ids: list | None) -> list:
+    """Move shelved screens BACK into the tray under their ORIGINAL ids.
+
+    Returns the ids that now resolve, in order -- a tray-resident id is included
+    untouched, so this is a no-op for a live tray. The original ``created_at`` is
+    preserved, so a revived screen keeps expiring on its own capture clock
+    instead of getting a fresh TTL, and everything downstream (_peek_captures,
+    the labels, the _select_prepare_images byte budget, _drop_captures) is
+    byte-identical to a host that re-sent the ids itself. Never raises."""
+    revived: list = []
+    try:
+        _sweep_carry_shelf()
+        for raw in list(capture_ids or [])[:_CAPTURE_TRAY_MAX]:
+            cid = str(raw or "").strip()
+            if not cid:
+                continue
+            if cid in _CAPTURE_TRAY:
+                revived.append(cid)
+                continue
+            item = _CARRY_SHELF.pop(cid, None)
+            if item:
+                _CAPTURE_TRAY[cid] = item
+                revived.append(cid)
+    except Exception:
+        logger.debug("reviving captured screens failed", exc_info=True)
+    return revived
+
+
+def _revive_resent_captures(capture_ids: list | None) -> tuple:
+    """RE-SENT ids: pull back anything a previous prepare already shipped.
+
+    ``(capture_ids, revived_from_shelf, note)``. Both tool docstrings tell the
+    host to re-send the SAME `capture_ids` unchanged, and once a prepare ships
+    them they live on the shelf rather than in the tray -- so without this they
+    look SUPPLIED (which suppresses the carry-forward check entirely) while
+    resolving to NOTHING, and the prep ships imageless with only a generic
+    "unknown or expired id" note. That is the same silent loss this whole guard
+    exists to stop, arrived at from the other direction.
+
+    The id list is returned UNCHANGED -- reviving mutates the tray, so
+    _peek_captures resolves them a few lines later, and a genuinely unknown id
+    must survive to be DISCLOSED rather than quietly filtered out. A
+    tray-resident id counts as nothing revived. Never raises."""
+    try:
+        wanted = [
+            str(x or "").strip()
+            for x in list(capture_ids or [])
+            if str(x or "").strip()
+        ]
+        if not wanted:
+            return (capture_ids, [], "")
+        from_shelf = [c for c in wanted if c in _CARRY_SHELF and c not in _CAPTURE_TRAY]
+        _revive_captures(wanted)
+        if not from_shelf:
+            return (capture_ids, [], "")
+        note = (
+            f"> \U0001f4f8 Re-used {len(from_shelf)} capture id(s) that an earlier"
+            " preparation for this source had already shipped: the screens were"
+            " still held server-side, so this preparation is grounded on the SAME"
+            " screens instead of reporting those ids as expired."
+        )
+        return (capture_ids, list(from_shelf), note)
+    except Exception:
+        logger.debug("_revive_resent_captures failed", exc_info=True)
+        return (capture_ids, [], "")
+
+
 def _drop_captures(capture_ids: list | None) -> None:
     """Remove tray entries once their screens have ACTUALLY shipped on a payload.
 
@@ -8150,7 +9037,13 @@ def _drop_captures(capture_ids: list | None) -> None:
         for raw in list(capture_ids or []):
             cid = str(raw or "").strip()
             if cid:
-                _CAPTURE_TRAY.pop(cid, None)
+                # MOVED to the carry-forward shelf, not freed (2026-08-09): a
+                # re-prepare of the same source -- or a re-sent id -- can revive
+                # these exact screens. The tray contract is unchanged: the id no
+                # longer resolves through _peek_captures.
+                item = _CAPTURE_TRAY.pop(cid, None)
+                if item:
+                    _shelve_capture(cid, item)
     except Exception:
         logger.debug("dropping captured screens failed", exc_info=True)
 

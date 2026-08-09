@@ -22,6 +22,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import subprocess
 import sys
 import threading
@@ -29,6 +30,34 @@ import time
 
 DIST_REPO = "OmarMokhtar-Saad/qa-agent-pro"
 IDLE_SECONDS = 60
+# The idle wait is UNBOUNDED on purpose (2026-08-09 review): a cap that
+# FORCED the restart would terminate() the child, and the child's
+# in-flight drain (mcp_server._INFLIGHT / _DRAIN_IDLE_S) does NOT apply
+# to a launcher SIGTERM -- so a forced restart could kill a running
+# generation. A long deferral is made visible by a periodic WARNING
+# instead. Trade-off: a client that polls faster than IDLE_SECONDS can
+# defer a .env change indefinitely; the WARNING says exactly that.
+IDLE_WARN_EVERY_S = 300
+# mcp_server.DRIFT_RESTART_EXIT_CODE -- the child's DELIBERATE 'a peer
+# client installed a new version, reload me' exit. Matched in
+# _pump_child_out so a reload is never reported to the editor as a
+# crash (2026-08-09). The two literals MUST stay equal;
+# tests/test_launcher_drift_exit.py asserts it.
+DRIFT_EXIT_CODE = 86
+# Several MCP clients share ONE install, so a single release makes every
+# supervisor respawn within the same second: JITTER is what de-syncs
+# them. The crash backoff on top is deliberately TINY -- pump_client_in
+# only retries a write to a missing child for CHILD_WRITE_RETRIES x
+# CHILD_WRITE_RETRY_SLEEP_S seconds, and a respawn slower than that
+# budget would DROP a client request and hang the editor on its id.
+RESPAWN_JITTER_S = 1.0
+RESPAWN_BACKOFF_BASE_S = 0.5
+RESPAWN_BACKOFF_MAX_S = 1.0
+RESPAWN_HEALTHY_S = 60.0
+# Write-retry budget for a client line that arrives mid-restart. MUST
+# outlast RESPAWN_BACKOFF_MAX_S + RESPAWN_JITTER_S.
+CHILD_WRITE_RETRIES = 8
+CHILD_WRITE_RETRY_SLEEP_S = 1.0
 
 # Used by the log-file dir below and the client-registration pass.
 # Was referenced without being defined until 2026-08-04: both call
@@ -77,6 +106,50 @@ def _write_session_state() -> None:
             json.dump({"client_schema_version": _disk_version()}, fh)
     except OSError:
         log.debug("could not write session state", exc_info=True)
+
+
+def _env_semantic_lines(text):
+    """Setting lines of a .env: blank lines, full-line comments and
+    surrounding whitespace removed."""
+    out = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        out.append(line)
+    return out
+
+
+def _env_fingerprint():
+    """sha256 of the install's .env SEMANTIC content ("" when the file is
+    absent or unreadable).
+
+    CONTENT, not mtime (2026-08-09). Two things rewrite a running
+    install's .env: updater.migrate_env(), which appends a dated banner of
+    newly shipped keys after an update, and env_heal.heal_env(), which
+    qa-doctor runs. Under the mtime check EITHER rewrite looked like a
+    tester edit -- so a release fanned a restart out across every
+    supervisor sharing this install, even when the settings were
+    unchanged. Mirrors the content-based rule
+    mcp_handlers._code_changed_since_start already applies to VERSION.
+    Never raises."""
+    try:
+        env_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), ".env"
+        )
+        if not os.path.isfile(env_path):
+            return ""
+        digest = hashlib.sha256()
+        with open(env_path, "r", encoding="utf-8", errors="replace") as fh:
+            # Capped: a .env is a few KiB, and a supervisor must never
+            # slurp an arbitrarily large file on a 15-minute timer.
+            for line in _env_semantic_lines(fh.read(1024 * 1024)):
+                digest.update(line.encode("utf-8"))
+                digest.update(b"|")
+        return digest.hexdigest()
+    except Exception:
+        log.debug("could not fingerprint .env for the watchdog", exc_info=True)
+        return ""
 
 
 def _self_hash() -> str:
@@ -157,6 +230,10 @@ class Supervisor:
     def __init__(self) -> None:
         self.child = None
         self.child_started_at = 0.0  # wall-clock at last spawn() -- see watchdog()
+        # Semantic hash of the .env the CURRENT child was started on, and
+        # the consecutive-crash counter behind the respawn backoff.
+        self.env_fingerprint = _env_fingerprint()
+        self.respawn_failures = 0
         self.child_lock = threading.RLock()
         self.handshake = []  # client's initialize + initialized lines
         self.swallow_id = None  # drop the child's reply to a REPLAYED initialize
@@ -185,6 +262,9 @@ class Supervisor:
         env["QA_MCP_ENABLED"] = "true"  # the server refuses to start without it
         with self.child_lock:
             self.child_started_at = time.time()
+            # Re-stamped on EVERY start: applying a .env change clears it,
+            # so one rewrite costs at most one restart per supervisor.
+            self.env_fingerprint = _env_fingerprint()
             self.child = subprocess.Popen(
                 [sys.executable, "mcp_server.py"],
                 stdin=subprocess.PIPE,
@@ -307,8 +387,39 @@ class Supervisor:
         # bring it back and replay the handshake (crash resilience).
         if self.closing or self.restarting or child is not self.child:
             return
-        log.warning("MCP server exited unexpectedly — respawning.")
-        self.restart_child("crash recovery")
+        try:
+            code = child.poll()
+        except Exception:
+            code = None
+        deliberate = code == DRIFT_EXIT_CODE
+        if deliberate:
+            # NOT a crash: mcp_server._drift_watch exits with exactly this
+            # code, once no tool is running, to load a version a PEER client
+            # installed. Reporting it at WARNING put it on stderr, which MCP
+            # clients render as an error -- so every release showed the
+            # tester 'MCP server exited unexpectedly', once per connected
+            # client (observed 2026-08-09).
+            self.respawn_failures = 0
+            log.info(
+                "MCP server exited to load a newly installed version "
+                "(exit %s) — restarting it.",
+                code,
+            )
+            reason = "version drift"
+        else:
+            if time.time() - self.child_started_at >= RESPAWN_HEALTHY_S:
+                self.respawn_failures = 0  # it had been serving fine
+            self.respawn_failures += 1
+            log.warning(
+                "MCP server exited unexpectedly (exit %s) — respawning.", code
+            )
+            reason = "crash recovery"
+        delay = self._respawn_delay(deliberate)
+        if delay:
+            time.sleep(delay)
+        if self.closing:
+            return
+        self.restart_child(reason)
         self.resend_setup_check()
 
     def pump_client_in(self) -> None:
@@ -327,7 +438,7 @@ class Supervisor:
                 _write_session_state()
             if _tool_call_name(msg) == SETUP_CHECK_TOOL:
                 self.note_setup_check(msg.get("id"), line)
-            for _attempt in range(3):
+            for _attempt in range(CHILD_WRITE_RETRIES):
                 with self.child_lock:
                     child = self.child
                 try:
@@ -335,7 +446,17 @@ class Supervisor:
                     child.stdin.flush()
                     break
                 except Exception:
-                    time.sleep(1)  # child mid-restart — retry on the new one
+                    # Child mid-restart -- retry on the new one. This budget
+                    # MUST outlast the worst-case _respawn_delay, or the line
+                    # is dropped and the editor waits forever on that id.
+                    time.sleep(CHILD_WRITE_RETRY_SLEEP_S)
+            else:
+                # Never silent: a dropped request is an editor hang.
+                log.warning(
+                    "Dropped a client request: the server did not come back "
+                    "within %d attempts.",
+                    CHILD_WRITE_RETRIES,
+                )
         # The editor closed our stdin: shut everything down.
         self.closing = True
         with self.child_lock:
@@ -456,26 +577,72 @@ class Supervisor:
 
     # -------------------------------------------------- update watchdog
     def _env_changed_since_child_start(self) -> bool:
-        """True when .env was written after the CURRENT child started.
+        """True when .env's SEMANTIC content differs from the content the
+        CURRENT child was started on.
 
-        Mirrors tools.mcp_handlers._env_changed_since_start, but compares
-        against child_started_at (this Supervisor's own record of when its
-        child last spawned) rather than the child's in-process import time --
-        the two are effectively the same instant, and this avoids importing
-        the full app into the long-lived Supervisor just to read one field.
-        Never raises: an unreadable .env reads as unchanged, so a failure
-        here can only ever SKIP a restart, never trigger a spurious one."""
-        try:
-            env_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), ".env"
-            )
-            return (
-                os.path.isfile(env_path)
-                and os.path.getmtime(env_path) > self.child_started_at
-            )
-        except OSError:
-            log.debug("could not stat .env for the watchdog drift check", exc_info=True)
+        Compares a content hash against self.env_fingerprint, which spawn()
+        re-stamps on every start. mtime was the 2026-08-09 defect: the
+        launcher's OWN run_update_check() calls migrate_env(), which
+        rewrites .env, so a release made every supervisor sharing this
+        install restart on the next tick even when no setting had changed.
+        A hash makes a no-op rewrite free.
+
+        Never raises, and an unreadable .env fingerprints as empty and reads
+        as UNCHANGED, so a failure here can only ever SKIP a restart, never
+        trigger a spurious one."""
+        current = _env_fingerprint()
+        if not current:
             return False
+        # An empty baseline (no readable .env at spawn) plus a readable one
+        # now IS a change -- and the restart re-stamps it, so it cannot loop.
+        return current != self.env_fingerprint
+
+    def wait_for_idle(self, reason: str) -> bool:
+        """Block until the session has been quiet for IDLE_SECONDS.
+
+        This is the contract the 'restarting at the next idle minute' log
+        line advertises: an ACTIVE session is never interrupted. There is
+        deliberately NO cap that forces the restart -- restart_child()
+        terminate()s the child, and the child's in-flight drain
+        (mcp_server._INFLIGHT / _DRAIN_IDLE_S) does NOT apply to a launcher
+        SIGTERM, so a forced restart could kill a running generation. The
+        cost of that choice -- a client that never goes idle defers the
+        change indefinitely -- is disclosed by a WARNING every
+        IDLE_WARN_EVERY_S rather than hidden. Returns False when the
+        launcher is shutting down."""
+        waited = 0.0
+        while time.time() - self.last_activity < IDLE_SECONDS:
+            if self.closing:
+                return False
+            time.sleep(5)
+            waited += 5.0
+            if waited % IDLE_WARN_EVERY_S < 5.0:
+                log.warning(
+                    "%s is still pending after %.0fs — this session has not "
+                    "been idle for %ds yet, so the restart is being deferred "
+                    "rather than interrupting it. It applies as soon as the "
+                    "session goes quiet.",
+                    reason,
+                    waited,
+                    IDLE_SECONDS,
+                )
+        return not self.closing
+
+    def _respawn_delay(self, deliberate: bool) -> float:
+        """Seconds to wait before bringing the child back.
+
+        Every client sharing this install detects the same peer update on the
+        same tick, so an undelayed respawn is a thundering herd against one
+        venv -- JITTER is the fix for that. A repeated crash adds a small
+        backoff, capped hard: the total delay must stay well inside
+        pump_client_in's write-retry budget, or a client line that arrives
+        mid-restart is dropped and the editor hangs on its id."""
+        jitter = random.uniform(0.0, RESPAWN_JITTER_S)
+        if deliberate:
+            return jitter
+        steps = max(0, self.respawn_failures - 1)
+        backoff = RESPAWN_BACKOFF_BASE_S * (2 ** min(steps, 16))
+        return min(RESPAWN_BACKOFF_MAX_S, backoff) + jitter
 
     def watchdog(self) -> None:
         from tools.updater import run_update_check
@@ -502,8 +669,19 @@ class Supervisor:
                     else "config (.env changed)"
                 )
                 log.info("%s applied — restarting at the next idle minute.", reason)
-                while time.time() - self.last_activity < IDLE_SECONDS:
-                    time.sleep(5)
+                if not self.wait_for_idle(reason):
+                    continue
+                # Re-check AFTER the wait. run_update_check() itself rewrites
+                # .env (migrate_env appends newly shipped keys) and qa-doctor's
+                # heal_env can restore it, so a change that is no longer
+                # pending must not cost a restart.
+                if status != "healed" and not self._env_changed_since_child_start():
+                    log.info(
+                        "%s is no longer pending after the idle wait — "
+                        "not restarting.",
+                        reason,
+                    )
+                    continue
                 self.restart_child(reason)
             except Exception as exc:
                 log.warning("Background update check failed (%s) — will retry.", exc)
@@ -512,10 +690,10 @@ class Supervisor:
 def main() -> int:
     # stderr is rendered as '[error] ...' by MCP clients (Cursor showed
     # every updater INFO line as an error on the v1.38.0 validation run),
-    # so stderr carries WARNING+ only and the INFO trail goes to
-    # data/logs/launcher.log. The threshold must sit on the HANDLER: a
-    # root-level threshold alone re-leaks INFO the moment the root drops
-    # to INFO for the file handler.
+    # so stderr carries WARNING+ only and the INFO trail goes to this
+    # PROCESS's own data/logs/launcher-<pid>.log. The threshold must sit
+    # on the HANDLER: a root-level threshold alone re-leaks INFO the
+    # moment the root drops to INFO for the file handler.
     _stderr = logging.StreamHandler(sys.stderr)
     _stderr.setLevel(logging.WARNING)
     _stderr.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
@@ -523,21 +701,21 @@ def main() -> int:
     _root.setLevel(logging.INFO)
     _root.addHandler(_stderr)
     try:
-        from logging.handlers import RotatingFileHandler
+        from tools.log_setup import configure_file_logging
 
         _log_dir = INSTALL_DIR / "data" / "logs"
-        _log_dir.mkdir(parents=True, exist_ok=True)
-        _fh = RotatingFileHandler(
-            str(_log_dir / "launcher.log"),
-            maxBytes=1024 * 1024,
-            backupCount=2,
-            encoding="utf-8",
-        )
-        _fh.setLevel(logging.INFO)
-        _fh.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-        )
-        _root.addHandler(_fh)
+        # PER-PROCESS file (launcher-<pid>.log). Three MCP clients share
+        # one install, so one shared RotatingFileHandler had three
+        # supervisors rotating and truncating the same name and losing
+        # each other's lines (2026-08-09). Same 1 MiB x 2 budget as
+        # before -- only the file name and the per-line pid tag change.
+        if configure_file_logging(
+            _log_dir,
+            prefix="launcher",
+            max_bytes=1024 * 1024,
+            backup_count=2,
+        ) is None:
+            raise OSError("no per-process launcher log file")
     except Exception:  # a log-file failure must never block startup
         _stderr.setLevel(logging.INFO)
     for _noisy in ("httpx", "httpcore"):

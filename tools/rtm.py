@@ -310,6 +310,32 @@ def rtm_trace(acs: list, test_cases: list) -> dict:
         return {"acs": 0, "covered": 0, "traced_cases": 0, "orphan_cases": 0}
 
 
+def orphan_case_ids(acs: list, test_cases: list, *, cap: int = 20) -> list:
+    """The tc_ids of the cases that trace to NO acceptance criterion.
+
+    rtm_trace already COUNTS them; the submit-side nudge needs to NAME a few, and
+    rtm_trace's dict is asserted byte-for-byte by tests/test_rtm.py, so this is a
+    second reader of the SAME _trace_map computation rather than a new key on a
+    contract other code already depends on. Order is the suite's own; the list is
+    capped because it is rendered into a tester-facing note.
+
+    Never raises -- an unreadable suite yields [] rather than breaking a
+    generation, exactly like rtm_trace beside it.
+    """
+    try:
+        if not acs or not test_cases:
+            return []
+        _ac_to_tcs, orphan_tc_ids = _trace_map(acs, test_cases)
+        try:
+            limit = max(0, int(cap))
+        except (TypeError, ValueError):
+            limit = 20
+        return [str(t) for t in orphan_tc_ids][:limit]
+    except Exception:
+        logger.exception("orphan_case_ids failed -- returning []")
+        return []
+
+
 def traceability_warning_section(acs: list, test_cases: list) -> str:
     """Escalate a DEGENERATE traceability outcome from a percentage to a finding.
 

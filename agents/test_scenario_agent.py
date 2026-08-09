@@ -86,6 +86,7 @@ from tools.rtm import (
     generate_acs,
     match_checklist,
     normalize_ac_id,
+    orphan_case_ids,
     parse_acceptance_criteria,
     render_checklist_section,
     rtm_oneline,
@@ -4110,6 +4111,12 @@ async def _finalize_generation(
     # _finalize_generation cannot reach _audit itself.
     try:
         suite._rtm_trace = rtm_trace(acs, renumbered)
+        # Batch C item 1 (2026-08-09): the submit-side nudge NAMES a few
+        # of the orphans, so carry the ids as well as the count. Same
+        # private-attr channel, same try -- and taken from `renumbered`,
+        # so the ids are the FINAL ones a tester can look up. Capped in
+        # tools/rtm.orphan_case_ids; never raises.
+        suite._rtm_orphan_ids = orphan_case_ids(acs, renumbered)
     except Exception:  # pragma: no cover - rtm_trace never raises
         logger.debug("could not attach _rtm_trace", exc_info=True)
 

@@ -294,6 +294,87 @@ def _prune_sync(path: Path, cap: int) -> None:
         logger.exception("rag_store: prune failed for %s", path)
 
 
+def _delete_source_sync(path: Path, source_key: str, keep_ids: set) -> int:
+    """Drop entries whose ``metadata.source_key`` is *source_key* and whose
+    ``id`` is NOT in *keep_ids*.
+
+    Returns how many were removed -- 0 when the file is missing, unreadable, or
+    holds nothing to remove. Atomic rewrite through a unique pid+uuid temp name,
+    exactly the discipline _prune_sync uses, so two cross-session writers cannot
+    clobber a shared temp; a failure is logged and NEVER raised, which leaves the
+    corpus untouched and the caller keeps both copies -- the behaviour that
+    predates this function.
+
+    LOST-WRITE GUARD (review W1): this is a read-modify-write over a file another
+    process may be APPENDING to (_save_entry_sync), and a plain rewrite would
+    silently drop anything appended between the read and the replace. The file's
+    (size, mtime_ns) is captured with the read and re-checked immediately before
+    tmp.replace; if it moved, the replace is ABANDONED and 0 is returned. That
+    trades a missed de-duplication (the next run removes it) against never losing
+    another writer's entry. It does not make the pre-existing _prune_sync race
+    disappear -- it only refuses to widen it.
+
+    It can only ever remove entries THIS code path stamped: ``source_key`` did
+    not exist before 2026-08-09, so no legacy entry can match. Entries that are
+    not dicts, or carry no metadata dict, are always kept."""
+    try:
+        if not path.is_file():
+            return 0
+        # STAT FIRST, then read (review N1): taken after the load it would
+        # observe the state INCLUDING a concurrent append, so the re-check below
+        # would compare post-append against post-append and always pass -- an
+        # inert guard that still dropped the line.
+        try:
+            st = path.stat()
+            before = (st.st_size, st.st_mtime_ns)
+        except OSError:
+            before = None
+        entries = _load_corpus_sync(path)
+
+        def _drop(entry) -> bool:
+            if not isinstance(entry, dict):
+                return False
+            md = entry.get("metadata")
+            if not isinstance(md, dict):
+                return False
+            if str(md.get("source_key") or "") != source_key:
+                return False
+            return str(entry.get("id") or "") not in keep_ids
+
+        keep = [e for e in entries if not _drop(e)]
+        removed = len(entries) - len(keep)
+        if removed <= 0:
+            return 0
+        tmp = path.with_suffix(f".{os.getpid()}.{uuid.uuid4().hex}.jsonl.tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as fh:
+                for e in keep:
+                    fh.write(json.dumps(e, ensure_ascii=False) + "\n")
+            try:
+                st2 = path.stat()
+                after = (st2.st_size, st2.st_mtime_ns)
+            except OSError:
+                after = None
+            if before is not None and after is not None and after != before:
+                logger.warning(
+                    "rag_store: %s changed under a source replace -- keeping both "
+                    "copies rather than losing a concurrent write",
+                    path.name,
+                )
+                return 0
+            tmp.replace(path)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+        return removed
+    except Exception:
+        logger.exception("rag_store: source replace failed for %s", path)
+        return 0
+
+
 _SAFE_ENTRY_TYPE = re.compile(r"^[A-Za-z0-9_]+$")
 
 
@@ -366,6 +447,50 @@ async def add_to_corpus(entry_type: str, content: str, metadata: dict) -> dict:
         return {"error": None, "content": {"id": entry_id}}
     except Exception as exc:
         logger.exception("rag_store.add_to_corpus failed")
+        return {"error": str(exc), "content": None}
+
+
+async def replace_source_entries(
+    entry_type: str, source_key: str, *, keep_ids: object = None
+) -> dict:
+    """Remove a source's SUPERSEDED entries so a re-run replaces, not appends.
+
+    The write half of the RAG loop was append-only, so re-generating the same
+    ticket stored a second full copy of its cases. The corpus grew 571 -> 676
+    docs in one day of re-runs and a later prepare saw 5/5 retrieved neighbours
+    flagged as duplicate risk. QA_RAG_MAX_ENTRIES bounds the FILE, not the
+    duplication -- it prunes the OLDEST entries, which is precisely the wrong
+    end.
+
+    ``keep_ids`` is the set of entry ids the caller has JUST written for this
+    source; they are spared and everything else under the same key goes. Called
+    with no keep_ids it removes every entry for the source, which is why
+    tools/mcp_handlers._persist_suite_to_corpus calls it only AFTER a successful
+    write and only with the fresh ids: an empty or wholly-unserializable suite
+    must never delete the previous good one.
+
+    An empty key is a no-op (0 removed) -- that is how the caller says "this
+    suite has no source identity, just append".
+
+    Returns {"error": None, "content": {"removed": int}} on success and
+    {"error": str, "content": None} on failure. Never raises.
+    """
+    try:
+        key = str(source_key or "").strip()
+        if not key:
+            return {"error": None, "content": {"removed": 0}}
+        keep = {str(i) for i in (keep_ids or []) if str(i or "")}
+        path = _corpus_path(entry_type)
+        removed = await asyncio.to_thread(_delete_source_sync, path, key, keep)
+        if removed:
+            logger.info(
+                "rag_store: removed %d superseded entry(ies) for one source in %s",
+                removed,
+                path.name,
+            )
+        return {"error": None, "content": {"removed": removed}}
+    except Exception as exc:
+        logger.exception("rag_store.replace_source_entries failed")
         return {"error": str(exc), "content": None}
 
 
