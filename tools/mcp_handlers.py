@@ -64,6 +64,7 @@ from tools.device_manager import (
 )
 from tools.gherkin_exporter import generate_feature_file
 from tools.image_description import describe_images
+from tools.jira_attachments import fetch_attachment_bytes
 from tools.jira_fetcher import fetch_url_content, verify_jira_access
 from tools.jira_mcp import (
     connect_hint_line,
@@ -1401,6 +1402,131 @@ def _safe_image_name(raw) -> str:
             ch for ch in str(raw or "") if ch in _IMAGE_NAME_ALLOWED
         ).strip()[:60]
     except Exception:
+        return ""
+
+
+async def _fetch_jira_attachment_bytes(url_content: dict | None) -> int:
+    """Download the ticket's image attachments SERVER-SIDE, in place.
+
+    Returns how many images arrived; 0 whenever QA_JIRA_ATTACHMENT_FETCH_ENABLED
+    is off, which is the default -- and in that case NO request is made at all
+    and *url_content* is not touched, so the flag-off path is byte-identical to
+    today.
+
+    ON, the bytes join the EXISTING host-image path: ``url_content["images"]`` is
+    exactly what ``host_images`` reads a few lines below, so the screenshots ride
+    the already-shipped IMAGE_JOB to the tester's own multimodal model. No new
+    LLM call, no new round trip and no new forwarding code -- which is why this
+    is a fetch, not a feature.
+
+    Never raises (it is called from inside the prepare handler's protective try,
+    but mcp_server._tracked re-raises, so a helper that leaked would surface as
+    an MCP tool error) and never overstates: with nothing fetched, the
+    pre-existing "I could not read this ticket's images" notice is left exactly
+    as it was.
+    """
+    try:
+        if not isinstance(url_content, dict):
+            return 0
+        if not getattr(settings, "qa_jira_attachment_fetch_enabled", False):
+            return 0
+        attachments = [
+            a
+            for a in (url_content.get("image_attachments") or [])
+            if isinstance(a, dict)
+        ]
+        # Already carrying bytes (a legacy path, or a second pass) -- never
+        # re-download and never overwrite what is already there.
+        if not attachments or url_content.get("images"):
+            return 0
+        result = await fetch_attachment_bytes(attachments)
+        images = [i for i in (result.get("content") or []) if isinstance(i, dict)]
+        failures = [f for f in (result.get("failures") or []) if isinstance(f, dict)]
+        if failures:
+            url_content["image_fetch_failures"] = failures
+        if result.get("error"):
+            url_content["image_fetch_error"] = str(result.get("error"))[:300]
+        if not images:
+            return 0
+        url_content["images"] = images
+        url_content["images_fetched_server_side"] = len(images)
+        # Some screens DID arrive, so the blanket "no image bytes are available"
+        # notice would now be FALSE. Anything that failed is named by
+        # _server_fetched_image_note instead, which is strictly more informative.
+        url_content["images_unavailable"] = False
+        return len(images)
+    except Exception:
+        logger.debug("server-side Jira attachment fetch failed", exc_info=True)
+        return 0
+
+
+# Failure reasons are assembled from an UNTRUSTED response (a Content-Type, a
+# ticket-supplied filename) and land inside a markdown reply, so they go through
+# the same shape of allowlist as _safe_image_name rather than being interpolated
+# raw. `re` is deliberately not imported by this module, hence a set.
+_FETCH_REASON_ALLOWED = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ._:/()-,"
+)
+
+
+def _safe_fetch_reason(raw) -> str:
+    """Sanitized, capped rendering of ONE fetch-failure reason. Never raises."""
+    try:
+        return "".join(
+            ch for ch in str(raw or "") if ch in _FETCH_REASON_ALLOWED
+        )[:200].strip()
+    except Exception:
+        return ""
+
+
+def _server_fetched_image_note(url_content) -> str:
+    """The QA_JIRA_ATTACHMENT_FETCH_ENABLED disclosure, or "" to stay silent.
+
+    Three outcomes, kept distinct because they are different facts: screens this
+    SERVER fetched and attached to this reply (naming any it could not get); an
+    attempt that fetched NOTHING, with the sanitized reason -- otherwise a 401
+    from an expired token would be indistinguishable from a ticket with no
+    screenshots; and silence when the flag is off or there was nothing to fetch.
+    Pure and never raises."""
+    try:
+        uc = url_content if isinstance(url_content, dict) else {}
+        fetched = int(uc.get("images_fetched_server_side") or 0)
+        if fetched:
+            names = [
+                _safe_image_name(i.get("filename")) or "attachment"
+                for i in (uc.get("images") or [])
+                if isinstance(i, dict)
+            ][:8]
+            failed = [
+                _safe_image_name((f or {}).get("filename")) or "attachment"
+                for f in (uc.get("image_fetch_failures") or [])
+                if isinstance(f, dict)
+            ][:8]
+            note = (
+                f"> \U0001f5bc\ufe0f {fetched} ticket screenshot(s) were fetched "
+                "from Jira BY THIS SERVER (`QA_JIRA_ATTACHMENT_FETCH_ENABLED` is "
+                "on, using this install's own Jira API token) and are attached to "
+                "this reply as image content for your own model to read: "
+                + ", ".join(f"`{n}`" for n in names)
+                + "."
+            )
+            if failed:
+                note += (
+                    " I could NOT fetch "
+                    + ", ".join(f"`{n}`" for n in failed)
+                    + " \u2014 attach those to this chat if they matter."
+                )
+            return note
+        reason = _safe_fetch_reason(uc.get("image_fetch_error"))
+        if reason:
+            return (
+                "> \u26a0\ufe0f I could not fetch this ticket's screenshots from "
+                "Jira server-side, even though QA_JIRA_ATTACHMENT_FETCH_ENABLED is "
+                "on: " + reason + ". Attach them to this chat if they matter."
+            )
+        return ""
+    except Exception:
+        logger.debug("_server_fetched_image_note failed", exc_info=True)
         return ""
 
 
@@ -3341,6 +3467,13 @@ async def handle_prepare_test_cases(
         )
         if isinstance(grounded, str):
             return PreparePayloadResult(clarify=grounded)
+        # --- QA_JIRA_ATTACHMENT_FETCH_ENABLED: server-side attachment bytes #
+        # Runs BETWEEN the fetch and BEAT 2 on purpose: beat 2 exists to ask for
+        # screens the ticket has and nothing supplied, so it must be told about
+        # the ones this server just fetched, or it would spend a round trip
+        # asking for images that are already attached to this very reply.
+        # Default OFF -> returns 0, touches nothing, makes no request.
+        _fetched_images = await _fetch_jira_attachment_bytes(grounded.url_content)
         # --- Jira image gate, BEAT 2: the INFORMED ask -------------------- #
         # The ticket is in hand now, so this one can NAME the screens. Fires
         # ONLY when the ticket revealed images and nothing supplied them;
@@ -3357,7 +3490,9 @@ async def handle_prepare_test_cases(
                 names=_img_names,
                 kind=_img_kind,
                 plan=_plan,
-                have_images=len(attached_images or []) + _attested,
+                have_images=len(attached_images or [])
+                + _attested
+                + _fetched_images,
             )
             if _beat2:
                 await _audit(
@@ -3786,6 +3921,14 @@ async def handle_prepare_test_cases(
         # Surface that to the tester by NAME instead of silently generating a
         # suite that never saw the screenshots. APPEND, never assign.
         _url_content = grounded.url_content or {}
+        # QA_JIRA_ATTACHMENT_FETCH_ENABLED: screens THIS SERVER fetched with
+        # the install's own Jira credential, as opposed to anything the tester
+        # attached. Emitted FIRST and separately, because "the screens are in
+        # this reply", "I tried and could not get them" and "the ticket has
+        # screens I cannot read" are three different facts.
+        _fetch_note = _server_fetched_image_note(_url_content)
+        if _fetch_note:
+            _notice = (_notice + "\n\n" + _fetch_note) if _notice else _fetch_note
         if _url_content.get("images_unavailable"):
             _names = [
                 str(a.get("filename") or "attachment")
@@ -3802,7 +3945,9 @@ async def handle_prepare_test_cases(
                 "screenshot(s) to this chat if they matter."
             )
             _notice = (_notice + "\n\n" + _img_note) if _notice else _img_note
-        elif _url_content.get("description_image_refs"):
+        elif _url_content.get("description_image_refs") and not _url_content.get(
+            "images_fetched_server_side"
+        ):
             # Ahead of attachments_unknown on purpose: when the description
             # embeds images we KNOW the ticket has them, so "I could not tell"
             # would understate it.
