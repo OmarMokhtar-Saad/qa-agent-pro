@@ -64,6 +64,7 @@ from tools.device_manager import (
 )
 from tools.gherkin_exporter import generate_feature_file
 from tools.image_description import describe_images
+from tools.jira_attachments import fetch_attachment_bytes
 from tools.jira_fetcher import fetch_url_content, verify_jira_access
 from tools.jira_mcp import (
     connect_hint_line,
@@ -1401,6 +1402,131 @@ def _safe_image_name(raw) -> str:
             ch for ch in str(raw or "") if ch in _IMAGE_NAME_ALLOWED
         ).strip()[:60]
     except Exception:
+        return ""
+
+
+async def _fetch_jira_attachment_bytes(url_content: dict | None) -> int:
+    """Download the ticket's image attachments SERVER-SIDE, in place.
+
+    Returns how many images arrived; 0 whenever QA_JIRA_ATTACHMENT_FETCH_ENABLED
+    is off, which is the default -- and in that case NO request is made at all
+    and *url_content* is not touched, so the flag-off path is byte-identical to
+    today.
+
+    ON, the bytes join the EXISTING host-image path: ``url_content["images"]`` is
+    exactly what ``host_images`` reads a few lines below, so the screenshots ride
+    the already-shipped IMAGE_JOB to the tester's own multimodal model. No new
+    LLM call, no new round trip and no new forwarding code -- which is why this
+    is a fetch, not a feature.
+
+    Never raises (it is called from inside the prepare handler's protective try,
+    but mcp_server._tracked re-raises, so a helper that leaked would surface as
+    an MCP tool error) and never overstates: with nothing fetched, the
+    pre-existing "I could not read this ticket's images" notice is left exactly
+    as it was.
+    """
+    try:
+        if not isinstance(url_content, dict):
+            return 0
+        if not getattr(settings, "qa_jira_attachment_fetch_enabled", False):
+            return 0
+        attachments = [
+            a
+            for a in (url_content.get("image_attachments") or [])
+            if isinstance(a, dict)
+        ]
+        # Already carrying bytes (a legacy path, or a second pass) -- never
+        # re-download and never overwrite what is already there.
+        if not attachments or url_content.get("images"):
+            return 0
+        result = await fetch_attachment_bytes(attachments)
+        images = [i for i in (result.get("content") or []) if isinstance(i, dict)]
+        failures = [f for f in (result.get("failures") or []) if isinstance(f, dict)]
+        if failures:
+            url_content["image_fetch_failures"] = failures
+        if result.get("error"):
+            url_content["image_fetch_error"] = str(result.get("error"))[:300]
+        if not images:
+            return 0
+        url_content["images"] = images
+        url_content["images_fetched_server_side"] = len(images)
+        # Some screens DID arrive, so the blanket "no image bytes are available"
+        # notice would now be FALSE. Anything that failed is named by
+        # _server_fetched_image_note instead, which is strictly more informative.
+        url_content["images_unavailable"] = False
+        return len(images)
+    except Exception:
+        logger.debug("server-side Jira attachment fetch failed", exc_info=True)
+        return 0
+
+
+# Failure reasons are assembled from an UNTRUSTED response (a Content-Type, a
+# ticket-supplied filename) and land inside a markdown reply, so they go through
+# the same shape of allowlist as _safe_image_name rather than being interpolated
+# raw. `re` is deliberately not imported by this module, hence a set.
+_FETCH_REASON_ALLOWED = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ._:/()-,"
+)
+
+
+def _safe_fetch_reason(raw) -> str:
+    """Sanitized, capped rendering of ONE fetch-failure reason. Never raises."""
+    try:
+        return "".join(
+            ch for ch in str(raw or "") if ch in _FETCH_REASON_ALLOWED
+        )[:200].strip()
+    except Exception:
+        return ""
+
+
+def _server_fetched_image_note(url_content) -> str:
+    """The QA_JIRA_ATTACHMENT_FETCH_ENABLED disclosure, or "" to stay silent.
+
+    Three outcomes, kept distinct because they are different facts: screens this
+    SERVER fetched and attached to this reply (naming any it could not get); an
+    attempt that fetched NOTHING, with the sanitized reason -- otherwise a 401
+    from an expired token would be indistinguishable from a ticket with no
+    screenshots; and silence when the flag is off or there was nothing to fetch.
+    Pure and never raises."""
+    try:
+        uc = url_content if isinstance(url_content, dict) else {}
+        fetched = int(uc.get("images_fetched_server_side") or 0)
+        if fetched:
+            names = [
+                _safe_image_name(i.get("filename")) or "attachment"
+                for i in (uc.get("images") or [])
+                if isinstance(i, dict)
+            ][:8]
+            failed = [
+                _safe_image_name((f or {}).get("filename")) or "attachment"
+                for f in (uc.get("image_fetch_failures") or [])
+                if isinstance(f, dict)
+            ][:8]
+            note = (
+                f"> \U0001f5bc\ufe0f {fetched} ticket screenshot(s) were fetched "
+                "from Jira BY THIS SERVER (`QA_JIRA_ATTACHMENT_FETCH_ENABLED` is "
+                "on, using this install's own Jira API token) and are attached to "
+                "this reply as image content for your own model to read: "
+                + ", ".join(f"`{n}`" for n in names)
+                + "."
+            )
+            if failed:
+                note += (
+                    " I could NOT fetch "
+                    + ", ".join(f"`{n}`" for n in failed)
+                    + " \u2014 attach those to this chat if they matter."
+                )
+            return note
+        reason = _safe_fetch_reason(uc.get("image_fetch_error"))
+        if reason:
+            return (
+                "> \u26a0\ufe0f I could not fetch this ticket's screenshots from "
+                "Jira server-side, even though QA_JIRA_ATTACHMENT_FETCH_ENABLED is "
+                "on: " + reason + ". Attach them to this chat if they matter."
+            )
+        return ""
+    except Exception:
+        logger.debug("_server_fetched_image_note failed", exc_info=True)
         return ""
 
 
@@ -3341,6 +3467,13 @@ async def handle_prepare_test_cases(
         )
         if isinstance(grounded, str):
             return PreparePayloadResult(clarify=grounded)
+        # --- QA_JIRA_ATTACHMENT_FETCH_ENABLED: server-side attachment bytes #
+        # Runs BETWEEN the fetch and BEAT 2 on purpose: beat 2 exists to ask for
+        # screens the ticket has and nothing supplied, so it must be told about
+        # the ones this server just fetched, or it would spend a round trip
+        # asking for images that are already attached to this very reply.
+        # Default OFF -> returns 0, touches nothing, makes no request.
+        _fetched_images = await _fetch_jira_attachment_bytes(grounded.url_content)
         # --- Jira image gate, BEAT 2: the INFORMED ask -------------------- #
         # The ticket is in hand now, so this one can NAME the screens. Fires
         # ONLY when the ticket revealed images and nothing supplied them;
@@ -3357,7 +3490,9 @@ async def handle_prepare_test_cases(
                 names=_img_names,
                 kind=_img_kind,
                 plan=_plan,
-                have_images=len(attached_images or []) + _attested,
+                have_images=len(attached_images or [])
+                + _attested
+                + _fetched_images,
             )
             if _beat2:
                 await _audit(
@@ -3417,6 +3552,29 @@ async def handle_prepare_test_cases(
         # auto-update cannot change what an in-flight prep expects back.
         _img_relevance = bool(
             _img_job and getattr(settings, "qa_image_relevance_enabled", True)
+        )
+        # Batch 4 LAYER 1 (QA_HOST_IMAGE_PREFLIGHT_ENABLED, default ON): ask the
+        # SAME job to ACT on its own `no` verdict in the host's PARENT turn --
+        # stop and ask the tester -- instead of only reporting it beside a suite
+        # that has already been generated from the wrong screen. Narrower than
+        # the flag, exactly like _img_relevance itself: with no verdict
+        # requested there is nothing to act on. Decided and stamped HERE so a
+        # mid-flow .env flip or a launcher auto-update cannot change what an
+        # in-flight prep was told to do.
+        _img_preflight = bool(
+            _img_relevance
+            and getattr(settings, "qa_host_image_preflight_enabled", True)
+        )
+        # Batch 4 LAYER 2 (QA_HOST_IMAGE_REQUIRE_RELEVANT, default OFF): whether
+        # a submission whose screens came back `no` -- or with no usable verdict
+        # at all -- is REFUSED at finalize. Same stamp-not-live discipline and
+        # the same narrowing: a prep that never asked for a verdict can never be
+        # judged on one. The submit side additionally requires that screens were
+        # actually FORWARDED on this prep (captured or chat-attested), so a
+        # ticket-image-only prep is never enforced.
+        _img_require = bool(
+            _img_relevance
+            and getattr(settings, "qa_host_image_require_relevant", False)
         )
         # Phase 3a: the two POST_MERGE folds. Each is an AND with the
         # pre-existing, default-OFF feature flag it rides on, so with that flag
@@ -3588,6 +3746,15 @@ async def handle_prepare_test_cases(
                 # OLD envelope (no stamp) parses no verdict and warns about
                 # nothing.
                 "host_image_relevance": bool(_img_relevance),
+                # Batch 4: whether THIS prep asked the host to STOP AND ASK the
+                # tester before generating from a screen it judged off-topic
+                # (Layer 1), and whether an off-topic or unjudged submission is
+                # REFUSED at finalize (Layer 2). Same stamp-not-live rule as
+                # every field above -- submit reads these stamps, never the live
+                # flags -- so an OLD envelope carries neither key and its submit
+                # is byte-identical to today's.
+                "host_image_preflight": bool(_img_preflight),
+                "host_image_require_relevant": bool(_img_require),
                 # Same rule again for the two Phase-3a post_merge folds: submit
                 # must know whether to expect `risk_scores` / `test_plan_report`,
                 # and a mid-flow .env flip must not change that for this prep.
@@ -3680,9 +3847,13 @@ async def handle_prepare_test_cases(
             ([host_mode.AC_JOB] if _ac_job else [])
             + (
                 [
-                    host_mode.IMAGE_RELEVANCE_JOB
-                    if _img_relevance
-                    else host_mode.IMAGE_JOB
+                    host_mode.IMAGE_PREFLIGHT_JOB
+                    if _img_preflight
+                    else (
+                        host_mode.IMAGE_RELEVANCE_JOB
+                        if _img_relevance
+                        else host_mode.IMAGE_JOB
+                    )
                 ]
                 if _img_job
                 else []
@@ -3700,6 +3871,8 @@ async def handle_prepare_test_cases(
                 "host_ac_job": bool(_ac_job),
                 "host_image_job": bool(_img_job),
                 "host_image_relevance": bool(_img_relevance),
+                "host_image_preflight": bool(_img_preflight),
+                "host_image_require_relevant": bool(_img_require),
                 "captured_image_count": _captured,
                 "host_risk_job": bool(_risk_job),
                 "host_test_plan_job": bool(_plan_job),
@@ -3748,6 +3921,14 @@ async def handle_prepare_test_cases(
         # Surface that to the tester by NAME instead of silently generating a
         # suite that never saw the screenshots. APPEND, never assign.
         _url_content = grounded.url_content or {}
+        # QA_JIRA_ATTACHMENT_FETCH_ENABLED: screens THIS SERVER fetched with
+        # the install's own Jira credential, as opposed to anything the tester
+        # attached. Emitted FIRST and separately, because "the screens are in
+        # this reply", "I tried and could not get them" and "the ticket has
+        # screens I cannot read" are three different facts.
+        _fetch_note = _server_fetched_image_note(_url_content)
+        if _fetch_note:
+            _notice = (_notice + "\n\n" + _fetch_note) if _notice else _fetch_note
         if _url_content.get("images_unavailable"):
             _names = [
                 str(a.get("filename") or "attachment")
@@ -3764,7 +3945,9 @@ async def handle_prepare_test_cases(
                 "screenshot(s) to this chat if they matter."
             )
             _notice = (_notice + "\n\n" + _img_note) if _notice else _img_note
-        elif _url_content.get("description_image_refs"):
+        elif _url_content.get("description_image_refs") and not _url_content.get(
+            "images_fetched_server_side"
+        ):
             # Ahead of attachments_unknown on purpose: when the description
             # embeds images we KNOW the ticket has them, so "I could not tell"
             # would understate it.
@@ -5067,6 +5250,173 @@ def _volume_floor_note(
         return "", ""
 
 
+# Batch 4, LAYER 2 (QA_HOST_IMAGE_REQUIRE_RELEVANT, default OFF).
+_IMAGE_GATE_MAX_NAMED = 8
+
+
+def _image_relevance_gate(
+    meta: object,
+    result: object,
+    prep_id: str,
+    *,
+    ack: bool = False,
+) -> "tuple[str, str]":
+    """Verdict on the IMAGE RELEVANCE of a finalizing submission.
+
+    Returns ``("", "")`` when this prep carries no enforcement contract or the
+    submission honours it, ``("acked", note)`` when a refusal was overridden by
+    ``image_relevance_ack`` on a prep this gate had ALREADY refused, and
+    ``("refuse", markdown)`` otherwise.
+
+    WHY: Batch 2 made the off-topic verdict visible; it still could not stop a
+    suite grounded on the wrong screen from being finalized, exported and
+    persisted. Under QA_HOST_IMAGE_REQUIRE_RELEVANT an operator may turn that
+    disclosure into a refusal, exactly as QA_HOST_AMBIGUITY_REQUIRE_RESULT does
+    for the boomeranged SHYJ-7154 preflight.
+
+    IT REFUSES ON TWO THINGS AND ONLY TWO:
+      * any ``relevant: "no"`` -- the host itself says the screen is not about
+        this ticket;
+      * NO usable verdict on ANY image -- the job was shipped, screens really
+        were forwarded, and nothing came back, so there is no record that the
+        screens were even looked at. "Silence reads as cleared" is the precise
+        failure the ambiguity FIX 2 audit change exists to end.
+
+    ``unsure`` PASSES, with Batch 2's warning. Refusing on uncertainty punishes
+    the honest answer and trains a host to reply ``yes``, which would destroy
+    the signal this whole feature is built on; ``no`` and "nothing came back"
+    are unambiguous, and the latter is what the reported run produced.
+
+    EVERY input is a META STAMP (``host_image_require_relevant``,
+    ``host_image_relevance``, ``captured_image_count`` /
+    ``attached_image_count``, ``image_relevance_refused``), never a live
+    settings flag, so neither a mid-flow .env flip nor a launcher auto-update
+    between prepare and submit can change an in-flight prep, and an envelope
+    written before those stamps existed returns ``("", "")`` on the first guard.
+    The verdicts themselves arrive already validated by
+    host_mode.extract_host_image_descriptions -- the strict three-word identity
+    map and the isinstance-str gate -- so nothing here re-reads an untrusted
+    token.
+
+    FORWARDED-SCREENS GUARD: enforcement needs both counts to be zero to opt
+    out, i.e. it applies only when this server captured screens or the host
+    attested chat attachments. Ticket images fetched from Jira are excluded on
+    purpose: they came from the ticket itself, so "off-topic relative to that
+    ticket" is a far weaker claim, and refusing a suite over one is the false
+    positive this gate can least afford.
+
+    Never raises; on an unexpected error it fails OPEN (``("", "")``) so the
+    guard itself can never block a legitimate finalize -- the same discipline as
+    _volume_floor_note and _fanout_incomplete_note.
+    """
+    try:
+        if not isinstance(meta, dict):
+            return "", ""
+        if not meta.get("host_image_require_relevant"):
+            return "", ""
+        if not meta.get("host_image_relevance"):
+            return "", ""
+        try:
+            forwarded = int(meta.get("captured_image_count") or 0) + int(
+                meta.get("attached_image_count") or 0
+            )
+        except (TypeError, ValueError):
+            forwarded = 0
+        if forwarded <= 0:
+            return "", ""
+        counts = host_mode.image_relevance_counts(result)
+        off = host_mode.off_topic_images(result)
+        if counts.get("ran") and not counts.get("no"):
+            return "", ""
+        # Review H1: a gap-remediation resubmit is asked to fix CASES, not to
+        # resend `image_descriptions` -- host_mode.build_gap_response never
+        # mentions the field, so an ABSENT field on a later round means "the
+        # server did not ask for it", NOT "the check was forfeited". Refusing
+        # there would reject a suite THIS gate had already passed in round 0.
+        # The round that DID answer stamps `image_relevance_seen` (see the
+        # gap-round block in handle_submit_suite) -- the same carry-forward
+        # discipline as serialize_adopted_state and the carried checklist
+        # beside it. Only ABSENCE is forgiven: a verdict that IS resent is
+        # judged normally, so a fresh `no` on a later round still refuses.
+        if not counts.get("ran") and meta.get("image_relevance_seen"):
+            return "", ""
+        refused_before = bool(meta.get("image_relevance_refused"))
+        mode = "acked" if (ack and refused_before) else "refuse"
+        if off:
+            named = "\n".join(
+                f"   - `{i.get('image_id', '?')}` \u2014 "
+                f"{i.get('relevance_reason', '') or i.get('description', '')}"
+                for i in off[:_IMAGE_GATE_MAX_NAMED]
+            )
+            if len(off) > _IMAGE_GATE_MAX_NAMED:
+                named += f"\n   - (+{len(off) - _IMAGE_GATE_MAX_NAMED} more)"
+            facts = (
+                f"- **{len(off)} of {counts.get('images', 0)} described "
+                'screen(s) came back `relevant: "no"`** -- your own chat '
+                "model's verdict, MODEL-DERIVED and not verified by this "
+                "server, which made no vision call:\n" + named
+            )
+        else:
+            facts = (
+                f"- **No usable `relevant` verdict came back for any image**, "
+                f"although this prep forwarded {forwarded} screen(s) to your "
+                "chat and asked for one per image. This server made no vision "
+                "call of its own, so there is NO record that the screens were "
+                "looked at -- and silence must not read as `yes`."
+            )
+        if mode == "acked":
+            return mode, (
+                "> \u26a0\ufe0f  Image relevance below the bar this prep asked "
+                "for (refusal OVERRIDDEN by `image_relevance_ack=true`):\n"
+                + "".join(
+                    f">   {line}\n" for line in facts.splitlines() if line.strip()
+                )
+                + ">   The suite below was accepted as submitted. If that is not "
+                "deliberate, capture or attach the correct screen and prepare "
+                "again with `proceed_anyway=true` (a prep for this source is "
+                "already open).\n\n"
+            )
+        ignored_ack = ""
+        if ack and not refused_before:
+            ignored_ack = (
+                "\n\n> \u26a0\ufe0f  `image_relevance_ack=true` arrived on the "
+                "FIRST submit for this prep and was IGNORED: the tester cannot "
+                "have seen these screens yet. Show them the finding above; if "
+                "they confirm the suite is right anyway, resubmit it unchanged "
+                "with the ack and it WILL be honoured."
+            )
+        return mode, (
+            "\u26d4 **Submission refused:** `QA_HOST_IMAGE_REQUIRE_RELEVANT` is "
+            "on for this prep and this submission carries no clean per-image "
+            "verdict for the screens it was generated from.\n\n"
+            + facts
+            + ignored_ack
+            + f"\n\nNothing was discarded and prep `{prep_id}` is intact -- the "
+            "prepared context and every staged category are still there, and no "
+            "remediation round was used.\n\n"
+            "**Pick one:**\n"
+            "1. If the screen really is the wrong one, capture or attach the "
+            "correct screen and run `qa_prepare_test_cases` again WITH "
+            "`proceed_anyway=true` -- a prep for this source is already open, "
+            "so the duplicate-prep guard (default ON) refuses that call "
+            "without it. Cases grounded on the wrong screen are the defect "
+            "this refusal exists to catch.\n"
+            "2. If you did read the screens and simply did not report it, "
+            f"resubmit the SAME suite with the SAME prep_id `{prep_id}` and a "
+            "top-level `image_descriptions` array carrying one `relevant` "
+            "verdict per image (the bare string `yes`, `no` or `unsure`) plus a "
+            "one-line `relevance_reason`. On the per-category route send it in "
+            "the finalize sidecar.\n"
+            "3. Or, ONLY if the TESTER has seen the finding above and confirms "
+            "the suite is right anyway, resubmit it unchanged with "
+            "`image_relevance_ack=true`. Ask them first -- do not decide that on "
+            "your own judgement."
+        )
+    except Exception:  # pragma: no cover - defensive, must never block a finalize
+        logger.debug("image relevance gate failed", exc_info=True)
+        return "", ""
+
+
 def _merge_category_rows(rows: list) -> "tuple[dict, int, dict]":
     """Merge accumulated per-category submission rows into ONE suite dict.
 
@@ -5882,6 +6232,7 @@ async def handle_submit_suite(
     suite_json,
     *,
     volume_floor_ack: bool = False,
+    image_relevance_ack: bool = False,
     ask_text: AskCb = None,
     progress: ProgressCb = None,
 ) -> str:
@@ -6450,6 +6801,11 @@ async def handle_submit_suite(
         # field. Keyed off the prep's meta stamp, so a mid-flow .env flip cannot
         # change an in-flight prep and a normal submit is byte-identical.
         img_note = ""
+        # Batch 4 LAYER 3: hoisted OUT of the block below so the submit audit
+        # row can read them. They stay None / {} on a prep that shipped no image
+        # job, which is what keeps that row byte-identical to today's.
+        _img_result = None
+        _img_counts: dict = {}
         if meta.get("host_image_job"):
             _img_result = host_mode.extract_host_image_descriptions(
                 getattr(parsed, "raw_image_descriptions", None),
@@ -6471,6 +6827,62 @@ async def handle_submit_suite(
                 _img_result,
                 captured=meta.get("captured_image_count"),
             )
+            _img_counts = host_mode.image_relevance_counts(_img_result)
+            # Batch 4 LAYER 2: the opt-in refusal. It runs HERE -- after the
+            # sidecar/merge branches above, so it sees BOTH finalize routes, and
+            # before _finalize_generation, the export and the persist, so a
+            # refusal costs one round trip and destroys nothing (the prep is
+            # kept, no staged row is dropped, no remediation round is consumed),
+            # exactly like the ambiguity and volume refusals. img_note is
+            # prefixed so the tester sees the off-topic finding itself, not just
+            # the refusal, and version_note for the same reason the two gates
+            # above prefix it.
+            _imode, _imd = _image_relevance_gate(
+                meta, _img_result, prep_id, ack=bool(image_relevance_ack)
+            )
+            if _imode == "refuse":
+                # TWO-BEAT ack, copied from the volume gate: mark the prep as
+                # refused so a LATER image_relevance_ack is honoured, while an
+                # ack sent on the FIRST submit -- which the tester cannot have
+                # seen this finding for -- is refused and told so. Non-fatal: an
+                # unpersisted mark only means the next ack is refused again,
+                # which fails in the SAFE direction.
+                try:
+                    _mark = await prep_store.update_prep(
+                        prep_id,
+                        {
+                            **envelope,
+                            "meta": {**meta, "image_relevance_refused": True},
+                        },
+                    )
+                    if (_mark or {}).get("error"):
+                        logger.warning(
+                            "prep %s not marked image_relevance_refused (%s)",
+                            prep_id,
+                            (_mark or {}).get("error"),
+                        )
+                except Exception:  # pragma: no cover - never block the refusal
+                    logger.debug("image_relevance_refused mark failed", exc_info=True)
+                await _audit(
+                    "mcp_submit_suite_refused",
+                    entity_id=prep_id,
+                    detail={
+                        "reason": "image_relevance",
+                        "host_image_off_topic": int(_img_counts.get("no") or 0),
+                        "host_image_relevance_ran": bool(_img_counts.get("ran")),
+                    },
+                )
+                return f"{version_note}{img_note}{_imd}"
+            if _imode == "acked":
+                await _audit(
+                    "mcp_submit_suite_image_override",
+                    entity_id=prep_id,
+                    detail={
+                        "reason": "image_relevance_ack",
+                        "host_image_off_topic": int(_img_counts.get("no") or 0),
+                    },
+                )
+                img_note += _imd
         # Phase 3a: the two POST_MERGE job return fields. Both rode in on THIS
         # submission -- no extra round trip and no server-side LLM call -- on the
         # whole-suite route directly, and on the per-category route through the
@@ -6904,6 +7316,21 @@ async def handle_submit_suite(
                 new_env = dict(envelope)
                 new_meta = dict(meta)
                 new_meta["round"] = round_no + 1
+                # Batch 4 (review H1): carry the IMAGE-VERDICT OUTCOME
+                # into the next round. build_gap_response asks the host
+                # to fix CASES and resubmit; it never mentions
+                # `image_descriptions`, so the host reasonably does not
+                # resend it -- and without this stamp the zero-verdict
+                # arm of _image_relevance_gate would refuse a round-2
+                # resubmit for a field the server itself did not ask
+                # for, rejecting a suite it had already passed. Exactly
+                # the silent-loss class serialize_adopted_state below
+                # and the carried checklist above exist to prevent. Only
+                # a round that actually PRODUCED usable verdicts stamps
+                # it, so a forfeited round-0 check is never laundered
+                # into a pass by the remediation loop.
+                if _img_counts.get("ran"):
+                    new_meta["image_relevance_seen"] = True
                 new_env["meta"] = new_meta
                 # Residue R4 (review iteration 3): re-serialize the ADOPTED prep
                 # state, not just the bumped round. `envelope["prepared"]` is the
@@ -7023,6 +7450,42 @@ async def handle_submit_suite(
                         "host_ambiguity_disclosed": bool(amb_note),
                     }
                     if amb_result is not None
+                    else {}
+                ),
+                # Batch 4 LAYER 3: the image FORFEIT-RATE signal, shaped exactly
+                # like the ambiguity pair above and for the same reason. Until
+                # now a submit row recorded only the PREPARE-side "we asked"
+                # stamp, so an operator reading audit.db could not tell "the
+                # screens were judged and matched" from "nothing came back and
+                # nobody was told" -- which is precisely the run that started
+                # this batch. `host_image_relevance_ran` is whether any USABLE
+                # verdict returned (never HostImageResult.ran, which only means
+                # a usable DESCRIPTION returned), `host_image_off_topic` counts
+                # hard `no` verdicts ONLY, and `host_image_disclosed` records
+                # whether the tester actually SAW the off-topic warning. Counts
+                # and booleans only, never the claimed content. Both keys sit
+                # inside a conditional on this prep having asked for a verdict,
+                # so a prep that shipped no image job -- or an OLD envelope --
+                # contributes no keys and its row stays byte-identical.
+                **(
+                    {
+                        "host_image_relevance_ran": bool(_img_counts.get("ran")),
+                        "host_image_off_topic": int(_img_counts.get("no") or 0),
+                        # Review L1: "disclosed" must mean the tester was
+                        # WARNED, in EITHER form -- the off-topic block or the
+                        # "no usable verdict came back" note. Keyed on the
+                        # off-topic list alone it read False on the
+                        # ZERO-VERDICT run, i.e. a forfeit read exactly like a
+                        # pass, which is the failure this signal exists to end.
+                        "host_image_disclosed": bool(
+                            img_note
+                            and (
+                                getattr(_img_result, "off_topic", None)
+                                or not _img_counts.get("ran")
+                            )
+                        ),
+                    }
+                    if _img_result is not None and meta.get("host_image_relevance")
                     else {}
                 ),
                 **_rtm_trace_detail(suite),

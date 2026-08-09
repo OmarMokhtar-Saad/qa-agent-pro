@@ -288,12 +288,21 @@ class Settings(BaseSettings):
     # Still read: used ONLY to recognise a self-hosted Jira on a custom domain
     # (tickets.example.com) as a ticket URL rather than a generic web page.
     jira_base_url: str = ""
-    # DEPRECATED 2026-08-01, retained as inert fields. The REST/Basic-Auth Jira
-    # path was removed in favour of the calling agent's own Atlassian MCP
-    # connection (OAuth 2.1, Jira Cloud), so nothing reads these any more. They
-    # are kept so an existing .env carrying JIRA_EMAIL / JIRA_API_TOKEN still
-    # loads cleanly instead of tripping validation on upgrade -- and, because
-    # nothing reads them, a stale token cannot silently be used either.
+    # DEPRECATED 2026-08-01 for TICKET TEXT, and still inert for it. The
+    # REST/Basic-Auth Jira path was removed in favour of the calling agent's own
+    # Atlassian MCP connection (OAuth 2.1, Jira Cloud), so no text path reads
+    # these. They are also kept so an existing .env carrying JIRA_EMAIL /
+    # JIRA_API_TOKEN still loads cleanly instead of tripping validation on
+    # upgrade.
+    #
+    # 2026-08-09 -- ONE reader again, and only one: with
+    # QA_JIRA_ATTACHMENT_FETCH_ENABLED (default OFF) turned ON,
+    # tools/jira_attachments.py uses this pair as HTTP Basic auth to download
+    # attachment BYTES from /rest/api/3/attachment/content/{id}. So the old
+    # sentence "a stale token cannot silently be used" holds only while that
+    # flag is OFF, which is the default; with it ON an expired token produces a
+    # NAMED 401 failure in the prepare reply rather than anything silent. The
+    # credential is sent over HTTPS to the configured JIRA_BASE_URL host only.
     jira_api_token: str = ""
     jira_email: str = ""
     # Tool-name prefix the CALLING agent uses for its Atlassian MCP tools.
@@ -466,6 +475,23 @@ class Settings(BaseSettings):
     jira_max_images: int = 3
     jira_max_image_bytes: int = 5_000_000  # Anthropic's own per-image vision cap
 
+    # --- Jira attachment BYTE retrieval -- opt-in, default OFF. ------------
+    # QA_JIRA_ATTACHMENT_FETCH_ENABLED. Jira is read through the calling agent's
+    # own Atlassian MCP connection, which returns attachment METADATA only
+    # (tools/jira_mcp.py makes no outbound HTTP request, by hard rule), so a
+    # ticket whose requirements live in mockups produced a suite written from the
+    # ticket TEXT alone unless a tester re-attached the screenshots by hand.
+    # ON, tools/jira_attachments.py downloads those bytes from
+    # /rest/api/3/attachment/content/{id} with this install's own JIRA_EMAIL +
+    # JIRA_API_TOKEN and hands them to the tester's OWN multimodal model on the
+    # existing IMAGE_JOB path -- no new LLM call, no new round trip.
+    # DEFAULT OFF, per the defaults-OFF hard rule and for a specific reason: it
+    # deliberately re-introduces the credentialed REST path the 2026-08-01
+    # migration removed, so an operator has to choose to store a Jira token
+    # again. With it off, nothing in this tree makes that request and the
+    # behaviour is byte-identical to today. See docs/FEATURE_FLAGS.md.
+    qa_jira_attachment_fetch_enabled: bool = False
+
     # Direct chat image uploads (screenshots/mockups attached to a message,
     # independent of Jira) — see tools/image_description.py -> llm.ask_vision()
     # (api backend only, same pipeline as Jira ticket images). These two caps
@@ -548,6 +574,38 @@ class Settings(BaseSettings):
     # disclosure that already ships under QA_IMAGE_GATE_ENABLED, whose own
     # `false` remains their kill switch.
     qa_image_relevance_enabled: bool = True
+
+    # --- Stop and ASK before generating from an off-topic screen (ON) -------
+    # Batch 4, LAYER 1 (2026-08-09). QA_IMAGE_RELEVANCE_ENABLED above made the
+    # verdict OBSERVABLE, but it arrives WITH the finished suite: by the time
+    # the tester reads "this screen may not belong to this ticket" the wrong
+    # screen has already grounded every case. The verdict is in fact produced in
+    # the host's PARENT turn at step_zero/order 20, BEFORE any category is
+    # generated -- the only thing missing was an instruction saying what to do
+    # with a `no` reached there. ON, the prepare payload ships
+    # host_mode.IMAGE_PREFLIGHT_JOB instead of IMAGE_RELEVANCE_JOB: the SAME job
+    # (same job_id / payload_key / stage / order / return_field / marker, so the
+    # merged-submission contract is byte-identical and it costs ZERO extra round
+    # trips and NO server-side LLM call), with blocking=True and one extra
+    # instruction clause telling the host to STOP AND ASK THE TESTER before
+    # generating when it judged an image `no`.
+    # NOT a discard, and grounding stays unconditional: the Batch-2 review
+    # rejected instruction text that tells the host to drop a screen or to make
+    # step 0c's grounding depend on its own judgement, and that finding stands.
+    # The only new behaviour is ask-the-tester-first -- the AMBIGUITY_JOB shape,
+    # blocking and default-ON since the SHYJ-7154 fix.
+    # The stop is deliberately NARROW: only a hard `no` stops. `unsure`, an
+    # unreadable image and a missing verdict all continue with Batch 2's
+    # warning, because the verdict is untrusted self-report and a fail-CLOSED
+    # reading of an uncertain signal would halt legitimate runs and would teach
+    # a host that `yes` is the cheap answer -- the exact failure this exists to
+    # detect.
+    # ITS OWN switch rather than QA_IMAGE_RELEVANCE_ENABLED's, because this is
+    # the ONE piece of Batch 4 that can halt a generation the tester did not ask
+    # to halt, and rolling that back must not also cost the reporting and the
+    # audit signal. false ships IMAGE_RELEVANCE_JOB exactly as Batch 2 released
+    # it (verdict requested, reported, non-blocking).
+    qa_host_image_preflight_enabled: bool = True
 
     # --- Mobile Device Testing (Maestro) — opt-in, all default OFF / dry-run ON. ---
     # Gates the "📱 Mobile Testing" starter chip, the guided wizard, and the
@@ -1293,6 +1351,33 @@ class Settings(BaseSettings):
     # cannot change an in-flight prep).
     qa_host_ambiguity_require_result: bool = False
 
+    # --- Refuse a host submit whose screens are off-topic / unjudged (OFF) --
+    # Batch 4, LAYER 2 (2026-08-09). Mirrors the flag above exactly: the
+    # disclosure is the honest-by-default behaviour, and an operator who
+    # genuinely relies on the screens being right turns the REFUSAL on. ON, a
+    # submission is refused at finalize when THIS prep asked for a relevance
+    # verdict, actually forwarded screens (captured or chat-attested), and the
+    # submission carries either a `relevant: "no"` verdict or NO usable verdict
+    # at all.
+    # `unsure` PASSES, with Batch 2's warning. Refusing on uncertainty punishes
+    # the honest answer and teaches a host that `yes` is the cheap one, which
+    # would silently destroy the whole signal; `no` and "nothing came back" are
+    # unambiguous and are what the reported run actually produced.
+    # Default OFF because it changes whether an ALREADY-GENERATED suite is
+    # accepted -- the same reasoning that shipped QA_HOST_VOLUME_FLOOR_ENABLED
+    # OFF -- and because the verdict is UNTRUSTED self-report derived partly
+    # from attacker-influenceable pixels, so as a hard gate a hostile or
+    # malformed field could refuse a perfectly good suite. The refusal is
+    # cheap and reversible: the prep and every staged category row survive
+    # ("Nothing was discarded"), no remediation round is consumed, and
+    # `image_relevance_ack=true` on qa_submit_suite clears it on the SECOND
+    # submit (two-beat, exactly like volume_floor_ack).
+    # Inert unless the prep's own meta stamps say so: it is keyed off
+    # `host_image_require_relevant` / `host_image_relevance` / the two image
+    # counts, never off the live flag, so a mid-flow .env flip cannot change an
+    # in-flight prep and an OLD envelope is untouched.
+    qa_host_image_require_relevant: bool = False
+
     # --- Duplicate / SHRINKING category re-submission (both default ON) -----
     # 2026-08-09 (Batch 3, FIX 1). EVIDENCE, ~/qa-agent-pro/data/audit.db, prep
     # 59ab1c492ef242228d97ccd6c673fed1 on 2026-08-04: mcp_submit_category fired
@@ -1897,6 +1982,7 @@ class Settings(BaseSettings):
         "jira_fetch_comments",
         "qa_comment_reconcile_enabled",
         "jira_fetch_images",
+        "qa_jira_attachment_fetch_enabled",
         "jira_fetch_parent",
         "qa_jira_ac_field_discovery",
         "qa_grounding_advisories_enabled",
@@ -1905,6 +1991,7 @@ class Settings(BaseSettings):
         "qa_mobile_capture",
         "qa_image_gate_enabled",
         "qa_image_relevance_enabled",
+        "qa_host_image_preflight_enabled",
         "qa_maestro_enabled",
         "qa_maestro_dry_run",
         "qa_maestro_heal_enabled",
@@ -1937,6 +2024,7 @@ class Settings(BaseSettings):
         "qa_semantic_dedup_enabled",
         "qa_host_feature_report_enabled",
         "qa_host_ambiguity_require_result",
+        "qa_host_image_require_relevant",
         "qa_host_category_resubmit_note_enabled",
         "qa_host_category_shrink_guard_enabled",
         "qa_host_dedup_review_enabled",
