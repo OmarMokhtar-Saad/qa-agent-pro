@@ -314,6 +314,29 @@ def _delete_source_sync(path: Path, source_key: str, keep_ids: set) -> int:
     another writer's entry. It does not make the pre-existing _prune_sync race
     disappear -- it only refuses to widen it.
 
+    PRE-WINDOW LOST-WRITE NARROWING (2026-08-09, review M4). The stat guard
+    above only catches appends made INSIDE this call's read window. A peer client
+    whose same-source entries were appended BEFORE the stat is already inside
+    ``entries``, matches ``source_key``, and is not in THIS caller's
+    ``keep_ids`` -- so its fresh suite was deleted. The corpus is append-only
+    JSONL, so file order IS insertion order, and nothing positioned AFTER this
+    caller's own newest kept entry can be superseded work of this caller's:
+    those rows are spared. No clock is involved, so ``added_at``'s 1-second
+    resolution is irrelevant and legacy rows need no new field.
+
+    This NARROWS the race; it does NOT close it, and the difference matters:
+
+    * (i) with an EMPTY ``keep_ids`` there is no floor at all and the documented
+      "remove every entry for this source" contract applies unchanged;
+    * (ii) a peer append that landed BEFORE this caller's newest kept row -- the
+      ordinary "the peer finalized first" ordering -- is STILL removed. Closing
+      that needs a per-entry writer identity the corpus does not carry, and is
+      tracked separately. tests/test_genquality_batch_c.py pins BOTH orderings,
+      so the limitation is a recorded decision rather than an accident.
+
+    An advisory lockfile would help neither case: the peer's append happened
+    before this call even opened the file.
+
     It can only ever remove entries THIS code path stamped: ``source_key`` did
     not exist before 2026-08-09, so no legacy entry can match. Entries that are
     not dicts, or carry no metadata dict, are always kept."""
@@ -331,7 +354,19 @@ def _delete_source_sync(path: Path, source_key: str, keep_ids: set) -> int:
             before = None
         entries = _load_corpus_sync(path)
 
-        def _drop(entry) -> bool:
+        # The insertion-order floor: the position of the LAST entry this caller
+        # just wrote. -1 means "no floor" -- either the caller passed no
+        # keep_ids (the documented remove-everything contract) or none of them
+        # are in the file, in which case there is nothing to anchor against and
+        # the pre-fix behaviour stands. See the docstring for what this does and
+        # does NOT close.
+        last_keep = -1
+        if keep_ids:
+            for index, entry in enumerate(entries):
+                if isinstance(entry, dict) and str(entry.get("id") or "") in keep_ids:
+                    last_keep = index
+
+        def _drop(index: int, entry) -> bool:
             if not isinstance(entry, dict):
                 return False
             md = entry.get("metadata")
@@ -339,9 +374,13 @@ def _delete_source_sync(path: Path, source_key: str, keep_ids: set) -> int:
                 return False
             if str(md.get("source_key") or "") != source_key:
                 return False
-            return str(entry.get("id") or "") not in keep_ids
+            if str(entry.get("id") or "") in keep_ids:
+                return False
+            # Appended AFTER this caller's newest kept entry -> another writer's
+            # later work, never this caller's superseded copy.
+            return not (keep_ids and last_keep >= 0 and index > last_keep)
 
-        keep = [e for e in entries if not _drop(e)]
+        keep = [e for i, e in enumerate(entries) if not _drop(i, e)]
         removed = len(entries) - len(keep)
         if removed <= 0:
             return 0
