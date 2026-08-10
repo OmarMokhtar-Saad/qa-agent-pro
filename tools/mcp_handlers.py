@@ -1950,8 +1950,7 @@ def _reprep_image_loss_refusal(
         if carries_att:
             _has.append(f"{carries_att} attached screenshot(s)")
         _carries_line = (
-            " THIS call carries " + " and ".join(_has) + ", which does not cover "
-            "them."
+            " THIS call carries " + " and ".join(_has) + ", which does not cover them."
             if _has
             else " THIS call carries no images at all."
         )
@@ -1963,7 +1962,7 @@ def _reprep_image_loss_refusal(
             " Generating now writes those cases WITHOUT them -- that is the "
             "silent regression this guard exists to prevent, and "
             "`proceed_anyway=true` does NOT dismiss it."
-            if _has
+            if _has or recovered_cap
             else " Generating now writes those cases from the ticket TEXT alone "
             "-- that is the silent regression this guard exists to prevent, and "
             "`proceed_anyway=true` does NOT dismiss it."
@@ -1972,8 +1971,12 @@ def _reprep_image_loss_refusal(
             f"## \u26d4 This would generate WITHOUT {short_total} of the screens "
             "the last preparation had\n\n"
             f"A preparation for this exact source (`{prep_id}`, started {_ago}) "
-            "was grounded on " + " and ".join(_channels) + "." + _carries_line
-            + _recovered_line + _consequence
+            "was grounded on "
+            + " and ".join(_channels)
+            + "."
+            + _carries_line
+            + _recovered_line
+            + _consequence
             + _label_block
             + "\n\nCall the SAME tool again with the SAME `feature_or_url` (and "
             "the SAME `jira_content_json` if you already fetched the ticket -- do "
@@ -2185,17 +2188,31 @@ def _carry_forward_or_refuse(
         # grounded on 3 + 2 with one screen still in hand reported that it had
         # had 4. What is generated WITH is the prior total minus the residual;
         # what is missing stays short_total.
+        # IDENTITY, not arithmetic residual (2026-08-10): `prior_total -
+        # short_total` counted a channel-SUBSTITUTE surplus as if it were one
+        # of the prior prep's own screens, so a prep whose two screens both
+        # expired off the shelf, re-sent with one fresh capture, reported
+        # "1 of the 2" present when 0 of that prep's own screens survived.
+        # Only a revived shelf screen or a re-sent id the prior prep was
+        # itself called with counts toward "the previous preparation had"; a
+        # surplus screen is named in its own clause instead.
+        identity_cap = recovered_cap + len([c for c in resolved_ids if c in prior_ids])
+        _substitute_clause = (
+            f" {surplus_cap} other screen(s) on this call were counted in their place."
+            if surplus_cap
+            else ""
+        )
         return (
             merged_ids,
             list(revived_ids),
             from_prep,
             (
-                f"> \u26a0\ufe0f Generating with {prior_total - short_total} of "
+                f"> \u26a0\ufe0f Generating with {identity_cap} of "
                 f"the {prior_total} screen(s) the previous preparation "
                 f"`{from_prep}` for this same source had: `image_carry_ack=true` "
                 f"was sent and {short_total} could not be recovered (chat "
                 "attachments never reach this server, and captured screens "
-                "expire). Anything that exists only in those "
+                f"expire).{_substitute_clause} Anything that exists only in those "
                 f"{short_total} screen(s) is NOT reflected in the cases below."
             ),
             "",
