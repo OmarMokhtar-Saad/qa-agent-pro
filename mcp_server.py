@@ -373,6 +373,8 @@ def _make_chooser(ctx):
     if not settings.qa_mcp_elicit_enabled:
         return None
 
+    _budget = {"deadline": time.monotonic() + mcp_handlers._ELICIT_CALL_BUDGET_S}
+
     async def choose(message, options):
         try:
             result = await ctx.elicit(message, response_type=list(options))
@@ -386,6 +388,7 @@ def _make_chooser(ctx):
             )
         return mcp_handlers.ChoiceResult(mcp_handlers.DECLINED)
 
+    choose._elicit_budget = _budget
     return choose
 
 
@@ -394,6 +397,8 @@ def _make_asker(ctx):
     the text sibling of _make_chooser (same gating and degradation rules)."""
     if not settings.qa_mcp_elicit_enabled:
         return None
+
+    _budget = {"deadline": time.monotonic() + mcp_handlers._ELICIT_CALL_BUDGET_S}
 
     async def ask_text(message):
         try:
@@ -408,7 +413,43 @@ def _make_asker(ctx):
             )
         return mcp_handlers.ChoiceResult(mcp_handlers.DECLINED)
 
+    ask_text._elicit_budget = _budget
     return ask_text
+
+
+def _make_elicitors(ctx):
+    """Build BOTH elicitation callbacks for one tool call, sharing ONE budget.
+
+    K1b (2026-08-10). MCP dialogs chain sequentially inside a single tool call --
+    the image gate asks twice, the wizard up to three times -- and most chains mix
+    an enum dialog with a free-text one. Bounding each dialog separately still let
+    one call run 110-220s and die at the client's ~120s idle timeout, so the budget
+    has to be shared BETWEEN the two callbacks, which is only possible in a scope
+    where both exist. That scope is this function.
+
+    The holder is stamped EAGERLY here rather than at the first dialog: these
+    callbacks are built as arguments to the handler coroutine, i.e. at the top of
+    the tool body before ``_tracked`` awaits anything, so pre-dialog work inside the
+    handler (device scans, the Jira fetch, generation) burns the same budget the
+    dialogs do. That is the call-entry anchor, without threading a parameter through
+    ~15 handler signatures.
+
+    Read back by ``mcp_handlers._elicit_wait_s`` via ``cb._elicit_budget``.
+    Single-sided call sites keep ``_make_chooser`` / ``_make_asker``: with only one
+    callback in play, that factory's own private holder is already per-call correct.
+
+    Returns a KWARGS DICT so a call site stays a single expression
+    (``**_make_elicitors(ctx)``) -- a tuple would need a preceding statement and a
+    restructure of every ``return await _tracked(...)`` it appears in.
+    """
+    choose = _make_chooser(ctx)
+    ask_text = _make_asker(ctx)
+    if choose is None or ask_text is None:
+        return {"choose": choose, "ask_text": ask_text}
+    budget = {"deadline": time.monotonic() + mcp_handlers._ELICIT_CALL_BUDGET_S}
+    choose._elicit_budget = budget
+    ask_text._elicit_budget = budget
+    return {"choose": choose, "ask_text": ask_text}
 
 
 def _image_content_blocks(image_specs):
@@ -564,8 +605,7 @@ def build_server():
             mcp_handlers.handle_generate_test_cases(
                 feature_or_url,
                 proceed_anyway=proceed_anyway,
-                choose=_make_chooser(ctx),
-                ask_text=_make_asker(ctx),
+                **_make_elicitors(ctx),
                 progress=_make_progress(ctx),
                 jira_content_json=jira_content_json,
                 source_plan=source_plan,
@@ -664,8 +704,7 @@ def build_server():
             mcp_handlers.handle_prepare_test_cases(
                 feature_or_url,
                 proceed_anyway=proceed_anyway,
-                choose=_make_chooser(ctx),
-                ask_text=_make_asker(ctx),
+                **_make_elicitors(ctx),
                 progress=_make_progress(ctx),
                 jira_content_json=jira_content_json,
                 source_plan=source_plan,
@@ -984,6 +1023,7 @@ def build_server():
         device_id: str = "",
         count: int = 1,
         rescan: bool = False,
+        names: str = "",
     ) -> list[ContentBlock]:
         """Capture screenshots from a connected phone / emulator / simulator and
         return them as image content PLUS one capture_id per screen (requires
@@ -992,10 +1032,14 @@ def build_server():
         Use this when the user wants test cases grounded in the REAL screens --
         especially for a Jira ticket, because this server cannot read images out
         of Jira (the Atlassian MCP connection returns attachment metadata, never
-        image bytes). Capture as many screens as you need with `count`, name them
-        when asked, then call `qa_prepare_test_cases` (or
-        `qa_generate_test_cases`) with the returned `capture_ids` so the
-        generated cases can reference each screen BY NAME.
+        image bytes). Capture as many screens as you need with `count`, then call
+        `qa_prepare_test_cases` (or `qa_generate_test_cases`) with the returned
+        `capture_ids` so the generated cases can reference each screen BY NAME.
+
+        Screens are named automatically -- from the ticket's own image labels when
+        a prepare disclosed them, else screen_1..N. Pass `names` (comma-separated,
+        in capture order, e.g. "Login screen, OTP screen") ONLY if the user told you
+        what to call them. Never ask them a separate question about it.
 
         Omit device_id to get a device picker (it includes a Rescan option for a
         phone plugged in after the list was built); pass rescan=true to force a
@@ -1011,8 +1055,8 @@ def build_server():
                 device_id=device_id,
                 count=count,
                 rescan=rescan,
-                choose=_make_chooser(ctx),
-                ask_text=_make_asker(ctx),
+                names=names,
+                **_make_elicitors(ctx),
                 progress=_make_progress(ctx),
             ),
         )
@@ -1046,8 +1090,7 @@ def build_server():
                     suite_id=suite_id,
                     app_id=app_id,
                     goal=goal,
-                    choose=_make_chooser(ctx),
-                    ask_text=_make_asker(ctx),
+                    **_make_elicitors(ctx),
                     progress=_make_progress(ctx),
                 ),
             )
@@ -1120,8 +1163,7 @@ def build_server():
                 "qa_wizard",
                 ctx,
                 mcp_handlers.handle_wizard(
-                    choose=_make_chooser(ctx),
-                    ask_text=_make_asker(ctx),
+                    **_make_elicitors(ctx),
                     progress=_make_progress(ctx),
                 ),
             )
