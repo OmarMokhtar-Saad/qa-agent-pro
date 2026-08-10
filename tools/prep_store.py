@@ -712,6 +712,71 @@ async def find_recent_prep_by_source(source_url: str, window_s: float = 1800) ->
         return {"error": str(exc), "content": None}
 
 
+def _find_prep_snapshot_sync(source_url: str, window_s: float) -> dict | None:
+    now = time.time()
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, payload_json, created_at FROM preps "
+            "ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+    finally:
+        conn.close()
+    for pid, payload_json, created in rows:
+        try:
+            created_f = float(created)
+        except (TypeError, ValueError):
+            continue
+        if window_s and (now - created_f) > window_s:
+            break  # ordered DESC, so everything older is out of the window too
+        try:
+            env = json.loads(payload_json) or {}
+        except (ValueError, TypeError):
+            continue
+        meta = env.get("meta") or {}
+        if str(meta.get("source_url") or "") != source_url:
+            continue
+        stamp = str(meta.get("jira_updated") or "").strip()[:64]
+        if not stamp:
+            continue  # a prep written before the stamp existed proves nothing
+        return {
+            "prep_id": pid,
+            "created_at": created_f,
+            "age_s": max(0.0, now - created_f),
+            "jira_updated": stamp,
+        }
+    return None
+
+
+async def find_prep_snapshot_by_source(
+    source_url: str, window_s: float = 86400
+) -> dict:
+    """The newest prep for *source_url* that stamped a Jira ``fields.updated``.
+
+    2026-08-10 (I2c). Deliberately NOT `find_recent_prep_by_source`, for two
+    reasons: that lookup SKIPS finalized preps -- and a finished generation is
+    exactly the snapshot a later call has to be compared against -- and it is
+    keyed to the duplicate-prep guard's window, whereas this is called with
+    QA_PREP_TTL_S so the staleness check is independent of that guard's flag.
+
+    Preps with no `jira_updated` stamp are skipped rather than returned empty,
+    so an envelope written before the key existed can never be mistaken for a
+    fresher snapshot. Same bounded 20-row scan as the guard; ids and one short
+    timestamp only. Never raises.
+    """
+    try:
+        url = str(source_url or "").strip()
+        if not url:
+            return {"error": None, "content": None}
+        hit = await asyncio.to_thread(
+            _find_prep_snapshot_sync, url, float(max(0, window_s))
+        )
+        return {"error": None, "content": hit}
+    except Exception as exc:
+        logger.exception("prep_store.find_prep_snapshot_by_source failed")
+        return {"error": str(exc), "content": None}
+
+
 async def list_unfinished_preps(limit: int = 3) -> dict:
     """Non-expired preps showing real activity (a fetched worker packet or
     >=1 staged category), newest first -- DISCLOSURE data for qa-doctor /

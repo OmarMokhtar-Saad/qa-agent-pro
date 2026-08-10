@@ -1647,6 +1647,19 @@ class Settings(BaseSettings):
     # with a real reason can still set this to false in .env.
     qa_host_duplicate_prep_guard_enabled: bool = True
     qa_host_duplicate_prep_window_s: int = 1800
+    # 2026-08-10 (I3): the FINISHED-SUITE half of the same guard gets its own,
+    # much wider window. The two are different failure modes and 1800s was only
+    # ever right for one of them: a second PREP 43 seconds later is wasted
+    # in-flight work, while a second finalized SUITE hours later is a duplicate
+    # deliverable the tester pays for twice. Live 2026-08-10: the 13:06 prepare
+    # was the THIRD full generation of one ticket that day -- SEVEN stored
+    # suites and a delivered .xlsx -- and said nothing, because the newest match
+    # was ~4.9x the prep window old. A generous default is safe here because
+    # this exit is INFORMATIONAL, not a refusal: it names the existing suite and
+    # `proceed_anyway=true` still regenerates, so the worst case is one extra
+    # confirmation round trip per ticket per day. Coerced by the same lenient,
+    # never-raising validator as every other int in this file.
+    qa_host_duplicate_suite_window_s: int = 86400
 
     # --- Host-boomerang migration of ALL remaining LLM call paths (2026-08-01)
     # ------------------------------------------------------------------------
@@ -2338,6 +2351,7 @@ class Settings(BaseSettings):
         "qa_category_stall_strikes",
         "qa_ambiguity_cache_ttl_s",
         "qa_host_duplicate_prep_window_s",
+        "qa_host_duplicate_suite_window_s",
         mode="before",
     )
     @classmethod

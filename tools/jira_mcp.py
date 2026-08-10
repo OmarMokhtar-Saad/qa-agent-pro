@@ -1803,7 +1803,7 @@ def build_fetch_directive(url: str, issue_key: str = "") -> str:
             "",
             f"1. Call `{prefix}getJiraIssue` for {target} with `fields` "
             "including `summary,description,priority,labels,components,"
-            "issuetype,status,parent,subtasks,issuelinks,attachment"
+            "issuetype,status,updated,parent,subtasks,issuelinks,attachment"
             + (",comment" if want_comments else "")
             + (f",{ac_field}" if ac_field else "")
             + "`.",
@@ -1840,7 +1840,10 @@ def build_fetch_directive(url: str, issue_key: str = "") -> str:
             "JSON of the raw tool output - ONE STRING argument (`json.dumps(...)` "
             "of the object below, NOT the object itself: that parameter is typed "
             "as a string and an object is rejected before I ever see the ticket). "
-            "Do NOT summarise, reword, translate or truncate it. The object you "
+            "Do NOT summarise, reword, translate or truncate it, and do NOT strip "
+            "fields - `fields.updated` in particular is how I tell whether the "
+            "payload you sent is a fresh read or a cached copy, and I say so in "
+            "the reply. The object you "
             "stringify must be shaped exactly like this:",
             "",
             "```json",
@@ -1992,6 +1995,12 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
 
         title = summary_src or key or "Jira issue"
         description = description_src
+        # 2026-08-10 (I2): the issue's own last-modified stamp, echoed back so
+        # the server can DISCLOSE which snapshot a generation ran on and warn
+        # when a host re-sends a cached payload older than one already used.
+        # UNTRUSTED like every other echoed field: one line, URL-free,
+        # backtick-free, capped. A host that trimmed `fields` yields "".
+        updated = _sanitize_echo(fields.get("updated"), 40)
 
         priority = _extract_priority(fields)
         labels = _extract_names(fields.get("labels"))
@@ -2097,6 +2106,9 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
             "raw_text": raw_text,
             "content": raw_text,
             "issue_key": key,
+            # Additive key (2026-08-10). Downstream consumers read the
+            # historical key set and are unaffected.
+            "updated": updated,
             "source": "atlassian_mcp",
             "error": None,
         }

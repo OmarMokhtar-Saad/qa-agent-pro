@@ -617,7 +617,9 @@ _EXPORTERS: dict[str, Callable] = {
 _ZEPHYR_FORMAT = "zephyr"
 
 
-def _available_exporters(story_key: str = "") -> dict[str, Callable]:
+def _available_exporters(
+    story_key: str = "", output_dir: str = ""
+) -> dict[str, Callable]:
     """The export-format map for this call.
 
     Built from the module-global ``_EXPORTERS`` at CALL time (so
@@ -639,7 +641,12 @@ def _available_exporters(story_key: str = "") -> dict[str, Callable]:
         # dry_run comes from settings too, so both call paths agree.
         exporters[_ZEPHYR_FORMAT] = lambda s: generate_zephyr_export(
             s,
-            (settings.qa_export_dir or "").strip() or None,
+            # I4 (2026-08-10): an explicit, already-validated `output_dir` from
+            # qa_export_suite wins over the configured folder; "" (the default)
+            # is byte-identical to before.
+            (output_dir or "").strip()
+            or (settings.qa_export_dir or "").strip()
+            or None,
             story_key=story_key,
             dry_run=bool(settings.qa_zephyr_dry_run),
         )
@@ -4058,6 +4065,148 @@ def _host_mode_server_llm_notice(
     return "\n".join(lines)
 
 
+async def _audit_image_plan_nudge(plan: str, channel: str, missing_ids) -> None:
+    """Audit + log ONE image-plan completion nudge exit. Never raises.
+
+    2026-08-10 (I1): both nudge returns in handle_prepare_test_cases handed the
+    tester a clarify and left NOTHING behind -- no audit row, no log line -- so
+    the repeating "how many screens?" loop observed that day (09:04, ~09:20,
+    13:03:48) was invisible in telemetry, while every other exit on that path
+    (image gate beat 1, beat 2, the _prepare_generation refusal) was traceable.
+
+    A NEW event id rather than a `mcp_prepare_rejected` variant: that row means
+    "_prepare_generation refused this source", a different fact, and overloading
+    it would make both unqueryable. `missing_ids` are HOST-supplied capture ids,
+    so they are length- and count-capped here even though `_peek_captures`
+    already produced and deduped them.
+    """
+    try:
+        ids = [str(x)[:64] for x in list(missing_ids or [])][:8]
+        safe_plan = str(plan or "")[:32]
+        await _audit(
+            "mcp_image_plan_nudge",
+            detail={
+                "plan": safe_plan,
+                "channel": channel,
+                "unresolved_captures": len(ids),
+                "capture_ids": ids,
+            },
+        )
+        logger.info(
+            "image-plan nudge: plan=%s channel=%s unresolved=%d",
+            safe_plan,
+            channel,
+            len(ids),
+        )
+    except Exception:  # pragma: no cover - a disclosure never breaks a prepare
+        logger.debug("image-plan nudge audit failed", exc_info=True)
+
+
+def _ago_label(seconds) -> str:
+    """Tester-facing age for a notice: "less than a minute", "12 minute(s)",
+    "2 hour(s) 31 minute(s)". Never raises.
+
+    I3 (2026-08-10): the duplicate-SUITE window is a day wide now, so the old
+    bare "{n} minute(s)" would routinely have printed "151 minute(s) ago".
+    """
+    try:
+        total = max(0, int(seconds))
+    except Exception:
+        return "some time"
+    mins = total // 60
+    if mins < 60:
+        return f"{mins} minute(s)" if mins else "less than a minute"
+    hours, rem = divmod(mins, 60)
+    return f"{hours} hour(s) {rem} minute(s)" if rem else f"{hours} hour(s)"
+
+
+def _safe_snapshot_stamp(raw) -> str:
+    """A Jira `fields.updated` value as safe, single-line, capped display text.
+
+    Already sanitized by `jira_mcp._sanitize_echo` on the boomerang path; capped
+    again here because this module must not depend on WHERE a grounded dict came
+    from. Set/str-based like every other sanitizer in this file -- `re` is
+    deliberately not imported at module scope. Never raises.
+    """
+    try:
+        text = "".join(ch for ch in str(raw or "") if ch.isprintable() and ch != "`")
+        return " ".join(text.split())[:40]
+    except Exception:
+        return ""
+
+
+def _parse_jira_timestamp(raw):
+    """Epoch seconds for a Jira timestamp, or None when it cannot be read.
+
+    None means "say nothing": these strings are HOST-supplied, so an unparseable
+    one must never produce a warning -- and never an exception. Handles the two
+    forms Jira emits that `datetime.fromisoformat` alone does not: a trailing
+    `Z`, and the compact `+0300` offset. A naive stamp is read as UTC, which is
+    only ever used to compare two stamps from the same ticket.
+    """
+    try:
+        from datetime import datetime, timezone
+
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        if text[-1] in ("Z", "z"):
+            text = text[:-1] + "+00:00"
+        if len(text) > 5 and text[-5] in "+-" and text[-3] != ":":
+            text = text[:-2] + ":" + text[-2:]
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+async def _stale_snapshot_note(source_text: str, updated: str) -> str:
+    """WARN when the ticket snapshot just handed back is OLDER than one this
+    install already prepared from. "" (silence) in every other case.
+
+    2026-08-10 (I2c). The host caches `jira_content_json` on disk and re-sends
+    hours-old copies -- files written at 09:06 were re-sent at 13:06 -- and the
+    server had no recency signal at all. Deliberately a WARNING and never a
+    refusal: the timestamps are host-supplied text, so a hard gate would be both
+    gameable and annoying.
+
+    Reads the newest prior prep for the SAME source inside QA_PREP_TTL_S that
+    stamped a `jira_updated`. FINALIZED preps count here, unlike the
+    duplicate-prep guard, because a finished generation is exactly the snapshot
+    a later call must be compared against. Never raises.
+    """
+    if not source_text or not updated:
+        return ""
+    try:
+        hit = await prep_store.find_prep_snapshot_by_source(
+            source_text, float(getattr(settings, "qa_prep_ttl_s", 86400) or 0)
+        )
+        prior = (hit or {}).get("content") or {}
+        prior_stamp = _safe_snapshot_stamp(prior.get("jira_updated"))
+        if not prior_stamp or prior_stamp == updated:
+            return ""
+        new_t = _parse_jira_timestamp(updated)
+        old_t = _parse_jira_timestamp(prior_stamp)
+        if new_t is None or old_t is None or new_t >= old_t:
+            return ""
+        when = time.strftime(
+            "%H:%M", time.localtime(float(prior.get("created_at") or 0))
+        )
+        return (
+            "> \u26a0\ufe0f The ticket snapshot you just sent (`updated` = "
+            f"`{updated}`) is OLDER than the one this install already prepared "
+            f"from at {when} (`{prior_stamp}`), so this is almost certainly a "
+            "CACHED copy of the ticket rather than a fresh read. Re-run "
+            "`getJiraIssue` and prepare again if the ticket may have changed. "
+            "Generation continues with the snapshot you sent."
+        )
+    except Exception:
+        logger.debug("stale-snapshot check failed", exc_info=True)
+        return ""
+
+
 async def _find_recent_duplicate_suite(source_text: str) -> dict | None:
     """Best-effort lookup for a recently-finalized suite generated from the
     SAME source_url. Never raises and never blocks prepare on a store error --
@@ -4066,16 +4215,24 @@ async def _find_recent_duplicate_suite(source_text: str) -> dict | None:
     Keyed on exact source_url match only (a Jira/issue/web/Swagger URL, as
     stored by handle_submit_suite). Free-text feature descriptions have no
     stable identity to dedupe against and are never flagged.
+
+    2026-08-10 (I3): windowed by QA_HOST_DUPLICATE_SUITE_WINDOW_S (24h), NOT by
+    the 1800s PREP window it used to share -- a second prep minutes later and a
+    second finished suite hours later are different failure modes. The scan is
+    20 rows rather than 5 for the same reason, and it is not cosmetic: with a
+    day-wide window the matching suite is routinely not among the 5 newest
+    (seven suites were stored on the day this was found), so a 5-row scan would
+    have left the whole widening as dead code.
     """
     if not source_text:
         return None
     try:
-        recent = await list_recent_suites(limit=5)
+        recent = await list_recent_suites(limit=20)
     except Exception:
         return None
     if recent.get("error"):
         return None
-    window_s = max(0, int(getattr(settings, "qa_host_duplicate_prep_window_s", 1800)))
+    window_s = max(0, int(getattr(settings, "qa_host_duplicate_suite_window_s", 86400)))
     now = time.time()
     for item in recent.get("content") or []:
         if item.get("source_url") != source_text:
@@ -4234,17 +4391,22 @@ async def handle_prepare_test_cases(
         # the IMAGE-loss refusal above is not, because it has its own ack.
         dup = None if proceed_anyway else await _find_recent_duplicate_suite(text)
         if dup is not None:
-            mins_ago = max(0, int((time.time() - (dup.get("created_at") or 0)) / 60))
+            # I3 (2026-08-10): hours-aware, because the window is a day wide now
+            # and "151 minute(s) ago" was about to become the normal reading.
+            _dup_ago = _ago_label(time.time() - (dup.get("created_at") or 0))
             return PreparePayloadResult(
                 clarify=(
                     "⚠️ A suite was already generated from this exact "
-                    f"source **{mins_ago} minute(s) ago** "
+                    f"source **{_dup_ago} ago** "
                     f"({dup.get('case_count', '?')} cases, suite "
                     f"`{dup.get('suite_id', '?')}`). Re-running now will create a "
                     "SEPARATE duplicate suite, not continue or replace that one.\n\n"
-                    "Ask the tester whether they actually want a fresh regeneration "
-                    "before proceeding. If they confirm yes, call "
-                    "`qa_prepare_test_cases` again with `proceed_anyway=true`."
+                    "To hand the tester THAT suite instead, call `qa_export_suite` "
+                    f"with `suite_id='{dup.get('suite_id', '')}'` -- the file is "
+                    "written again from the stored cases, so no regeneration is "
+                    "needed. Otherwise ask the tester whether they actually want a "
+                    "fresh regeneration before proceeding; if they confirm yes, "
+                    "call `qa_prepare_test_cases` again with `proceed_anyway=true`."
                 )
             )
         # Deferred REVIVE (review M3). NOTHING above this point may move a
@@ -4372,6 +4534,9 @@ async def handle_prepare_test_cases(
             else ""
         )
         if _plan in ("jira_attach", "jira_both") and not _attested:
+            # I1 (2026-08-10): this exit is tester-visible and used to leave no
+            # trace at all, so a loop of them was invisible in telemetry.
+            await _audit_image_plan_nudge(_plan, "attach", _cap_missing)
             return PreparePayloadResult(
                 clarify=(
                     "## 📎 Attach the screenshots now\n\n"
@@ -4390,6 +4555,10 @@ async def handle_prepare_test_cases(
                 )
             )
         if _plan in ("jira_device", "jira_both", "device") and not _cap_images:
+            # I1 (2026-08-10): same finding as the attach nudge above. The
+            # unresolved-id count is the useful signal here -- it separates
+            # "never captured anything" from "sent ids that expired".
+            await _audit_image_plan_nudge(_plan, "capture", _cap_missing)
             return PreparePayloadResult(
                 clarify=(
                     "## 📸 Capture the screens first\n\n"
@@ -4519,6 +4688,18 @@ async def handle_prepare_test_cases(
         # neither the stamp nor the notice may say anything was suppressed.
         _comment_kept = int(getattr(grounded, "comment_thread_kept", 0) or 0)
         _comment_suppressed_real = bool(_comment_suppress and _comment_kept > 0)
+
+        # I2 (2026-08-10): ticket snapshot RECENCY. The host caches the Jira
+        # payload on disk and re-sends hours-old copies, and `fields.updated` is
+        # the only recency signal obtainable WITHOUT a second fetch -- the
+        # directive now asks for the field and jira_mcp echoes it through. Both
+        # values are computed HERE, before the envelope is written, so the stamp
+        # below and the disclosure further down can never disagree. Empty for a
+        # non-Jira source, or a host that trimmed the field.
+        _snapshot_updated = _safe_snapshot_stamp(
+            (grounded.url_content or {}).get("updated")
+        )
+        _stale_note = await _stale_snapshot_note(text, _snapshot_updated)
 
         async def _on_status(msg: str) -> None:
             await _emit(progress, msg)
@@ -4859,6 +5040,14 @@ async def handle_prepare_test_cases(
                 # reads the stamp, never the live flag.
                 "host_comment_reconcile_suppressed": bool(_comment_suppressed_real),
                 "comment_thread_kept": _comment_kept,
+                # I2 (2026-08-10): the ticket's own `fields.updated` for THIS
+                # prep. Stamped so a LATER prepare for the same source can tell
+                # that the payload it was handed is older than the one already
+                # used -- the only way to see a re-sent cached snapshot without
+                # fetching the ticket a second time. Additive and .get-read
+                # everywhere, so an envelope written before this key existed is
+                # simply "no prior stamp" and stays silent.
+                "jira_updated": _snapshot_updated,
                 # Parallel fan-out contract is stamped at PREPARE time so a mid-flight
                 # .env flip cannot change the finalize gate for an in-flight prep.
                 # 2026-08-09 (Batch 3, FIX 1): whether THIS prep warns on a
@@ -5091,6 +5280,19 @@ async def handle_prepare_test_cases(
                 "NOT reflected in the cases below."
             )
             _notice = (_notice + "\n\n" + _cap_note) if _notice else _cap_note
+        # I2b (2026-08-10): WHICH snapshot these cases were generated from, so a
+        # reused cached payload is visible instead of silent. APPEND, never
+        # assign -- see PreparePayloadResult.
+        if _snapshot_updated:
+            _snap_note = (
+                f"> 🕒 Ticket snapshot as of `{_snapshot_updated}` (the "
+                "`updated` timestamp on the Jira payload you handed back). This "
+                "server never fetches the ticket itself, so if that looks old, "
+                "re-run `getJiraIssue` before generating again."
+            )
+            _notice = (_notice + "\n\n" + _snap_note) if _notice else _snap_note
+        if _stale_note:
+            _notice = (_notice + "\n\n" + _stale_note) if _notice else _stale_note
         # Revive / carry-forward / acked-loss disclosure. APPEND, never assign
         # -- see PreparePayloadResult.
         if _carry_note:
@@ -8903,13 +9105,59 @@ async def handle_submit_suite(
         return f"⚠️ Submitting the suite failed: {exc}"
 
 
+def _relocate_export(path: str, target_dir: str) -> tuple[str, str]:
+    """Move a written export into the folder the tester named.
+
+    Returns ``(path, note)``. The note is non-empty ONLY when the move failed,
+    and in that case the ORIGINAL path comes back, so the reply always points at
+    a file that exists. Never raises.
+
+    WHY a move rather than an output path: the five single-file exporters each
+    choose their own filename and extension, so threading a directory into them
+    would mean a per-format extension table that can silently drift. The Zephyr
+    exporter is the exception -- it writes a PAIR into a directory -- and takes
+    the folder directly (see _available_exporters).
+    """
+    try:
+        src = Path(path)
+        dest_dir = Path(target_dir).expanduser()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / src.name
+        if src.resolve() == dest.resolve():
+            return str(dest), ""
+        shutil.move(str(src), str(dest))
+        return str(dest), ""
+    except Exception:
+        logger.warning(
+            "export relocate to %r failed -- keeping the original path",
+            target_dir,
+            exc_info=True,
+        )
+        return path, (
+            "\n> ℹ️  I could not move the file into the folder you asked "
+            "for, so it stayed at the path above."
+        )
+
+
 async def handle_export_suite(
     suite_id: str,
     fmt: str,
     *,
+    output_dir: str = "",
     choose: ChooseCb = None,
     progress: ProgressCb = None,
 ) -> str:
+    """Export a stored suite to one format and return the written path.
+
+    *output_dir* (I4, 2026-08-10) is the OPTIONAL, tester-supplied save folder.
+    It exists because the auto-export save-location dialog is unreachable
+    whenever QA_EXPORT_DIR resolves -- which it does on every default install --
+    so tester control belongs on the call that is explicitly about exporting,
+    as a parameter rather than an elicitation. Always optional: a required
+    field here would break every existing caller. Empty keeps each format's
+    current destination exactly (secure temp for the five single-file
+    exporters, QA_EXPORT_DIR for the Zephyr pair). Never raises.
+    """
     fmt = (fmt or "").strip().lower()
     if not fmt and settings.qa_mcp_elicit_enabled:
         picked = await _elicit_choice(
@@ -8945,19 +9193,43 @@ async def handle_export_suite(
         if suite is None:
             return f"⚠️ No stored suite with id `{suite_id}`. Generate one first."
         await _emit(progress, f"📦 Exporting suite to {fmt}…")
+        # I4 (2026-08-10): UNTRUSTED folder text, validated by exactly the same
+        # rules as an elicited answer -- absolute / ~-rooted only, no config
+        # lines, length-capped, root-allowlisted, with the "did you mean
+        # ~/Desktop?" correction for a bare well-known word. Every branch below
+        # keys off `target_dir`, the RESOLVED value: a rejected answer is
+        # truthy as raw text but resolves to "", and must not send the file
+        # anywhere. A rejection keeps the default destination AND says so.
+        target_dir, dir_note = "", ""
+        if (output_dir or "").strip():
+            target_dir, _why = _safe_elicited_dir(output_dir)
+            if not target_dir:
+                dir_note = _why
         # The Zephyr exporter needs the originating Jira key for its Project /
         # Issue columns; every other format ignores it.
         story_key = await _suite_story_key(suite_id) if fmt == _ZEPHYR_FORMAT else ""
         try:
-            path = await asyncio.to_thread(_available_exporters(story_key)[fmt], suite)
+            path = await asyncio.to_thread(
+                _available_exporters(story_key, target_dir)[fmt], suite
+            )
         except Exception as exc:
             logger.exception("mcp export failed")
             return f"⚠️ Export to {fmt} failed: {exc}"
+        if target_dir and fmt != _ZEPHYR_FORMAT:
+            # Zephyr already wrote its PAIR into target_dir; moving just the
+            # workbook would split it from its zfj_import_config.json.
+            path, _move_note = _relocate_export(path, target_dir)
+            if _move_note:
+                dir_note += _move_note
         telemetry.add_tool_properties(format=fmt, case_count=len(suite.test_cases))
         await _audit(
-            "mcp_export_suite", entity_id=suite_id, detail={"format": fmt, "path": path}
+            "mcp_export_suite",
+            entity_id=suite_id,
+            detail={"format": fmt, "path": path, "custom_dir": bool(target_dir)},
         )
         result = shape_export_result(suite_id, fmt, path, len(suite.test_cases))
+        if dir_note:
+            result += dir_note
         if fmt == _ZEPHYR_FORMAT:
             result += _zephyr_pair_note(
                 path,
