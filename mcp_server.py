@@ -600,7 +600,9 @@ def build_server():
         credentials. For a Jira URL the FIRST reply is a DIRECTIVE telling you to
         call your OWN `mcp__atlassian__getJiraIssue` (and once more for the
         parent issue, when there is one), then call this tool AGAIN with the same
-        feature_or_url plus `jira_content_json` set to the RAW JSON result. Do
+        feature_or_url plus `jira_content_json` set to the raw result as a
+        JSON STRING -- stringified JSON, i.e. `json.dumps(result)`, because
+        that parameter is typed `str`; do not pass the object itself. Do
         not summarise, translate or invent ticket content, and do not generate
         from the URL alone. If you have no `atlassian` MCP server connected, show
         the user the connection steps the directive includes.
@@ -1168,7 +1170,8 @@ def build_server():
 
             For a Jira URL the reply may be a DIRECTIVE asking you to fetch the
             issue with your own mcp__atlassian__getJiraIssue tool and call again
-            with jira_content_json set to its raw JSON result."""
+            with jira_content_json set to its raw result as a JSON STRING
+            (stringified JSON -- that parameter is typed `str`)."""
             return await _tracked(
                 "qa_feature_analysis",
                 ctx,

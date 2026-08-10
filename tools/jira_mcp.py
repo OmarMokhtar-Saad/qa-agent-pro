@@ -1836,9 +1836,12 @@ def build_fetch_directive(url: str, issue_key: str = "") -> str:
             step += 1
         lines += [
             f"{step}. Call `qa_prepare_test_cases` again with the SAME "
-            "`feature_or_url`, plus `jira_content_json` set to a JSON object "
-            "shaped exactly like this (raw tool output, do NOT summarise, "
-            "reword, translate or truncate it):",
+            "`feature_or_url`, plus `jira_content_json` set to the STRINGIFIED "
+            "JSON of the raw tool output - ONE STRING argument (`json.dumps(...)` "
+            "of the object below, NOT the object itself: that parameter is typed "
+            "as a string and an object is rejected before I ever see the ticket). "
+            "Do NOT summarise, reword, translate or truncate it. The object you "
+            "stringify must be shaped exactly like this:",
             "",
             "```json",
             "{",

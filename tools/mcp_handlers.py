@@ -360,6 +360,21 @@ _PROCESS_START = time.time()
 # ops-6 (bug 3): cap on an elicited folder answer before it is treated as a path.
 _MAX_EXPORT_DIR_CHARS = 400
 
+# F1b (2026-08-10): how long the auto-export save-folder dialog may hold a
+# FINISHED, already-persisted suite open before the default folder is used. The
+# prompt interpolates int() of this value, so the wording and the bound cannot
+# drift apart. A module global so tests can shrink it.
+_ELICIT_DIR_TIMEOUT_S = 55.0
+
+# F2 (2026-08-10): the folder words a tester actually types. A bare relative
+# answer is never resolved (it would land inside the install dir); the matching
+# entry is offered back as the full path they meant.
+_WELL_KNOWN_FOLDERS = {
+    "desktop": "~/Desktop",
+    "documents": "~/Documents",
+    "downloads": "~/Downloads",
+}
+
 
 def _safe_elicited_dir(answer: str) -> tuple[str, str]:
     """Validate an elicited save-folder answer BEFORE it becomes a real path.
@@ -399,6 +414,25 @@ def _safe_elicited_dir(answer: str) -> tuple[str, str]:
         import tempfile
 
         from tools.updater import _INSTALL_DIR
+
+        # F2 (2026-08-10): an ELICITED answer is free-text a tester typed, so a
+        # bare word like "desktop" must never be resolved against the process
+        # CWD -- that is the install dir, which is itself an allowed root, so the
+        # check below APPROVED it and the deliverable landed inside the
+        # installation. Only absolute / ~-rooted answers reach that check.
+        if not Path(raw).expanduser().is_absolute():
+            suggestion = _WELL_KNOWN_FOLDERS.get(raw.lower())
+            if suggestion:
+                return "", (
+                    "\n> ℹ️  I need the FULL path of that folder, so the "
+                    "configured export folder was used instead. Reply "
+                    f"`{suggestion}` if that is the one you meant."
+                )
+            return "", (
+                "\n> ℹ️  The folder you replied with is not a full path "
+                "(it would have been read relative to the server's own folder), "
+                "so the configured export folder was used instead."
+            )
 
         resolved = Path(raw).expanduser().resolve()
         roots = [
@@ -1506,6 +1540,26 @@ async def _fetch_jira_attachment_bytes(url_content: dict | None) -> int:
             url_content["image_fetch_failures"] = failures
         if result.get("error"):
             url_content["image_fetch_error"] = str(result.get("error"))[:300]
+        if failures or result.get("error"):
+            # N3 (2026-08-10): a HANDLED failure (401/403, size cap, disallowed
+            # MIME) returns NORMALLY from jira_attachments, so nothing at WARNING
+            # or above ever recorded it -- in the log an expired JIRA_API_TOKEN
+            # was indistinguishable from a ticket with no screenshots.
+            #
+            # What the sanitizer below actually guarantees, stated exactly: the
+            # reason is reduced to single-line, length-capped text drawn from a
+            # fixed character class, and any scheme://... run is collapsed to
+            # `(url)`. It is NOT a general secret-scrubber -- it is safe here
+            # because these reasons are jira_attachments' own literals (HTTP
+            # status, byte cap, MIME) and never the attachment URL, which
+            # carries a signed token and is kept out of the logs at its source.
+            logger.warning(
+                "jira attachment fetch: %d of %d ticket screenshot(s) failed: %s",
+                len(failures),
+                len(attachments),
+                "; ".join(_log_safe_fetch_reason(f.get("reason")) for f in failures[:3])
+                or _log_safe_fetch_reason(result.get("error")),
+            )
         if not images:
             return 0
         url_content["images"] = images
@@ -1552,6 +1606,35 @@ def _safe_fetch_reason(raw) -> str:
         return "".join(ch for ch in str(raw or "") if ch in _FETCH_REASON_ALLOWED)[
             :200
         ].strip()
+    except Exception:
+        return ""
+
+
+def _log_safe_fetch_reason(raw) -> str:
+    """_safe_fetch_reason, plus: any scheme://... run becomes `(url)`.
+
+    N3a (2026-08-10). The allowlist above permits `:` and `/` -- it has
+    to, because the reasons it renders for the TESTER carry MIME types
+    ("unsupported attachment type: image/svg+xml") and `filename: reason`
+    pairs -- so an https:// URL would survive it intact. Every reason
+    jira_attachments actually produces today is a module-authored literal
+    with no URL in it (the signed media link is already kept out of the
+    logs by its own _log_target), so this is belt-and-braces against a
+    FUTURE reason string, not a fix for a live leak -- and it is applied
+    HERE, at the log call site, rather than by narrowing
+    _FETCH_REASON_ALLOWED, which is shared with the tester-facing note
+    that legitimately needs those two characters.
+
+    Token-wise and regex-free on purpose: `re` is deliberately not
+    imported by this module (see the comment on the allowlist). Never
+    raises."""
+    try:
+        text = str(raw or "")
+        if "://" in text:
+            text = " ".join(
+                "(url)" if "://" in token else token for token in text.split()
+            )
+        return _safe_fetch_reason(text)
     except Exception:
         return ""
 
@@ -2500,13 +2583,41 @@ async def _auto_export_xlsx(
         output_path = None
         export_dir = _resolved_export_dir()
         reject_note = ""
-        if settings.qa_mcp_elicit_enabled and ask_text is not None:
-            default_label = export_dir or "a secure temp folder"
-            asked = await _elicit_text(
-                ask_text,
-                "Where should the Excel file be saved? Reply with a folder "
-                f"path, or leave blank for the default ({default_label}).",
-            )
+        if settings.qa_mcp_elicit_enabled and ask_text is not None and not export_dir:
+            # F1a (2026-08-10): ASK ONLY WHEN THERE IS NO ANSWER ALREADY. With
+            # QA_EXPORT_DIR resolved (the shipped default always resolves) this
+            # dialog held qa_submit_suite -- a FINISHED, already-persisted suite
+            # -- open on a client that may never answer, and the retried submit
+            # then produced a second suite. An empty export_dir is the legacy
+            # secure-temp install, where the tester's answer is the only signal.
+            await _emit(progress, "📂 Asking where to save the Excel file…")
+            asked = ChoiceResult(UNAVAILABLE)
+            try:
+                asked = await asyncio.wait_for(
+                    _elicit_text(
+                        ask_text,
+                        "Where should the Excel file be saved? Reply with a full "
+                        "folder path, leave blank for the default (a secure temp "
+                        f"folder), or wait {int(_ELICIT_DIR_TIMEOUT_S)}s for the "
+                        "default.",
+                    ),
+                    timeout=_ELICIT_DIR_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                # F1b: _elicit_text itself stays never-raising and untouched --
+                # the timeout is a property of the CALL, so it is bounded and
+                # caught HERE and degrades to the default folder rather than
+                # holding the submit open forever.
+                logger.warning(
+                    "auto-export: no save-folder answer within %ss -- using the "
+                    "default export folder",
+                    int(_ELICIT_DIR_TIMEOUT_S),
+                )
+                reject_note = (
+                    "\n> ℹ️  No answer to the save-folder question arrived "
+                    f"within {int(_ELICIT_DIR_TIMEOUT_S)}s, so the default export "
+                    "folder was used."
+                )
             if asked.status == CHOSEN and (asked.value or "").strip():
                 # ops-6 (bug 3): UNTRUSTED host text -- validate before it
                 # becomes a real directory. A rejected answer keeps the
@@ -4374,17 +4485,33 @@ async def handle_prepare_test_cases(
         # the same capture_ids works.
         if getattr(settings, "qa_image_gate_enabled", True) and not image_gate_ack:
             _img_n, _img_names, _img_kind = _ticket_image_evidence(grounded.url_content)
+            # N4 (2026-08-10): bound, not inlined -- the audit row could not tell
+            # "no screens at all" from "3 of 4 arrived" without the ratio.
+            _have_images = len(attached_images or []) + _attested + _fetched_images
             _beat2 = _image_gate_second_beat(
                 count=_img_n,
                 names=_img_names,
                 kind=_img_kind,
                 plan=_plan,
-                have_images=len(attached_images or []) + _attested + _fetched_images,
+                have_images=_have_images,
             )
             if _beat2:
+                # N3b: the fetch-failure disclosure reached the tester ONLY on the
+                # prepare-SUCCESS reply, so a GATED round asked for screens without
+                # saying this server had just tried and been refused (e.g. HTTP 401
+                # on a stale JIRA_API_TOKEN). Same helper, no duplicated logic.
+                _beat2_fetch_note = _server_fetched_image_note(grounded.url_content)
+                if _beat2_fetch_note:
+                    _beat2 = _beat2 + "\n\n" + _beat2_fetch_note
                 await _audit(
                     "mcp_image_gate_beat2",
-                    detail={"kind": _img_kind, "count": _img_n, "plan": _plan},
+                    detail={
+                        "kind": _img_kind,
+                        "count": _img_n,
+                        "plan": _plan,
+                        "have_images": _have_images,
+                        "fetched": _fetched_images,
+                    },
                 )
                 return PreparePayloadResult(clarify=_beat2)
         # Narrower than the decision, exactly like _ac_job / _img_job: a ticket
@@ -4514,9 +4641,23 @@ async def handle_prepare_test_cases(
         )
         if isinstance(prepared, tuple):
             # Early return from _prepare_generation (unreadable source / no real
-            # feature text) -- its first element is the tester-facing message.
+            # feature text) -- its first element is the tester-facing message,
+            # which already NAMES what was missing or unreadable, so it is passed
+            # through unchanged rather than re-worded on top of itself.
+            #
+            # N2 (2026-08-10): this refusal was the ONE prepare outcome that left
+            # no audit row at all, so a tester reporting "it just asked me a
+            # question again" was untraceable. Capped, single-line, machine-safe.
+            _reject_msg = str(prepared[0] or "")
+            await _audit(
+                "mcp_prepare_rejected",
+                detail={
+                    "reason": " ".join(_reject_msg.split())[:120],
+                    "source_kind": "url" if _is_url(text) else "text",
+                },
+            )
             return PreparePayloadResult(
-                clarify=prepared[0] + _capture_retry_hint(capture_ids)
+                clarify=_reject_msg + _capture_retry_hint(capture_ids)
             )
 
         # Whether the AC job was actually SHIPPED, which is narrower than the
@@ -8537,7 +8678,14 @@ async def handle_submit_suite(
         _t0 = time.monotonic()
         await _emit(progress, "\U0001f4be Saving the suite…")
         _t_emit = time.monotonic()
-        saved = await save_suite(suite, feature_text=source_text, source_url=source_url)
+        saved = await save_suite(
+            suite,
+            feature_text=source_text,
+            source_url=source_url,
+            # F1c: a retried finalize for this SAME prep must converge on the
+            # suite this prep already produced, not fork a second one.
+            prep_id=prep_id,
+        )
         logger.info(
             "submit tail: progress emit %.1fs | save_suite %.1fs",
             _t_emit - _t0,
