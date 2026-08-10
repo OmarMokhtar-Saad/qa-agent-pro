@@ -802,12 +802,21 @@ def build_server():
 
     @mcp.tool()
     async def qa_export_suite(
-        ctx: Context, suite_id: str = "", format: str = ""
+        ctx: Context, suite_id: str = "", format: str = "", output_dir: str = ""
     ) -> str:
         """Export a previously generated suite (by suite_id) to one of:
         csv | xlsx | gherkin | playwright | testrail | zephyr.
         Returns the written file path. Reuses the stored suite; live-push dry-run
         defaults are preserved (this writes files, it never pushes to a TMS).
+
+        `output_dir` is OPTIONAL and is where the tester wants the file: pass a
+        FULL path (`~/Desktop`, `/Users/you/Documents`). A bare relative answer
+        like `desktop` is refused with the full path it probably meant, and the
+        configured default is used instead. Leave it empty and each format keeps
+        its own default location -- a secure temp folder for
+        csv/xlsx/gherkin/playwright/testrail, QA_EXPORT_DIR for the zephyr pair.
+        The .xlsx that generation auto-exports is unaffected: it always lands in
+        QA_EXPORT_DIR with no question asked.
 
         `zephyr` is the Zephyr for Jira / Squad import pair: a 15-column workbook
         plus its zfj_import_config.json field map. It is accepted only when
@@ -821,6 +830,7 @@ def build_server():
             mcp_handlers.handle_export_suite(
                 suite_id,
                 format,
+                output_dir=output_dir,
                 choose=_make_chooser(ctx),
                 progress=_make_progress(ctx),
             ),
