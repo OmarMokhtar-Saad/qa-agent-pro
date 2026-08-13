@@ -42,8 +42,8 @@ def generate_testrail_csv(suite: TestSuite, output_path: str | None = None) -> s
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
     # The optional "Test Data" column is added ONLY when at least one case carries a
-    # data-provisioning plan (QA_TEST_DATA_STRATEGY). With none, both the header and
-    # every row are byte-identical to the pre-feature export.
+    # data-provisioning plan. With none, both the header and every row are
+    # byte-identical to the pre-feature export.
     has_test_data = any(tc.test_data for tc in suite.test_cases)
     headers = _HEADERS + ["Test Data"] if has_test_data else _HEADERS
 

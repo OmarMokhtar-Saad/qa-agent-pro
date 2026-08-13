@@ -56,7 +56,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Awaitable, Callable, Literal, Type, TypeVar
+from typing import Awaitable, Callable, Type, TypeVar
 
 from pydantic import BaseModel
 
@@ -243,50 +243,6 @@ def _resolve_model(model: str | None) -> str:
     smaller/faster model without changing the global backend config (I-027).
     """
     return model or _model()
-
-
-def resolve_tiered_model(site_override: str) -> str | None:
-    """Resolve the model for an opt-in-tiered, non-generation call site.
-
-    "sonnet" forces None (today's default model) regardless of the master
-    flag; "haiku" forces settings.qa_classifier_model regardless of the master
-    flag; "default" (or any value the settings coercer already normalised
-    away) follows settings.qa_model_tiering_enabled. The return value is
-    passed straight through to ask()/ask_json()'s existing model= kwarg, which
-    already treats None as "use the configured default model" -- so this
-    function adds no new fallback path, only a routing decision in front of
-    one that already exists (I-027). Never raises for any string input.
-    """
-    tier = (site_override or "default").strip().lower()
-    if tier == "sonnet":
-        return None
-    if tier == "haiku":
-        return settings.qa_classifier_model or None
-    if settings.qa_model_tiering_enabled:
-        return settings.qa_classifier_model or None
-    return None
-
-
-def resolve_max_tokens_tier(
-    tier: Literal["category", "critic", "rewrite"],
-) -> int | None:
-    """Per-call-type max_tokens ceiling (QA_MAX_TOKENS_TIERING_ENABLED, opt-in).
-
-    Returns None when the master flag is OFF (the default), so ask()/ask_json()
-    fall back to their own _MAX_TOKENS constant exactly as before this helper
-    existed -- byte-identical behaviour. When ON, "category" resolves to
-    settings.qa_llm_max_tokens_category (16384 by default -- the SAME value as
-    _MAX_TOKENS, so category-class calls are unaffected either way) while
-    "critic" / "rewrite" resolve to their own, much lower configured ceilings.
-    Pure function, never raises.
-    """
-    if not settings.qa_max_tokens_tiering_enabled:
-        return None
-    if tier == "critic":
-        return settings.qa_llm_max_tokens_critic
-    if tier == "rewrite":
-        return settings.qa_llm_max_tokens_rewrite
-    return settings.qa_llm_max_tokens_category
 
 
 # --------------------------------------------------------------------------- #
@@ -514,40 +470,18 @@ def _backend() -> str:
 def resolve_generation_mode() -> str:
     """Resolve the effective test-generation mode ('server' or 'host').
 
-    QA_GENERATION_MODE (default "server", per the defaults-OFF rule) selects
-    WHERE the 8-category LLM fan-out runs:
+    ALWAYS returns "host". Test-case generation has been chat-only since
+    2026-08-01, and on 2026-08-12 the residual QA_GENERATION_MODE setting and
+    its _coerce_generation_mode validator were deleted (flag-surface reduction,
+    batch 1). The 8-category fan-out always runs on the tester's OWN chat
+    model; no combination of settings can route it through a server-side
+    cli/api/cursor backend.
 
-    * "server" -> the MCP server generates through its own backend. Byte-
-      identical to the behaviour before host mode existed.
-    * "host"   -> the server returns a grounded prompt for the tester's OWN chat
-      model (any MCP host) to generate, then validates the submitted JSON.
-    * "auto"   -> reuse this module's host/backend detection: server mode ONLY
-      when the tester's own host EDITOR (Cursor / Claude Code / Desktop) has a
-      usable, host-matched backend; an unknown host (ChatGPT / Kimi / Gemini) or
-      an unusable/quota-dead backend degrades to host mode. This is the graceful
-      alternative to LLMBackendUnavailableError — it never raises.
-
-    QA_LLM_STRICT_HOST is respected in auto mode: with it OFF, an unknown host
-    that has ANY usable backend may still pick server mode (legacy fallback).
-    Never raises; an unrecognised value degrades to "server".
+    The function is RETAINED, with its 'server'|'host' contract unchanged,
+    because callers exist (tools/mcp_handlers.py, agents/host_mode.py) and the
+    'server' value stays meaningful to them. It simply never returns it.
+    Never raises.
     """
-    mode = (
-        (getattr(settings, "qa_generation_mode", "server") or "server").strip().lower()
-    )
-    if mode in ("server", "host"):
-        return mode
-    if mode != "auto":
-        logger.warning("Unknown QA_GENERATION_MODE=%r — using 'server'", mode)
-        return "server"
-    host = _HOST_CLIENT["name"]
-    if "cursor" in host and _cursor_usable():
-        return "server"
-    if "claude" in host and _cli_usable():
-        return "server"
-    if not _strict_host_enabled() and (
-        _cli_usable() or _cursor_usable() or bool(settings.anthropic_api_key)
-    ):
-        return "server"
     return "host"
 
 
@@ -1399,8 +1333,8 @@ def _schema_key(response_model: Type[T]) -> str:
 def _tool_name(response_model: Type[T]) -> str:
     """Derive a stable, provider-legal tool name from the model class name.
 
-    ``TestSuite`` -> ``emit_test_suite``, ``_CategoryReasonedSuite`` ->
-    ``emit_category_reasoned_suite``. A meaningful name is not cosmetic: it is
+    ``TestSuite`` -> ``emit_test_suite``, ``CoverageCritique`` ->
+    ``emit_coverage_critique``. A meaningful name is not cosmetic: it is
     part of what the model reads when deciding what to put in the call. It is
     also STABLE per schema, which matters for prompt caching — the tools block
     renders before ``system``, so a name that varied per call would invalidate
@@ -2827,8 +2761,7 @@ async def ask(
     Pass ``model`` to override the configured model for this one call (e.g. route
     a cheap classification to a smaller model). Both backends honour it. Pass
     ``max_tokens`` to override the per-call output-token ceiling on the api
-    backend (see ``resolve_max_tokens_tier``) — a no-op on cli/cursor, which
-    have no such concept.
+    backend — a no-op on cli/cursor, which have no such concept.
 
     ``user_suffix`` + ``cache_prefix`` split the user message into a large
     STABLE prefix and a small per-call suffix so concurrent calls can share one
@@ -2982,10 +2915,9 @@ async def ask_json(
     Streams tokens in real time. If on_progress is provided it is called with the
     running count of ``tc_id`` keys seen so far (proxy for test cases written).
     Pass ``model`` to override the model for this call, ``max_tokens`` to
-    override the api-backend output-token ceiling (a no-op on cli/cursor --
-    see ``resolve_max_tokens_tier``). Raises on parse or
-    validation failure — callers should catch and fall back to ``ask()`` with a
-    markdown prompt.
+    override the api-backend output-token ceiling (a no-op on cli/cursor).
+    Raises on parse or validation failure — callers should catch and fall
+    back to ``ask()`` with a markdown prompt.
 
     With QA_STRUCTURED_JSON_ENABLED and the ``api`` backend, ``response_model``
     is compiled into a forced tool call instead of being described in prose, and

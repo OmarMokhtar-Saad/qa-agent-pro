@@ -729,18 +729,26 @@ def run_update_check(
         install_dir = _INSTALL_DIR
     try:
         _check_embedded_pubkey()
-        if not (settings.qa_auto_update_enabled or force):
-            logger.info("Auto-update disabled (QA_AUTO_UPDATE_ENABLED=false).")
+        # QA_AUTO_UPDATE_ENABLED was DELETED on 2026-08-13 (flag-surface
+        # reduction, batch 6) and hardcoded OFF, so a check happens only when a
+        # caller FORCES it. The distribution launcher does exactly that
+        # (force=True), and its precedence is unchanged -- what is gone is a
+        # developer checkout's ability to arm the check from .env.
+        if not force:
+            logger.info("Auto-update is off unless the caller forces it.")
             return "disabled"
         repo = (repo_override or settings.qa_update_repo or "").strip()
         if not repo:
             logger.warning(
-                "QA_AUTO_UPDATE_ENABLED is on but QA_UPDATE_REPO is empty — skipping update."
+                "An update check was forced but no repo is configured (QA_UPDATE_REPO empty) — skipping update."
             )
             return "no-repo"
         token = (settings.github_token or "").strip()
         timeout = settings.qa_update_timeout
-        lock = settings.qa_code_lock_enabled if lock_override is None else lock_override
+        # QA_CODE_LOCK_ENABLED was DELETED on 2026-08-13 and hardcoded OFF for a
+        # developer checkout; lock_override still wins, which is how the
+        # distribution launcher (lock_override=True) keeps the lock working.
+        lock = False if lock_override is None else lock_override
         local = _local_version(install_dir)
         release = fetch_latest_release(repo, token, timeout)
         if not release or not release.get("tag_name"):

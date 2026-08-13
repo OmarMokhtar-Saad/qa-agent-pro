@@ -39,10 +39,6 @@ Two mechanisms live here:
   returns the parsed payload pre-tagged as model-derived/untrusted with a
   per-field character cap, tolerant fenced-or-prose JSON extraction, no ``eval``,
   a hard whole-submission size cap, and a one-shot ``task_id`` deleted on close.
-* ``maybe_sample`` -- the capability-gated MCP **sampling** bridge for calls that
-  cannot be split at all (mid-loop verdicts). Returns ``None`` -- never raises,
-  never fabricates -- when sampling is disabled or the client does not support it,
-  so a caller keeps ONE code path and falls back deterministically.
 
 It also owns the migration's DISCLOSURE surface (``UNMIGRATED_PATHS``,
 ``disclosure``, ``warn_once_if_degraded``): with ``QA_SERVER_LLM_ENABLED=false``
@@ -111,6 +107,8 @@ _KNOWN_KINDS = frozenset(
         "explore_step",
         "feature_analysis",
         "translate_cases",
+        "api_test",
+        "api_contract_fill",
         "generic",
     }
 )
@@ -286,11 +284,16 @@ UNMIGRATED_PATHS: tuple[tuple[str, str], ...] = (
     #     * tools/mcp_handlers._nli_suppress (Phase 3b). Un-widened, the two
     #       ask_json calls in tools/rtm.py fire server-side on a host submit and
     #       `rtm.nli_verdicts`'s terminal status becomes FALSE in the tree.
-    #     * agents/host_mode._coverage_instruction. Un-widened, the whole
-    #       QA_HOST_COVERAGE_REVIEW_ENABLED clause vanishes from the payload --
-    #       deleting the very host analog that 3b's row names as the replacement
-    #       for the tiers it suppressed. This one was found in R4 exploration;
-    #       no earlier plan had recorded it.
+    #     * agents/host_mode._coverage_instruction -- HISTORICAL, this widen no
+    #       longer exists. Un-widened it would have made the whole
+    #       QA_HOST_COVERAGE_REVIEW_ENABLED clause vanish from the payload,
+    #       deleting the host analog that 3b's row named as the replacement
+    #       for the tiers it suppressed. It was found in R4 exploration; no
+    #       earlier plan had recorded it. On 2026-08-12 (flag-surface
+    #       reduction, batch 2b) that helper AND that flag were DELETED as an
+    #       unvalidated, never-shipped experiment, so there is no host analog
+    #       to keep alive: the 3b disclosure now states plainly that there is
+    #       none, and _nli_suppress above is the only surviving widen.
     #
     #   The legacy call is NOT deleted (graph.py, evals/test_eval_goldens.py and
     #   evals/test_terse_schemas_goldens.py all still reach
@@ -382,14 +385,6 @@ _WARNED = False
 # drift. Phase 4 shipped the last of the real callers and none of them wanted one,
 # so the dict stays the single representation; a typed handle arrives only with a
 # user, never ahead of one.
-
-
-def sampling_enabled() -> bool:
-    """True when opportunistic MCP sampling may be attempted. Never raises."""
-    try:
-        return bool(getattr(settings, "qa_host_llm_sampling_enabled", False))
-    except Exception:  # pragma: no cover - settings is never-raising by contract
-        return False
 
 
 def server_llm_retired() -> bool:
@@ -966,36 +961,3 @@ async def close_task(task_id: str, raw: str, *, expect_kind: str = "") -> dict:
     except Exception as exc:
         logger.exception("host_llm.close_task failed")
         return {"error": str(exc), "content": None}
-
-
-async def maybe_sample(ctx, system: str, user: str) -> str | None:
-    """Ask the CLIENT's model for a completion via MCP sampling, or return None.
-
-    None means "not available" for every reason -- the flag is off, the context
-    has no ``sample``, the client does not advertise the sampling capability, or
-    the call failed. Callers therefore need no try/except and no capability probe:
-    a None simply routes them to their deterministic fallback or to disabling the
-    feature with a disclosed reason. NEVER raises and never invents a result.
-
-    Claude Desktop, Claude Code and Cursor do not advertise sampling today, so on
-    those clients this returns None even with the flag on -- do not build a path
-    that only works when it returns a string.
-    """
-    if not sampling_enabled():
-        return None
-    sample = getattr(ctx, "sample", None)
-    if sample is None or not callable(sample):
-        return None
-    try:
-        result = await sample(str(user or ""), system_prompt=str(system or "") or None)
-    except Exception:
-        logger.debug(
-            "host_llm.maybe_sample: client sampling unavailable", exc_info=True
-        )
-        return None
-    text = getattr(result, "text", None)
-    if isinstance(text, str) and text.strip():
-        return text
-    if isinstance(result, str) and result.strip():
-        return result
-    return None

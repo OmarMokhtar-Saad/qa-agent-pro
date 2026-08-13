@@ -8,13 +8,30 @@ from urllib.parse import urlparse
 
 import httpx
 
-from config.settings import settings
+# config.settings is no longer imported here: QA_WEB_SEARCH_ENABLED was
+# DELETED on 2026-08-13 (flag-surface reduction, batch 6) and web search
+# hardcoded OFF, so this module reads no setting at all.
 from tools.jira_fetcher import PinnedIPTransport
 
 logger = logging.getLogger(__name__)
 
 _DUCKDUCKGO_URL = "https://api.duckduckgo.com/"
 _TIMEOUT = 10  # seconds
+
+
+def enabled() -> bool:
+    """Always False -- web-search grounding is OFF, unconditionally.
+
+    QA_WEB_SEARCH_ENABLED was DELETED on 2026-08-13 (flag-surface reduction,
+    batch 6) and this hardcoded to its default, so no feature or ticket text
+    leaves the org for a third-party search API. This is a NAMED SEAM rather
+    than an inline ``return`` in :func:`search_web` on purpose: the fetch,
+    SSRF and parse code below is retained as the revival path, and a seam
+    keeps it reachable from its tests (and from the coverage floor) instead
+    of leaving ~120 lines that nothing can execute. It is NOT settings-
+    derived -- no .env value reaches it. See docs/FEATURE_FLAGS.md.
+    """
+    return False
 
 
 async def search_web(query: str) -> dict:
@@ -27,7 +44,7 @@ async def search_web(query: str) -> dict:
     Never raises — all exceptions are caught and returned as error dicts.
     """
     try:
-        if not settings.qa_web_search_enabled:
+        if not enabled():
             return {"error": "Web search disabled", "content": None}
 
         if not query or not query.strip():

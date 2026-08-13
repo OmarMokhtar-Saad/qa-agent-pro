@@ -62,16 +62,11 @@ _POSITIVE_INT_FIELDS = frozenset(
         "qa_web_run_timeout_s",
         "qa_comment_reconcile_max_comments",
         "qa_comment_reconcile_max_amendments",
-        "qa_llm_max_tokens_category",
-        "qa_llm_max_tokens_critic",
-        "qa_llm_max_tokens_rewrite",
         # NB: qa_category_stall_s is intentionally ABSENT -- 0 is its documented
         # kill-switch, and membership here would rewrite it to the default.
         "qa_category_stall_strikes",
         "qa_host_dedup_max_groups",
         "qa_host_dedup_max_group_size",
-        "qa_host_coverage_max_items",
-        "qa_host_coverage_max_tc_per_item",
     }
 )
 
@@ -195,25 +190,6 @@ class Settings(BaseSettings):
     # legacy first-available fallback as an escape hatch.
     qa_llm_strict_host: bool = True
 
-    # Test-generation orchestration mode (QA_GENERATION_MODE, default "server"
-    # per the defaults-OFF rule). "server" -> the MCP server runs the 8-category
-    # LLM fan-out through its own backend (byte-identical to before host mode).
-    # "host" -> the server returns a grounded prompt for the tester's OWN chat
-    # model (any MCP host) to generate, then validates the submitted JSON — no
-    # server-side API key/CLI/quota needed. "auto" -> reuse llm's host/backend
-    # detection (server when the host editor's own backend is usable, host
-    # otherwise), which also turns a hard LLMBackendUnavailableError into
-    # graceful degradation. Resolved by llm.resolve_generation_mode().
-    # 2026-08-01: HARDCODED to "host" by _coerce_generation_mode below --
-    # QA_GENERATION_MODE is no longer read from .env at all. Test-case
-    # generation must never run through a server-side CLI/API/cursor backend;
-    # the 8-category fan-out always runs on the tester's own chat model. This
-    # default is now purely documentation of the effective value, not a
-    # user-configurable one. Does NOT affect the other agents (bug reporter,
-    # exploratory coach, Feature Analysis, mobile healing, RAG, RTM), which
-    # call llm.py directly and never call resolve_generation_mode().
-    qa_generation_mode: str = "host"
-
     # Cheaper/faster model for the intent router's classification pass (T-04 /
     # I-027). Empty string means "use qa_llm_model" (no override). Set to a haiku
     # model to cut routing cost — the classifier is a tiny, low-stakes call.
@@ -269,22 +245,6 @@ class Settings(BaseSettings):
     # tokens. Raise it to 1 only if a future API version rejects 0.
     qa_prompt_cache_warm_max_tokens: int = 0
 
-    # Model tiering for non-generation call sites (default OFF -- preserves
-    # today's sonnet behaviour byte-for-byte). AC synthesis
-    # (tools/rtm.generate_acs) already uses qa_classifier_model unconditionally
-    # and needs no flag; these two sites are opt-in because their output is
-    # user-visible free text / generated Maestro commands rather than an
-    # internal structured critique. See .claude/plans/plan-model-tiering.md for
-    # the eval-gated rollout and the >5pp quality-regression rollback rule.
-    qa_model_tiering_enabled: bool = False
-
-    # Per-site override -- "default" follows qa_model_tiering_enabled, "haiku"
-    # forces the cheap model regardless of the master flag, "sonnet" forces
-    # today's model regardless of the master flag (a per-site kill-switch that
-    # doesn't require flipping the master off for every site).
-    qa_model_tier_coverage_gaps: str = "default"
-    qa_model_tier_maestro_translate: str = "default"
-
     # Still read: used ONLY to recognise a self-hosted Jira on a custom domain
     # (tickets.example.com) as a ticket URL rather than a generic web page.
     jira_base_url: str = ""
@@ -295,14 +255,13 @@ class Settings(BaseSettings):
     # JIRA_API_TOKEN still loads cleanly instead of tripping validation on
     # upgrade.
     #
-    # 2026-08-09 -- ONE reader again, and only one: with
-    # QA_JIRA_ATTACHMENT_FETCH_ENABLED (default OFF) turned ON,
-    # tools/jira_attachments.py uses this pair as HTTP Basic auth to download
-    # attachment BYTES from /rest/api/3/attachment/content/{id}. So the old
-    # sentence "a stale token cannot silently be used" holds only while that
-    # flag is OFF, which is the default; with it ON an expired token produces a
-    # NAMED 401 failure in the prepare reply rather than anything silent. The
-    # credential is sent over HTTPS to the configured JIRA_BASE_URL host only.
+    # 2026-08-13 -- NO reader again, and the original sentence holds in full.
+    # QA_JIRA_ATTACHMENT_FETCH_ENABLED was DELETED and the credentialed
+    # attachment fetch hardcoded OFF (flag-surface reduction, batch 6), so
+    # tools/jira_attachments.enabled() returns the False constant and nothing in
+    # this tree sends this pair anywhere: a stale token cannot silently be used.
+    # The fields are kept only so an existing .env carrying them still loads.
+    # See docs/FEATURE_FLAGS.md.
     jira_api_token: str = ""
     jira_email: str = ""
     # Tool-name prefix the CALLING agent uses for its Atlassian MCP tools.
@@ -311,14 +270,6 @@ class Settings(BaseSettings):
     # must be adjustable rather than hardcoded. Empty falls back to the Claude
     # form. Not a feature flag -- it changes wording, never behaviour.
     qa_jira_mcp_tool_prefix: str = "mcp__atlassian__"
-    # Jira access pre-flight (QA_JIRA_PREFLIGHT). Default **ON** — a deliberate
-    # exception to the constitution's defaults-OFF rule, with the same
-    # precedent as the ambiguity gate and QA_AUTO_EXPORT_XLSX: before fetching a
-    # Jira ticket URL on the MCP path the handler live-probes
-    # /rest/api/3/myself, so a missing/invalid credential set returns guided
-    # setup steps instead of a suite fabricated from an empty anonymous Jira
-    # SPA shell. Set QA_JIRA_PREFLIGHT=false to disable the probe (kill-switch).
-    qa_jira_preflight: bool = True
     # Jira custom-field id that holds Acceptance Criteria. Defaults to the common
     # Jira Software default; different instances use different ids, so make it
     # configurable (QW-11 / I-023 / B-015). When empty on a ticket, jira_fetcher
@@ -332,17 +283,6 @@ class Settings(BaseSettings):
     # on a real run. `qa-doctor` discloses what was resolved either way, so
     # a mis-configured field is visible without this being on.
     qa_jira_ac_field_discovery: bool = False
-
-    # Kill switch for the deterministic grounding/consistency advisories on the
-    # finalize summary (undefined option values, requirements no case mentions,
-    # defects in the ticket itself, unfalsifiable oracles, contradictory state
-    # assumptions). Default ON is a DELIBERATE exception to the defaults-OFF
-    # rule, documented in docs/FEATURE_FLAGS.md: these run no model, mutate no
-    # case, and render "" when they find nothing, so an unaffected run's summary
-    # is byte-identical -- the same reasoning that leaves quality_warning_section
-    # unflagged. The switch exists because a code review noted there was no way
-    # to turn them off if a heuristic ever misfires on a particular team's style.
-    qa_grounding_advisories_enabled: bool = True
 
     # Ask the tester's own chat model to classify every generated case as
     # entailed / ungrounded / unspecified against the ticket, and route the
@@ -475,22 +415,15 @@ class Settings(BaseSettings):
     jira_max_images: int = 3
     jira_max_image_bytes: int = 5_000_000  # Anthropic's own per-image vision cap
 
-    # --- Jira attachment BYTE retrieval -- opt-in, default OFF. ------------
-    # QA_JIRA_ATTACHMENT_FETCH_ENABLED. Jira is read through the calling agent's
-    # own Atlassian MCP connection, which returns attachment METADATA only
-    # (tools/jira_mcp.py makes no outbound HTTP request, by hard rule), so a
-    # ticket whose requirements live in mockups produced a suite written from the
-    # ticket TEXT alone unless a tester re-attached the screenshots by hand.
-    # ON, tools/jira_attachments.py downloads those bytes from
-    # /rest/api/3/attachment/content/{id} with this install's own JIRA_EMAIL +
-    # JIRA_API_TOKEN and hands them to the tester's OWN multimodal model on the
-    # existing IMAGE_JOB path -- no new LLM call, no new round trip.
-    # DEFAULT OFF, per the defaults-OFF hard rule and for a specific reason: it
-    # deliberately re-introduces the credentialed REST path the 2026-08-01
-    # migration removed, so an operator has to choose to store a Jira token
-    # again. With it off, nothing in this tree makes that request and the
-    # behaviour is byte-identical to today. See docs/FEATURE_FLAGS.md.
-    qa_jira_attachment_fetch_enabled: bool = False
+    # --- Jira attachment BYTE retrieval -- REMOVED 2026-08-13. --------------
+    # QA_JIRA_ATTACHMENT_FETCH_ENABLED was DELETED and the behaviour hardcoded
+    # OFF (flag-surface reduction, batch 6): a kill-switch is no longer a
+    # tester-editable .env value, because .env holds credentials and paths and
+    # not behaviour. tools/jira_attachments.enabled() returns the False constant,
+    # so nothing in this tree makes the credentialed
+    # /rest/api/3/attachment/content/{id} request and a ticket's screenshots
+    # reach a model only when a tester attaches them to the chat. See
+    # docs/FEATURE_FLAGS.md.
 
     # Direct chat image uploads (screenshots/mockups attached to a message,
     # independent of Jira) — see tools/image_description.py -> llm.ask_vision()
@@ -506,113 +439,20 @@ class Settings(BaseSettings):
     # the text backend -- see llm.ask_vision).
     qa_mobile_capture: bool = False
 
-    # --- Jira image gate (QA_IMAGE_GATE_ENABLED) -- default ON. ------------
-    # A DISCLOSURE, not a feature. Jira is read through the calling agent's own
-    # Atlassian MCP connection, which returns attachment METADATA and never the
-    # image bytes (tools/jira_mcp makes no outbound HTTP request, by hard rule),
-    # so a ticket whose requirements live in mockups silently produced a suite
-    # written from ticket TEXT alone. ON, qa_prepare_test_cases says so BEFORE
-    # the fetch (beat 1, collecting a source plan: attach / capture / both /
-    # text-only) and again -- naming the ticket's OWN screens -- once the
-    # fetched ticket reveals images the chosen plan did not supply (beat 2).
-    # Default ON is the SAME deliberate exception the honest-disclosure family
-    # already carries (JIRA_FETCH_IMAGES, QA_GROUNDING_ADVISORIES_ENABLED,
-    # QA_AMBIGUITY_GATE_SEVERITY on the MCP path): defaulting a disclosure OFF
-    # means a fresh install keeps shipping exactly the suite the gate exists to
-    # flag. false restores the pre-gate flow exactly -- the post-hoc "could not
-    # read images" notice on the finished payload, and nothing else.
-    qa_image_gate_enabled: bool = True
     # Timeout (seconds) for device-discovery commands (adb devices / simctl list).
     qa_device_command_timeout: int = 20
     # Timeout (seconds) for a single screenshot capture (larger -- image transfer).
     qa_device_screenshot_timeout: int = 60
 
-    # --- Image RELEVANCE verdict (QA_IMAGE_RELEVANCE_ENABLED) -- default ON. -
-    # 2026-08-09, from a live run (prep dade2abd..., SHYJ-5646, device
-    # R5CR207KY7H): the tester captured ONE mobile screen, it was forwarded to
-    # their own multimodal model as MCP image content, and NOTHING ever told them
-    # it had nothing to do with the user story. IMAGE_JOB asked for a
-    # description and never for a relevance judgement, so an off-topic screen was
-    # either silently used as grounding or silently dropped.
-    # ON, the SAME job (agents.host_mode.IMAGE_RELEVANCE_JOB -- same job_id, same
-    # payload_key, same step, still NON-BLOCKING, ZERO extra round trips and NO
-    # server-side LLM call) also asks for a per-image `relevant`: yes|no|unsure
-    # plus a one-line reason, and any no/unsure verdict is surfaced PROMINENTLY at
-    # the head of the submit reply.
-    # SCOPE OF THE ON PATH, deliberately narrow (review finding H2): it adds a
-    # REPORTING request only. Step 0c's grounding instruction is left exactly as
-    # it ships -- this server does NOT tell the host to discard a screen it
-    # judged off-topic, because a host that misjudges a RELEVANT screen would
-    # then silently drop legitimate grounding, a generation-quality regression on
-    # the DEFAULT path. The host is asked instead to say so in
-    # `relevance_reason` if it did rely on a screen it judged no/unsure.
-    # Default ON is the same deliberate exception the honest-disclosure family
-    # already carries (QA_IMAGE_GATE_ENABLED above, JIRA_FETCH_IMAGES,
-    # QA_GROUNDING_ADVISORIES_ENABLED), and it is defensible precisely BECAUSE
-    # the ON path changes no generation instruction: the whole symptom of the
-    # reported defect is that the tester heard NOTHING, so a disclosure defaulted
-    # OFF ships exactly the run this flag exists to flag -- and qa-agent-pro
-    # installs never edit .env.
-    # UNTRUSTED host output (pixels are as attacker-influenceable as
-    # _GUARD-wrapped ticket text): `relevant` must be a bare STRING in
-    # {yes, no, unsure} -- non-strings are rejected before any coercion and every
-    # other token records NO VERDICT rather than an answer, so nothing (including
-    # a JSON `true`) can ever read as `yes`. The reason is URL-stripped,
-    # control-char-stripped, newline-collapsed and capped. Neither feeds a prompt
-    # or an exporter field.
-    # It NEVER blocks, and that is a DEFAULT, not a limitation of the
-    # architecture: a submit-time refusal is available and precedented
-    # (QA_HOST_AMBIGUITY_REQUIRE_RESULT refuses at submit and keeps the prep and
-    # the staged rows -- "Nothing was discarded."). It is deliberately NOT used
-    # here because the verdict is untrusted self-report and the ticket TEXT still
-    # grounds the suite; an opt-in QA_HOST_IMAGE_REQUIRE_RELEVANT is a named
-    # follow-up, not an impossibility.
-    # false restores today's host-facing contract byte-for-byte (base IMAGE_JOB,
-    # no verdict requested, none parsed, none rendered). It does NOT revert the
-    # two new prep meta keys (`captured_image_count`, `host_image_relevance`) or
-    # the widened image-evidence gap note: those are a correctness fix to a
-    # disclosure that already ships under QA_IMAGE_GATE_ENABLED, whose own
-    # `false` remains their kill switch.
-    qa_image_relevance_enabled: bool = True
-
-    # --- Stop and ASK before generating from an off-topic screen (ON) -------
-    # Batch 4, LAYER 1 (2026-08-09). QA_IMAGE_RELEVANCE_ENABLED above made the
-    # verdict OBSERVABLE, but it arrives WITH the finished suite: by the time
-    # the tester reads "this screen may not belong to this ticket" the wrong
-    # screen has already grounded every case. The verdict is in fact produced in
-    # the host's PARENT turn at step_zero/order 20, BEFORE any category is
-    # generated -- the only thing missing was an instruction saying what to do
-    # with a `no` reached there. ON, the prepare payload ships
-    # host_mode.IMAGE_PREFLIGHT_JOB instead of IMAGE_RELEVANCE_JOB: the SAME job
-    # (same job_id / payload_key / stage / order / return_field / marker, so the
-    # merged-submission contract is byte-identical and it costs ZERO extra round
-    # trips and NO server-side LLM call), with blocking=True and one extra
-    # instruction clause telling the host to STOP AND ASK THE TESTER before
-    # generating when it judged an image `no`.
-    # NOT a discard, and grounding stays unconditional: the Batch-2 review
-    # rejected instruction text that tells the host to drop a screen or to make
-    # step 0c's grounding depend on its own judgement, and that finding stands.
-    # The only new behaviour is ask-the-tester-first -- the AMBIGUITY_JOB shape,
-    # blocking and default-ON since the SHYJ-7154 fix.
-    # The stop is deliberately NARROW: only a hard `no` stops. `unsure`, an
-    # unreadable image and a missing verdict all continue with Batch 2's
-    # warning, because the verdict is untrusted self-report and a fail-CLOSED
-    # reading of an uncertain signal would halt legitimate runs and would teach
-    # a host that `yes` is the cheap answer -- the exact failure this exists to
-    # detect.
-    # ITS OWN switch rather than QA_IMAGE_RELEVANCE_ENABLED's, because this is
-    # the ONE piece of Batch 4 that can halt a generation the tester did not ask
-    # to halt, and rolling that back must not also cost the reporting and the
-    # audit signal. false ships IMAGE_RELEVANCE_JOB exactly as Batch 2 released
-    # it (verdict requested, reported, non-blocking).
-    qa_host_image_preflight_enabled: bool = True
-
     # --- Mobile Device Testing (Maestro) — opt-in, all default OFF / dry-run ON. ---
     # Gates the "📱 Mobile Testing" starter chip, the guided wizard, and the
     # "maestro" export keyword/button. Off by default per the constitution.
     qa_maestro_enabled: bool = False
-    # Runner PRINTS the command instead of executing on a device when ON (default).
-    qa_maestro_dry_run: bool = True
+    # Maestro runner dry-run -- UNCONDITIONAL since 2026-08-13 (flag-surface
+    # reduction, batch 6): QA_MAESTRO_DRY_RUN was DELETED and the dry run
+    # hardcoded ON, so maestro_runner._dry_run() returns the True constant and
+    # the runner always PRINTS the command instead of executing on a device.
+    # See docs/FEATURE_FLAGS.md.
     # Maestro CLI binary, flow output directory, and per-run timeout (seconds).
     qa_maestro_binary: str = "maestro"
     qa_maestro_flow_dir: str = "maestro_flows"
@@ -623,8 +463,8 @@ class Settings(BaseSettings):
     qa_maestro_heal_max_attempts: int = 2
     # AI exploratory run (Layer 3 -- observe->decide->act). Off by default; adds
     # a 4th "🧭 AI exploratory run" mode to the Mobile Testing wizard,
-    # bounded by a step budget. Each per-step device action honours
-    # QA_MAESTRO_DRY_RUN (default ON).
+    # bounded by a step budget. Each per-step device action is dry-run --
+    # unconditionally so since 2026-08-13, when QA_MAESTRO_DRY_RUN was deleted.
     qa_maestro_explore_enabled: bool = False
     qa_maestro_explore_max_steps: int = 15
     qa_maestro_explore_step_timeout: int = 60
@@ -639,16 +479,13 @@ class Settings(BaseSettings):
     qa_test_user: str = ""
     qa_test_password: str = ""
 
-    # --- Web Suite Execution -- opt-in, default OFF / dry-run ON. ---
-    # Runs a generated suite step-by-step against a live web app in a real
-    # browser (tools/web_runner.py, the web analogue of the Maestro run
-    # pipeline) and reports pass/fail per TC-ID. Off by default per the
-    # constitution; the browser is launched through the same SSRF-hardened
-    # path as tools/browser_renderer.py.
-    qa_web_run_enabled: bool = False
-    # Dry-run (default ON): translate + validate + report the PLANNED browser
-    # actions WITHOUT launching a browser or spending a vision call.
-    qa_web_run_dry_run: bool = True
+    # --- Web Suite Execution -- REMOVED 2026-08-13. ---
+    # QA_WEB_RUN_ENABLED and QA_WEB_RUN_DRY_RUN were DELETED and hardcoded to
+    # their defaults, OFF and ON (flag-surface reduction, batch 6), so
+    # qa_run_web_suite / qa_submit_web_run always refuse and tools/web_runner.py
+    # never launches a browser. The bounds below survive as tuning knobs for
+    # whoever revives the runner in code; they gate nothing on their own.
+    # See docs/FEATURE_FLAGS.md.
     # Max cases executed per run (bounds cost + wall time).
     qa_web_run_max_cases: int = 20
     # Max ask_vision screenshot judgments per run (the text assertion runs
@@ -662,16 +499,18 @@ class Settings(BaseSettings):
     langchain_api_key: str = ""
     langchain_project: str = "qa-agents"
 
-    # Web search grounding — disabled by default.
-    qa_web_search_enabled: bool = False
+    # Web search grounding -- REMOVED 2026-08-13 (flag-surface reduction,
+    # batch 6): QA_WEB_SEARCH_ENABLED was DELETED and hardcoded OFF, so
+    # tools/web_search.search_web always returns "Web search disabled" and no
+    # feature or ticket text leaves the org for a third-party search API.
+    # See docs/FEATURE_FLAGS.md.
 
-    # Structured coverage critic + remediation (T-08). When ON, after the initial
-    # fan-out a structured critique runs and, if gaps are found, ONE supplemental
-    # generation pass fills them (merged + re-deduped + re-scored). Off by default
-    # so the flagship generation path is unchanged until validated via the eval
-    # harness (T-12).
-    qa_coverage_regen_enabled: bool = False
-    # Bound on the critic->generate remediation loop above (was a hardcoded
+    # Structured coverage critic + remediation (T-08): after the initial
+    # fan-out a structured critique runs and, if gaps are found, ONE
+    # supplemental generation pass fills them (merged + re-deduped + re-scored).
+    # UNCONDITIONAL since 2026-08-12 -- QA_COVERAGE_REGEN_ENABLED was DELETED
+    # (flag-surface reduction, batch 3); see docs/FEATURE_FLAGS.md.
+    # Bound on the critic->generate remediation loop (was a hardcoded
     # module constant _MAX_REMEDIATION_ROUNDS = 3). Default lowered to 2:
     # published self-critique research shows gains flatten after 2-3 rounds and
     # an unbounded/over-long loop can compound errors rather than improve
@@ -691,66 +530,6 @@ class Settings(BaseSettings):
     # output includes tester-facing generated test cases, not just an internal
     # critique).
     qa_coverage_regen_merge_calls: bool = False
-    # Chain-of-Thought reasoning stage per category (Feature 1 / CoT). When ON,
-    # each category's single ask_json call is asked to FIRST enumerate what to test
-    # (fields, limits, risks, attack vectors) into an internal ``analysis`` field,
-    # THEN derive its test_cases from that reasoning -- one call, no extra
-    # round-trip. ``analysis`` is discarded after generation (never shown to
-    # testers). Off by default: when OFF the assembled prompt and the response model
-    # are byte-identical to the pre-feature path. Adds only output tokens, so mind
-    # the cli/cursor per-category timeout (_CATEGORY_TIMEOUT).
-    qa_cot_reasoning_enabled: bool = False
-
-    # Terse category-generation output (opt-in, default OFF -- see
-    # .claude/plans/plan-terse-schemas.md). Every category ask_json call fills
-    # the WHOLE TestCase schema, including fields that are ALWAYS overwritten
-    # after generation regardless of what the model writes -- risk_score/
-    # risk_label/risk_rationale are unconditionally replaced by
-    # tools.risk_scorer.score_and_sort / score_with_llm on every path -- or
-    # never read by any exporter -- postconditions is accepted by every
-    # exporter's schema but rendered by NONE of them (xlsx/csv/gherkin/
-    # playwright/testrail/xray/maestro all skip it; only "preconditions" is
-    # rendered anywhere). When ON, the category system prompt tells the model
-    # to leave those fields at their schema default and keep the fields that
-    # DO matter to one concise sentence, cutting real output tokens with ZERO
-    # relaxation of the existing anti-vagueness rules and ZERO effect on any
-    # exported artifact's column layout. NOTE (rollout): the flag DOES change
-    # the generated WORDING of title/steps/test_data/expected_result, and
-    # tools/models._compute_stable_id hashes exactly those fields -- so
-    # flipping this flag re-keys every content-derived stable_id (SID-*),
-    # which dedup, suite_store persistence, TMS push and Zephyr External
-    # IDs all key off. Treat enabling it like a suite re-baseline. OFF =
-    # the assembled category prompt is byte-identical to today.
-    qa_terse_category_output_enabled: bool = False
-
-    # Per-call-type max_tokens ceiling (opt-in master flag, default OFF -- see
-    # .claude/plans/plan-terse-schemas.md). llm.py hard-codes ONE ceiling
-    # (_MAX_TOKENS = 16384) for every api-backend call, from the 8-category
-    # fan-out (which legitimately needs headroom for up to 15 detailed cases)
-    # down to the coverage critic and the vague-step rewriter (whose real
-    # output is a handful of short strings). OFF = every call keeps today's
-    # single 16384 ceiling. ON = category-class calls are unaffected
-    # (qa_llm_max_tokens_category defaults to the SAME 16384) while
-    # critic/rewrite-class calls get a much lower ceiling
-    # (qa_llm_max_tokens_critic / qa_llm_max_tokens_rewrite) as a defensive
-    # circuit breaker against a pathological repeating/looping generation on a
-    # call that should never legitimately need more than a few hundred output
-    # tokens. NOTE: max_tokens bounds worst-case spend/latency -- it does NOT
-    # itself reduce the tokens billed for a normal-sized response, since
-    # billing is on tokens actually generated, not the ceiling.
-    qa_max_tokens_tiering_enabled: bool = False
-    qa_llm_max_tokens_category: int = 16384
-    qa_llm_max_tokens_critic: int = 4096
-    qa_llm_max_tokens_rewrite: int = 4096
-
-    # Spec-mutation eval axis (Feature 2). When ON, tools/eval_runner.mutation_score
-    # asks an LLM for N behavioural mutations of a feature spec and judges, per
-    # mutant, whether any generated test case would catch it (mutants_killed /
-    # total). Makes REAL LLM calls, so it is gated here and never runs in the default
-    # ``pytest tests/`` gate (the live path lives in evals/, marked ``eval``). Off by
-    # default; never-raise (a failure yields a neutral, omitted score).
-    qa_mutation_eval_enabled: bool = False
-
     # Enterprise Feature Analysis Report (opt-in, off by default). When ON,
     # generate_test_scenarios runs ONE extra structured LLM pass (text backend,
     # via llm.ask_json) that merges the Jira ticket content with any screenshot
@@ -763,20 +542,20 @@ class Settings(BaseSettings):
     # omits the report.
     qa_feature_analysis_enabled: bool = False
 
-    # Token/cost meter (T-05): append an estimated-token cost line to the
-    # generation summary. Disable to hide it.
-    qa_token_meter_enabled: bool = True
+    # API test agent (chat-only): qa_prepare/submit/write_api_test. All OFF by
+    # default; the write path is dry-run-first (qa_api_framework_write_dry_run).
+    qa_api_test_enabled: bool = False
+    qa_api_framework_write_enabled: bool = False
+    qa_api_framework_path: str = ""
+    qa_api_framework_write_dry_run: bool = True
 
-    # Per-phase breakdown on the meter line (opt-in, default OFF). When ON the
-    # summary gains a second "By phase" line splitting the run's tokens across
-    # generation / critic / rewrite / other. Purely presentational: it never
-    # changes what is generated, only what is reported.
-    qa_token_meter_detail_enabled: bool = False
-
-    # $ cost estimate on the meter line (opt-in, default OFF). Priced ONLY from
-    # calls whose REAL API usage was captured (api backend); a char-estimated
-    # call is reported as unpriced rather than silently priced from a guess.
-    qa_token_meter_cost_enabled: bool = False
+    # Per-phase breakdown + $ cost estimate on the meter line -- UNCONDITIONAL
+    # since 2026-08-13 (flag-surface reduction, batch 5): QA_TOKEN_METER_DETAIL_ENABLED
+    # and QA_TOKEN_METER_COST_ENABLED were DELETED, both deletion candidates per
+    # tools/flag_registry.py's own rationale rather than real experiments. Neither
+    # gates a real behavioural risk -- no external call, no write -- so both are
+    # now always shown alongside the (already unflagged) base meter line. See
+    # docs/FEATURE_FLAGS.md.
 
     # Approximate per-1M-token prices for the two model tiers this codebase
     # actually configures (qa_llm_model / qa_classifier_model). These are
@@ -847,91 +626,76 @@ class Settings(BaseSettings):
     # case. OFF = zero extra LLM calls and the heuristic path is byte-identical.
     qa_llm_risk_scoring: bool = False
 
-    # Test-data strategy (opt-in, default OFF). When ON, the per-category
-    # generation prompt asks the model to populate each case's ``test_data`` plan
-    # (which fields need unique-per-run / seed-account / chained / static values,
-    # each with a SAFE fake example and no real-looking PII), and the exporters +
-    # chat summary render a Test Data column/note. OFF = prompt byte-identical, any
-    # emitted test_data stripped before render, every export byte-identical to today.
-    qa_test_data_strategy: bool = False
+    # Test-data strategy: the per-category generation prompt asks the model to
+    # populate each case's ``test_data`` plan (which fields need unique-per-run /
+    # seed-account / chained / static values, each with a SAFE fake example and no
+    # real-looking PII), and the exporters + chat summary render a Test Data
+    # column/note. UNCONDITIONAL since 2026-08-12: QA_TEST_DATA_STRATEGY was
+    # DELETED (flag-surface reduction, batch 4) and the behaviour hardcoded ON.
+    # The distribution .env had shipped it `true` since 2026-07-30.
 
-    # Retype the "Edge Cases" fan-out category from Exploratory to Functional
-    # (opt-in, default OFF). CATEGORIES[3] tells the model the preferred `type`
-    # for that category is "Exploratory", so on the 2026-07-30 run all 8
-    # fully-SCRIPTED edge cases exported as Exploratory and the XLSX Summary
-    # reported "Exploratory 8 / Performance 0" -- test-type metrics describing
-    # unscripted charter testing for a suite that contains none. This is a PROMPT
-    # change, so it is flag-gated for two reasons: the house rule, and because
-    # tests/test_server_mode_equivalence.py's golden fixtures record the 8
-    # category prompts VERBATIM (`should be: Exploratory` included). OFF,
-    # agents.test_scenario_agent.effective_categories() returns the CATEGORIES
-    # object itself and every prompt byte is unchanged.
-    qa_edge_cases_functional_type: bool = False
+    # The "Edge Cases" fan-out category is typed Functional, not Exploratory.
+    # UNCONDITIONAL since 2026-08-12: QA_EDGE_CASES_FUNCTIONAL_TYPE was DELETED
+    # (batch 4); the distribution .env had shipped it `true` since 2026-07-30.
+    # CATEGORIES[3] used to tell the model the preferred `type` for that category
+    # is "Exploratory" while the cases it produces are fully SCRIPTED, so the
+    # 2026-07-30 run exported 8 scripted cases as Exploratory and the XLSX
+    # Summary reported "Exploratory 8 / Performance 0" -- test-type metrics
+    # describing unscripted charter testing for a suite that contains none.
+    # This is a PROMPT change, so tests/fixtures/server_mode_equivalence/ (which
+    # records the 8 category prompts VERBATIM) was RE-CAPTURED with it applied.
 
-    # Merge a QUALIFIER-PREFIXED module label onto the bare label it qualifies
-    # (opt-in, default OFF). tools/quality_checks.normalize_module_names has always
-    # merged CASING/whitespace variants, but it buckets on a casefolded key, so
-    # "Sehhaty Store - Cancel Order" and "Cancel Order" are different keys and never
-    # merged: a real 2026-08-03 run shipped ONE feature split 12 / 86 across exactly
-    # those two labels, fragmenting every group-by-module view (Jira, TestRail, the
-    # XLSX pivot). ON, a second pass merges the qualified label into the bare one.
-    #
-    # Flag-gated because a WRONG merge silently destroys a real distinction, which
-    # is worse than the split it fixes. The rule merges ONLY on TAIL containment and
-    # REFUSES head containment -- "Store Wallet - Top Up" is a sub-module of "Store
-    # Wallet", not a variant of it -- and refuses a tail claimed by more than one
-    # qualifier ("Admin - Login" + "User - Login"). Read at the CALL SITE via
-    # getattr, so an install whose .env predates this field is byte-identical.
-    # See tools/quality_checks._qualifier_prefix_merges for the full rationale.
-    qa_module_prefix_normalize_enabled: bool = False
+    # A QUALIFIER-PREFIXED module label is merged onto the bare label it
+    # qualifies. UNCONDITIONAL since 2026-08-12:
+    # QA_MODULE_PREFIX_NORMALIZE_ENABLED was DELETED (batch 4); the distribution
+    # had shipped it `true` since v1.39.3 and tools/env_heal repaired installs
+    # still carrying the superseded shipped `false`.
+    # tools/quality_checks.normalize_module_names buckets on a CASEFOLDED key, so
+    # "Sehhaty Store - Cancel Order" and "Cancel Order" were different keys and
+    # never merged: a real 2026-08-03 run shipped ONE feature split 12 / 86
+    # across exactly those two labels, fragmenting every group-by-module view
+    # (Jira, TestRail, the XLSX pivot).
+    # THE SAFETY RULE IS UNCHANGED and is what makes this safe to hardcode:
+    # tools/quality_checks._qualifier_prefix_merges merges ONLY on TAIL
+    # containment, REFUSES head containment ("Store Wallet - Top Up" is a
+    # SUB-module of "Store Wallet", not a variant of it) and refuses a tail
+    # claimed by rival qualifier families ("Admin - Login" + "User - Login").
 
-    # Extract acceptance criteria from a USE-CASE TABLE description.
-    # Default **ON** since 2026-08-03, user-approved -- a deliberate exception to
-    # the defaults-OFF rule, in the same family as JIRA_FETCH_PARENT /
-    # JIRA_FETCH_COMMENTS / JIRA_FETCH_SIBLING_STORIES.
+    # Acceptance criteria are extracted from a USE-CASE TABLE description when the
+    # ticket carries no "Acceptance Criteria" heading. UNCONDITIONAL since
+    # 2026-08-12: QA_JIRA_UC_TABLE_AC_ENABLED was DELETED (batch 4). It had
+    # already been default **ON** since 2026-08-03, so this is a flag COLLAPSE,
+    # not a behaviour change.
     #
     # The AC fallback in tools/jira_mcp only understands an "Acceptance Criteria"
-    # heading followed by a block. A whole ticket family writes its requirements as
-    # a markdown UC table instead -- rows labelled Basic Flow / Alternative Flow /
-    # Business Rules / Post-condition -- with no such heading anywhere.
+    # heading followed by a block. A whole ticket family writes its requirements
+    # as a markdown UC table instead -- rows labelled Basic Flow / Alternative
+    # Flow / Business Rules / Post-condition -- with no such heading anywhere.
     #
-    # WHY THE DEFAULT FLIPPED. This shipped OFF on the reasoning that it adds
-    # ticket text to the generation prompt, and a mis-parse could introduce
-    # requirements the ticket never stated. That weighed the risk against the wrong
-    # baseline. With this OFF the run does not get NO acceptance criteria -- the
-    # host's AC_JOB SYNTHESIZES them, and the first production v1.34.0 run
-    # finalized with SIX model-invented criteria and a "6/6 traced, all covered"
-    # RTM built on them. Measured on that same ticket, ON yields FOUR criteria read
-    # out of the ticket's own table. So the real choice is not "extra text vs no
-    # extra text", it is "criteria read from the ticket vs criteria invented by a
+    # WHY THE DEFAULT FLIPPED (kept verbatim as history: it records a real
+    # incident). This shipped OFF on the reasoning that it adds ticket text to
+    # the generation prompt, and a mis-parse could introduce requirements the
+    # ticket never stated. That weighed the risk against the wrong baseline. With
+    # it OFF the run does not get NO acceptance criteria -- the host's AC_JOB
+    # SYNTHESIZES them, and the first production v1.34.0 run finalized with SIX
+    # model-invented criteria and a "6/6 traced, all covered" RTM built on them.
+    # Measured on that same ticket, ON yields FOUR criteria read out of the
+    # ticket's own table. So the real choice is not "extra text vs no extra
+    # text", it is "criteria read from the ticket vs criteria invented by a
     # model", and reading them is plainly safer.
     #
-    # The mis-parse risk is bounded and disclosed rather than hidden: the extractor
-    # takes only requirement-bearing rows (context rows like Description / Actor /
-    # Pre-condition are skipped), caps at 12 rows x 600 chars, an explicit
-    # "Acceptance Criteria" heading still wins, and anything it produces still
-    # flows through the untrusted-text path. Set to false to restore the previous
-    # behaviour -- note that this means going back to model-synthesized criteria on
-    # this ticket family, not to none.
-    qa_jira_uc_table_ac_enabled: bool = True
+    # The mis-parse risk stays bounded and disclosed rather than hidden: the
+    # extractor takes only requirement-bearing rows (context rows like
+    # Description / Actor / Pre-condition are skipped), caps at 12 rows x 600
+    # chars, an explicit "Acceptance Criteria" heading still wins, and anything
+    # it produces still flows through the untrusted-text path.
 
-    # Re-register this server in editor MCP configs on startup (opt-in, OFF).
-    # Registration otherwise happens exactly ONCE, at install: connect.sh skips a
-    # client whose config dir does not exist yet, install.sh refuses to re-run
-    # without QA_FORCE, and the launcher never called connect.sh -- so an editor
-    # installed AFTER qa-agent-pro is never picked up and the tester has no way to
-    # know connect.sh needs re-running.
-    #
-    # OFF by default, deliberately, even though that limits reach: this WRITES to
-    # files outside the install dir (~/.cursor/mcp.json, Claude Desktop's config),
-    # and a server that inserts itself into other editors' configs whenever it
-    # starts is a shape worth requiring consent for. The write is bounded to
-    # INSERTING one absent key -- an existing entry is never rewritten -- and is
-    # atomic + locked (tools/client_registry). Note the limit this cannot escape:
-    # if NO client is registered, nothing launches the server, so a startup pass
-    # can never bootstrap the very first client. Running connect.sh remains the
-    # answer for that case, and qa-doctor points at it.
-    qa_auto_register_clients: bool = False
+    # Startup re-registration of this server in editor MCP configs -- REMOVED
+    # 2026-08-13 (flag-surface reduction, batch 6): QA_AUTO_REGISTER_CLIENTS was
+    # DELETED and hardcoded OFF, so the dist launcher's startup pass no longer
+    # exists and nothing writes to files outside the install dir unattended.
+    # Running connect.sh by hand remains the answer for an editor installed
+    # after qa-agent-pro, and qa-doctor points at it. See docs/FEATURE_FLAGS.md.
 
     # Write the hosted Atlassian MCP entry (Jira Cloud, OAuth) into the clients
     # that keep it in a FILE -- Cursor today -- when the tester runs connect.sh or
@@ -963,35 +727,29 @@ class Settings(BaseSettings):
     # "Not connected -- add this to ~/.cursor/mcp.json". Only fresh installs were
     # fixed, which is the opposite of where the users are.
     #
-    # Note the apparent contradiction with qa_auto_register_clients above, which
-    # defaults OFF for writing outside the install dir. The distinguishing line is
-    # INVOKED vs SILENT, not the file's location: that flag guards a pass that runs
-    # "whenever it starts", unattended; this one runs because a tester asked this
-    # tool for a report, and the write is disclosed in that same report. The
-    # startup pass is still untouched.
-    qa_register_atlassian_mcp: bool = True
+    # UNCONDITIONAL since 2026-08-13 (flag-surface reduction, batch 6):
+    # QA_REGISTER_ATLASSIAN_MCP was DELETED and hardcoded ON, which is the value
+    # both the code default and the shipped dist .env already carried, so no
+    # install changes behaviour. The rationale above is kept because it is the
+    # justification for the write, not for the flag; the connect scripts and
+    # qa-doctor now always write the entry, insert-only, atomic, locked and
+    # backed up. The unattended startup pass it was contrasted with
+    # (QA_AUTO_REGISTER_CLIENTS) was deleted in the same batch and hardcoded
+    # OFF, so the INVOKED-vs-SILENT line now separates code paths rather than
+    # two flags. See docs/FEATURE_FLAGS.md.
 
-    # Surgical quality retry (opt-in, both default OFF -- see
-    # .claude/plans/plan-surgical-retry.md). The per-category quality gate
-    # (tools/quality_checks.quality_ratio) flags a category whose steps are
-    # >30% vague/placeholder; by default it re-runs the ENTIRE category once
-    # with a stricter reminder appended. These two independent flags change
-    # that:
+    # Surgical quality retry -- hardcoded ON 2026-08-12 (flag-surface
+    # reduction, batch 3): QA_QUALITY_REMINDER_UPFRONT and
+    # QA_SURGICAL_QUALITY_RETRY were DELETED. See docs/FEATURE_FLAGS.md and
+    # .claude/plans/plan-surgical-retry.md.
     #
-    # qa_quality_reminder_upfront: fold the stricter reminder into EVERY
-    # category's FIRST prompt instead of only on a triggered retry. Cheapest
-    # fix when it prevents the retry outright (zero extra calls); costs ~230
-    # extra words on every category's first prompt even when that category
-    # was never going to need a retry. OFF = first-attempt prompt byte-
-    # identical to today.
-    qa_quality_reminder_upfront: bool = False
-
-    # qa_surgical_quality_retry: when a retry is still needed, repair ONLY the
-    # flagged test cases (a smaller ask_json call carrying just those cases +
-    # targeted feedback, merged back by stable_id) instead of regenerating the
-    # whole category from scratch. OFF = the existing full-category retry
-    # runs unchanged.
-    qa_surgical_quality_retry: bool = False
+    # The per-category quality gate (tools/quality_checks.quality_ratio) flags a
+    # category whose steps are >30% vague/placeholder. The stricter reminder is
+    # now folded into EVERY category's FIRST prompt, and when the gate still
+    # trips the repair is SURGICAL -- only the flagged cases are re-asked (a
+    # smaller ask_json call carrying just those cases + targeted feedback,
+    # merged back by stable_id). The legacy full-category retry it replaced is
+    # gone; there is no setting left that can bring either behaviour back.
 
     # RAG corpus grounding — disabled by default.
     qa_rag_enabled: bool = False
@@ -1145,13 +903,15 @@ class Settings(BaseSettings):
     qa_standing_rules: bool = False
 
     # TestRail API push (T-10). Base instance URL (e.g. https://acme.testrail.io),
-    # a user email, and an API key. TESTRAIL_DRY_RUN defaults ON so a push
-    # previews what WOULD be created without writing to the customer's TMS until
-    # an operator explicitly sets TESTRAIL_DRY_RUN=false.
+    # a user email, and an API key. Dry run is UNCONDITIONAL since 2026-08-13
+    # (flag-surface reduction, batch 6): TESTRAIL_DRY_RUN was DELETED, so a push
+    # that passes no explicit dry_run argument always previews what WOULD be
+    # created and never writes to the customer's TMS. push_suite(dry_run=False)
+    # survives as a code-level override -- the decision moved out of .env, it
+    # did not disappear. See docs/FEATURE_FLAGS.md.
     testrail_url: str = ""
     testrail_user: str = ""
     testrail_api_key: str = ""
-    testrail_dry_run: bool = True
 
     # Spec-document ingestion. Off by default like every other feature gate.
     # When ON, a PDF/DOCX/TXT/MD attached to a chat message is extracted to text
@@ -1166,60 +926,29 @@ class Settings(BaseSettings):
     qa_max_spec_bytes: int = 10_000_000
     qa_max_spec_chars: int = 20_000
 
-    # Fine-tuning dataset export. Off by default. When ON, testers can type an
-    # "export dataset" keyword to download the corpus (generated test cases +
-    # bug reports) as a JSONL SFT dataset (tools/finetune_exporter.py).
-    qa_finetune_export_enabled: bool = False
-    # Output shape: "messages" (chat SFT, default) or "prompt_completion".
-    qa_finetune_format: str = "messages"
-
-    # Swagger/OpenAPI link ingestion. Off by default. When ON, a pasted spec
-    # URL is fetched with the same SSRF hardening as Jira/web content,
-    # condensed to a bounded endpoint summary (tools/swagger_fetcher.py), and
-    # used to ground API test-case generation.
-    qa_swagger_enabled: bool = False
-    # Auto-build the Excel (xlsx) export the moment test-case generation
-    # finishes on the MCP path (tools/mcp_handlers.handle_generate_test_cases),
-    # so the reply hands the tester a ready file path -- no separate
-    # qa_export_suite call and no "which format?" round trip.
-    #
-    # Deliberately ON by default -- the one documented exception to the
-    # opt-in-defaults-OFF rule. The spreadsheet IS the deliverable a manual
-    # tester came for; it is a local file write with no external side effect;
-    # and defaulting in CODE (not in the generated .env) is the only way
-    # already-installed users pick it up, since .env files survive updates.
-    # Set QA_AUTO_EXPORT_XLSX=0 to go back to export-on-request.
-    #
-    # Reuses the SAME generate_test_case_xlsx code path (cell_sanitizer
-    # formula-injection protection included) and never fails generation -- an
-    # export error only appends a warning note.
-    qa_auto_export_xlsx: bool = True
-
-    # 2026-08-04 (user-approved): qa-doctor repairs values in the install's
-    # own .env that are still EXACTLY a default this project shipped and later
-    # superseded (tools/env_heal.HEAL_RULES). ON by default, and a deliberate
-    # exception to the defaults-OFF rule for the same reason as
-    # qa_auto_export_xlsx: a default-OFF switch would never be found by the
-    # non-technical testers it exists for, and updater.migrate_env cannot do this
-    # job -- it only APPENDS missing keys and never rewrites a line, so a stale
-    # 1500 or an inherited `false` outlives every release. A value the operator
-    # chose is never touched, a commented-out key is treated as a deliberate
-    # opt-out, and the file is backed up before any write.
-    # Set QA_ENV_SELFHEAL_ENABLED=false to disable.
-    qa_env_selfheal_enabled: bool = True
-
-    # Export the computed risk SCORE into the XLSX Notes column (opt-in,
-    # default OFF). tools/risk_scorer.py scores EVERY suite and the sheet's row
-    # order IS the risk order (TC-001 = highest risk), but risk_label /
-    # risk_score were never exported -- while the Notes column was empty in
-    # 65/65 rows of the 2026-07-30 run, because it only ever carried a Batch-3
-    # rule-pack note and the rule packs are off in that deployment. When ON, a
-    # case with NO rule-pack note gets "Risk 78"; a rule-pack note ALWAYS wins,
-    # so nothing is ever displaced. OFF = every exported workbook is
-    # byte-identical to today. 2026-08-04: the risk LABEL left that cell -- it
+    # Swagger/OpenAPI link ingestion -- UNCONDITIONAL since 2026-08-13
+    # (flag-surface reduction, batch 6): QA_SWAGGER_ENABLED was DELETED and
+    # the behaviour hardcoded ON. Read that as written: ON is the SHIPPED and
+    # ADVERTISED value, NOT the code default this field carried. The
+    # distribution .env template shipped QA_SWAGGER_ENABLED=true and the
+    # qa-agent-pro README advertises a Swagger/OpenAPI link as a headline
+    # input, so pinning the code default (False) would have silently deleted
+    # a capability every real install was running. A pasted spec URL is
+    # fetched with the same SSRF hardening as Jira/web content, condensed to
+    # a bounded endpoint summary (tools/swagger_fetcher.py) and used to
+    # ground API test-case generation; the only remaining gate is
+    # tools.swagger_fetcher.looks_like_openapi_url(). See
+    # docs/FEATURE_FLAGS.md.
+    # The computed risk SCORE is exported into the XLSX Notes column whenever no
+    # rule-pack note claims that cell. UNCONDITIONAL since 2026-08-12:
+    # QA_XLSX_RISK_NOTES was DELETED (batch 4); the distribution .env had shipped
+    # it `true` since 2026-07-30. tools/risk_scorer.py scores EVERY suite and the
+    # sheet's row order IS the risk order (TC-001 = highest risk), but
+    # risk_label / risk_score were never exported -- while the Notes column was
+    # empty in 65/65 rows of the 2026-07-30 run. A rule-pack note ALWAYS wins, so
+    # nothing is ever displaced. 2026-08-04: the risk LABEL left that cell -- it
     # duplicated the Priority column and contradicted it on 10/97 rows of that
     # day's run; only the SCORE, the sheet's row-order key, is written now.
-    qa_xlsx_risk_notes: bool = False
 
     # Directory the auto-exported .xlsx is written to. A RELATIVE value is
     # resolved against the INSTALL ROOT by mcp_handlers._resolved_export_dir --
@@ -1246,17 +975,17 @@ class Settings(BaseSettings):
     # before, and tools/zephyr_exporter.py never runs.
     qa_zephyr_export_enabled: bool = False
 
-    # Dry run for that export, ON by default -- the house rule for an external
-    # write, and the column layout is not vendor-verified yet (operations/
-    # runbook.md -> "Zephyr export pilot gate"). The IMPORT into Jira is the
-    # external write, performed by the tester on our artifact, so dry run bounds
-    # the artifact instead of suppressing it: the workbook holds ONE case (the
+    # Dry run for that export -- UNCONDITIONAL since 2026-08-13 (flag-surface
+    # reduction, batch 6): QA_ZEPHYR_DRY_RUN was DELETED and hardcoded ON. The
+    # IMPORT into Jira is the external write, performed by the tester on our
+    # artifact, and the column layout is still not vendor-verified
+    # (operations/runbook.md -> "Zephyr export pilot gate"), so the artifact
+    # stays bounded rather than suppressed: the workbook holds ONE case (the
     # first multi-step one, so the multi-row layout is actually exercised), is
     # named zephyr_import_PILOT.xlsx inside a zephyr_pilot_* folder, and the
-    # reply tells the tester to import it into a SANDBOX project first. Set to
-    # false only after a pilot is recorded in the runbook. Both flags use the
-    # lenient never-raising bool coercer like every other flag.
-    qa_zephyr_dry_run: bool = True
+    # reply tells the tester to import it into a SANDBOX project first. Lifting
+    # that bound is now a code change, not an .env line. See
+    # docs/FEATURE_FLAGS.md.
 
     # Distribution / test-cases-only mode. When ON, the UI exposes ONLY the
     # test-case generation flows (feature text / Jira / web URL / Swagger link
@@ -1266,14 +995,16 @@ class Settings(BaseSettings):
     qa_dist_mode: bool = False
 
     # Xray (Jira test management) write-back -- mirrors the TestRail push above.
-    # Xray Cloud client credentials + target project key. XRAY_DRY_RUN defaults
-    # ON so a push previews what WOULD be created until an operator sets
-    # XRAY_DRY_RUN=false. xray_base_url is the fixed Cloud host by default.
+    # Xray Cloud client credentials + target project key. Dry run is
+    # UNCONDITIONAL since 2026-08-13 (flag-surface reduction, batch 6):
+    # XRAY_DRY_RUN was DELETED, so a push that passes no explicit dry_run
+    # argument always previews what WOULD be created. push_suite(dry_run=False)
+    # survives as a code-level override. xray_base_url is the fixed Cloud host
+    # by default. See docs/FEATURE_FLAGS.md.
     xray_client_id: str = ""
     xray_client_secret: str = ""
     xray_project_key: str = ""
     xray_base_url: str = "https://xray.cloud.getxray.app"
-    xray_dry_run: bool = True
 
     # SQLite file that persists generated suites so they survive a browser
     # refresh and stay re-exportable (T-01). Parent dirs are created on first
@@ -1289,54 +1020,6 @@ class Settings(BaseSettings):
     # submission). Both never-raise-coerced as positive ints.
     qa_prep_ttl_s: int = 3600
     qa_prep_max_bytes: int = 4000000
-
-    # --- Inline Feature Analysis report on a HOST submit (opt-in, default OFF) -
-    # QA_FEATURE_ANALYSIS_ENABLED does TWO unrelated things: it registers the
-    # standalone qa_feature_analysis tool (mcp_server.py) AND makes every
-    # _finalize_generation run agents.feature_analysis.analyze_feature -- one
-    # server-side LLM call. On the host path that second half straight-up
-    # contradicts host mode's premise (no key, no backend, no quota), and it is
-    # expensive: MEASURED 42.0s on the 2026-07-30 SHYJ-5645 run (69s on an
-    # earlier one) against 0.02s for the whole deterministic finalize of 65
-    # cases -- the report was ~99.95% of that step. This flag SPLITS them: the
-    # tool stays available on demand, the inline report on a HOST submit runs
-    # only if an operator asks for it. Server mode is untouched --
-    # _finalize_generation's feature_report_enabled parameter defaults True and
-    # only the host submit call site passes this flag.
-    qa_host_feature_report_enabled: bool = False
-
-    # --- Host-side ambiguity preflight (opt-in, default OFF) ---------------
-    # WHY: QA_GENERATION_MODE=host only boomerangs the 8-category fan-out.
-    # The SHYJ-7154 ambiguity gate still runs server-side via llm.ask_json ->
-    # QA_LLM_BACKEND (usually cli / claude subprocess). MCP cannot call the
-    # Cursor chat model as an llm.py backend. Tonight's 2026-07-30 evening
-    # run hit a Claude CLI session limit, returned degraded, and told the
-    # tester the ticket was "under-specified" even though DF01/DF02 were
-    # present. When this flag is ON and generation mode resolves to host,
-    # prepare SKIPS the server classifier and returns an ambiguity_job for
-    # the chat to run first (prepare-side preflight -- NOT the blocked F12
-    # submit-side ambiguities GO/NO-GO). Server mode is untouched.
-    qa_host_ambiguity_review_enabled: bool = (
-        True  # 2026-08-01: hardcoded ON, see _force_host_boomerang_on
-    )
-
-    # --- Host-derived acceptance criteria (opt-in, default OFF) -------------
-    # WHY: rtm.generate_acs is an UNCONDITIONAL server-side llm.ask_json. It
-    # fires on every prepare whose ticket carried no parsed acceptance criteria
-    # (agents/test_scenario_agent._need_acs) -- common for sub-tasks and bugs --
-    # and it has no off switch, so a keyless / quota-dead host-mode install
-    # cannot get past it. AC synthesis is PREPARE-side (its output feeds
-    # rtm_hint, the RTM and the atomic checklist), so it cannot be deferred to
-    # submit: when this flag is ON and generation mode resolves to host, prepare
-    # SKIPS the call and ships an `acceptance_criteria_job` in the payload
-    # instead. The tester's own chat model derives the criteria, tags
-    # requirement_id with them, and returns them beside its suite; submit
-    # validates that field as UNTRUSTED input and labels it MODEL-DERIVED, never
-    # ticket-sourced. Server mode is untouched (_prepare_generation's
-    # synthesize_acs parameter defaults True and only host prepare passes False).
-    qa_host_ac_review_enabled: bool = (
-        True  # 2026-08-01: hardcoded ON, see _force_host_boomerang_on
-    )
 
     # --- Refuse a host submit with no verified ambiguity preflight (OFF) ----
     # QA_HOST_AMBIGUITY_REVIEW_ENABLED hands the SHYJ-7154 pre-pass to the host,
@@ -1378,97 +1061,15 @@ class Settings(BaseSettings):
     # in-flight prep and an OLD envelope is untouched.
     qa_host_image_require_relevant: bool = False
 
-    # --- Duplicate / SHRINKING category re-submission (both default ON) -----
-    # 2026-08-09 (Batch 3, FIX 1). EVIDENCE, ~/qa-agent-pro/data/audit.db, prep
-    # 59ab1c492ef242228d97ccd6c673fed1 on 2026-08-04: mcp_submit_category fired
-    # for "Boundary Values" THREE times -- 12 cases, then 1, then 12 -- and twice
-    # each for "Integration" and "UI/UX Validation": ~67 seconds of pure rework.
-    # prep_submissions is UNIQUE(prep_id, category_name) and the write is INSERT
-    # OR REPLACE (tools/prep_store.py:334-347), so the `cases: 1` row SILENTLY
-    # REPLACED a good 12-case row. The existing stop banner cannot help: it
-    # returns "" unless EVERY expected category is staged, which is exactly the
-    # window all of that rework landed in.
-    #
-    # NOTE-only flag: prepends a warning naming both counts; the save proceeds
-    # exactly as today. Default ON for the same reason _all_staged_banner -- the
-    # 2026-08-04 sibling disclosure for this same incident class -- ships with no
-    # flag at all: it only prevents wasted minutes and can never refuse work.
-    # It does NOT gate the override note: a replace_smaller=true call that really
-    # dropped cases is disclosed whatever this flag says (review C1), because
-    # that note is a consequence of the GUARD below, not of this disclosure.
-    qa_host_category_resubmit_note_enabled: bool = True
-    # GUARD flag: REFUSES a re-submission carrying FEWER cases than the row it
-    # would replace, unless the caller passes replace_smaller=true. Refusing
-    # costs ONE round trip and keeps the good row; accepting deletes accepted
-    # cases and tells nobody, so the fail-safe direction is to refuse. Never a
-    # dead end -- the reply names the override and states that nothing was
-    # discarded. Default ON on the same argument that moved
-    # QA_HOST_DUPLICATE_PREP_GUARD_ENABLED to ON on 2026-08-01: opt-in is the
-    # wrong default for a guard against an already-OBSERVED loss. BOTH flags are
-    # stamped into the prep envelope's meta at PREPARE time and read from the
-    # STAMP at submit, so a mid-flow .env flip or a launcher auto-update between
-    # prepare and submit cannot change an in-flight prep, and an OLD envelope
-    # (which carries neither key) behaves exactly as before.
-    #
-    # KNOWN LIMIT (review M3): the read->compare->write window is NOT atomic.
-    # prep_store has no application lock and load_submissions / save_submission
-    # are separate to_thread hops, so two CONCURRENT submits of the SAME category
-    # can both read the prior count before either writes. It fails OPEN (worst
-    # case is today's behaviour). An in-process asyncio.Lock is deliberately not
-    # used: this store is shared by several MCP server PROCESSES (see
-    # prep_store._connect), so a lock would close only half the race while making
-    # the code look serialized. Real serialization needs a compare-and-set inside
-    # prep_store and is a separate change.
-    qa_host_category_shrink_guard_enabled: bool = True
-
-    # --- Host-derived image descriptions (opt-in, default OFF) -------------
-    # WHY: the last two server-side LLM calls on the host path are BOTH
-    # vision-only -- tools/ui_extractor's Tier-3 ask_vision (a rendered
-    # screenshot of a non-Jira page) and tools/image_description.describe_images
-    # (screenshots / mockups the tester attached to the chat). llm.ask_vision is
-    # api-backend only, so on QA_LLM_BACKEND=cli/cursor both already no-op with
-    # their "Error: ..." sentinel: image grounding is silently LOST there today,
-    # not saved. When this flag is ON and generation mode resolves to host, the
-    # server makes NEITHER call and instead forwards the RAW bytes to the
-    # tester's OWN multimodal chat model as MCP image content -- the same
-    # mechanism Jira ticket images already use (PreparePayloadResult.images) --
-    # together with an `image_description_job` in the payload. The host describes
-    # them in-chat (no llm.py, no backend, no key, no quota) and returns an
-    # OPTIONAL top-level `image_descriptions` array, which submit validates as
-    # UNTRUSTED input exactly like `acceptance_criteria`. It ALSO lifts the
-    # attached_images host-routing suppression in tools/mcp_handlers, which only
-    # existed because those attachments were consumable server-side alone.
-    # Server mode is untouched: every branch is gated on the flag AND on
-    # llm.resolve_generation_mode() == "host".
-    qa_host_image_description_enabled: bool = (
-        True  # 2026-08-01: hardcoded ON, see _force_host_boomerang_on
-    )
-
-    # --- Host-reviewed duplicate review (Piece 1; opt-in, default OFF) -----
-    # qa_semantic_dedup_enabled needs qa_embeddings_backend, and the only KEYLESS
-    # embeddings backend is "local" (sentence-transformers, ~2 GB of torch), so on
-    # a keyless host-mode deployment neither runs and ONLY byte-identical
-    # duplicates are collapsed (_dedupe_cases keys on the content hash). A real
-    # 2026-07-29 run submitted 8 categories x 8 cases and kept all 64 -- the
-    # categories are generated in PARALLEL, blind to each other, which is exactly
-    # how cross-category near-duplicates appear.
-    # When this is ON, qa_prepare_test_cases asks the tester's OWN chat model --
-    # already in the loop, already holding the merged set -- to return an OPTIONAL
-    # top-level `duplicate_groups` alongside the suite, and qa_submit_suite
-    # validates and acts on it in pure Python. Zero extra round trips (the field
-    # rides the existing submission), zero extra server-side LLM calls, no API key.
-    # 2026-08-03: default flipped OFF -> ON. Report-only, and the evidence is two
-    # runs: the 2026-07-29 run above kept all 64 of 8x8 submitted cases, and the
-    # 2026-08-03 SHYJ-5645 run shipped 18 duplicates across 12 clusters. With this
-    # OFF the only thing that collapses anything on a keyless install is an exact
-    # content hash (qa_semantic_dedup_enabled is also OFF and additionally needs an
-    # embeddings backend), so step 5 of the host instructions was a politely-worded
-    # request that nothing verified. ON, the host is asked for `duplicate_groups`
-    # and the server validates what comes back in pure Python. REMOVAL is a
-    # separate decision and stays OFF -- see qa_host_dedup_apply below, whose
-    # reasoning (host output is attacker-influenceable through the _GUARD-wrapped
-    # ticket text) is unchanged by this flip.
-    qa_host_dedup_review_enabled: bool = True
+    # --- Host duplicate review: flags DELETED 2026-08-12 ----------------
+    # QA_HOST_CATEGORY_RESUBMIT_NOTE_ENABLED,
+    # QA_HOST_CATEGORY_SHRINK_GUARD_ENABLED,
+    # QA_HOST_IMAGE_DESCRIPTION_ENABLED and QA_HOST_DEDUP_REVIEW_ENABLED were
+    # deleted as flags on 2026-08-12 (flag-surface reduction, batch 1): every
+    # one of them had soaked ON, so their ON behaviour is now unconditional and
+    # no .env value can change it. The duplicate REVIEW is always requested;
+    # whether the reported groups are ACTED on is still the opt-in sub-flag
+    # below. See docs/FEATURE_FLAGS.md -> "Changelog 2026-08-12".
     # Sub-flag: actually REMOVE the non-keeper members of each reported group.
     # Default OFF, and deliberately ASYMMETRIC with qa_semantic_dedup_enabled
     # (which does remove): that path drops on a NUMERIC cosine >=
@@ -1509,44 +1110,6 @@ class Settings(BaseSettings):
     # guarantee and not be one.
     qa_host_dedup_low_text_ratio: float = 0.5
 
-    # --- Host-reviewed requirement coverage (Piece 2; opt-in, default OFF) ---
-    # MOOT WITHOUT QA_ATOMIC_CHECKLIST_ENABLED: with no atomic requirements
-    # checklist there is nothing to match test cases against, so this flag is a
-    # safe no-op (agents/host_mode._coverage_instruction returns "" when the prep
-    # presented no checklist item, and extract_requirement_matches has no known
-    # item ids to validate against and ignores the field).
-    # WHY IT EXISTS. tools/rtm.match_checklist is TIERED and the tiers are NOT
-    # alternatives: tier (a), the similarity matrix, is the GATE, and the optional
-    # entailment/adjudication tiers only RE-JUDGE the shortlist tier (a) already
-    # surfaced. With no qa_embeddings_backend tier (a) degrades to a TF-IDF lexical
-    # matrix, so the shortlist is built from word overlap -- and requirement
-    # <-> test-case matching is exactly the high-paraphrase-distance case where
-    # word overlap is weakest. When this is ON, the tester's OWN chat model --
-    # already in the loop, already holding the merged 8-category suite and the
-    # checklist block -- returns an OPTIONAL top-level `requirement_matches`
-    # mapping {CL id: [tc_id, ...]} alongside the suite it already submits, and
-    # qa_submit_suite reports it in pure Python. Zero extra round trips, zero
-    # server-side LLM calls, no API key.
-    # IT IS MODEL JUDGEMENT, NOT MEASUREMENT, and is kept structurally apart from
-    # the deterministic measurement: it publishes NO percentage, is never averaged
-    # or merged into ChecklistCoverage, never reaches the XLSX or the suite_store,
-    # and never drives the qa_checklist_remediation_enabled gap loop (a lexical
-    # measurement is FORBIDDEN to drive that loop, so letting an uncalibrated
-    # self-assessment do it would invert the honesty rule). All three honesty rules
-    # stand unchanged: the deterministic percentage stays suppressed while the
-    # matcher is degraded, NOT-PRESENTED requirements stay excluded from every
-    # count, and the textual-coverage boundary is restated in the section.
-    qa_host_coverage_review_enabled: bool = False
-    # Caps on the UNTRUSTED field's SHAPE: how many mapping entries are read and
-    # how many tc_ids one requirement may name. Never-raise-coerced as positive
-    # ints and additionally hard-capped in agents/host_mode.py, whose constant wins
-    # when it is smaller. These are shape caps only -- unlike the duplicate review
-    # above there is NO destructive path to bound: the field is report-only by
-    # construction, and its one coverage-affecting direction (self-reported gaps)
-    # is bounded by the "no claims at all => UNUSABLE review" rule in host_mode.
-    qa_host_coverage_max_items: int = 500
-    qa_host_coverage_max_tc_per_item: int = 12
-
     # --- Host-mode parallel chat fan-out (opt-in, default OFF) -----------------
     # When ON, qa_prepare_test_cases adds an orchestration contract so the PARENT
     # chat can spawn one same-session worker per category (Cursor Task / equivalent).
@@ -1562,90 +1125,13 @@ class Settings(BaseSettings):
     # Flag OFF => prepare payload / instructions byte-identical to today.
     qa_host_parallel_fanout_enabled: bool = False
 
-    # --- Host-mode generation-VOLUME floor (opt-in, default OFF) --------------
-    # WHY: the prepare payload TELLS the host a per-category floor -- every
-    # `categories[]` entry and every job packet carries `min_cases` /
-    # `max_cases`, derived from THIS feature's own complexity by
-    # agents.test_scenario_agent._case_count_bounds (bands 8-10 / 10-13 /
-    # 12-15) -- and until 2026-08-09 nothing on the submit side ever read it
-    # (`grep -n min_cases tools/mcp_handlers.py` returned nothing). Observed
-    # that morning (prep dade2abd..., suite 7bc2af95...): the host ignored the
-    # parallel fan-out contract, generated ONE case per category inline in the
-    # parent turn and finalized a merged 8-case suite 28 seconds after
-    # prepare. It was accepted in silence and exported as if normal, while two
-    # comparable runs on the sibling ticket produced 99 and 97 cases whose
-    # per-category counts never dropped below 12 (measured out of suites.db).
-    # MECHANISM: prepare stamps the contract into the prep envelope
-    # (`volume_floor`, `volume_min_cases`, `volume_categories`) and
-    # tools.mcp_handlers._volume_floor_note checks the finalizing suite against
-    # THAT prep's own stamps -- never a live flag, so neither a mid-flow .env
-    # flip nor a launcher auto-update between prepare and submit can change an
-    # in-flight prep. BOTH finalize routes are covered: the merged Path B blob
-    # AND the staged Path A set (which is the route the payload actually
-    # RECOMMENDS, so gating only Path B would have left a free bypass).
-    # Below 50% of the summed floor the finalize is REFUSED; a materially
-    # short category, or a total under the summed floor, is a loud WARNING;
-    # and a prep that stamped `parallel_fanout` whose suite has an ENTIRELY
-    # ABSENT expected category (with too few unlabelled cases to account for
-    # it) is refused too -- the fan-out completeness gate finally reaching the
-    # route it never covered ("Path B (non-empty suite_json) is unaffected",
-    # as handle_submit_suite's own comment put it).
-    # SAFETY: the floor is always the prep's OWN stamped value, so a genuinely
-    # small feature that legitimately lands at 8 per category passes
-    # untouched, and one category sitting a single case under the floor is
-    # within slack -- measured: replayed against the two known-good
-    # distributions above, neither would have warned. The gate never raises
-    # and fails OPEN, a refusal deletes no prep, discards no staged row and
-    # consumes no remediation round, and `volume_floor_ack=true` on
-    # qa_submit_suite is honoured only on a prep this gate has ALREADY refused
-    # once, so the tester really has seen the numbers before their host waves
-    # them through.
-    # DEFAULT ON since 2026-08-09 (owner decision, same day it shipped). It was
-    # authored default-OFF with a one-release soak, and that soak was
-    # deliberately WAIVED: OFF costs exactly the silent 8-case run this gate
-    # exists to stop -- accepted without a word and exported as if normal --
-    # and a tester cannot tell 8 cases from 97 without comparing runs, so the
-    # failure is invisible precisely to the people it hurts. The residual risk
-    # is the opposite error, a FALSE refusal on a legitimately small suite;
-    # that is bounded by construction (the floor is the prep's OWN stamped
-    # value, the refusal costs a round trip and destroys nothing, and
-    # volume_floor_ack=true clears it on the second submit), which is what
-    # made waiving the soak defensible rather than merely faster.
-    # `false` still restores the pre-2026-08-09 flow exactly: reply and submit
-    # behaviour byte-identical (the three meta keys are still stamped, which
-    # costs ~200 bytes of envelope and one pure _case_count_bounds call;
-    # nothing reads them while this is false).
-    qa_host_volume_floor_enabled: bool = True
-
-    # --- Host-mode duplicate-prepare guard (default ON as of 2026-08-01) ------
-    # WHY: host mode's premise is that the tester's own chat model drives
-    # generation end to end, and qa_prepare_test_cases is stateless -- nothing
-    # stops the SAME chat turn from silently re-running an entire ticket a
-    # second time (fresh Jira fetch, fresh 8-category fan-out, fresh submit)
-    # instead of asking the tester first or resubmitting under the existing
-    # prep_id. Observed 2026-08-01, TWICE: one "create test cases for
-    # SHYJ-5645" request produced two independent finalized suites four
-    # minutes apart (68 then 77 cases) even though the first finalize
-    # reported zero coverage or quality gaps -- and the SAME ticket was
-    # regenerated from scratch again in a later session with the guard
-    # still off, with no warning that a finished suite already existed.
-    # Nothing server-side ever asked for a redo either time -- this is the
-    # host model's own unannounced decision, and a guard against an
-    # already-observed failure mode should not require an operator to
-    # discover and enable it (same reasoning as the prep crash-safety flags
-    # above). When ON, qa_prepare_test_cases checks
-    # suite_store.list_recent_suites for a suite whose source_url matches
-    # this request's source_url within QA_HOST_DUPLICATE_PREP_WINDOW_S and,
-    # if found, returns a clarify notice instead of proceeding -- the host
-    # must either pass proceed_anyway=true (an explicit, visible decision,
-    # already a supported parameter) or use the existing suite instead of
-    # starting over. Deliberately keyed on source_url only (a
-    # Jira/issue/web/Swagger URL): free-text feature descriptions have no
-    # stable identity to dedupe against and are never flagged. Best-effort
-    # and fail-open: any suite_store error is treated as "no duplicate
-    # found", since this is a UX guard, not a correctness gate. An operator
-    # with a real reason can still set this to false in .env.
-    qa_host_duplicate_prep_guard_enabled: bool = True
+    # --- Volume floor + duplicate-prepare guard: flags DELETED 2026-08-12 -
+    # QA_HOST_VOLUME_FLOOR_ENABLED and QA_HOST_DUPLICATE_PREP_GUARD_ENABLED were
+    # deleted as flags on 2026-08-12 (flag-surface reduction, batch 1); both had
+    # soaked ON and are now unconditional. The floor is still always the prep's
+    # OWN stamped value, the guard is still keyed on source_url only, both still
+    # fail OPEN, and `volume_floor_ack=true` is still honoured only after a
+    # refusal. The two WINDOW settings below stay as tuning knobs.
     qa_host_duplicate_prep_window_s: int = 1800
     # 2026-08-10 (I3): the FINISHED-SUITE half of the same guard gets its own,
     # much wider window. The two are different failure modes and 1800s was only
@@ -1692,211 +1178,31 @@ class Settings(BaseSettings):
     # A plain str field: any .env value is already a valid str, so no coercer is
     # needed and it can never raise at load time.
     qa_server_llm_allow: str = ""
-    # Opportunistic MCP sampling (fastmcp Context.sample) for the calls that
-    # cannot boomerang because the host is blocked waiting for the tool call
-    # that needs the completion (maestro heal/explore, web-runner step verify,
-    # eval judges, router). Default OFF: Claude Desktop/Code and Cursor do not
-    # advertise the sampling capability today, so ON is a no-op there --
-    # tools.host_llm.maybe_sample() returns None (never raises) and the caller
-    # uses its deterministic fallback or disables the feature out loud.
-    qa_host_llm_sampling_enabled: bool = False
-
-    # --- Phase 3a of the host-boomerang migration: generation-pipeline folds --
-    # Both default TRUE, deliberately, and that is NOT a defaults-OFF violation:
-    # these are MIGRATION flags, not features. They add no behaviour -- they
-    # REMOVE a server-side LLM call from the host path and hand the same work to
-    # the tester's own chat model as one more field on the submission it was
-    # already going to send (ZERO extra round trips). Same reasoning and same
-    # precedent as QA_HOST_AC_REVIEW_ENABLED / QA_HOST_IMAGE_DESCRIPTION_ENABLED
-    # (2026-08-01). Each is ALSO an AND with the pre-existing, default-OFF
-    # feature flag it rides on, so on a default install nothing new runs at all
-    # and the prepare payload stays key-identical. Setting either to false
-    # restores the server-side call with no code change -- which is what makes
-    # the migration's Rollback Plan true for these two rows.
-    #
-    # ON + QA_LLM_RISK_SCORING: the host returns a top-level `risk_scores` field
-    # on its submission and tools/risk_scorer.score_with_llm is never called. The
-    # deterministic score_and_sort heuristic remains the baseline and the
-    # fallback for every case the host omits, and for an absent/unusable field.
-    qa_host_risk_review_enabled: bool = True
-    # ON + QA_TEST_PLAN_ARTIFACTS: the host returns a top-level
-    # `test_plan_report` field carrying BOTH artifacts (ac_validation +
-    # test_plan) and tools/test_plan_report.build_test_plan_artifacts is never
-    # called. An absent or unusable field yields NO artifacts plus a disclosed
-    # UNVERIFIED note -- the server does NOT fall back to making the call.
-    qa_host_test_plan_review_enabled: bool = True
-    # --- Residue R4: requirement decomposition on the host path -------------
-    # ledger id `atomic_checklist.decompose`, the LAST row of the
-    # host-boomerang migration. A MIGRATION flag, not a new feature, so it
-    # defaults ON for the same reason the three above do: `migrated` may only
-    # be claimed when the host path genuinely cannot reach the backend, and a
-    # default of False would leave an operator with QA_ATOMIC_CHECKLIST_ENABLED
-    # on still making the server-side ask_json.
-    #
-    # AND-ed with QA_ATOMIC_CHECKLIST_ENABLED (default OFF) AND host mode, so a
-    # default install ships a key-identical prepare payload and nothing changes.
-    #
-    # ON + QA_ATOMIC_CHECKLIST_ENABLED + host mode: _prepare_generation is
-    # called with decompose_checklist=False and makes NO decomposition call;
-    # agents/host_mode.CHECKLIST_JOB (stage step_zero) asks the host to derive
-    # the atomic checklist BEFORE generating and to return it as a top-level
-    # `checklist_items` field. The server re-assigns every CL-NNN id, runs the
-    # pure-Python audit_granularity over the result, and feeds the DETERMINISTIC
-    # Pass-3 matcher unchanged. An absent or unusable field means NO checklist:
-    # the server does NOT fall back to making the call it just skipped.
-    #
-    # Two knock-on gates are widened for this flag rather than left to break
-    # silently -- tools/mcp_handlers._nli_suppress (Phase 3b) and
-    # agents/host_mode._coverage_instruction -- because both are AND-ed with
-    # "the prep produced checklist items", which is False at prepare time once
-    # the decomposition is boomeranged. See docs/FEATURE_FLAGS.md.
-    qa_host_checklist_review_enabled: bool = True
-
-    # --- Phase 3b: the checklist NLI / adjudication tiers on the host path ----
-    # A MIGRATION flag with the same default-ON rationale as the two above, and
-    # the same AND with the (default-OFF) feature flags it rides on
-    # (QA_CHECKLIST_NLI_ENABLED / QA_CHECKLIST_ADJUDICATE_ENABLED), so on a
-    # default install nothing changes at all. It is additionally AND-ed with
-    # QA_ATOMIC_CHECKLIST_ENABLED *and* with the prep actually carrying
-    # checklist items, because both tiers only ever run over a checklist -- see
-    # tools/mcp_handlers.py's _nli_suppress.
-    #
-    # ON + either tier flag + a real checklist + host generation:
-    # _finalize_generation passes allow_llm_tiers=False into
-    # tools.rtm.match_checklist, so tiers (b) and (c) make NO server-side
-    # ask_json call on a host submit.
-    #
-    # There is deliberately NO host job replacing them, and that is the whole
-    # finding of this sub-phase (see docs/LLM_MIGRATION_INVENTORY.md, ledger id
-    # `rtm.nli_verdicts`). Both tiers exist precisely so a model OTHER than the
-    # generator re-judges the deterministic shortlist -- tools/rtm.py says so in
-    # source: "a DIFFERENT system prompt from the generator, so the generating
-    # model still never marks its own homework". In host mode the generator IS
-    # the host, so folding the tiers would (a) have the suite's own author grade
-    # it and (b) feed that judgement into ChecklistCoverage, i.e. into the
-    # coverage percentage, the XLSX sheets and the remediation loop -- exactly
-    # what agents/host_mode.py's host-reviewed coverage block refuses to do
-    # ("NOTHING IS MERGED OR AVERAGED... IT NEVER DRIVES THE GAP LOOP"). The
-    # DISCLOSED host analog is QA_HOST_COVERAGE_REVIEW_ENABLED's
-    # `requirement_matches`, reported as a separate, explicitly labelled tier.
-    #
-    # Consequence, disclosed in the submit reply, the prepare notice AND in
-    # ChecklistCoverage.notes (so it survives into the exported artifact): the
-    # ambiguous similarity band is reported as UNCOVERED instead of being
-    # re-judged, so a run with QA_CHECKLIST_NLI_ENABLED on can show MORE gaps
-    # than before. Set this to false to restore the server-side tiers with no
-    # code change.
-    qa_host_checklist_nli_suppress_enabled: bool = True
-
-    # --- Phase 3c: Jira comment reconciliation on the host path ---------------
-    # ledger id `comment_reconciler.candidates`. Default ON for the same reason
-    # as the three flags above: this is a MIGRATION flag, not a new feature.
-    # `migrated` / `disabled (disclosed)` may only be claimed when the host path
-    # genuinely cannot reach the backend, so a default of False would leave an
-    # operator with QA_COMMENT_RECONCILE_ENABLED=true still making the Stage 1b
-    # ask_json call on every host prepare and the ledger flip would over-claim.
-    # It is still an AND with the pre-existing, default-OFF
-    # QA_COMMENT_RECONCILE_ENABLED, so a default install is byte-identical.
-    #
-    # WHY THERE IS NO HOST JOB (the load-bearing finding of Phase 3c).
-    # tools/comment_reconciler.py Stage 1b is a QUARANTINED extractor: its
-    # entire security value is that the model reading the raw comment thread has
-    # a system prompt containing ONLY extraction instructions -- no generation
-    # prompt, no test-case instructions, no tools -- so a directive injected into
-    # a Jira comment has nothing privileged to target. The module docstring
-    # states the resulting invariant outright: when the flag is on, tools/jira_mcp
-    # STOPS appending the raw "## Comments" dump to raw_text and "the fenced
-    # amendments block becomes the ONLY comment-derived input the privileged
-    # generation model ever sees". In host mode the privileged generation model
-    # IS the host, so ANY boomerang -- a folded HostJob or a separate
-    # tools/host_llm task -- would put the raw thread into the context of the
-    # model that is about to write the tests and hold the tool handles. That is
-    # not a migration of the capability, it is the deletion of the defence.
-    # Two further blockers, either sufficient on its own:
-    #   * ORDERING. The rendered amendments block enters url_content
-    #     ["amendments_context"] BEFORE _prepare_generation, i.e. it shapes the
-    #     generation prompt. A HostJob return field arrives on the SUBMIT, which
-    #     is far too late for a prompt-side consumer (`step_zero` is only an
-    #     instruction-ordering rank inside ONE host turn, not a round trip).
-    #   * A SAFETY GATE. kind="question" candidates become
-    #     FLAGGED_FOR_CLARIFICATION strings that tools/mcp_handlers feeds into the
-    #     QA_AMBIGUITY_GATE_SEVERITY gate, which can RETURN EARLY and refuse to
-    #     prepare at all. A gate cannot be answered after the thing it gates.
-    # So on the host path Stage 1b is DISABLED, not delegated: Stage 1a (the
-    # pure-Python noise filter) still runs so the tester is told how many
-    # comments went unreconciled, Stages 2 and 3 produce nothing, and the
-    # prepare notice, the submit reply and the audit log all say so.
-    #
-    # Consequence, disclosed on all three surfaces: no AMENDMENTS block reaches
-    # the generation prompt and no comment-derived clarification question can
-    # gate the prepare, so a ticket whose current truth lives in its comment
-    # thread generates from the description alone. Set this to false to restore
-    # the server-side extractor with no code change.
-    qa_host_comment_reconcile_suppress_enabled: bool = True
-
-    # --- Prep crash-safety (2026-07-31 SHYJ-5645 incident; default ON as of
-    # 2026-08-01) --------------------------------------------------------------
-    # The first live parallel fan-out was silently lost: 8 worker packets fetched
-    # via qa_get_category_job, the host window reloaded, no submit ever arrived,
-    # and the prep expired after QA_PREP_TTL_S with no trace and no resume path.
-    # RECURRED 2026-08-01 on this same install with these flags still off (the
-    # SHYJ-5645 ticket, again) -- confirming "opt-in" was the wrong default for
-    # a crash-safety guard against a failure mode already observed twice. Two
-    # independent, disclosure-first mitigations, each behind its own flag,
-    # BOTH now default ON (an operator with a real reason to revert can still
-    # set either to false in .env):
-    #
-    # Sliding TTL: qa_get_category_job / qa_submit_category refresh the prep's
-    # TTL clock so an ACTIVE orchestration cannot expire mid-run. Bounded by
-    # qa_prep_max_lifetime_s from creation (the same anti-extension stance
-    # prep_store.update_prep takes for the gap loop), so activity can never
-    # extend a prep forever. OFF => the fixed created_at TTL, unchanged.
-    qa_prep_sliding_ttl_enabled: bool = True
+    # --- Host-boomerang migration flags: DELETED 2026-08-12 ---------------
+    # QA_HOST_RISK_REVIEW_ENABLED, QA_HOST_TEST_PLAN_REVIEW_ENABLED,
+    # QA_HOST_CHECKLIST_REVIEW_ENABLED, QA_HOST_CHECKLIST_NLI_SUPPRESS_ENABLED
+    # and QA_HOST_COMMENT_RECONCILE_SUPPRESS_ENABLED were MIGRATION flags, not
+    # features, and every ledger row they governed is terminal. On 2026-08-12
+    # they were deleted and their ON behaviour hardcoded: on the host path this
+    # server makes no risk-scoring, test-plan, requirement-decomposition,
+    # checklist NLI/adjudication or Jira comment-extraction call. Each stays
+    # AND-ed with the pre-existing, default-OFF feature flag it rides on
+    # (QA_LLM_RISK_SCORING / QA_TEST_PLAN_ARTIFACTS / QA_ATOMIC_CHECKLIST_ENABLED
+    # / QA_CHECKLIST_NLI_ENABLED / QA_COMMENT_RECONCILE_ENABLED), so a default
+    # install is unchanged, and every disclosure they drove is unchanged too.
+    # See docs/FEATURE_FLAGS.md -> "Changelog 2026-08-12" and
+    # docs/LLM_MIGRATION_INVENTORY.md.
+    # --- Prep crash-safety (2026-07-31 SHYJ-5645 incident) ----------------
+    # The sliding TTL (qa_get_category_job / qa_submit_category refresh the
+    # prep's TTL clock so an ACTIVE orchestration cannot expire mid-run) and the
+    # unfinished-prep disclosure shipped as QA_PREP_SLIDING_TTL_ENABLED /
+    # QA_PREP_DISCLOSE_UNFINISHED, both default ON since 2026-08-01. On
+    # 2026-08-12 both flags were deleted and the behaviour hardcoded ON
+    # (flag-surface reduction, batch 1). Activity can still never extend a prep
+    # forever: total lifetime stays bounded by qa_prep_max_lifetime_s below.
     # Hard ceiling (seconds) on a prep's TOTAL lifetime under the sliding TTL.
     # Lenient never-raise int coercion like the rest; <=0 -> the default.
     qa_prep_max_lifetime_s: int = 14400
-    # Disclose unfinished preps (a fetched worker packet or >=1 staged category
-    # row, not yet expired) on qa-doctor and qa_prepare_test_cases:
-    # "unfinished prep <id> from HH:MM, N/8 staged, expires ~HH:MM -- resume
-    # with qa_prep_status / qa_submit_category, or ignore". DISCLOSURE ONLY --
-    # it never blocks a new prepare and never auto-resumes anything. The line
-    # PRINTS the prep_id, which is a capability token for that prep -- turn this
-    # back off (or ignore the note) anywhere the tool output is shared more
-    # widely than the tester's own chat; the default-ON tradeoff is deliberate
-    # because a run silently vanishing with zero trace is a worse failure mode
-    # for the intended single-tester use case than a short-lived token in that
-    # tester's own transcript. The "fetched packet" signal is preps.touched_at,
-    # which qa_get_category_job and save_submission write whenever EITHER this
-    # flag or qa_prep_sliding_ttl_enabled is on -- so a run that fetched 8
-    # packets and staged nothing (the incident) is disclosed even with the
-    # sliding TTL off. Writing the timestamp is free while TTL enforcement
-    # stays off: prep_store._expired() reads touched_at only under
-    # qa_prep_sliding_ttl_enabled.
-    qa_prep_disclose_unfinished: bool = True
-
-    # --- Phase 2 fan-out follow-ups (2026-07-31; opt-in, default OFF) -------
-    # Category-qualified tc_id contract for finalize-time review sidecars.
-    # Every staged category restarts its tc_ids at TC-001, so a bare
-    # cross-category id is ambiguous until the merge renumbers it. ON:
-    # sidecar ids may be written "<category>:<tc_id>", bare ids stay accepted
-    # where unambiguous, an AMBIGUOUS bare id is refused with a loud note
-    # instead of silently mapping to whichever category merged first (the
-    # latent first-category-wins collision in _remap_dup_groups), and
-    # requirement_matches becomes a valid sidecar field with the same
-    # collision-safe remap. OFF: byte-identical to today, including the
-    # documented latent collision.
-    qa_qualified_tc_ids_enabled: bool = False
-    # Server-assisted duplicate shortlist: when the FINAL expected category is
-    # staged, qa_submit_category's reply appends lexically prescreened
-    # candidate duplicate pairs (stdlib difflib over the merged cases, printed
-    # with POST-MERGE GLOBAL tc_ids -- the phase-1 review settled on global
-    # ids to dodge the per-category TC-001 collision trap) so the host
-    # confirms a shortlist instead of re-reading the merged suite. ADVISORY
-    # only; requires QA_HOST_DEDUP_REVIEW_ENABLED to matter.
-    # Default ON since 2026-08-04 (documented default-OFF exception): the
-    # 22:33 live finalize spent ~4.7 minutes re-reading 79 cases to remove 0;
-    # the prescreen turns that into a confirm/deny of a short list.
-    qa_dup_shortlist_enabled: bool = True
 
     # Append-only audit log (LT-1 ph2). SQLite file recording key events (suite
     # generated, exported, pushed, bug reported) so multi-team deployments have a
@@ -1919,15 +1225,15 @@ class Settings(BaseSettings):
     # still works via markdown menus.
     qa_mcp_elicit_enabled: bool = False
 
-    # GitHub-Release startup self-update (launcher.py -> tools/updater.py).
-    # Opt-in, OFF by default like every other feature gate. When ON, an operator
-    # who starts the server via `python launcher.py` gets a check against the
-    # configured GitHub repo's latest Release; a newer version is downloaded,
-    # swapped in (operator-local state preserved), and `pip install -e .` re-run
-    # before the MCP server starts. Any failure never blocks startup (see updater.py).
-    qa_auto_update_enabled: bool = False
+    # GitHub-Release startup self-update (launcher.py -> tools/updater.py) --
+    # REMOVED 2026-08-13 (flag-surface reduction, batch 6): QA_AUTO_UPDATE_ENABLED
+    # was DELETED and hardcoded OFF, so a developer checkout's `python
+    # launcher.py` never opts itself into a self-update. This does NOT change
+    # the distribution: its generated launcher calls
+    # run_update_check(force=True, ...), and that force argument bypasses the
+    # deleted field exactly as it always did. See docs/FEATURE_FLAGS.md.
     # "owner/name" of the (private) GitHub repo to check for releases. Empty
-    # disables the check even when the flag above is on.
+    # disables the check even when a caller forces it.
     qa_update_repo: str = ""
     # GitHub token for the Releases API + zipball download. REQUIRED for a
     # private repo (fine-grained PAT, read-only Contents scope). Sent only as an
@@ -1935,11 +1241,13 @@ class Settings(BaseSettings):
     github_token: str = ""
     # Bounded network timeout (seconds) for the release check + download.
     qa_update_timeout: int = 10
-    # Integrity self-heal + read-only code lock (distribution installs). When ON
-    # (or forced by the dist launcher), startup verifies every MANIFEST.sha256
-    # entry, re-downloads locally-modified files from the current release, and
-    # chmods code files read-only. OFF by default for developer checkouts.
-    qa_code_lock_enabled: bool = False
+    # Integrity self-heal + read-only code lock (distribution installs) --
+    # REMOVED 2026-08-13 (flag-surface reduction, batch 6): QA_CODE_LOCK_ENABLED
+    # was DELETED and hardcoded OFF for a developer checkout. The distribution
+    # is unaffected: its launcher passes lock_override=True, which takes
+    # precedence exactly as it always did, so startup still verifies every
+    # MANIFEST.sha256 entry, re-downloads locally-modified files and chmods code
+    # read-only there. See docs/FEATURE_FLAGS.md.
 
     # Release-signature enforcement for auto-updates (Ed25519). When ON, an
     # update or self-heal is REFUSED unless the release ships a MANIFEST.sig
@@ -1954,11 +1262,17 @@ class Settings(BaseSettings):
     # --- Usage analytics (telemetry) - opt-out; ON only in the dist. ---
     # Anonymous usage metrics via tools/telemetry.py (PostHog). Sends only
     # when a PostHog key is present (POSTHOG_API_KEY / the dist's baked
-    # default) AND neither opt-out is set. Constitution note: feature gates
-    # default OFF, but telemetry follows the CLI industry standard (opt-out)
-    # - it stays inert in the private checkout (no key) and is turned ON only
-    # by the distribution build, with README disclosure + two opt-outs.
-    qa_telemetry_disabled: bool = False
+    # default) AND no opt-out is set. It stays inert in the private checkout
+    # (no key) and is turned ON only by the distribution build, with README
+    # disclosure.
+    #
+    # 2026-08-13, and this one deserves reading twice: QA_TELEMETRY_DISABLED was
+    # DELETED and hardcoded to its default, False (flag-surface reduction,
+    # batch 6). There is now exactly ONE opt-out, the cross-vendor standard
+    # DO_NOT_TRACK=1 environment variable, which tools/telemetry._opted_out()
+    # still honours. Every document that offered two must name only that one --
+    # an opt-out that silently does nothing is worse than no opt-out at all.
+    # See docs/FEATURE_FLAGS.md.
     # Optional operator-set identity (known teams). When set it becomes the
     # PostHog distinct_id and person email; otherwise an anonymous install
     # UUID (qa_telemetry_id_path) is used. No other PII is ever collected.
@@ -1970,103 +1284,51 @@ class Settings(BaseSettings):
     posthog_api_key: str = ""
 
     @field_validator(
-        "qa_web_search_enabled",
+        "qa_api_test_enabled",
+        "qa_api_framework_write_enabled",
+        "qa_api_framework_write_dry_run",
         "qa_rag_enabled",
-        "qa_token_meter_enabled",
-        "qa_token_meter_detail_enabled",
-        "qa_token_meter_cost_enabled",
-        "qa_coverage_regen_enabled",
         "qa_coverage_regen_merge_calls",
         "qa_ac_anchoring_enforce",
-        "qa_cot_reasoning_enabled",
-        "qa_mutation_eval_enabled",
         "qa_feature_analysis_enabled",
         "qa_test_plan_artifacts",
         "qa_llm_risk_scoring",
-        "qa_test_data_strategy",
-        "qa_edge_cases_functional_type",
-        "qa_module_prefix_normalize_enabled",
-        "qa_jira_uc_table_ac_enabled",
-        "qa_auto_register_clients",
-        "qa_register_atlassian_mcp",
-        "qa_quality_reminder_upfront",
-        "qa_surgical_quality_retry",
-        "testrail_dry_run",
         "jira_fetch_comments",
         "qa_comment_reconcile_enabled",
         "jira_fetch_images",
-        "qa_jira_attachment_fetch_enabled",
         "jira_fetch_parent",
         "qa_jira_ac_field_discovery",
-        "qa_grounding_advisories_enabled",
         "qa_host_grounding_review_enabled",
         "jira_fetch_sibling_stories",
         "qa_mobile_capture",
-        "qa_image_gate_enabled",
-        "qa_image_relevance_enabled",
-        "qa_host_image_preflight_enabled",
         "qa_maestro_enabled",
-        "qa_maestro_dry_run",
         "qa_maestro_heal_enabled",
         "qa_maestro_explore_enabled",
         "qa_maestro_translate_enabled",
         "qa_spec_ingest_enabled",
         "qa_spec_rag_persist",
-        "qa_finetune_export_enabled",
-        "qa_swagger_enabled",
-        "qa_auto_export_xlsx",
-        "qa_env_selfheal_enabled",
-        "qa_xlsx_risk_notes",
         "qa_zephyr_export_enabled",
-        "qa_zephyr_dry_run",
         "qa_dist_mode",
         "qa_mcp_enabled",
         "qa_mcp_elicit_enabled",
-        "qa_jira_preflight",
-        "qa_auto_update_enabled",
-        "qa_code_lock_enabled",
         "qa_update_require_signature",
-        "qa_telemetry_disabled",
-        "xray_dry_run",
         "qa_llm_strict_host",
-        "qa_web_run_enabled",
-        "qa_web_run_dry_run",
         "qa_bilingual_rules",
         "qa_atomicity_rules",
         "qa_standing_rules",
         "qa_semantic_dedup_enabled",
-        "qa_host_feature_report_enabled",
         "qa_host_ambiguity_require_result",
         "qa_host_image_require_relevant",
-        "qa_host_category_resubmit_note_enabled",
-        "qa_host_category_shrink_guard_enabled",
-        "qa_host_dedup_review_enabled",
         "qa_host_dedup_apply",
-        "qa_host_coverage_review_enabled",
         "qa_host_parallel_fanout_enabled",
-        "qa_host_volume_floor_enabled",
-        "qa_host_duplicate_prep_guard_enabled",
         "qa_server_llm_enabled",
-        "qa_host_llm_sampling_enabled",
-        "qa_host_risk_review_enabled",
-        "qa_host_test_plan_review_enabled",
-        "qa_host_checklist_review_enabled",
-        "qa_host_checklist_nli_suppress_enabled",
-        "qa_host_comment_reconcile_suppress_enabled",
-        "qa_prep_sliding_ttl_enabled",
-        "qa_prep_disclose_unfinished",
-        "qa_qualified_tc_ids_enabled",
-        "qa_dup_shortlist_enabled",
         "qa_atomic_checklist_enabled",
         "qa_checklist_nli_enabled",
         "qa_checklist_adjudicate_enabled",
         "qa_checklist_remediation_enabled",
-        "qa_model_tiering_enabled",
         "qa_prompt_cache_enabled",
         "qa_structured_json_enabled",
         "qa_structured_json_strict",
-        "qa_terse_category_output_enabled",
-        "qa_max_tokens_tiering_enabled",
         mode="before",
     )
     @classmethod
@@ -2080,77 +1342,6 @@ class Settings(BaseSettings):
         return _lenient_bool(
             v, info.field_name, raw_default if isinstance(raw_default, bool) else False
         )
-
-    @field_validator(
-        "qa_model_tier_coverage_gaps",
-        "qa_model_tier_maestro_translate",
-        mode="before",
-    )
-    @classmethod
-    def _coerce_model_tier(cls, v: object, info) -> str:
-        """Lenient enum-like coercer for the per-site model-tier overrides.
-
-        Mirrors _coerce_jira_int's shape: an unrecognised value is logged at
-        WARNING and replaced with "default" (follow qa_model_tiering_enabled)
-        rather than raising or wedging the setting into a value
-        resolve_tiered_model doesn't understand.
-        """
-        token = str(v).strip().lower() if v is not None else "default"
-        if token not in ("default", "haiku", "sonnet"):
-            logger.warning(
-                "Invalid %s=%r -- expected default/haiku/sonnet; using default",
-                info.field_name.upper(),
-                v,
-            )
-            return "default"
-        return token
-
-    @field_validator("qa_generation_mode", mode="before")
-    @classmethod
-    def _coerce_generation_mode(cls, v: object) -> str:
-        """QA_GENERATION_MODE is HARDCODED to "host" -- .env is not read.
-
-        2026-08-01: test-case generation must never fall back to a
-        server-side CLI/API/cursor backend, on this install or any other
-        qa-agent-pro install built from this tree. Every input value
-        (server/host/auto, valid or not, including unset) resolves to "host".
-        This only affects resolve_generation_mode()'s three call sites in
-        tools/mcp_handlers.py (test-case generation); it does not touch the
-        other agents, which call llm.py directly and never read this field.
-        """
-        if v not in (None, "host"):
-            logger.info(
-                "QA_GENERATION_MODE=%r ignored -- test-case generation is "
-                "chat-only; always resolving to 'host'",
-                v,
-            )
-        return "host"
-
-    @field_validator(
-        "qa_host_ambiguity_review_enabled",
-        "qa_host_ac_review_enabled",
-        "qa_host_image_description_enabled",
-        mode="before",
-    )
-    @classmethod
-    def _force_host_boomerang_on(cls, v: object, info) -> bool:
-        """These three flags are what makes host-mode generation ACTUALLY
-        chat-only (see qa_generation_mode's WHY above): with any one of them
-        OFF, qa_prepare_test_cases still makes a server-side llm.ask_json /
-        ask_vision call for the ambiguity gate, AC synthesis, or image
-        description respectively. 2026-08-01: hardcoded ON, ignoring .env
-        entirely, for the same reason QA_GENERATION_MODE is hardcoded to
-        "host" -- no combination of settings may reintroduce a server-side
-        LLM call on the test-case generation path.
-        """
-        if v not in (None, True, "true", "True", "1", 1):
-            logger.info(
-                "%s=%r ignored -- host-mode generation is chat-only; "
-                "always forcing this flag ON",
-                info.field_name.upper(),
-                v,
-            )
-        return True
 
     @field_validator("qa_rag_similarity_threshold", mode="before")
     @classmethod
@@ -2337,16 +1528,11 @@ class Settings(BaseSettings):
         "qa_checklist_max_pairs",
         "qa_prompt_cache_min_tokens",
         "qa_prompt_cache_warm_max_tokens",
-        "qa_llm_max_tokens_category",
-        "qa_llm_max_tokens_critic",
-        "qa_llm_max_tokens_rewrite",
         "qa_prep_ttl_s",
         "qa_prep_max_bytes",
         "qa_prep_max_lifetime_s",
         "qa_host_dedup_max_groups",
         "qa_host_dedup_max_group_size",
-        "qa_host_coverage_max_items",
-        "qa_host_coverage_max_tc_per_item",
         "qa_category_stall_s",
         "qa_category_stall_strikes",
         "qa_ambiguity_cache_ttl_s",

@@ -1,8 +1,9 @@
 [project]
 name = "qa-agent-pro"
-version = "1.51.0"
+version = "1.52.0"
 requires-python = ">=3.10"
 dependencies = [
+    "pyyaml>=6.0",  # contracts + OpenAPI specs are YAML (api_test agent)
     # The product surface is the MCP stdio server (mcp_server.py + fastmcp).
     "fastmcp>=2.0",
     # Telemetry runtime (tools/telemetry.py): anonymous machine id + PostHog

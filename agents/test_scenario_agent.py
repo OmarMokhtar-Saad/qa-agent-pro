@@ -22,8 +22,6 @@ from llm import (
     ask_json,
     ask_vision,
     backend_unavailable_reason,
-    resolve_max_tokens_tier,
-    resolve_tiered_model,
     server_llm_scope,
     warm_cache_prefix,
 )
@@ -117,6 +115,7 @@ from tools.token_meter import TokenMeter
 from tools.token_meter import model_text as _meter_model_text
 from tools.token_meter import note as _meter_note
 from tools.untrusted import _GUARD, wrap_untrusted
+from tools.web_search import enabled as web_search_enabled
 from tools.web_search import search_web
 from tools.xlsx_generator import generate_test_case_xlsx
 
@@ -326,11 +325,11 @@ CATEGORIES: list[tuple[str, str, str]] = [
     ),
 ]
 
-# Index of "Edge Cases" in CATEGORIES, plus the opt-in retype
-# (QA_EDGE_CASES_FUNCTIONAL_TYPE). See config/settings.qa_edge_cases_functional_type
-# for the measurement; the short version is that CATEGORIES[3] asks the model for
-# type "Exploratory" while the cases it produces are fully scripted, which skews
-# the XLSX Summary's type metrics.
+# Index of "Edge Cases" in CATEGORIES, plus the retype applied to it.
+# UNCONDITIONAL since 2026-08-12 (QA_EDGE_CASES_FUNCTIONAL_TYPE was deleted).
+# See config/settings.py for the measurement; the short version is that
+# CATEGORIES[3] used to ask the model for type "Exploratory" while the cases it
+# produces are fully scripted, which skewed the XLSX Summary's type metrics.
 _EDGE_CASES_INDEX = 3
 _EDGE_CASES_SCRIPTED_NOTE = (
     ' (these are SCRIPTED cases -- reserve type "Exploratory" for genuinely '
@@ -339,20 +338,15 @@ _EDGE_CASES_SCRIPTED_NOTE = (
 
 
 def effective_categories() -> list[tuple[str, str, str]]:
-    """CATEGORIES with the opt-in QA_EDGE_CASES_FUNCTIONAL_TYPE override applied.
+    """CATEGORIES with the Edge Cases retype applied. Pure and never raises.
 
-    Pure and never raises. With the flag OFF it returns the CATEGORIES object
-    ITSELF, so all 8 category prompts stay byte-identical -- which is what keeps
-    tests/test_server_mode_equivalence.py's golden fixtures valid (they record the
-    category system prompts verbatim, "should be: Exploratory" included). Read by
-    BOTH halves: the server fan-out, and prepared.categories, which is what host
-    mode builds its per-category instructions from.
+    Always returns a NEW list: the retype is unconditional since 2026-08-12, and
+    tests/fixtures/server_mode_equivalence/ (which records the 8 category system
+    prompts verbatim) was RE-CAPTURED against it. The module-level CATEGORIES
+    list is never mutated. Read by BOTH halves: the server fan-out, and
+    prepared.categories, which is what host mode builds its per-category
+    instructions from.
     """
-    try:
-        if not settings.qa_edge_cases_functional_type:
-            return CATEGORIES
-    except Exception:  # pragma: no cover - settings must never break generation
-        return CATEGORIES
     out = list(CATEGORIES)
     name, focus, _ptype = out[_EDGE_CASES_INDEX]
     out[_EDGE_CASES_INDEX] = (name, focus + _EDGE_CASES_SCRIPTED_NOTE, "Functional")
@@ -474,7 +468,11 @@ async def _enrich_with_web_search(feature_text: str) -> tuple[str, list[str]]:
     enrichment_block is an empty string when search is disabled or all searches fail.
     Never raises.
     """
-    if not settings.qa_web_search_enabled:
+    # QA_WEB_SEARCH_ENABLED was DELETED on 2026-08-13 (flag-surface
+    # reduction, batch 6); web_search.enabled() is a hardcoded False that no
+    # .env value reaches, so this always returns empty and nothing leaves the
+    # org for a third-party search API.
+    if not web_search_enabled():
         return "", []
 
     matches = _detect_compliance_keywords(feature_text)
@@ -624,8 +622,9 @@ _CATEGORY_SYSTEM_TEMPLATE = (
     _CATEGORY_HEADER + _CATEGORY_TASK_TEMPLATE + _CATEGORY_RULES + _CATEGORY_JSON_TAIL
 )
 
-# Appended to the category prompt ONLY when QA_TEST_DATA_STRATEGY is ON. When OFF
-# the assembled prompt is byte-identical to the pre-feature path.
+# Appended to EVERY category prompt. Unconditional since 2026-08-12
+# (QA_TEST_DATA_STRATEGY was deleted). The base template constant itself is
+# unchanged, so the cached-prefix recomposition still matches it byte for byte.
 _TEST_DATA_INSTRUCTION = """
 
 TEST DATA STRATEGY (populate the case-level "test_data" array ONLY when the case
@@ -1358,80 +1357,14 @@ async def _semantic_dedupe_cases(
         return cases, ""
 
 
-class _CategoryReasonedSuite(TestSuite):
-    """CoT wrapper (Feature 1): a TestSuite plus an optional ``analysis`` field.
-
-    When ``qa_cot_reasoning_enabled`` is ON, the category prompt asks the model to
-    FIRST enumerate what to test (fields, limits, risks, attack vectors for this
-    category) into ``analysis``, THEN derive ``test_cases`` from that reasoning — in
-    the SAME ask_json call. ``analysis`` is discarded after generation (never shown
-    to testers); it exists only so the model's chain-of-thought is an explicit,
-    validated part of the response instead of being suppressed by the JSON-only
-    instruction. Subclassing TestSuite keeps every existing validator (unique
-    tc_ids, sequential steps, stable-id assignment) and the ``extra="forbid"`` guard
-    intact — ``analysis`` is a declared field, so it is not rejected as "extra".
-    Defaulted to an empty list so a model that omits it still validates.
-    """
-
-    analysis: list[str] = pydantic.Field(
-        default_factory=list,
-        description="Internal reasoning: things-to-test for this category "
-        "(fields, boundaries, risks, attack vectors). Used only to steer "
-        "generation; discarded afterwards.",
-    )
-
-
-_COT_ANALYSIS_INSTRUCTION = """
-
-CHAIN-OF-THOUGHT (reason before you write):
-Before writing any test case, FIRST populate the "analysis" array with short bullet
-phrases enumerating exactly what must be tested for THIS category — every input
-field and its limits, the boundary/edge values that matter, the error/negative
-paths, and (for Security) the concrete attack vectors. Then derive every entry in
-"test_cases" directly from that analysis so each thing you listed becomes at least
-one concrete case. Keep "analysis" concise (roughly 6-12 short bullets); it is
-internal scaffolding that is discarded after generation, so do NOT restate it inside
-the test cases.
-"""
-
-_TERSE_OUTPUT_INSTRUCTION = """
-
-OUTPUT DISCIPLINE (token budget -- read carefully; this does NOT relax any
-concreteness rule above):
-- Do NOT populate "risk_score", "risk_label", or "risk_rationale" -- the
-  system computes these AFTER your output and unconditionally overwrites
-  whatever you write, so any value here is pure wasted output. Leave
-  risk_score as 0 and risk_label/risk_rationale as empty strings ("").
-- Set "automation_status" to "Manual" for every case without deliberating a
-  classification -- this field is not evaluated downstream today.
-- "postconditions" is optional and is NOT rendered by any export format
-  (XLSX/CSV/Gherkin/Playwright/TestRail/Xray/Maestro) -- only
-  "preconditions" is. Set it to null unless a genuinely different follow-up
-  state matters beyond what the last step's expected_result already states;
-  when used, one short phrase only, never a paragraph.
-- "module" and "title" are short labels, not sentences -- do not pad them
-  with extra clauses.
-- Keep every "action" and "expected_result" to the shortest sentence that
-  still satisfies every concreteness rule above -- do not restate the
-  scenario, add a rationale/explanation clause, or repeat information
-  already given in an earlier step or in preconditions.
-- EXEMPTION: bilingual template tokens such as {{EN:KEY}} / {{AR:KEY}} are
-  NEVER redundant -- when a rule above requires both language tokens in an
-  expected_result, keep every one of them. The "do not repeat information"
-  rule does not apply to these tokens; they are substituted mechanically
-  after generation and dropping one breaks the bilingual pair.
-- Do not add any field, prose, or commentary beyond the JSON object itself.
-"""
-
-
 def _category_response_model() -> type[TestSuite]:
-    """The response model every category call uses this run (Feature 1 / CoT).
+    """The response model every category call uses.
 
     Shared by _generate_for_category and the cache warm-up so the JSON schema
     baked into `system` by llm._json_system is byte-identical in both — a
     mismatch would warm an entry nothing ever reads.
     """
-    return _CategoryReasonedSuite if settings.qa_cot_reasoning_enabled else TestSuite
+    return TestSuite
 
 
 def _category_shared_system(rtm_hint: str) -> str:
@@ -1451,13 +1384,7 @@ def _category_shared_system(rtm_hint: str) -> str:
         + _CATEGORY_RULES_LEAD
         + _CATEGORY_RULES
         + _CATEGORY_JSON_TAIL.format()
-        + (_COT_ANALYSIS_INSTRUCTION if settings.qa_cot_reasoning_enabled else "")
-        + (_TEST_DATA_INSTRUCTION if settings.qa_test_data_strategy else "")
-        + (
-            _TERSE_OUTPUT_INSTRUCTION
-            if settings.qa_terse_category_output_enabled
-            else ""
-        )
+        + _TEST_DATA_INSTRUCTION
         + rtm_hint
         + _GUARD
     )
@@ -1484,42 +1411,21 @@ async def _generate_for_category(
     min_count, max_count = _case_count_bounds(
         complexity_text or feature_text or user_msg, ui_content
     )
-    cot_enabled = bool(settings.qa_cot_reasoning_enabled)
-    # Feature 1 (CoT): when ON, use the wrapper model (TestSuite + an ``analysis``
-    # field) and append the reasoning instruction so the model plans before it
-    # writes — in the SAME ask_json call (no extra round-trip). When OFF,
-    # response_model/cot_suffix are exactly TestSuite/"" so the assembled prompt and
-    # the validation model are byte-identical to the pre-feature path.
-    response_model: type[TestSuite] = (
-        _CategoryReasonedSuite if cot_enabled else TestSuite
-    )
-    cot_suffix = _COT_ANALYSIS_INSTRUCTION if cot_enabled else ""
-    # Test-data strategy instruction (QA_TEST_DATA_STRATEGY, default OFF). When OFF
-    # the assembled prompt is byte-identical to the pre-feature path. Computed once
-    # here so BOTH assembly sites (this one and the fallback-model rebuild) splice it.
-    test_data_suffix = _TEST_DATA_INSTRUCTION if settings.qa_test_data_strategy else ""
-    # Folds the strict quality reminder into the FIRST prompt (opt-in, default
-    # OFF) instead of only appending it after a triggered retry -- prevents
-    # rather than repairs. See .claude/plans/plan-surgical-retry.md.
-    quality_reminder_suffix = (
-        _QUALITY_RETRY_REMINDER if settings.qa_quality_reminder_upfront else ""
-    )
-    # Token-budget suffix (QA_TERSE_CATEGORY_OUTPUT_ENABLED, opt-in, default
-    # OFF -- see .claude/plans/plan-terse-schemas.md). Never relaxes the
-    # anti-vagueness rules; only tells the model to skip fields that are
-    # always discarded/unread downstream and to avoid filler on the rest.
-    # Used by BOTH non-cached assembly sites below; the cached-prefix path
-    # applies the same conditional inside _category_shared_system instead,
-    # so the warmed entry and every category call stay byte-stable.
-    terse_suffix = (
-        _TERSE_OUTPUT_INSTRUCTION if settings.qa_terse_category_output_enabled else ""
-    )
+    response_model: type[TestSuite] = TestSuite
+    # Test-data strategy instruction. Unconditional since 2026-08-12
+    # (QA_TEST_DATA_STRATEGY was deleted). Computed once here so BOTH assembly
+    # sites (this one and the fallback-model rebuild) splice the same string.
+    test_data_suffix = _TEST_DATA_INSTRUCTION
+    # Folds the strict quality reminder into the FIRST prompt instead of only
+    # appending it after a triggered retry -- prevents rather than repairs.
+    # Unconditional since 2026-08-12 (QA_QUALITY_REMINDER_UPFRONT was deleted).
+    # See .claude/plans/plan-surgical-retry.md.
+    quality_reminder_suffix = _QUALITY_RETRY_REMINDER
     # Prompt caching (QA_PROMPT_CACHE_ENABLED + api backend + a prefix the
     # caller already warmed). ON: `system` becomes category-INDEPENDENT and the
     # FOCUS / case-count / preferred-type instruction moves into a small
     # trailing UNCACHED user block, so all 8 concurrent calls share one cached
-    # prefix. The upfront quality reminder (surgical-retry's
-    # QA_QUALITY_REMINDER_UPFRONT) rides that suffix too, because
+    # prefix. The upfront quality reminder rides that suffix too, because
     # _category_shared_system must stay byte-stable to match the warmed entry.
     # OFF (or an un-warmed prefix): identical template, identical order,
     # identical trailing _GUARD — the assembled prompt is byte-for-byte what
@@ -1547,9 +1453,7 @@ async def _generate_for_category(
                 min_count=min_count,
                 max_count=max_count,
             )
-            + cot_suffix
             + test_data_suffix
-            + terse_suffix
             + quality_reminder_suffix
             + rtm_hint
             + _GUARD
@@ -1584,7 +1488,6 @@ async def _generate_for_category(
                         model=model_override,
                         user_suffix=user_suffix,
                         cache_prefix=cache_on,
-                        max_tokens=resolve_max_tokens_tier("category"),
                     ),
                     timeout=category_timeout,
                 )
@@ -1631,113 +1534,46 @@ async def _generate_for_category(
             try:
                 ratio = quality_ratio(cases)
                 if ratio > _QUALITY_RETRY_THRESHOLD and attempt == 0:
-                    if settings.qa_surgical_quality_retry:
-                        try:
-                            issues = _flagged_case_issues(cases)
-                            repair_user, flagged = _build_quality_repair_prompt(
-                                cases, issues
-                            )
-                            if flagged:
-                                logger.warning(
-                                    "Category '%s': %.0f%% of steps are vague/placeholder — "
-                                    "repairing %d/%d flagged case(s) only",
-                                    category_name,
-                                    ratio * 100,
-                                    len(flagged),
-                                    len(cases),
-                                )
-                                repair_batch: _QualityRepairBatch = (
-                                    await asyncio.wait_for(
-                                        _tagged_ask_json(
-                                            _FANOUT_LEDGER_ID,
-                                            system=_CATEGORY_REPAIR_SYSTEM,
-                                            user=repair_user,
-                                            response_model=_QualityRepairBatch,
-                                            max_tokens=resolve_max_tokens_tier(
-                                                "rewrite"
-                                            ),
-                                        ),
-                                        timeout=_CATEGORY_TIMEOUT,
-                                    )
-                                )
-                                cases = _merge_repaired_cases(
-                                    cases, repair_batch, flagged
-                                )
-                                _meter_note(
-                                    meter,
-                                    "rewrite",
-                                    settings.qa_llm_model,
-                                    system=_CATEGORY_REPAIR_SYSTEM,
-                                    user=repair_user,
-                                    output_text=_meter_model_text(repair_batch),
-                                )
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception:
-                            logger.exception(
-                                "Category '%s' surgical quality repair failed — "
-                                "keeping original result",
-                                category_name,
-                            )
-                    else:
-                        logger.warning(
-                            "Category '%s': %.0f%% of steps are vague/placeholder — "
-                            "retrying once with a stricter reminder",
-                            category_name,
-                            ratio * 100,
+                    try:
+                        issues = _flagged_case_issues(cases)
+                        repair_user, flagged = _build_quality_repair_prompt(
+                            cases, issues
                         )
-                        try:
-                            # Caching ON: the reminder rides the SUFFIX so
-                            # `system` stays byte-stable and this retry is
-                            # another cheap cache READ instead of a fresh
-                            # 1.25x write. Both paths keep surgical-retry's
-                            # guard: never append the reminder a second time
-                            # when the upfront flag already folded it in.
-                            retry_system = (
-                                system
-                                if cache_on or _QUALITY_RETRY_REMINDER in system
-                                else system + _QUALITY_RETRY_REMINDER
+                        if flagged:
+                            logger.warning(
+                                "Category '%s': %.0f%% of steps are vague/placeholder — "
+                                "repairing %d/%d flagged case(s) only",
+                                category_name,
+                                ratio * 100,
+                                len(flagged),
+                                len(cases),
                             )
-                            retry_user_suffix = user_suffix
-                            if cache_on and _QUALITY_RETRY_REMINDER not in (
-                                user_suffix or ""
-                            ):
-                                retry_user_suffix = (
-                                    user_suffix or ""
-                                ) + _QUALITY_RETRY_REMINDER
-                            retry_suite: TestSuite = await asyncio.wait_for(
+                            repair_batch: _QualityRepairBatch = await asyncio.wait_for(
                                 _tagged_ask_json(
                                     _FANOUT_LEDGER_ID,
-                                    system=retry_system,
-                                    user=user_msg,
-                                    response_model=response_model,
-                                    on_progress=on_progress,
-                                    user_suffix=retry_user_suffix,
-                                    cache_prefix=cache_on,
-                                    max_tokens=resolve_max_tokens_tier("category"),
+                                    system=_CATEGORY_REPAIR_SYSTEM,
+                                    user=repair_user,
+                                    response_model=_QualityRepairBatch,
                                 ),
                                 timeout=_CATEGORY_TIMEOUT,
                             )
-                            if quality_ratio(retry_suite.test_cases) < ratio:
-                                cases = retry_suite.test_cases
+                            cases = _merge_repaired_cases(cases, repair_batch, flagged)
                             _meter_note(
                                 meter,
-                                "generation",
+                                "rewrite",
                                 settings.qa_llm_model,
-                                system=retry_system,
-                                user=user_msg + (retry_user_suffix or ""),
-                                output_text="".join(
-                                    tc.model_dump_json()
-                                    for tc in retry_suite.test_cases
-                                ),
+                                system=_CATEGORY_REPAIR_SYSTEM,
+                                user=repair_user,
+                                output_text=_meter_model_text(repair_batch),
                             )
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception:
-                            logger.exception(
-                                "Category '%s' quality-retry failed — keeping original result",
-                                category_name,
-                            )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "Category '%s' surgical quality repair failed — "
+                            "keeping original result",
+                            category_name,
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1750,9 +1586,9 @@ async def _generate_for_category(
             # ids are still unambiguous within THIS category. Cross-category flatten
             # + the final renumber both rewrite tc_ids, so a raw-id ref would then
             # collide/mis-resolve across categories; stable_id survives both and is
-            # restored to the final tc_id after renumber. No-op when the flag is OFF.
-            if settings.qa_test_data_strategy:
-                cases = resolve_chained_refs_to_stable(cases)
+            # restored to the final tc_id after renumber. A case that declared no
+            # test_data is untouched.
+            cases = resolve_chained_refs_to_stable(cases)
             return CategoryResult(
                 category_name=category_name,
                 cases=cases,
@@ -1826,9 +1662,7 @@ async def _generate_for_category(
                                     min_count=rescue_min,
                                     max_count=rescue_max,
                                 )
-                                + cot_suffix
                                 + test_data_suffix
-                                + terse_suffix
                                 + quality_reminder_suffix
                                 + rtm_hint
                                 + _GUARD
@@ -2013,7 +1847,6 @@ async def _rewrite_vague_fields(
             user=user,
             response_model=_RewriteBatch,
             model=settings.qa_classifier_model or None,
-            max_tokens=resolve_max_tokens_tier("rewrite"),
         )
         _meter_note(
             meter,
@@ -2084,14 +1917,11 @@ async def analyze_coverage_gaps(
             _MARKDOWN_LEDGER_ID,
             system=_COVERAGE_CRITIC_SYSTEM,
             user=user_msg,
-            model=resolve_tiered_model(settings.qa_model_tier_coverage_gaps),
-            max_tokens=resolve_max_tokens_tier("critic"),
         )
         _meter_note(
             meter,
             "critic",
-            resolve_tiered_model(settings.qa_model_tier_coverage_gaps)
-            or settings.qa_llm_model,
+            settings.qa_llm_model,
             system=_COVERAGE_CRITIC_SYSTEM,
             user=user_msg,
             output_text=result if isinstance(result, str) else "",
@@ -2175,7 +2005,6 @@ async def critique_coverage(
                 user=user_msg,
                 response_model=CoverageCritique,
                 model=settings.qa_classifier_model or None,
-                max_tokens=resolve_max_tokens_tier("critic"),
             ),
             timeout=_resolve_category_ceiling(),
         )
@@ -2443,17 +2272,6 @@ async def _remediate_gaps(
                     focus = format_checklist_gap_focus(batch)
                     gap_preview = ", ".join(it.item_id for it in batch[:3])
             if not focus:
-                if not settings.qa_coverage_regen_enabled:
-                    # Checklist matching degraded (or produced no usable focus)
-                    # and the legacy critic is OFF: stop instead of inventing
-                    # work. Zero extra generation rounds.
-                    remaining = []
-                    await _emit_status(
-                        on_status,
-                        "⚠️ Coverage review skipped — requirement matching was "
-                        "unreliable (no embeddings backend).",
-                    )
-                    break
                 if settings.qa_coverage_regen_merge_calls:
                     # QA_COVERAGE_REGEN_MERGE_CALLS (P2#5): critique + gap-fill
                     # in ONE ask_json call. Applies ONLY to this legacy critic
@@ -3730,8 +3548,6 @@ def grounding_sections(
     Never raises: any failure yields two empty strings.
     """
     try:
-        if not bool(getattr(settings, "qa_grounding_advisories_enabled", True)):
-            return "", ""
         source = source_text or target_source_text(user_msg)
         consistency = consistency_warning_section(cases)
         enum_values = enumerations(source)
@@ -3833,16 +3649,19 @@ async def _finalize_generation(
     if source_acs and settings.qa_ac_anchoring_enforce:
         all_cases = filter_unanchored_cases(all_cases, source_acs)
 
-    # T-08: structured critic + bounded remediation loop (opt-in). When enabled,
-    # gaps the fan-out missed are reviewed and filled round by round, so the
-    # critique actually closes the loop instead of only being displayed.
-    # remaining_gaps is None when the review loop didn't run (regen disabled); a
-    # list (possibly empty) when it did — used to drive a UNIFIED, advisory gap
-    # display consistent with what the loop actually tried to close.
+    # T-08: structured critic + bounded remediation loop. UNCONDITIONAL since
+    # 2026-08-12 (QA_COVERAGE_REGEN_ENABLED was deleted): gaps the fan-out
+    # missed are reviewed and filled round by round, so the critique actually
+    # closes the loop instead of only being displayed.
+    # remaining_gaps is None only when the review loop didn't run at all (host
+    # submit, an empty suite, or single_screen); a list (possibly empty) when it
+    # did — used to drive a UNIFIED, advisory gap display consistent with what
+    # the loop actually tried to close.
     remaining_gaps: list[str] | None = None
     # Batch 2: the checklist can drive the SAME bounded loop with a deterministic
-    # stop condition. Requires BOTH flags, so enabling the checklist for its
-    # audit alone never silently starts extra generation rounds.
+    # stop condition. QA_CHECKLIST_REMEDIATION_ENABLED still gates that, so
+    # enabling the checklist for its audit alone never silently switches the loop
+    # from the LLM critic to the checklist matcher.
     # ``remediate`` is False ONLY on the host-mode ("boomerang") submit path:
     # there the regeneration round belongs to the tester's OWN chat model, and
     # a server-side round would (a) defeat host mode's cost premise and (b) with
@@ -3855,12 +3674,7 @@ async def _finalize_generation(
     _checklist_remediation = bool(
         remediate and checklist_items and settings.qa_checklist_remediation_enabled
     )
-    if (
-        remediate
-        and (settings.qa_coverage_regen_enabled or _checklist_remediation)
-        and all_cases
-        and not single_screen
-    ):
+    if remediate and all_cases and not single_screen:
         await _emit_status(
             on_status,
             f"📝 Drafted {len(all_cases)} test cases — starting coverage review…",
@@ -4069,19 +3883,11 @@ async def _finalize_generation(
         tc.model_copy(update={"tc_id": f"TC-{i:03d}"}) for i, tc in enumerate(scored, 1)
     ]
 
-    # Test-data strategy (QA_TEST_DATA_STRATEGY, default OFF). When ON, restore each
-    # case's chained_from — held as the target's content stable_id since the
-    # per-category boundary — to the target's FINAL tc_id (renumber rewrote ids);
-    # a stable_id whose case was deduped/dropped is cleared (dangling). When OFF,
-    # drop any test_data the model emitted uninstructed so every renderer and export
-    # stays byte-identical to the pre-feature output.
-    if settings.qa_test_data_strategy:
-        renumbered = restore_chained_refs_from_stable(renumbered)
-    else:
-        renumbered = [
-            tc.model_copy(update={"test_data": []}) if tc.test_data else tc
-            for tc in renumbered
-        ]
+    # Test-data strategy (unconditional since 2026-08-12). Restore each case's
+    # chained_from -- held as the target's content stable_id since the
+    # per-category boundary -- to the target's FINAL tc_id (renumber rewrote ids);
+    # a stable_id whose case was deduped/dropped is cleared (dangling).
+    renumbered = restore_chained_refs_from_stable(renumbered)
 
     # Module-name canonicalization (2026-08-01): parallel category workers are
     # blind to each other's output and `module` is unconstrained free text, so
@@ -4089,19 +3895,15 @@ async def _finalize_generation(
     # order" x60 / "Cancel Order" x36 in one real suite). Unconditional and
     # deterministic, same as the tc_id renumber above -- it only rewrites
     # casing/whitespace, never drops or reorders a case.
-    # Second pass (2026-08-03, QA_MODULE_PREFIX_NORMALIZE_ENABLED, default OFF):
-    # the casing pass above cannot merge a QUALIFIER-PREFIXED variant, because
-    # "Sehhaty Store - Cancel Order" and "Cancel Order" are different bucket keys.
-    # A real suite shipped 12 + 86 cases of ONE feature under those two labels.
-    # Read with getattr so an install whose .env predates the flag behaves exactly
-    # as before; see tools/quality_checks._qualifier_prefix_merges for why the rule
-    # merges only on TAIL containment and refuses head containment outright.
-    renumbered = normalize_module_names(
-        renumbered,
-        merge_qualifier_prefixes=bool(
-            getattr(settings, "qa_module_prefix_normalize_enabled", False)
-        ),
-    )
+    # Second pass (2026-08-03; unconditional since 2026-08-12, when
+    # QA_MODULE_PREFIX_NORMALIZE_ENABLED was deleted): the casing pass above
+    # cannot merge a QUALIFIER-PREFIXED variant, because "Sehhaty Store - Cancel
+    # Order" and "Cancel Order" are different bucket keys. A real suite shipped
+    # 12 + 86 cases of ONE feature under those two labels. See
+    # tools/quality_checks._qualifier_prefix_merges for why the rule merges only
+    # on TAIL containment, refuses head containment outright, and refuses a tail
+    # claimed by rival qualifier families.
+    renumbered = normalize_module_names(renumbered, merge_qualifier_prefixes=True)
 
     suite = TestSuite(test_cases=renumbered)
     # Step 0: carry the traceability counts OUT as data. build_rtm_summary has
@@ -4232,8 +4034,8 @@ async def _finalize_generation(
         deterministic_coverage=bool(checklist_section),
     )
 
-    # One-line-per-case test-data note (QA_TEST_DATA_STRATEGY). Empty string when
-    # no case declares a data plan, so the summary is byte-identical when unused.
+    # One-line-per-case test-data note. Empty string when no case declares a data
+    # plan, so the summary is byte-identical when unused.
     test_data_section = data_notes_section(renumbered)
 
     # SHYJ-7154 Fix 3: advisory AC-anchoring report — only when the ticket
@@ -4325,8 +4127,8 @@ async def _finalize_generation(
         # identified during the review rounds were addressed" directly under a
         # section listing real uncovered requirements.
         # ALL THREE conditions are load-bearing. _checklist_remediation: with
-        # QA_COVERAGE_REGEN_ENABLED=true and
-        # QA_CHECKLIST_REMEDIATION_ENABLED=false the LEGACY critic ran, and its
+        # QA_CHECKLIST_REMEDIATION_ENABLED=false the LEGACY critic ran (it is
+        # unconditional since 2026-08-12), and its
         # gap phrases appear NOWHERE in the checklist section (which lists CL
         # ids only), so suppressing them here would delete the only report of
         # them. checklist_section: when the final matcher call failed there is
@@ -4404,12 +4206,12 @@ async def _finalize_generation(
     # F13: `feature_report_enabled=False` suppresses the AUTOMATIC report on the
     # host submit path -- 42.0s of fixed-backend LLM work (measured 2026-07-30)
     # on a path whose whole premise is that the server makes no generation LLM
-    # call. That argument is no longer hardcoded: the submit call site passes
-    # QA_HOST_FEATURE_REPORT_ENABLED (default OFF), so the suppression is the
-    # default rather than the only option, and the reply discloses it.
-    # force_feature_report stays honoured: the qa_feature_analysis TOOL passes it
-    # explicitly, so asking for the report still produces it. Only the implicit
-    # "run it on every generation too" behaviour is gated.
+    # call. The host submit call site passes the constant False (the operator
+    # opt-in QA_HOST_FEATURE_REPORT_ENABLED was deleted on 2026-08-12; it was
+    # default OFF, so nothing changed). force_feature_report stays honoured: the
+    # qa_feature_analysis TOOL passes it explicitly, so asking for the report
+    # still produces it. Only the implicit "run it on every generation too"
+    # behaviour is gated.
     if (
         feature_report_enabled
         and (settings.qa_feature_analysis_enabled or force_feature_report)
@@ -4429,8 +4231,8 @@ async def _finalize_generation(
             )
             logger.info(
                 "finalize: feature-analysis report took %.1fs (server-side LLM "
-                "call; QA_HOST_FEATURE_REPORT_ENABLED=false skips it on a host "
-                "submit, QA_FEATURE_ANALYSIS_ENABLED=false everywhere)",
+                "call; the host submit path passes feature_report_enabled=False, "
+                "QA_FEATURE_ANALYSIS_ENABLED=false everywhere)",
                 time.monotonic() - _fa_t0,
             )
             full_md = render_report_markdown(report)
@@ -4472,14 +4274,7 @@ async def _finalize_generation(
         rtm_line = rtm_oneline(
             acs, suite.test_cases, derived=bool(acs) and not source_acs
         )
-        meter_line = (
-            meter.summary_line(
-                detailed=settings.qa_token_meter_detail_enabled,
-                show_cost=settings.qa_token_meter_cost_enabled,
-            )
-            if settings.qa_token_meter_enabled
-            else ""
-        )
+        meter_line = meter.summary_line(detailed=True, show_cost=True)
         compact = (
             f"{feature_report}"
             f"Generated **{tc_count} test cases** ({priority_summary})."

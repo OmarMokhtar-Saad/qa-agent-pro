@@ -758,26 +758,13 @@ def main() -> int:
             log.info("Startup update check: %s", status)
         except Exception as exc:  # never block startup
             log.warning("Update check failed (%s) — starting current version.", exc)
-        # Fix 7: pick up an editor installed AFTER this server was. A
-        # SEPARATE step from the update check on purpose -- code integrity
-        # and editor registration must not gate one another through
-        # QA_AUTO_UPDATE_ENABLED. insert_only, so an entry a tester edited
-        # by hand is never rewritten. Never blocks startup.
-        try:
-            from config.settings import settings as _s
-
-            if bool(getattr(_s, "qa_auto_register_clients", False)):
-                from tools.client_registry import register_all
-
-                _entry = "start.cmd" if sys.platform == "win32" else "start.sh"
-                _start = str(INSTALL_DIR / _entry)
-                for _label, _status, _detail in register_all(
-                    _start, insert_only=True
-                ):
-                    if _status in ("added", "error"):
-                        log.info("MCP registration: %s: %s (%s)", _label, _status, _detail)
-        except Exception as exc:  # never block startup
-            log.warning("Client registration pass failed (%s).", exc)
+        # Fix 7 (the startup client-registration pass) was REMOVED on
+        # 2026-08-13: QA_AUTO_REGISTER_CLIENTS was deleted along with the
+        # rest of the kill-switch flag family and hardcoded to its
+        # default, OFF, so this launcher no longer writes MCP entries into
+        # editor config files outside the install dir, unattended, at
+        # startup. An editor installed AFTER qa-agent-pro is picked up by
+        # running ~/qa-agent-pro/connect.sh, which qa-doctor points at.
     sup = Supervisor()
     if resume_path:
         try:

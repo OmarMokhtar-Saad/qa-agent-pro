@@ -81,7 +81,7 @@ class TestStep(BaseModel):
 
 
 class TestDataItem(BaseModel):
-    """One field's data-provisioning plan for a test case (QA_TEST_DATA_STRATEGY).
+    """One field's data-provisioning plan for a test case.
 
     Declares WHAT data a case needs and HOW a manual tester should source it, so
     testers stop guessing which values must be unique per run, come from a seeded
@@ -211,9 +211,8 @@ class TestCase(BaseModel):
         default_factory=list,
         description="Optional per-case data-provisioning plan: for each data field "
         "the test needs, how to source its value (unique per run / seed account / "
-        "chained from an earlier case / static) with a SAFE fake example. Empty by "
-        "default; populated only when QA_TEST_DATA_STRATEGY is enabled and ignored "
-        "by renderers otherwise.",
+        "chained from an earlier case / static) with a SAFE fake example. Empty "
+        "for a case that manipulates no data.",
     )
 
     @field_validator("steps", mode="after")

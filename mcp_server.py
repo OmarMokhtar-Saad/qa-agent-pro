@@ -561,8 +561,8 @@ def build_server():
         ask them myself (describe / Jira / web / Swagger / mobile screens /
         Jira + mobile) via a dialog or menu.
 
-        Returns a concise markdown summary plus a persisted suite_id. Unless
-        QA_AUTO_EXPORT_XLSX is turned off, the reply ALREADY contains the path
+        Returns a concise markdown summary plus a persisted suite_id. The reply
+        ALREADY contains the path
         to a finished .xlsx file: relay that path to the user as the
         deliverable and do NOT ask which export format they want or offer to
         push anywhere. Call qa_export_suite only when the user names a
@@ -573,7 +573,7 @@ def build_server():
         user. Once they answer, call again with the fuller text, or set
         proceed_anyway=true to generate anyway with whatever is available.
 
-        IMAGE GATE (QA_IMAGE_GATE_ENABLED, ON by default). This tool runs the
+        IMAGE GATE (always on). This tool runs the
         generation in YOUR chat model. ASK FIRST: for a Jira URL, ask the USER
         where the ticket's SCREENS come from BEFORE your first call and pass
         `source_plan` on it -- this server cannot read images out of Jira, only
@@ -659,7 +659,7 @@ def build_server():
         prep_id. Use `qa_get_category_job` with category_name="all" for every
         worker packet in ONE call (or one name for a single packet).
 
-        IMAGE GATE (QA_IMAGE_GATE_ENABLED, ON by default). ASK FIRST: for a Jira
+        IMAGE GATE (always on). ASK FIRST: for a Jira
         URL, ask the USER where the ticket's SCREENS come from BEFORE your first
         call and pass `source_plan` on it -- this server cannot read images out of
         Jira, only text, so it has to know, and asking up front costs ZERO extra
@@ -931,6 +931,70 @@ def build_server():
                     task_id, report, progress=_make_progress(ctx)
                 ),
             )
+
+        if settings.qa_api_test_enabled:
+
+            @mcp.tool()
+            async def qa_prepare_api_tests(
+                input: str = "",
+                intake_id: str = "",
+                confirmed: bool = False,
+                ctx: Context = None,
+            ) -> str:
+                """Start (or continue) an API endpoint test intake.
+
+                Chat-only: the server makes NO model call. Paste a filled/partial
+                contract template, a curl command, an OpenAPI URL/JSON, or prose.
+                Returns an intake card (with the questions to ask) or, once complete
+                and confirmed=true, a generation task envelope YOU answer, then call
+                qa_submit_api_tests with the task_id and your cases.
+                """
+                return await _tracked(
+                    "qa_prepare_api_tests",
+                    ctx,
+                    mcp_handlers.handle_prepare_api_tests(
+                        input, intake_id, confirmed, progress=_make_progress(ctx)
+                    ),
+                )
+
+            @mcp.tool()
+            async def qa_submit_api_tests(
+                task_id: str, suite: str, ctx: Context
+            ) -> str:
+                """Submit the API test cases YOU generated for a qa_prepare_api_tests task.
+
+                Send the task_id and your JSON {"cases": [...]}. The server grounds
+                every assertion against the confirmed contract (dropping hallucinated
+                fields, refusing cases that cannot fail) and returns the grounded
+                suite + a suite_id for qa_write_api_test.
+                """
+                return await _tracked(
+                    "qa_submit_api_tests",
+                    ctx,
+                    mcp_handlers.handle_submit_api_tests(
+                        task_id, suite, progress=_make_progress(ctx)
+                    ),
+                )
+
+            @mcp.tool()
+            async def qa_write_api_test(
+                suite_id: str, apply: bool = False, ctx: Context = None
+            ) -> str:
+                """Render + (dry-run or) write the Java tests for a finalized suite.
+
+                apply=false (default) returns the branch, target paths and the full
+                Java source — nothing is written. apply=true writes via the framework
+                repo's own ops pipeline (branch -> write -> spotless -> test-compile
+                -> commit), and only when QA_API_FRAMEWORK_WRITE_ENABLED is on and
+                QA_API_FRAMEWORK_WRITE_DRY_RUN is off. Never main, never push.
+                """
+                return await _tracked(
+                    "qa_write_api_test",
+                    ctx,
+                    mcp_handlers.handle_write_api_test(
+                        suite_id, apply, progress=_make_progress(ctx)
+                    ),
+                )
 
         @mcp.tool()
         async def qa_submit_explore_step(task_id: str, step: str, ctx: Context) -> str:

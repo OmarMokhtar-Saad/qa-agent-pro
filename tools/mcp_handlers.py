@@ -64,6 +64,7 @@ from tools.device_manager import (
 )
 from tools.gherkin_exporter import generate_feature_file
 from tools.image_description import describe_images
+from tools.jira_attachments import enabled as attachments_enabled
 from tools.jira_attachments import fetch_attachment_bytes
 from tools.jira_fetcher import fetch_url_content, verify_jira_access
 from tools.jira_mcp import (
@@ -706,7 +707,7 @@ def _available_exporters(
             or (settings.qa_export_dir or "").strip()
             or None,
             story_key=story_key,
-            dry_run=bool(settings.qa_zephyr_dry_run),
+            dry_run=_zephyr_dry_run(),
         )
     return exporters
 
@@ -1639,6 +1640,35 @@ def _safe_image_name(raw) -> str:
         return ""
 
 
+def _web_run_enabled() -> bool:
+    """Always False -- live web-suite execution is OFF, unconditionally.
+
+    QA_WEB_RUN_ENABLED was DELETED on 2026-08-13 (flag-surface reduction,
+    batch 6) and hardcoded to its default. A named seam, mirroring
+    ``tools.web_runner.enabled``, so the retained handler bodies stay
+    executable by their tests and a revival is one line in each of two
+    documented places. NOT settings-derived.
+    """
+    return False
+
+
+def _web_run_dry_run() -> bool:
+    """Always True -- QA_WEB_RUN_DRY_RUN was DELETED on 2026-08-13 and the
+    dry run hardcoded ON. Moot while the runner itself is off; read by the
+    qa-doctor disclosure line only.
+    """
+    return True
+
+
+def _zephyr_dry_run() -> bool:
+    """Always True -- QA_ZEPHYR_DRY_RUN was DELETED on 2026-08-13 and the
+    PILOT workbook hardcoded ON. A named seam because the full-workbook
+    branch of tools/zephyr_exporter.py is retained and still has to be
+    reachable from its tests. NOT settings-derived.
+    """
+    return True
+
+
 async def _fetch_jira_attachment_bytes(url_content: dict | None) -> int:
     """Download the ticket's image attachments SERVER-SIDE, in place.
 
@@ -1662,7 +1692,12 @@ async def _fetch_jira_attachment_bytes(url_content: dict | None) -> int:
     try:
         if not isinstance(url_content, dict):
             return 0
-        if not getattr(settings, "qa_jira_attachment_fetch_enabled", False):
+        # QA_JIRA_ATTACHMENT_FETCH_ENABLED was DELETED on 2026-08-13
+        # (flag-surface reduction, batch 6) and hardcoded OFF, so
+        # jira_attachments.enabled() is a constant False and this helper never
+        # fetches -- the pre-existing "I could not read this ticket's images"
+        # notice is left exactly as it was.
+        if not attachments_enabled():
             return 0
         attachments = [
             a
@@ -2649,7 +2684,7 @@ async def _jira_preflight(
 
     Returns None to proceed, or a markdown string to short-circuit. Never raises.
     """
-    if not settings.qa_jira_preflight or not _looks_like_jira_host(url):
+    if not _looks_like_jira_host(url):
         return None
     try:
         probe = await verify_jira_access()
@@ -2936,7 +2971,7 @@ async def _auto_export_zephyr(
         return ""
     try:
         await _emit(progress, "🧩 Writing the Zephyr import pair…")
-        dry_run = bool(settings.qa_zephyr_dry_run)
+        dry_run = _zephyr_dry_run()
         story_key = derive_story_key(source_text or "")
         if near_path:
             output_dir = str(Path(near_path).parent)
@@ -3033,9 +3068,7 @@ def _shape_ambiguity_clarify(
             f"{q_md}\n\n"
             "If you know the ticket is testable, call again with "
             "`proceed_anyway=true`. Or fix the server LLM backend "
-            "(`QA_LLM_BACKEND` / Claude CLI login / API key) and retry. "
-            "With `QA_HOST_AMBIGUITY_REVIEW_ENABLED=true` in host mode the "
-            "preflight runs in your chat instead of the server CLI."
+            "(`QA_LLM_BACKEND` / Claude CLI login / API key) and retry."
         )
     return (
         "## \u26a0\ufe0f A few details will make these test cases valid\n\n"
@@ -3543,11 +3576,7 @@ async def handle_generate_test_cases(
                 **_rtm_trace_detail(suite),
             },
         )
-        auto_export = bool(
-            settings.qa_auto_export_xlsx
-            and suite is not None
-            and getattr(suite, "test_cases", None)
-        )
+        auto_export = bool(suite is not None and getattr(suite, "test_cases", None))
         result_md = shape_generation_result(
             summary, suite, suite_id, status, auto_export=auto_export
         )
@@ -3646,7 +3675,11 @@ async def _ground_and_gate(
         )
         if preflight is not None:
             return preflight
-        if settings.qa_swagger_enabled and looks_like_openapi_url(text):
+        # QA_SWAGGER_ENABLED was DELETED on 2026-08-13 (flag-surface
+        # reduction, batch 6) and hardcoded ON -- the value the distribution
+        # shipped and the README advertises. looks_like_openapi_url is the
+        # only gate left.
+        if looks_like_openapi_url(text):
             await _emit(progress, "\U0001f517 Fetching the OpenAPI spec…")
             spec_result = await fetch_openapi_spec(text)
             if not spec_result.get("error"):
@@ -3871,26 +3904,6 @@ _SERVER_LLM_FLAGS_PREPARE: tuple = (
     ),
 )
 _SERVER_LLM_FLAGS_SUBMIT: tuple = (
-    (
-        # NOT qa_feature_analysis_enabled any more: that flag now only
-        # REGISTERS the standalone qa_feature_analysis tool and no longer buys
-        # the inline report on a host submit, so disclosing it here claims a
-        # cost the server does not pay -- exactly the kind of stale disclosure
-        # this notice exists to prevent.
-        # The finalize gate is an AND -- feature_report_enabled AND
-        # (qa_feature_analysis_enabled or force_feature_report) -- so THIS flag
-        # ON with QA_FEATURE_ANALYSIS_ENABLED OFF also costs nothing. The `what`
-        # string says so: over-claiming a cost is the same class of dishonesty
-        # as under-claiming one.
-        "qa_host_feature_report_enabled",
-        "QA_HOST_FEATURE_REPORT_ENABLED",
-        # 42.0s is the only DIRECT measurement (the F10c timing line, 2026-07-30).
-        # The earlier "~69s" attributed a whole unattributed finalize window to
-        # this one call; that window was 70.6s on 07-29 and 45.0s on 07-30.
-        "an inline Feature Analysis report on every submit -- ONLY when "
-        "QA_FEATURE_ANALYSIS_ENABLED is also true, which is what actually "
-        "builds the report (42s on one measured run)",
-    ),
     ("qa_test_plan_artifacts", "QA_TEST_PLAN_ARTIFACTS", "test-plan artifacts"),
     ("qa_llm_risk_scoring", "QA_LLM_RISK_SCORING", "LLM risk scoring"),
     (
@@ -3942,16 +3955,14 @@ def _dist_needs_no_backend() -> bool:
 
 
 def _host_image_forwarding_on() -> bool:
-    """True when QA_HOST_IMAGE_DESCRIPTION_ENABLED is on AND generation resolves
-    to host -- i.e. when raw screenshots go to the tester's OWN multimodal model
-    as MCP image content instead of through this server's ask_vision.
+    """True when generation resolves to host -- i.e. when raw screenshots go to
+    the tester's OWN multimodal model as MCP image content instead of through
+    this server's ask_vision.
 
     Never raises: an unreadable setting or an import failure reads as OFF, which
     is today's behaviour, so this can only ever fail CLOSED.
     """
     try:
-        if not getattr(settings, "qa_host_image_description_enabled", False):
-            return False
         import llm
 
         return llm.resolve_generation_mode() == "host"
@@ -3980,7 +3991,7 @@ def _host_mode_server_llm_notice(
     # Phase 3a: a flag whose call THIS prepare boomeranged must not be listed as
     # a reason "this server" calls an LLM -- with the fold shipped it makes no
     # such call, and over-claiming a cost is the same class of dishonesty as
-    # under-claiming one (see the qa_host_feature_report_enabled note above).
+    # under-claiming one.
     # Each is disclosed instead by its own block at the bottom of this notice,
     # exactly as the shipped AC / image folds are.
     _boomeranged: set = set()
@@ -4032,11 +4043,7 @@ def _host_mode_server_llm_notice(
     # NOT run server-side, so the closing sentence below must not claim it
     # always classifies. Read defensively — an unreadable setting simply
     # means we do not claim the skip.
-    amb_skipped = False
-    try:
-        amb_skipped = bool(getattr(settings, "qa_host_ambiguity_review_enabled", False))
-    except Exception:  # pragma: no cover - settings never raises
-        logger.debug("could not read qa_host_ambiguity_review_enabled", exc_info=True)
+    amb_skipped = True
     # NOT `if not on: return ""` any more: with every server-LLM flag off but
     # the preflight on, there is still something the tester must be told.
     # ...and the same again for the AC boomerang: with every flag off and the
@@ -4087,30 +4094,29 @@ def _host_mode_server_llm_notice(
         lines.append(tail)
     if amb_skipped:
         lines.append(
-            "> \u2139\ufe0f  `QA_HOST_AMBIGUITY_REVIEW_ENABLED` is on, so the "
-            "SHYJ-7154 requirement pre-pass did **not** run on this server: the "
-            "under-specified/no-UI check was handed to your own chat model "
-            "instead. That is why this prepare made no ambiguity-gate LLM call."
+            "> \u2139\ufe0f  The SHYJ-7154 requirement pre-pass did **not** run on "
+            "this server: the under-specified/no-UI check is handed to your own "
+            "chat model instead. That is why this prepare made no "
+            "ambiguity-gate LLM call."
         )
     if ac_boomeranged:
         lines.append(
-            "> \u2139\ufe0f  This ticket carries no acceptance criteria, and "
-            "`QA_HOST_AC_REVIEW_ENABLED` is on, so this server did **not** "
-            "synthesize any: deriving them is step 0b of the payload's "
-            "`jobs_to_run`. Return them as a top-level `acceptance_criteria` "
-            "array with your suite; they will be labelled MODEL-DERIVED, and "
-            "without them the suite finalizes with no requirements "
-            "traceability."
+            "> \u2139\ufe0f  This ticket carries no acceptance criteria, and this "
+            "server did **not** synthesize any: deriving them is step 0b of the "
+            "payload's `jobs_to_run`. Return them as a top-level "
+            "`acceptance_criteria` array with your suite; they will be labelled "
+            "MODEL-DERIVED, and without them the suite finalizes with no "
+            "requirements traceability."
         )
     if img_boomeranged:
         lines.append(
-            "> \u2139\ufe0f  `QA_HOST_IMAGE_DESCRIPTION_ENABLED` is on, so this "
-            "server made **no** vision call for the screenshot(s): they are "
-            "attached to this reply as image content for your OWN multimodal "
-            "model, which needs no `ANTHROPIC_API_KEY` and no backend. Read them "
-            "as step 0c of the payload's `jobs_to_run`, ground your cases in "
-            "them, and return an optional top-level `image_descriptions` array "
-            "so this server can record what they showed."
+            "> \u2139\ufe0f  This server made **no** vision call for the "
+            "screenshot(s): they are attached to this reply as image content for "
+            "your OWN multimodal model, which needs no `ANTHROPIC_API_KEY` and no "
+            "backend. Read them as step 0c of the payload's `jobs_to_run`, ground "
+            "your cases in them, and return an optional top-level "
+            "`image_descriptions` array so this server can record what they "
+            "showed."
         )
     if risk_boomeranged:
         lines.append(
@@ -4144,10 +4150,8 @@ def _host_mode_server_llm_notice(
             "coverage figure, the exported sheets and the gap loop. So the "
             "ambiguous band is reported as uncovered instead of re-judged: you "
             "may see MORE gaps than with those tiers on. "
-            "`QA_HOST_COVERAGE_REVIEW_ENABLED` is the host analog and is "
-            "reported separately as REVIEWED, NOT MEASURED. Set "
-            "`QA_HOST_CHECKLIST_NLI_SUPPRESS_ENABLED=false` to restore the "
-            "server-side tiers."
+            "There is no host analog: the host-reviewed coverage review "
+            "that once filled that role was deleted on 2026-08-12."
         )
     if comment_suppressed:
         lines.append(
@@ -4167,9 +4171,7 @@ def _host_mode_server_llm_notice(
             "leaving it on like this**: with it off, `tools/jira_mcp` puts the "
             "raw `## Comments` dump back into the ticket text you are given, "
             "whereas on it strips the dump in favour of an amendments block "
-            "that is no longer being built. Or set "
-            "`QA_HOST_COMMENT_RECONCILE_SUPPRESS_ENABLED=false` to restore the "
-            "server-side reconciliation."
+            "that is no longer being built."
         )
     # Residue R4: the checklist fold's own block -- the REPLACEMENT for the
     # QA_ATOMIC_CHECKLIST_ENABLED line the _boomeranged set just removed from
@@ -4193,8 +4195,7 @@ def _host_mode_server_llm_notice(
             "granularity audit still run over your list and are the only "
             "independent checks left. Omit the field and the suite finalizes "
             "with NO requirement coverage tally: nothing is decomposed to fill "
-            "the gap. Set `QA_HOST_CHECKLIST_REVIEW_ENABLED=false` to restore "
-            "the server-side decomposition."
+            "the gap."
         )
     # ...and the ONE accepted capability narrowing that rides with it, claimed
     # only when a rule pack actually mandated a line that is now falling back to
@@ -4421,157 +4422,154 @@ async def handle_prepare_test_cases(
     _carry_note = ""
     _carried_ids: list = []
     _carried_from = ""
-    if settings.qa_host_duplicate_prep_guard_enabled:
-        # RE-SENT ids first (2026-08-09). Both tool docstrings ask the host to
-        # re-send the SAME capture_ids, and after a prepare ships them they are
-        # on the carry-forward shelf, not in the tray -- so this must run BEFORE
-        # the "does this call carry images?" test below, which they would
-        # otherwise satisfy while resolving to nothing.
-        # 2026-08-09 (review M3): this is now a PROBE. It reports what WOULD
-        # revive and mutates NOTHING, because two dismissible clarifies below
-        # can still end this call -- and a shelf entry consumed by a round that
-        # was refused makes the RETRY look like a call whose ids were already in
-        # the tray, losing the "Re-used" disclosure and the carried_forward_*
-        # stamps for good. The real revive is committed once, past both
-        # clarifies (see "Deferred REVIVE" below).
-        capture_ids, _carried_ids, _carry_note = _revive_resent_captures(capture_ids)
-        # 2026-08-09 (review H1): the re-prepare image precondition is now PER
-        # CHANNEL and lives inside _carry_forward_or_refuse, which re-resolves
-        # the CAPTURED channel itself from `capture_ids` (an unknown or EXPIRED
-        # id resolves to nothing there and stays in the list, so _peek_captures
-        # still discloses it by name through _cap_missing -- it no longer counts
-        # as an image this call carries, which is what shipped an imageless
-        # payload in silence). Only the ATTESTED channel has to be assembled
-        # here, because it has two sources: the host's own count, plus any image
-        # bytes a caller handed over directly (the Feature-Analysis route does).
-        # A coercion failure fails OPEN on THAT channel -- 99 attested means no
-        # attested gap and no refusal from it -- because a refusal must never be
-        # triggered by a bug in its own precondition. The captured channel
-        # deliberately fails the OTHER way (see _resolvable_captures): a probe
-        # that cannot read the tray must not silently conclude the screens are
-        # present, and the resulting refusal is one ack away from proceeding.
-        try:
-            _have_attested = _clamped_count(attached_image_count, hi=99) + len(
-                [i for i in list(attached_images or []) if i]
-            )
-        except Exception:  # pragma: no cover - a coercion never breaks a prepare
-            logger.debug("incoming-image check failed", exc_info=True)
-            _have_attested = 99
-        # 2026-08-03: ALSO check for a recent unfinalized PREP, which is what this
-        # guard is named for and never actually looked at -- it only queried
-        # finished suites. A real run made two preps 43s apart for a byte-identical
-        # source, was told nothing, and discarded a whole preparation. Checked
-        # BEFORE the suite lookup because it is the earlier, cheaper signal: a
-        # second prepare with no suite yet is precisely the wasted-work case.
-        _window = max(
-            0, int(getattr(settings, "qa_host_duplicate_prep_window_s", 1800))
+    # RE-SENT ids first (2026-08-09). Both tool docstrings ask the host to
+    # re-send the SAME capture_ids, and after a prepare ships them they are
+    # on the carry-forward shelf, not in the tray -- so this must run BEFORE
+    # the "does this call carry images?" test below, which they would
+    # otherwise satisfy while resolving to nothing.
+    # 2026-08-09 (review M3): this is now a PROBE. It reports what WOULD
+    # revive and mutates NOTHING, because two dismissible clarifies below
+    # can still end this call -- and a shelf entry consumed by a round that
+    # was refused makes the RETRY look like a call whose ids were already in
+    # the tray, losing the "Re-used" disclosure and the carried_forward_*
+    # stamps for good. The real revive is committed once, past both
+    # clarifies (see "Deferred REVIVE" below).
+    capture_ids, _carried_ids, _carry_note = _revive_resent_captures(capture_ids)
+    # 2026-08-09 (review H1): the re-prepare image precondition is now PER
+    # CHANNEL and lives inside _carry_forward_or_refuse, which re-resolves
+    # the CAPTURED channel itself from `capture_ids` (an unknown or EXPIRED
+    # id resolves to nothing there and stays in the list, so _peek_captures
+    # still discloses it by name through _cap_missing -- it no longer counts
+    # as an image this call carries, which is what shipped an imageless
+    # payload in silence). Only the ATTESTED channel has to be assembled
+    # here, because it has two sources: the host's own count, plus any image
+    # bytes a caller handed over directly (the Feature-Analysis route does).
+    # A coercion failure fails OPEN on THAT channel -- 99 attested means no
+    # attested gap and no refusal from it -- because a refusal must never be
+    # triggered by a bug in its own precondition. The captured channel
+    # deliberately fails the OTHER way (see _resolvable_captures): a probe
+    # that cannot read the tray must not silently conclude the screens are
+    # present, and the resulting refusal is one ack away from proceeding.
+    try:
+        _have_attested = _clamped_count(attached_image_count, hi=99) + len(
+            [i for i in list(attached_images or []) if i]
         )
-        try:
-            _recent = await prep_store.find_recent_prep_by_source(text, _window)
-            _prep = (_recent or {}).get("content")
-        except Exception:
-            logger.debug("recent-prep duplicate check failed", exc_info=True)
-            _prep = None
-        # 2026-08-09 (live re-prepare defect): the IMAGE-GROUNDING half of this
-        # guard's advertised purpose -- "warns instead of silently starting a
-        # second full generation for the same source". Losing the previous
-        # prep's screens IS the silent harm it exists to prevent, so it rides
-        # this same default-ON flag and needs no new one. Unlike the two
-        # clarifies below it runs REGARDLESS of `proceed_anyway`, which the host
-        # model in the live run sent: a generic dismissal must not answer a
-        # specific loss, so this takes its own `image_carry_ack=true` (the
-        # volume_floor_ack pattern). The decision itself is in
-        # _carry_forward_or_refuse, which never raises.
-        if _prep:
-            # Unconditional now (review H1): the helper itself compares the prior
-            # prep's captured and attested counts against this call's resolved
-            # counts, credits any cross-channel surplus, and returns all-empty
-            # when nothing actually went missing -- so a healthy re-prepare, and
-            # a deliberate channel SUBSTITUTION, are both untouched while a
-            # half-lost one is caught.
-            (
-                _ids,
-                _more_carried,
-                _from,
-                _note,
-                _refusal,
-            ) = _carry_forward_or_refuse(
-                _prep,
-                image_carry_ack=image_carry_ack,
-                capture_ids=capture_ids,
-                have_attested=_have_attested,
+    except Exception:  # pragma: no cover - a coercion never breaks a prepare
+        logger.debug("incoming-image check failed", exc_info=True)
+        _have_attested = 99
+    # 2026-08-03: ALSO check for a recent unfinalized PREP, which is what this
+    # guard is named for and never actually looked at -- it only queried
+    # finished suites. A real run made two preps 43s apart for a byte-identical
+    # source, was told nothing, and discarded a whole preparation. Checked
+    # BEFORE the suite lookup because it is the earlier, cheaper signal: a
+    # second prepare with no suite yet is precisely the wasted-work case.
+    _window = max(0, int(getattr(settings, "qa_host_duplicate_prep_window_s", 1800)))
+    try:
+        _recent = await prep_store.find_recent_prep_by_source(text, _window)
+        _prep = (_recent or {}).get("content")
+    except Exception:
+        logger.debug("recent-prep duplicate check failed", exc_info=True)
+        _prep = None
+    # 2026-08-09 (live re-prepare defect): the IMAGE-GROUNDING half of this
+    # guard's advertised purpose -- "warns instead of silently starting a
+    # second full generation for the same source". Losing the previous
+    # prep's screens IS the silent harm it exists to prevent, so it rides
+    # this same default-ON flag and needs no new one. Unlike the two
+    # clarifies below it runs REGARDLESS of `proceed_anyway`, which the host
+    # model in the live run sent: a generic dismissal must not answer a
+    # specific loss, so this takes its own `image_carry_ack=true` (the
+    # volume_floor_ack pattern). The decision itself is in
+    # _carry_forward_or_refuse, which never raises.
+    if _prep:
+        # Unconditional now (review H1): the helper itself compares the prior
+        # prep's captured and attested counts against this call's resolved
+        # counts, credits any cross-channel surplus, and returns all-empty
+        # when nothing actually went missing -- so a healthy re-prepare, and
+        # a deliberate channel SUBSTITUTION, are both untouched while a
+        # half-lost one is caught.
+        (
+            _ids,
+            _more_carried,
+            _from,
+            _note,
+            _refusal,
+        ) = _carry_forward_or_refuse(
+            _prep,
+            image_carry_ack=image_carry_ack,
+            capture_ids=capture_ids,
+            have_attested=_have_attested,
+        )
+        if _ids:
+            capture_ids = list(_ids)
+        if _more_carried:
+            # APPEND: ids revived from a re-sent list and ids recovered from
+            # the prior prep are different findings and both are stamped.
+            _carried_ids = list(_carried_ids) + [
+                c for c in _more_carried if c not in _carried_ids
+            ]
+            _carried_from = _from
+        if _note:
+            _carry_note = (_carry_note + "\n\n" + _note) if _carry_note else _note
+        if _refusal:
+            return PreparePayloadResult(clarify=_refusal)
+    if _prep and _carried_ids and not _carried_from:
+        # Re-sent ids revived above: attribute them to the prep they came
+        # from, so the stamp and the audit row say where the screens began.
+        _carried_from = str(_prep.get("prep_id") or "")
+    if _prep and not proceed_anyway:
+        _mins = max(0, int(float(_prep.get("age_s") or 0) / 60))
+        _ago = f"{_mins} minute(s)" if _mins else "less than a minute"
+        return PreparePayloadResult(
+            clarify=(
+                "⚠️ A preparation for this exact source is ALREADY open "
+                f"(`{_prep.get('prep_id', '?')}`, started {_ago} ago) and has "
+                "not been finalized. Preparing again starts a SECOND full "
+                "generation of the same ticket -- 8 categories of cases your "
+                "chat model has to write twice -- and does not continue or "
+                "replace the open one.\n\n"
+                "To CONTINUE the open one, submit its categories against that "
+                "prep_id (`qa_prep_status` shows what is still missing). To "
+                "deliberately start over, call `qa_prepare_test_cases` again "
+                "with `proceed_anyway=true`."
             )
-            if _ids:
-                capture_ids = list(_ids)
-            if _more_carried:
-                # APPEND: ids revived from a re-sent list and ids recovered from
-                # the prior prep are different findings and both are stamped.
-                _carried_ids = list(_carried_ids) + [
-                    c for c in _more_carried if c not in _carried_ids
-                ]
-                _carried_from = _from
-            if _note:
-                _carry_note = (_carry_note + "\n\n" + _note) if _carry_note else _note
-            if _refusal:
-                return PreparePayloadResult(clarify=_refusal)
-        if _prep and _carried_ids and not _carried_from:
-            # Re-sent ids revived above: attribute them to the prep they came
-            # from, so the stamp and the audit row say where the screens began.
-            _carried_from = str(_prep.get("prep_id") or "")
-        if _prep and not proceed_anyway:
-            _mins = max(0, int(float(_prep.get("age_s") or 0) / 60))
-            _ago = f"{_mins} minute(s)" if _mins else "less than a minute"
-            return PreparePayloadResult(
-                clarify=(
-                    "⚠️ A preparation for this exact source is ALREADY open "
-                    f"(`{_prep.get('prep_id', '?')}`, started {_ago} ago) and has "
-                    "not been finalized. Preparing again starts a SECOND full "
-                    "generation of the same ticket -- 8 categories of cases your "
-                    "chat model has to write twice -- and does not continue or "
-                    "replace the open one.\n\n"
-                    "To CONTINUE the open one, submit its categories against that "
-                    "prep_id (`qa_prep_status` shows what is still missing). To "
-                    "deliberately start over, call `qa_prepare_test_cases` again "
-                    "with `proceed_anyway=true`."
-                )
+        )
+    # The two clarifies here stay dismissible by `proceed_anyway=true`; only
+    # the IMAGE-loss refusal above is not, because it has its own ack.
+    dup = None if proceed_anyway else await _find_recent_duplicate_suite(text)
+    if dup is not None:
+        # I3 (2026-08-10): hours-aware, because the window is a day wide now
+        # and "151 minute(s) ago" was about to become the normal reading.
+        _dup_ago = _ago_label(time.time() - (dup.get("created_at") or 0))
+        return PreparePayloadResult(
+            clarify=(
+                "⚠️ A suite was already generated from this exact "
+                f"source **{_dup_ago} ago** "
+                f"({dup.get('case_count', '?')} cases, suite "
+                f"`{dup.get('suite_id', '?')}`). Re-running now will create a "
+                "SEPARATE duplicate suite, not continue or replace that one.\n\n"
+                "To hand the tester THAT suite instead, call `qa_export_suite` "
+                f"with `suite_id='{dup.get('suite_id', '')}'` -- the file is "
+                "written again from the stored cases, so no regeneration is "
+                "needed. Otherwise ask the tester whether they actually want a "
+                "fresh regeneration before proceeding; if they confirm yes, "
+                "call `qa_prepare_test_cases` again with `proceed_anyway=true`."
             )
-        # The two clarifies here stay dismissible by `proceed_anyway=true`; only
-        # the IMAGE-loss refusal above is not, because it has its own ack.
-        dup = None if proceed_anyway else await _find_recent_duplicate_suite(text)
-        if dup is not None:
-            # I3 (2026-08-10): hours-aware, because the window is a day wide now
-            # and "151 minute(s) ago" was about to become the normal reading.
-            _dup_ago = _ago_label(time.time() - (dup.get("created_at") or 0))
-            return PreparePayloadResult(
-                clarify=(
-                    "⚠️ A suite was already generated from this exact "
-                    f"source **{_dup_ago} ago** "
-                    f"({dup.get('case_count', '?')} cases, suite "
-                    f"`{dup.get('suite_id', '?')}`). Re-running now will create a "
-                    "SEPARATE duplicate suite, not continue or replace that one.\n\n"
-                    "To hand the tester THAT suite instead, call `qa_export_suite` "
-                    f"with `suite_id='{dup.get('suite_id', '')}'` -- the file is "
-                    "written again from the stored cases, so no regeneration is "
-                    "needed. Otherwise ask the tester whether they actually want a "
-                    "fresh regeneration before proceeding; if they confirm yes, "
-                    "call `qa_prepare_test_cases` again with `proceed_anyway=true`."
-                )
-            )
-        # Deferred REVIVE (review M3). NOTHING above this point may move a
-        # screen off the carry-forward shelf: both clarifies above are
-        # dismissible RETRIES, and consuming the shelf on a round that returned a
-        # clarify destroyed the very disclosure the retry needed. Everything
-        # above only PROBES; the mutation happens here, once the call is certain
-        # to proceed to the gate and the fetch.
-        #
-        # ONE deliberate exception, above: _carry_forward_or_refuse revives
-        # before ITS refusal. That is correct -- a recovered screen must not sit
-        # orphaned on the shelf while the reply says it was recovered -- and it
-        # loses nothing, because that decision is driven by the prior PREP ROW,
-        # which is still in the store and re-derives the identical note on the
-        # retry. The re-sent-id path has no such source of truth.
-        if capture_ids:
-            _revive_captures(capture_ids)
+        )
+    # Deferred REVIVE (review M3). NOTHING above this point may move a
+    # screen off the carry-forward shelf: both clarifies above are
+    # dismissible RETRIES, and consuming the shelf on a round that returned a
+    # clarify destroyed the very disclosure the retry needed. Everything
+    # above only PROBES; the mutation happens here, once the call is certain
+    # to proceed to the gate and the fetch.
+    #
+    # ONE deliberate exception, above: _carry_forward_or_refuse revives
+    # before ITS refusal. That is correct -- a recovered screen must not sit
+    # orphaned on the shelf while the reply says it was recovered -- and it
+    # loses nothing, because that decision is driven by the prior PREP ROW,
+    # which is still in the store and re-derives the identical note on the
+    # retry. The re-sent-id path has no such source of truth.
+    if capture_ids:
+        _revive_captures(capture_ids)
     # --- Jira image gate, BEAT 1 (QA_IMAGE_GATE_ENABLED) ------------------- #
     # Placed AFTER the duplicate-prep guard (an already-open prep is the
     # cheaper, more urgent signal) and BEFORE the fetch -- which is the whole
@@ -4627,8 +4625,7 @@ async def handle_prepare_test_cases(
         logger.debug("counting captured screens failed", exc_info=True)
         _captured = 0
     if (
-        getattr(settings, "qa_image_gate_enabled", True)
-        and not _plan
+        not _plan
         and not jira_content_json
         and not attached_images
         and not _attested
@@ -4666,11 +4663,7 @@ async def handle_prepare_test_cases(
                 clarify=_image_gate_menu_markdown(_elicit_status)
             )
         _plan = _picked
-    if (
-        getattr(settings, "qa_image_gate_enabled", True)
-        and _plan
-        and not image_gate_ack
-    ):
+    if _plan and not image_gate_ack:
         # Plan-completion nudge: a plan that PROMISED images and has not
         # delivered them yet gets ONE actionable instruction per missing channel,
         # on every call until it is satisfied. `image_gate_ack=true` is always
@@ -4731,29 +4724,20 @@ async def handle_prepare_test_cases(
         # swallowed by this function's except into "Preparation failed".
         import llm
 
-        _host_amb = (
-            bool(getattr(settings, "qa_host_ambiguity_review_enabled", False))
-            and llm.resolve_generation_mode() == "host"
-        )
+        _host_amb = llm.resolve_generation_mode() == "host"
         # The SECOND unconditional server-side call on this path (the first
         # being the ambiguity classifier above): rtm.generate_acs, which fires
         # whenever the ticket carried no parsed ACs and has no off switch of
         # its own. Decided BEFORE _prepare_generation because AC synthesis is
         # prepare-side -- its output feeds rtm_hint and the RTM -- so it
         # cannot be deferred to submit; what is deferred is the RESULT.
-        _host_ac = (
-            bool(getattr(settings, "qa_host_ac_review_enabled", False))
-            and llm.resolve_generation_mode() == "host"
-        )
+        _host_ac = llm.resolve_generation_mode() == "host"
         # The LAST two server-side calls on this path, both vision-only and both
         # api-backend only -- so on cli/cursor they already no-op and the image
         # grounding is LOST today, not saved. ON, this server makes NEITHER call
         # and the raw bytes go to the host's OWN multimodal model as MCP image
         # content. Read defensively (getattr) like every other flag here.
-        _host_img = (
-            bool(getattr(settings, "qa_host_image_description_enabled", False))
-            and llm.resolve_generation_mode() == "host"
-        )
+        _host_img = llm.resolve_generation_mode() == "host"
         # Phase 3c: the QUARANTINED Stage 1b comment extractor
         # (tools/comment_reconciler, ledger id `comment_reconciler.candidates`).
         # Unlike the Phase-3a/3b decisions this one CANNOT wait until after
@@ -4765,9 +4749,6 @@ async def handle_prepare_test_cases(
         # happened (Phase 3b's MAJOR).
         _comment_suppress = (
             bool(getattr(settings, "qa_comment_reconcile_enabled", False))
-            and bool(
-                getattr(settings, "qa_host_comment_reconcile_suppress_enabled", True)
-            )
             and llm.resolve_generation_mode() == "host"
         )
         grounded = await _ground_and_gate(
@@ -4800,7 +4781,7 @@ async def handle_prepare_test_cases(
         # saved, the duplicate-prep guard cannot fire on the follow-up call.
         # The captures are still in the tray (peeked, not popped), so re-sending
         # the same capture_ids works.
-        if getattr(settings, "qa_image_gate_enabled", True) and not image_gate_ack:
+        if not image_gate_ack:
             _img_n, _img_names, _img_kind = _ticket_image_evidence(grounded.url_content)
             # N4 (2026-08-10): bound, not inlined -- the audit row could not tell
             # "no screens at all" from "3 of 4 arrived" without the ratio.
@@ -4900,9 +4881,7 @@ async def handle_prepare_test_cases(
         # itself: with no job shipped there is nothing to ask for. Decided and
         # stamped HERE, at prepare time, so a mid-flow .env flip or a launcher
         # auto-update cannot change what an in-flight prep expects back.
-        _img_relevance = bool(
-            _img_job and getattr(settings, "qa_image_relevance_enabled", True)
-        )
+        _img_relevance = bool(_img_job)
         # Batch 4 LAYER 1 (QA_HOST_IMAGE_PREFLIGHT_ENABLED, default ON): ask the
         # SAME job to ACT on its own `no` verdict in the host's PARENT turn --
         # stop and ask the tester -- instead of only reporting it beside a suite
@@ -4911,10 +4890,7 @@ async def handle_prepare_test_cases(
         # requested there is nothing to act on. Decided and stamped HERE so a
         # mid-flow .env flip or a launcher auto-update cannot change what an
         # in-flight prep was told to do.
-        _img_preflight = bool(
-            _img_relevance
-            and getattr(settings, "qa_host_image_preflight_enabled", True)
-        )
+        _img_preflight = bool(_img_relevance)
         # Batch 4 LAYER 2 (QA_HOST_IMAGE_REQUIRE_RELEVANT, default OFF): whether
         # a submission whose screens came back `no` -- or with no usable verdict
         # at all -- is REFUSED at finalize. Same stamp-not-live discipline and
@@ -4932,14 +4908,10 @@ async def handle_prepare_test_cases(
         # today. Decided HERE, before the envelope, because submit keys off the
         # prep's meta stamp rather than off the live flag.
         _risk_job = bool(
-            settings.qa_llm_risk_scoring
-            and getattr(settings, "qa_host_risk_review_enabled", True)
-            and llm.resolve_generation_mode() == "host"
+            settings.qa_llm_risk_scoring and llm.resolve_generation_mode() == "host"
         )
         _plan_job = bool(
-            settings.qa_test_plan_artifacts
-            and getattr(settings, "qa_host_test_plan_review_enabled", True)
-            and llm.resolve_generation_mode() == "host"
+            settings.qa_test_plan_artifacts and llm.resolve_generation_mode() == "host"
         )
         # Residue R4 (ledger id `atomic_checklist.decompose`): the LAST
         # server-side LLM call on the prepare path. Unlike the two Phase-3a
@@ -4950,7 +4922,6 @@ async def handle_prepare_test_cases(
         # flag, so a default install ships a key-identical payload.
         _checklist_job = bool(
             settings.qa_atomic_checklist_enabled
-            and getattr(settings, "qa_host_checklist_review_enabled", True)
             and llm.resolve_generation_mode() == "host"
         )
         prepared = await _prepare_generation(
@@ -5035,7 +5006,6 @@ async def handle_prepare_test_cases(
             and (
                 list(getattr(prepared, "checklist_items", None) or []) or _checklist_job
             )
-            and getattr(settings, "qa_host_checklist_nli_suppress_enabled", True)
             and llm.resolve_generation_mode() == "host"
         )
 
@@ -5216,12 +5186,8 @@ async def handle_prepare_test_cases(
                 # re-submission -- see the audit block in handle_submit_category:
                 # forensic fidelity is deliberately not gated on a disclosure
                 # flag, review M1).
-                "host_category_resubmit_note": bool(
-                    getattr(settings, "qa_host_category_resubmit_note_enabled", False)
-                ),
-                "host_category_shrink_guard": bool(
-                    getattr(settings, "qa_host_category_shrink_guard_enabled", False)
-                ),
+                "host_category_resubmit_note": True,
+                "host_category_shrink_guard": True,
                 "parallel_fanout": bool(settings.qa_host_parallel_fanout_enabled),
                 "expected_categories": (
                     host_mode.expected_category_names(prepared)
@@ -5243,9 +5209,7 @@ async def handle_prepare_test_cases(
                 # the floor is checked on BOTH finalize routes, including a
                 # merged submit for a prep that never asked for the fan-out.
                 # The live flag is read exactly ONCE, here.
-                "volume_floor": bool(
-                    getattr(settings, "qa_host_volume_floor_enabled", False)
-                ),
+                "volume_floor": True,
                 "volume_min_cases": host_mode.prepared_case_bounds(prepared)[0],
                 "volume_categories": host_mode.expected_category_names(prepared),
             },
@@ -5260,9 +5224,7 @@ async def handle_prepare_test_cases(
                     + _capture_retry_hint(capture_ids)
                 )
             )
-        payload = host_mode.build_prepare_payload(
-            prepared, prep_id, checklist_job=_checklist_job
-        )
+        payload = host_mode.build_prepare_payload(prepared, prep_id)
         if _host_amb:
             payload = host_mode.attach_ambiguity_job(payload)
         # The GENERAL job mechanism. Also indexes the ambiguity job attached
@@ -5426,13 +5388,11 @@ async def handle_prepare_test_cases(
             # describe_attached_images_server_side=True), so say precisely that
             # rather than either "they went nowhere" or "the screens were read".
             _cap_note = (
-                f"> ⚠️ {len(_cap_labels)} captured device screen(s) were NOT "
-                "forwarded to your model as image content: this install has "
-                "QA_HOST_IMAGE_DESCRIPTION_ENABLED off (or is not in host "
-                "generation mode). No image content rides on this reply. The "
-                "legacy server-side vision path may still have described them "
-                "into the prepared text; anything that is not in that text is "
-                "NOT reflected in the cases below."
+                f"> \u26a0\ufe0f {len(_cap_labels)} captured device screen(s) were NOT "
+                "forwarded to your model as image content. No image content rides "
+                "on this reply. The legacy server-side vision path may still have "
+                "described them into the prepared text; anything that is not in "
+                "that text is NOT reflected in the cases below."
             )
             _notice = (_notice + "\n\n" + _cap_note) if _notice else _cap_note
         # I2b (2026-08-10): WHICH snapshot these cases were generated from, so a
@@ -6024,7 +5984,7 @@ def _rtm_orphan_note(suite: object) -> str:
         return ""
 
 
-def _no_coverage_signal_note(view: object, cov_review: object) -> str:
+def _no_coverage_signal_note(view: object) -> str:
     """Disclosure for a finalize that computed NO coverage signal at all.
 
     Batch C item 4 (2026-08-09): a real finalize logged
@@ -6034,9 +5994,9 @@ def _no_coverage_signal_note(view: object, cov_review: object) -> str:
     left an 8-case suite able to pass with zero quality signal AND zero
     disclosure. This does not run the critic; it says that none ran.
 
-    SILENT whenever anything DID run: a deterministic matcher coverage view
+    SILENT whenever the deterministic matcher DID produce a coverage view
     (`view is not None` -- _coverage_view only builds one when the matcher
-    actually produced coverage), or a host coverage review that reports `ran`.
+    actually produced coverage).
 
     ALWAYS-ON IS THE INTENT, not an oversight (review W2). On a default install
     QA_ATOMIC_CHECKLIST_ENABLED is off, so NO coverage signal is ever computed on
@@ -6044,11 +6004,9 @@ def _no_coverage_signal_note(view: object, cov_review: object) -> str:
     produces. A disclosure that fired only on small suites would be worse than
     none: its ABSENCE would then read as "coverage WAS checked", which is exactly
     the inference this batch exists to stop. Operators who do run the atomic
-    checklist (or the host coverage review) never see it. Never raises."""
+    checklist never see it. Never raises."""
     try:
         if view is not None:
-            return ""
-        if cov_review is not None and getattr(cov_review, "ran", False):
             return ""
         return (
             "> \u2139\ufe0f  **No automated coverage critique ran on this "
@@ -6191,14 +6149,11 @@ async def _unfinished_preps_note(exclude_prep_id: str = "") -> str:
     staged category rows) so an interrupted host-mode run is resumable
     instead of evaporating at TTL (2026-07-31 SHYJ-5645 incident).
 
-    DISCLOSURE ONLY -- never blocks anything. Returns "" when
-    QA_PREP_DISCLOSE_UNFINISHED is off, nothing qualifies, or the store
-    errors. The line prints the prep_id, which is the capability token for
-    that prep -- that is why the flag defaults OFF. Times render as the
-    server's local HH:MM. Never raises."""
+    DISCLOSURE ONLY -- never blocks anything. Returns "" when nothing
+    qualifies or the store errors. The line prints the prep_id, which is the
+    capability token for that prep. Times render as the server's local HH:MM.
+    Never raises."""
     try:
-        if not bool(getattr(settings, "qa_prep_disclose_unfinished", False)):
-            return ""
         res = await prep_store.list_unfinished_preps(limit=3)
         rows = res.get("content") or []
         lines = []
@@ -6235,12 +6190,8 @@ _SIDECAR_KEYS = ("duplicate_groups", "acceptance_criteria", "ambiguity_result")
 def _sidecar_keys(meta: object = None) -> tuple:
     """The recognised sidecar review fields for THIS request.
 
-    `requirement_matches` joins the tuple ONLY under
-    QA_QUALIFIED_TC_IDS_ENABLED (phase 2): without the qualified-id contract
-    its tc_id values could only be remapped by the first-category-wins guess
-    this flag exists to retire. _SIDECAR_KEYS itself is unchanged (and stays
-    pinned by tests/test_host_ac_review.py) so the flag-OFF surface is
-    byte-identical. Never raises.
+    _SIDECAR_KEYS itself stays pinned by tests/test_host_ac_review.py.
+    Never raises.
 
     Phase 3a: the two post_merge fold fields are recognised from the PREP'S OWN
     meta stamp whenever ``meta`` is supplied -- NOT from the live flag values,
@@ -6254,23 +6205,16 @@ def _sidecar_keys(meta: object = None) -> tuple:
     callers) the live AND is used, so the shipped surface is unchanged."""
     try:
         keys = _SIDECAR_KEYS
-        if getattr(settings, "qa_host_image_description_enabled", False):
-            # The image job's return field is finalize-time review material like
-            # the others, so the staged (crash-safe) route must be able to carry
-            # it in a sidecar. Flag-gated, so the OFF surface is unchanged.
-            keys = keys + ("image_descriptions",)
-        if host_mode.qualified_ids_on():
-            keys = keys + ("requirement_matches",)
+        # The image job's return field is finalize-time review material like
+        # the others, so the staged (crash-safe) route must be able to carry
+        # it in a sidecar.
+        keys = keys + ("image_descriptions",)
         if isinstance(meta, dict):
             _risk_on = bool(meta.get("host_risk_job"))
             _plan_on = bool(meta.get("host_test_plan_job"))
         else:
-            _risk_on = bool(settings.qa_llm_risk_scoring) and bool(
-                getattr(settings, "qa_host_risk_review_enabled", True)
-            )
-            _plan_on = bool(settings.qa_test_plan_artifacts) and bool(
-                getattr(settings, "qa_host_test_plan_review_enabled", True)
-            )
+            _risk_on = bool(settings.qa_llm_risk_scoring)
+            _plan_on = bool(settings.qa_test_plan_artifacts)
         if _risk_on:
             keys = keys + ("risk_scores",)
         if _plan_on:
@@ -6286,10 +6230,7 @@ def _sidecar_keys(meta: object = None) -> tuple:
         if (
             bool(meta.get("host_checklist_job"))
             if isinstance(meta, dict)
-            else (
-                bool(settings.qa_atomic_checklist_enabled)
-                and bool(getattr(settings, "qa_host_checklist_review_enabled", True))
-            )
+            else bool(settings.qa_atomic_checklist_enabled)
         ):
             keys = keys + ("checklist_items",)
         return keys
@@ -6473,46 +6414,6 @@ def _map_qualified_id(
     return id_map.get(bare, bare)
 
 
-def _remap_sidecar_groups(
-    groups, id_map: dict, qual_map: dict, ambiguous: set
-) -> "tuple[list, list]":
-    """Qualified-id-aware remap of a sidecar's duplicate_groups (phase 2).
-
-    Mirrors _remap_dup_groups but consults the qualified map first, passes a
-    post-merge global id straight through, and REFUSES an ambiguous bare id
-    with a loud note instead of the shipped first-category-wins guess. Runs
-    ONLY under QA_QUALIFIED_TC_IDS_ENABLED -- flag OFF keeps calling
-    _remap_dup_groups, byte-identically. UNTRUSTED input: shape-tolerant,
-    notes bounded, never raises."""
-    out: list = []
-    notes: list = []
-
-    def _note(msg: str) -> None:
-        if len(notes) < _QUAL_REMAP_MAX_NOTES:
-            notes.append(msg)
-
-    try:
-        global_ids = set(id_map.values())
-        for g in groups or []:
-            if not isinstance(g, (list, tuple)):
-                continue
-            mapped: list = []
-            for tid in g:
-                if not isinstance(tid, str):
-                    continue
-                hit = _map_qualified_id(
-                    tid, id_map, qual_map, ambiguous, global_ids, _note
-                )
-                if hit:
-                    mapped.append(hit)
-            if mapped:
-                out.append(mapped)
-        return out, notes
-    except Exception:
-        logger.debug("qualified dup group remap failed", exc_info=True)
-        return list(groups or []), notes
-
-
 def _remap_risk_scores(
     raw, id_map: dict, qual_map: dict, ambiguous: set
 ) -> "tuple[object, list]":
@@ -6527,8 +6428,8 @@ def _remap_risk_scores(
     category's case.
 
     CALLER CONTRACT (review round 3 MAJOR): the caller MUST pass real qualified
-    maps -- built by _qualified_id_maps(rows) -- regardless of
-    QA_QUALIFIED_TC_IDS_ENABLED. With empty maps this function degrades exactly
+    maps -- built by _qualified_id_maps(rows) -- unconditionally, as it always
+    has. With empty maps this function degrades exactly
     as duplicate_groups' shipped path does, and for THIS field that degradation
     is lossy and MISATTRIBUTING rather than merely imprecise: every
     `<category>:<tc_id>` key would be dropped as "no such staged category", and
@@ -6558,54 +6459,6 @@ def _remap_risk_scores(
         return out, notes
     except Exception:
         logger.debug("sidecar risk score remap failed", exc_info=True)
-        return raw, notes
-
-
-def _remap_req_matches(
-    raw, id_map: dict, qual_map: dict, ambiguous: set
-) -> "tuple[object, list]":
-    """Qualified-id-aware remap of a sidecar's requirement_matches VALUES.
-
-    Shape-tolerant on UNTRUSTED input and deliberately MINIMAL: keys are left
-    untouched (they are requirement ids, not tc_ids), a str value is treated
-    as a one-element list exactly as the downstream validator does, any other
-    value shape and any non-str member are passed through UNCHANGED so
-    host_mode.extract_requirement_matches remains the sole screening / shape
-    authority (its never-raise notes still fire on garbage), and a non-dict
-    field is returned as-is for the same reason. Never raises."""
-    notes: list = []
-
-    def _note(msg: str) -> None:
-        if len(notes) < _QUAL_REMAP_MAX_NOTES:
-            notes.append(msg)
-
-    try:
-        if not isinstance(raw, dict):
-            return raw, notes
-        global_ids = set(id_map.values())
-        out: dict = {}
-        for key, value in raw.items():
-            if isinstance(value, str):
-                members = [value]
-            elif isinstance(value, list):
-                members = value
-            else:
-                out[key] = value
-                continue
-            mapped: list = []
-            for m in members:
-                if not isinstance(m, str):
-                    mapped.append(m)
-                    continue
-                hit = _map_qualified_id(
-                    m, id_map, qual_map, ambiguous, global_ids, _note
-                )
-                if hit:
-                    mapped.append(hit)
-            out[key] = mapped
-        return out, notes
-    except Exception:
-        logger.debug("qualified requirement_matches remap failed", exc_info=True)
         return raw, notes
 
 
@@ -7177,25 +7030,14 @@ def _prep_status_finalize_hint() -> str:
     sidecar as an afterthought steered hosts into losing a review the tester had
     switched on -- observed on run3 (SHYJ-5645), where 98 cases from 8 mutually
     blind workers got no cross-category review at all. Both routes stage the same
-    rows, so the sidecar is equally crash-safe; only the review differs. With the
-    review OFF this returns the ORIGINAL wording verbatim.
+    rows, so the sidecar is equally crash-safe; only the review differs.
     """
-    if bool(getattr(settings, "qa_host_dedup_review_enabled", False)):
-        return (
-            "\nPRIMARY finalize (Path A, crash-safe, keeps your review): when "
-            "ready=yes, call `qa_submit_suite` with the small review SIDECAR "
-            "object described in your preparation instructions (no "
-            "`test_cases`). Finalizing with an empty `suite_json` instead is "
-            "equally crash-safe but FORFEITS the duplicate review. ALTERNATIVE "
-            "(Path B, one merged `suite_json`) does not need ready=yes, but "
-            "nothing is saved until that single call, so an interrupted chat "
-            "loses every category."
-        )
     return (
-        "\nPRIMARY finalize (Path A, crash-safe): when ready=yes, call "
-        "`qa_submit_suite` with an empty `suite_json` -- or, to keep the "
-        "duplicate review, the small review SIDECAR object described in "
-        "your preparation instructions (no `test_cases`). ALTERNATIVE "
+        "\nPRIMARY finalize (Path A, crash-safe, keeps your review): when "
+        "ready=yes, call `qa_submit_suite` with the small review SIDECAR "
+        "object described in your preparation instructions (no "
+        "`test_cases`). Finalizing with an empty `suite_json` instead is "
+        "equally crash-safe but FORFEITS the duplicate review. ALTERNATIVE "
         "(Path B, one merged `suite_json`) does not need ready=yes, but "
         "nothing is saved until that single call, so an interrupted chat "
         "loses every category."
@@ -7496,19 +7338,11 @@ async def handle_submit_category(
         # sends duplicate_groups, which on THIS route it can never do -- so keying
         # the route wording off the note steered testers away from the only route
         # where the review works.
-        review_available = bool(
-            settings.qa_host_dedup_review_enabled
-            or settings.qa_host_coverage_review_enabled
-        )
-        if settings.qa_host_dedup_review_enabled:
-            # Duplicate review is only possible on the MERGED suite -- _merge_category_rows
-            # copies only test_cases and renumbers every tc_id -- so say the field
-            # cannot be used here rather than swallowing it.
-            review_note += host_mode.category_dedup_note(parsed)
-        if settings.qa_host_coverage_review_enabled:
-            # Same structural reason, plus a semantic one: requirement coverage can
-            # only be judged on the WHOLE merged suite.
-            review_note += host_mode.category_coverage_note(parsed)
+        review_available = True
+        # Duplicate review is only possible on the MERGED suite -- _merge_category_rows
+        # copies only test_cases and renumbers every tc_id -- so say the field
+        # cannot be used here rather than swallowing it.
+        review_note += host_mode.category_dedup_note(parsed)
         # Residue R4: same class of silent drop for the checklist job's return
         # field -- _validate_suite pops it and _merge_category_rows keeps only
         # test_cases, so a host that ignores the "use the finalize sidecar"
@@ -7532,29 +7366,22 @@ async def handle_submit_category(
         except Exception:  # defensive -- the count alone is still correct
             logger.debug("could not list staged category names", exc_info=True)
         if review_available:
-            # Name only the review(s) actually enabled -- with one flag on,
-            # promising both would over-state what the merged route delivers.
-            _enabled = []
-            if settings.qa_host_dedup_review_enabled:
-                _enabled.append("duplicate")
-            if settings.qa_host_coverage_review_enabled:
-                _enabled.append("coverage")
-            _review_label = " or ".join(_enabled) + " review"
-            # A duplicate/coverage review is enabled, and those reviews run ONLY on
-            # the merged suite. The two routes are therefore a real CHOICE, and
-            # this branch must fire on the FLAG rather than on review_note: the
-            # note is empty until the host sends the field, which is impossible on
-            # this route, so the old condition steered away from the only route
-            # that works (F11).
+            # Only the duplicate review runs on the merged suite now that the
+            # host coverage review is deleted (2026-08-12), so name just it.
+            _review_label = "duplicate review"
+            # The duplicate review runs ONLY on the merged suite, so the two
+            # routes are a real CHOICE, and this branch must fire on that fact
+            # rather than on review_note: the note is empty until the host sends
+            # the field, which is impossible on this route, so the old condition
+            # steered away from the only route that works (F11).
             # F11/F4 (iteration 4): this GENERAL "how to keep your review"
             # explanation must NOT name a review FIELD by its literal token.
-            # The per-submission notes above (category_dedup_note /
-            # category_coverage_note) are the only place a field name may
-            # appear, and only when THIS submission's own payload carried it;
-            # naming it here too would read as "a review already ran" or "you
-            # were supposed to send it here". Pinned by
-            # test_submit_category_is_silent_without_the_field in both
-            # tests/test_host_dedup_review.py and test_host_coverage_review.py.
+            # The per-submission note above (category_dedup_note) is the only
+            # place a field name may appear, and only when THIS submission's
+            # own payload carried it; naming it here too would read as "a
+            # review already ran" or "you were supposed to send it here".
+            # Pinned by test_submit_category_is_silent_without_the_field in
+            # tests/test_host_dedup_review.py.
             # The field NAME is taught once, at prepare time, by
             # host_mode._HOST_DEDUP_INSTRUCTION.
             _sidecar_line = (
@@ -7565,24 +7392,6 @@ async def handle_submit_category(
                 "empty or absent `test_cases`. The server remaps its tc_ids "
                 "across the merge, so staging categories does NOT forfeit "
                 "that review."
-                if settings.qa_host_dedup_review_enabled
-                else ""
-            )
-            _coverage_line = (
-                " The coverage review is the one review no sidecar can "
-                "carry: it is judged against the merged suite's global "
-                "tc_ids, so it needs the merged route below."
-                if settings.qa_host_coverage_review_enabled
-                else ""
-            )
-            # MINOR (iteration 5): when the duplicate review is reachable from
-            # the staged route (via the sidecar described above), naming it on
-            # the merged bullet too made the two adjacent sentences read as an
-            # even choice. Name only what the merged route UNIQUELY provides.
-            _merged_label = (
-                "coverage review"
-                if settings.qa_host_coverage_review_enabled
-                else _review_label
             )
             # 2026-08-03 (Fix 2): when the duplicate review is ON, the EMPTY
             # finalize is precisely the call that FORFEITS it -- so labelling that
@@ -7595,32 +7404,21 @@ async def handle_submit_category(
             # here -- that is taught once at prepare time, pinned by
             # test_submit_category_is_silent_without_the_field.
             _primary_bullet = (
-                (
-                    "- **Finalize from these rows, keeping your review "
-                    "(recommended)**: when every category is staged, call "
-                    "`qa_submit_suite` with this prep_id and the small review "
-                    "SIDECAR object described in your preparation instructions "
-                    "(no `test_cases`). No case is re-sent, nothing already "
-                    "staged can be lost, and the review you were asked to run is "
-                    "carried across the merge."
-                    f"{_coverage_line}\n"
-                    "- **Or finalize with an EMPTY `suite_json` "
-                    '(`suite_json=""`)**: the same crash-safe merge, but it '
-                    "FORFEITS that review.\n"
-                )
-                if settings.qa_host_dedup_review_enabled
-                else (
-                    "- **Finalize from these rows (crash-safe, recommended)**: "
-                    "when every category is staged, call `qa_submit_suite` with "
-                    'this prep_id and an EMPTY `suite_json` (`suite_json=""`); '
-                    "no case is re-sent and nothing already staged can be lost."
-                    f"{_sidecar_line}{_coverage_line}\n"
-                )
+                "- **Finalize from these rows, keeping your review "
+                "(recommended)**: when every category is staged, call "
+                "`qa_submit_suite` with this prep_id and the small review "
+                "SIDECAR object described in your preparation instructions "
+                "(no `test_cases`). No case is re-sent, nothing already "
+                "staged can be lost, and the review you were asked to run is "
+                "carried across the merge.\n"
+                "- **Or finalize with an EMPTY `suite_json` "
+                '(`suite_json=""`)**: the same crash-safe merge, but it '
+                "FORFEITS that review.\n"
             )
             route = (
                 "Choose ONE route -- do not do both:\n\n"
                 f"{_primary_bullet}"
-                f"- **Or send one merged `suite_json`**: the {_merged_label} "
+                f"- **Or send one merged `suite_json`**: the {_review_label} "
                 "runs on it, and the rows staged here are ignored -- but "
                 "nothing at all is saved until that single call, so an "
                 "interrupted chat loses every category.\n\n"
@@ -7848,8 +7646,6 @@ async def _dup_shortlist_note(meta: object, rows_content: list) -> str:
     try:
         if not host_mode.dup_shortlist_on():
             return ""
-        if not bool(getattr(settings, "qa_host_dedup_review_enabled", False)):
-            return ""
         if not isinstance(meta, dict):
             return ""
         expected = list(meta.get("expected_categories") or [])
@@ -8013,28 +7809,15 @@ async def handle_submit_suite(
                 # `duplicate_groups` present-but-empty reads downstream as "the
                 # host reviewed and found none", which an AC-only sidecar
                 # must not claim.
-                # Phase 2 (QA_QUALIFIED_TC_IDS_ENABLED): qualified-id-aware
-                # remap with a LOUD refusal of ambiguous bare ids. Flag OFF
-                # takes the shipped _remap_dup_groups path byte-identically
-                # (including its documented first-category-wins collision).
+                # duplicate_groups keeps the shipped _remap_dup_groups path,
+                # including its documented first-category-wins collision --
+                # the qualified-id contract that would have retired it was
+                # deleted on 2026-08-12 (default OFF, never validated).
                 _sidecar_notes: list = []
-                if host_mode.qualified_ids_on():
-                    _qual_map, _amb_bare = _qualified_id_maps(rows)
-                else:
-                    _qual_map, _amb_bare = {}, set()
                 if sidecar_raw is not None:
-                    if host_mode.qualified_ids_on():
-                        (
-                            merged_dict["duplicate_groups"],
-                            _dg_notes,
-                        ) = _remap_sidecar_groups(
-                            sidecar_raw, id_map, _qual_map, _amb_bare
-                        )
-                        _sidecar_notes += _dg_notes
-                    else:
-                        merged_dict["duplicate_groups"] = _remap_dup_groups(
-                            sidecar_raw, id_map
-                        )
+                    merged_dict["duplicate_groups"] = _remap_dup_groups(
+                        sidecar_raw, id_map
+                    )
                 _sidecar_acs = sidecar_obj.get("acceptance_criteria")
                 if _sidecar_acs is not None:
                     merged_dict["acceptance_criteria"] = _sidecar_acs
@@ -8046,19 +7829,6 @@ async def handle_submit_suite(
                 _sidecar_amb = sidecar_obj.get("ambiguity_result")
                 if _sidecar_amb is not None:
                     merged_dict["ambiguity_result"] = _sidecar_amb
-                # Phase 2 (QA_QUALIFIED_TC_IDS_ENABLED): requirement_matches
-                # may ride the sidecar too -- VALUES remapped through the same
-                # qualified-id-aware machinery, keys (requirement ids) left
-                # untouched. host_mode.extract_requirement_matches stays the
-                # sole shape/screening authority downstream, unchanged.
-                if host_mode.qualified_ids_on():
-                    _sidecar_rm = sidecar_obj.get("requirement_matches")
-                    if _sidecar_rm is not None:
-                        _rm_mapped, _rm_notes = _remap_req_matches(
-                            _sidecar_rm, id_map, _qual_map, _amb_bare
-                        )
-                        merged_dict["requirement_matches"] = _rm_mapped
-                        _sidecar_notes += _rm_notes
                 # Phase 3a: the two post_merge folds on Path A. This is the ONLY
                 # channel for them on the per-category route -- exactly what the
                 # RISK_JOB / TEST_PLAN_JOB instructions tell the host to use --
@@ -8077,21 +7847,17 @@ async def handle_submit_suite(
                         # review round 3 MAJOR: risk_scores' KEYS are tc_ids, and
                         # on Path A every category restarts at TC-001, so this
                         # ONE field builds the qualified maps UNCONDITIONALLY --
-                        # with QA_QUALIFIED_TC_IDS_ENABLED off (the DEFAULT) the
-                        # empty maps would drop every `<category>:<tc_id>` key
-                        # the job instructions ask for AND collapse every
-                        # colliding bare id onto the first category's global id,
-                        # silently overwriting most of the verdicts and
-                        # misattributing the survivor's rationale into another
-                        # case's row. duplicate_groups can live with that guess
-                        # (a wrong group member is visible in the report); a
-                        # misattributed risk rationale is not. Ambiguous bare
-                        # ids are refused with a note by _map_qualified_id.
-                        _risk_qual, _risk_amb = (
-                            (_qual_map, _amb_bare)
-                            if host_mode.qualified_ids_on()
-                            else _qualified_id_maps(rows)
-                        )
+                        # with empty maps every `<category>:<tc_id>` key the job
+                        # instructions ask for would be DROPPED, and every
+                        # colliding bare id would collapse onto the first
+                        # category's global id, silently overwriting most of the
+                        # verdicts and misattributing the survivor's rationale
+                        # into another case's row. duplicate_groups can live
+                        # with that guess (a wrong group member is visible in
+                        # the report); a misattributed risk rationale is not.
+                        # Ambiguous bare ids are refused with a note by
+                        # _map_qualified_id.
+                        _risk_qual, _risk_amb = _qualified_id_maps(rows)
                         _risk_mapped, _risk_notes = _remap_risk_scores(
                             _sidecar_risk, id_map, _risk_qual, _risk_amb
                         )
@@ -8392,10 +8158,8 @@ async def handle_submit_suite(
         # Pass-3 matcher and the XLSX sheets read it unchanged.
         #
         # ORDERING IS LOAD-BEARING and is pinned by a test: this block must run
-        # BEFORE extract_requirement_matches (which validates the host coverage
-        # review's keys against prepared.checklist_items -- an empty list there
-        # would silently drop every claim) and BEFORE the _nli_suppressed
-        # re-check further down (which asks whether a checklist exists at all).
+        # BEFORE the _nli_suppressed re-check further down (which asks whether a
+        # checklist exists at all).
         #
         # presented_ids is EVERY returned id: the host had the whole list in its
         # own context, so the QA_CHECKLIST_MAX_PROMPT_CHARS "NOT PRESENTED TO
@@ -8578,11 +8342,10 @@ async def handle_submit_suite(
                 "wrote these cases, so your verdict on them is not an "
                 "independent second opinion, and unlike the reviews above it "
                 "would enter the measurement itself. "
-                "`QA_HOST_COVERAGE_REVIEW_ENABLED` is the host analog and is "
-                "reported separately as REVIEWED, NOT MEASURED. Set "
-                "`QA_HOST_CHECKLIST_NLI_SUPPRESS_ENABLED=false` to restore the "
-                "server-side tiers. (The same disclosure is written into the "
-                "checklist coverage notes, so it survives into the export.)"
+                "There is no host analog: the host-reviewed coverage review "
+                "that once filled that role was deleted on 2026-08-12. (The "
+                "same disclosure is written into the checklist coverage notes, "
+                "so it survives into the export.)"
                 "\n\n"
             )
         # Phase 3c: Jira comment reconciliation (ledger id
@@ -8609,9 +8372,7 @@ async def handle_submit_suite(
                 "tools, and you have both. So no AMENDMENTS block reached the "
                 "generation prompt and no comment-derived clarifying question "
                 "gated this run -- if the ticket's current truth lives in its "
-                "comments, these cases do not reflect it. Set "
-                "`QA_HOST_COMMENT_RECONCILE_SUPPRESS_ENABLED=false` to restore "
-                "the server-side reconciliation."
+                "comments, these cases do not reflect it. "
                 "\n\n"
             )
         # Piece 1: the host's OPTIONAL cross-category duplicate review. It rode in
@@ -8626,7 +8387,7 @@ async def handle_submit_suite(
         # `submitted_cases` was captured where the submission was read, NOT here:
         # by this point the grounding review may have narrowed `all_cases`, and the
         # reviews below need the ids the host actually sent.
-        dup_review_on = bool(settings.qa_host_dedup_review_enabled)
+        dup_review_on = True
         dup_apply = bool(settings.qa_host_dedup_apply)
         dup_groups = list(getattr(parsed, "duplicate_groups", None) or [])
         dup_notes = list(getattr(parsed, "duplicate_notes", None) or [])
@@ -8698,27 +8459,6 @@ async def handle_submit_suite(
                         host_mode.apply_duplicate_groups(all_cases, screened)
                     )
                     dup_notes += apply_notes
-        # Piece 2: the host's OPTIONAL requirement-coverage review. Like the
-        # duplicate review it rode in on THIS submission -- no extra round trip and
-        # no server-side LLM call -- but it is REPORT-ONLY: validated here, rendered
-        # as an explicitly-labelled `host-reviewed` tier, and NEVER merged into the
-        # deterministic ChecklistCoverage, the XLSX, the suite_store payload or the
-        # remediation loop below. Ids are validated against the SUBMITTED tc_ids
-        # (the ids the host itself used) and against THIS prep's checklist, so the
-        # field is a safe no-op without QA_ATOMIC_CHECKLIST_ENABLED.
-        cov_note = ""
-        cov_review = None
-        if settings.qa_host_coverage_review_enabled:
-            cov_review = host_mode.extract_requirement_matches(
-                getattr(parsed, "raw_requirement_matches", None),
-                {tc.tc_id for tc in submitted_cases},
-                [
-                    getattr(it, "item_id", "")
-                    for it in (getattr(prepared, "checklist_items", None) or [])
-                ],
-                list(getattr(prepared, "checklist_presented_ids", None) or []),
-            )
-
         # ONE synthetic CategoryResult so _finalize_generation's "N of 8 failed"
         # partial line correctly does NOT fire (its only use of category_results).
         category_results = [
@@ -8751,7 +8491,6 @@ async def handle_submit_suite(
         fa_skip_note = ""
         if (
             settings.qa_feature_analysis_enabled
-            and not settings.qa_host_feature_report_enabled
             # 2026-08-03: the test-cases-only edition no longer registers
             # qa_feature_analysis, so "call it on demand" would name a tool the
             # tester's client cannot see. A stale QA_FEATURE_ANALYSIS_ENABLED=true
@@ -8761,9 +8500,8 @@ async def handle_submit_suite(
             fa_skip_note = (
                 "> \u2139\ufe0f  Feature Analysis report SKIPPED for this "
                 "host-mode submit (it is a server-side LLM call -- 42.0s on the "
-                "2026-07-30 run). Set `QA_HOST_FEATURE_REPORT_ENABLED=true` to "
-                "include it inline, or call `qa_feature_analysis` on "
-                "demand.\n\n"
+                "2026-07-30 run). Call `qa_feature_analysis` on demand if you "
+                "want it.\n\n"
             )
         summary, _x, _c, _t, status = await _finalize_generation(
             prepared,
@@ -8793,12 +8531,17 @@ async def handle_submit_suite(
             # on the 2026-07-30 host-mode run -- against 0.02s for the entire
             # deterministic finalize of 65 cases -- so it was ~99.95% of this
             # step and the single largest server-side cost left on a submit.
-            # QA_FEATURE_ANALYSIS_ENABLED exists to expose the qa_feature_analysis
-            # TOOL, which passes force_feature_report=True and still works.
-            # Hardcoding False removed the capability outright; this makes it an
-            # operator decision that still DEFAULTS to suppressed, and the gate
-            # remains an AND with qa_feature_analysis_enabled.
-            feature_report_enabled=bool(settings.qa_host_feature_report_enabled),
+            # HARDCODED False, and the constant is LOAD-BEARING: the parameter
+            # DEFAULTS to True for server mode and for the standalone tool, so
+            # dropping this argument would re-enable that 42s call on any host
+            # install with QA_FEATURE_ANALYSIS_ENABLED=true -- the one call this
+            # chat-only path exists to avoid. QA_FEATURE_ANALYSIS_ENABLED still
+            # exposes the qa_feature_analysis TOOL, which passes
+            # force_feature_report=True and still works. The operator opt-in
+            # that used to be read here (QA_HOST_FEATURE_REPORT_ENABLED) was
+            # deleted on 2026-08-12; it was default OFF, so this is
+            # behaviour-neutral.
+            feature_report_enabled=False,
             # Phase 3a: None means the job was NOT requested, so the server-side
             # call (if its own feature flag is on) still runs and this submit is
             # byte-identical to today. A dict -- possibly EMPTY -- means it WAS
@@ -8873,83 +8616,6 @@ async def handle_submit_suite(
         # round per call. It is additionally gated on the remediation flag; see the
         # plan's "server-side remediation interaction" note.
         view = _coverage_view(suite)
-        # Piece 2: built AFTER finalize so each claimed tc_id resolves to the FINAL
-        # renumbered id via its content stable_id, and told whether the DETERMINISTIC
-        # percentage is suppressed for this run -- the situation in which a
-        # model-judged view is most likely to be misread as the coverage report. It
-        # is handed the same `view` the gap loop reads, but ONLY to label itself: the
-        # loop condition below is untouched, so a model-judged gap can never drive a
-        # remediation round.
-        # F11: same silence as the duplicate review had. On the merge route
-        # raw_requirement_matches is None, so the coverage review cannot run and
-        # said nothing at all about being forfeited.
-        if (
-            settings.qa_host_coverage_review_enabled
-            and not has_full
-            and (cov_review is None or not cov_review.ran)
-        ):
-            if host_mode.qualified_ids_on():
-                dup_status_note += (
-                    "> \u2139\ufe0f  No host coverage review ran either: send "
-                    "`requirement_matches` with ONE merged `suite_json`, or "
-                    "on the staged route put it in the finalize review "
-                    "SIDECAR with category-qualified tc_ids (see your "
-                    "preparation instructions).\n\n"
-                )
-            else:
-                dup_status_note += (
-                    "> \u2139\ufe0f  No host coverage review ran either: that also "
-                    "needs ONE merged `suite_json`.\n\n"
-                )
-        if cov_review is not None:
-            cov_note = host_mode.build_coverage_review_section(
-                cov_review,
-                submitted_cases,
-                list(getattr(suite, "test_cases", None) or []),
-                list(getattr(prepared, "checklist_items", None) or []),
-                deterministic_degraded=bool(
-                    view is not None and getattr(view, "degraded", False)
-                ),
-            )
-            # ops-4d (MEDIUM-1): the ONE signal in this section that is INDEPENDENT
-            # of the host. A claim survives validation on a single EXISTING tc_id --
-            # semantic relevance is never checked, by design -- so a host can quietly
-            # drop a real requirement off its OWN self-reported gap list by claiming
-            # a case covers it. That cannot subtract from the deterministic report
-            # (rendered separately and provably untouched), but it costs the tester's
-            # attention, which is the whole value of the section. Pure set arithmetic
-            # against the deterministic matcher turns that invisible false negative
-            # into a visible DISAGREEMENT. No embeddings, no percentage, no LLM call.
-            try:
-                _det_gaps = {
-                    str(g) for g in (getattr(view, "gap_item_ids", None) or [])
-                }
-                _disputed = sorted(_det_gaps & {str(k) for k in cov_review.claims})
-                if cov_note and _disputed:
-                    _shown = ", ".join(f"`{d}`" for d in _disputed[:20])
-                    _more = (
-                        f" …and {len(_disputed) - 20} more"
-                        if len(_disputed) > 20
-                        else ""
-                    )
-                    # When the matcher itself is degraded BOTH signals are weak, so
-                    # say so rather than lending the disagreement false authority.
-                    _caveat = (
-                        " Both signals are weak in this run: the matcher fell back "
-                        "to lexical matching and is stamped UNRELIABLE."
-                        if view is not None and getattr(view, "degraded", False)
-                        else ""
-                    )
-                    cov_note += (
-                        "\n> ⚠️ **The two coverage views DISAGREE about "
-                        f"{len(_disputed)} requirement(s).** The deterministic "
-                        "matcher lists them as NOT COVERED while the model claims a "
-                        f"test covers them: {_shown}{_more}. A claim is accepted on "
-                        "a valid tc_id alone, so read the named cases yourself "
-                        "before trusting either view." + _caveat + "\n"
-                    )
-            except Exception:
-                logger.debug("coverage cross-check failed -- omitted", exc_info=True)
         cap_note = ""
         if (
             settings.qa_checklist_remediation_enabled
@@ -9018,7 +8684,7 @@ async def handle_submit_suite(
                     f"{cat_source}"
                     f"{volume_note}"
                     f"{ac_note}{grounding_note}{checklist_note}{img_note}{dup_status_note}{dup_note}"
-                    f"{cov_note}{gap_md}"
+                    f"{gap_md}"
                 )
             cap_note = (
                 "\n\n> ⚠️  Requirement coverage still shows "
@@ -9149,22 +8815,9 @@ async def handle_submit_suite(
                 "dedup_offered": bool(
                     getattr(parsed, "duplicate_review_offered", False)
                 ),
-                # Piece 2: counts ONLY (never the claimed content), and
-                # only when a usable review actually ran -- so a flag-OFF run's
-                # audit row is byte-identical to today's.
-                **(
-                    {
-                        "host_coverage_claimed": len(cov_review.claims),
-                        "host_coverage_unclaimed": len(cov_review.unclaimed),
-                    }
-                    if cov_review is not None and cov_review.ran
-                    else {}
-                ),
             },
         )
-        auto_export = bool(
-            settings.qa_auto_export_xlsx and getattr(suite, "test_cases", None)
-        )
+        auto_export = bool(getattr(suite, "test_cases", None))
         result_md = shape_generation_result(
             summary, suite, suite_id, status, auto_export=auto_export
         )
@@ -9219,7 +8872,7 @@ async def handle_submit_suite(
         # byte-identical; the coverage note is expected to be always-on on a
         # default install, which is the point (see its docstring).
         rtm_note = _rtm_orphan_note(suite)
-        cov_signal_note = _no_coverage_signal_note(view, cov_review)
+        cov_signal_note = _no_coverage_signal_note(view)
         _final_stamp = {
             "suite_id": str(getattr(suite, "suite_id", "") or ""),
             "export_path": str(xlsx_paths[0]) if xlsx_paths else "",
@@ -9252,7 +8905,7 @@ async def handle_submit_suite(
             f"{fa_skip_note}{ac_note}{grounding_note}{checklist_note}{img_note}{risk_note}{plan_note}"
             f"{nli_note}{comment_note}"
             f"{dup_status_note}{dup_note}"
-            f"{cov_note}{rtm_note}{cov_signal_note}{result_md}{cap_note}"
+            f"{rtm_note}{cov_signal_note}{result_md}{cap_note}"
         )
     except Exception as exc:
         logger.exception("handle_submit_suite failed")
@@ -9389,7 +9042,7 @@ async def handle_export_suite(
             result += _zephyr_pair_note(
                 path,
                 story_key,
-                dry_run=bool(settings.qa_zephyr_dry_run),
+                dry_run=_zephyr_dry_run(),
                 total_cases=len(suite.test_cases),
             )
         return result
@@ -9512,6 +9165,161 @@ _MAX_BUG_REPORT_ROUNDS = 2
 # Hard cap on coach-memory areas recorded from host <meta> labels, so a chatty
 # host cannot grow an in-memory session without bound.
 _MAX_COACH_AREAS = 50
+
+
+# ── API test agent (chat-only; qa_api_test_enabled) ──────────────────────────
+def _render_api_write_result(r: dict) -> str:
+    if not isinstance(r, dict):
+        return "⚠️ write returned an unexpected value."
+    if r.get("error") and r.get("status") not in ("failed", "failed_not_discarded"):
+        return f"⚠️ {r['error']}"
+    status = r.get("status")
+    if status == "dry_run":
+        java = "\n\n".join(
+            f"### {p}\n```java\n{s}\n```"
+            for p, s in (r.get("java_sources") or {}).items()
+        )
+        return (
+            f"## API test — dry run\n**branch:** `{r.get('branch')}` (off `{r.get('base_commit')}`)\n"
+            f"**targets:** {', '.join(str(t) for t in (r.get('targets') or []))}\n\n{java}\n\n"
+            f"```yaml\n{r.get('contract_yaml', '')}\n```\n\n{r.get('note', '')}"
+        )
+    if status == "committed":
+        return f"✅ Committed on `{r.get('branch')}` (`{r.get('commit')}`). {r.get('note', '')}"
+    if status in ("committed_head_not_restored",):
+        return f"✅ Committed on `{r.get('branch')}` — {r.get('note', '')}"
+    if status == "unchanged":
+        return f"ℹ️ {r.get('note', '')}"
+    if status in ("failed", "failed_not_discarded"):
+        out = r.get("output")
+        out = out if isinstance(out, str) else ("" if out is None else str(out))
+        tail = f"\n\n```\n{out[-2000:]}\n```" if out else ""
+        return f"⚠️ {r.get('error')}. {r.get('note', '')}{tail}"
+    return f"⚠️ {r.get('error') or 'write failed'}"
+
+
+async def handle_prepare_api_tests(
+    input: str = "",
+    intake_id: str = "",
+    confirmed: bool = False,
+    *,
+    progress: ProgressCb = None,
+) -> str:
+    """PREPARE half of the chat-only API test agent. The server makes NO model
+    call — it returns an intake card or a task envelope your chat model acts on.
+    Never raises."""
+    from config.settings import settings as _s
+
+    if not _s.qa_api_test_enabled:
+        return "⚠️ The API test agent is off. Set QA_API_TEST_ENABLED=true and restart the server."
+    try:
+        from agents import api_test_agent as _agent
+
+        await _emit(progress, "🧭 Processing the API endpoint intake…")
+        r = await _agent.prepare_api_tests(
+            input or "", (intake_id or "").strip(), bool(confirmed)
+        )
+        kind = r.get("kind")
+        disc = ("\n\n" + r["disclosure"]) if r.get("disclosure") else ""
+        if kind == "error":
+            return f"⚠️ {r.get('error')}"
+        if kind in ("card", "confirm"):
+            await _audit(f"mcp_api_prepare_{kind}", entity_id=r.get("intake_id"))
+            return (r.get("card") or "") + disc
+        if kind == "ai_fill_prompt":
+            await _audit("mcp_api_prepare_aifill", entity_id=r.get("intake_id"))
+            return (r.get("prompt") or "") + disc
+        if kind == "envelope":
+            await _audit("mcp_api_prepare_envelope", entity_id=r.get("task_id"))
+            return (
+                shape_host_task(
+                    "Generate the API test suite — your turn",
+                    r.get("task_id", ""),
+                    r.get("envelope") or {},
+                    "qa_submit_api_tests",
+                    'field `suite` (JSON {"cases": [...]})',
+                )
+                + disc
+            )
+        return "⚠️ Unexpected intake result."
+    except Exception as exc:
+        logger.exception("handle_prepare_api_tests failed")
+        return f"⚠️ API test preparation failed ({type(exc).__name__}) — see the server log."
+
+
+async def handle_submit_api_tests(
+    task_id: str, suite: str, *, progress: ProgressCb = None
+) -> str:
+    """SUBMIT half: ground the cases YOUR chat model wrote, persist the suite.
+    Never raises."""
+    from config.settings import settings as _s
+
+    if not _s.qa_api_test_enabled:
+        return "⚠️ The API test agent is off (QA_API_TEST_ENABLED)."
+    task_id = (task_id or "").strip()
+    if not task_id:
+        return "⚠️ Pass the `task_id` from `qa_prepare_api_tests`."
+    if not (suite or "").strip():
+        return '⚠️ Send your generated cases as `suite` (JSON {"cases": [...]}).'
+    try:
+        from agents import api_test_agent as _agent
+
+        await _emit(progress, "🔎 Grounding the generated cases against the contract…")
+        r = await _agent.submit_api_suite(task_id, suite)
+        if r.get("error"):
+            return f"⚠️ {r['error']}. A task id is one-shot — start again with `qa_prepare_api_tests`."
+        await _audit("mcp_api_submit", entity_id=r.get("suite_id"))
+        parts = [
+            r.get("markdown", ""),
+            "",
+            r.get("disclosure", ""),
+            "",
+            f'Review the cases, then `qa_write_api_test(suite_id="{r["suite_id"]}")` for a dry-run of the Java.',
+        ]
+        return "\n".join(p for p in parts if p is not None)
+    except Exception as exc:
+        logger.exception("handle_submit_api_tests failed")
+        return f"⚠️ API suite submission failed ({type(exc).__name__}) — see the server log."
+
+
+async def handle_write_api_test(
+    suite_id: str, apply: bool = False, *, progress: ProgressCb = None
+) -> str:
+    """WRITE half: render + (dry-run or) write the Java into the framework repo via
+    that repo's ops pipeline. Never raises."""
+    from config.settings import settings as _s
+
+    if not _s.qa_api_test_enabled:
+        return "⚠️ The API test agent is off (QA_API_TEST_ENABLED)."
+    suite_id = (suite_id or "").strip()
+    if not suite_id:
+        return "⚠️ Pass the `suite_id` from `qa_submit_api_tests`."
+    fw_path = _s.qa_api_framework_path
+    if not fw_path:
+        return "⚠️ Set QA_API_FRAMEWORK_PATH to your api-automation-framework checkout, then restart."
+    try:
+        from agents import api_test_agent as _agent
+
+        # A real write needs the write flag ON and dry-run OFF; otherwise apply is a no-op refusal.
+        write_enabled = bool(_s.qa_api_framework_write_enabled) and not bool(
+            _s.qa_api_framework_write_dry_run
+        )
+        await _emit(progress, "🧱 Rendering the Java…")
+        r = await _agent.write_api_suite(
+            suite_id,
+            bool(apply),
+            framework_path=fw_path,
+            write_enabled=(write_enabled and bool(apply)),
+        )
+        await _audit(
+            "mcp_api_write",
+            entity_id=suite_id,
+            detail={"apply": bool(apply), "status": r.get("status")},
+        )
+        return _render_api_write_result(r)
+    except Exception as exc:
+        logger.exception("handle_write_api_test failed")
+        return f"⚠️ API test write failed ({type(exc).__name__}) — see the server log."
 
 
 def shape_host_task(
@@ -10520,8 +10328,11 @@ async def handle_run_web_suite(
     the planned browser actions without launching a browser. Never raises."""
     if _test_cases_only():
         return _TEST_CASES_ONLY_NOTICE
-    if not settings.qa_web_run_enabled:
-        return "ℹ️ Web suite execution is disabled (set QA_WEB_RUN_ENABLED=true)."
+    # QA_WEB_RUN_ENABLED was DELETED on 2026-08-13 (flag-surface reduction,
+    # batch 6) and hardcoded OFF. The message no longer names an env var:
+    # it would be naming one that does not exist.
+    if not _web_run_enabled():
+        return "ℹ️ Web suite execution is disabled in this build."
     base_url = (base_url or "").strip()
     if not base_url:
         return (
@@ -10666,8 +10477,11 @@ async def handle_submit_web_run(
     """
     if _test_cases_only():
         return _TEST_CASES_ONLY_NOTICE
-    if not settings.qa_web_run_enabled:
-        return "ℹ️ Web suite execution is disabled (set QA_WEB_RUN_ENABLED=true)."
+    # QA_WEB_RUN_ENABLED was DELETED on 2026-08-13 (flag-surface reduction,
+    # batch 6) and hardcoded OFF. The message no longer names an env var:
+    # it would be naming one that does not exist.
+    if not _web_run_enabled():
+        return "ℹ️ Web suite execution is disabled in this build."
     task_id = (task_id or "").strip()
     if not task_id:
         return "⚠️ Pass the `task_id` from `qa_run_web_suite`."
@@ -11650,9 +11464,8 @@ def _ac_field_section() -> list[str]:
                 "- `QA_JIRA_AC_FIELD_DISCOVERY` is off (default). When the "
                 "configured field holds nothing usable, the ticket description is "
                 "parsed instead -- an 'Acceptance Criteria' heading, or a "
-                "use-case table when `QA_JIRA_UC_TABLE_AC_ENABLED` is on. If "
-                "neither yields anything, your chat model is asked to derive the "
-                "criteria, so traceability still works."
+                "use-case table. If neither yields anything, your chat model is "
+                "asked to derive the criteria, so traceability still works."
             )
         out.append(
             "- To check the id for your instance, open a ticket's field list in "
@@ -11703,8 +11516,10 @@ async def _atlassian_autofix() -> tuple[list[str], list[str]]:
     otherwise healthy install report "Not ready".
     """
     try:
-        if not getattr(settings, "qa_register_atlassian_mcp", False):
-            return [], []
+        # QA_REGISTER_ATLASSIAN_MCP was DELETED on 2026-08-13 (flag-surface
+        # reduction, batch 6) and hardcoded ON -- the value both the code
+        # default and the shipped dist .env already carried, so no install
+        # changes behaviour. The autofix therefore always runs.
         from tools.client_registry import ADDED, ERROR, register_atlassian
 
         # to_thread because it takes a file lock, exactly as heal_env is called.
@@ -11931,8 +11746,8 @@ async def handle_setup_check(
                     "served in the middle of a tool call",
                 ),
                 (
-                    settings.qa_web_run_enabled
-                    and not settings.qa_web_run_dry_run
+                    _web_run_enabled()
+                    and not _web_run_dry_run()
                     and bool(settings.qa_web_run_vision_budget),
                     "web_runner.verify",
                     "Web suite execution (qa_run_web_suite) will still run every "
@@ -12124,36 +11939,35 @@ async def handle_setup_check(
         )
 
         export_line = ""
-        if settings.qa_auto_export_xlsx:
-            export_dir = _resolved_export_dir()
-            if export_dir:
-                dest = Path(export_dir).expanduser()
-                probe = dest if dest.is_absolute() else Path.cwd() / dest
-                while not probe.exists() and probe.parent != probe:
-                    probe = probe.parent
-                export_ok = os.access(probe, os.W_OK)
-                export_line = (
-                    # K5 (2026-08-10): this said "you choose where each file is
-                    # saved" -- but F1a gates the save-folder dialog on an
-                    # UNRESOLVED export dir, so in THIS branch the tester is never
-                    # asked. QA_EXPORT_DIR is the control here, and
-                    # qa_export_suite(output_dir=...) is the per-call override.
-                    f"- {'✅' if export_ok else '⚠️'} **Excel auto-export** — "
-                    f"files are saved to `{dest}` (set `QA_EXPORT_DIR`, or pass "
-                    "`output_dir` to `qa_export_suite`)"
-                    + ("" if export_ok else " — not writable")
+        export_dir = _resolved_export_dir()
+        if export_dir:
+            dest = Path(export_dir).expanduser()
+            probe = dest if dest.is_absolute() else Path.cwd() / dest
+            while not probe.exists() and probe.parent != probe:
+                probe = probe.parent
+            export_ok = os.access(probe, os.W_OK)
+            export_line = (
+                # K5 (2026-08-10): this said "you choose where each file is
+                # saved" -- but F1a gates the save-folder dialog on an
+                # UNRESOLVED export dir, so in THIS branch the tester is never
+                # asked. QA_EXPORT_DIR is the control here, and
+                # qa_export_suite(output_dir=...) is the per-call override.
+                f"- {'✅' if export_ok else '⚠️'} **Excel auto-export** — "
+                f"files are saved to `{dest}` (set `QA_EXPORT_DIR`, or pass "
+                "`output_dir` to `qa_export_suite`)"
+                + ("" if export_ok else " — not writable")
+            )
+            if not export_ok:
+                recommended.append(
+                    f"Make the export directory `{dest}` writable (or "
+                    "change QA_EXPORT_DIR) — until then generated Excel "
+                    "files fall back to a temp folder."
                 )
-                if not export_ok:
-                    recommended.append(
-                        f"Make the export directory `{dest}` writable (or "
-                        "change QA_EXPORT_DIR) — until then generated Excel "
-                        "files fall back to a temp folder."
-                    )
-            else:
-                export_line = (
-                    "- ✅ **Excel auto-export** — you choose where each file "
-                    "is saved (fallback: secure temp directory)"
-                )
+        else:
+            export_line = (
+                "- ✅ **Excel auto-export** — you choose where each file "
+                "is saved (fallback: secure temp directory)"
+            )
 
         # Repair superseded .env defaults BEFORE the verdict, so the report
         # reflects the file as it now stands. Never fatal: a failure is reported
@@ -12184,6 +11998,37 @@ async def handle_setup_check(
                 )
         except Exception:
             logger.debug("env self-heal step skipped", exc_info=True)
+
+        # Flag-governance disclosure (2026-08-13): tools/flag_registry.py is a
+        # PRIVATE-repo-only module (not in scripts/build_dist.TOOL_FILES), so a
+        # public qa-agent-pro install never runs this repo's own test suite and
+        # would otherwise never learn that an `experiment` flag's review_by
+        # date has passed -- CLAUDE.md says "holding a flag at OFF indefinitely
+        # is not an option", but nothing besides pytest enforced that until
+        # now. Optional, never blocking: an expired review date is maintainer
+        # housekeeping, never something that should stop a tester from
+        # generating test cases today. The import is local so a public dist
+        # build (which never ships this module) is byte-identical without it,
+        # and the catch is broad -- matching the env self-heal block right
+        # above -- so a bug in flag_registry degrades to a skipped optional
+        # line instead of escaping to this function's OUTER except Exception
+        # and discarding the whole report.
+        try:
+            from datetime import date
+
+            from tools import flag_registry
+
+            _expired = flag_registry.expiring_on_or_before(date.today().isoformat())
+            if _expired:
+                _names = ", ".join(f"`{name.upper()}`" for name, _e in _expired[:5])
+                _more = f" (+{len(_expired) - 5} more)" if len(_expired) > 5 else ""
+                optional.append(
+                    f"{len(_expired)} feature flag(s) are past their review-by "
+                    f"date: {_names}{_more}. Promote each to always-on or delete "
+                    "it per the CLAUDE.md flag policy — see docs/FEATURE_FLAGS.md."
+                )
+        except Exception:
+            logger.debug("flag-registry expiry check skipped", exc_info=True)
 
         if blockers:
             verdict = (
@@ -12236,14 +12081,14 @@ async def handle_setup_check(
             ),
             ("Mobile capture (QA_MOBILE_CAPTURE)", settings.qa_mobile_capture),
             (
-                "Swagger/OpenAPI links (QA_SWAGGER_ENABLED)",
-                settings.qa_swagger_enabled,
+                "Swagger/OpenAPI links (always on since 2026-08-13)",
+                True,
             ),
         ]
         if not _test_cases_only():
             gates += [
                 ("Mobile testing (QA_MAESTRO_ENABLED)", settings.qa_maestro_enabled),
-                ("Maestro dry-run (QA_MAESTRO_DRY_RUN)", settings.qa_maestro_dry_run),
+                ("Maestro dry-run (always on since 2026-08-13)", True),
                 (
                     "AI exploratory (QA_MAESTRO_EXPLORE_ENABLED)",
                     settings.qa_maestro_explore_enabled,

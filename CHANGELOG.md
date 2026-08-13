@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.51.0] - 2026-08-10
+## [1.52.0] - 2026-08-13
 
 ### Added
 
@@ -23,5 +23,4 @@ project adheres to [Semantic Versioning](https://semver.org/).
   qa_search_corpus, and automatic corpus pruning.
 - Release-manifest integrity self-heal and read-only code lock.
 - Anonymous, opt-out usage analytics (telemetry). See the README
-  'Telemetry & privacy' section; disable with QA_TELEMETRY_DISABLED=1
-  or DO_NOT_TRACK=1.
+  'Telemetry & privacy' section; disable with DO_NOT_TRACK=1.

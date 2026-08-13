@@ -462,17 +462,13 @@ def _extract_ac_from_description(description: str) -> str:
         m = _AC_HEADING_RE.search(description)
         if not m:
             # No "Acceptance Criteria" heading. Before giving up, try the use-case
-            # table shape (opt-in) -- a whole ticket family has its requirements
-            # only there, and returning "" left those suites with no traceability.
-            # Fallback matches the DECLARED default (True since 2026-08-03) on
-            # purpose: a mismatch would make the feature behave differently on an
-            # install whose settings object somehow lacks the field than on one
-            # where it is present and defaulted, which is a difference nobody would
-            # think to look for. Failing toward the old behaviour is not the safe
-            # choice here either -- the old behaviour is model-INVENTED criteria.
-            if bool(getattr(settings, "qa_jira_uc_table_ac_enabled", True)):
-                return _extract_ac_from_uc_table(description)
-            return ""
+            # table shape -- a whole ticket family has its requirements only there,
+            # and returning "" left those suites with no traceability.
+            # Unconditional since 2026-08-12 (QA_JIRA_UC_TABLE_AC_ENABLED was
+            # deleted; it had been default ON since 2026-08-03). Failing toward
+            # the OLD behaviour would not have been the safe choice here either --
+            # the old behaviour is model-INVENTED criteria, not none.
+            return _extract_ac_from_uc_table(description)
         rest = description[m.end() :].lstrip("\n")
         collected: list[str] = []
         for line in rest.splitlines():

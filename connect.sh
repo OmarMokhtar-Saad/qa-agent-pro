@@ -67,7 +67,7 @@ PYEOF
 # to edit a .env value that is already correct. All non-zero paths print the
 # JSON to add by hand, so no branch is a dead end and none writes blindly.
 ATLAS_URL="https://mcp.atlassian.com/v1/mcp/authv2"
-"$PY" -c "from config.settings import settings; raise SystemExit(0 if settings.qa_register_atlassian_mcp else 3)" >/dev/null 2>&1
+"$PY" -c "import config.settings; raise SystemExit(0)" >/dev/null 2>&1
 ATLAS_RC=$?
 if [ "$ATLAS_RC" -eq 0 ]; then
   echo ""

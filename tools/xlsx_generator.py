@@ -10,7 +10,6 @@ from pathlib import Path
 
 import xlsxwriter
 
-from config.settings import settings
 from tools.bilingual import bidi_isolate, is_rtl_cell
 from tools.cell_sanitizer import sanitize_cell
 from tools.models import TestSuite, format_test_data_lines
@@ -135,11 +134,12 @@ def _notes_cell(tc: object, rule_pack_note: str) -> str:
     order (TC-001 = highest risk), but risk_label / risk_score were never
     exported -- while Notes was empty in 65/65 rows of the 2026-07-30 run,
     because it only ever carried a Batch-3 rule-pack note and the rule packs are
-    off in that deployment. Opt-in via QA_XLSX_RISK_NOTES.
+    off in that deployment. Unconditional since 2026-08-12 (QA_XLSX_RISK_NOTES
+    was deleted).
 
     A rule-pack note ALWAYS wins, so no information is ever displaced, and any
-    problem degrades to the rule-pack note -- i.e. exactly today's output. Pure
-    and never raises.
+    problem degrades to the rule-pack note -- i.e. exactly the pre-feature
+    output. Pure and never raises.
 
     2026-08-04: the cell used to read "Risk: <label> (<score>)", and the LABEL
     duplicated the Priority column -- contradicting it in 10/97 rows of that
@@ -151,8 +151,6 @@ def _notes_cell(tc: object, rule_pack_note: str) -> str:
     if note:
         return note
     try:
-        if not settings.qa_xlsx_risk_notes:
-            return note
         # The gate stays on risk_label: an UNSCORED suite has risk_label == ""
         # and risk_score == 0, and must keep producing an empty Notes cell rather
         # than a meaningless "Risk 0".
@@ -538,9 +536,9 @@ def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
         data_lines = [
             f"Step {s.step_number}: {s.test_data}" for s in tc.steps if s.test_data
         ]
-        # Case-level data-provisioning plan (QA_TEST_DATA_STRATEGY). Only present
-        # when the case declared test_data; appended after the per-step lines so a
-        # case with none renders byte-identically to before.
+        # Case-level data-provisioning plan. Only present when the case declared
+        # test_data; appended after the per-step lines so a case with none renders
+        # byte-identically to before.
         data_lines.extend(format_test_data_lines(tc.test_data))
         test_data_text = _prepare("\n".join(data_lines))
 

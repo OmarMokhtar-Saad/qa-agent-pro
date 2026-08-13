@@ -1,4 +1,9 @@
-"""Swagger / OpenAPI link ingestion (``QA_SWAGGER_ENABLED`` — opt-in, OFF by default).
+"""Swagger / OpenAPI link ingestion (always on since 2026-08-13).
+
+``QA_SWAGGER_ENABLED`` was DELETED on 2026-08-13 (flag-surface reduction,
+batch 6) and the behaviour hardcoded ON -- the value the distribution ``.env``
+template always shipped. ``tools.mcp_handlers`` now reaches this module
+whenever :func:`looks_like_openapi_url` recognises a pasted URL.
 
 Fetches an OpenAPI (Swagger) specification from a pasted URL and condenses it
 into a bounded, human-readable endpoint summary used to ground API test-case

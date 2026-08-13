@@ -16,8 +16,6 @@ import logging
 import time
 from pathlib import Path
 
-from config.settings import settings
-
 logger = logging.getLogger(__name__)
 
 # key -> (superseded values that MAY be rewritten, new value, one-line reason)
@@ -25,14 +23,6 @@ logger = logging.getLogger(__name__)
 # Every entry must name values THIS PROJECT once shipped. Anything else is an
 # operator decision and is out of scope by construction.
 HEAL_RULES: dict[str, tuple[tuple[str, ...], str, str]] = {
-    "QA_MODULE_PREFIX_NORMALIZE_ENABLED": (
-        ("false", "0", "no", "off"),
-        "true",
-        "merges a qualifier-prefixed module label onto its bare variant -- the "
-        "2026-08-04 SHYJ-5645 run shipped one feature split 12/85 across "
-        "'Cancel order' and 'Sehhaty Store - Cancel order', which breaks "
-        "module-based filtering in TestRail/Xray pushes",
-    ),
     "JIRA_MAX_PARENT_CHARS": (
         ("1500",),
         "2500",
@@ -77,8 +67,6 @@ def heal_env(install_dir: Path) -> dict:
     """
     result: dict = {"changed": [], "backup": "", "error": None}
     try:
-        if not bool(getattr(settings, "qa_env_selfheal_enabled", False)):
-            return result
         env = Path(install_dir) / ".env"
         if not env.is_file():
             return result

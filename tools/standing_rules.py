@@ -553,8 +553,10 @@ def standing_warning_section(
             if triggers.spec_hint:
                 lines.append(
                     "  - A spec URL appears in the ticket text "
-                    f"(`{triggers.spec_hint}`). Re-run with `QA_SWAGGER_ENABLED=true` "
-                    "to generate the API cases from the real contract instead."
+                    f"(`{triggers.spec_hint}`). Spec ingestion is always on, so "
+                    "if the API cases were not written from the contract the "
+                    "URL was not recognised as an OpenAPI/Swagger link, or the "
+                    "fetch failed."
                 )
         if triggers.ui:
             lines.append(

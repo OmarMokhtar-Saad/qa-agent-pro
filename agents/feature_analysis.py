@@ -196,15 +196,15 @@ async def analyze_feature(
             feature_text, jira_text, screenshot_descriptions, ui_content, acs
         )
         # LEGACY server-side call, KEPT deliberately. Its only remaining caller
-        # is _finalize_generation's opt-in in-prep report
-        # (agents/test_scenario_agent.py, gated by QA_HOST_FEATURE_REPORT_ENABLED
-        # AND QA_FEATURE_ANALYSIS_ENABLED, both default OFF); the STANDALONE
-        # qa_feature_analysis tool no longer reaches it -- it goes through
-        # prepare_feature_analysis below. Tagged with this row's ledger id so
-        # QA_SERVER_LLM_ENABLED governs it and
-        # QA_SERVER_LLM_ALLOW=feature_analysis.report can revive exactly this one
-        # path after the Phase-6 flip; untagged it would silently degrade to an
-        # empty report instead.
+        # is _finalize_generation's in-prep report, which server mode and
+        # force_feature_report can still reach (the host submit hardcodes
+        # feature_report_enabled=False, and QA_FEATURE_ANALYSIS_ENABLED is
+        # default OFF); the STANDALONE qa_feature_analysis tool no longer
+        # reaches it -- it goes through prepare_feature_analysis below. Tagged
+        # with this row's ledger id so QA_SERVER_LLM_ENABLED governs it and
+        # QA_SERVER_LLM_ALLOW=feature_analysis.report can revive exactly this
+        # one path after the Phase-6 flip; untagged it would silently degrade
+        # to an empty report instead.
         with server_llm_scope(_LEDGER_ID):
             return await ask_json(
                 system=system,
