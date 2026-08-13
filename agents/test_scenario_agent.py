@@ -375,15 +375,40 @@ def _detect_compliance_keywords(text: str) -> list[tuple[str, str]]:
     return [(kw, query) for kw, query in _COMPLIANCE_KEYWORDS if kw in lower]
 
 
+def rag_enabled() -> bool:
+    """Always True -- RAG corpus grounding is ON, unconditionally.
+
+    QA_RAG_ENABLED was DELETED on 2026-08-13 (flag-surface reduction, batch 7
+    (needs-config)) and hardcoded to the value the DISTRIBUTION ships (`true`),
+    not this field's code default. A named seam so the no-corpus path stays
+    executable by its tests -- and so the mocked suite never reads a developer
+    machine's real corpus/ directory. NOT settings-derived.
+    """
+    return True
+
+
+def semantic_dedup_enabled() -> bool:
+    """Always False -- intra-suite semantic dedup is RETIRED.
+
+    QA_SEMANTIC_DEDUP_ENABLED was DELETED on 2026-08-13 and hardcoded to its
+    own code default: it never shipped in the distribution's .env template, and
+    OFF is the safe direction for the one path in that batch that DROPS
+    generated cases. QA_EMBEDDINGS_BACKEND is untouched and still powers vector
+    RAG ranking -- exactly the separation this gate existed to protect.
+    _semantic_dedupe_cases is retained for revival. NOT settings-derived.
+    """
+    return False
+
+
 async def _enrich_with_rag(feature_text: str, parts: list[str]) -> None:
     """Optionally query the RAG corpus for similar past test cases.
 
     Appends a '## Similar Past Test Cases' block and/or a '## Duplicate Risk'
     block to parts when relevant results are found.
-    Checks settings.qa_rag_enabled first — returns immediately when disabled.
+    Checks rag_enabled() first — returns immediately when that seam is off.
     Never raises.
     """
-    if not settings.qa_rag_enabled:
+    if not rag_enabled():
         return
 
     result = await query_corpus(
@@ -3817,12 +3842,13 @@ async def _finalize_generation(
     scored, rule_pack_ctx = apply_rule_packs(scored, rule_packs)
     # Ordering alone is not enough: two substituted bilingual cases still
     # differ only by which documented message they quote, and a real
-    # sentence-embedding model can score that pair above
-    # QA_SEMANTIC_DEDUP_THRESHOLD. Empty set when the pack is off.
+    # sentence-embedding model could score that pair above
+    # QA_SEMANTIC_DEDUP_THRESHOLD if the retired dedup path were revived.
+    # Empty set when the pack is off.
     protected_ids = protected_stable_ids(rule_pack_ctx)
 
     semantic_dedup_note = ""
-    if settings.qa_semantic_dedup_enabled and backend_enabled():
+    if semantic_dedup_enabled() and backend_enabled():
         scored, semantic_dedup_note = await _semantic_dedupe_cases(
             scored, protected_stable_ids=protected_ids
         )
