@@ -76,7 +76,7 @@ try {
 # branch instead. ASCII only in here, like the rest of this file.
 $AtlasUrl = "https://mcp.atlassian.com/v1/mcp/authv2"
 $LASTEXITCODE = 99
-& $Py -c "from config.settings import settings; raise SystemExit(0 if settings.qa_register_atlassian_mcp else 3)" 2>&1 | Out-Null
+& $Py -c "import config.settings; raise SystemExit(0)" 2>&1 | Out-Null
 $AtlasRc = $LASTEXITCODE
 if ($AtlasRc -eq 0) {
   Write-Host ""

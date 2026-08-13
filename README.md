@@ -331,11 +331,10 @@ Edit `~/qa-agent-pro/.env` (created from `.env.example`):
 |---|---|
 | _(none)_ | No LLM credentials: generation runs in your own chat model, so there is no API key or backend to set |
 | _(none)_ | Jira ticket URLs work via your own Atlassian MCP connection -- no `.env` entry needed |
-| `QA_SWAGGER_ENABLED` | Swagger/OpenAPI link → API test cases |
+| _(none)_ | Swagger/OpenAPI link → API test cases: paste a spec URL and it is ingested automatically |
 | `QA_MOBILE_CAPTURE` | Mobile-screen capture (Android via adb). The screenshots are handed to your own chat model, so no API key is involved |
 | `QA_RAG_ENABLED` | Learn from your past suites: grounding + duplicate flagging (on by default) |
 | `QA_MCP_ELICIT_ENABLED` | Interactive pickers in Cursor / Claude Code (on by default; automatic text-menu fallback on clients without dialog support) |
-| `QA_AUTO_EXPORT_XLSX` | Auto-build the Excel file the instant generation finishes; the reply tells you exactly where the `.xlsx` is (on by default) |
 | `QA_EXPORT_DIR` | Folder the auto-exported Excel files are saved to -- `data/exports` in the dist, so your files persist there across sessions and updates |
 
 ## Connect Jira (to paste ticket URLs)
@@ -415,11 +414,11 @@ generated test cases, LLM prompts or completions, exception messages,
 absolute file paths, or secrets. The only personal field is an email, and ONLY if
 you set `QA_USER_EMAIL` yourself.
 
-**Opt out** at any time (either works) in `~/qa-agent-pro/.env`:
+**Opt out** at any time in `~/qa-agent-pro/.env`, with the cross-tool
+standard variable -- since 2026-08-13 this is the only opt-out
+(`QA_TELEMETRY_DISABLED` was removed):
 
 ```bash
-QA_TELEMETRY_DISABLED=1
-# or the cross-tool standard:
 DO_NOT_TRACK=1
 ```
 

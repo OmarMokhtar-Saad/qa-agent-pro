@@ -530,11 +530,9 @@ _HOST_DEDUP_INSTRUCTION = (
 # ambiguity_result sidecar) -- staged rows survive a host crash/reload, and the
 # completeness gate in mcp_handlers uses meta.expected_categories stamped at
 # prepare time. ALTERNATIVE (Path B): merge in parent, then qa_submit_suite with
-# full suite_json -- the only route that can carry the coverage review's
-# requirement_matches (checked against the merged suite's global tc_ids; the
-# duplicate review reaches the server on EITHER route, via the sidecar that
-# _review_sidecar / _remap_dup_groups already handle), but a single point of
-# loss if the chat dies before that one call.
+# full suite_json -- a single point of loss if the chat dies before that one
+# call. The duplicate review reaches the server on EITHER route, via the
+# sidecar that _review_sidecar / _remap_dup_groups already handle.
 # Never duplicate full user_context into jobs[] (token bomb).
 # Every helper below is pure / sync / never-raise where noted.
 # --------------------------------------------------------------------------- #
@@ -602,12 +600,11 @@ _HOST_PARALLEL_INSTRUCTION = (
     "requested.\n"
     "4. ALTERNATIVE finalize (Path B -- merge in parent): merge all workers' "
     "test_cases into ONE object (unique tc_ids), run any post-merge reviews "
-    "asked elsewhere in these instructions (`duplicate_groups` works on either "
-    "route; `requirement_matches` needs THIS one, because it is checked against "
-    "the merged suite's global tc_ids), then call `qa_submit_suite` with this "
+    "asked elsewhere in these instructions (`duplicate_groups` works on "
+    "either route), then call `qa_submit_suite` with this "
     "prep_id and the merged suite_json. Nothing is saved until that one call, "
     "so an interrupted chat loses every worker's output.\n"
-    "5. Optional: `qa_get_category_job(prep_id, \"all\")` returns EVERY job "
+    '5. Optional: `qa_get_category_job(prep_id, "all")` returns EVERY job '
     "packet in ONE call, with the shared prompt blocks hoisted once; a "
     "single category_name returns one packet. NEVER fetch packets one "
     "call per category -- an observed run spent 8 round trips on that.\n"
@@ -634,17 +631,13 @@ def _parallel_fanout_on() -> bool:
 
 
 def _dedup_review_on() -> bool:
-    """Never-raise read of QA_HOST_DEDUP_REVIEW_ENABLED.
-
-    Mirrors _parallel_fanout_on. Used by the orchestration contract (Fix 2,
-    2026-08-03) so the finalize route it names as `preferred` is the one that
-    KEEPS this review rather than the one that forfeits it.
+    """The cross-category duplicate review is unconditional since 2026-08-12
+    (QA_HOST_DEDUP_REVIEW_ENABLED was deleted; it had soaked ON since
+    2026-08-03). Kept as a function because the orchestration contract (Fix 2,
+    2026-08-03) reads it to name the finalize route that KEEPS this review
+    rather than the one that forfeits it.
     """
-    try:
-        return bool(getattr(settings, "qa_host_dedup_review_enabled", False))
-    except Exception:  # pragma: no cover
-        logger.debug("could not read qa_host_dedup_review_enabled", exc_info=True)
-        return False
+    return True
 
 
 def _parallel_instruction() -> str:
@@ -662,49 +655,16 @@ def _parallel_instruction() -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Category-qualified tc_ids (QA_QUALIFIED_TC_IDS_ENABLED, phase 2)
+# Category-qualified tc_id parsing
 #
-# Every staged category restarts its tc_ids at TC-001, so a bare id in a
-# finalize-time review sidecar is ambiguous the moment two categories are
-# staged -- the shipped _remap_dup_groups path resolves it first-category-wins.
-# Under this flag, sidecar ids may be written "<category>:<tc_id>"; bare ids
-# stay accepted where unambiguous, and an ambiguous bare id is refused LOUDLY
-# (mcp_handlers._remap_sidecar_groups), never guessed. Colon is the separator
-# because no canonical category name contains ":" (several contain "/").
+# The QA_QUALIFIED_TC_IDS_ENABLED contract was DELETED on 2026-08-12 (default
+# OFF, never validated). The SPLIT helper below is NOT part of that contract
+# and survives: mcp_handlers._map_qualified_id uses it for the finalize
+# sidecar's `risk_scores` keys, whose qualified maps are built
+# UNCONDITIONALLY because a misattributed risk rationale is unacceptable.
+# Colon is the separator because no canonical category name contains ':'
+# (several contain "/").
 # --------------------------------------------------------------------------- #
-
-_QUALIFIED_ID_INSTRUCTION = (
-    "\n"
-    "QUALIFIED TC IDS (finalize-time review fields) -- every staged category "
-    "restarts its tc_ids at TC-001, so a bare id like `TC-003` is AMBIGUOUS "
-    "once two categories are staged. When a review field travels on a "
-    "finalize SIDECAR after `qa_submit_category` staging, write each "
-    "test-case id CATEGORY-QUALIFIED as `<category>:<tc_id>` -- e.g. "
-    '`"Security:TC-003"` or `"Positive / Happy Path:TC-001"`. The part '
-    "before the LAST colon is the category, exactly as you submitted it "
-    "(recognised aliases work too); no category name contains a colon. This "
-    "applies to `duplicate_groups` members AND to `requirement_matches` "
-    "values (`requirement_matches` keys stay requirement ids like CL-1, and "
-    "under this contract that field may ride the sidecar as well). Bare ids "
-    "remain accepted when only one staged category used that id; an "
-    "ambiguous bare id is REFUSED with a note -- the server never guesses. "
-    "On the merged Path B route nothing changes: use the merged suite's own "
-    "tc_ids, unqualified.\n"
-)
-
-
-def qualified_ids_on() -> bool:
-    """Never-raise read of QA_QUALIFIED_TC_IDS_ENABLED (default OFF)."""
-    try:
-        return bool(getattr(settings, "qa_qualified_tc_ids_enabled", False))
-    except Exception:  # pragma: no cover
-        logger.debug("could not read qa_qualified_tc_ids_enabled", exc_info=True)
-        return False
-
-
-def _qualified_instruction() -> str:
-    """Appendix for prepare instructions, or "" when the flag is OFF."""
-    return _QUALIFIED_ID_INSTRUCTION if qualified_ids_on() else ""
 
 
 def split_qualified_tc_id(raw: object) -> "tuple[str, str]":
@@ -806,14 +766,12 @@ def build_orchestration(prepared, prep_id: str = "") -> dict | None:
             "qa_prep_status until ready=true and finalize with a review sidecar "
             "carrying duplicate_groups (an empty suite_json also finalizes, but "
             "FORFEITS the duplicate review you were asked to run). "
-            "Merge-in-parent (Path B) is the fallback and the only route that "
-            "can carry requirement_matches."
+            "Merge-in-parent (Path B) is the fallback."
             if _dedup_review_on()
             else "Fan out one same-session worker per expected category; stage "
             "each category via qa_submit_category as it returns (crash-safe), "
             "then qa_prep_status until ready=true and finalize with an empty "
-            "suite_json. Merge-in-parent (Path B) is the fallback and the only "
-            "route that can carry requirement_matches."
+            "suite_json. Merge-in-parent (Path B) is the fallback."
         ),
         "worker_instructions": (
             "Emit ONLY one category's TestSuite JSON matching response_schema. "
@@ -852,9 +810,7 @@ def build_category_job(prepared, prep_id: str, category_name: str) -> dict | Non
             prepared.complexity_text or prepared.feature_text or prepared.user_msg,
             prepared.ui_content,
         )
-        quality_reminder = (
-            _QUALITY_RETRY_REMINDER if settings.qa_quality_reminder_upfront else ""
-        )
+        quality_reminder = _QUALITY_RETRY_REMINDER
         match = None
         for name, focus, ptype in getattr(prepared, "categories", None) or []:
             if name == canon or normalize_category(name) == canon:
@@ -1123,177 +1079,11 @@ def route_ungrounded_cases(raw: object, cases: list) -> RoutedCases | None:
 
 
 def _dedup_instruction() -> str:
-    """The duplicate-review clause appended to the host instructions, or "" when
-    QA_HOST_DEDUP_REVIEW_ENABLED is OFF -- in which case the prepare payload is
-    byte-identical to the pre-feature output. Never raises."""
-    try:
-        if bool(getattr(settings, "qa_host_dedup_review_enabled", False)):
-            return _HOST_DEDUP_INSTRUCTION
-    except Exception:  # pragma: no cover - settings never raises
-        logger.debug("could not read qa_host_dedup_review_enabled", exc_info=True)
-    return ""
+    """The duplicate-review clause appended to the host instructions.
 
-
-# --------------------------------------------------------------------------- #
-# Piece 2: host-reviewed requirement coverage (QA_HOST_COVERAGE_REVIEW_ENABLED)
-#
-# ``tools/rtm.match_checklist`` is TIERED and the tiers are NOT alternatives: tier
-# (a) (the similarity matrix, ``_similarity_matrix``) is the GATE, and the optional
-# entailment (b) / adjudication (c) tiers only RE-JUDGE pairs tier (a) already
-# shortlisted. With no QA_EMBEDDINGS_BACKEND tier (a) is a TF-IDF lexical matrix, so
-# on a keyless deployment the shortlist is built from WORD OVERLAP -- and
-# requirement <-> test-case matching is precisely the high-paraphrase-distance
-# problem where word overlap is weakest (an EARS requirement and the test that
-# verifies it share almost no vocabulary by construction). Turning on
-# QA_CHECKLIST_ADJUDICATE_ENABLED does not fix that: it adjudicates the word-overlap
-# shortlist. The honest consequence today is that the percentage is SUPPRESSED and
-# the tally stamped UNRELIABLE -- correct, but it leaves the tester with no view at
-# all of WHICH requirement went untested.
-#
-# The meaning engine used instead is the tester's OWN chat model: already in the
-# loop, already holding the merged 8-category suite, already holding the checklist
-# block. Prepare asks it for an OPTIONAL top-level ``requirement_matches`` mapping
-# {CL id: [tc_id, ...]}; submit validates and reports it here in pure Python. ZERO
-# extra round trips (it rides the existing submission) and ZERO server-side LLM
-# calls -- the last one on this path was removed deliberately.
-#
-# THIS IS MODEL JUDGEMENT, NOT MEASUREMENT. It ships as a SEPARATE, EXPLICITLY
-# LABELLED tier (``host-reviewed``) held structurally apart from the deterministic
-# measurement:
-#
-#   * NO PERCENTAGE IS PUBLISHED -- not even a labelled one. A suppressed percentage
-#     is exactly what honesty rule 1 removes, and ``rtm.checklist_tally_line``
-#     already records why: "a bold number with a caveat underneath is still read as a
-#     number". A self-graded percentage printed beside a figure the tool deliberately
-#     refuses to print would be read AS that figure. Counts of CLAIMS are printed;
-#     a ratio of them never is, and there is no percentage field to format.
-#   * NOTHING IS MERGED OR AVERAGED. ``ChecklistCoverage``, ``coverage_to_dict``,
-#     the XLSX checklist sheets and the ``suite_store`` payload are untouched, so no
-#     later reader can republish this as coverage.
-#   * IT NEVER DRIVES THE GAP LOOP. QA_CHECKLIST_REMEDIATION_ENABLED REFUSES a
-#     degraded (lexical) coverage view; letting an uncalibrated self-assessment do
-#     what a measurement is forbidden to do would invert that rule -- and it would
-#     recreate Piece 1's LOW-10 shape, a loop manufacturing the gaps it then asks the
-#     host to refill, three times over (_MAX_GAP_ROUNDS).
-#   * IT IS MONOTONE IN THE SAFE DIRECTION -- which is what replaces a "safety
-#     bound" here, because there is no destructive path to bound. The only thing this
-#     field can add is a FLAG. A hostile review claiming everything is covered
-#     removes no gap from anywhere: it merely produces no self-reported gaps, i.e.
-#     today's behaviour. A review claiming NOTHING is treated as UNUSABLE rather
-#     than as "every requirement is a gap", so the field cannot manufacture a gap
-#     list either.
-#   * ASYMMETRIC BY DESIGN. A CLAIM ("CL-007 is covered by TC-012") is unverified
-#     model judgement and is labelled as such. A NON-CLAIM is the generating model's
-#     own admission that it wrote no test for a requirement: that is the direction
-#     worth acting on, and it can only ever add work, never subtract it.
-#
-# NO LEXICAL SIMILARITY GATE. Piece 1 measured the alternative on this very repo:
-# a genuine cross-category duplicate scores difflib 0.29-0.54 / Jaccard 0.12-0.25
-# while two boundary siblings that must NOT be merged score 0.95-0.98 / 0.78-0.83 --
-# the signal is ANTI-CORRELATED with the target class, because a real paraphrase has
-# different vocabulary by construction while a sibling is identical wording with one
-# token changed. Requirement <-> case matching is the same problem, one step worse
-# (different genre, not just different words), so no lexical floor is used to accept
-# or reject a claim anywhere below. See ``dup_agreements`` for the full table.
-#
-# Every function below is pure, synchronous, stdlib-only and never raises.
-# --------------------------------------------------------------------------- #
-
-# Shape caps on the untrusted field. settings may LOWER these, never raise them.
-_HR_MAX_ITEMS = 500
-_HR_MAX_TC_PER_ITEM = 12
-_HR_MAX_NOTES = 20
-# Rendered lists are bounded by ROWS, and the largest (least actionable) list is
-# additionally bounded by CHARACTERS, so a 200-requirement checklist cannot turn the
-# reply into a wall of text. The actionable lists are rendered FIRST, so truncation
-# can never hide a self-reported gap.
-# ops-4d (MEDIUM-2, PARTIAL): these lists were ROW-capped only, so 3 lists x 60
-# rows x ~270 chars/row put the worst case near 47 KB prepended ahead of the
-# tester's export path. 20 rows bounds it at ~16 KB. This is a MITIGATION, not
-# the character budget the claims list below already uses -- tracked as a
-# follow-up, because converting the three loops to a shared character budget is a
-# refactor of a function with 66 tests around it and does not belong in a release
-# hotfix. The render ORDER already guarantees truncation cannot hide a
-# self-reported gap: SELF-REPORTED NOT COVERED is emitted first.
-_HR_MAX_ROWS = 20
-_HR_MAX_SECTION_CHARS = 4000
-# A review this sparse is LABELLED, never rejected: claiming a test for only a
-# handful of many requirements is likelier an incomplete field than a real gap list.
-_HR_SPARSE_MIN_PRESENTED = 8
-_HR_SPARSE_NUM = 1
-_HR_SPARSE_DEN = 4
-
-_HOST_COVERAGE_INSTRUCTION = (
-    "\n"
-    "REQUIREMENT COVERAGE REVIEW -- do this AFTER merging all the categories, "
-    "before submitting. `user_context` contains an ATOMIC REQUIREMENTS CHECKLIST "
-    "whose items are identified as CL-001, CL-002, ... Re-read the merged "
-    "`test_cases` and decide, for EACH checklist item, which of your test cases "
-    "actually VERIFY it.\n"
-    "   FIRST, fix what you find: if an item has no test, WRITE the missing test "
-    "case now and include it in the merged suite. Only leave an item unmatched when "
-    "you genuinely cannot test it from the material you were given.\n"
-    "   THEN add ONE optional top-level field to the merged JSON you submit:\n"
-    '   "requirement_matches": {"CL-001": ["TC-004"], "CL-002": ["TC-011", '
-    '"TC-032"]}\n'
-    "   Rules: keys are checklist item ids EXACTLY as they appear in the checklist "
-    "block; values are arrays of tc_id values EXACTLY as they appear in the JSON "
-    "you are submitting. List an item only when a case really verifies it -- leave "
-    "it out otherwise, and never invent an id. Omit the whole field if you cannot "
-    "do the review.\n"
-    "   What the server does with it: it REPORTS your judgement to the tester, "
-    "clearly labelled REVIEWED, NOT MEASURED. It is NOT turned into a coverage "
-    "percentage, it is NOT written into the exported spreadsheet, and it does NOT "
-    "change the server's own deterministic coverage figure. So do not optimise it: "
-    'an honest "no test for CL-007" is worth far more here than a full-looking '
-    "map.\n"
-    "   About `response_schema`: it describes ONE category's suite object and sets "
-    '"additionalProperties": false, which applies to each per-category object. The '
-    "MERGED object you send to `qa_submit_suite` may legitimately carry this extra "
-    "top-level key beside `test_cases`; the server strips it before validating the "
-    "suite against that schema, so including it is correct. Per-category objects "
-    "must NOT carry it: only `qa_submit_suite` accepts it, because requirement "
-    "coverage can only be judged on the MERGED set, and `qa_submit_category` cannot "
-    "use it at all."
-)
-
-
-def _coverage_instruction(prepared, checklist_job: bool = False) -> str:
-    """The coverage-review clause appended to the host instructions, or "" when
-    QA_HOST_COVERAGE_REVIEW_ENABLED is OFF **or** this run will have NO checklist
-    at all -- in which case the prepare payload is byte-identical to the
-    pre-feature output.
-
-    "Will have no checklist" is a DISJUNCTION since residue R4, and both halves
-    matter: the prep presented no checklist item of its own (the server route --
-    with no checklist block in the prompt there are no CL ids to map, so asking
-    for the field would only invite invented ones) AND ``checklist_job`` is False
-    (no CHECKLIST_JOB was shipped, so the host will not author one either). That
-    pair is what encodes the QA_ATOMIC_CHECKLIST_ENABLED dependency in code
-    rather than in prose: with the decomposition boomeranged, presented_ids is
-    empty at payload-build time BY CONSTRUCTION and yet a checklist will exist
-    while the host generates, so the single-condition form silently deleted the
-    whole clause. Never raises."""
-    try:
-        if not bool(getattr(settings, "qa_host_coverage_review_enabled", False)):
-            return ""
-        # Residue R4 widen. `checklist_job` is True when THIS prepare handed the
-        # decomposition to the host (CHECKLIST_JOB), in which case
-        # checklist_presented_ids is EMPTY at payload-build time by construction
-        # -- the server made no decomposition call -- yet a checklist WILL exist
-        # while the host generates, because the host writes it in step 0d of the
-        # same turn. Without this disjunct the whole coverage-review clause
-        # silently disappeared from the payload, deleting the very host analog
-        # that Phase 3b's ledger row (`rtm.nli_verdicts`) names as the
-        # replacement for the suppressed entailment tiers.
-        if not list(
-            getattr(prepared, "checklist_presented_ids", None) or []
-        ) and not bool(checklist_job):
-            return ""
-        return _HOST_COVERAGE_INSTRUCTION
-    except Exception:  # pragma: no cover - settings never raises
-        logger.debug("could not read qa_host_coverage_review_enabled", exc_info=True)
-    return ""
+    Unconditional since 2026-08-12 (QA_HOST_DEDUP_REVIEW_ENABLED deleted).
+    Never raises."""
+    return _HOST_DEDUP_INSTRUCTION
 
 
 # Step-by-step instructions handed to the tester's own chat model. Code-authored
@@ -1378,11 +1168,12 @@ class ParsedSubmission:
     # Why part of that field was rejected. Surfaced in the reply -- silence about a
     # rejected untrusted field is the failure mode being avoided.
     duplicate_notes: list = dataclasses.field(default_factory=list)
-    # Piece 2: the host's OPTIONAL `requirement_matches` field, carried RAW and
+    # The host's OPTIONAL `requirement_matches` field, carried RAW and
     # UNVALIDATED. It is popped here (before TestSuite validation, which sets
-    # extra="forbid") but validated LATER, in extract_requirement_matches, because
-    # its ids must be checked against the PREP's checklist -- which _validate_suite
-    # does not have. Nothing downstream may read it without validating it.
+    # extra="forbid") so a stray field from a host still following an older
+    # prompt cannot fail an otherwise valid submit. NOTHING READS IT since the
+    # host coverage review was deleted (2026-08-12); it is kept for that
+    # tolerance alone.
     raw_requirement_matches: object = None
     # The host's OPTIONAL `acceptance_criteria` field (the AC boomerang job's
     # return_field), carried RAW and UNVALIDATED for exactly the same reason:
@@ -1447,11 +1238,10 @@ class ParsedSubmission:
 # without parsing every spec, and ADOPTS jobs attached by the earlier bespoke
 # helper (_LEGACY_JOB_KEYS) so nothing has to be rewritten to be indexed.
 #
-# NOT migrated on purpose: the post-merge duplicate/coverage reviews
-# (QA_HOST_DEDUP_REVIEW_ENABLED / QA_HOST_COVERAGE_REVIEW_ENABLED) already ship
-# as instruction appendices with ~66 tests around their exact wording. They are
-# the same SHAPE as a post_merge job and can be folded in later; doing it here
-# would be a refactor with no behaviour change and real regression risk.
+# NOT migrated on purpose: the post-merge duplicate review already ships as an
+# instruction appendix with tests around its exact wording. It is the same
+# SHAPE as a post_merge job and can be folded in later; doing it here would be
+# a refactor with no behaviour change and real regression risk.
 #
 # Pure, synchronous, stdlib-only, never raises.
 # --------------------------------------------------------------------------- #
@@ -2124,8 +1914,8 @@ def build_host_ac_section(result, cases=None) -> str:
 # host's checklist.
 #
 # Ids are ALWAYS assigned here, never trusted from the host -- CL-NNN ids are
-# referenced by `requirement_matches` and by the exported spreadsheet, so a
-# colliding or invented id would silently re-point a requirement row.
+# referenced by the exported spreadsheet, so a colliding or invented id would
+# silently re-point a requirement row.
 # --------------------------------------------------------------------------- #
 
 _CHECKLIST_JOB_MARKER = "DERIVE THE ATOMIC REQUIREMENTS CHECKLIST"
@@ -2288,8 +2078,8 @@ def extract_host_checklist(raw, *, requested: bool = True) -> HostChecklistResul
                                         granularity audit's provenance ratio down
       * ANY host-supplied item_id    -> DISCARDED and counted in ``renumbered``.
         Ids are assigned here, positionally, CL-001 .. CL-NNN, because they are
-        referenced by `requirement_matches` and by the exported sheet: a colliding
-        or invented id would silently re-point a requirement row.
+        referenced by the exported sheet: a colliding or invented id would
+        silently re-point a requirement row.
       * ZERO surviving items         -> ran=False + note
     """
     from tools.atomic_checklist import (
@@ -3111,7 +2901,7 @@ def off_topic_images(result) -> list:
 # IMAGE_JOB this is a POST_MERGE job: the verdicts are about cases that do not
 # exist until the host has generated them, so the host answers it in the SAME
 # chat turn it submits, as one more top-level field. STILL zero extra round
-# trips -- exactly how `duplicate_groups` and `requirement_matches` already work.
+# trips -- exactly how `duplicate_groups` already works.
 #
 # The deterministic score_and_sort heuristic is NOT replaced: it stays the
 # baseline, and any case the host omits (or mis-ids) keeps its heuristic score.
@@ -3121,11 +2911,10 @@ def off_topic_images(result) -> list:
 # PATH A (qa_submit_category) is supported too: _merge_category_rows structurally
 # drops every non-test_cases key, so on that route the field rides the finalize
 # REVIEW SIDECAR (tools/mcp_handlers._sidecar_keys / _remap_risk_scores), whose
-# tc_id keys are remapped onto the post-merge global ids. UNLIKE
-# duplicate_groups, that remap builds the qualified-id maps UNCONDITIONALLY
-# (see _remap_risk_scores): with QA_QUALIFIED_TC_IDS_ENABLED off -- the
-# DEFAULT -- the first-category-wins guess would silently OVERWRITE ~7/8 of
-# the verdicts and misattribute a rationale into another case's XLSX row.
+# tc_id keys are remapped onto the post-merge global ids. That remap builds the
+# qualified-id maps UNCONDITIONALLY: with empty maps the first-category-wins
+# guess would silently OVERWRITE ~7/8 of the verdicts and misattribute a
+# rationale into another case's XLSX row.
 # The instruction below says so, and it is true.
 # --------------------------------------------------------------------------- #
 
@@ -3245,7 +3034,7 @@ def extract_host_risk_scores(
 
     NEVER raises and NEVER trusts the field. Rules, enforced here in Python over
     already-``json.loads``'d data (no eval, no dynamic attribute access), and
-    deliberately mirroring extract_host_acs / extract_requirement_matches:
+    deliberately mirroring extract_host_acs:
 
       * absent / None                    -> ran=False, no notes (the common case)
       * not a dict                       -> ran=False + note
@@ -3483,8 +3272,8 @@ def _tp_clean(text: object) -> str:
 def _tp_list(raw) -> list:
     """A capped list of clean strings from an untrusted value. Never raises.
 
-    A bare string is tolerated as a one-element list (the same leniency
-    extract_requirement_matches applies); anything else non-list yields [].
+    A bare string is tolerated as a one-element list (the same leniency the
+    other untrusted-field readers apply); anything else non-list yields [].
     """
     try:
         if isinstance(raw, str):
@@ -3658,9 +3447,7 @@ def build_host_test_plan_section(result) -> str:
         return ""
 
 
-def build_prepare_payload(
-    prepared, prep_id: str = "", *, checklist_job: bool = False
-) -> dict:
+def build_prepare_payload(prepared, prep_id: str = "") -> dict:
     """Build the dict the tester's own chat model needs to run the 8-category
     fan-out itself. Pure and synchronous -- no LLM call, no I/O.
 
@@ -3678,8 +3465,8 @@ def build_prepare_payload(
       _GUARD).
     * each ``categories[i]["instruction"]`` == the cache-ON per-category user
       suffix: ``_CATEGORY_TASK_TEMPLATE.format(...)`` + the upfront quality
-      reminder (only when QA_QUALITY_REMINDER_UPFRONT is on) -- the exact FOCUS /
-      min-max count / preferred-type block.
+      reminder (unconditional since 2026-08-12) -- the exact FOCUS / min-max
+      count / preferred-type block.
     * ``min_cases`` / ``max_cases`` == ``_case_count_bounds(complexity_text or
       feature_text or user_msg, ui_content)`` -- same complexity proxy, same
       precedence the server's _generate_for_category uses.
@@ -3714,9 +3501,7 @@ def build_prepare_payload(
         prepared.complexity_text or prepared.feature_text or prepared.user_msg,
         prepared.ui_content,
     )
-    quality_reminder = (
-        _QUALITY_RETRY_REMINDER if settings.qa_quality_reminder_upfront else ""
-    )
+    quality_reminder = _QUALITY_RETRY_REMINDER
 
     categories = []
     for name, focus, ptype in prepared.categories:
@@ -3786,8 +3571,6 @@ def build_prepare_payload(
         "instructions": _HOST_GENERATION_INSTRUCTIONS
         + _parallel_instruction()
         + _dedup_instruction()
-        + _coverage_instruction(prepared, checklist_job)
-        + _qualified_instruction()
         # LAST on purpose: it must read after the numbered generation steps and
         # after the duplicate review it tells the host to follow.
         + _grounding_instruction(),
@@ -4083,14 +3866,10 @@ _DUP_SHORTLIST_TITLE_CHARS = 80
 
 
 def dup_shortlist_on() -> bool:
-    """Never-raise read of QA_DUP_SHORTLIST_ENABLED (default ON since
-    2026-08-04; the getattr fallback stays False so a missing setting is
-    conservative)."""
-    try:
-        return bool(getattr(settings, "qa_dup_shortlist_enabled", False))
-    except Exception:  # pragma: no cover
-        logger.debug("could not read qa_dup_shortlist_enabled", exc_info=True)
-        return False
+    """The server-assisted duplicate shortlist is unconditional since
+    2026-08-12 (QA_DUP_SHORTLIST_ENABLED was deleted; it had soaked ON since
+    2026-08-04)."""
+    return True
 
 
 def _dup_text_from_dict(case: object) -> str:
@@ -5006,441 +4785,6 @@ def build_gap_response(
         f"`qa_submit_suite` tool with prep_id `{prep_id}` and your corrected JSON.",
     ]
     return "\n".join(lines)
-
-
-@dataclasses.dataclass
-class HostCoverageReview:
-    """The validated ``host-reviewed`` coverage view: COUNTS and LISTS only.
-
-    There is deliberately NO percentage field and no score field, so no caller --
-    now or later -- can format one from this object. That is the structural half of
-    honesty rule 1; the wording is the other half.
-
-    ``ran`` is False when the field was absent or UNUSABLE. In that case
-    ``unclaimed`` is EMPTY on purpose: an unreadable or empty field must never be
-    rendered as "every requirement is a gap", which is the only direction in which a
-    hostile field could otherwise affect a coverage report."""
-
-    ran: bool = False
-    # {item_id: [tc_id, ...]} -- every id already checked to EXIST.
-    claims: dict = dataclasses.field(default_factory=dict)
-    # PRESENTED item ids the review claimed no case for (self-reported gaps).
-    unclaimed: list = dataclasses.field(default_factory=list)
-    # Claimed ids that were never presented to the generator (honesty rule 2).
-    not_presented_claimed: list = dataclasses.field(default_factory=list)
-    notes: list = dataclasses.field(default_factory=list)
-    presented_count: int = 0
-
-
-def _hr_cap(name: str, ceiling: int) -> int:
-    """A settings int cap, floored at 1 and never allowed above the module ceiling
-    (so an operator can only tighten it). Never raises."""
-    try:
-        cfg = int(getattr(settings, name, ceiling) or ceiling)
-    except (TypeError, ValueError):
-        cfg = ceiling
-    return max(1, min(ceiling, cfg))
-
-
-def extract_requirement_matches(
-    raw, valid_tc_ids, item_ids, presented_ids
-) -> HostCoverageReview:
-    """Validate the SHAPE of the UNTRUSTED top-level ``requirement_matches`` field.
-
-    Returns a HostCoverageReview. NEVER raises and NEVER trusts the field: an
-    unreadable value degrades to "no review" plus a note, and every id is checked
-    against real data -- ``valid_tc_ids`` (the tc_ids of the SUBMITTED suite) and
-    ``item_ids`` / ``presented_ids`` (this prep's checklist, and the subset that
-    actually fitted into the generator prompt).
-
-    Rules, all enforced here in Python over already-``json.loads``'d data (no eval,
-    no ast, no dynamic attribute access):
-
-      * absent / ``None``                  -> ran=False, no notes (the common case)
-      * no checklist ids / no suite ids    -> ran=False + note (the
-        QA_ATOMIC_CHECKLIST_ENABLED dependency: nothing to match against)
-      * not a dict                         -> ran=False + note. NOT "every
-        requirement is a gap" -- see the class docstring.
-      * a non-str key                      -> dropped + noted
-      * a key not in the checklist         -> dropped + noted (hallucinated/stale)
-      * a key not in ``presented_ids``     -> moved to ``not_presented_claimed``,
-        EXCLUDED from every count, reported as NOT PRESENTED TO GENERATOR
-        (honesty rule 2, unchanged)
-      * a str value                        -> tolerated as a one-element list
-      * any other non-list value           -> dropped + noted
-      * a non-str member                   -> dropped + noted
-      * a member not in the suite          -> dropped + noted (hallucinated)
-      * a repeated member in one entry     -> collapsed silently
-      * beyond the entry / per-entry / note caps -> truncated + noted
-      * ZERO surviving claims              -> ran=False + note: an empty or broken
-        field is an UNUSABLE review, not a gap list. This is the DETERMINISTIC
-        BOUND on the one coverage-affecting direction this field has.
-      * very few claims for many presented items -> LABELLED sparse (never
-        rejected, and never gated on any similarity score)
-    """
-    rev = HostCoverageReview()
-
-    def _note(msg: str) -> None:
-        if len(rev.notes) < _HR_MAX_NOTES:
-            rev.notes.append(msg)
-
-    try:
-        if raw is None:
-            return rev
-        known_items = {str(x) for x in (item_ids or ())}
-        presented: list = []
-        presented_set: set = set()
-        for x in presented_ids or ():
-            s = str(x)
-            if s not in presented_set:
-                presented_set.add(s)
-                presented.append(s)
-        known_tcs = {str(x) for x in (valid_tc_ids or ())}
-        rev.presented_count = len(presented)
-
-        if not known_items or not known_tcs:
-            _note(
-                "`requirement_matches` was ignored: this run has no requirements "
-                "checklist to match against (QA_ATOMIC_CHECKLIST_ENABLED is off, or "
-                "the checklist was empty)."
-            )
-            return rev
-        if not isinstance(raw, dict):
-            _note(
-                "`requirement_matches` was not an object mapping requirement ids to "
-                "test-case ids -- the whole field was ignored. Nothing is reported "
-                "as covered OR as a gap from it."
-            )
-            return rev
-
-        max_items = _hr_cap("qa_host_coverage_max_items", _HR_MAX_ITEMS)
-        max_per = _hr_cap("qa_host_coverage_max_tc_per_item", _HR_MAX_TC_PER_ITEM)
-        entries = list(raw.items())
-        if len(entries) > max_items:
-            _note(
-                f"`requirement_matches` named {len(entries)} requirements -- only "
-                f"the first {max_items} were read."
-            )
-            entries = entries[:max_items]
-
-        claims: dict = {}
-        not_presented: list = []
-        for key, value in entries:
-            if not isinstance(key, str):
-                _note(
-                    "a non-string requirement id in `requirement_matches` was ignored."
-                )
-                continue
-            item_id = key.strip()
-            if item_id not in known_items:
-                _note(
-                    f"`{item_id[:32]}` is not a requirement id in this run's "
-                    "checklist -- ignored."
-                )
-                continue
-            if item_id not in presented_set:
-                if item_id not in not_presented:
-                    not_presented.append(item_id)
-                continue
-            if isinstance(value, str):
-                members_raw: list = [value]
-            elif isinstance(value, list):
-                members_raw = value
-            else:
-                _note(
-                    f"the test-case list for `{item_id}` was not a list of tc_ids "
-                    "-- ignored."
-                )
-                continue
-            members: list = []
-            for m in members_raw:
-                if not isinstance(m, str):
-                    _note("a non-string tc_id in `requirement_matches` was ignored.")
-                    continue
-                tid = m.strip()
-                if tid not in known_tcs:
-                    _note(
-                        f"`{tid[:32]}` (named for {item_id}) is not a tc_id in the "
-                        "submitted suite -- ignored."
-                    )
-                    continue
-                if tid in members:
-                    continue
-                if len(members) >= max_per:
-                    _note(
-                        f"`{item_id}` named more than {max_per} test cases -- the "
-                        "extra ids were ignored."
-                    )
-                    break
-                members.append(tid)
-            if members:
-                claims[item_id] = members
-
-        rev.not_presented_claimed = not_presented
-        if not_presented:
-            _note(
-                f"{len(not_presented)} requirement(s) named by the review were NEVER "
-                "PRESENTED to the generator (they did not fit the prompt budget). "
-                "They are listed as NOT PRESENTED TO GENERATOR and EXCLUDED from "
-                "every count here, exactly as in the deterministic report."
-            )
-        if not claims:
-            _note(
-                "`requirement_matches` claimed no test case for any presented "
-                "requirement, so it is treated as an UNUSABLE review rather than as "
-                "a gap list: an empty or broken field must not be reported as "
-                f"{len(presented)} uncovered requirement(s)."
-            )
-            return rev
-
-        rev.claims = claims
-        rev.unclaimed = [i for i in presented if i not in claims]
-        rev.ran = True
-        if (
-            len(presented) >= _HR_SPARSE_MIN_PRESENTED
-            and len(claims) * _HR_SPARSE_DEN < len(presented) * _HR_SPARSE_NUM
-        ):
-            _note(
-                f"the review claimed a test for only {len(claims)} of "
-                f"{len(presented)} presented requirement(s). A review that sparse "
-                "is more likely incomplete than a real gap list -- read the list "
-                "below as a prompt to re-check the suite, not as a count."
-            )
-        logger.info(
-            "host-reviewed coverage: %d claimed, %d unclaimed of %d presented "
-            "requirement(s) -- model judgement, not a measurement",
-            len(claims),
-            len(rev.unclaimed),
-            len(presented),
-        )
-        return rev
-    except Exception:
-        logger.warning(
-            "could not read requirement_matches -- ignoring the field", exc_info=True
-        )
-        return HostCoverageReview(
-            notes=[
-                "`requirement_matches` could not be read -- it was ignored (nothing "
-                "is reported as covered or as a gap from it)."
-            ]
-        )
-
-
-def build_coverage_review_section(
-    review,
-    submitted_cases: list,
-    final_cases: list,
-    items: list,
-    *,
-    deterministic_degraded: bool = False,
-) -> str:
-    """The bounded, deterministic ``host-reviewed`` coverage block, prepended to the
-    submit reply AHEAD of the variable-length generated summary (the same ordering
-    rule that moved ``quality_section`` in front of ``checklist_section``).
-
-    PUBLISHES NO PERCENTAGE -- see the module comment for why, and note that
-    ``HostCoverageReview`` has no field one could be computed from. Counts of CLAIMS
-    are printed, and every one of them is labelled REVIEWED, NOT MEASURED.
-
-    Each claimed tc_id is resolved to the id the tester will actually SEE:
-    ``_finalize_generation`` renumbers ids, so the mapping goes through the case's
-    content ``stable_id``, which survives dedup and the renumber. An item whose EVERY
-    claimed case vanished (collapsed as an exact duplicate, or removed by the Piece 1
-    apply path) is reported as CLAIM NO LONGER SUPPORTED rather than silently
-    rendered as covered -- the removal/coverage interaction is disclosed, not hidden.
-
-    ``deterministic_degraded`` adds an explicit non-substitution warning when the
-    deterministic percentage is suppressed for this run, which is the exact situation
-    in which this section is most likely to be misread as the coverage report.
-
-    Pure and synchronous. Never raises."""
-    try:
-        if review is None:
-            return ""
-        ran = bool(getattr(review, "ran", False))
-        notes = list(getattr(review, "notes", None) or [])
-        if not ran and not notes:
-            return ""
-        claims = dict(getattr(review, "claims", None) or {})
-        unclaimed = list(getattr(review, "unclaimed", None) or [])
-        not_presented = list(getattr(review, "not_presented_claimed", None) or [])
-        presented_count = int(getattr(review, "presented_count", 0) or 0)
-
-        by_item = {getattr(it, "item_id", ""): it for it in (items or [])}
-        sub_by_id = {tc.tc_id: tc for tc in (submitted_cases or [])}
-        final_by_stable: dict = {}
-        for tc in final_cases or []:
-            sid = getattr(tc, "stable_id", "") or ""
-            if sid:
-                final_by_stable.setdefault(sid, tc.tc_id)
-
-        def _label(item_id: str) -> str:
-            it = by_item.get(item_id)
-            if it is None:
-                return ""
-            text = (getattr(it, "text", "") or "")[:200]
-            source = getattr(it, "source", "") or "unattributed"
-            return f"{text} _[source: {source}]_"
-
-        def _final_id(tc_id: str) -> str:
-            tc = sub_by_id.get(tc_id)
-            sid = (getattr(tc, "stable_id", "") or "") if tc is not None else ""
-            return final_by_stable.get(sid, "") if sid else ""
-
-        lines: list = [
-            "## \U0001f9fe Host-reviewed requirement coverage (REVIEWED, NOT MEASURED)",
-            "",
-            "Your chat model was asked which of its own test cases verify each "
-            "requirement. This is **MODEL JUDGEMENT about its own output**, not a "
-            "measurement: it has no calibrated precision, so NO percentage is "
-            "published from it, it is NOT written into the Excel file or the suite "
-            "store, and it does NOT change the server's deterministic coverage "
-            "figure -- or the suppression of that figure -- anywhere.",
-            "",
-        ]
-        if deterministic_degraded:
-            lines += [
-                "> ⚠️  The deterministic coverage percentage is SUPPRESSED "
-                "for this run (lexical fallback -- no QA_EMBEDDINGS_BACKEND). This "
-                "section is NOT a substitute for it: nothing below is measured, and "
-                "no percentage is published here either.",
-                "",
-            ]
-        if ran:
-            lines += [
-                f"- **CLAIMED (unverified):** {len(claims)} of {presented_count} "
-                "presented requirement(s) were claimed to have a matching test. A "
-                "claim is a pointer to read, not evidence.",
-                f"- **SELF-REPORTED NOT COVERED:** {len(unclaimed)} presented "
-                "requirement(s) were claimed by no test case. The model that wrote "
-                "the suite says it did not cover them -- that is the direction worth "
-                "acting on.",
-                "",
-            ]
-
-        if unclaimed:
-            lines += [
-                "### SELF-REPORTED NOT COVERED (model-judged, not measured)",
-                "",
-            ]
-            for iid in unclaimed[:_HR_MAX_ROWS]:
-                lines.append(f"- **SELF-REPORTED NOT COVERED: {iid}** — {_label(iid)}")
-            if len(unclaimed) > _HR_MAX_ROWS:
-                lines.append(f"- …and {len(unclaimed) - _HR_MAX_ROWS} more")
-            lines.append("")
-
-        unsupported = [
-            (iid, tcs)
-            for iid, tcs in claims.items()
-            if not any(_final_id(t) for t in tcs)
-        ]
-        if unsupported:
-            lines += [
-                "### CLAIM NO LONGER SUPPORTED",
-                "",
-                "Every case these requirements named is absent from the final suite "
-                "(collapsed as an exact duplicate, or removed by duplicate review), "
-                "so the claim points at nothing. Nothing was changed because of it:",
-                "",
-            ]
-            for iid, tcs in unsupported[:_HR_MAX_ROWS]:
-                named = ", ".join(f"`{t}`" for t in tcs[:_HR_MAX_TC_PER_ITEM])
-                lines.append(f"- **{iid}** claimed {named} — not in the final suite")
-            if len(unsupported) > _HR_MAX_ROWS:
-                lines.append(f"- …and {len(unsupported) - _HR_MAX_ROWS} more")
-            lines.append("")
-
-        if not_presented:
-            lines += [
-                "### NOT PRESENTED TO GENERATOR (excluded from every count above)",
-                "",
-                "The review named these requirements, but they never fitted into the "
-                "generator prompt, so they are a configuration issue and NOT a "
-                "coverage result -- exactly as the deterministic report treats them "
-                "(raise QA_CHECKLIST_MAX_PROMPT_CHARS):",
-                "",
-            ]
-            for iid in not_presented[:_HR_MAX_ROWS]:
-                lines.append(f"- **NOT PRESENTED: {iid}** — {_label(iid)}")
-            if len(not_presented) > _HR_MAX_ROWS:
-                lines.append(f"- …and {len(not_presented) - _HR_MAX_ROWS} more")
-            lines.append("")
-
-        if claims:
-            lines += ["### Claimed links (unverified model judgement)", ""]
-            budget = _HR_MAX_SECTION_CHARS
-            shown = 0
-            for iid, tcs in claims.items():
-                rendered: list = []
-                for t in tcs:
-                    fid = _final_id(t)
-                    if fid and fid != t:
-                        rendered.append(f"`{fid}` (submitted as `{t}`)")
-                    elif fid:
-                        rendered.append(f"`{fid}`")
-                    else:
-                        rendered.append(f"`{t}` (not in the final suite)")
-                row = f"- {iid} → " + ", ".join(rendered)
-                if shown and len(row) > budget:
-                    break
-                budget -= len(row)
-                lines.append(row)
-                shown += 1
-            if shown < len(claims):
-                lines.append(
-                    f"- …and {len(claims) - shown} more claimed link(s); this "
-                    f"list is truncated at ~{_HR_MAX_SECTION_CHARS} characters. The "
-                    "actionable lists are rendered ABOVE it, so truncation here can "
-                    "never hide a self-reported gap."
-                )
-            lines.append("")
-
-        if notes:
-            lines.append(
-                "> ℹ️  Review notes (`requirement_matches` is UNTRUSTED "
-                "input and is validated server-side):"
-            )
-            lines += [f">   - {n}" for n in notes[:_HR_MAX_NOTES]]
-            lines.append("")
-        lines.append(
-            "_HONESTY BOUNDARY: this section reports TEXTUAL alignment CLAIMED by "
-            "the generating model about its own output. It is not a measurement and "
-            "it is not a verification-strength guarantee. Treat every SELF-REPORTED "
-            "NOT COVERED item as work, not noise._"
-        )
-        return "\n".join(lines) + "\n\n"
-    except Exception:
-        logger.warning(
-            "build_coverage_review_section failed -- omitting the section",
-            exc_info=True,
-        )
-        return ""
-
-
-def category_coverage_note(parsed) -> str:
-    """One line explaining that a PER-CATEGORY submission's ``requirement_matches``
-    cannot be used at all.
-
-    Structurally the same reason as ``category_dedup_note``:
-    ``mcp_handlers._merge_category_rows`` copies ONLY ``test_cases`` and GLOBALLY
-    RENUMBERS every tc_id, so the field has no channel and per-category ids could not
-    be mapped onto the merged suite. It is also semantically impossible here: a
-    requirement is frequently verified by a case from a DIFFERENT category, so
-    coverage can only be judged on the merged set. Empty (and therefore
-    output-identical) when the field was absent. Never raises."""
-    try:
-        if getattr(parsed, "raw_requirement_matches", None) is None:
-            return ""
-        return (
-            "> ℹ️  `requirement_matches` cannot be used on the "
-            "per-category path: finalizing from accumulated rows merges only "
-            "`test_cases` and renumbers every tc_id, so the field has no channel -- "
-            "and requirement coverage can only be judged on the WHOLE merged suite, "
-            "because a requirement is often verified by a case from a different "
-            "category. Send it with the merged suite to `qa_submit_suite`.\n\n"
-        )
-    except Exception:  # pragma: no cover - defensive
-        return ""
 
 
 def category_checklist_note(parsed) -> str:

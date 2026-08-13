@@ -100,11 +100,16 @@ _MAX_JSON_BYTES = 8192
 
 
 def enabled() -> bool:
-    """Whether QA_JIRA_ATTACHMENT_FETCH_ENABLED is on. Never raises."""
-    try:
-        return bool(getattr(settings, "qa_jira_attachment_fetch_enabled", False))
-    except Exception:  # pragma: no cover - settings is lenient by contract
-        return False
+    """Always False. Never raises.
+
+    QA_JIRA_ATTACHMENT_FETCH_ENABLED was DELETED on 2026-08-13 (flag-surface
+    reduction, batch 6) and the credentialed attachment fetch hardcoded OFF, so
+    NO module in this tree makes an outbound request carrying JIRA_EMAIL /
+    JIRA_API_TOKEN. The rest of this module is kept, unreachable, because its
+    SSRF stack, MIME allowlist and per-hop credential re-check are the contract
+    a revival must satisfy -- see CLAUDE.md and docs/FEATURE_FLAGS.md.
+    """
+    return False
 
 
 def _base_url() -> str:

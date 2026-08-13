@@ -129,32 +129,21 @@ def _ensure_touched_at(conn: sqlite3.Connection) -> bool:
 
 
 def _sliding_ttl_on() -> bool:
-    """QA_PREP_SLIDING_TTL_ENABLED, read never-raise. OFF => fixed TTL, unchanged."""
-    try:
-        return bool(getattr(settings, "qa_prep_sliding_ttl_enabled", False))
-    except Exception:
-        return False
+    """The sliding TTL is unconditional since 2026-08-12
+    (QA_PREP_SLIDING_TTL_ENABLED was deleted; it had soaked ON since
+    2026-08-01)."""
+    return True
 
 
 def _touch_enabled() -> bool:
     """Whether an activity touch is RECORDED in preps.touched_at.
 
-    TRUE under EITHER flag, deliberately. The sliding TTL needs the timestamp
-    to enforce a refreshed clock; DISCLOSURE needs it to see the incident at
+    Unconditional since 2026-08-12. The sliding TTL needs the timestamp to
+    enforce a refreshed clock; DISCLOSURE needs it to see the incident at
     all -- the 2026-07-31 shape was 8 worker packets fetched via
     qa_get_category_job and ZERO qa_submit_category calls, so staged == 0 and
-    touched_at is the only evidence the run ever existed. Gating the write on
-    the sliding TTL alone made QA_PREP_DISCLOSE_UNFINISHED unable to disclose
-    the very incident it exists for unless a second, unrelated flag was also
-    on. Writing the column costs nothing while TTL enforcement stays off:
-    _expired() reads touched_at only when _sliding_ttl_on(). Never raises."""
-    try:
-        return bool(
-            getattr(settings, "qa_prep_sliding_ttl_enabled", False)
-            or getattr(settings, "qa_prep_disclose_unfinished", False)
-        )
-    except Exception:
-        return False
+    touched_at is the only evidence the run ever existed. Never raises."""
+    return True
 
 
 def _max_lifetime_s() -> float:
@@ -591,12 +580,11 @@ async def touch_prep(prep_id: str) -> dict:
     """Record real orchestration activity (qa_get_category_job /
     qa_submit_category) on a prep.
 
-    NO-OP unless QA_PREP_SLIDING_TTL_ENABLED **or**
-    QA_PREP_DISCLOSE_UNFINISHED is on (see _touch_enabled: disclosure needs
+    Unconditional since 2026-08-12 (see _touch_enabled: the disclosure needs
     the touch to see a fetched-packet-only run, which is exactly the
-    2026-07-31 incident shape). The TTL clock only actually slides under
-    QA_PREP_SLIDING_TTL_ENABLED, and total lifetime stays bounded by
-    QA_PREP_MAX_LIFETIME_S (see _expired). Never raises."""
+    2026-07-31 incident shape). The TTL clock slides on every touch and total
+    lifetime stays bounded by QA_PREP_MAX_LIFETIME_S (see _expired). Never
+    raises."""
     try:
         if not prep_id or not _touch_enabled():
             return {"error": None, "content": None}

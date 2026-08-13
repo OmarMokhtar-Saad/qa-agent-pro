@@ -38,11 +38,9 @@ logger = logging.getLogger(__name__)
 # _LEDGER_ID here would invite that call site to reuse the wrong tag.
 #
 # Ledger rule 4: the surviving direct call sites -- still reachable from
-# graph.py, from evals/, and from any install that sets
-# QA_HOST_CHECKLIST_NLI_SUPPRESS_ENABLED=false -- must TAG themselves, or the
-# Phase-6 kill switch refuses them as UNTAGGED calls and the documented rollback
-# ("set the flag false and the tiers come back") would silently degrade to tier
-# (a) instead of restoring anything. Tagged, QA_SERVER_LLM_ALLOW=rtm.nli_verdicts
+# graph.py and from evals/ -- must TAG themselves, or the Phase-6 kill switch
+# refuses them as UNTAGGED calls and they would silently degrade to tier (a)
+# instead of running. Tagged, QA_SERVER_LLM_ALLOW=rtm.nli_verdicts
 # keeps exactly this one path alive. No behavioural change while
 # QA_SERVER_LLM_ENABLED is on (its default).
 _NLI_LEDGER_ID = "rtm.nli_verdicts"
@@ -920,11 +918,10 @@ async def match_checklist(
                 "this measurement, so the ambiguous similarity band is reported "
                 "as uncovered instead of being re-judged and the coverage "
                 "figure may UNDERSTATE real coverage. On a host-mode submit "
-                "this is deliberate (QA_HOST_CHECKLIST_NLI_SUPPRESS_ENABLED, "
-                "default on): those tiers are only worth something when a model "
-                "OTHER than the one that wrote the cases re-judges them, and in "
-                "host mode the generator is the chat model itself. Set "
-                "QA_HOST_CHECKLIST_NLI_SUPPRESS_ENABLED=false to restore them."
+                "this is deliberate: those tiers are only worth something when "
+                "a model OTHER than the one that wrote the cases re-judges "
+                "them, and in host mode the generator is the chat model "
+                "itself."
             )
 
         for i, row in enumerate(matrix):

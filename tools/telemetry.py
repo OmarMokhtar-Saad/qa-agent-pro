@@ -5,7 +5,9 @@ never-raise contract; it imports nothing internal except ``config.settings``.
 Transport is a plain HTTP POST to PostHog Cloud (no SDK). Fire-and-forget on a
 daemon thread with a ~2s timeout; a failed send is dropped. Privacy: no PII
 beyond an OPTIONAL ``QA_USER_EMAIL``; on failure only the exception class name
-is recorded. Opt out with ``QA_TELEMETRY_DISABLED=1`` or ``DO_NOT_TRACK=1``.
+is recorded. Opt out with ``DO_NOT_TRACK=1`` -- the cross-vendor standard, and
+since 2026-08-13 the ONLY opt-out: ``QA_TELEMETRY_DISABLED`` was DELETED
+(flag-surface reduction, batch 6) and hardcoded to its default, False.
 Active only when a PostHog key is present AND no opt-out is set.
 """
 
@@ -51,12 +53,14 @@ def _api_key() -> str:
 
 
 def _opted_out() -> bool:
-    """True when the operator disabled telemetry (either flag)."""
-    try:
-        if settings.qa_telemetry_disabled:
-            return True
-    except Exception:
-        pass
+    """True when the operator disabled telemetry.
+
+    ONE opt-out since 2026-08-13, not two: QA_TELEMETRY_DISABLED was DELETED
+    (flag-surface reduction, batch 6) and hardcoded to its default, False, so
+    the cross-vendor DO_NOT_TRACK environment variable is the whole mechanism.
+    Every document that offered two was rewritten in the same change -- an
+    opt-out that silently does nothing is worse than no opt-out at all.
+    """
     return str(os.environ.get("DO_NOT_TRACK", "")).strip().lower() in _TRUTHY
 
 
@@ -75,13 +79,10 @@ def startup_notice() -> None:
         if not _api_key():
             logger.info("telemetry: off (no analytics key in this build)")
         elif _opted_out():
-            logger.info(
-                "telemetry: off (disabled via QA_TELEMETRY_DISABLED / DO_NOT_TRACK)"
-            )
+            logger.info("telemetry: off (disabled via DO_NOT_TRACK)")
         else:
             logger.info(
-                "telemetry: on - anonymous usage metrics; opt out with "
-                "QA_TELEMETRY_DISABLED=1 or DO_NOT_TRACK=1"
+                "telemetry: on - anonymous usage metrics; opt out with DO_NOT_TRACK=1"
             )
     except Exception:
         logger.debug("telemetry startup notice failed", exc_info=True)
