@@ -381,6 +381,21 @@ _AC_DISCOVERY_MAX_CHARS = 20000
 _AC_DISCOVERY_MIN_CHARS = 40
 
 
+def _ac_field_discovery_on() -> bool:
+    """The search of the OTHER custom fields. HARDCODED OFF since 2026-08-13.
+
+    NOT settings-derived: QA_JIRA_AC_FIELD_DISCOVERY was DELETED (flag-surface
+    reduction, batch 8a). Silently adopting the wrong field is the exact failure
+    that made a DATE field's timestamp a suite's only acceptance criterion, and
+    the search was never validated against a real workspace. Everything that
+    made a mis-configured field survivable is UNAFFECTED and still runs: the
+    ``_usable_ac_text`` rejection, the description fallback, ``AC_JOB`` and the
+    ``qa-doctor`` line naming the resolved field. The scan below is retained and
+    still tested through this seam; reviving it is one line here.
+    """
+    return False
+
+
 def resolve_ac_field(fields: object) -> tuple[str, str, str]:
     """(field_id, raw_value, reason) for the acceptance-criteria source.
 
@@ -390,15 +405,15 @@ def resolve_ac_field(fields: object) -> tuple[str, str, str]:
     The configured field therefore wins ONLY when its value survives
     :func:`_usable_ac_text`.
 
-    When it does not, and ``QA_JIRA_AC_FIELD_DISCOVERY`` is on, the other custom
-    fields are searched for one whose VALUE looks like requirement prose. Display
-    names are not available to match on: the Atlassian MCP ``getJiraIssue``
-    response carries no ``names`` map, verified against a real payload. The
-    longest plausible candidate wins, and the choice is logged.
+    When it does not, and :func:`_ac_field_discovery_on` says so, the other
+    custom fields are searched for one whose VALUE looks like requirement prose.
+    Display names are not available to match on: the Atlassian MCP
+    ``getJiraIssue`` response carries no ``names`` map, verified against a real
+    payload. The longest plausible candidate wins, and the choice is logged.
 
-    Discovery is OFF by default on purpose -- silently adopting the wrong field is
-    the exact failure this whole change set exists to remove, so an operator opts
-    in, and :func:`qa-doctor` shows what was resolved either way.
+    That search is HARDCODED OFF since 2026-08-13 (QA_JIRA_AC_FIELD_DISCOVERY was
+    deleted) -- silently adopting the wrong field is the exact failure this whole
+    change set exists to remove. :func:`qa-doctor` still shows what was resolved.
 
     Never raises: degrades to (configured_id, "", reason).
     """
@@ -410,7 +425,7 @@ def resolve_ac_field(fields: object) -> tuple[str, str, str]:
         if _usable_ac_text(raw):
             return configured, raw, "configured field"
         rejected = bool(raw)
-        if not bool(getattr(settings, "qa_jira_ac_field_discovery", False)):
+        if not _ac_field_discovery_on():
             return (
                 configured,
                 "",

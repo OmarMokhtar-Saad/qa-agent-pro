@@ -375,6 +375,36 @@ def _detect_compliance_keywords(text: str) -> list[tuple[str, str]]:
     return [(kw, query) for kw, query in _COMPLIANCE_KEYWORDS if kw in lower]
 
 
+def prompt_cache_enabled() -> bool:
+    """The shared cached prompt prefix. HARDCODED OFF since 2026-08-13.
+
+    NOT settings-derived: QA_PROMPT_CACHE_ENABLED was DELETED (flag-surface
+    reduction, batch 8a). Deliberately a SECOND seam beside
+    ``llm._prompt_cache_enabled`` rather than an import of a private name: this
+    module owns the PROMPT-SHAPE half of the feature (hoisting the per-category
+    instruction out of ``system`` into a trailing uncached user block) while
+    llm.py owns the cache_control markers and the warm-up. Both are constants,
+    neither reads a setting, and the whole ON path below is retained and still
+    exercised through this seam.
+    """
+    return False
+
+
+def coverage_regen_merge_calls() -> bool:
+    """Merged critique + gap-fill. HARDCODED ON since 2026-08-13.
+
+    NOT settings-derived: QA_COVERAGE_REGEN_MERGE_CALLS was DELETED
+    (flag-surface reduction, batch 8a) and hardcoded ON on direct maintainer
+    review -- one ask_json per remediation round instead of two. The LEGACY
+    two-call branch (``critique_coverage`` then a full ``_generate_for_category``
+    pass) is RETAINED below and still exercised through this seam, because it is
+    the fallback a revival needs and dropping it would delete the coverage of
+    ``critique_coverage`` itself. Applies ONLY to the legacy-critic branch: the
+    checklist-driven branch has no LLM critique to merge.
+    """
+    return True
+
+
 def rag_enabled() -> bool:
     """Always True -- RAG corpus grounding is ON, unconditionally.
 
@@ -1455,7 +1485,7 @@ async def _generate_for_category(
     # OFF (or an un-warmed prefix): identical template, identical order,
     # identical trailing _GUARD — the assembled prompt is byte-for-byte what
     # the pre-cache path produced.
-    cache_on = bool(cache_prefix and settings.qa_prompt_cache_enabled)
+    cache_on = bool(cache_prefix and prompt_cache_enabled())
     user_suffix: str | None = None
     if cache_on:
         system = _category_shared_system(rtm_hint)
@@ -2297,7 +2327,7 @@ async def _remediate_gaps(
                     focus = format_checklist_gap_focus(batch)
                     gap_preview = ", ".join(it.item_id for it in batch[:3])
             if not focus:
-                if settings.qa_coverage_regen_merge_calls:
+                if coverage_regen_merge_calls():
                     # QA_COVERAGE_REGEN_MERGE_CALLS (P2#5): critique + gap-fill
                     # in ONE ask_json call. Applies ONLY to this legacy critic
                     # branch -- the checklist branch above has no LLM critique
@@ -3398,7 +3428,7 @@ async def _prepare_generation(
     # cache_prefix_warm=False is warm_cache_prefix's own documented value
     # meaning "send UNMARKED prompts", i.e. today's cost, never worse.
     cache_prefix_warm = False
-    if warm_cache and settings.qa_prompt_cache_enabled:
+    if warm_cache and prompt_cache_enabled():
         cache_prefix_warm = await warm_cache_prefix(
             system=_category_shared_system(rtm_hint),
             user=user_msg,

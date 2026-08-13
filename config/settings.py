@@ -196,41 +196,35 @@ class Settings(BaseSettings):
     qa_classifier_model: str = "claude-haiku-4-5"
 
     # ---- Structured JSON via forced tool use (api backend only) -------------
-    # QA_STRUCTURED_JSON_ENABLED, default OFF (constitution: new behaviour is
-    # opt-in). When ON, llm.ask_json stops asking the model for JSON in prose and
-    # instead compiles the pydantic response_model's JSON schema into an
-    # Anthropic TOOL input_schema, forcing that one tool with tool_choice. The
-    # API then returns tool_use.input as an already-parsed dict, so on that
-    # branch a JSONDecodeError is structurally impossible -- which matters because a
-    # single parse failure today re-runs an ENTIRE test-case category
-    # (agents/test_scenario_agent.py's _RETRYABLE path: one full ~110s call).
-    # Pydantic still validates semantics, so a genuinely wrong field is still
-    # caught and still retried exactly as before.
-    # Ignored by the cli/cursor backends: they drive a subprocess that has no
-    # tool API, so they keep the JSON-in-prompt path byte-for-byte unchanged.
-    qa_structured_json_enabled: bool = False
-    # QA_STRUCTURED_JSON_STRICT, default OFF. Adds "strict": true to the tool
-    # definition, which switches the provider to CONSTRAINED DECODING (the schema
-    # becomes a grammar) instead of mere schema guidance. It is a second flag
-    # rather than part of the first because strict mode is model-gated and
-    # schema-fussy: it needs additionalProperties:false on every object node and
-    # rejects pattern / minLength / maxLength / minimum / maximum / minItems,
-    # all of which tools/models.py's TestCase uses. llm.py sanitises the schema
-    # and only sends strict on models known to support it; an API rejection is
-    # memoised per (model, schema) and degrades to non-strict forced tool use.
-    qa_structured_json_strict: bool = False
+    # UNCONDITIONAL since 2026-08-13 (flag-surface reduction, batch 8a):
+    # QA_STRUCTURED_JSON_ENABLED and QA_STRUCTURED_JSON_STRICT were DELETED as
+    # settings and the behaviour hardcoded ON. On the `api` backend llm.ask_json
+    # no longer asks the model for JSON in prose: it compiles the pydantic
+    # response_model's schema into an Anthropic TOOL input_schema, forces that
+    # one tool with tool_choice, and sends "strict": true (constrained decoding)
+    # wherever the model supports it. A JSONDecodeError is then structurally
+    # impossible on that branch -- which is the point, because a single parse
+    # failure re-runs an ENTIRE test-case category. Nothing about the degradation
+    # ladder changed: llm.py still sanitises the schema, still memoises an API
+    # rejection per (model, schema), and still falls back to non-strict forced
+    # tool use and then to the JSON-in-prompt path. The cli/cursor backends drive
+    # a subprocess with no tool API and are byte-for-byte unchanged.
+    # The surviving seams are llm._structured_json_enabled() /
+    # llm._strict_json_enabled(); both read NO setting.
+    # See docs/FEATURE_FLAGS.md.
 
     # ---- Anthropic prompt caching for the category fan-out (api backend) ----
-    # QA_PROMPT_CACHE_ENABLED, default OFF (constitution: new behaviour is
-    # opt-in). When ON, agents/test_scenario_agent.py hoists the per-category
-    # instruction OUT of the system prompt into a small trailing user block, so
-    # all 8 concurrent category calls share ONE byte-identical cached prefix
-    # (system + the whole grounded user context). Cache reads bill 0.10x input,
-    # writes 1.25x, with a 5-minute ephemeral TTL that every read refreshes.
-    # This changes the PROMPT STRUCTURE, which is exactly why it is a flag:
-    # OFF, the assembled prompt is byte-identical to the pre-cache path on all
-    # three backends. Ignored entirely by the cli/cursor backends.
-    qa_prompt_cache_enabled: bool = False
+    # REMOVED 2026-08-13 (flag-surface reduction, batch 8a):
+    # QA_PROMPT_CACHE_ENABLED was DELETED and the shared cached prompt prefix
+    # hardcoded OFF. It was an unvalidated experiment whose runbook rollout gate
+    # was never run, and it is now doubly moot: generation is chat-only, so the
+    # server-side 8-category fan-out it existed to make cheaper does not run on
+    # the tester path at all (tools/mcp_handlers already passes warm_cache=False
+    # on every host prepare). The assembled prompt is the pre-cache path on all
+    # three backends, byte for byte. The surviving seam is
+    # llm._prompt_cache_enabled(), which reads NO setting; the two numeric knobs
+    # below are retained with the machinery they bound so a revival is one line.
+    # See docs/FEATURE_FLAGS.md.
     # Minimum cacheable prefix in TOKENS. 0 = derive it from the model, using
     # llm.py's published table (4096 for opus 4.5-4.8 and haiku 4.5, 2048 for
     # sonnet 4.6 and haiku 3/3.5, 1024 for sonnet 3.7-4.5; an unrecognised id
@@ -276,32 +270,30 @@ class Settings(BaseSettings):
     # falls back to scanning the description for an "Acceptance Criteria" heading.
     jira_ac_field: str = "customfield_10016"
 
-    # Search the OTHER custom fields for one whose value reads like requirements
-    # when the configured `jira_ac_field` does not. OFF by default and staying
-    # that way until an operator asks: adopting the wrong field is exactly the
-    # failure that made a date field's timestamp the only "acceptance criterion"
-    # on a real run. `qa-doctor` discloses what was resolved either way, so
-    # a mis-configured field is visible without this being on.
-    qa_jira_ac_field_discovery: bool = False
+    # Searching the OTHER custom fields for one whose value reads like
+    # requirements when the configured `jira_ac_field` does not is OFF, and
+    # unsettable: QA_JIRA_AC_FIELD_DISCOVERY was DELETED 2026-08-13
+    # (flag-surface reduction, batch 8a) and hardcoded to its default, False.
+    # Adopting the wrong field is exactly the failure that made a date field's
+    # timestamp the only "acceptance criterion" on a real run, and the search was
+    # never validated against a real workspace. `qa-doctor` still discloses which
+    # field was resolved, so a mis-configured field stays visible without this.
+    # The surviving seam is tools.jira_mcp._ac_field_discovery_on().
+    # See docs/FEATURE_FLAGS.md.
 
-    # Ask the tester's own chat model to classify every generated case as
-    # entailed / ungrounded / unspecified against the ticket, and route the
-    # ungrounded ones onto their own export sheet instead of the executable
-    # suite. This is the ONE judgement none of the deterministic checks can make:
-    # they are all lexical, so a fabricated-but-fluent case ("a refund status
-    # appears") passes every one of them. Zero extra round trips -- the
-    # instruction rides the existing prepare payload and the verdicts ride the
-    # existing submission, exactly like the duplicate review.
-    #
-    # OFF by default, and genuinely opt-in rather than a documented exception:
-    # unlike the deterministic advisories this changes what the host is ASKED to
-    # do, spends the tester's tokens on one judgement per case, and its output is
-    # model-authored. tools/grounding_verdicts.py bounds what that output may do
-    # -- ids matched against the suite's own, verdicts enum-gated, notes capped,
-    # a 40% proportional ceiling mirroring screen_duplicate_groups, and cases
-    # MOVED rather than deleted -- so the worst a hostile verdict list achieves
-    # is reviewer noise.
-    qa_host_grounding_review_enabled: bool = False
+    # Asking the tester's own chat model to classify every generated case as
+    # entailed / ungrounded / unspecified against the ticket is OFF, and
+    # unsettable: QA_HOST_GROUNDING_REVIEW_ENABLED was DELETED 2026-08-13
+    # (flag-surface reduction, batch 8a) and hardcoded to its default, False.
+    # It changed what the host was ASKED to do and spent the tester's tokens on
+    # one judgement per case for a precision nobody had measured, which is what
+    # made it an experiment rather than an advisory. tools/grounding_verdicts.py
+    # and agents.host_mode.build_grounding_section are RETAINED with every bound
+    # they carry (ids matched against the suite's own, verdicts enum-gated, notes
+    # capped, a 40% proportional ceiling, cases MOVED rather than deleted), so a
+    # submission that carries verdicts anyway is still handled safely. What is
+    # gone is only the INSTRUCTION that asks for them; the seam is
+    # agents.host_mode.grounding_review_enabled(). See docs/FEATURE_FLAGS.md.
     # Parent-story context (JIRA_FETCH_PARENT). Default **ON** — the THIRD
     # deliberate exception to the constitution's defaults-OFF rule, alongside
     # QA_AUTO_EXPORT_XLSX and QA_AMBIGUITY_GATE_SEVERITY / QA_JIRA_PREFLIGHT.
@@ -486,11 +478,14 @@ class Settings(BaseSettings):
     # 2026-08-13, when QA_MAESTRO_DRY_RUN was deleted.
     qa_maestro_explore_max_steps: int = 15
     qa_maestro_explore_step_timeout: int = 60
-    # LLM step translation (Layer 1 upgrade) -- opt-in. When ON, the Maestro
-    # exporter converts each test case's natural-language steps into concrete,
-    # whitelist-validated Maestro commands (one llm.ask_json call per case,
-    # bounded concurrency). When OFF the exporter keeps its skeleton behaviour.
-    qa_maestro_translate_enabled: bool = False
+    # LLM step translation (Layer 1 upgrade) -- REMOVED 2026-08-13 (flag-surface
+    # reduction, batch 8a): QA_MAESTRO_TRANSLATE_ENABLED was DELETED and
+    # hardcoded to its default, False. It was already INERT on the MCP surface --
+    # its only caller was the retired Chainlit export path, so `qa-doctor` had to
+    # report the flag itself as having no effect -- and Maestro was retired
+    # wholesale in batch 7. tools/maestro_exporter.translate_suite_steps survives
+    # behind the seam translate_enabled() for whoever re-wires the export path.
+    # See docs/FEATURE_FLAGS.md.
     qa_maestro_translate_concurrency: int = 3
     # Test-account credentials for the Maestro login/recovery subflow. Injected as
     # Maestro env vars at RUN time (never written into YAML). .env only.
@@ -539,15 +534,17 @@ class Settings(BaseSettings):
     # qa_maestro_explore_max_steps), which are likewise floor-only. See
     # .claude/plans/plan-remediation-cap.md.
     qa_coverage_regen_max_rounds: int = 2
-    # Merge the critique + gap-fill generation into ONE ask_json call per round
-    # instead of two sequential calls (critique_coverage then a full
-    # _generate_for_category pass). Off by default: the existing two-call
-    # behaviour is preserved byte-for-byte until this is validated. See
-    # .claude/plans/plan-remediation-cap.md for the model-choice tradeoff (the
-    # merged call resolves to qa_llm_model, NOT qa_classifier_model, because its
-    # output includes tester-facing generated test cases, not just an internal
-    # critique).
-    qa_coverage_regen_merge_calls: bool = False
+    # Merging the critique + gap-fill generation into ONE ask_json call per
+    # remediation round (instead of critique_coverage followed by a full
+    # _generate_for_category pass) is UNCONDITIONAL since 2026-08-13
+    # (flag-surface reduction, batch 8a): QA_COVERAGE_REGEN_MERGE_CALLS was
+    # DELETED and hardcoded ON. This halves the call count of every legacy-critic
+    # remediation round, and the merged call resolves to qa_llm_model, NOT
+    # qa_classifier_model, because its output includes tester-facing generated
+    # test cases and not just an internal critique. The checklist-driven branch
+    # is unaffected, exactly as before: its "critique" is the deterministic
+    # external matcher, so there is nothing there to merge.
+    # See .claude/plans/plan-remediation-cap.md and docs/FEATURE_FLAGS.md.
     # Enterprise Feature Analysis Report (opt-in, off by default). When ON,
     # generate_test_scenarios runs ONE extra structured LLM pass (text backend,
     # via llm.ask_json) that merges the Jira ticket content with any screenshot
@@ -944,15 +941,21 @@ class Settings(BaseSettings):
     testrail_user: str = ""
     testrail_api_key: str = ""
 
-    # Spec-document ingestion. Off by default like every other feature gate.
-    # When ON, a PDF/DOCX/TXT/MD attached to a chat message is extracted to text
-    # (tools/doc_ingest.py), wrapped as UNTRUSTED context, and injected into the
-    # generation prompt. PDF/DOCX need the optional `spec` extra (pypdf /
-    # python-docx); TXT/MD work with no extra deps.
-    qa_spec_ingest_enabled: bool = False
-    # When ON (and ingestion is on), the extracted spec text is ALSO written to
-    # the RAG corpus as an entry_type="spec" entry for reuse / fine-tuning.
-    qa_spec_rag_persist: bool = False
+    # Spec-document ingestion -- REMOVED 2026-08-13 (flag-surface reduction,
+    # batch 8a): QA_SPEC_INGEST_ENABLED was DELETED and hardcoded to its default,
+    # False, so tools/doc_ingest.ingest_document() always refuses and no attached
+    # PDF/DOCX/TXT/MD is ever extracted into the generation prompt. The quality
+    # gain was never measured. The module and its optional `spec` extra are
+    # retained behind the seam tools.doc_ingest.enabled().
+    #
+    # QA_SPEC_RAG_PERSIST went with it, hardcoded to `True` on the maintainer's
+    # instruction, and the honest note is that this is a DOCUMENTED NO-OP: the
+    # field had NO reader anywhere in the tree even before this batch, and the
+    # corpus write it once described can only have happened while ingestion was
+    # on -- which it now never is. It is recorded here rather than silently
+    # dropped so nobody re-derives the value from an empty grep.
+    # See docs/FEATURE_FLAGS.md.
+    # Raw upload byte cap and extracted-text char cap (mirror the image caps).
     # Raw upload byte cap and extracted-text char cap (mirror the image caps).
     qa_max_spec_bytes: int = 10_000_000
     qa_max_spec_chars: int = 20_000
@@ -997,14 +1000,15 @@ class Settings(BaseSettings):
     qa_export_dir: str = "data/exports"
 
     # Zephyr for Jira import export (Batch 4 -- tools/zephyr_exporter.py).
-    # Opt-in, OFF by default per the house rule. When ON, `zephyr` joins the
-    # qa_export_suite format list and the auto-export path additionally writes a
-    # Zephyr-shaped 15-column workbook plus its zfj_import_config.json field map
-    # next to the Excel deliverable, so a tester imports straight into Jira
-    # instead of hand-massaging the generic 11-column sheet. OFF = the export
-    # surface, the format menus and the generation reply are byte-identical to
-    # before, and tools/zephyr_exporter.py never runs.
-    qa_zephyr_export_enabled: bool = False
+    # Zephyr for Jira import export -- REMOVED 2026-08-13 (flag-surface
+    # reduction, batch 8a): QA_ZEPHYR_EXPORT_ENABLED was DELETED and hardcoded to
+    # its default, False. `zephyr` never joins the qa_export_suite format list,
+    # the elicitation picker and markdown menu are byte-identical to before the
+    # feature existed, and the auto-export path writes no workbook pair. The
+    # 15-column layout was never verified against a live Zephyr importer, which
+    # is why its runbook pilot gate exists and why it was never promoted.
+    # tools/zephyr_exporter.py is retained and still directly tested; the seam is
+    # tools.mcp_handlers._zephyr_export_enabled(). See docs/FEATURE_FLAGS.md.
 
     # Dry run for that export -- UNCONDITIONAL since 2026-08-13 (flag-surface
     # reduction, batch 6): QA_ZEPHYR_DRY_RUN was DELETED and hardcoded ON. The
@@ -1142,20 +1146,25 @@ class Settings(BaseSettings):
     # guarantee and not be one.
     qa_host_dedup_low_text_ratio: float = 0.5
 
-    # --- Host-mode parallel chat fan-out (opt-in, default OFF) -----------------
-    # When ON, qa_prepare_test_cases adds an orchestration contract so the PARENT
-    # chat can spawn one same-session worker per category (Cursor Task / equivalent).
-    # MCP cannot invoke host Task tools; this flag only changes the prepare payload,
-    # instructions, status tool, and the empty-suite finalize completeness gate.
-    # Primary finalize (Path A, crash-safe -- 2026-07-31 incident): qa_submit_category
-    # x N as each worker returns, then empty qa_submit_suite (+ optional
-    # acceptance_criteria/ambiguity_result sidecar), gated until all expected
-    # categories are staged. Fallback (Path B): merge in parent + ONE full
-    # qa_submit_suite -- keeps the dedup/coverage review (which needs the merged
-    # suite's global tc_ids) but is lost wholesale if the chat dies before that
-    # single call, which is exactly how the first live run died.
-    # Flag OFF => prepare payload / instructions byte-identical to today.
-    qa_host_parallel_fanout_enabled: bool = False
+    # --- Host-mode parallel chat fan-out ---------------------------------------
+    # UNCONDITIONAL since 2026-08-13 (flag-surface reduction, batch 8a):
+    # QA_HOST_PARALLEL_FANOUT_ENABLED was DELETED and hardcoded to `True` -- the
+    # SHIPPED value of the public distribution .env template, NOT this field's
+    # code default. qa_prepare_test_cases therefore always carries the
+    # orchestration contract that lets the PARENT chat spawn one same-session
+    # worker per category (Cursor Task / equivalent), always exposes
+    # qa_prep_status, and always applies the empty-suite finalize completeness
+    # gate. MCP cannot invoke host Task tools, so this only ever changed the
+    # prepare payload, the instructions, that status tool and that gate.
+    # Primary finalize (Path A, crash-safe -- 2026-07-31 incident):
+    # qa_submit_category x N as each worker returns, then an empty
+    # qa_submit_suite (+ optional acceptance_criteria/ambiguity_result sidecar),
+    # gated until every expected category is staged. Fallback (Path B): merge in
+    # the parent + ONE full qa_submit_suite -- which keeps the dedup/coverage
+    # review (it needs the merged suite's global tc_ids) but is lost wholesale if
+    # the chat dies before that single call, exactly how the first live run died.
+    # The seam is agents.host_mode._parallel_fanout_on().
+    # See docs/FEATURE_FLAGS.md.
 
     # --- Volume floor + duplicate-prepare guard: flags DELETED 2026-08-12 -
     # QA_HOST_VOLUME_FLOOR_ENABLED and QA_HOST_DUPLICATE_PREP_GUARD_ENABLED were
@@ -1324,7 +1333,6 @@ class Settings(BaseSettings):
         "qa_api_test_enabled",
         "qa_api_framework_write_enabled",
         "qa_api_framework_write_dry_run",
-        "qa_coverage_regen_merge_calls",
         "qa_ac_anchoring_enforce",
         "qa_feature_analysis_enabled",
         "qa_test_plan_artifacts",
@@ -1333,13 +1341,7 @@ class Settings(BaseSettings):
         "qa_comment_reconcile_enabled",
         "jira_fetch_images",
         "jira_fetch_parent",
-        "qa_jira_ac_field_discovery",
-        "qa_host_grounding_review_enabled",
         "jira_fetch_sibling_stories",
-        "qa_maestro_translate_enabled",
-        "qa_spec_ingest_enabled",
-        "qa_spec_rag_persist",
-        "qa_zephyr_export_enabled",
         "qa_dist_mode",
         "qa_mcp_enabled",
         "qa_update_require_signature",
@@ -1350,15 +1352,11 @@ class Settings(BaseSettings):
         "qa_host_ambiguity_require_result",
         "qa_host_image_require_relevant",
         "qa_host_dedup_apply",
-        "qa_host_parallel_fanout_enabled",
         "qa_server_llm_enabled",
         "qa_atomic_checklist_enabled",
         "qa_checklist_nli_enabled",
         "qa_checklist_adjudicate_enabled",
         "qa_checklist_remediation_enabled",
-        "qa_prompt_cache_enabled",
-        "qa_structured_json_enabled",
-        "qa_structured_json_strict",
         mode="before",
     )
     @classmethod

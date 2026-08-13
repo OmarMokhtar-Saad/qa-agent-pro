@@ -68,6 +68,7 @@ from tools.jira_attachments import enabled as attachments_enabled
 from tools.jira_attachments import fetch_attachment_bytes
 from tools.jira_fetcher import fetch_url_content, verify_jira_access
 from tools.jira_mcp import (
+    _ac_field_discovery_on,
     connect_hint_line,
     connect_steps,
     not_connected_message,
@@ -669,10 +670,10 @@ _EXPORTERS: dict[str, Callable] = {
     "testrail": lambda s: generate_testrail_csv(s),
 }
 
-# Zephyr for Jira import export (QA_ZEPHYR_EXPORT_ENABLED, default OFF).
-# Deliberately kept OUT of _EXPORTERS so the flag genuinely removes it: with the
-# flag off the format map, the elicitation picker and the markdown menu are
-# byte-identical to before this feature existed.
+# Zephyr for Jira import export -- HARDCODED OFF since 2026-08-13, see
+# _zephyr_export_enabled(). Deliberately kept OUT of _EXPORTERS so the gate
+# genuinely removes it: with it off the format map, the elicitation picker and
+# the markdown menu are byte-identical to before this feature existed.
 _ZEPHYR_FORMAT = "zephyr"
 
 
@@ -691,7 +692,7 @@ def _available_exporters(
     tests/test_mcp_zephyr_export.py asserts exactly that.
     """
     exporters = dict(_EXPORTERS)
-    if settings.qa_zephyr_export_enabled:
+    if _zephyr_export_enabled():
         # Honour the configured export directory exactly like
         # _auto_export_zephyr does: the workbook + zfj_import_config.json pair is
         # a KEEP-THIS-FILE deliverable, so leaving output_dir unset would drop
@@ -1734,6 +1735,21 @@ def _maestro_explore_enabled() -> bool:
     the exploratory loop hardcoded OFF. Read by the mode list and the qa-doctor
     disclosure line; ``tools.maestro_explorer.enabled`` is the module's own
     seam.
+    """
+    return False
+
+
+def _zephyr_export_enabled() -> bool:
+    """The Zephyr for Jira import export. HARDCODED OFF since 2026-08-13.
+
+    NOT settings-derived: QA_ZEPHYR_EXPORT_ENABLED was DELETED (flag-surface
+    reduction, batch 8a) and cannot be reached from `.env`. `zephyr` therefore
+    never joins the qa_export_suite format map, the elicitation picker and the
+    markdown menu are byte-identical to before the feature existed, and the
+    auto-export path writes no workbook pair. The 15-column layout was never
+    verified against a live Zephyr importer, which is why its runbook pilot gate
+    exists and why it was never promoted. ``tools/zephyr_exporter.py`` is
+    RETAINED and still directly tested; reviving it is one line here.
     """
     return False
 
@@ -3029,14 +3045,14 @@ async def _auto_export_zephyr(
     suite, *, source_text: str = "", near_path: str = "", progress: ProgressCb = None
 ) -> str:
     """Write the Zephyr workbook + zfj_import_config.json pair alongside the
-    auto-exported Excel file (QA_ZEPHYR_EXPORT_ENABLED, default OFF).
+    auto-exported Excel file (_zephyr_export_enabled, hardcoded OFF 2026-08-13).
 
-    Returns "" when the flag is off, so with the flag off the generation reply is
-    byte-identical to today's. NEVER raises: a failure here only appends a
+    Returns "" when the gate is off -- which is always -- so the generation reply
+    is byte-identical to today's. NEVER raises: a failure here only appends a
     warning note -- the already-generated, already-persisted suite and its Excel
     deliverable are never put at risk by a secondary export.
     """
-    if not settings.qa_zephyr_export_enabled:
+    if not _zephyr_export_enabled():
         return ""
     try:
         await _emit(progress, "🧩 Writing the Zephyr import pair…")
@@ -5257,10 +5273,10 @@ async def handle_prepare_test_cases(
                 # flag, review M1).
                 "host_category_resubmit_note": True,
                 "host_category_shrink_guard": True,
-                "parallel_fanout": bool(settings.qa_host_parallel_fanout_enabled),
+                "parallel_fanout": bool(host_mode._parallel_fanout_on()),
                 "expected_categories": (
                     host_mode.expected_category_names(prepared)
-                    if settings.qa_host_parallel_fanout_enabled
+                    if host_mode._parallel_fanout_on()
                     else []
                 ),
                 # Batch 1 (2026-08-09): the generation-VOLUME contract,
@@ -11515,7 +11531,7 @@ def _ac_field_section() -> list[str]:
     """
     try:
         field = str(getattr(settings, "jira_ac_field", "") or "(unset)")
-        discovery = bool(getattr(settings, "qa_jira_ac_field_discovery", False))
+        discovery = _ac_field_discovery_on()
         out = [
             "### Acceptance-criteria field",
             "",
@@ -11527,17 +11543,17 @@ def _ac_field_section() -> list[str]:
         ]
         if discovery:
             out.append(
-                "- `QA_JIRA_AC_FIELD_DISCOVERY` is **on**: when the configured "
-                "field holds nothing usable, other custom fields are searched for "
-                "one whose value reads like requirements. The choice is logged."
+                "- Custom-field discovery is **on**: when the configured field "
+                "holds nothing usable, other custom fields are searched for one "
+                "whose value reads like requirements. The choice is logged."
             )
         else:
             out.append(
-                "- `QA_JIRA_AC_FIELD_DISCOVERY` is off (default). When the "
-                "configured field holds nothing usable, the ticket description is "
-                "parsed instead -- an 'Acceptance Criteria' heading, or a "
-                "use-case table. If neither yields anything, your chat model is "
-                "asked to derive the criteria, so traceability still works."
+                "- Custom-field discovery is off (default). When the configured "
+                "field holds nothing usable, the ticket description is parsed "
+                "instead -- an 'Acceptance Criteria' heading, or a use-case "
+                "table. If neither yields anything, your chat model is asked to "
+                "derive the criteria, so traceability still works."
             )
         out.append(
             "- To check the id for your instance, open a ticket's field list in "
@@ -11874,25 +11890,14 @@ async def handle_setup_check(
                     "(needs a working LLM backend) to restore it, or use the "
                     "`jira` mode."
                 )
-        # Phase 5d: QA_MAESTRO_TRANSLATE_ENABLED is INERT on the MCP surface.
-        # Its only caller was the retired Chainlit export path; this server calls
-        # generate_maestro_flows(suite) with no translations map, so the flag
-        # currently buys a tester nothing whatever the kill switch says. That is
-        # a configuration surprise an operator should hear about here rather than
-        # discover from flows that never contain a command -- and it is reported
-        # unconditionally, NOT gated on the kill switch, because the flag is
-        # inert either way. Deliberately NOT a per-mode allow-list item like the
-        # three above: `maestro_exporter.translate` is terminal but not
-        # tester-reachable, so naming QA_SERVER_LLM_ALLOW here would promise a
-        # capability the export path cannot deliver.
-        if not _test_cases_only() and settings.qa_maestro_translate_enabled:
-            recommended.append(
-                "QA_MAESTRO_TRANSLATE_ENABLED is on but currently has NO effect: "
-                "Maestro flows are exported as skeletons because the MCP export "
-                "path does not pass a translations map (its only caller was the "
-                "retired Chainlit UI). Leave it off until the export path is "
-                "re-wired — see docs/FEATURE_FLAGS.md."
-            )
+        # Phase 5d: the Maestro step-translation flag was already INERT on
+        # the MCP surface -- its only caller was the retired Chainlit export
+        # path, so qa-doctor had to report the FLAG ITSELF as having no
+        # effect. On 2026-08-13 QA_MAESTRO_TRANSLATE_ENABLED was DELETED and
+        # hardcoded OFF (flag-surface reduction, batch 8a), so there is no
+        # longer a configuration surprise to disclose, and that advisory is
+        # gone with it. tools.maestro_exporter.translate_enabled() is the
+        # seam; re-wiring the export path is still a separate plan.
         # 2026-08-03: the public dist edition is credential-free by design (see
         # _dist_needs_no_backend). "Fix the LLM backend -- nothing generates
         # without it" is then simply FALSE there, and contradicts that build's

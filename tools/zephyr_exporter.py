@@ -71,7 +71,11 @@ falling back to the case's own Priority. The reference implementation's
 documentation admits it treats "session" as a High signal and so marks nearly
 every case High on any story about sessions / calls / appointments.
 
-Opt-in: nothing here runs unless ``QA_ZEPHYR_EXPORT_ENABLED`` is on, and
+REMOVED 2026-08-13 (flag-surface reduction, batch 8a): nothing here runs on the
+MCP surface at all -- ``QA_ZEPHYR_EXPORT_ENABLED`` was DELETED and
+``tools.mcp_handlers._zephyr_export_enabled()`` is the False constant. The module
+is retained, still directly tested, and is the cheapest revival path. Formerly:
+nothing here ran unless that flag was on, and
 ``QA_ZEPHYR_DRY_RUN`` (default ON) decides whether the workbook is a one-case
 pilot or the full suite. This module reads NO settings itself -- ``dry_run`` is
 a parameter whose default is the SAFE value -- so it stays a dependency-free
