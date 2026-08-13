@@ -42,8 +42,8 @@ and the RAG corpus (`corpus/`) are protected paths.
 | `qa_generate_test_cases` | Feature text, Jira/issue URL, web page URL, or Swagger/OpenAPI link → structured test suite (steps, expected results, priority, risk) with a persisted `suite_id` |
 | `qa_export_suite` | Export a suite by `suite_id`: `csv`, `xlsx`, `testrail`, `gherkin`, or `playwright` |
 | `qa_list_devices` | List connected Android/iOS devices, emulators and simulators |
-| `qa_capture_screens` | Capture phone / emulator screens as image content + reusable `capture_ids` for grounded generation (needs `QA_MOBILE_CAPTURE`, shipped on in this edition) |
-| `qa_search_corpus` | Search past generated suites (requires `QA_RAG_ENABLED`) |
+| `qa_capture_screens` | Capture phone / emulator screens as image content + reusable `capture_ids` for grounded generation (always available -- nothing to switch on) |
+| `qa_search_corpus` | Search past generated suites (always available -- nothing to switch on) |
 | `qa-doctor` | Verify this machine: version, mobile tooling, devices, enabled features — no credentials to check |
 
 ## Quick start
@@ -332,9 +332,9 @@ Edit `~/qa-agent-pro/.env` (created from `.env.example`):
 | _(none)_ | No LLM credentials: generation runs in your own chat model, so there is no API key or backend to set |
 | _(none)_ | Jira ticket URLs work via your own Atlassian MCP connection -- no `.env` entry needed |
 | _(none)_ | Swagger/OpenAPI link → API test cases: paste a spec URL and it is ingested automatically |
-| `QA_MOBILE_CAPTURE` | Mobile-screen capture (Android via adb). The screenshots are handed to your own chat model, so no API key is involved |
-| `QA_RAG_ENABLED` | Learn from your past suites: grounding + duplicate flagging (on by default) |
-| `QA_MCP_ELICIT_ENABLED` | Interactive pickers in Cursor / Claude Code (on by default; automatic text-menu fallback on clients without dialog support) |
+| _(none)_ | Mobile-screen capture (Android via adb) is always on: the screenshots are handed to your own chat model, so no API key is involved |
+| _(none)_ | Learning from your past suites -- grounding + duplicate flagging -- is always on |
+| _(none)_ | Interactive pickers in Cursor / Claude Code are always on, with an automatic text-menu fallback on clients without dialog support |
 | `QA_EXPORT_DIR` | Folder the auto-exported Excel files are saved to -- `data/exports` in the dist, so your files persist there across sessions and updates |
 
 ## Connect Jira (to paste ticket URLs)

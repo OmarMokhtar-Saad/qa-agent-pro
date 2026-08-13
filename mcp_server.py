@@ -360,17 +360,35 @@ def _make_progress(ctx):
     return progress
 
 
+def _elicit_enabled() -> bool:
+    """Always True -- MCP elicitation dialogs are ON, unconditionally.
+
+    QA_MCP_ELICIT_ENABLED was DELETED on 2026-08-13 (flag-surface reduction,
+    batch 7 (needs-config)) and hardcoded to the value the DISTRIBUTION ships
+    (`true`), not this field's code default. A named seam, mirroring
+    ``tools.mcp_handlers._elicit_enabled``, so the non-interactive fallback
+    below stays executable by its tests and a revival is one line in each of
+    two documented places. NOT settings-derived.
+
+    The per-CLIENT limitation this used to be confused with is unaffected and
+    still handled below: a client that cannot show dialogs makes ``ctx.elicit``
+    raise, which is caught and reported as UNAVAILABLE so the caller falls back
+    to the markdown menu.
+    """
+    return True
+
+
 def _make_chooser(ctx):
     """Adapt ``ctx.elicit`` into the handlers' ``choose(message, options)`` callback,
-    mirroring ``_make_progress``. Returns ``None`` when QA_MCP_ELICIT_ENABLED is
-    off so the retrofit tools keep today's non-interactive behaviour (the wizard
+    mirroring ``_make_progress``. Returns ``None`` when ``_elicit_enabled()``
+    is False so the retrofit tools keep the non-interactive behaviour (the wizard
     treats a ``None``/unavailable chooser as 'render the markdown menu').
 
     Elicitation is supported only by some clients (Claude Code, Cursor — NOT
     Claude Desktop). A client without support makes ``ctx.elicit`` raise, which is
     caught here and reported as UNAVAILABLE so the caller falls back to markdown.
     """
-    if not settings.qa_mcp_elicit_enabled:
+    if not _elicit_enabled():
         return None
 
     _budget = {"deadline": time.monotonic() + mcp_handlers._ELICIT_CALL_BUDGET_S}
@@ -395,7 +413,7 @@ def _make_chooser(ctx):
 def _make_asker(ctx):
     """Adapt ``ctx.elicit`` into a free-text ``ask_text(message)`` callback —
     the text sibling of _make_chooser (same gating and degradation rules)."""
-    if not settings.qa_mcp_elicit_enabled:
+    if not _elicit_enabled():
         return None
 
     _budget = {"deadline": time.monotonic() + mcp_handlers._ELICIT_CALL_BUDGET_S}
@@ -1016,8 +1034,7 @@ def build_server():
     async def qa_search_corpus(
         query: str, ctx: Context, entry_type: str = "test_case", feature: str = ""
     ) -> str:
-        """Search the RAG corpus (requires QA_RAG_ENABLED) for similar past test
-        cases or bug reports. entry_type is 'test_case' or 'bug_report'; pass
+        """Search the RAG corpus for similar past test cases or bug reports. entry_type is 'test_case' or 'bug_report'; pass
         feature to narrow results to entries stored for that feature."""
         return await _tracked(
             "qa_search_corpus",
@@ -1076,11 +1093,12 @@ def build_server():
     # tools/device_manager IS shipped in the test-cases-only edition, capturing
     # app screens GROUNDS test-case generation -- that edition's one job -- and
     # this tool makes no server-side vision call and needs no credentials, so
-    # the credential-free promise holds. It is gated on QA_MOBILE_CAPTURE inside
-    # the handler, and note that the dist .env.example SHIPS
-    # QA_MOBILE_CAPTURE=true (scripts/build_dist.py), so this tool is LIVE by
-    # default on that edition -- a deliberate decision, documented in
-    # docs/FEATURE_FLAGS.md and in the dist README's tool table.
+    # the credential-free promise holds. QA_MOBILE_CAPTURE was DELETED on
+    # 2026-08-13 (flag-surface reduction, batch 7) and hardcoded to the `true`
+    # the dist .env.example already shipped, so this tool is LIVE on every
+    # edition -- a deliberate decision, documented in docs/FEATURE_FLAGS.md and
+    # in the dist README's tool table. The handler's gate is now the named seam
+    # tools/mcp_handlers._mobile_capture().
     @mcp.tool()
     async def qa_capture_screens(
         ctx: Context,
@@ -1090,8 +1108,7 @@ def build_server():
         names: str = "",
     ) -> list[ContentBlock]:
         """Capture screenshots from a connected phone / emulator / simulator and
-        return them as image content PLUS one capture_id per screen (requires
-        QA_MOBILE_CAPTURE).
+        return them as image content PLUS one capture_id per screen.
 
         Use this when the user wants test cases grounded in the REAL screens --
         especially for a Jira ticket, because this server cannot read images out
@@ -1139,12 +1156,14 @@ def build_server():
             app_id: str = "",
             goal: str = "",
         ) -> str:
-            """Drive Maestro mobile testing (requires QA_MAESTRO_ENABLED). mode is one of:
-            export (suite_id -> YAML flows in a per-suite dir),
-            run (device_id + suite_id, reads that per-suite dir, dry-run default),
-            heal (device_id + suite_id, requires QA_MAESTRO_HEAL_ENABLED), or
-            explore (device_id + goal + app_id, requires QA_MAESTRO_EXPLORE_ENABLED).
-            Per-device dry-run defaults are honoured."""
+            """RETIRED 2026-08-13 -- this tool refuses on every install.
+
+            QA_MAESTRO_ENABLED, QA_MAESTRO_HEAL_ENABLED and
+            QA_MAESTRO_EXPLORE_ENABLED were deleted as settings and hardcoded
+            OFF (flag-surface reduction, batch 7), so all four modes -- export
+            (suite_id -> YAML flows in a per-suite dir), run, heal and explore
+            -- return a disabled notice. Registration and the whole handler are
+            RETAINED for revival; do not call this expecting a device run."""
             return await _tracked(
                 "qa_run_mobile_suite",
                 ctx,
@@ -1278,9 +1297,8 @@ def build_server():
             and your JSON report.
 
             mode is one of: jira (analyse a feature description or Jira/issue
-            URL), mobile (capture screens from a connected device, needs
-            QA_MOBILE_CAPTURE), or jira_mobile (merge the ticket with captured
-            screens). Omit mode and I'll ask; the mobile modes also ask for the
+            URL), mobile (capture screens from a connected device), or
+            jira_mobile (merge the ticket with captured screens). Omit mode and I'll ask; the mobile modes also ask for the
             device and offer a capture-another-screen loop, and their screenshot
             descriptions are still produced by this server's own vision call.
 

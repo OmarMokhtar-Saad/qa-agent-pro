@@ -431,23 +431,36 @@ class Settings(BaseSettings):
     # bound what the pipeline will actually read from an uploaded image.
     qa_max_chat_images: int = 3
     qa_max_chat_image_bytes: int = 5_000_000  # Anthropic's own per-image vision cap
-    # Mobile device capture -> test cases (opt-in, off by default like the other
-    # feature gates above). When ON, testers can list attached Android/iOS
-    # devices, pick one, and generate test cases from a captured screenshot.
-    # NOTE: the screenshot is analysed via llm.ask_vision(), which needs
-    # ANTHROPIC_API_KEY regardless of QA_LLM_BACKEND (vision is decoupled from
-    # the text backend -- see llm.ask_vision).
-    qa_mobile_capture: bool = False
+    # Mobile device capture -> test cases -- UNCONDITIONAL since 2026-08-13
+    # (flag-surface reduction, batch 7 (needs-config)): QA_MOBILE_CAPTURE was
+    # DELETED and the behaviour hardcoded to the value the DISTRIBUTION ships
+    # (`true`), NOT this field's code default (`False`) -- the same divergence,
+    # and the same reasoning, batch 6 recorded for QA_SWAGGER_ENABLED. Testers
+    # can always list attached Android/iOS devices, pick one, and capture
+    # screens; tools/mcp_handlers._mobile_capture() returns the True constant.
+    # qa_capture_screens makes NO server-side vision call (the screens ride to
+    # the tester's own chat model as MCP image content), so that path needs no
+    # credential; the Feature-Analysis mobile modes still call llm.ask_vision(),
+    # which needs ANTHROPIC_API_KEY regardless of QA_LLM_BACKEND. Device
+    # discovery/capture is bounded by the two timeouts below. See
+    # docs/FEATURE_FLAGS.md.
 
     # Timeout (seconds) for device-discovery commands (adb devices / simctl list).
     qa_device_command_timeout: int = 20
     # Timeout (seconds) for a single screenshot capture (larger -- image transfer).
     qa_device_screenshot_timeout: int = 60
 
-    # --- Mobile Device Testing (Maestro) — opt-in, all default OFF / dry-run ON. ---
-    # Gates the "📱 Mobile Testing" starter chip, the guided wizard, and the
-    # "maestro" export keyword/button. Off by default per the constitution.
-    qa_maestro_enabled: bool = False
+    # --- Mobile Device Testing (Maestro) — RETIRED as a setting 2026-08-13. ---
+    # QA_MAESTRO_ENABLED was DELETED and the behaviour hardcoded OFF
+    # (flag-surface reduction, batch 7 (needs-config)). Unlike the three flags
+    # in that batch pinned ON, this one was never shipped in the public
+    # distribution's .env template at all: it needs the Maestro CLI plus an
+    # attached device or simulator on the operator's own machine, so it was a
+    # private-checkout capability, and .env now holds credentials, paths and
+    # per-install identifiers only. handle_run_mobile_suite and every mode it
+    # drives are RETAINED and still registered in the full edition, but
+    # tools/mcp_handlers._maestro_enabled() returns the False constant, so the
+    # tool refuses. See docs/FEATURE_FLAGS.md.
     # Maestro runner dry-run -- UNCONDITIONAL since 2026-08-13 (flag-surface
     # reduction, batch 6): QA_MAESTRO_DRY_RUN was DELETED and the dry run
     # hardcoded ON, so maestro_runner._dry_run() returns the True constant and
@@ -457,15 +470,20 @@ class Settings(BaseSettings):
     qa_maestro_binary: str = "maestro"
     qa_maestro_flow_dir: str = "maestro_flows"
     qa_maestro_run_timeout: int = 600
-    # AI-assisted fail→diagnose→patch→rerun heal loop (mode c). Off by default; uses
-    # llm.ask_vision on the failure screenshot, bounded by max attempts.
-    qa_maestro_heal_enabled: bool = False
+    # AI-assisted fail→diagnose→patch→rerun heal loop (mode c) -- REMOVED as a
+    # setting 2026-08-13 (flag-surface reduction, batch 7 (needs-config)):
+    # QA_MAESTRO_HEAL_ENABLED was DELETED and hardcoded OFF, so
+    # tools/maestro_healer.enabled() returns the False constant and the loop
+    # never runs. The attempt bound below is retained with the loop it bounds.
     qa_maestro_heal_max_attempts: int = 2
-    # AI exploratory run (Layer 3 -- observe->decide->act). Off by default; adds
-    # a 4th "🧭 AI exploratory run" mode to the Mobile Testing wizard,
-    # bounded by a step budget. Each per-step device action is dry-run --
-    # unconditionally so since 2026-08-13, when QA_MAESTRO_DRY_RUN was deleted.
-    qa_maestro_explore_enabled: bool = False
+    # AI exploratory run (Layer 3 -- observe->decide->act) -- REMOVED as a
+    # setting 2026-08-13 (flag-surface reduction, batch 7 (needs-config)):
+    # QA_MAESTRO_EXPLORE_ENABLED was DELETED and hardcoded OFF, so
+    # tools/maestro_explorer.enabled() returns the False constant and the 4th
+    # "🧭 AI exploratory run" mode is never offered. The step budget and
+    # per-step timeout below are retained with the loop they bound; each
+    # per-step device action was already unconditionally dry-run since
+    # 2026-08-13, when QA_MAESTRO_DRY_RUN was deleted.
     qa_maestro_explore_max_steps: int = 15
     qa_maestro_explore_step_timeout: int = 60
     # LLM step translation (Layer 1 upgrade) -- opt-in. When ON, the Maestro
@@ -751,8 +769,15 @@ class Settings(BaseSettings):
     # merged back by stable_id). The legacy full-category retry it replaced is
     # gone; there is no setting left that can bring either behaviour back.
 
-    # RAG corpus grounding — disabled by default.
-    qa_rag_enabled: bool = False
+    # RAG corpus grounding -- UNCONDITIONAL since 2026-08-13 (flag-surface
+    # reduction, batch 7 (needs-config)): QA_RAG_ENABLED was DELETED and the
+    # behaviour hardcoded to the value the DISTRIBUTION ships (`true`), NOT this
+    # field's code default (`False`) -- the QA_SWAGGER_ENABLED divergence again.
+    # Retrieval is always attempted, and an EMPTY corpus is already a no-op
+    # (query_corpus returns no hits and never raises), which is what made the
+    # per-install switch redundant. The knobs below -- storage path, threshold,
+    # top-k, similarity mode, recency, entry cap and the relevance floor -- are
+    # the surviving controls. See docs/FEATURE_FLAGS.md.
     qa_rag_storage_path: str = "corpus"
     qa_rag_similarity_threshold: float = 0.3
     qa_rag_top_k: int = 5
@@ -799,11 +824,17 @@ class Settings(BaseSettings):
     # Cosine threshold at/above which two cases are treated as the same for
     # intra-suite semantic dedup. Only used when qa_embeddings_backend is set.
     qa_semantic_dedup_threshold: float = 0.9
-    # Master gate for intra-suite semantic dedup (opt-in, default OFF). Required
-    # IN ADDITION to an embeddings backend so enabling embeddings purely for RAG
-    # ranking never silently starts DROPPING near-duplicate cases. OFF => the
-    # generation pipeline never merges cases on embedding similarity.
-    qa_semantic_dedup_enabled: bool = False
+    # Intra-suite semantic dedup -- REMOVED as a setting 2026-08-13
+    # (flag-surface reduction, batch 7 (needs-config)):
+    # QA_SEMANTIC_DEDUP_ENABLED was DELETED and hardcoded OFF, so
+    # agents.test_scenario_agent.semantic_dedup_enabled() returns the False
+    # constant and the generation pipeline never merges cases on embedding
+    # similarity. QA_EMBEDDINGS_BACKEND survives and still powers vector RAG
+    # ranking -- which is exactly the separation this gate existed to protect,
+    # now enforced in code rather than by a second .env line. OFF is also the
+    # SAFE direction: this was the one gate in the batch whose ON state DROPS
+    # generated cases. The threshold above is retained with the
+    # retained-for-revival _semantic_dedupe_cases path.
 
     # --- Atomic Requirements Checklist (Batch 2; opt-in, default OFF) ------
     # Master gate for the three-pass auditable-coverage pipeline:
@@ -1071,8 +1102,9 @@ class Settings(BaseSettings):
     # whether the reported groups are ACTED on is still the opt-in sub-flag
     # below. See docs/FEATURE_FLAGS.md -> "Changelog 2026-08-12".
     # Sub-flag: actually REMOVE the non-keeper members of each reported group.
-    # Default OFF, and deliberately ASYMMETRIC with qa_semantic_dedup_enabled
-    # (which does remove): that path drops on a NUMERIC cosine >=
+    # Default OFF, and deliberately ASYMMETRIC with the embedding-based semantic
+    # dedup path (which does remove -- itself hardcoded OFF on 2026-08-13,
+    # flag-surface reduction batch 7): that path drops on a NUMERIC cosine >=
     # qa_semantic_dedup_threshold over a fixed payload, with a protected-id list
     # and the NB-016 sole-tracer rescue. A host model's free-form judgement has no
     # threshold and no calibrated precision, and -- unlike an embedding computed
@@ -1216,14 +1248,19 @@ class Settings(BaseSettings):
     # device runs -- each MCP tool call is separately audited.
     qa_mcp_enabled: bool = False
 
-    # Guided, choice-driven MCP wizard (qa_wizard) + missing-parameter prompts via
-    # MCP elicitation (ctx.elicit). Off by default like every other feature gate.
-    # When ON, qa_wizard and the export/mobile tools ask interactive choice
-    # dialogs on clients that support elicitation (Claude Code, Cursor); Claude
-    # Desktop does not, so those calls transparently fall back to a markdown menu.
-    # With this OFF the existing tools behave exactly as before and qa_wizard
-    # still works via markdown menus.
-    qa_mcp_elicit_enabled: bool = False
+    # Guided, choice-driven MCP wizard (qa_wizard) + missing-parameter prompts
+    # via MCP elicitation (ctx.elicit) -- UNCONDITIONAL since 2026-08-13
+    # (flag-surface reduction, batch 7 (needs-config)): QA_MCP_ELICIT_ENABLED
+    # was DELETED and the behaviour hardcoded to the value the DISTRIBUTION
+    # ships (`true`) -- as do this repo's own .mcp.json and .cursor/mcp.json --
+    # NOT this field's code default (`False`). The per-CLIENT limitation that
+    # made a switch look necessary is handled WITHOUT one: Claude Desktop
+    # advertises no elicitation capability, so ctx.elicit raises there, the
+    # callback reports UNAVAILABLE and the caller falls back to the markdown
+    # menu exactly as it did with the flag off. mcp_server._elicit_enabled() and
+    # tools/mcp_handlers._elicit_enabled() return the True constant; every
+    # dialog stays bounded by the existing per-call elicitation budget. See
+    # docs/FEATURE_FLAGS.md.
 
     # GitHub-Release startup self-update (launcher.py -> tools/updater.py) --
     # REMOVED 2026-08-13 (flag-surface reduction, batch 6): QA_AUTO_UPDATE_ENABLED
@@ -1287,7 +1324,6 @@ class Settings(BaseSettings):
         "qa_api_test_enabled",
         "qa_api_framework_write_enabled",
         "qa_api_framework_write_dry_run",
-        "qa_rag_enabled",
         "qa_coverage_regen_merge_calls",
         "qa_ac_anchoring_enforce",
         "qa_feature_analysis_enabled",
@@ -1300,23 +1336,17 @@ class Settings(BaseSettings):
         "qa_jira_ac_field_discovery",
         "qa_host_grounding_review_enabled",
         "jira_fetch_sibling_stories",
-        "qa_mobile_capture",
-        "qa_maestro_enabled",
-        "qa_maestro_heal_enabled",
-        "qa_maestro_explore_enabled",
         "qa_maestro_translate_enabled",
         "qa_spec_ingest_enabled",
         "qa_spec_rag_persist",
         "qa_zephyr_export_enabled",
         "qa_dist_mode",
         "qa_mcp_enabled",
-        "qa_mcp_elicit_enabled",
         "qa_update_require_signature",
         "qa_llm_strict_host",
         "qa_bilingual_rules",
         "qa_atomicity_rules",
         "qa_standing_rules",
-        "qa_semantic_dedup_enabled",
         "qa_host_ambiguity_require_result",
         "qa_host_image_require_relevant",
         "qa_host_dedup_apply",

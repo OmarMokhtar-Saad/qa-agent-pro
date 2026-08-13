@@ -944,12 +944,15 @@ async def _recent_suites_markdown(tool: str) -> str:
 
 def _mobile_mode_options() -> list:
     """Maestro modes offered by the wizard/elicitation, filtered by their gates.
-    export/run are always available under QA_MAESTRO_ENABLED; heal/explore need
-    their own flags (mirrors app.py's _mt_mode_actions)."""
+
+    RETIRED 2026-08-13: every gate below is now a hardcoded-False seam, so this
+    returns ["export", "run"] and handle_run_mobile_suite refuses both. Kept in
+    its original shape -- the mode list is part of what a revival restores.
+    """
     modes = ["export", "run"]
-    if settings.qa_maestro_heal_enabled:
+    if _maestro_heal_enabled():
         modes.append("heal")
-    if settings.qa_maestro_explore_enabled:
+    if _maestro_explore_enabled():
         modes.append("explore")
     return modes
 
@@ -1560,18 +1563,16 @@ async def _elicit_source_plan_status(
 
     WHY THE LABEL IS NOT JUST THE ChoiceResult (review H3): _elicit_choice returns
     UNAVAILABLE for a MISSING callback *and* for a raising ctx.elicit (the module
-    comment above ChoiceResult already flags this), and QA_MCP_ELICIT_ENABLED
-    defaults FALSE -- so on a stock install the label would read
+    comment above ChoiceResult already flags this), and the elicitation gate
+    used to default FALSE -- so on a stock install the label would read
     "unavailable/unavailable", indistinguishable from the client-capability limit
     it exists to identify. The flag/callback state is the only thing that can tell
-    those apart, so an unresolved gate on a disabled install is reported as
+    those apart, so an unresolved gate on an install whose _elicit_enabled()
+    seam is off is reported as
     "disabled/disabled" and everything else keeps the honest
     "<enum-status>/<text-status>" form ("unavailable/unavailable" for a client
     that cannot show dialogs, "declined/..." for a tester who dismissed one)."""
-    _disabled = bool(
-        not getattr(settings, "qa_mcp_elicit_enabled", False)
-        or (choose is None and ask_text is None)
-    )
+    _disabled = bool(not _elicit_enabled() or (choose is None and ask_text is None))
     picked = await _elicit_choice(
         choose,
         "I cannot read images out of Jira -- where do this ticket's screens come from?",
@@ -1667,6 +1668,74 @@ def _zephyr_dry_run() -> bool:
     reachable from its tests. NOT settings-derived.
     """
     return True
+
+
+def _elicit_enabled() -> bool:
+    """Always True -- MCP elicitation dialogs are ON, unconditionally.
+
+    QA_MCP_ELICIT_ENABLED was DELETED on 2026-08-13 (flag-surface reduction,
+    batch 7 (needs-config)) and hardcoded to the value the DISTRIBUTION already
+    shipped. A named seam, mirroring ``mcp_server._elicit_enabled``, so the
+    markdown-menu fallback below every dialog stays executable by its tests.
+    NOT settings-derived. A client that cannot show dialogs is UNAFFECTED: its
+    ``ctx.elicit`` raises, the callback reports UNAVAILABLE, and the caller
+    renders the menu exactly as it did with the flag off.
+    """
+    return True
+
+
+def _mobile_capture() -> bool:
+    """Always True -- device screen capture is ON, unconditionally.
+
+    QA_MOBILE_CAPTURE was DELETED on 2026-08-13 and hardcoded to the `true` the
+    dist .env.example already shipped. A named seam so the capture-disabled
+    branches stay executable by their tests (they are unreachable in
+    production), and so a test suite never shells out to `adb` by default.
+    NOT settings-derived.
+    """
+    return True
+
+
+def _rag_enabled() -> bool:
+    """Always True -- RAG corpus grounding is ON, unconditionally.
+
+    QA_RAG_ENABLED was DELETED on 2026-08-13 and hardcoded to the `true` the
+    dist .env.example already shipped. An EMPTY corpus was always a silent
+    no-op, which is what made the per-install switch redundant. NOT
+    settings-derived.
+    """
+    return True
+
+
+def _maestro_enabled() -> bool:
+    """Always False -- Maestro mobile testing is RETIRED.
+
+    QA_MAESTRO_ENABLED was DELETED on 2026-08-13 (flag-surface reduction,
+    batch 7) and hardcoded to its own code default: unlike the three flags
+    pinned ON in that batch it was never in the public distribution's .env
+    template, so the code default IS the value every install ran. A named seam,
+    mirroring ``tools.web_runner.enabled``, so the retained handler body stays
+    executable by its tests and a revival is one line here. NOT
+    settings-derived.
+    """
+    return False
+
+
+def _maestro_heal_enabled() -> bool:
+    """Always False -- QA_MAESTRO_HEAL_ENABLED was DELETED on 2026-08-13 and
+    the heal loop hardcoded OFF. Read by the mode list and the qa-doctor
+    disclosure line; ``tools.maestro_healer.enabled`` is the module's own seam.
+    """
+    return False
+
+
+def _maestro_explore_enabled() -> bool:
+    """Always False -- QA_MAESTRO_EXPLORE_ENABLED was DELETED on 2026-08-13 and
+    the exploratory loop hardcoded OFF. Read by the mode list and the qa-doctor
+    disclosure line; ``tools.maestro_explorer.enabled`` is the module's own
+    seam.
+    """
+    return False
 
 
 async def _fetch_jira_attachment_bytes(url_content: dict | None) -> int:
@@ -2758,7 +2827,7 @@ async def _auto_export_xlsx(
         output_path = None
         export_dir = _resolved_export_dir()
         reject_note = ""
-        if settings.qa_mcp_elicit_enabled and ask_text is not None and not export_dir:
+        if _elicit_enabled() and ask_text is not None and not export_dir:
             # F1a (2026-08-10): ASK ONLY WHEN THERE IS NO ANSWER ALREADY. With
             # QA_EXPORT_DIR resolved (the shipped default always resolves) this
             # dialog held qa_submit_suite -- a FINISHED, already-persisted suite
@@ -8967,7 +9036,7 @@ async def handle_export_suite(
     exporters, QA_EXPORT_DIR for the Zephyr pair). Never raises.
     """
     fmt = (fmt or "").strip().lower()
-    if not fmt and settings.qa_mcp_elicit_enabled:
+    if not fmt and _elicit_enabled():
         picked = await _elicit_choice(
             choose, "Which export format?", list(sorted(_available_exporters()))
         )
@@ -8983,7 +9052,7 @@ async def handle_export_suite(
             f"{', '.join(sorted(_available_exporters()))}."
         )
     suite_id = (suite_id or "").strip()
-    if not suite_id and settings.qa_mcp_elicit_enabled:
+    if not suite_id and _elicit_enabled():
         picked = await _elicit_suite(choose)
         if picked.status == CHOSEN:
             suite_id = (picked.value or "").strip()
@@ -9517,8 +9586,8 @@ async def handle_search_corpus(
     query = (query or "").strip()
     if not query:
         return "⚠️ Provide a search query."
-    if not settings.qa_rag_enabled:
-        return "ℹ️ The RAG corpus is disabled (set QA_RAG_ENABLED=true to enable corpus search)."
+    if not _rag_enabled():
+        return "ℹ️ Corpus search is disabled in this build."
     entry_type = (entry_type or "test_case").strip()
     if entry_type not in ("test_case", "bug_report"):
         return f"⚠️ Unknown corpus '{entry_type}'. Choose 'test_case' or 'bug_report'."
@@ -9987,20 +10056,19 @@ async def handle_capture_screens(
     screens per call, and a clamped request is DISCLOSED rather than silently
     trimmed.
 
-    Gated on QA_MOBILE_CAPTURE. Deliberately does NOT refuse in the
-    test-cases-only edition (unlike handle_run_mobile_suite /
-    handle_feature_analysis): tools/device_manager IS shipped there, capturing
-    app screens grounds test-case generation -- that edition's one job -- and
-    this makes no server-side vision call, so the credential-free promise holds.
-    That edition also ships QA_MOBILE_CAPTURE=true in its .env.example, so this
-    tool is LIVE there by default; that is a deliberate decision, not an
-    accident (see docs/FEATURE_FLAGS.md). Never raises."""
+    Gated on the _mobile_capture() seam, which is hardcoded True since
+    2026-08-13 (QA_MOBILE_CAPTURE deleted, pinned to the `true` the dist
+    .env.example already shipped), so this tool is LIVE on every edition.
+    Deliberately does NOT refuse in the test-cases-only edition (unlike
+    handle_run_mobile_suite / handle_feature_analysis): tools/device_manager IS
+    shipped there, capturing app screens grounds test-case generation -- that
+    edition's one job -- and this makes no server-side vision call, so the
+    credential-free promise holds (see docs/FEATURE_FLAGS.md). Never raises."""
     try:
-        if not settings.qa_mobile_capture:
+        if not _mobile_capture():
             return (
-                "ℹ️ Device screen capture is disabled (set QA_MOBILE_CAPTURE=true "
-                "in .env and restart the MCP server). You can still attach the "
-                "screenshots to this chat instead and pass "
+                "ℹ️ Device screen capture is disabled in this build. You can "
+                "still attach the screenshots to this chat instead and pass "
                 "`attached_image_count` to `qa_prepare_test_cases`.",
                 [],
             )
@@ -10137,7 +10205,7 @@ async def handle_run_mobile_suite(
     if _test_cases_only():
         return _TEST_CASES_ONLY_NOTICE
     mode = (mode or "").strip().lower()
-    if not mode and settings.qa_mcp_elicit_enabled:
+    if not mode and _elicit_enabled():
         picked = await _elicit_mobile_mode(choose)
         if picked.status == CHOSEN:
             mode = (picked.value or "").strip().lower()
@@ -10147,12 +10215,16 @@ async def handle_run_mobile_suite(
             return _mobile_mode_menu_markdown()
     if mode not in _MOBILE_MODES:
         return f"⚠️ Unknown mode '{mode}'. Choose one of: {', '.join(_MOBILE_MODES)}."
-    if not settings.qa_maestro_enabled:
-        return "ℹ️ Mobile testing is disabled (set QA_MAESTRO_ENABLED=true)."
+    # QA_MAESTRO_ENABLED was DELETED on 2026-08-13 (flag-surface reduction,
+    # batch 7) and hardcoded OFF, so this refusal is unconditional in
+    # production and everything below it is retained-for-revival. The message
+    # no longer names an env var: it would be naming one that does not exist.
+    if not _maestro_enabled():
+        return "ℹ️ Mobile testing (Maestro) is disabled in this build."
     try:
         if mode == "export":
             suite_id = (suite_id or "").strip()
-            if not suite_id and settings.qa_mcp_elicit_enabled:
+            if not suite_id and _elicit_enabled():
                 picked = await _elicit_suite(choose)
                 if picked.status == CHOSEN:
                     suite_id = (picked.value or "").strip()
@@ -10174,7 +10246,7 @@ async def handle_run_mobile_suite(
             return shape_mobile_export(suite_id, path, len(suite.test_cases))
 
         device_id = (device_id or "").strip()
-        if not device_id and settings.qa_mcp_elicit_enabled:
+        if not device_id and _elicit_enabled():
             picked = await _elicit_device(choose)
             if picked.status == CHOSEN:
                 device_id = picked.value or ""
@@ -10193,7 +10265,7 @@ async def handle_run_mobile_suite(
             # run/heal read the flows written by mode "export" into the per-suite
             # dir flow_dir_for_suite(suite_id) (parity with app.py). Reject cleanly
             # when nothing was exported yet, rather than silently running an empty dir.
-            if not (suite_id or "").strip() and settings.qa_mcp_elicit_enabled:
+            if not (suite_id or "").strip() and _elicit_enabled():
                 picked = await _elicit_suite(choose)
                 if picked.status == CHOSEN:
                     suite_id = (picked.value or "").strip()
@@ -10259,7 +10331,7 @@ async def handle_run_mobile_suite(
             return shape_mobile_heal(device["id"], res.get("content") or {})
 
         # mode == "explore"
-        if not (app_id or "").strip() and settings.qa_mcp_elicit_enabled:
+        if not (app_id or "").strip() and _elicit_enabled():
             apps = (await list_installed_apps(device)).get("content") or []
             if apps:
                 labels = [
@@ -10273,7 +10345,7 @@ async def handle_run_mobile_suite(
                     app_id = by_label.get(picked.value or "") or ""
                 elif picked.status == DECLINED:
                     return "👍 Cancelled — no app selected."
-        if not (goal or "").strip() and settings.qa_mcp_elicit_enabled:
+        if not (goal or "").strip() and _elicit_enabled():
             asked = await _elicit_text(
                 ask_text,
                 "What should the exploration focus on? (e.g. 'the login flow') "
@@ -10324,7 +10396,7 @@ async def handle_run_web_suite(
 ) -> str:
     """Run a stored suite against a live web app and report pass/fail per TC-ID.
 
-    Full edition only, gated by QA_WEB_RUN_ENABLED; dry-run (default) previews
+    Full edition only, gated by the _web_run_enabled() seam; dry-run previews
     the planned browser actions without launching a browser. Never raises."""
     if _test_cases_only():
         return _TEST_CASES_ONLY_NOTICE
@@ -10343,7 +10415,7 @@ async def handle_run_web_suite(
     try:
         # web L3: keep the elicitation + recent-suites lookups inside the
         # never-raise guard so a transport error can't escape the handler.
-        if not suite_id and settings.qa_mcp_elicit_enabled:
+        if not suite_id and _elicit_enabled():
             picked = await _elicit_suite(choose)
             if picked.status == CHOSEN:
                 suite_id = (picked.value or "").strip()
@@ -10733,9 +10805,9 @@ async def _guided_test_cases(
         text = asked.value.strip()
     images: list = []
     if src in ("mobile", "jira_mobile"):
-        if not settings.qa_mobile_capture:
+        if not _mobile_capture():
             if src == "mobile":
-                return "ℹ️ Mobile capture is disabled (set QA_MOBILE_CAPTURE=true)."
+                return "ℹ️ Mobile capture is disabled in this build."
             # jira_mobile continues from the ticket alone (parity with the
             # Chainlit wizard's capture-off fallback).
         else:
@@ -10835,7 +10907,7 @@ async def _fa_capture_screens(
             # only limit. count=0 (every pre-existing caller) is byte-identical
             # to before.
             continue
-        if not settings.qa_mcp_elicit_enabled or choose is None:
+        if not _elicit_enabled() or choose is None:
             break
         picked = await _elicit_choice(
             choose,
@@ -10932,7 +11004,7 @@ async def handle_feature_analysis(
         mode = "jira_mobile"
 
     if not mode:
-        if settings.qa_mcp_elicit_enabled:
+        if _elicit_enabled():
             picked = await _elicit_choice(
                 choose, "Which Feature Analysis mode?", list(_FA_MODE_LABELS)
             )
@@ -10980,13 +11052,13 @@ async def handle_feature_analysis(
         screen_descriptions = ""
         screens_captured = 0
         if mode in ("mobile", "jira_mobile"):
-            if not settings.qa_mobile_capture:
+            if not _mobile_capture():
                 if mode == "mobile":
-                    return "ℹ️ Mobile capture is disabled (set QA_MOBILE_CAPTURE=true)."
+                    return "ℹ️ Mobile capture is disabled in this build."
                 # jira_mobile continues from the ticket alone (parity with app.py)
             else:
                 device_id = (device_id or "").strip()
-                if not device_id and settings.qa_mcp_elicit_enabled:
+                if not device_id and _elicit_enabled():
                     picked = await _elicit_device(choose)
                     if picked.status == CHOSEN:
                         device_id = picked.value or ""
@@ -11731,7 +11803,7 @@ async def handle_setup_check(
 
             for _mode_on, _mode_id, _mode_loss in (
                 (
-                    settings.qa_maestro_heal_enabled,
+                    _maestro_heal_enabled(),
                     "maestro_healer.classify",
                     'Maestro self-healing (mode="heal") will NOT triage a failure, '
                     "patch the flow or re-run it — transient interruptions "
@@ -11739,7 +11811,7 @@ async def handle_setup_check(
                     "need a manual re-run",
                 ),
                 (
-                    settings.qa_maestro_explore_enabled,
+                    _maestro_explore_enabled(),
                     "maestro_explorer.decide",
                     'AI exploratory runs (mode="explore") will produce ZERO steps '
                     "— every step needs one model decision, which cannot be "
@@ -11788,7 +11860,7 @@ async def handle_setup_check(
         if (
             not _test_cases_only()
             and settings.qa_feature_analysis_enabled
-            and settings.qa_mobile_capture
+            and _mobile_capture()
         ):
             from llm import server_llm_enabled as _fa_vision_allowed
 
@@ -12079,7 +12151,7 @@ async def handle_setup_check(
                     )
                 ]
             ),
-            ("Mobile capture (QA_MOBILE_CAPTURE)", settings.qa_mobile_capture),
+            ("Mobile capture (always on since 2026-08-13)", _mobile_capture()),
             (
                 "Swagger/OpenAPI links (always on since 2026-08-13)",
                 True,
@@ -12087,20 +12159,20 @@ async def handle_setup_check(
         ]
         if not _test_cases_only():
             gates += [
-                ("Mobile testing (QA_MAESTRO_ENABLED)", settings.qa_maestro_enabled),
-                ("Maestro dry-run (always on since 2026-08-13)", True),
+                # ONE row, not four. The three Maestro switches were deleted
+                # on 2026-08-13 and hardcoded OFF, so listing "AI exploratory"
+                # and "Self-heal" as separate unchecked gates would send an
+                # operator looking for env vars that no longer exist -- the
+                # precise thing this report's disclosure discipline forbids.
                 (
-                    "AI exploratory (QA_MAESTRO_EXPLORE_ENABLED)",
-                    settings.qa_maestro_explore_enabled,
-                ),
-                (
-                    "Self-heal (QA_MAESTRO_HEAL_ENABLED)",
-                    settings.qa_maestro_heal_enabled,
+                    "Mobile testing (retired 2026-08-13 — the Maestro modes, "
+                    "including self-heal and AI exploratory, are permanently off)",
+                    _maestro_enabled(),
                 ),
             ]
         gates += [
-            ("RAG corpus (QA_RAG_ENABLED)", settings.qa_rag_enabled),
-            ("Wizard dialogs (QA_MCP_ELICIT_ENABLED)", settings.qa_mcp_elicit_enabled),
+            ("RAG corpus (always on since 2026-08-13)", _rag_enabled()),
+            ("Wizard dialogs (always on since 2026-08-13)", _elicit_enabled()),
         ]
         for label, value in gates:
             lines.append(f"- {'✅' if value else '⬜'} {label}")
