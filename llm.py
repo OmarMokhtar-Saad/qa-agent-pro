@@ -1142,6 +1142,20 @@ def _cache_min_chars(model: str | None) -> int:
     return min_tokens * _CACHE_CHARS_PER_TOKEN
 
 
+def _prompt_cache_enabled() -> bool:
+    """The shared cached prompt prefix. HARDCODED OFF since 2026-08-13.
+
+    NOT settings-derived: QA_PROMPT_CACHE_ENABLED was DELETED (flag-surface
+    reduction, batch 8a) and cannot be reached from `.env`. The whole cache
+    path below -- ``_cache_prefix_ok``, ``_split_user_content``,
+    ``warm_cache_prefix``, the write canary and the model-minimum table -- is
+    RETAINED behind this one constant, because it is the cheapest revival path
+    and its bounds are the contract a revival has to satisfy. Reviving it is a
+    one-line change here. If this ever reads a setting again, the flag is back.
+    """
+    return False
+
+
 def _cache_prefix_ok(system: str, user: str, model: str | None) -> bool:
     """True when <system + user> is long enough to be a worthwhile cache prefix.
 
@@ -1153,7 +1167,7 @@ def _cache_prefix_ok(system: str, user: str, model: str | None) -> bool:
     """
     if _CACHE_WARM_DISABLED:
         return False
-    if not getattr(settings, "qa_prompt_cache_enabled", False):
+    if not _prompt_cache_enabled():
         return False
     return (len(system) + len(user)) >= _cache_min_chars(model)
 
@@ -1314,15 +1328,30 @@ _TOOL_SYSTEM_INSTRUCTION = (
 
 
 def _structured_json_enabled() -> bool:
-    """QA_STRUCTURED_JSON_ENABLED (default OFF). Never raises."""
-    value = getattr(settings, "qa_structured_json_enabled", False)
-    return value if isinstance(value, bool) else False
+    """Forced tool use on the ``api`` backend. HARDCODED ON since 2026-08-13.
+
+    NOT settings-derived: QA_STRUCTURED_JSON_ENABLED was DELETED (flag-surface
+    reduction, batch 8a) and cannot be reached from `.env` at all. Kept as a
+    named seam rather than inlined so the JSON-in-prompt path below stays
+    executable -- it is still the real fallback for every cli/cursor call and
+    for an api model that rejects the tool schema -- and so a revival is one
+    line here. If this ever reads a setting again, the flag is back.
+    """
+    return True
 
 
 def _strict_json_enabled() -> bool:
-    """QA_STRUCTURED_JSON_STRICT (default OFF). Never raises."""
-    value = getattr(settings, "qa_structured_json_strict", False)
-    return value if isinstance(value, bool) else False
+    """Constrained decoding (``strict: true``). HARDCODED ON since 2026-08-13.
+
+    Same contract as ``_structured_json_enabled``: QA_STRUCTURED_JSON_STRICT is
+    gone. Strict mode STACKS on forced tool use and is meaningless without it,
+    which is coherent here precisely because both constants are True. The
+    degradation ladder is unchanged and is what makes ON safe: the schema
+    sanitiser drops the keywords strict mode rejects, an API rejection is
+    memoised per (model, schema), and the call degrades to non-strict forced
+    tool use and then to JSON-in-prompt.
+    """
+    return True
 
 
 def _schema_key(response_model: Type[T]) -> str:
@@ -1385,7 +1414,7 @@ def _warn_if_prompt_cache_also_on() -> None:
     hear about it. Never raises.
     """
     global _BOTH_FLAGS_WARNED
-    if _BOTH_FLAGS_WARNED or not getattr(settings, "qa_prompt_cache_enabled", False):
+    if _BOTH_FLAGS_WARNED or not _prompt_cache_enabled():
         return
     _BOTH_FLAGS_WARNED = True
     logger.warning(
@@ -1655,7 +1684,7 @@ async def warm_cache_prefix(
         logger.info("llm.warm_cache_prefix suppressed: %s", _SERVER_LLM_OFF_MSG)
         return False
     try:
-        if not getattr(settings, "qa_prompt_cache_enabled", False):
+        if not _prompt_cache_enabled():
             return False
         if _backend() != "api":
             # cli/cursor drive a subprocess — there is no cache_control to write.

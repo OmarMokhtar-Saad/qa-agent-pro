@@ -622,12 +622,29 @@ _HOST_PARALLEL_INSTRUCTION = (
 
 
 def _parallel_fanout_on() -> bool:
-    """Never-raise read of QA_HOST_PARALLEL_FANOUT_ENABLED."""
-    try:
-        return bool(getattr(settings, "qa_host_parallel_fanout_enabled", False))
-    except Exception:  # pragma: no cover
-        logger.debug("could not read qa_host_parallel_fanout_enabled", exc_info=True)
-        return False
+    """The parent-chat parallel category fan-out. HARDCODED ON since 2026-08-13.
+
+    NOT settings-derived: QA_HOST_PARALLEL_FANOUT_ENABLED was DELETED
+    (flag-surface reduction, batch 8a) and hardcoded to `True`, the value the
+    PUBLIC DISTRIBUTION `.env` template already shipped -- not this field's old
+    code default. Kept as a named seam so the no-orchestration payload below
+    stays executable and a revival is one line here.
+    """
+    return True
+
+
+def grounding_review_enabled() -> bool:
+    """The per-case host entailment review. HARDCODED OFF since 2026-08-13.
+
+    NOT settings-derived: QA_HOST_GROUNDING_REVIEW_ENABLED was DELETED
+    (flag-surface reduction, batch 8a). Only the INSTRUCTION is gone.
+    ``build_grounding_section`` and every bound in ``tools/grounding_verdicts.py``
+    (ids matched against the submitted suite, verdicts enum-gated, notes capped,
+    the 40% proportional ceiling, cases MOVED never deleted) are retained and
+    still run over a submission that carries verdicts anyway, which is exactly
+    why this is a seam and not an inline literal.
+    """
+    return False
 
 
 def _dedup_review_on() -> bool:
@@ -994,10 +1011,10 @@ def _grounding_instruction() -> str:
     run-this-last instruction first. Never raises.
     """
     try:
-        if bool(getattr(settings, "qa_host_grounding_review_enabled", False)):
+        if grounding_review_enabled():
             return _HOST_GROUNDING_INSTRUCTION
-    except Exception:  # pragma: no cover - settings never raises
-        logger.debug("could not read qa_host_grounding_review_enabled", exc_info=True)
+    except Exception:  # pragma: no cover - the seam never raises
+        logger.debug("grounding-review seam read failed", exc_info=True)
     return ""
 
 
@@ -2440,9 +2457,11 @@ IMAGE_RELEVANCE_JOB = HostJob(
 # that fails or says stop means STOP, do not generate"; and the clause below.
 #
 # HONESTY ABOUT WHAT `blocking` BUYS (review M3): step 6 of
-# _HOST_PARALLEL_INSTRUCTION is emitted ONLY when _parallel_fanout_on(), and
-# QA_HOST_PARALLEL_FANOUT_ENABLED defaults FALSE -- so on a STOCK install the
-# index entry's `blocking: true` carries no prose contract behind it and the
+# _HOST_PARALLEL_INSTRUCTION is emitted ONLY when _parallel_fanout_on(), which
+# has been the hardcoded True constant since 2026-08-13 (batch 8a) -- so unlike
+# the period when the flag defaulted FALSE, the index entry's `blocking: true`
+# now always has that prose contract behind it. The reasoning below is left
+# standing because it does not depend on the flag: the
 # clause below is the ONLY carrier of the STOP semantics. Layer 1 is therefore
 # INSTRUCTION-ONLY, with no server-side enforcement of any kind, until
 # QA_HOST_IMAGE_REQUIRE_RELEVANT is turned on. The clause is written to be

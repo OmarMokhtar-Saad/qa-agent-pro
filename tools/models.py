@@ -274,7 +274,8 @@ class TestSuite(BaseModel):
 
     # Rows for the "Assumed Requirements" sheet: the cases an entailment review
     # judged ungrounded, moved OFF the executable suite rather than deleted
-    # (QA_HOST_GROUNDING_REVIEW_ENABLED). A PrivateAttr for the same reasons as
+    # (host_mode.grounding_review_enabled, hardcoded OFF 2026-08-13). A
+    # PrivateAttr for the same reasons as
     # the two above -- it must not appear in the JSON schema handed to a model.
     _assumed_artifacts: Optional[dict] = PrivateAttr(default=None)
 
