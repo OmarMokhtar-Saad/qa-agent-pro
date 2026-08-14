@@ -50,7 +50,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-from config.settings import settings
 from tools.atomicity import (
     ATOMICITY_INSTRUCTION,
     bundling_warning_section,
@@ -125,12 +124,37 @@ class RulePackResult:
         return bool(self.bilingual_on or self.atomicity_on or self.standing_on)
 
 
-def _flag(name: str) -> bool:
-    """Read a settings bool defensively (a missing field must never raise)."""
-    try:
-        return bool(getattr(settings, name, False))
-    except Exception:  # pragma: no cover - defensive
-        return False
+def bilingual_rules_enabled() -> bool:
+    """The EN/AR bilingual pack. HARDCODED OFF since 2026-08-14.
+
+    NOT settings-derived: QA_BILINGUAL_RULES was DELETED (flag-surface
+    reduction, batch 8b) and hardcoded to its own code default. A named seam
+    rather than an inline literal so the whole pack below -- pair extraction,
+    the mandated RP-I18N lines, the {{EN:..}}/{{AR:..}} substitution and the
+    RTL-safe XLSX path -- stays executable by its existing tests under the
+    tools/ >=90% floor, and so a revival is ONE line here.
+    """
+    return False
+
+
+def atomicity_rules_enabled() -> bool:
+    """The anti-bundling pack. HARDCODED OFF since 2026-08-14.
+
+    NOT settings-derived: QA_ATOMICITY_RULES was DELETED (flag-surface
+    reduction, batch 8b) and hardcoded to its own code default. Same seam
+    rationale as bilingual_rules_enabled above.
+    """
+    return False
+
+
+def standing_rules_enabled() -> bool:
+    """The standing API/UI pack. HARDCODED OFF since 2026-08-14.
+
+    NOT settings-derived: QA_STANDING_RULES was DELETED (flag-surface
+    reduction, batch 8b) and hardcoded to its own code default. Same seam
+    rationale as bilingual_rules_enabled above.
+    """
+    return False
 
 
 def build_rule_packs(
@@ -150,9 +174,9 @@ def build_rule_packs(
     """
     result = RulePackResult(
         source_ref=source_ref,
-        bilingual_on=_flag("qa_bilingual_rules"),
-        atomicity_on=_flag("qa_atomicity_rules"),
-        standing_on=_flag("qa_standing_rules"),
+        bilingual_on=bilingual_rules_enabled(),
+        atomicity_on=atomicity_rules_enabled(),
+        standing_on=standing_rules_enabled(),
     )
     if not result.active:
         return result

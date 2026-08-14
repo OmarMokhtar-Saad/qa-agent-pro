@@ -8702,8 +8702,15 @@ async def handle_submit_suite(
         # plan's "server-side remediation interaction" note.
         view = _coverage_view(suite)
         cap_note = ""
+        # The seam is imported at CALL time, not module level: mcp_handlers
+        # uses `from agents.test_scenario_agent import ...` at line 49, and a
+        # module-level from-import would bind the constant once and silently
+        # ignore a revival (or a test's patch) of the single seam. This is
+        # batch 8a's Decision-5 hazard, avoided rather than re-fixed.
+        from agents.test_scenario_agent import checklist_remediation_enabled
+
         if (
-            settings.qa_checklist_remediation_enabled
+            checklist_remediation_enabled()
             and view is not None
             and not view.degraded
             and view.gap_item_ids

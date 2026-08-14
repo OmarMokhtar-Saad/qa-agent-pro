@@ -439,7 +439,8 @@ class DataFieldTable:
         meant an Arabic-valued case was reported as selecting "an option the
         ticket does not define" while that exact label sat in the ticket's own
         Arabic column on the same row -- and bilingual cases are the norm here
-        (``QA_BILINGUAL_RULES``), so that single omission would have fired on
+        (the bilingual rule pack, removed as a setting 2026-08-14), so that
+        single omission would have fired on
         most real Arabic suites.
         """
         out: set[str] = set()

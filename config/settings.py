@@ -857,10 +857,18 @@ class Settings(BaseSettings):
     # "unsure". Its matches are always reported as LOW confidence / review
     # required.
     qa_checklist_adjudicate_enabled: bool = False
-    # Deterministic remediation: when ON, the bounded critic loop's stop
-    # condition becomes "every checklist item is traced" instead of "the LLM
-    # critic ran out of patience". Requires qa_atomic_checklist_enabled.
-    qa_checklist_remediation_enabled: bool = False
+    # QA_CHECKLIST_REMEDIATION_ENABLED was DELETED on 2026-08-14
+    # (flag-surface reduction, batch 8b) and the behaviour hardcoded OFF --
+    # this field's own code default, and the value every shipped template
+    # carried. ON it made the bounded critic loop's stop condition "every
+    # checklist item is traced" instead of "the LLM critic ran out of
+    # patience"; its registry rationale said plainly that it needs a tally
+    # proven reliable first, and that measurement was never made. OFF the
+    # legacy critic remains the stop condition, which is the state the whole
+    # suite is written against. NOTHING is deleted: the checklist-driven
+    # branch is retained and
+    # agents.test_scenario_agent.checklist_remediation_enabled() is the named
+    # seam -- a revival is one line there. See docs/FEATURE_FLAGS.md.
     # Embedding-cosine bands. score >= high -> HIGH-confidence match;
     # low <= score < high -> the ambiguous band handed to tiers (b)/(c);
     # score < low -> no match. Thresholds are dataset-dependent (TraceLLM tunes
@@ -891,44 +899,26 @@ class Settings(BaseSettings):
     # latency, which the NLI traceability literature does not report.
     qa_checklist_max_pairs: int = 40
 
-    # --- Batch 3 rule packs (opt-in, every flag default OFF) ---------------
-    # Three domain rules this repo had zero handling for. All three are
-    # implemented as rules about WHAT MUST APPEAR ON THE ATOMIC REQUIREMENTS
-    # CHECKLIST (Batch 2), not as new pipeline stages, so the existing external
-    # coverage tally enforces them and each future rule costs one prompt clause
-    # instead of one stage. All three are PURE + SYNCHRONOUS: zero extra LLM
-    # calls and zero network, whether on or off. Enforcement BY THE TALLY needs
-    # QA_ATOMIC_CHECKLIST_ENABLED as well; with the checklist off the packs
-    # degrade to prompt + advisory mode (documented, logged, not silent).
+    # --- Batch 3 rule packs (REMOVED as settings) --------------------------
+    # QA_BILINGUAL_RULES, QA_ATOMICITY_RULES and QA_STANDING_RULES were
+    # DELETED on 2026-08-14 (flag-surface reduction, batch 8b) and all three
+    # hardcoded OFF -- each field's own code default, and the value every
+    # shipped template carried, so no install changes behaviour. All three
+    # were unvalidated experiments held at OFF past the point the flag policy
+    # allows: EN/AR pair extraction was never checked against a real bilingual
+    # corpus, the anti-bundling detectors' false-positive rate was never
+    # measured, and the standing rules' two-hit circumstantial API trigger was
+    # never tuned.
     #
-    # QA_BILINGUAL_RULES — every documented EN/AR message pair (a DM##/MSG##
-    # table) becomes its own mandated checklist line, gets ONE test case with
-    # two steps (English locale, Arabic locale), and the two strings are carried
-    # into Expected Results MECHANICALLY: the generator writes opaque
-    # {{EN:DM01}} / {{AR:DM01}} tokens and tools/bilingual.py substitutes the
-    # values parsed from the ticket. Verbatim reproduction by an LLM
-    # hallucinates, and this way the untrusted literals never enter a prompt at
-    # all. Also switches tools/xlsx_generator.py to RTL-safe cells
-    # (reading_order=2 + RLM/LRM bidi isolation) for Arabic-majority text, and
-    # appends a templated native-speaker linguistic-validation case (the MANUAL
-    # half that an automated bilingual case cannot cover).
-    qa_bilingual_rules: bool = False
-    # QA_ATOMICITY_RULES — the anti-bundling split rule in the generator prompt
-    # ("never bundle a backend/state outcome with a UI/navigation outcome"; the
-    # split boundary is the SUBSYSTEM, not a cosmetic UI toggle) plus two
-    # DETERMINISTIC, FLAG-ONLY detectors. A bundled case passes on the visible
-    # half while the hidden half is silently broken.
-    qa_atomicity_rules: bool = False
-    # QA_STANDING_RULES — content-triggered mandates. A genuine API mention
-    # forces status-code / request-design / response-structure lines (plus error
-    # handling when a failure flow is named); any user-facing screen forces one
-    # baseline UI build-quality line. With no documented contract the cases are
-    # written against standard REST convention and labelled ASSUMED
-    # mechanically. The API trigger is two-tiered: circumstantial words ("HTTP",
-    # "JSON", "integration") need TWO distinct hits and are then reported as
-    # circumstantial, because on a pure-UI ticket a single "integration with the
-    # wallet screen" used to force four backend cases.
-    qa_standing_rules: bool = False
+    # NOTHING is deleted. tools/rule_packs.bilingual_rules_enabled(),
+    # .atomicity_rules_enabled() and .standing_rules_enabled() are the named
+    # seams and each revival is one line there. With all three off
+    # RulePackResult.active is False and build_rule_packs returns an inert
+    # result -- a state tools/rule_packs' own module docstring already
+    # documents as supported, because it is the same state the packs were
+    # already in on every install. They were always PURE + SYNCHRONOUS: zero
+    # LLM calls and zero network, on or off, so this removes no cost either.
+    # See docs/FEATURE_FLAGS.md.
 
     # TestRail API push (T-10). Base instance URL (e.g. https://acme.testrail.io),
     # a user email, and an API key. Dry run is UNCONDITIONAL since 2026-08-13
@@ -1346,9 +1336,6 @@ class Settings(BaseSettings):
         "qa_mcp_enabled",
         "qa_update_require_signature",
         "qa_llm_strict_host",
-        "qa_bilingual_rules",
-        "qa_atomicity_rules",
-        "qa_standing_rules",
         "qa_host_ambiguity_require_result",
         "qa_host_image_require_relevant",
         "qa_host_dedup_apply",
@@ -1356,7 +1343,6 @@ class Settings(BaseSettings):
         "qa_atomic_checklist_enabled",
         "qa_checklist_nli_enabled",
         "qa_checklist_adjudicate_enabled",
-        "qa_checklist_remediation_enabled",
         mode="before",
     )
     @classmethod
