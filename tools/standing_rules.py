@@ -541,8 +541,8 @@ def standing_warning_section(
                     '"API", "endpoint" or "status code" appears on this ticket; the '
                     "rules fired on "
                     + ", ".join(f"`{e}`" for e in triggers.api_evidence[:5])
-                    + ". If this story has no backend surface, ignore the API cases "
-                    "and set `QA_STANDING_RULES=false` for this kind of ticket."
+                    + ". If this story has no backend surface, ignore the "
+                    "API cases -- they are advisory."
                 )
             if not triggers.has_spec:
                 lines.append(

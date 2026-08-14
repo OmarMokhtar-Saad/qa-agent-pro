@@ -405,6 +405,24 @@ def coverage_regen_merge_calls() -> bool:
     return True
 
 
+def checklist_remediation_enabled() -> bool:
+    """Checklist-driven remediation. HARDCODED OFF since 2026-08-14.
+
+    NOT settings-derived: QA_CHECKLIST_REMEDIATION_ENABLED was DELETED
+    (flag-surface reduction, batch 8b) and hardcoded to its own code default.
+    OFF, the bounded critic loop keeps the LEGACY stop condition (the critic
+    runs out of patience) rather than "every checklist item is traced".
+
+    A named seam, not an inline literal, for two reasons. The checklist branch
+    below and tools/mcp_handlers' host-side gap round are both retained for
+    revival and would otherwise become unreachable under the agents/ >=80%
+    floor; and mcp_handlers reaches THIS function (through a call-time import)
+    rather than owning a second seam, so one patch target governs both halves
+    and they cannot be revived out of step.
+    """
+    return False
+
+
 def rag_enabled() -> bool:
     """Always True -- RAG corpus grounding is ON, unconditionally.
 
@@ -3727,7 +3745,7 @@ async def _finalize_generation(
     # mode never passes it, so the default True keeps every existing caller
     # byte-identical.
     _checklist_remediation = bool(
-        remediate and checklist_items and settings.qa_checklist_remediation_enabled
+        remediate and checklist_items and checklist_remediation_enabled()
     )
     if remediate and all_cases and not single_screen:
         await _emit_status(
