@@ -3268,75 +3268,6 @@ class PreparePayloadResult:
     images: list = field(default_factory=list)
 
 
-def _dist_needs_no_backend() -> bool:
-    """True when NOTHING on this install can reach a server-side LLM backend.
-
-    The test-cases-only (public dist) edition. The enumeration, stated
-    explicitly rather than asserted, because a wrong True here suppresses a
-    REAL blocker:
-
-      * generation is hardcoded host mode -- llm.resolve_generation_mode()
-        returns the "host" constant (2026-08-12), so the ambiguity pre-pass
-        (run_ambiguity_llm=False, and amb_skipped below is a literal True),
-        AC synthesis (synthesize_acs=False -> AC_JOB) and image description
-        (describe_*_server_side=False) all run on the HOST, not here;
-      * the requirement decomposition is CHECKLIST_JOB (decompose_checklist
-        is structurally False on this path) since 2026-08-14;
-      * comment reconciliation, the two checklist tiers, risk scoring and
-        test-plan artifacts are False seams since 2026-08-14 and return at
-        their own gate with zero calls;
-      * the prompt-cache warm-up no longer exists to suppress: it was
-        skipped on every host prepare from Phase 3d and DELETED on
-        2026-08-16 (P2-F2), along with the `warm_cache` parameter;
-      * ui_extractor's Tier-3 ask_vision no longer exists at all: it was
-        DEFERRED on every production call from 2026-08-12 and DELETED on
-        2026-08-16 (P2-F1). The rendered screenshot rides to the host's own
-        multimodal model instead;
-      * handle_generate_test_cases has no legacy SERVER branch at all any
-        more: it was unreachable behind two constant-derived guards from
-        2026-08-12 and was DELETED on 2026-08-15 (dead-code deletion Phase 2),
-        so every call unconditionally re-enters handle_prepare_test_cases;
-      * the qa_feature_analysis pair has not been registered in this edition
-        since 2026-08-03, and the bug reporter / exploratory coach have been
-        chat-only since Phase 2;
-      * on submit, the four ledger rows that could still reach a backend
-        (test_scenario_agent.server_fanout / .rewrite_vague, the advisory gap
-        prose, rtm.nli_verdicts) are terminal and structurally unreachable.
-        Three of them no longer name any code at all: _rewrite_vague_fields,
-        analyze_coverage_gaps and the coverage critic pair were DELETED on
-        2026-08-16 (dead-code deletion P2-E1), and the ids stay in
-        host_llm.LEDGER_IDS on purpose -- see docs/LLM_MIGRATION_INVENTORY.md.
-
-    THE ONE WAY THIS BECOMES FALSE AGAIN: any new unconditional ``llm.*``
-    call added to the prepare or submit path. There is no flag left to AND
-    in -- the six server-LLM feature gates (QA_ATOMIC_CHECKLIST_ENABLED,
-    QA_CHECKLIST_NLI_ENABLED, QA_CHECKLIST_ADJUDICATE_ENABLED,
-    QA_COMMENT_RECONCILE_ENABLED, QA_LLM_RISK_SCORING, QA_TEST_PLAN_ARTIFACTS)
-    were DELETED in batch 8b-ii. That is NOT the QA_SERVER_LLM_ENABLED kill
-    switch, which is untouched and still live -- see below. So a new call
-    would silently make this claim untrue. Add its gate here, or do not add
-    the call.
-
-    Used ONLY to decide whether an unusable backend is a BLOCKER in
-    ``qa-doctor`` -- the same judgement ``host_llm.server_llm_retired()``
-    already encodes for the kill switch. Deliberately NOT a claim about the
-    kill switch: this does not flip, imply or substitute for
-    QA_SERVER_LLM_ENABLED, whose default flip is gated on a release soak
-    (operations/runbook.md -> Server-LLM retirement rollout gate).
-
-    Never raises, and fails toward reporting the blocker. False in the full
-    edition UNLESS QA_DIST_MODE=true -- _test_cases_only() is
-    `qa_dist_mode or not _FULL_EDITION`, so a full checkout that sets that
-    flag opts into the dist verdict deliberately. Absent it the private
-    checkout is byte-identical and every keyed install still sees the blocker.
-    """
-    try:
-        return _test_cases_only()
-    except Exception:  # pragma: no cover - a verdict helper must never raise
-        logger.debug("dist backend-optional check failed", exc_info=True)
-        return False
-
-
 def _host_mode_server_llm_notice(
     *,
     ac_boomeranged: bool = False,
@@ -10672,13 +10603,6 @@ _TOOL_INFO: dict[str, dict] = {
         "purpose": "iOS Simulator, macOS only — ships with Xcode",
         "install": {"darwin": "xcode-select --install"},
     },
-    "cursor-agent": {
-        "purpose": "the `cursor` server-side LLM backend",
-        "install": {
-            "darwin": "curl https://cursor.com/install -fsS | bash",
-            "linux": "curl https://cursor.com/install -fsS | bash",
-        },
-    },
 }
 
 
@@ -10714,11 +10638,12 @@ def _tooling_lines() -> list[str]:
     three crosses as three things they had to fix.
     """
     rows: list[str] = []
-    # cursor-agent serves the `cursor` LLM BACKEND. On an install that needs no
-    # backend this row can only report a failure that cannot matter -- and the
-    # backend row above already says "not required" on exactly those installs.
-    if not _dist_needs_no_backend():
-        rows.append(_binary_line("cursor-agent"))
+    # A binary earns a row only if something here USES it. The `cursor-agent`
+    # row was dropped on 2026-08-20: it served the `cursor` server-side LLM
+    # backend, which P2-G deleted on 2026-08-16, so the row was offering an
+    # install command for a capability no edition has. Its gate was an EDITION
+    # check, which is why it kept rendering on a full checkout long after the
+    # backend was gone.
     # adb stays in both editions: qa_list_devices ships in the dist too.
     rows.append(_binary_line("adb"))
     # xcrun can NEVER exist off macOS, so a cross there is noise, not news.
