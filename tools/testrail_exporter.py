@@ -9,15 +9,22 @@ import time
 from pathlib import Path
 
 from tools.cell_sanitizer import sanitize_cell
-from tools.models import TestSuite, format_test_data_lines
+from tools.models import (
+    TestSuite,
+    display_requirement_id,
+    format_test_data_lines,
+)
 from tools.secure_temp import SUBDIR_NAME, make_secure_temp_path
 
 logger = logging.getLogger(__name__)
 
-# Standard TestRail CSV import columns. References / Custom Risk Score /
-# Stable ID are intentionally NOT exported here — see the matching comment in
+# Standard TestRail CSV import columns. Custom Risk Score / Stable ID are
+# intentionally NOT exported here — see the matching comment in
 # xlsx_generator.py (those fields remain on the TestCase model for internal
 # use, e.g. tools/testrail_pusher.py still pushes stable_id as the API refs field).
+# `References` is OPTIONAL and appended below when at least one case carries a
+# requirement tag (F06, 2026-08-19) — this CSV is imported into TestRail / Xray /
+# Zephyr, where a requirement link is a first-class field.
 _HEADERS = [
     "Title",
     "Section",
@@ -45,7 +52,20 @@ def generate_testrail_csv(suite: TestSuite, output_path: str | None = None) -> s
     # data-provisioning plan. With none, both the header and every row are
     # byte-identical to the pre-feature export.
     has_test_data = any(tc.test_data for tc in suite.test_cases)
-    headers = _HEADERS + ["Test Data"] if has_test_data else _HEADERS
+    # F06: TestRail's own requirement-link column, conditional for exactly the
+    # reason "Test Data" is -- with no tagged case the header and every row stay
+    # byte-identical to the pre-feature export.
+    #
+    # DELIBERATE DIVERGENCE from tools/testrail_pusher.py, which sends
+    # `stable_id` in the API `refs` field: a CSV a human imports wants the
+    # acceptance criterion, and changing what the live credentialed pusher sends
+    # is a decision of its own, not a side effect of adding a column here.
+    has_refs = any((tc.requirement_id or "").strip() for tc in suite.test_cases)
+    headers = list(_HEADERS)
+    if has_test_data:
+        headers.append("Test Data")
+    if has_refs:
+        headers.append("References")
 
     with open(output_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
@@ -70,6 +90,11 @@ def generate_testrail_csv(suite: TestSuite, output_path: str | None = None) -> s
                 row.append(
                     sanitize_cell("\n".join(format_test_data_lines(tc.test_data)))
                 )
+            if has_refs:
+                # BLANK for an untraced case, not the "(untraced)" label the
+                # xlsx/csv columns use: this file is machine-imported, and a TMS
+                # would ingest that literal as a reference string.
+                row.append(sanitize_cell(display_requirement_id(tc.requirement_id)))
             writer.writerow(row)
 
     logger.info(

@@ -9,13 +9,19 @@ import time
 from pathlib import Path
 
 from tools.cell_sanitizer import sanitize_cell
-from tools.models import TestSuite, format_test_data_lines
+from tools.models import (
+    TestSuite,
+    display_requirement_id,
+    format_test_data_lines,
+)
 from tools.secure_temp import SUBDIR_NAME, make_secure_temp_path
 
 logger = logging.getLogger(__name__)
 
-# Requirement ID / Risk Score / Risk Label / Risk Rationale / Stable ID are
-# intentionally NOT exported here — see the matching comment in xlsx_generator.py.
+# Risk Score / Risk Label / Risk Rationale / Stable ID are intentionally NOT
+# exported here — see the matching comment in xlsx_generator.py. Requirement ID
+# left that list on 2026-08-19 (F06) and is the 13th column, in lockstep with the
+# xlsx as always.
 # Kept in lockstep with xlsx_generator._HEADERS -- an invariant asserted by
 # tests/test_csv_exporter.test_csv_headers_match_xlsx_headers. "Test Type" /
 # "Coverage Category" renamed 2026-08-04 with the xlsx; nothing external reads
@@ -33,6 +39,7 @@ _HEADERS = [
     "Status",
     "Notes",
     "Coverage Category",
+    "Requirement ID",
 ]
 
 
@@ -81,6 +88,12 @@ def generate_test_case_csv(suite: TestSuite, output_path: str | None = None) -> 
                     # gets here, but TestCase.category itself accepts any
                     # <=60-char string, so a future path could bypass that.
                     sanitize_cell(getattr(tc, "category", None) or ""),
+                    # F06: the acceptance criterion this case verifies.
+                    # "(untraced)" rather than a blank, for the reason
+                    # xlsx_generator._requirement_cell gives.
+                    sanitize_cell(
+                        display_requirement_id(tc.requirement_id) or "(untraced)"
+                    ),
                 ]
             )
 

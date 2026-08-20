@@ -37,7 +37,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, NamedTuple, Optional
 from urllib.parse import urlparse
 
 from agents import host_mode
@@ -50,22 +50,17 @@ from agents.test_scenario_agent import (
     CategoryResult,
     _finalize_generation,
     _prepare_generation,
-    generate_test_scenarios,
 )
 from config.settings import settings
 from tools import prep_store, telemetry
 from tools.audit_log import record_event
-from tools.comment_reconciler import neutralize_for_display, reconcile_comments
+from tools.build_fingerprint import code_fingerprint
 from tools.csv_exporter import generate_test_case_csv
 from tools.device_manager import (
     capture_screenshot,
     list_devices,
-    list_installed_apps,
 )
 from tools.gherkin_exporter import generate_feature_file
-from tools.image_description import describe_images
-from tools.jira_attachments import enabled as attachments_enabled
-from tools.jira_attachments import fetch_attachment_bytes
 from tools.jira_fetcher import fetch_url_content, verify_jira_access
 from tools.jira_mcp import (
     _ac_field_discovery_on,
@@ -81,11 +76,6 @@ from tools.rag_store import (
     query_corpus,
     replace_source_entries,
 )
-from tools.requirement_analyzer import (
-    SEVERITY_ORDER,
-    analyze_requirements,
-    gate_triggers,
-)
 from tools.suite_store import (
     list_recent_suites,
     load_suite,
@@ -97,22 +87,18 @@ from tools.testrail_exporter import generate_testrail_csv
 from tools.ui_extractor import extract_ui_elements
 from tools.untrusted import wrap_untrusted
 from tools.xlsx_generator import generate_test_case_xlsx
-from tools.zephyr_exporter import (
-    PILOT_CASE_LIMIT,
-    config_path_for,
-    derive_story_key,
-    generate_zephyr_export,
-)
 
 # The distribution build ships ONLY the test-case pipeline (see QA_DIST_MODE):
 # bug-report / exploratory-coach / Maestro modules are absent there, so their
 # imports are guarded. mcp_server.py skips registering the excluded tools when
 # _test_cases_only() is true; the handler gates below are defense in depth.
 try:
-    # The LEGACY generate_bug_report / coach_next_step are deliberately NOT
-    # imported here any more: no handler calls them (host-boomerang Phase 2)
-    # and graph.py imports them straight from the agent modules, so keeping
-    # them here would be an unused import (F401). tools.coach_memory.strip_meta
+    # The LEGACY generate_bug_report / coach_next_step are not imported here.
+    # They were dropped from this block in host-boomerang Phase 2, when no
+    # handler called them any more and graph.py imported them straight from the
+    # agent modules; on 2026-08-15 (dead-code deletion Phase 2, batches P2-A and
+    # P2-C) graph.py and both coroutines were DELETED outright, so there is now
+    # nothing to import even in principle. tools.coach_memory.strip_meta
     # likewise moved inside agents.exploratory_coach_agent.finalize_coach_step.
     from agents.bug_report_agent import (
         clean_host_report,
@@ -128,18 +114,6 @@ try:
         create_session_memory,
         update_coverage,
     )
-    from tools.maestro_explorer import explore as maestro_explore
-    from tools.maestro_exporter import flow_dir_for_suite, generate_maestro_flows
-    from tools.maestro_healer import heal_and_rerun
-    from tools.maestro_runner import run_flows
-    from tools.web_runner import (
-        build_translation_prompt,
-        coerce_host_translations,
-        plan_cases,
-        precheck_run_target,
-        run_suite_web,
-        translation_response_schema,
-    )
 
     _FULL_EDITION = True
 except ImportError:  # pragma: no cover — exercised only in distribution builds
@@ -151,17 +125,6 @@ except ImportError:  # pragma: no cover — exercised only in distribution build
     prepare_coach_step = None
     create_session_memory = None
     update_coverage = None
-    maestro_explore = None
-    flow_dir_for_suite = None
-    generate_maestro_flows = None
-    heal_and_rerun = None
-    run_flows = None
-    build_translation_prompt = None
-    coerce_host_translations = None
-    plan_cases = None
-    precheck_run_target = None
-    run_suite_web = None
-    translation_response_schema = None
 
     _FULL_EDITION = False
 
@@ -399,12 +362,38 @@ _WELL_KNOWN_FOLDERS = {
 }
 
 
-def _safe_elicited_dir(answer: str, sentinel_ok: bool = False) -> tuple[str, str]:
+# The destination a REJECTED save-folder answer really falls back to. BOTH call
+# sites land in the secure temp dir: _auto_export_xlsx only ASKS when
+# _resolved_export_dir() is empty, and handle_export_suite's five single-file
+# exporters each write into <tempdir>/qa_agents_exports/ when no directory is
+# threaded into them.
+#
+# 2026-08-15 (dead-code deletion batch D4): this used to be wrapped in a
+# _default_export_label(fmt) helper, because the Zephyr PAIR was the ONE export
+# handed the configured directory and therefore the one format whose rejection
+# note named a different folder. tools/zephyr_exporter.py is DELETED, so every
+# surviving format falls back here and the helper was a constant-returning
+# branch over nothing. Both call sites interpolate this name directly. If a
+# format is ever added that writes somewhere else, bring the per-format helper
+# back WITH a test -- do not quietly widen this constant.
+_TEMP_EXPORT_LABEL = "a secure temp folder"
+
+
+def _safe_elicited_dir(
+    answer: str,
+    sentinel_ok: bool = False,
+    fallback_label: str = _TEMP_EXPORT_LABEL,
+) -> tuple[str, str]:
     """Validate an elicited save-folder answer BEFORE it becomes a real path.
 
     Returns ``(directory_or_empty, note)``. An empty directory means "rejected --
-    keep the configured default", and *note* is always non-empty in that case so
+    keep the default destination", and *note* is always non-empty in that case so
     the tester is told, rather than silently getting a different location.
+
+    *fallback_label* NAMES that destination inside every rejection note: only the
+    caller knows where its own default write lands, and a note that claims a
+    folder the file did not go to is worse than no note at all -- the tester goes
+    looking in an empty directory. The reply prints the real path beside it.
 
     WHY: the answer is UNTRUSTED host-model text, and it used to be passed
     straight to ``Path(...).mkdir(parents=True)``. On 2026-07-29 a host echoed
@@ -436,13 +425,13 @@ def _safe_elicited_dir(answer: str, sentinel_ok: bool = False) -> tuple[str, str
     if len(raw) > _MAX_EXPORT_DIR_CHARS:
         return "", (
             "\n> ℹ️  The folder you replied with was too long to be a real path, "
-            "so the configured export folder was used instead."
+            f"so {fallback_label} was used instead."
         )
     if any(ch in raw for ch in ("#", "\n", "\r", "\x00")):
         return "", (
             "\n> ℹ️  The folder you replied with looks like a config line rather "
-            "than a folder (it contains a comment marker or a line break), so the "
-            "configured export folder was used instead."
+            "than a folder (it contains a comment marker or a line break), "
+            f"so {fallback_label} was used instead."
         )
     try:
         import tempfile
@@ -458,14 +447,14 @@ def _safe_elicited_dir(answer: str, sentinel_ok: bool = False) -> tuple[str, str
             suggestion = _WELL_KNOWN_FOLDERS.get(raw.lower())
             if suggestion:
                 return "", (
-                    "\n> ℹ️  I need the FULL path of that folder, so the "
-                    "configured export folder was used instead. Reply "
+                    "\n> ℹ️  I need the FULL path of that folder, so "
+                    f"{fallback_label} was used instead. Reply "
                     f"`{suggestion}` if that is the one you meant."
                 )
             return "", (
                 "\n> ℹ️  The folder you replied with is not a full path "
                 "(it would have been read relative to the server's own folder), "
-                "so the configured export folder was used instead."
+                f"so {fallback_label} was used instead."
             )
 
         resolved = Path(raw).expanduser().resolve()
@@ -477,15 +466,15 @@ def _safe_elicited_dir(answer: str, sentinel_ok: bool = False) -> tuple[str, str
         if not any(resolved == r or r in resolved.parents for r in roots):
             return "", (
                 "\n> ℹ️  The folder you replied with is outside the install "
-                "folder, your home folder and the temp folder, so the configured "
-                "export folder was used instead."
+                "folder, your home folder and the temp folder, "
+                f"so {fallback_label} was used instead."
             )
         return str(resolved), ""
     except Exception:
         logger.debug("elicited export dir rejected", exc_info=True)
         return "", (
-            "\n> ℹ️  The folder you replied with could not be used, so the "
-            "configured export folder was used instead."
+            "\n> ℹ️  The folder you replied with could not be used, "
+            f"so {fallback_label} was used instead."
         )
 
 
@@ -670,50 +659,26 @@ _EXPORTERS: dict[str, Callable] = {
     "testrail": lambda s: generate_testrail_csv(s),
 }
 
-# Zephyr for Jira import export -- HARDCODED OFF since 2026-08-13, see
-# _zephyr_export_enabled(). Deliberately kept OUT of _EXPORTERS so the gate
-# genuinely removes it: with it off the format map, the elicitation picker and
-# the markdown menu are byte-identical to before this feature existed.
-_ZEPHYR_FORMAT = "zephyr"
 
-
-def _available_exporters(
-    story_key: str = "", output_dir: str = ""
-) -> dict[str, Callable]:
+def _available_exporters() -> dict[str, Callable]:
     """The export-format map for this call.
 
-    Built from the module-global ``_EXPORTERS`` at CALL time (so
-    ``monkeypatch.setitem(mcp_handlers._EXPORTERS, ...)`` keeps working) plus the
-    flag-gated Zephyr entry, which needs the suite's Jira story key for its
-    Project / Issue columns. Never raises.
+    Built from the module-global ``_EXPORTERS`` at CALL time, so
+    ``monkeypatch.setitem(mcp_handlers._EXPORTERS, ...)`` keeps working. Never
+    raises.
+
+    2026-08-15 (dead-code deletion batch D4): this used to take ``story_key`` /
+    ``output_dir`` and add a sixth, gate-controlled ``zephyr`` entry -- the only
+    exporter that wrote a PAIR into a directory rather than a single file, and
+    the only reason those two parameters existed. ``tools/zephyr_exporter.py``
+    is DELETED, so the map is now exactly ``_EXPORTERS`` and the parameters went
+    with the entry instead of being kept as arguments nothing reads.
 
     NOTE: mcp_server.py's qa_export_suite docstring is the only format list an
-    MCP client ever sees, so it must stay a superset of these keys --
-    tests/test_mcp_zephyr_export.py asserts exactly that.
+    MCP client ever sees, so it must stay a superset of these keys.
     """
-    exporters = dict(_EXPORTERS)
-    if _zephyr_export_enabled():
-        # Honour the configured export directory exactly like
-        # _auto_export_zephyr does: the workbook + zfj_import_config.json pair is
-        # a KEEP-THIS-FILE deliverable, so leaving output_dir unset would drop
-        # qa_export_suite's copy into the sweepable secure temp dir while the
-        # auto-export path wrote to QA_EXPORT_DIR -- two homes for one feature.
-        # dry_run comes from settings too, so both call paths agree.
-        exporters[_ZEPHYR_FORMAT] = lambda s: generate_zephyr_export(
-            s,
-            # I4 (2026-08-10): an explicit, already-validated `output_dir` from
-            # qa_export_suite wins over the configured folder; "" (the default)
-            # is byte-identical to before.
-            (output_dir or "").strip()
-            or (settings.qa_export_dir or "").strip()
-            or None,
-            story_key=story_key,
-            dry_run=_zephyr_dry_run(),
-        )
-    return exporters
+    return dict(_EXPORTERS)
 
-
-_MOBILE_MODES = ("export", "run", "heal", "explore")
 
 _SUMMARY_CAP = 4000  # cap the embedded generation summary in the shaped result
 
@@ -772,18 +737,6 @@ async def _resolve_device(device_id: str) -> dict | None:
         if dev.get("id") == device_id:
             return dev
     return None
-
-
-def _resolve_flow_path(suite_id: str) -> str:
-    """The on-disk Maestro flow directory for run/heal.
-
-    Mode "export" writes flows to the PER-SUITE dir flow_dir_for_suite(suite_id)
-    (maestro_flows/<suite_id>), mirroring app.py. run/heal must read from that
-    same dir when a suite_id is supplied; otherwise they fall back to the parent
-    settings.qa_maestro_flow_dir (a hand-populated flow dir).
-    """
-    suite_id = (suite_id or "").strip()
-    return flow_dir_for_suite(suite_id) if suite_id else settings.qa_maestro_flow_dir
 
 
 # --------------------------------------------------------------------------- #
@@ -943,21 +896,6 @@ async def _recent_suites_markdown(tool: str) -> str:
     return "\n".join(lines)
 
 
-def _mobile_mode_options() -> list:
-    """Maestro modes offered by the wizard/elicitation, filtered by their gates.
-
-    RETIRED 2026-08-13: every gate below is now a hardcoded-False seam, so this
-    returns ["export", "run"] and handle_run_mobile_suite refuses both. Kept in
-    its original shape -- the mode list is part of what a revival restores.
-    """
-    modes = ["export", "run"]
-    if _maestro_heal_enabled():
-        modes.append("heal")
-    if _maestro_explore_enabled():
-        modes.append("explore")
-    return modes
-
-
 def _device_options(devices: list):
     """Build (labels, label->id) for a device elicitation. The label leads with
     the device name and carries the id so distinct devices sharing a name stay
@@ -1018,30 +956,13 @@ async def _elicit_device_with_rescan(
     return ChoiceResult(UNAVAILABLE)
 
 
-async def _device_menu_markdown(tool: str = "qa_run_mobile_suite") -> str:
+async def _device_menu_markdown(tool: str) -> str:
     """Markdown fallback for the device picker: the live device list plus a
     re-call instruction for *tool*."""
     result = await list_devices()
     devices = result.get("content") or []
     return shape_devices(devices) + (
         f"\n\nRe-call `{tool}` with the chosen `device_id`."
-    )
-
-
-async def _elicit_mobile_mode(choose: ChooseCb) -> ChoiceResult:
-    """Elicit a Maestro mode from the gated option list (shared by the wizard and
-    handle_run_mobile_suite)."""
-    return await _elicit_choice(
-        choose, "Which mobile testing mode?", _mobile_mode_options()
-    )
-
-
-def _mobile_mode_menu_markdown() -> str:
-    modes = _mobile_mode_options()
-    return (
-        "## Mobile testing\n\n"
-        "Call `qa_run_mobile_suite` with one of these modes as `mode`:\n"
-        + "\n".join(f"- `{m}`" for m in modes)
     )
 
 
@@ -1058,6 +979,181 @@ def _format_menu_markdown() -> str:
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# Finalize-reply budget (F03, 2026-08-16)
+# --------------------------------------------------------------------------- #
+# _SUMMARY_CAP above bounds ONE of the twenty slots the submit reply is
+# assembled from -- the `summary` embedded by shape_generation_result. The
+# 2026-08-16 live run measured 4844 chars, of which 2006 (41%) sat in the notice
+# preamble that no cap has ever seen: the notes are concatenated one level up,
+# at the return of handle_submit_suite, and that string is what the tester
+# reads.
+#
+# WHAT YIELDS. Almost every note in that preamble is a disclosure with its own
+# written "must always be surfaced" contract -- dropped_note (:5390), the
+# always-on coverage signal (:5346), the image-relevance warning the submit
+# AUDIT row claims was shown (:8095), the duplicate note that reports cases the
+# server actually REMOVED (:7842). Trimming those to make room for prose would
+# be a worse bug than an over-long reply, and one of them would additionally
+# make the audit trail assert a disclosure that never happened. So they are
+# PROTECTED, and the block that yields is `summary`: its content is the suite,
+# the suite is in the workbook, and its truncation marker already says so.
+# Only when the summary has yielded to its floor do four genuinely repeatable
+# sections drop -- and they are NAMED where they were, so nothing is silent.
+_REPLY_CAP = 6000
+
+# The summary never shrinks below this. A reply with no summary at all is not a
+# cheaper reply, it is a different (and useless) one.
+_SUMMARY_FLOOR = 1200
+
+# What shape_generation_result appends AFTER the slice when it truncates -- a
+# blank line and the "…(truncated — …)" marker. It is charged to the reply but
+# is not part of `summary`, so a budget that ignores it over-runs the cap by
+# exactly this much on every truncated reply. Reserved unconditionally rather
+# than only when the summary is actually cut, because the budget is computed
+# BEFORE the shaping that would decide.
+_TRUNC_RESERVE = 64
+
+# Drop priorities for the four trimmable sections. LOWER drops FIRST, and each
+# constant names WHY that section is droppable at all -- a section that cannot
+# answer that question is protected instead.
+_REPLY_P_EXPORTED = 1  # the same disclosure is written into the export
+_REPLY_P_POINTER = 2  # names an on-demand tool that reproduces it
+_REPLY_P_PROVENANCE = 3  # how a field was derived, not what it says
+_REPLY_P_REPORT = 4  # a measurement section, re-derivable from the suite
+
+
+class ReplySection(NamedTuple):
+    """One slot of the submit reply. *text* carries its own separators.
+
+    `protected` is not a priority: a protected section is never dropped and
+    never truncated, whatever the budget says.
+    """
+
+    name: str
+    text: str
+    priority: int = _REPLY_P_REPORT
+    protected: bool = False
+
+
+def _omission_marker(names: list[str]) -> str:
+    """Disclose what the budget left out, BY NAME.
+
+    The wording is deliberately narrow. An earlier draft said "the Excel file
+    and the Suite ID cover every case", which is false for three of the notes
+    this reply can carry -- the duplicate note reports cases the server removed,
+    and neither it nor the dropped-case note nor the image warning is written
+    into the workbook. Only sections that genuinely repeat something the tester
+    can still reach are droppable, and this text claims exactly that and no
+    more.
+    """
+    return (
+        "\n\n> \u2139\ufe0f  "
+        f"{len(names)} informational section(s) were left out to keep this "
+        f"reply readable: {', '.join(names)}. Every notice about whether this "
+        "suite is VALID is still above -- what was left out repeats something "
+        "you can still reach (the export, the coverage notes, or a tool you "
+        "can call on demand).\n"
+    )
+
+
+def summary_budget(sections: list[ReplySection], header_len: int) -> int:
+    """How many chars of `summary` fit, given everything else in the reply.
+
+    *sections* must be EVERY section of the reply except the one the summary
+    sits in -- including the ones appended after it, which the round-2 review
+    caught this missing: `cap_note` is added at the assemble call and was never
+    counted, so the reply over-ran the cap by its length on the max-gap-round
+    path. Pass the whole list; the only thing left out is the suite block.
+
+    Clamped into [_SUMMARY_FLOOR, _SUMMARY_CAP], so this can only ever be
+    STRICTER than the cap that shipped, never looser: a reply with few notes
+    keeps today's exact 4000-char allowance and stays byte-identical.
+    """
+    try:
+        overhead = (
+            sum(len(s.text) for s in sections) + max(header_len, 0) + _TRUNC_RESERVE
+        )
+        return max(_SUMMARY_FLOOR, min(_SUMMARY_CAP, _REPLY_CAP - overhead))
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("summary budget failed - using the static cap", exc_info=True)
+        return _SUMMARY_CAP
+
+
+def assemble_finalize_reply(sections: list[ReplySection], cap: int = _REPLY_CAP) -> str:
+    """Join *sections* into the submit reply, bounded by *cap*. Never raises.
+
+    UNDER budget the result is byte-identical to ``"".join(s.text ...)``. That
+    fast path is the point of the design: every healthy run keeps today's exact
+    reply, so every assertion pinned on it stays true.
+
+    OVER budget, trimmable sections are dropped WHOLE and in STRICT priority
+    order -- the loop stops at the first section it can keep, so a long
+    high-priority section can never lose its place to a short low-priority one.
+    The names of the dropped sections are disclosed in a trailing marker whose
+    length is reserved BEFORE the decision, because disclosure may not be the
+    thing that pushes the reply back over the bound.
+
+    A protected section is never dropped and never truncated, so the bound is
+    honest rather than absolute: if the protected band alone exceeds *cap*, the
+    reply is that band plus the marker. Bookkeeping is keyed on INDEX, not on
+    name, so a future section that reuses a name cannot silently duplicate or
+    delete another section's text.
+    """
+    try:
+        joined = "".join(s.text for s in sections)
+        if len(joined) <= cap:
+            return joined
+        trimmable = [
+            (i, s) for i, s in enumerate(sections) if not s.protected and s.text
+        ]
+        used = len(joined)
+        dropped: list[int] = []
+        # STRICT order: cheapest-to-lose first, and every one of them goes until
+        # the reply fits. No greedy back-fill -- see the docstring.
+        #
+        # The reserve is what the marker would cost IF THE LOOP STOPPED HERE, so
+        # it is recomputed from the names dropped so far. Reserving for every
+        # trimmable name up front (the round-3 review, MINOR 4) over-charged a
+        # borderline reply and could drop one more section than it needed to --
+        # the tester paying a section for a disclosure that was never emitted.
+        for idx, sec in sorted(trimmable, key=lambda pair: (pair[1].priority, pair[0])):
+            reserve = (
+                len(_omission_marker([sections[i].name for i in dropped]))
+                if dropped
+                else 0
+            )
+            if used + reserve <= cap:
+                break
+            used -= len(sec.text)
+            dropped.append(idx)
+        if not dropped:
+            return joined
+        gone = set(dropped)
+        body = "".join(s.text for i, s in enumerate(sections) if i not in gone)
+        out = body + _omission_marker([sections[i].name for i in sorted(gone)])
+        # Dropping may never make the reply LONGER than leaving it alone. The
+        # marker costs ~300 chars, so a droppable set smaller than that is a net
+        # loss -- and the tester would have paid a lost section for nothing.
+        # Round-2 review, the tail of MAJOR 1.
+        return out if len(out) < len(joined) else joined
+    except Exception:
+        # Fail OPEN, and defensively: the recovery may not re-run whatever threw
+        # (a genexpr over the same texts is exactly what threw above), or the
+        # tester loses the entire reply to a bounding bug.
+        logger.warning(
+            "finalize reply budget failed - returning the reply unbounded",
+            exc_info=True,
+        )
+        parts: list[str] = []
+        for sec in sections or []:
+            try:
+                parts.append(str(getattr(sec, "text", "") or ""))
+            except Exception:  # pragma: no cover - defence in depth
+                continue
+        return "".join(parts)
+
+
 def shape_generation_result(
     summary: str,
     suite,
@@ -1066,6 +1162,7 @@ def shape_generation_result(
     *,
     auto_export: bool = False,
     submitted_count: int | None = None,
+    summary_cap: int = _SUMMARY_CAP,
 ) -> str:
     """Shape the generation reply.
 
@@ -1073,6 +1170,14 @@ def shape_generation_result(
     nothing here points at qa_export_suite: the tester is handed the finished
     deliverable instead of a "which format?" question. The suite_id stays
     visible either way (it is still the handle for a different format).
+
+    *summary_cap* (F03, 2026-08-16) is how much of *summary* fits once the
+    caller knows what ELSE is in the reply. It defaults to the static
+    _SUMMARY_CAP, so every direct caller -- including
+    tests/test_finalize_reply_cap.py, which is the guard on that inner budget --
+    is byte-identical. handle_submit_suite passes a smaller one when its
+    disclosure notices need the room, because the summary is the block that
+    yields: its content is the suite, and the suite is in the workbook.
     """
     cases = len(getattr(suite, "test_cases", []) or []) if suite is not None else 0
     icon = {"ok": "✅", "partial": "⚠️", "fallback": "⚠️", "error": "❌"}.get(status, "ℹ️")
@@ -1101,13 +1206,29 @@ def shape_generation_result(
     lines.append(f"**Status:** {_STATUS_TEXT.get(status, status)}")
     body = (summary or "").strip()
     if body:
-        if len(body) > _SUMMARY_CAP:
+        if len(body) > summary_cap:
             tail = (
                 "the Excel file below has every case"
                 if auto_export
                 else "export the suite for the full set"
             )
-            body = body[:_SUMMARY_CAP].rstrip() + f"\n\n…(truncated — {tail})"
+            # What the marker may promise depends on WHAT was cut. The claim
+            # above is about CASES, and it is true of them. It is false of the
+            # advisory sections the summary also carries -- Suite Consistency,
+            # Test Data, the grounding notes -- because none of those is written
+            # into the workbook: the export carries the cases and (since F06)
+            # their requirement ids, and no advisory at all. F14 measured the
+            # Suite Consistency block alone at 4173 bytes against a 4000
+            # _SUMMARY_CAP, so a squeeze reaching an advisory heading is
+            # reachable, not theoretical. Telling that tester the export has it
+            # sends them to look for something that is not there.
+            cut = body[summary_cap:]
+            if "\n## " in cut or cut.lstrip().startswith("## "):
+                tail += (
+                    ". Some advisory notes were cut and are NOT in the export -- "
+                    "re-submit a smaller suite to read them"
+                )
+            body = body[:summary_cap].rstrip() + f"\n\n…(truncated — {tail})"
         lines += ["", body]
     return "\n".join(lines)
 
@@ -1164,88 +1285,6 @@ def shape_explore_step(session_id: str, sess: dict, step: str) -> str:
             "Reply with what you found via `qa_explore_step` (same session_id) to continue.",
         ]
     )
-
-
-def shape_mobile_export(suite_id: str, path: str, count: int) -> str:
-    return (
-        f"## ✅ Maestro flows exported for suite `{suite_id}`\n\n"
-        f"**Flows:** {count}\n"
-        f"**Directory:** `{path}`\n\n"
-        'Run them with `qa_run_mobile_suite(mode="run", device_id=…, suite_id='
-        f'"{suite_id}")`.'
-    )
-
-
-def shape_mobile_run(device_id: str, payload: dict) -> str:
-    if payload.get("dry_run"):
-        cmd = payload.get("command") or ""
-        extra = f"\n\n```\n{cmd}\n```" if cmd else ""
-        return (
-            f"## Maestro run (dry-run) on `{device_id}`\n\n"
-            "Dry-run is ON (QA_MAESTRO_DRY_RUN) — nothing was executed on the "
-            "device. Set QA_MAESTRO_DRY_RUN=false to run for real." + extra
-        )
-    return (
-        f"## Maestro run on `{device_id}`\n\n"
-        f"**Passed:** {payload.get('passed', 0)}  ·  "
-        f"**Failed:** {payload.get('failed', 0)}  ·  "
-        f"**Total:** {payload.get('total', 0)}"
-    )
-
-
-def shape_mobile_heal(device_id: str, payload: dict) -> str:
-    if payload.get("reason") == "disabled":
-        return "ℹ️ Maestro heal is disabled (set QA_MAESTRO_HEAL_ENABLED=true)."
-    # Phase 5b: a kill-switch refusal must NEVER render as a verdict. Before this
-    # branch existed, a refused triage arrived here as classification "bug" with
-    # the backend's refusal sentinel hidden in a `verdict` field this shaper does
-    # not render -- so the tester was told their app had a genuine defect and was
-    # never told that nothing had been triaged. The disclosure is rendered verbatim.
-    if payload.get("reason") == "server_llm_disabled":
-        return (
-            f"## Maestro heal on `{device_id}` — NOT triaged\n\n"
-            "⚠️ "
-            + str(
-                payload.get("disclosure")
-                or "self-healing is disabled on this install (QA_SERVER_LLM_ENABLED)"
-            )
-            + "\n\n**Classification:** untriaged (no diagnosis was made)\n"
-            "**Healed:** False\n"
-            "**Attempts:** 0"
-        )
-    return (
-        f"## Maestro heal on `{device_id}`\n\n"
-        f"**Classification:** {payload.get('classification', 'unknown')}\n"
-        f"**Healed:** {payload.get('healed', False)}\n"
-        f"**Attempts:** {payload.get('attempts', 0)}"
-    )
-
-
-def shape_mobile_explore(device_id: str, payload: dict) -> str:
-    if payload.get("reason") == "disabled":
-        return "ℹ️ Maestro exploratory mode is disabled (set QA_MAESTRO_EXPLORE_ENABLED=true)."
-    # Phase 5b: distinct from stop_reason "decide_error" (the model WAS asked and
-    # failed). Zero steps, and the tester is told why in the reply itself rather
-    # than being handed an opaque stop reason after the device was already driven.
-    if payload.get("reason") == "server_llm_disabled":
-        return (
-            f"## Maestro exploratory run on `{device_id}` — did not start\n\n"
-            "⚠️ "
-            + str(
-                payload.get("disclosure")
-                or "AI exploration is disabled on this install (QA_SERVER_LLM_ENABLED)"
-            )
-            + "\n\n**Steps:** 0  ·  **Stop reason:** server_llm_disabled"
-        )
-    steps = payload.get("steps") or []
-    summary = (payload.get("summary") or "").strip()
-    head = (
-        f"## Maestro exploratory run on `{device_id}`\n\n"
-        f"**Steps:** {len(steps)}  ·  "
-        f"**Stop reason:** {payload.get('stop_reason', 'n/a')}  ·  "
-        f"**Possible bug:** {payload.get('possible_bug', False)}"
-    )
-    return f"{head}\n\n{summary}" if summary else head
 
 
 # --------------------------------------------------------------------------- #
@@ -1488,17 +1527,20 @@ def _image_gate_menu_markdown(elicit_status: str = "") -> str:
     2026-08-09 (Batch 3, FIX 3, review H4): *elicit_status* is the
     "<enum>/<text>" outcome from _elicit_source_plan_status, used ONLY to word
     the CAUSE of this fallback correctly. This menu is relayed whenever no plan
-    resolved, which includes elicitation being TURNED OFF on this server
-    (QA_MCP_ELICIT_ENABLED defaults False) and the tester DECLINING the dialog --
-    so asserting "your client has no elicitation support" unconditionally would
-    be an over-claim, in the one batch dedicated to removing over-claims.
+    resolved, which includes a call arriving with no elicitation channel at
+    all and the tester DECLINING the dialog -- so asserting "your client has
+    no elicitation support" unconditionally would be an over-claim, in the one
+    batch dedicated to removing over-claims. 2026-08-14: the "disabled" label
+    no longer means a server setting. QA_MCP_ELICIT_ENABLED was DELETED on
+    2026-08-13 and hardcoded ON, so _elicit_enabled() is the True constant and
+    the only surviving cause is both callbacks being absent.
     Defaults to "" (cause unknown), which words it as a plain statement of fact
     with no cause attributed. Never raises."""
     _cause = "could not be shown to you inline"
     if elicit_status.startswith("disabled"):
         _cause = (
-            "was not shown inline because MCP elicitation is turned OFF on this "
-            "server (`QA_MCP_ELICIT_ENABLED`)"
+            "was not shown inline because this call arrived with no elicitation "
+            "channel (your client offered none for this call)"
         )
     elif "declined" in elicit_status:
         _cause = "was shown inline and dismissed, so I am repeating it as text"
@@ -1642,35 +1684,6 @@ def _safe_image_name(raw) -> str:
         return ""
 
 
-def _web_run_enabled() -> bool:
-    """Always False -- live web-suite execution is OFF, unconditionally.
-
-    QA_WEB_RUN_ENABLED was DELETED on 2026-08-13 (flag-surface reduction,
-    batch 6) and hardcoded to its default. A named seam, mirroring
-    ``tools.web_runner.enabled``, so the retained handler bodies stay
-    executable by their tests and a revival is one line in each of two
-    documented places. NOT settings-derived.
-    """
-    return False
-
-
-def _web_run_dry_run() -> bool:
-    """Always True -- QA_WEB_RUN_DRY_RUN was DELETED on 2026-08-13 and the
-    dry run hardcoded ON. Moot while the runner itself is off; read by the
-    qa-doctor disclosure line only.
-    """
-    return True
-
-
-def _zephyr_dry_run() -> bool:
-    """Always True -- QA_ZEPHYR_DRY_RUN was DELETED on 2026-08-13 and the
-    PILOT workbook hardcoded ON. A named seam because the full-workbook
-    branch of tools/zephyr_exporter.py is retained and still has to be
-    reachable from its tests. NOT settings-derived.
-    """
-    return True
-
-
 def _elicit_enabled() -> bool:
     """Always True -- MCP elicitation dialogs are ON, unconditionally.
 
@@ -1708,147 +1721,17 @@ def _rag_enabled() -> bool:
     return True
 
 
-def _maestro_enabled() -> bool:
-    """Always False -- Maestro mobile testing is RETIRED.
+def _feature_analysis_enabled() -> bool:
+    """Always True -- Feature Analysis is ON, unconditionally.
 
-    QA_MAESTRO_ENABLED was DELETED on 2026-08-13 (flag-surface reduction,
-    batch 7) and hardcoded to its own code default: unlike the three flags
-    pinned ON in that batch it was never in the public distribution's .env
-    template, so the code default IS the value every install ran. A named seam,
-    mirroring ``tools.web_runner.enabled``, so the retained handler body stays
-    executable by its tests and a revival is one line here. NOT
-    settings-derived.
+    QA_FEATURE_ANALYSIS_ENABLED was DELETED on 2026-08-14 (flag-surface
+    reduction, batch 8c) and hardcoded ON. A named seam, mirroring
+    ``mcp_server._feature_analysis_enabled``. NOT settings-derived.
+
+    Every caller still checks ``_test_cases_only()`` FIRST: the edition gate
+    outranks this, so the public distribution is unaffected.
     """
-    return False
-
-
-def _maestro_heal_enabled() -> bool:
-    """Always False -- QA_MAESTRO_HEAL_ENABLED was DELETED on 2026-08-13 and
-    the heal loop hardcoded OFF. Read by the mode list and the qa-doctor
-    disclosure line; ``tools.maestro_healer.enabled`` is the module's own seam.
-    """
-    return False
-
-
-def _maestro_explore_enabled() -> bool:
-    """Always False -- QA_MAESTRO_EXPLORE_ENABLED was DELETED on 2026-08-13 and
-    the exploratory loop hardcoded OFF. Read by the mode list and the qa-doctor
-    disclosure line; ``tools.maestro_explorer.enabled`` is the module's own
-    seam.
-    """
-    return False
-
-
-def _zephyr_export_enabled() -> bool:
-    """The Zephyr for Jira import export. HARDCODED OFF since 2026-08-13.
-
-    NOT settings-derived: QA_ZEPHYR_EXPORT_ENABLED was DELETED (flag-surface
-    reduction, batch 8a) and cannot be reached from `.env`. `zephyr` therefore
-    never joins the qa_export_suite format map, the elicitation picker and the
-    markdown menu are byte-identical to before the feature existed, and the
-    auto-export path writes no workbook pair. The 15-column layout was never
-    verified against a live Zephyr importer, which is why its runbook pilot gate
-    exists and why it was never promoted. ``tools/zephyr_exporter.py`` is
-    RETAINED and still directly tested; reviving it is one line here.
-    """
-    return False
-
-
-async def _fetch_jira_attachment_bytes(url_content: dict | None) -> int:
-    """Download the ticket's image attachments SERVER-SIDE, in place.
-
-    Returns how many images arrived; 0 whenever QA_JIRA_ATTACHMENT_FETCH_ENABLED
-    is off, which is the default -- and in that case NO request is made at all
-    and *url_content* is not touched, so the flag-off path is byte-identical to
-    today.
-
-    ON, the bytes join the EXISTING host-image path: ``url_content["images"]`` is
-    exactly what ``host_images`` reads a few lines below, so the screenshots ride
-    the already-shipped IMAGE_JOB to the tester's own multimodal model. No new
-    LLM call, no new round trip and no new forwarding code -- which is why this
-    is a fetch, not a feature.
-
-    Never raises (it is called from inside the prepare handler's protective try,
-    but mcp_server._tracked re-raises, so a helper that leaked would surface as
-    an MCP tool error) and never overstates: with nothing fetched, the
-    pre-existing "I could not read this ticket's images" notice is left exactly
-    as it was.
-    """
-    try:
-        if not isinstance(url_content, dict):
-            return 0
-        # QA_JIRA_ATTACHMENT_FETCH_ENABLED was DELETED on 2026-08-13
-        # (flag-surface reduction, batch 6) and hardcoded OFF, so
-        # jira_attachments.enabled() is a constant False and this helper never
-        # fetches -- the pre-existing "I could not read this ticket's images"
-        # notice is left exactly as it was.
-        if not attachments_enabled():
-            return 0
-        attachments = [
-            a
-            for a in (url_content.get("image_attachments") or [])
-            if isinstance(a, dict)
-        ]
-        # Already carrying bytes (a legacy path, or a second pass) -- never
-        # re-download and never overwrite what is already there.
-        if not attachments or url_content.get("images"):
-            return 0
-        result = await fetch_attachment_bytes(attachments)
-        images = [i for i in (result.get("content") or []) if isinstance(i, dict)]
-        failures = [f for f in (result.get("failures") or []) if isinstance(f, dict)]
-        if failures:
-            url_content["image_fetch_failures"] = failures
-        if result.get("error"):
-            url_content["image_fetch_error"] = str(result.get("error"))[:300]
-        if failures or result.get("error"):
-            # N3 (2026-08-10): a HANDLED failure (401/403, size cap, disallowed
-            # MIME) returns NORMALLY from jira_attachments, so nothing at WARNING
-            # or above ever recorded it -- in the log an expired JIRA_API_TOKEN
-            # was indistinguishable from a ticket with no screenshots.
-            #
-            # What the sanitizer below actually guarantees, stated exactly: the
-            # reason is reduced to single-line, length-capped text drawn from a
-            # fixed character class, and any scheme://... run is collapsed to
-            # `(url)`. It is NOT a general secret-scrubber -- it is safe here
-            # because these reasons are jira_attachments' own literals (HTTP
-            # status, byte cap, MIME) and never the attachment URL, which
-            # carries a signed token and is kept out of the logs at its source.
-            logger.warning(
-                "jira attachment fetch: %d of %d ticket screenshot(s) failed: %s",
-                len(failures),
-                len(attachments),
-                "; ".join(_log_safe_fetch_reason(f.get("reason")) for f in failures[:3])
-                or _log_safe_fetch_reason(result.get("error")),
-            )
-        if not images:
-            return 0
-        url_content["images"] = images
-        url_content["images_fetched_server_side"] = len(images)
-        # Batch C item 5 / R3 (2026-08-09): COMPLETENESS, not presence.
-        #
-        # This used to clear the flag on ANY non-empty fetch, under a comment
-        # reading "Some screens DID arrive, so the blanket notice would now be
-        # FALSE" -- true only when ALL of them arrived. With one screenshot of
-        # three, _ticket_image_evidence returned kind == "" and the completeness
-        # arm of _image_gate_second_beat never saw the un-fetched remainder, so
-        # generation started on a SUBSET of the screens, silently.
-        #
-        # Clear it only when the fetch got everything it should have. The cap is
-        # what bounds how many screens this server will ever carry, so the target
-        # is min(disclosed attachments, JIRA_MAX_IMAGES) -- read through the
-        # SHARED _jira_image_cap so this and the gate cannot drift apart. On a
-        # PARTIAL fetch the flag STAYS SET on purpose: that is what keeps the
-        # gate armed, and BOTH readers of the flag are partial-aware --
-        # _server_fetched_image_note names what arrived and what did not, and
-        # _unreadable_images_note narrows its count, its names and its wording to
-        # the remainder instead of claiming a TEXT-only generation.
-        _img_expected = min(len(attachments), _jira_image_cap())
-        if _img_expected and len(images) >= _img_expected:
-            url_content["images_unavailable"] = False
-        return len(images)
-    except Exception:
-        logger.debug("server-side Jira attachment fetch failed", exc_info=True)
-        return 0
+    return True
 
 
 # Failure reasons are assembled from an UNTRUSTED response (a Content-Type, a
@@ -1866,35 +1749,6 @@ def _safe_fetch_reason(raw) -> str:
         return "".join(ch for ch in str(raw or "") if ch in _FETCH_REASON_ALLOWED)[
             :200
         ].strip()
-    except Exception:
-        return ""
-
-
-def _log_safe_fetch_reason(raw) -> str:
-    """_safe_fetch_reason, plus: any scheme://... run becomes `(url)`.
-
-    N3a (2026-08-10). The allowlist above permits `:` and `/` -- it has
-    to, because the reasons it renders for the TESTER carry MIME types
-    ("unsupported attachment type: image/svg+xml") and `filename: reason`
-    pairs -- so an https:// URL would survive it intact. Every reason
-    jira_attachments actually produces today is a module-authored literal
-    with no URL in it (the signed media link is already kept out of the
-    logs by its own _log_target), so this is belt-and-braces against a
-    FUTURE reason string, not a fix for a live leak -- and it is applied
-    HERE, at the log call site, rather than by narrowing
-    _FETCH_REASON_ALLOWED, which is shared with the tester-facing note
-    that legitimately needs those two characters.
-
-    Token-wise and regex-free on purpose: `re` is deliberately not
-    imported by this module (see the comment on the allowlist). Never
-    raises."""
-    try:
-        text = str(raw or "")
-        if "://" in text:
-            text = " ".join(
-                "(url)" if "://" in token else token for token in text.split()
-            )
-        return _safe_fetch_reason(text)
     except Exception:
         return ""
 
@@ -2164,15 +2018,18 @@ def _jira_image_cap() -> int:
     """The ONE reading of JIRA_MAX_IMAGES shared by the two halves of the
     image-COMPLETENESS contract.
 
-    Scope, precisely (review N5): this covers _fetch_jira_attachment_bytes and
-    _image_gate_second_beat, the two places that decide whether the screens on
-    hand are "all of them". Other readers of the same setting -- the prepare
-    payload's own image budget below, and jira_attachments._max_images, which
-    caps what is downloaded -- are deliberately NOT rewired here; they answer
-    different questions and folding them in would widen this batch.
+    Scope, precisely (review N5): this used to cover TWO places that decide
+    whether the screens on hand are "all of them" -- the server-side attachment
+    fetch and _image_gate_second_beat. Batch D1 (2026-08-15) deleted the fetch,
+    and tools/jira_attachments.py with it, so only the gate reads this clamp
+    today. It is KEPT and kept SHARED on purpose: a revived fetch
+    (docs/RETIRED_CAPABILITIES.md) must clamp JIRA_MAX_IMAGES exactly the way
+    the gate does, and clamping it differently in the two halves is the defect
+    this function exists to prevent. The prepare payload's own image budget
+    below is deliberately NOT rewired here; it answers a different question.
 
-    Batch C, M1 (2026-08-09): the fetch-completeness check in
-    _fetch_jira_attachment_bytes and the beat-2 arithmetic in
+    Batch C, M1 (2026-08-09), the reasoning that still binds a revival: the
+    fetch-completeness check and the beat-2 arithmetic in
     _image_gate_second_beat are two halves of ONE contract -- "how many screens
     will this server ever carry" -- and clamping the same setting differently in
     each would let a misconfigured install fetch a number the gate then refuses
@@ -2812,11 +2669,41 @@ def _resolved_export_dir() -> str:
         return (settings.qa_export_dir or "").strip()
 
 
+def _export_ticket_slug(source_url: str) -> str:
+    """A Jira issue key for use inside an export FILENAME, or "".
+
+    F11 (2026-08-15): three suites exported into one folder were
+    ``qa_test_cases_<suite_id>_<stamp>.xlsx`` and nothing else, so a tester
+    holding three tickets had to open all three to tell them apart.
+
+    FILESYSTEM SAFETY is the whole reason this goes through
+    ``jira_mcp.issue_key_from_url`` rather than any part of the raw URL: that
+    helper is regex-gated to ``[A-Z][A-Z0-9]*-[0-9]+`` (``_valid_issue_key``),
+    so the value spliced into a path cannot contain a separator, a traversal
+    sequence, a NUL, or anything else needing escaping -- it is re-checked here
+    anyway rather than trusted, because this function's output becomes a path.
+    Returns "" for a non-Jira source, which restores the previous filename
+    byte-for-byte. Never raises."""
+    try:
+        from tools.jira_mcp import issue_key_from_url
+
+        key = str(issue_key_from_url(str(source_url or "")) or "").strip()
+        if not key or len(key) > 32:
+            return ""
+        if not all(ch.isalnum() or ch == "-" for ch in key):
+            return ""
+        return key
+    except Exception:  # pragma: no cover - defensive; a filename must never raise
+        logger.debug("export ticket slug failed", exc_info=True)
+        return ""
+
+
 async def _auto_export_xlsx(
     suite,
     ask_text: AskCb = None,
     on_path: Callable[[str], None] | None = None,
     progress: ProgressCb = None,
+    source_url: str = "",
 ) -> str:
     """Best-effort Excel auto-export for QA_AUTO_EXPORT_XLSX (MCP path only).
 
@@ -2897,7 +2784,15 @@ async def _auto_export_xlsx(
                 # ops-6 (bug 3): UNTRUSTED host text -- validate before it
                 # becomes a real directory. A rejected answer keeps the
                 # configured default AND says so.
-                picked, why = _safe_elicited_dir(asked.value, sentinel_ok=True)
+                # export_dir is EMPTY in this branch (the dialog is only
+                # asked when the configured folder did not resolve), so a
+                # rejected answer falls back to the secure temp dir -- and
+                # the note has to name that one, not a configured folder.
+                picked, why = _safe_elicited_dir(
+                    asked.value,
+                    sentinel_ok=True,
+                    fallback_label=_TEMP_EXPORT_LABEL,
+                )
                 if picked:
                     export_dir = picked
                 elif why:
@@ -2908,8 +2803,22 @@ async def _auto_export_xlsx(
                 dest.mkdir(parents=True, exist_ok=True)
                 frag = (getattr(suite, "suite_id", "") or "suite")[:16]
                 stamp = time.strftime("%Y%m%d_%H%M%S")
+                # F11: ticket key FIRST, because that is what a tester scans a
+                # folder for. The `qa_test_cases_` prefix is kept (every
+                # cleanup_temp_files glob keys off it) and so are the suite_id
+                # fragment and the timestamp, so uniqueness and every existing
+                # consumer are unchanged. "" for a non-Jira source -> the
+                # previous name exactly.
+                ticket = _export_ticket_slug(source_url)
                 output_path = str(
-                    (dest / f"qa_test_cases_{frag}_{stamp}.xlsx").resolve()
+                    (
+                        dest
+                        / (
+                            f"qa_test_cases_{ticket}_{frag}_{stamp}.xlsx"
+                            if ticket
+                            else f"qa_test_cases_{frag}_{stamp}.xlsx"
+                        )
+                    ).resolve()
                 )
             except OSError:
                 logger.warning(
@@ -2923,8 +2832,11 @@ async def _auto_export_xlsx(
         else:
             path = await asyncio.to_thread(_EXPORTERS["xlsx"], suite)
         if on_path is not None:
-            # Lets the caller drop the Zephyr pair beside the Excel file the
-            # tester actually got, including an elicited custom folder.
+            # Hands the caller the path the tester actually got,
+            # including an elicited custom folder. Added so the
+            # Zephyr pair could land beside the workbook; that
+            # exporter was DELETED on 2026-08-15 (batch D4) and
+            # handle_submit_suite still reports the path.
             try:
                 on_path(path)
             except Exception:
@@ -2962,416 +2874,19 @@ async def _auto_export_xlsx(
         )
 
 
-async def _suite_story_key(suite_id: str) -> str:
-    """Best-effort Jira story key for a STORED suite (Zephyr columns B / I / J).
-
-    Reads the source_url / feature_text persisted alongside the suite and derives
-    a PROJECT-123 key from it. Never raises -- an unknown key exports blank
-    Project / Issue cells plus an explicit warning inside
-    zfj_import_config.json, the correct outcome for a suite generated from plain
-    feature text rather than a ticket.
-    """
-    try:
-        # Imported HERE, not at module scope, on purpose: Batch 2 rewrites
-        # the module-level `from tools.suite_store import ...` line, and a
-        # second edit to it would make the two batches order-dependent. The
-        # module already imports tools.updater / llm this way. Tests patch
-        # tools.suite_store.load_suite_meta (not a handler-module global).
-        from tools.suite_store import load_suite_meta
-
-        meta = await load_suite_meta(suite_id)
-        row = (meta or {}).get("content") or {}
-        return derive_story_key(str(row.get("source_url") or "")) or derive_story_key(
-            str(row.get("feature_text") or "")
-        )
-    except Exception:
-        logger.debug("zephyr: no story key for suite %s", suite_id, exc_info=True)
-        return ""
-
-
-def _zephyr_pair_note(
-    xlsx_path: str,
-    story_key: str,
-    *,
-    dry_run: bool = False,
-    total_cases: int = 0,
-) -> str:
-    """Markdown footer for a Zephyr export: the config file, the UNVERIFIED
-    format caveat, and the manual steps Zephyr's importer cannot do for us.
-    Pure and never raises."""
-    parts: list[str] = []
-    try:
-        cfg = config_path_for(xlsx_path)
-    except Exception:
-        cfg = ""
-    if cfg:
-        parts.append(f"**Zephyr field map:** `{cfg}`")
-    if dry_run:
-        parts.append(
-            f"\u26a0\ufe0f **PILOT FILE \u2014 {PILOT_CASE_LIMIT} of "
-            f"{total_cases or PILOT_CASE_LIMIT} case(s).** The Zephyr column "
-            "layout is not vendor-verified yet, so `QA_ZEPHYR_DRY_RUN` (ON by "
-            "default) keeps this file small. Import it into a **sandbox** Zephyr "
-            "project, map column A (External ID), and check that the multi-step "
-            "case became ONE test with all of its steps. Then set "
-            "`QA_ZEPHYR_DRY_RUN=false` to export the full suite."
-        )
-    else:
-        parts.append(
-            "\u26a0\ufe0f _The Zephyr column layout is not vendor-verified. If "
-            "you have not piloted it on a sandbox project yet, do that first._"
-        )
-    parts.append(
-        "_Import with Zephyr for Jira / Squad (NOT Zephyr Scale, which imports "
-        "over REST) and keep `zfj_import_config.json` beside the workbook \u2014 a "
-        "re-import can only UPDATE existing tests if your first import mapped "
-        "column A and created Zephyr's External Issue ID field._"
-    )
-    if story_key:
-        parts.append(
-            "_Zephyr cannot link tests to a story during import: link the created "
-            f"tests to **{story_key}** afterwards \u2014 every external-id/issue "
-            "pair is listed in the JSON._"
-        )
-    else:
-        parts.append(
-            "_No Jira story key was found for this suite, so Project and Issue "
-            "are blank \u2014 choose the project in the importer UI._"
-        )
-    return "\n\n" + "\n\n".join(parts)
-
-
-async def _auto_export_zephyr(
-    suite, *, source_text: str = "", near_path: str = "", progress: ProgressCb = None
-) -> str:
-    """Write the Zephyr workbook + zfj_import_config.json pair alongside the
-    auto-exported Excel file (_zephyr_export_enabled, hardcoded OFF 2026-08-13).
-
-    Returns "" when the gate is off -- which is always -- so the generation reply
-    is byte-identical to today's. NEVER raises: a failure here only appends a
-    warning note -- the already-generated, already-persisted suite and its Excel
-    deliverable are never put at risk by a secondary export.
-    """
-    if not _zephyr_export_enabled():
-        return ""
-    try:
-        await _emit(progress, "🧩 Writing the Zephyr import pair…")
-        dry_run = _zephyr_dry_run()
-        story_key = derive_story_key(source_text or "")
-        if near_path:
-            output_dir = str(Path(near_path).parent)
-        else:
-            output_dir = _resolved_export_dir()
-        path = await asyncio.to_thread(
-            generate_zephyr_export,
-            suite,
-            output_dir or None,
-            story_key=story_key,
-            dry_run=dry_run,
-        )
-        await _audit(
-            "mcp_auto_export_zephyr", detail={"path": path, "dry_run": dry_run}
-        )
-        total = len(getattr(suite, "test_cases", None) or [])
-        return (
-            "\n\n### \U0001f9e9 Zephyr for Jira import pair\n\n"
-            f"`{path}`"
-            + _zephyr_pair_note(path, story_key, dry_run=dry_run, total_cases=total)
-        )
-    except Exception as exc:
-        logger.exception("mcp auto-export zephyr failed")
-        return (
-            f"\n\n\u26a0\ufe0f Zephyr export failed: {exc} -- the Excel file "
-            "above is unaffected."
-        )
-
-
-def _ambiguity_source_text(
-    text: str, url_content: dict | None, openapi_text: str | None
-) -> str:
-    """The text the ambiguity gate should judge.
-
-    For a Jira/web URL, judge the FETCHED ticket content (never the bare URL, so
-    the SHYJ-7154 no-UI documentation story is assessed on its real body); for
-    an OpenAPI spec, skip the gate (an explicit spec is not ambiguous). Never
-    raises.
-    """
-    if openapi_text:
-        return ""
-    if url_content and not url_content.get("error"):
-        raw = str(url_content.get("raw_text") or url_content.get("description") or "")
-        ac = str(url_content.get("acceptance_criteria") or "")
-        # A Jira SUB-TASK is a one-liner on its own; its requirements live on
-        # the parent story, which jira_fetcher now supplies under its own key.
-        # Judge the gate on that too, or every sub-task keeps getting blocked
-        # as "under-specified" even though the context is right there.
-        parent = str(url_content.get("parent_context") or "")
-        combined = "\n".join(p for p in (raw, ac, parent) if p).strip()
-        return combined or text
-    return text
-
-
-def _shape_ambiguity_clarify(
-    questions: list,
-    testable_surface: str = "",
-    *,
-    degraded: bool = False,
-    reason: str = "",
-) -> str:
-    """Render the clarifying-questions reply for the non-interactive MCP path.
-
-    When ``degraded`` is True the pre-pass could NOT classify (backend
-    unavailable / session limit / parse failure) -- that is NOT the same as a
-    classified "under-specified" ticket. Wording must say so (2026-07-30
-    evening run: Claude CLI session limit was relayed as a vague ticket).
-    """
-    q_md = "\n".join(f"- {q}" for q in list(questions)[:3])
-    surface = ""
-    if testable_surface in ("backend", "api", "docs", "none"):
-        surface = (
-            " This ticket reads as a backend / API / documentation change with "
-            "no obvious user-facing screen, so the key thing to confirm is WHERE "
-            "these should be tested."
-        )
-    if degraded:
-        why = (
-            "I held off generating because the requirement pre-pass could not "
-            "classify this ticket (LLM backend unavailable or the classifier "
-            "call failed) -- this is a safety pause, not a judgement that the "
-            "ticket itself lacks detail."
-        )
-        detail = ""
-        clean = (reason or "").strip().replace("\n", " ")
-        if clean:
-            detail = f"\n\nClassifier error (truncated): `{clean[:160]}`"
-        return (
-            "## \u26a0\ufe0f Could not verify the ticket is testable\n\n"
-            + why
-            + surface
-            + detail
-            + "\n\n"
-            f"{q_md}\n\n"
-            "If you know the ticket is testable, call again with "
-            "`proceed_anyway=true`. Or fix the server LLM backend "
-            "(`QA_LLM_BACKEND` / Claude CLI login / API key) and retry."
-        )
-    return (
-        "## \u26a0\ufe0f A few details will make these test cases valid\n\n"
-        "I held off generating because this ticket looks under-specified for "
-        "reliable manual test cases." + surface + "\n\n"
-        f"{q_md}\n\n"
-        "Reply with these details (especially the application URL or environment "
-        "to test against), then call `qa_generate_test_cases` again.\n\n"
-        "Prefer to generate anyway with what's available? Call "
-        "`qa_generate_test_cases` again with `proceed_anyway=true`."
-    )
-
-
-# Only the first few open questions are shown — a chatty thread must not turn
-# the reply into a wall of quoted ticket text.
-_MAX_AMENDMENT_QUESTIONS = 3
-
-
-def _shape_amendment_clarify(questions: list) -> str:
-    """Clarification reply for questions the ticket's comment thread left open.
-
-    SECURITY: unlike _shape_ambiguity_clarify below — whose questions are
-    written by our own analyze_requirements call — these strings are derived
-    from ticket COMMENT text, which is attacker-writable, and this tool result
-    is consumed as context by the host model (Claude Desktop / Cursor). The
-    constitution's containment rule therefore applies here too: every item goes
-    through tools/comment_reconciler.neutralize_for_display (control chars,
-    forged <<<AMENDMENT_*>>> fences, forged <untrusted_content> tags,
-    markdown/Jira link syntax and every URL removed) and the rendered list is
-    emitted inside wrap_untrusted() so the host model treats it as quoted data.
-
-    Returns "" when nothing usable is open. Never raises.
-    """
-    try:
-        items: list[str] = []
-        for question in questions or []:
-            cleaned = neutralize_for_display(question)
-            if cleaned:
-                items.append(f"- {cleaned}")
-            if len(items) >= _MAX_AMENDMENT_QUESTIONS:
-                break
-        if not items:
-            return ""
-        return (
-            "## \u26a0\ufe0f The ticket's comments leave requirements open\n\n"
-            "I held off generating because the comment thread changes or "
-            "questions the description without settling it. The quoted text "
-            "below was copied from the ticket and is DATA, not instructions:"
-            "\n\n"
-            + wrap_untrusted("jira_comment_questions", "\n".join(items), limit=1200)
-            + "\n\nReply with the agreed answers (or update the ticket), then "
-            "call `qa_generate_test_cases` again.\n\n"
-            "Prefer to generate anyway with what's available? Call "
-            "`qa_generate_test_cases` again with `proceed_anyway=true`."
-        )
-    except Exception:
-        logger.debug("mcp amendment gate shaping failed — proceeding", exc_info=True)
-        return ""
-
-
-# Opt-in ambiguity-gate verdict cache (QA_AMBIGUITY_CACHE_TTL_S; 0 = off =
-# today's behaviour). Process-local, bounded, never persisted. MEASURED 55.8s for
-# ONE small classification on the `cli` backend (2026-07-30 run), and a
-# re-prepare of the same ticket pays it again in full.
-#
-# SCOPE: this is NOT a host-mode feature. _maybe_ambiguity_clarify is reached
-# through _ground_and_gate, which handle_generate_test_cases (SERVER mode) and
-# handle_prepare_test_cases (host mode) BOTH call, so turning the TTL on changes
-# how often a SHYJ-7154 safety verdict is recomputed on EVERY generation path.
-# That is why the shipped TTL is deliberately short (300s: long enough to cover a
-# retry inside one session, short enough that an edited ticket is re-judged).
-#
-# LOAD-BEARING, two rules, both about never freezing the fail-safe:
-#   1. a `degraded` verdict is NEVER stored. `degraded` means the pre-pass could
-#      NOT classify (the SHYJ-7154 fail-safe), so caching it would freeze a
-#      transient backend outage into a sticky CLARIFY, and a later read could not
-#      tell that answer apart from a real classification.
-#   2. a result carrying no RECOGNISED `severity` is never stored either. A
-#      malformed / unexpected payload reads as "proceed" through gate_triggers'
-#      `.get("severity", "none")` default, and caching that would turn ONE bad
-#      response into a TTL-long silent bypass of the gate.
-# Only CLASSIFIED verdicts (severity in SEVERITY_ORDER, not degraded) are cached.
-_AMBIGUITY_CACHE_MAX = 32
-# key -> (monotonic_ts, clarify_markdown_or_None). A plain dict: insertion order
-# is guaranteed, so FIFO eviction needs no extra import.
-_ambiguity_cache: dict = {}
-
-
-def _ambiguity_cache_key(analysis_text: str, gate: str) -> str:
-    """Content hash + gate severity + classifier model.
-
-    The gate severity and the model are part of the key because both change the
-    VERDICT, not just its cost -- lowering the gate or switching classifier must
-    MISS rather than replay a verdict taken under the old configuration.
-    """
-    digest = hashlib.sha256(analysis_text.encode("utf-8", "replace")).hexdigest()
-    try:
-        model = str(settings.qa_classifier_model or "")
-    except Exception:  # pragma: no cover - defensive
-        model = ""
-    return f"{digest}|{gate}|{model}"
-
-
-def _ambiguity_cache_get(key: str, ttl: int) -> tuple:
-    """Return (True, verdict) on a live hit, else (False, None). Never raises."""
-    if not key or ttl <= 0:
-        return False, None
-    try:
-        entry = _ambiguity_cache.get(key)
-        if entry is None:
-            return False, None
-        ts, verdict = entry
-        if time.monotonic() - ts > ttl:
-            _ambiguity_cache.pop(key, None)
-            return False, None
-        return True, verdict
-    except Exception:
-        # MINOR-4: DROP the unreadable entry. Leaving it in place makes this key
-        # raise, be swallowed and re-classify on EVERY call for the life of the
-        # process -- a permanent, silent cache miss that looks like a working cache.
-        _ambiguity_cache.pop(key, None)
-        logger.debug("ambiguity cache read failed -- reclassifying", exc_info=True)
-        return False, None
-
-
-def _is_classified(result: dict) -> bool:
-    """True only for a result the gate can actually READ as a verdict: not
-    degraded, and carrying a severity in SEVERITY_ORDER. Anything else -- a
-    truncated response, a schema change, a stub -- counts as unclassified and is
-    never cached. Never raises."""
-    try:
-        if result.get("degraded"):
-            return False
-        return str(result.get("severity", "")).strip().lower() in SEVERITY_ORDER
-    except Exception:  # pragma: no cover - defensive
-        return False
-
-
-def _ambiguity_cache_put(key: str, verdict) -> None:
-    """Store a CLASSIFIED verdict. A falsy key means the cache is off (or the
-    result was not classifiable). Never raises, and never called with a degraded
-    or unclassified result."""
-    if not key:
-        return
-    try:
-        _ambiguity_cache.pop(key, None)
-        _ambiguity_cache[key] = (time.monotonic(), verdict)
-        while len(_ambiguity_cache) > _AMBIGUITY_CACHE_MAX:
-            _ambiguity_cache.pop(next(iter(_ambiguity_cache)), None)
-    except Exception:  # pragma: no cover - defensive
-        logger.debug("ambiguity cache write failed -- ignoring", exc_info=True)
-
-
-async def _maybe_ambiguity_clarify(
-    text: str, url_content: dict | None, openapi_text: str | None
-) -> str | None:
-    """Ambiguity/clarify gate for the MCP path (respects QA_AMBIGUITY_GATE_SEVERITY).
-
-    Returns a clarifying-questions markdown string when the ticket is too
-    under-specified / no-UI to generate reliable cases from; otherwise None.
-    Never raises — any failure returns None so generation proceeds.
-    """
-    try:
-        gate = (settings.qa_ambiguity_gate_severity or "high").strip().lower()
-        if gate == "off":
-            return None
-        analysis_text = _ambiguity_source_text(text, url_content, openapi_text)
-        if not analysis_text.strip():
-            return None
-        ttl = 0
-        try:
-            ttl = int(settings.qa_ambiguity_cache_ttl_s or 0)
-        except Exception:  # pragma: no cover - defensive
-            ttl = 0
-        cache_key = _ambiguity_cache_key(analysis_text, gate) if ttl > 0 else ""
-        hit, cached = _ambiguity_cache_get(cache_key, ttl)
-        if hit:
-            # INFO, alongside the existing timing line: the gate cost must stay
-            # attributable in the log, and a vanished line reads as a vanished
-            # step rather than a cheap one.
-            logger.info(
-                "ambiguity gate: cache HIT (ttl=%ds) -> %s -- no LLM call",
-                ttl,
-                "CLARIFY" if cached else "proceed",
-            )
-            return cached
-        result = await analyze_requirements(analysis_text)
-        # SHYJ-7154 fail-SAFE (host mode): a "degraded" result means the pre-pass
-        # could NOT classify (no usable backend, or the call failed), NOT that
-        # the ticket is clear. The gate is ON here (off already returned above),
-        # so treat "unable to classify" as CLARIFY — never fabricate a suite from
-        # an under-specified / no-UI ticket just because we could not check it.
-        if result.get("degraded"):
-            # DELIBERATELY NOT CACHED. This is the fail-safe answer to "could
-            # not classify", not a classification: caching it would freeze a
-            # transient backend outage into a sticky CLARIFY for the whole TTL.
-            return _shape_ambiguity_clarify(
-                result.get("questions") or [],
-                str(result.get("testable_surface") or ""),
-                degraded=True,
-                reason=str(result.get("failure_reason") or ""),
-            )
-        # MINOR-5: only a result the gate can READ as a verdict is cacheable.
-        # An unrecognised payload falls through gate_triggers as 'proceed'
-        # (its severity default is "none"); caching that would turn ONE bad
-        # response into a TTL-long silent bypass of a safety gate.
-        cacheable = cache_key if _is_classified(result) else ""
-        if not gate_triggers(result, gate):
-            _ambiguity_cache_put(cacheable, None)
-            return None
-        verdict = _shape_ambiguity_clarify(
-            result.get("questions") or [], str(result.get("testable_surface") or "")
-        )
-        _ambiguity_cache_put(cacheable, verdict)
-        return verdict
-    except Exception:
-        logger.debug("mcp ambiguity gate failed — proceeding", exc_info=True)
-        return None
+# The server-side ambiguity gate lived here until 2026-08-16 (dead-code
+# deletion P2-J): _ambiguity_source_text, _shape_ambiguity_clarify, the
+# bounded verdict cache and _maybe_ambiguity_clarify itself. It had been
+# unreachable since 2026-08-12 -- _ground_and_gate was its only caller and
+# reached it only through the `else` of `if not run_ambiguity_llm:`, a
+# condition constantly True because the generation mode is the "host"
+# constant. tools/requirement_analyzer.py, which held analyze_requirements
+# and gate_triggers, went with it; the ledger id
+# `requirement_analyzer.ambiguity_gate` STAYS in tools.host_llm.LEDGER_IDS,
+# which never shrinks. The check itself is not lost: it runs on the tester's
+# own model as the prepare payload's step-0 ambiguity_job
+# (agents.host_mode.attach_ambiguity_job), which carries the SHYJ-7154 rule
+# verbatim.
 
 
 # Cap on the free-form feature description stored as corpus metadata (the
@@ -3381,20 +2896,43 @@ _FEATURE_TEXT_METADATA_CAP = 2000
 
 _CORPUS_SOURCE_KEY_CAP = 300
 
+# Prefix for the identity a PASTED FEATURE DESCRIPTION gets. It is a prefix, not
+# a bare digest, so a key can never be mistaken for a URL and the two namespaces
+# cannot collide.
+_CORPUS_TEXT_KEY_PREFIX = "text:"
 
-def _corpus_source_key(source_url: object) -> str:
+
+def _corpus_source_key(source_url: object, feature_text: object = "") -> str:
     """Stable corpus identity for the SOURCE a suite was generated from.
 
-    The trimmed, trailing-slash-stripped source URL -- the only identity a stored
-    corpus entry can carry here, and the one a re-generation of the same Jira
-    ticket reproduces exactly. Anything that is not an http(s) URL (a plain
-    feature description, an empty string, None) yields "", which the caller reads
-    as "no key" and falls back to today's append. Pure; never raises."""
+    For a Jira/spec URL: the trimmed, trailing-slash-stripped URL, which a
+    re-generation of the same ticket reproduces exactly.
+
+    For everything else -- a pasted feature description, which is the product's
+    primary advertised flow -- a digest of that description, whitespace-collapsed
+    and lower-cased so incidental re-formatting still matches. This used to
+    return "" for every non-URL source, and the caller reads "" as "just append":
+    the de-dup fix therefore protected Jira suites and left the pasted-text path
+    append-only, re-creating in that half exactly the corpus self-confounding
+    (571 -> 676 docs, 5/5 neighbours flagged as duplicate risk) that
+    _persist_suite_to_corpus below exists to end.
+
+    An EDITED description is a different key and so appends -- deliberately: two
+    different descriptions are two different sources, and only the server-side
+    text can be compared here. The duplicate this closes is the dominant one, a
+    re-run of the same input.
+
+    With neither a URL nor any text there is no identity at all and this still
+    returns "". Pure; never raises."""
     try:
         raw = str(source_url or "").strip().rstrip("/")
-        if not raw.lower().startswith(("http://", "https://")):
+        if raw.lower().startswith(("http://", "https://")):
+            return raw[:_CORPUS_SOURCE_KEY_CAP]
+        text = " ".join(str(feature_text or "").split()).lower()
+        if not text:
             return ""
-        return raw[:_CORPUS_SOURCE_KEY_CAP]
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+        return f"{_CORPUS_TEXT_KEY_PREFIX}{digest}"
     except Exception:  # pragma: no cover - defensive
         return ""
 
@@ -3436,7 +2974,9 @@ async def _persist_suite_to_corpus(
     # which is the very defect this change exists to end, and the corpus is a
     # grounding aid, not a system of record (the suite itself lives in
     # suite_store and the .xlsx export).
-    source_key = _corpus_source_key(source_url)
+    # feature_text matters here: without it a pasted-description suite has no
+    # identity and silently falls back to append.
+    source_key = _corpus_source_key(source_url, feature_text)
     written = 0
     fresh_ids: list = []
     for tc in cases:
@@ -3486,9 +3026,9 @@ async def _persist_suite_to_corpus(
         )
     else:
         logger.debug(
-            "RAG: this suite has no source key (no http(s) source URL) -- "
-            "appending, since the corpus cannot de-duplicate a source it "
-            "cannot name"
+            "RAG: this suite has no source key (no http(s) source URL and no "
+            "feature text) -- appending, since the corpus cannot de-duplicate a "
+            "source it cannot name"
         )
 
 
@@ -3496,7 +3036,6 @@ async def handle_generate_test_cases(
     feature_or_url: str,
     *,
     attached_images: list | None = None,
-    force_feature_report: bool = False,
     proceed_anyway: bool = False,
     source_plan: str = "",
     attached_image_count: int = 0,
@@ -3515,181 +3054,53 @@ async def handle_generate_test_cases(
         return await _guided_test_cases(
             choose=choose, ask_text=ask_text, progress=progress
         )
-    # Host-mode routing (ops-3d-3): QA_GENERATION_MODE=host -- or =auto resolving
-    # to host on a non-editor host / unusable backend -- runs the 8-category
-    # fan-out in the tester's OWN chat model. Return the grounded prepare payload
-    # instead of generating server-side. Placed BEFORE grounding so host mode
-    # grounds exactly ONCE (handle_prepare_test_cases -> _ground_and_gate fetches
-    # + gates on its own). attached_images SUPPRESS host routing BY DEFAULT:
-    # mobile screenshots / mockups are consumed by a server-side describe_images()
-    # vision call and are NOT forwarded to the host model (PreparePayloadResult
-    # .images then carries only Jira ticket images), so that path stays
-    # server-mode. QA_HOST_IMAGE_DESCRIPTION_ENABLED lifts exactly that
-    # suppression -- and only it: the attachments then ride to the host's own
-    # multimodal model as MCP image content and NO server-side vision call is
-    # made, which is why the reason for the suppression no longer holds.
-    # qa_generate_test_cases returns str, so render_prepare_payload's
-    # self-contained markdown+JSON block is what even a string-only client relays.
-    if not attached_images or _host_image_forwarding_on():
-        import llm
-
-        if llm.resolve_generation_mode() == "host":
-            # The image gate lives in handle_prepare_test_cases, and this branch
-            # is how most testers reach it (generation mode is hardcoded "host"),
-            # so the four gate arguments MUST be forwarded: without them the gate
-            # would ask a question this tool has no parameter to answer, and the
-            # only escape on a client that auto-cancels dialogs would be to call
-            # a DIFFERENT tool. The legacy server-mode path below is untouched
-            # and keeps its post-hoc notice.
-            #
-            # attached_images is forwarded too, which this reroute previously
-            # DROPPED: the Feature-Analysis `jira_mobile` route captures device
-            # screens and calls this handler with them, so without this the
-            # screens vanished here AND beat 1 asked the tester where the screens
-            # come from immediately after they captured them.
-            return render_prepare_payload(
-                await handle_prepare_test_cases(
-                    text,
-                    attached_images=attached_images,
-                    proceed_anyway=proceed_anyway,
-                    choose=choose,
-                    ask_text=ask_text,
-                    progress=progress,
-                    jira_content_json=jira_content_json,
-                    source_plan=source_plan,
-                    attached_image_count=attached_image_count,
-                    capture_ids=list(capture_ids or []),
-                    image_gate_ack=image_gate_ack,
-                    image_carry_ack=image_carry_ack,
-                )
-            )
-    try:
-        # Front half CONVERGED onto _ground_and_gate (ops-3d-3, debt item 2a):
-        # this handler and the host-mode prepare path now share ONE grounding +
-        # gating implementation, so a future safety fix (SHYJ-7154 ambiguity gate,
-        # amendment gate, comment reconcile) cannot silently miss one path. The
-        # server path passes audit_source="generate" so the audit-log "source"
-        # tag is byte-identical to the pre-convergence behaviour; the only other
-        # deltas were two log-message em-dashes that became "--" (cosmetic,
-        # unasserted). The drift regression test (tests/test_host_mode_routing.py)
-        # guards this convergence against future one-sided edits.
-        grounded = await _ground_and_gate(
+    # Generation is CHAT-ONLY and UNCONDITIONAL: this tool grounds the request
+    # and hands the 8-category fan-out to the tester's OWN chat model, exactly
+    # as qa_prepare_test_cases does. qa_generate_test_cases returns str, so
+    # render_prepare_payload's self-contained markdown+JSON block is what even a
+    # string-only client relays.
+    #
+    # The four gate arguments MUST be forwarded: the image gate lives in
+    # handle_prepare_test_cases and this tool is how most testers reach it, so
+    # without them the gate would ask a question this tool has no parameter to
+    # answer, and the only escape on a client that auto-cancels dialogs would be
+    # to call a DIFFERENT tool. attached_images is forwarded for a reason this
+    # reroute once got wrong by DROPPING it: the Feature-Analysis `jira_mobile`
+    # route captures device screens and calls this handler with them, so without
+    # it the screens vanished here AND beat 1 asked the tester where the screens
+    # come from immediately after they captured them.
+    #
+    # 2026-08-15 (dead-code deletion Phase 2, batch P2-D): the reroute used to
+    # sit under two guards -- `not attached_images or _host_image_forwarding_on()`
+    # and `llm.resolve_generation_mode() == "host"` -- with a legacy SERVER-mode
+    # branch below them. Both guards resolve from the hardcoded "host" constant,
+    # so that branch had been unreachable since 2026-08-12 and is now DELETED,
+    # and the guards went with it. They are deliberately not kept as a
+    # "harmless" wrapper: with nothing below, `if <constant>: return ...` falls
+    # off the end and returns None, and re-adding an else is how a server-side
+    # call gets back onto a tester-facing tool. The deleted branch called
+    # _ground_and_gate WITHOUT run_ambiguity_llm, i.e. at its dangerous default
+    # (True), which would have reached
+    # requirement_analyzer.analyze_requirements -- a server-side backend call.
+    # That is what makes deleting the whole fall-through, rather than only its
+    # guard, the safe direction. (ui_extractor's Tier-3 vision fallback was the
+    # other such call; P2-F1 deleted it outright on 2026-08-16.)
+    return render_prepare_payload(
+        await handle_prepare_test_cases(
             text,
             attached_images=attached_images,
             proceed_anyway=proceed_anyway,
             choose=choose,
             ask_text=ask_text,
             progress=progress,
-            audit_source="generate",
             jira_content_json=jira_content_json,
+            source_plan=source_plan,
+            attached_image_count=attached_image_count,
+            capture_ids=list(capture_ids or []),
+            image_gate_ack=image_gate_ack,
+            image_carry_ack=image_carry_ack,
         )
-        if isinstance(grounded, str):
-            return grounded
-        url_content = grounded.url_content
-        ui_content = grounded.ui_content
-        openapi_text = grounded.openapi_text
-
-        captured: dict = {}
-
-        def _on_ready(suite) -> None:
-            captured["suite"] = suite
-
-        async def _on_status(msg: str) -> None:
-            await _emit(progress, msg)
-
-        async def _on_progress(count: int) -> None:
-            await _emit(progress, f"🧪 {count} test cases generated so far…")
-
-        summary, _x, _c, _t, status = await generate_test_scenarios(
-            feature_text=text,
-            url_content=url_content,
-            ui_content=ui_content,
-            openapi_text=openapi_text,
-            attached_images=attached_images,
-            force_feature_report=force_feature_report,
-            defer_files=True,
-            on_suite_ready=_on_ready,
-            on_status=_on_status,
-            on_progress=_on_progress,
-        )
-
-        suite = captured.get("suite")
-        suite_id = ""
-        if suite is not None and getattr(suite, "test_cases", None):
-            await _emit(progress, "💾 Saving the suite…")
-            saved = await save_suite(
-                suite,
-                feature_text=text,
-                source_url=(text if url_content else None),
-            )
-            suite_id = (saved.get("content") or {}).get(
-                "suite_id", ""
-            ) or suite.suite_id
-            # Batch 2: the atomic checklist + its coverage audit are a DURABLE
-            # artifact — persist them next to the suite so a coverage claim can
-            # be re-audited after the session. Never-raise; a failure here must
-            # not affect the generation reply.
-            _checklist_artifacts = getattr(suite, "_checklist_artifacts", None)
-            if _checklist_artifacts and suite_id:
-                await save_checklist(suite_id, _checklist_artifacts)
-            # QW-6: seed the RAG corpus with the fresh cases — the write
-            # half of the RAG loop (query_corpus grounding is the read half).
-            await _persist_suite_to_corpus(
-                suite,
-                feature_text=text,
-                source_url=(text if url_content else ""),
-            )
-        case_count = len(getattr(suite, "test_cases", []) or [])
-        if openapi_text:
-            source = "swagger"
-        elif url_content:
-            source = "jira"
-        elif attached_images:
-            source = "mobile"
-        else:
-            source = "text"
-        telemetry.add_tool_properties(case_count=case_count, source=source)
-        await _audit(
-            "mcp_generate_test_cases",
-            entity_id=suite_id or None,
-            detail={
-                "status": status,
-                "cases": case_count,
-                # Step 0: traceability outcome as data (acs / covered /
-                # traced_cases / orphan_cases), so a degenerate RTM is
-                # queryable instead of only printed.
-                **_rtm_trace_detail(suite),
-            },
-        )
-        auto_export = bool(suite is not None and getattr(suite, "test_cases", None))
-        result_md = shape_generation_result(
-            summary, suite, suite_id, status, auto_export=auto_export
-        )
-        xlsx_paths: list[str] = []
-        if auto_export:
-            _export_note = await _auto_export_xlsx(
-                suite,
-                ask_text=ask_text,
-                on_path=xlsx_paths.append,
-                progress=progress,
-            )
-            if _export_note:
-                # PREPENDED (see _auto_export_xlsx): the deliverable path must
-                # not sit behind the suite body, where a host model that
-                # summarises the tool result drops it silently.
-                result_md = f"{_export_note}\n\n---\n\n{result_md}"
-        if suite is not None and getattr(suite, "test_cases", None):
-            result_md += await _auto_export_zephyr(
-                suite,
-                source_text=text,
-                near_path=xlsx_paths[0] if xlsx_paths else "",
-                progress=progress,
-            )
-        return result_md
-    except Exception as exc:
-        logger.exception("handle_generate_test_cases failed")
-        _capture_error(exc, "qa_generate_test_cases")
-        return f"⚠️ Test-case generation failed: {exc}"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -3715,11 +3126,6 @@ class _Grounding:
     url_content: dict | None = None
     ui_content: dict | None = None
     openapi_text: str | None = None
-    # Phase 3c: how many ticket comments survived comment_reconciler's Stage 1a
-    # noise filter. 0 when the feature is off, when there is no ticket, or when
-    # the thread was empty. The prepare handler needs it to avoid announcing a
-    # suppression that could not have happened (Phase 3b's MAJOR, not repeated).
-    comment_thread_kept: int = 0
 
 
 async def _ground_and_gate(
@@ -3731,15 +3137,20 @@ async def _ground_and_gate(
     ask_text: AskCb = None,
     progress: ProgressCb = None,
     audit_source: str = "prepare",
-    run_ambiguity_llm: bool = True,
-    suppress_comment_llm: bool = False,
-    defer_vision: bool = False,
     jira_content_json: str = "",
 ) -> "str | _Grounding":
     """Run the shared front half: URL/Jira fetch, _jira_preflight, Swagger
-    ingest, UI extraction, comment reconciliation, and the (fail-safe) ambiguity
-    gate. Returns a markdown STRING to short-circuit (setup hint / preflight /
-    clarifying questions) or a _Grounding to proceed.
+    ingest, UI extraction and the (fail-safe) ambiguity gate. Returns a markdown
+    STRING to short-circuit (setup hint / preflight / clarifying questions) or a
+    _Grounding to proceed.
+
+    Comment reconciliation left that list on 2026-08-15: dead-code deletion
+    batch D5 deleted tools/comment_reconciler.py, the amendment gate that could
+    short-circuit here, and the suppress_comment_llm parameter that governed it.
+    A ticket's comment thread now reaches generation exactly as it did before
+    the pipeline existed -- as the raw "## Comments" dump jira_mcp leaves in the
+    ticket text -- which is what every install has actually done since the seam
+    was pinned False on 2026-08-14. See docs/RETIRED_CAPABILITIES.md section 4.
 
     A faithful re-derivation of the front half of handle_generate_test_cases; it
     is intentionally a SEPARATE helper rather than a refactor of that handler, so
@@ -3803,144 +3214,31 @@ async def _ground_and_gate(
                 ui_content = None
             else:
                 try:
-                    ui_content = await extract_ui_elements(
-                        text, prefetched=url_content, defer_vision=defer_vision
-                    )
+                    ui_content = await extract_ui_elements(text, prefetched=url_content)
                 except Exception:
                     logger.debug(
                         "mcp: UI extraction failed -- continuing", exc_info=True
                     )
                     ui_content = None
 
-    amendment_questions: list = []
-    comment_thread_kept = 0
-    if (
-        settings.qa_comment_reconcile_enabled
-        and url_content
-        and not url_content.get("error")
-    ):
-        try:
-            # Phase 3c: with suppress_comment_llm the QUARANTINED Stage 1b
-            # ask_json is skipped, so say "reading", not "reconciling" -- the
-            # progress line must not promise resolution that will not happen.
-            await _emit(
-                progress,
-                "\U0001f9fe Reading the ticket's comments…"
-                if suppress_comment_llm
-                else "\U0001f9fe Reconciling the ticket's comments…",
-            )
-            recon = await reconcile_comments(
-                url_content.get("comments_meta") or [],
-                field_vocabulary_text="\n".join(
-                    str(url_content.get(key) or "")
-                    for key in ("description", "acceptance_criteria")
-                ),
-                suppress_llm_extraction=suppress_comment_llm,
-            )
-            recon_content = recon.get("content") or {}
-            block = str(recon_content.get("block") or "")
-            if block:
-                url_content["amendments_context"] = block
-            amendment_questions = list(recon_content.get("flagged") or [])
-            try:
-                comment_thread_kept = int(
-                    (recon_content.get("stats") or {}).get("kept", 0) or 0
-                )
-            except Exception:
-                comment_thread_kept = 0
-            await _audit(
-                "mcp_comment_reconcile",
-                detail={
-                    "amendments": len(recon_content.get("amendments") or []),
-                    "flagged": len(amendment_questions),
-                    "resolutions": recon_content.get("audit") or [],
-                    # Phase 3c: an audit row that recorded "0 amendments" without
-                    # this key could not be told apart from a thread that
-                    # genuinely contained none.
-                    "llm_extraction_suppressed": bool(suppress_comment_llm),
-                    "comments_kept": comment_thread_kept,
-                },
-            )
-        except Exception:
-            logger.warning(
-                "mcp comment reconciliation failed -- generating without it",
-                exc_info=True,
-            )
-
     if not proceed_anyway and not attached_images:
-        gate_off = (
-            settings.qa_ambiguity_gate_severity or "high"
-        ).strip().lower() == "off"
-        if amendment_questions and not gate_off:
-            clarify = _shape_amendment_clarify(amendment_questions)
-            if clarify:
-                await _audit("mcp_amendment_gate", detail={"source": audit_source})
-                return clarify
-        # ops-7: this gate was completely un-logged -- a real run on 2026-07-29
-        # showed a 28-second hole here with no output at all. Time it, so the cost
-        # is attributable instead of a mystery.
-        # CORRECTION (2026-07-30): this comment used to claim the gate was the ONLY
-        # server-side LLM call left on the host prepare path. It is not.
-        # rtm.generate_acs (tools/rtm.py:76, via _need_acs at
-        # agents/test_scenario_agent.py:2830) fires unconditionally whenever the
-        # ticket carried no parsed ACs and has NO off switch; comment
-        # reconciliation (tools/comment_reconciler.py) and atomic-checklist
-        # decomposition (tools/atomic_checklist.py) add one each when enabled; and
-        # ui_extractor's Tier-3 ask_vision is reachable for a non-Jira page URL.
-        # _SERVER_LLM_FLAGS below discloses the flag-gated ones to the tester.
-        if not gate_off:
-            # 55.8s of complete silence on the 2026-07-30 run: the tester read
-            # a working gate as a hung server (Cursor's own progress bridge was
-            # ALSO down that session -- see operations/runbook.md). Advisory
-            # only, so no flag: a progress notification is not part of any
-            # generated artifact. Skipped entirely when the gate is off, so a
-            # kill-switched deployment stays silent.
-            # SCOPE: _ground_and_gate is SHARED -- handle_generate_test_cases
-            # (SERVER mode) and handle_prepare_test_cases (host mode) both call
-            # it, so this line appears on BOTH paths, not just host prepare.
-            await _emit(
-                progress,
-                "\U0001f9d0 Checking the ticket has enough detail to test\u2026",
-            )
-        # The timing line below covers SERVER mode too, for the same reason.
-        # run_ambiguity_llm=False: host-mode prepare with
-        # QA_HOST_AMBIGUITY_REVIEW_ENABLED -- skip the server CLI/API call and
-        # let the chat run ambiguity_job from the prepare payload instead.
-        if not run_ambiguity_llm:
-            logger.info(
-                "prepare: ambiguity gate SKIPPED (host ambiguity review; "
-                "no server-side classifier call)"
-            )
-            await _audit(
-                "mcp_ambiguity_gate",
-                detail={"source": audit_source, "skipped": "host_ambiguity_review"},
-            )
-        else:
-            _gate_t0 = time.monotonic()
-            clarify = await _maybe_ambiguity_clarify(text, url_content, openapi_text)
-            logger.info(
-                "prepare: ambiguity gate took %.1fs (severity=%s, model=%s) -> %s",
-                time.monotonic() - _gate_t0,
-                settings.qa_ambiguity_gate_severity,
-                settings.qa_classifier_model or "default",
-                "CLARIFY" if clarify else "proceed",
-            )
-            if clarify:
-                await _audit(
-                    "mcp_ambiguity_gate",
-                    detail={
-                        "source": audit_source,
-                        "degraded": "could not verify" in (clarify or "").lower()
-                        or "could not classify" in (clarify or "").lower(),
-                    },
-                )
-                return clarify
+        # The server-side ambiguity pre-pass is GONE (P2-J, 2026-08-16), so
+        # there is no branch here any more and no progress line announcing a
+        # check this process does not perform. The audit event is KEPT: an
+        # operator reading the trail must still see that the gate was
+        # DELEGATED rather than silently absent.
+        logger.info(
+            "prepare: ambiguity gate runs on the host (no server-side classifier call)"
+        )
+        await _audit(
+            "mcp_ambiguity_gate",
+            detail={"source": audit_source, "skipped": "host_ambiguity_review"},
+        )
 
     return _Grounding(
         url_content=url_content,
         ui_content=ui_content,
         openapi_text=openapi_text,
-        comment_thread_kept=comment_thread_kept,
     )
 
 
@@ -3970,52 +3268,54 @@ class PreparePayloadResult:
     images: list = field(default_factory=list)
 
 
-# Flags that put a SERVER-SIDE LLM call back on the host-mode path, split by
-# which half pays for it. Host mode's premise is that the tester's OWN model
-# generates, so each of these quietly breaks it: a keyless install degrades
-# silently, and a backed one pays latency the tester never sees.
-# NOT exhaustive by design -- see the closing line of the notice: the ambiguity
-# pre-pass and AC synthesis call the backend unconditionally.
-_SERVER_LLM_FLAGS_PREPARE: tuple = (
-    (
-        "qa_atomic_checklist_enabled",
-        "QA_ATOMIC_CHECKLIST_ENABLED",
-        "the atomic requirements checklist",
-    ),
-    (
-        "qa_comment_reconcile_enabled",
-        "QA_COMMENT_RECONCILE_ENABLED",
-        "Jira comment reconciliation",
-    ),
-)
-_SERVER_LLM_FLAGS_SUBMIT: tuple = (
-    ("qa_test_plan_artifacts", "QA_TEST_PLAN_ARTIFACTS", "test-plan artifacts"),
-    ("qa_llm_risk_scoring", "QA_LLM_RISK_SCORING", "LLM risk scoring"),
-    (
-        "qa_checklist_nli_enabled",
-        "QA_CHECKLIST_NLI_ENABLED",
-        "checklist entailment (needs QA_ATOMIC_CHECKLIST_ENABLED)",
-    ),
-    (
-        "qa_checklist_adjudicate_enabled",
-        "QA_CHECKLIST_ADJUDICATE_ENABLED",
-        "checklist adjudication (needs QA_ATOMIC_CHECKLIST_ENABLED)",
-    ),
-)
-_SERVER_LLM_FLAGS: tuple = _SERVER_LLM_FLAGS_PREPARE + _SERVER_LLM_FLAGS_SUBMIT
-
-
 def _dist_needs_no_backend() -> bool:
     """True when NOTHING on this install can reach a server-side LLM backend.
 
-    The test-cases-only (public dist) edition: generation is hardcoded host mode
-    (``_coerce_generation_mode``), the three boomerang gates are hardcoded ON, and
-    since 2026-08-03 the ``qa_feature_analysis`` pair -- whose mobile modes were
-    the last tester-facing ``ask_vision`` caller here -- is not registered. What
-    is left that could still call a backend is exactly ``_SERVER_LLM_FLAGS``,
-    every one of them opt-in and absent from the shipped ``.env``; ANDing them in
-    (rather than hardcoding a second list) means an operator who turns one ON is
-    correctly told the backend matters again.
+    The test-cases-only (public dist) edition. The enumeration, stated
+    explicitly rather than asserted, because a wrong True here suppresses a
+    REAL blocker:
+
+      * generation is hardcoded host mode -- llm.resolve_generation_mode()
+        returns the "host" constant (2026-08-12), so the ambiguity pre-pass
+        (run_ambiguity_llm=False, and amb_skipped below is a literal True),
+        AC synthesis (synthesize_acs=False -> AC_JOB) and image description
+        (describe_*_server_side=False) all run on the HOST, not here;
+      * the requirement decomposition is CHECKLIST_JOB (decompose_checklist
+        is structurally False on this path) since 2026-08-14;
+      * comment reconciliation, the two checklist tiers, risk scoring and
+        test-plan artifacts are False seams since 2026-08-14 and return at
+        their own gate with zero calls;
+      * the prompt-cache warm-up no longer exists to suppress: it was
+        skipped on every host prepare from Phase 3d and DELETED on
+        2026-08-16 (P2-F2), along with the `warm_cache` parameter;
+      * ui_extractor's Tier-3 ask_vision no longer exists at all: it was
+        DEFERRED on every production call from 2026-08-12 and DELETED on
+        2026-08-16 (P2-F1). The rendered screenshot rides to the host's own
+        multimodal model instead;
+      * handle_generate_test_cases has no legacy SERVER branch at all any
+        more: it was unreachable behind two constant-derived guards from
+        2026-08-12 and was DELETED on 2026-08-15 (dead-code deletion Phase 2),
+        so every call unconditionally re-enters handle_prepare_test_cases;
+      * the qa_feature_analysis pair has not been registered in this edition
+        since 2026-08-03, and the bug reporter / exploratory coach have been
+        chat-only since Phase 2;
+      * on submit, the four ledger rows that could still reach a backend
+        (test_scenario_agent.server_fanout / .rewrite_vague, the advisory gap
+        prose, rtm.nli_verdicts) are terminal and structurally unreachable.
+        Three of them no longer name any code at all: _rewrite_vague_fields,
+        analyze_coverage_gaps and the coverage critic pair were DELETED on
+        2026-08-16 (dead-code deletion P2-E1), and the ids stay in
+        host_llm.LEDGER_IDS on purpose -- see docs/LLM_MIGRATION_INVENTORY.md.
+
+    THE ONE WAY THIS BECOMES FALSE AGAIN: any new unconditional ``llm.*``
+    call added to the prepare or submit path. There is no flag left to AND
+    in -- the six server-LLM feature gates (QA_ATOMIC_CHECKLIST_ENABLED,
+    QA_CHECKLIST_NLI_ENABLED, QA_CHECKLIST_ADJUDICATE_ENABLED,
+    QA_COMMENT_RECONCILE_ENABLED, QA_LLM_RISK_SCORING, QA_TEST_PLAN_ARTIFACTS)
+    were DELETED in batch 8b-ii. That is NOT the QA_SERVER_LLM_ENABLED kill
+    switch, which is untouched and still live -- see below. So a new call
+    would silently make this claim untrue. Add its gate here, or do not add
+    the call.
 
     Used ONLY to decide whether an unusable backend is a BLOCKER in
     ``qa-doctor`` -- the same judgement ``host_llm.server_llm_retired()``
@@ -4024,35 +3324,16 @@ def _dist_needs_no_backend() -> bool:
     QA_SERVER_LLM_ENABLED, whose default flip is gated on a release soak
     (operations/runbook.md -> Server-LLM retirement rollout gate).
 
-    Never raises, and fails toward reporting the blocker. Always False in the
-    full edition, so the private checkout is byte-identical.
+    Never raises, and fails toward reporting the blocker. False in the full
+    edition UNLESS QA_DIST_MODE=true -- _test_cases_only() is
+    `qa_dist_mode or not _FULL_EDITION`, so a full checkout that sets that
+    flag opts into the dist verdict deliberately. Absent it the private
+    checkout is byte-identical and every keyed install still sees the blocker.
     """
     try:
-        if not _test_cases_only():
-            return False
-        return not any(
-            bool(getattr(settings, attr, False))
-            for attr, _env, _what in _SERVER_LLM_FLAGS
-        )
+        return _test_cases_only()
     except Exception:  # pragma: no cover - a verdict helper must never raise
         logger.debug("dist backend-optional check failed", exc_info=True)
-        return False
-
-
-def _host_image_forwarding_on() -> bool:
-    """True when generation resolves to host -- i.e. when raw screenshots go to
-    the tester's OWN multimodal model as MCP image content instead of through
-    this server's ask_vision.
-
-    Never raises: an unreadable setting or an import failure reads as OFF, which
-    is today's behaviour, so this can only ever fail CLOSED.
-    """
-    try:
-        import llm
-
-        return llm.resolve_generation_mode() == "host"
-    except Exception:
-        logger.debug("_host_image_forwarding_on check failed", exc_info=True)
         return False
 
 
@@ -4060,130 +3341,43 @@ def _host_mode_server_llm_notice(
     *,
     ac_boomeranged: bool = False,
     img_boomeranged: bool = False,
-    risk_boomeranged: bool = False,
-    plan_boomeranged: bool = False,
-    nli_suppressed: bool = False,
-    comment_suppressed: bool = False,
     checklist_boomeranged: bool = False,
     rule_packs_narrowed: bool = False,
 ) -> str:
-    """Disclose the flags that make THIS SERVER call an LLM on the host path.
+    """Disclose what this server did NOT do on the host path.
 
-    Returns "" when none are on. Never raises: a setting that cannot be read is
-    simply not mentioned, so this can only ever under-report, never break a
-    prepare.
+    ALWAYS returns at least one line -- the ambiguity-preflight disclosure is
+    unconditional -- so there is no "nothing to disclose" early return any
+    more. Never raises.
+
+    2026-08-14 (flag-surface reduction, batch 8b-ii): the "these settings
+    still make THIS SERVER call an LLM" paragraph, its `on` list and the
+    `_boomeranged` set that filtered it are GONE, together with the four
+    risk / test-plan / NLI-tier / comment-reconciliation blocks and their
+    parameters. All six settings were DELETED and hardcoded, five of them
+    OFF, so each block's text -- "`QA_LLM_RISK_SCORING` is on",
+    "`QA_TEST_PLAN_ARTIFACTS` is on", "`QA_COMMENT_RECONCILE_ENABLED` is on
+    and this ticket has comments" -- asserted a fact that can no longer be
+    true. Announcing a deleted setting as ON is the same over-claim class
+    this function was built to prevent, inverted. The `on` list was provably
+    empty in any case: five members are permanently False and the sixth,
+    the checklist, is unconditionally filtered out as boomeranged.
+
+    The four parameters below are RETAINED because they still vary per
+    prepare: a ticket carrying real ACs ships no AC job, a prepare with no
+    screenshots ships no image job, and rule_packs_narrowed is the only
+    channel by which a REVIVED rule pack's narrowing reaches the tester.
     """
-    # Phase 3a: a flag whose call THIS prepare boomeranged must not be listed as
-    # a reason "this server" calls an LLM -- with the fold shipped it makes no
-    # such call, and over-claiming a cost is the same class of dishonesty as
-    # under-claiming one.
-    # Each is disclosed instead by its own block at the bottom of this notice,
-    # exactly as the shipped AC / image folds are.
-    _boomeranged: set = set()
-    if risk_boomeranged:
-        _boomeranged.add("qa_llm_risk_scoring")
-    if plan_boomeranged:
-        _boomeranged.add("qa_test_plan_artifacts")
-    # Phase 3b: the same rule for the two checklist tiers, with one honest
-    # difference -- they are not FOLDED (no host job replaces them; see the
-    # ledger's `rtm.nli_verdicts` row), they are DISABLED on this path. Either
-    # way this server makes no such call on a host submit, so leaving them in
-    # the "these settings still make THIS SERVER call an LLM" list would be
-    # exactly the over-claim this set exists to prevent. The caller only passes
-    # nli_suppressed=True when this run actually HAS a checklist for the tiers
-    # to have judged, so the block below can never claim a suppression that
-    # could not have happened. The block says which of the two it is, and names
-    # the reversal switch.
-    if nli_suppressed:
-        _boomeranged.add("qa_checklist_nli_enabled")
-        _boomeranged.add("qa_checklist_adjudicate_enabled")
-    # Phase 3c: the same rule again for Jira comment reconciliation, and again
-    # as a DISABLEMENT rather than a fold (ledger id
-    # `comment_reconciler.candidates`). This server makes no Stage 1b call on a
-    # suppressed host prepare, so leaving QA_COMMENT_RECONCILE_ENABLED in the
-    # "these settings still make THIS SERVER call an LLM" list would be exactly
-    # the over-claim this set exists to prevent. The caller only passes
-    # comment_suppressed=True when the ticket actually HAD comments that
-    # survived the Stage 1a noise filter, so the block below can never announce
-    # a suppression that could not have happened.
-    if comment_suppressed:
-        _boomeranged.add("qa_comment_reconcile_enabled")
-    # Residue R4: the requirement decomposition is FOLDED (CHECKLIST_JOB), so
-    # this server makes no ask_json for it on a host prepare and listing
-    # QA_ATOMIC_CHECKLIST_ENABLED as a reason "this server calls an LLM" would
-    # be exactly the over-claim this set exists to prevent. It is disclosed
-    # instead by its own block, which names the honest cost.
-    if checklist_boomeranged:
-        _boomeranged.add("qa_atomic_checklist_enabled")
-    on: list = []
-    for attr, env, what in _SERVER_LLM_FLAGS:
-        if attr in _boomeranged:
-            continue
-        try:
-            if getattr(settings, attr, False):
-                on.append((env, what))
-        except Exception:
-            logger.debug("could not read %s", attr, exc_info=True)
-    # Host-side ambiguity preflight: when ON, the SHYJ-7154 pre-pass does
-    # NOT run server-side, so the closing sentence below must not claim it
-    # always classifies. Read defensively — an unreadable setting simply
-    # means we do not claim the skip.
-    amb_skipped = True
-    # NOT `if not on: return ""` any more: with every server-LLM flag off but
-    # the preflight on, there is still something the tester must be told.
-    # ...and the same again for the AC boomerang: with every flag off and the
-    # ambiguity gate still server-side, a prepare that shipped an AC job to
-    # the chat has something the tester must be told, and a notice that
-    # misdescribes what this server did is worse than no notice.
-    if (
-        not on
-        and not amb_skipped
-        and not ac_boomeranged
-        and not img_boomeranged
-        and not risk_boomeranged
-        and not plan_boomeranged
-        and not nli_suppressed
-        and not comment_suppressed
-        # Residue R4, and both disjuncts are load-bearing. The fold REMOVES
-        # QA_ATOMIC_CHECKLIST_ENABLED from the `on` list above (it no longer
-        # costs a server-side call), so without these a checklist-ONLY host
-        # prepare -- every other server-LLM flag off, the ambiguity/AC/image
-        # folds inapplicable -- returned an EMPTY notice and the tester was told
-        # nothing at all about the decomposition boomerang, its denominator cost
-        # or the accepted rule-pack narrowing.
-        and not checklist_boomeranged
-        and not rule_packs_narrowed
-    ):
-        return ""
     lines: list = []
-    if on:
-        lines.append(
-            "> \u26a0\ufe0f  This is a host-mode generation, but these settings "
-            "still make **this server** call an LLM while grounding and finishing "
-            "your suite:"
-        )
-        lines += [f">   - `{env}` \u2014 {what}" for env, what in on]
-        tail = (
-            ">   Each needs a working backend and adds latency you will not see in "
-            "the chat. Set them to `false` to remove the server-side LLM work this "
-            "server controls."
-        )
-        if not ac_boomeranged:
-            tail += (
-                " Note this is not the whole story: acceptance criteria are "
-                "synthesised when the ticket carries none — that calls the "
-                "backend by design."
-            )
-        if not amb_skipped:
-            tail += " The requirement pre-pass also classifies on every prepare."
-        lines.append(tail)
-    if amb_skipped:
-        lines.append(
-            "> \u2139\ufe0f  The SHYJ-7154 requirement pre-pass did **not** run on "
-            "this server: the under-specified/no-UI check is handed to your own "
-            "chat model instead. That is why this prepare made no "
-            "ambiguity-gate LLM call."
-        )
+    # Host-side ambiguity preflight, UNCONDITIONAL: the SHYJ-7154 pre-pass
+    # never runs server-side, because llm.resolve_generation_mode() returns
+    # the "host" constant, so _ground_and_gate gets run_ambiguity_llm=False.
+    lines.append(
+        "> \u2139\ufe0f  The SHYJ-7154 requirement pre-pass did **not** run on "
+        "this server: the under-specified/no-UI check is handed to your own "
+        "chat model instead. That is why this prepare made no "
+        "ambiguity-gate LLM call."
+    )
     if ac_boomeranged:
         lines.append(
             "> \u2139\ufe0f  This ticket carries no acceptance criteria, and this "
@@ -4203,71 +3397,18 @@ def _host_mode_server_llm_notice(
             "`image_descriptions` array so this server can record what they "
             "showed."
         )
-    if risk_boomeranged:
-        lines.append(
-            "> \u2139\ufe0f  `QA_LLM_RISK_SCORING` is on, but this server made "
-            "**no** risk-scoring call: judging business risk is a `post_merge` "
-            "step in the payload's `jobs_to_run`. Return an optional top-level "
-            "`risk_scores` map with your merged suite (or in the finalize "
-            "review sidecar on the per-category route); without it every case "
-            "keeps this server's deterministic priority/type heuristic score, "
-            "and nothing is invented to fill the gap."
-        )
-    if plan_boomeranged:
-        lines.append(
-            "> \u2139\ufe0f  `QA_TEST_PLAN_ARTIFACTS` is on, but this server "
-            "made **no** test-plan call: the Test Plan / Strategy and the "
-            "AC-Validation verdicts are a `post_merge` step in the payload's "
-            "`jobs_to_run`. Return an optional top-level `test_plan_report` "
-            "object with your merged suite (or in the finalize review sidecar "
-            "on the per-category route); without it the suite finalizes with "
-            "no test-plan artifacts and none are invented."
-        )
-    if nli_suppressed:
-        lines.append(
-            "> \u2139\ufe0f  The OPTIONAL checklist **entailment / "
-            "adjudication** tiers did **not** run on this server, and they were "
-            "NOT handed to "
-            "your chat model either. Their whole value is that a model OTHER "
-            "than the one that wrote the cases re-judges the borderline "
-            "requirement/case pairs, and here that model would be you -- and "
-            "unlike the reviews above, their verdicts feed the DETERMINISTIC "
-            "coverage figure, the exported sheets and the gap loop. So the "
-            "ambiguous band is reported as uncovered instead of re-judged: you "
-            "may see MORE gaps than with those tiers on. "
-            "There is no host analog: the host-reviewed coverage review "
-            "that once filled that role was deleted on 2026-08-12."
-        )
-    if comment_suppressed:
-        lines.append(
-            "> \u2139\ufe0f  `QA_COMMENT_RECONCILE_ENABLED` is on and this "
-            "ticket has comments, but the **AMENDMENTS block was not built**: "
-            "the extraction step is a server-side LLM call and it was NOT "
-            "handed to your chat model either. It is a QUARANTINED reader whose "
-            "whole value is that the model seeing the raw comment thread has no "
-            "generation prompt and no tools -- and here that model would be "
-            "you, holding both. So the comment thread was read only by this "
-            "server's pure-Python noise filter and then dropped. **Generate "
-            "from the description and the acceptance criteria; if the ticket's "
-            "current truth lives in its comments, read them yourself and say so "
-            "to the tester.** No comment-derived clarification question gated "
-            "this prepare either. **On a host-only install, "
-            "`QA_COMMENT_RECONCILE_ENABLED=false` is strictly BETTER than "
-            "leaving it on like this**: with it off, `tools/jira_mcp` puts the "
-            "raw `## Comments` dump back into the ticket text you are given, "
-            "whereas on it strips the dump in favour of an amendments block "
-            "that is no longer being built."
-        )
-    # Residue R4: the checklist fold's own block -- the REPLACEMENT for the
-    # QA_ATOMIC_CHECKLIST_ENABLED line the _boomeranged set just removed from
-    # the over-claim list above. It names the fold, the return field, BOTH
-    # submission routes and the honest cost (host authorship of the coverage
-    # denominator), plus the two server-side counterweights that are what make
-    # the fold defensible rather than an over-claim.
+    # Residue R4: the checklist fold's own block. It names the fold, the
+    # return field, BOTH submission routes and the honest cost (host
+    # authorship of the coverage denominator), plus the two server-side
+    # counterweights that are what make the fold defensible rather than an
+    # over-claim. 2026-08-14 (batch 8b-ii): it no longer opens by naming
+    # QA_ATOMIC_CHECKLIST_ENABLED -- that setting was DELETED and the
+    # checklist hardcoded ON, so announcing it as a live switch would be the
+    # over-claim this whole function exists to prevent, inverted.
     if checklist_boomeranged:
         lines.append(
-            "> \u2139\ufe0f  `QA_ATOMIC_CHECKLIST_ENABLED` is on, but this "
-            "server made **no** requirement-decomposition call: breaking the "
+            "> \u2139\ufe0f  This server made **no** "
+            "requirement-decomposition call: breaking the "
             "ticket into an atomic requirements checklist is step 0d of the "
             "payload's `jobs_to_run`. Derive it BEFORE you generate, generate "
             "so that every item is covered, and return it as an optional "
@@ -4287,8 +3428,8 @@ def _host_mode_server_llm_notice(
     # prompt + advisory instead of being scored.
     if rule_packs_narrowed:
         lines.append(
-            "> \u2139\ufe0f  Rule packs (`QA_BILINGUAL_RULES` / "
-            "`QA_ATOMICITY_RULES` / `QA_STANDING_RULES`) mandated requirement "
+            "> \u2139\ufe0f  Rule packs (bilingual / atomicity / standing "
+            "rules) mandated requirement "
             "line(s) for this ticket, and with the decomposition handed to you "
             "they run in **prompt + advisory** mode: the mandated lines still "
             "reach your generation prompt and the advisory rule-pack report is "
@@ -4438,6 +3579,110 @@ async def _stale_snapshot_note(source_text: str, updated: str) -> str:
         )
     except Exception:
         logger.debug("stale-snapshot check failed", exc_info=True)
+        return ""
+
+
+def _jira_content_chars(url_content) -> int:
+    """How much TICKET TEXT this grounded payload yielded. 0 when unknown.
+
+    F9 (2026-08-15). Counts the two fields that actually ground generation --
+    the description and the acceptance criteria -- and deliberately NOT
+    ``raw_text``, which has the comment thread appended: comments arrive
+    through a different path and a ticket gaining a comment between two runs
+    would otherwise read as the ticket growing. Never raises.
+    """
+    try:
+        if not isinstance(url_content, dict) or url_content.get("error"):
+            return 0
+        return len(str(url_content.get("description") or "")) + len(
+            str(url_content.get("acceptance_criteria") or "")
+        )
+    except Exception:  # pragma: no cover - defensive
+        return 0
+
+
+# F9 thresholds. A payload must be BOTH proportionally and absolutely smaller
+# before anything is said, so neither a long ticket losing a sentence nor a
+# two-line ticket losing a word can trip it.
+#
+# MEASURED, not guessed: the reported incident is 4,262 chars against 8,600+ for
+# the same ticket -- a ratio of 0.50 and a delta of 4,338 -- so 0.80 / 500 sits
+# an order of magnitude inside the real signal while leaving room for the
+# genuinely benign differences the SAME revision can still produce (a client
+# that renders an ADF table with different cell padding, or normalises
+# whitespace).
+_CONDENSED_MAX_RATIO = 0.80
+_CONDENSED_MIN_DELTA = 500
+
+
+async def _condensed_payload_note(source_text: str, updated: str, chars: int) -> str:
+    """WARN when the SAME ticket revision came back materially SMALLER than a
+    prior run of this install already saw. "" in every other case.
+
+    F9 (2026-08-15). ``tools/jira_mcp``'s fetch directive tells the host "Do NOT
+    summarise, reword, translate or truncate it", and a host ignored that: it
+    handed back a condensed ticket (4,262 stored chars against 8,600+ for the
+    same ticket on another run) and the server had no way to tell. It showed up
+    downstream as the DF04 status matrix collapsing to ``Received`` alone,
+    losing the Shipped and Delivered rows that two other requirements depend on.
+
+    WHY THIS COMPARISON AND NOT A DIRECT ONE: this server never fetches the
+    ticket. ``jira_mcp`` returns a fetch DIRECTIVE and the host's own Atlassian
+    MCP connection does the read, so there is no server-side original to diff
+    against -- which is exactly why asking the host to confirm its own fidelity
+    is worthless. ``fields.updated`` is the lever: it is Jira's own revision
+    stamp, so two payloads carrying the SAME ``updated`` value describe
+    BYTE-IDENTICAL ticket content by definition. Any material size difference
+    between them was introduced by whatever sat between Jira and this server. No
+    model is asked anything; this is arithmetic on two integers.
+
+    KNOWN LIMIT, stated rather than papered over: it needs a PRIOR prep for the
+    same ticket revision, so it cannot fire on the first run of a ticket. Every
+    prep now stamps its size, so the baseline exists from the first run onward
+    -- which is precisely the shape of the reported incident, where the same
+    ticket was prepared more than once. A first-run condensation still passes
+    silently; detecting THAT would need a second independent read of the ticket.
+
+    Deliberately a WARNING and never a refusal: it is a size heuristic over
+    host-supplied text, and the honest response to "this looks truncated" is to
+    tell the tester, not to destroy the run. Never raises.
+    """
+    if not source_text or not updated or chars <= 0:
+        return ""
+    try:
+        hit = await prep_store.find_prep_snapshot_by_source(
+            source_text, float(getattr(settings, "qa_prep_ttl_s", 86400) or 0)
+        )
+        prior = (hit or {}).get("content") or {}
+        prior_chars = int(prior.get("content_chars") or 0)
+        prior_stamp = _safe_snapshot_stamp(prior.get("jira_updated"))
+        # SAME revision only. A different `updated` means the ticket itself
+        # changed, and a genuinely shortened ticket is not a defect.
+        if not prior_stamp or prior_stamp != updated or prior_chars <= 0:
+            return ""
+        if chars > prior_chars * _CONDENSED_MAX_RATIO:
+            return ""
+        if (prior_chars - chars) < _CONDENSED_MIN_DELTA:
+            return ""
+        when = time.strftime(
+            "%H:%M", time.localtime(float(prior.get("created_at") or 0))
+        )
+        pct = int(round(100 - (chars * 100.0 / prior_chars)))
+        return (
+            "> \u26a0\ufe0f  **The ticket text looks CONDENSED.** This payload "
+            f"carries {chars:,} characters of description and acceptance "
+            f"criteria; the same ticket revision (`updated` = `{updated}`) "
+            f"yielded {prior_chars:,} at {when} on this install -- about {pct}% "
+            "less text for content Jira says is unchanged, so the difference "
+            "was introduced between Jira and here. The `getJiraIssue` result "
+            "must be passed through RAW: do not summarise, reword, translate or "
+            "truncate it, and do not re-render it as prose. Re-run the fetch "
+            "and prepare again. Generation continues with what you sent, but "
+            "requirements that only exist in the missing text -- table rows, "
+            "status lists, edge cases -- cannot be covered."
+        )
+    except Exception:
+        logger.debug("condensed-payload check failed", exc_info=True)
         return ""
 
 
@@ -4817,25 +4062,12 @@ async def handle_prepare_test_cases(
         # prepare-side -- its output feeds rtm_hint and the RTM -- so it
         # cannot be deferred to submit; what is deferred is the RESULT.
         _host_ac = llm.resolve_generation_mode() == "host"
-        # The LAST two server-side calls on this path, both vision-only and both
-        # api-backend only -- so on cli/cursor they already no-op and the image
-        # grounding is LOST today, not saved. ON, this server makes NEITHER call
-        # and the raw bytes go to the host's OWN multimodal model as MCP image
-        # content. Read defensively (getattr) like every other flag here.
+        # Retained because it still decides whether the raw bytes are forwarded
+        # to the host as MCP image content (host_images / _img_job below). The
+        # two server-side vision calls it used to suppress -- the Jira
+        # ticket-image description and ui_extractor's Tier-3 fallback -- were
+        # DELETED on 2026-08-16 (P2-F1), so there is nothing left to suppress.
         _host_img = llm.resolve_generation_mode() == "host"
-        # Phase 3c: the QUARANTINED Stage 1b comment extractor
-        # (tools/comment_reconciler, ledger id `comment_reconciler.candidates`).
-        # Unlike the Phase-3a/3b decisions this one CANNOT wait until after
-        # _prepare_generation: the call it governs happens inside
-        # _ground_and_gate, before the prompt is built, because its output is a
-        # prompt-side block AND a gate. So the decision is taken from the flags
-        # alone here, and the DISCLOSURE is narrowed below by what grounding
-        # actually found -- never claim a suppression that could not have
-        # happened (Phase 3b's MAJOR).
-        _comment_suppress = (
-            bool(getattr(settings, "qa_comment_reconcile_enabled", False))
-            and llm.resolve_generation_mode() == "host"
-        )
         grounded = await _ground_and_gate(
             text,
             attached_images=attached_images,
@@ -4843,20 +4075,10 @@ async def handle_prepare_test_cases(
             choose=choose,
             ask_text=ask_text,
             progress=progress,
-            run_ambiguity_llm=not _host_amb,
-            suppress_comment_llm=_comment_suppress,
-            defer_vision=_host_img,
             jira_content_json=jira_content_json,
         )
         if isinstance(grounded, str):
             return PreparePayloadResult(clarify=grounded)
-        # --- QA_JIRA_ATTACHMENT_FETCH_ENABLED: server-side attachment bytes #
-        # Runs BETWEEN the fetch and BEAT 2 on purpose: beat 2 exists to ask for
-        # screens the ticket has and nothing supplied, so it must be told about
-        # the ones this server just fetched, or it would spend a round trip
-        # asking for images that are already attached to this very reply.
-        # Default OFF -> returns 0, touches nothing, makes no request.
-        _fetched_images = await _fetch_jira_attachment_bytes(grounded.url_content)
         # --- Jira image gate, BEAT 2: the INFORMED ask -------------------- #
         # The ticket is in hand now, so this one can NAME the screens. Fires
         # ONLY when the ticket revealed images and nothing supplied them;
@@ -4870,7 +4092,7 @@ async def handle_prepare_test_cases(
             _img_n, _img_names, _img_kind = _ticket_image_evidence(grounded.url_content)
             # N4 (2026-08-10): bound, not inlined -- the audit row could not tell
             # "no screens at all" from "3 of 4 arrived" without the ratio.
-            _have_images = len(attached_images or []) + _attested + _fetched_images
+            _have_images = len(attached_images or []) + _attested
             _beat2 = _image_gate_second_beat(
                 count=_img_n,
                 names=_img_names,
@@ -4886,10 +4108,16 @@ async def handle_prepare_test_cases(
                 # them. This branch is the only path that actually sends the tester
                 # off to capture.
                 _shelve_ticket_image_labels(_img_names, text)
-                # N3b: the fetch-failure disclosure reached the tester ONLY on the
-                # prepare-SUCCESS reply, so a GATED round asked for screens without
-                # saying this server had just tried and been refused (e.g. HTTP 401
-                # on a stale JIRA_API_TOKEN). Same helper, no duplicated logic.
+                # N3b: the fetch-failure disclosure used to be added
+                # here, because a GATED round would otherwise ask for
+                # screens without saying this server had just tried and
+                # been refused. Batch D1 (2026-08-15) deleted the fetch,
+                # so nothing sets images_fetched_server_side any more and
+                # _server_fetched_image_note is now always "". The call
+                # is KEPT rather than inlined to "": it is the single
+                # place a revived fetch (docs/RETIRED_CAPABILITIES.md)
+                # would need to light up again, and it costs one dict
+                # lookup. It is NOT evidence the fetch still exists.
                 _beat2_fetch_note = _server_fetched_image_note(grounded.url_content)
                 if _beat2_fetch_note:
                     _beat2 = _beat2 + "\n\n" + _beat2_fetch_note
@@ -4900,16 +4128,9 @@ async def handle_prepare_test_cases(
                         "count": _img_n,
                         "plan": _plan,
                         "have_images": _have_images,
-                        "fetched": _fetched_images,
                     },
                 )
                 return PreparePayloadResult(clarify=_beat2)
-        # Narrower than the decision, exactly like _ac_job / _img_job: a ticket
-        # with no comments (or no ticket at all) had nothing to reconcile, so
-        # neither the stamp nor the notice may say anything was suppressed.
-        _comment_kept = int(getattr(grounded, "comment_thread_kept", 0) or 0)
-        _comment_suppressed_real = bool(_comment_suppress and _comment_kept > 0)
-
         # I2 (2026-08-10): ticket snapshot RECENCY. The host caches the Jira
         # payload on disk and re-sends hours-old copies, and `fields.updated` is
         # the only recency signal obtainable WITHOUT a second fetch -- the
@@ -4921,14 +4142,24 @@ async def handle_prepare_test_cases(
             (grounded.url_content or {}).get("updated")
         )
         _stale_note = await _stale_snapshot_note(text, _snapshot_updated)
+        # F9: and the fidelity half of the same question. _stale_snapshot_note
+        # asks "is this the CURRENT revision of the ticket?"; this asks "is this
+        # the WHOLE of it?" -- the failure the fetch directive's "do NOT
+        # summarise, reword or truncate" was already trying to prevent, with
+        # nothing behind it. Same lookup, so no extra store round trip beyond
+        # the one already made.
+        _content_chars = _jira_content_chars(grounded.url_content)
+        _condensed_note = await _condensed_payload_note(
+            text, _snapshot_updated, _content_chars
+        )
 
         async def _on_status(msg: str) -> None:
             await _emit(progress, msg)
 
         # Pop the DEFERRED Tier-3 screenshot BEFORE _prepare_generation: raw
         # bytes must never reach serialize_prepared / the prep store, which are
-        # JSON. The key is absent unless defer_vision actually suppressed the
-        # vision call, so this is a no-op with the flag off.
+        # JSON. The key is absent unless Tier 2 actually rendered a screenshot
+        # that yielded no elements, so this is a no-op on every other page.
         page_screenshot = None
         if isinstance(grounded.ui_content, dict):
             page_screenshot = grounded.ui_content.pop("vision_screenshot", None)
@@ -4987,27 +4218,30 @@ async def handle_prepare_test_cases(
             _img_relevance
             and getattr(settings, "qa_host_image_require_relevant", False)
         )
-        # Phase 3a: the two POST_MERGE folds. Each is an AND with the
-        # pre-existing, default-OFF feature flag it rides on, so with that flag
-        # off no job is shipped and the prepare payload is key-identical to
-        # today. Decided HERE, before the envelope, because submit keys off the
-        # prep's meta stamp rather than off the live flag.
-        _risk_job = bool(
-            settings.qa_llm_risk_scoring and llm.resolve_generation_mode() == "host"
-        )
-        _plan_job = bool(
-            settings.qa_test_plan_artifacts and llm.resolve_generation_mode() == "host"
-        )
-        # Residue R4 (ledger id `atomic_checklist.decompose`): the LAST
-        # server-side LLM call on the prepare path. Unlike the two Phase-3a
-        # post_merge decisions this one must be taken BEFORE
-        # _prepare_generation, because it is an ARGUMENT to it: the
-        # decomposition happens inside the enrichment gather, and its output
-        # feeds the generation prompt. AND-ed with the (default-OFF) feature
-        # flag, so a default install ships a key-identical payload.
+        # Phase 3a's two POST_MERGE folds -- the `_risk_job` / `_plan_job`
+        # locals, both hardcoded False since 2026-08-14 (batch 8b-ii) -- were
+        # DELETED on 2026-08-16 (dead-code deletion P2-H) together with
+        # host_mode.RISK_JOB / TEST_PLAN_JOB, their prep-meta stamps, the
+        # Path-A sidecar copy and the submit-side extraction. Nothing is
+        # boomeranged in their place and nothing calls a model: risk scoring is
+        # the deterministic score_and_sort heuristic, and there are no
+        # test-plan artifacts. Reviving either is a fresh implementation -- see
+        # docs/LLM_MIGRATION_INVENTORY.md rows 10 and 12.
+        # Residue R4 (ledger id `atomic_checklist.decompose`). This USED to be
+        # the last server-side LLM call on the prepare path, and it was decided
+        # here because it was an ARGUMENT to _prepare_generation
+        # (`decompose_checklist`). Dead-code deletion P2-F2 deleted
+        # tools/atomic_checklist.decompose_to_checklist and that parameter on
+        # 2026-08-16, so the decision now governs ONE thing: whether
+        # CHECKLIST_JOB ships to the host. 2026-08-14 (batch 8b-ii):
+        # QA_ATOMIC_CHECKLIST_ENABLED was DELETED and hardcoded ON, so this is
+        # True on every install and the job ships on every host prepare.
+        # Reads the SEAM, not a literal, so tests/conftest.py's suite-wide pin
+        # governs it and a revival is one line.
+        from tools.atomic_checklist import checklist_enabled
+
         _checklist_job = bool(
-            settings.qa_atomic_checklist_enabled
-            and llm.resolve_generation_mode() == "host"
+            checklist_enabled() and llm.resolve_generation_mode() == "host"
         )
         prepared = await _prepare_generation(
             text,
@@ -5015,20 +4249,6 @@ async def handle_prepare_test_cases(
             grounded.ui_content,
             attached_images=attached_images,
             openapi_text=grounded.openapi_text,
-            describe_images_server_side=False,
-            describe_attached_images_server_side=not _host_img,
-            synthesize_acs=not _host_ac,
-            # Residue R4: the host derives the atomic checklist in step 0d of
-            # its own turn (agents.host_mode.CHECKLIST_JOB) and returns it on
-            # the submission; this server makes no decomposition call.
-            decompose_checklist=not _checklist_job,
-            # Phase 3d: host mode makes no server-side fan-out call, so the
-            # prompt-cache warm-up would write a cache nothing on this path
-            # reads -- one billable client.messages.create per prepare under
-            # QA_PROMPT_CACHE_ENABLED on the api backend. Ledger row
-            # `llm.warm_cache_prefix`, terminal status
-            # `retired (no host analog)`: a chat model has no prefix to warm.
-            warm_cache=False,
             on_status=_on_status,
         )
         if isinstance(prepared, tuple):
@@ -5059,40 +4279,32 @@ async def handle_prepare_test_cases(
 
         # Phase 3b: the checklist entailment/adjudication tiers. NOT a job --
         # no payload key, no instruction clause, no return field -- just a
-        # decision taken HERE, at prepare time, and stamped, so that a mid-flow
-        # .env flip cannot change what an in-flight prep does and so the submit
-        # reply can disclose it.
+        # decision taken HERE, at prepare time, and STAMPED.
         #
-        # Computed AFTER _prepare_generation on purpose. The two tier flags are
-        # NOT a sufficient condition: both tiers only ever run over a checklist,
-        # so with QA_ATOMIC_CHECKLIST_ENABLED off (or with a checklist that came
-        # back empty) there is nothing they could have judged and stamping True
-        # would make the notice announce a suppression that could never have
-        # happened. `prepared.checklist_items` is FINAL at this point and is
-        # serialized verbatim into the envelope below, then rehydrated unchanged
-        # at submit -- so this gate evaluates to exactly what submit sees, and
-        # the two surfaces cannot disagree.
-        _nli_suppress = bool(
-            (
-                settings.qa_checklist_nli_enabled
-                or settings.qa_checklist_adjudicate_enabled
-            )
-            and settings.qa_atomic_checklist_enabled
-            # Residue R4 widen, and it is REQUIRED, not cosmetic. With
-            # CHECKLIST_JOB shipped this server makes no decomposition call, so
-            # prepared.checklist_items is EMPTY here by construction -- yet a
-            # checklist DOES exist at finalize, because the host returns one and
-            # the submit path adopts it before _finalize_generation. Left as a
-            # bare checklist_items test this stamped False, allow_llm_tiers went
-            # back to True, and the two ask_json calls in tools/rtm.py fired
-            # server-side on a host submit -- making Phase 3b's ledger row
-            # (`rtm.nli_verdicts`, terminal status `disabled (disclosed)`) FALSE
-            # in the tree. Do not narrow this back.
-            and (
-                list(getattr(prepared, "checklist_items", None) or []) or _checklist_job
-            )
-            and llm.resolve_generation_mode() == "host"
-        )
+        # 2026-08-14 (batch 8b-ii): QA_CHECKLIST_NLI_ENABLED and
+        # QA_CHECKLIST_ADJUDICATE_ENABLED were DELETED and hardcoded OFF, and
+        # tools/rtm's two tier seams are False constants, so there is no tier
+        # left to suppress and this is constantly False. False is the
+        # SEMANTICALLY correct value, not merely the convenient one: nothing
+        # is being suppressed when the tier no longer exists, and a True stamp
+        # would announce a suppression that could not have happened.
+        #
+        # The stamp itself SURVIVES (see the meta writes below and the
+        # meta.get read at submit). Dropping it would make submit read None
+        # -- the same value, but silently by ABSENCE rather than by decision.
+        # It also keeps host_suppress_llm_tiers=False exercising the
+        # belt-and-braces path whenever a test revives a tier seam.
+        #
+        # !! REVIVAL HAZARD, read before flipping a tier seam back on. This
+        # literal REPLACED the CORRECTION 5 widening, and it is safe ONLY
+        # because tools/rtm's two seams are False constants. The stamp is read
+        # back at submit as host_suppress_llm_tiers and becomes
+        # allow_llm_tiers=not <stamp>, so with it constant False a revived tier
+        # would fire its ask_json SERVER-SIDE on a host submit -- exactly the
+        # failure CORRECTION 5 widened this to prevent. Reviving
+        # _nli_tier_enabled or _adjudicate_tier_enabled therefore REQUIRES
+        # re-widening this expression, not just flipping the seam.
+        _nli_suppress = False
 
         # Residue R4: the ONE capability narrowing this fold accepts, and the
         # TESTER -- not only the ledger and docs/FEATURE_FLAGS.md -- has to be
@@ -5145,6 +4357,15 @@ async def handle_prepare_test_cases(
                 # deserialized by a different code version than wrote it.
                 # Observed on 2026-07-29. Stamp the writer so submit can say so.
                 "app_version": _BOOT_VERSION,
+                # F4 (2026-08-15): the version string is NOT enough. A developer
+                # checkout reports the same 0.1.0 across every code change, and
+                # data/suites.db is shared by every server process on the
+                # machine, so a prep staged by pre-fix code is silently reused
+                # by a fixed server -- which is how a fixed _strip_html still
+                # produced placeholder-stripped output on the SHYJ-5645 run.
+                # A content hash of the prep-shaping modules moves whenever they
+                # do. Disclosure only; "" when unavailable.
+                "code_fingerprint": code_fingerprint(),
                 # 2026-07-30 evening: stamp when prepare skipped the server
                 # classifier so a mid-flow flag flip remains auditable.
                 "host_ambiguity_review": bool(_host_amb),
@@ -5227,11 +4448,6 @@ async def handle_prepare_test_cases(
                 # is byte-identical to today's.
                 "host_image_preflight": bool(_img_preflight),
                 "host_image_require_relevant": bool(_img_require),
-                # Same rule again for the two Phase-3a post_merge folds: submit
-                # must know whether to expect `risk_scores` / `test_plan_report`,
-                # and a mid-flow .env flip must not change that for this prep.
-                "host_risk_job": bool(_risk_job),
-                "host_test_plan_job": bool(_plan_job),
                 # Phase 3b: whether THIS prep suppresses the server-side
                 # checklist entailment/adjudication tiers at finalize. Same
                 # mid-flow-flip rule; submit reads this stamp, never the live
@@ -5244,12 +4460,6 @@ async def handle_prepare_test_cases(
                 # a `checklist_items` field. Same mid-flow-flip rule as above:
                 # submit reads this stamp, never the live flag.
                 "host_checklist_job": bool(_checklist_job),
-                # Phase 3c: whether THIS prep skipped the quarantined Jira
-                # comment extractor, and how many comments went unreconciled.
-                # Stamped for the same mid-flow-flip reason; the submit reply
-                # reads the stamp, never the live flag.
-                "host_comment_reconcile_suppressed": bool(_comment_suppressed_real),
-                "comment_thread_kept": _comment_kept,
                 # I2 (2026-08-10): the ticket's own `fields.updated` for THIS
                 # prep. Stamped so a LATER prepare for the same source can tell
                 # that the payload it was handed is older than the one already
@@ -5258,6 +4468,13 @@ async def handle_prepare_test_cases(
                 # everywhere, so an envelope written before this key existed is
                 # simply "no prior stamp" and stays silent.
                 "jira_updated": _snapshot_updated,
+                # F9 (2026-08-15): how much ticket text THIS revision yielded,
+                # so a later prepare for the same revision can tell that it was
+                # handed less. Stamped unconditionally -- the baseline is only
+                # useful if every run writes one -- and read with .get, so an
+                # envelope written before this key existed is simply "no
+                # baseline" and the check stays silent.
+                "jira_content_chars": _content_chars,
                 # Parallel fan-out contract is stamped at PREPARE time so a mid-flight
                 # .env flip cannot change the finalize gate for an in-flight prep.
                 # 2026-08-09 (Batch 3, FIX 1): whether THIS prep warns on a
@@ -5330,8 +4547,6 @@ async def handle_prepare_test_cases(
                 if _img_job
                 else []
             )
-            + ([host_mode.RISK_JOB] if _risk_job else [])
-            + ([host_mode.TEST_PLAN_JOB] if _plan_job else [])
             + ([host_mode.CHECKLIST_JOB] if _checklist_job else [])
         )
         payload = host_mode.attach_jobs(payload, _host_jobs)
@@ -5349,20 +4564,16 @@ async def handle_prepare_test_cases(
                 "captured_image_read": _captured,
                 "carried_forward_capture_count": len(_carried_ids),
                 "image_carry_ack": bool(image_carry_ack),
-                "host_risk_job": bool(_risk_job),
-                "host_test_plan_job": bool(_plan_job),
                 "host_nli_suppressed": bool(_nli_suppress),
                 "host_checklist_job": bool(_checklist_job),
-                "host_comment_reconcile_suppressed": bool(_comment_suppressed_real),
-                "comment_thread_kept": _comment_kept,
             },
         )
         # Item 6: carry the RAW ticket screenshots so the TOOL layer can forward
-        # them to the host's OWN multimodal model as MCP image content (the server
-        # made no vision call -- describe_images_server_side=False above). Present
-        # only when JIRA_FETCH_IMAGES + ANTHROPIC_API_KEY let jira_fetcher download
-        # them; otherwise empty and the payload's text image_context is the
-        # fallback. Bytes are never persisted in the prep store.
+        # them to the host's OWN multimodal model as MCP image content. This
+        # server makes no vision call at all -- P2-F1 deleted the last two on
+        # 2026-08-16. Present only when JIRA_FETCH_IMAGES + ANTHROPIC_API_KEY let
+        # jira_fetcher download them; otherwise empty and the payload's text
+        # image_context is the fallback. Bytes are never persisted in the prep store.
         # QA_HOST_IMAGE_DESCRIPTION_ENABLED additionally forwards the tester's
         # chat attachments and any deferred Tier-3 page screenshot. OFF (or with
         # nothing extra to send) this is EXACTLY today's ticket-images-only list.
@@ -5370,16 +4581,12 @@ async def handle_prepare_test_cases(
         # image it has to drop, so the wider list needs no new cap here.
         ticket_images = list(_prospective_images)
         # Phase 3a: tell the notice which server-side calls THIS prepare handed
-        # to the chat, so it stops listing QA_LLM_RISK_SCORING /
-        # QA_TEST_PLAN_ARTIFACTS as reasons this server calls an LLM when the
-        # fold means it no longer does.
+        # to the chat. Since 2026-08-14 (batch 8b-ii) the notice names no
+        # setting at all -- all six were deleted -- so it takes only the four
+        # booleans that still vary from one prepare to the next.
         _notice = _host_mode_server_llm_notice(
             ac_boomeranged=_ac_job,
             img_boomeranged=_img_job,
-            risk_boomeranged=_risk_job,
-            plan_boomeranged=_plan_job,
-            nli_suppressed=_nli_suppress,
-            comment_suppressed=_comment_suppressed_real,
             checklist_boomeranged=_checklist_job,
             rule_packs_narrowed=_rp_narrowed,
         )
@@ -5467,17 +4674,15 @@ async def handle_prepare_test_cases(
             )
             _notice = (_notice + "\n\n" + _cap_note) if _notice else _cap_note
         elif _cap_labels:
-            # Host-image forwarding is off on this install, so the captured bytes
-            # are NOT handed to the tester's own model. They are still passed to
-            # the legacy SERVER-side vision path (_prepare_generation with
-            # describe_attached_images_server_side=True), so say precisely that
-            # rather than either "they went nowhere" or "the screens were read".
+            # No image job shipped, so the captured bytes are NOT handed to the
+            # tester's own model -- and since P2-F1 (2026-08-16) there is no
+            # server-side vision path left to read them either. Say exactly that:
+            # the screens went nowhere.
             _cap_note = (
                 f"> \u26a0\ufe0f {len(_cap_labels)} captured device screen(s) were NOT "
                 "forwarded to your model as image content. No image content rides "
-                "on this reply. The legacy server-side vision path may still have "
-                "described them into the prepared text; anything that is not in "
-                "that text is NOT reflected in the cases below."
+                "on this reply, and this server describes no screenshots itself, "
+                "so nothing they show is reflected in the cases below."
             )
             _notice = (_notice + "\n\n" + _cap_note) if _notice else _cap_note
         # I2b (2026-08-10): WHICH snapshot these cases were generated from, so a
@@ -5493,6 +4698,13 @@ async def handle_prepare_test_cases(
             _notice = (_notice + "\n\n" + _snap_note) if _notice else _snap_note
         if _stale_note:
             _notice = (_notice + "\n\n" + _stale_note) if _notice else _stale_note
+        # F9: ahead of nothing in particular, but in the SAME notice block as
+        # the staleness warning -- they answer the two halves of "is the ticket
+        # this suite will be built from the right one, and all of it?".
+        if _condensed_note:
+            _notice = (
+                (_notice + "\n\n" + _condensed_note) if _notice else _condensed_note
+            )
         # Revive / carry-forward / acked-loss disclosure. APPEND, never assign
         # -- see PreparePayloadResult.
         if _carry_note:
@@ -5876,7 +5088,7 @@ def assemble_prepare_payload(
 # reachable from a server-mode path, and host-submitted JSON is treated as
 # UNTRUSTED throughout (json.loads only, size-capped, and sanitized via
 # tools/cell_sanitizer.sanitize_cell by EVERY exporter reachable from this path
-# -- xlsx_generator, csv_exporter, testrail_exporter AND zephyr_exporter --
+# -- xlsx_generator, csv_exporter and testrail_exporter --
 # before it reaches a spreadsheet cell).
 # --------------------------------------------------------------------------- #
 
@@ -6083,13 +5295,17 @@ def _no_coverage_signal_note(view: object) -> str:
     (`view is not None` -- _coverage_view only builds one when the matcher
     actually produced coverage).
 
-    ALWAYS-ON IS THE INTENT, not an oversight (review W2). On a default install
-    QA_ATOMIC_CHECKLIST_ENABLED is off, so NO coverage signal is ever computed on
-    this path and this note is the standing truth about every suite that install
-    produces. A disclosure that fired only on small suites would be worse than
-    none: its ABSENCE would then read as "coverage WAS checked", which is exactly
-    the inference this batch exists to stop. Operators who do run the atomic
-    checklist never see it. Never raises."""
+    ALWAYS-ON IS THE INTENT, not an oversight (review W2). A disclosure that
+    fired only on small suites would be worse than none: its ABSENCE would
+    then read as "coverage WAS checked", which is exactly the inference this
+    batch exists to stop.
+
+    2026-08-14 (batch 8b-ii): QA_ATOMIC_CHECKLIST_ENABLED was DELETED and the
+    checklist hardcoded ON, which INVERTS how often this fires. It used to be
+    the standing truth about every suite a default install produced; now a
+    coverage view is normally present and this note marks the exception --
+    a submission that returned no checklist_items, so nothing was matched.
+    Never raises."""
     try:
         if view is not None:
             return ""
@@ -6099,9 +5315,10 @@ def _no_coverage_signal_note(view: object) -> str:
             "does not make, and no deterministic requirement checklist was "
             "matched either -- so the generation-volume floor is the ONLY "
             "quantitative gate this suite passed. Read the cases against the "
-            "requirements yourself before signing them off. (Turn on "
-            "`QA_ATOMIC_CHECKLIST_ENABLED` for a deterministic requirement "
-            "coverage tally.)\n\n"
+            "requirements yourself before signing them off. (The requirement "
+            "checklist itself is unconditional -- this suite carries no "
+            "coverage tally because no `checklist_items` came back with it, "
+            "and nothing is decomposed to fill that gap.)\n\n"
         )
     except Exception:  # pragma: no cover - a disclosure must never raise
         logger.debug("_no_coverage_signal_note failed", exc_info=True)
@@ -6278,16 +5495,18 @@ def _sidecar_keys(meta: object = None) -> tuple:
     _SIDECAR_KEYS itself stays pinned by tests/test_host_ac_review.py.
     Never raises.
 
-    Phase 3a: the two post_merge fold fields are recognised from the PREP'S OWN
-    meta stamp whenever ``meta`` is supplied -- NOT from the live flag values,
-    which is how the copy logic in handle_submit_suite already works. Keying
-    RECOGNITION off the live flags instead was inconsistent in both directions:
-    flipping QA_LLM_RISK_SCORING off between prepare and submit stopped a
-    risk-only sidecar being recognised as a sidecar at all, so it fell into the
-    full-suite branch and produced a confusing parse error instead of degrading
-    cleanly; and an UNSTAMPED prep advertised `risk_scores` in this reply's key
-    label and then silently ignored it. With no meta (module-level and legacy
-    callers) the live AND is used, so the shipped surface is unchanged."""
+    Recognition is keyed off the PREP'S OWN meta stamp whenever ``meta`` is
+    supplied -- never off live flag values, which is how the copy logic in
+    handle_submit_suite already works, and which is what stops a flag flipped
+    between prepare and submit from turning a legitimate sidecar into a
+    confusing full-suite parse error. With no meta (module-level and legacy
+    callers) the checklist falls back to the checklist_enabled() seam -- read
+    rather than inlined so every checklist surface answers to the one switch
+    tests/conftest.py pins.
+
+    Phase 3a's two post_merge fold fields (`risk_scores` / `test_plan_report`)
+    left this function on 2026-08-16 with the jobs themselves (dead-code
+    deletion P2-H)."""
     try:
         keys = _SIDECAR_KEYS
         # The image job's return field is finalize-time review material like
@@ -6295,15 +5514,7 @@ def _sidecar_keys(meta: object = None) -> tuple:
         # it in a sidecar.
         keys = keys + ("image_descriptions",)
         if isinstance(meta, dict):
-            _risk_on = bool(meta.get("host_risk_job"))
-            _plan_on = bool(meta.get("host_test_plan_job"))
-        else:
-            _risk_on = bool(settings.qa_llm_risk_scoring)
-            _plan_on = bool(settings.qa_test_plan_artifacts)
-        if _risk_on:
-            keys = keys + ("risk_scores",)
-        if _plan_on:
-            keys = keys + ("test_plan_report",)
+            pass
         # Residue R4: the checklist job's return field is finalize-time material
         # like the others, so the staged (crash-safe) Path A route must be able
         # to carry it in a sidecar. Recognised from the prep's OWN meta stamp
@@ -6312,10 +5523,12 @@ def _sidecar_keys(meta: object = None) -> tuple:
         # server-side in extract_host_checklist and are never tc_ids, so 3a's
         # _remap_risk_scores problem -- every staged category restarting at
         # TC-001 -- cannot arise here.
+        from tools.atomic_checklist import checklist_enabled
+
         if (
             bool(meta.get("host_checklist_job"))
             if isinstance(meta, dict)
-            else bool(settings.qa_atomic_checklist_enabled)
+            else checklist_enabled()
         ):
             keys = keys + ("checklist_items",)
         return keys
@@ -6405,148 +5618,6 @@ def _remap_dup_groups(groups, id_map: dict) -> list:
     return out
 
 
-_QUAL_REMAP_MAX_NOTES = 20
-
-
-def _qualified_id_maps(rows: list) -> "tuple[dict, set]":
-    """(qualified_id_map, ambiguous_bare_ids) for a staged-row merge.
-
-    Replays _merge_category_rows' iteration EXACTLY (same row/case skip
-    rules, same global renumber sequence) so the qualified map agrees with
-    the id_map that function returns. Kept SEPARATE so the shipped 3-tuple
-    return contract (pinned by tests) is untouched and the flag-OFF path
-    never runs this at all; a consistency test pins the two against each
-    other (tests/test_qualified_tc_ids.py). Keys are "<category>:<old_id>"
-    for BOTH the raw submitted category name and its canonical form;
-    ambiguous_bare_ids is every old_id submitted by more than one staged
-    row -- the set the remap refuses LOUDLY instead of first-match guessing.
-    Never raises."""
-    qual: dict = {}
-    ambiguous: set = set()
-    seen_bare: set = set()
-    try:
-        i = 0
-        for row in rows or []:
-            if not isinstance(row, dict):
-                continue
-            name = row.get("category_name", "")
-            if name == "__round__":
-                continue
-            payload = row.get("payload") or {}
-            cases = payload.get("test_cases")
-            if not isinstance(cases, list):
-                continue
-            canon = host_mode.normalize_category(name)
-            raw_name = str(name or "").strip()
-            for c in cases:
-                if not isinstance(c, dict):
-                    continue
-                i += 1
-                old_id = c.get("tc_id")
-                if not (isinstance(old_id, str) and old_id):
-                    continue
-                new_id = f"TC-{i:04d}"
-                for cat_key in {canon, raw_name}:
-                    if cat_key:
-                        qual.setdefault(f"{cat_key}:{old_id}", new_id)
-                if old_id in seen_bare:
-                    ambiguous.add(old_id)
-                else:
-                    seen_bare.add(old_id)
-    except Exception:
-        logger.debug("_qualified_id_maps failed", exc_info=True)
-    return qual, ambiguous
-
-
-def _map_qualified_id(
-    tid: str, id_map: dict, qual_map: dict, ambiguous: set, global_ids: set, note
-) -> str:
-    """Map ONE possibly-qualified UNTRUSTED id onto its post-merge global id.
-
-    Returns "" when the id must be DROPPED: an unknown qualified id, or an
-    ambiguous bare id -- refused loudly via ``note``, never guessed (the
-    latent first-category-wins collision this contract retires). An id that
-    is already a post-merge GLOBAL id (e.g. copied from the server's dup
-    shortlist) passes through untouched. Pure; the note text is sanitised
-    for backtick-span interpolation."""
-    cat, bare = host_mode.split_qualified_tc_id(tid)
-    safe = tid[:48].replace("`", "").replace("\n", " ")
-    if cat:
-        canon = host_mode.normalize_category(cat)
-        hit = qual_map.get(f"{cat}:{bare}")
-        if not hit and canon:
-            hit = qual_map.get(f"{canon}:{bare}")
-        if hit:
-            return hit
-        note(f"`{safe}` does not match any staged category submission -- ignored.")
-        return ""
-    if bare in global_ids:
-        if bare in ambiguous:
-            note(
-                f"`{safe}` matched a post-merge GLOBAL id but is ALSO a tc_id "
-                "submitted by more than one staged category -- interpreted as "
-                "the GLOBAL id. Send `<category>:<tc_id>` if you meant a "
-                "category's own case."
-            )
-        return bare
-    if bare in ambiguous:
-        note(
-            f"`{safe}` is AMBIGUOUS: more than one staged category submitted "
-            "that tc_id, so it was IGNORED rather than guessed. Resend it "
-            "category-qualified as `<category>:<tc_id>`."
-        )
-        return ""
-    return id_map.get(bare, bare)
-
-
-def _remap_risk_scores(
-    raw, id_map: dict, qual_map: dict, ambiguous: set
-) -> "tuple[object, list]":
-    """Remap a sidecar's `risk_scores` KEYS (tc_ids) onto post-merge global ids.
-
-    Path A stages one category at a time, so `TC-001` recurs in EVERY category
-    and _merge_category_rows renumbers them all -- a verdict map keyed by the
-    per-category ids is meaningless until it is remapped, exactly like
-    duplicate_groups. Reuses _map_qualified_id, so a `<category>:<tc_id>` key
-    resolves exactly, a post-merge global id passes through, and an AMBIGUOUS
-    bare id is REFUSED with a note instead of silently landing on another
-    category's case.
-
-    CALLER CONTRACT (review round 3 MAJOR): the caller MUST pass real qualified
-    maps -- built by _qualified_id_maps(rows) -- unconditionally, as it always
-    has. With empty maps this function degrades exactly
-    as duplicate_groups' shipped path does, and for THIS field that degradation
-    is lossy and MISATTRIBUTING rather than merely imprecise: every
-    `<category>:<tc_id>` key would be dropped as "no such staged category", and
-    every colliding bare id would resolve to the FIRST category's global id, so
-    last-write-wins silently discards ~7/8 of the verdicts and parks the
-    survivor's rationale in some other test case's report row and XLSX cell.
-    UNTRUSTED input: shape-tolerant, notes bounded, never raises.
-    host_mode.extract_host_risk_scores stays the sole shape/clamp/id-screening
-    authority downstream, unchanged."""
-    out: dict = {}
-    notes: list = []
-
-    def _note(msg: str) -> None:
-        if len(notes) < _QUAL_REMAP_MAX_NOTES:
-            notes.append(msg)
-
-    try:
-        if not isinstance(raw, dict):
-            return raw, notes
-        global_ids = set(id_map.values())
-        for tid, verdict in raw.items():
-            if not isinstance(tid, str):
-                continue
-            hit = _map_qualified_id(tid, id_map, qual_map, ambiguous, global_ids, _note)
-            if hit:
-                out[hit] = verdict
-        return out, notes
-    except Exception:
-        logger.debug("sidecar risk score remap failed", exc_info=True)
-        return raw, notes
-
-
 def _fanout_incomplete_note(meta: object, rows: list, prep_id: str) -> str:
     """Refusal text when a parallel-fan-out prep's staged set is INCOMPLETE.
 
@@ -6595,29 +5666,30 @@ def _fanout_incomplete_note(meta: object, rows: list, prep_id: str) -> str:
 #
 # _VOLUME_REFUSE_RATIO -- the share of the prep's OWN summed per-category floor
 # below which a finalize is REFUSED rather than warned about.
-# _VOLUME_WARN_SLACK -- how far ONE category may sit under the floor before it
-# is reported at all. MEASURED, not guessed: the two known-good runs of
-# 2026-08-04 (suites 26600607... = 99 cases and 4ecf093a... = 97 cases, both a
-# band-2 feature, floor 12) bottom out at EXACTLY 12 per category, read out of
-# ~/qa-agent-pro/data/suites.db, so an exact-floor comparison would not have
-# warned on either -- but an 11/12 dip on some future good run would, for no
-# useful signal. An EMPTY category is never slack.
+# _VOLUME_WARN_SLACK is GONE (E02, 2026-08-20). It allowed ONE category to sit
+# exactly one case under the floor before being reported -- measured against the
+# two known-good runs of 2026-08-04 (suites 26600607... = 99 cases and
+# 4ecf093a... = 97 cases, band-2, floor 12), which bottom out at EXACTLY 12 per
+# category. It is not relaxed but SUBSUMED: with redistribution legitimate, a
+# category is reported only when it is empty or below HALF its floor, and every
+# 11/12 dip that the slack existed to silence is far inside that line. Leaving
+# it in place would have been a second, tighter threshold that could never fire.
+# An EMPTY category was never slack and still is not.
 # _VOLUME_MAX_NAMED -- how many short categories the note lists by name. All
 # 8 canonical categories fit, so the 08-09 shape (every category short)
 # names them all; the cap only bounds a longer, hand-built list.
 #
-# The slack is deliberately ASYMMETRIC: a category may sit one case under the
-# floor, the TOTAL may not. At floor 12, two categories at 11 (94 of 96)
-# therefore warn even though each is individually within slack -- accurate
-# (the suite really is short of what was asked) and warning-only, so it costs
-# a line rather than a round trip.
+# The asymmetry survives the slack's deletion and is now the whole design: a
+# CATEGORY may come in under its floor, the TOTAL may not. At floor 12, two
+# categories at 11 (94 of 96) still warn -- not because 11 is too few for a
+# category, but because 94 is too few for the suite, which is the number the
+# prep actually contracted for and the one the 2026-08-09 collapse violated.
 #
 # Module CONSTANTS, not settings fields: every decision here keys off the prep's
 # stamps so a mid-flow .env flip cannot change an in-flight prep, and a ratio
 # that lives in code can only move with a code update -- which
 # _version_skew_note already discloses to the tester.
 _VOLUME_REFUSE_RATIO = 0.5
-_VOLUME_WARN_SLACK = 1
 _VOLUME_MAX_NAMED = 8
 
 
@@ -6688,6 +5760,28 @@ def _volume_floor_note(
     in-flight prep. An envelope written before those stamps existed returns
     ``("", "")`` on the first guard -- inert, never a spurious refusal.
 
+    E02 (2026-08-20) -- REDISTRIBUTION IS LEGITIMATE. The per-category floor
+    used to be reported whenever a category came in under it, even when the
+    suite as a whole honoured the contract. That was consistent with the
+    prompt of the day, which asked every category for the same number and got
+    it: 3/3 measured runs returned an identical count across all eight workers
+    (12, 12, 13; zero within-run disagreement), because the instruction scoped
+    the COUNT to the category and its CONDITION to the feature. Now that the
+    prompt asks each worker to judge its OWN category's material, a thin
+    category is a correct answer, and warning about it would make the honest
+    outcome look like a shortfall on every run.
+
+    So the TOTAL is the contract -- it is what the 2026-08-09 collapse
+    actually violated (8 cases, one per category) -- and per category only two
+    things are still reported when the total is met: a category that is EMPTY,
+    and one that has COLLAPSED to less than half its floor. Half is
+    ``_VOLUME_REFUSE_RATIO``, reused rather than invented: it is the same
+    "materially short" line already drawn for the total. It is NOT measured on
+    this axis and cannot be until suites generated under the new prompt exist,
+    because no run before it was free to vary per category -- the two known-good
+    2026-08-04 runs bottom out at exactly the floor. Calibrate it against the
+    first such suites; do not read it as evidence-backed today.
+
     ``post_dedup=True`` is the WARNING-ONLY channel used once the suite is
     finalized: it returns a warning where it would otherwise refuse, and
     nothing at all otherwise (see the call site for why volume is measured
@@ -6724,12 +5818,18 @@ def _volume_floor_note(
         floor_total = floor * len(names)
         short = [(n, counts.get(n, 0)) for n in names if counts.get(n, 0) < floor]
         empty = [n for n, got in short if got == 0]
-        material = [n for n, got in short if got <= floor - _VOLUME_WARN_SLACK - 1]
-        # Clean exit: the summed floor is met AND no category is empty or short
-        # by more than the measured slack. The TOTAL is checked as well as the
-        # per-category counts because unlabelled cases belong to no category, so
-        # neither condition implies the other.
-        if total >= floor_total and not material and not empty:
+        # E02: below HALF its floor a category has not judged its material thin,
+        # it has collapsed -- that is the 08-09 shape surviving inside one
+        # category. Everything between that line and the floor is the
+        # redistribution the prompt now asks for and is not reported.
+        collapsed = [n for n, got in short if got < floor * _VOLUME_REFUSE_RATIO]
+        # Clean exit: the summed floor is met AND no category is empty or
+        # collapsed. The TOTAL is checked as well as the per-category counts
+        # because unlabelled cases belong to no category, so neither condition
+        # implies the other. Note the ASYMMETRY: `collapsed` and `empty` are
+        # per-category, and the note below still names every merely-short
+        # category once one of those -- or the total -- has opened it.
+        if total >= floor_total and not collapsed and not empty:
             return "", ""
         # A materially-short TOTAL refuses outright. A per-category refusal is
         # restricted to a genuinely ABSENT category on a prep that asked for the
@@ -6742,8 +5842,18 @@ def _volume_floor_note(
         else:
             mode = "warn"
         if post_dedup:
-            if mode != "refuse":
-                return "", ""
+            # F5 (2026-08-15): this used to be `if mode != "refuse": return "", ""`
+            # -- the post-dedup channel REPORTED a would-be refusal as a warning
+            # and threw every genuine warning away. So a suite that cleared the
+            # floor as submitted and fell under it only after de-duplication,
+            # re-filing or an applied duplicate review was finalized in total
+            # silence, which is the exact shape the audit measured. The
+            # collapse test above already suppresses the noise case (a category
+            # merely under its floor, with the suite whole, never reaches here),
+            # so what was being discarded was signal. A refusal is still DOWNGRADED to a
+            # warning: by this point the suite is finalized and about to be
+            # exported, and the tester must not lose it over cases the server
+            # itself removed.
             mode = "warn"
         refused_before = bool(meta.get("volume_refused"))
         if mode == "refuse" and ack and refused_before:
@@ -6757,8 +5867,12 @@ def _volume_floor_note(
             f"- **{'In the FINAL suite' if post_dedup else 'Submitted'}:** "
             f"{total} case(s), {total - unknown} of them carrying a recognised "
             "category.",
-            f"- **This prep asked for:** at least {floor} case(s) per category "
-            f"\u00d7 {len(names)} categories = {floor_total}.",
+            f"- **This prep asked for:** {floor_total} case(s) overall "
+            f"({floor} per category \u00d7 {len(names)} categories). A category "
+            "may come in under that number when it genuinely has less to test, "
+            "PROVIDED the suite makes it up elsewhere -- what is reported here "
+            "is the suite falling short overall, a category with nothing in it, "
+            "or one below half its share.",
             f"- **Below that floor:** {shown or '(none)'}.",
         ]
         if unknown:
@@ -6794,10 +5908,14 @@ def _volume_floor_note(
                 "there, and no remediation round was used.\n\n"
                 "**Pick one:**\n"
                 "1. Generate the missing cases and resubmit the COMPLETE "
-                f"suite with the SAME prep_id `{prep_id}` -- each category "
-                f"needs at least {floor}. That is what `categories[].min_cases` "
-                "in the payload asked for, and the number came from THIS "
-                "feature's own complexity, not a fixed floor.\n"
+                f"suite with the SAME prep_id `{prep_id}` -- the suite needs "
+                f"{floor_total} case(s) overall. `categories[].min_cases` asks "
+                f"{floor} per category and that is the right target for each, "
+                "but a category with genuinely less to test may come in under "
+                "it PROVIDED another covers the difference; what may not stand "
+                "is the total, an empty category, or one below half its share. "
+                "The number came from THIS feature's own complexity, not a "
+                "fixed floor.\n"
                 "2. Or top up per category: call `qa_submit_category` again for "
                 "each short category (a repeat call REPLACES that category's "
                 "staged row, so send its full set), then finalize with an empty "
@@ -6807,30 +5925,102 @@ def _volume_floor_note(
                 "with `volume_floor_ack=true`. Ask them first -- do not decide "
                 "that on your own judgement."
             )
+        # F5: the shortfall goes in the HEAD line, named and quantified. The
+        # facts below were always right, but the old head said only "Volume
+        # below the requested floor" and the tail said the suite "was accepted
+        # as submitted" -- so the one number that matters (`Boundary Values`
+        # 2/8) sat in the middle of a blockquote, and the closing sentence read
+        # as reassurance. A host summarising this reply kept the .xlsx path and
+        # dropped this.
+        worst = min(short, key=lambda pair: pair[1]) if short else None
         head = (
-            "> \u26a0\ufe0f  Volume below the requested floor"
+            "> \u26a0\ufe0f  **UNDER-GENERATED"
             + (
-                " in the FINAL suite (after de-duplication and any re-filing)"
+                " (in the FINAL suite, after de-duplication and any re-filing)"
                 if post_dedup
                 else ""
             )
             + (
-                " (refusal OVERRIDDEN by `volume_floor_ack=true`)"
+                " -- refusal OVERRIDDEN by `volume_floor_ack=true`"
                 if mode == "acked"
                 else ""
             )
-            + ":\n"
+            + ":** "
+            + (
+                f"{len(short)} of {len(names)} categories are below the number "
+                "of cases this prep asked for"
+                + (
+                    f", the worst being `{worst[0]}` with {worst[1]} of {floor}"
+                    if worst
+                    else ""
+                )
+                if short
+                else f"the suite totals {total} case(s) against {floor_total}"
+            )
+            + ".\n"
         )
         return mode, (
             head
             + "".join(f">   {line}\n" for line in facts)
-            + ">   The suite below was accepted as submitted. If that is not "
-            "deliberate, regenerate the short categories and resubmit with "
-            f"prep_id `{prep_id}`.\n\n"
+            + ">   **This suite was still accepted and exported** -- nothing "
+            "here blocked it, and the shortfall is recorded on the "
+            '"Generation Notes" sheet of the workbook. Show the tester these '
+            "numbers. If the short categories were not a deliberate choice, "
+            "regenerate them and resubmit with prep_id "
+            f"`{prep_id}`.\n\n"
         )
     except Exception:  # pragma: no cover - defensive, must never block a finalize
         logger.debug("volume floor gate failed", exc_info=True)
         return "", ""
+
+
+def _volume_shortfall_detail(meta: object, cases: list) -> str:
+    """One plain-text line naming every category below this prep's floor, or "".
+
+    The workbook cell version of what _volume_floor_note renders as markdown.
+    Kept SEPARATE rather than parsed out of that note, because the note is
+    tester-facing prose that is rewritten whenever the wording is improved and a
+    cell should not break when a sentence changes.
+
+    It deliberately MIRRORS the gate's bucketing (normalize_category, unlabelled
+    cases counting toward the total but toward no category) so the two can never
+    disagree about which categories are short -- if that loop ever changes, both
+    must change. Unlike the gate it applies NO slack: this is a record, not a
+    verdict, so `7/8` belongs in it even though 7/8 is deliberately not worth a
+    warning. Never raises.
+    """
+    try:
+        if not isinstance(meta, dict) or not meta.get("volume_floor"):
+            return ""
+        try:
+            floor = int(meta.get("volume_min_cases") or 0)
+        except (TypeError, ValueError):
+            return ""
+        names = [
+            str(n).strip()
+            for n in (meta.get("volume_categories") or [])
+            if str(n).strip()
+        ]
+        if floor <= 0 or not names:
+            return ""
+        counts: dict = {}
+        for tc in cases or []:
+            canon = host_mode.normalize_category(getattr(tc, "category", None))
+            if canon:
+                counts[canon] = counts.get(canon, 0) + 1
+        short = [(n, counts.get(n, 0)) for n in names if counts.get(n, 0) < floor]
+        if not short:
+            return ""
+        listed = ", ".join(f"{n} {got}/{floor}" for n, got in short)
+        return (
+            f"{len(short)} of {len(names)} categories came back below the "
+            f"{floor} cases per category this prep asked for: {listed}. "
+            "The suite was accepted and exported anyway -- nothing blocked it. "
+            "Re-generate the short categories if that was not deliberate."
+        )
+    except Exception:  # pragma: no cover - defensive; a note must never raise
+        logger.debug("volume shortfall detail failed", exc_info=True)
+        return ""
 
 
 # Batch 4, LAYER 2 (QA_HOST_IMAGE_REQUIRE_RELEVANT, default OFF).
@@ -7107,6 +6297,64 @@ def _version_skew_note(staged: str, running: str) -> str:
         return ""
 
 
+def _code_skew_note(staged: str, running: str, *, version_matched: bool) -> str:
+    """Warning for a prep staged by DIFFERENT CODE than is now running.
+
+    Returns "" when the fingerprints match or either is unknown, so callers can
+    use it unconditionally. Never raises.
+
+    F4 (2026-08-15). This is the case _version_skew_note structurally cannot
+    see. That note compares ``meta.app_version`` against ``_BOOT_VERSION``, and
+    a developer checkout reports ``0.1.0`` before and after any edit -- so
+    through exactly the changes a tester most needs to know about (a grounding
+    fix, a sanitisation fix), the versions match and it stays silent. Meanwhile
+    ``data/suites.db`` is shared by every server process on the machine and a
+    prep survives a restart, so "restart the server and submit the prep_id you
+    already have" reuses pre-fix context against fixed code and produces
+    pre-fix output with nothing disclosing it. That is what happened on the
+    SHYJ-5645 validation run.
+
+    WARNING, NEVER A REFUSAL -- the same stance as _version_skew_note, and for
+    the same reason: the prepared work is the tester's, and most code changes
+    do not invalidate a staged prep. What is fixed here is the SILENCE.
+
+    ``version_matched`` shapes the wording only. When the versions ALSO differ,
+    _version_skew_note has already said the builds are different and named both
+    causes, so this adds the one fact that note cannot supply (the prepared
+    context itself is stale) without repeating it.
+    """
+    try:
+        staged = str(staged or "").strip()
+        running = str(running or "").strip()
+        if not staged or not running or staged == running:
+            return ""
+        head = (
+            "\n> \u26a0\ufe0f  Stale prepared context: this prep was staged by a "
+            f"DIFFERENT BUILD of the generation code (`{staged[:12]}`) than the "
+            f"one now running (`{running[:12]}`)."
+        )
+        if version_matched:
+            head += (
+                " The version numbers are identical, so this is a code change "
+                "on the same install -- typically a fix applied between "
+                "`qa_prepare_test_cases` and this submit, with the server "
+                "restarted in between."
+            )
+        body = (
+            " The prepared context in this prep -- the grounded ticket text, "
+            "the acceptance criteria, the category specs -- was built by the "
+            "OLD code and is replayed here as it was stored; restarting the "
+            "server did not rebuild it. If the change was to how ticket text "
+            "is read or grounded, this suite still carries the old behaviour. "
+            "Run `qa_prepare_test_cases` again on the same ticket to rebuild "
+            "the context, then generate against the NEW prep_id.\n"
+        )
+        return head + body
+    except Exception:  # pragma: no cover - defensive; must never break a submit
+        logger.exception("_code_skew_note failed")
+        return ""
+
+
 def _prep_status_finalize_hint() -> str:
     """The finalize advice appended to the `qa_prep_status` reply.
 
@@ -7122,7 +6370,9 @@ def _prep_status_finalize_hint() -> str:
         "ready=yes, call `qa_submit_suite` with the small review SIDECAR "
         "object described in your preparation instructions (no "
         "`test_cases`). Finalizing with an empty `suite_json` instead is "
-        "equally crash-safe but FORFEITS the duplicate review. ALTERNATIVE "
+        "equally crash-safe but FORFEITS the duplicate review -- so send the "
+        "sidecar even when you found nothing, because an EMPTY review field "
+        "still counts as a review. ALTERNATIVE "
         "(Path B, one merged `suite_json`) does not need ready=yes, but "
         "nothing is saved until that single call, so an interrupted chat "
         "loses every category."
@@ -7476,7 +6726,9 @@ async def handle_submit_category(
                 "preparation instructions -- that review field alone, with "
                 "empty or absent `test_cases`. The server remaps its tc_ids "
                 "across the merge, so staging categories does NOT forfeit "
-                "that review."
+                "that review. Send it even when you found nothing: an EMPTY "
+                "review field still counts as a review, while sending nothing "
+                "is recorded as no review at all."
             )
             # 2026-08-03 (Fix 2): when the duplicate review is ON, the EMPTY
             # finalize is precisely the call that FORFEITS it -- so labelling that
@@ -7495,7 +6747,9 @@ async def handle_submit_category(
                 "SIDECAR object described in your preparation instructions "
                 "(no `test_cases`). No case is re-sent, nothing already "
                 "staged can be lost, and the review you were asked to run is "
-                "carried across the merge.\n"
+                "carried across the merge. Found nothing? Send the sidecar "
+                "anyway with its review field EMPTY -- an EMPTY review field "
+                "still counts as a review.\n"
                 "- **Or finalize with an EMPTY `suite_json` "
                 '(`suite_json=""`)**: the same crash-safe merge, but it '
                 "FORFEITS that review.\n"
@@ -7820,6 +7074,15 @@ async def handle_submit_suite(
                 # and let the version SHAPE hint at which: a self-update moves
                 # between released versions, while a dev checkout reports 0.x.
                 version_note = _version_skew_note(_wrote, _BOOT_VERSION)
+            # F4: and the case the version string cannot express -- same
+            # version, different code. Appended rather than substituted: when
+            # BOTH differ, the tester needs the second install warning AND the
+            # fact that the prepared context itself is stale.
+            version_note += _code_skew_note(
+                str(meta.get("code_fingerprint") or ""),
+                code_fingerprint(),
+                version_matched=bool(_wrote and _wrote == _BOOT_VERSION),
+            )
         except Exception:
             logger.debug("prep version check failed", exc_info=True)
         try:
@@ -7898,7 +7161,6 @@ async def handle_submit_suite(
                 # including its documented first-category-wins collision --
                 # the qualified-id contract that would have retired it was
                 # deleted on 2026-08-12 (default OFF, never validated).
-                _sidecar_notes: list = []
                 if sidecar_raw is not None:
                     merged_dict["duplicate_groups"] = _remap_dup_groups(
                         sidecar_raw, id_map
@@ -7914,44 +7176,6 @@ async def handle_submit_suite(
                 _sidecar_amb = sidecar_obj.get("ambiguity_result")
                 if _sidecar_amb is not None:
                     merged_dict["ambiguity_result"] = _sidecar_amb
-                # Phase 3a: the two post_merge folds on Path A. This is the ONLY
-                # channel for them on the per-category route -- exactly what the
-                # RISK_JOB / TEST_PLAN_JOB instructions tell the host to use --
-                # because _merge_category_rows drops every non-test_cases key.
-                # Keyed off the prep's META STAMP, never the live flag, like the
-                # submit-side extraction AND (since review round 3) like
-                # _sidecar_keys' recognition, and with the same
-                # present-but-empty discipline as the other sidecar fields: a
-                # sidecar that did not mention a field must not be read as "the
-                # host reviewed and found nothing". test_plan_report is keyed by
-                # AC id and section name, so it is copied verbatim and
-                # shape-validated downstream like any other submission.
-                if meta.get("host_risk_job"):
-                    _sidecar_risk = sidecar_obj.get("risk_scores")
-                    if _sidecar_risk is not None:
-                        # review round 3 MAJOR: risk_scores' KEYS are tc_ids, and
-                        # on Path A every category restarts at TC-001, so this
-                        # ONE field builds the qualified maps UNCONDITIONALLY --
-                        # with empty maps every `<category>:<tc_id>` key the job
-                        # instructions ask for would be DROPPED, and every
-                        # colliding bare id would collapse onto the first
-                        # category's global id, silently overwriting most of the
-                        # verdicts and misattributing the survivor's rationale
-                        # into another case's row. duplicate_groups can live
-                        # with that guess (a wrong group member is visible in
-                        # the report); a misattributed risk rationale is not.
-                        # Ambiguous bare ids are refused with a note by
-                        # _map_qualified_id.
-                        _risk_qual, _risk_amb = _qualified_id_maps(rows)
-                        _risk_mapped, _risk_notes = _remap_risk_scores(
-                            _sidecar_risk, id_map, _risk_qual, _risk_amb
-                        )
-                        merged_dict["risk_scores"] = _risk_mapped
-                        _sidecar_notes += _risk_notes
-                if meta.get("host_test_plan_job"):
-                    _sidecar_plan = sidecar_obj.get("test_plan_report")
-                    if _sidecar_plan is not None:
-                        merged_dict["test_plan_report"] = _sidecar_plan
                 # Residue R4: the checklist job's return field on Path A. THIS
                 # COPY IS THE POINT of adding `checklist_items` to
                 # _sidecar_keys -- recognition alone only makes the object COUNT
@@ -8001,16 +7225,6 @@ async def handle_submit_suite(
                     f"row(s) plus a review sidecar ({_keys_label}) (no full "
                     "suite_json test_cases were submitted).\n\n"
                 )
-                if _sidecar_notes:
-                    conflict_note += (
-                        "> ⚠️  Sidecar id notes (qualified-id contract; "
-                        "UNTRUSTED input, validated server-side):\n"
-                        + "".join(
-                            f">   - {n}\n"
-                            for n in _sidecar_notes[:_QUAL_REMAP_MAX_NOTES]
-                        )
-                        + "\n"
-                    )
             elif has_full:
                 parsed = host_mode.parse_host_suite(suite_json)
                 rows_res = await prep_store.load_submissions(prep_id)
@@ -8253,6 +7467,11 @@ async def handle_submit_suite(
         # independent counterweight that makes host authorship of the
         # requirement set defensible.
         checklist_note = ""
+        # F6 (2026-08-15): "there is no note" and "the note says no checklist
+        # arrived" are different states, and only the second is a capability
+        # loss worth hoisting and recording. Tracked explicitly rather than
+        # sniffed out of the rendered markdown.
+        checklist_gap = False
         if meta.get("host_checklist_job"):
             from tools.atomic_checklist import audit_granularity
 
@@ -8286,6 +7505,9 @@ async def handle_submit_suite(
             checklist_note = host_mode.build_host_checklist_section(
                 _cl_result, _cl_audit, carried=(0 if _cl_result.ran else _cl_carried)
             )
+            # A carried-forward list is NOT a gap: the requirements are still in
+            # force and the coverage tally still ran over them.
+            checklist_gap = not _cl_result.ran and not _cl_carried
         # The image job's return field. This server described NOTHING itself on
         # this prep -- no ask_vision at all -- so the host's own multimodal model
         # is the only thing that read the screenshots. UNTRUSTED (pixels can be
@@ -8377,29 +7599,6 @@ async def handle_submit_suite(
                     },
                 )
                 img_note += _imd
-        # Phase 3a: the two POST_MERGE job return fields. Both rode in on THIS
-        # submission -- no extra round trip and no server-side LLM call -- on the
-        # whole-suite route directly, and on the per-category route through the
-        # review sidecar handled above. Both are UNTRUSTED, so host_mode
-        # shape-validates, id-checks, clamps, URL-strips and caps them before
-        # anything reads them. Keyed off the prep's meta stamp, so a mid-flow
-        # .env flip cannot change an in-flight prep and a submit for a prep that
-        # shipped neither job is byte-identical to today.
-        host_risk_result = None
-        risk_note = ""
-        if meta.get("host_risk_job"):
-            host_risk_result = host_mode.extract_host_risk_scores(
-                getattr(parsed, "raw_risk_scores", None),
-                {tc.tc_id for tc in all_cases},
-            )
-            risk_note = host_mode.build_host_risk_section(host_risk_result)
-        host_plan_result = None
-        plan_note = ""
-        if meta.get("host_test_plan_job"):
-            host_plan_result = host_mode.extract_host_test_plan(
-                getattr(parsed, "raw_test_plan_report", None)
-            )
-            plan_note = host_mode.build_host_test_plan_section(host_plan_result)
         # Phase 3b: the checklist entailment (b) / adjudication (c) tiers.
         # Nothing comes BACK from the host for these -- they are not folded,
         # they are DISABLED on this path (ledger id `rtm.nli_verdicts`), because
@@ -8431,33 +7630,6 @@ async def handle_submit_suite(
                 "that once filled that role was deleted on 2026-08-12. (The "
                 "same disclosure is written into the checklist coverage notes, "
                 "so it survives into the export.)"
-                "\n\n"
-            )
-        # Phase 3c: Jira comment reconciliation (ledger id
-        # `comment_reconciler.candidates`). Like the tiers above, nothing comes
-        # BACK from the host -- the quarantined extractor was DISABLED on this
-        # path, not delegated -- so the whole submit-side wiring is this
-        # disclosure. Keyed off the prep's meta stamp for the mid-flow-flip
-        # reason, and prepare already refuses to stamp a prep whose ticket had
-        # no comments, so this can never announce a suppression that could not
-        # have happened. Unlike Phase 3b there is NO exported-artifact channel
-        # for this row (a comment thread has no ChecklistCoverage.notes analog),
-        # which is why the reply and the prepare notice have to carry it.
-        comment_note = ""
-        if meta.get("host_comment_reconcile_suppressed"):
-            _kept = int(meta.get("comment_thread_kept") or 0)
-            comment_note = (
-                "> \u2139\ufe0f  "
-                f"{_kept} ticket comment(s) were **not reconciled** into "
-                "requirements: `QA_COMMENT_RECONCILE_ENABLED` is on, but the "
-                "extraction step is a server-side LLM call and this was a "
-                "host-mode run. It was deliberately not handed to your chat "
-                "model: it is a QUARANTINED reader, safe precisely because the "
-                "model that sees the raw thread has no generation prompt and no "
-                "tools, and you have both. So no AMENDMENTS block reached the "
-                "generation prompt and no comment-derived clarifying question "
-                "gated this run -- if the ticket's current truth lives in its "
-                "comments, these cases do not reflect it. "
                 "\n\n"
             )
         # Piece 1: the host's OPTIONAL cross-category duplicate review. It rode in
@@ -8514,8 +7686,10 @@ async def handle_submit_suite(
                     "finalized from per-category rows with no `duplicate_groups` "
                     "sidecar. Either submit ONE merged `suite_json`, or finalize with "
                     '`suite_json={"duplicate_groups":[[...]]}` (empty/absent '
-                    "`test_cases`) after staging categories. Any cross-category "
-                    "duplicates are still present.\n\n"
+                    "`test_cases`) after staging categories -- send an EMPTY "
+                    "`duplicate_groups` list (`[]`) there if you DID review and "
+                    "found none, which records the review as run. Any "
+                    "cross-category duplicates are still present.\n\n"
                 )
         elif dup_review_on and has_full and not dup_groups:
             if getattr(parsed, "duplicate_review_offered", False):
@@ -8528,7 +7702,9 @@ async def handle_submit_suite(
                     "> \u2139\ufe0f  Duplicate review was requested but this "
                     "submission carried no `duplicate_groups` field, so NO "
                     "duplicate review ran -- which is NOT the same as finding "
-                    "none. Any cross-category duplicates are still present.\n\n"
+                    "none. To report a review that found none, send the field "
+                    'as an EMPTY list (`"duplicate_groups": []`). Any '
+                    "cross-category duplicates are still present.\n\n"
                 )
         if dup_review_on and dup_groups:
             # Advisory, shown next to every group in BOTH modes. Never a veto -- see
@@ -8575,11 +7751,11 @@ async def handle_submit_suite(
         # otherwise repeat on every round.
         fa_skip_note = ""
         if (
-            settings.qa_feature_analysis_enabled
+            _feature_analysis_enabled()
             # 2026-08-03: the test-cases-only edition no longer registers
             # qa_feature_analysis, so "call it on demand" would name a tool the
-            # tester's client cannot see. A stale QA_FEATURE_ANALYSIS_ENABLED=true
-            # left in an already-installed .env is exactly how that would happen.
+            # tester's client cannot see. The edition gate is the only thing
+            # deciding that now (batch 8c hardcoded the feature ON).
             and not _test_cases_only()
         ):
             fa_skip_note = (
@@ -8596,50 +7772,13 @@ async def handle_submit_suite(
             on_suite_ready=_on_ready,
             on_status=_on_status,
             ui_content=prepared.ui_content,
-            # HOST PATH: never run the server-side remediation loop -- the
-            # regeneration round is the tester's chat model's job, and a dead
-            # fixed backend would otherwise stall this call for minutes.
-            remediate=False,
-            # Same reasoning for the vague-field REWRITE, a SECOND server-side
-            # ask_json inside _finalize_generation: host mode's premise is that the
-            # server needs no key, no backend and no quota, and a weak host model is
-            # the most likely to emit vague steps -- so it would fire exactly when it
-            # hurts most. Suppressed, the deterministic quality gate still FLAGS
-            # those fields in the reply instead of rewriting them here.
-            rewrite_vague=False,
-            # And the THIRD: the advisory coverage-gap critique. remediate=False
-            # leaves remaining_gaps None, which made _finalize_generation fall
-            # through to analyze_coverage_gaps unconditionally -- ~108s of
-            # fixed-backend LLM work on a path documented as needing none.
-            advisory_gaps=False,
-            # And the FOURTH: the inline Feature Analysis report. MEASURED 42.0s
-            # on the 2026-07-30 host-mode run -- against 0.02s for the entire
-            # deterministic finalize of 65 cases -- so it was ~99.95% of this
-            # step and the single largest server-side cost left on a submit.
-            # HARDCODED False, and the constant is LOAD-BEARING: the parameter
-            # DEFAULTS to True for server mode and for the standalone tool, so
-            # dropping this argument would re-enable that 42s call on any host
-            # install with QA_FEATURE_ANALYSIS_ENABLED=true -- the one call this
-            # chat-only path exists to avoid. QA_FEATURE_ANALYSIS_ENABLED still
-            # exposes the qa_feature_analysis TOOL, which passes
-            # force_feature_report=True and still works. The operator opt-in
-            # that used to be read here (QA_HOST_FEATURE_REPORT_ENABLED) was
-            # deleted on 2026-08-12; it was default OFF, so this is
-            # behaviour-neutral.
-            feature_report_enabled=False,
-            # Phase 3a: None means the job was NOT requested, so the server-side
-            # call (if its own feature flag is on) still runs and this submit is
-            # byte-identical to today. A dict -- possibly EMPTY -- means it WAS
-            # requested, so the server must not make the call; empty is "the host
-            # returned nothing usable", disclosed above, never silently replaced.
-            host_risk_scores=(
-                dict(host_risk_result.scores) if host_risk_result is not None else None
-            ),
-            host_test_plan=(
-                dict(host_plan_result.artifacts)
-                if host_plan_result is not None
-                else None
-            ),
+            # The FOURTH suppression that used to sit here -- feature_report_enabled=False,
+            # against the inline Feature Analysis report, measured at 42.0s on the
+            # 2026-07-30 host-mode run -- became unnecessary on 2026-08-16, when
+            # dead-code deletion P2-E3 removed the branch and analyze_feature with
+            # it. There is no argument left to pass and no call left to avoid. The
+            # qa_feature_analysis TOOL is untouched and still produces a report;
+            # it is chat-only.
             # Phase 3b: True stops _finalize_generation's ONE remaining
             # match_checklist call from firing tiers (b)/(c). False (an
             # unstamped prep) is byte-identical to today.
@@ -8770,13 +7909,49 @@ async def handle_submit_suite(
                         "gaps": len(view.gap_item_ids),
                     },
                 )
-                return (
-                    # FIX 2: same ordering contract as the final return below.
-                    f"{amb_note}{version_note}{dropped_note}{conflict_note}"
-                    f"{cat_source}"
-                    f"{volume_note}"
-                    f"{ac_note}{grounding_note}{checklist_note}{img_note}{dup_status_note}{dup_note}"
-                    f"{gap_md}"
+                # F03 (2026-08-16): the gap reply is the SECOND concatenation
+                # of these same variables, so it gets the same budget -- an
+                # unbounded intermediate reply is the same bug in a different
+                # place. gap_md is protected: it is the instruction the host
+                # has to act on, and a gap round with no instruction is a dead
+                # end. Same ordering contract as the final return below.
+                return assemble_finalize_reply(
+                    [
+                        ReplySection("ambiguity screening", amb_note, protected=True),
+                        ReplySection("server version", version_note, protected=True),
+                        ReplySection("dropped cases", dropped_note, protected=True),
+                        ReplySection(
+                            "unused staged rows", conflict_note, protected=True
+                        ),
+                        ReplySection(
+                            "category provenance", cat_source, _REPLY_P_PROVENANCE
+                        ),
+                        ReplySection("volume floor", volume_note, protected=True),
+                        ReplySection("acceptance criteria", ac_note, protected=True),
+                        ReplySection("grounding", grounding_note, protected=True),
+                        # Split on checklist_gap exactly as the finalize site
+                        # does. Round-2 review, MAJOR 2: one slot here made the
+                        # MISSING-checklist warning droppable in the gap reply
+                        # while it is protected in the final one -- the same
+                        # note, two contradictory rulings, and the weaker one on
+                        # the branch that repeats every round.
+                        ReplySection(
+                            "checklist gap",
+                            checklist_note if checklist_gap else "",
+                            protected=True,
+                        ),
+                        ReplySection(
+                            "checklist coverage",
+                            "" if checklist_gap else checklist_note,
+                            _REPLY_P_REPORT,
+                        ),
+                        ReplySection("screenshots", img_note, protected=True),
+                        ReplySection(
+                            "duplicate review", dup_status_note, protected=True
+                        ),
+                        ReplySection("duplicates", dup_note, protected=True),
+                        ReplySection("gap instructions", gap_md, protected=True),
+                    ]
                 )
             cap_note = (
                 "\n\n> ⚠️  Requirement coverage still shows "
@@ -8807,6 +7982,55 @@ async def handle_submit_suite(
             time.monotonic() - _t_emit,
         )
         suite_id = (saved.get("content") or {}).get("suite_id", "") or suite.suite_id
+        # F5/F6/F7 (2026-08-15): carry this run's SHORTFALLS into the workbook.
+        # Every one of these was already disclosed in the reply, and every one
+        # was measured surviving into a finalized, exported suite anyway: the
+        # reply is transient chat that a summarising host model prunes, while
+        # the .xlsx is what the tester keeps, attaches to the ticket and reads
+        # back a week later. Attached HERE -- after finalize, before
+        # _auto_export_xlsx below -- because only here are all three verdicts
+        # known and the suite object still the one about to be written.
+        # Best-effort: a suite with nothing to report gets no sheet at all, and
+        # a failure here must never cost the tester the export.
+        try:
+            _gen_notes: list = []
+            _vol_detail = _volume_shortfall_detail(
+                meta, list(getattr(suite, "test_cases", None) or [])
+            )
+            if _vol_detail:
+                _gen_notes.append(("Under-generated categories", _vol_detail))
+            if checklist_gap:
+                _gen_notes.append(
+                    (
+                        "No requirements checklist",
+                        "The requirement decomposition runs in the tester's chat "
+                        "model, not on this server, and this run returned no "
+                        "usable `checklist_items`. There is therefore NO "
+                        "requirement coverage tally for this suite, and no "
+                        "Requirements Checklist or Coverage Audit sheet. "
+                        "Nothing was invented to fill the gap -- treat the "
+                        "suite's coverage as unmeasured, not as complete.",
+                    )
+                )
+            if amb_result is not None and not getattr(amb_result, "ran", False):
+                _gen_notes.append(
+                    (
+                        "Ambiguity preflight did not run",
+                        "The testability pre-pass (SHYJ-7154 protection) was "
+                        "declared `blocking: true` in the prepare payload, but "
+                        "it runs inside the tester's chat model and this "
+                        "submission came back with no readable result -- so "
+                        "there is no evidence it ran, and this server cannot "
+                        "enforce a step it does not execute. These cases were "
+                        "generated against a ticket nothing checked for being "
+                        "too under-specified to test. That is NOT the same as "
+                        "'checked and found nothing'.",
+                    )
+                )
+            if _gen_notes:
+                suite._generation_notes = _gen_notes
+        except Exception:  # pragma: no cover - defensive; must never block export
+            logger.debug("generation notes attachment failed", exc_info=True)
         _checklist_artifacts = getattr(suite, "_checklist_artifacts", None)
         if _checklist_artifacts and suite_id:
             await save_checklist(suite_id, _checklist_artifacts)
@@ -8910,9 +8134,10 @@ async def handle_submit_suite(
             },
         )
         auto_export = bool(getattr(suite, "test_cases", None))
-        result_md = shape_generation_result(
-            summary, suite, suite_id, status, auto_export=auto_export
-        )
+        # F03: result_md is shaped at the RETURN now, not here -- its summary
+        # budget depends on export_note, rtm_note and cov_signal_note, none of
+        # which exist yet at this point. Nothing between here and there reads
+        # it.
         xlsx_paths: list[str] = []
         # FRONT-loaded, not appended (see _auto_export_xlsx): export_note goes
         # near the HEAD of the returned string below, ahead of every OTHER note
@@ -8937,17 +8162,12 @@ async def handle_submit_suite(
             export_note = await _auto_export_xlsx(
                 suite,
                 ask_text=ask_text,
+                source_url=source_url or source_text,
                 on_path=xlsx_paths.append,
                 progress=progress,
             )
             if export_note:
                 export_note += "\n\n---\n\n"
-        result_md += await _auto_export_zephyr(
-            suite,
-            source_text=source_text,
-            near_path=xlsx_paths[0] if xlsx_paths else "",
-            progress=progress,
-        )
         # Fix 5b: STAMP instead of DELETE. Deleting made "prep gone" mean three
         # different things at once, so a resubmit after a SUCCESSFUL finalize was
         # told to re-prepare -- i.e. to regenerate a suite that already existed.
@@ -8981,6 +8201,84 @@ async def handle_submit_suite(
                 _stamped.get("error"),
             )
             await prep_store.delete_prep(prep_id)
+        # F03 (2026-08-16): the slot ORDER below is unchanged -- it is the
+        # precedence the two comment blocks above argue for. What changed is
+        # that each slot now carries a name and, where it is droppable, a
+        # reason; the reply as a WHOLE is bounded instead of only the
+        # `summary` inside result_md; and the summary yields to the
+        # disclosures rather than the other way round. Under budget
+        # assemble_finalize_reply returns the identical concatenation.
+        #
+        # PROTECTED means "this section states whether the deliverable is
+        # what it appears to be". Each one below was read against its own
+        # builder before being ranked -- cited by SYMBOL, because line
+        # numbers in this file rot (a concurrent batch moved every one of
+        # them by ~290 lines while this very plan was under review):
+        # _dropped_note is documented as never-swallowed, and
+        # _no_coverage_signal_note as always-on because its ABSENCE would
+        # read as "coverage was checked"; img_note because the _audit call
+        # above stamps host_image_disclosed from it BEFORE this assembly
+        # runs; dup_note because it reports cases the server REMOVED;
+        # conflict_note because it reports staged rows that did NOT make it
+        # in; version_note because a prep staged on a different install was
+        # finalized under different flags.
+        _sections = [
+            ReplySection("ambiguity screening", amb_note, protected=True),
+            ReplySection("volume floor", volume_note, protected=True),
+            ReplySection(
+                "checklist gap",
+                checklist_note if checklist_gap else "",
+                protected=True,
+            ),
+            ReplySection("Excel export", export_note, protected=True),
+            ReplySection("server version", version_note, protected=True),
+            ReplySection("dropped cases", dropped_note, protected=True),
+            ReplySection("unused staged rows", conflict_note, protected=True),
+            # Provenance of a field, not a claim about the suite: it says
+            # the category labels are self-reported. Re-derivable by
+            # submitting per category.
+            ReplySection("category provenance", cat_source, _REPLY_P_PROVENANCE),
+            # Names a tool the tester can call on demand, which is the
+            # whole content of the note.
+            ReplySection("Feature Analysis pointer", fa_skip_note, _REPLY_P_POINTER),
+            ReplySection("acceptance criteria", ac_note, protected=True),
+            ReplySection("grounding", grounding_note, protected=True),
+            # The coverage REPORT (not the gap warning, which is protected
+            # above): a measurement section re-derivable from the suite.
+            ReplySection(
+                "checklist coverage",
+                "" if checklist_gap else checklist_note,
+                _REPLY_P_REPORT,
+            ),
+            ReplySection("screenshots", img_note, protected=True),
+            # Its own text says "the same disclosure is written into the
+            # checklist coverage notes, so it survives into the export" --
+            # which is what makes it, alone, safe to drop first.
+            ReplySection("checklist NLI tier", nli_note, _REPLY_P_EXPORTED),
+            ReplySection("duplicate review", dup_status_note, protected=True),
+            ReplySection("duplicates", dup_note, protected=True),
+            ReplySection("traceability orphans", rtm_note, protected=True),
+            ReplySection("coverage signal", cov_signal_note, protected=True),
+        ]
+        # cap_note is appended AFTER the suite block, so it has to be part
+        # of the budget's overhead even though it is not part of the
+        # preamble. Round-2 review, MAJOR 1: omitting it put the reply over
+        # the cap by its own length on the max-gap-round path.
+        _tail = [ReplySection("coverage round limit", cap_note, protected=True)]
+        # Two shaping passes, both pure and both cheap: the first measures
+        # the header the summary sits under, so the budget is exact rather
+        # than a reserved guess.
+        _head = shape_generation_result(
+            "", suite, suite_id, status, auto_export=auto_export
+        )
+        result_md = shape_generation_result(
+            summary,
+            suite,
+            suite_id,
+            status,
+            auto_export=auto_export,
+            summary_cap=summary_budget(_sections + _tail, len(_head)),
+        )
         return (
             # FIX 2 (2026-08-09): {amb_note} LEADS. host_mode's
             # build_ambiguity_result_section documents itself as "Emitted FIRST,
@@ -8991,13 +8289,21 @@ async def handle_submit_suite(
             # any prep that shipped no ambiguity job, so those replies stay
             # byte-identical. The precedence against export_note's own
             # FRONT-loading contract is recorded where that contract is stated.
-            f"{amb_note}{export_note}"
-            f"{version_note}{dropped_note}{conflict_note}{cat_source}"
-            f"{volume_note}"
-            f"{fa_skip_note}{ac_note}{grounding_note}{checklist_note}{img_note}{risk_note}{plan_note}"
-            f"{nli_note}{comment_note}"
-            f"{dup_status_note}{dup_note}"
-            f"{rtm_note}{cov_signal_note}{result_md}{cap_note}"
+            # F5/F6 (2026-08-15): {volume_note} and a MISSING checklist now sit
+            # ahead of {export_note}, joining {amb_note} in the leading caveat
+            # band. Same reasoning that hoisted {amb_note} on 2026-08-09 and the
+            # same measured failure: a host model summarising this reply keeps
+            # the .xlsx path -- the thing that looks like the deliverable -- and
+            # drops what follows it. An under-generated suite and a suite with
+            # no requirement coverage tally at all are both claims about whether
+            # the deliverable is what it appears to be, so they must not sit
+            # behind it. Both are "" on a healthy run, so those replies keep
+            # today's exact ordering. A checklist note that is NOT a gap
+            # (present, or carried forward from an earlier round) stays in the
+            # tail with the other informational sections.
+            assemble_finalize_reply(
+                _sections + [ReplySection("suite", result_md, protected=True)] + _tail
+            )
         )
     except Exception as exc:
         logger.exception("handle_submit_suite failed")
@@ -9015,8 +8321,9 @@ def _relocate_export(path: str, target_dir: str) -> tuple[str, str]:
     WHY a move rather than an output path: the five single-file exporters each
     choose their own filename and extension, so threading a directory into them
     would mean a per-format extension table that can silently drift. The Zephyr
-    exporter is the exception -- it writes a PAIR into a directory -- and takes
-    the folder directly (see _available_exporters).
+    exporter was the one exception -- it wrote a PAIR into a directory and took
+    the folder directly -- and it was DELETED on 2026-08-15 (dead-code
+    deletion batch D4), so every surviving format is relocated by this function.
     """
     try:
         src = Path(path)
@@ -9039,6 +8346,189 @@ def _relocate_export(path: str, target_dir: str) -> tuple[str, str]:
         )
 
 
+_PUSH_TARGETS = ("testrail", "xray")
+
+
+async def handle_push_suite(
+    suite_id: str,
+    target: str,
+    project_id: int = 0,
+    section_name: str = "",
+    apply: bool = False,
+    *,
+    progress: ProgressCb = None,
+) -> str:
+    """PUSH a stored suite into TestRail or Xray. Never raises.
+
+    This is the ONLY credentialed outbound WRITE in the tree, which is why it has
+    two independent guards: the target's kill-switch setting AND ``apply=true`` on
+    the call. Either one missing means no request is made.
+
+    A dry run (the default) needs no flag: it reports what WOULD be created and
+    makes no request at all. A flag-OFF call with ``apply=true`` REFUSES BY NAME
+    rather than quietly downgrading to a dry run -- a tester who asked to push and
+    got a success-shaped reply would believe cases exist in a tracker that do not.
+
+    Nothing here deletes a remote case afterwards, so a successful push says so.
+    """
+    from agents.api_test_agent import _safe
+
+    target = (target or "").strip().lower()
+    if target not in _PUSH_TARGETS:
+        return (
+            "\u26a0\ufe0f Unknown push target "
+            + repr(_safe(target, 40))
+            + ". Choose one of: "
+            + ", ".join(_PUSH_TARGETS)
+            + "."
+        )
+    flag_name = (
+        "QA_TESTRAIL_PUSH_ENABLED" if target == "testrail" else "QA_XRAY_PUSH_ENABLED"
+    )
+    enabled = bool(
+        settings.qa_testrail_push_enabled
+        if target == "testrail"
+        else settings.qa_xray_push_enabled
+    )
+    if apply and not enabled:
+        return (
+            "\u26a0\ufe0f **Nothing was sent.** A real push to "
+            + target
+            + " needs `"
+            + flag_name
+            + "=true` in `.env` and an MCP server restart. Re-run with `apply=false` "
+            "for a preview of exactly what would be created."
+        )
+    suite_id = (suite_id or "").strip()
+    if not suite_id:
+        return await _recent_suites_markdown("qa_push_suite")
+    try:
+        loaded = await load_suite(suite_id)
+        if loaded.get("error"):
+            return (
+                "\u26a0\ufe0f Could not load suite `"
+                + _safe(suite_id, 80)
+                + "`: "
+                + _safe(loaded["error"], 300)
+            )
+        suite = loaded.get("content")
+        if suite is None:
+            return (
+                "\u26a0\ufe0f No stored suite with id `"
+                + _safe(suite_id, 80)
+                + "`. Generate one first."
+            )
+        total = len(getattr(suite, "test_cases", []) or [])
+        if target == "testrail":
+            try:
+                project_id = int(project_id or 0)
+            except (TypeError, ValueError):
+                project_id = 0
+            if project_id <= 0:
+                return (
+                    "\u26a0\ufe0f TestRail needs the numeric project id: "
+                    '`qa_push_suite(suite_id="'
+                    + _safe(suite_id, 80)
+                    + '", target="testrail", project_id=<id>)`. '
+                    "It is the number in the TestRail URL for that project."
+                )
+            from tools import testrail_pusher
+
+            await _emit(
+                progress,
+                "\U0001f4e4 "
+                + ("Pushing" if apply else "Previewing")
+                + " to TestRail\u2026",
+            )
+            result = await testrail_pusher.push_suite(
+                suite,
+                project_id,
+                section_name=(section_name or "QA Assistant Export"),
+                dry_run=not apply,
+            )
+        else:
+            from tools import xray_pusher
+
+            await _emit(
+                progress,
+                "\U0001f4e4 "
+                + ("Pushing" if apply else "Previewing")
+                + " to Xray\u2026",
+            )
+            result = await xray_pusher.push_suite(suite, dry_run=not apply)
+
+        if result.get("error"):
+            return "\u26a0\ufe0f " + _safe(result["error"], 400)
+        content = result.get("content") or {}
+        pushed = int(content.get("pushed") or 0)
+        skipped = int(content.get("skipped") or 0)
+        would = int(content.get("would_push") or 0)
+        await _audit(
+            "mcp_push_suite",
+            entity_id=suite_id,
+            detail={
+                "target": target,
+                "apply": bool(apply),
+                "pushed": pushed,
+                "skipped": skipped,
+                "would_push": would,
+            },
+        )
+        # The pushers cap the case list BEFORE counting, so `would_push`/`pushed` can
+        # never reveal the truncation on their own -- compare against the suite.
+        counted = would if not apply else pushed + skipped
+        cap_note = ""
+        if total and counted and counted < total:
+            cap_note = (
+                "\n\n\u26a0\ufe0f Only the first "
+                + str(counted)
+                + " of "
+                + str(total)
+                + " cases were included \u2014 this pusher caps the batch. The rest were "
+                "NOT sent."
+            )
+        if not apply:
+            return (
+                "## Push preview \u2014 "
+                + target
+                + "\n\n**Nothing was sent.** "
+                + str(would)
+                + " case(s) from suite `"
+                + _safe(suite_id, 80)
+                + "` would be created"
+                + (
+                    " under section '" + _safe(content.get("section_name"), 60) + "'"
+                    if content.get("section_name")
+                    else ""
+                )
+                + ".\n\nRe-run with `apply=true` to push for real"
+                + ("" if enabled else " (needs `" + flag_name + "=true` first)")
+                + "."
+                + cap_note
+            )
+        created = content.get("case_ids") or content.get("issue_keys") or []
+        return (
+            "\u2705 Pushed **"
+            + str(pushed)
+            + "** case(s) to "
+            + target
+            + (" (" + str(skipped) + " skipped)" if skipped else "")
+            + ".\n\n"
+            + (
+                "- created: `"
+                + _safe(", ".join(str(c) for c in created[:20]), 300)
+                + "`\n"
+                if created
+                else ""
+            )
+            + "\nThis left your organisation and **nothing here deletes those cases \u2014 "
+            "remove them in " + target + " if this was a mistake.**" + cap_note
+        )
+    except Exception as exc:  # never-raise contract
+        logger.exception("mcp push_suite failed")
+        return "\u26a0\ufe0f Push to " + target + " failed: " + _safe(str(exc), 200)
+
+
 async def handle_export_suite(
     suite_id: str,
     fmt: str,
@@ -9055,8 +8545,9 @@ async def handle_export_suite(
     so tester control belongs on the call that is explicitly about exporting,
     as a parameter rather than an elicitation. Always optional: a required
     field here would break every existing caller. Empty keeps each format's
-    current destination exactly (secure temp for the five single-file
-    exporters, QA_EXPORT_DIR for the Zephyr pair). Never raises.
+    current destination exactly -- a secure temp folder for all five
+    single-file exporters, which since batch D4 deleted the Zephyr pair
+    (2026-08-15) is every format there is. Never raises.
     """
     fmt = (fmt or "").strip().lower()
     if not fmt and _elicit_enabled():
@@ -9102,22 +8593,22 @@ async def handle_export_suite(
         # anywhere. A rejection keeps the default destination AND says so.
         target_dir, dir_note = "", ""
         if (output_dir or "").strip():
-            target_dir, _why = _safe_elicited_dir(output_dir)
+            target_dir, _why = _safe_elicited_dir(
+                output_dir, fallback_label=_TEMP_EXPORT_LABEL
+            )
             if not target_dir:
                 dir_note = _why
-        # The Zephyr exporter needs the originating Jira key for its Project /
-        # Issue columns; every other format ignores it.
-        story_key = await _suite_story_key(suite_id) if fmt == _ZEPHYR_FORMAT else ""
         try:
-            path = await asyncio.to_thread(
-                _available_exporters(story_key, target_dir)[fmt], suite
-            )
+            path = await asyncio.to_thread(_available_exporters()[fmt], suite)
         except Exception as exc:
             logger.exception("mcp export failed")
             return f"⚠️ Export to {fmt} failed: {exc}"
-        if target_dir and fmt != _ZEPHYR_FORMAT:
-            # Zephyr already wrote its PAIR into target_dir; moving just the
-            # workbook would split it from its zfj_import_config.json.
+        if target_dir:
+            # Every surviving format writes ONE file, so relocating it is
+            # safe. The exception was the Zephyr PAIR, which wrote itself
+            # into target_dir and would have been split from its
+            # zfj_import_config.json by a move; that exporter was DELETED
+            # on 2026-08-15 (dead-code deletion batch D4).
             path, _move_note = _relocate_export(path, target_dir)
             if _move_note:
                 dir_note += _move_note
@@ -9130,13 +8621,6 @@ async def handle_export_suite(
         result = shape_export_result(suite_id, fmt, path, len(suite.test_cases))
         if dir_note:
             result += dir_note
-        if fmt == _ZEPHYR_FORMAT:
-            result += _zephyr_pair_note(
-                path,
-                story_key,
-                dry_run=_zephyr_dry_run(),
-                total_cases=len(suite.test_cases),
-            )
         return result
     except Exception as exc:
         logger.exception("handle_export_suite failed")
@@ -9290,10 +8774,187 @@ def _render_api_write_result(r: dict) -> str:
     return f"⚠️ {r.get('error') or 'write failed'}"
 
 
+async def handle_api_project(
+    create: str = "", use: str = "", *, progress: ProgressCb = None
+) -> str:
+    """PROJECT step of the chat-only API test agent (Phase A).
+
+    Creates a new project from the public template repo, or continues with an
+    existing one by registered name or by path. NEVER uses ctx.elicit -- markdown
+    cards only (the blocking-elicitation class, 2026-08-10: those dialogs render
+    collapsed-and-required in Cursor and hang the call). The card is
+    server-authored text the host model reads as trusted, so every value it
+    echoes -- a project name, a path, a marker field -- is fence-sanitised.
+    Never raises."""
+    import asyncio as _asyncio
+
+    from config.settings import settings as _s
+
+    if not _s.qa_api_test_enabled:
+        return "\u26a0\ufe0f The API test agent is off. Set QA_API_TEST_ENABLED=true and restart the server."
+    create = (create or "").strip()
+    use = (use or "").strip()
+    if create and use:
+        return '\u26a0\ufe0f Pass either `create="<new project name>"` or `use="<name or path>"` \u2014 not both.'
+    try:
+        from agents.api_test_agent import _safe
+        from tools import api_project, framework_template
+
+        if not create and not use:
+            listed = await api_project.list_projects()
+            rows = listed.get("content") or []
+            lines = [
+                "## API test project",
+                "",
+                "Every API flow starts with a project. Two ways forward \u2014 ask the tester which:",
+                "",
+                '1. **A new project** \u2014 `qa_api_project(create="<name>")`. The name becomes the '
+                "Maven artifactId and the Java package, so it must be lowercase letters, digits "
+                "and single hyphens (for example `wallet-api`).",
+                '2. **Continue with an existing one** \u2014 `qa_api_project(use="<name or path>")`.',
+                "",
+            ]
+            if rows:
+                lines.append("Already registered:")
+                lines += [
+                    "- `"
+                    + _safe(r.get("name"), 60)
+                    + "` \u2014 `"
+                    + _safe(r.get("path"), 200)
+                    + "`"
+                    for r in rows
+                ]
+            else:
+                lines.append("No projects are registered yet.")
+            await _audit("mcp_api_project_menu")
+            return "\n".join(lines)
+
+        if use:
+            resolved = await api_project.resolve_project(use)
+            if resolved.get("error"):
+                return "\u26a0\ufe0f " + _safe(resolved["error"], 500)
+            identity = resolved.get("content") or {}
+            await _audit("mcp_api_project_use", entity_id=identity.get("name"))
+            notes = "\n".join(
+                "- " + _safe(n, 300) for n in (identity.get("notes") or [])
+            )
+            return "\n".join(
+                p
+                for p in [
+                    "\u2705 Using project **" + _safe(identity.get("name"), 60) + "**",
+                    "",
+                    "- path: `" + _safe(identity.get("path"), 200) + "`",
+                    "- java package: `"
+                    + _safe(identity.get("package_root"), 100)
+                    + "`",
+                    notes,
+                    "",
+                    "Next: `qa_prepare_api_tests` with the endpoint source \u2014 a curl command, an "
+                    "OpenAPI spec, or a plain description.",
+                ]
+                if p
+            )
+
+        repo = (_s.qa_api_template_repo or "").strip()
+        if not repo:
+            return (
+                "\u26a0\ufe0f Set `QA_API_TEMPLATE_REPO` to the public template repo, e.g. `owner/name`, "
+                "in your `.env` and restart \u2014 a new project is created from its latest release. "
+                "Nothing was created."
+            )
+        projects_dir = (_s.qa_api_projects_dir or "").strip()
+        if not projects_dir:
+            return (
+                "\u26a0\ufe0f Set `QA_API_PROJECTS_DIR` to the folder new API projects should be created "
+                "in, then restart. Nothing was created."
+            )
+        await _emit(
+            progress,
+            "\U0001f4e6 Fetching the project template and proving it compiles\u2026",
+        )
+        created = await _asyncio.to_thread(
+            framework_template.bootstrap,
+            name=create,
+            dest_root=projects_dir,
+            repo=repo,
+        )
+        if created.get("error"):
+            output = created.get("output")
+            # Build output comes from the DOWNLOADED template repo: externally-
+            # sourced text reaching a model, so it goes through wrap_untrusted like
+            # every other such payload (hard constraint). The backtick swap is a
+            # SEPARATE concern -- it stops the output breaking out of the fence of
+            # the server-authored card around it.
+            from tools.untrusted import wrap_untrusted
+
+            fenced = (
+                wrap_untrusted(
+                    "template build output",
+                    str(output)[-2000:].replace("```", "'''"),
+                )
+                if output
+                else ""
+            )
+            tail = "\n\n```\n" + fenced + "\n```" if output else ""
+            await _audit(
+                "mcp_api_project_create_failed", detail={"gate": created.get("gate")}
+            )
+            return (
+                "\u26a0\ufe0f "
+                + _safe(created["error"], 400)
+                + " Nothing was created."
+                + tail
+            )
+        registered = await api_project.register_project(
+            name=created["name"],
+            path=created["path"],
+            artifact_id=created["artifact_id"],
+            package_root=created["package_root"],
+            template_repo=created["template_repo"],
+            template_version=created["template_version"],
+        )
+        warning = ""
+        # A colliding slug repoints an existing row. R8 records it; disclose it HERE
+        # too, or the create path stays silent about it (review MINOR).
+        moved_from = str((registered.get("content") or {}).get("repointed_from") or "")
+        if moved_from:
+            warning += (
+                "\n\n\u26a0\ufe0f A project named that was already registered at `"
+                + _safe(moved_from, 200)
+                + "` and now points here. If those are two different projects, give one"
+                " of them a different name."
+            )
+        if registered.get("error"):
+            warning = (
+                "\n\n\u26a0\ufe0f The project was created but could not be added to the registry ("
+                + _safe(registered["error"], 200)
+                + '); continue with `qa_api_project(use="'
+                + _safe(created["path"], 200)
+                + '")`.'
+            )
+        await _audit("mcp_api_project_created", entity_id=created["name"])
+        return (
+            "\u2705 Created project **" + _safe(created["name"], 60) + "**\n\n"
+            "- path: `" + _safe(created["path"], 200) + "`\n"
+            "- java package: `" + _safe(created["package_root"], 100) + "`\n"
+            "- template: `"
+            + _safe(created["template_repo"], 120)
+            + "` `"
+            + _safe(created["template_version"], 60)
+            + "`\n"
+            "- one local commit, no remote, nothing pushed; `-B test-compile` is green\n\n"
+            "Next: `qa_prepare_api_tests` with the endpoint source." + warning
+        )
+    except Exception as exc:
+        logger.exception("handle_api_project failed")
+        return f"\u26a0\ufe0f API project step failed ({type(exc).__name__}) \u2014 see the server log."
+
+
 async def handle_prepare_api_tests(
     input: str = "",
     intake_id: str = "",
     confirmed: bool = False,
+    project: str = "",
     *,
     progress: ProgressCb = None,
 ) -> str:
@@ -9309,7 +8970,10 @@ async def handle_prepare_api_tests(
 
         await _emit(progress, "🧭 Processing the API endpoint intake…")
         r = await _agent.prepare_api_tests(
-            input or "", (intake_id or "").strip(), bool(confirmed)
+            input or "",
+            (intake_id or "").strip(),
+            bool(confirmed),
+            (project or "").strip(),
         )
         kind = r.get("kind")
         disc = ("\n\n" + r["disclosure"]) if r.get("disclosure") else ""
@@ -9375,7 +9039,11 @@ async def handle_submit_api_tests(
 
 
 async def handle_write_api_test(
-    suite_id: str, apply: bool = False, *, progress: ProgressCb = None
+    suite_id: str,
+    apply: bool = False,
+    project: str = "",
+    *,
+    progress: ProgressCb = None,
 ) -> str:
     """WRITE half: render + (dry-run or) write the Java into the framework repo via
     that repo's ops pipeline. Never raises."""
@@ -9386,11 +9054,48 @@ async def handle_write_api_test(
     suite_id = (suite_id or "").strip()
     if not suite_id:
         return "⚠️ Pass the `suite_id` from `qa_submit_api_tests`."
-    fw_path = _s.qa_api_framework_path
-    if not fw_path:
-        return "⚠️ Set QA_API_FRAMEWORK_PATH to your api-automation-framework checkout, then restart."
+    project = (project or "").strip()
+    fw_path = ""
+    package_root = ""
+    project_notes: list = []
     try:
         from agents import api_test_agent as _agent
+        from agents.api_test_agent import _safe
+
+        # Project selection is EXPLICIT (A5): the tester names the project on
+        # the call, so nothing depends on hidden "current project" state that a
+        # second editor window could silently change. Naming none falls back to
+        # QA_API_FRAMEWORK_PATH, so everything that works today keeps working.
+        if project:
+            from tools import api_project as _projects
+
+            # adopt=False ON PURPOSE. Naming a PATH here must never write
+            # .qa-api-project.json into the tester's repo as a side effect of a
+            # write: adoption is a visible, tester-initiated qa_api_project(use=)
+            # action, which is also the only place the "commit it" note is
+            # shown -- and op 8's clean-tree MARKER_NAME exemption would stop
+            # the gate from ever revealing a marker adopted silently here.
+            resolved = await _projects.resolve_project(project, adopt=False)
+            if resolved.get("error"):
+                # Fence-sanitised like every other echoed value: this string can
+                # carry a path and marker fields out of a repo we do not control.
+                return "⚠️ " + _safe(resolved["error"], 500)
+            identity = resolved.get("content") or {}
+            fw_path = identity.get("path") or ""
+            package_root = identity.get("package_root") or ""
+            # Do NOT drop these. A repoint warning and a template-version note only
+            # reach the tester if the write path echoes them (review MINOR: dropping
+            # them was one of the concealment mechanisms R5 set out to remove).
+            project_notes = [
+                "- " + _safe(n, 300) for n in (identity.get("notes") or [])
+            ]
+        else:
+            fw_path = _s.qa_api_framework_path
+            if not fw_path:
+                return (
+                    '⚠️ Name a project with `project="<name>"` (see `qa_api_project()`), or set '
+                    "QA_API_FRAMEWORK_PATH to your api-automation-framework checkout and restart."
+                )
 
         # A real write needs the write flag ON and dry-run OFF; otherwise apply is a no-op refusal.
         write_enabled = bool(_s.qa_api_framework_write_enabled) and not bool(
@@ -9402,13 +9107,21 @@ async def handle_write_api_test(
             bool(apply),
             framework_path=fw_path,
             write_enabled=(write_enabled and bool(apply)),
+            package_root=package_root,
         )
         await _audit(
             "mcp_api_write",
             entity_id=suite_id,
-            detail={"apply": bool(apply), "status": r.get("status")},
+            detail={
+                "apply": bool(apply),
+                "status": r.get("status"),
+                "project": project,
+            },
         )
-        return _render_api_write_result(r)
+        rendered = _render_api_write_result(r)
+        if project_notes:
+            rendered = "\n".join(project_notes) + "\n\n" + rendered
+        return rendered
     except Exception as exc:
         logger.exception("handle_write_api_test failed")
         return f"⚠️ API test write failed ({type(exc).__name__}) — see the server log."
@@ -10083,7 +9796,7 @@ async def handle_capture_screens(
     2026-08-13 (QA_MOBILE_CAPTURE deleted, pinned to the `true` the dist
     .env.example already shipped), so this tool is LIVE on every edition.
     Deliberately does NOT refuse in the test-cases-only edition (unlike
-    handle_run_mobile_suite / handle_feature_analysis): tools/device_manager IS
+    handle_feature_analysis): tools/device_manager IS
     shipped there, capturing app screens grounds test-case generation -- that
     edition's one job -- and this makes no server-side vision call, so the
     credential-free promise holds (see docs/FEATURE_FLAGS.md). Never raises."""
@@ -10212,512 +9925,6 @@ async def handle_capture_screens(
         logger.exception("handle_capture_screens failed")
         _capture_error(exc, "qa_capture_screens")
         return (f"⚠️ Screen capture failed: {exc}", [])
-
-
-async def handle_run_mobile_suite(
-    mode: str,
-    device_id: str = "",
-    suite_id: str = "",
-    app_id: str = "",
-    goal: str = "",
-    *,
-    choose: ChooseCb = None,
-    ask_text: AskCb = None,
-    progress: ProgressCb = None,
-) -> str:
-    if _test_cases_only():
-        return _TEST_CASES_ONLY_NOTICE
-    mode = (mode or "").strip().lower()
-    if not mode and _elicit_enabled():
-        picked = await _elicit_mobile_mode(choose)
-        if picked.status == CHOSEN:
-            mode = (picked.value or "").strip().lower()
-        elif picked.status == DECLINED:
-            return "👍 Cancelled — no mobile testing mode selected."
-        else:
-            return _mobile_mode_menu_markdown()
-    if mode not in _MOBILE_MODES:
-        return f"⚠️ Unknown mode '{mode}'. Choose one of: {', '.join(_MOBILE_MODES)}."
-    # QA_MAESTRO_ENABLED was DELETED on 2026-08-13 (flag-surface reduction,
-    # batch 7) and hardcoded OFF, so this refusal is unconditional in
-    # production and everything below it is retained-for-revival. The message
-    # no longer names an env var: it would be naming one that does not exist.
-    if not _maestro_enabled():
-        return "ℹ️ Mobile testing (Maestro) is disabled in this build."
-    try:
-        if mode == "export":
-            suite_id = (suite_id or "").strip()
-            if not suite_id and _elicit_enabled():
-                picked = await _elicit_suite(choose)
-                if picked.status == CHOSEN:
-                    suite_id = (picked.value or "").strip()
-                elif picked.status == DECLINED:
-                    return "👍 Cancelled — no suite selected."
-            if not suite_id:
-                return await _recent_suites_markdown("qa_run_mobile_suite")
-            loaded = await load_suite(suite_id)
-            suite = loaded.get("content")
-            if suite is None:
-                return f"⚠️ No stored suite with id `{suite_id}`."
-            await _emit(progress, "📱 Writing Maestro flows…")
-            path = await asyncio.to_thread(generate_maestro_flows, suite)
-            await _audit(
-                "mcp_run_mobile_suite",
-                entity_id=suite_id,
-                detail={"mode": mode, "path": path},
-            )
-            return shape_mobile_export(suite_id, path, len(suite.test_cases))
-
-        device_id = (device_id or "").strip()
-        if not device_id and _elicit_enabled():
-            picked = await _elicit_device(choose)
-            if picked.status == CHOSEN:
-                device_id = picked.value or ""
-            elif picked.status == DECLINED:
-                return "👍 Cancelled — no device selected."
-            else:
-                return await _device_menu_markdown()
-        device = await _resolve_device(device_id)
-        if device is None:
-            return (
-                f"⚠️ Device `{device_id}` not found. Run qa_list_devices to see "
-                "connected devices, then pass a listed id."
-            )
-
-        if mode in ("run", "heal"):
-            # run/heal read the flows written by mode "export" into the per-suite
-            # dir flow_dir_for_suite(suite_id) (parity with app.py). Reject cleanly
-            # when nothing was exported yet, rather than silently running an empty dir.
-            if not (suite_id or "").strip() and _elicit_enabled():
-                picked = await _elicit_suite(choose)
-                if picked.status == CHOSEN:
-                    suite_id = (picked.value or "").strip()
-                elif picked.status == DECLINED:
-                    return "👍 Cancelled — no suite selected."
-                elif _unanswered(picked):
-                    # K1 (2026-08-10): falling through here ran a SIDE-EFFECTING
-                    # device flow against settings.qa_maestro_flow_dir -- the wrong
-                    # artifacts -- because the tester did not answer a dialog they
-                    # very likely never saw. Say so instead.
-                    _why = (
-                        f"no answer arrived within {int(_ELICIT_TIMEOUT_S)}s"
-                        if picked.timed_out
-                        else "this call had already run past its interactive budget"
-                    )
-                    return (
-                        f"⚠️ I asked which suite to {mode}, but {_why}, so I stopped "
-                        "rather than running against the wrong flows. Re-call "
-                        "`qa_run_mobile_suite` with an explicit `suite_id`."
-                    )
-                # UNAVAILABLE (no dialogs / no stored suites) still falls through to
-                # the legacy global-flow-dir path, which is its documented meaning.
-                # Only the no-answer cases are separated out above.
-            flow_path = _resolve_flow_path(suite_id)
-            if (suite_id or "").strip() and (
-                not flow_path or not Path(flow_path).exists()
-            ):
-                # Chainlit couples export -> run; mirror that so running a
-                # freshly generated suite just works without a manual export.
-                loaded = await load_suite(suite_id.strip())
-                fresh_suite = loaded.get("content")
-                if fresh_suite is not None:
-                    await _emit(
-                        progress, "📱 No flows yet — exporting the suite first…"
-                    )
-                    flow_path = await asyncio.to_thread(
-                        generate_maestro_flows, fresh_suite
-                    )
-            if not flow_path or not Path(flow_path).exists():
-                return (
-                    f"⚠️ No Maestro flows found at `{flow_path}`. Export the suite "
-                    'first with qa_run_mobile_suite(mode="export", suite_id=…), '
-                    "then pass the same suite_id here."
-                )
-            audit_detail = {"mode": mode, "suite_id": (suite_id or "").strip()}
-
-            if mode == "run":
-                await _emit(progress, "📱 Running Maestro flows on the device…")
-                res = await run_flows(device, flow_path=flow_path)
-                if res.get("error"):
-                    return f"⚠️ Maestro run failed: {res['error']}"
-                await _audit(
-                    "mcp_run_mobile_suite", entity_id=device["id"], detail=audit_detail
-                )
-                return shape_mobile_run(device["id"], res.get("content") or {})
-
-            # mode == "heal"
-            await _emit(progress, "🩹 Running the Maestro heal loop…")
-            res = await heal_and_rerun(device, flow_path=flow_path)
-            await _audit(
-                "mcp_run_mobile_suite", entity_id=device["id"], detail=audit_detail
-            )
-            return shape_mobile_heal(device["id"], res.get("content") or {})
-
-        # mode == "explore"
-        if not (app_id or "").strip() and _elicit_enabled():
-            apps = (await list_installed_apps(device)).get("content") or []
-            if apps:
-                labels = [
-                    f"{a.get('name') or a.get('id')} ({a.get('id')})" for a in apps[:15]
-                ]
-                by_label = {lab: a.get("id") for lab, a in zip(labels, apps[:15])}
-                picked = await _elicit_choice(
-                    choose, "Which app should I explore?", labels
-                )
-                if picked.status == CHOSEN:
-                    app_id = by_label.get(picked.value or "") or ""
-                elif picked.status == DECLINED:
-                    return "👍 Cancelled — no app selected."
-        if not (goal or "").strip() and _elicit_enabled():
-            asked = await _elicit_text(
-                ask_text,
-                "What should the exploration focus on? (e.g. 'the login flow') "
-                "— or reply `default` to explore broadly.",
-            )
-            if asked.status == CHOSEN:
-                goal = (asked.value or "").strip()
-                if goal.lower() == "default":
-                    # Cursor cannot submit an empty value, so `default` is the only
-                    # reachable way to say "no particular focus". Empty goal falls
-                    # through to the broad "Explore the app" default below.
-                    goal = ""
-            elif asked.status == DECLINED:
-                return "👍 Cancelled."
-        await _emit(progress, "🧭 Starting the AI exploratory run…")
-        res = await maestro_explore(device, goal or "Explore the app", app_id or "")
-        await _audit(
-            "mcp_run_mobile_suite", entity_id=device["id"], detail={"mode": mode}
-        )
-        return shape_mobile_explore(device["id"], res.get("content") or {})
-    except Exception as exc:
-        logger.exception("handle_run_mobile_suite failed")
-        _capture_error(exc, "qa_run_mobile_suite")
-        return f"⚠️ Mobile {mode} failed: {exc}"
-
-
-def shape_web_run(base_url: str, payload: dict) -> str:
-    """Shape a web-run result. Prefers the pre-rendered per-TC markdown."""
-    if payload.get("reason") == "disabled":
-        return "ℹ️ Web suite execution is disabled (set QA_WEB_RUN_ENABLED=true)."
-    md = (payload.get("markdown") or "").strip()
-    if md:
-        return md
-    return (
-        f"## Web run on `{base_url}`\n\n"
-        f"**Passed:** {payload.get('passed', 0)}  ·  "
-        f"**Failed:** {payload.get('failed', 0)}  ·  "
-        f"**Total:** {payload.get('total', 0)}"
-    )
-
-
-async def handle_run_web_suite(
-    base_url: str,
-    suite_id: str = "",
-    *,
-    choose: ChooseCb = None,
-    progress: ProgressCb = None,
-) -> str:
-    """Run a stored suite against a live web app and report pass/fail per TC-ID.
-
-    Full edition only, gated by the _web_run_enabled() seam; dry-run previews
-    the planned browser actions without launching a browser. Never raises."""
-    if _test_cases_only():
-        return _TEST_CASES_ONLY_NOTICE
-    # QA_WEB_RUN_ENABLED was DELETED on 2026-08-13 (flag-surface reduction,
-    # batch 6) and hardcoded OFF. The message no longer names an env var:
-    # it would be naming one that does not exist.
-    if not _web_run_enabled():
-        return "ℹ️ Web suite execution is disabled in this build."
-    base_url = (base_url or "").strip()
-    if not base_url:
-        return (
-            "⚠️ Provide the application base URL to run against, e.g. "
-            "https://staging.example.com."
-        )
-    suite_id = (suite_id or "").strip()
-    try:
-        # web L3: keep the elicitation + recent-suites lookups inside the
-        # never-raise guard so a transport error can't escape the handler.
-        if not suite_id and _elicit_enabled():
-            picked = await _elicit_suite(choose)
-            if picked.status == CHOSEN:
-                suite_id = (picked.value or "").strip()
-            elif picked.status == DECLINED:
-                return "👍 Cancelled — no suite selected."
-        if not suite_id:
-            return await _recent_suites_markdown("qa_run_web_suite")
-        loaded = await load_suite(suite_id)
-        if loaded.get("error"):
-            return f"⚠️ Could not load suite `{suite_id}`: {loaded['error']}"
-        suite = loaded.get("content")
-        if suite is None:
-            return f"⚠️ No stored suite with id `{suite_id}`. Generate one first."
-        # Phase 5d: this half now makes NO model call. It does the work only a
-        # server can do (flag gate, suite lookup, the shared case-budget rule, a
-        # cheap SSRF pre-check) and hands the translation to the tester's own
-        # chat model. The browser itself -- and every safety check around it:
-        # _validate_public_host, the DNS pin, _resolve_nav_target, the action
-        # whitelist -- runs on the submit half, unchanged.
-        await _emit(progress, "🌐 Preparing the web-run translation task…")
-        opened = await _open_web_run_task(suite, suite_id, base_url)
-        if opened.get("error"):
-            return f"⚠️ Web run preparation failed: {opened['error']}"
-        opened_content = opened.get("content") or {}
-        task_id = str(opened_content.get("task_id") or "")
-        n_cases = int(opened_content.get("cases") or 0)
-        envelope = opened_content.get("envelope") or {}
-        await _audit(
-            "mcp_run_web_suite_prepare",
-            entity_id=suite_id,
-            detail={"base_url": base_url, "cases": n_cases},
-        )
-        return (
-            f"_Suite `{suite_id}` · {n_cases} case(s) · target `{base_url}`. "
-            "This server made no model call: translate the steps below, then "
-            "call `qa_submit_web_run` — the browser run happens there._\n\n"
-        ) + shape_host_task(
-            "Web run — translate the steps into browser actions",
-            task_id,
-            envelope,
-            "qa_submit_web_run",
-            "field `translations_json`",
-            response_schema=envelope.get("response_schema"),
-        )
-    except Exception as exc:
-        logger.exception("handle_run_web_suite failed")
-        _capture_error(exc, "qa_run_web_suite")
-        return f"⚠️ Web run failed: {exc}"
-
-
-# --------------------------------------------------------------------------- #
-# Chat-only web run (host-boomerang Phase 5d, ledger id `web_runner.translate`)
-#
-# qa_run_web_suite PREPARES a batched `translate_cases` task covering EVERY case
-# in the run; qa_submit_web_run closes it, validates the untrusted payload and
-# drives the browser. The split point is where the legacy code already batched:
-# every case was translated before anything executed, so nothing loop-bound is
-# being pretended away here. One bounded resubmit round, the Phase-2/4 budget.
-#
-# The governing rule on the submit side, learned the hard way in review: a host
-# answer is only usable if it produced a real ACTION. "An entry parsed" and "a
-# tc_id matched" are not the same thing, and treating them as such is how a
-# zero-action browser run gets launched and reported as a full-suite failure with
-# nothing in the reply explaining why.
-# --------------------------------------------------------------------------- #
-
-_MAX_WEB_RUN_ROUNDS = 2
-
-
-async def _open_web_run_task(suite, suite_id: str, base_url: str, round_no: int = 1):
-    """Open the batched translation task for one web run. Never raises.
-
-    ALL cases ride in ONE task -- the point of Phase 5d: the legacy path issued
-    one ``ask_json`` per case. ``suite_id`` / ``base_url`` live on the task
-    RECORD, never in the envelope, so the host cannot retarget the run it is
-    translating for: the submit half re-loads the suite from this server's own
-    store and re-validates that URL before a browser exists.
-
-    The target is pre-checked HERE, before a task is opened, because Phase 5d put
-    a whole host turn between this call and the browser: without it a private or
-    unresolvable URL would only be refused AFTER the tester's model had already
-    translated the entire suite. ``run_suite_web``'s own ``_validate_public_host``
-    on the submit half stays exactly as it was and remains the authoritative gate.
-    """
-    try:
-        from tools import host_llm as _host_llm
-
-        cases = plan_cases(suite)
-        if not cases:
-            return {"error": "the suite has no test cases to run", "content": None}
-        block = await precheck_run_target(base_url)
-        if block:
-            return {"error": block, "content": None}
-        system, user = build_translation_prompt(cases, base_url)
-        opened = await _host_llm.open_task(
-            "translate_cases",
-            system,
-            user,
-            return_field="translations",
-            response_schema=translation_response_schema(),
-            meta={
-                "suite_id": str(suite_id or ""),
-                "base_url": str(base_url or ""),
-                "cases": len(cases),
-                "round": int(round_no),
-            },
-            submit_tool="qa_submit_web_run",
-        )
-        if opened.get("error"):
-            return opened
-        content = dict(opened.get("content") or {})
-        content["cases"] = len(cases)
-        return {"error": None, "content": content}
-    except Exception as exc:
-        logger.exception("_open_web_run_task failed")
-        return {"error": str(exc), "content": None}
-
-
-async def handle_submit_web_run(
-    task_id: str, translations_json: str, *, progress: ProgressCb = None
-) -> str:
-    """SUBMIT half of the chat-only web run. Never raises.
-
-    The host translated every case in ONE turn; this server treats that payload
-    as UNTRUSTED (``coerce_host_translations`` drops unknown/duplicate tc_ids and
-    non-whitelisted actions), re-loads the suite from its OWN store using the
-    ``suite_id`` bound to the task record, and runs ``run_suite_web`` with the
-    validated plan -- so ``_validate_public_host``, the DNS pin,
-    ``_resolve_nav_target`` and the execute-time action whitelist all still run
-    exactly as they did when the server itself produced the actions.
-    """
-    if _test_cases_only():
-        return _TEST_CASES_ONLY_NOTICE
-    # QA_WEB_RUN_ENABLED was DELETED on 2026-08-13 (flag-surface reduction,
-    # batch 6) and hardcoded OFF. The message no longer names an env var:
-    # it would be naming one that does not exist.
-    if not _web_run_enabled():
-        return "ℹ️ Web suite execution is disabled in this build."
-    task_id = (task_id or "").strip()
-    if not task_id:
-        return "⚠️ Pass the `task_id` from `qa_run_web_suite`."
-    if not (translations_json or "").strip():
-        return "⚠️ Send the translated browser actions as `translations_json`."
-    try:
-        from tools import host_llm as _host_llm
-
-        await _emit(progress, "🌐 Checking the translated browser actions…")
-        closed = await _host_llm.close_task(
-            task_id, translations_json, expect_kind="translate_cases"
-        )
-        if closed.get("error"):
-            return (
-                f"⚠️ {closed['error']}. Start again with `qa_run_web_suite` — "
-                "a task id is one-shot and expires with the prep TTL."
-            )
-        content = closed.get("content") or {}
-        meta = content.get("meta") or {}
-        suite_id = str(meta.get("suite_id") or "")
-        base_url = str(meta.get("base_url") or "")
-        round_no = int(meta.get("round") or 1)
-        loaded = await load_suite(suite_id)
-        suite = loaded.get("content")
-        if suite is None:
-            return (
-                f"⚠️ No stored suite with id `{suite_id}` any more — nothing was "
-                "run. Generate or re-select a suite and call `qa_run_web_suite` "
-                "again."
-            )
-        cases = plan_cases(suite)
-        plans, stats = coerce_host_translations(content.get("payload"), cases)
-        total_actions = sum(len(sa.actions) for plan in plans for sa in plan.steps)
-        shape_note = ""
-        if content.get("payload") is None:
-            # Distinct from "matched nothing": close_task parsed no JSON object
-            # out of the reply at all, so saying the translation produced no
-            # usable action would misattribute the cause.
-            shape_note = (
-                " No JSON object could be parsed from that reply at all — send "
-                "ONE JSON object and nothing else (a fenced ```json block is "
-                "accepted)."
-            )
-        elif stats["wrong_shape"]:
-            shape_note = (
-                f" {stats['wrong_shape']} entr(ies) carried a `steps` key — that "
-                "is the WRONG shape and it is why nothing could be run from "
-                "them. Each entry has a FLAT `actions` list and every action "
-                "carries its own positive `step_number`; there is no per-step "
-                "`steps` object anywhere in the answer."
-            )
-        if not stats["matched"] or not total_actions:
-            # NOTHING usable. Note the second half of that test: an entry can
-            # match a tc_id and still yield no action at all (the retired nested
-            # `steps` shape does exactly that), so `matched` alone would let a
-            # zero-action browser run through and report every case failed for a
-            # reason nothing in the report explains. Ask once, then stop.
-            if round_no < _MAX_WEB_RUN_ROUNDS:
-                reopened = await _open_web_run_task(
-                    suite, suite_id, base_url, round_no=round_no + 1
-                )
-                reopened_content = reopened.get("content") or {}
-                reopened_envelope = reopened_content.get("envelope") or {}
-                if not reopened.get("error") and reopened_content.get("task_id"):
-                    return (
-                        "> ⚠️ That submission produced no usable browser action "
-                        "for any case in this run, so no browser was launched."
-                        + shape_note
-                        + " Re-emit a SINGLE JSON object matching "
-                        "`response_schema`, echoing each `tc_id` EXACTLY, and "
-                        "submit it against the NEW task id below.\n\n"
-                        + shape_host_task(
-                            "Web run — resubmit the translation (round 2 of 2)",
-                            str(reopened_content.get("task_id") or ""),
-                            reopened_envelope,
-                            "qa_submit_web_run",
-                            "field `translations_json`",
-                            response_schema=reopened_envelope.get("response_schema"),
-                        )
-                    )
-                logger.warning(
-                    "could not open a resubmit round for web-run task %s", task_id
-                )
-            return (
-                "⚠️ The submitted translation produced no usable browser action "
-                f"for any of this run's {len(cases)} case(s), so no browser was "
-                "launched and nothing was reported as failed." + shape_note + " "
-                "Call `qa_run_web_suite` again, echo each `tc_id` exactly as the "
-                "task envelope lists it, and give every action a positive "
-                "`step_number`."
-            )
-        await _emit(progress, "🌐 Running the suite against the web app…")
-        res = await run_suite_web(suite, base_url, translations=plans)
-        if res.get("error"):
-            return f"⚠️ Web run failed: {res['error']}"
-        await _audit(
-            "mcp_run_web_suite",
-            entity_id=suite_id,
-            detail={"base_url": base_url, "round": round_no, **stats},
-        )
-        header = ""
-        faults = (
-            "missing",
-            "empty",
-            "wrong_shape",
-            "unknown",
-            "duplicate",
-            "malformed",
-            "dropped_actions",
-            "dropped_steps",
-        )
-        if any(stats[key] for key in faults):
-            # Every cause named separately and honestly: a duplicate tc_id, a
-            # tc_id from another run and a garbage list element have three
-            # different fixes, so one merged number could only be described by
-            # misattributing two of them.
-            header = (
-                f"> ℹ️ Translation coverage: {stats['matched']} of {len(cases)} "
-                f"case(s) ran with translated actions. {stats['missing']} "
-                f"case(s) had no entry at all and "
-                f"{stats['empty'] + stats['wrong_shape']} had an entry that "
-                "produced no usable action; NEITHER kind was executed at all — "
-                "each is reported as an error, because a case with no actions "
-                "navigates nowhere and judging its expected result against the "
-                "previous case's leftover page could report a false pass. "
-                "Nothing was assumed on their behalf. Of the entries sent, "
-                f"{stats['unknown']} named a tc_id that is not in this run, "
-                f"{stats['duplicate']} repeated a tc_id already answered (the "
-                f"first one won) and {stats['malformed']} were not a usable "
-                f"object. {stats['dropped_actions']} individual action(s) were "
-                "dropped for failing the 8-verb browser-action whitelist, "
-                "carrying no real positive `step_number`, or exceeding the "
-                f"per-case action cap, and {stats['dropped_steps']} step "
-                "group(s) exceeded the per-case step cap."
-                f"{shape_note}\n\n"
-            )
-        return header + shape_web_run(base_url, res.get("content") or {})
-    except Exception as exc:
-        logger.exception("handle_submit_web_run failed")
-        _capture_error(exc, "qa_submit_web_run")
-        return f"⚠️ Web run submission failed: {exc}"
 
 
 _FA_MODES = ("jira", "mobile", "jira_mobile")
@@ -10860,13 +10067,15 @@ async def _guided_test_cases(
             if capture_error and not screens:
                 return f"⚠️ Couldn't capture a screenshot: {capture_error}"
             images = screens
-    # Chainlit parity: the "Test cases" starter runs the Feature Analysis
-    # wizard, which forces the report on and generates the full suite —
-    # mirror that for every source.
+    # The Feature Analysis wizard generates the full suite for every source.
+    # It used to pass force_feature_report=True as well; that argument stopped
+    # reaching anything at 41e0ec5 (which deleted the server fall-through that
+    # forwarded it) and the parameter was deleted on 2026-08-16 with the report
+    # branch itself (P2-E3). The tester still gets a report -- from
+    # qa_feature_analysis / qa_submit_feature_analysis, which are chat-only.
     return await handle_generate_test_cases(
         text or "Feature captured from mobile device screens.",
         attached_images=images or None,
-        force_feature_report=True,
         choose=choose,
         ask_text=ask_text,
         progress=progress,
@@ -10880,7 +10089,7 @@ def _fa_mode_menu_markdown() -> str:
         "Provide a feature description or a Jira/issue URL as `feature_or_url`, "
         "and call `qa_feature_analysis` with one of these as `mode`:\n"
         "- `jira` — analyse a feature description or Jira/issue URL\n"
-        "- `mobile` — capture screens from a connected device (needs QA_MOBILE_CAPTURE)\n"
+        "- `mobile` — capture screens from a connected device\n"
         "- `jira_mobile` — merge the ticket with captured screens"
     )
 
@@ -10942,6 +10151,26 @@ async def _fa_capture_screens(
     return screens, ""
 
 
+class FeatureAnalysisReply(str):
+    """The Feature Analysis reply text, plus the screens to attach as MCP
+    image content.
+
+    A ``str`` SUBCLASS on purpose. ``handle_feature_analysis`` has 17 return
+    statements and 16 of them are plain text (errors, menus, cancellations);
+    every caller and every existing test treats the reply as a string. This
+    lets the ONE success path carry attachments without rewriting the other
+    sixteen or breaking `x in reply`. ``mcp_server.qa_feature_analysis`` reads
+    ``.images`` via getattr, so a plain str from any other path still works.
+    """
+
+    images: list
+
+    def __new__(cls, text: str, images=()):
+        obj = super().__new__(cls, text)
+        obj.images = list(images or [])
+        return obj
+
+
 def _fa_vision_disclosure(screens_captured: int) -> str:
     """Disclose that captured device screens reached NO vision description.
 
@@ -10952,35 +10181,26 @@ def _fa_vision_disclosure(screens_captured: int) -> str:
     simply goes quiet and the tester is left assuming the screens were read.
 
     Fires ONLY when screens were actually captured and NOTHING came back
-    (Phase 3b's narrowing rule -- never claim a loss that did not happen). That
-    is already the case today on a cli/api backend without ANTHROPIC_API_KEY
-    (cursor's vision path still works there), where `llm.ask_vision` returns its "Error:" sentinel so `describe_images` returns
-    "", and it becomes the case on every backend once QA_SERVER_LLM_ENABLED=false
-    refuses the call. The two causes get DIFFERENT wording, because naming the
-    kill switch when it is not the cause -- or blaming the backend when it is --
-    is the same class of dishonesty as saying nothing.
+    (Phase 3b's narrowing rule -- never claim a loss that did not happen). Since
+    the 2026-08-15 migration the mobile branch ATTACHES its screens instead of
+    describing them, so the ordinary outcome is the `forwarded_screens` notice
+    at the call site and THIS disclosure is the residual: screens captured,
+    nothing attached and nothing described. It therefore has ONE cause and one
+    wording. The second branch -- "the server-LLM switch refused the call" --
+    was DELETED on 2026-08-15 together with the switch: `llm.server_llm_enabled`
+    is a True constant, so that branch was unreachable, and its text named two
+    settings that no longer exist.
 
     Never raises: a disclosure must not be able to break a prepare.
     """
     try:
         if not screens_captured:
             return ""
-        from llm import server_llm_enabled as _vision_allowed
-
-        if not _vision_allowed("image_description.describe_images"):
-            why = (
-                "server-side LLM calls are retired on this install "
-                "(QA_SERVER_LLM_ENABLED=false) and this vision call has no "
-                "chat-only replacement \u2014 set "
-                "QA_SERVER_LLM_ALLOW=image_description.describe_images "
-                "(needs a working LLM backend) to restore it"
-            )
-        else:
-            why = (
-                "this server produced no description for them \u2014 vision "
-                "needs a working backend (the `api`/`cli` backends need ANTHROPIC_API_KEY, the `cursor` backend needs `CURSOR_API_KEY` or a cursor-agent login) \u2014 "
-                "check qa-doctor, or describe the screens yourself in the chat"
-            )
+        why = (
+            "this server produced no description for them \u2014 it makes no "
+            "vision call of any kind, and the screens were not attached to "
+            "the reply either \u2014 describe them yourself in the chat"
+        )
         return (
             f"> \u26a0\ufe0f {screens_captured} screen(s) were captured but NOT "
             f"described: {why}. The analysis is written from the text above, "
@@ -11004,9 +10224,10 @@ async def handle_feature_analysis(
 
     The server makes NO model call for the ANALYSIS. It still runs the mode menu
     (jira / mobile / jira_mobile), the device pick and capture-another screenshot
-    loop on the mobile modes, and the vision descriptions via `describe_images`
-    -- that vision call IS still this server's own, and the reply says so -- then
-    hands the tester's own chat model a task envelope. The written report comes
+    loop on the mobile modes, and then ATTACHES the captured screens to the
+    reply as MCP image content -- since 2026-08-15 there is no server-side
+    vision call on this path at all; the tester's own multimodal model reads
+    the screens -- then hands that model a task envelope. The written report comes
     back through `qa_submit_feature_analysis`, which coerces the untrusted
     payload, renders it and records the delivered-artifact audit row. A plain
     call with only feature_or_url (no mode, no elicitation) still covers the
@@ -11019,8 +10240,8 @@ async def handle_feature_analysis(
     # handle_bug_report / handle_explore_step.
     if _test_cases_only():
         return _TEST_CASES_ONLY_NOTICE
-    if not settings.qa_feature_analysis_enabled:
-        return "ℹ️ Feature Analysis is disabled (set QA_FEATURE_ANALYSIS_ENABLED=true)."
+    if not _feature_analysis_enabled():
+        return "ℹ️ Feature Analysis is disabled in this build."
     text = (feature_or_url or "").strip()
     mode = (mode or "").strip().lower().replace("+", "_").replace(" ", "_")
     if mode == "jira_and_mobile":
@@ -11073,6 +10294,7 @@ async def handle_feature_analysis(
                 jira_text = url_content.get("content") or ""
 
         screen_descriptions = ""
+        forwarded_screens: list = []
         screens_captured = 0
         if mode in ("mobile", "jira_mobile"):
             if not _mobile_capture():
@@ -11102,11 +10324,15 @@ async def handle_feature_analysis(
                     return f"⚠️ Couldn't capture a screenshot: {capture_error}"
                 screens_captured = len(screens)
                 if screens:
+                    # NO server vision call: the raw screens ride to the
+                    # tester's own multimodal model as MCP image content,
+                    # exactly as qa_capture_screens already returns them and
+                    # as IMAGE_JOB does on the generation path.
                     await _emit(
                         progress,
-                        f"🖼️ Describing {screens_captured} captured screen(s)…",
+                        f"🖼️ Attaching {screens_captured} captured screen(s) for your model…",
                     )
-                    screen_descriptions = await describe_images(screens)
+                    forwarded_screens = list(screens)
 
         feature_text = text or "Feature captured from mobile device screens."
         await _emit(
@@ -11139,7 +10365,17 @@ async def handle_feature_analysis(
         header = ""
         if mode != "jira":
             header = f"_Mode: {mode} · screens captured: {screens_captured}_\n\n"
-        if screen_descriptions:
+        if forwarded_screens:
+            # The screens are ATTACHED to this reply, so the old two-branch
+            # vision disclosure would now be a lie in both directions: nothing
+            # was described server-side, and nothing was lost either.
+            header += (
+                "> ℹ️  "
+                f"{len(forwarded_screens)} captured screen(s) are attached to "
+                "this message as images. This server made NO vision call — "
+                "read them yourself.\n\n"
+            )
+        elif screen_descriptions:
             # Honesty: the ANALYSIS is chat-only from here, but the screenshot
             # descriptions above were produced by THIS server's vision call
             # (ledger row `image_description.describe_images`, whose terminal
@@ -11161,12 +10397,16 @@ async def handle_feature_analysis(
             # Phase-6 flip it happens on every backend. Either way the tester must
             # not be left believing the screens were read.
             header += _fa_vision_disclosure(screens_captured)
-        return header + shape_host_task(
-            "Feature Analysis — your turn",
-            task_id,
-            opened_content.get("envelope") or {},
-            "qa_submit_feature_analysis",
-            "field `report_json`",
+        return FeatureAnalysisReply(
+            header
+            + shape_host_task(
+                "Feature Analysis — your turn",
+                task_id,
+                opened_content.get("envelope") or {},
+                "qa_submit_feature_analysis",
+                "field `report_json`",
+            ),
+            forwarded_screens,
         )
     except Exception as exc:
         logger.exception("handle_feature_analysis failed")
@@ -11195,8 +10435,8 @@ async def handle_submit_feature_analysis(
     # Defence in depth -- see handle_feature_analysis above (2026-08-03).
     if _test_cases_only():
         return _TEST_CASES_ONLY_NOTICE
-    if not settings.qa_feature_analysis_enabled:
-        return "ℹ️ Feature Analysis is disabled (set QA_FEATURE_ANALYSIS_ENABLED=true)."
+    if not _feature_analysis_enabled():
+        return "ℹ️ Feature Analysis is disabled in this build."
     task_id = (task_id or "").strip()
     if not task_id:
         return "⚠️ Pass the `task_id` from `qa_feature_analysis`."
@@ -11281,7 +10521,7 @@ async def handle_submit_feature_analysis(
 # Guided wizard (choice-driven UX; markdown fallback when elicitation is off)  #
 # --------------------------------------------------------------------------- #
 
-# Each non-mobile branch maps a menu option to the tool the client should call
+# Each branch maps a menu option to the tool the client should call
 # next and the free-text parameter it still needs (choices are elicited; free
 # text is not).
 _WIZARD_HANDOFFS = {
@@ -11310,7 +10550,6 @@ def _wizard_options() -> list:
         "Generate test cases",
         "Report a bug",
         "Exploratory testing coach",
-        "Mobile testing",
     ]
 
 
@@ -11322,12 +10561,6 @@ def _wizard_menu_markdown(options: list) -> str:
         "",
     ]
     for opt in options:
-        if opt == "Mobile testing":
-            lines.append(
-                "- **Mobile testing** — call `qa_run_mobile_suite` "
-                "(I'll ask for the mode and device)."
-            )
-            continue
         tool, hint = _WIZARD_HANDOFFS[opt]
         lines.append(f"- **{opt}** — call `{tool}`. {hint}")
     return "\n".join(lines)
@@ -11411,20 +10644,6 @@ async def handle_wizard(
                 return "👍 Cancelled."
             return _wizard_handoff_markdown(choice)
 
-        if choice == "Mobile testing":
-            picked = await _elicit_mobile_mode(choose)
-            if picked.status == UNAVAILABLE:
-                return _mobile_mode_menu_markdown()
-            if picked.status == DECLINED:
-                return "👍 Cancelled — no mobile mode selected."
-            # Run the real flow — device / suite / app / goal are elicited inside.
-            return await handle_run_mobile_suite(
-                picked.value or "",
-                choose=choose,
-                ask_text=ask_text,
-                progress=progress,
-            )
-
         if choice in _WIZARD_HANDOFFS:
             return _wizard_handoff_markdown(choice)
         # Unrecognised selection — fall back to the full menu.
@@ -11452,13 +10671,6 @@ _TOOL_INFO: dict[str, dict] = {
     "xcrun": {
         "purpose": "iOS Simulator, macOS only — ships with Xcode",
         "install": {"darwin": "xcode-select --install"},
-    },
-    "maestro": {
-        "purpose": "on-device flow runs — `qa_run_mobile_suite`",
-        "install": {
-            "darwin": "brew tap mobile-dev-inc/tap && brew install maestro",
-            "linux": "curl -Ls https://get.maestro.mobile.dev | bash",
-        },
     },
     "cursor-agent": {
         "purpose": "the `cursor` server-side LLM backend",
@@ -11507,9 +10719,6 @@ def _tooling_lines() -> list[str]:
     # backend row above already says "not required" on exactly those installs.
     if not _dist_needs_no_backend():
         rows.append(_binary_line("cursor-agent"))
-    # maestro only drives on-device runs — not part of the dist edition.
-    if not _test_cases_only():
-        rows.append(_binary_line("maestro"))
     # adb stays in both editions: qa_list_devices ships in the dist too.
     rows.append(_binary_line("adb"))
     # xcrun can NEVER exist off macOS, so a cross there is noise, not news.
@@ -11677,7 +10886,6 @@ async def handle_setup_check(
     hint falls back to its previous candidate chain."""
     await _audit("mcp_setup_check")
     try:
-        from llm import check_backend
         from tools.updater import _INSTALL_DIR, _local_version
 
         if _test_cases_only() and _DIST_UPDATE_REPO:
@@ -11732,10 +10940,6 @@ async def handle_setup_check(
         # next settled call always reports the most recent reload.
         reload_note, reload_action = _reload_outcome(_consume_reload_marker())
         await _emit(progress, "🔎 Validating the environment…")
-        ok, warning = check_backend()
-        from llm import describe_backend
-
-        backend = describe_backend()
         app_version = _local_version(_INSTALL_DIR)
         restart_note = ""
         try:
@@ -11804,61 +11008,17 @@ async def handle_setup_check(
             # statement belongs. Both degraded branches are unchanged and
             # still land in `recommended`.
             optional.append(_server_llm_note)
-        # Phase 5b: `maestro_healer.classify` and `maestro_explorer.decide` are
-        # terminal `disabled (disclosed)` rows, so they have LEFT
-        # UNMIGRATED_PATHS and the disclosure line above no longer names them --
-        # but unlike Phase 5a's two rows these ARE tester-facing, so an operator
-        # who has switched the modes ON must be told HERE that the mode will
-        # refuse, instead of a tester discovering it mid-run at a device. Named
-        # per mode, with the exact allow-list id to type. Skipped in the dist
-        # edition, which ships neither the Maestro modules nor the web runner.
-        # Phase 5c added a THIRD entry, `web_runner.verify`. Its condition is a
-        # three-way AND rather than one flag because the loss is only REAL when the
-        # runner is on AND dry-run is off (dry-run never verifies anything) AND the
-        # vision budget is non-zero (a 0 budget never reaches the vision tier at
-        # all, so nothing changes for it). Unlike the two Maestro rows that one
-        # DEGRADES rather than disables: the text-first assertion tier survives and
-        # still passes every expectation it can literally see. Because this entry
-        # is not a `mode`, the shared remediation sentence below says "adjust the
-        # relevant setting" rather than naming a mode switch.
-        if not _test_cases_only():
-            from llm import server_llm_enabled as _server_llm_allowed
-
-            for _mode_on, _mode_id, _mode_loss in (
-                (
-                    _maestro_heal_enabled(),
-                    "maestro_healer.classify",
-                    'Maestro self-healing (mode="heal") will NOT triage a failure, '
-                    "patch the flow or re-run it — transient interruptions "
-                    "(session expiry, permission dialogs, consent banners) now "
-                    "need a manual re-run",
-                ),
-                (
-                    _maestro_explore_enabled(),
-                    "maestro_explorer.decide",
-                    'AI exploratory runs (mode="explore") will produce ZERO steps '
-                    "— every step needs one model decision, which cannot be "
-                    "served in the middle of a tool call",
-                ),
-                (
-                    _web_run_enabled()
-                    and not _web_run_dry_run()
-                    and bool(settings.qa_web_run_vision_budget),
-                    "web_runner.verify",
-                    "Web suite execution (qa_run_web_suite) will still run every "
-                    "case and still PASS every expectation whose wording appears "
-                    "in the page text, but a visual-only expectation (a colour or "
-                    "state change, an icon, a modal) can no longer be judged \u2014 "
-                    "those steps report `error` (could not be evaluated) instead "
-                    "of a verdict, and the rest of that case is not run",
-                ),
-            ):
-                if _mode_on and not _server_llm_allowed(_mode_id):
-                    recommended.append(
-                        f"{_mode_loss}. Set QA_SERVER_LLM_ALLOW={_mode_id} (needs "
-                        "a working LLM backend) to restore it, or adjust the "
-                        "relevant setting so this path is not offered."
-                    )
+        # 2026-08-15 (dead-code deletion batches D2 and D3): the three
+        # per-mode entries that stood here -- `maestro_healer.classify`,
+        # `maestro_explorer.decide` and `web_runner.verify` -- were DELETED
+        # with the modules and the modes they disclosed (tools/maestro_*.py
+        # in D2, tools/web_runner.py in D3). Naming a loss for a mode that
+        # no longer exists is the same dishonesty as hiding a real one,
+        # which is this block's whole discipline. Their ledger rows are
+        # HISTORY and stay in docs/LLM_MIGRATION_INVENTORY.md and in
+        # host_llm.LEDGER_IDS (ids never leave it; the set is pinned at 24
+        # in five test files), so an allow-list typo on any of them is
+        # still detectable.
         # Residue sub-phase R3: `image_description.describe_images` is a terminal
         # `disabled (disclosed)` row, so it has LEFT UNMIGRATED_PATHS and the
         # generic disclosure line above no longer names it -- but its surviving
@@ -11880,23 +11040,13 @@ async def handle_setup_check(
         # it is `migrated` (the rendered page screenshot rides to the host's own
         # model through IMAGE_JOB on the only route that reaches it), so an item
         # would invent a loss no tester suffers.
-        if (
-            not _test_cases_only()
-            and settings.qa_feature_analysis_enabled
-            and _mobile_capture()
-        ):
-            from llm import server_llm_enabled as _fa_vision_allowed
-
-            if not _fa_vision_allowed("image_description.describe_images"):
-                recommended.append(
-                    "qa_feature_analysis (modes `mobile` / `jira_mobile`) will "
-                    "still capture device screens, but this server can no longer "
-                    "DESCRIBE them \u2014 the report is written from the text "
-                    "alone. Set "
-                    "QA_SERVER_LLM_ALLOW=image_description.describe_images "
-                    "(needs a working LLM backend) to restore it, or use the "
-                    "`jira` mode."
-                )
+        # 2026-08-15: the per-mode vision-loss item was DELETED, not disabled.
+        # qa_feature_analysis's mobile modes no longer need a server vision
+        # call at all -- the captured screens ride to the tester's own
+        # multimodal model as MCP image content -- so there is no loss to
+        # disclose, and QA_SERVER_LLM_ALLOW=image_description.describe_images
+        # would restore nothing (that caller is gone). Claiming a loss no
+        # tester suffers is the same dishonesty as hiding a real one.
         # Phase 5d: the Maestro step-translation flag was already INERT on
         # the MCP surface -- its only caller was the retired Chainlit export
         # path, so qa-doctor had to report the FLAG ITSELF as having no
@@ -11905,67 +11055,20 @@ async def handle_setup_check(
         # longer a configuration surprise to disclose, and that advisory is
         # gone with it. tools.maestro_exporter.translate_enabled() is the
         # seam; re-wiring the export path is still a separate plan.
-        # 2026-08-03: the public dist edition is credential-free by design (see
-        # _dist_needs_no_backend). "Fix the LLM backend -- nothing generates
-        # without it" is then simply FALSE there, and contradicts that build's
-        # own README. So the blocker becomes conditional on BOTH escapes, for
-        # exactly the reason the kill-switch one is already conditional. The
-        # full edition is byte-identical: _dist_needs_no_backend() is always
-        # False there.
-        _backend_optional = _host_llm.server_llm_retired() or _dist_needs_no_backend()
-        if not ok and not _backend_optional:
-            blockers.append(
-                "Fix the LLM backend — nothing generates without it. " + warning
-            )
-        elif not ok and _host_llm.server_llm_retired() and _host_llm.allowed_paths():
-            # Retired AND allow-listed AND the backend is broken: no longer a
-            # blocker (generation runs on the host model), but the allow-listed
-            # paths DO still call this backend and will fail, so the diagnostic
-            # must not be dropped -- it moves to recommended rather than
-            # vanishing with the blocker.
-            recommended.append(
-                "The LLM backend is unusable. That no longer blocks generation "
-                "(QA_SERVER_LLM_ENABLED=false — the tester's chat model does it), "
-                "but QA_SERVER_LLM_ALLOW still routes some paths to this backend, "
-                "so those will fail until it is fixed: " + warning
-            )
-        # Phase-6 preparation (2026-08-02): with the server LLM retired an
-        # unusable backend is not a failure of THIS install -- generation runs
-        # on the tester's own chat model, which is exactly why the blocker
-        # above is already conditional. The Environment line has to follow:
-        # a red cross beside an overall verdict of "Ready" is a contradiction
-        # a non-technical tester cannot resolve. It becomes informational
-        # instead, while the allow-list diagnostic above keeps the detail for
-        # the one configuration where the backend still genuinely matters.
-        # Byte-identical whenever the kill switch is at its default ON.
-        if ok:
-            _backend_icon, _backend_desc = "\u2705", "ready"
-        elif _backend_optional:
-            _backend_icon = "\u2b1c"
-            _backend_desc = (
-                (
-                    "not required \u2014 server-side LLM calls are retired "
-                    "(QA_SERVER_LLM_ENABLED=false) and the tester's own chat "
-                    "model does the generation"
-                )
-                if _host_llm.server_llm_retired()
-                else (
-                    "not required \u2014 this edition generates test cases "
-                    "only, and your own chat model writes them"
-                )
-            )
-        else:
-            _backend_icon, _backend_desc = "\u274c", warning
-        if not ok and _dist_needs_no_backend() and not _host_llm.server_llm_retired():
-            # Informational, NOT an action item: the verdict is derived from
-            # `recommended` being non-empty, and a correctly credential-free
-            # install must not report "Ready, with warnings" forever.
-            optional.append(
-                "No LLM backend is configured — and this edition does not need "
-                "one. Test cases are written by your own chat model; nothing "
-                "here calls an LLM API on its own. Probe result, for reference: "
-                + warning
-            )
+        # 2026-08-16 (dead-code deletion P2-G2b): the LLM-backend BLOCKER, the
+        # Environment backend line and both ANTHROPIC_API_KEY placeholder items
+        # stood here. All three reported on a capability this product no longer
+        # has -- P2-G2c deletes `llm.py`'s coroutines and all three backends, so
+        # nothing in the tree can reach one. The blocker was the harmful part:
+        # it told a tester whose Claude CLI session had expired that "nothing
+        # generates without it" while everything generated fine, because the
+        # generation runs in their own chat. Reporting a fault that cannot
+        # affect any tester flow is the same over-claim this function's
+        # disclosure discipline forbids in the other direction.
+        #
+        # The host-boomerang migration disclosure above is a DIFFERENT seam and
+        # is untouched: it reports what this server does not do, not whether a
+        # backend is reachable.
         if restart_note:
             recommended.append(
                 "Quit and reopen the editor once so it reloads the agent's "
@@ -12137,7 +11240,6 @@ async def handle_setup_check(
             "### Environment",
             f"- {'✅' if py_ok else '❌'} **Python** {py_version}"
             + ("" if py_ok else " — 3.10 or newer required"),
-            f"- {_backend_icon} **LLM backend** `{backend}` \u2014 {_backend_desc}",
             *([export_line] if export_line else []),
             "",
             "### Integrations",
@@ -12148,18 +11250,20 @@ async def handle_setup_check(
             "### Feature gates",
         ]
         gates = [
-            # Feature Analysis is a FULL-edition gate only: the test-cases-only
-            # edition does not register its tools (2026-08-03), so listing the
-            # flag there advertises a capability the tester cannot reach -- and
-            # would report a stale QA_FEATURE_ANALYSIS_ENABLED=true as though it
-            # still did something.
+            # Feature Analysis is a FULL-edition capability only: the
+            # test-cases-only edition does not register its tools
+            # (2026-08-03), so listing it there advertises something the
+            # tester cannot reach. The flag was DELETED 2026-08-14 (batch
+            # 8c) and hardcoded ON, so on the full edition this row is now
+            # always true -- it is kept because a tester reading qa-doctor
+            # wants to know the capability EXISTS, not which flag carried it.
             *(
                 []
                 if _test_cases_only()
                 else [
                     (
-                        "Feature Analysis (QA_FEATURE_ANALYSIS_ENABLED)",
-                        settings.qa_feature_analysis_enabled,
+                        "Feature Analysis (always on since 2026-08-14)",
+                        _feature_analysis_enabled(),
                     )
                 ]
             ),
@@ -12169,19 +11273,6 @@ async def handle_setup_check(
                 True,
             ),
         ]
-        if not _test_cases_only():
-            gates += [
-                # ONE row, not four. The three Maestro switches were deleted
-                # on 2026-08-13 and hardcoded OFF, so listing "AI exploratory"
-                # and "Self-heal" as separate unchecked gates would send an
-                # operator looking for env vars that no longer exist -- the
-                # precise thing this report's disclosure discipline forbids.
-                (
-                    "Mobile testing (retired 2026-08-13 — the Maestro modes, "
-                    "including self-heal and AI exploratory, are permanently off)",
-                    _maestro_enabled(),
-                ),
-            ]
         gates += [
             ("RAG corpus (always on since 2026-08-13)", _rag_enabled()),
             ("Wizard dialogs (always on since 2026-08-13)", _elicit_enabled()),

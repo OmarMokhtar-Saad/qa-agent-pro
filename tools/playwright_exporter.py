@@ -19,7 +19,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from tools.models import TestCase, TestSuite
+from tools.models import TestCase, TestSuite, display_requirement_id
 from tools.secure_temp import SUBDIR_NAME, make_secure_temp_path
 
 logger = logging.getLogger(__name__)
@@ -64,6 +64,12 @@ def _test_block(tc: TestCase, slug: str) -> str:
     lines.append(f"@pytest.mark.{re.sub(r'[^a-z0-9_]', '_', marker)}")
     lines.append(f"def test_{slug}(page: Page) -> None:")
     lines.append(f'    """{_comment(tc.title)} [{tc.tc_id} / {tc.stable_id}]"""')
+    # F06: the acceptance criterion this skeleton belongs to. Omitted entirely
+    # when the case carries no usable tag -- a comment reading "Requirement:"
+    # with nothing after it is worse than no line.
+    requirement = display_requirement_id(getattr(tc, "requirement_id", ""))
+    if requirement:
+        lines.append(f"    # Requirement: {_comment(requirement)}")
     if tc.preconditions and tc.preconditions.strip():
         lines.append(f"    # Precondition: {_comment(tc.preconditions)}")
     lines.append("    # TODO: navigate to the feature under test, e.g. page.goto(...)")

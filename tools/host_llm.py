@@ -62,7 +62,6 @@ from __future__ import annotations
 import json
 import logging
 
-from config.settings import settings
 from tools import prep_store
 from tools.untrusted import wrap_untrusted
 
@@ -163,6 +162,24 @@ LEDGER_IDS: frozenset = frozenset(
     }
 )
 
+# !! READ FIRST -- CORRECTION, 2026-08-17. The rationale below is preserved as
+# the design record for why each ledger row is terminal, and two classes of
+# statement in it are now FALSE about this tree:
+#
+#   * every "graph.py / evals/ still call X" clause. Both were DELETED --
+#     graph.py and router.py in P2-A, evals/ and tools/eval_runner.py in P2-B
+#     (2026-08-15). Nothing outside the host route reaches any of these paths,
+#     because there is no outside route left.
+#   * every "QA_SERVER_LLM_ALLOW=<id> revives it after the Phase-6 flip"
+#     recipe. That setting was DELETED on 2026-08-15 and there is no flip
+#     pending; llm.py has had no backend at all since P2-G (2026-08-16), so
+#     there is nothing an allow-list could re-enable. Reviving one of these
+#     paths is a fresh implementation against the house rule in CLAUDE.md --
+#     fold it into a prepare/submit boomerang as a HostJob, or open a task
+#     through this module's broker.
+#
+# The ids themselves are unaffected: LEDGER_IDS never shrinks, and an id
+# outliving its code is what keeps "this path migrated" checkable.
 UNMIGRATED_PATHS: tuple[tuple[str, str], ...] = (
     # test_scenario_agent.jira_images left this tuple in the residue-cleanup R1
     # ops file that flipped its ledger row to `migrated` (ledger rule 4: same op,
@@ -270,7 +287,9 @@ UNMIGRATED_PATHS: tuple[tuple[str, str], ...] = (
     #   R4 built the programme's ONLY genuinely new fold: CHECKLIST_JOB
     #   (agents/host_mode.py, mechanism A, stage step_zero, order 30, return
     #   field `checklist_items`), shipped behind QA_HOST_CHECKLIST_REVIEW_ENABLED
-    #   AND-ed with the default-OFF QA_ATOMIC_CHECKLIST_ENABLED. The host
+    #   AND-ed with QA_ATOMIC_CHECKLIST_ENABLED, which was default-OFF at the
+    #   time and was DELETED on 2026-08-14, the checklist becoming
+    #   unconditional. The host
     #   decomposes the ticket in step 0d of its OWN turn, generates against that
     #   checklist, and returns it; the server re-assigns every CL-NNN id, runs
     #   the pure-Python audit_granularity over it and feeds the DETERMINISTIC
@@ -316,11 +335,15 @@ UNMIGRATED_PATHS: tuple[tuple[str, str], ...] = (
     # maestro_healer.classify and maestro_explorer.decide left this tuple in the
     # Phase-5b ops file that flipped both ledger rows to `disabled (disclosed)`
     # (ledger rule 4: same op, or the drift test fails). Both remain in
-    # LEDGER_IDS, so an allow-list typo on either is still detectable -- and they
-    # are now ids operators actually type. Because a terminal row also leaves the
-    # kill-switch disclosure, and because these two are TESTER-FACING (unlike
-    # Phase 5a's rows), qa-doctor gained an explicit per-mode warning for
-    # them in that same op.
+    # LEDGER_IDS, so an allow-list typo on either is still detectable.
+    # 2026-08-15 (dead-code deletion batch D2): tools/maestro_healer.py and
+    # tools/maestro_explorer.py were DELETED, so nothing carries either scope tag
+    # any more and the per-mode qa-doctor warnings they earned were deleted with
+    # the modes. The ids STAY here -- ids never leave LEDGER_IDS (asserted in five
+    # test files and pinned at 24) and the drift test compares this frozenset to
+    # docs/LLM_MIGRATION_INVENTORY.md, so shrinking one without the other is the
+    # single edit that guard cannot see. The same holds for maestro_exporter.translate
+    # above, whose module went in the same batch.
     # web_runner.translate left this tuple in the Phase-5d ops file that flipped
     # its ledger row to `migrated` -- the ONLY genuinely migrated row in Phase 5.
     # It was never loop-bound: every case was translated BEFORE anything
@@ -343,6 +366,25 @@ UNMIGRATED_PATHS: tuple[tuple[str, str], ...] = (
     # landed and was what actually decided this tool's post-flip fate; sub-phase
     # 5d migrated it, so qa_run_web_suite now survives the flip with only the
     # visual-verify degradation described above.
+    # 2026-08-15 (dead-code deletion batch D3): tools/web_runner.py was
+    # DELETED, along with both MCP tools and the whole handler chain, so
+    # nothing carries either web scope tag any more and the qa-doctor item
+    # web_runner.verify earned was deleted with the tool. BOTH ids STAY in
+    # LEDGER_IDS -- ids never leave it (asserted in five test files and
+    # pinned at 24) and the drift test compares this frozenset to
+    # docs/LLM_MIGRATION_INVENTORY.md, so shrinking one without the other is
+    # the single edit that guard cannot see.
+    # 2026-08-15 (dead-code deletion batch D5): tools/comment_reconciler.py
+    # was DELETED, along with the whole amendment pipeline in mcp_handlers,
+    # the jira_mcp seam reads and the six QA_COMMENT_RECONCILE_* settings, so
+    # nothing carries the comment_reconciler.candidates scope tag any more.
+    # The id STAYS in LEDGER_IDS on the same terms as the maestro and web ids
+    # above -- ids never leave it (asserted in five test files and pinned at
+    # 24) and the drift test compares this frozenset to
+    # docs/LLM_MIGRATION_INVENTORY.md, so shrinking one without the other is
+    # the single edit that guard cannot see. Reviving that row is now a
+    # module rebuild against docs/RETIRED_CAPABILITIES.md section 4, not a
+    # seam flip.
     #
     # WHAT IS LEFT AFTER RESIDUE SUB-PHASE R4: NOTHING. This tuple is EMPTY.
     # R1 closed
@@ -388,25 +430,24 @@ _WARNED = False
 
 
 def server_llm_retired() -> bool:
-    """True when QA_SERVER_LLM_ENABLED is off (direct llm.* calls are retired)."""
-    try:
-        return not bool(getattr(settings, "qa_server_llm_enabled", True))
-    except Exception:  # pragma: no cover - settings is never-raising by contract
-        return False
+    """Always False since 2026-08-15: the kill switch was DELETED, not pinned.
+
+    QA_SERVER_LLM_ENABLED is gone and ``llm.server_llm_enabled()`` is a True
+    constant, so no install is in the 'retired' state this predicate
+    described. Retained as a NAMED SEAM: qa-doctor and the startup
+    disclosure both branch on it. Never raises.
+    """
+    return False
 
 
 def allowed_paths() -> frozenset:
-    """Ledger ids still permitted to call a backend directly (QA_SERVER_LLM_ALLOW).
+    """Always empty since 2026-08-15: QA_SERVER_LLM_ALLOW was DELETED.
 
-    Parsed here as well as in ``llm.server_llm_allow_list`` so the disclosure has
-    no import cycle back into ``llm``. Never raises.
+    No ledger id can be re-permitted from `.env`; reviving a path is a CODE
+    change. Retained as a NAMED SEAM because the disclosure surface branches
+    on emptiness. Never raises.
     """
-    try:
-        raw = str(getattr(settings, "qa_server_llm_allow", "") or "")
-    except Exception:  # pragma: no cover - settings is never-raising by contract
-        return frozenset()
-    parts = raw.replace(";", ",").replace("\n", ",").split(",")
-    return frozenset(p.strip() for p in parts if p.strip())
+    return frozenset()
 
 
 def wildcard_allowed() -> bool:
@@ -492,14 +533,14 @@ def disclosure_state() -> tuple[str, bool]:
         unknown = unknown_allow_ids()
         if unknown:
             logger.warning(
-                "QA_SERVER_LLM_ALLOW lists %d id(s) that are not in "
+                "allowed_paths() lists %d id(s) that are not in "
                 "docs/LLM_MIGRATION_INVENTORY.md, so they allow NOTHING "
                 "(typo?): %s",
                 len(unknown),
                 ", ".join(unknown),
             )
         unknown_note = (
-            " ⚠️ Unrecognised QA_SERVER_LLM_ALLOW id(s) — not in the "
+            " \u26a0\ufe0f Unrecognised allow-list id(s) \u2014 not in the "
             f"ledger, so they allow NOTHING (typo?): {', '.join(unknown)}."
             if unknown
             else ""
@@ -545,24 +586,22 @@ def disclosure_state() -> tuple[str, bool]:
             # relaxing those assertions to fit new prose is how a disclosure
             # quietly loses the guarantee it exists to make.
             return (
-                "\u2705 Server LLM retired (QA_SERVER_LLM_ENABLED=false) \u2014 "
-                "the tester's own chat model does all test-case generation, "
-                "and every ledger row is migrated to the host model or "
-                "disabled with a disclosed reason, so nothing degrades "
-                "silently. Read `disabled (disclosed)` as a REAL loss, not a "
-                "no-op: mobile heal/explore triage, web visual-verify "
-                "adjudication, Feature-Analysis screen descriptions, the "
-                "server-side vague-step rewrite and advisory gap prose, Jira "
-                "comment extraction, checklist NLI re-judging, the eval "
-                "judges, LangGraph intent classification, and the inert "
-                "Maestro step translation stay OFF unless "
-                "that specific row is named in QA_SERVER_LLM_ALLOW. This line "
-                "lists no ids on purpose \u2014 qa-doctor names one only "
-                "where THIS install really loses the capability. For the "
-                "per-row ids and the copy-paste recipes see "
+                "\u2705 Server LLM retired \u2014 the tester's own chat "
+                "model does all test-case generation, and every ledger row "
+                "is migrated to the host model or disabled with a disclosed "
+                "reason, so nothing degrades silently. Read "
+                "`disabled (disclosed)` as a REAL loss, not a no-op: mobile "
+                "heal/explore triage, web visual-verify adjudication, "
+                "Feature-Analysis screen descriptions, the server-side "
+                "vague-step rewrite and advisory gap prose, Jira comment "
+                "extraction, checklist NLI re-judging, the eval judges, "
+                "LangGraph intent classification, and the inert Maestro "
+                "step translation stay OFF unless that specific row is "
+                "named by the allow-list seam. This line lists no ids on "
+                "purpose \u2014 qa-doctor names one only where THIS install "
+                "really loses the capability. For the per-row ids see "
                 "docs/LLM_MIGRATION_INVENTORY.md \u2192 Phase 6 sign-off "
-                "(Table A) and docs/FEATURE_FLAGS.md \u2192 "
-                "QA_SERVER_LLM_ALLOW." + unknown_note,
+                "(Table A) and docs/FEATURE_FLAGS.md." + unknown_note,
                 False,
             )
         if off:
@@ -576,31 +615,33 @@ def disclosure_state() -> tuple[str, bool]:
                 else ""
             )
             return (
-                "⚠️ Server LLM disabled — QA_SERVER_LLM_ENABLED=false "
-                f"but {len(off)} of {total} ledger rows are NOT yet migrated, so "
+                "\u26a0\ufe0f Server LLM disabled \u2014 "
+                f"{len(off)} of {total} ledger rows are NOT yet migrated, so "
                 f"these features are OFF (not boomeranged): {shown}{more}."
-                f"{bypass_note} Set QA_SERVER_LLM_ENABLED=true to restore them, or "
-                "keep individual paths alive with QA_SERVER_LLM_ALLOW=<ledger "
-                "ids>. See docs/LLM_MIGRATION_INVENTORY.md." + unknown_note,
+                f"{bypass_note} Reviving them is a CODE change in "
+                "llm.server_llm_enabled / host_llm.allowed_paths -- the "
+                "QA_SERVER_LLM_* settings were DELETED on 2026-08-15. "
+                "See docs/LLM_MIGRATION_INVENTORY.md." + unknown_note,
                 True,
             )
         # off is empty while UNMIGRATED_PATHS is not: the allow-list covers every
         # unmigrated row, so the kill switch is bypassed and NOTHING migrated.
         # This must never look like the calm branch above.
         how = (
-            "QA_SERVER_LLM_ALLOW=* — the kill switch is BYPASSED for every "
-            "path that tags itself. `*` is debug-only and UNSUPPORTED: list the "
-            "specific ledger ids you actually need instead."
+            "The allow-list seam is the `*` wildcard \u2014 the server-LLM "
+            "seam is BYPASSED for every path that tags itself. `*` is "
+            "debug-only and UNSUPPORTED: list the specific ledger ids you "
+            "actually need instead."
             if wildcard_allowed()
-            else "QA_SERVER_LLM_ALLOW names every still-unmigrated ledger row, so "
-            "the kill switch is BYPASSED rather than in force."
+            else "The allow-list seam names every still-unmigrated ledger "
+            "row, so the server-LLM seam is BYPASSED rather than in force."
         )
         return (
-            "⚠️ " + how + " QA_SERVER_LLM_ENABLED=false is set, but "
+            "\u26a0\ufe0f " + how + " The server LLM is retired, but "
             f"{len(bypassed)} of {total} ledger rows are allow-listed and still "
             "UNMIGRATED: they keep calling the server-side backend and keep "
-            "billing (allow-listed is NOT migrated — nothing moved to the host "
-            "model). See docs/LLM_MIGRATION_INVENTORY.md." + unknown_note,
+            "billing (allow-listed is NOT migrated \u2014 nothing moved to "
+            "the host model). See docs/LLM_MIGRATION_INVENTORY.md." + unknown_note,
             True,
         )
     except Exception:  # pragma: no cover - defensive; disclosure must never break

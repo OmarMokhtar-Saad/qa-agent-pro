@@ -20,7 +20,14 @@ What did NOT change:
   public-IP gate where EVERY resolved answer must be global, a pinned-IP
   transport that defeats DNS rebinding between check and connect, and MANUAL
   per-hop redirect following that re-runs the full guard on every hop.
-* ``PinnedIPTransport`` stays exported here - ``tools/web_search.py`` imports it.
+* ``PinnedIPTransport`` stays here, and the reason is INTERNAL and
+  SUFFICIENT ON ITS OWN: this module's manual per-hop redirect follower
+  builds one on EVERY hop (:func:`_fetch_one_hop`). It has NO importer
+  outside this file -- ``tools/web_search.py`` and
+  ``tools/jira_attachments.py`` were the last two and both were deleted
+  on 2026-08-15 (batch D1). **An empty importer list is NOT evidence this
+  class is unused**, and it is the substrate any revived credentialed
+  fetch must reuse (docs/RETIRED_CAPABILITIES.md).
 
 What is gone with the REST path: the Basic-Auth credential, the attachment
 download + its hardcoded ``api.media.atlassian.com`` redirect allowlist (the
@@ -41,8 +48,11 @@ import httpx
 from bs4 import BeautifulSoup
 
 # Re-exported for backwards compatibility: these helpers are PURE (no HTTP) and
-# moved to tools/jira_mcp.py with the rest of the Jira logic. Existing importers
-# (router.py, tests, tools/comment_reconciler docs) keep working unchanged.
+# moved to tools/jira_mcp.py with the rest of the Jira logic. The importers this
+# comment used to name are down to one -- router.py was deleted in P2-A
+# (2026-08-15), leaving the tests. tools/comment_reconciler's docs
+# named _comment_lines here too; that module was deleted on 2026-08-15
+# (dead-code deletion batch D5).
 from tools.jira_mcp import (  # noqa: F401
     _MAX_ADF_DEPTH,
     _build_parent_context,

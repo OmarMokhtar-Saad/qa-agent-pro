@@ -24,7 +24,11 @@ effect on server-mode behaviour.
 
 Design rules honoured here:
 
-* ``agents/`` MUST NOT import ``router.py`` -- this module imports none of it.
+* ``agents/`` imports no routing or handler layer. The ``router.py`` this rule
+  used to name was deleted in P2-A (2026-08-15); what survives it is the
+  DIRECTION of the dependency -- ``tools/mcp_handlers.py`` imports this
+  module, never the reverse -- which is what lets host mode be tested without
+  the MCP transport.
 * No LLM access is needed in this batch (pure, synchronous (de)serialization).
 * The serialized payload round-trips through SQLite and, in ops-3d, is treated as
   UNTRUSTED on the way back in. Deserialization therefore constructs only a FIXED
@@ -52,7 +56,6 @@ from tools.quality_checks import (
 from tools.rtm import AcceptanceCriterion, checklist_tally_line, normalize_ac_id
 from tools.rule_packs import RulePackLine, RulePackResult
 from tools.standing_rules import Triggers
-from tools.token_meter import TokenMeter
 from tools.untrusted import _GUARD
 
 logger = logging.getLogger(__name__)
@@ -87,7 +90,6 @@ _KNOWN_FIELDS = frozenset(
         "ui_content",
         "parent_context",
         "cache_prefix_warm",
-        "meter",
         "jira_image_text",
         "attached_image_text",
         "jira_context_text",
@@ -272,11 +274,6 @@ def serialize_prepared(prepared) -> dict:
         # tuples are JSON-lossy (json turns them into lists); store as lists and
         # re-tuple on load, or downstream tuple-unpacking breaks.
         payload["categories"] = [list(t) for t in prepared.categories]
-        # Host mode runs the fan-out in the tester's chat, so there are ZERO
-        # server-side generation tokens to meter -- a fresh zeroed meter is the
-        # ACCURATE value on rehydrate, not a lossy one. Persist only a sentinel;
-        # deserialize always builds a fresh TokenMeter().
-        payload["meter"] = "fresh"
         return payload
     except PrepSerializeError:
         raise
@@ -381,7 +378,6 @@ def deserialize_prepared(payload: dict):
             ui_content=payload.get("ui_content"),
             parent_context=str(payload["parent_context"]),
             cache_prefix_warm=bool(payload.get("cache_prefix_warm", False)),
-            meter=TokenMeter(),  # fresh + zeroed -- see serialize_prepared
             jira_image_text=str(payload["jira_image_text"]),
             attached_image_text=str(payload["attached_image_text"]),
             jira_context_text=str(payload["jira_context_text"]),
@@ -492,7 +488,12 @@ _HOST_DEDUP_INSTRUCTION = (
     "   Rules: use tc_id values EXACTLY as they appear in the JSON you are "
     "submitting; every group needs at least TWO different ids; never group cases "
     "that differ in boundary value, role, error message, or platform -- those are "
-    "distinct tests. Omit the field entirely when you find no duplicates. It is "
+    "distinct tests. Reviewed the merged set and found NO real duplicates? Do "
+    "NOT stay silent -- send the field as an EMPTY list, "
+    '`"duplicate_groups": []`, which records the review as RUN with none '
+    "found. OMITTING the field entirely is recorded as NO REVIEW RAN and the "
+    "tester is warned that cross-category duplicates may still be present. "
+    "It is "
     "OPTIONAL and, by default, ADVISORY: the server REPORTS the groups to the "
     "tester and deletes nothing. The server also SCREENS every group before any "
     "removal: a cluster naming more than 4 cases is refused outright, and the whole "
@@ -515,7 +516,9 @@ _HOST_DEDUP_INSTRUCTION = (
     "your category submissions; the server remaps them across merge "
     "renumbering. If you merge in the parent instead, put `duplicate_groups` "
     "beside `test_cases` in the ONE merged `suite_json`. An EMPTY "
-    "`suite_json` with no sidecar forfeits this review."
+    "`suite_json` with no sidecar forfeits this review -- so when your review "
+    "found nothing, still send the sidecar (or the merged field) carrying an "
+    "EMPTY list rather than nothing at all."
 )
 
 
@@ -554,7 +557,9 @@ _FINALIZE_SIDECAR_FIRST = (
     "`ambiguity_result` and NO test_cases (the server remaps a sidecar's tc_ids "
     "across the merge) -- this KEEPS the duplicate review you were asked to run. "
     'Finalizing with suite_json="" also works and is equally crash-safe, but it '
-    "FORFEITS that review."
+    "FORFEITS that review. A review that found NO duplicates is still a "
+    'review: report it with an EMPTY list -- `"duplicate_groups": []` -- in '
+    "the sidecar, not by sending nothing."
 )
 
 _FINALIZE_EMPTY_FIRST = (
@@ -671,39 +676,6 @@ def _parallel_instruction() -> str:
     )
 
 
-# --------------------------------------------------------------------------- #
-# Category-qualified tc_id parsing
-#
-# The QA_QUALIFIED_TC_IDS_ENABLED contract was DELETED on 2026-08-12 (default
-# OFF, never validated). The SPLIT helper below is NOT part of that contract
-# and survives: mcp_handlers._map_qualified_id uses it for the finalize
-# sidecar's `risk_scores` keys, whose qualified maps are built
-# UNCONDITIONALLY because a misattributed risk rationale is unacceptable.
-# Colon is the separator because no canonical category name contains ':'
-# (several contain "/").
-# --------------------------------------------------------------------------- #
-
-
-def split_qualified_tc_id(raw: object) -> "tuple[str, str]":
-    """Split an UNTRUSTED, possibly category-qualified id into (category, tc_id).
-
-    ``"Security:TC-003"`` -> ``("Security", "TC-003")``; a bare ``"TC-003"``
-    -> ``("", "TC-003")``. Splits on the LAST colon: a canonical category
-    name can contain ``/`` and spaces but never ``:``, and tc_ids never
-    contain a colon either, so ``rpartition`` is deterministic. Never raises;
-    garbage degrades and downstream id validation drops unknown ids with a
-    note.
-    """
-    try:
-        text = str(raw or "").strip()
-        if ":" not in text:
-            return "", text
-        cat, _, tid = text.rpartition(":")
-        return cat.strip(), tid.strip()
-    except Exception:  # pragma: no cover - str() of plain objects
-        return "", ""
-
-
 def expected_category_names(prepared) -> list:
     """Canonical category names from prepared.categories (name is tuple[0]).
     Never raises; returns []."""
@@ -781,8 +753,10 @@ def build_orchestration(prepared, prep_id: str = "") -> dict | None:
             "Fan out one same-session worker per expected category; stage each "
             "category via qa_submit_category as it returns (crash-safe), then "
             "qa_prep_status until ready=true and finalize with a review sidecar "
-            "carrying duplicate_groups (an empty suite_json also finalizes, but "
-            "FORFEITS the duplicate review you were asked to run). "
+            "carrying duplicate_groups -- an EMPTY duplicate_groups list is the "
+            "correct way to report that you DID review and found none (an "
+            "empty suite_json also finalizes, but FORFEITS the duplicate "
+            "review you were asked to run). "
             "Merge-in-parent (Path B) is the fallback."
             if _dedup_review_on()
             else "Fan out one same-session worker per expected category; stage "
@@ -796,6 +770,38 @@ def build_orchestration(prepared, prep_id: str = "") -> dict | None:
         ),
         "prep_id": prep_id or "",
     }
+
+
+def _prepared_ac_entries(prepared) -> list[dict]:
+    """The SERVER-KNOWN acceptance criteria as job-packet entries. Never raises.
+
+    Read from ``prepared.acs`` -- the SAME list ``rtm_hint`` is rendered from
+    (``format_ac_prompt_block(acs)`` in ``_prepare_generation``), so the
+    structured field and the system prompt can never disagree about which ids
+    exist. That agreement is the whole point: the packet used to hardcode ``[]``
+    while its own system_prompt listed AC-001..AC-00N, and a literal-minded host
+    model following the structured field nulls every requirement_id and silently
+    destroys the RTM (live repro 2026-08-15, prep 4931b9c5ad084e918ff2b6dd5f025433).
+
+    Non-empty whenever the server parsed criteria at prepare time: the Jira AC
+    field, the description fallback, or (since 2026-08-15) a pasted feature text
+    carrying its own "Acceptance Criteria" heading.
+
+    Empty ONLY when the server genuinely has none -- the AC_JOB boomerang case,
+    where the PARENT derives the list and fills this field before dispatch.
+    """
+    out: list[dict] = []
+    try:
+        for ac in getattr(prepared, "acs", None) or []:
+            ac_id = str(getattr(ac, "ac_id", "") or "").strip()
+            desc = str(getattr(ac, "description", "") or "").strip()
+            if not ac_id or not desc:
+                continue
+            out.append({"ac_id": ac_id, "description": desc})
+    except Exception:
+        logger.warning("_prepared_ac_entries failed", exc_info=True)
+        return []
+    return out
 
 
 def build_category_job(prepared, prep_id: str, category_name: str) -> dict | None:
@@ -817,7 +823,7 @@ def build_category_job(prepared, prep_id: str, category_name: str) -> dict | Non
         # Assemble without recursing through build_prepare_payload's jobs branch.
         from agents.test_scenario_agent import (
             _CATEGORY_TASK_TEMPLATE,
-            _QUALITY_RETRY_REMINDER,
+            _QUALITY_RULES_UPFRONT,
             _case_count_bounds,
             _category_shared_system,
         )
@@ -827,7 +833,7 @@ def build_category_job(prepared, prep_id: str, category_name: str) -> dict | Non
             prepared.complexity_text or prepared.feature_text or prepared.user_msg,
             prepared.ui_content,
         )
-        quality_reminder = _QUALITY_RETRY_REMINDER
+        quality_reminder = _QUALITY_RULES_UPFRONT
         match = None
         for name, focus, ptype in getattr(prepared, "categories", None) or []:
             if name == canon or normalize_category(name) == canon:
@@ -857,11 +863,15 @@ def build_category_job(prepared, prep_id: str, category_name: str) -> dict | Non
             "min_cases": min_count,
             "max_cases": max_count,
             "preferred_type": ptype,
-            # Filled by the PARENT before dispatch when step 0b derived a
-            # list: [{"ac_id": "AC-001", "description": "..."}, ...].
-            # Left empty here because the server never sees that list until
-            # the suite is submitted.
-            "acceptance_criteria": [],
+            # The criteria the SERVER already knows, in the shape the parent
+            # would otherwise have to fill by hand:
+            # [{"ac_id": "AC-001", "description": "..."}, ...]. Sourced from
+            # prepared.acs -- the same list rtm_hint above is rendered from --
+            # so this field AGREES with the system prompt instead of
+            # contradicting it. EMPTY only when the server truly has none (the
+            # AC_JOB boomerang case), where the PARENT still fills it from step
+            # 0b before dispatch; the worker_instructions below describe both.
+            "acceptance_criteria": _prepared_ac_entries(prepared),
             "worker_instructions": (
                 "Emit ONLY a JSON object matching response_schema for this "
                 "category. Set each case's category field to category_name "
@@ -1212,14 +1222,6 @@ class ParsedSubmission:
     # Absent is NOT a failure here: the job is non-blocking, so an absent field
     # only means the server has no record of what the screenshots showed.
     raw_image_descriptions: object = None
-    # Phase 3a: the host's OPTIONAL `risk_scores` field (RISK_JOB's return_field),
-    # raw and unvalidated. Absent is NOT a failure -- the job is non-blocking, so
-    # an absent field only means the deterministic heuristic score stands.
-    raw_risk_scores: object = None
-    # Phase 3a: the host's OPTIONAL `test_plan_report` field (TEST_PLAN_JOB's
-    # return_field), raw and unvalidated. Absent means NO artifacts: the server
-    # does not fall back to its own two ask_json calls.
-    raw_test_plan_report: object = None
     # Residue R4: the checklist job's OPTIONAL `checklist_items` field, raw and
     # unvalidated. Popped before TestSuite validation (extra="forbid") and
     # validated later in extract_host_checklist. Absent means NO checklist: the
@@ -1503,11 +1505,15 @@ class HostACResult:
 def _ac_clean(text: object) -> str:
     """Sanitize one host-authored criterion for display + downstream reuse.
 
-    URLs are stripped for the same reason tools/comment_reconciler strips them:
-    this text is derived from _GUARD-wrapped ticket/comment material that host
-    mode deliberately places in the host's context, and it comes back as a
-    requirement -- it must never be able to plant a navigation target. Newlines
-    collapse so one criterion cannot forge extra list rows in the report.
+    URLs are stripped for the reason tools/comment_reconciler stripped them
+    before batch D5 deleted it on 2026-08-15: this text is derived from
+    _GUARD-wrapped ticket/comment material that host mode deliberately places
+    in the host's context, and it comes back as a requirement -- it must never
+    be able to plant a navigation target. That makes this one of the two URL
+    strippers that SURVIVE the reconciler (the other is the parent-context
+    stripper in tools/jira_mcp), and the reasoning is recorded in
+    docs/RETIRED_CAPABILITIES.md section 4. Newlines collapse so one criterion
+    cannot forge extra list rows in the report.
     """
     try:
         s = _AC_URL_RE.sub("[link removed]", str(text or ""))
@@ -1775,21 +1781,35 @@ def build_ambiguity_result_section(result) -> str:
         if not getattr(result, "ran", False):
             out = [
                 "> \u26a0\ufe0f  **The ticket's testability was never verified.** "
-                "`QA_HOST_AMBIGUITY_REVIEW_ENABLED` moved the requirement pre-pass "
-                "into your chat, so this server ran no classifier -- and this "
-                "submission came back with no readable `ambiguity_result`, so "
-                "there is no evidence the preflight ran at all. Treat the suite "
-                "below as UNVERIFIED against an under-specified ticket. Set "
-                "`QA_HOST_AMBIGUITY_REQUIRE_RESULT=true` to refuse such a "
-                "submission, or `QA_HOST_AMBIGUITY_REVIEW_ENABLED=false` to put "
-                "the check back on this server."
+                "The SHYJ-7154 requirement pre-pass runs in your chat, not on "
+                "this server -- and this submission came back with no readable "
+                "`ambiguity_result`, so there is no evidence it ran at all. "
+                # F7 (2026-08-15): say that the step was declared BLOCKING and
+                # that this server cannot enforce it. The prepare payload marks
+                # step 0 `blocking: true` in `jobs_to_run`, and submit accepts
+                # the suite regardless -- an asymmetry a tester reading only
+                # this block could not see, and which decides whether they read
+                # "it did not run" as a server bug or as their host skipping a
+                # step. It is stated rather than fixed by refusing on purpose:
+                # a refusal would throw away generation work the tester already
+                # paid for. QA_HOST_AMBIGUITY_REQUIRE_RESULT (below) is the
+                # operator switch for installs that want the stricter trade.
+                "The payload declared that step `blocking: true`, but this "
+                "server has no way to enforce a step that runs inside your "
+                "chat: it can only report that the evidence never came back. "
+                "Treat the suite below as UNVERIFIED against an under-specified "
+                "ticket. Set `QA_HOST_AMBIGUITY_REQUIRE_RESULT=true` to refuse "
+                "such a submission outright."
                 # 2026-08-09 (Batch 3, FIX 2): say the LOSS, not just the
                 # process. Modelled on _attested_image_gap_note and the nli_note,
                 # which both refuse to claim a check that could not have happened.
-                # This matters more than it reads: with
-                # QA_HOST_AMBIGUITY_REVIEW_ENABLED hardcoded ON the server-side
-                # SHYJ-7154 gate is SKIPPED, so an absent verdict means no
-                # screening happened anywhere at all.
+                # This matters more than it reads: the server-side SHYJ-7154 gate
+                # is unconditionally SKIPPED -- the pre-pass is boomeranged since
+                # 2026-08-12, when QA_HOST_AMBIGUITY_REVIEW_ENABLED was DELETED
+                # and its ON behaviour hardcoded -- so an absent verdict means no
+                # screening happened anywhere at all. The remedy named above is
+                # the one that still exists; there is no longer a setting that
+                # puts the check back on this server.
                 " **This suite carries NO ambiguity screening**: the preflight "
                 "did not run, so nothing checked whether the ticket is specified "
                 "well enough to test. That is NOT the same as 'checked and found "
@@ -1838,11 +1858,11 @@ def build_host_ac_section(result, cases=None) -> str:
         if not getattr(result, "ran", False):
             head = (
                 "> \u2139\ufe0f  **No acceptance criteria were derived.** This "
-                "ticket carried none, and this server did not synthesize any "
-                "(QA_HOST_AC_REVIEW_ENABLED -- that call was handed to your chat "
-                "model). Your submission carried no usable `acceptance_criteria` "
-                "field, so the suite below has NO requirements traceability. "
-                "Nothing was invented to fill it.\n"
+                "ticket carried none, and this server did not synthesize any -- "
+                "that derivation runs in your chat, not on this server. Your "
+                "submission carried no usable `acceptance_criteria` field, so "
+                "the suite below has NO requirements traceability. Nothing was "
+                "invented to fill it.\n"
             )
             return head + "".join(f">   - {n}\n" for n in notes) + "\n"
         acs = list(getattr(result, "acs", None) or [])
@@ -2233,11 +2253,10 @@ def build_host_checklist_section(
                 )
             return (
                 "> \u2139\ufe0f  **No requirements checklist.** This server did not "
-                "decompose the ticket (`QA_HOST_CHECKLIST_REVIEW_ENABLED` -- the "
-                "decomposition was handed to your chat model) and the submission "
-                "carried no usable `checklist_items` field, so there is NO "
-                "requirement coverage tally for this run. Nothing was invented to "
-                "fill the gap.\n\n"
+                "decompose the ticket -- that decomposition runs in your chat, "
+                "not on this server -- and the submission carried no usable "
+                "`checklist_items` field, so there is NO requirement coverage "
+                "tally for this run. Nothing was invented to fill the gap.\n\n"
             )
         lines = [
             "> \u2139\ufe0f  **Requirements checklist: MODEL-DERIVED.** "
@@ -2811,21 +2830,20 @@ def build_host_image_section(result) -> str:
                 )
         if not getattr(result, "ran", False):
             lines.append(
-                "> \u2139\ufe0f  `QA_HOST_IMAGE_DESCRIPTION_ENABLED` forwarded the "
-                "screenshot(s) to your chat instead of describing them on this "
-                "server, but the submission carried no readable "
-                "`image_descriptions`. The images may still have grounded the "
-                "cases -- this server simply has no record of what they showed, "
-                "and it did NOT fall back to a vision call."
+                "> \u2139\ufe0f  The screenshot(s) were forwarded to your chat "
+                "instead of being described on this server, but the submission "
+                "carried no readable `image_descriptions`. The images may still "
+                "have grounded the cases -- this server simply has no record of "
+                "what they showed, and it did NOT fall back to a vision call."
             )
         else:
             imgs = list(getattr(result, "images", []) or [])
             lines.append(
                 f"> \U0001f5bc\ufe0f  **Image descriptions ({len(imgs)}) -- "
                 "MODEL-DERIVED by your own chat model.** This server made no "
-                "vision call for them (`QA_HOST_IMAGE_DESCRIPTION_ENABLED`); the "
-                "text below is untrusted input, URL-stripped and length-capped, "
-                "and grounds nothing beyond this report."
+                "vision call for them; the text below is untrusted input, "
+                "URL-stripped and length-capped, and grounds nothing beyond "
+                "this report."
             )
             for img in imgs:
                 # The verdict tag is emitted ONLY when a verdict resolved, so a
@@ -2913,557 +2931,21 @@ def off_topic_images(result) -> list:
 
 
 # --------------------------------------------------------------------------- #
-# Job: LLM-judged risk scoring (QA_HOST_RISK_REVIEW_ENABLED)
+# RISK_JOB and TEST_PLAN_JOB -- DELETED 2026-08-16 (dead-code deletion P2-H)
 #
-# Replaces tools/risk_scorer.score_with_llm, a batched server-side ask_json that
-# fires on every finalize when QA_LLM_RISK_SCORING is on. Unlike AC_JOB and
-# IMAGE_JOB this is a POST_MERGE job: the verdicts are about cases that do not
-# exist until the host has generated them, so the host answers it in the SAME
-# chat turn it submits, as one more top-level field. STILL zero extra round
-# trips -- exactly how `duplicate_groups` already works.
+# Two post_merge HostJobs stood here: one asking the host to score business risk
+# 0-100 per merged case, one asking it for a Test Plan / Strategy plus one
+# validation verdict per acceptance criterion. With them went their markers,
+# instruction strings, response specs, shape caps, the two sanitizers, the two
+# result dataclasses, both SHAPE validators and both provenance renderers.
 #
-# The deterministic score_and_sort heuristic is NOT replaced: it stays the
-# baseline, and any case the host omits (or mis-ids) keeps its heuristic score.
-# An absent field means the heuristic result stands, disclosed as such -- the
-# server never falls back to a scoring call it was configured not to make.
-#
-# PATH A (qa_submit_category) is supported too: _merge_category_rows structurally
-# drops every non-test_cases key, so on that route the field rides the finalize
-# REVIEW SIDECAR (tools/mcp_handlers._sidecar_keys / _remap_risk_scores), whose
-# tc_id keys are remapped onto the post-merge global ids. That remap builds the
-# qualified-id maps UNCONDITIONALLY: with empty maps the first-category-wins
-# guess would silently OVERWRITE ~7/8 of the verdicts and misattribute a
-# rationale into another case's XLSX row.
-# The instruction below says so, and it is true.
+# Neither job ever shipped. `tools/mcp_handlers` decided them with the hardcoded
+# literals `_risk_job = False` / `_plan_job = False`, those locals were the only
+# writers of the prep-meta stamps `host_risk_job` / `host_test_plan_job`, and
+# every reader -- the attach_jobs list, the Path-A sidecar copy, the submit-side
+# extraction -- keyed off those stamps. Reviving either is a fresh
+# implementation; the ledger ids stay in `tools/host_llm.LEDGER_IDS`.
 # --------------------------------------------------------------------------- #
-
-_RISK_JOB_MARKER = "SCORE THE BUSINESS RISK"
-
-_RISK_JOB_INSTRUCTIONS = (
-    "5a. " + _RISK_JOB_MARKER + " (AFTER merging, BEFORE you submit): this "
-    "server did NOT make its own risk-scoring call -- that call was handed to "
-    "you. For each merged case judge business risk 0 (trivial) to 100 "
-    "(catastrophic) on blast radius, data-loss potential, exploitability and "
-    "user impact, with ONE short sentence of rationale. Add ONE optional "
-    "top-level field to the merged JSON you submit:\n"
-    '   "risk_scores": {"TC-001": {"risk_score": 80, "rationale": "..."}, ...}\n'
-    "   Key it by the tc_id you used in `test_cases`. The server treats this "
-    "field as UNTRUSTED: it clamps every score to 0-100, drops any id that is "
-    "not in the suite you submitted, strips URLs and control characters from "
-    "the rationale and caps its length. It is OPTIONAL: omit it and every case "
-    "keeps the server's deterministic priority/type heuristic score -- the "
-    "server will NOT make a scoring call to fill the gap. `qa_submit_category` "
-    "cannot carry the field; on THAT route send it in the finalize review "
-    "sidecar instead -- the `qa_submit_suite` call that has no `test_cases` -- "
-    "and the server remaps your per-category tc_ids onto the merged ids for "
-    "you. Per-category tc_ids COLLIDE -- every category restarts at TC-001 -- "
-    "so send each key category-qualified as `<category>:<tc_id>`. A BARE "
-    "tc_id that more than one category submitted is REFUSED with a note in "
-    "the reply, never guessed, because a misattributed risk rationale lands "
-    "in the wrong case's row.\n"
-)
-
-_RISK_JOB_SPEC: dict = {
-    "task": "score_business_risk_after_merging",
-    "instructions": (
-        "Score every merged test case for business risk 0-100 with a one-line "
-        "rationale, and return the map as a top-level `risk_scores` object on "
-        "the merged submission (or on the finalize review sidecar when you "
-        "submitted per category), keyed by tc_id."
-    ),
-    "response_schema": {
-        "type": "object",
-        "properties": {
-            "risk_scores": {
-                "type": "object",
-                "additionalProperties": {
-                    "type": "object",
-                    "properties": {
-                        "risk_score": {"type": "integer"},
-                        "rationale": {"type": "string"},
-                    },
-                    "required": ["risk_score"],
-                },
-            }
-        },
-        "required": ["risk_scores"],
-    },
-}
-
-RISK_JOB = HostJob(
-    job_id="risk_scores",
-    payload_key="risk_scores_job",
-    stage="post_merge",
-    order=10,
-    blocking=False,
-    return_field="risk_scores",
-    marker=_RISK_JOB_MARKER,
-    step_instructions=_RISK_JOB_INSTRUCTIONS,
-    spec=_RISK_JOB_SPEC,
-)
-
-# Shape caps on the UNTRUSTED `risk_scores` field. Corpus-independent: a map
-# larger than the largest suite this server will finalize is a malformed field,
-# not a richer ticket.
-_RISK_MAX_ITEMS = 400
-_RISK_MAX_RATIONALE_CHARS = 300
-_RISK_MAX_NOTES = 10
-
-
-def _risk_clean(text: object) -> str:
-    """Sanitize one host-authored risk rationale for the report AND the XLSX.
-
-    Deliberately STRICTER than _ac_clean: besides the URL strip and whitespace
-    collapse _ac_clean does, control characters are removed as well (the
-    _tp_clean / _IMG_CTRL_RE treatment). A rationale renders into the markdown
-    risk TABLE and into the exported XLSX Notes column, so a stray 0x0b/0x7f byte can
-    break a table row or a spreadsheet cell, and a URL could plant a navigation
-    target. Never raises.
-    """
-    try:
-        s = _AC_URL_RE.sub("[link removed]", str(text or ""))
-        s = _IMG_CTRL_RE.sub("", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        return s[:_RISK_MAX_RATIONALE_CHARS]
-    except Exception:
-        return ""
-
-
-@dataclasses.dataclass
-class HostRiskResult:
-    """Validated result of the host's `risk_scores` field.
-
-    ``ran`` is False when the field was absent or UNUSABLE. Nothing falls back to
-    a server-side LLM call: the deterministic heuristic already scores every
-    case, and inventing a "judged" score would be worse than an honest
-    heuristic one.
-    """
-
-    ran: bool = False
-    requested: bool = False
-    scores: dict = dataclasses.field(default_factory=dict)
-    notes: list = dataclasses.field(default_factory=list)
-    dropped: int = 0
-
-
-def extract_host_risk_scores(
-    raw, valid_tc_ids=None, *, requested: bool = True
-) -> HostRiskResult:
-    """Validate the SHAPE of the UNTRUSTED top-level `risk_scores` field.
-
-    NEVER raises and NEVER trusts the field. Rules, enforced here in Python over
-    already-``json.loads``'d data (no eval, no dynamic attribute access), and
-    deliberately mirroring extract_host_acs:
-
-      * absent / None                    -> ran=False, no notes (the common case)
-      * not a dict                       -> ran=False + note
-      * beyond _RISK_MAX_ITEMS entries   -> truncated + noted
-      * a non-str / blank key            -> dropped + counted
-      * a key not in ``valid_tc_ids``    -> dropped + counted (hallucinated id).
-        Skipped entirely when no id set is supplied.
-      * a bare number value              -> tolerated as the score
-      * a dict value                     -> `risk_score` (or `score`) + optional
-                                            `rationale` / `reason`
-      * a non-numeric (or bool) score    -> dropped + counted
-      * a score outside 0-100            -> CLAMPED into range
-      * ZERO surviving verdicts          -> ran=False + note
-
-    Rationales go through _risk_clean (URL-stripped, control-chars removed,
-    newline-collapsed, length-capped) for the same reason AC descriptions are
-    sanitised, and one reason more: they render into a tester-facing report AND
-    into the exported XLSX Notes column, so they must never be able to plant a
-    navigation target or forge extra table rows.
-    """
-    res = HostRiskResult(requested=bool(requested))
-
-    def _note(msg: str) -> None:
-        if len(res.notes) < _RISK_MAX_NOTES:
-            res.notes.append(msg)
-
-    try:
-        if raw is None:
-            return res
-        if not isinstance(raw, dict):
-            _note(
-                "`risk_scores` was not an object -- the whole field was ignored. "
-                "Every case keeps its deterministic heuristic score."
-            )
-            return res
-        known = {str(x) for x in (valid_tc_ids or ())}
-        items = list(raw.items())
-        if len(items) > _RISK_MAX_ITEMS:
-            _note(
-                f"`risk_scores` carried {len(items)} entries -- only the first "
-                f"{_RISK_MAX_ITEMS} were read."
-            )
-            items = items[:_RISK_MAX_ITEMS]
-        for key, value in items:
-            if not isinstance(key, str) or not key.strip():
-                res.dropped += 1
-                continue
-            tc_id = key.strip()
-            if known and tc_id not in known:
-                res.dropped += 1
-                continue
-            rationale = ""
-            if isinstance(value, dict):
-                score_raw = value.get("risk_score", value.get("score"))
-                rationale = _risk_clean(
-                    value.get("rationale") or value.get("reason") or ""
-                )
-            else:
-                score_raw = value
-            if isinstance(score_raw, bool) or not isinstance(score_raw, (int, float)):
-                res.dropped += 1
-                continue
-            res.scores[tc_id] = {
-                "risk_score": max(0, min(100, int(score_raw))),
-                "rationale": rationale,
-            }
-        if res.dropped:
-            _note(
-                f"{res.dropped} `risk_scores` "
-                f"{'entry was' if res.dropped == 1 else 'entries were'} dropped "
-                "as unreadable, non-numeric, or naming a tc_id this suite does "
-                "not contain."
-            )
-        if not res.scores:
-            if not res.notes:
-                _note(
-                    "`risk_scores` carried no usable verdict -- every case keeps "
-                    "its deterministic heuristic score."
-                )
-            return res
-        res.ran = True
-        return res
-    except Exception:
-        logger.debug("extract_host_risk_scores failed", exc_info=True)
-        return HostRiskResult(requested=bool(requested))
-
-
-def build_host_risk_section(result) -> str:
-    """Render the host's risk verdicts as a bounded, provenanced report block.
-
-    Says out loud that the scores are MODEL-DERIVED and that THIS SERVER made no
-    scoring call, so a reader never mistakes them for a server-side judgement.
-    Returns "" when the job was not requested. Never raises.
-    """
-    try:
-        if result is None or not getattr(result, "requested", False):
-            return ""
-        lines: list = []
-        if not getattr(result, "ran", False):
-            lines.append(
-                "> \u2139\ufe0f  `QA_HOST_RISK_REVIEW_ENABLED` handed risk "
-                "scoring to your chat model instead of scoring it on this "
-                "server, but the submission carried no readable `risk_scores`. "
-                "Every case keeps its deterministic priority/type heuristic "
-                "score -- this server did NOT fall back to a scoring call."
-            )
-        else:
-            scored = len(getattr(result, "scores", None) or {})
-            lines.append(
-                f"> \U0001f3af  **Risk scores ({scored}) -- MODEL-DERIVED by your "
-                "own chat model.** This server made no risk-scoring call "
-                "(`QA_HOST_RISK_REVIEW_ENABLED`); the values are untrusted "
-                "input, clamped to 0-100 and matched against the submitted "
-                "tc_ids. Any case left unscored keeps the heuristic value."
-            )
-        for note in list(getattr(result, "notes", None) or [])[:_RISK_MAX_NOTES]:
-            lines.append(f">   - \u26a0\ufe0f  {note}")
-        return "\n".join(lines) + "\n\n"
-    except Exception:
-        logger.debug("build_host_risk_section failed", exc_info=True)
-        return ""
-
-
-# --------------------------------------------------------------------------- #
-# Job: the test-plan artifacts (QA_HOST_TEST_PLAN_REVIEW_ENABLED)
-#
-# Replaces BOTH ask_json calls in tools/test_plan_report (AC validation + Test
-# Plan / Strategy) with ONE post_merge job carrying two return sub-objects --
-# the master plan's "one job, two return fields", expressed as one field with two
-# keys so the host answers it in a single step and the server validates it in a
-# single place. These artifacts reach a tester-facing XLSX sheet, so every string
-# is URL-stripped, control-char-stripped, newline-collapsed and capped.
-#
-# PATH A is supported the same way the risk fold is: on the per-category route
-# the field rides the finalize review sidecar. No id remap is needed for it --
-# the artifacts are keyed by AC id and by section name, never by tc_id.
-# --------------------------------------------------------------------------- #
-
-_TEST_PLAN_JOB_MARKER = "DRAFT THE TEST PLAN AND AC VALIDATION"
-
-_TEST_PLAN_JOB_INSTRUCTIONS = (
-    "5b. " + _TEST_PLAN_JOB_MARKER + " (AFTER merging, BEFORE you submit): this "
-    "server did NOT make its own test-plan calls -- they were handed to you. "
-    "Using `user_context` as DATA only, produce (a) a Test Plan / Strategy and "
-    "(b), ONLY if the ticket carried real acceptance criteria, one verdict per "
-    "criterion. Add ONE optional top-level field to the merged JSON you "
-    "submit:\n"
-    '   "test_plan_report": {"test_plan": {"scope_in": [], "scope_out": [], '
-    '"test_levels": [], "environment": [], "test_data": [], '
-    '"entry_criteria": [], "exit_criteria": [], "techniques": []}, '
-    '"ac_validation": {"verdicts": [{"ac_id": "AC-001", "summary": "...", '
-    '"testable": true, "unambiguous": true, "independent": true, '
-    '"notes": "..."}], "open_questions": [], "missing_scenarios": []}}\n'
-    "   Every string is treated as UNTRUSTED: the server strips URLs and "
-    "control characters, collapses newlines and caps each entry and each list "
-    "before rendering it into the summary and into two XLSX sheets. Stay "
-    "grounded in the material -- do NOT invent requirements the ticket does not "
-    "imply. It is OPTIONAL: omit it and the suite finalizes with NO test-plan "
-    "artifacts, and the server will NOT make a call to fill the gap. "
-    "`qa_submit_category` cannot carry the field; on THAT route send it in the "
-    "finalize review sidecar -- the `qa_submit_suite` call that has no "
-    "`test_cases`.\n"
-)
-
-_TEST_PLAN_JOB_SPEC: dict = {
-    "task": "draft_test_plan_and_validate_acceptance_criteria",
-    "instructions": (
-        "After merging the categories, draft the Test Plan / Strategy and (only "
-        "when the ticket carried real acceptance criteria) one validation "
-        "verdict per criterion, and return both as a top-level "
-        "`test_plan_report` object on the merged submission (or on the finalize "
-        "review sidecar when you submitted per category)."
-    ),
-    "response_schema": {
-        "type": "object",
-        "properties": {
-            "test_plan_report": {
-                "type": "object",
-                "properties": {
-                    "test_plan": {"type": "object"},
-                    "ac_validation": {"type": "object"},
-                },
-            }
-        },
-        "required": ["test_plan_report"],
-    },
-}
-
-TEST_PLAN_JOB = HostJob(
-    job_id="test_plan",
-    payload_key="test_plan_job",
-    stage="post_merge",
-    order=20,
-    blocking=False,
-    return_field="test_plan_report",
-    marker=_TEST_PLAN_JOB_MARKER,
-    step_instructions=_TEST_PLAN_JOB_INSTRUCTIONS,
-    spec=_TEST_PLAN_JOB_SPEC,
-)
-
-# Shape caps on the UNTRUSTED `test_plan_report` field.
-_TP_MAX_ITEMS = 25
-_TP_MAX_VERDICTS = 40
-_TP_MAX_CHARS = 400
-_TP_MAX_NOTES = 10
-_TP_PLAN_KEYS = (
-    "scope_in",
-    "scope_out",
-    "test_levels",
-    "environment",
-    "test_data",
-    "entry_criteria",
-    "exit_criteria",
-    "techniques",
-)
-
-
-def _tp_clean(text: object) -> str:
-    """Sanitize one host-authored plan string for the report AND the XLSX sheet.
-
-    Same treatment, and the same reason, as _risk_clean: this text is derived
-    from material host mode deliberately places in the host's context and comes
-    back into a file the tester opens, so it must never plant a navigation
-    target or forge extra table rows. Never raises.
-    """
-    try:
-        s = _AC_URL_RE.sub("[link removed]", str(text or ""))
-        s = _IMG_CTRL_RE.sub("", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        return s[:_TP_MAX_CHARS]
-    except Exception:
-        return ""
-
-
-def _tp_list(raw) -> list:
-    """A capped list of clean strings from an untrusted value. Never raises.
-
-    A bare string is tolerated as a one-element list (the same leniency the
-    other untrusted-field readers apply); anything else non-list yields [].
-    """
-    try:
-        if isinstance(raw, str):
-            raw = [raw]
-        if not isinstance(raw, list):
-            return []
-        out: list = []
-        for entry in raw[:_TP_MAX_ITEMS]:
-            text = _tp_clean(entry)
-            if len(text) >= 3:
-                out.append(text)
-        return out
-    except Exception:
-        return []
-
-
-@dataclasses.dataclass
-class HostTestPlanResult:
-    """Validated result of the host's `test_plan_report` field.
-
-    ``ran`` is False when the field was absent or UNUSABLE. In that case
-    ``artifacts`` is EMPTY and the server does NOT synthesize its own -- the
-    whole point of the flag is that it makes no such call.
-    """
-
-    ran: bool = False
-    requested: bool = False
-    artifacts: dict = dataclasses.field(default_factory=dict)
-    notes: list = dataclasses.field(default_factory=list)
-    dropped: int = 0
-
-
-def extract_host_test_plan(raw, *, requested: bool = True) -> HostTestPlanResult:
-    """Validate the SHAPE of the UNTRUSTED top-level `test_plan_report` field.
-
-    NEVER raises and NEVER trusts the field. The output dict is built key by key
-    into EXACTLY the shape tools/test_plan_report's renderers already consume
-    (`render_markdown`, `ac_validation_rows`, `plan_rows`), so an unexpected key
-    the host invents is simply never copied across:
-
-      * absent / None / not a dict     -> ran=False (+ note when it was present)
-      * `test_plan`                    -> only the eight known section keys, each
-                                          a capped list of clean strings
-      * `ac_validation.verdicts`       -> capped list of {ac_id, summary,
-                                          testable, unambiguous, independent,
-                                          notes}; the three flags are coerced to
-                                          real bools, an entry with neither an
-                                          id nor a summary is dropped + counted
-      * `open_questions`/`missing_scenarios` -> capped lists of clean strings
-      * ZERO surviving artifacts       -> ran=False + note
-    """
-    res = HostTestPlanResult(requested=bool(requested))
-
-    def _note(msg: str) -> None:
-        if len(res.notes) < _TP_MAX_NOTES:
-            res.notes.append(msg)
-
-    try:
-        if raw is None:
-            return res
-        if not isinstance(raw, dict):
-            _note(
-                "`test_plan_report` was not an object -- the whole field was "
-                "ignored. No test-plan artifacts were recorded and none were "
-                "invented."
-            )
-            return res
-
-        plan_raw = raw.get("test_plan")
-        plan: dict = {}
-        if isinstance(plan_raw, dict):
-            for key in _TP_PLAN_KEYS:
-                values = _tp_list(plan_raw.get(key))
-                if values:
-                    plan[key] = values
-        elif plan_raw is not None:
-            res.dropped += 1
-
-        ac_raw = raw.get("ac_validation")
-        ac: dict = {}
-        if isinstance(ac_raw, dict):
-            verdicts: list = []
-            for entry in list(ac_raw.get("verdicts") or [])[:_TP_MAX_VERDICTS]:
-                if not isinstance(entry, dict):
-                    res.dropped += 1
-                    continue
-                ac_id = _tp_clean(entry.get("ac_id"))[:_IMG_MAX_ID_CHARS]
-                summary = _tp_clean(entry.get("summary") or entry.get("text"))
-                if not ac_id and not summary:
-                    res.dropped += 1
-                    continue
-                verdicts.append(
-                    {
-                        "ac_id": ac_id,
-                        "summary": summary,
-                        "testable": bool(entry.get("testable")),
-                        "unambiguous": bool(entry.get("unambiguous")),
-                        "independent": bool(entry.get("independent")),
-                        "notes": _tp_clean(entry.get("notes")),
-                    }
-                )
-            questions = _tp_list(ac_raw.get("open_questions"))
-            missing = _tp_list(ac_raw.get("missing_scenarios"))
-            if verdicts or questions or missing:
-                ac = {
-                    "verdicts": verdicts,
-                    "open_questions": questions,
-                    "missing_scenarios": missing,
-                    "ac_count": len(verdicts),
-                }
-        elif ac_raw is not None:
-            res.dropped += 1
-
-        if plan:
-            res.artifacts["test_plan"] = plan
-        if ac:
-            res.artifacts["ac_validation"] = ac
-        if res.dropped:
-            _note(
-                f"{res.dropped} part(s) of `test_plan_report` were unreadable "
-                "and were dropped."
-            )
-        if not res.artifacts:
-            if not res.notes:
-                _note(
-                    "`test_plan_report` carried no usable artifact -- none were "
-                    "recorded and none were invented."
-                )
-            return res
-        res.ran = True
-        return res
-    except Exception:
-        logger.debug("extract_host_test_plan failed", exc_info=True)
-        return HostTestPlanResult(requested=bool(requested))
-
-
-def build_host_test_plan_section(result) -> str:
-    """Render a one-line provenance block for the host's test-plan artifacts.
-
-    The artifacts THEMSELVES are rendered by tools/test_plan_report.render_markdown
-    from _finalize_generation, exactly as the server-authored ones are; this block
-    only states WHO wrote them. Returns "" when the job was not requested. Never
-    raises.
-    """
-    try:
-        if result is None or not getattr(result, "requested", False):
-            return ""
-        lines: list = []
-        if not getattr(result, "ran", False):
-            lines.append(
-                "> \u2139\ufe0f  `QA_HOST_TEST_PLAN_REVIEW_ENABLED` handed the "
-                "Test Plan and AC-Validation artifacts to your chat model "
-                "instead of building them on this server, but the submission "
-                "carried no readable `test_plan_report`. No artifacts were "
-                "produced -- this server did NOT fall back to building them."
-            )
-        else:
-            names = ", ".join(sorted(getattr(result, "artifacts", None) or {}))
-            lines.append(
-                f"> \U0001f4cb  **Test-plan artifacts ({names}) -- MODEL-DERIVED "
-                "by your own chat model.** This server made no test-plan call "
-                "(`QA_HOST_TEST_PLAN_REVIEW_ENABLED`); the text below and in the "
-                "exported sheets is untrusted input, URL-stripped and capped, "
-                "and grounds nothing beyond this report."
-            )
-        for note in list(getattr(result, "notes", None) or [])[:_TP_MAX_NOTES]:
-            lines.append(f">   - \u26a0\ufe0f  {note}")
-        return "\n".join(lines) + "\n\n"
-    except Exception:
-        logger.debug("build_host_test_plan_section failed", exc_info=True)
-        return ""
 
 
 def build_prepare_payload(prepared, prep_id: str = "") -> dict:
@@ -3510,7 +2992,7 @@ def build_prepare_payload(prepared, prep_id: str = "") -> dict:
     # agent module, and mirrors the server assembly from its single source.
     from agents.test_scenario_agent import (
         _CATEGORY_TASK_TEMPLATE,
-        _QUALITY_RETRY_REMINDER,
+        _QUALITY_RULES_UPFRONT,
         _case_count_bounds,
         _category_shared_system,
     )
@@ -3520,7 +3002,7 @@ def build_prepare_payload(prepared, prep_id: str = "") -> dict:
         prepared.complexity_text or prepared.feature_text or prepared.user_msg,
         prepared.ui_content,
     )
-    quality_reminder = _QUALITY_RETRY_REMINDER
+    quality_reminder = _QUALITY_RULES_UPFRONT
 
     categories = []
     for name, focus, ptype in prepared.categories:
@@ -3598,7 +3080,12 @@ def build_prepare_payload(prepared, prep_id: str = "") -> dict:
     orch = build_orchestration(prepared, prep_id)
     if orch is not None:
         out["orchestration"] = orch
-        # Job stubs only -- never duplicate user_context here.
+        # Job stubs only -- never duplicate user_context here. The server-known
+        # criteria DO ride along (they are small, and a parent dispatching
+        # straight from a stub must agree with the qa_get_category_job packet
+        # and with the system prompt's AC block). The key is OMITTED when the
+        # server has none, so the AC_JOB payload stays byte-identical.
+        job_acs = _prepared_ac_entries(prepared)
         out["jobs"] = [
             {
                 "prep_id": prep_id or "",
@@ -3608,6 +3095,7 @@ def build_prepare_payload(prepared, prep_id: str = "") -> dict:
                 "max_cases": c.get("max_cases"),
                 "preferred_type": c.get("preferred_type") or "",
                 "focus": c.get("focus") or "",
+                **({"acceptance_criteria": job_acs} if job_acs else {}),
             }
             for c in categories
         ]
@@ -3746,14 +3234,15 @@ def _validate_suite(data: dict) -> ParsedSubmission:
     # same COPY so a submission carrying it still takes the fast whole-suite
     # validation path against TestSuite's extra="forbid".
     raw_image_descriptions = data.pop("image_descriptions", None)
-    # Phase 3a: the two post_merge job return fields, popped off the same COPY for
-    # the same reason -- TestSuite sets extra="forbid", so leaving either in place
-    # would push every submission carrying it into the salvage branch and silently
-    # drop cases. Validated LATER (extract_host_risk_scores /
-    # extract_host_test_plan), because the risk field's ids must be checked
-    # against the SUBMITTED suite, which _validate_suite does not have yet.
-    raw_risk_scores = data.pop("risk_scores", None)
-    raw_test_plan_report = data.pop("test_plan_report", None)
+    # The two Phase-3a post_merge return fields. RISK_JOB and TEST_PLAN_JOB were
+    # DELETED on 2026-08-16 (dead-code deletion P2-H) and nothing reads either
+    # field now -- but the POPS stay, because they never depended on the jobs.
+    # TestSuite sets extra="forbid", so a submission carrying a stray
+    # `risk_scores` or `test_plan_report` key would fail whole-suite validation
+    # and drop into the salvage branch, silently losing cases. Popped off the
+    # same COPY as every field above; the values are discarded.
+    data.pop("risk_scores", None)
+    data.pop("test_plan_report", None)
     # Residue R4: the checklist job's return field, popped off the same COPY for
     # the same reason. Leaving it in place would push EVERY submission carrying
     # it into the salvage branch below and silently drop cases -- and it is
@@ -3779,8 +3268,6 @@ def _validate_suite(data: dict) -> ParsedSubmission:
             raw_grounding_verdicts=raw_grounding,
             raw_ambiguity_result=raw_amb,
             raw_image_descriptions=raw_image_descriptions,
-            raw_risk_scores=raw_risk_scores,
-            raw_test_plan_report=raw_test_plan_report,
             raw_checklist_items=raw_checklist_items,
         )
 
@@ -3829,8 +3316,6 @@ def _validate_suite(data: dict) -> ParsedSubmission:
         raw_grounding_verdicts=raw_grounding,
         raw_ambiguity_result=raw_amb,
         raw_image_descriptions=raw_image_descriptions,
-        raw_risk_scores=raw_risk_scores,
-        raw_test_plan_report=raw_test_plan_report,
         raw_checklist_items=raw_checklist_items,
     )
 
@@ -3870,18 +3355,47 @@ def _dup_text_ratio(a, b) -> float:
 
 
 # --- Server-assisted duplicate shortlist (QA_DUP_SHORTLIST_ENABLED, OFF) -- #
-# Lexical PRESCREEN over the merged, globally renumbered cases, reusing the
-# same _DUP_WS_RE / difflib machinery as the advisory agreement label. Pairs
-# are reported with POST-MERGE GLOBAL tc_ids (the phase-1 review settled on
-# global ids to dodge the per-category TC-001 collision trap) so the host
-# CONFIRMS a shortlist via the finalize sidecar instead of re-reading the
-# merged suite. ADVISORY only: nothing is removed here, and a confirmed
-# sidecar still passes through _extract_duplicate_groups +
-# screen_duplicate_groups unchanged.
-_DUP_SHORTLIST_MIN_RATIO = 0.75
+# Lexical PRESCREEN over the merged, globally renumbered cases. Pairs are
+# reported with POST-MERGE GLOBAL tc_ids (the phase-1 review settled on global
+# ids to dodge the per-category TC-001 collision trap) so the host CONFIRMS a
+# shortlist via the finalize sidecar instead of re-reading the merged suite.
+# ADVISORY only: nothing is removed here, and a confirmed sidecar still passes
+# through _extract_duplicate_groups + screen_duplicate_groups unchanged.
+#
+# F08 (2026-08-19) -- the feature CHANGED, and the reason is measured rather
+# than asserted. This used to score `title + first step action` with
+# difflib.SequenceMatcher.ratio() at >= 0.75, the same machinery as the
+# advisory agreement label below. Replayed against the 2026-08-16 live run's
+# 96 persisted cases that emitted 21 pairs -- truncated to the 12-pair cap, so
+# the list was SATURATED and hiding nine more -- of which exactly one was a
+# real near-duplicate. Cause: in a generated suite the shared scaffolding
+# ("per-transaction limit sar ...", "disable ... channel on ... card") is most
+# of the character mass, while the discriminating content is a numeral or a
+# direction word, so `SAR 1,500 accepted` vs `SAR 1,050 rejected` scored 0.906
+# -- ABOVE the one pair worth surfacing at 0.827. No threshold fixes that: any
+# cut keeping the real pair keeps seven false positives with it. Suppressing
+# the tier outright (the tools/rtm._LEXICAL_COMPACT_CAVEAT precedent) would
+# also stop surfacing the real pair, so it was rejected too.
+#
+# Jaccard over TITLE tokens instead: each discriminating word counts once
+# rather than in proportion to its length, and dropping the action removes the
+# most templated field in the suite. Same run, same cases: 21 pairs -> 3, the
+# real pair retained, precision 1/12 -> 1/3, and the cap no longer binds. A
+# numeric-disagreement veto was measured too (21 -> 1) and REJECTED: the pair
+# it drops is the real one.
+_DUP_SHORTLIST_MIN_RATIO = 0.65
 _DUP_SHORTLIST_MAX_PAIRS = 12
 _DUP_SHORTLIST_MAX_CASES = 200
 _DUP_SHORTLIST_TITLE_CHARS = 80
+# Title chars scanned for tokens (the rendered title is capped separately at
+# _DUP_SHORTLIST_TITLE_CHARS) and the cheap size prefilter: two token sets
+# whose sizes differ by more than this factor cannot reach the threshold.
+_DUP_SHORTLIST_TITLE_SCAN = 300
+# Word tokens, keeping a hyphenated term ("per-transaction") and a formatted
+# number ("5,000", "1.5") whole -- splitting those was measured to drop the
+# one pair on the F08 run worth surfacing from 0.667 to 0.615, under the
+# threshold. Unicode-aware, so an Arabic title tokenises too.
+_DUP_SHORTLIST_TOKEN_RE = re.compile(r"[^\W_](?:[^\W_]|[-,.](?=[^\W_]))*", re.UNICODE)
 
 
 def dup_shortlist_on() -> bool:
@@ -3891,20 +3405,20 @@ def dup_shortlist_on() -> bool:
     return True
 
 
-def _dup_text_from_dict(case: object) -> str:
-    """``_dup_text`` for a JSON-native merged-case dict (the shape
-    ``mcp_handlers._merge_category_rows`` emits). UNTRUSTED; never raises."""
+def _dup_title_tokens(case: object) -> frozenset:
+    """Lower-cased word tokens of a JSON-native merged-case dict's TITLE (the
+    shape ``mcp_handlers._merge_category_rows`` emits), for the Jaccard
+    prescreen. The first step's action is deliberately NOT included -- it is the
+    most templated field in a generated suite and was the main driver of the F08
+    false positives. UNTRUSTED input; never raises, returns an empty set on
+    anything unusable."""
     try:
         if not isinstance(case, dict):
-            return ""
-        title = str(case.get("title") or "")
-        steps = case.get("steps") or []
-        action = ""
-        if isinstance(steps, list) and steps and isinstance(steps[0], dict):
-            action = str(steps[0].get("action") or "")
-        return _DUP_WS_RE.sub(" ", f"{title} {action}".lower()).strip()[:600]
+            return frozenset()
+        title = str(case.get("title") or "")[:_DUP_SHORTLIST_TITLE_SCAN]
+        return frozenset(_DUP_SHORTLIST_TOKEN_RE.findall(title.lower()))
     except Exception:
-        return ""
+        return frozenset()
 
 
 def _shortlist_safe(text: object, cap: int) -> str:
@@ -3919,13 +3433,15 @@ def _shortlist_safe(text: object, cap: int) -> str:
 def build_dup_shortlist(merged_cases: list) -> list:
     """Candidate duplicate PAIRS over the merged, renumbered cases.
 
-    Pure, synchronous, stdlib difflib only -- no LLM, no embeddings, no I/O.
+    Pure, synchronous, stdlib only -- no LLM, no embeddings, no I/O.
     Deterministic and bounded: at most _DUP_SHORTLIST_MAX_CASES cases are
-    compared, quick-ratio prefilters skip cheap non-matches, and at most
+    compared, a size prefilter skips cheap non-matches, and at most
     _DUP_SHORTLIST_MAX_PAIRS pairs are returned, highest agreement first.
     UNTRUSTED input tolerated (host-authored dicts); never raises, returns []
     on anything unusable. Output rows: {id_a, title_a, id_b, title_b, ratio}
-    where the ids are POST-MERGE GLOBAL tc_ids.
+    where the ids are POST-MERGE GLOBAL tc_ids and ``ratio`` is now the Jaccard
+    overlap of the two TITLE token sets -- see the F08 note on the constants
+    above for why the character-level difflib score was dropped.
     """
     try:
         entries = []
@@ -3933,18 +3449,21 @@ def build_dup_shortlist(merged_cases: list) -> list:
             if not isinstance(c, dict):
                 continue
             tid = str(c.get("tc_id") or "")
-            text = _dup_text_from_dict(c)
-            if tid and text:
-                entries.append((tid, str(c.get("title") or ""), text))
+            toks = _dup_title_tokens(c)
+            if tid and toks:
+                entries.append((tid, str(c.get("title") or ""), toks))
         pairs: list = []
         for i in range(len(entries)):
             for j in range(i + 1, len(entries)):
-                sm = difflib.SequenceMatcher(None, entries[i][2], entries[j][2])
-                if sm.real_quick_ratio() < _DUP_SHORTLIST_MIN_RATIO:
+                a, b = entries[i][2], entries[j][2]
+                # |a & b| <= min(|a|, |b|) and |a | b| >= max(|a|, |b|), so this
+                # bounds the Jaccard from above without building either set.
+                if min(len(a), len(b)) < _DUP_SHORTLIST_MIN_RATIO * max(len(a), len(b)):
                     continue
-                if sm.quick_ratio() < _DUP_SHORTLIST_MIN_RATIO:
+                union = len(a | b)
+                if not union:
                     continue
-                ratio = sm.ratio()
+                ratio = len(a & b) / union
                 if ratio < _DUP_SHORTLIST_MIN_RATIO:
                     continue
                 pairs.append(
@@ -3977,13 +3496,17 @@ def build_dup_shortlist_section(pairs: list) -> str:
             "(server lexical prescreen -- ADVISORY)",
             "",
             "Every expected category is staged, so the server compared the "
-            "merged cases lexically (title + first step action, stdlib "
-            "difflib -- no LLM). These pairs look like the SAME test. The "
+            "merged case TITLES lexically (shared-word overlap, stdlib only "
+            "-- no LLM). These pairs look like the SAME test. The "
             "ids are POST-MERGE GLOBAL tc_ids: confirm a shortlist instead "
             "of re-reading the merged suite by finalizing with "
             '`suite_json={"duplicate_groups": [["<id>", "<id>"], ...]}` (no '
             "`test_cases`), keeping ONLY the pairs you agree are one test "
-            "and using these ids exactly as printed. This is a lexical "
+            "and using these ids exactly as printed. If you review these pairs "
+            "and agree with NONE of them, finalize with "
+            '`suite_json={"duplicate_groups": []}`: an EMPTY list records the '
+            "review as RUN with none found, while omitting the field is "
+            "recorded as NO REVIEW RAN. This is a lexical "
             "prescreen, not a verdict -- drop any pair that differs in "
             "boundary value, role, error message, or platform. By default "
             "nothing is removed (the review is advisory); every confirmed "

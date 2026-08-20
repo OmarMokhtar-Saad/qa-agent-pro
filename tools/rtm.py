@@ -14,36 +14,24 @@ import re
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 
-from pydantic import BaseModel, Field
-
 from config.settings import settings
-from llm import ask_json, server_llm_scope
-from tools import token_meter
 from tools.atomic_checklist import (
     HONESTY_BOUNDARY,
+    PROVENANCE_LIMITATION,
     lexical_cosine_matrix,
     provenance_caveats,
 )
 from tools.embeddings import backend_enabled, cosine_similarity, embed_texts
-from tools.models import TestCase
-from tools.untrusted import _GUARD, wrap_untrusted
+from tools.models import TestCase, normalize_ac_id
 
 logger = logging.getLogger(__name__)
 
-# docs/LLM_MIGRATION_INVENTORY.md ledger id for the OPTIONAL entailment (b) and
-# adjudication (c) tiers below. Named _NLI_ rather than generically, because
-# this module owns a SECOND ledger call site
-# (`rtm.acceptance_criteria`, the AC synthesis near the top of the file),
-# tagged `_AC_LEDGER_ID` -- deliberately a different constant, since a bare
-# _LEDGER_ID here would invite that call site to reuse the wrong tag.
-#
-# Ledger rule 4: the surviving direct call sites -- still reachable from
-# graph.py and from evals/ -- must TAG themselves, or the Phase-6 kill switch
-# refuses them as UNTAGGED calls and they would silently degrade to tier (a)
-# instead of running. Tagged, QA_SERVER_LLM_ALLOW=rtm.nli_verdicts
-# keeps exactly this one path alive. No behavioural change while
-# QA_SERVER_LLM_ENABLED is on (its default).
-_NLI_LEDGER_ID = "rtm.nli_verdicts"
+# `_NLI_LEDGER_ID = "rtm.nli_verdicts"` stood here until 2026-08-16 (dead-code
+# deletion P2-G1), together with the two OPTIONAL LLM tiers it tagged. Its
+# sibling `_AC_LEDGER_ID` ("rtm.acceptance_criteria") went in P2-F2. Both ids
+# STAY in tools/host_llm.LEDGER_IDS -- that frozenset never shrinks, because an
+# id is what keeps "this path migrated / was disabled" checkable after the code
+# is gone. There is nothing left in this module to tag: it makes no LLM call.
 
 
 @dataclass
@@ -52,106 +40,34 @@ class AcceptanceCriterion:
     description: str
 
 
-class _GeneratedAC(BaseModel):
-    description: str = Field(
-        min_length=3, description="One testable acceptance criterion"
-    )
-
-
-class _GeneratedACList(BaseModel):
-    acceptance_criteria: list[_GeneratedAC] = Field(default_factory=list)
-
-
-# Ledger id for the AC-synthesis call below (`rtm.acceptance_criteria`), the
-# SECOND of this module's two ledger rows and deliberately a DISTINCT constant
-# from _NLI_LEDGER_ID -- exactly as that constant's own comment instructs. The
-# two rows migrate and are allow-listed independently.
+# generate_acs lived here until 2026-08-16 (dead-code deletion P2-F2),
+# together with its _GeneratedAC / _GeneratedACList response models, the
+# _AC_GEN_SYSTEM prompt and the ledger id `rtm.acceptance_criteria`. It made
+# ONE server-side llm.ask_json call synthesizing acceptance criteria for the
+# 3-of-4 input types that carry none, so the RTM could light up.
 #
-# Ledger rule 4. The host route never reaches this call: handle_prepare_test_cases
-# passes synthesize_acs=False (its `_host_ac` decision), so _run_gen_acs returns
-# [] and agents/host_mode.AC_JOB derives the criteria on the tester's OWN model.
-# What survives is the LEGACY route -- graph.py -> generate_test_scenarios ->
-# _prepare_generation(synthesize_acs=True), plus evals/ -- and it is NOT deleted
-# (Phase 3a's precedent). A surviving call must TAG itself or the Phase-6 kill
-# switch refuses it as UNTAGGED, and QA_SERVER_LLM_ALLOW=rtm.acceptance_criteria
-# would then allow nothing at all. Inert while QA_SERVER_LLM_ENABLED is on (its
-# default): the scope only sets a ContextVar the guard reads when the flag is off.
-_AC_LEDGER_ID = "rtm.acceptance_criteria"
+# It was dead. Its only caller was agents/test_scenario_agent._run_gen_acs,
+# which ran only under `synthesize_acs=True`; the one live caller of
+# _prepare_generation (tools/mcp_handlers.handle_prepare_test_cases) passed
+# synthesize_acs=not _host_ac, and `_host_ac` derives from
+# llm.resolve_generation_mode() == "host" -- a constant since 2026-08-12. The
+# legacy routes that still reached it, graph.py and evals/, were deleted in
+# P2-A and P2-B.
+#
+# There is NO capability loss: the criteria are derived by the tester's OWN
+# model as agents/host_mode.AC_JOB, and _prepare_generation still appends
+# _HOST_AC_JOB_DIRECTIVE to rtm_hint to ask for them. parse_acceptance_criteria,
+# rtm_trace, match_checklist and the rest of this module are LIVE and untouched.
 
 
-_AC_GEN_SYSTEM = """\
-You are a senior QA analyst. From the feature description, derive a concise list
-of testable acceptance criteria — the observable conditions that must hold for
-the feature to be considered correct.
-
-Rules:
-- 3 to 8 criteria, each a single, specific, verifiable statement.
-- Cover the happy path, key negative/error cases, and important boundaries.
-- Do NOT invent unrelated requirements; stay grounded in the description.
-- Phrase each as an outcome (e.g. "A user with a valid token can access the page").
-"""
-
-
-async def generate_acs(
-    feature_text: str, meter: object | None = None
-) -> list[AcceptanceCriterion]:
-    """Generate acceptance criteria from a plain-text feature description (T-11).
-
-    Lets the RTM light up for the 3-of-4 input types that carry no explicit ACs.
-    Returns numbered AcceptanceCriterion items, or [] on empty input / any failure.
-    Never raises.
-
-    ``meter`` is an optional tools.token_meter.TokenMeter; when passed, this
-    call's tokens are recorded against it. Purely bookkeeping -- it never
-    changes the prompt, the model, or the result.
-    """
-    try:
-        if not feature_text or not feature_text.strip():
-            return []
-        _ac_user = wrap_untrusted("feature_description", feature_text)
-        with server_llm_scope(_AC_LEDGER_ID):
-            result = await ask_json(
-                system=_AC_GEN_SYSTEM + _GUARD,
-                user=_ac_user,
-                response_model=_GeneratedACList,
-                model=settings.qa_classifier_model or None,
-            )
-        token_meter.note(
-            meter,
-            "other",
-            settings.qa_classifier_model or settings.qa_llm_model,
-            system=_AC_GEN_SYSTEM,
-            user=_ac_user,
-            output_text=token_meter.model_text(result),
-        )
-        acs = [
-            AcceptanceCriterion(ac_id=f"AC-{i:03d}", description=g.description.strip())
-            for i, g in enumerate(result.acceptance_criteria, 1)
-            if g.description.strip()
-        ]
-        logger.info("generate_acs: synthesized %d acceptance criteria", len(acs))
-        return acs
-    except Exception:
-        logger.exception("generate_acs failed — returning empty list")
-        return []
-
-
-def normalize_ac_id(raw: str | None) -> str:
-    """Canonicalise an AC identifier so trace matching is robust to LLM/Jira
-    formatting drift (QW-12 / I-059 / B-024).
-
-    Upper-cases, strips spaces, and rewrites any ``AC``/``AC-``/``AC0`` + number
-    form to the canonical ``AC-{N:03d}`` (so ``AC-1``, ``AC001``, ``ac-01`` all
-    map to ``AC-001``). Non-matching values are returned upper-cased/stripped so
-    unrelated ids still compare consistently. Never raises.
-    """
-    if not raw:
-        return ""
-    s = str(raw).strip().upper().replace(" ", "")
-    m = re.match(r"^AC-?0*(\d+)$", s)
-    if m:
-        return f"AC-{int(m.group(1)):03d}"
-    return s
+# ``normalize_ac_id`` MOVED to tools/models.py on 2026-08-19 (F06) and is
+# re-exported by the import above, so `from tools.rtm import normalize_ac_id`
+# still resolves for tools/ac_anchor.py, agents/host_mode.py,
+# agents/test_scenario_agent.py and tests/test_rtm.py -- none of them changed.
+# It moved because its sibling ``display_requirement_id`` is needed by all five
+# exporters on every row, and importing THIS module to reach it would have pulled
+# tools.atomic_checklist and tools.embeddings into csv_exporter /
+# gherkin_exporter / playwright_exporter, which need neither.
 
 
 # Values that are NOT acceptance criteria even when a configured field returns
@@ -461,6 +377,111 @@ def build_rtm_summary(
     return table + coverage_line + orphan_tc_line
 
 
+# Bounds for the traceability SHEET. The description is a spreadsheet cell, not
+# the 80-char markdown one build_rtm_summary trims to, so it can be generous --
+# but a host-authored AC has no length contract at all. The linked-TC cap keeps
+# one over-weighted criterion (25 of 96 cases on AC-001 in the 2026-08-16 run)
+# from producing a cell no spreadsheet will render.
+_RTM_DESC_CAP = 1000
+_RTM_LINKED_CAP = 60
+
+
+def _linked_cell(tc_ids: list) -> str:
+    """A capped, comma-joined list of linked tc_ids, with the shortfall NAMED."""
+    shown = ", ".join(str(t) for t in tc_ids[:_RTM_LINKED_CAP])
+    extra = len(tc_ids) - _RTM_LINKED_CAP
+    return f"{shown}, ... (+{extra} more)" if extra > 0 else shown
+
+
+def rtm_rows(acs: list, test_cases: list, *, derived: bool = False) -> list:
+    """Rows (header first) for the 'Requirements Traceability' XLSX sheet.
+
+    F06 (2026-08-19). The finalize reply's headline -- "7/7 acceptance criteria
+    traced, all covered" -- was unverifiable by the person who RECEIVES the
+    workbook: ``requirement_id`` sat on every case in the database and was dropped
+    on the way to the spreadsheet. These rows are the SAME ``_trace_map``
+    computation the reply prints, shaped for a sheet, so the file and the claim
+    cannot drift apart.
+
+    The per-AC CASE COUNT is a column of its own on purpose: a suite can be 7/7
+    covered and still be 25 cases on one criterion against 3 on another, and a
+    total hides exactly that.
+
+    *derived* means the criteria were SYNTHESIZED because the source carried none
+    (``rtm_oneline`` says the same thing on the reply). 100% coverage of invented
+    requirements is not evidence of anything, so the caveat travels with the file.
+
+    Pure -- cell sanitisation happens in tools/xlsx_generator, exactly like
+    ``atomic_checklist.checklist_rows``. Returns [] when there are no criteria, so
+    no sheet is written at all. Never raises."""
+    try:
+        if not acs:
+            return []
+        cases = list(test_cases or [])
+        ac_to_tcs, orphan_tc_ids = _trace_map(acs, cases)
+        rows: list = [
+            ["AC ID", "Acceptance Criterion", "Cases", "Linked TCs", "Status"]
+        ]
+        for ac in acs:
+            linked = ac_to_tcs.get(ac.ac_id) or []
+            rows.append(
+                [
+                    ac.ac_id,
+                    str(getattr(ac, "description", "") or "")[:_RTM_DESC_CAP],
+                    str(len(linked)),
+                    _linked_cell(linked),
+                    "Covered" if linked else "ORPHAN",
+                ]
+            )
+        if orphan_tc_ids:
+            # F04 will make an untraced case legitimate; this row already renders
+            # one honestly rather than as an absence a reader has to notice.
+            rows.append(
+                [
+                    "(untraced)",
+                    "Cases carrying no `requirement_id`. They test something, but "
+                    "this sheet cannot say which requirement -- they are exactly "
+                    "the gap between the two case numbers on the coverage line "
+                    "below, and they raise no criterion's count.",
+                    str(len(orphan_tc_ids)),
+                    _linked_cell(orphan_tc_ids),
+                    "NOT TRACED",
+                ]
+            )
+        total = len(acs)
+        covered = sum(1 for tcs in ac_to_tcs.values() if tcs)
+        traced = sum(len(tcs) for tcs in ac_to_tcs.values())
+        pct = int(covered / total * 100) if total else 0
+        kind = "MODEL-DERIVED acceptance criteria" if derived else "acceptance criteria"
+        rows.append(["", "", "", "", ""])
+        rows.append(
+            [
+                "Coverage",
+                f"{covered} of {total} {kind} covered ({pct}%) -- "
+                f"{traced} of {len(cases)} case(s) trace to one.",
+                "",
+                "",
+                "",
+            ]
+        )
+        if derived:
+            rows.append(
+                [
+                    "Provenance",
+                    "These criteria were SYNTHESIZED because the source carried "
+                    "none, so this table measures self-consistency, NOT coverage "
+                    "of stated requirements.",
+                    "",
+                    "",
+                    "",
+                ]
+            )
+        return rows
+    except Exception:
+        logger.exception("rtm_rows failed -- returning []")
+        return []
+
+
 def rtm_oneline(
     acs: list[AcceptanceCriterion],
     test_cases: list[TestCase],
@@ -479,6 +500,13 @@ def rtm_oneline(
     traceability. 100% coverage of invented requirements is not evidence of
     anything, so the provenance has to travel WITH the number rather than near it.
     Defaults False, so a ticket that really carried criteria is unchanged.
+
+    F04 (2026-08-16) applied the same reasoning to a second missing number. The
+    line reports TWO figures now: how many criteria have at least one case, and
+    how many CASES trace to a criterion. A case whose ``requirement_id`` is null
+    -- or names an id this AC list does not contain -- counts as untraced, which
+    is why the second figure can fall short of the suite size while the first
+    still reads "all covered".
     """
     try:
         if not acs:
@@ -495,6 +523,25 @@ def rtm_oneline(
         kind = "MODEL-DERIVED acceptance criteria" if derived else "acceptance criteria"
         line = f"\n\n**Requirements:** {covered}/{total} {kind} traced"
         line += f", {orphans} orphan(s)." if orphans else ", all covered."
+        # F04 (2026-08-16): the AC figure ALONE read "7/7 acceptance criteria
+        # traced, all covered" over a suite whose deterministic checklist matcher
+        # mapped 21 of its 96 cases. The two figures answer different questions —
+        # how many criteria got at least one case, versus how many cases verify a
+        # stated criterion — and printing only the first is what let a suite of
+        # convenience tags read as fully traced. They travel together from here,
+        # so "all covered" can never stand alone. Counts only (the clause grows
+        # with integer WIDTH, never with the suite), and silent when there are no
+        # cases at all, which keeps the stored-suite re-render byte-identical.
+        cases = list(test_cases or [])
+        if cases:
+            traced = sum(
+                1
+                for tc in cases
+                if normalize_ac_id(getattr(tc, "requirement_id", None)) in ac_norm_ids
+            )
+            untraced = len(cases) - traced
+            line += f" {traced} of {len(cases)} case(s) trace to one of them"
+            line += f"; {untraced} trace to none." if untraced else "."
         if derived:
             line += (
                 " They were synthesized because the ticket carried none, so this "
@@ -521,10 +568,30 @@ def format_ac_prompt_block(acs: list[AcceptanceCriterion]) -> str:
         "Use ONLY these AC IDs:\n"
         + lines
         + (
-            "\nIf no AC applies to a test case, use JSON null for "
-            "requirement_id — but prefer a real AC id: a case you cannot "
-            "trace to any of the IDs above is usually testing something "
-            "outside this ticket's scope.\n"
+            # F04 (live run 2026-08-16, suite 1ed83399b4b84831b79ead7936235989).
+            # The clause that stood here offered null and then argued against it
+            # in the same breath ("but prefer a real AC id ... usually testing
+            # something outside this ticket's scope"), so the model picked the
+            # nearest id instead of declaring itself untraced: 96 of 96 cases
+            # tagged, 0 untraced, and AC-001 — the first and broadest id —
+            # absorbing 25 of them while its sibling AC-002 got 3. Roughly 20 of
+            # those tags were tags of convenience (authorisation, rate limiting,
+            # RTL layout, screen-reader labels), which no AC on that ticket
+            # stated, and they inflated the reply's "7/7 ... all covered".
+            # A null is now stated to be CORRECT rather than tolerated, the
+            # shapes that legitimately have no AC are named, and the consequence
+            # of stretching a tag is named too — rtm_oneline reports the
+            # case-level count unconditionally, so a stretched tag is not a
+            # private convenience, it moves a number every reader sees.
+            "\nIf none of the IDs above applies to a test case, set "
+            "requirement_id to JSON null. That is the CORRECT answer, not a "
+            "gap: security, accessibility, empty-state and cross-device cases "
+            "routinely verify something no acceptance criterion states, and "
+            "they are legitimate tests. Do NOT stretch an ID to cover a case it "
+            "does not literally state. Every case is counted either way — the "
+            "summary reports how many trace to a criterion and how many trace "
+            "to none — so a stretched tag does not hide anything, it only "
+            "overstates coverage for everyone downstream.\n"
         )
     )
 
@@ -542,20 +609,16 @@ def format_ac_prompt_block(acs: list[AcceptanceCriterion]) -> str:
 # Three tiers, cheapest first:
 #   (a) embedding cosine via tools/embeddings (TF-IDF lexical fallback, pure
 #       stdlib, when the backend is disabled or fails);
-#   (b) OPTIONAL batched entailment judgement over the ambiguous middle band
-#       (QA_CHECKLIST_NLI_ENABLED, default OFF);
-#   (c) OPTIONAL batched adjudication over ONLY what (a)+(b) could not separate
-#       (QA_CHECKLIST_ADJUDICATE_ENABLED, default OFF).
-#
-# DEVIATION FROM THE RESEARCH, DELIBERATE: tiers (b)/(c) do NOT use a
-# fine-tuned BERT-large NLI model. Adding a transformer dependency would break
-# the "no new embedding dependency" constraint and the optional-extra install
-# story, and the cited paper reports no latency/cost figures. Instead both tiers
-# are compact BATCHED ``llm.ask_json`` calls with a strict, non-generative
-# judging prompt and a DIFFERENT system prompt from the generator — so the
-# generating model still never marks its own homework — bounded by
-# QA_CHECKLIST_MAX_PAIRS. Both default OFF, so the default path is embeddings
-# (or lexical) only and costs ZERO extra LLM calls.
+#   (b) two OPTIONAL batched LLM tiers -- entailment over the ambiguous middle
+#       band, then adjudication over what (a)+(b) could not separate -- were
+#       DELETED on 2026-08-16 (dead-code deletion P2-G1). They were the last
+#       two `llm.ask_json` calls in the tree. Both had been unreachable since
+#       2026-08-14 (batch 8b-ii) behind `_nli_tier_enabled()` /
+#       `_adjudicate_tier_enabled()`, which survive below as `False` constants
+#       and still gate the degradation note. The ambiguous band itself is gone
+#       with them, so a score below the HIGH threshold is simply not a link.
+#       Reviving the tiers is now a fresh implementation, not a flag flip;
+#       `git show <this commit>~1` is the last tree that carried them.
 #
 # THREE CORRECTNESS INVARIANTS, each of which was a real defect risk:
 #   1. TRUNCATION IS NOT A GAP. ``presented_item_ids`` names the items that
@@ -574,8 +637,19 @@ def format_ac_prompt_block(acs: list[AcceptanceCriterion]) -> str:
 # operator-tunable embedding thresholds must NOT be applied to it. These fixed
 # lexical thresholds are used instead, a lexical match is capped at MEDIUM
 # confidence (never HIGH), and the tally suppresses the percentage entirely.
+#
+# MEASURED 2026-08-19 (finding F10), over the 96 persisted cases and 20
+# checklist items of suite 1ed83399b4b84831b79ead7936235989. All SEVEN reported
+# gaps were FALSE: for each one the top-ranked lexical hit was the plainly
+# correct case (CL-011 -> TC-044 at 0.420, CL-013 -> TC-046 at 0.442,
+# CL-020 -> TC-005 at 0.441, CL-004 -> TC-010 at 0.177). True coverage was
+# 20/20. That is NOT an argument for lowering this number: the same sweep gives
+# 17/20 items and 29/96 cases at 0.40, and 18/20 and 48/96 at 0.30 -- no cut-off
+# recovers coverage without collapsing the orphan signal, and two requirements
+# stay uncovered all the way down. The tier cannot produce a trustworthy figure
+# at ANY threshold, which is exactly why the tally suppresses the percentage.
+# Do not tune this constant in response to a low lexical coverage report.
 _LEXICAL_HIGH = 0.45
-_LEXICAL_LOW = 0.15
 
 # Above this many (items x cases) cells the matrix build is slow enough to be
 # worth telling the operator about. It is NOT a drop threshold — dropping pairs
@@ -626,59 +700,6 @@ class ChecklistCoverage:
     degraded: bool = False
     notes: list = dc_field(default_factory=list)
     ran: bool = False
-
-
-class _PairVerdict(BaseModel):
-    pair_id: int = Field(default=-1, description="The pair id you were given")
-    verdict: str = Field(default="unsure", description="entails | contradicts | unsure")
-
-
-class _PairVerdicts(BaseModel):
-    verdicts: list[_PairVerdict] = Field(default_factory=list)
-
-
-class _Adjudication(BaseModel):
-    pair_id: int = Field(default=-1)
-    covered: bool = Field(default=False)
-    reason: str = Field(default="")
-
-
-class _Adjudications(BaseModel):
-    decisions: list[_Adjudication] = Field(default_factory=list)
-
-
-_ENTAILMENT_SYSTEM = """\
-You are a requirements-traceability judge. You are given numbered PAIRS. Each
-pair has a REQUIREMENT (one atomic, independently-verifiable outcome) and a TEST
-(its title plus its expected results).
-
-For every pair answer ONE question: does executing the TEST verify the
-REQUIREMENT — i.e. would the test FAIL if the requirement were not implemented?
-
-verdict values:
-  "entails"     - yes, the test's expected results verify this exact outcome.
-  "contradicts" - the test is about a different outcome.
-  "unsure"      - genuinely undecidable from the text you were given.
-
-Judge ONLY the text provided; never invent behaviour. Do not be generous: a test
-that merely mentions the same screen, field or feature does NOT entail the
-requirement unless its expected result asserts that requirement's outcome.
-Return exactly one verdict for every pair id you were given.
-Output STRICTLY the JSON object for the schema, nothing else.
-"""
-
-_ADJUDICATION_SYSTEM = """\
-You are the final adjudicator for requirement-to-test traceability. You see only
-the pairs that an embedding matcher and an entailment judge could NOT separate.
-
-For each pair decide strictly: is this requirement verified by this test?
-Default to false. Answer true only when the test's expected result asserts the
-requirement's outcome. Give a one-line reason.
-
-Your true verdicts are reported to the tester as LOW-confidence matches that
-REQUIRE human review, so a wrong true is worse than a wrong false.
-Output STRICTLY the JSON object for the schema, nothing else.
-"""
 
 
 def _item_text(item) -> str:
@@ -752,62 +773,33 @@ async def _similarity_matrix(item_texts: list[str], case_texts: list[str]) -> tu
     return matrix, "lexical", True
 
 
-async def _entailment_pass(pairs: list[tuple]) -> dict:
-    """Tier (b). ``pairs`` is [(pair_id, requirement_text, case_text), ...].
+def _nli_tier_enabled() -> bool:
+    """Checklist entailment (tier b) is OFF, and since 2026-08-16 it is GONE.
 
-    Returns {pair_id: "entails"|"contradicts"|"unsure"}. Returns {} (all pairs
-    left unresolved) when the flag is OFF or on any failure. Never raises."""
-    try:
-        if not pairs or not getattr(settings, "qa_checklist_nli_enabled", False):
-            return {}
-        body = "\n\n".join(
-            f"PAIR {pid}\nREQUIREMENT: {req}\nTEST: {case}" for pid, req, case in pairs
-        )
-        with server_llm_scope(_NLI_LEDGER_ID):
-            result: _PairVerdicts = await ask_json(
-                system=_ENTAILMENT_SYSTEM + _GUARD,
-                user=wrap_untrusted("requirement_test_pairs", body, limit=20000),
-                response_model=_PairVerdicts,
-                model=settings.qa_classifier_model or None,
-            )
-        out: dict = {}
-        for v in result.verdicts:
-            verdict = (v.verdict or "").strip().lower()
-            if verdict in ("entails", "contradicts", "unsure"):
-                out[int(v.pair_id)] = verdict
-        return out
-    except Exception:
-        logger.warning(
-            "checklist matcher: entailment tier failed — leaving the band unresolved",
-            exc_info=True,
-        )
-        return {}
+    NOT settings-derived: QA_CHECKLIST_NLI_ENABLED was DELETED (flag-surface
+    reduction, batch 8b-ii) and hardcoded OFF -- its own code default and the
+    value .env.example shipped, so no install changed. Dead-code deletion
+    P2-G1 then deleted `_entailment_pass` itself, along with the ambiguous
+    band that fed it.
+
+    The seam is RETAINED as documentation and as the switch that still gates
+    the degradation note in match_checklist -- the only channel by which a
+    revived tier's weakened measurement reaches the EXPORTED artifact rather
+    than just the chat reply. It no longer gates a call, so flipping it now
+    changes nothing except that note: reviving the tier means writing the pass,
+    the band and its prompt again.
+    """
+    return False
 
 
-async def _adjudication_pass(pairs: list[tuple]) -> dict:
-    """Tier (c). Same input shape as tier (b). Returns {pair_id: bool}.
+def _adjudicate_tier_enabled() -> bool:
+    """Checklist adjudication (tier c) is OFF, and since 2026-08-16 it is GONE.
 
-    Returns {} when the flag is OFF or on any failure. Never raises."""
-    try:
-        if not pairs or not getattr(settings, "qa_checklist_adjudicate_enabled", False):
-            return {}
-        body = "\n\n".join(
-            f"PAIR {pid}\nREQUIREMENT: {req}\nTEST: {case}" for pid, req, case in pairs
-        )
-        with server_llm_scope(_NLI_LEDGER_ID):
-            result: _Adjudications = await ask_json(
-                system=_ADJUDICATION_SYSTEM + _GUARD,
-                user=wrap_untrusted("requirement_test_pairs", body, limit=20000),
-                response_model=_Adjudications,
-                model=settings.qa_classifier_model or None,
-            )
-        return {int(d.pair_id): bool(d.covered) for d in result.decisions}
-    except Exception:
-        logger.warning(
-            "checklist matcher: adjudication tier failed — leaving the band unresolved",
-            exc_info=True,
-        )
-        return {}
+    Same batch and same reasoning as _nli_tier_enabled above: hardcoded OFF in
+    batch 8b-ii, `_adjudication_pass` deleted by P2-G1, the seam retained for
+    the degradation note.
+    """
+    return False
 
 
 async def match_checklist(
@@ -875,13 +867,9 @@ async def match_checklist(
 
         if degraded:
             high = _LEXICAL_HIGH
-            low = _LEXICAL_LOW
             cov.notes.append(_DEGRADED_NOTE)
         else:
             high = float(getattr(settings, "qa_checklist_match_high", 0.75) or 0.75)
-            low = float(getattr(settings, "qa_checklist_match_low", 0.30) or 0.30)
-        if low > high:
-            low, high = high, low
 
         if not_presented:
             cov.notes.append(
@@ -896,10 +884,6 @@ async def match_checklist(
             )
 
         links: list[MatchLink] = []
-        band: list[tuple] = []  # (pair_id, req_text, case_text)
-        band_meta: dict = {}  # pair_id -> (i, j, score)
-        pair_id = 0
-        max_pairs = int(getattr(settings, "qa_checklist_max_pairs", 40) or 40)
         tiers_on = bool(allow_llm_tiers)
         # Phase 3b: `notes` is this module's OWN established channel for "this
         # measurement was degraded" (see _DEGRADED_NOTE) and is the only one
@@ -909,10 +893,13 @@ async def match_checklist(
         # EXPORTED artifact would silently look like a full-strength
         # measurement. Only emitted when a tier was genuinely turned off, i.e.
         # when it would otherwise have run.
-        if not tiers_on and (
-            getattr(settings, "qa_checklist_nli_enabled", False)
-            or getattr(settings, "qa_checklist_adjudicate_enabled", False)
-        ):
+        #
+        # 2026-08-14 (batch 8b-ii): both tier seams are False constants, so
+        # this can only fire under a REVIVED seam. KEPT deliberately rather
+        # than deleted -- it is the ONLY channel by which the degradation
+        # reaches the exported artifact, so without it a one-line revival
+        # would silently ship an undisclosed degraded measurement.
+        if not tiers_on and (_nli_tier_enabled() or _adjudicate_tier_enabled()):
             cov.notes.append(
                 "The OPTIONAL entailment / adjudication tiers were NOT run for "
                 "this measurement, so the ambiguous similarity band is reported "
@@ -936,44 +923,6 @@ async def match_checklist(
                             tier=tier,
                         )
                     )
-                elif score >= low and tiers_on and len(band) < max_pairs:
-                    band.append((pair_id, item_texts[i], case_texts[j]))
-                    band_meta[pair_id] = (i, j, float(score))
-                    pair_id += 1
-
-        entail = await _entailment_pass(band)
-        unresolved: list[tuple] = []
-        for pid, req, case in band:
-            verdict = entail.get(pid)
-            i, j, score = band_meta[pid]
-            if verdict == "entails":
-                links.append(
-                    MatchLink(
-                        item_id=scored[i].item_id,
-                        tc_id=test_cases[j].tc_id,
-                        score=score,
-                        confidence="MEDIUM",
-                        tier="entailment",
-                    )
-                )
-            elif verdict == "contradicts":
-                continue
-            else:
-                unresolved.append((pid, req, case))
-
-        adjudicated = await _adjudication_pass(unresolved)
-        for pid, _req, _case in unresolved:
-            if adjudicated.get(pid):
-                i, j, score = band_meta[pid]
-                links.append(
-                    MatchLink(
-                        item_id=scored[i].item_id,
-                        tc_id=test_cases[j].tc_id,
-                        score=score,
-                        confidence="LOW",
-                        tier="adjudication",
-                    )
-                )
 
         covered = {ln.item_id for ln in links}
         mapped_tcs = {ln.tc_id for ln in links}
@@ -1038,6 +987,12 @@ def coverage_to_dict(coverage: ChecklistCoverage) -> dict:
         if not coverage or not coverage.ran:
             return {}
         return {
+            # Literal True, not coverage.ran: the guard four lines above
+            # already returned {} for a falsy ran, so True is the only
+            # reachable value and writing it literally keeps the two facts
+            # from drifting apart. Absent before 2026-08-19 -- see
+            # coverage_from_dict for how the rows written without it default.
+            "ran": True,
             "total_items": coverage.total_items,
             "presented_items": coverage.presented_items,
             "total_cases": coverage.total_cases,
@@ -1070,6 +1025,74 @@ def coverage_to_dict(coverage: ChecklistCoverage) -> dict:
     except Exception:
         logger.exception("coverage_to_dict failed — returning an empty dict")
         return {}
+
+
+def coverage_from_dict(payload: dict) -> ChecklistCoverage:
+    """Rehydrate a persisted coverage -- the inverse of ``coverage_to_dict``.
+
+    The symmetric partner of ``atomic_checklist.checklist_from_dicts``, which
+    the coverage side went without until 2026-08-19. Every reader therefore
+    hand-rolled ``ChecklistCoverage(**payload)``, and that constructor call is
+    wrong four ways: it silently loses ``ran`` (so every render/tally guard
+    short-circuits to ""), leaves ``links`` as plain dicts rather than
+    MatchLinks, puts the deliberate ``None`` a degraded run writes for the
+    three rates onto a float field, and raises TypeError on any key a newer
+    build added. Never raises.
+
+    SCOPE of the ``ran`` default below: it is exact for a payload written by
+    ``coverage_to_dict``, which is what the ``checklists`` table holds. A dict
+    hand-built by a caller can of course omit ``ran`` without having run
+    anything -- such a caller should pass ``ran`` explicitly."""
+    cov = ChecklistCoverage()
+    try:
+        if not payload:
+            return cov
+        # ``ran`` was not persisted before 2026-08-19. It did not need to be:
+        # coverage_to_dict returns {} unless coverage.ran, so a NON-EMPTY
+        # payload is itself proof that the matcher ran. That is what defaults
+        # the pre-existing rows -- no migration, and it is total rather than a
+        # heuristic. Deriving it from ``tier_used`` instead would be WRONG: the
+        # "nothing fitted into the prompt budget" branch above runs with
+        # tier_used "", and that branch is exactly the diagnostic a re-audit
+        # most wants to recover.
+        cov.ran = bool(payload.get("ran", True))
+        cov.total_items = int(payload.get("total_items") or 0)
+        cov.presented_items = int(payload.get("presented_items") or 0)
+        cov.total_cases = int(payload.get("total_cases") or 0)
+        for row in payload.get("links") or []:
+            try:
+                cov.links.append(
+                    MatchLink(
+                        item_id=str(row.get("item_id") or ""),
+                        tc_id=str(row.get("tc_id") or ""),
+                        score=float(row.get("score") or 0.0),
+                        confidence=str(row.get("confidence") or ""),
+                        tier=str(row.get("tier") or ""),
+                    )
+                )
+            except Exception:
+                logger.debug("skipping a malformed coverage link", exc_info=True)
+        cov.covered_item_ids = list(payload.get("covered_item_ids") or [])
+        cov.gap_item_ids = list(payload.get("gap_item_ids") or [])
+        cov.not_presented_item_ids = list(payload.get("not_presented_item_ids") or [])
+        cov.orphan_tc_ids = list(payload.get("orphan_tc_ids") or [])
+        cov.confidence_counts = dict(payload.get("confidence_counts") or {})
+        # None on the wire is DELIBERATE -- a degraded run publishes no
+        # percentage anywhere, including in the persisted payload. 0.0 is the
+        # dataclass default and is never read on that path, because
+        # ``degraded`` gates every branch that formats one. Restoring None
+        # instead would put a None on a float field and turn the first
+        # f-string that touched it into an exception.
+        cov.coverage_pct = float(payload.get("coverage_pct") or 0.0)
+        cov.gap_rate = float(payload.get("gap_rate") or 0.0)
+        cov.orphan_rate = float(payload.get("orphan_rate") or 0.0)
+        cov.tier_used = str(payload.get("tier_used") or "")
+        cov.degraded = bool(payload.get("degraded"))
+        cov.notes = list(payload.get("notes") or [])
+    except Exception:
+        logger.exception("coverage_from_dict failed -- reporting no coverage data")
+        return ChecklistCoverage()
+    return cov
 
 
 def checklist_tally_line(coverage: ChecklistCoverage) -> str:
@@ -1142,12 +1165,88 @@ def checklist_oneline(coverage: ChecklistCoverage) -> str:
         return ""
 
 
+# Lexical-tier stand-in for FOUR fixed prose blocks: the "SECOND, independent
+# coverage view" paragraph, _DEGRADED_NOTE, PROVENANCE_LIMITATION and the closing
+# HONESTY_BOUNDARY. Those four are ~1.5-2.0 KB repeated verbatim on every run,
+# wrapping a tally line that already says UNRELIABLE / SUPPRESSED -- and on a real
+# run (96 cases, 18 items, 2026-08-16) they pushed the finalize reply to 4546
+# chars against the 4000-char cap in
+# tools/mcp_handlers.shape_generation_result, so the Test Data list was cut off
+# mid-enumeration. Every CLAIM they make survives here (additive-not-RTM,
+# lexical understates, self-reported provenance, textual-alignment-only, and
+# where the full detail lives); only the length is spent differently. The
+# EMBEDDINGS tier still renders the full prose, byte-identically to before.
+#
+# It deliberately does NOT restate the tier verdict: the BOLD TALLY LINE
+# directly above it already reads "UNRELIABLE (lexical fallback — no embeddings
+# backend): coverage percentage SUPPRESSED ... which UNDERSTATES real coverage".
+# What survives here is the four claims that appear nowhere else in the section.
+_LEXICAL_COMPACT_CAVEAT = (
+    "_Set `QA_EMBEDDINGS_BACKEND` for a usable audit. "
+    "Provenance tags are SELF-REPORTED. Textual alignment only — NOT a "
+    "verification-strength guarantee. Full detail (per-requirement and orphan "
+    "lists) is on the 'Requirements Checklist' workbook sheet._"
+)
+
+
+# The reconciliation between THIS figure and the RTM's used to live in the
+# caveat above -- i.e. at the END of the section, roughly 900 characters after
+# the tester has already read "**Requirements:** 7/7 acceptance criteria traced,
+# all covered" and then met "UNRELIABLE ... 13 of 20". A non-technical tester
+# read the pair as contradictory (F10), which is a fair reading: nothing at the
+# point of first contact said the second number measures something else.
+#
+# So it is rendered BEFORE the bold tally instead, and the clause was DELETED
+# from the caveat rather than copied -- the claim moves, it is not repeated, and
+# the finalize reply has 261 characters of headroom against
+# tools/mcp_handlers._SUMMARY_CAP on the 96-case fixture (net cost here: +114).
+#
+# LEXICAL TIER ONLY. The embeddings branch already carries the full "SECOND,
+# independent coverage view" paragraph and its output is pinned byte-identical
+# by tests/test_checklist_matcher.test_embeddings_section_prose_is_byte_identical.
+_LEXICAL_LEAD = (
+    "_A SECOND, different measurement — not the **Requirements** line above. "
+    "It counts different things a different way, so the two are NOT expected "
+    "to agree, and a low number here contradicts nothing._"
+)
+
+
 def render_checklist_section(coverage: ChecklistCoverage, items: list) -> str:
     """Full markdown coverage report: tally, NOT PRESENTED items, NOT COVERED
     gaps, REVIEW_REQUIRED orphans, provenance caveats (comment-derived
     requirements are called out HERE, not only in the spreadsheet), and the
     mandatory honesty boundary. "" when the matcher did not run. Never raises."""
     try:
+        # A coverage that genuinely did NOT run is a BARE ChecklistCoverage():
+        # both no-run returns in match_checklist leave every field at its
+        # dataclass default. So an object that denies running while CARRYING
+        # run data did not come from the matcher -- it came from
+        # ``ChecklistCoverage(**persisted_payload)``, which drops ``ran``. That
+        # produced a silent "" for six stored suites and no log line at all
+        # (F12), because the legitimate no-run path returns "" too. Warn on the
+        # malformed shape ONLY; the legitimate one stays silent, byte-identical
+        # to before. Inside the try, and a logger call on dataclass attribute
+        # reads cannot throw, so "never raises" is unaffected.
+        if (
+            coverage
+            and not coverage.ran
+            and (
+                coverage.tier_used
+                or coverage.total_cases
+                or coverage.total_items
+                or coverage.links
+            )
+        ):
+            logger.warning(
+                "render_checklist_section: coverage.ran is False but the "
+                "object carries run data (tier=%r, %d case(s), %d "
+                'requirement(s)) -- returning "". This is the signature of '
+                "a persisted coverage rebuilt with ChecklistCoverage(**payload); "
+                "use rtm.coverage_from_dict() instead.",
+                coverage.tier_used,
+                coverage.total_cases,
+                coverage.total_items,
+            )
         if not coverage or not coverage.ran or not items:
             return ""
         by_id = {it.item_id: it for it in items}
@@ -1159,24 +1258,46 @@ def render_checklist_section(coverage: ChecklistCoverage, items: list) -> str:
             source = getattr(it, "source", "") or "unattributed"
             return f"{_item_text(it)} _[source: {source}]_"
 
-        lines = [
-            "\n\n---\n\n## Requirements Checklist Coverage (bidirectional)",
+        # On the lexical fallback the four fixed prose blocks collapse into
+        # _LEXICAL_COMPACT_CAVEAT (appended last, where HONESTY_BOUNDARY would
+        # otherwise sit). `compact` is False on the embeddings tier, so that
+        # tier's output is byte-identical to before.
+        compact = bool(coverage.degraded)
+        lines = ["\n\n---\n\n## Requirements Checklist Coverage (bidirectional)"]
+        if compact:
+            # BEFORE the tally, deliberately: the number is what the reader
+            # reacts to, so the framing has to arrive first. See _LEXICAL_LEAD.
+            lines += ["", _LEXICAL_LEAD]
+        lines += [
             "",
             f"**{checklist_tally_line(coverage)}**",
             "",
             f"_Matcher tier: {coverage.tier_used}._",
-            "",
-            "_This is a SECOND, independent coverage view; it does not replace "
-            "the Requirements Traceability Matrix above, and the two figures are "
-            "not expected to agree. The RTM counts ACCEPTANCE CRITERIA that the "
-            "test cases tagged themselves against (self-reported, one row per "
-            "AC). This section counts ATOMIC REQUIREMENTS matched EXTERNALLY "
-            "from each case's expected results, ignoring those tags — a "
-            "different denominator, computed a different way._",
         ]
+        if not compact:
+            lines += [
+                "",
+                "_This is a SECOND, independent coverage view; it does not replace "
+                "the Requirements Traceability Matrix above, and the two figures are "
+                "not expected to agree. The RTM counts ACCEPTANCE CRITERIA that the "
+                "test cases tagged themselves against (self-reported, one row per "
+                "AC). This section counts ATOMIC REQUIREMENTS matched EXTERNALLY "
+                "from each case's expected results, ignoring those tags — a "
+                "different denominator, computed a different way._",
+            ]
         for note in coverage.notes or []:
+            # _DEGRADED_NOTE only ever appears WITH coverage.degraded, and the
+            # compact caveat already carries its claim. Every OTHER note (e.g.
+            # the host NLI-tier suppression note) still prints in full.
+            if compact and note == _DEGRADED_NOTE:
+                continue
             lines += ["", f"> {note}"]
         for caveat in provenance_caveats(items):
+            # Same treatment for the unconditional self-reported-provenance
+            # blockquote. The comment-derived and unattributed WARNINGS are
+            # per-run findings, not boilerplate, and are never dropped.
+            if compact and caveat == PROVENANCE_LIMITATION:
+                continue
             lines += ["", f"> {caveat}"]
 
         not_presented = coverage.not_presented_item_ids or []
@@ -1196,29 +1317,58 @@ def render_checklist_section(coverage: ChecklistCoverage, items: list) -> str:
                 lines.append(f"- … and {len(not_presented) - 50} more")
 
         gaps = coverage.gap_item_ids or []
-        if gaps:
-            lines += ["", "### NOT COVERED (forward gaps)", ""]
-            for gid in gaps[:50]:
-                lines.append(
-                    f"- **NOT COVERED: {gid}** — {_label(gid)} "
-                    "(no test case matched this requirement above the "
-                    "configured threshold)"
-                )
-            if len(gaps) > 50:
-                lines.append(f"- … and {len(gaps) - 50} more")
-
         orphans = coverage.orphan_tc_ids or []
-        if orphans:
-            lines += ["", "### REVIEW_REQUIRED (backward orphans)", ""]
-            lines.append(
-                "These test cases matched no checklist requirement. That is EITHER "
-                "undocumented behaviour being tested OR a sign the checklist is "
-                "under-decomposed — the matcher cannot tell which. Nothing was "
-                "dropped:"
-            )
-            lines.append(
-                "- " + ", ".join(orphans[:30]) + (" …" if len(orphans) > 30 else "")
-            )
+        if compact:
+            # On the lexical tier BOTH directions are dominated by matcher
+            # misses rather than findings: TF-IDF cosine rarely clears the
+            # threshold for a genuine paraphrase, which is why the tally above
+            # already SUPPRESSES the percentage. One line per unmatched
+            # requirement plus 30 orphan ids is a flood of near-certainly-false
+            # review work AND, on a real run (18 items, 96 cases, 2026-08-16),
+            # it pushed the reply past the 4000-char cap in
+            # tools/mcp_handlers.shape_generation_result so genuine content was
+            # truncated. ONE block with one counted bullet per direction: two
+            # headings and two repetitions of "see the exported workbook" were
+            # themselves a measurable part of the overflow. Both full lists
+            # still ship on the 'Requirements Checklist' sheet.
+            unmatched = []
+            if gaps:
+                unmatched.append(
+                    f"- {len(gaps)} of {coverage.presented_items} requirement(s) "
+                    "had no lexical match. This is **NOT a gap list** — most are "
+                    "near-certainly covered."
+                )
+            if orphans:
+                unmatched.append(
+                    f"- {len(orphans)} case(s) matched no checklist requirement "
+                    "(REVIEW_REQUIRED orphans) — a matcher weakness on this "
+                    "tier, not a finding."
+                )
+            if unmatched:
+                lines += ["", "### Unmatched (lexical tier)", ""] + unmatched
+        else:
+            if gaps:
+                lines += ["", "### NOT COVERED (forward gaps)", ""]
+                for gid in gaps[:50]:
+                    lines.append(
+                        f"- **NOT COVERED: {gid}** — {_label(gid)} "
+                        "(no test case matched this requirement above the "
+                        "configured threshold)"
+                    )
+                if len(gaps) > 50:
+                    lines.append(f"- … and {len(gaps) - 50} more")
+
+            if orphans:
+                lines += ["", "### REVIEW_REQUIRED (backward orphans)", ""]
+                lines.append(
+                    "These test cases matched no checklist requirement. That is "
+                    "EITHER undocumented behaviour being tested OR a sign the "
+                    "checklist is under-decomposed — the matcher cannot tell "
+                    "which. Nothing was dropped:"
+                )
+                lines.append(
+                    "- " + ", ".join(orphans[:30]) + (" …" if len(orphans) > 30 else "")
+                )
 
         low = (coverage.confidence_counts or {}).get("LOW", 0)
         if low:
@@ -1228,7 +1378,7 @@ def render_checklist_section(coverage: ChecklistCoverage, items: list) -> str:
                 "(LOW confidence) and require human review.",
             ]
 
-        lines += ["", HONESTY_BOUNDARY]
+        lines += ["", _LEXICAL_COMPACT_CAVEAT if compact else HONESTY_BOUNDARY]
         return "\n".join(lines)
     except Exception:
         logger.exception("render_checklist_section failed — returning empty string")

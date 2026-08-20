@@ -30,8 +30,10 @@ Because ``ChecklistItem`` forbids extra fields, the rule-pack metadata that has
 no home on it (``origin`` / ``subsystem``) stays on ``RulePackResult.lines`` and
 is joined back by ``line_id`` -- that is what ``line_subsystem_map`` is for.
 
-DEGRADATION WHEN THE CHECKLIST IS OFF. When ``QA_ATOMIC_CHECKLIST_ENABLED`` is
-OFF the agent's ``checklist_items`` is empty; the agent deliberately does NOT
+DEGRADATION WHEN THE CHECKLIST IS OFF. When the checklist is off -- since
+2026-08-14 only under a revived ``tools/atomic_checklist.checklist_enabled``
+seam, the flag QA_ATOMIC_CHECKLIST_ENABLED having been deleted -- the agent's
+``checklist_items`` is empty; the agent deliberately does NOT
 create a synthetic checklist out of rule-pack lines alone (that would silently
 switch the pipeline into checklist mode and skip ``qa_ac_anchoring_enforce``).
 The packs then run in PROMPT + ADVISORY mode: the rules still reach the
@@ -323,8 +325,8 @@ def rule_pack_checklist_items(result: RulePackResult) -> list:
     except ImportError:
         logger.error(
             "tools.atomic_checklist is missing - Batch 3 rule packs require Batch 2 "
-            "(QA_ATOMIC_CHECKLIST_ENABLED) for checklist enforcement; running in "
-            "prompt + advisory mode only"
+            "(tools.atomic_checklist.checklist_enabled) for checklist enforcement; "
+            "running in prompt + advisory mode only"
         )
         return []
     except Exception:

@@ -1,23 +1,29 @@
-"""Atomic Requirements Checklist (Batch 2) — decomposition + granularity audit.
+"""Atomic Requirements Checklist (Batch 2) — granularity audit + matcher input.
 
-Pass 1 of the three-pass "auditable coverage" pipeline:
+Pass 1 of the three-pass "auditable coverage" pipeline USED to live here as
+``decompose_to_checklist``: one server-side llm.ask_json call decomposing the
+ticket into an UNBOUNDED, EARS-shaped, source-tagged flat checklist. It was
+DELETED on 2026-08-16 (dead-code deletion P2-F2) -- see the tombstone below
+the response models. The decomposition now runs on the TESTER'S OWN model as
+agents/host_mode.CHECKLIST_JOB (stage step_zero) and arrives back on the
+submission, where tools/mcp_handlers.py validates its shape and sets
+``prepared.checklist_items``. Everything in this module that CONSUMES a
+checklist is live and unchanged:
 
-  Pass 1 (this module)  decompose the ticket into an UNBOUNDED, EARS-shaped,
-                        source-tagged, flat numbered checklist of every
-                        independently-verifiable outcome. One outcome = one line.
-  Pass 2 (agents/test_scenario_agent.py) the existing 8-category fan-out, with
-                        the checklist in context — CLUSTERED, so the prompt never
+  Pass 2 (agents/test_scenario_agent.py) the 8-category fan-out with the
+                        checklist in context — CLUSTERED, so the prompt never
                         becomes a flat 40-line constraint wall (constraint decay:
                         LLM quality drops ~30pp as structural requirements
                         accumulate, arXiv 2605.06445).
-  Pass 3 (tools/rtm.py) a DETERMINISTIC external matcher (embeddings -> optional
-                        entailment -> optional adjudication) computing
+  Pass 3 (tools/rtm.py) a DETERMINISTIC external matcher (embeddings ->
+                        optional entailment -> optional adjudication) computing
                         bidirectional coverage. The GENERATING model never marks
                         its own homework.
 
-Everything here is gated by ``settings.qa_atomic_checklist_enabled`` (default
-OFF). With the flag OFF ``decompose_to_checklist`` returns ``[]`` with ZERO LLM
-calls and every downstream caller degrades to today's behaviour.
+``checklist_enabled()`` is LIVE and load-bearing -- a True constant since
+2026-08-14, when QA_ATOMIC_CHECKLIST_ENABLED was DELETED and the behaviour
+hardcoded ON. tools/mcp_handlers.py reads it at call time to decide whether
+CHECKLIST_JOB ships to the host. tests/conftest.py pins it False suite-wide.
 
 TRUNCATION IS NEVER SILENT. ``format_checklist_prompt_block`` returns BOTH the
 prompt block and the exact list of item ids that fitted inside
@@ -30,28 +36,18 @@ report its own prompt truncation as a requirement gap.
 House rules honoured:
   * Never raises at the public boundary — every helper degrades to an empty /
     benign result so a failure here can never break generation.
-  * LLM access only via ``llm.ask_json``.
-  * Ticket-derived text is wrapped with ``tools.untrusted.wrap_untrusted`` and
-    the system prompt carries ``_GUARD``.
+  * NO LLM access at all: this module reaches no backend since P2-F2.
   * No new dependency: the lexical fallback is pure-stdlib TF-IDF.
 
-WHAT PASS 1 READS — AND WHAT IT DELIBERATELY DOES NOT. It reads the feature
-text (on a pasted Jira URL that is only the ticket TITLE), the ticket
-DESCRIPTION, the acceptance-criteria field and the parent-story BACKGROUND
-block. ``description_text`` is load-bearing, not a nicety: without it the
-decomposition runs on one title line plus the AC field and the matcher then
-reports high coverage against a truncated requirement set — an inflated figure
-stamped "auditable", the exact failure this batch exists to prevent. Callers MUST
-pass ``url_content["description"]``, NEVER ``raw_text``: jira_fetcher appends the
-comment list to raw_text (tools/jira_fetcher.py:626), so raw_text would launder
-attacker-written comment text as description-sourced.
-
-It does NOT read the Jira comment thread. Comment handling belongs to Batch 1
-(tools/comment_reconciler), which resolves comments deterministically in Python
-and injects its own fenced, provenanced AMENDMENTS block into the generation
-prompt. A second, unreconciled comment path here would have had nothing but a
-model-self-reported tag standing between a fabricated comment requirement and a
-"requirement" row in the audit — see PROVENANCE below.
+WHAT THE CHECKLIST NEVER CONTAINED, and still must not. The deleted Pass 1
+read the feature text, the ticket DESCRIPTION, the acceptance-criteria field
+and the parent-story BACKGROUND block -- and deliberately NOT the Jira comment
+thread. Comment handling BELONGED to Batch 1 (tools/comment_reconciler), which
+resolved comments deterministically in Python and injected its own fenced,
+provenanced AMENDMENTS block into the generation prompt; dead-code deletion
+batch D5 deleted that module on 2026-08-15. CHECKLIST_JOB's prompt inherits
+the same rule, and the host's reply is treated as UNTRUSTED and shape-capped
+by agents/host_mode.py before any item reaches a report.
 
 PROVENANCE IS A READING AID, NOT A SECURITY CONTROL. ``source`` is SELF-REPORTED
 by the same model call that reads the ticket. ``normalize_source`` folds anything
@@ -77,9 +73,7 @@ from collections import Counter
 from pydantic import BaseModel, Field
 
 from config.settings import settings
-from llm import ask_json, server_llm_scope
-from tools import token_meter
-from tools.untrusted import _GUARD, wrap_untrusted
+from tools.untrusted import wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -302,98 +296,17 @@ class ChecklistItem(BaseModel):
     source: str = Field(default="", description="Provenance tag (allowlisted)")
 
 
-class _DecomposedItem(BaseModel):
-    text: str = Field(
-        min_length=5,
-        description="ONE independently-verifiable outcome, written in EARS form",
-    )
-    ears_pattern: str = Field(
-        default="ubiquitous",
-        description="One of: ubiquitous, event_driven, state_driven, optional, "
-        "unwanted, complex",
-    )
-    source: str = Field(
-        default="",
-        description='Where the outcome came from, e.g. "acceptance_criteria:AC-003", '
-        '"description:AF03", "comment#2", "parent_story", "implied"',
-    )
-
-
-class _Decomposition(BaseModel):
-    items: list[_DecomposedItem] = Field(default_factory=list)
-
-
-# Ledger id for the ONE ask_json below (docs/LLM_MIGRATION_INVENTORY.md).
-# Residue sub-phase R4 flipped that row to `migrated`: the host analog is
-# agents/host_mode.CHECKLIST_JOB (mechanism A, stage step_zero), shipped with
-# QA_HOST_CHECKLIST_REVIEW_ENABLED, and the host prepare passes
-# decompose_checklist=False so no MCP route reaches this call. The call is NOT
-# deleted -- generate_test_scenarios still reaches it from graph.py and
-# evals/test_eval_goldens.py, and evals/test_terse_schemas_goldens.py calls
-# decompose_to_checklist DIRECTLY -- so it is TAGGED instead: after the Phase-6
-# flip, QA_SERVER_LLM_ALLOW=atomic_checklist.decompose revives exactly this one
-# path. Untagged it would revive nothing, which is the silent failure this
-# constant exists to prevent. The tag is inert while QA_SERVER_LLM_ENABLED is
-# on: server_llm_scope only sets a ContextVar the guard reads when it is off.
-_CHECKLIST_LEDGER_ID = "atomic_checklist.decompose"
-
-_DECOMPOSE_SYSTEM = """\
-You are a requirements engineer decomposing a ticket into an ATOMIC requirements
-checklist that a manual QA team will be audited against.
-
-Produce a FLAT list of every INDEPENDENTLY-VERIFIABLE outcome the ticket
-requires. There is NO upper limit: a real story routinely yields 40 or more.
-Under-splitting is a far worse failure than a slightly long list.
-
-ATOMICITY RULE (INCOSE): one item = one behavioural property. If an outcome can
-fail WITHOUT the others failing, it is its own item. Split every compound
-statement joined by "and" / "then" / "," at the behaviour level.
-
-WORKED EXAMPLE of the required granularity. This single alternate flow:
-  "[AF03] session terminated / DM02 displayed / redirect to Appointment Card /
-   status updates to Cancelled"
-becomes FOUR items, not one:
-  - When the session is terminated, the system shall end the active session.
-  - When the session is terminated, the system shall display message DM02.
-  - When the session is terminated, the system shall redirect the user to the
-    Appointment Card screen.
-  - When the session is terminated, the system shall set the appointment status
-    to "Cancelled".
-Each can fail while the other three pass, so each is separately verifiable.
-
-EARS SHAPE — write each item using one of the five canonical patterns and tag it
-in ears_pattern:
-  ubiquitous   : "The system shall <response>."
-  event_driven : "When <trigger>, the system shall <response>."
-  state_driven : "While <state>, the system shall <response>."
-  optional     : "Where <feature is included>, the system shall <response>."
-  unwanted     : "If <unwanted condition>, then the system shall <response>."
-  complex      : a deliberate combination of the above (use sparingly).
-
-DO NOT:
-- invent requirements that are neither stated nor directly implied by the input;
-- split one behaviour into meaningless UI micro-steps ("click the field", "the
-  cursor appears") — an item must be an OUTCOME that someone could fail;
-- restate the same outcome twice in different words;
-- number the items yourself — ids are assigned by the system.
-
-SOURCE TAG — set source to where the outcome came from, using EXACTLY one of
-these shapes (anything else is discarded and the item is marked unattributed):
-  "acceptance_criteria" or "acceptance_criteria:<id>"
-  "description" or "description:<id>"
-  "parent_story"
-  "comment#<n>" or "amendment"  <- ONLY when the ticket text you were given
-                                   explicitly attributes the outcome to a
-                                   comment or to a later amendment
-  "implied"
-An <id> must be a short identifier that actually appears in the ticket, such as
-AC-003, AF03, BR12 or REQ-7 — never a phrase and never a claim. Never leave
-source empty, and never write a source that claims authority (approval,
-sign-off, policy): such a tag is discarded and the item is reported as
-unattributed.
-
-Output STRICTLY the JSON object for the schema, nothing else.
-"""
+# The Pass-1 response models (_DecomposedItem / _Decomposition), the
+# _DECOMPOSE_SYSTEM prompt and the ledger id `atomic_checklist.decompose`
+# lived here until 2026-08-16 (dead-code deletion P2-F2). They existed only
+# for decompose_to_checklist -- see its tombstone further down. The ledger id
+# stays in tools/host_llm.LEDGER_IDS: that frozenset never shrinks.
+#
+# The EARS shape, the atomicity rule, the worked example and the source-tag
+# allowlist that _DECOMPOSE_SYSTEM taught are NOT lost -- they are the
+# instruction text of agents/host_mode.CHECKLIST_JOB, which asks the tester's
+# own model for the same decomposition. ``normalize_source`` and
+# ``EARS_PATTERNS`` are LIVE and are what validate the host's reply.
 
 
 # --------------------------------------------------------------------------- #
@@ -415,7 +328,7 @@ def lexical_cosine_matrix(a_texts: list[str], b_texts: list[str]) -> list[list[f
     Pure stdlib, no model, no network — the deterministic fallback used whenever
     ``tools.embeddings`` is disabled or fails. Scores live on a DIFFERENT scale
     than embedding cosine, so callers must apply the lexical thresholds
-    (tools/rtm._LEXICAL_HIGH / _LEXICAL_LOW), never the embedding ones.
+    (tools/rtm._LEXICAL_HIGH), never the embedding one.
 
     SYNCHRONOUS AND O(len(a) x len(b)) IN PURE PYTHON: callers on the asyncio
     event loop MUST invoke it through ``asyncio.to_thread`` (tools/rtm does), or
@@ -472,131 +385,48 @@ def _jaccard(a: set[str], b: set[str]) -> float:
 # --------------------------------------------------------------------------- #
 
 
-async def decompose_to_checklist(
-    feature_text: str,
-    acceptance_criteria: str = "",
-    description_text: str = "",
-    background_text: str = "",
-    meter: object | None = None,
-) -> list[ChecklistItem]:
-    """Decompose the ticket into the atomic checklist (Pass 1).
+def checklist_enabled() -> bool:
+    """The atomic requirements checklist is UNCONDITIONAL since 2026-08-14.
 
-    ``description_text`` is the ticket BODY and is LOAD-BEARING. On a pasted Jira
-    URL ``feature_text`` has already been replaced by the ticket TITLE
-    (agents/test_scenario_agent.py, SHYJ-7154 Fix 1), so without the description
-    this decomposition sees one title line plus the AC field, misses every
-    alternate flow, and the external matcher then reports high coverage against a
-    truncated requirement set. Callers MUST pass ``url_content["description"]``,
-    NEVER ``raw_text``: jira_fetcher appends the comment list to raw_text
-    (tools/jira_fetcher.py:626), and laundering attacker-written comment text as
-    description-sourced is precisely what this must not do. The comment thread
-    itself is Batch 1's job and is deliberately not read here.
+    NOT settings-derived: QA_ATOMIC_CHECKLIST_ENABLED was DELETED
+    (flag-surface reduction, batch 8b-ii) and the behaviour hardcoded ON --
+    the flag policy's "promote the experiment, delete the flag" exit, and the
+    ONE flag in that batch whose value really changed on every install.
 
-    ``background_text`` is the parent-story BACKGROUND block — included as
-    CONTEXT only, and the prompt tells the model not to derive requirements from
-    it (the SHYJ-7154 separate-block precedent).
+    A named SEAM rather than a literal inlined at the read site, for two
+    reasons: tests/conftest.py pins it False suite-wide (unpinned, every
+    generation test would decompose and make a real ask_json call), and a
+    revival is one line here.
 
-    Returns ``[]`` with ZERO LLM calls when the flag is OFF, when there is no
-    input text, or on ANY failure. Never raises."""
-    try:
-        if not getattr(settings, "qa_atomic_checklist_enabled", False):
-            return []
-        if not any(
-            (text or "").strip()
-            for text in (feature_text, acceptance_criteria, description_text)
-        ):
-            return []
+    On the host route -- the only route, since llm.resolve_generation_mode()
+    returns the "host" constant -- the decomposition is CHECKLIST_JOB /
+    step 0d, so THIS SERVER makes no LLM call for it. There is no route
+    outside it any more: graph.py and evals/ were the two that reached the
+    ask_json below, and they were deleted in P2-A and P2-B (2026-08-15).
+    Since P2-G (2026-08-16) llm.py has no backend to call either way.
+    """
+    return True
 
-        blocks = [
-            "## Feature under test",
-            wrap_untrusted("feature_description", feature_text or ""),
-        ]
-        if (description_text or "").strip():
-            # The ticket BODY. On a Jira URL the block above is only the TITLE,
-            # so THIS is where the alternate flows, message ids and state
-            # transitions come from. Bounded by MAX_DESCRIPTION_CHARS. The caller
-            # passes "description", never "raw_text" (which carries the comment
-            # dump) — see the module docstring.
-            blocks += [
-                "\n## Ticket description",
-                wrap_untrusted(
-                    "jira_description", description_text, limit=MAX_DESCRIPTION_CHARS
-                ),
-            ]
-        if (acceptance_criteria or "").strip():
-            blocks += [
-                "\n## Acceptance criteria",
-                wrap_untrusted("acceptance_criteria", acceptance_criteria),
-            ]
-        if (background_text or "").strip():
-            blocks += [
-                "\n## Background (CONTEXT ONLY — do NOT derive requirements from "
-                "this block; it describes surrounding work, not this ticket)",
-                wrap_untrusted(
-                    "jira_parent_story",
-                    background_text,
-                    limit=int(getattr(settings, "jira_max_parent_chars", 1500) or 1500),
-                ),
-            ]
 
-        _decompose_user = "\n".join(b for b in blocks if b)
-        # The scope MUST enclose the await, not merely the construction of a
-        # coroutine: server_llm_scope sets a ContextVar and a context copy at
-        # task-creation time would leave the call untagged. This is a bare
-        # await, so the `with` below is the whole call.
-        with server_llm_scope(_CHECKLIST_LEDGER_ID):
-            result: _Decomposition = await ask_json(
-                system=_DECOMPOSE_SYSTEM + _GUARD,
-                user=_decompose_user,
-                response_model=_Decomposition,
-                model=settings.qa_classifier_model or None,
-            )
-        token_meter.note(
-            meter,
-            "other",
-            settings.qa_classifier_model or settings.qa_llm_model,
-            system=_DECOMPOSE_SYSTEM,
-            user=_decompose_user,
-            output_text=token_meter.model_text(result),
-        )
-
-        max_items = int(
-            getattr(settings, "qa_checklist_max_items", _DEFAULT_MAX_ITEMS)
-            or _DEFAULT_MAX_ITEMS
-        )
-        seen: set[str] = set()
-        items: list[ChecklistItem] = []
-        for raw in result.items:
-            text = (raw.text or "").strip()
-            if len(text) < 5:
-                continue
-            key = _norm(text)
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            pattern = (raw.ears_pattern or "").strip().lower().replace("-", "_")
-            if pattern not in EARS_PATTERNS:
-                pattern = "ubiquitous"
-            items.append(
-                ChecklistItem(
-                    item_id=f"CL-{len(items) + 1:03d}",
-                    text=text,
-                    ears_pattern=pattern,
-                    source=normalize_source(raw.source),
-                )
-            )
-            if len(items) >= max_items:
-                logger.warning(
-                    "Atomic checklist truncated at the QA_CHECKLIST_MAX_ITEMS cap "
-                    "(%d) — the decomposition may be inflated",
-                    max_items,
-                )
-                break
-        logger.info("decompose_to_checklist: %d atomic requirement(s)", len(items))
-        return items
-    except Exception:
-        logger.exception("decompose_to_checklist failed — returning an empty checklist")
-        return []
+# decompose_to_checklist lived here until 2026-08-16 (dead-code deletion
+# P2-F2). It made the ONE server-side llm.ask_json call in this module: the
+# Pass-1 decomposition of the ticket into the atomic checklist, reading the
+# feature text, the ticket description (load-bearing -- on a pasted Jira URL
+# the feature text is only the TITLE), the AC field and the parent-story
+# background as CONTEXT ONLY.
+#
+# It was dead. Its only caller was agents/test_scenario_agent._run_checklist,
+# which ran only under `decompose_checklist=True`; the one live caller of
+# _prepare_generation (tools/mcp_handlers.handle_prepare_test_cases) passed
+# decompose_checklist=not _checklist_job, and `_checklist_job` is True on
+# every install (checklist_enabled() is a True constant and the mode is "host"
+# by constant). graph.py and evals/, the last routes that reached it, were
+# deleted in P2-A and P2-B.
+#
+# There is NO capability loss: the decomposition is agents/host_mode.CHECKLIST_JOB
+# on the tester's own model, and tools/mcp_handlers.py sets the validated result
+# onto prepared.checklist_items at submit. checklist_enabled() above STAYS --
+# it is live and gates whether that job ships.
 
 
 # --------------------------------------------------------------------------- #

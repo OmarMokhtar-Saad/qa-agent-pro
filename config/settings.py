@@ -22,8 +22,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 logger = logging.getLogger("qa_agents.settings")
 
 # Load .env into os.environ so libraries that read the environment directly
-# (langsmith / langgraph) also see the values. BaseSettings additionally reads
-# the same file for its own declared fields below.
+# also see the values -- the anthropic SDK's ANTHROPIC_API_KEY is the live
+# example. (This comment named langsmith / langgraph until 2026-08-15, when
+# dead-code deletion Phase 2 batch P2-A deleted graph.py and dropped both
+# packages; the call itself is unaffected.) BaseSettings additionally reads the
+# same file for its own declared fields below.
 load_dotenv()
 
 
@@ -38,33 +41,18 @@ _FALSY_TOKENS = ("0", "false", "no", "off", "")
 #   * qa_rag_recency_half_life_days / qa_rag_max_entries — 0 is a documented
 #     "disable" / "unlimited" sentinel.
 #   * the byte/char/image/comment CAPS (jira_max_comments, jira_max_images,
-#     jira_max_image_bytes, qa_max_chat_images, qa_max_chat_image_bytes,
-#     qa_max_spec_bytes, qa_max_spec_chars) — 0 there is a legitimate
-#     "allow none" cap; bounding them would be a behaviour change out of scope
-#     for this hygiene batch.
+#     jira_max_image_bytes, qa_max_chat_images, qa_max_chat_image_bytes)
+#     — 0 there is a legitimate "allow none" cap; bounding them would be
+#     a behaviour change out of scope for this hygiene batch.
+#     qa_max_spec_bytes / qa_max_spec_chars were on this list until
+#     2026-08-15, when batch D1 deleted them with tools/doc_ingest.py.
 _POSITIVE_INT_FIELDS = frozenset(
     {
         "qa_checklist_max_items",
         "qa_checklist_max_prompt_chars",
-        "qa_checklist_max_pairs",
-        "qa_llm_timeout_s",
         "qa_device_command_timeout",
         "qa_device_screenshot_timeout",
-        "qa_maestro_run_timeout",
-        "qa_maestro_explore_step_timeout",
-        "qa_maestro_translate_concurrency",
-        "qa_maestro_heal_max_attempts",
-        "qa_maestro_explore_max_steps",
-        "qa_coverage_regen_max_rounds",
         "qa_update_timeout",
-        "qa_web_run_max_cases",
-        "qa_web_run_vision_budget",
-        "qa_web_run_timeout_s",
-        "qa_comment_reconcile_max_comments",
-        "qa_comment_reconcile_max_amendments",
-        # NB: qa_category_stall_s is intentionally ABSENT -- 0 is its documented
-        # kill-switch, and membership here would rewrite it to the default.
-        "qa_category_stall_strikes",
         "qa_host_dedup_max_groups",
         "qa_host_dedup_max_group_size",
     }
@@ -126,73 +114,31 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # LLM backend selection — see llm.py.
-    #   "cli"    : drive the Claude CLI OAuth session via subprocess (no API key needed).
-    #   "api"    : call the Anthropic API directly (needs ANTHROPIC_API_KEY).
-    #   "cursor" : drive the `cursor-agent` CLI via subprocess (needs CURSOR_API_KEY).
-    #              SECURITY NOTE: cursor-agent has no flag to fully disable tool
-    #              use in headless mode (unlike the "cli" backend's
-    #              --disallowedTools '*'), so llm.py sandboxes each call to a
-    #              disposable temp directory to contain any stray write/command.
-    qa_llm_backend: str = "cli"
-
-    # Used by the "api" backend. The "cli" backend ignores this and strips it
-    # from the subprocess environment so it always uses the CLI OAuth session.
-    anthropic_api_key: str = ""
-
-    # Used by the "cursor" backend (needs the `cursor-agent` CLI installed).
-    cursor_api_key: str = ""
-
-    # Model id used by both backends (CLI --model flag / API model field).
-    qa_llm_model: str = "claude-sonnet-4-6"
-    # Per-LLM-call timeout in seconds (llm.py kills the subprocess beyond it).
-    # 120 suits dev; distribution installs ship 300 in .env (grounded prompts
-    # + concurrent category fan-out through a local CLI can run long).
-    qa_llm_timeout_s: int = 120
-
-    # Liveness (stall) detection for the streaming cli/cursor backends. The
-    # per-category deadline above cannot tell "slow but streaming" from "wedged",
-    # so it killed categories that were actively producing output (measured
-    # 2026-07-28 on a real ticket: 6 of 8 categories dropped, all mid-stream).
-    # These bound SILENCE instead of elapsed time: llm._ask_json_cli waits this
-    # long for the next token, and gives up only after this many consecutive
-    # idle windows.
+    # ---- The backend settings -- ALL DELETED 2026-08-16 (P2-I) --------------
+    # `QA_LLM_BACKEND`, `QA_LLM_MODEL`, `ANTHROPIC_API_KEY`, `CURSOR_API_KEY`,
+    # `QA_LLM_TIMEOUT_S`, `QA_CATEGORY_STALL_S` / `_STRIKES`, `QA_CURSOR_MODEL`,
+    # `QA_CURSOR_FALLBACK_MODEL`, `QA_LLM_STRICT_HOST` and the two
+    # `QA_PROMPT_CACHE_*` knobs all lost their ONLY reader when dead-code
+    # deletion P2-G deleted `llm.py`'s four public coroutines and all three
+    # backends (`cli` / `api` / `cursor`) on 2026-08-16. An unread setting is
+    # the stale-flag class `tests/test_no_deleted_flag_in_output.py` exists to
+    # catch, so the fields go rather than sit as inert identifiers.
     #
-    # ON by default -- unlike a new capability, this repairs a default-path
-    # defect, and it also aborts a genuinely dead subprocess SOONER than the
-    # deadline did. 0 disables detection entirely (the kill-switch), which is why
-    # qa_category_stall_s is deliberately kept OUT of _POSITIVE_INT_FIELDS;
-    # llm._resolve_stall_policy clamps negatives at the point of use.
-    qa_category_stall_s: int = 120
-    qa_category_stall_strikes: int = 3
-
-    # Model id for the "cursor" backend (e.g. "sonnet-4", "gpt-5"). Uses
-    # cursor-agent's own model naming, which differs from qa_llm_model's.
-    qa_cursor_model: str = "sonnet-4"
-
-    # Fallback model the "cursor" backend switches to on a category's 2nd+ retry
-    # after a CursorAgentError (e.g. "Agent Looping Detected"). That error's own
-    # message literally suggests "try again with a different model" — some
-    # prompt/model combinations loop deterministically on every retry with the
-    # SAME model, so switching breaks the pattern instead of repeating it
-    # verbatim. Must be a valid `cursor-agent models` id (plain "gpt-5" is NOT
-    # one). The "-fast" variant is deliberate: plain "gpt-5.2" was observed to
-    # run noticeably slower than sonnet-4 under --sandbox enabled, causing
-    # TimeoutError on the retry that was meant to rescue the category. Empty
-    # string disables the switch (keeps retrying qa_cursor_model).
-    qa_cursor_fallback_model: str = "gpt-5.2-fast"
-    # Strict host-matched auto backend (QA_LLM_STRICT_HOST, default ON). When
-    # QA_LLM_BACKEND=auto, honour ONLY the account of the host editor the tester
-    # is working in — Cursor -> cursor-agent, Claude Code/Desktop -> claude CLI —
-    # and NEVER silently fall through to a different backend/account when the
-    # host's own is present-but-unauthenticated (llm.py then fails fast with an
-    # actionable message instead of hanging on a 120s timeout). OFF restores the
-    # legacy first-available fallback as an escape hatch.
-    qa_llm_strict_host: bool = True
+    # A stale line for any of them in an existing `.env` is IGNORED, not an
+    # error: `model_config` uses `extra="ignore"`. That is the same contract
+    # P2-G1 gave `QA_CHECKLIST_MATCH_LOW` / `_MAX_PAIRS`, and it is pinned in
+    # `tests/test_settings.py`.
+    #
+    # `qa_classifier_model` below is deliberately NOT in that set: it still has
+    # two live readers in `tools/mcp_handlers.py` (the ambiguity gate's model
+    # label). Restoring a server-side model call is a NEW implementation and an
+    # architectural decision -- see CLAUDE.md's host-boomerang house rule -- so
+    # it would bring its own settings with it rather than reviving these.
 
     # Cheaper/faster model for the intent router's classification pass (T-04 /
-    # I-027). Empty string means "use qa_llm_model" (no override). Set to a haiku
-    # model to cut routing cost — the classifier is a tiny, low-stakes call.
+    # I-027). Empty string means "use the host's own model" (no override).
+    # Still LIVE: `tools/mcp_handlers` reads it twice, to label which model the
+    # ambiguity gate would name.
     qa_classifier_model: str = "claude-haiku-4-5"
 
     # ---- Structured JSON via forced tool use (api backend only) -------------
@@ -213,51 +159,20 @@ class Settings(BaseSettings):
     # llm._strict_json_enabled(); both read NO setting.
     # See docs/FEATURE_FLAGS.md.
 
-    # ---- Anthropic prompt caching for the category fan-out (api backend) ----
-    # REMOVED 2026-08-13 (flag-surface reduction, batch 8a):
-    # QA_PROMPT_CACHE_ENABLED was DELETED and the shared cached prompt prefix
-    # hardcoded OFF. It was an unvalidated experiment whose runbook rollout gate
-    # was never run, and it is now doubly moot: generation is chat-only, so the
-    # server-side 8-category fan-out it existed to make cheaper does not run on
-    # the tester path at all (tools/mcp_handlers already passes warm_cache=False
-    # on every host prepare). The assembled prompt is the pre-cache path on all
-    # three backends, byte for byte. The surviving seam is
-    # llm._prompt_cache_enabled(), which reads NO setting; the two numeric knobs
-    # below are retained with the machinery they bound so a revival is one line.
-    # See docs/FEATURE_FLAGS.md.
-    # Minimum cacheable prefix in TOKENS. 0 = derive it from the model, using
-    # llm.py's published table (4096 for opus 4.5-4.8 and haiku 4.5, 2048 for
-    # sonnet 4.6 and haiku 3/3.5, 1024 for sonnet 3.7-4.5; an unrecognised id
-    # takes the conservative 4096). Set this explicitly only for a model whose
-    # minimum llm.py does not know. Below the minimum a cache_control marker is
-    # silently ignored by the provider — no error, just a wasted 1.25x write —
-    # so llm.py sends a plain unmarked block instead.
-    qa_prompt_cache_min_tokens: int = 0
-    # max_tokens for the cache warm-up request that runs BEFORE the fan-out.
-    # 0 is correct and free: it runs prefill only (writing the cache), returns
-    # an empty content list with stop_reason "max_tokens" and bills zero output
-    # tokens. Raise it to 1 only if a future API version rejects 0.
-    qa_prompt_cache_warm_max_tokens: int = 0
-
     # Still read: used ONLY to recognise a self-hosted Jira on a custom domain
     # (tickets.example.com) as a ticket URL rather than a generic web page.
     jira_base_url: str = ""
-    # DEPRECATED 2026-08-01 for TICKET TEXT, and still inert for it. The
-    # REST/Basic-Auth Jira path was removed in favour of the calling agent's own
-    # Atlassian MCP connection (OAuth 2.1, Jira Cloud), so no text path reads
-    # these. They are also kept so an existing .env carrying JIRA_EMAIL /
-    # JIRA_API_TOKEN still loads cleanly instead of tripping validation on
-    # upgrade.
+    # JIRA_EMAIL / JIRA_API_TOKEN were DELETED on 2026-08-15 (dead-code
+    # deletion, batch D1) together with tools/jira_attachments.py, which
+    # was their ONLY reader in the whole tree. Nothing has sent this pair
+    # anywhere since 2026-08-13, when the credentialed attachment fetch
+    # was hardcoded OFF. An existing .env still carrying the keys loads
+    # cleanly and silently: model_config uses extra="ignore".
     #
-    # 2026-08-13 -- NO reader again, and the original sentence holds in full.
-    # QA_JIRA_ATTACHMENT_FETCH_ENABLED was DELETED and the credentialed
-    # attachment fetch hardcoded OFF (flag-surface reduction, batch 6), so
-    # tools/jira_attachments.enabled() returns the False constant and nothing in
-    # this tree sends this pair anywhere: a stale token cannot silently be used.
-    # The fields are kept only so an existing .env carrying them still loads.
-    # See docs/FEATURE_FLAGS.md.
-    jira_api_token: str = ""
-    jira_email: str = ""
+    # Re-adding them is part of reviving that fetch, and the safety
+    # contract a revival must satisfy (per-hop host re-check, HTTPS-only
+    # Basic auth to the configured Jira host, MIME allowlist, size caps,
+    # never-raise) is in docs/RETIRED_CAPABILITIES.md.
     # Tool-name prefix the CALLING agent uses for its Atlassian MCP tools.
     # Claude Code / Desktop expose them as `mcp__atlassian__getJiraIssue`;
     # other clients namespace differently, so the directive this server returns
@@ -294,9 +209,11 @@ class Settings(BaseSettings):
     # submission that carries verdicts anyway is still handled safely. What is
     # gone is only the INSTRUCTION that asks for them; the seam is
     # agents.host_mode.grounding_review_enabled(). See docs/FEATURE_FLAGS.md.
-    # Parent-story context (JIRA_FETCH_PARENT). Default **ON** — the THIRD
-    # deliberate exception to the constitution's defaults-OFF rule, alongside
-    # QA_AUTO_EXPORT_XLSX and QA_AMBIGUITY_GATE_SEVERITY / QA_JIRA_PREFLIGHT.
+    # Parent-story context (JIRA_FETCH_PARENT). Default **ON** — a deliberate
+    # exception to the constitution's defaults-OFF rule. The two flags this
+    # comment used to name alongside it are both gone: QA_AUTO_EXPORT_XLSX was
+    # hardcoded ON in batch 4 (2026-08-12) and QA_AMBIGUITY_GATE_SEVERITY was
+    # deleted by P2-J2 with the gate it switched.
     # A Jira SUB-TASK ("Add Apple Pay button") carries almost no requirements
     # — they live on the parent story — so fetching only the sub-task makes
     # the generator either fabricate a suite or trip the ambiguity gate, which
@@ -350,46 +267,26 @@ class Settings(BaseSettings):
     jira_fetch_comments: bool = True
     jira_max_comments: int = 5
 
-    # --- Comment reconciliation (Batch 1) — opt-in, default OFF. -----------
-    # A Jira description is a snapshot taken at refinement; the requirements
-    # that are actually current accumulate in the comment thread. When ON,
-    # tools/comment_reconciler runs a three-stage pipeline (Python noise filter
-    # -> ONE quarantined extraction call -> deterministic Python resolution)
-    # and the MCP handler injects a fenced AMENDMENTS block carrying only the
-    # winners, with provenance emitted mechanically in code. While ON,
-    # tools/jira_fetcher also SUPPRESSES the raw "## Comments" dump from
-    # raw_text, so that block is the only comment-derived input the generation
-    # model sees. OFF = zero extra LLM calls and a byte-identical prompt.
-    qa_comment_reconcile_enabled: bool = False
-    # Hard cap on comments handed to Stage 1 (the NEWEST N are kept). NOTE the
-    # interaction with jira_max_comments above (default 5): while the
-    # reconciler is ON, tools/jira_fetcher._effective_comment_cap requests
-    # max(jira_max_comments, this) so the window here is real instead of being
-    # silently clamped to 5; the filter then keeps the newest N of what arrived.
-    qa_comment_reconcile_max_comments: int = 50
-    # Comma-separated bot names, matched WHOLE-TOKEN against the author's
-    # display name (see tools/comment_reconciler._is_bot_author) — never as a
-    # substring, so "bot" drops "Release Bot" but keeps a reviewer named
-    # "Bothaina" or "Talbot". Empty falls back to the module's built-in list.
-    qa_comment_reconcile_bot_authors: str = (
-        "jira-automation,automation for jira,github-actions,dependabot,"
-        "depbot,renovate,bot"
-    )
-    # difflib ratio a comment's inferred field key must reach against the
-    # ticket's own vocabulary before an amendment is applied. Below it the
-    # candidate is FLAGGED for clarification instead of being applied to a
-    # guessed field.
-    qa_comment_reconcile_field_threshold: float = 0.90
-    # Cosine similarity at/above which two additions count as the same
-    # requirement (only used when an embeddings backend is configured;
-    # otherwise normalised-string equality applies).
-    qa_comment_reconcile_dedup_threshold: float = 0.92
-    # Cap on amendments rendered into the block (newest survive).
-    qa_comment_reconcile_max_amendments: int = 12
-    # Character cap on the rendered block. 0 means "emit no block" (same
-    # convention as jira_max_parent_chars), which is why this field is
-    # deliberately NOT in _POSITIVE_INT_FIELDS.
-    qa_comment_reconcile_max_chars: int = 1500
+    # --- Comment reconciliation (Batch 1) — DELETED 2026-08-15. -----------
+    # Batch 8b-ii (2026-08-14) deleted QA_COMMENT_RECONCILE_ENABLED and
+    # hardcoded the pipeline OFF -- this field's own code default AND the
+    # value .env.example shipped, so no install changed -- and kept the six
+    # qa_comment_reconcile_* knobs as revival tuning behind the named seam
+    # tools/comment_reconciler.enabled(). Dead-code deletion batch D5
+    # (2026-08-15) deleted the module that seam guarded, so all six lost their
+    # last reader and went with it: _MAX_COMMENTS, _BOT_AUTHORS,
+    # _FIELD_THRESHOLD, _DEDUP_THRESHOLD, _MAX_AMENDMENTS, _MAX_CHARS. They
+    # also left BOTH validator lists above (_POSITIVE_INT_FIELDS and the
+    # second field_validator, which hold different fields in a different
+    # order) and the _coerce_reconcile_threshold list.
+    #
+    # A stale QA_COMMENT_RECONCILE_* line in an existing .env still loads --
+    # model_config uses extra="ignore" -- and now does nothing at all.
+    # JIRA_MAX_COMMENTS (above, default 5) is the ONLY comment bound left, and
+    # tools/jira_mcp leaves the raw "## Comments" dump in the ticket text.
+    # The revival contract, including the containment control that sanitised
+    # attacker-writable comment text before it reached a model, is
+    # docs/RETIRED_CAPABILITIES.md section 4.
 
     # Image attachments. 2026-08-03 (user-approved): ON by default -- but read
     # what it does and does NOT buy. On the MCP Jira path this yields attachment
@@ -442,98 +339,55 @@ class Settings(BaseSettings):
     # Timeout (seconds) for a single screenshot capture (larger -- image transfer).
     qa_device_screenshot_timeout: int = 60
 
-    # --- Mobile Device Testing (Maestro) — RETIRED as a setting 2026-08-13. ---
-    # QA_MAESTRO_ENABLED was DELETED and the behaviour hardcoded OFF
-    # (flag-surface reduction, batch 7 (needs-config)). Unlike the three flags
-    # in that batch pinned ON, this one was never shipped in the public
-    # distribution's .env template at all: it needs the Maestro CLI plus an
-    # attached device or simulator on the operator's own machine, so it was a
-    # private-checkout capability, and .env now holds credentials, paths and
-    # per-install identifiers only. handle_run_mobile_suite and every mode it
-    # drives are RETAINED and still registered in the full edition, but
-    # tools/mcp_handlers._maestro_enabled() returns the False constant, so the
-    # tool refuses. See docs/FEATURE_FLAGS.md.
-    # Maestro runner dry-run -- UNCONDITIONAL since 2026-08-13 (flag-surface
-    # reduction, batch 6): QA_MAESTRO_DRY_RUN was DELETED and the dry run
-    # hardcoded ON, so maestro_runner._dry_run() returns the True constant and
-    # the runner always PRINTS the command instead of executing on a device.
-    # See docs/FEATURE_FLAGS.md.
-    # Maestro CLI binary, flow output directory, and per-run timeout (seconds).
-    qa_maestro_binary: str = "maestro"
-    qa_maestro_flow_dir: str = "maestro_flows"
-    qa_maestro_run_timeout: int = 600
-    # AI-assisted fail→diagnose→patch→rerun heal loop (mode c) -- REMOVED as a
-    # setting 2026-08-13 (flag-surface reduction, batch 7 (needs-config)):
-    # QA_MAESTRO_HEAL_ENABLED was DELETED and hardcoded OFF, so
-    # tools/maestro_healer.enabled() returns the False constant and the loop
-    # never runs. The attempt bound below is retained with the loop it bounds.
-    qa_maestro_heal_max_attempts: int = 2
-    # AI exploratory run (Layer 3 -- observe->decide->act) -- REMOVED as a
-    # setting 2026-08-13 (flag-surface reduction, batch 7 (needs-config)):
-    # QA_MAESTRO_EXPLORE_ENABLED was DELETED and hardcoded OFF, so
-    # tools/maestro_explorer.enabled() returns the False constant and the 4th
-    # "🧭 AI exploratory run" mode is never offered. The step budget and
-    # per-step timeout below are retained with the loop they bound; each
-    # per-step device action was already unconditionally dry-run since
-    # 2026-08-13, when QA_MAESTRO_DRY_RUN was deleted.
-    qa_maestro_explore_max_steps: int = 15
-    qa_maestro_explore_step_timeout: int = 60
-    # LLM step translation (Layer 1 upgrade) -- REMOVED 2026-08-13 (flag-surface
-    # reduction, batch 8a): QA_MAESTRO_TRANSLATE_ENABLED was DELETED and
-    # hardcoded to its default, False. It was already INERT on the MCP surface --
-    # its only caller was the retired Chainlit export path, so `qa-doctor` had to
-    # report the flag itself as having no effect -- and Maestro was retired
-    # wholesale in batch 7. tools/maestro_exporter.translate_suite_steps survives
-    # behind the seam translate_enabled() for whoever re-wires the export path.
-    # See docs/FEATURE_FLAGS.md.
-    qa_maestro_translate_concurrency: int = 3
-    # Test-account credentials for the Maestro login/recovery subflow. Injected as
-    # Maestro env vars at RUN time (never written into YAML). .env only.
-    qa_test_user: str = ""
-    qa_test_password: str = ""
+    # --- Mobile Device Testing (Maestro) -- DELETED 2026-08-15. ---
+    # Batch 7 (2026-08-13) retired the feature and kept seven QA_MAESTRO_* tuning
+    # fields as knobs that gated nothing. On 2026-08-15 (dead-code deletion batch
+    # D2) the cluster itself was DELETED -- tools/maestro_runner.py,
+    # maestro_healer.py, maestro_explorer.py, maestro_exporter.py,
+    # handle_run_mobile_suite, the qa_run_mobile_suite tool and the qa_wizard
+    # Mobile branch -- so all seven fields lost their last reader and went with
+    # it. A stale QA_MAESTRO_* line in an existing .env is ignored (extra="ignore").
+    # Device capture is untouched: qa_capture_screens / qa_list_devices /
+    # tools/device_manager.py never depended on Maestro.
+    #
+    # QA_TEST_USER / QA_TEST_PASSWORD went the same way on 2026-08-15. Batch
+    # D2 kept them because their last reader had become tools/web_runner.py's
+    # seed_account field filler; dead-code deletion batch D3 deleted that
+    # module, so both fields lost their only reader and went with it.
 
-    # --- Web Suite Execution -- REMOVED 2026-08-13. ---
-    # QA_WEB_RUN_ENABLED and QA_WEB_RUN_DRY_RUN were DELETED and hardcoded to
-    # their defaults, OFF and ON (flag-surface reduction, batch 6), so
-    # qa_run_web_suite / qa_submit_web_run always refuse and tools/web_runner.py
-    # never launches a browser. The bounds below survive as tuning knobs for
-    # whoever revives the runner in code; they gate nothing on their own.
-    # See docs/FEATURE_FLAGS.md.
-    # Max cases executed per run (bounds cost + wall time).
-    qa_web_run_max_cases: int = 20
-    # Max ask_vision screenshot judgments per run (the text assertion runs
-    # first; vision is only a bounded fallback when it is inconclusive).
-    qa_web_run_vision_budget: int = 5
-    # Per-browser-action timeout (seconds).
-    qa_web_run_timeout_s: int = 60
-
-    # LangSmith — read directly by langsmith/langgraph from the environment;
-    # mirrored here for visibility.
-    langchain_api_key: str = ""
-    langchain_project: str = "qa-agents"
-
-    # Web search grounding -- REMOVED 2026-08-13 (flag-surface reduction,
-    # batch 6): QA_WEB_SEARCH_ENABLED was DELETED and hardcoded OFF, so
-    # tools/web_search.search_web always returns "Web search disabled" and no
-    # feature or ticket text leaves the org for a third-party search API.
+    # --- Web Suite Execution -- DELETED 2026-08-15 (batch D3). ---
+    # Batch 6 (2026-08-13) deleted the two switches and hardcoded the runner
+    # OFF, keeping three bounds as tuning knobs for whoever revived it in
+    # code. D3 deleted the code they bounded -- tools/web_runner.py,
+    # handle_run_web_suite / handle_submit_web_run, the qa_run_web_suite and
+    # qa_submit_web_run tools and suite_store's web_runs table -- so the
+    # three fields lost their last reader too. A stale QA_WEB_RUN_* or
+    # QA_TEST_USER line in an existing .env is ignored (extra="ignore").
     # See docs/FEATURE_FLAGS.md.
 
-    # Structured coverage critic + remediation (T-08): after the initial
-    # fan-out a structured critique runs and, if gaps are found, ONE
-    # supplemental generation pass fills them (merged + re-deduped + re-scored).
-    # UNCONDITIONAL since 2026-08-12 -- QA_COVERAGE_REGEN_ENABLED was DELETED
-    # (flag-surface reduction, batch 3); see docs/FEATURE_FLAGS.md.
-    # Bound on the critic->generate remediation loop (was a hardcoded
-    # module constant _MAX_REMEDIATION_ROUNDS = 3). Default lowered to 2:
-    # published self-critique research shows gains flatten after 2-3 rounds and
-    # an unbounded/over-long loop can compound errors rather than improve
-    # coverage (.claude/reports/research/testgen-accuracy-techniques-2026.md
-    # section 1). Only a floor is enforced (>=1, via _POSITIVE_INT_FIELDS) --
-    # no code-level ceiling, matching this file's existing convention for other
-    # bounded-loop-count fields (qa_maestro_heal_max_attempts,
-    # qa_maestro_explore_max_steps), which are likewise floor-only. See
-    # .claude/plans/plan-remediation-cap.md.
-    qa_coverage_regen_max_rounds: int = 2
+    # LangSmith tracing is GONE. These two fields mirrored LANGCHAIN_API_KEY /
+    # LANGCHAIN_PROJECT "for visibility" -- nothing in this tree ever read
+    # them; the langsmith and langgraph packages read those variables straight
+    # from the environment, on the graph.py path. Dead-code deletion Phase 2
+    # batch P2-A (2026-08-15) deleted graph.py, router.py and langgraph.json
+    # and dropped langchain-core / langgraph / langsmith /
+    # langchain-anthropic from pyproject.toml and requirements.txt, so there is
+    # no reader left inside OR outside this process. A stale LANGCHAIN_* line
+    # in an existing .env is ignored (extra="ignore").
+
+    # Web search grounding is GONE. QA_WEB_SEARCH_ENABLED was DELETED on
+    # 2026-08-13 (flag-surface reduction, batch 6) and hardcoded OFF; on
+    # 2026-08-15 (dead-code deletion, batch D1) tools/web_search.py itself was
+    # deleted, along with the compliance-keyword scan in
+    # agents/test_scenario_agent.py. No feature or ticket text can leave the
+    # org for a third-party search API, and there is no module left to
+    # re-enable. See docs/RETIRED_CAPABILITIES.md.
+
+    # The structured coverage critic + bounded remediation loop, and the
+    # QA_COVERAGE_REGEN_MAX_ROUNDS int field that bounded it, were DELETED on
+    # 2026-08-16 (dead-code deletion P2-E1). The loop was the field's only
+    # reader; a stale QA_COVERAGE_REGEN_MAX_ROUNDS= line in an existing .env
+    # is inert (model_config uses extra="ignore").
     # Merging the critique + gap-fill generation into ONE ask_json call per
     # remediation round (instead of critique_coverage followed by a full
     # _generate_for_category pass) is UNCONDITIONAL since 2026-08-13
@@ -545,80 +399,49 @@ class Settings(BaseSettings):
     # is unaffected, exactly as before: its "critique" is the deterministic
     # external matcher, so there is nothing there to merge.
     # See .claude/plans/plan-remediation-cap.md and docs/FEATURE_FLAGS.md.
-    # Enterprise Feature Analysis Report (opt-in, off by default). When ON,
-    # generate_test_scenarios runs ONE extra structured LLM pass (text backend,
-    # via llm.ask_json) that merges the Jira ticket content with any screenshot
-    # descriptions into a full "Feature Analysis Report" (feature summary,
-    # requirement analysis, UI analysis, user flow, missing requirements, risks)
-    # and prepends it to the generation summary -- in ADDITION to the normal
-    # test-case suite. Screenshot content still requires ANTHROPIC_API_KEY for
-    # vision (image description is unchanged); with no screenshots the report is
-    # built from Jira/feature text alone. Never breaks generation: a failure just
-    # omits the report.
-    qa_feature_analysis_enabled: bool = False
+    # Enterprise Feature Analysis Report. QA_FEATURE_ANALYSIS_ENABLED was
+    # DELETED on 2026-08-14 (flag-surface reduction, batch 8c) and the
+    # feature hardcoded ON -- the flag policy's "promote to default ON,
+    # flag deleted" outcome for an experiment. The seams are
+    # mcp_server._feature_analysis_enabled and
+    # tools.mcp_handlers._feature_analysis_enabled. The test-cases-only
+    # EDITION gate is unchanged and still outranks them, so the public
+    # distribution registers neither tool.
 
     # API test agent (chat-only): qa_prepare/submit/write_api_test. All OFF by
     # default; the write path is dry-run-first (qa_api_framework_write_dry_run).
     qa_api_test_enabled: bool = False
+    # Kill switches for the LIVE pushers (2026-08-18). tools/testrail_pusher.py and
+    # tools/xray_pusher.py had no caller at all; qa_push_suite is that caller. ON
+    # permits a credentialed outbound WRITE to a system outside this org's control,
+    # which nothing else in this tree does, so both default OFF forever and a real
+    # push additionally requires apply=true on the call. A dry-run preview needs
+    # neither flag. Flipping either one needs an MCP server restart.
+    qa_testrail_push_enabled: bool = False
+    qa_xray_push_enabled: bool = False
     qa_api_framework_write_enabled: bool = False
     qa_api_framework_path: str = ""
     qa_api_framework_write_dry_run: bool = True
-
-    # Per-phase breakdown + $ cost estimate on the meter line -- UNCONDITIONAL
-    # since 2026-08-13 (flag-surface reduction, batch 5): QA_TOKEN_METER_DETAIL_ENABLED
-    # and QA_TOKEN_METER_COST_ENABLED were DELETED, both deletion candidates per
-    # tools/flag_registry.py's own rationale rather than real experiments. Neither
-    # gates a real behavioural risk -- no external call, no write -- so both are
-    # now always shown alongside the (already unflagged) base meter line. See
-    # docs/FEATURE_FLAGS.md.
-
-    # Approximate per-1M-token prices for the two model tiers this codebase
-    # actually configures (qa_llm_model / qa_classifier_model). These are
-    # APPROXIMATE published rates and drift; override via .env rather than
-    # treating them as authoritative. The cost line is always labelled an
-    # estimate and never drives generation behaviour, so a stale default
-    # degrades to a slightly-off dollar figure, nothing more. Coerced by
-    # _coerce_token_price (never raises; negatives clamp to 0.0).
-    qa_token_price_generation_input_per_1m: float = 3.0
-    qa_token_price_generation_output_per_1m: float = 15.0
-    qa_token_price_classifier_input_per_1m: float = 1.0
-    qa_token_price_classifier_output_per_1m: float = 5.0
-    # Anthropic bills cache reads/writes as a fraction/multiple of the SAME
-    # tier's input rate, so these scale that rate rather than adding two more
-    # absolute-rate fields per tier.
-    qa_token_price_cache_read_discount: float = 0.1
-    qa_token_price_cache_write_multiplier: float = 1.25
-
-    # Ambiguity pre-pass (T-11): minimum severity ("low"/"medium"/"high") at which
-    # the app pauses to offer clarifying questions before generating. "off"
-    # disables the pre-pass entirely (no extra LLM call).
-    #
-    # SHYJ-7154: this same flag ALSO gates the non-interactive MCP path, where it
-    # is DELIBERATELY default-ON — the second intentional exception to the
-    # defaults-OFF rule (after QA_AUTO_EXPORT_XLSX). Rationale: this gate exists
-    # precisely to stop the confirmed P0 — confidently-wrong suites (fabricated
-    # portals/endpoints) shipping to non-technical testers from under-specified /
-    # no-UI tickets. Rollout impact: existing qa-agent-pro installs will, with NO
-    # config change, receive clarifying questions (not a suite) for high-severity
-    # under-specified tickets until the caller re-invokes with proceed_anyway=true.
-    # Operator kill-switch: set QA_AMBIGUITY_GATE_SEVERITY=off.
-    qa_ambiguity_gate_severity: str = "high"
-
-    # Ambiguity-gate verdict cache TTL, in seconds. 0 = OFF (default, today's
-    # behaviour: every prepare re-classifies). MEASURED 55.8s for ONE small
-    # classification on the `cli` backend on the 2026-07-30 run -- ~56% of the
-    # whole server-controlled cost of that session -- and a plain re-prepare of
-    # the SAME ticket pays it again in full. The cache is process-local, bounded
-    # (32 entries, FIFO) and keyed on the classified text + gate severity +
-    # classifier model, so changing the gate or the model MISSES.
-    # NB deliberately NOT in _POSITIVE_INT_FIELDS: 0 is its documented
-    # kill-switch, exactly like qa_category_stall_s, and membership there would
-    # rewrite it to the default.
-    # LOAD-BEARING: a `degraded` verdict is NEVER cached (see
-    # tools/mcp_handlers._ambiguity_cache_put). Degraded means "could not
-    # classify" -- the SHYJ-7154 fail-safe -- so caching it would freeze a
-    # transient backend outage into a sticky CLARIFY.
-    qa_ambiguity_cache_ttl_s: int = 0
+    # The PUBLIC GitHub template repo (owner/name) qa_api_project(create=...)
+    # fetches the project skeleton from. THE IDENTIFIER IS THE GATE: empty means
+    # create= refuses BY NAME, so no second default-OFF boolean is added (a flag
+    # nobody flips is dead code plus an untested off-path). Flag-policy category
+    # (2) needs-config -- the same shape as qa_api_framework_path, and the
+    # feature already sits behind default-OFF QA_API_TEST_ENABLED. The fetch is
+    # unauthenticated: no token is read, sent or stored anywhere on this path.
+    qa_api_template_repo: str = ""
+    # Parent folder new API projects are created in. No default: an unset value
+    # refuses rather than guessing where to write on the tester's disk.
+    qa_api_projects_dir: str = ""
+    # SQLite file holding the durable project registry (tools/api_project.py).
+    # Resolved through tools/install_paths like qa_suite_store_path, so it does
+    # not follow the client's working directory. NOT prep_store: a project must
+    # outlive the 1h intake TTL (design review G1).
+    qa_api_project_store_path: str = "data/api-projects.db"
+    # B2 — the durable endpoint / auth-flow registry. A path, not a toggle:
+    # the feature is already behind default-OFF QA_API_TEST_ENABLED, and
+    # this only says WHERE the store lives (same shape as the line above).
+    qa_api_registry_store_path: str = "data/api-registry.db"
 
     # AC anchoring (SHYJ-7154 Fix 3): when the source ticket carries REAL
     # (source-parsed) acceptance criteria, drop generated cases that cite a
@@ -626,20 +449,29 @@ class Settings(BaseSettings):
     # "AC Anchoring" warning section is always shown; only the dropping is gated.
     qa_ac_anchoring_enforce: bool = False
 
-    # Test-plan artifacts (house rule: opt-in, default OFF). When ON, the
-    # test-generation pipeline builds an AC-Validation report (only when the
-    # ticket carried REAL source acceptance criteria) and a Test Plan / Strategy
-    # section — at most two extra ask_json calls — rendered into the summary and
-    # added as extra XLSX sheets. OFF = zero extra LLM calls.
-    qa_test_plan_artifacts: bool = False
+    # QA_TEST_PLAN_ARTIFACTS was DELETED on 2026-08-14 (flag-surface
+    # reduction, batch 8b-ii) and the behaviour hardcoded OFF -- this field's
+    # own code default, and it appeared in no shipped template, so no install
+    # changed. ON it built an AC-Validation report (only when the ticket
+    # carried REAL source acceptance criteria) and a Test Plan / Strategy
+    # section -- at most two extra ask_json calls -- rendered into the summary
+    # and added as extra XLSX sheets. The two builders and the
+    # test_plan_artifacts_enabled() seam were deleted on 2026-08-16 (P2-F3) and
+    # the host-side TEST_PLAN_JOB that replaced them the same day (P2-H), so
+    # there is no seam left to flip and no artifacts are produced at all.
+    # tools/test_plan_report's render helpers and the two XLSX sheets are
+    # RETAINED (unreachable, but removing them is a product decision).
 
-    # LLM-based risk scoring (opt-in, default OFF). When ON, generate_test_scenarios
-    # replaces the deterministic priority×type heuristic with ONE batched ask_json
-    # call that judges each case's business risk (business impact, blast radius,
-    # data-loss potential, exploitability). Any failure (LLM error/timeout/missing
-    # ids) falls through to the existing heuristic — never fails, never drops a
-    # case. OFF = zero extra LLM calls and the heuristic path is byte-identical.
-    qa_llm_risk_scoring: bool = False
+    # QA_LLM_RISK_SCORING was DELETED on 2026-08-14 (flag-surface reduction,
+    # batch 8b-ii) and the behaviour hardcoded OFF -- this field's own code
+    # default, and it appeared in no shipped template, so no install changed.
+    # ON it replaced the deterministic priority x type heuristic with ONE
+    # batched ask_json call judging each case's business risk, falling through
+    # to the heuristic on any failure. score_with_llm and its seam were deleted
+    # on 2026-08-16 (P2-F3), and apply_host_risk -- the chat-only overlay --
+    # the same day with the RISK_JOB cluster (P2-H). The heuristic is now the
+    # only thing that scores a case, and reviving either half is a fresh
+    # implementation. See docs/FEATURE_FLAGS.md.
 
     # Test-data strategy: the per-category generation prompt asks the model to
     # populate each case's ``test_data`` plan (which fields need unique-per-run /
@@ -833,30 +665,39 @@ class Settings(BaseSettings):
     # generated cases. The threshold above is retained with the
     # retained-for-revival _semantic_dedupe_cases path.
 
-    # --- Atomic Requirements Checklist (Batch 2; opt-in, default OFF) ------
-    # Master gate for the three-pass auditable-coverage pipeline:
+    # --- Atomic Requirements Checklist (Batch 2) --------------------------
+    # QA_ATOMIC_CHECKLIST_ENABLED was DELETED on 2026-08-14 (flag-surface
+    # reduction, batch 8b-ii) and the behaviour hardcoded **ON**. Unlike every
+    # other flag in batches 8b-i/8b-ii this DOES change shipped behaviour:
+    # the field defaulted False, .env.example shipped `false` and the dist
+    # template never carried the key, so the checklist was OFF on every
+    # install. It is now unconditional -- the flag policy's "promoted to
+    # default behaviour (flag deleted)" exit for an experiment. The pipeline:
     #   Pass 1  tools/atomic_checklist.decompose_to_checklist -> an unbounded,
     #           EARS-shaped, source-tagged checklist of every independently-
-    #           verifiable outcome (ONE extra ask_json, run inside the existing
-    #           concurrent enrichment gather so it costs no extra wall clock).
+    #           verifiable outcome. On the (unconditional) host route this is
+    #           CHECKLIST_JOB / step 0d, so it costs this server NO LLM call.
     #   Pass 2  the 8-category fan-out with that checklist injected as its OWN
     #           untrusted, CLUSTERED block (constraint-decay mitigation).
     #   Pass 3  tools/rtm.match_checklist -> a DETERMINISTIC EXTERNAL matcher
     #           that recomputes coverage instead of trusting the generating
-    #           model's self-assigned requirement_id.
-    # OFF => zero extra LLM calls, zero extra embedding work, and every summary
-    # and export is byte-identical to the pre-feature output.
-    qa_atomic_checklist_enabled: bool = False
-    # Tier (b) of the matcher: ONE batched entailment judgement over the
-    # ambiguous similarity band. Deliberately NOT a BERT-large NLI dependency --
-    # a compact ask_json call with a strict judging prompt that is DIFFERENT from
-    # the generator's, so the model still never marks its own homework.
-    # OFF => the ambiguous band is simply reported as uncovered.
-    qa_checklist_nli_enabled: bool = False
-    # Tier (c): a final batched adjudication over ONLY the pairs tier (b) left
-    # "unsure". Its matches are always reported as LOW confidence / review
-    # required.
-    qa_checklist_adjudicate_enabled: bool = False
+    #           model's self-assigned requirement_id. Falls back to the
+    #           lexical tier when no embeddings backend is configured, so a
+    #           bare install degrades rather than fails.
+    # The named seam is tools/atomic_checklist.checklist_enabled(), a True
+    # constant, and tests/conftest.py pins it False suite-wide -- unpinned,
+    # every generation test would decompose and make a real ask_json call.
+    #
+    # QA_CHECKLIST_NLI_ENABLED (tier b: ONE batched entailment judgement over
+    # the ambiguous similarity band) and QA_CHECKLIST_ADJUDICATE_ENABLED
+    # (tier c: a final adjudication over ONLY the pairs tier b left "unsure")
+    # were DELETED the same day and hardcoded OFF -- their own code defaults
+    # and the value .env.example shipped. The ambiguous band is reported as
+    # uncovered, which is what every install already did. Both are retained
+    # behind tools/rtm._nli_tier_enabled() / _adjudicate_tier_enabled(), and
+    # tools/rtm's degradation note still fires under a revived seam so a
+    # revival cannot silently ship an undisclosed degraded measurement.
+    # See docs/FEATURE_FLAGS.md.
     # QA_CHECKLIST_REMEDIATION_ENABLED was DELETED on 2026-08-14
     # (flag-surface reduction, batch 8b) and the behaviour hardcoded OFF --
     # this field's own code default, and the value every shipped template
@@ -870,14 +711,14 @@ class Settings(BaseSettings):
     # agents.test_scenario_agent.checklist_remediation_enabled() is the named
     # seam -- a revival is one line there. See docs/FEATURE_FLAGS.md.
     # Embedding-cosine bands. score >= high -> HIGH-confidence match;
-    # low <= score < high -> the ambiguous band handed to tiers (b)/(c);
+    # low <= score < high -> the ambiguous band, REPORTED AS UNCOVERED since
+    # 2026-08-14 (tiers (b)/(c) are False seams, so nothing is handed to them);
     # score < low -> no match. Thresholds are dataset-dependent (TraceLLM tunes
     # 0.01..1.0 per domain against labelled ground truth); these are
     # conservative project-level defaults, NOT tuned optima. The lexical TF-IDF
     # fallback uses its own fixed constants in tools/rtm.py because its scores
     # live on a different scale.
     qa_checklist_match_high: float = 0.75
-    qa_checklist_match_low: float = 0.30
     # Phase-0 granularity gate. Below this the decomposition is reported as
     # probably inflated / under-split -- ADVISORY only, it never blocks
     # generation (house rule: log and degrade).
@@ -895,9 +736,6 @@ class Settings(BaseSettings):
     # normal operation.
     qa_checklist_max_items: int = 200
     qa_checklist_max_prompt_chars: int = 32000
-    # Hard cap on ambiguous-band pairs handed to tiers (b)/(c) -- bounds cost and
-    # latency, which the NLI traceability literature does not report.
-    qa_checklist_max_pairs: int = 40
 
     # --- Batch 3 rule packs (REMOVED as settings) --------------------------
     # QA_BILINGUAL_RULES, QA_ATOMICITY_RULES and QA_STANDING_RULES were
@@ -931,24 +769,15 @@ class Settings(BaseSettings):
     testrail_user: str = ""
     testrail_api_key: str = ""
 
-    # Spec-document ingestion -- REMOVED 2026-08-13 (flag-surface reduction,
-    # batch 8a): QA_SPEC_INGEST_ENABLED was DELETED and hardcoded to its default,
-    # False, so tools/doc_ingest.ingest_document() always refuses and no attached
-    # PDF/DOCX/TXT/MD is ever extracted into the generation prompt. The quality
-    # gain was never measured. The module and its optional `spec` extra are
-    # retained behind the seam tools.doc_ingest.enabled().
-    #
-    # QA_SPEC_RAG_PERSIST went with it, hardcoded to `True` on the maintainer's
-    # instruction, and the honest note is that this is a DOCUMENTED NO-OP: the
-    # field had NO reader anywhere in the tree even before this batch, and the
-    # corpus write it once described can only have happened while ingestion was
-    # on -- which it now never is. It is recorded here rather than silently
-    # dropped so nobody re-derives the value from an empty grep.
-    # See docs/FEATURE_FLAGS.md.
-    # Raw upload byte cap and extracted-text char cap (mirror the image caps).
-    # Raw upload byte cap and extracted-text char cap (mirror the image caps).
-    qa_max_spec_bytes: int = 10_000_000
-    qa_max_spec_chars: int = 20_000
+    # Spec-document ingestion is GONE. QA_SPEC_INGEST_ENABLED and
+    # QA_SPEC_RAG_PERSIST were deleted on 2026-08-13 (flag-surface
+    # reduction, batch 8a) and the behaviour hardcoded OFF; on 2026-08-15
+    # (dead-code deletion, batch D1) tools/doc_ingest.py itself was
+    # deleted, and QA_MAX_SPEC_BYTES / QA_MAX_SPEC_CHARS went with it --
+    # the module was their only real reader. The one surviving reference,
+    # the spec_document prompt block in agents/test_scenario_agent.py,
+    # carries the 20_000 char cap inline. A stale .env key is ignored.
+    # See docs/RETIRED_CAPABILITIES.md.
 
     # Swagger/OpenAPI link ingestion -- UNCONDITIONAL since 2026-08-13
     # (flag-surface reduction, batch 6): QA_SWAGGER_ENABLED was DELETED and
@@ -989,32 +818,19 @@ class Settings(BaseSettings):
     # mcp_handlers for exactly that reason.
     qa_export_dir: str = "data/exports"
 
-    # Zephyr for Jira import export (Batch 4 -- tools/zephyr_exporter.py).
-    # Zephyr for Jira import export -- REMOVED 2026-08-13 (flag-surface
-    # reduction, batch 8a): QA_ZEPHYR_EXPORT_ENABLED was DELETED and hardcoded to
-    # its default, False. `zephyr` never joins the qa_export_suite format list,
-    # the elicitation picker and markdown menu are byte-identical to before the
-    # feature existed, and the auto-export path writes no workbook pair. The
-    # 15-column layout was never verified against a live Zephyr importer, which
-    # is why its runbook pilot gate exists and why it was never promoted.
-    # tools/zephyr_exporter.py is retained and still directly tested; the seam is
-    # tools.mcp_handlers._zephyr_export_enabled(). See docs/FEATURE_FLAGS.md.
-
-    # Dry run for that export -- UNCONDITIONAL since 2026-08-13 (flag-surface
-    # reduction, batch 6): QA_ZEPHYR_DRY_RUN was DELETED and hardcoded ON. The
-    # IMPORT into Jira is the external write, performed by the tester on our
-    # artifact, and the column layout is still not vendor-verified
-    # (operations/runbook.md -> "Zephyr export pilot gate"), so the artifact
-    # stays bounded rather than suppressed: the workbook holds ONE case (the
-    # first multi-step one, so the multi-row layout is actually exercised), is
-    # named zephyr_import_PILOT.xlsx inside a zephyr_pilot_* folder, and the
-    # reply tells the tester to import it into a SANDBOX project first. Lifting
-    # that bound is now a code change, not an .env line. See
-    # docs/FEATURE_FLAGS.md.
+    # The Zephyr for Jira import export used to be described here. Its two flags
+    # were deleted in batches 8a / 6 (2026-08-13) and the feature itself --
+    # tools/zephyr_exporter.py, the two _zephyr_* seams in mcp_handlers, the
+    # _auto_export_zephyr / _zephyr_pair_note / _suite_story_key chain and the
+    # workbook + zfj_import_config.json pair -- was DELETED on 2026-08-15
+    # (dead-code deletion batch D4). No field has existed here since 8a and none
+    # is coming back; a stale QA_ZEPHYR_* line in an existing .env is ignored
+    # (model_config uses extra="ignore"). See operations/runbook.md ->
+    # "Zephyr for Jira import export -- DELETED 2026-08-15".
 
     # Distribution / test-cases-only mode. When ON, the UI exposes ONLY the
     # test-case generation flows (feature text / Jira / web URL / Swagger link
-    # / mobile screens); bug-report, exploratory-coach, Maestro and fine-tune
+    # / mobile screens); bug-report, exploratory-coach and fine-tune
     # surfaces are hidden. Forced implicitly when those modules are absent
     # (the public distribution build ships without them).
     qa_dist_mode: bool = False
@@ -1178,37 +994,21 @@ class Settings(BaseSettings):
     # never-raising validator as every other int in this file.
     qa_host_duplicate_suite_window_s: int = 86400
 
-    # --- Host-boomerang migration of ALL remaining LLM call paths (2026-08-01)
-    # ------------------------------------------------------------------------
-    # QA_GENERATION_MODE made test-case generation chat-only. ~30 OTHER call
-    # sites still reach a server-side cli/api/cursor backend, so a keyless
-    # install silently degrades (bug reports, coaching, vision grounding, the
-    # ambiguity gate) and a keyed install burns a second quota for work the
-    # tester's own chat model could do. qa_server_llm_enabled is the single
-    # chokepoint that retires those calls; it defaults to True so introducing
-    # it is a runtime NO-OP, and flipping it False is the LAST step of the
-    # migration (gated on docs/LLM_MIGRATION_INVENTORY.md). OFF, llm.ask /
-    # ask_vision return their existing never-raising "Error: ..." sentinel,
-    # llm.ask_json raises LLMBackendUnavailableError and llm.warm_cache_prefix
-    # returns False -- each path's documented contract, so every caller degrades
-    # exactly as it already does when no backend is usable. Nothing invents a
-    # substitute result. While any ledger row is still unmigrated, turning this
-    # OFF DISABLES that feature rather than boomeranging it, so qa-doctor
-    # and a one-time startup WARNING name the affected features out loud.
-    qa_server_llm_enabled: bool = True
-    # Per-path escape hatch for the paths that CANNOT boomerang (a completion is
-    # needed mid-loop, inside a tool call): comma-separated ledger call-site ids
-    # -- e.g. "maestro_healer.classify,eval_runner.judge", or "*" for all --
-    # that may still call a backend directly while qa_server_llm_enabled is
-    # False. Without this, one boolean conflates "retired because migrated" with
-    # "disabled because unmigratable", and an operator with a working key could
-    # not keep the mobile healer/explorer, web vision-verify or the eval harness
-    # alive without also re-enabling every already-migrated path. Callers tag
-    # themselves via llm.server_llm_scope(<id>); an UNTAGGED call is always
-    # refused when the master flag is off, so the list cannot widen by accident.
-    # A plain str field: any .env value is already a valid str, so no coercer is
-    # needed and it can never raise at load time.
-    qa_server_llm_allow: str = ""
+    # --- Server-LLM kill switch: DELETED 2026-08-15 ------------------
+    # QA_SERVER_LLM_ENABLED and QA_SERVER_LLM_ALLOW were the host-boomerang
+    # migration's rollout switch. That migration is done on the surface it
+    # was built for: NO MCP tool reaches a server-side backend any more,
+    # the last holdout (Feature Analysis screen descriptions) having moved
+    # to the tester's own chat model on 2026-08-15. Under the flag policy a
+    # soaked rollout flag is deleted with the behaviour hardcoded to the
+    # value it SHIPPED -- here `true` and an empty allow-list -- so both
+    # fields are gone and `llm.server_llm_enabled()` is a True constant.
+    # A stale QA_SERVER_LLM_* line in an existing .env is ignored
+    # (model_config uses extra="ignore"). Deleted rather than pinned OFF:
+    # pinning OFF would suppress the paths that are NOT on the MCP surface
+    # (evals/, the legacy graph.py/router.py coroutines), and deleting
+    # those backends is the separate follow-up plan CLAUDE.md names, never
+    # a drive-by. See docs/FEATURE_FLAGS.md -> "Changelog -- 2026-08-15".
     # --- Host-boomerang migration flags: DELETED 2026-08-12 ---------------
     # QA_HOST_RISK_REVIEW_ENABLED, QA_HOST_TEST_PLAN_REVIEW_ENABLED,
     # QA_HOST_CHECKLIST_REVIEW_ENABLED, QA_HOST_CHECKLIST_NLI_SUPPRESS_ENABLED
@@ -1216,11 +1016,15 @@ class Settings(BaseSettings):
     # features, and every ledger row they governed is terminal. On 2026-08-12
     # they were deleted and their ON behaviour hardcoded: on the host path this
     # server makes no risk-scoring, test-plan, requirement-decomposition,
-    # checklist NLI/adjudication or Jira comment-extraction call. Each stays
-    # AND-ed with the pre-existing, default-OFF feature flag it rides on
-    # (QA_LLM_RISK_SCORING / QA_TEST_PLAN_ARTIFACTS / QA_ATOMIC_CHECKLIST_ENABLED
-    # / QA_CHECKLIST_NLI_ENABLED / QA_COMMENT_RECONCILE_ENABLED), so a default
-    # install is unchanged, and every disclosure they drove is unchanged too.
+    # checklist NLI/adjudication or Jira comment-extraction call. Each was
+    # then AND-ed with the pre-existing, default-OFF feature flag it rode on
+    # -- and those five flags (QA_LLM_RISK_SCORING / QA_TEST_PLAN_ARTIFACTS /
+    # QA_ATOMIC_CHECKLIST_ENABLED / QA_CHECKLIST_NLI_ENABLED /
+    # QA_COMMENT_RECONCILE_ENABLED) were themselves DELETED on 2026-08-14
+    # (batch 8b-ii) and hardcoded, the checklist ON and the other four OFF.
+    # So there is no flag left to AND with: the switches are the named seams
+    # listed in docs/FEATURE_FLAGS.md, and a default install now RUNS the
+    # atomic checklist rather than opting out of it.
     # See docs/FEATURE_FLAGS.md -> "Changelog 2026-08-12" and
     # docs/LLM_MIGRATION_INVENTORY.md.
     # --- Prep crash-safety (2026-07-31 SHYJ-5645 incident) ----------------
@@ -1321,28 +1125,21 @@ class Settings(BaseSettings):
 
     @field_validator(
         "qa_api_test_enabled",
+        "qa_testrail_push_enabled",
+        "qa_xray_push_enabled",
         "qa_api_framework_write_enabled",
         "qa_api_framework_write_dry_run",
         "qa_ac_anchoring_enforce",
-        "qa_feature_analysis_enabled",
-        "qa_test_plan_artifacts",
-        "qa_llm_risk_scoring",
         "jira_fetch_comments",
-        "qa_comment_reconcile_enabled",
         "jira_fetch_images",
         "jira_fetch_parent",
         "jira_fetch_sibling_stories",
         "qa_dist_mode",
         "qa_mcp_enabled",
         "qa_update_require_signature",
-        "qa_llm_strict_host",
         "qa_host_ambiguity_require_result",
         "qa_host_image_require_relevant",
         "qa_host_dedup_apply",
-        "qa_server_llm_enabled",
-        "qa_atomic_checklist_enabled",
-        "qa_checklist_nli_enabled",
-        "qa_checklist_adjudicate_enabled",
         mode="before",
     )
     @classmethod
@@ -1385,7 +1182,6 @@ class Settings(BaseSettings):
 
     @field_validator(
         "qa_checklist_match_high",
-        "qa_checklist_match_low",
         "qa_checklist_min_granularity",
         "qa_rag_similar_min_score",
         mode="before",
@@ -1433,15 +1229,21 @@ class Settings(BaseSettings):
         return parsed
 
     @field_validator(
-        "qa_comment_reconcile_field_threshold",
-        "qa_comment_reconcile_dedup_threshold",
         "qa_host_dedup_max_removal_ratio",
         "qa_host_dedup_low_text_ratio",
         mode="before",
     )
     @classmethod
     def _coerce_reconcile_threshold(cls, v: object, info) -> float:
-        """Lenient, never-raising float coercion for the reconciler thresholds."""
+        """Lenient, never-raising float coercion for the host-dedup ratios.
+
+        The NAME is historical: it was written for
+        qa_comment_reconcile_field_threshold / _dedup_threshold, which were
+        deleted on 2026-08-15 with tools/comment_reconciler.py (dead-code
+        deletion batch D5). Kept rather than renamed because
+        _coerce_token_price's docstring below refers to it by name and the two
+        surviving fields' coercion behaviour is unchanged.
+        """
         default = cls.model_fields[info.field_name].default
         if isinstance(v, (int, float)) and not isinstance(v, bool):
             return float(v)
@@ -1456,47 +1258,6 @@ class Settings(BaseSettings):
             )
             return default
 
-    @field_validator(
-        "qa_token_price_generation_input_per_1m",
-        "qa_token_price_generation_output_per_1m",
-        "qa_token_price_classifier_input_per_1m",
-        "qa_token_price_classifier_output_per_1m",
-        "qa_token_price_cache_read_discount",
-        "qa_token_price_cache_write_multiplier",
-        mode="before",
-    )
-    @classmethod
-    def _coerce_token_price(cls, v: object, info) -> float:
-        """Lenient, never-raising float coercion for the token price table.
-
-        Mirrors _coerce_reconcile_threshold's shape, plus a floor: a NEGATIVE
-        rate would make the cost estimate SUBTRACT spend, which is never
-        meaningful, so it is clamped to 0.0 with a WARNING instead of being
-        honoured.
-        """
-        default = cls.model_fields[info.field_name].default
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            parsed = float(v)
-        else:
-            try:
-                parsed = float(str(v).strip())
-            except (TypeError, ValueError):
-                logger.warning(
-                    "Invalid %s=%r — using default %s",
-                    info.field_name.upper(),
-                    v,
-                    default,
-                )
-                return default
-        if parsed < 0:
-            logger.warning(
-                "Invalid %s=%r — a negative price would subtract cost; using 0.0",
-                info.field_name.upper(),
-                v,
-            )
-            return 0.0
-        return parsed
-
     @field_validator("qa_rag_top_k", mode="before")
     @classmethod
     def _coerce_top_k(cls, v: object) -> int:
@@ -1510,9 +1271,6 @@ class Settings(BaseSettings):
 
     @field_validator(
         "jira_max_comments",
-        "qa_comment_reconcile_max_comments",
-        "qa_comment_reconcile_max_amendments",
-        "qa_comment_reconcile_max_chars",
         "jira_max_images",
         "jira_max_image_bytes",
         "jira_max_parent_chars",
@@ -1522,34 +1280,16 @@ class Settings(BaseSettings):
         "qa_max_chat_image_bytes",
         "qa_device_command_timeout",
         "qa_device_screenshot_timeout",
-        "qa_maestro_run_timeout",
-        "qa_maestro_heal_max_attempts",
-        "qa_maestro_explore_max_steps",
-        "qa_maestro_explore_step_timeout",
-        "qa_maestro_translate_concurrency",
-        "qa_coverage_regen_max_rounds",
-        "qa_max_spec_bytes",
-        "qa_max_spec_chars",
-        "qa_llm_timeout_s",
         "qa_rag_recency_half_life_days",
         "qa_rag_max_entries",
         "qa_update_timeout",
-        "qa_web_run_max_cases",
-        "qa_web_run_vision_budget",
-        "qa_web_run_timeout_s",
         "qa_checklist_max_items",
         "qa_checklist_max_prompt_chars",
-        "qa_checklist_max_pairs",
-        "qa_prompt_cache_min_tokens",
-        "qa_prompt_cache_warm_max_tokens",
         "qa_prep_ttl_s",
         "qa_prep_max_bytes",
         "qa_prep_max_lifetime_s",
         "qa_host_dedup_max_groups",
         "qa_host_dedup_max_group_size",
-        "qa_category_stall_s",
-        "qa_category_stall_strikes",
-        "qa_ambiguity_cache_ttl_s",
         "qa_host_duplicate_prep_window_s",
         "qa_host_duplicate_suite_window_s",
         mode="before",

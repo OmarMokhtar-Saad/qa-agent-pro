@@ -12,16 +12,27 @@ import xlsxwriter
 
 from tools.bilingual import bidi_isolate, is_rtl_cell
 from tools.cell_sanitizer import sanitize_cell
-from tools.models import TestSuite, format_test_data_lines
+from tools.models import (
+    TestSuite,
+    display_requirement_id,
+    format_test_data_lines,
+)
 from tools.secure_temp import SUBDIR_NAME, make_secure_temp_path
 
 logger = logging.getLogger(__name__)
 
 # One row per test case — steps and expected results joined with newlines.
-# Requirement ID / Risk Score / Risk Label / Risk Rationale / Stable ID are
-# intentionally NOT exported here — they're internal fields (RTM traceability,
-# risk_scorer sorting, dedup and TestRail push all still read them off the
-# TestCase model), just not shown as columns in the tester-facing file.
+# Risk Score / Risk Label / Risk Rationale / Stable ID are intentionally NOT
+# exported here — they're internal fields (risk_scorer sorting, dedup and the
+# TestRail push all still read them off the TestCase model), just not shown as
+# columns in the tester-facing file.
+#
+# `requirement_id` LEFT that list on 2026-08-19 (F06). It was a defensible
+# "internal field" while it was only a sort/dedup key; it stopped being one when
+# the finalize reply started claiming "N/N acceptance criteria traced", because
+# the evidence for that claim then lived only in data/suites.db and the person
+# holding the workbook could not check it. It is column M, and the Requirements
+# Traceability sheet gives it the per-AC counts.
 _COL_TCID = 0
 _COL_MODULE = 1
 _COL_TITLE = 2
@@ -37,7 +48,10 @@ _COL_NOTES = 10
 # Priority, J for Status, A for TC ID) is derived from these indices via
 # _col_letter(), so a future insert cannot leave a stale letter behind.
 _COL_CATEGORY = 11
-_TOTAL_COLS = 12
+# F06 (2026-08-19): APPENDED for the same reason _COL_CATEGORY was, never
+# inserted -- every hardcoded column letter is derived from these indices.
+_COL_REQUIREMENT = 12
+_TOTAL_COLS = 13
 
 
 def _col_letter(index: int) -> str:
@@ -74,12 +88,13 @@ _HEADERS = [
     "Status",
     "Notes",
     "Coverage Category",
+    "Requirement ID",
 ]
 
 # Index-parallel to _HEADERS (test_column_constants_stay_in_lockstep) and also
 # the row-height autofit input. Column L went 22 -> 24: "Coverage Category" is 17
 # chars and the widest value, "Negative / Error Flows", is 22.
-_COL_WIDTHS = [10, 18, 30, 12, 14, 28, 45, 28, 45, 12, 20, 24]
+_COL_WIDTHS = [10, 18, 30, 12, 14, 28, 45, 28, 45, 12, 20, 24, 16]
 
 
 def _prepare(text: str) -> str:
@@ -166,6 +181,28 @@ def _notes_cell(tc: object, rule_pack_note: str) -> str:
         return note
 
 
+_UNTRACED_LABEL = "(untraced)"
+
+
+def _requirement_cell(tc: object) -> str:
+    """The Requirement ID cell for one case: the canonical tag, or _UNTRACED_LABEL.
+
+    Canonicalised through tools.models.display_requirement_id so this column and
+    the Requirements Traceability sheet name the same criterion identically.
+
+    An untagged case gets the LITERAL "(untraced)" rather than a blank: a reader
+    cannot tell an empty spreadsheet cell from a lost value or a broken export,
+    and "this case traces to no requirement" is a fact worth stating -- the one
+    F04 will make routine. Pure and never raises."""
+    try:
+        return (
+            display_requirement_id(getattr(tc, "requirement_id", "")) or _UNTRACED_LABEL
+        )
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("requirement cell rendering failed", exc_info=True)
+        return _UNTRACED_LABEL
+
+
 def generate_test_case_xlsx(suite: TestSuite, output_path: str | None = None) -> str:
     """Write suite to an XLSX file and return the file path."""
     if output_path is None:
@@ -177,8 +214,10 @@ def generate_test_case_xlsx(suite: TestSuite, output_path: str | None = None) ->
     try:
         _write_workbook(workbook, suite)
         _write_report_sheets(workbook, suite)
+        _write_rtm_sheet(workbook, suite)
         _write_checklist_sheets(workbook, suite)
         _write_assumed_sheet(workbook, suite)
+        _write_generation_notes_sheet(workbook, suite)
     finally:
         workbook.close()
 
@@ -212,9 +251,11 @@ def cleanup_temp_files(max_age_seconds: int = 3600) -> int:
 
 def _write_checklist_sheets(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
     """Append the 'Requirements Checklist' and 'Coverage Audit' sheets when the
-    suite carries ``_checklist_artifacts`` (QA_ATOMIC_CHECKLIST_ENABLED).
+    suite carries ``_checklist_artifacts`` (unconditional since 2026-08-14 --
+    QA_ATOMIC_CHECKLIST_ENABLED was deleted and the checklist hardcoded ON).
 
-    No-op when absent, so the workbook is byte-identical on the flag-off path.
+    No-op when absent, so the workbook is byte-identical for a suite that
+    carried no checklist.
     Never raises — a failure here must never break the core workbook. The
     checklist is a DURABLE artifact, which is why it gets its own sheet rather
     than a note in the summary."""
@@ -266,6 +307,120 @@ def _write_checklist_sheets(workbook: xlsxwriter.Workbook, suite: TestSuite) -> 
         logger.warning("checklist-sheet generation failed — skipping", exc_info=True)
 
 
+def _write_rtm_sheet(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
+    """Append the 'Requirements Traceability' sheet when the suite carries
+    ``_rtm_artifacts`` (attached in agents.test_scenario_agent._finalize_generation).
+
+    F06 (2026-08-19): the finalize reply claims "N/N acceptance criteria traced";
+    until this sheet existed that claim was checkable only against
+    data/suites.db. One row per criterion WITH the case count, so an
+    over-weighted criterion -- 25 of 96 cases on AC-001 against 3 on AC-002 in
+    the 2026-08-16 run -- is legible instead of hidden behind a total.
+
+    Written AHEAD of 'Requirements Checklist' deliberately: that sheet links
+    `CL-*` ids, the model-derived atomic checklist, which is a different
+    denominator with a different provenance. This one is about the `AC-*` ids the
+    headline claim is actually made against.
+
+    NO-OP WHEN THE SUITE CARRIES NO ARTIFACTS, which includes every re-export
+    through qa_export_suite: suite_store.load_suite rebuilds a TestSuite from the
+    `cases` table alone, so no private attribute survives and the checklist /
+    report / assumed / generation-notes sheets are all absent there too. The
+    Requirement ID COLUMN is unaffected (it is read off the case). Persisting the
+    artifacts is its own change, scoped with F12, and is deliberately NOT done by
+    re-parsing suites.feature_text -- that would rebuild a DIFFERENT AC list from
+    the one the suite was judged against. Never raises: a failure here must never
+    break the core workbook."""
+    try:
+        artifacts = getattr(suite, "_rtm_artifacts", None)
+        rows = (artifacts or {}).get("rows") or []
+        if not rows:
+            return
+        header_fmt = workbook.add_format(
+            {
+                "bold": True,
+                "font_color": "#FFFFFF",
+                "bg_color": "#1F4E79",
+                "border": 1,
+                "valign": "vcenter",
+                "text_wrap": True,
+            }
+        )
+        cell_fmt = workbook.add_format(
+            {"border": 1, "valign": "top", "text_wrap": True}
+        )
+        ws = workbook.add_worksheet("Requirements Traceability")
+        ws.set_column(0, 0, 14)
+        ws.set_column(1, 1, 72)
+        ws.set_column(2, 2, 8)
+        ws.set_column(3, 3, 42)
+        ws.set_column(4, 4, 14)
+        for r, row in enumerate(rows):
+            fmt = header_fmt if r == 0 else cell_fmt
+            for c, value in enumerate(row):
+                ws.write(r, c, sanitize_cell(str(value)), fmt)
+    except Exception:
+        logger.warning(
+            "Failed writing the Requirements Traceability sheet - skipping it",
+            exc_info=True,
+        )
+
+
+def _write_generation_notes_sheet(
+    workbook: xlsxwriter.Workbook, suite: TestSuite
+) -> None:
+    """Write the "Generation Notes" sheet: what this run could not do.
+
+    2026-08-15 (F5/F6/F7). Under-generated categories, an absent requirements
+    checklist and a preflight that left no evidence it ran were all disclosed in
+    the tool reply and all still reached finalized, exported suites -- because
+    the reply is transient chat a summarising host model prunes, while this
+    workbook is what the tester keeps and attaches to a ticket. The caveat has
+    to travel with the deliverable.
+
+    Deliberately the LAST sheet: it must not displace the test cases as the
+    thing that opens first, and its absence is the normal, healthy case.
+
+    No-op when the suite carries no notes, so a clean run's workbook is
+    byte-identical. Never raises -- a failure here must never break the core
+    workbook.
+    """
+    rows = getattr(suite, "_generation_notes", None)
+    if not rows:
+        return
+    try:
+        header_fmt = workbook.add_format(
+            {
+                "bold": True,
+                "font_color": "#FFFFFF",
+                "bg_color": "#9C2C2C",
+                "border": 1,
+                "valign": "vcenter",
+                "text_wrap": True,
+            }
+        )
+        cell_fmt = workbook.add_format(
+            {"border": 1, "valign": "top", "text_wrap": True}
+        )
+        ws = workbook.add_worksheet("Generation Notes")
+        ws.set_column(0, 0, 30)
+        ws.set_column(1, 1, 96)
+        ws.write(0, 0, "Finding", header_fmt)
+        ws.write(0, 1, "Detail", header_fmt)
+        for r, row in enumerate(rows, start=1):
+            try:
+                finding, detail = row[0], row[1]
+            except (TypeError, IndexError, KeyError):
+                finding, detail = "Note", row
+            ws.write(r, 0, sanitize_cell(str(finding)), cell_fmt)
+            ws.write(r, 1, sanitize_cell(str(detail)), cell_fmt)
+    except Exception:
+        logger.warning(
+            "Failed writing the Generation Notes sheet - skipping it",
+            exc_info=True,
+        )
+
+
 def _write_assumed_sheet(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
     """Write the "Assumed Requirements" sheet, if an entailment review produced one.
 
@@ -312,7 +467,10 @@ def _write_assumed_sheet(workbook: xlsxwriter.Workbook, suite: TestSuite) -> Non
 
 def _write_report_sheets(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
     """Append 'AC Validation' and 'Test Plan' sheets when the suite carries
-    report_artifacts (QA_TEST_PLAN_ARTIFACTS). No-op when absent. Never raises —
+    report_artifacts (from the host, or from a revived
+    tools.test_plan_report.test_plan_artifacts_enabled seam -- the flag
+    QA_TEST_PLAN_ARTIFACTS was deleted 2026-08-14). No-op when absent. Never
+    raises --
     a failure here must never break the core workbook."""
     artifacts = getattr(suite, "_report_artifacts", None)
     if not artifacts:
@@ -578,6 +736,10 @@ def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
         # it could not be resolved -- never guessed. A value self-reported by the
         # host model is normalised before it reaches here.
         _write_text(_COL_CATEGORY, getattr(tc, "category", None) or "")
+        # F06: the acceptance criterion this case verifies -- the evidence for
+        # the reply's "N/N traced" claim, in the file the tester keeps.
+        requirement_text = _requirement_cell(tc)
+        _write_text(_COL_REQUIREMENT, requirement_text)
 
         # Row height: fit the tallest cell in the row (wrapped text included),
         # not just the step count -- long titles/preconditions/data/expected
@@ -585,6 +747,7 @@ def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
         row_cells = [
             (notes_text, _COL_WIDTHS[_COL_NOTES]),
             (getattr(tc, "category", None) or "", _COL_WIDTHS[_COL_CATEGORY]),
+            (requirement_text, _COL_WIDTHS[_COL_REQUIREMENT]),
             (tc.tc_id, _COL_WIDTHS[_COL_TCID]),
             (tc.module, _COL_WIDTHS[_COL_MODULE]),
             (tc.title, _COL_WIDTHS[_COL_TITLE]),

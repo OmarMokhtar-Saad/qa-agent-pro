@@ -544,22 +544,19 @@ def _comment_lines(records: list[dict]) -> list[str]:
 def _effective_comment_cap() -> int:
     """How many comments to keep from the host-supplied payload.
 
-    jira_max_comments defaults to 5 while qa_comment_reconcile_max_comments
-    defaults to 50, so without this widening the deep-thread window would be a
-    dead knob. Widens ONLY while the reconciler is enabled. Never raises.
+    Returns ``jira_max_comments`` (default 5), and nothing else. Until
+    2026-08-15 this widened to
+    ``max(jira_max_comments, qa_comment_reconcile_max_comments)`` inside an
+    ``if comment_reconciler.enabled():`` branch -- unreachable since that seam
+    was pinned False on 2026-08-14, and deleted outright by dead-code deletion
+    batch D5 together with the module and the setting. The function itself is
+    RETAINED: it is the single place the comment window is decided, and
+    _extract_comment_records is written against it. Never raises.
     """
     try:
-        base = int(settings.jira_max_comments)
+        return int(settings.jira_max_comments)
     except Exception:
-        base = 5
-    try:
-        if settings.qa_comment_reconcile_enabled:
-            deep = int(settings.qa_comment_reconcile_max_comments)
-            if deep > base:
-                return deep
-    except Exception:
-        logger.debug("Comment-cap widening failed - using jira_max_comments")
-    return base
+        return 5
 
 
 def _extract_comment_records(fields: dict) -> list[dict]:
@@ -1943,7 +1940,7 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
     the REST path used to return.
 
     Returns EXACTLY the historical key set so every downstream consumer
-    (``_ground_and_gate``, ``comment_reconciler``, ``_prepare_generation``,
+    (``_ground_and_gate``, ``_prepare_generation``,
     ``rtm``) is unchanged: ``title, description, acceptance_criteria, priority,
     labels, components, comments, comments_meta, images, parent, subtasks,
     issuelinks, parent_context, raw_text, content`` (plus ``error``).
@@ -2050,12 +2047,17 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
         meta_block = ("\n".join(meta_lines) + "\n") if meta_lines else ""
 
         raw_text = f"{title}\n{meta_block}{description}".strip()
-        # QA_COMMENT_RECONCILE_ENABLED ON: the raw thread is SUPPRESSED here
-        # deliberately - tools/comment_reconciler turns it into a fenced,
-        # deterministically-resolved, URL-stripped AMENDMENTS block that becomes
-        # the ONLY comment-derived input the generator sees. Unchanged from the
-        # REST implementation.
-        if comments and not settings.qa_comment_reconcile_enabled:
+        # The raw "## Comments" dump, unchanged from the REST implementation
+        # and now UNCONDITIONAL. It was briefly conditional: while
+        # tools/comment_reconciler was enabled the thread was SUPPRESSED here
+        # deliberately, so its fenced, deterministically-resolved, URL-stripped
+        # AMENDMENTS block could be the only comment-derived input the
+        # generator saw. That seam became a False constant on 2026-08-14 and
+        # the module was DELETED on 2026-08-15 (dead-code deletion batch D5),
+        # so the dump is restored permanently -- which is what every install
+        # has actually done since the pin. A revival must re-suppress it here;
+        # see docs/RETIRED_CAPABILITIES.md section 4.
+        if comments:
             raw_text += "\n\n## Comments\n" + "\n".join(f"- {c}" for c in comments)
 
         # resolve_ac_field re-checks usability and, when enabled, looks for a
