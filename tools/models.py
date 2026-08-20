@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import re
 import uuid
 from enum import Enum
 from typing import Literal, Optional
@@ -12,6 +14,8 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _compute_stable_id(title: str, steps: list["TestStep"]) -> str:
@@ -141,6 +145,63 @@ def format_test_data_lines(items: list["TestDataItem"]) -> list[str]:
     return lines
 
 
+# --------------------------------------------------------------------------- #
+# Requirement-id helpers
+#
+# They live HERE, beside TestCase, rather than in tools/rtm.py where
+# normalize_ac_id was born, because the five exporters need them on every row of
+# every export and tools/rtm.py is a comparatively heavy sibling -- it pulls in
+# tools.atomic_checklist and tools.embeddings, which a plain CSV / feature file /
+# Playwright skeleton has no reason to load. tools.rtm RE-EXPORTS
+# normalize_ac_id, so every existing `from tools.rtm import normalize_ac_id`
+# keeps resolving and no caller changed. Both are pure and never raise.
+# --------------------------------------------------------------------------- #
+
+_CANONICAL_AC_RE = re.compile(r"^AC-\d{3,}$")
+
+
+def normalize_ac_id(raw: str | None) -> str:
+    """Canonicalise an AC identifier so trace matching is robust to LLM/Jira
+    formatting drift (QW-12 / I-059 / B-024).
+
+    Upper-cases, strips spaces, and rewrites any ``AC``/``AC-``/``AC0`` + number
+    form to the canonical ``AC-{N:03d}`` (so ``AC-1``, ``AC001``, ``ac-01`` all
+    map to ``AC-001``). Non-matching values are returned upper-cased/stripped so
+    unrelated ids still compare consistently. Never raises.
+    """
+    if not raw:
+        return ""
+    s = str(raw).strip().upper().replace(" ", "")
+    m = re.match(r"^AC-?0*(\d+)$", s)
+    if m:
+        return f"AC-{int(m.group(1)):03d}"
+    return s
+
+
+def display_requirement_id(raw: str | None) -> str:
+    """A case's requirement tag as a reader should see it, or "" when it has none.
+
+    F06 (2026-08-19). Canonicalises an AC-SHAPED tag through ``normalize_ac_id``
+    so the exported Requirement ID column and the Requirements Traceability sheet
+    cannot name one criterion two ways ("AC-1" in the column, "AC-001" in the
+    sheet, matched as the same thing).
+
+    Anything NOT AC-shaped is returned stripped but otherwise UNTOUCHED:
+    ``normalize_ac_id`` upper-cases and de-spaces every value it does not
+    recognise, which is right for something only ever COMPARED and wrong for
+    something rendered into a deliverable -- "Login must work" is not
+    "LOGINMUSTWORK". Never raises."""
+    try:
+        text = str(raw or "").strip()
+        if not text:
+            return ""
+        canonical = normalize_ac_id(text)
+        return canonical if _CANONICAL_AC_RE.match(canonical) else text
+    except Exception:  # pragma: no cover - a display helper must never raise
+        logger.debug("display_requirement_id failed -- returning empty", exc_info=True)
+        return ""
+
+
 class TestCase(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -248,15 +309,19 @@ class TestSuite(BaseModel):
     )
 
     # Tester-facing report artifacts (AC-Validation / Test Plan) attached
-    # post-generation by agents.test_scenario_agent when QA_TEST_PLAN_ARTIFACTS
-    # is ON. A PrivateAttr so it is EXCLUDED from the JSON schema used as an LLM
+    # post-generation by agents.test_scenario_agent when
+    # tools.test_plan_report.test_plan_artifacts_enabled() is ON (a False
+    # constant since 2026-08-14) or the host returned artifacts. A PrivateAttr
+    # so it is EXCLUDED from the JSON schema used as an LLM
     # response_model (it must never pollute generation) and from serialization;
     # tools.xlsx_generator reads it via getattr to add matching sheets.
     _report_artifacts: Optional[dict] = PrivateAttr(default=None)
 
     # Atomic Requirements Checklist + its coverage audit (Batch 2), attached
-    # post-generation by agents.test_scenario_agent when
-    # QA_ATOMIC_CHECKLIST_ENABLED is ON. A PrivateAttr for the same reasons as
+    # post-generation by agents.test_scenario_agent whenever a checklist was
+    # produced -- unconditional since 2026-08-14, when
+    # QA_ATOMIC_CHECKLIST_ENABLED was deleted and the behaviour hardcoded ON.
+    # A PrivateAttr for the same reasons as
     # _report_artifacts above: it must never pollute the JSON schema used as an
     # LLM response_model, and must not be serialized. tools.xlsx_generator and
     # tools.mcp_handlers read it via getattr.
@@ -278,6 +343,35 @@ class TestSuite(BaseModel):
     # PrivateAttr for the same reasons as
     # the two above -- it must not appear in the JSON schema handed to a model.
     _assumed_artifacts: Optional[dict] = PrivateAttr(default=None)
+
+    # Rows for the "Generation Notes" sheet: what this run could NOT do, or did
+    # short of what was asked -- an under-generated category, an absent
+    # requirements checklist, a preflight that left no evidence it ran. A list
+    # of (finding, detail) pairs, attached by tools.mcp_handlers just before the
+    # export.
+    #
+    # WHY IT EXISTS (2026-08-15, F5/F6/F7): each of these was already disclosed
+    # in the tool reply, and each was measured surviving into a finalized suite
+    # anyway -- because the reply is transient chat that a summarising host
+    # model prunes, while the .xlsx is the artifact the tester keeps, attaches
+    # to a ticket and reads a week later. A caveat that does not travel with the
+    # deliverable is not a caveat. A PrivateAttr for the same reasons as the
+    # attributes above: it must never appear in the JSON schema handed to a
+    # model, and must not be serialized.
+    _generation_notes: Optional[list] = PrivateAttr(default=None)
+
+    # Rows for the "Requirements Traceability" sheet: one per acceptance
+    # criterion, with the case COUNT and the linked tc_ids. Attached by
+    # agents.test_scenario_agent._finalize_generation -- the one place holding
+    # both the final renumbered cases and the ACs.
+    #
+    # WHY IT EXISTS (F06, 2026-08-19): the finalize reply claims "N/N acceptance
+    # criteria traced", and until this sheet existed that claim could only be
+    # checked against data/suites.db -- `requirement_id` was on every case and on
+    # no exported column. A PrivateAttr for the same reasons as the attributes
+    # above: it must never appear in the JSON schema handed to a model, and must
+    # not be serialized.
+    _rtm_artifacts: Optional[dict] = PrivateAttr(default=None)
 
     @field_validator("test_cases", mode="after")
     @classmethod

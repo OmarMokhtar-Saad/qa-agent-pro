@@ -23,7 +23,7 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
-from tools.models import TestCase, TestSuite
+from tools.models import TestCase, TestSuite, display_requirement_id
 from tools.secure_temp import SUBDIR_NAME, make_secure_temp_path
 
 logger = logging.getLogger(__name__)
@@ -43,10 +43,37 @@ def _tag(value: str) -> str:
     return "@" + "_".join(str(value).split())
 
 
+# F06 (2026-08-19): a tag is the idiomatic Gherkin carrier for traceability
+# (`@AC-001`), and BDD runners filter on it. Allowlist-gated rather than passed
+# through _tag: `requirement_id` is free text a model wrote, and a value carrying
+# an `@`, a quote or a newline would emit a line that is not valid Gherkin. An
+# unusable value emits NO tag -- the xlsx/csv Requirement ID column still carries
+# it verbatim, so nothing is lost, only this one representation is declined.
+_TAG_SAFE = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+_TAG_MAX = 40
+
+
+def _requirement_tag(tc: TestCase) -> str:
+    """``@AC-001`` for a case with a usable requirement tag, else ""."""
+    try:
+        value = display_requirement_id(getattr(tc, "requirement_id", ""))
+        if not value or len(value) > _TAG_MAX:
+            return ""
+        if not all(ch in _TAG_SAFE for ch in value):
+            return ""
+        return "@" + value
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("requirement tag rendering failed", exc_info=True)
+        return ""
+
+
 def _scenario_tags(tc: TestCase) -> str:
     tags = [_tag(tc.type.value), _tag(tc.priority.value)]
     if tc.risk_label:
         tags.append(_tag(f"risk_{tc.risk_label}"))
+    requirement = _requirement_tag(tc)
+    if requirement:
+        tags.append(requirement)
     return "  " + " ".join(tags)
 
 

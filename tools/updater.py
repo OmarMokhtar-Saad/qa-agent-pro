@@ -513,6 +513,37 @@ def _fetch_latest_release_uncached(
     }
 
 
+def _restore_exec_bits(zf: zipfile.ZipFile, dest: Path) -> None:
+    """Re-apply the archive's EXECUTE bits after extraction.
+
+    ``ZipFile.extractall`` does not restore the POSIX mode, even though
+    ``_safe_extract_zip`` has already parsed ``external_attr`` for its symlink
+    check and could simply keep it. Everything executable in a release therefore
+    landed non-executable. ``apply_update`` had a suffix-scoped workaround for
+    ``*.sh`` only, so ``connect.sh`` survived and nothing else did; the sibling
+    path shipped a tester-facing "./mvnw is not executable" message for the same
+    root cause (framework_writer.py), which is this class reaching a real user.
+
+    Bounded on purpose: the execute bits the archive itself carried, OR-ed onto
+    what is there. Never setuid/setgid/sticky, never a bit the archive did not
+    carry, and an OSError on one member is skipped rather than failing an
+    extraction that has already passed every containment check.
+    """
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        exec_bits = (info.external_attr >> 16) & 0o111
+        if not exec_bits:
+            continue
+        target = dest / info.filename
+        if target.is_symlink() or not target.is_file():
+            continue
+        try:
+            target.chmod(stat.S_IMODE(target.stat().st_mode) | exec_bits)
+        except OSError:
+            continue
+
+
 def _safe_extract_zip(zf: zipfile.ZipFile, dest: Path) -> None:
     """Extract a release zip, refusing any member that would escape ``dest``.
 
@@ -537,6 +568,7 @@ def _safe_extract_zip(zf: zipfile.ZipFile, dest: Path) -> None:
         if stat.S_ISLNK(mode):
             raise ValueError(f"Unsafe symlink in zip: {name!r}")
     zf.extractall(dest)
+    _restore_exec_bits(zf, dest)
 
 
 def download_and_extract(
@@ -608,11 +640,16 @@ def apply_update(new_tree: Path, install_dir: Path, version: str = "update") -> 
             _make_writable(dest)
             shutil.copy2(src, dest)
             if rel.endswith(".sh"):
-                # Zip extraction drops POSIX modes, so a shell script would
-                # otherwise land non-executable for the window between this
-                # copy and the later lock_files() pass (which only runs after
-                # _pip_install()/migrate_env() finish) -- long enough for a
-                # client's spawn attempt to hit EACCES. Restore exec bits now.
+                # RETAINED, and not redundant now that _safe_extract_zip
+                # restores modes. That restore can only replay bits the archive
+                # CARRIED: a zip built on Windows has create_system != 3 and no
+                # POSIX bits at all, so `external_attr >> 16` is 0 and there is
+                # nothing to put back. This suffix rule is the only thing
+                # covering that case, and without it a shell script would land
+                # non-executable for the window between this copy and the later
+                # lock_files() pass (which only runs after _pip_install() /
+                # migrate_env() finish) -- long enough for a client's spawn
+                # attempt to hit EACCES.
                 st_mode = os.stat(dest).st_mode
                 os.chmod(dest, st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         logger.info(

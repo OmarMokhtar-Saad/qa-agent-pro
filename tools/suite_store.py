@@ -22,7 +22,6 @@ import json
 import logging
 import sqlite3
 import time
-import uuid
 from pathlib import Path
 
 from config.settings import settings
@@ -51,19 +50,6 @@ CREATE TABLE IF NOT EXISTS cases (
     FOREIGN KEY (suite_id) REFERENCES suites(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_cases_suite_id ON cases(suite_id);
-CREATE TABLE IF NOT EXISTS web_runs (
-    id           TEXT PRIMARY KEY,
-    suite_id     TEXT NOT NULL,
-    base_url     TEXT NOT NULL DEFAULT '',
-    dry_run      INTEGER NOT NULL DEFAULT 1,
-    passed       INTEGER NOT NULL DEFAULT 0,
-    failed       INTEGER NOT NULL DEFAULT 0,
-    total        INTEGER NOT NULL DEFAULT 0,
-    payload_json TEXT NOT NULL,
-    created_at   REAL NOT NULL,
-    FOREIGN KEY (suite_id) REFERENCES suites(id) ON DELETE CASCADE
-);
-CREATE INDEX IF NOT EXISTS idx_web_runs_suite_id ON web_runs(suite_id);
 CREATE TABLE IF NOT EXISTS checklists (
     suite_id     TEXT PRIMARY KEY,
     payload_json TEXT NOT NULL,
@@ -116,6 +102,54 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
         logger.debug("suite_store: suites.prep_id migration skipped", exc_info=True)
 
 
+def _drop_retired_tables(conn: sqlite3.Connection) -> None:
+    """Shed schema a DELETED feature left behind in an ALREADY-created DB.
+
+    F13 (2026-08-19): dead-code batch D3 (2026-08-15) deleted web suite
+    execution outright -- ``tools/web_runner.py``, the ``qa_run_web_suite`` /
+    ``qa_submit_web_run`` tools and this module's own ``web_runs`` DDL and
+    save/load pair. What it could not delete is the table inside a suites.db
+    that already existed: ``CREATE TABLE IF NOT EXISTS`` only ever ADDS, so an
+    install whose store predates that date carries ``web_runs``, its
+    ``idx_web_runs_suite_id`` index and every row it ever wrote through every
+    future upgrade, advertising a capability the product no longer has.
+
+    Dropping it here rather than in a one-off script is what makes the
+    disposition hold: the row data and the declaration go in the SAME statement
+    (SQLite drops a table's indexes with it), and no DDL remains anywhere in the
+    tree that could recreate it, so the table cannot reappear empty on the next
+    start.
+
+    Discarded rows are DISCLOSED, not deleted silently -- a populated
+    ``web_runs`` held per-run browser detail against a real ``base_url``, and an
+    operator who wanted it back deserves to learn from the log that it went and
+    how much. The COUNT is logged; the payload and the URL are not, because they
+    are captured external content and a log line is not the place for them.
+
+    Idempotent (the second connect finds no table and does nothing) and never
+    raises -- a store that cannot drop a dead table must still save suites.
+    """
+    try:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("web_runs",),
+        ).fetchone()
+        if row is None:
+            return
+        count = conn.execute("SELECT COUNT(*) FROM web_runs").fetchone()[0]
+        if count:
+            logger.warning(
+                "suite_store: dropping retired table 'web_runs' and discarding "
+                "%d row(s) -- web suite execution was deleted on 2026-08-15 "
+                "(dead-code batch D3). Restore a backup of suites.db if the run "
+                "history is still wanted.",
+                count,
+            )
+        conn.execute("DROP TABLE web_runs")
+    except sqlite3.Error:
+        logger.debug("suite_store: web_runs drop skipped", exc_info=True)
+
+
 def _connect() -> sqlite3.Connection:
     """Open the DB (creating parent dirs + schema). Caller must close."""
     path = _db_path()
@@ -127,6 +161,10 @@ def _connect() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(_SCHEMA)
     _ensure_columns(conn)
+    # AFTER _ensure_columns on purpose: the prep_id migration is the one
+    # that changes behaviour if it fails, so nothing this function does
+    # can be what stopped it.
+    _drop_retired_tables(conn)
     return conn
 
 
@@ -383,9 +421,13 @@ async def load_suite_meta(suite_id: str) -> dict:
 
     ``load_suite`` rebuilds the TestSuite from the persisted cases; this returns
     the suite ROW instead (feature_text / source_url / created_at / created_by).
-    Exporters that need the originating ticket -- e.g. tools/zephyr_exporter.py,
-    whose Project / Issue columns come from the Jira story key -- read it here.
-    No schema change: every column already existed. Never raises.
+    It was added for tools/zephyr_exporter.py, whose Project / Issue columns
+    came from the Jira story key. That module and its caller
+    ``mcp_handlers._suite_story_key`` were DELETED on 2026-08-15 (dead-code
+    deletion batch D4), so this accessor has NO production caller today. It
+    is RETAINED on purpose -- a general-purpose store read on a live module,
+    not a zephyr helper -- and tests/test_suite_store.py is its cover. No
+    schema change: every column already existed. Never raises.
     """
     try:
         if not suite_id:
@@ -408,115 +450,6 @@ async def list_recent_suites(limit: int = 5) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Web-run persistence (Web Suite Execution -- tools/web_runner.py)
-# --------------------------------------------------------------------------- #
-
-
-def _save_web_run_sync(
-    suite_id: str,
-    base_url: str,
-    dry_run: bool,
-    summary: dict,
-    payload: dict,
-) -> str:
-    run_id = uuid.uuid4().hex
-    now = time.time()
-    conn = _connect()
-    try:
-        with conn:  # transaction
-            # M1-web: web_runs.suite_id is an FK into suites and PRAGMA
-            # foreign_keys is ON, so a run against an in-session suite that was
-            # never persisted would raise IntegrityError and be silently dropped.
-            # Upsert a stub suites row (INSERT OR IGNORE never touches an existing
-            # suite's feature_text) so the self-contained run always persists.
-            if suite_id:
-                conn.execute(
-                    "INSERT OR IGNORE INTO suites (id, feature_text, created_at) "
-                    "VALUES (?, '', ?)",
-                    (suite_id, now),
-                )
-            conn.execute(
-                "INSERT INTO web_runs (id, suite_id, base_url, dry_run, passed, "
-                "failed, total, payload_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    run_id,
-                    suite_id or "",
-                    base_url or "",
-                    1 if dry_run else 0,
-                    int(summary.get("passed", 0)),
-                    int(summary.get("failed", 0)),
-                    int(summary.get("total", 0)),
-                    json.dumps(payload),
-                    now,
-                ),
-            )
-        return run_id
-    finally:
-        conn.close()
-
-
-def _load_web_run_sync(run_id: str) -> dict | None:
-    conn = _connect()
-    try:
-        row = conn.execute(
-            "SELECT id, suite_id, base_url, dry_run, passed, failed, total, "
-            "payload_json, created_at FROM web_runs WHERE id = ?",
-            (run_id,),
-        ).fetchone()
-    finally:
-        conn.close()
-    if row is None:
-        return None
-    try:
-        payload = json.loads(row[7])
-    except (ValueError, TypeError):
-        payload = {}
-    return {
-        "run_id": row[0],
-        "suite_id": row[1],
-        "base_url": row[2],
-        "dry_run": bool(row[3]),
-        "passed": row[4],
-        "failed": row[5],
-        "total": row[6],
-        "payload": payload,
-        "created_at": row[8],
-    }
-
-
-async def save_web_run(
-    suite_id: str,
-    base_url: str,
-    dry_run: bool,
-    summary: dict,
-    payload: dict,
-) -> dict:
-    """Persist one web run. Returns {"content": {"run_id": ...}}. Never raises."""
-    try:
-        run_id = await asyncio.to_thread(
-            _save_web_run_sync, suite_id, base_url, dry_run, summary, payload
-        )
-        logger.info("suite_store: saved web run %s (suite %s)", run_id, suite_id)
-        return {"error": None, "content": {"run_id": run_id}}
-    except Exception as exc:
-        logger.exception("suite_store.save_web_run failed")
-        return {"error": str(exc), "content": None}
-
-
-async def load_web_run(run_id: str) -> dict:
-    """Load a web run by id. Returns {"content": dict|None}. Never raises."""
-    try:
-        if not run_id:
-            return {"error": None, "content": None}
-        row = await asyncio.to_thread(_load_web_run_sync, run_id)
-        return {"error": None, "content": row}
-    except Exception as exc:
-        logger.exception("suite_store.load_web_run failed")
-        return {"error": str(exc), "content": None}
-
-
-# --------------------------------------------------------------------------- #
 # Atomic Requirements Checklist persistence (Batch 2)
 #
 # The checklist + its coverage audit are a DURABLE artifact, not an in-memory
@@ -533,7 +466,8 @@ def _save_checklist_sync(suite_id: str, payload: dict) -> str:
             # ON, so a checklist for an in-session suite that was never persisted
             # would raise IntegrityError and be silently dropped. Upsert a stub
             # suites row first (INSERT OR IGNORE never touches an existing
-            # suite's feature_text) — same fix as _save_web_run_sync (M1-web).
+            # suite's feature_text) — the M1-web fix, first written for the
+            # web-run persistence block batch D3 deleted on 2026-08-15.
             conn.execute(
                 "INSERT OR IGNORE INTO suites (id, feature_text, created_at) "
                 "VALUES (?, '', ?)",

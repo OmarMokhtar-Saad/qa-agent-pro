@@ -229,6 +229,39 @@ def _connect() -> sqlite3.Connection:
 # --------------------------------------------------------------------------- #
 
 
+def _purge_expired_sync(conn: sqlite3.Connection) -> int:
+    """Delete every prep past the HARD lifetime cap. Returns the row count.
+
+    F8 (2026-08-15). Until now the only expiry path was _load_prep_sync, which
+    evaluates _expired() for ONE prep_id -- the one a caller already named. A
+    prep nobody ever loads again was therefore never examined and never
+    deleted: data/suites.db held 205 rows reaching back to 2026-07-28 under
+    QA_PREP_TTL_S=3600 and QA_PREP_MAX_LIFETIME_S=14400. The TTL governed
+    USABILITY, never RETENTION, and each of those payloads carries the ticket's
+    full description, its comment thread and its sibling stories, so the gap is
+    a data-retention one rather than a disk-space one.
+
+    WHY THE HARD CAP AND NOT THE SLIDING TTL: _expired() restarts the TTL clock
+    at the last touch, so a prep inside its TTL may still be live for a flow
+    this process knows nothing about (host mode means several MCP server
+    processes share this one file). ``created_at + _max_lifetime_s()`` is the
+    one bound no touch can extend -- _expired() returns True for every row past
+    it unconditionally -- so a row this deletes could not have been loaded
+    successfully by anyone anyway. Deleting it destroys no reachable work.
+
+    prep_submissions rows go with it via ON DELETE CASCADE (_connect sets
+    PRAGMA foreign_keys = ON). Caller supplies the connection and owns the
+    transaction. Never raises -- retention hygiene must not break a save.
+    """
+    try:
+        cutoff = time.time() - _max_lifetime_s()
+        cur = conn.execute("DELETE FROM preps WHERE created_at < ?", (cutoff,))
+        return int(cur.rowcount or 0)
+    except sqlite3.Error:
+        logger.debug("prep_store: expired-prep purge skipped", exc_info=True)
+        return 0
+
+
 def _save_prep_sync(payload: dict, created_by: str | None) -> str:
     prep_id = uuid.uuid4().hex
     now = time.time()
@@ -239,6 +272,19 @@ def _save_prep_sync(payload: dict, created_by: str | None) -> str:
                 "INSERT INTO preps (id, payload_json, created_at, created_by) "
                 "VALUES (?, ?, ?, ?)",
                 (prep_id, json.dumps(payload), now, created_by),
+            )
+            # Sweep on WRITE, inside the same transaction. Not in _connect():
+            # that runs on every read too, and a DELETE on the read path would
+            # turn a concurrent reader into a writer and contend for the WAL
+            # lock. A prepare is the natural, low-frequency sweep point, and it
+            # is already a write. The preps table is small (hundreds of rows),
+            # so the scan is bounded in practice.
+            purged = _purge_expired_sync(conn)
+        if purged:
+            logger.info(
+                "prep_store: purged %d prep(s) past the %ds lifetime cap",
+                purged,
+                int(_max_lifetime_s()),
             )
         return prep_id
     finally:
@@ -727,11 +773,19 @@ def _find_prep_snapshot_sync(source_url: str, window_s: float) -> dict | None:
         stamp = str(meta.get("jira_updated") or "").strip()[:64]
         if not stamp:
             continue  # a prep written before the stamp existed proves nothing
+        try:
+            # F9 (2026-08-15): how much ticket text the SAME revision yielded
+            # last time. 0 for an envelope written before this key existed,
+            # which the caller reads as "no baseline" and stays silent about.
+            content_chars = int(meta.get("jira_content_chars") or 0)
+        except (TypeError, ValueError):
+            content_chars = 0
         return {
             "prep_id": pid,
             "created_at": created_f,
             "age_s": max(0.0, now - created_f),
             "jira_updated": stamp,
+            "content_chars": max(0, content_chars),
         }
     return None
 

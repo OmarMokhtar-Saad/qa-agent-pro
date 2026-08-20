@@ -310,7 +310,25 @@ async def _tracked(name, ctx, coro):
     the dist path, a scrubbed ``capture_error_dist`` on failure. A per-tool
     ``$ai_trace_id`` is set so LLM ``$ai_generation`` events link to this call.
     Telemetry NEVER changes behaviour: the result or exception propagates
-    unchanged and any metric failure is swallowed in the telemetry layer."""
+    unchanged and any metric failure is swallowed in the telemetry layer.
+
+    It also writes the ONE log line that names the tool (2026-08-19, F07).
+    Before it, the only per-call trace in ``data/logs/qa-agents-<pid>.log`` was
+    the MCP library's nameless ``Processing request of type CallToolRequest``:
+    a 12-call live run left 11 calls unattributable, and a forensics script that
+    looked for tool names in the log found none and picked no log at all. The
+    line belongs HERE, not in each handler, because this is the one seam every
+    tool already passes through and the name is a literal at each call site.
+
+    WHY IT CANNOT LEAK A PAYLOAD: this function is handed a NAME and an already
+    built coroutine. Ticket text, generated cases and test data are bound inside
+    that coroutine and are not values this frame can see, so the containment is
+    structural rather than a rule about what to format. Keep it that way -- do
+    not add an ``args`` parameter to satisfy a future 'just log the prep_id'.
+
+    One line, INFO, per call: the file already reaches ~220 KB on a busy install,
+    and ``mcp.server.lowlevel.server`` is silenced in ``_configure_logging`` so
+    the per-call volume is unchanged rather than doubled."""
     start = time.monotonic()
     ok = True
     error_type = None
@@ -324,9 +342,16 @@ async def _tracked(name, ctx, coro):
         telemetry.capture_error_dist(exc, tool=name, origin="mcp_tool")
         raise
     finally:
+        duration_ms = int((time.monotonic() - start) * 1000)
+        logger.info(
+            "tool %s: %s in %d ms",
+            name,
+            "ok" if ok else "error %s" % (error_type or "Exception"),
+            duration_ms,
+        )
         telemetry.tool_called(
             name,
-            duration_ms=int((time.monotonic() - start) * 1000),
+            duration_ms=duration_ms,
             ok=ok,
             error_type=error_type,
             client_name=_CLIENT.get("name", ""),
@@ -358,6 +383,25 @@ def _make_progress(ctx):
             logger.debug("mcp report_progress failed for %r", message, exc_info=True)
 
     return progress
+
+
+def _feature_analysis_enabled() -> bool:
+    """Always True -- Feature Analysis is ON, unconditionally.
+
+    QA_FEATURE_ANALYSIS_ENABLED was DELETED on 2026-08-14 (flag-surface
+    reduction, batch 8c) and hardcoded ON: the flag policy's "promote to
+    default ON (flag deleted)" outcome for an experiment, taken by the
+    maintainer ahead of the 2026-11-12 review date. A named seam, mirroring
+    ``tools.mcp_handlers._feature_analysis_enabled``, so a revival is one
+    line in each of two documented places. NOT settings-derived.
+
+    This is the ONE batch in the programme that changes behaviour in the
+    EXPANDING direction, so read the gate below carefully: the
+    test-cases-only EDITION check still outranks this seam and is still
+    evaluated, which is what keeps the credential-free public distribution
+    from registering a pair whose mobile modes reach ``ask_vision``.
+    """
+    return True
 
 
 def _elicit_enabled() -> bool:
@@ -862,7 +906,7 @@ def build_server():
         ctx: Context, suite_id: str = "", format: str = "", output_dir: str = ""
     ) -> str:
         """Export a previously generated suite (by suite_id) to one of:
-        csv | xlsx | gherkin | playwright | testrail | zephyr.
+        csv | xlsx | gherkin | playwright | testrail.
         Returns the written file path. Reuses the stored suite; live-push dry-run
         defaults are preserved (this writes files, it never pushes to a TMS).
 
@@ -870,16 +914,10 @@ def build_server():
         FULL path (`~/Desktop`, `/Users/you/Documents`). A bare relative answer
         like `desktop` is refused with the full path it probably meant, and the
         configured default is used instead. Leave it empty and each format keeps
-        its own default location -- a secure temp folder for
-        csv/xlsx/gherkin/playwright/testrail, QA_EXPORT_DIR for the zephyr pair.
-        The .xlsx that generation auto-exports is unaffected: it always lands in
-        QA_EXPORT_DIR with no question asked.
-
-        `zephyr` is the Zephyr for Jira / Squad import pair: a 15-column workbook
-        plus its zfj_import_config.json field map. It is accepted only when
-        QA_ZEPHYR_EXPORT_ENABLED is on, and while QA_ZEPHYR_DRY_RUN is on (the
-        default) it emits a single-case PILOT workbook meant for a sandbox
-        project first, because the column layout is not vendor-verified yet.
+        its own default location -- a secure temp folder, which since the
+        Zephyr pair was deleted on 2026-08-15 is every format there is.
+        The .xlsx that generation auto-exports is unaffected: it always
+        lands in QA_EXPORT_DIR with no question asked.
         """
         return await _tracked(
             "qa_export_suite",
@@ -950,13 +988,69 @@ def build_server():
                 ),
             )
 
+        if settings.qa_testrail_push_enabled or settings.qa_xray_push_enabled:
+
+            @mcp.tool()
+            async def qa_push_suite(
+                suite_id: str,
+                target: str,
+                project_id: int = 0,
+                section_name: str = "",
+                apply: bool = False,
+                ctx: Context = None,
+            ) -> str:
+                """Push a stored test suite into TestRail or Xray.
+
+                target="testrail" (needs the numeric project_id from the TestRail
+                URL) or target="xray". Defaults to a PREVIEW: it reports what would
+                be created and sends nothing. A real push needs apply=true AND the
+                target's kill-switch flag enabled in .env. Nothing here can delete
+                the cases afterwards.
+                """
+                return await _tracked(
+                    "qa_push_suite",
+                    ctx,
+                    mcp_handlers.handle_push_suite(
+                        suite_id,
+                        target,
+                        project_id=project_id,
+                        section_name=section_name,
+                        apply=apply,
+                        progress=_make_progress(ctx),
+                    ),
+                )
+
         if settings.qa_api_test_enabled:
+
+            @mcp.tool()
+            async def qa_api_project(
+                create: str = "", use: str = "", ctx: Context = None
+            ) -> str:
+                """Create a new API test project, or continue with an existing one.
+
+                Every API flow starts here. Call with NO arguments to get the
+                choice plus the projects already registered, and ask the tester in
+                plain chat. create="<name>" fetches the public project template,
+                renames it to that project, makes ONE local commit (no remote,
+                nothing pushed) and proves it compiles before keeping it.
+                use="<name or path>" continues with an existing project; an
+                existing api-automation-framework checkout is adopted in place.
+                Then call qa_prepare_api_tests.
+                """
+                return await _tracked(
+                    "qa_api_project",
+                    ctx,
+                    mcp_handlers.handle_api_project(
+                        create, use, progress=_make_progress(ctx)
+                    ),
+                )
 
             @mcp.tool()
             async def qa_prepare_api_tests(
                 input: str = "",
                 intake_id: str = "",
                 confirmed: bool = False,
+                project: str = "",
                 ctx: Context = None,
             ) -> str:
                 """Start (or continue) an API endpoint test intake.
@@ -966,12 +1060,21 @@ def build_server():
                 Returns an intake card (with the questions to ask) or, once complete
                 and confirmed=true, a generation task envelope YOU answer, then call
                 qa_submit_api_tests with the task_id and your cases.
+
+                project="<name>" scopes the endpoint and auth-flow registry, so a
+                dependency you already built is reused instead of rebuilt. Pass it
+                once, on the first call; it is remembered for the rest of the
+                intake. Omit it and everything still works for this session only.
                 """
                 return await _tracked(
                     "qa_prepare_api_tests",
                     ctx,
                     mcp_handlers.handle_prepare_api_tests(
-                        input, intake_id, confirmed, progress=_make_progress(ctx)
+                        input,
+                        intake_id,
+                        confirmed,
+                        project,
+                        progress=_make_progress(ctx),
                     ),
                 )
 
@@ -996,7 +1099,10 @@ def build_server():
 
             @mcp.tool()
             async def qa_write_api_test(
-                suite_id: str, apply: bool = False, ctx: Context = None
+                suite_id: str,
+                apply: bool = False,
+                project: str = "",
+                ctx: Context = None,
             ) -> str:
                 """Render + (dry-run or) write the Java tests for a finalized suite.
 
@@ -1005,12 +1111,15 @@ def build_server():
                 repo's own ops pipeline (branch -> write -> spotless -> test-compile
                 -> commit), and only when QA_API_FRAMEWORK_WRITE_ENABLED is on and
                 QA_API_FRAMEWORK_WRITE_DRY_RUN is off. Never main, never push.
+
+                project="<name>" targets a project registered by qa_api_project;
+                omit it to use QA_API_FRAMEWORK_PATH.
                 """
                 return await _tracked(
                     "qa_write_api_test",
                     ctx,
                     mcp_handlers.handle_write_api_test(
-                        suite_id, apply, progress=_make_progress(ctx)
+                        suite_id, apply, project, progress=_make_progress(ctx)
                     ),
                 )
 
@@ -1143,100 +1252,23 @@ def build_server():
         )
         return [TextContent(type="text", text=text), *_image_content_blocks(specs)]
 
-    # Full edition only — Maestro runs + the multi-workflow wizard reference
-    # modules the distribution build does not ship.
+    # Full edition only -- the multi-workflow wizard references modules the
+    # distribution build does not ship. Two tool pairs that stood here were
+    # DELETED on 2026-08-15: `qa_run_mobile_suite` in dead-code deletion
+    # batch D2 with tools/maestro_*.py, and `qa_run_web_suite` /
+    # `qa_submit_web_run` in batch D3 with tools/web_runner.py. Both had
+    # refused on every install since batches 6/7 retired their features, and
+    # a registered tool that can only refuse costs a tester a round trip to
+    # learn nothing; a client with either name cached now gets an
+    # unknown-tool error instead of a disabled notice, which belongs in the
+    # release note. Device capture is unaffected -- qa_capture_screens and
+    # qa_list_devices are registered above and still live.
     if not mcp_handlers._test_cases_only():
-
-        @mcp.tool()
-        async def qa_run_mobile_suite(
-            ctx: Context,
-            mode: str = "",
-            device_id: str = "",
-            suite_id: str = "",
-            app_id: str = "",
-            goal: str = "",
-        ) -> str:
-            """RETIRED 2026-08-13 -- this tool refuses on every install.
-
-            QA_MAESTRO_ENABLED, QA_MAESTRO_HEAL_ENABLED and
-            QA_MAESTRO_EXPLORE_ENABLED were deleted as settings and hardcoded
-            OFF (flag-surface reduction, batch 7), so all four modes -- export
-            (suite_id -> YAML flows in a per-suite dir), run, heal and explore
-            -- return a disabled notice. Registration and the whole handler are
-            RETAINED for revival; do not call this expecting a device run."""
-            return await _tracked(
-                "qa_run_mobile_suite",
-                ctx,
-                mcp_handlers.handle_run_mobile_suite(
-                    mode,
-                    device_id=device_id,
-                    suite_id=suite_id,
-                    app_id=app_id,
-                    goal=goal,
-                    **_make_elicitors(ctx),
-                    progress=_make_progress(ctx),
-                ),
-            )
-
-        @mcp.tool()
-        async def qa_run_web_suite(
-            ctx: Context,
-            base_url: str = "",
-            suite_id: str = "",
-        ) -> str:
-            """Start a run of a generated suite against a live web app in a
-            real browser (requires QA_WEB_RUN_ENABLED).
-
-            Chat-only: the server makes NO model call. It returns a task
-            envelope carrying the suite's steps and a response_schema; YOU
-            translate every case into whitelisted browser actions and call
-            qa_submit_web_run with the task_id and that JSON — the browser run,
-            the SSRF checks and the pass/fail report all happen there. Dry-run
-            default previews the planned actions without launching a browser.
-            Pass the base_url of the app under test and the suite_id from
-            qa_generate_test_cases."""
-            return await _tracked(
-                "qa_run_web_suite",
-                ctx,
-                mcp_handlers.handle_run_web_suite(
-                    base_url,
-                    suite_id=suite_id,
-                    choose=_make_chooser(ctx),
-                    progress=_make_progress(ctx),
-                ),
-            )
-
-        @mcp.tool()
-        async def qa_submit_web_run(
-            task_id: str, translations_json: str, ctx: Context
-        ) -> str:
-            """Submit the browser actions YOU translated for a task opened by
-            qa_run_web_suite, and run the suite.
-
-            qa_run_web_suite makes no model call: it hands you a task envelope
-            with a system_prompt, the untrusted-wrapped test cases and a
-            response_schema. Produce a SINGLE JSON object matching that schema —
-            one entry per case in `translations`, echoing that case's tc_id
-            EXACTLY, whose `actions` list is FLAT: every action carries the
-            positive `step_number` of the step it belongs to, and there is NO
-            per-step `steps` object (an entry with one is rejected and that case
-            is not run) — then call this with the task_id and that JSON as
-            `translations_json`. The server validates every action against its
-            8-verb whitelist, re-validates the target URL, launches the browser
-            (or previews the plan when dry-run is on) and reports pass/fail per
-            TC-ID."""
-            return await _tracked(
-                "qa_submit_web_run",
-                ctx,
-                mcp_handlers.handle_submit_web_run(
-                    task_id, translations_json, progress=_make_progress(ctx)
-                ),
-            )
 
         @mcp.tool()
         async def qa_wizard(ctx: Context) -> str:
             """Guided entry point for testers: pick a workflow (Test cases / Bug
-            report / Exploratory / Mobile testing) and I walk you through it
+            report / Exploratory) and I walk you through it
             END-TO-END. Test cases asks where the feature comes from (describe it /
             Jira ticket / mobile screens / Jira + mobile), captures device screens
             when relevant, and returns the generated suite plus the Feature
@@ -1273,12 +1305,14 @@ def build_server():
     # last tester-facing path there that could reach a server-side LLM backend
     # (its `mobile` / `jira_mobile` modes describe captured screens through
     # this server's own ask_vision, tools/image_description.py). The edition
-    # gate outranks the flag on purpose: install.sh seeds .env only when the
-    # file is absent and updates never rewrite it, so every ALREADY-installed
-    # dist still carries QA_FEATURE_ANALYSIS_ENABLED=true from an older
-    # .env.example. Dropping the key from the template alone would leave those
-    # installs exposing both tools.
-    if settings.qa_feature_analysis_enabled and not mcp_handlers._test_cases_only():
+    # EDITION gate is what protects the dist, and it still does: the flag was
+    # DELETED on 2026-08-14 (batch 8c) and hardcoded ON, so _test_cases_only()
+    # is now the ONLY thing standing between the public build and this pair.
+    # (Since 2026-08-15 the mobile modes reach NO ask_vision: the captured
+    # screens are attached to the reply as MCP image content for the tester's
+    # own model.) It is checked here and again inside both handlers,
+    # deliberately.
+    if _feature_analysis_enabled() and not mcp_handlers._test_cases_only():
 
         @mcp.tool()
         async def qa_feature_analysis(
@@ -1287,9 +1321,8 @@ def build_server():
             mode: str = "",
             device_id: str = "",
             jira_content_json: str = "",
-        ) -> str:
-            """Start a compact enterprise Feature Analysis Report (requires
-            QA_FEATURE_ANALYSIS_ENABLED).
+        ) -> list[ContentBlock]:
+            """Start a compact enterprise Feature Analysis Report.
 
             Chat-only: the server makes NO model call. It returns a task envelope
             (system_prompt + untrusted-wrapped context + a response_schema) that
@@ -1299,14 +1332,17 @@ def build_server():
             mode is one of: jira (analyse a feature description or Jira/issue
             URL), mobile (capture screens from a connected device), or
             jira_mobile (merge the ticket with captured screens). Omit mode and I'll ask; the mobile modes also ask for the
-            device and offer a capture-another-screen loop, and their screenshot
-            descriptions are still produced by this server's own vision call.
+            device and offer a capture-another-screen loop, and the captured
+            screens are attached to the reply as images for YOUR model to read
+            -- this server makes no vision call.
 
             For a Jira URL the reply may be a DIRECTIVE asking you to fetch the
             issue with your own mcp__atlassian__getJiraIssue tool and call again
             with jira_content_json set to its raw result as a JSON STRING
             (stringified JSON -- that parameter is typed `str`)."""
-            return await _tracked(
+            from mcp.types import TextContent
+
+            reply = await _tracked(
                 "qa_feature_analysis",
                 ctx,
                 mcp_handlers.handle_feature_analysis(
@@ -1318,6 +1354,12 @@ def build_server():
                     jira_content_json=jira_content_json,
                 ),
             )
+            # Captured screens ride to the tester's own multimodal model as
+            # image content. getattr: every other return path is a plain str.
+            return [
+                TextContent(type="text", text=str(reply)),
+                *_image_content_blocks(getattr(reply, "images", ())),
+            ]
 
         @mcp.tool()
         async def qa_submit_feature_analysis(
@@ -1390,7 +1432,13 @@ def _configure_logging() -> None:
     # the list because it attaches its OWN rich handler (bypassing the root
     # config above), so its INFO transport banner still reached stderr on the
     # v1.38.0 validation run.
-    for noisy in ("httpx", "httpcore", "FastMCP"):
+    #
+    # ``mcp.server.lowlevel.server`` joined the list on 2026-08-19 (F07): its
+    # INFO line is "Processing request of type CallToolRequest" and names
+    # nothing, so it cost one line per call and told a diagnoser nothing.
+    # ``_tracked`` now logs a NAMED line for every call, which is what that line
+    # was standing in for -- dropping it keeps per-call volume flat.
+    for noisy in ("httpx", "httpcore", "FastMCP", "mcp.server.lowlevel.server"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     # The setLevel above is NOT enough for FastMCP: it (re)configures its own
     # handler and level during server.run(), which overrode this on the
@@ -1424,17 +1472,12 @@ def main() -> None:
     server = build_server()
     telemetry.server_start()
 
-    def _prewarm_backend() -> None:
-        # Warm the cursor-agent auth probe cache off the serving path: it can
-        # take up to 20s and must never run while a request is in flight.
-        try:
-            import llm as _llm
-
-            _llm._cursor_usable()
-        except Exception:
-            logger.debug("backend prewarm failed", exc_info=True)
-
-    threading.Thread(target=_prewarm_backend, daemon=True).start()
+    # _prewarm_backend stood here until 2026-08-16 (dead-code deletion P2-G2b).
+    # It was a daemon thread calling llm._cursor_usable() to warm the
+    # cursor-agent auth probe -- up to 20s -- off the serving path. P2-G2c
+    # deletes all three backends, so there is no probe to warm; the bare
+    # `except` around it is exactly why this had to be deleted deliberately
+    # rather than left to fail silently.
     threading.Thread(target=_drift_watch, daemon=True).start()
     logger.info("Starting the qa-agents MCP server over stdio…")
     server.run(show_banner=False)
