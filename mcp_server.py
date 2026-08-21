@@ -34,6 +34,7 @@ from urllib.parse import unquote, urlparse
 os.chdir(Path(__file__).resolve().parent)
 
 from config.settings import settings  # noqa: E402, I001
+from tools import guidance  # noqa: E402
 from tools import mcp_handlers  # noqa: E402
 from tools import telemetry  # noqa: E402
 
@@ -604,6 +605,33 @@ def _prepare_payload_to_content(result):
     return blocks
 
 
+def _register_prompts(mcp, *, test_cases_only: bool, api_tests: bool) -> None:
+    """Register one MCP Prompt per guidance workflow this edition can support.
+
+    A loop rather than N decorated functions on purpose: the gate deciding
+    WHICH prompts exist already lives in ``tools/guidance.prompt_texts``, and
+    re-expressing it here as a second ladder of ``if`` statements is exactly how
+    two copies of one rule drift apart. Each body is closed over through a
+    factory -- closing over the loop variable directly would hand every prompt
+    the LAST body, silently.
+    """
+    for name, body in guidance.prompt_texts(
+        test_cases_only=test_cases_only, api_tests=api_tests
+    ).items():
+
+        def _make(text: str):
+            def _prompt() -> str:
+                return text
+
+            return _prompt
+
+        fn = _make(body)
+        fn.__name__ = name
+        description = guidance.prompt_description(name)
+        fn.__doc__ = description
+        mcp.prompt(name=name, description=description)(fn)
+
+
 def build_server():
     """Construct and return the FastMCP server with every qa_* tool registered.
 
@@ -614,7 +642,23 @@ def build_server():
     from fastmcp import Context, FastMCP
     from mcp.types import ContentBlock
 
-    mcp = FastMCP(SERVER_NAME)
+    # The two edition gates, read here so the GUIDANCE text is built from the
+    # same expressions the registration gates below use. (Those gates still
+    # call `_test_cases_only()` inline at their own sites; this is a second
+    # read of one pure function, not a second source of truth.) The guidance
+    # names tools, and a client that calls a tool this edition never registered
+    # fails mid-workflow in front of a tester -- so the text and the
+    # registration must not be able to disagree.
+    edition_test_cases_only = mcp_handlers._test_cases_only()
+    edition_api_tests = bool(settings.qa_api_test_enabled)
+
+    mcp = FastMCP(
+        SERVER_NAME,
+        instructions=guidance.server_instructions(
+            test_cases_only=edition_test_cases_only,
+            api_tests=edition_api_tests,
+        ),
+    )
 
     @mcp.tool()
     async def qa_generate_test_cases(
@@ -724,16 +768,20 @@ def build_server():
         the user the connection steps the directive includes.
 
         WHAT TO DO WITH THE RESULT: when the payload includes `orchestration`
-        with mode `parallel_chat_workers`, fan out ONE same-session worker per
-        category (Cursor Task / equivalent), then PREFER merging worker JSON and
-        calling `qa_submit_suite` with the merged suite (Path B). Fallback Path A:
-        `qa_submit_category` per category, `qa_prep_status` until ready, then
-        `qa_submit_suite` with empty suite_json. Without orchestration, generate
-        the full merged suite yourself and call `qa_submit_suite`. The server
+        (mode `staged_categories`), generate the categories yourself and stage
+        each one with `qa_submit_category` AS SOON AS it is written (Path A),
+        then `qa_prep_status` until ready and `qa_submit_suite` with an empty
+        suite_json or the review sidecar. Path A is recommended for two reasons,
+        neither of which is speed: staged categories survive a chat reload, and
+        the server's duplicate prescreen runs only over a staged set. Path B
+        (merge everything, one `qa_submit_suite` call) is supported for a client
+        that cannot hold a multi-call session, but nothing is saved until that
+        single call. Without orchestration, generate the full merged suite
+        yourself and call `qa_submit_suite`. The server
         validates, de-duplicates, scores, exports and persists it, and replies
         with the finished suite + file path OR gaps to regenerate under the SAME
         prep_id. Use `qa_get_category_job` with category_name="all" for every
-        worker packet in ONE call (or one name for a single packet).
+        category packet in ONE call (or one name for a single packet).
 
         IMAGE GATE (always on). ASK FIRST: for a Jira
         URL, ask the USER where the ticket's SCREENS come from BEFORE your first
@@ -847,9 +895,9 @@ def build_server():
         """Show which categories are staged for a host-mode prep_id and whether
         Path A (empty suite_json) finalize is allowed yet.
 
-        Use after parallel qa_submit_category calls. ready=yes means you may call
-        qa_submit_suite with suite_json="". Path B (full merged suite_json) does
-        not require ready=yes.
+        Use while staging categories with qa_submit_category. ready=yes means you
+        may call qa_submit_suite with suite_json="". Path B (full merged
+        suite_json) does not require ready=yes.
         """
         return await _tracked(
             "qa_prep_status",
@@ -864,11 +912,11 @@ def build_server():
         """Return ONE self-contained category generation job for a prep_id
         (system_prompt + user_context + instruction + response_schema).
 
-        Use when a same-session worker should not re-parse the full prepare
+        Use to fetch one category's packet without re-parsing the full prepare
         payload. category_name should match orchestration.expected_categories.
         Pass category_name="all" (or "*") to get EVERY job in ONE call with
-        the shared prompt blocks hoisted once -- preferred when dispatching
-        parallel workers; never fetch packets one call per category.
+        the shared prompt blocks hoisted once -- always preferred; never fetch
+        packets one call per category.
         """
         return await _tracked(
             "qa_get_category_job",
@@ -886,8 +934,8 @@ def build_server():
     ) -> str:
         """Submit ONE category's cases for a host that generates incrementally.
 
-        Use this for Path A / incremental hosts (including parallel workers that
-        stage one category each): pass the `prep_id` from qa_prepare_test_cases,
+        Use this for Path A, the recommended route -- stage each category as soon
+        as you finish it: pass the `prep_id` from qa_prepare_test_cases,
         the category name (canonical or known alias), and `suite_json` for THAT
         category -- as a JSON OBJECT when your client can send one, which avoids
         serialising a large payload into a string argument; a JSON string is still
@@ -896,12 +944,13 @@ def build_server():
         category that is already staged unless a reply asked you to; check
         `qa_prep_status` first. A re-submission carrying FEWER cases than the
         staged row is REFUSED (nothing is saved, the staged row survives) because
-        that is usually a truncated worker output; pass `replace_smaller=true`
+        that is usually a truncated output; pass `replace_smaller=true`
         only when dropping those cases is deliberate -- it is always reported.
         When every expected category is staged, call
-        qa_submit_suite with the same prep_id and an EMPTY suite_json. Prefer
-        Path B (parent merge + full suite_json) when host dedup/coverage review
-        matters. Check progress with qa_prep_status.
+        qa_submit_suite with the same prep_id and an EMPTY suite_json -- or with
+        a small review SIDECAR, which is how the duplicate review rides this
+        route (it works on EITHER route; what it needs is the field, not a
+        particular route). Check progress with qa_prep_status.
         """
         return await _tracked(
             "qa_submit_category",
@@ -1396,6 +1445,12 @@ def build_server():
                     task_id, report_json, progress=_make_progress(ctx)
                 ),
             )
+
+    _register_prompts(
+        mcp,
+        test_cases_only=edition_test_cases_only,
+        api_tests=edition_api_tests,
+    )
 
     return mcp
 
