@@ -744,6 +744,136 @@ async def _resolve_device(device_id: str) -> dict | None:
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# Per-process, per-client elicitation gate (2026-08-21)                        #
+# --------------------------------------------------------------------------- #
+#
+# v1.56.2 (866ae959) made a TIMED-OUT dialog skip the remaining dialogs of the
+# SAME tool call. The live SHYJ-5645 run (pid 58542) then showed the next call
+# paying the full 55s again, and the two declines landing 68/72 ms AFTER the
+# call had already returned -- the client resolved them at turn end, so the
+# tester never saw them. No timeout value fixes that; only not asking does.
+#
+# So the observation is lifted from per-CALL to per-PROCESS, keyed by the MCP
+# client name from the initialize handshake. Deliberately NOT a hardcoded
+# blocklist: the same client is on record as rendering dialogs in other runs,
+# and a static list would silently remove a working path from testers who do
+# answer. This record is EARNED at runtime and self-correcting in both
+# directions -- an answered (or in-time declined) dialog clears it.
+#
+# NOT persisted. A wrong verdict must not survive a restart, and an install
+# shared by three clients must not have one client's verdict affect another.
+# Process lifetime is the right scope, which is why this is a module dict and
+# not a row in data/.
+#
+# NOT a settings flag either (CLAUDE.md flag policy): a per-install toggle has
+# no right answer here, and the behaviour is self-correcting.
+
+# Two, not one. With the v1.56.2 per-call fix a single tool call produces at
+# most ONE timeout, so two strikes means two SEPARATE calls -- ~110s worst case
+# before a client is gated. One strike would let a single slow human cost their
+# whole session's dialogs. Two consecutive timeouts with zero answers in
+# between is the signal.
+_ELICIT_GATE_STRIKES = 2
+
+# client name (lower-cased, from the handshake) -> CONSECUTIVE timeouts.
+# Any answer resets the entry to 0, so this counts a run, not a lifetime total.
+_elicit_client_strikes: dict[str, int] = {}
+
+# The client the current process is talking to. An MCP stdio server serves one
+# client, but the key is still per NAME so a shared ~/qa-agent-pro install can
+# never have one editor's verdict gate another's.
+_elicit_client_current = {"name": ""}
+
+
+def _reset_elicit_client_state() -> None:
+    """Test-only reset. Used by an autouse conftest fixture, because the record
+    is module-global and a leaked strike would gate the "" client for whatever
+    test runs next."""
+    _elicit_client_strikes.clear()
+    _elicit_client_current["name"] = ""
+
+
+def note_elicit_client(name) -> None:
+    """Record which client this process is serving (mcp_server._note_client
+    forwards the initialize handshake's clientInfo.name). Never raises."""
+    try:
+        _elicit_client_current["name"] = str(name or "").strip().lower()
+    except Exception:
+        logger.debug("elicit client note failed", exc_info=True)
+
+
+def _elicit_client_key(name=None) -> str:
+    try:
+        if name is None:
+            return _elicit_client_current.get("name", "") or ""
+        return str(name or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def elicit_client_gated(name=None) -> bool:
+    """True when THIS client has timed out _ELICIT_GATE_STRIKES dialogs in a row
+    with no answer in between, i.e. elicitation on it has never been answerable
+    in this process. Read by mcp_server._make_chooser / _make_asker, which then
+    hand back None and let the existing markdown-menu fallback run.
+    Never raises -- a read failure means "not gated", so the dialog is asked."""
+    try:
+        return _elicit_client_strikes.get(_elicit_client_key(name), 0) >= (
+            _ELICIT_GATE_STRIKES
+        )
+    except Exception:
+        logger.debug("elicit gate read failed", exc_info=True)
+        return False
+
+
+def note_elicit_timeout(name=None) -> None:
+    """One dialog timed out: add a strike, and say so ONCE at INFO when the gate
+    closes. INFO rather than DEBUG for the same reason _elicit_choice's timeout
+    logs at WARNING -- the installed log runs at INFO and a silent capability
+    downgrade is undiagnosable from the log file. Never raises."""
+    try:
+        key = _elicit_client_key(name)
+        strikes = _elicit_client_strikes.get(key, 0) + 1
+        _elicit_client_strikes[key] = strikes
+        if strikes == _ELICIT_GATE_STRIKES:
+            logger.info(
+                "mcp elicitation gated for client %r after %d consecutive "
+                "unanswered dialogs -- no further dialogs this process; the "
+                "markdown menu is used instead. Any answered dialog clears it.",
+                key or "<unknown>",
+                strikes,
+            )
+    except Exception:
+        logger.debug("elicit strike failed", exc_info=True)
+
+
+def note_elicit_answered(name=None) -> None:
+    """A dialog was ANSWERED, or DECLINED in time -- either way the tester saw it,
+    so the transport works and the strike run is over. This is the half that
+    makes the gate self-correcting: a client that answers is never gated, no
+    matter how many earlier timeouts it accumulated. Never raises."""
+    try:
+        _elicit_client_strikes[_elicit_client_key(name)] = 0
+    except Exception:
+        logger.debug("elicit answer note failed", exc_info=True)
+
+
+def _note_elicit_outcome(result) -> None:
+    """Feed one completed dialog result into the per-client record.
+
+    ONLY a CHOSEN or DECLINED result counts as evidence that the tester saw the
+    dialog. UNAVAILABLE does not: it is what a raising ctx.elicit degrades to,
+    which says nothing about the human, and clearing strikes on it would make a
+    client whose transport raises every time permanently ungatable.
+    Never raises."""
+    try:
+        if getattr(result, "status", None) in (CHOSEN, DECLINED):
+            note_elicit_answered()
+    except Exception:
+        logger.debug("elicit outcome note failed", exc_info=True)
+
+
 def _elicit_wait_s(cb) -> float | None:
     """How long the NEXT dialog on *cb* may wait, or None when the per-call budget
     is already spent and this is not the call's first dialog.
@@ -842,11 +972,15 @@ async def _elicit_choice(choose: ChooseCb, message: str, options: list) -> Choic
         # DECLINED result and the answered result all leave the next dialog
         # askable -- a tester who dismisses dialog 1 must still get dialog 2.
         _mark_elicit_dead(choose)
+        # ...and one strike against the CLIENT, which outlives this call. Two in a
+        # row with no answer between them gate it for the process.
+        note_elicit_timeout()
         return ChoiceResult(UNAVAILABLE, timed_out=True)
     except Exception:
         logger.debug("mcp elicit_choice failed for %r", message, exc_info=True)
         return ChoiceResult(UNAVAILABLE)
     if isinstance(result, ChoiceResult):
+        _note_elicit_outcome(result)
         return result
     return ChoiceResult(UNAVAILABLE)
 
@@ -877,11 +1011,13 @@ async def _elicit_text(ask_text: AskCb, message: str) -> ChoiceResult:
         logger.warning("mcp elicit_text timed out after %.0fs for %r", wait_s, message)
         # ONLY the timeout branch -- see the sibling in _elicit_choice.
         _mark_elicit_dead(ask_text)
+        note_elicit_timeout()  # see the sibling in _elicit_choice
         return ChoiceResult(UNAVAILABLE, timed_out=True)
     except Exception:
         logger.debug("mcp elicit_text failed for %r", message, exc_info=True)
         return ChoiceResult(UNAVAILABLE)
     if isinstance(result, ChoiceResult):
+        _note_elicit_outcome(result)
         return result
     return ChoiceResult(UNAVAILABLE)
 
@@ -1648,7 +1784,17 @@ async def _elicit_source_plan_status(
     "disabled/disabled" and everything else keeps the honest
     "<enum-status>/<text-status>" form ("unavailable/unavailable" for a client
     that cannot show dialogs, "declined/..." for a tester who dismissed one)."""
-    _disabled = bool(not _elicit_enabled() or (choose is None and ask_text is None))
+    # 2026-08-21: a client GATED by elicit_client_gated() also arrives with both
+    # callbacks None, but that is a capability OBSERVATION about the client, not
+    # an operator disabling the feature -- and this label is stamped into the
+    # mcp_image_gate_beat1 audit row. It therefore keeps the byte-identical
+    # "unavailable/unavailable" form, which is exactly what a client that cannot
+    # show dialogs already reports; "disabled" stays reserved for the
+    # _elicit_enabled() seam it was written for.
+    _disabled = bool(
+        not _elicit_enabled()
+        or (choose is None and ask_text is None and not elicit_client_gated())
+    )
     picked = await _elicit_choice(
         choose,
         "I cannot read images out of Jira -- where do this ticket's screens come from?",
