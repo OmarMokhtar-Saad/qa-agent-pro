@@ -205,6 +205,29 @@ def find_empty_data_cases(cases: list[TestCase]) -> list[str]:
         return []
 
 
+def find_empty_test_data_cases(cases: list[TestCase]) -> list[str]:
+    """Return the tc_id of every case whose case-level test_data plan is empty,
+    measured INDEPENDENTLY of preconditions.
+
+    A SPLIT from find_empty_data_cases above rather than a redefinition of it:
+    that function's BOTH-empty meaning is pinned by test and still supplies the
+    detail count in quality_warning_section. The conjunction was the bug --
+    live run 2026-08-21, suite 817a09c8: 58 of 64 cases shipped an empty
+    test_data plan (90.6%, well past EMPTY_DATA_WARN_RATIO) while every one of
+    them carried good preconditions, so the BOTH-empty count was 0 and the
+    advisory could not fire. The exported Test Data column was blank on 58 rows.
+
+    BOTH-empty is a strict subset of this, so the gate built on it is a strict
+    superset of the old one: no warning that used to fire stops firing.
+
+    Never raises."""
+    try:
+        return [tc.tc_id for tc in cases if not (getattr(tc, "test_data", None) or [])]
+    except Exception:
+        logger.exception("find_empty_test_data_cases failed — returning empty list")
+        return []
+
+
 # --- First-step findability -------------------------------------------------
 # The generator is ALREADY told this rule twice per category job:
 # agents.test_scenario_agent._CATEGORY_RULES ("LOCATION MUST BE FINDABLE", in
@@ -1144,10 +1167,17 @@ def quality_warning_section(cases: list[TestCase], max_examples: int = 10) -> st
         # mean something, so a one-case fixture never trips it.
         total_cases = len(list(cases))
         empty_data = find_empty_data_cases(cases)
+        empty_test_data = find_empty_test_data_cases(cases)
         unanchored = find_unanchored_first_steps(cases)
+        # 2026-08-21: the RATIO is taken over the empty-test_data measure, which
+        # does not also require empty preconditions. The old conjunction meant
+        # this advisory could only fire on a suite that was ALSO missing its
+        # preconditions, so the live 90.6%-empty run was invisible to it.
+        # BOTH-empty is a subset of test_data-empty, so this is a strict
+        # superset of the old gate; empty_data survives as the detail count.
         empty_data_flagged = (
             total_cases >= EMPTY_DATA_MIN_CASES
-            and len(empty_data) / total_cases >= EMPTY_DATA_WARN_RATIO
+            and len(empty_test_data) / total_cases >= EMPTY_DATA_WARN_RATIO
         )
         if (
             not vague
@@ -1182,24 +1212,32 @@ def quality_warning_section(cases: list[TestCase], max_examples: int = 10) -> st
             for tc_id, step_number, expected in vague_expected[:max_examples]:
                 lines.append(f"  - {tc_id} step {step_number}: {expected[:120]}")
         if empty_data_flagged:
-            no_pre = sum(
-                1
-                for tc in cases
-                if not (getattr(tc, "preconditions", None) or "").strip()
-            )
-            no_data = sum(
-                1 for tc in cases if not (getattr(tc, "test_data", None) or [])
-            )
-            pct = round(100 * len(empty_data) / total_cases)
+            pct = round(100 * len(empty_test_data) / total_cases)
+            threshold_pct = round(100 * EMPTY_DATA_WARN_RATIO)
+            # COUNTS ONLY, never an id list: this section is where the finalize
+            # reply's _SUMMARY_CAP truncation lands (live repro 2026-08-15).
+            # It leads with the RATIO judgement rather than the raw missing
+            # count so that it does not restate data_notes_section's "N of M
+            # case(s) declare a data plan; K declare none" line -- that is a
+            # DISCLOSURE of a contractually legal shape, this is the advisory
+            # that the shape has taken over the suite. Additive, not a second
+            # rendering of the same number.
+            #
+            # AND IT IS BUDGETED (reviewer F1, 2026-08-21, MEASURED not
+            # estimated). The suite shape that TRIPS this advisory is also the
+            # shape whose Test Data enumeration has almost nothing left to
+            # enumerate, so the section does not shrink enough to pay for a
+            # long bullet: a first draft ran 380 chars and pushed the finalize
+            # reply to 4229 against mcp_handlers._SUMMARY_CAP = 4000,
+            # truncating the grounding/scope advisories and the
+            # REVIEW_REQUIRED tail that print after it. One line, ~134 chars at
+            # a 96-case suite. If it must grow, shorten something else here --
+            # do not raise the cap.
+            # tests/test_finalize_reply_cap.py measures the tripped shape.
             lines.append(
-                f"- {len(empty_data)} of {total_cases} case(s) ({pct}%) have BOTH no "
-                "preconditions and an empty test data plan "
-                f"({no_pre} with no preconditions, {no_data} with no test data), so "
-                "the Preconditions and Test Data columns of the export will be "
-                "blank. Values written inside the step text are NOT machine-readable "
-                "test data. Advisory only — the suite was accepted unchanged; "
-                "add per-case preconditions and a test_data entry per field where "
-                "the case manipulates data."
+                f"- {pct}% of {total_cases} case(s) have no test data plan "
+                f"(threshold {threshold_pct}%; {len(empty_data)} also lack "
+                "preconditions) — add a test_data entry per field the case uses."
             )
         if unanchored:
             # The ids go to the log, not the reply: see FINDABILITY_MAX_LOGGED.
