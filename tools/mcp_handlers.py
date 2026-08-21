@@ -758,6 +758,13 @@ def _elicit_wait_s(cb) -> float | None:
     The FIRST dialog of a call is floored at _ELICIT_FLOOR_S even on an exhausted
     budget, so a dialog behind minutes of work is still asked. ``asked`` makes
     "first dialog" a recorded fact rather than something inferred from the clock.
+
+    2026-08-21: a dialog that TIMED OUT marks the shared holder ``dead``, and a
+    dead transport skips every LATER dialog of the same call. The live SHYJ-5645
+    run spent 80.0s of an 80.02s tool call re-asking a transport that had already
+    proven unresponsive: _elicit_choice returned timed_out=True and NOTHING read
+    it. Checked AFTER the first-dialog floor above, so that guarantee is
+    unchanged, and per-CALL because the holder is per-call.
     Never raises."""
     try:
         budget = getattr(cb, "_elicit_budget", None)
@@ -766,6 +773,8 @@ def _elicit_wait_s(cb) -> float | None:
         remaining = float(budget.get("deadline") or 0.0) - time.monotonic()
         if not budget.get("asked"):
             return max(min(_ELICIT_TIMEOUT_S, remaining), _ELICIT_FLOOR_S)
+        if budget.get("dead"):
+            return None
         if remaining <= 0:
             return None
         return min(_ELICIT_TIMEOUT_S, remaining)
@@ -782,6 +791,23 @@ def _mark_elicit_asked(cb) -> None:
             budget["asked"] = True
     except Exception:
         logger.debug("elicit budget mark failed", exc_info=True)
+
+
+def _mark_elicit_dead(cb) -> None:
+    """Record that a dialog on *cb* TIMED OUT, so later dialogs of the SAME call
+    are skipped instead of re-waiting on a transport that has proven unresponsive.
+
+    ONLY a timeout sets this. A DECLINED dialog means the tester saw the question
+    and dismissed it, and an answered one means the transport works -- both must
+    leave the next dialog askable. Same never-raising discipline as
+    _mark_elicit_asked, and the same per-call holder, so deadness never leaks
+    across tool calls."""
+    try:
+        budget = getattr(cb, "_elicit_budget", None)
+        if isinstance(budget, dict):
+            budget["dead"] = True
+    except Exception:
+        logger.debug("elicit budget dead-mark failed", exc_info=True)
 
 
 async def _elicit_choice(choose: ChooseCb, message: str, options: list) -> ChoiceResult:
@@ -811,6 +837,11 @@ async def _elicit_choice(choose: ChooseCb, message: str, options: list) -> Choic
         logger.warning(
             "mcp elicit_choice timed out after %.0fs for %r", wait_s, message
         )
+        # ONLY here. A proven-dead transport must not cost the rest of this call
+        # another full dialog bound. The bare `except Exception` below, the
+        # DECLINED result and the answered result all leave the next dialog
+        # askable -- a tester who dismisses dialog 1 must still get dialog 2.
+        _mark_elicit_dead(choose)
         return ChoiceResult(UNAVAILABLE, timed_out=True)
     except Exception:
         logger.debug("mcp elicit_choice failed for %r", message, exc_info=True)
@@ -844,6 +875,8 @@ async def _elicit_text(ask_text: AskCb, message: str) -> ChoiceResult:
         result = await asyncio.wait_for(ask_text(message), timeout=wait_s)
     except asyncio.TimeoutError:
         logger.warning("mcp elicit_text timed out after %.0fs for %r", wait_s, message)
+        # ONLY the timeout branch -- see the sibling in _elicit_choice.
+        _mark_elicit_dead(ask_text)
         return ChoiceResult(UNAVAILABLE, timed_out=True)
     except Exception:
         logger.debug("mcp elicit_text failed for %r", message, exc_info=True)
