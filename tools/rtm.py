@@ -385,6 +385,13 @@ def build_rtm_summary(
 _RTM_DESC_CAP = 1000
 _RTM_LINKED_CAP = 60
 
+# D1 (2026-08-21). The Status cell for a criterion nothing links to, WHEN the
+# whole suite carries no usable `requirement_id`. "ORPHAN" asserts that this
+# criterion was missed; on the 2026-08-21 SHYJ-5646 run that assertion was made
+# 4 times about a suite whose 96 cases plainly exercised the criteria and simply
+# arrived with the link field null. ASCII "--" to match this file's style.
+_NOT_REPORTED = "NOT REPORTED -- the generator returned no requirement links"
+
 
 def _linked_cell(tc_ids: list) -> str:
     """A capped, comma-joined list of linked tc_ids, with the shortfall NAMED."""
@@ -419,6 +426,30 @@ def rtm_rows(acs: list, test_cases: list, *, derived: bool = False) -> list:
             return []
         cases = list(test_cases or [])
         ac_to_tcs, orphan_tc_ids = _trace_map(acs, cases)
+        covered = sum(1 for tcs in ac_to_tcs.values() if tcs)
+        # D1 (2026-08-21). Two DIFFERENT outcomes were printed identically.
+        #
+        # 2026-08-16, SHYJ-5645: 40 of 64 cases linked, 24 did not, 3 criteria
+        # were never referenced. Those 3 are ORPHAN and "x of y covered (n%)" is
+        # a true statement about a suite that really does miss them.
+        #
+        # 2026-08-21, SHYJ-5646: the host returned `requirement_id: null` on all
+        # 96 cases, and this sheet said "0 of 4 acceptance criteria covered (0%)"
+        # with four ORPHAN rows and no caveat. A tester reads that as a coverage
+        # FAILURE by the suite. It is not -- the cases plainly exercise the
+        # criteria; only the LINK FIELD is absent. The same workbook's
+        # 'Coverage Audit' sheet, driven by the same missing data, prints
+        # "SUPPRESSED -- lexical fallback" rather than a number, so one file
+        # carried two coverage reports, one hedged and one not.
+        #
+        # So: when NOT ONE case carries a usable `requirement_id`, this sheet
+        # reports the data as ABSENT rather than the coverage as zero. The
+        # genuine-orphan render above is unchanged, byte for byte.
+        #
+        # `bool(cases)` matters: an EMPTY suite is not evidence of a broken
+        # generator, and it must keep today's wording.
+        no_links = bool(cases) and covered == 0 and len(orphan_tc_ids) == len(cases)
+        status_uncovered = _NOT_REPORTED if no_links else "ORPHAN"
         rows: list = [
             ["AC ID", "Acceptance Criterion", "Cases", "Linked TCs", "Status"]
         ]
@@ -430,40 +461,73 @@ def rtm_rows(acs: list, test_cases: list, *, derived: bool = False) -> list:
                     str(getattr(ac, "description", "") or "")[:_RTM_DESC_CAP],
                     str(len(linked)),
                     _linked_cell(linked),
-                    "Covered" if linked else "ORPHAN",
+                    "Covered" if linked else status_uncovered,
                 ]
             )
         if orphan_tc_ids:
             # F04 will make an untraced case legitimate; this row already renders
             # one honestly rather than as an absence a reader has to notice.
+            #
+            # D1: that sentence points at "the two case numbers on the coverage
+            # line below". In the no-links shape the coverage line below carries
+            # NO pair of case numbers, so the pointer would point at nothing.
+            # Say what is true in that shape instead of leaving a dangling
+            # cross-reference in the deliverable.
+            untraced_desc = (
+                "EVERY case in this suite is listed here: not one carries a "
+                "usable `requirement_id`, so this sheet cannot say which "
+                "requirement any of them tests. They are UNTRACED, which is not "
+                "the same as untested."
+                if no_links
+                else "Cases carrying no `requirement_id`. They test something, but "
+                "this sheet cannot say which requirement -- they are exactly "
+                "the gap between the two case numbers on the coverage line "
+                "below, and they raise no criterion's count."
+            )
             rows.append(
                 [
                     "(untraced)",
-                    "Cases carrying no `requirement_id`. They test something, but "
-                    "this sheet cannot say which requirement -- they are exactly "
-                    "the gap between the two case numbers on the coverage line "
-                    "below, and they raise no criterion's count.",
+                    untraced_desc,
                     str(len(orphan_tc_ids)),
                     _linked_cell(orphan_tc_ids),
                     "NOT TRACED",
                 ]
             )
         total = len(acs)
-        covered = sum(1 for tcs in ac_to_tcs.values() if tcs)
         traced = sum(len(tcs) for tcs in ac_to_tcs.values())
         pct = int(covered / total * 100) if total else 0
         kind = "MODEL-DERIVED acceptance criteria" if derived else "acceptance criteria"
         rows.append(["", "", "", "", ""])
-        rows.append(
-            [
-                "Coverage",
-                f"{covered} of {total} {kind} covered ({pct}%) -- "
-                f"{traced} of {len(cases)} case(s) trace to one.",
-                "",
-                "",
-                "",
-            ]
-        )
+        if no_links:
+            # The percentage is SUPPRESSED, not rendered as 0%: 0% is a claim
+            # about the suite, and the only thing actually known is that the
+            # generator returned no links. The criteria rows are KEPT -- the
+            # reader still needs to see what was meant to be covered.
+            rows.append(
+                [
+                    "Coverage",
+                    f"NOT REPORTED -- none of the {len(cases)} case(s) carries a "
+                    f"usable `requirement_id`, so coverage of the {total} {kind} "
+                    "cannot be measured from this suite. The percentage is "
+                    "SUPPRESSED rather than reported as 0%: these cases are "
+                    "untraced, NOT untested. Re-check the `requirement_id` on "
+                    "each case against the criteria above.",
+                    "",
+                    "",
+                    "",
+                ]
+            )
+        else:
+            rows.append(
+                [
+                    "Coverage",
+                    f"{covered} of {total} {kind} covered ({pct}%) -- "
+                    f"{traced} of {len(cases)} case(s) trace to one.",
+                    "",
+                    "",
+                    "",
+                ]
+            )
         if derived:
             rows.append(
                 [

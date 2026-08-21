@@ -5759,7 +5759,12 @@ def _fanout_incomplete_note(meta: object, rows: list, prep_id: str) -> str:
             ", ".join(f"`{m}`" for m in (status.get("missing") or [])) or "(unknown)"
         )
         return (
-            "⚠️ Incomplete parallel fan-out: not every expected "
+            # D3 (2026-08-21): this refusal used to name the retired fan-out
+            # workflow, which this server no longer asks for anywhere (the old
+            # wording is deliberately not quoted back here -- see the batch
+            # reply above). The GATE is unchanged: it is the crash-safety half
+            # of why the staged route was kept.
+            "⚠️ Incomplete staged submission: not every expected "
             f"category is staged for prep_id `{prep_id}`.\n\n"
             f"Staged {status.get('staged_count', 0)}/"
             f"{status.get('expected_count', 0)}. Missing: {missing}.\n\n"
@@ -6476,13 +6481,18 @@ def _prep_status_finalize_hint() -> str:
     rows, so the sidecar is equally crash-safe; only the review differs.
     """
     return (
-        "\nPRIMARY finalize (Path A, crash-safe, keeps your review): when "
+        # D3 (2026-08-21): "PRIMARY / ALTERNATIVE" against the prepare
+        # instruction's "recommended / a supported route, not a shortcut" was
+        # the honest-peers framing delivered by halves. Same recommendation,
+        # same words as host_mode.
+        "\nRECOMMENDED finalize (Path A, crash-safe, keeps your review, and "
+        "the only route the server duplicate prescreen runs on): when "
         "ready=yes, call `qa_submit_suite` with the small review SIDECAR "
         "object described in your preparation instructions (no "
         "`test_cases`). Finalizing with an empty `suite_json` instead is "
         "equally crash-safe but FORFEITS the duplicate review -- so send the "
         "sidecar even when you found nothing, because an EMPTY review field "
-        "still counts as a review. ALTERNATIVE "
+        "still counts as a review. The SUPPORTED ALTERNATIVE "
         "(Path B, one merged `suite_json`) does not need ready=yes, but "
         "nothing is saved until that single call, so an interrupted chat "
         "loses every category."
@@ -6591,8 +6601,17 @@ async def handle_get_category_job(prep_id: str, category_name: str) -> str:
                 f"`prep_id`: `{prep_id}`\n\n"
                 "`shared` applies to EVERY job; `shared` plus one `jobs[]` "
                 "entry is the same packet the single-category form returns. "
-                "Launch ONE worker per `jobs[]` entry IN PARALLEL now — do "
-                "not fetch categories one call at a time.\n\n"
+                # D3 (2026-08-21): this line used to ask the host to launch
+                # one same-session sub-context per `jobs[]` entry, all at once.
+                # It was the SECOND place this server asked for that, and the
+                # one a host reads at the exact moment it decides how to
+                # generate -- so retiring the ask in host_mode alone would have
+                # left the contradiction here. The retired wording is NOT quoted
+                # back: a tombstone comment is how an absence grep gets armed by
+                # the very change that satisfied it.
+                "Generate each `jobs[]` entry and call `qa_submit_category` "
+                "for it as soon as its cases are written — do not fetch "
+                "categories one call at a time.\n\n"
                 "```json\n"
                 + _json.dumps(batch, ensure_ascii=False, indent=2)
                 + "\n```\n"
@@ -6951,8 +6970,8 @@ def _shrinking_resubmit_reply(
         f"**{prior} case(s)** are already staged for this category and this "
         f"submission carries only **{new}**. Accepting it would DELETE "
         f"{prior - new} already-validated case(s) -- the staging write is "
-        "replace-by-category, newest wins -- and the usual cause is a worker "
-        "whose output was cut short, not a deliberate trim.\n\n"
+        "replace-by-category, newest wins -- and the usual cause is an output "
+        "that was cut short, not a deliberate trim.\n\n"
         "**Nothing was discarded and nothing was saved.** The "
         f"{prior}-case row for **{category_name}** is still staged for prep_id "
         f"`{prep_id}`. Choose ONE:\n\n"

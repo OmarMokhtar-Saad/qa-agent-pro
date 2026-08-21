@@ -47,6 +47,7 @@ import re
 from config.settings import settings
 from tools.atomic_checklist import ChecklistItem
 from tools.bilingual import LanguagePair
+from tools.id_collisions import find_identifier_collisions
 from tools.models import TestCase, TestSuite
 from tools.quality_checks import (
     find_placeholder_data,
@@ -476,7 +477,10 @@ _DUP_WS_RE = re.compile(r"[^a-z0-9]+")
 
 _HOST_DEDUP_INSTRUCTION = (
     "\n"
-    "5. DUPLICATE REVIEW -- do this AFTER merging, before submitting. The 8 "
+    # D3 (2026-08-21): renumbered 5 -> 7. The composed instruction is now ONE
+    # ascending sequence (0, 0a, 0d, 1, 1b, 2, 3, 4, 5, 6, 7, 8); it used to
+    # restart mid-string and carry two different step 4s.
+    "7. DUPLICATE REVIEW -- do this AFTER merging, before submitting. The 8 "
     "categories are generated independently, so two of them can describe the SAME "
     "test in different words -- a Security case about cancelling another user's "
     "order by changing the order ID and a Negative case about cancelling an order "
@@ -523,19 +527,42 @@ _HOST_DEDUP_INSTRUCTION = (
 
 
 # --------------------------------------------------------------------------- #
-# Host parallel fan-out (QA_HOST_PARALLEL_FANOUT_ENABLED)
+# Host STAGED CATEGORY submission (the `orchestration` / `jobs` contract)
 #
-# MCP cannot spawn Cursor Task / chat subagents. When this flag is ON, prepare
-# returns an orchestration contract the PARENT chat executes in the SAME session:
-# one worker per category. PRIMARY finalize (Path A, reordered after the
-# 2026-07-31 SHYJ-5645 loss): stage each category via qa_submit_category as its
-# worker returns, then empty suite_json (+ an optional acceptance_criteria /
-# ambiguity_result sidecar) -- staged rows survive a host crash/reload, and the
-# completeness gate in mcp_handlers uses meta.expected_categories stamped at
-# prepare time. ALTERNATIVE (Path B): merge in parent, then qa_submit_suite with
-# full suite_json -- a single point of loss if the chat dies before that one
-# call. The duplicate review reaches the server on EITHER route, via the
-# sidecar that _review_sidecar / _remap_dup_groups already handle.
+# D3, 2026-08-21 -- THE PARALLEL FAN-OUT ASK IS RETIRED. This block used to open
+# "PARALLEL FAN-OUT -- DECIDE THIS BEFORE YOU GENERATE ANYTHING" and tell the
+# host to launch one same-session worker per category. It was ignored on THREE
+# measured runs (v1.36.0, run3/SHYJ-5645, SHYJ-5646 on 2026-08-21), and the
+# prose lever is spent: the 2026-08-03 prominence fix moved it from 61% to 47%
+# of the way through `instructions` and changed nothing, so a third re-word was
+# refused. What actually killed the feature is that its premise stopped being
+# true:
+#   * LATENCY is no longer the argument. SHYJ-5646 generated 96 cases
+#     SEQUENTIALLY in 2m17s, not the 26 minutes this block used to cite.
+#   * CONSISTENCY argues the other way. The DF03/DF04 split that made D2 was
+#     inherited from the ticket's own identifier collision; eight independent
+#     workers each inherit it too, with no shared context to converge on.
+#   * D4 (cross-category duplication) gets WORSE with mutually blind workers.
+# The brief's own suggestion -- a `jobs_to_run` entry for the fan-out DECISION
+# -- was rejected: such a job has no verifiable return artifact, so the server
+# cannot tell "I decided not to fan out" from "I ignored it". That is precisely
+# the unenforceable, zero-feedback delegated check the _AMBIGUITY_RETURN_CLAUSE
+# comment below was written to end.
+#
+# WHAT IS KEPT, and why it has nothing to do with parallelism: the staged route
+# (qa_submit_category per category, then qa_prep_status, then a finalize)
+# carries TWO values a single merged submit does not.
+#   1. CRASH-SAFETY: staged rows survive a chat reload; on the merge-in-parent
+#      route nothing is saved until one final call (the 2026-07-31 SHYJ-5645
+#      loss). The completeness gate in mcp_handlers uses meta.expected_categories
+#      stamped at prepare time.
+#   2. The server-side duplicate PRESCREEN (mcp_handlers._dup_shortlist_note)
+#      runs ONLY on the category path, gated on the submission completing the
+#      expected set. It is the one existing hook for the D4 fix.
+# So the two routes are peers with different costs, not "finalize" and
+# "ALTERNATIVE finalize"; the staged one is RECOMMENDED for those two reasons
+# and neither of them is speed. The duplicate review reaches the server on
+# EITHER route, via the sidecar that _review_sidecar / _remap_dup_groups handle.
 # Never duplicate full user_context into jobs[] (token bomb).
 # Every helper below is pure / sync / never-raise where noted.
 # --------------------------------------------------------------------------- #
@@ -549,7 +576,7 @@ _HOST_DEDUP_INSTRUCTION = (
 # that FORFEITS it, and this instruction is the FIRST and most authoritative text
 # the host reads. run3 (SHYJ-5645) took the empty route it led with and lost the
 # review across 98 cases from 8 mutually blind workers.
-_FINALIZE_SENTINEL = "@@PARALLEL_FINALIZE@@"
+_FINALIZE_SENTINEL = "@@FINALIZE_ROUTE@@"
 
 _FINALIZE_SIDECAR_FIRST = (
     "When ready=true, finalize with `qa_submit_suite` and a small JSON SIDECAR "
@@ -569,71 +596,89 @@ _FINALIZE_EMPTY_FIRST = (
     "test_cases (the server remaps a sidecar's tc_ids across the merge)."
 )
 
-_HOST_PARALLEL_INSTRUCTION = (
+_HOST_STAGED_INSTRUCTION = (
     "\n"
-    "PARALLEL FAN-OUT -- DECIDE THIS BEFORE YOU GENERATE ANYTHING. If your host "
-    "can run parallel workers (Cursor Task / subagents / equivalent), launch ONE "
-    "PER CATEGORY NOW and do NOT generate all 8 in this turn. This is the single "
-    "biggest lever on how long the tester waits: a measured run that fanned out "
-    "landed 7 categories inside ONE SECOND and finished in under 5 minutes, while "
-    "one that generated them sequentially in the parent turn took 26 minutes for "
-    "the same ticket. If your host genuinely cannot run parallel workers, generate "
-    "sequentially and ignore the numbered steps below.\n"
-    "1. Keep prep_id, system_prompt, user_context, and response_schema from this "
-    "payload (shared once -- copy them into each worker prompt; do not rely on "
-    "jobs[] for user_context).\n"
-    "2. Launch ONE worker per entry in `orchestration.expected_categories` / "
-    "`jobs[]` in the SAME session, in parallel. Each worker uses system_prompt + "
-    "user_context + that job's instruction; emits ONLY a JSON object matching "
-    "response_schema for THAT category; sets each case's `category` field to the "
-    "job's category_name EXACTLY. Pass `suite_json` STRAIGHT THROUGH as a JSON "
-    "OBJECT: do NOT serialise it into a string, and do NOT write it to a file or "
-    "build a script to assemble it. Measured on real payloads, a 20 KB category "
-    "object and a 150 KB merged 80-case object both arrive byte-identical, so "
-    "size is not a reason to stage through files -- observed runs spent minutes "
-    "re-encoding payloads that would have transferred as-is. A JSON string is "
-    "still accepted if your client genuinely cannot send an object.\n"
-    "3. PRIMARY finalize (Path A -- stage as you go): call `qa_submit_category` "
-    "for EACH category AS SOON AS its worker returns (from the worker when it "
-    "can call MCP tools, otherwise from the parent). Do NOT hold results only "
-    "in the parent's memory until the end: a chat reload or crash loses "
-    "unstaged work, while staged categories survive on the server and "
-    "`qa_prep_status` shows what is left. "
+    "3. FETCH THE CATEGORY PACKETS IN ONE CALL. "
+    '`qa_get_category_job(prep_id, "all")` returns EVERY job packet in ONE '
+    "call, with the shared prompt blocks hoisted once; a single category_name "
+    "returns one packet. NEVER fetch packets one call per category -- an "
+    "observed run spent 8 round trips on that. Keep prep_id, system_prompt, "
+    "user_context and response_schema from THIS payload; do not rely on "
+    "`jobs[]` for user_context. `orchestration.expected_categories` is the "
+    "exact set this server expects to see staged, and it REFUSES an incomplete "
+    "staged finalize, so do not finalize early.\n"
+)
+
+# Steps 4-6: generate, then the two finalize routes. ALWAYS emitted -- a host
+# with no orchestration contract still needs them -- which is why they live
+# outside the seam-gated block above. _FINALIZE_SENTINEL is resolved by
+# _finalize_instruction() so step 5 recommends the route that KEEPS the
+# duplicate review whenever that review is enabled (Fix 2, 2026-08-03).
+_HOST_FINALIZE_INSTRUCTIONS = (
+    "4. For EACH of the entries in `categories`, produce test cases using "
+    "`system_prompt` as your system instruction, `user_context` as the feature "
+    "material, and that entry's `instruction` (its FOCUS, case-count range and "
+    "preferred type). Emit ONLY a JSON object conforming to `response_schema`.\n"
+    "   Set each case's `category` field to that entry's `name`, copied EXACTLY "
+    '(e.g. "Positive / Happy Path"). It is what makes the exported Category '
+    "column meaningful; a value the server cannot resolve is stored empty rather "
+    "than guessed.\n"
+    "5. SUBMIT EACH CATEGORY AS YOU FINISH IT (Path A -- recommended). Call "
+    "`qa_submit_category` with this `prep_id`, the category's name and that "
+    "category's JSON the moment its cases are written, before you start the "
+    "next category. Pass `suite_json` STRAIGHT THROUGH as a JSON OBJECT: do NOT "
+    "serialise it into a string, and do NOT write it to a file or build a "
+    "script to assemble it -- measured on real payloads, a 20 KB category "
+    "object and a 150 KB merged 80-case object both arrive byte-identical, and "
+    "observed runs spent minutes re-encoding payloads that would have "
+    "transferred as-is. A JSON string is still accepted if your client "
+    "genuinely cannot send an object. Two things make this the recommended "
+    "route, and NEITHER is speed: staged categories survive a chat reload or a "
+    "crash and `qa_prep_status` shows what is still outstanding, while on the "
+    "other route nothing is saved until the final call; and the server runs its "
+    "own duplicate PRESCREEN across the staged set, which the other route never "
+    "sees. "
     + _FINALIZE_SENTINEL
-    + " Do not finalize early -- the "
-    "server rejects an incomplete Path A finalize when this orchestration was "
-    "requested.\n"
-    "4. ALTERNATIVE finalize (Path B -- merge in parent): merge all workers' "
-    "test_cases into ONE object (unique tc_ids), run any post-merge reviews "
-    "asked elsewhere in these instructions (`duplicate_groups` works on "
-    "either route), then call `qa_submit_suite` with this "
-    "prep_id and the merged suite_json. Nothing is saved until that one call, "
-    "so an interrupted chat loses every worker's output.\n"
-    '5. Optional: `qa_get_category_job(prep_id, "all")` returns EVERY job '
-    "packet in ONE call, with the shared prompt blocks hoisted once; a "
-    "single category_name returns one packet. NEVER fetch packets one "
-    "call per category -- an observed run spent 8 round trips on that.\n"
-    "6. STEP-ZERO JOBS COME FIRST, AND ONLY IN THE PARENT. If this payload "
-    "carries `jobs_to_run`, run every entry whose stage is `step_zero` "
-    "YOURSELF, in the parent turn, in `order`, BEFORE launching any worker -- "
-    "a `blocking` one that fails or says stop means STOP, do not generate. A "
-    "worker must NEVER run one: if all 8 derive their own acceptance "
-    "criteria you get 8 conflicting AC-001s in one suite. Copy each result "
-    "into EVERY worker prompt (the derived criteria go in the job packet's "
-    "`acceptance_criteria` field) -- a worker only receives system_prompt + "
-    "user_context + its own instruction and never sees this parent text. "
-    "Return each job's `return_field` on the merged submission.\n"
+    + " Do not finalize early -- the server rejects an incomplete staged "
+    "finalize when this orchestration was requested.\n"
+    "6. OR SUBMIT THE WHOLE SUITE AT ONCE (Path B). Merge all categories into "
+    "ONE JSON object with a single `test_cases` array, keeping tc_id values "
+    "unique (TC-001, TC-002, ...; they are renumbered on submission), then call "
+    "`qa_submit_suite` with the `prep_id` returned alongside this payload. This "
+    "is a supported route, not a shortcut: take it when your client cannot hold "
+    "a multi-call session. What it costs you is the two things named in step "
+    "5.\n"
+    "   Either way the server validates the suite, scores requirement coverage "
+    "deterministically, and returns either a gap report to fix and resubmit "
+    "(same prep_id) or the finished suite and its export path. If you already "
+    "sent categories one at a time with `qa_submit_category`, do NOT also send "
+    'the merged JSON: finalize with an EMPTY `suite_json` (`suite_json=""`) or '
+    "the review sidecar described below -- a non-empty `suite_json` is "
+    "authoritative, so every staged row would be ignored."
 )
 
 
 def _parallel_fanout_on() -> bool:
-    """The parent-chat parallel category fan-out. HARDCODED ON since 2026-08-13.
+    """The `orchestration` / `jobs` STAGED-CATEGORY contract. HARDCODED ON.
 
     NOT settings-derived: QA_HOST_PARALLEL_FANOUT_ENABLED was DELETED
-    (flag-surface reduction, batch 8a) and hardcoded to `True`, the value the
-    PUBLIC DISTRIBUTION `.env` template already shipped -- not this field's old
-    code default. Kept as a named seam so the no-orchestration payload below
-    stays executable and a revival is one line here.
+    (flag-surface reduction, batch 8a, 2026-08-13) and hardcoded to `True`, the
+    value the PUBLIC DISTRIBUTION `.env` template already shipped -- not this
+    field's old code default. Kept as a named seam so the no-orchestration
+    payload stays executable and a revival is one line here.
+
+    D3 (2026-08-21) -- WHAT THIS SEAM GATES CHANGED, ITS NAME DID NOT. The
+    parallel-WORKER ask it used to emit is retired (see the block comment
+    above); what it gates now is the staged-category contract: the
+    `orchestration` and `jobs` payload keys and the packet-fetch step. The name
+    is retained DELIBERATELY, and the reason is not inertia: its persisted twin
+    `meta["parallel_fanout"]` is stamped into every prep envelope and read at
+    submit time by the completeness gate, so renaming the function alone would
+    put the code and the stamp out of step, and renaming the STAMP would make
+    every in-flight and historical envelope unreadable. One misleading private
+    identifier is cheaper than either. The tester-facing wording and the
+    machine-readable `orchestration.mode` -- the two things a host or a tester
+    actually reads -- were corrected instead.
     """
     return True
 
@@ -662,15 +707,27 @@ def _dedup_review_on() -> bool:
     return True
 
 
-def _parallel_instruction() -> str:
-    """Appendix for prepare instructions, or "" when the flag is OFF.
+def _staged_instruction() -> str:
+    """Step 3 (fetch the category packets), or "" when the seam is OFF.
 
-    Resolves the finalize sentinel so step 3 recommends the route that KEEPS the
-    duplicate review whenever that review is enabled (Fix 2).
+    The ONLY seam-gated part of the numbered sequence: `qa_get_category_job`
+    needs the orchestration contract, while generating and submitting (steps
+    4-6) do not. When it returns "" the sequence simply skips 3 -- a GAP, never
+    a duplicate, which is the invariant tests/test_host_staged_categories.py
+    pins.
     """
     if not _parallel_fanout_on():
         return ""
-    return _HOST_PARALLEL_INSTRUCTION.replace(
+    return _HOST_STAGED_INSTRUCTION
+
+
+def _finalize_instruction() -> str:
+    """Steps 4-6 with the finalize sentinel resolved.
+
+    Always emitted. Resolves the sentinel so step 5 recommends the route that
+    KEEPS the duplicate review whenever that review is enabled (Fix 2).
+    """
+    return _HOST_FINALIZE_INSTRUCTIONS.replace(
         _FINALIZE_SENTINEL,
         _FINALIZE_SIDECAR_FIRST if _dedup_review_on() else _FINALIZE_EMPTY_FIRST,
     )
@@ -731,7 +788,14 @@ def build_orchestration(prepared, prep_id: str = "") -> dict | None:
         return None
     names = expected_category_names(prepared)
     return {
-        "mode": "parallel_chat_workers",
+        # D3 (2026-08-21): was "parallel_chat_workers". This value is
+        # MACHINE-READABLE guidance, so a stale one is worse than a stale
+        # paragraph -- it named workers this server stopped asking for.
+        # `expected_categories` / `jobs` are UNCHANGED: they describe the work,
+        # not who does it. The `worker_count` / `worker_instructions` KEYS keep
+        # their names -- hosts and two other test modules read them, and they
+        # describe whatever context generates a category.
+        "mode": "staged_categories",
         "expected_categories": list(names),
         "worker_count": len(names),
         # 2026-08-03 (Fix 2): this is MACHINE-READABLE guidance, and naming the
@@ -750,19 +814,22 @@ def build_orchestration(prepared, prep_id: str = "") -> dict | None:
             "require_all_categories": True,
         },
         "parent_instructions": (
-            "Fan out one same-session worker per expected category; stage each "
-            "category via qa_submit_category as it returns (crash-safe), then "
+            "Generate each expected category and stage it via "
+            "qa_submit_category as soon as it is written (crash-safe, and the "
+            "only route the server duplicate prescreen runs on), then "
             "qa_prep_status until ready=true and finalize with a review sidecar "
             "carrying duplicate_groups -- an EMPTY duplicate_groups list is the "
             "correct way to report that you DID review and found none (an "
             "empty suite_json also finalizes, but FORFEITS the duplicate "
             "review you were asked to run). "
-            "Merge-in-parent (Path B) is the fallback."
+            "One merged qa_submit_suite call (Path B) is the supported "
+            "alternative for a client that cannot hold a multi-call session."
             if _dedup_review_on()
-            else "Fan out one same-session worker per expected category; stage "
-            "each category via qa_submit_category as it returns (crash-safe), "
-            "then qa_prep_status until ready=true and finalize with an empty "
-            "suite_json. Merge-in-parent (Path B) is the fallback."
+            else "Generate each expected category and stage it via "
+            "qa_submit_category as soon as it is written (crash-safe), then "
+            "qa_prep_status until ready=true and finalize with an empty "
+            "suite_json. One merged qa_submit_suite call (Path B) is the "
+            "supported alternative."
         ),
         "worker_instructions": (
             "Emit ONLY one category's TestSuite JSON matching response_schema. "
@@ -984,7 +1051,10 @@ def prep_status_view(
 _HOST_GROUNDING_MARKER = "GROUNDING REVIEW"
 
 _HOST_GROUNDING_INSTRUCTION = (
-    "\n7. " + _HOST_GROUNDING_MARKER + " -- do this AFTER merging and after any "
+    # D3 (2026-08-21): renumbered 7 -> 8, one past the duplicate review it
+    # tells the host to run first. The seam is OFF today; the number is kept
+    # coherent so a revival does not reintroduce a collision.
+    "\n8. " + _HOST_GROUNDING_MARKER + " -- do this AFTER merging and after any "
     "duplicate review, immediately before submitting. Every check this server runs "
     "on your suite is lexical, so none of them can tell whether a case's EXPECTED "
     "RESULT actually follows from the ticket. You can. Using `user_context` as DATA "
@@ -1116,6 +1186,14 @@ def _dedup_instruction() -> str:
 # Step-by-step instructions handed to the tester's own chat model. Code-authored
 # (trusted); the only untrusted text is inside user_context, which is already
 # _GUARD / wrap_untrusted-wrapped and must be treated as DATA.
+# D3 (2026-08-21): this is now the HEAD of the sequence (steps 1, 1b, 2) only.
+# Generating and submitting moved to _HOST_FINALIZE_INSTRUCTIONS (steps 4-6) so
+# that the seam-gated packet-fetch step 3 can sit between them and the whole
+# composed string reads as one ascending list. Three tests asserted
+# `instructions.startswith(_HOST_GENERATION_INSTRUCTIONS)`; that pin was the
+# reason the 2026-08-03 prominence fix could only reorder the OPTIONAL blocks,
+# it never checked anything a host cares about, and it is replaced by
+# tests/test_host_staged_categories.py's ascending-sequence invariant.
 _HOST_GENERATION_INSTRUCTIONS = (
     "You will generate a professional manual-testing suite yourself, then submit "
     "it back for deterministic validation and export.\n"
@@ -1134,25 +1212,16 @@ _HOST_GENERATION_INSTRUCTIONS = (
     "exported cleanly, path never shown). Never report the suite as delivered "
     "without showing the path. Do not offer alternate export formats unless "
     "the tester asks.\n"
-    "2. For EACH of the entries in `categories`, produce test cases using "
-    "`system_prompt` as your system instruction, `user_context` as the feature "
-    "material, and that entry's `instruction` (its FOCUS, case-count range and "
-    "preferred type). Emit ONLY a JSON object conforming to `response_schema`.\n"
-    "   Set each case's `category` field to that entry's `name`, copied EXACTLY "
-    '(e.g. "Positive / Happy Path"). It is what makes the exported Category '
-    "column meaningful; a value the server cannot resolve is stored empty rather "
-    "than guessed.\n"
-    "3. Merge all categories into ONE JSON object with a single `test_cases` "
-    "array. Keep tc_id values unique (TC-001, TC-002, ...); they are renumbered "
-    "on submission.\n"
-    "4. Submit the merged JSON by calling the `qa_submit_suite` tool with the "
-    "`prep_id` returned alongside this payload. The server validates it, scores "
-    "requirement coverage deterministically, and returns either a gap report to "
-    "fix and resubmit (same prep_id) or the finished suite and its export path.\n"
-    "   If instead you already sent categories one at a time with "
-    "`qa_submit_category`, call `qa_submit_suite` with an EMPTY `suite_json` "
-    '(`suite_json=""`) and do NOT also send the merged JSON -- a non-empty '
-    "`suite_json` is authoritative, so every staged row would be ignored."
+    "2. STEP-ZERO JOBS COME FIRST, IN THIS TURN, BEFORE YOU GENERATE ANYTHING. "
+    "If this payload carries `jobs_to_run`, run every entry whose stage is "
+    "`step_zero` YOURSELF, in `order`, before you write a single test case -- a "
+    "`blocking` one that fails or tells you to stop means STOP, do not "
+    "generate. Their results are INPUTS to every category: the derived "
+    "acceptance criteria land in each job packet's `acceptance_criteria` "
+    "field, so a category generated ahead of them is generated against the "
+    "wrong requirements, and a category generated in some separate context that "
+    "never saw them derives its own -- eight conflicting AC-001s in one suite. "
+    "Return each job's `return_field` on the submission.\n"
 )
 
 # HONESTY RULE (load-bearing): a degraded (lexical, no-embeddings) coverage object
@@ -1421,9 +1490,11 @@ _AC_JOB_INSTRUCTIONS = (
     "applies), and (b) add ONE optional top-level field to the merged JSON you "
     "submit:\n"
     '   "acceptance_criteria": [{"ac_id": "AC-001", "description": "..."}, ...]\n'
-    "   If you fan out to parallel workers, derive the list ONCE in the parent "
-    "and copy it into every worker prompt -- a worker that never sees it cannot "
-    "tag `requirement_id`. The server treats this field as UNTRUSTED: it "
+    "   Derive the list ONCE, in THIS parent turn, before you generate any "
+    "category -- a category written in a separate context that never sees the "
+    "list cannot tag `requirement_id`, and one that derives its own gives you "
+    "conflicting AC-001s in a single suite. The server treats this field as "
+    "UNTRUSTED: it "
     "re-canonicalises the ids, caps the list, and labels the criteria "
     "MODEL-DERIVED rather than ticket-sourced. It is OPTIONAL: if you omit it "
     "the suite still finalizes, with NO requirements traceability -- the server "
@@ -1866,11 +1937,14 @@ def build_host_ac_section(result, cases=None) -> str:
             )
             return head + "".join(f">   - {n}\n" for n in notes) + "\n"
         acs = list(getattr(result, "acs", None) or [])
-        # DIVERGENCE DETECTOR (deterministic, no LLM). The real parallel-fan-out
-        # failure mode is not "the parent forgot to pass the list on" -- it is
-        # EACH of the 8 workers deriving its own AC-001..AC-00N, so the merged
-        # suite cites ids that never existed in the ONE returned list. Prose in
-        # the worker directive is the mitigation; this is the detection, and it
+        # DIVERGENCE DETECTOR (deterministic, no LLM). The failure mode is not
+        # "the parent forgot to pass the list on" -- it is a category written in
+        # a context that never saw the derived list and numbered its own
+        # AC-001..AC-00N, so the merged suite cites ids that never existed in
+        # the ONE returned list. D3 (2026-08-21) retired the ask that made this
+        # the EXPECTED shape (eight blind workers), but not the shape itself: a
+        # host may still delegate a category, and step 2 of the generation
+        # instructions is the prose mitigation. This is the detection, and it
         # costs one set difference.
         known = {a.ac_id for a in acs}
         unknown_ids: list = []
@@ -1896,8 +1970,15 @@ def build_host_ac_section(result, cases=None) -> str:
             lines.append(
                 f">   - \u26a0\ufe0f  {len(unknown_ids)} cited requirement id(s) are "
                 f"NOT in the list above: {shown}{more}. The usual cause is a "
-                "PARALLEL FAN-OUT in which each worker derived its own numbering, "
-                "so identical ids mean different things per category. Those cases "
+                # D3 (2026-08-21): this used to name "a PARALLEL FAN-OUT in
+                # which each worker derived its own numbering". That cause is
+                # impossible on a stock run once the fan-out ask is retired, so
+                # it would misdirect the reader of a real divergence. The
+                # detector is deterministic and unchanged -- only the cause
+                # sentence moves to the shape that can still occur.
+                "category generated in a separate context that derived its own "
+                "numbering, so identical ids mean different things per "
+                "category. Those cases "
                 "trace to nothing and are listed as orphans in the matrix below -- "
                 "re-check them before trusting any per-requirement claim."
             )
@@ -1984,9 +2065,10 @@ _CHECKLIST_JOB_INSTRUCTIONS = (
     'shall display message DM02.", "ears_pattern": "event_driven", "source": '
     '"description:AF03"}, ...]\n'
     "   Do NOT number the items yourself: the server assigns every CL-001, "
-    "CL-002 ... id and ignores any id you send. If you fan out to parallel "
-    "workers, derive the checklist ONCE in the parent and copy it into every "
-    "worker prompt. The server treats this field as UNTRUSTED: it strips URLs, "
+    "CL-002 ... id and ignores any id you send. Derive the checklist ONCE, in "
+    "THIS parent turn, before you generate any category -- one checklist per "
+    "suite, never one per category. The server treats this field as UNTRUSTED: "
+    "it strips URLs, "
     "collapses whitespace, caps the item count and each item's length, folds "
     "unknown EARS tags and unrecognised source tags, and labels the result "
     "MODEL-DERIVED. It is OPTIONAL: if you omit it the suite still finalizes, "
@@ -2472,14 +2554,16 @@ IMAGE_RELEVANCE_JOB = HostJob(
 # every existing test of them) is unchanged -- and this costs ZERO extra round
 # trips and NO server-side LLM call. Exactly two things differ from
 # IMAGE_RELEVANCE_JOB: `blocking=True`, which is what makes the `jobs_to_run`
-# index entry (and step 6 of _HOST_PARALLEL_INSTRUCTION) read "a blocking one
-# that fails or says stop means STOP, do not generate"; and the clause below.
+# index entry (and step 2 of _HOST_GENERATION_INSTRUCTIONS) read "a blocking
+# one that fails or tells you to stop means STOP, do not generate"; and the
+# clause below.
 #
-# HONESTY ABOUT WHAT `blocking` BUYS (review M3): step 6 of
-# _HOST_PARALLEL_INSTRUCTION is emitted ONLY when _parallel_fanout_on(), which
-# has been the hardcoded True constant since 2026-08-13 (batch 8a) -- so unlike
-# the period when the flag defaulted FALSE, the index entry's `blocking: true`
-# now always has that prose contract behind it. The reasoning below is left
+# HONESTY ABOUT WHAT `blocking` BUYS (review M3): that prose used to be step 6
+# of _HOST_PARALLEL_INSTRUCTION and was emitted ONLY when _parallel_fanout_on().
+# D3 (2026-08-21) moved it into _HOST_GENERATION_INSTRUCTIONS as step 2, which
+# is UNCONDITIONAL -- so the index entry's `blocking: true` now always has that
+# prose contract behind it, on every payload rather than merely on every
+# payload since the flag was hardcoded True. The reasoning below is left
 # standing because it does not depend on the flag: the
 # clause below is the ONLY carrier of the STOP semantics. Layer 1 is therefore
 # INSTRUCTION-ONLY, with no server-side enforcement of any kind, until
@@ -2510,7 +2594,7 @@ _IMAGE_PREVENTION_MARKER = "STOP AND ASK BEFORE GENERATING FROM AN OFF-TOPIC SCR
 
 _IMAGE_PREVENTION_CLAUSE = (
     "0c-ter. " + _IMAGE_PREVENTION_MARKER + ": you reach the 0c-bis verdicts in "
-    "THIS parent turn, BEFORE step 1 and before you launch any worker -- so act "
+    "THIS parent turn, BEFORE step 1 and before you generate anything -- so act "
     "on them HERE, while acting is still free. If you judged ANY image `no`, do "
     "NOT generate and do NOT submit yet. Instead tell the tester, in one short "
     "message, WHICH screen you believe does not belong to this ticket and WHY, "
@@ -3053,24 +3137,25 @@ def build_prepare_payload(prepared, prep_id: str = "") -> dict:
         "categories": categories,
         "response_schema": prepared.category_response_schema,
         "image_context": image_context,
-        # 2026-08-03: _parallel_instruction() moved from FOURTH to FIRST of the
-        # optional blocks. Measured on a real payload, it previously began at char
-        # 4853 of 7925 -- 61% of the way through -- while the very first thing the
-        # host reads is "You will generate a professional manual-testing suite
-        # yourself", which reads as "do it in this turn". The correction arrived 61%
-        # later, hedged as a conditional aside, and a v1.36.0 run duly generated all
-        # 8 categories sequentially: 26 minutes against under 5 for a run that
-        # fanned out. The server had asked correctly -- orchestration.mode was
-        # parallel_chat_workers with 8 job packets -- so this is a PROMINENCE fix,
-        # the same class as demoting the review-forfeiting finalize in Fix 2.
+        # D3 (2026-08-21): ONE ascending sequence, assembled in reading order.
         #
-        # _HOST_GENERATION_INSTRUCTIONS stays FIRST: two tests assert
-        # instructions.startswith(...) on it, and a third asserts exact equality
-        # when every optional block is empty. Ordering among the optional blocks is
-        # not pinned, EXCEPT that _grounding_instruction() must stay last (it reads
-        # after the numbered steps and after the duplicate review it references).
+        #   _HOST_GENERATION_INSTRUCTIONS  1, 1b, 2   (intro, data, step-zero)
+        #   _staged_instruction()          3          (seam-gated packet fetch)
+        #   _finalize_instruction()        4, 5, 6    (generate, Path A, Path B)
+        #   _dedup_instruction()           7
+        #   _grounding_instruction()       8          (seam OFF today)
+        #
+        # attach_jobs / attach_ambiguity_job PREPEND the 0., 0a., 0d. job
+        # clauses, so the full payload still ascends. With the seam OFF the
+        # sequence skips 3 -- a gap, never a duplicate.
+        #
+        # HISTORY, kept because it is the argument against re-wording this
+        # again: the retired fan-out block was moved from 61% to 47% of the way
+        # through this string on 2026-08-03 and the next measured run ignored it
+        # anyway. Prominence was not the binding constraint; the ask was.
         "instructions": _HOST_GENERATION_INSTRUCTIONS
-        + _parallel_instruction()
+        + _staged_instruction()
+        + _finalize_instruction()
         + _dedup_instruction()
         # LAST on purpose: it must read after the numbered generation steps and
         # after the duplicate review it tells the host to follow.
@@ -3114,6 +3199,20 @@ _AMBIGUITY_JOB_INSTRUCTIONS = (
 )
 
 
+# D2 (2026-08-21). ONE sentence, added ONLY when the server actually found a
+# collision, so a clean ticket's `instructions` stays byte-identical. It is
+# deliberately short and carries NO ticket text: the findings themselves ride in
+# `ambiguity_job.detected_collisions`, which the host is already told to treat as
+# data. The SHYJ-5646 payload's `instructions` was 13,050 chars and the host read
+# it in windows; every char added here is a char of the same budget, so this must
+# not grow into a paragraph.
+_COLLISION_CLAUSE = (
+    "   The server also found identifier collision(s) in the source -- see "
+    "`ambiguity_job.detected_collisions`, where one id is bound to two different "
+    "things. Raise them as issues and use each id CONSISTENTLY in every case.\n"
+)
+
+
 def attach_ambiguity_job(payload: dict) -> dict:
     """Add ambiguity_job + step-0 instructions for host-side preflight. Never raises."""
     out = dict(payload or {})
@@ -3143,9 +3242,24 @@ def attach_ambiguity_job(payload: dict) -> dict:
                 "required": ["severity", "issues", "questions", "testable_surface"],
             },
         }
+        # DETECT AND REPORT ONLY. This does not resolve the collision, does not
+        # block generation, and does not touch `host_ambiguity_severity` -- the
+        # host self-reports that, and the server does not classify. It puts the
+        # finding in the host's hand BEFORE it generates, which is the one thing
+        # that was missing on SHYJ-5646: the gate rated a self-contradicting
+        # spec `low` and the generator then split 22 cases against 8 on it.
+        # The key is OMITTED when there is nothing to say, so a clean ticket's
+        # payload is key-identical to today's.
+        collisions = find_identifier_collisions(out.get("user_context"))
+        if collisions:
+            out["ambiguity_job"]["detected_collisions"] = collisions
         instr = str(out.get("instructions") or "")
         if "AMBIGUITY PREFLIGHT" not in instr:
-            out["instructions"] = _AMBIGUITY_JOB_INSTRUCTIONS + instr
+            out["instructions"] = (
+                _AMBIGUITY_JOB_INSTRUCTIONS
+                + (_COLLISION_CLAUSE if collisions else "")
+                + instr
+            )
     except Exception:
         logger.debug("attach_ambiguity_job failed", exc_info=True)
         return dict(payload or {})
