@@ -107,7 +107,16 @@ _ID_RE = re.compile(
     r"(?<![A-Za-z0-9_])(DF|UI|AF|BR)(\d{1,3})(?![A-Za-z0-9_])", re.IGNORECASE
 )
 _TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
-_DEFINITIONAL_RE = re.compile(r"^[ \t]*[=|][ \t]*(.*)$")
+# The emphasis class is load-bearing, and it was found by running this detector
+# over the REAL SHYJ-5646 ticket rather than over a fixture: it returned [] on
+# the very collision it was written for. That ticket writes its screen table as
+# `| **DF03** | Return bottom sheet: ... |`, and requiring the delimiter to
+# follow the id IMMEDIATELY meant the `**` suppressed the definitional binding
+# -- so guard 1, which demands one, could never fire and EVERY table definition
+# in the ticket was invisible. Bold/italic/code around an id is the normal
+# rendering of a Jira or markdown spec table, not an edge case. Bounded to 3
+# characters so this stays a delimiter tolerance and not a general scan.
+_DEFINITIONAL_RE = re.compile(r"^[*_~`]{0,3}[ \t]*[=|][ \t]*(.*)$")
 _TERMINATOR_RE = re.compile(r"[.;|]")
 _BEFORE_CUT_RE = re.compile(r"[.;|:]")
 _LATIN_RE = re.compile(r"^[a-z]", re.IGNORECASE)

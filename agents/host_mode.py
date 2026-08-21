@@ -1210,7 +1210,17 @@ _HOST_GENERATION_INSTRUCTIONS = (
     "tester asked for, and a summary that omits it reads as a finished run "
     "with no file (exactly what happened on 2026-08-03: 98 cases generated, "
     "exported cleanly, path never shown). Never report the suite as delivered "
-    "without showing the path. Do not offer alternate export formats unless "
+    "without showing the path. "
+    "THE SAME RULE COVERS THE QUALITY CAVEATS IN THAT REPLY. If it carries "
+    "a traceability warning, an UNRELIABLE (lexical fallback) coverage "
+    "caveat, a contradicted duplicate review, or a dropped-case or volume "
+    "warning, quote those lines too and put them ABOVE your own summary "
+    "table -- do not paraphrase them into it, and do not call the run "
+    "complete without them. Measured on 2026-08-21: the server reported 0 "
+    "of 4 acceptance criteria traced, 96 orphaned cases and an UNRELIABLE "
+    'matcher tier; the tester was shown "Status: Complete" and a tidy '
+    "per-category table. A caveat the tester never sees did not happen. "
+    "Do not offer alternate export formats unless "
     "the tester asks.\n"
     "2. STEP-ZERO JOBS COME FIRST, IN THIS TURN, BEFORE YOU GENERATE ANYTHING. "
     "If this payload carries `jobs_to_run`, run every entry whose stage is "
@@ -3544,8 +3554,25 @@ def _shortlist_safe(text: object, cap: int) -> str:
         return ""
 
 
-def build_dup_shortlist(merged_cases: list) -> list:
-    """Candidate duplicate PAIRS over the merged, renumbered cases.
+def build_dup_shortlist_counted(merged_cases: list) -> tuple[list, int]:
+    """Candidate duplicate PAIRS over the merged, renumbered cases, WITH
+    the uncapped total.
+
+    Returns ``(pairs, total)``: *pairs* truncated to
+    _DUP_SHORTLIST_MAX_PAIRS, *total* how many cleared the threshold BEFORE
+    that truncation. D4 (2026-08-21) split this out of
+    ``build_dup_shortlist``, which is now a thin wrapper carrying its exact
+    previous contract, so a caller that RENDERS the list can NAME the
+    shortfall when the cap binds instead of quietly showing 12 of N -- this
+    repo's no-silent-caps rule, and not a hypothetical: the F08 replay
+    recorded above was itself misread once because a saturated 12-pair list
+    was hiding nine more. NOTHING about the similarity measure changed --
+    there is still exactly ONE implementation and F08's constants are
+    untouched, because the F08 note above rejected threshold-tuning on
+    measurement and the D4 replay reproduced that result on a second suite
+    (see .claude/plans/plan-d4-d5-shyj5646-2026-08-21.md for the sweep).
+
+    The original contract, unchanged:
 
     Pure, synchronous, stdlib only -- no LLM, no embeddings, no I/O.
     Deterministic and bounded: at most _DUP_SHORTLIST_MAX_CASES cases are
@@ -3590,10 +3617,18 @@ def build_dup_shortlist(merged_cases: list) -> list:
                     }
                 )
         pairs.sort(key=lambda p: (-p["ratio"], p["id_a"], p["id_b"]))
-        return pairs[:_DUP_SHORTLIST_MAX_PAIRS]
+        return pairs[:_DUP_SHORTLIST_MAX_PAIRS], len(pairs)
     except Exception:
-        logger.debug("build_dup_shortlist failed", exc_info=True)
-        return []
+        logger.debug("build_dup_shortlist_counted failed", exc_info=True)
+        return [], 0
+
+
+def build_dup_shortlist(merged_cases: list) -> list:
+    """The capped pair list only -- the pre-D4 signature and behaviour,
+    byte-for-byte. Retained because ``mcp_handlers._dup_shortlist_note``
+    (the qa_submit_category call site) and the F08 tests are written
+    against it. See ``build_dup_shortlist_counted``."""
+    return build_dup_shortlist_counted(merged_cases)[0]
 
 
 def build_dup_shortlist_section(pairs: list) -> str:
@@ -3645,6 +3680,145 @@ def build_dup_shortlist_section(pairs: list) -> str:
         return "\n".join(lines) + "\n"
     except Exception:
         logger.debug("build_dup_shortlist_section failed", exc_info=True)
+        return ""
+
+
+def dup_shortlist_cases_json(cases: list) -> list:
+    """Adapt FINALIZED suite cases to the JSON-native shape the prescreen reads.
+
+    D4 (2026-08-21) -- WHY THIS EXISTS. The prescreen was written for the
+    per-category path, where ``mcp_handlers._merge_category_rows`` already hands
+    it plain dicts. On the MERGED finalize path the cases are ``TestCase`` model
+    objects, and they are read AFTER ``_finalize_generation`` -- deliberately,
+    because that call renumbers every ``tc_id``, so these are the FINAL ids that
+    match the exported workbook. Reading them any earlier would print ids that
+    send the tester to the wrong rows.
+
+    Accepts either shape. Pure, synchronous, stdlib only. Never raises; returns
+    [] on anything unusable.
+    """
+    out: list = []
+    try:
+        for c in cases or []:
+            if isinstance(c, dict):
+                tid, title = c.get("tc_id"), c.get("title")
+            else:
+                tid, title = getattr(c, "tc_id", ""), getattr(c, "title", "")
+            if tid:
+                out.append({"tc_id": str(tid), "title": str(title or "")})
+    except Exception:
+        logger.debug("dup_shortlist_cases_json failed", exc_info=True)
+    return out
+
+
+def build_dup_contradiction_headline(found: int, total: int) -> str:
+    """The PROTECTED finalize-reply CLAIM: the host's empty duplicate review is
+    contradicted by the server's own prescreen. "" when nothing was found.
+
+    D4 (2026-08-21). On the SHYJ-5646 run the host finalized through the merged
+    route with ``duplicate_groups: []``, so the server recorded "review ran,
+    none found" -- an assurance that was false over a suite in which a reviewer
+    found nine redundant clusters. The prescreen that could have contradicted it
+    already existed and was wired to ``qa_submit_category`` only, so it never
+    ran on the route this suite took.
+
+    Bounded by construction at 496 chars, which is what lets it afford to be a
+    PROTECTED reply section. The EVIDENCE (the pair list) is a SEPARATE and
+    TRIMMABLE section, ``build_dup_contradiction_pairs``: the claim about
+    whether the deliverable is what it appears to be must survive the reply
+    budget, the list backing it need not. See the reply-budget section of
+    .claude/plans/plan-d4-d5-shyj5646-2026-08-21.md for the measurements.
+
+    HONESTY BOUND, stated here because it is the reason the wording is a FLOOR
+    rather than a finding. Measured on the stored SHYJ-5646 suite (96 cases,
+    the run that produced this fix) against nine redundant clusters covering 33
+    case pairs: this prescreen returns FIVE pairs and recovers exactly ONE
+    cluster (TC-084 / TC-095, ratio 0.667). Four of the five are deliberate
+    variants -- English/Arabic, Shipped/Delivered, Pending/Cancelled -- i.e.
+    correctly distinct cases. Lowering _DUP_SHORTLIST_MIN_RATIO does NOT rescue
+    it and was not done: 0.70 recovers none, 0.60 and 0.55 recover two of nine,
+    and 0.30 recovers five of nine only by emitting forty-four pairs at 23%
+    precision. That is the same shape F08 measured when it rejected
+    threshold-tuning. So this text says "check these", never "remove these", and
+    it says out loud that an EMPTY prescreen is not evidence either.
+
+    Pure, synchronous, stdlib only. Never raises.
+    """
+    try:
+        n = int(found)
+    except (TypeError, ValueError):
+        return ""
+    if n <= 0:
+        return ""
+    # NO SILENT CAPS: when _DUP_SHORTLIST_MAX_PAIRS truncated the list, say so
+    # in the same breath as the count. A saturated list read as a complete one
+    # is exactly how the F08 replay was misread the first time.
+    more = ""
+    try:
+        if int(total) > n:
+            more = (
+                f" {int(total)} pair(s) cleared the bar in all; only the "
+                f"closest {n} are listed."
+            )
+    except (TypeError, ValueError):
+        more = ""
+    return (
+        "> \u267b\ufe0f  **That duplicate review is CONTRADICTED by the "
+        "server's own prescreen.** You reported no cross-category duplicates; "
+        "a stdlib shared-word comparison of the FINAL case titles found "
+        f"{n} candidate pair(s).{more} It is a FLOOR, not a measurement: "
+        "replayed on a real 96-case suite in which a reviewer found nine "
+        "redundant clusters it recovered ONE, so an empty prescreen is not "
+        "evidence of a clean suite either. Nothing was removed.\n\n"
+    )
+
+
+def build_dup_contradiction_pairs(pairs: list) -> str:
+    """The TRIMMABLE finalize-reply EVIDENCE behind the headline above: the
+    candidate pairs themselves. "" when there are none.
+
+    Deliberately NOT ``build_dup_shortlist_section``. That renderer's body is a
+    call to action for a host still mid-flight ("confirm a shortlist via the
+    finalize sidecar", "finalize with duplicate_groups: []"), which on a
+    finalize reply is unfollowable -- the suite is validated, exported and
+    persisted by the time this is read. Same measure, same sanitiser, different
+    audience, and no dead instruction.
+
+    Ids and titles are UNTRUSTED host text: every interpolation goes through
+    ``_shortlist_safe`` (backtick-span breakout and newlines stripped, length
+    capped). Pure, synchronous, stdlib only. Never raises.
+    """
+    try:
+        rows = [p for p in (pairs or []) if isinstance(p, dict)]
+        if not rows:
+            return ""
+        lines = [
+            "",
+            "### \U0001f50d Candidate duplicate pairs (server lexical "
+            "prescreen -- ADVISORY)",
+            "",
+            "Titles only -- no LLM, no embeddings, nothing removed. Check each "
+            "against the workbook and drop any that differ in boundary value, "
+            "role, error message, language or platform; most near-identical "
+            "titles turn out to be deliberate variants.",
+            "",
+        ]
+        for p in rows[:_DUP_SHORTLIST_MAX_PAIRS]:
+            try:
+                ratio = float(p.get("ratio") or 0.0)
+            except (TypeError, ValueError):
+                ratio = 0.0
+            id_a = _shortlist_safe(p.get("id_a"), 16)
+            id_b = _shortlist_safe(p.get("id_b"), 16)
+            t_a = _shortlist_safe(p.get("title_a"), _DUP_SHORTLIST_TITLE_CHARS)
+            t_b = _shortlist_safe(p.get("title_b"), _DUP_SHORTLIST_TITLE_CHARS)
+            lines.append(
+                f'- `{id_a}` "{t_a}" ~ `{id_b}` "{t_b}" (lexical agreement {ratio:.2f})'
+            )
+        lines.append("")
+        return "\n".join(lines) + "\n"
+    except Exception:
+        logger.debug("build_dup_contradiction_pairs failed", exc_info=True)
         return ""
 
 

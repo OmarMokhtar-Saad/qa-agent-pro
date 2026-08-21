@@ -7806,8 +7806,25 @@ async def handle_submit_suite(
             # the sidecar is recommended whenever this review is on.
             if getattr(parsed, "duplicate_review_offered", False):
                 dup_status_note = (
-                    "> \u267b\ufe0f  Duplicate review ran and reported no "
-                    "cross-category duplicates.\n\n"
+                    # D4 (2026-08-21), reviewer item 4. This used to read
+                    # "Duplicate review ran and reported no cross-category
+                    # duplicates." -- flat, unattributed, and the MAJORITY
+                    # outcome, because the server prescreen added below
+                    # recovers only about one redundant cluster in nine.
+                    # A false assurance standing unchallenged is the whole
+                    # of D4, so the common path could not keep it. This is
+                    # a REPLACEMENT, not an addition: +152 chars inside a
+                    # section that is already protected, so the reply gains
+                    # attribution without gaining a slot, without a new
+                    # omission-marker risk, and without touching the
+                    # tests/test_finalize_reply_budget.py fixture, which
+                    # reports NO review and therefore renders the `else`
+                    # branch below instead of this one.
+                    "> \u267b\ufe0f  Duplicate review ran: the HOST "
+                    "reported no cross-category duplicates -- its verdict, "
+                    "not a server check. The server's title prescreen is a "
+                    "weak floor (1 of 9 clusters, measured), so neither "
+                    "empty result is evidence.\n\n"
                 )
             else:
                 dup_status_note = (
@@ -7823,8 +7840,25 @@ async def handle_submit_suite(
         elif dup_review_on and has_full and not dup_groups:
             if getattr(parsed, "duplicate_review_offered", False):
                 dup_status_note = (
-                    "> \u267b\ufe0f  Duplicate review ran and reported no "
-                    "cross-category duplicates.\n\n"
+                    # D4 (2026-08-21), reviewer item 4. This used to read
+                    # "Duplicate review ran and reported no cross-category
+                    # duplicates." -- flat, unattributed, and the MAJORITY
+                    # outcome, because the server prescreen added below
+                    # recovers only about one redundant cluster in nine.
+                    # A false assurance standing unchallenged is the whole
+                    # of D4, so the common path could not keep it. This is
+                    # a REPLACEMENT, not an addition: +152 chars inside a
+                    # section that is already protected, so the reply gains
+                    # attribution without gaining a slot, without a new
+                    # omission-marker risk, and without touching the
+                    # tests/test_finalize_reply_budget.py fixture, which
+                    # reports NO review and therefore renders the `else`
+                    # branch below instead of this one.
+                    "> \u267b\ufe0f  Duplicate review ran: the HOST "
+                    "reported no cross-category duplicates -- its verdict, "
+                    "not a server check. The server's title prescreen is a "
+                    "weak floor (1 of 9 clusters, measured), so neither "
+                    "empty result is evidence.\n\n"
                 )
             else:
                 dup_status_note = (
@@ -8314,6 +8348,53 @@ async def handle_submit_suite(
         # default install, which is the point (see its docstring).
         rtm_note = _rtm_orphan_note(suite)
         cov_signal_note = _no_coverage_signal_note(view)
+        # D4 (2026-08-21): the server's OWN duplicate prescreen, on the MERGED
+        # finalize path. The measure already existed -- host_mode's F08
+        # title-token Jaccard -- but `_dup_shortlist_note` wires it to
+        # `qa_submit_category` ONLY, and only when that submission completes the
+        # expected set. The SHYJ-5646 run finalized through `qa_submit_suite`,
+        # so the prescreen never ran and the host's empty `duplicate_groups`
+        # ("review ran, none found") stood unchallenged over a suite with nine
+        # redundant clusters. Same measure, same constants, second call site.
+        #
+        # THREE things about the placement are deliberate:
+        #   * AFTER the gap-round early return above, so a "fix and resubmit"
+        #     reply is untouched and this cannot repeat once per round.
+        #   * AFTER _finalize_generation, which renumbers every tc_id, so the
+        #     ids printed are the FINAL ones the workbook carries.
+        #   * Gated on `_review_claimed_none`. With no review reported,
+        #     dup_status_note above ALREADY says "No duplicate review ran ...
+        #     Any cross-category duplicates are still present" -- there is no
+        #     false assurance to contradict, so this section would be noise.
+        #     When the host DID name groups, build_duplicate_section reports
+        #     them pair by pair and a second advisory list would be noise too.
+        #
+        # Split in TWO on purpose: the CLAIM (dup_prescreen_head) is a protected
+        # reply section because it states that the assurance above is false,
+        # while the EVIDENCE (dup_prescreen_pairs) is trimmable -- every pair is
+        # a tc_id and a title, both printed in the workbook this same reply just
+        # handed over. See the ReplySection rows below and the reply-budget
+        # section of .claude/plans/plan-d4-d5-shyj5646-2026-08-21.md.
+        dup_prescreen_head = ""
+        dup_prescreen_pairs = ""
+        _review_claimed_none = bool(getattr(parsed, "duplicate_review_offered", False))
+        try:
+            if dup_review_on and not dup_groups and _review_claimed_none:
+                _pre_pairs, _pre_total = host_mode.build_dup_shortlist_counted(
+                    host_mode.dup_shortlist_cases_json(
+                        list(getattr(suite, "test_cases", None) or [])
+                    )
+                )
+                dup_prescreen_head = host_mode.build_dup_contradiction_headline(
+                    len(_pre_pairs), _pre_total
+                )
+                if dup_prescreen_head:
+                    dup_prescreen_pairs = host_mode.build_dup_contradiction_pairs(
+                        _pre_pairs
+                    )
+        except Exception:
+            # A disclosure must never be able to break a finalize.
+            logger.debug("merged-path duplicate prescreen failed", exc_info=True)
         _final_stamp = {
             "suite_id": str(getattr(suite, "suite_id", "") or ""),
             "export_path": str(xlsx_paths[0]) if xlsx_paths else "",
@@ -8386,6 +8467,36 @@ async def handle_submit_suite(
             ReplySection("checklist NLI tier", nli_note, _REPLY_P_EXPORTED),
             ReplySection("duplicate review", dup_status_note, protected=True),
             ReplySection("duplicates", dup_note, protected=True),
+            # D4: PROTECTED, because it states that the duplicate-review
+            # assurance immediately above it is CONTRADICTED -- a claim
+            # about whether the deliverable is what it appears to be, which
+            # is the definition _omission_marker leans on when it promises
+            # "every notice about whether this suite is VALID is still
+            # above". Dropping it would leave the false assurance standing
+            # alone, which is the exact D4 defect. It is bounded at 496
+            # chars by construction, so protecting it is cheap.
+            ReplySection("duplicate prescreen", dup_prescreen_head, protected=True),
+            # D4: TRIMMABLE at _REPLY_P_EXPORTED, whose stated reason is
+            # "the same disclosure is written into the export" -- here
+            # literally true, since every pair is a tc_id and a title and
+            # both are printed in the workbook this reply just handed
+            # over. NOTE THE ACTUAL DROP ORDER: assemble_finalize_reply
+            # sorts (priority, INDEX), so this row does NOT go first --
+            # the checklist NLI tier note shares this priority and sits
+            # at a lower index, so it yields ahead of this list. That is
+            # intended rather than tolerated: that note says of itself
+            # that the same disclosure is written into the checklist
+            # coverage notes, so it is FULLY reproduced in the export,
+            # while these pairs are only reconstructible from it. If the
+            # budget takes this one too, _omission_marker names it AND
+            # the protected headline above still carries the
+            # contradiction and the count, so nothing false is left
+            # standing. Marking this protected instead is what put the
+            # first attempt at this fix over the cap;
+            # tests/test_dup_prescreen_merged_submit.py pins the split.
+            ReplySection(
+                "duplicate prescreen pairs", dup_prescreen_pairs, _REPLY_P_EXPORTED
+            ),
             ReplySection("traceability orphans", rtm_note, protected=True),
             ReplySection("coverage signal", cov_signal_note, protected=True),
         ]
