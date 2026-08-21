@@ -59,6 +59,10 @@ def _note_client(ctx) -> None:
         llm.set_host_client(name)
         _CLIENT["name"] = (name or "").strip().lower()
         _CLIENT["version"] = str(getattr(info, "version", "") or "")
+        # ...and to the per-client elicitation record, which keys its strikes by
+        # this name so one editor's verdict can never gate another's on a shared
+        # install. Never raises (see tools.mcp_handlers.note_elicit_client).
+        mcp_handlers.note_elicit_client(name)
         # Tag this process's log lines with the editor that owns it: on an
         # install shared by three clients, the pid alone does not say WHICH.
         from tools.log_setup import set_client
@@ -434,6 +438,14 @@ def _make_chooser(ctx):
     """
     if not _elicit_enabled():
         return None
+    # 2026-08-21: and no dialog at all for a client whose elicitation transport
+    # has proven unanswerable in this process (two consecutive timeouts, no
+    # answer between them). None is the existing, tested "render the markdown
+    # menu" path, so the caller degrades exactly as it does for a client with no
+    # elicitation support -- but at 0s instead of 55s. Gated HERE rather than in
+    # _make_elicitors so the single-sided call sites are covered too.
+    if mcp_handlers.elicit_client_gated():
+        return None
 
     _budget = {"deadline": time.monotonic() + mcp_handlers._ELICIT_CALL_BUDGET_S}
 
@@ -458,6 +470,8 @@ def _make_asker(ctx):
     """Adapt ``ctx.elicit`` into a free-text ``ask_text(message)`` callback —
     the text sibling of _make_chooser (same gating and degradation rules)."""
     if not _elicit_enabled():
+        return None
+    if mcp_handlers.elicit_client_gated():  # see _make_chooser
         return None
 
     _budget = {"deadline": time.monotonic() + mcp_handlers._ELICIT_CALL_BUDGET_S}
