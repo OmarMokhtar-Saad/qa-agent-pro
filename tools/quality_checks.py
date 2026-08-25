@@ -189,6 +189,37 @@ EMPTY_DATA_MIN_CASES = 5
 # cap has no per-install right answer to tune.
 DATA_NOTES_MAX_CASES = 10
 
+# D1 (SHYJ-5138, 2026-08-21): the gap line NAMES the affected cases now --
+# but only while they are a MINORITY of the suite. F01 (2026-08-16) made the
+# line counts-only for reply-budget reasons, and the count duly fired on the
+# live run ("49 of 64 ... 15 declare none"); what it could not do is tell the
+# tester to open TC-006 (catalog API load), TC-024 (HTTP 503) or TC-041 (BR01
+# alphabetical order). A fifth prompt clause was rejected rather than tried:
+# memory e02-null-result-2026-08-20 measured prose as a CONFIRMED WEAK LEVER
+# on this generator, and this finding already recurred once (19 of 96, memory
+# live-validation-2026-08-16) with all four existing clauses live.
+#
+# THE RATIO GATE IS LOAD-BEARING, AND MEASURED. Above EMPTY_DATA_WARN_RATIO
+# the ids are suppressed and this line is byte-identical to its pre-SHYJ-5138
+# form, for two independent reasons: (1) the suite-level advisory in
+# quality_warning_section already owns that message ("91% of 96 case(s) have
+# no test data plan"), so 12 of 87 ids is noise on top of it; (2) that shape
+# has the LEAST reply headroom of any -- a suite where almost nothing
+# declares a plan has almost no enumeration left to shrink in payment. A
+# first draft of this change named ids unconditionally and measured the
+# 87-of-96 fixture in tests/test_finalize_reply_cap.py at 4025 chars against
+# mcp_handlers._SUMMARY_CAP = 4000 -- over by 25, because dropping
+# enumeration rows there CREATED an "... and N more" overflow line that had
+# been absent. See `limit` below for the second half of that guard.
+# Measured after the gate: 0/96 and 87/96 byte-identical, 19/96 -47 chars.
+# Twelve ids covers the live 15-case run with a "(+3 more)" tail, and the
+# per-id width cap bounds the whole line at ~190 chars even for a malformed
+# tc_id. Module constants, deliberately NOT settings flags (CLAUDE.md flag
+# policy): a display cap has no per-install right answer to tune.
+DATA_GAP_MAX_IDS = 12
+DATA_GAP_MAX_ID_CHARS = 12
+DATA_GAP_ROW_COST = 4
+
 
 def find_empty_data_cases(cases: list[TestCase]) -> list[str]:
     """Return the tc_id of every case carrying BOTH no preconditions and an empty
@@ -1596,13 +1627,24 @@ def data_notes_section(cases: list[TestCase]) -> str:
     the section enumerated only the 77 cases that HAD a plan ("10 + 67 more"), so
     a reader doing arithmetic could not tell "needs no data" from "plan missing".
 
-    The disclosure is a COUNT and never an id list, and it is BUDGETED. The
-    finalize reply is capped (tools/mcp_handlers._SUMMARY_CAP = 4000) and this
-    section is followed by the anchoring / scope / grounding advisories and the
-    token meter, which are what a truncation actually cuts — so the line is held to
-    79 chars at a 96-case suite (counts-only, so it grows only with the width of
-    three integers) AND paid for by spending one fewer enumeration row whenever it
-    renders. tests/test_finalize_reply_cap.py measures both shapes.
+    The disclosure carries the affected case IDS -- not only a count -- whenever
+    the missing cases are a MINORITY (below EMPTY_DATA_WARN_RATIO), and it is
+    BUDGETED. F01 (2026-08-16) made it counts-only; SHYJ-5138 (2026-08-21)
+    reversed that for the minority case, because "15 declare none" does not
+    tell a tester to open TC-006 / TC-024 / TC-041. At or above the ratio the
+    ids are suppressed and the line is byte-identical to its F01 form: the
+    suite-level advisory already owns that message, and that shape has the
+    least reply headroom of any (see the module constants above for the
+    measurement that forced the gate).
+    At most DATA_GAP_MAX_IDS ids are named, each clipped to
+    DATA_GAP_MAX_ID_CHARS, followed by "(+N more)" -- so the line is bounded at
+    ~190 chars at ANY suite size. The finalize reply is capped
+    (tools/mcp_handlers._SUMMARY_CAP = 4000) and this section is followed by
+    the anchoring / scope / grounding advisories, which are what a truncation
+    actually cuts -- so the ids are paid for out of this section's own
+    enumeration budget, and ONLY where that payment is real (see `limit`).
+    tests/test_finalize_reply_cap.py measures all three shapes; measured
+    end-to-end: 0/96 and 87/96 unchanged, 19/96 from 3938 to 3891 chars.
 
     Fires when at least one case declares no plan AND the suite carries at least
     EMPTY_DATA_MIN_CASES cases, reusing that existing threshold so small fixtures
@@ -1616,20 +1658,33 @@ def data_notes_section(cases: list[TestCase]) -> str:
         rows: list[str] = []
         total = 0
         missing = 0
+        missing_ids: list[str] = []
         for tc in cases:
             total += 1
             if not getattr(tc, "test_data", None):
                 missing += 1
+                missing_ids.append(str(getattr(tc, "tc_id", "") or "?"))
                 continue
             fields = ", ".join(f"{it.field}={it.strategy}" for it in tc.test_data)
             rows.append(f"- {tc.tc_id}: {fields}")
-        # Fixed-cost gap line (counts only, never ids), rendered AHEAD of the
-        # enumeration so an intra-section cut can never eat it.
+        # Bounded gap line: counts always, plus the affected ids while they are
+        # a MINORITY of the suite (see the module constants above for why the
+        # ids were added and why the ratio gate is not optional). Rendered
+        # AHEAD of the enumeration so an intra-section cut can never eat it.
         gap = ""
         if missing and total >= EMPTY_DATA_MIN_CASES:
+            named = ""
+            if missing < total * EMPTY_DATA_WARN_RATIO:
+                shown_ids = [
+                    str(i)[:DATA_GAP_MAX_ID_CHARS]
+                    for i in missing_ids[:DATA_GAP_MAX_IDS]
+                ]
+                extra = missing - len(shown_ids)
+                tail = f" (+{extra} more)" if extra > 0 else ""
+                named = f": {', '.join(shown_ids)}{tail}"
             gap = (
                 f"{total - missing} of {total} case(s) declare a data plan; "
-                f"{missing} declare none (blank Test Data column).\n"
+                f"{missing} declare none (blank Test Data column){named}.\n"
             )
         if not rows:
             # Nothing to enumerate. Stay silent unless the gap line has something
@@ -1641,11 +1696,27 @@ def data_notes_section(cases: list[TestCase]) -> str:
             "Each case below declares what data it needs and how to source it "
             "(see the **Test Data** column in the exported file):\n"
         )
-        # One fewer enumerated row whenever the gap line renders, so the
-        # disclosure is paid for out of THIS section's budget instead of out of
-        # the shared _SUMMARY_CAP. The dropped row is not lost: it rolls into the
-        # overflow count, and the full plan is in the exported file either way.
-        limit = DATA_NOTES_MAX_CASES - 1 if gap else DATA_NOTES_MAX_CASES
+        # DATA_GAP_ROW_COST fewer enumerated rows when the gap line renders -- it
+        # was ONE until SHYJ-5138 (2026-08-21) made the line name ids -- so the
+        # disclosure is still paid for out of THIS section's budget instead of
+        # out of the shared _SUMMARY_CAP. The dropped rows are not lost: they
+        # roll into the overflow count, and the full plan is in the exported
+        # file either way. The trade is deliberate on content as well as on
+        # arithmetic: an enumerated row describes a case whose plan is ALREADY
+        # in the exported Test Data column, whereas a named missing id is
+        # actionable nowhere else.
+        #
+        # THE OVERFLOW CONDITION IS LOAD-BEARING. Charging the cost when the
+        # enumeration fits today CREATES an "... and N more" line that was
+        # absent, which costs ~87 chars to save ~150 of rows and can end up NET
+        # POSITIVE -- measured at +42 on the 87-of-96 fixture in
+        # tests/test_finalize_reply_cap.py, i.e. 4025 against a 4000 cap. So the
+        # rows are only ever taken from an enumeration that already overflows,
+        # where each dropped row is a pure saving. Never let this become an
+        # unconditional `if gap`.
+        limit = DATA_NOTES_MAX_CASES
+        if gap and len(rows) > DATA_NOTES_MAX_CASES:
+            limit = max(1, DATA_NOTES_MAX_CASES - DATA_GAP_ROW_COST)
         shown = rows[:limit]
         overflow = len(rows) - len(shown)
         if overflow:

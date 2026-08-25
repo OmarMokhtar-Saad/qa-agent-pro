@@ -336,6 +336,19 @@ def _write_rtm_sheet(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
         rows = (artifacts or {}).get("rows") or []
         if not rows:
             return
+        # C1/C2 (SHYJ-5138): reconcile this sheet's DECLARED-LINK percentage with
+        # the 'Coverage Audit' sheet's SIMILARITY-MATCHED figure, and name a
+        # degraded matcher HERE -- next to the number a tester actually reads.
+        # The live run printed an unqualified "4 of 4 ... (100%)" here while that
+        # sheet suppressed every percentage it had. Done at render time because
+        # this is the only place holding both artifacts, and it leaves rtm_rows'
+        # output byte-identical. See tools.rtm.reconcile_coverage_rows.
+        from tools.rtm import reconcile_coverage_rows
+
+        rows = reconcile_coverage_rows(
+            rows,
+            (getattr(suite, "_checklist_artifacts", None) or {}).get("coverage"),
+        )
         header_fmt = workbook.add_format(
             {
                 "bold": True,

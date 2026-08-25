@@ -336,7 +336,28 @@ _MAX_EXPORT_DIR_CHARS = 400
 # "User Input Required" panel with a REQUIRED Value* field. The tester never sees
 # the question, so an unanswered dialog held the whole tool call until the client
 # killed it at its ~120s idle timeout.
-_ELICIT_TIMEOUT_S = 55.0
+# A1 (2026-08-21, SHYJ-5138): 20.0, was 55.0. A live Cursor run spent 55023 ms of a
+# 55023 ms qa_prepare_test_cases call waiting on ONE dialog -- ~100% of the tool
+# call -- and the answer still arrived only AFTER the call had returned. 55s was
+# chosen in K1 for exactly one property, "worst case stays under the client's
+# measured ~120s idle kill"; it was never justified as long enough for a tester to
+# ANSWER, and in Cursor it cannot be: the dialog renders as a COLLAPSED
+# "User Input Required" panel with a required Value* field, so the dominant failure
+# is the tester never SEEING the question. Extra seconds do not cure not-noticing;
+# they only delay the fallback that is visible -- the markdown menu in the reply
+# text, which the host relays into the chat.
+#
+# WHY 20.0 and not an arbitrary smaller number: 20.0 IS _ELICIT_FLOOR_S below. The
+# floor already asks a call's FIRST dialog for at least 20s even on a spent budget,
+# so any value under 20 would make this constant a bound the floor routinely
+# overrides -- a number that does not describe the behaviour, which is the class of
+# untrue text this whole area exists to remove -- and would break the pinned
+# invariant _ELICIT_FLOOR_S <= _ELICIT_TIMEOUT_S. At 20.0 the three-dialog wizard's
+# worst case is 3x20 = 60s inside the unchanged 80s per-call budget, still well
+# under ~120s, and one blind dialog costs a tester 20s instead of 55s. A shorter
+# bound also makes LATE orphan answers more frequent, which is exactly what
+# _suppress_orphan_elicit_logs handles.
+_ELICIT_TIMEOUT_S = 20.0
 
 # Per-CALL budget. Dialogs chain sequentially inside one tool call (the image gate
 # asks twice, the wizard up to three times), so a per-dialog bound alone still let
@@ -870,6 +891,12 @@ def _note_elicit_outcome(result) -> None:
     try:
         if getattr(result, "status", None) in (CHOSEN, DECLINED):
             note_elicit_answered()
+            # A3 re-arm (2026-08-21). The status carve-out is NOT widened: it is
+            # load-bearing and separately pinned -- an UNAVAILABLE result is a
+            # raising transport, not an answer. A live transport means a later
+            # unknown-request-ID record is unexplained again, so the demotion
+            # filter is removed here.
+            _rearm_orphan_elicit_logs()
     except Exception:
         logger.debug("elicit outcome note failed", exc_info=True)
 
@@ -913,6 +940,124 @@ def _elicit_wait_s(cb) -> float | None:
         return _ELICIT_TIMEOUT_S
 
 
+def _elicit_dead(cb) -> bool:
+    """True when an EARLIER dialog of this same call timed out.
+
+    Read only for WORDING, by _log_elicit_skip. The skip DECISION stays in
+    _elicit_wait_s, which remains the single owner of it. Never raises."""
+    try:
+        budget = getattr(cb, "_elicit_budget", None)
+        return bool(isinstance(budget, dict) and budget.get("dead"))
+    except Exception:  # pragma: no cover - defensive; a read must never raise
+        logger.debug("elicit dead read failed", exc_info=True)
+        return False
+
+
+def _log_elicit_skip(what: str, cb, message: str) -> None:
+    """Log a SKIPPED dialog with its REAL cause.
+
+    A2 (2026-08-21, SHYJ-5138): both helpers logged "per-call elicitation budget
+    spent" for every skip. On the live run the choice dialog timed out at
+    21:06:12,506 and its own elicit_text fallback was skipped 2 ms later -- 2 ms
+    into an 80s budget, so nothing was spent; the cause was the dead-mark. A
+    timed-out prompt must not be ACCOUNTED as its own fallback's budget spend.
+
+    The fallback is still skipped, deliberately: a transport that just proved it
+    does not answer within the bound renders the second dialog just as invisibly,
+    so re-asking buys another blind wait and no answer. What reaches the tester is
+    the markdown menu the call site already relays. Never raises."""
+    if _elicit_dead(cb):
+        logger.warning(
+            "mcp %s skipped for %r -- an earlier dialog in this call timed out, "
+            "so this client is not answering (per-call budget NOT spent)",
+            what,
+            message,
+        )
+    else:
+        logger.warning(
+            "mcp %s skipped for %r -- per-call elicitation budget spent",
+            what,
+            message,
+        )
+
+
+# A3 (2026-08-21, SHYJ-5138): the SDK loggers that report an elicitation answer
+# arriving AFTER we abandoned the dialog. Attached individually because the stdlib
+# does not consult an ANCESTOR logger's filters.
+_ORPHAN_RESPONSE_LOGGERS = ("mcp.server.lowlevel.server", "mcp.shared.session")
+_ORPHAN_RESPONSE_NEEDLE = "unknown request id"
+_orphan_filter_installed: dict = {"done": False, "filter": None}
+
+
+class _OrphanElicitResponseFilter(logging.Filter):
+    """Demote a late "unknown request ID" record from ERROR to DEBUG.
+
+    asyncio.wait_for CANCELS the pending ctx.elicit, so a tester who answers the
+    collapsed Cursor panel late sends a JSON-RPC response for a request id the
+    session no longer tracks, and the SDK logs "Received exception from stream:
+    Received response with an unknown request ID" at ERROR. On the live run that
+    arrived 24 ms after the tool returned. Nothing is broken and there is nothing
+    for a tester or an operator to do: it is a designed consequence of OUR bound,
+    and it was the loudest line in the log.
+
+    DEMOTED rather than dropped, so a genuine protocol desync is still findable at
+    DEBUG. Handler level checks read record.levelno, so the installed INFO log no
+    longer shows it. Returns True always -- no other filter or handler behaviour
+    changes -- and never raises. Accepted cost: a real desync in a process that has
+    already abandoned a dialog is reported at DEBUG."""
+
+    def filter(self, record) -> bool:
+        try:
+            if _ORPHAN_RESPONSE_NEEDLE in str(record.getMessage()).lower():
+                record.levelno = logging.DEBUG
+                record.levelname = "DEBUG"
+                record.exc_info = None
+                record.exc_text = None
+        except Exception:  # pragma: no cover - defensive; a filter must not raise
+            return True
+        return True
+
+
+def _suppress_orphan_elicit_logs() -> None:
+    """Arm the orphan-response filter once per process, at the moment a dialog is
+    ABANDONED.
+
+    Lazily and not at import, deliberately: before this process has abandoned a
+    dialog an "unknown request ID" really IS unexplained and must stay at ERROR.
+    Idempotent; never raises."""
+    if _orphan_filter_installed["done"]:
+        return
+    try:
+        _filter = _OrphanElicitResponseFilter()
+        for _name in _ORPHAN_RESPONSE_LOGGERS:
+            logging.getLogger(_name).addFilter(_filter)
+        _orphan_filter_installed["filter"] = _filter
+        _orphan_filter_installed["done"] = True
+    except Exception:  # pragma: no cover - defensive; logging is not a feature
+        logger.debug("orphan elicit filter install failed", exc_info=True)
+
+
+def _rearm_orphan_elicit_logs() -> None:
+    """DISARM the orphan filter after a dialog was answered (or declined).
+
+    Without this the filter, once armed, demotes every unknown-request-ID record
+    for the rest of the process -- including a genuine protocol desync minutes
+    later on a client that has since started answering dialogs. An answered or
+    declined dialog is proof the transport is live, which is the same signal
+    note_elicit_answered uses to clear the per-client strike record, so the two
+    clear together. Idempotent; never raises."""
+    _filter = _orphan_filter_installed.get("filter")
+    if _filter is None:
+        return
+    try:
+        for _name in _ORPHAN_RESPONSE_LOGGERS:
+            logging.getLogger(_name).removeFilter(_filter)
+    except Exception:  # pragma: no cover - defensive; logging is not a feature
+        logger.debug("orphan elicit filter re-arm failed", exc_info=True)
+    _orphan_filter_installed["filter"] = None
+    _orphan_filter_installed["done"] = False
+
+
 def _mark_elicit_asked(cb) -> None:
     """Record that this call has now shown a dialog, so the floor applies once."""
     try:
@@ -932,6 +1077,10 @@ def _mark_elicit_dead(cb) -> None:
     leave the next dialog askable. Same never-raising discipline as
     _mark_elicit_asked, and the same per-call holder, so deadness never leaks
     across tool calls."""
+    # A3 (2026-08-21): abandoning a dialog is exactly when a late answer becomes
+    # EXPECTED, so this is where the orphan-response filter is armed. One site
+    # covers both helpers -- every timeout branch already calls this function.
+    _suppress_orphan_elicit_logs()
     try:
         budget = getattr(cb, "_elicit_budget", None)
         if isinstance(budget, dict):
@@ -951,10 +1100,9 @@ async def _elicit_choice(choose: ChooseCb, message: str, options: list) -> Choic
         return ChoiceResult(UNAVAILABLE)
     wait_s = _elicit_wait_s(choose)
     if wait_s is None:
-        logger.warning(
-            "mcp elicit_choice skipped for %r -- per-call elicitation budget spent",
-            message,
-        )
+        # A2: the cause is logged by _log_elicit_skip, which distinguishes a spent
+        # budget from a transport this call already proved unresponsive.
+        _log_elicit_skip("elicit_choice", choose, message)
         return ChoiceResult(UNAVAILABLE, budget_skipped=True)
     _mark_elicit_asked(choose)
     try:
@@ -999,10 +1147,8 @@ async def _elicit_text(ask_text: AskCb, message: str) -> ChoiceResult:
         return ChoiceResult(UNAVAILABLE)
     wait_s = _elicit_wait_s(ask_text)
     if wait_s is None:
-        logger.warning(
-            "mcp elicit_text skipped for %r -- per-call elicitation budget spent",
-            message,
-        )
+        # A2: see the sibling in _elicit_choice.
+        _log_elicit_skip("elicit_text", ask_text, message)
         return ChoiceResult(UNAVAILABLE, budget_skipped=True)
     _mark_elicit_asked(ask_text)
     try:
@@ -5507,7 +5653,19 @@ def _finalized_reply(prep_id: str, record: object) -> str:
         export_path = str(info.get("export_path") or "").strip()
         lines = [
             f"✅ Nothing to do: prep `{prep_id}` was ALREADY finalized "
-            "successfully. Its cases are saved."
+            "successfully. Its cases are saved.",
+            # B2 (2026-08-21, SHYJ-5138): this reply is a NOTICE, not an artifact,
+            # and it must say so before anything else. On the live run a second
+            # editor process replayed a whole finalize against an
+            # already-finalized prep and its host wrote all eight 520-byte
+            # "nothing to do" replies over the files holding the REAL finalize
+            # output, destroying it. The server cannot stop a host writing files;
+            # the only lever it has is the CONTENT. The suite_id and export path
+            # below are the recovery half -- they make an overwrite re-derivable.
+            "\n- **this reply contains NO new output.** It is a no-op notice. "
+            "Do "
+            "NOT save it over, or replace, any file you wrote from the earlier "
+            "successful finalize -- that file is the real result.",
         ]
         if suite_id:
             lines.append(f"- **suite_id:** `{suite_id}`")
@@ -6499,6 +6657,40 @@ def _prep_status_finalize_hint() -> str:
     )
 
 
+# B1 (2026-08-21, SHYJ-5138): the two prep_status states a polling host can switch
+# on. A second editor process re-used a prep_id whose suite had finalized 11s
+# earlier and polled qa_prep_status 122 times at 1s (21:10:22 -> 21:12:26, every
+# reply 1-12 ms) before giving up. _finalized_reply was returned all 122 times and
+# DID name the suite -- but it is prose in a different shape from the status reply
+# a loop parses, so there was no FIELD a loop condition could read as terminal.
+_PREP_STATE_IN_PROGRESS = "in_progress"
+_PREP_STATE_FINALIZED = "finalized"
+
+
+def _prep_status_state_line(state: str) -> str:
+    """The one machine-readable field a polling host can switch on.
+
+    COMPATIBILITY: this is a NEW bullet. `ready to finalize (Path A)`, `staged`,
+    `missing` and `unrecognized names` keep their exact wording, order, values and
+    meaning on the non-finalized path, and the finalized path keeps emitting NONE
+    of them (pinned by tests/test_prep_finalized_stamp.py, which asserts "staged:"
+    is absent) -- no fake `staged: 0/0` is manufactured for a finished prep,
+    because that would redefine those fields. A caller that ignores this line
+    behaves exactly as it does today."""
+    return f"- **state:** {state}\n"
+
+
+def _prep_status_finalized_reply(prep_id: str, finalized_note: str) -> str:
+    """The already-finalized notice, in the prep-status SHAPE, with a terminal
+    state. ``finalized_note`` is _finalized_reply's text, used unchanged."""
+    return (
+        f"## Prep status (`{prep_id}`)\n\n"
+        + _prep_status_state_line(_PREP_STATE_FINALIZED)
+        + "- **terminal:** yes -- this prep will never change again. STOP polling "
+        "`qa_prep_status` for this prep_id; nothing is pending.\n\n" + finalized_note
+    )
+
+
 async def handle_prep_status(prep_id: str) -> str:
     """Report staged vs expected categories for a prep_id. Never raises."""
     prep_id = (prep_id or "").strip()
@@ -6516,9 +6708,11 @@ async def handle_prep_status(prep_id: str) -> str:
         # before rehydrating. Without this, prep_status would report `staged: 0/8`
         # and then recommend the Path A finalize -- actively instructing a re-stage
         # of all 8 categories for a suite that is already finished.
+        # B1 (2026-08-21): wrapped in the status shape so the finalized case is a
+        # readable TERMINAL state and not only prose. The note itself is unchanged.
         _final_note = _finalized_reply(prep_id, envelope)
         if _final_note:
-            return _final_note
+            return _prep_status_finalized_reply(prep_id, _final_note)
         meta = envelope.get("meta") or {}
         expected = list(meta.get("expected_categories") or [])
         if not expected and not meta.get("parallel_fanout"):
@@ -6548,7 +6742,8 @@ async def handle_prep_status(prep_id: str) -> str:
         )
         return (
             f"## Prep status (`{prep_id}`)\n\n"
-            f"- **ready to finalize (Path A):** {ready}\n"
+            + _prep_status_state_line(_PREP_STATE_IN_PROGRESS)
+            + f"- **ready to finalize (Path A):** {ready}\n"
             f"- **staged:** {status.get('staged_count', 0)}/"
             f"{status.get('expected_count', 0)} — {staged}\n"
             f"- **missing:** {missing}\n" + unrec_line + _prep_status_finalize_hint()
@@ -11098,6 +11293,79 @@ async def _atlassian_autofix() -> tuple[list[str], list[str]]:
         return [], []
 
 
+def _embeddings_backend_advisory() -> str:
+    """The qa-doctor line for an UNSET QA_EMBEDDINGS_BACKEND.
+
+    C2 (2026-08-21, SHYJ-5138): the setting defaults to "" and nothing told the
+    operator. On the live run every requirement-coverage percentage in the
+    workbook was SUPPRESSED and 9 of 15 checklist rows read "NOT COVERED
+    (UNRELIABLE -- lexical fallback)", while qa-doctor reported all gates on -- a
+    gate reporting less than it claims.
+
+    Returns "" when a backend IS configured, so it is used as a guard: this
+    function names a loss only where the loss is real, which is the disclosure
+    discipline the rest of handle_setup_check follows. RECOMMENDED, never a
+    blocker: generation, dedup and export are unaffected, so it must not flip the
+    verdict to "Not ready". No threshold is tuned -- a lexical score's on-topic
+    band overlaps its unrelated band, so no threshold separates them. Never
+    raises."""
+    try:
+        from tools import embeddings as _embeddings
+
+        if _embeddings.backend_enabled():
+            return ""
+    except Exception:  # pragma: no cover - an advisory must never break qa-doctor
+        logger.debug("embeddings backend check failed", exc_info=True)
+        return ""
+    return (
+        "Set `QA_EMBEDDINGS_BACKEND` (`local` or `voyage`) if you rely on the "
+        "coverage numbers. It is UNSET, so requirement matching runs on the "
+        "LEXICAL fallback: the workbook's Coverage Audit sheet SUPPRESSES every "
+        "coverage percentage, marks its gap and orphan counts UNRELIABLE, and "
+        'checklist rows it cannot match read "NOT COVERED (UNRELIABLE)" whether '
+        "or not a case actually covers them. Test generation, deduplication and "
+        "export are unaffected. `local` needs "
+        '`pip install -e ".[embeddings]"`; `voyage` needs a `VOYAGE_API_KEY`.'
+    )
+
+
+def _update_rate_limit_advisory(status: str) -> str:
+    """The qa-doctor line for an update check GitHub refused on quota.
+
+    D4 (2026-08-21, SHYJ-5138) shipped the detection half: run_update_check
+    returns "rate-limited" instead of folding a spent quota into "error", so a
+    403 is no longer indistinguishable from a DNS failure in the log. Nothing
+    told the TESTER, which was the half that mattered -- the live Cursor run at
+    21:33:55 logged the 403 and started the version already on disk, so the
+    install was silently BLIND to a newer release with the remedy nowhere in
+    front of anyone.
+
+    Returns "" for every other status, so it is used as a guard exactly like
+    _embeddings_backend_advisory above: a line is printed only where the loss is
+    real. RECOMMENDED rather than a blocker -- generation, export and every
+    other tool are unaffected, and the quota is per hour, so this cannot make an
+    otherwise healthy install report "Not ready". It is deliberately NOT
+    `optional` either: unlike the always-true retirement note above, this fires
+    only on a run whose quota really was spent, so "Ready, with warnings" is
+    accurate for that run and gone by the next one.
+
+    No try/except, unlike its neighbour: this reads no module and no setting, so
+    there is no failure mode to swallow -- and therefore no defensive branch that
+    would sit uncovered in a directory held at 90%. Never raises."""
+    if status != "rate-limited":
+        return ""
+    return (
+        "GitHub RATE-LIMITED this install's update check, so auto-update is "
+        "blind right now: the server could not see whether a newer release "
+        "exists and is running the version already on disk. This is not a "
+        "network failure -- GitHub was reached and refused on quota. No action "
+        "is needed to recover: the quota is per hour and clears by itself, so "
+        "the next check succeeds. Set `GITHUB_TOKEN` in the install's `.env` "
+        "only if you keep seeing this -- an unauthenticated check shares 60 "
+        "requests/hour with everything else on this machine, a token gets 5,000."
+    )
+
+
 async def handle_setup_check(
     *, progress: ProgressCb = None, workspace_roots: list[Path] | None = None
 ) -> str:
@@ -11122,6 +11390,9 @@ async def handle_setup_check(
     try:
         from tools.updater import _INSTALL_DIR, _local_version
 
+        # Bound BEFORE the edition gate: the advisory below reads it on
+        # every edition, and a full checkout never runs the check at all.
+        update_status = ""
         if _test_cases_only() and _DIST_UPDATE_REPO:
             from tools.updater import run_update_check
 
@@ -11331,6 +11602,17 @@ async def handle_setup_check(
                 recommended.append(_split)
         except Exception:
             logger.debug("split-server check failed", exc_info=True)
+        # C2 (2026-08-21): an UNSET embeddings backend silently degrades every
+        # coverage number the workbook prints. Recommended, not blocking.
+        _embeddings_note = _embeddings_backend_advisory()
+        if _embeddings_note:
+            recommended.append(_embeddings_note)
+        # D4 follow-up (2026-08-25): the tester-facing half of the
+        # "rate-limited" status. "" on every other status, so a healthy
+        # run is byte-identical.
+        _rate_limit_note = _update_rate_limit_advisory(update_status)
+        if _rate_limit_note:
+            recommended.append(_rate_limit_note)
         # BEFORE connect_hint_line, deliberately: that helper re-reads the config
         # from disk, so a fresh write flips its message to "already configured on
         # disk" instead of telling the tester to add what was just added.

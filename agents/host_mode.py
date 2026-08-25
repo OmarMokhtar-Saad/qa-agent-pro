@@ -792,12 +792,33 @@ def build_orchestration(prepared, prep_id: str = "") -> dict | None:
         # MACHINE-READABLE guidance, so a stale one is worse than a stale
         # paragraph -- it named workers this server stopped asking for.
         # `expected_categories` / `jobs` are UNCHANGED: they describe the work,
-        # not who does it. The `worker_count` / `worker_instructions` KEYS keep
-        # their names -- hosts and two other test modules read them, and they
-        # describe whatever context generates a category.
+        # not who does it.
+        # SHYJ-5138 D3 (2026-08-21) finished the job for the COUNT:
+        # `worker_count` is now `category_count`, because the VALUE was never
+        # stale (it always counted categories) but the NAME kept instructing an
+        # LLM host to think in workers -- the very behaviour the rename above
+        # retired, and exactly the class this comment calls worse than stale
+        # prose. A back-compat ALIAS was rejected for that reason: keeping the
+        # old key would keep the old instruction verbatim.
+        # Reader audit before renaming (grep worker_count over tests/ agents/
+        # tools/ mcp_server.py scripts/): the ONLY hits were this line, the
+        # comment above it, and a DOCSTRING in
+        # tests/test_host_staged_categories.py -- no code anywhere reads
+        # orchestration["worker_count"], and the dist launcher template reads
+        # only run_update_check's status. A host that misses the rename loses
+        # nothing it cannot recompute: `expected_categories` is the same set as
+        # a list.
+        # `worker_instructions` KEEPS its name, in BOTH places it appears -- on
+        # this orchestration dict (below, read by
+        # tests/test_host_staged_categories.py's prose scan) and on each
+        # per-category job packet in build_category_job (read by
+        # tests/test_host_ac_review.py and
+        # tests/test_category_job_acceptance_criteria.py). Unlike the count, it
+        # is not a stale instruction: it describes whatever context generates a
+        # category, and the server simply stopped ASKING for a separate one.
         "mode": "staged_categories",
         "expected_categories": list(names),
-        "worker_count": len(names),
+        "category_count": len(names),
         # 2026-08-03 (Fix 2): this is MACHINE-READABLE guidance, and naming the
         # empty finalize as `preferred` while the duplicate review is ON told the
         # host to take the one route that DISCARDS that review. run3 followed it

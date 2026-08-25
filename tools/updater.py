@@ -413,6 +413,48 @@ def _auth_headers(token: str) -> dict:
     return headers
 
 
+# GitHub answers an exhausted quota with 403 (primary limit) or 429
+# (secondary), and in BOTH cases sets `x-ratelimit-remaining: 0`. Before
+# SHYJ-5138 (2026-08-21) that landed in run_update_check's blanket
+# `except Exception` as "Startup update check failed (...)" -- the SAME line a
+# DNS failure produces -- so the live install whose quota was spent (Cursor
+# client log, 21:33:55) read as broken rather than BLIND, and the remedy was
+# nowhere in the record. A 401, a 404, or a 403 that is NOT a quota must stay
+# a plain error, so the remaining-header check is what separates the two.
+_RATE_LIMIT_STATUSES = (403, 429)
+
+
+def _rate_limit_detail(exc: Exception) -> Optional[str]:
+    """Short human note when ``exc`` is a GitHub rate-limit refusal, else None.
+
+    Never raises, and never reads or logs the token. A missing or garbled
+    header degrades to a LESS SPECIFIC note; anything unparseable enough to
+    throw returns None, so the caller falls back to the generic error path
+    rather than mislabelling an unrelated failure as a rate limit."""
+    try:
+        resp = getattr(exc, "response", None)
+        if resp is None:
+            return None
+        if getattr(resp, "status_code", None) not in _RATE_LIMIT_STATUSES:
+            return None
+        headers = getattr(resp, "headers", None) or {}
+        remaining = str(headers.get("x-ratelimit-remaining", "")).strip()
+        if remaining != "0":
+            return None
+        limit = str(headers.get("x-ratelimit-limit", "")).strip()
+        authed = limit.isdigit() and int(limit) > 60
+        who = "authenticated" if authed else "unauthenticated, 60/hour"
+        wait = ""
+        reset = str(headers.get("x-ratelimit-reset", "")).strip()
+        if reset.isdigit():
+            mins = max(0, int((int(reset) - time.time()) // 60))
+            wait = f", resets in ~{mins} min"
+        return f"{who}{wait}"
+    except Exception:
+        logger.debug("rate-limit detail parse failed", exc_info=True)
+        return None
+
+
 def _parse_version(value: str) -> Optional[tuple]:
     """Parse a ``X.Y.Z`` (optionally ``v``-prefixed) version to an int tuple.
 
@@ -756,7 +798,7 @@ def run_update_check(
 ) -> str:
     """Startup self-update + integrity pass. Returns a status string and NEVER
     raises: ``"disabled" | "no-repo" | "up-to-date" | "updated" | "healed" |
-    "heal-aborted" | "error"``. On any failure the caller starts the current version.
+    "heal-aborted" | "rate-limited" | "error"``. On any failure the caller starts the current version.
 
     ``force`` / ``repo_override`` / ``lock_override`` let a distribution
     launcher mandate the check regardless of local ``.env`` toggles; developer
@@ -882,6 +924,27 @@ def run_update_check(
                 logger.debug("Code lock: all files already read-only.")
         logger.info("Up to date (local=%s, latest=%s).", local, remote)
         return status
+    except httpx.HTTPStatusError as exc:
+        # Ahead of the blanket clause below ON PURPOSE: an exhausted GitHub
+        # quota is not a failure to reach GitHub. Both directions matter --
+        # a non-quota 403/401/404 falls through to the generic message and
+        # "error", which is what keeps this branch from becoming "every HTTP
+        # error is a rate limit".
+        detail = _rate_limit_detail(exc)
+        if detail is None:
+            logger.warning(
+                "Startup update check failed (%s) — starting current version.",
+                exc,
+            )
+            return "error"
+        logger.warning(
+            "Startup update check hit the GitHub API rate limit (%s) — "
+            "auto-update is BLIND until it resets, not broken, and this "
+            "server is starting the version already on disk. Set GITHUB_TOKEN "
+            "in .env to raise the limit from 60 to 5000 requests/hour.",
+            detail,
+        )
+        return "rate-limited"
     except Exception as exc:
         logger.warning(
             "Startup update check failed (%s) — starting current version.", exc

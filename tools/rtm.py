@@ -546,6 +546,119 @@ def rtm_rows(acs: list, test_cases: list, *, derived: bool = False) -> list:
         return []
 
 
+# C1/C2 (SHYJ-5138, 2026-08-21). One delivered workbook carried two coverage
+# claims that contradicted each other. 'Requirements Traceability' ended with
+# "4 of 4 acceptance criteria covered (100%) -- 56 of 64 case(s) trace to one."
+# while 'Coverage Audit', on the same run, reported "Requirements traced 6" of
+# 15 with EVERY percentage "SUPPRESSED -- lexical fallback" and its 9 gaps and
+# 56 orphans self-labelled UNRELIABLE. A tester reads the 100%.
+#
+# They are NOT two measurements of one thing, and this must not pretend they
+# are:
+#   * the traceability figure is a DECLARED-LINK tally over the COARSE
+#     acceptance criteria parsed from the source (4 of them). It is
+#     deterministic and true in its own terms -- and it says nothing about
+#     whether a case actually verifies the criterion its `requirement_id` names.
+#   * the audit figure is a SIMILARITY MATCH over the FINER EARS atomic
+#     checklist (15 items), and on the lexical fallback it is wrong in BOTH
+#     directions, which is why that sheet suppresses its own percentages.
+#
+# So the traceability percentage is NOT suppressed here. Suppressing a
+# deterministic tally because an unrelated matcher is degraded would make the
+# honest tier look like the dishonest one, and a guard that fires on a number it
+# does not govern is exactly how a gate goes inert. Instead the cell names its
+# own SCOPE, and one added row states the other sheet's figure, its different
+# denominator, its tier, and -- only when that matcher really is degraded --
+# that it cannot be trusted and what to set.
+#
+# Applied at RENDER time (tools/xlsx_generator._write_rtm_sheet) rather than
+# inside `rtm_rows`: rtm_rows runs at finalize with no knowledge of the matcher
+# tier, and the workbook is the only place that holds both artifacts. That also
+# keeps rtm_rows' output byte-identical, so the D1 exact-equality contract in
+# tests/test_f06_requirement_export.py stands and this fix has to be tested
+# against the DELIVERED cell rather than a builder return.
+_SCOPE_NOTE = (
+    " SCOPE: this counts DECLARED `requirement_id` links against the acceptance"
+    " criteria parsed from the source. It does NOT check that a case verifies"
+    " the criterion it names, and it is a COARSER requirement set than the"
+    " 'Coverage Audit' sheet's atomic checklist -- the two sheets are not"
+    " measuring the same thing, and neither number alone establishes coverage."
+)
+
+
+def reconcile_coverage_rows(rows: list, coverage: dict | None) -> list:
+    """Amend traceability rows with their own scope and the audit's figure.
+
+    *rows* is ``rtm_rows`` output; *coverage* is the checklist coverage dict
+    (``coverage_to_dict`` above) or None. Returns a NEW row list and never
+    mutates the input. Never raises -- on any surprise the rows come back
+    exactly as they went in, because a reconciliation note must never cost the
+    workbook its traceability sheet.
+
+    Three guards, all load-bearing:
+      * no ``Coverage`` row -> nothing to qualify, rows unchanged;
+      * a Coverage cell already reading "NOT REPORTED --" (the D1 no-links
+        shape) is left ALONE: it publishes no percentage, so it has no scope to
+        qualify and no contradiction to reconcile;
+      * the audit row is emitted only when the coverage object carries a real
+        denominator -- which is the PRESENTED count (``presented_items``,
+        falling back to ``total_items``), the same denominator the 'Coverage
+        Audit' sheet's "Coverage % (of presented)" row uses, which is why the
+        wording says "of the N presented": on a prompt-capped run the two differ
+        and "of N" would overstate the requirement set the generator ever saw; and the UNRELIABLE / QA_EMBEDDINGS_BACKEND wording only
+        when that object says ``degraded``.
+    """
+    try:
+        out = [list(r) for r in rows]
+        idx = -1
+        for i, row in enumerate(out):
+            if row and str(row[0]) == "Coverage":
+                idx = i
+                break
+        if idx < 0:
+            return out
+        cell = str(out[idx][1]) if len(out[idx]) > 1 else ""
+        if cell.startswith("NOT REPORTED --"):
+            return out
+        out[idx][1] = cell + _SCOPE_NOTE
+        cov = coverage or {}
+        total = int(cov.get("presented_items") or cov.get("total_items") or 0)
+        if total <= 0:
+            return out
+        traced = len(cov.get("covered_item_ids") or [])
+        tier = str(cov.get("tier_used") or "unknown")
+        head = (
+            "The 'Coverage Audit' sheet measures a DIFFERENT and FINER "
+            f"requirement set -- {traced} of the {total} presented atomic "
+            "checklist requirements traced"
+        )
+        if cov.get("degraded"):
+            tail = (
+                " -- by SIMILARITY MATCHING rather than by declared links. That "
+                f"matcher ran on the LEXICAL fallback (matcher tier: {tier}) "
+                "because no embeddings backend is configured, so every "
+                "percentage on that sheet is SUPPRESSED and its gap and orphan "
+                "lists are labelled UNRELIABLE -- wrong in BOTH directions, not "
+                "merely pessimistic. So read the percentage above as what it "
+                "is, a link tally over the coarser criteria; it is NOT a second "
+                "opinion confirming this suite's coverage. Set "
+                "QA_EMBEDDINGS_BACKEND for a trustworthy second measurement."
+            )
+        else:
+            pct = float(cov.get("coverage_pct") or 0.0)
+            tail = (
+                f" ({pct:.1f}%) -- by similarity matching on the {tier} tier "
+                "rather than by declared links. Read both: the percentage above "
+                "is a link tally over the coarser criteria, this one is a match "
+                "over the finer requirement set."
+            )
+        out.insert(idx + 1, ["Second measurement", head + tail, "", "", ""])
+        return out
+    except Exception:
+        logger.exception("reconcile_coverage_rows failed -- rows unchanged")
+        return list(rows or [])
+
+
 def rtm_oneline(
     acs: list[AcceptanceCriterion],
     test_cases: list[TestCase],

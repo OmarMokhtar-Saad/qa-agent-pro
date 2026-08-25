@@ -2320,10 +2320,27 @@ async def _finalize_generation(
         _cov = getattr(suite, "_checklist_artifacts", None) or {}
         _cov_tier = str((_cov.get("coverage") or {}).get("tier_used") or "none")
         logger.info(
-            "finalize: %d case(s) final | coverage tier=%s | quality flags=%s",
+            # SHYJ-5138 (2026-08-21). Two more facts on the SAME line, no new
+            # call. D1: 15 of 64 cases shipped a blank Test Data column and the
+            # only durable record was the workbook, so a truncated reply left
+            # nothing to grep in data/logs/. D2: the Module column was the
+            # literal "View Store" on all 64 rows -- a single-value column
+            # carries no information, and until now answering "was this suite
+            # uniform or FRAGMENTED?" (the failure normalize_module_names
+            # exists to fix, and the one this count actually detects) needed a
+            # hand read of the file. Both are counts over `renumbered`, i.e.
+            # the cases actually shipped.
+            "finalize: %d case(s) final | coverage tier=%s | quality flags=%s"
+            " | empty test_data=%d/%d | module labels=%d",
             len(getattr(suite, "test_cases", None) or []),
             _cov_tier,
             "yes" if quality_section else "no",
+            sum(1 for _tc in renumbered if not getattr(_tc, "test_data", None)),
+            len(renumbered),
+            len(
+                {(getattr(_tc, "module", "") or "").strip() for _tc in renumbered}
+                - {""}
+            ),
         )
     except Exception:
         logger.debug("finalize summary log failed", exc_info=True)
