@@ -847,6 +847,7 @@ def build_server():
         suite_json: str | dict = "",
         volume_floor_ack: bool = False,
         image_relevance_ack: bool = False,
+        step_assertion_ack: bool = False,
     ) -> str:
         """Submit a host-generated test suite back to the server to be validated,
         finalized, exported and persisted (the BACK half of host mode).
@@ -876,6 +877,16 @@ def build_server():
         with the per-image verdicts filled in. `image_relevance_ack` follows the
         SAME two-beat rule as `volume_floor_ack`: ignored on the first submit,
         honoured only after that refusal, and only ever on the USER's word.
+
+        If the reply refuses the submission because a whole category's steps have
+        an `expected_result` that only restates the `action` ("The step completes
+        successfully: ..."), rewrite those expected results to name the concrete
+        observable outcome -- the on-screen message, the field/button state, or
+        the resulting screen -- and resubmit under the same prep_id. A step that
+        restates its action passes whether the software works or not, so it
+        measures nothing. `step_assertion_ack` follows the SAME two-beat rule as
+        the two acks above: ignored on the first submit, honoured only after that
+        refusal, and only ever on the USER's word.
         """
         return await _tracked(
             "qa_submit_suite",
@@ -885,6 +896,7 @@ def build_server():
                 suite_json,
                 volume_floor_ack=volume_floor_ack,
                 image_relevance_ack=image_relevance_ack,
+                step_assertion_ack=step_assertion_ack,
                 ask_text=_make_asker(ctx),
                 progress=_make_progress(ctx),
             ),

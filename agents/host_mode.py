@@ -1892,16 +1892,26 @@ def build_ambiguity_result_section(result) -> str:
                 # the suite regardless -- an asymmetry a tester reading only
                 # this block could not see, and which decides whether they read
                 # "it did not run" as a server bug or as their host skipping a
-                # step. It is stated rather than fixed by refusing on purpose:
-                # a refusal would throw away generation work the tester already
-                # paid for. QA_HOST_AMBIGUITY_REQUIRE_RESULT (below) is the
-                # operator switch for installs that want the stricter trade.
+                # step. 2026-08-29: this used to say the asymmetry was left
+                # unfixed on purpose, because "a refusal would throw away
+                # generation work the tester already paid for". That rationale
+                # is retired -- the refusal keeps the prep and every staged row,
+                # so it costs one round trip and no work at all, which is why
+                # QA_HOST_AMBIGUITY_REQUIRE_RESULT now defaults ON. This block
+                # therefore renders in TWO situations and must read correctly in
+                # both: on an install that turned the refusal OFF, and prefixed
+                # onto the refusal itself (mcp_handlers.py:7719), where telling
+                # the reader to enable what is already enabled -- and pointing
+                # at "the suite below", which was not returned -- would be
+                # simply false.
                 "The payload declared that step `blocking: true`, but this "
                 "server has no way to enforce a step that runs inside your "
                 "chat: it can only report that the evidence never came back. "
-                "Treat the suite below as UNVERIFIED against an under-specified "
-                "ticket. Set `QA_HOST_AMBIGUITY_REQUIRE_RESULT=true` to refuse "
-                "such a submission outright."
+                "Where `QA_HOST_AMBIGUITY_REQUIRE_RESULT` is on -- the default "
+                "since 2026-08-29 -- the submission is REFUSED and nothing was "
+                "discarded: run step 0 and resubmit the same suite under the "
+                "same prep_id. Where it has been turned off, any suite shown "
+                "below is UNVERIFIED against an under-specified ticket."
                 # 2026-08-09 (Batch 3, FIX 2): say the LOSS, not just the
                 # process. Modelled on _attested_image_gap_note and the nli_note,
                 # which both refuse to claim a check that could not have happened.
