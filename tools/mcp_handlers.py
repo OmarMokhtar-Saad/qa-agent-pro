@@ -52,7 +52,7 @@ from agents.test_scenario_agent import (
     _prepare_generation,
 )
 from config.settings import settings
-from tools import prep_store, telemetry
+from tools import prep_store, step_assertion, telemetry
 from tools.audit_log import record_event
 from tools.build_fingerprint import code_fingerprint
 from tools.csv_exporter import generate_test_case_csv
@@ -5756,6 +5756,18 @@ async def _unfinished_preps_note(exclude_prep_id: str = "") -> str:
 
 _SIDECAR_KEYS = ("duplicate_groups", "acceptance_criteria", "ambiguity_result")
 
+# What a sidecar-only submit may leave on the prep for a later finalize (F3).
+# A CLOSED set, deliberately wider than _SIDECAR_KEYS because the two
+# meta-gated fields are copied by the same merge block: an unbounded copy would
+# let a host park arbitrary keys in the envelope.
+_SIDECAR_RETAINABLE = (
+    "duplicate_groups",
+    "acceptance_criteria",
+    "ambiguity_result",
+    "checklist_items",
+    "image_descriptions",
+)
+
 
 def _sidecar_keys(meta: object = None) -> tuple:
     """The recognised sidecar review fields for THIS request.
@@ -5803,6 +5815,114 @@ def _sidecar_keys(meta: object = None) -> tuple:
     except Exception:  # pragma: no cover
         logger.debug("_sidecar_keys flag read failed", exc_info=True)
     return _SIDECAR_KEYS
+
+
+def _retained_sidecar(meta: object) -> dict:
+    """The review sidecar an EARLIER sidecar-only submit left on this prep.
+
+    Empty dict when there is none, when the envelope predates the retention
+    (an old prep simply has no `pending_sidecar` key) or when the stored value
+    is not a dict. UNTRUSTED on the way back in: it is host-authored JSON that
+    happens to have been round-tripped through our own store, so it is handed
+    back into exactly the same `_apply`/`parse_host_suite` path a fresh
+    submission takes and is re-validated there. Never raises.
+    """
+    try:
+        pending = (meta or {}).get("pending_sidecar")  # type: ignore[union-attr]
+        return dict(pending) if isinstance(pending, dict) else {}
+    except Exception:
+        logger.debug("_retained_sidecar read failed", exc_info=True)
+        return {}
+
+
+def _merge_retained_sidecar(sidecar_obj, meta: object):
+    """This call's sidecar laid over the retained one (either may be absent).
+
+    Returning a non-None value here is what lets a BARE finalize -- no
+    suite_json, no sidecar -- still reach the sidecar merge branch and pick up
+    the acceptance criteria, checklist and ambiguity verdict a previous
+    sidecar-only submit produced. That is F3's whole acceptance path.
+
+    PRESENT-BUT-EMPTY DISCIPLINE is preserved end to end: only keys a sidecar
+    actually MENTIONED are stored and only those are overlaid, so a field
+    neither sidecar named stays absent and can never read downstream as "the
+    host reviewed and found none".
+    """
+    try:
+        retained = _retained_sidecar(meta)
+        if not retained:
+            return sidecar_obj
+        if not isinstance(sidecar_obj, dict):
+            return retained
+        merged = dict(retained)
+        merged.update(sidecar_obj)
+        return merged
+    except Exception:
+        logger.debug("_merge_retained_sidecar failed", exc_info=True)
+        return sidecar_obj
+
+
+def _superseded_sidecar_note(sidecar_obj, meta: object) -> str:
+    """Name the retained keys this call's sidecar overwrote.
+
+    A silent overwrite is the same class of loss F3 exists to close: the host
+    would have no way to know its earlier review had been replaced.
+    """
+    try:
+        retained = _retained_sidecar(meta)
+        if not retained or not isinstance(sidecar_obj, dict):
+            return ""
+        clashes = sorted(k for k in sidecar_obj if k in retained)
+        if not clashes:
+            return ""
+        return (
+            "> \u2139\ufe0f  This submission's `"
+            + "` / `".join(clashes)
+            + "` REPLACED the value retained from an earlier sidecar-only "
+            "submit on this prep.\n\n"
+        )
+    except Exception:
+        logger.debug("_superseded_sidecar_note failed", exc_info=True)
+        return ""
+
+
+def _with_retained_sidecar(suite_json, meta: object):
+    """Fold a retained sidecar into a FULL (Path B) submission.
+
+    CRITICAL CONTRACT: the submitted `test_cases` are what must never be lost,
+    so every doubt here returns `suite_json` UNCHANGED. A retained field is
+    added ONLY when the submission does not carry that key itself -- this call's
+    own values always win, and a key neither side mentioned stays absent, which
+    is the same present-but-empty discipline the sidecar merge uses.
+
+    Path B needs its own fold because `_review_sidecar` returns None for a
+    submission that HAS test cases, so a full suite can never enter the sidecar
+    merge branch -- and must not, since that branch rebuilds the suite from
+    staged rows and would discard everything the host just sent.
+    """
+    try:
+        retained = _retained_sidecar(meta)
+        if not retained:
+            return suite_json
+        if isinstance(suite_json, str):
+            data = json.loads(suite_json)
+        elif isinstance(suite_json, dict):
+            data = suite_json
+        else:
+            return suite_json
+        if not isinstance(data, dict) or not data.get("test_cases"):
+            return suite_json
+        merged = dict(data)
+        for key, value in retained.items():
+            if key not in merged:
+                merged[key] = value
+        return merged
+    except Exception:
+        logger.debug(
+            "_with_retained_sidecar failed - using the submission as sent",
+            exc_info=True,
+        )
+        return suite_json
 
 
 def _review_sidecar(suite_json, meta: object = None) -> "dict | None":
@@ -7337,6 +7457,7 @@ async def handle_submit_suite(
     *,
     volume_floor_ack: bool = False,
     image_relevance_ack: bool = False,
+    step_assertion_ack: bool = False,
     ask_text: AskCb = None,
     progress: ProgressCb = None,
 ) -> str:
@@ -7451,6 +7572,23 @@ async def handle_submit_suite(
             # recognised from THIS prep's stamps rather than from live
             # flags that may have been flipped since prepare.
             sidecar_obj = _review_sidecar(suite_json, meta) if has_full else None
+            # F3 (2026-08-29): a sidecar-only submit that arrived BEFORE any
+            # category was staged is retained on the prep, not discarded.
+            #
+            # GUARDED, and the guard is the whole safety of this fix. A FULL
+            # submission (test_cases present) makes `_review_sidecar` return
+            # None, so an UNCONDITIONAL overlay would hand a non-None
+            # sidecar_obj to the branch below, which rebuilds the suite from
+            # STAGED ROWS ONLY -- silently discarding every case the host just
+            # sent, and returning "Nothing to finalize" when no rows exist.
+            # That path is reachable precisely because the ambiguity and
+            # step-assertion refusals both tell the host to resubmit under the
+            # same prep_id. So the overlay runs ONLY where the call was already
+            # going to take the sidecar or the bare-finalize route; Path B folds
+            # the retained fields into its own submission instead, below.
+            _superseded_note = _superseded_sidecar_note(sidecar_obj, meta)
+            if sidecar_obj is not None or not has_full:
+                sidecar_obj = _merge_retained_sidecar(sidecar_obj, meta)
             sidecar_raw = (
                 sidecar_obj.get("duplicate_groups")
                 if isinstance(sidecar_obj, dict)
@@ -7461,10 +7599,69 @@ async def handle_submit_suite(
                 rows = rows_res.get("content") or []
                 if not rows:
                     _keys_label = "`" + "` / `".join(_sidecar_keys(meta)) + "`"
+                    # F3 (2026-08-29): RETAIN it. Until now this branch read the
+                    # sidecar, found nothing to merge it into and threw it away,
+                    # so a host that ran step 0 before staging its categories
+                    # lost its acceptance criteria, its checklist and its
+                    # ambiguity verdict outright -- which is why the SHYJ-5692
+                    # run finalized with zero ACs, zero checklist items and
+                    # host_ambiguity_ran:false. Only keys the sidecar actually
+                    # MENTIONED are stored, so the present-but-empty discipline
+                    # survives the round trip. Bounds are inherited rather than
+                    # reinvented: update_prep rejects a payload over
+                    # QA_PREP_MAX_BYTES, refuses an unknown/expired prep_id, and
+                    # leaves created_at alone so QA_PREP_TTL_S /
+                    # QA_PREP_MAX_LIFETIME_S still count from prepare.
+                    _mentioned = {
+                        k: sidecar_obj[k]
+                        for k in _SIDECAR_RETAINABLE
+                        if isinstance(sidecar_obj, dict) and k in sidecar_obj
+                    }
+                    _kept = False
+                    if _mentioned:
+                        try:
+                            _store = await prep_store.update_prep(
+                                prep_id,
+                                {
+                                    **envelope,
+                                    "meta": {
+                                        **meta,
+                                        "pending_sidecar": {
+                                            **_retained_sidecar(meta),
+                                            **_mentioned,
+                                        },
+                                    },
+                                },
+                            )
+                            _kept = not (_store or {}).get("error")
+                            if not _kept:
+                                logger.warning(
+                                    "prep %s sidecar NOT retained (%s)",
+                                    prep_id,
+                                    (_store or {}).get("error"),
+                                )
+                        except Exception:  # pragma: no cover - defensive
+                            logger.debug("sidecar retain failed", exc_info=True)
+                    if _kept:
+                        return (
+                            "\u2139\ufe0f Received a review sidecar "
+                            f"({_keys_label}) but no per-category rows are "
+                            f"staged for prep_id `{prep_id}` yet. **It was "
+                            "RETAINED, not discarded** -- record your categories "
+                            "with `qa_submit_category`, then finalize with "
+                            f"`qa_submit_suite(prep_id='{prep_id}')` and this "
+                            "review will be applied. You do not need to send it "
+                            "again."
+                        )
+                    # Say so plainly. A success-shaped reply for a review that
+                    # was NOT kept is the failure this fix exists to remove.
                     return (
-                        "⚠️ Nothing to finalize: received a review sidecar "
+                        "\u26a0\ufe0f Nothing to finalize: received a review sidecar "
                         f"({_keys_label}) but no per-category rows are staged "
-                        f"for prep_id `{prep_id}`."
+                        f"for prep_id `{prep_id}`, and it could NOT be retained "
+                        "on the prep. Record your categories with "
+                        "`qa_submit_category` and send this sidecar again with "
+                        "the finalize call."
                     )
                 # CRITICAL (iteration 5): the SIDECAR finalize merges the same
                 # staged rows and deletes the prep on success, so it needs the
@@ -7544,13 +7741,15 @@ async def handle_submit_suite(
                 parsed = host_mode.parse_host_suite(merged_dict)
                 has_full = False
                 _keys_label = "`" + "` / `".join(_sidecar_keys(meta)) + "`"
-                conflict_note = (
-                    f"> ℹ️  Finalized from {used} accumulated per-category "
+                conflict_note = _superseded_note + (
+                    f"> \u2139\ufe0f  Finalized from {used} accumulated per-category "
                     f"row(s) plus a review sidecar ({_keys_label}) (no full "
                     "suite_json test_cases were submitted).\n\n"
                 )
             elif has_full:
-                parsed = host_mode.parse_host_suite(suite_json)
+                parsed = host_mode.parse_host_suite(
+                    _with_retained_sidecar(suite_json, meta)
+                )
                 rows_res = await prep_store.load_submissions(prep_id)
                 n_rows = len(rows_res.get("content") or [])
                 if n_rows:
@@ -7681,6 +7880,90 @@ async def handle_submit_suite(
                 },
             )
         volume_note = _vmd if _vmode else ""
+        # F4 (2026-08-29): an ENFORCEMENT gate, not a prompt one -- the
+        # system_prompt has always demanded a verifiable expected_result. On the
+        # SHYJ-5692 run two regenerated categories came back with 65 steps whose
+        # expected_result merely restated the action ("The step completes
+        # successfully: <action>"), 74% and 78% of their steps, while the other
+        # six scored zero. Placed HERE, beside the volume floor and before
+        # finalize, for the same reason that one is: a refusal costs one round
+        # trip and destroys nothing.
+        assertion_note = ""
+        _assert_findings = step_assertion.find_tautological_steps(all_cases)
+        _assert_over = step_assertion.categories_over_threshold(all_cases)
+        if _assert_over:
+            _assert_detail = "\n".join(
+                f"- **{name}**: {hit} of {total} step(s) ({ratio:.0%})"
+                for name, hit, total, ratio in _assert_over
+            )
+            _assert_refused_before = bool(meta.get("assertion_refused"))
+            if not (step_assertion_ack and _assert_refused_before):
+                if step_assertion_ack and not _assert_refused_before:
+                    _first_beat = (
+                        "\n\n> \u26a0\ufe0f  `step_assertion_ack=true` arrived on the "
+                        "FIRST submit for this prep and was IGNORED -- the finding "
+                        "below had not been shown to anyone yet."
+                    )
+                else:
+                    _first_beat = ""
+                # Two-beat, exactly like volume_floor_ack / image_relevance_ack:
+                # an unpersisted mark only means the next ack is refused again,
+                # which fails safe.
+                try:
+                    _mark = await prep_store.update_prep(
+                        prep_id,
+                        {**envelope, "meta": {**meta, "assertion_refused": True}},
+                    )
+                    if (_mark or {}).get("error"):
+                        logger.warning(
+                            "prep %s not marked assertion_refused (%s)",
+                            prep_id,
+                            (_mark or {}).get("error"),
+                        )
+                except Exception:  # pragma: no cover - must never block the refusal
+                    logger.debug("assertion_refused mark failed", exc_info=True)
+                await _audit(
+                    "mcp_submit_suite_refused",
+                    entity_id=prep_id,
+                    detail={
+                        "reason": "step_assertion",
+                        "categories": [row[0] for row in _assert_over],
+                        "flagged_steps": len(_assert_findings),
+                    },
+                )
+                return (
+                    f"{version_note}\u26d4 **Submission refused:** in the "
+                    "categor(ies) below, most steps have an `expected_result` "
+                    "that asserts nothing the `action` did not already say -- "
+                    "typically a restatement of the action itself. A step like "
+                    "that passes against correct software AND against broken "
+                    "software, so executing it measures nothing.\n\n"
+                    f"{_assert_detail}\n\n"
+                    f"{step_assertion.step_assertion_detail(_assert_findings)}\n\n"
+                    "Rewrite those expected results to name the concrete "
+                    "observable outcome -- the exact on-screen message, the "
+                    "field/button state, or the resulting screen -- and resubmit "
+                    f"under the SAME prep_id `{prep_id}`. **Nothing was "
+                    "discarded**: the prep and every staged category row survive "
+                    "and no remediation round was consumed. To finalize as-is "
+                    "anyway, ask the tester first and then resend with "
+                    f"`step_assertion_ack=true`.{_first_beat}"
+                )
+            await _audit(
+                "mcp_submit_suite_assertion_override",
+                entity_id=prep_id,
+                detail={
+                    "reason": "step_assertion_ack",
+                    "categories": [row[0] for row in _assert_over],
+                    "flagged_steps": len(_assert_findings),
+                },
+            )
+            assertion_note = (
+                "> \u26a0\ufe0f  Finalized with `step_assertion_ack=true` over "
+                f"{len(_assert_findings)} step(s) whose expected_result asserts "
+                "nothing the action did not already state.\n\n"
+            )
+        _data_findings = step_assertion.find_echoed_test_data(all_cases)
         dropped_note = _dropped_note(parsed)
         # The ambiguity job's verdict. QA_HOST_AMBIGUITY_REVIEW_ENABLED
         # removed this server's classifier call AND, until now, every
@@ -8285,6 +8568,7 @@ async def handle_submit_suite(
                             "category provenance", cat_source, _REPLY_P_PROVENANCE
                         ),
                         ReplySection("volume floor", volume_note, protected=True),
+                        ReplySection("step assertions", assertion_note, protected=True),
                         ReplySection("acceptance criteria", ac_note, protected=True),
                         ReplySection("grounding", grounding_note, protected=True),
                         # Split on checklist_gap exactly as the finalize site
@@ -8384,6 +8668,18 @@ async def handle_submit_suite(
                         "too under-specified to test. That is NOT the same as "
                         "'checked and found nothing'.",
                     )
+                )
+            # F4 (2026-08-29): the .xlsx is what the tester keeps; a step that
+            # cannot fail has to be visible there and not only in a chat reply.
+            # Both notes are advisory here -- the REFUSAL above is the gate, and
+            # the test_data finding never gates at all.
+            _assert_detail_text = step_assertion.step_assertion_detail(_assert_findings)
+            if _assert_detail_text:
+                _gen_notes.append(("Steps that cannot fail", _assert_detail_text))
+            _data_detail_text = step_assertion.test_data_detail(_data_findings)
+            if _data_detail_text:
+                _gen_notes.append(
+                    ("Test data that restates the field name", _data_detail_text)
                 )
             if _gen_notes:
                 suite._generation_notes = _gen_notes
@@ -8630,6 +8926,11 @@ async def handle_submit_suite(
         _sections = [
             ReplySection("ambiguity screening", amb_note, protected=True),
             ReplySection("volume floor", volume_note, protected=True),
+            # PROTECTED for the same reason volume_note is: this line is the
+            # only place the finalize reply says the tester waved 65
+            # unfalsifiable steps through. Accepting an ack silently is the
+            # F2 pattern this whole batch exists to correct.
+            ReplySection("step assertions", assertion_note, protected=True),
             ReplySection(
                 "checklist gap",
                 checklist_note if checklist_gap else "",

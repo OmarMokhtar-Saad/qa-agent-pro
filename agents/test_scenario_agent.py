@@ -452,6 +452,43 @@ Output ONLY the JSON object — no markdown fences, no prose, no explanation. St
 # Used ONLY on the cached-prefix path, where the FOCUS/Requirements header has
 # moved to the trailing user block and the rules would otherwise open as a bare
 # bullet list with no lead-in.
+# F5 (2026-08-29). On the SHYJ-5692 run, two of eight categories came back in a
+# {step, action, payload} shape instead of the schema's {step_number, action,
+# expected_result, test_data}. Those 85 steps carried NO expected_result at all,
+# `additionalProperties: false` rejected them, and the client's regeneration of
+# exactly those two categories introduced 65 steps whose expected_result merely
+# restated the action. The prose rules above were already correct and already
+# demanded a verifiable expected_result -- what was missing was one concrete
+# instance of the SHAPE, which is what a generating model actually copies.
+#
+# Placed between the rules and the "output ONLY JSON" tail: right after the
+# rules that describe the fields, and right before the instruction to emit
+# only JSON. It is NOT the last thing in the prompt -- _TEST_DATA_INSTRUCTION,
+# rtm_hint and _GUARD still follow at 987-989.
+#
+# BRACES ARE SINGLE, deliberately. Only _CATEGORY_JSON_TAIL is passed through
+# .format() in _category_shared_system; this constant is plain concatenation, so
+# doubling would ship a doubled opening brace to the model -- an example of the
+# WRONG shape, in the one fix whose entire purpose is shape fidelity. A test
+# asserts that no doubled brace reaches the rendered prompt.
+_STEP_SHAPE_EXAMPLE = """\
+Every entry in "steps" MUST use exactly these four keys. One fully-worked step:
+
+  {
+    "step_number": 2,
+    "action": "On the Payment summary screen, enter card number 4111 1111 1111 1111 and tap 'Pay'.",
+    "test_data": "card_number: 4111 1111 1111 1111, expiry: 12/29, cvv: 123",
+    "expected_result": "The Payment result screen opens showing 'Payment successful' and the booking reference in the format BK-000000."
+  }
+
+Note what makes that expected_result acceptable: it names something the tester
+can SEE and that would look different if the feature were broken. An
+expected_result that repeats the action is NOT acceptable and will be rejected --
+never write "The step completes successfully: <the action again>", "works as
+expected", or "no error occurs". If a step genuinely has no observable outcome of
+its own, merge it into the next step rather than inventing an assertion.
+
+"""
 _CATEGORY_RULES_LEAD = "Requirements that apply to EVERY test case you generate:\n"
 
 # Appended to EVERY category prompt. Unconditional since 2026-08-12
@@ -983,6 +1020,7 @@ def _category_shared_system(rtm_hint: str) -> str:
         _CATEGORY_HEADER
         + _CATEGORY_RULES_LEAD
         + _CATEGORY_RULES
+        + _STEP_SHAPE_EXAMPLE
         + _CATEGORY_JSON_TAIL.format()
         + _TEST_DATA_INSTRUCTION
         + rtm_hint

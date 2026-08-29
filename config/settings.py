@@ -862,18 +862,34 @@ class Settings(BaseSettings):
     qa_prep_ttl_s: int = 3600
     qa_prep_max_bytes: int = 4000000
 
-    # --- Refuse a host submit with no verified ambiguity preflight (OFF) ----
+    # --- Refuse a host submit with no verified ambiguity preflight (ON) -----
     # QA_HOST_AMBIGUITY_REVIEW_ENABLED hands the SHYJ-7154 pre-pass to the host,
     # which also removes the server's only evidence that the check happened. The
     # job now asks for an `ambiguity_result` back and the submit reply ALWAYS
     # discloses a missing or `high` verdict. This flag turns that disclosure into
-    # a REFUSAL. Default OFF because refusing throws away a generation the tester
-    # already paid for, and the disclosure is the honest-by-default behaviour this
-    # codebase prefers; an operator who genuinely relies on the gate turns it on.
+    # a REFUSAL.
+    #
+    # DEFAULT FLIPPED TO ON, 2026-08-29 (SHYJ-5692). The OFF rationale -- that a
+    # refusal throws away a generation the tester already paid for -- assumed a
+    # cost the refusal does not actually impose: it deletes no prep, drops no
+    # staged category row and consumes no remediation round, so the tester runs
+    # step 0 and resubmits the SAME suite under the SAME prep_id, at the price of
+    # one round trip. Weighed against that, a disclosure buried in a reply a
+    # summarising host model prunes did not stop the SHYJ-5692 run finalizing 80
+    # cases against a ticket nothing had checked for being too under-specified to
+    # test -- which is the SHYJ-7154 failure this preflight exists to prevent.
+    # "No verdict" is also structurally different from "checked and found
+    # nothing", and only a refusal keeps those two apart.
+    # Still an `operator_choice`, and OFF remains legitimate per install: a team
+    # whose tickets are written to a template, or one whose host client cannot be
+    # relied on to return the field, is better served by the disclosure than by a
+    # gate it will learn to route around. Setting
+    # QA_HOST_AMBIGUITY_REQUIRE_RESULT=false restores the previous behaviour
+    # exactly, with no code change.
     # Inert unless QA_HOST_AMBIGUITY_REVIEW_ENABLED actually shipped the job (it
     # is keyed off the prep's meta stamp, not off the flag, so a mid-flow flip
     # cannot change an in-flight prep).
-    qa_host_ambiguity_require_result: bool = False
+    qa_host_ambiguity_require_result: bool = True
 
     # --- Refuse a host submit whose screens are off-topic / unjudged (OFF) --
     # Batch 4, LAYER 2 (2026-08-09). Mirrors the flag above exactly: the
