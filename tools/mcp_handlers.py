@@ -7257,6 +7257,54 @@ async def handle_submit_category(
         return f"⚠️ Recording the category failed: {exc}"
 
 
+async def _staged_resubmit_hint(prep_id: str, extra_field: str = "") -> str:
+    """How a refused host should come back, given what the server already holds.
+
+    MEASURED (audit.db, prep 2b0de0011a44, SHYJ-3541): eight categories staged at
+    ts 1788013283, refused 0.026s later for a missing ambiguity_result, and all
+    eight RE-STAGED 21 seconds after that with ``"replaced": true`` -- two of them
+    carrying different case counts (State Transitions 8 -> 11, Negative 9 -> 10).
+    The host had read "resubmit the SAME suite" literally and regenerated. The
+    server's own work across that refusal was ~0.19s; the 21 seconds and the
+    CHANGED suite were pure waste, and the tester's reviewed cases silently moved.
+
+    On the staged route the rows are already on the server, so the correct retry
+    carries the missing field ALONE and the merge rebuilds from those rows. This
+    returns the instruction that matches reality; ``extra_field`` names the
+    top-level key the caller needs back (empty for an ack-only retry).
+
+    Never raises: an unreadable store falls back to the resend wording, which
+    costs a regeneration but never claims work is held when it is not.
+    """
+    try:
+        rows_res = await prep_store.load_submissions(prep_id)
+        rows = (rows_res or {}).get("content") or []
+        staged = [
+            str(r.get("category_name") or "").strip()
+            for r in rows
+            if isinstance(r, dict) and str(r.get("category_name") or "").strip()
+        ]
+    except Exception:
+        logger.debug("staged-rows resubmit hint failed", exc_info=True)
+        staged = []
+    if not staged:
+        if extra_field:
+            return (
+                f"resubmit the SAME suite with prep_id `{prep_id}` and a top-level "
+                f"`{extra_field}`"
+            )
+        return f"resubmit the SAME suite with prep_id `{prep_id}`"
+    sidecar = '{"' + extra_field + '": ...}' if extra_field else '"" (empty)'
+    return (
+        f"**do NOT resend the cases** -- all {len(staged)} staged categor"
+        f"{'y is' if len(staged) == 1 else 'ies are'} already held on prep "
+        f"`{prep_id}` and the finalize rebuilds the suite from them. Call "
+        f"`qa_submit_suite` with prep_id `{prep_id}` and `suite_json={sidecar}` "
+        "and nothing else. Regenerating instead costs a second full pass AND "
+        "silently changes cases the tester already reviewed"
+    )
+
+
 def _prior_category_count(rows_result: object, category_name: str) -> int:
     """How many cases are ALREADY staged for *category_name* on this prep.
 
@@ -7948,6 +7996,20 @@ async def handle_submit_suite(
                         "flagged_steps": len(_assert_findings),
                     },
                 )
+                # Rewriting needs new content, so that half of the message is
+                # right as it stands. Finalizing as-is does not: with rows
+                # staged the ack alone is the whole retry.
+                _ack_shape = (
+                    ""
+                    if not (
+                        ((await prep_store.load_submissions(prep_id)) or {}).get(
+                            "content"
+                        )
+                        or []
+                    )
+                    else " and an EMPTY `suite_json` -- the staged categories are "
+                    "held server-side, so do not resend them"
+                )
                 return (
                     f"{version_note}\u26d4 **Submission refused:** in the "
                     "categor(ies) below, most steps have an `expected_result` "
@@ -7964,7 +8026,7 @@ async def handle_submit_suite(
                     "discarded**: the prep and every staged category row survive "
                     "and no remediation round was consumed. To finalize as-is "
                     "anyway, ask the tester first and then resend with "
-                    f"`step_assertion_ack=true`.{_first_beat}"
+                    f"`step_assertion_ack=true`{_ack_shape}.{_first_beat}"
                 )
             await _audit(
                 "mcp_submit_suite_assertion_override",
@@ -8016,12 +8078,12 @@ async def handle_submit_suite(
                         "severity": amb_result.severity or "absent",
                     },
                 )
+                _how = await _staged_resubmit_hint(prep_id, "ambiguity_result")
                 return (
                     f"{amb_note}⛔ **Submission refused:** `QA_HOST_AMBIGUITY_REQUIRE_RESULT` is on and this submission "
                     "carries no cleared ambiguity preflight. Run step 0 of "
-                    "the payload's `jobs_to_run`, then resubmit the SAME "
-                    f"suite with prep_id `{prep_id}` and a top-level "
-                    "`ambiguity_result`. Nothing was discarded."
+                    f"the payload's `jobs_to_run`, then {_how}. "
+                    "Nothing was discarded."
                 )
         # The AC boomerang's return field. It rode in on THIS submission -- no
         # extra round trip and no server-side LLM call -- and is UNTRUSTED, so
