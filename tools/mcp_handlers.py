@@ -5821,6 +5821,20 @@ def _retained_sidecar(meta: object) -> dict:
     """The review sidecar an EARLIER sidecar-only submit left on this prep.
 
     Empty dict when there is none, when the envelope predates the retention
+    LIFETIME -- the retention is never cleared, on purpose. Reviewed 2026-08-29:
+    a second finalize that OMITS a key would re-apply the value the first one
+    retained, and the present-but-empty discipline below covers "sent empty" but
+    not "not sent at all". That is unreachable rather than merely unlikely: a
+    successful finalize STAMPS the prep (``FINALIZED_KEY``, see the update_prep
+    near the end of handle_submit_suite) rather than deleting it, and the next
+    submit returns at the already-finalized guard before any sidecar work runs.
+    The only route that finalizes twice on one prep is gap remediation, which is
+    itself unreachable while ``checklist_remediation_enabled()`` is a ``False``
+    constant -- and on THAT route re-applying is the behaviour you want: same
+    prep, same ticket, so step-0 work should survive a remediation round rather
+    than be silently dropped from the second suite. Clearing on fold would turn
+    this into exactly the loss the retention exists to prevent.
+
     (an old prep simply has no `pending_sidecar` key) or when the stored value
     is not a dict. UNTRUSTED on the way back in: it is host-authored JSON that
     happens to have been round-tripped through our own store, so it is handed
@@ -7626,6 +7640,9 @@ async def handle_submit_suite(
                                     **envelope,
                                     "meta": {
                                         **meta,
+                                        # Accumulates, and is deliberately NEVER
+                                        # cleared -- see _retained_sidecar. It
+                                        # lives as long as the prep does.
                                         "pending_sidecar": {
                                             **_retained_sidecar(meta),
                                             **_mentioned,

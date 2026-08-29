@@ -196,6 +196,26 @@ def has_generic_phrase(expected: str) -> bool:
         return False
 
 
+def _get(obj: object, name: str, default: object = None) -> object:
+    """Read ``name`` off a model OR a plain mapping. Never raises.
+
+    Every reader below used ``getattr`` alone. Call sites in this tree pass
+    Pydantic ``TestCase`` models, so that worked -- but every artifact ON DISK is
+    JSON, and a caller handing those straight in got an empty result with no
+    error and no log line, which "Returns [] on any internal error. Never raises."
+    made indistinguishable from a clean suite. Accepting both shapes is cheaper
+    than a warning nobody reads, and it makes the corpus files a usable fixture.
+    """
+    try:
+        if isinstance(obj, dict):
+            got = obj.get(name, default)
+        else:
+            got = getattr(obj, name, default)
+        return default if got is None else got
+    except Exception:
+        return default
+
+
 def find_tautological_steps(cases: list) -> list[StepAssertionFinding]:
     """Steps whose expected_result restates the action or asserts nothing.
 
@@ -204,11 +224,11 @@ def find_tautological_steps(cases: list) -> list[StepAssertionFinding]:
     findings: list[StepAssertionFinding] = []
     try:
         for case in cases or []:
-            tc_id = str(getattr(case, "tc_id", "") or "")
-            category = str(getattr(case, "category", "") or "")
-            for step in getattr(case, "steps", None) or []:
-                action = str(getattr(step, "action", "") or "")
-                expected = str(getattr(step, "expected_result", "") or "")
+            tc_id = str(_get(case, "tc_id", "") or "")
+            category = str(_get(case, "category", "") or "")
+            for step in _get(case, "steps", None) or []:
+                action = str(_get(step, "action", "") or "")
+                expected = str(_get(step, "expected_result", "") or "")
                 if not action or not expected:
                     continue
                 overlap = action_overlap(action, expected)
@@ -222,7 +242,7 @@ def find_tautological_steps(cases: list) -> list[StepAssertionFinding]:
                     StepAssertionFinding(
                         tc_id=tc_id,
                         category=category,
-                        step_number=int(getattr(step, "step_number", 0) or 0),
+                        step_number=int(_get(step, "step_number", 0) or 0),
                         kind=kind,
                         overlap=round(overlap, 2),
                         expected=expected[:160],
@@ -243,12 +263,12 @@ def category_flag_ratios(cases: list) -> dict:
     try:
         flagged = {(f.tc_id, f.step_number) for f in find_tautological_steps(cases)}
         for case in cases or []:
-            category = str(getattr(case, "category", "") or "") or "(uncategorised)"
-            tc_id = str(getattr(case, "tc_id", "") or "")
+            category = str(_get(case, "category", "") or "") or "(uncategorised)"
+            tc_id = str(_get(case, "tc_id", "") or "")
             hit, total = totals.get(category, (0, 0))
-            for step in getattr(case, "steps", None) or []:
+            for step in _get(case, "steps", None) or []:
                 total += 1
-                number = int(getattr(step, "step_number", 0) or 0)
+                number = int(_get(step, "step_number", 0) or 0)
                 if (tc_id, number) in flagged:
                     hit += 1
             totals[category] = (hit, total)
@@ -289,10 +309,10 @@ def find_echoed_test_data(cases: list) -> list[DataFinding]:
     findings: list[DataFinding] = []
     try:
         for case in cases or []:
-            tc_id = str(getattr(case, "tc_id", "") or "")
-            for datum in getattr(case, "test_data", None) or []:
-                field = str(getattr(datum, "field", "") or "")
-                value = str(getattr(datum, "example_value", "") or "")
+            tc_id = str(_get(case, "tc_id", "") or "")
+            for datum in _get(case, "test_data", None) or []:
+                field = str(_get(datum, "field", "") or "")
+                value = str(_get(datum, "example_value", "") or "")
                 if not field:
                     continue
                 field_tokens = [w.lower() for w in _ALNUM_RE.findall(field)]
