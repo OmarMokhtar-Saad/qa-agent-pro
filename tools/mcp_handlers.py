@@ -11502,9 +11502,12 @@ def _ac_field_section() -> list[str]:
                 "derive the criteria, so traceability still works."
             )
         out.append(
-            "- To check the id for your instance, open a ticket's field list in "
-            "Jira admin and set `JIRA_AC_FIELD` in `.env` to the Acceptance "
-            "Criteria field."
+            "- **No action needed.** A wrong id costs nothing: it is detected and "
+            "discarded, and the criteria are read from the description instead. "
+            "Setting `JIRA_AC_FIELD` to your instance's real Acceptance Criteria "
+            "field is an accuracy hint, not a fix -- worth doing only if your "
+            "tickets keep their criteria in a custom field rather than in the "
+            "description or a use-case table."
         )
         return out
     except Exception:
