@@ -1,6 +1,6 @@
 [project]
 name = "qa-agent-pro"
-version = "1.60.1"
+version = "1.60.2"
 requires-python = ">=3.10"
 dependencies = [
     "pyyaml>=6.0",  # contracts + OpenAPI specs are YAML (api_test agent)
@@ -91,7 +91,13 @@ target-version = "py310"
 # fragments, so formatting could not have fixed them -- the scope was the bug,
 # not the formatting. Excluding here makes the repo-wide command mean exactly
 # what the scoped one already meant, so CI now gates the product and nothing else.
-extend-exclude = [".claude"]
+# `.tmp/` is scratch from live validation runs -- the SHYJ-9311 generation
+# scripts and their outputs. Kept on disk as run evidence, never shipped, and
+# not this project's code to keep formatted. It is gitignored as well, but that
+# alone does NOT stop ruff: ruff walks an untracked directory regardless, which
+# is exactly how `ruff check .` -- the gate CLAUDE.md documents -- went red for
+# everyone the moment those artifacts appeared.
+extend-exclude = [".claude", ".tmp"]
 
 # mypy had NO configuration at all, so `mypy .` -- the lint_cmd the pre-push
 # hook runs -- walked into the ops executor's own backups/ directories, found
@@ -99,7 +105,7 @@ extend-exclude = [".claude"]
 # a single line of product code. These are the same trees ruff excludes, plus
 # the backup dirs, which are generated output and never imported.
 [tool.mypy]
-exclude = "^(backups/|\\.claude/|\\.worktrees/|build/|dist/)"
+exclude = "^(backups/|\\.claude/|\\.tmp/|\\.worktrees/|build/|dist/)"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
