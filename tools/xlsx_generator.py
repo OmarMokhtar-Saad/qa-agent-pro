@@ -213,7 +213,6 @@ def generate_test_case_xlsx(suite: TestSuite, output_path: str | None = None) ->
     workbook = xlsxwriter.Workbook(output_path, {"strings_to_formulas": False})
     try:
         _write_workbook(workbook, suite)
-        _write_report_sheets(workbook, suite)
         _write_rtm_sheet(workbook, suite)
         _write_checklist_sheets(workbook, suite)
         _write_assumed_sheet(workbook, suite)
@@ -478,52 +477,13 @@ def _write_assumed_sheet(workbook: xlsxwriter.Workbook, suite: TestSuite) -> Non
         )
 
 
-def _write_report_sheets(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
-    """Append 'AC Validation' and 'Test Plan' sheets when the suite carries
-    report_artifacts (from the host, or from a revived
-    tools.test_plan_report.test_plan_artifacts_enabled seam -- the flag
-    QA_TEST_PLAN_ARTIFACTS was deleted 2026-08-14). No-op when absent. Never
-    raises --
-    a failure here must never break the core workbook."""
-    artifacts = getattr(suite, "_report_artifacts", None)
-    if not artifacts:
-        return
-    try:
-        from tools.test_plan_report import ac_validation_rows, plan_rows
-
-        header_fmt = workbook.add_format(
-            {
-                "bold": True,
-                "font_color": "#FFFFFF",
-                "bg_color": "#1F4E79",
-                "border": 1,
-                "valign": "vcenter",
-                "text_wrap": True,
-            }
-        )
-        cell_fmt = workbook.add_format(
-            {"border": 1, "valign": "top", "text_wrap": True}
-        )
-        for name, rows in (
-            ("AC Validation", ac_validation_rows(artifacts)),
-            ("Test Plan", plan_rows(artifacts)),
-        ):
-            if not rows:
-                continue
-            try:
-                ws = workbook.add_worksheet(name)
-                ws.set_column(0, 0, 22)
-                ws.set_column(1, max(1, len(rows[0]) - 1), 45)
-                for r, row in enumerate(rows):
-                    fmt = header_fmt if r == 0 else cell_fmt
-                    for c, value in enumerate(row):
-                        ws.write(r, c, sanitize_cell(str(value)), fmt)
-            except Exception:
-                logger.warning(
-                    "Failed writing the %s sheet — skipping it", name, exc_info=True
-                )
-    except Exception:
-        logger.warning("report-sheet generation failed — skipping", exc_info=True)
+# The 'AC Validation' / 'Test Plan' report sheets were DELETED 2026-08-30.
+# TEST_PLAN_JOB went in dead-code deletion P2-H (2026-08-16) and was the only
+# writer of ``TestSuite._report_artifacts``, so both sheets had been provably
+# unreachable since -- no tester ever saw one in that window. P2-H recorded
+# removing them as a PRODUCT decision rather than a deletion; that decision was
+# taken on 2026-08-30, together with tools/test_plan_report.py and the private
+# attribute itself.
 
 
 def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:

@@ -9179,8 +9179,11 @@ async def handle_push_suite(
     two independent guards: the target's kill-switch setting AND ``apply=true`` on
     the call. Either one missing means no request is made.
 
-    A dry run (the default) needs no flag: it reports what WOULD be created and
-    makes no request at all. A flag-OFF call with ``apply=true`` REFUSES BY NAME
+    A dry run (the default) needs no flag HERE: it reports what WOULD be created
+    and makes no request at all. The kill-switch nonetheless gates tool
+    REGISTRATION in ``mcp_server``, so with both push flags OFF this tool is not
+    offered at all and the flagless preview is reachable only once one of them is
+    ON. A flag-OFF call with ``apply=true`` REFUSES BY NAME
     rather than quietly downgrading to a dry run -- a tester who asked to push and
     got a success-shaped reply would believe cases exist in a tracker that do not.
 
