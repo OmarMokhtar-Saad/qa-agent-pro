@@ -52,7 +52,13 @@ Scope, deliberately:
   false positive is conceivable. A phrase that merely APPEARS inside a real
   assertion is not flagged;
 * it does NOT judge a field NAME. A truncated-name rule was drafted and
-  dropped for having a one-character margin -- see ``find_echoed_test_data``.
+  dropped for having a one-character margin -- see ``find_echoed_test_data``;
+* the flagged set in ``category_flag_ratios`` is keyed on ``(tc_id,
+  step_number)``, so DUPLICATE tc_ids double-count. Both finalize routes
+  renumber during the merge before this module sees a case, so the ratios are
+  correct there; a caller handing in raw per-category JSON straight off disk --
+  which ``_get``'s dict support makes possible -- has no such guarantee and must
+  renumber first.
 
 Deterministic, bounded, model-free, and -- like every other module in
 ``tools/`` -- never raises to callers.

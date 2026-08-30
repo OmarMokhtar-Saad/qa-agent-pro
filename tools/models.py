@@ -308,33 +308,29 @@ class TestSuite(BaseModel):
         min_length=1, description="All generated test cases"
     )
 
-    # Tester-facing report artifacts (AC-Validation / Test Plan) attached
-    # post-generation by agents.test_scenario_agent when
-    # tools.test_plan_report.test_plan_artifacts_enabled() is ON (a False
-    # constant since 2026-08-14) or the host returned artifacts. A PrivateAttr
-    # so it is EXCLUDED from the JSON schema used as an LLM
-    # response_model (it must never pollute generation) and from serialization;
-    # tools.xlsx_generator reads it via getattr to add matching sheets.
-    _report_artifacts: Optional[dict] = PrivateAttr(default=None)
+    # ``_report_artifacts`` (AC-Validation / Test Plan) was DELETED 2026-08-30
+    # with tools/test_plan_report.py and the two XLSX report sheets: P2-H had
+    # already removed its only writer on 2026-08-16, so it was permanently None.
+    # The PrivateAttrs below are the surviving members of the same family and
+    # carried their rationale by reference to it, which is why each now states
+    # that rationale itself.
 
     # Atomic Requirements Checklist + its coverage audit (Batch 2), attached
     # post-generation by agents.test_scenario_agent whenever a checklist was
     # produced -- unconditional since 2026-08-14, when
     # QA_ATOMIC_CHECKLIST_ENABLED was deleted and the behaviour hardcoded ON.
-    # A PrivateAttr for the same reasons as
-    # _report_artifacts above: it must never pollute the JSON schema used as an
-    # LLM response_model, and must not be serialized. tools.xlsx_generator and
-    # tools.mcp_handlers read it via getattr.
+    # A PrivateAttr so it is EXCLUDED from the JSON schema used as an LLM
+    # response_model (it must never pollute generation) and from serialization.
+    # tools.xlsx_generator and tools.mcp_handlers read it via getattr.
     _checklist_artifacts: Optional[dict] = PrivateAttr(default=None)
 
     # {tc_id: note} for the XLSX Notes column — the Batch 3
     # standing-rules pack's mechanical [ASSUMED] /
     # [NEEDS-CLARIFICATION] label, attached post-renumber by
-    # agents.test_scenario_agent. A PrivateAttr for the same
-    # reasons as _report_artifacts above: it must never
-    # pollute the JSON schema used as an LLM response_model,
-    # and must not be serialized. tools.xlsx_generator reads
-    # it via getattr.
+    # agents.test_scenario_agent. A PrivateAttr so it is
+    # EXCLUDED from the JSON schema used as an LLM
+    # response_model and from serialization.
+    # tools.xlsx_generator reads it via getattr.
     _rule_pack_notes: Optional[dict] = PrivateAttr(default=None)
 
     # Rows for the "Assumed Requirements" sheet: the cases an entailment review

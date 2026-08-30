@@ -2190,7 +2190,7 @@ async def _finalize_generation(
     # Step 0: carry the traceability counts OUT as data. build_rtm_summary has
     # always printed them; nothing exported them, so answering "is
     # traceability degenerate?" needed a hand investigation. Private attr, the
-    # same channel _checklist_artifacts / _report_artifacts already use --
+    # same channel _checklist_artifacts already uses --
     # _finalize_generation cannot reach _audit itself.
     try:
         suite._rtm_trace = rtm_trace(acs, renumbered)
@@ -2346,9 +2346,9 @@ async def _finalize_generation(
     # argument could never be anything but None and the branch never ran. It
     # was also the ONLY writer of ``suite._report_artifacts``, so
     # tools/xlsx_generator's two report sheets were already unreachable before
-    # this deletion and are unchanged by it. Removing those sheets and
-    # tools/test_plan_report's render helpers is a PRODUCT decision, not a
-    # deletion, so both are retained.
+    # this deletion. Removing them was called a PRODUCT decision rather than a
+    # deletion; that decision was taken on 2026-08-30, and the sheets,
+    # tools/test_plan_report.py and the private attribute are all gone.
 
     # ops-5 (issue 7): the closing funnel line. Deliberately ONE line carrying
     # everything a reader needs to spot a silent change: the count, whether the
