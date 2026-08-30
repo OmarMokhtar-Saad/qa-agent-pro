@@ -681,12 +681,17 @@ def build_server():
         ask them myself (describe / Jira / web / Swagger / mobile screens /
         Jira + mobile) via a dialog or menu.
 
-        Returns a concise markdown summary plus a persisted suite_id. The reply
-        ALREADY contains the path
-        to a finished .xlsx file: relay that path to the user as the
-        deliverable and do NOT ask which export format they want or offer to
-        push anywhere. Call qa_export_suite only when the user names a
-        different format themselves.
+        Returns a PREPARE PAYLOAD, not a finished suite: a prep_id, the
+        grounded generation prompts and the per-category job list. NOTHING is
+        generated yet -- this server calls no model, so YOU write the cases.
+        Continue exactly as for qa_prepare_test_cases: call
+        qa_get_category_job(prep_id, "all") ONCE for every job packet, generate
+        each category, qa_submit_category each one as soon as it is written,
+        then qa_submit_suite with the same prep_id to finalize. THAT finalize
+        reply is the one carrying the persisted suite_id and the path to the
+        written .xlsx: relay that path to the user as the deliverable and do
+        NOT ask which export format they want or offer to push anywhere. Call
+        qa_export_suite only when the user names a different format themselves.
 
         For an under-specified or no-UI ticket the reply may instead be a short
         list of clarifying questions (no suite is generated) — relay them to the
@@ -1346,8 +1351,9 @@ def build_server():
             report / Exploratory) and I walk you through it
             END-TO-END. Test cases asks where the feature comes from (describe it /
             Jira ticket / mobile screens / Jira + mobile), captures device screens
-            when relevant, and returns the generated suite plus the Feature
-            Analysis report. No tool names or parameters needed. On clients
+            when relevant, and returns the generated suite. (The inline Feature
+            Analysis report tier was deleted -- call `qa_feature_analysis` for
+            one.) No tool names or parameters needed. On clients
             without MCP elicitation it returns a concise markdown menu instead."""
             return await _tracked(
                 "qa_wizard",
@@ -1360,9 +1366,13 @@ def build_server():
 
     @mcp.tool(name="qa-doctor")
     async def qa_doctor(ctx: Context) -> str:
-        """Check whether THIS machine is ready: overall verdict, LLM backend
-        auth, integrations, CLI tooling (adb/xcrun), enabled features and
-        action items. Fast and read-only. Run this first on a new machine."""
+        """Check whether THIS machine is ready: overall verdict, environment,
+        integrations (Jira/Atlassian, embeddings), CLI tooling (adb/xcrun),
+        enabled features and action items. It reports NO model backend --
+        there is none: every generative step runs in YOUR chat model. Fast, but NOT read-only -- it repairs what it can: it
+        rewrites `.env` (keeping a timestamped `.env.bak-*`) and writes the
+        hosted `atlassian` entry into this client's MCP config. Run this first
+        on a new machine."""
         progress = _make_progress(ctx)
         # Resolved BEFORE entering _tracked: this is a round trip back to the
         # client, not part of the report's own work, and _tracked owns the

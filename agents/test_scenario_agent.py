@@ -30,6 +30,7 @@ from tools.quality_checks import (
     find_vague_steps,
     normalize_module_names,
     quality_warning_section,
+    resolve_chained_refs_to_stable,
     restore_chained_refs_from_stable,
 )
 from tools.rag_store import query_corpus
@@ -2037,6 +2038,37 @@ async def _finalize_generation(
     image_notice = prepared.image_notice
     failed = [r for r in category_results if not r.succeeded]
 
+    # 2026-08-30 audit F4: the RESOLVE half of the chained-ref pair had no live
+    # caller. `restore_chained_refs_from_stable` below (just after the risk-order
+    # renumber) looks each `chained_from` up in a stable_id -> tc_id map, but
+    # nothing had ever converted a tc_id into a stable_id -- so every chained ref
+    # reached it looking dangling, was cleared, and the item was downgraded to
+    # `static`. The tester's workbook lost the prerequisite pointer on every
+    # chained row.
+    #
+    # THIS CALL IS THE SECOND OF TWO, and it does not close the finding on its
+    # own (review round 2, C1). A chained ref crosses TWO renumbers, and each
+    # needs its own carrier:
+    #   1. the MERGE, `tools/mcp_handlers._merge_category_rows`, which flattens
+    #      the per-category submissions into one TC-0001..N sequence. That is
+    #      handled THERE, by `_remap_chained_from`, per CATEGORY ROW -- the only
+    #      place a host-written tc_id is unambiguous, since every category
+    #      numbers from TC-001. Doing it here instead resolved a Negative case's
+    #      ref to its own TC-001 onto the POSITIVE category's TC-001: a
+    #      confident, wrong prerequisite where there had at least been an honest
+    #      blank.
+    #   2. the FINAL risk-order renumber below, which is what this call carries
+    #      the ref across. By the time we get here ids are globally unique --
+    #      either the merge made them so, or the host submitted one merged
+    #      suite_json (Path B) whose ids are unique by contract -- so a
+    #      whole-suite resolve is unambiguous.
+    #
+    # Run BEFORE `_dedupe_cases` deliberately: exact dedup drops CONTENT-identical
+    # cases, which share a stable_id with the twin that survives, so a ref
+    # resolved here still lands on the survivor. Resolving after the dedup would
+    # turn that same ref into a dangling one instead. Never raises; returns the
+    # list unchanged on any failure.
+    all_cases = resolve_chained_refs_to_stable(all_cases)
     _received = len(all_cases)
     all_cases = _dedupe_cases(all_cases)
     # ops-5 (issue 7): finalize used to log NOTHING across its whole run. That is
