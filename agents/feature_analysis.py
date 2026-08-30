@@ -121,6 +121,53 @@ fill it.
 """
 
 
+# F16 (2026-08-30): with `mode: "jira"` and no images the envelope's
+# user_context correctly says "(no screenshots provided)" while the rubric above
+# still spent STEP 2 on reconstructing a flow ACROSS SCREENS and STEP 4 on
+# detecting Jira-vs-screenshot conflicts -- instructions no host could follow,
+# for a comparison it had nothing to compare. The steps are re-aimed rather than
+# deleted: `ui_analysis`, `user_flow` and `conflicts` are still real fields and
+# a ticket can still contradict ITSELF. Selected purely on whether any screen
+# reached the host, so the screens-attached path is byte-identical.
+_SYSTEM_PROMPT_NO_SCREENS = """\
+You are a senior enterprise QA business analyst. Produce a STRUCTURED Feature
+Analysis Report from a Jira ticket / feature description. NO screenshots were
+provided for this analysis. Follow these steps in order:
+
+STEP 1 -- Extract requirements from the Jira/feature text: functional
+requirements, acceptance criteria, preconditions, user roles, dependencies,
+validation rules, and error handling.
+
+STEP 2 -- Describe the UI the text DESCRIBES (ui_analysis) and reconstruct the
+user_flow the text implies, in order. Where the text names no screen, no field
+and no control, say so in `assumptions` and leave the list short: do NOT invent
+screens, element names or a flow the source does not support.
+
+STEP 3 -- Build one coherent picture from the text alone. A requirement stated
+once is still a requirement.
+
+STEP 4 -- CONFLICT DETECTION: wherever the ticket contradicts ITSELF (a
+field/label/rule/flow described one way in the description and a different way
+in an acceptance criterion, a comment or the parent story), REPORT the
+discrepancy in `conflicts` -- never silently drop it. Leave `conflicts` empty
+if the source is internally consistent.
+
+STEP 5 -- Mark anything you inferred (rather than found stated) explicitly in
+`assumptions`. NEVER invent business rules unless they are clearly inferable
+from the provided material.
+
+STEP 6 -- Populate `missing_requirements` with requirements a complete spec
+would need but that are absent from the source. The absence of any screen or
+visual reference is itself a gap worth naming when it applies.
+
+STEP 7 -- RISK ANALYSIS: populate `risks` with the testing/quality risks implied
+by the gaps, conflicts, and assumptions above.
+
+Return ONLY the structured object. Every list may be empty; do not fabricate to
+fill it.
+"""
+
+
 def build_feature_analysis_prompt(
     feature_text: str,
     jira_text: str,
@@ -206,7 +253,9 @@ def build_feature_analysis_prompt(
         + shots_block
         + ui_block
     )
-    return _SYSTEM_PROMPT + (reminder or "") + _GUARD, user_msg
+    has_screens = bool(screenshot_descriptions) or int(screens_attached or 0) > 0
+    rubric = _SYSTEM_PROMPT if has_screens else _SYSTEM_PROMPT_NO_SCREENS
+    return rubric + (reminder or "") + _GUARD, user_msg
 
 
 # analyze_feature() lived here until 2026-08-16 (dead-code deletion P2-E3). It

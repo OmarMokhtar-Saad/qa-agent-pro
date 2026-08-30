@@ -2070,6 +2070,22 @@ def _load_payload(raw: object) -> tuple[dict, str]:
         return {}, "invalid_json"
 
 
+def _name_of(value: object) -> str:
+    """``{"name": "Story"}`` -> ``"Story"``; a bare string passes through.
+
+    Atlassian returns issue type, status and priority as name objects. Never
+    raises -- an unexpected shape yields "" and the caller omits the line.
+    """
+    try:
+        if isinstance(value, dict):
+            return str(value.get("name") or "").strip()
+        if isinstance(value, str):
+            return value.strip()
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("_name_of failed", exc_info=True)
+    return ""
+
+
 def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
     """Turn a host-submitted Atlassian MCP issue payload into the grounded dict
     the REST path used to return.
@@ -2177,7 +2193,23 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
                 sibling_total=_count_sibling_candidates(payload, key),
             )
 
+        # F14 (2026-08-30): the fetch DIRECTIVE asks the host for `issuetype` and
+        # `status` by name, and neither reached the model -- 79 cases were
+        # written against a ticket still in "BA Validation" without the generator
+        # ever being told it was not a settled requirement. Both are echoed with
+        # the same sanitiser `updated` uses (one line, URL-free, backtick-free,
+        # capped), so a host that trimmed `fields` simply contributes nothing.
+        issuetype_name = _sanitize_echo(_name_of(fields.get("issuetype")), 40)
+        status_name = _sanitize_echo(_name_of(fields.get("status")), 40)
         meta_lines = []
+        if issuetype_name:
+            meta_lines.append(f"Issue type: {issuetype_name}")
+        if status_name:
+            meta_lines.append(
+                f"Status: {status_name} "
+                "(workflow state at the time this snapshot was taken -- a ticket "
+                "not yet in a done/approved state may still change)"
+            )
         if priority:
             meta_lines.append(f"Priority: {priority}")
         if labels:

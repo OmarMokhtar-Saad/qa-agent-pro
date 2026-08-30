@@ -52,7 +52,7 @@ from agents.test_scenario_agent import (
     _prepare_generation,
 )
 from config.settings import settings
-from tools import prep_store, step_assertion, telemetry
+from tools import case_quality_gate, prep_store, step_assertion, telemetry
 from tools.audit_log import record_event
 from tools.build_fingerprint import code_fingerprint
 from tools.csv_exporter import generate_test_case_csv
@@ -1540,8 +1540,12 @@ def shape_generation_result(
             cut = body[summary_cap:]
             if "\n## " in cut or cut.lstrip().startswith("## "):
                 tail += (
-                    ". Some advisory notes were cut and are NOT in the export -- "
-                    "re-submit a smaller suite to read them"
+                    ". Some advisory notes were cut from THIS reply -- read them "
+                    'in full on the workbook\'s "Generation Notes" sheet, which '
+                    "carries the whole advisory verbatim"
+                    if auto_export
+                    else ". Some advisory notes were cut and are NOT in the "
+                    "export -- re-submit a smaller suite to read them"
                 )
             body = body[:summary_cap].rstrip() + f"\n\n…(truncated — {tail})"
         lines += ["", body]
@@ -4806,6 +4810,35 @@ async def handle_prepare_test_cases(
             + ([host_mode.CHECKLIST_JOB] if _checklist_job else [])
         )
         payload = host_mode.attach_jobs(payload, _host_jobs)
+        # F3 (2026-08-30): the step-zero jobs live on the PAYLOAD, which is
+        # built AFTER save_prep and never persisted -- so
+        # `qa_get_category_job(prep_id, "all")`, the one call this server's own
+        # `instructions` block tells a host to make, returned the 8 category
+        # jobs and NONE of the step-zero ones, including the ambiguity preflight
+        # marked `blocking: true` and the acceptance-criteria job whose ac_ids
+        # every case's requirement_id must cite. A host following the
+        # instructions literally therefore discovered the AC job at FINALIZE,
+        # by which time all 95 cases were staged with requirement_id null and
+        # the only remedy was regenerating the suite (measured 2026-08-30: 0 of
+        # 95 traced following the instructions, 79 of 79 running step 0 first).
+        # Persist the step-zero subset so that call can serve it. Best-effort:
+        # a failed update costs the passthrough, never the prep.
+        try:
+            _sz_index = [
+                _e
+                for _e in (payload.get("jobs_to_run") or [])
+                if isinstance(_e, dict) and str(_e.get("stage") or "") == "step_zero"
+            ]
+            if _sz_index:
+                _sz: dict = {"jobs_to_run": _sz_index}
+                for _e in _sz_index:
+                    _k = str(_e.get("payload_key") or "")
+                    if _k and isinstance(payload.get(_k), dict):
+                        _sz[_k] = payload[_k]
+                envelope["step_zero"] = _sz
+                await prep_store.update_prep(prep_id, envelope)
+        except Exception:  # pragma: no cover - never costs the prepare
+            logger.debug("step-zero passthrough persist failed", exc_info=True)
         await _audit(
             "mcp_prepare_test_cases",
             entity_id=prep_id,
@@ -7074,6 +7107,16 @@ async def handle_get_category_job(prep_id: str, category_name: str) -> str:
             batch = host_mode.build_category_jobs_batch(prepared, prep_id)
             if batch is None:
                 return f"⚠️ No category jobs available for prep_id `{prep_id}`."
+            # F3 (2026-08-30): serve the step-zero jobs HERE, in the one call the
+            # instructions tell a host to make. Stamped at prepare time -- see
+            # the persist site in _prepare_generation for the defect this closes.
+            # FIRST key in the dict on purpose: a host reading the JSON top-down
+            # meets the blocking preflight before the categories. An envelope
+            # written before this key existed simply carries none, and that
+            # reply is byte-identical to today's.
+            _sz = envelope.get("step_zero") if isinstance(envelope, dict) else None
+            if isinstance(_sz, dict) and _sz.get("jobs_to_run"):
+                batch = {"step_zero": _sz, **batch}
             _n = len(batch["jobs"])
             return (
                 f"## Category jobs — ALL {_n} categories (one fetch)\n\n"
@@ -7088,9 +7131,15 @@ async def handle_get_category_job(prep_id: str, category_name: str) -> str:
                 # left the contradiction here. The retired wording is NOT quoted
                 # back: a tombstone comment is how an absence grep gets armed by
                 # the very change that satisfied it.
-                "Generate each `jobs[]` entry and call `qa_submit_category` "
-                "for it as soon as its cases are written — do not fetch "
-                "categories one call at a time.\n\n"
+                "**Run every `step_zero` job FIRST, before you generate a single "
+                "case.** The ambiguity preflight is `blocking: true`, and the "
+                "acceptance-criteria job produces the ac_ids each case's "
+                "`requirement_id` has to cite — a case written before those "
+                "ids exist can only be tagged null, and the only way to fix that "
+                "afterwards is to regenerate the suite. Then generate each "
+                "`jobs[]` entry and call `qa_submit_category` for it as soon as "
+                "its cases are written — do not fetch categories one call at "
+                "a time.\n\n"
                 "```json\n"
                 + _json.dumps(batch, ensure_ascii=False, indent=2)
                 + "\n```\n"
@@ -7306,6 +7355,37 @@ async def handle_submit_category(
             ]
             if names:
                 staged_names = " (" + ", ".join(names) + ")"
+            # F11 (2026-08-30): this reply counted every stored row, including a
+            # category name that normalises to nothing, and listed the bogus name
+            # among the staged categories -- while `qa_prep_status`, on the same
+            # prep a moment later, correctly reported `staged: 1/8` plus
+            # `unrecognized names: ...`. Two tools disagreeing about whether work
+            # was recorded is worse than either answer: the instructions tell a
+            # host to track progress from THESE replies (prep_status is
+            # optional), so it believed it was 2/8 done when it was 1/8. Same
+            # computation as prep_status, so they cannot drift again. Silent when
+            # the prep stamped no expected set (an old envelope), which keeps
+            # those replies byte-identical.
+            _expected = list((_meta or {}).get("expected_categories") or [])
+            if _expected:
+                _view = host_mode.prep_status_view(
+                    expected=_expected, staged_raw_names=names
+                )
+                _recognized = list(_view.get("staged") or [])
+                _unrecognized = list(_view.get("unrecognized") or [])
+                if _unrecognized:
+                    on_file = len(_recognized)
+                    staged_names = (
+                        " (" + ", ".join(_recognized) + ")" if _recognized else ""
+                    )
+                    note += (
+                        "> ⚠️  **Not a recognised category:** "
+                        + ", ".join(str(n)[:60] for n in _unrecognized)
+                        + ". Those rows are stored but will NOT be merged into "
+                        "the suite and do NOT count toward the staged set. Use a "
+                        "name from `orchestration.expected_categories` and "
+                        "re-submit those cases under it.\n\n"
+                    )
         except Exception:  # defensive -- the count alone is still correct
             logger.debug("could not list staged category names", exc_info=True)
         if review_available:
@@ -7721,6 +7801,7 @@ async def handle_submit_suite(
     volume_floor_ack: bool = False,
     image_relevance_ack: bool = False,
     step_assertion_ack: bool = False,
+    quality_gate_ack: bool = False,
     ask_text: AskCb = None,
     progress: ProgressCb = None,
 ) -> str:
@@ -8297,6 +8378,32 @@ async def handle_submit_suite(
                 _how = await _staged_resubmit_hint(
                     prep_id, "ambiguity_result", staged_count=staged_rows
                 )
+                # F4 (2026-08-30): the refusal used to give ONE instruction --
+                # "run step 0, then resubmit" -- for two different states, and
+                # for one of them that instruction cannot be satisfied.
+                # `HostAmbiguityResult.cleared` is `ran and severity in
+                # (none, low, medium)`, so a `high` verdict never clears; there
+                # is no ack argument and no override. A host that had ALREADY
+                # run step 0, reached `high` and reported it honestly was told
+                # to run step 0 and resubmit, which loops forever. The policy is
+                # right -- an untestable ticket should not yield a suite -- so
+                # what changes is only what the tester is told to DO about it.
+                if amb_result.ran and amb_result.severity == "high":
+                    return (
+                        f"{amb_note}⛔ **Submission refused:** your own "
+                        "ambiguity preflight rated this source **high** — too "
+                        "under-specified to write trustworthy test cases from. "
+                        "Re-running step 0 will not change that, and there is no "
+                        "acknowledgement argument that overrides it.\n\n"
+                        "**Do this instead:** put the unanswered questions above "
+                        "to the tester, get the ticket or the description "
+                        "amended, then call `qa_prepare_test_cases` again with "
+                        "the fuller source. An operator who accepts the risk can "
+                        "set `QA_HOST_AMBIGUITY_REQUIRE_RESULT=false`, which "
+                        "discloses the verdict and returns the suite instead of "
+                        "refusing it. Nothing was discarded — prep_id "
+                        f"`{prep_id}` still holds this work."
+                    )
                 return (
                     f"{amb_note}⛔ **Submission refused:** `QA_HOST_AMBIGUITY_REQUIRE_RESULT` is on and this submission "
                     "carries no cleared ambiguity preflight. Run step 0 of "
@@ -8773,6 +8880,85 @@ async def handle_submit_suite(
             )
             if _pmode:
                 volume_note = _pmd
+
+        # C2 (2026-08-30 audit): the submit-time CASE QUALITY gate. It reads the
+        # FINAL merged+renumbered suite rather than `all_cases`, because the
+        # duplicate-title signal only means anything after the merge and the
+        # tc_ids it prints must be the ids the tester reads in the export.
+        # Placed HERE -- after _finalize_generation, BEFORE the gap round, the
+        # persist, the export and the finalized stamp -- so a refusal costs one
+        # round trip and destroys nothing: the prep and every staged category row
+        # survive, no remediation round is consumed and nothing is written.
+        # Two-beat, exactly like volume_floor_ack / step_assertion_ack: an ack on
+        # the FIRST submit is IGNORED and told so, because the tester cannot have
+        # seen these findings yet. A CLEAN suite yields no section and no
+        # refusal, so its reply stays byte-identical.
+        quality_note = ""
+        _quality = case_quality_gate.scan_suite(
+            list(getattr(suite, "test_cases", None) or [])
+        )
+        if _quality.found:
+            _q_kinds = sorted(_quality.counts)
+            _q_refused_before = bool(meta.get("quality_refused"))
+            if not (quality_gate_ack and _q_refused_before):
+                _q_first_beat = ""
+                if quality_gate_ack and not _q_refused_before:
+                    _q_first_beat = (
+                        "\n\n> \u26a0\ufe0f  `quality_gate_ack=true` arrived on "
+                        "the FIRST submit for this prep and was IGNORED -- the "
+                        "findings below had not been shown to anyone yet."
+                    )
+                try:
+                    _mark = await prep_store.update_prep(
+                        prep_id,
+                        {**envelope, "meta": {**meta, "quality_refused": True}},
+                    )
+                    if (_mark or {}).get("error"):
+                        logger.warning(
+                            "prep %s not marked quality_refused (%s)",
+                            prep_id,
+                            (_mark or {}).get("error"),
+                        )
+                except Exception:  # pragma: no cover - must never block a refusal
+                    logger.debug("quality_refused mark failed", exc_info=True)
+                await _audit(
+                    "mcp_submit_suite_refused",
+                    entity_id=prep_id,
+                    detail={
+                        "reason": "case_quality",
+                        "findings": len(_quality.findings),
+                        "kinds": _q_kinds,
+                    },
+                )
+                return (
+                    f"{version_note}\u26d4 **Submission refused:** the finished "
+                    "suite carries cases a tester cannot execute as written.\n\n"
+                    f"{case_quality_gate.gate_detail(_quality)}\n\n"
+                    "Fix those cases -- give every step concrete `test_data`, "
+                    "make each `expected_result` name the observable outcome "
+                    "instead of repeating the action, and give duplicated titles "
+                    "distinct behaviour -- then resubmit under the SAME prep_id "
+                    f"`{prep_id}`. **Nothing was discarded**: the prep and every "
+                    "staged category row survive, no remediation round was used, "
+                    "and nothing was exported or saved. To finalize as-is anyway, "
+                    "ask the tester first and then resend with "
+                    f"`quality_gate_ack=true`.{_q_first_beat}"
+                )
+            await _audit(
+                "mcp_submit_suite_quality_override",
+                entity_id=prep_id,
+                detail={
+                    "reason": "quality_gate_ack",
+                    "findings": len(_quality.findings),
+                    "kinds": _q_kinds,
+                },
+            )
+            quality_note = (
+                "> \u26a0\ufe0f  Finalized with `quality_gate_ack=true` over "
+                f"{len(_quality.findings)} case-quality finding(s) "
+                f"({', '.join(_q_kinds)}). Those cases are in the suite and in "
+                "the export AS SUBMITTED.\n\n"
+            )
         # Piece 1: the bounded, deterministic duplicate-review block. Built AFTER
         # finalize so each submitted tc_id resolves to the FINAL renumbered id via
         # its content stable_id, and PREPENDED ahead of the variable-length summary
@@ -9016,6 +9202,33 @@ async def handle_submit_suite(
                         "'checked and found nothing'.",
                     )
                 )
+            # F6 (2026-08-30): the ambiguity verdict is the ONE signal the
+            # server holds about whether the source named a screen at all, and
+            # nothing downstream consumed it. On a live run a `medium` verdict
+            # whose first listed issue was "the ticket names no screen or URL"
+            # was printed once, and 59 cases were then written against an
+            # invented home screen, 15 of them instructing a tester to verify an
+            # "indicator dot" that no ticket, mockup or comment mentions. The
+            # tester looks for a UI element that may not exist and files its
+            # absence as a defect. Nothing here judges the cases -- it records,
+            # in the artifact the tester keeps, that the element NAMES in them
+            # are inferred rather than promised.
+            if amb_result is not None and getattr(amb_result, "ran", False):
+                if getattr(amb_result, "severity", "") in ("medium", "high"):
+                    _gen_notes.append(
+                        (
+                            "UI element names may be inferred",
+                            "The testability preflight rated this source "
+                            f"`{amb_result.severity}`. Where the source names no "
+                            "screen, no control and no label, the screen names, "
+                            "element names and UI copy in these cases were "
+                            "inferred by the generating model, not promised by "
+                            "the ticket. Confirm an element exists before "
+                            "raising a defect for its absence, and treat a "
+                            "mismatch in wording as a question for the BA rather "
+                            "than a bug.",
+                        )
+                    )
             # F4 (2026-08-29): the .xlsx is what the tester keeps; a step that
             # cannot fail has to be visible there and not only in a chat reply.
             # Both notes are advisory here -- the REFUSAL above is the gate, and
@@ -9028,6 +9241,27 @@ async def handle_submit_suite(
                 _gen_notes.append(
                     ("Test data that restates the field name", _data_detail_text)
                 )
+            # F8 (2026-08-30): the finalize reply truncates at _SUMMARY_CAP and
+            # told the tester to "re-submit a smaller suite" to read the
+            # advisories it cut -- i.e. to regenerate the work in order to read a
+            # comment about it. The advisories being cut are among the most
+            # actionable output this server produces (on one run the cut landed
+            # mid-sentence in "2 test class(es) an experienced tester would
+            # expect are missing"). The workbook already carries a Generation
+            # Notes sheet and is what the tester keeps, so the FULL advisory goes
+            # there. Gated on the static cap, which is the ceiling every dynamic
+            # budget sits under, so a run whose summary fits is unchanged.
+            try:
+                _full_summary = (summary or "").strip()
+                if len(_full_summary) > _SUMMARY_CAP:
+                    _gen_notes.append(
+                        (
+                            "Full generation advisory (the chat reply was cut)",
+                            _full_summary,
+                        )
+                    )
+            except Exception:  # pragma: no cover - a note never blocks the export
+                logger.debug("full-advisory note attachment failed", exc_info=True)
             if _gen_notes:
                 suite._generation_notes = _gen_notes
         except Exception:  # pragma: no cover - defensive; must never block export
@@ -9278,6 +9512,11 @@ async def handle_submit_suite(
             # unfalsifiable steps through. Accepting an ack silently is the
             # F2 pattern this whole batch exists to correct.
             ReplySection("step assertions", assertion_note, protected=True),
+            # PROTECTED for the same reason: this line is the only place the
+            # finalize reply says the tester waved through cases whose steps
+            # name no data, restate their own action, or repeat another case's
+            # title. "" on every clean run, so those replies stay byte-identical.
+            ReplySection("case quality", quality_note, protected=True),
             ReplySection(
                 "checklist gap",
                 checklist_note if checklist_gap else "",
@@ -11559,12 +11798,21 @@ async def handle_feature_analysis(
             header += _fa_vision_disclosure(screens_captured)
         return FeatureAnalysisReply(
             header
+            # F16 (2026-08-30): `shape_host_task`'s response_schema is opt-IN and
+            # this call site never passed it, so the envelope the host received
+            # carried NO schema -- while the tool description promises one. Field
+            # names then have to be guessed, and a wrong guess fails INVISIBLY:
+            # finalize_feature_report drops unknown keys by design. A live run
+            # lost `feature_summary` to exactly that.
             + shape_host_task(
                 "Feature Analysis — your turn",
                 task_id,
                 opened_content.get("envelope") or {},
                 "qa_submit_feature_analysis",
                 "field `report_json`",
+                response_schema=(opened_content.get("envelope") or {}).get(
+                    "response_schema"
+                ),
             ),
             forwarded_screens,
         )
@@ -11581,6 +11829,50 @@ async def handle_feature_analysis(
 # one-shot). A still-unusable round 2 renders the blank report WITH a warning:
 # never discard the tester's turn, never pretend it worked.
 _MAX_FEATURE_ANALYSIS_ROUNDS = 2
+
+
+async def _write_feature_analysis_file(task_id: str, markdown: str) -> str:
+    """Write the FULL Feature Analysis report beside the other exports.
+
+    F1 (2026-08-30). The submit reply renders the report COMPACT -- four of its
+    sixteen sections -- and ``render_report_markdown`` justifies that mode on
+    the grounds that "the full analysis is delivered as a downloadable file".
+    No caller ever wrote one. Twelve sections the rubric spends seven numbered
+    steps asking the host for -- every functional requirement, every acceptance
+    criterion, the preconditions, roles, dependencies, validation rules, error
+    handling, edge cases, the assumptions, the UI analysis, the user flow, and
+    the conflicts the rubric says to "never silently drop" -- were submitted,
+    validated and thrown away, with nothing in the reply to say so.
+
+    Returns a markdown line naming the path, or "" when there is no configured
+    export dir or the write fails: a missing file must never cost the tester the
+    report body. Never raises.
+    """
+    try:
+        export_dir = _resolved_export_dir()
+        if not export_dir:
+            return ""
+        dest = Path(export_dir).expanduser()
+        dest.mkdir(parents=True, exist_ok=True)
+        safe_id = (
+            "".join(ch for ch in str(task_id or "") if ch.isalnum() or ch in "-_")[:32]
+            or "report"
+        )
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        path = dest / f"qa_feature_analysis_{safe_id}_{stamp}.md"
+        path.write_text(markdown, encoding="utf-8")
+        # LOGGED, not audited: the mcp_feature_analysis row is this submission's
+        # audit event and tests pin it as the last one, so a second row here
+        # would make the artifact write look like the submission.
+        logger.info("feature analysis report written to %s", path)
+        return (
+            f"**Full report (all sections):** `{path}`\n\n"
+            "The summary below is the short view; the file has the requirement "
+            "analysis, assumptions, UI analysis, user flow and conflicts.\n\n"
+        )
+    except Exception:
+        logger.warning("could not write the Feature Analysis file", exc_info=True)
+        return ""
 
 
 async def handle_submit_feature_analysis(
@@ -11643,6 +11935,9 @@ async def handle_submit_feature_analysis(
                         reopened_content.get("envelope") or {},
                         "qa_submit_feature_analysis",
                         "field `report_json`",
+                        response_schema=(reopened_content.get("envelope") or {}).get(
+                            "response_schema"
+                        ),
                     )
                 )
             logger.warning(
@@ -11670,7 +11965,10 @@ async def handle_submit_feature_analysis(
                 "section below is empty. Call `qa_feature_analysis` again to "
                 "retry.\n\n"
             )
-        return header + render_report_markdown(report, compact=True)
+        file_note = await _write_feature_analysis_file(
+            task_id, header + render_report_markdown(report)
+        )
+        return header + file_note + render_report_markdown(report, compact=True)
     except Exception as exc:
         logger.exception("handle_submit_feature_analysis failed")
         _capture_error(exc, "qa_submit_feature_analysis")
@@ -11752,7 +12050,18 @@ async def handle_wizard(
         if top.status == UNAVAILABLE:
             return _wizard_menu_markdown(options)
         if top.status == DECLINED:
-            return "👍 No problem — nothing selected. Call `qa_wizard` again anytime."
+            # F12 (2026-08-30): a DECLINED choice is not always a tester saying
+            # no. In Cursor the wizard returned this cancellation on a turn where
+            # `qa_generate_test_cases` correctly rendered its markdown menu, so
+            # the documented entry point for non-technical testers dead-ended on
+            # the very client the session ran in. Show the menu either way: a
+            # tester who really did cancel loses nothing by being shown what they
+            # declined, while one whose client never rendered a dialog now has
+            # something to act on.
+            return (
+                "👍 Nothing selected — here is the menu, or call "
+                "`qa_wizard` again anytime.\n\n" + _wizard_menu_markdown(options)
+            )
         choice = top.value
 
         if choice == "Generate test cases":

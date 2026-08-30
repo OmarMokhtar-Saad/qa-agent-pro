@@ -803,6 +803,23 @@ def _case_count_bounds(
     else:
         sig_band = 0
 
+    # F10 (2026-08-30) -- WHY THERE IS STILL NO FLOOR BAND HERE, so the next
+    # reader does not re-add one. The finding is real: "make the reports better"
+    # (four words, no product, no screen, no behaviour) produces a payload
+    # asking for 8-10 cases per category, 64 overall, under the standard "an
+    # empty category is always wrong" instruction -- a direct instruction to
+    # invent, and the ambiguity gate only catches it at finalize, after the
+    # whole generation cost is paid. A `(2, 4)` band gated on `length < 40 and
+    # signal <= 2` was written, MEASURED, and reverted: "Login page" is 10
+    # chars with the same low signal and lands in it, and that input is pinned
+    # at (8, 10) deliberately -- a tester who names a real product surface wants
+    # a real suite. Length and this signal score cannot separate the two, so
+    # tuning the COUNT here trades a documented over-generation for an
+    # undocumented under-generation. What was fixed instead is the missing
+    # caveat: host_mode._thin_source adds a do-not-invent clause to
+    # worker_instructions for exactly this shape. A count-level fix needs a
+    # signal that reads whether the text names a SURFACE, which this one does
+    # not.
     band = max(len_band, sig_band)
     return ((8, 10), (10, 13), (12, 15))[band]
 
@@ -887,12 +904,19 @@ def _risk_key(tc: TestCase) -> tuple:
     )
 
 
+#: The cosine cut-off the deleted QA_SEMANTIC_DEDUP_THRESHOLD carried (audit G3,
+#: 2026-08-30). Its only reader was this function, which runs only behind
+#: semantic_dedup_enabled() -- the False constant since 2026-08-13 -- so the
+#: setting could never be observed. Same 0.9, one line to change on revival.
+_SEMANTIC_DEDUP_THRESHOLD = 0.9
+
+
 async def _semantic_dedupe_cases(
     cases: list[TestCase], protected_stable_ids: set[str] | None = None
 ) -> tuple[list[TestCase], str]:
     """Opt-in semantic dedup (QA_EMBEDDINGS_BACKEND). Founder-based greedy
     clustering: each case joins the first existing cluster whose FOUNDER (first
-    member) is >= qa_semantic_dedup_threshold cosine-similar, else it starts a
+    member) is >= _SEMANTIC_DEDUP_THRESHOLD cosine-similar, else it starts a
     new cluster. Within each cluster the highest-risk case is kept as the
     representative and the rest are merged into it.
 
@@ -919,7 +943,7 @@ async def _semantic_dedupe_cases(
         vectors = emb["content"]
         if len(vectors) != len(cases):
             return cases, ""
-        threshold = float(getattr(settings, "qa_semantic_dedup_threshold", 0.9))
+        threshold = _SEMANTIC_DEDUP_THRESHOLD
         clusters: list[list[int]] = []
         for i in range(len(cases)):
             placed = False

@@ -123,6 +123,32 @@ def looks_like_requirement_text(text: object) -> bool:
         return False
 
 
+# `AC1:` / `AC-2.` / `AC 03)` -- the label form acceptance criteria are most
+# often written in, and the one the split below used to miss ENTIRELY. A ticket
+# whose criteria were written `AC1:`..`AC10:` followed by a trailing `Notes:`
+# paragraph parsed as ONE criterion plus the Notes line, and the RTM then
+# reported "2/2 acceptance criteria traced, all covered" over a ten-criterion
+# ticket: a silent under-count that fails GREEN (F2, live run 2026-08-30).
+#
+# The trailing paragraph is what disabled the recovery path: the single-newline
+# fallback fired only when the paragraph split produced <= 1 chunk, so any
+# trailing prose -- Notes, links, a sign-off -- silently switched it off.
+_AC_LABEL_RE = re.compile(r"(?m)^\s*AC\s*-?\s*\d{1,3}\s*[:.)\]-]\s+")
+_AC_SPLIT_RE = (
+    r"(?m)(?:^\s*[-*•]\s+|^\s*\d+[.)\]]\s+"
+    r"|^\s*AC\s*-?\s*\d{1,3}\s*[:.)\]-]\s+)|\n{2,}"
+)
+
+# Section labels that introduce prose ABOUT the ticket rather than a criterion.
+# Admitting one creates a bogus AC that every downstream anchoring check then
+# treats as ground truth -- the same class the numeric/date guard above exists
+# for, reached through a different door.
+_NON_AC_PREFIX_RE = re.compile(
+    r"^\s*(notes?|links?|references?|out of scope|scope|assumptions?|context)\s*:",
+    re.IGNORECASE,
+)
+
+
 def parse_acceptance_criteria(raw: str) -> list[AcceptanceCriterion]:
     """Parse raw acceptance criteria text into numbered AcceptanceCriterion items.
 
@@ -140,11 +166,15 @@ def parse_acceptance_criteria(raw: str) -> list[AcceptanceCriterion]:
 
         # Split on bullet or numbered list markers at the start of a line,
         # or on double-newlines (paragraph breaks).
-        lines = re.split(r"(?m)(?:^\s*[-*•]\s+|^\s*\d+[.)\]]\s+)|\n{2,}", raw)
+        lines = re.split(_AC_SPLIT_RE, raw)
 
-        # If that produced only one non-empty chunk, fall back to single-newline split.
+        # If that produced only one non-empty chunk -- or if any single chunk
+        # STILL carries more than one `ACn:` label, which is exactly what a
+        # trailing paragraph used to hide -- fall back to single-newline split.
         non_empty = [ln.strip() for ln in lines if ln.strip()]
-        if len(non_empty) <= 1:
+        if len(non_empty) <= 1 or any(
+            len(_AC_LABEL_RE.findall(ln)) > 1 for ln in non_empty
+        ):
             lines = raw.splitlines()
 
         items: list[str] = []
@@ -154,8 +184,17 @@ def parse_acceptance_criteria(raw: str) -> list[AcceptanceCriterion]:
             # A bare digit is CONTENT (e.g. "3 failed logins", "200ms"); only
             # strip a leading number when it is a real list marker — i.e. it is
             # immediately followed by a delimiter (./)/]) AND whitespace.
-            line = re.sub(r"^\s*(?:[-*•]|\d+[.)\]])\s+", "", line).strip()
+            line = re.sub(
+                r"^\s*(?:[-*•]|\d+[.)\]]|AC\s*-?\s*\d{1,3}\s*[:.)\]-])\s+",
+                "",
+                line,
+            ).strip()
             if len(line) < 5:
+                continue
+            # A trailing "Notes:"/"Links:" paragraph is prose ABOUT the ticket,
+            # not a criterion -- see _NON_AC_PREFIX_RE.
+            if _NON_AC_PREFIX_RE.match(line):
+                logger.debug("Dropping non-criterion section label: %.60r", line)
                 continue
             # A configured AC field can return something that is not a
             # requirement at all (a date, an id, a number). Letting it

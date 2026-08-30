@@ -87,6 +87,10 @@ _RETRY_DELAYS = (1.0, 2.0)  # seconds between attempts
 _MIN_READABLE_CHARS = 20
 
 _MAX_RAW_HTML_CHARS = 200_000  # cap raw HTML exposed to callers on very large pages
+# HARD read budget per hop (audit E1b, 2026-08-30). An order of magnitude above
+# _MAX_RAW_HTML_CHARS, the only consumer of the full body, so no real page is
+# affected -- what it bounds is the ALLOCATION a hostile response can force.
+_MAX_BODY_BYTES = 3_000_000
 
 # Sentinels indicating a JS-only SPA shell (e.g. a React/Vue app that renders
 # nothing without a browser) rather than a genuinely empty/broken page.
@@ -272,6 +276,8 @@ class _HopResult:
     status_code: int
     headers: dict
     text: str
+    #: True when the body hit _MAX_BODY_BYTES and the tail was never read.
+    truncated: bool = False
 
 
 async def _fetch_one_hop(url: str) -> _HopResult:
@@ -290,16 +296,55 @@ async def _fetch_one_hop(url: str) -> _HopResult:
     async with httpx.AsyncClient(
         timeout=15, transport=transport, follow_redirects=False
     ) as client:
-        resp = await client.get(
-            url, headers={"User-Agent": "Mozilla/5.0 QA-Agents/1.0"}
-        )
-        # Read the body now, while the connection is still open, so the socket
-        # is consumed/released before the client closes — never returned live.
-        return _HopResult(
-            status_code=resp.status_code,
-            headers=dict(resp.headers),
-            text=resp.text,
-        )
+        async with client.stream(
+            "GET", url, headers={"User-Agent": "Mozilla/5.0 QA-Agents/1.0"}
+        ) as resp:
+            # 2026-08-30 (audit E1b): the body is read under a HARD byte budget
+            # while streaming, instead of being fully buffered by `resp.text` and
+            # sliced to _MAX_RAW_HTML_CHARS afterwards. The slice never bounded
+            # the ALLOCATION -- an attacker-controlled page (or a redirect chain
+            # ending at one) could make this process hold the whole response in
+            # memory before a single character was discarded. A declared
+            # over-budget content-length is logged, not trusted; the read stops
+            # at the budget either way, since the header is attacker-controlled
+            # too. Everything is still read BEFORE the client closes, so no live
+            # response and no half-open socket escapes (NB-001).
+            headers = dict(resp.headers)
+            if resp.status_code in _REDIRECT_STATUSES and "location" in headers:
+                # A redirect's body is never parsed by any caller; do not read it.
+                return _HopResult(
+                    status_code=resp.status_code, headers=headers, text=""
+                )
+            declared = headers.get("content-length") or ""
+            if declared.isdigit() and int(declared) > _MAX_BODY_BYTES:
+                logger.warning(
+                    "Response declares %s bytes, over the %d-byte read budget - "
+                    "reading a bounded prefix only",
+                    declared,
+                    _MAX_BODY_BYTES,
+                )
+            chunks: list[bytes] = []
+            total = 0
+            truncated = False
+            async for chunk in resp.aiter_bytes():
+                if total + len(chunk) >= _MAX_BODY_BYTES:
+                    chunks.append(chunk[: max(_MAX_BODY_BYTES - total, 0)])
+                    total = _MAX_BODY_BYTES
+                    truncated = True
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            raw = b"".join(chunks)
+            try:
+                text = raw.decode(resp.encoding or "utf-8", errors="replace")
+            except (LookupError, TypeError):
+                text = raw.decode("utf-8", errors="replace")
+            return _HopResult(
+                status_code=resp.status_code,
+                headers=headers,
+                text=text,
+                truncated=truncated,
+            )
 
 
 async def _follow_redirects_with_pinning(start_url: str) -> tuple[_HopResult, str]:

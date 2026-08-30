@@ -892,6 +892,38 @@ def _prepared_ac_entries(prepared) -> list[dict]:
     return out
 
 
+# F10 (2026-08-30): a source with nothing in it to ground a test case still
+# gets the full "an empty category is always wrong" instruction and a request
+# for 8-10 cases per category. The COUNT is deliberately not lowered -- see the
+# reverted-band note in agents/test_scenario_agent._case_count_bounds for the
+# measurement that rules that out -- so what changes is what the worker is told
+# about inventing. Deliberately narrow: two thresholds that a real one-line
+# feature description clears comfortably, so a normal run's packet is unchanged.
+_THIN_SOURCE_CHARS = 40
+
+_THIN_SOURCE_CLAUSE = (
+    " This source is VERY THIN -- it names little or no product behaviour. Write "
+    "what it actually supports and no more: do NOT invent screens, element "
+    "names, UI copy, environments or business rules to reach a case count, and "
+    "prefer fewer, honestly-grounded cases over a full category of guesses. Say "
+    "what you could not ground in your ambiguity verdict."
+)
+
+
+def _thin_source(prepared) -> bool:
+    """True when the generation source is too thin to ground a suite. Never raises."""
+    try:
+        text = (
+            getattr(prepared, "complexity_text", "")
+            or getattr(prepared, "feature_text", "")
+            or getattr(prepared, "user_msg", "")
+            or ""
+        )
+        return len(str(text).strip()) < _THIN_SOURCE_CHARS
+    except Exception:  # pragma: no cover - a caveat never breaks a packet
+        return False
+
+
 def build_category_job(prepared, prep_id: str, category_name: str) -> dict | None:
     """Self-contained packet for qa_get_category_job. None if unknown/unusable.
 
@@ -967,6 +999,7 @@ def build_category_job(prepared, prep_id: str, category_name: str) -> dict | Non
                 "case's requirement_id with an ac_id from THAT list and "
                 "never derive or renumber your own; if it is empty, leave "
                 "requirement_id null rather than inventing an id."
+                + (_THIN_SOURCE_CLAUSE if _thin_source(prepared) else "")
             ),
         }
     except Exception:
@@ -3443,7 +3476,12 @@ def _validate_suite(data: dict) -> ParsedSubmission:
         except Exception as exc:
             raw_id = c.get("tc_id")
             tcid = raw_id if isinstance(raw_id, str) else "?"
-            dropped.append(f"{tcid}: failed validation ({type(exc).__name__})")
+            # F15 (2026-08-30): the class name alone ("failed validation
+            # (ValidationError)") does not say WHICH field or WHICH rule, so a
+            # host cannot fix the case without re-deriving the schema. Name up
+            # to two field/message pairs; the messages are pydantic's own text,
+            # never the rejected VALUE, so nothing untrusted is echoed back.
+            dropped.append(f"{tcid}: failed validation ({_validation_detail(exc)})")
             continue
         if tc.tc_id in seen_ids:
             dropped.append(f"{tc.tc_id}: duplicate tc_id")
@@ -3587,6 +3625,136 @@ def _shortlist_safe(text: object, cap: int) -> str:
         return ""
 
 
+# F5 (2026-08-30, MEASURED): across three live runs the prescreen surfaced 8
+# candidate pairs and NONE was a duplicate -- every one was a deliberate
+# boundary or contrast pair (min vs max, below vs above, increased vs
+# decreased, production vs UAT, negative vs non-numeric). That is not bad luck:
+# title-word overlap is HIGHEST precisely where two cases are opposites, which
+# is the coverage a good suite must contain. The finalize reply then told the
+# tester their (correct) clean review was "CONTRADICTED by the server's own
+# prescreen", nudging a non-technical tester toward deleting boundary coverage.
+#
+# The filter is the one the section's OWN guidance already states -- "drop any
+# pair that differs in boundary value" -- applied server-side instead of being
+# delegated to the reader. A pair is suppressed only when EVERY token the two
+# titles disagree about is a discriminator: a contrast word, or a token
+# carrying a digit. Two cases that differ in a product noun are untouched.
+_DUP_DISCRIMINATORS = frozenset(
+    {
+        "min",
+        "max",
+        "minimum",
+        "maximum",
+        "lower",
+        "upper",
+        "least",
+        "most",
+        "above",
+        "below",
+        "over",
+        "under",
+        "before",
+        "after",
+        "beyond",
+        "within",
+        "increase",
+        "increased",
+        "increases",
+        "decrease",
+        "decreased",
+        "decreases",
+        "more",
+        "less",
+        "fewer",
+        "greater",
+        "smaller",
+        "larger",
+        "longer",
+        "shorter",
+        "first",
+        "last",
+        "start",
+        "end",
+        "top",
+        "bottom",
+        "valid",
+        "invalid",
+        "enabled",
+        "disabled",
+        "allowed",
+        "blocked",
+        "present",
+        "absent",
+        "empty",
+        "full",
+        "positive",
+        "negative",
+        "numeric",
+        "alphanumeric",
+        "alphabetic",
+        "cyrillic",
+        "unicode",
+        "ascii",
+        "single",
+        "multiple",
+        "none",
+        "all",
+        "missing",
+        "extra",
+        "production",
+        "prod",
+        "staging",
+        "uat",
+        "sandbox",
+        "qa",
+        "dev",
+        "development",
+        "preprod",
+        "live",
+        "local",
+        "penny",
+        "cent",
+        "zero",
+        "one",
+        "two",
+        "non",
+        "not",
+        "no",
+        "android",
+        "ios",
+        "web",
+        "mobile",
+        "desktop",
+        "tablet",
+    }
+)
+
+
+def _is_boundary_contrast(tokens_a: frozenset, tokens_b: frozenset) -> bool:
+    """True when two titles disagree ONLY about contrast WORDS.
+
+    Pure and never raises. Returns False when the titles are identical -- an
+    identical pair is the one shape that really IS a duplicate, and suppressing
+    it would break the check this filter exists to make usable.
+
+    A DIGIT-BEARING token is deliberately NOT a discriminator, though the first
+    cut of this filter treated it as one. "penny below minimum" ~ "penny above
+    minimum" is a boundary pair because of below/above, not because of a
+    number; meanwhile 40 titles differing only by "variant 1", "variant 2", ...
+    are the duplicate shape this prescreen exists to catch, and the digit rule
+    silenced them (tests/test_dup_prescreen_merged_submit.py pins that fixture).
+    Re-measured against the eight pairs the 2026-08-30 run reported: the word
+    list alone suppresses seven of the eight.
+    """
+    try:
+        diff = tokens_a.symmetric_difference(tokens_b)
+        if not diff:
+            return False
+        return all(t in _DUP_DISCRIMINATORS for t in diff)
+    except Exception:  # pragma: no cover - a filter never breaks the prescreen
+        return False
+
+
 def build_dup_shortlist_counted(merged_cases: list) -> tuple[list, int]:
     """Candidate duplicate PAIRS over the merged, renumbered cases, WITH
     the uncapped total.
@@ -3640,6 +3808,9 @@ def build_dup_shortlist_counted(merged_cases: list) -> tuple[list, int]:
                 ratio = len(a & b) / union
                 if ratio < _DUP_SHORTLIST_MIN_RATIO:
                     continue
+                # F5: a deliberate contrast pair is not a duplicate candidate.
+                if _is_boundary_contrast(a, b):
+                    continue
                 pairs.append(
                     {
                         "id_a": entries[i][0],
@@ -3654,6 +3825,28 @@ def build_dup_shortlist_counted(merged_cases: list) -> tuple[list, int]:
     except Exception:
         logger.debug("build_dup_shortlist_counted failed", exc_info=True)
         return [], 0
+
+
+def _validation_detail(exc: Exception) -> str:
+    """``field `tc_id`: <rule>`` for the first couple of pydantic errors.
+
+    Falls back to the exception class name for anything that is not a pydantic
+    ValidationError, which is exactly the previous behaviour. Never raises, and
+    never echoes the rejected value.
+    """
+    try:
+        errors = exc.errors()  # type: ignore[attr-defined]
+        parts = []
+        for err in list(errors)[:2]:
+            loc = ".".join(str(p) for p in (err.get("loc") or ())) or "(root)"
+            msg = str(err.get("msg") or "invalid")[:120]
+            parts.append(f"field `{loc}`: {msg}")
+        if parts:
+            extra = "" if len(errors) <= 2 else f", +{len(errors) - 2} more"
+            return "; ".join(parts) + extra
+    except Exception:
+        pass
+    return type(exc).__name__
 
 
 def build_dup_shortlist(merged_cases: list) -> list:

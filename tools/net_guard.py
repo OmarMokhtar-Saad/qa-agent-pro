@@ -17,6 +17,10 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import socket
+from urllib.parse import urlparse
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -58,3 +62,64 @@ def embedded_v4_non_public(addr: ipaddress._BaseAddress) -> bool:
     except Exception:
         logger.warning("embedded_v4_non_public: unparseable address, failing closed")
         return True
+
+
+def validate_public_url_sync(url: str) -> tuple:
+    """Synchronous twin of ``tools.jira_fetcher._validate_public_url``.
+
+    Returns ``(hostname, pinned_ip, error)`` -- ``error`` is None on success.
+    Same rule, same order, same failure text: scheme allowlist, then ONE DNS
+    resolution in which EVERY answer must be global and must not embed a
+    non-public IPv4 (NAT64 / IPv4-mapped). It exists because
+    ``tools/framework_template.py`` is blocking code called through
+    ``asyncio.to_thread`` and cannot await the coroutine version -- one rule with
+    two call conventions, rather than two rules that can drift apart. Never
+    raises; an unexpected failure is reported as a block, because this guard
+    fails closed.
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return None, None, "Blocked: scheme '" + str(parsed.scheme) + "' not allowed"
+        hostname = parsed.hostname
+        if not hostname:
+            return None, None, "Blocked: invalid hostname"
+        try:
+            infos = socket.getaddrinfo(hostname, None)
+        except socket.gaierror:
+            return None, None, "Blocked: could not resolve hostname '" + hostname + "'"
+        first_public = None
+        for info in infos:
+            addr = ipaddress.ip_address(info[4][0])
+            if not addr.is_global or embedded_v4_non_public(addr):
+                return None, None, "Blocked: non-public address"
+            if first_public is None:
+                first_public = info[4][0]
+        if first_public is None:
+            return None, None, "Blocked: non-public address"
+        return hostname, first_public, None
+    except Exception:
+        logger.warning("validate_public_url_sync: failing closed", exc_info=True)
+        return None, None, "Blocked: address validation failed"
+
+
+class PinnedIPSyncTransport(httpx.HTTPTransport):
+    """Synchronous twin of ``tools.jira_fetcher.PinnedIPTransport``.
+
+    Forces the connection onto the IP that was validated, so a second DNS lookup
+    by the HTTP stack (DNS rebinding) cannot retarget it after the check passed.
+    The Host header and TLS SNI keep the original hostname, so virtual-hosted and
+    SNI-routed servers, and certificate verification, are unaffected.
+    """
+
+    def __init__(self, hostname: str, pinned_ip: str, **kwargs):
+        super().__init__(**kwargs)
+        self._hostname = hostname
+        self._pinned_ip = pinned_ip
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        if request.url.host == self._hostname:
+            request.url = request.url.copy_with(host=self._pinned_ip)
+            request.headers.setdefault("host", self._hostname)
+            request.extensions["sni_hostname"] = self._hostname
+        return super().handle_request(request)

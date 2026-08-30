@@ -45,6 +45,15 @@ plan-b3-rule-packs.md -- no over-claiming.
 Every function is never-raise. With all three flags OFF, ``build_rule_packs``
 returns an inert result, every helper returns "" / the input unchanged, and the
 pipeline is byte-identical to today.
+
+2026-08-30 (audit G3): the ATOMICITY pack's module, ``tools/atomicity.py``, was
+DELETED. It had been behaviourally unreachable since 2026-08-14 -- every call
+site sat under ``result.atomicity_on``, which ``build_rule_packs`` sets from
+``atomicity_rules_enabled()``, the ``False`` constant. The seam and the
+``RulePackResult.atomicity_on`` FIELD are retained: ``agents/host_mode.py``
+serialises that field into the prep envelope, so removing it would be a
+prep-format change. What is gone is the split-rule instruction and the two
+bundling detectors; reviving them is a fresh implementation, not a flag flip.
 """
 
 from __future__ import annotations
@@ -52,12 +61,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-from tools.atomicity import (
-    ATOMICITY_INSTRUCTION,
-    bundling_warning_section,
-    detect_bundled_cases,
-    detect_cross_line_bundles,
-)
 from tools.bilingual import (
     LanguagePair,
     bilingual_warning_section,
@@ -143,8 +146,14 @@ def atomicity_rules_enabled() -> bool:
     """The anti-bundling pack. HARDCODED OFF since 2026-08-14.
 
     NOT settings-derived: QA_ATOMICITY_RULES was DELETED (flag-surface
-    reduction, batch 8b) and hardcoded to its own code default. Same seam
-    rationale as bilingual_rules_enabled above.
+    reduction, batch 8b) and hardcoded to its own code default.
+
+    2026-08-30 (audit G3): unlike its two siblings this seam no longer gates any
+    CODE -- ``tools/atomicity.py`` was deleted, because a pack whose every call
+    site is unreachable is dead code that only looks revivable. It is retained
+    because ``RulePackResult.atomicity_on`` is part of the serialised prep
+    envelope (``agents/host_mode.py``) and because a True here must still not
+    make the pack claim to run.
     """
     return False
 
@@ -402,8 +411,6 @@ def format_rule_pack_prompt_block(
             parts.append(
                 format_bilingual_prompt_block(result.pairs, checklist_mode=mode)
             )
-        if result.atomicity_on:
-            parts.append(ATOMICITY_INSTRUCTION)
         if result.standing_on:
             parts.append(
                 format_standing_prompt_block(
@@ -575,15 +582,6 @@ def rule_pack_section(
             parts.append(
                 bilingual_warning_section(
                     result.pairs, ctx.get("bilingual") or new_bilingual_report()
-                )
-            )
-        if result.atomicity_on:
-            parts.append(
-                bundling_warning_section(
-                    detect_bundled_cases(cases),
-                    detect_cross_line_bundles(
-                        matches or {}, line_subsystem_map(result)
-                    ),
                 )
             )
         if result.standing_on:
