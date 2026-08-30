@@ -152,6 +152,14 @@ MAX_DESCRIPTION_CHARS = 12000
 _SOURCE_REF = r"(?::[A-Za-z]{1,6}[-_.]?\d{1,4}(?:\.\d{1,3})?)?"
 _SOURCE_PATTERNS = (
     re.compile(rf"^acceptance_criteria{_SOURCE_REF}$", re.IGNORECASE),
+    # F9 (2026-08-30): the bare label form a host actually writes when the job
+    # asks it to attribute a decomposed requirement -- "AC1", "AC-10", "AC 03".
+    # It was not on the allowlist, so EVERY correctly-attributed item folded to
+    # "unattributed" and the workbook's Source column rendered one constant.
+    # This admits an IDENTIFIER shape, never free text, so the control the
+    # allowlist exists to be is unchanged: "SHYJ-10974 Proposed Change" still
+    # folds, and so does "AC1: APPROVED BY SECURITY".
+    re.compile(r"^AC[-_ ]?\d{1,4}$", re.IGNORECASE),
     re.compile(rf"^description{_SOURCE_REF}$", re.IGNORECASE),
     re.compile(r"^comment(#\d{1,4})?$", re.IGNORECASE),
     re.compile(r"^amendment(#\d{1,4})?$", re.IGNORECASE),
@@ -196,6 +204,12 @@ def normalize_source(raw: str) -> str:
             return UNATTRIBUTED
         for pattern in _SOURCE_PATTERNS:
             if pattern.match(tag):
+                # F9: canonicalise the bare label onto the qualified form the
+                # rest of the report already speaks, so "AC1" and
+                # "acceptance_criteria:AC-001" do not read as two sources.
+                bare = re.match(r"^AC[-_ ]?(\d{1,4})$", tag, re.IGNORECASE)
+                if bare:
+                    return f"acceptance_criteria:AC-{int(bare.group(1)):03d}"
                 return tag
         return UNATTRIBUTED
     except Exception:

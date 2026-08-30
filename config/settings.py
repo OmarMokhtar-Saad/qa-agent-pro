@@ -662,9 +662,14 @@ class Settings(BaseSettings):
     qa_embeddings_model: str = ""
     # Voyage API key (voyage backend). .env only; falls back to $VOYAGE_API_KEY.
     voyage_api_key: str = ""
-    # Cosine threshold at/above which two cases are treated as the same for
-    # intra-suite semantic dedup. Only used when qa_embeddings_backend is set.
-    qa_semantic_dedup_threshold: float = 0.9
+    # QA_SEMANTIC_DEDUP_THRESHOLD stood here until 2026-08-30 (audit G3). It was
+    # the cosine cut-off for intra-suite semantic dedup -- a path hardcoded OFF
+    # on 2026-08-13, so the field's only reader sat behind
+    # agents.test_scenario_agent.semantic_dedup_enabled(), the False constant,
+    # and no value an operator set could change anything. The retained-for-
+    # revival _semantic_dedupe_cases path now uses a module constant of the same
+    # 0.9. A stale line in an existing .env is IGNORED, not an error
+    # (model_config uses extra="ignore"), pinned in tests/test_settings.py.
     # Intra-suite semantic dedup -- REMOVED as a setting 2026-08-13
     # (flag-surface reduction, batch 7 (needs-config)):
     # QA_SEMANTIC_DEDUP_ENABLED was DELETED and hardcoded OFF, so
@@ -674,8 +679,8 @@ class Settings(BaseSettings):
     # ranking -- which is exactly the separation this gate existed to protect,
     # now enforced in code rather than by a second .env line. OFF is also the
     # SAFE direction: this was the one gate in the batch whose ON state DROPS
-    # generated cases. The threshold above is retained with the
-    # retained-for-revival _semantic_dedupe_cases path.
+    # generated cases. The threshold that stood above it was deleted on
+    # 2026-08-30; the revival path keeps its 0.9 as a module constant.
 
     # --- Atomic Requirements Checklist (Batch 2) --------------------------
     # QA_ATOMIC_CHECKLIST_ENABLED was DELETED on 2026-08-14 (flag-surface
@@ -1194,19 +1199,6 @@ class Settings(BaseSettings):
                 "Invalid QA_RAG_SIMILARITY_THRESHOLD=%r — using default 0.3", v
             )
             return 0.3
-
-    @field_validator("qa_semantic_dedup_threshold", mode="before")
-    @classmethod
-    def _coerce_semantic_threshold(cls, v: object) -> float:
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            return float(v)
-        try:
-            return float(str(v).strip())
-        except (TypeError, ValueError):
-            logger.warning(
-                "Invalid QA_SEMANTIC_DEDUP_THRESHOLD=%r — using default 0.9", v
-            )
-            return 0.9
 
     @field_validator(
         "qa_checklist_match_high",

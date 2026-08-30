@@ -853,6 +853,7 @@ def build_server():
         volume_floor_ack: bool = False,
         image_relevance_ack: bool = False,
         step_assertion_ack: bool = False,
+        quality_gate_ack: bool = False,
     ) -> str:
         """Submit a host-generated test suite back to the server to be validated,
         finalized, exported and persisted (the BACK half of host mode).
@@ -892,6 +893,14 @@ def build_server():
         measures nothing. `step_assertion_ack` follows the SAME two-beat rule as
         the two acks above: ignored on the first submit, honoured only after that
         refusal, and only ever on the USER's word.
+
+        If the reply refuses the submission for CASE QUALITY -- steps with no
+        concrete `test_data`, an `expected_result` that only restates its own
+        `action`, or two cases sharing a title -- fix those cases and resubmit
+        under the same prep_id. `quality_gate_ack` follows the SAME two-beat rule
+        as the three acks above: ignored on the first submit, honoured only after
+        that refusal, and only ever on the USER's word. Nothing is exported or
+        saved on a refusal, so nothing is lost by fixing the cases instead.
         """
         return await _tracked(
             "qa_submit_suite",
@@ -902,6 +911,7 @@ def build_server():
                 volume_floor_ack=volume_floor_ack,
                 image_relevance_ack=image_relevance_ack,
                 step_assertion_ack=step_assertion_ack,
+                quality_gate_ack=quality_gate_ack,
                 ask_text=_make_asker(ctx),
                 progress=_make_progress(ctx),
             ),

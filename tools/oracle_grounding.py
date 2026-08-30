@@ -136,13 +136,70 @@ def _looks_like_identifier(span: str) -> bool:
 # Straight and curly, single and double. The generator writes straight singles;
 # a pasted description routinely uses curly ones, and normalizing BOTH sides is
 # what lets a curly-quoted promise ground a straight-quoted assertion.
+# The single-quote alternatives are flanked by (?<![A-Za-z0-9]) / (?![A-Za-z0-9])
+# because a straight or curly single quote is ALSO an apostrophe. Without the
+# flanks the scan matched between the apostrophes of "the server's UTC date
+# rather than the device's local date" and reported the fragment
+# "s UTC date rather than the device" as invented UI copy -- one of the five
+# false positives measured on the 2026-08-30 run (F7). A real quoted UI string
+# is never preceded or followed immediately by a word character; a possessive
+# always is. The DOUBLE-quote alternatives are deliberately left unflanked:
+# they carry no apostrophe ambiguity and adding the lookarounds there could
+# only lose real copy.
 _SPAN_LEN = f"{_MIN_SPAN_CHARS},{_MAX_SPAN_CHARS}"
 _QUOTED_SPAN_RE = re.compile(
-    rf"'([^'\n]{{{_SPAN_LEN}}})'"
+    rf"(?<![A-Za-z0-9])'([^'\n]{{{_SPAN_LEN}}})'(?![A-Za-z0-9])"
     rf"|\"([^\"\n]{{{_SPAN_LEN}}})\""
-    rf"|‘([^’\n]{{{_SPAN_LEN}}})’"
+    rf"|(?<![A-Za-z0-9])‘([^’\n]{{{_SPAN_LEN}}})’(?![A-Za-z0-9])"
     rf"|“([^”\n]{{{_SPAN_LEN}}})”"
 )
+
+# A source that promises a message TEMPLATE promises every instance of it. The
+# 2026-08-30 run flagged 'Add GBP 7.50 more to use this code' and
+# 'Add GBP 0.01 more to use this code' as ungrounded against an acceptance
+# criterion that literally reads "Add GBP {amount} more to use this code" --
+# two false positives that tell a tester to LOOSEN a correct assertion. Each
+# placeholder becomes a bounded wildcard; the rest of the template is escaped,
+# so nothing but the placeholder is fuzzy.
+_PLACEHOLDER_RE = re.compile(r"\{[^{}\n]{1,40}\}")
+_MAX_TEMPLATES = 60
+
+
+def _template_patterns(grounding: str) -> list:
+    """Compiled matchers for every `{placeholder}`-bearing QUOTED span of the source.
+
+    Built from the source's own QUOTED spans, not from the sentence around them:
+    a criterion reads "the app shows 'Add GBP {amount} more to use this code'",
+    and the assertion under test quotes only the message. A matcher built from
+    the whole sentence carries the "the app shows" prefix and can never match the
+    instance -- which is what the first cut of this fix did, and it left two of
+    the five measured false positives standing.
+
+    Matching is `fullmatch`: a template promises the WHOLE message, so an
+    invented string that merely contains a promised fragment stays reported.
+
+    Operates on the NORMALIZED grounding text, so a caller compiles once per
+    suite. Never raises -- an unusable template is skipped, not reported.
+    """
+    out: list = []
+    try:
+        for span in _quoted_spans(grounding or ""):
+            span = span.strip()
+            if not span or not _PLACEHOLDER_RE.search(span):
+                continue
+            parts = [re.escape(p) for p in _PLACEHOLDER_RE.split(span)]
+            if len(parts) < 2:
+                continue
+            try:
+                out.append(re.compile(".{0,40}?".join(parts)))
+            except re.error:
+                continue
+            if len(out) >= _MAX_TEMPLATES:
+                break
+    except Exception:
+        logger.exception("_template_patterns failed - grounding without templates")
+    return out
+
 
 _SMART_CHARS = str.maketrans(
     {
@@ -250,6 +307,7 @@ def find_ungrounded_ui_strings(
         grounding = _normalize(grounding_text)
         if len(grounding) < _MIN_GROUNDING_CHARS:
             return []
+        templates = _template_patterns(grounding)
         out: list[tuple[str, int, str]] = []
         for tc in cases or []:
             own_data = _case_data_text(tc)
@@ -259,6 +317,9 @@ def find_ungrounded_ui_strings(
                         continue
                     normalized = _normalize(span)
                     if normalized in grounding or normalized in own_data:
+                        continue
+                    # F7: a filled instance of a promised template is promised.
+                    if any(t.fullmatch(normalized) for t in templates):
                         continue
                     out.append(
                         (

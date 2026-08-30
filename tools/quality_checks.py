@@ -1266,9 +1266,22 @@ def quality_warning_section(cases: list[TestCase], max_examples: int = 10) -> st
             # do not raise the cap.
             # tests/test_finalize_reply_cap.py measures the tripped shape.
             lines.append(
-                f"- {pct}% of {total_cases} case(s) have no test data plan "
-                f"(threshold {threshold_pct}%; {len(empty_data)} also lack "
-                "preconditions) — add a test_data entry per field the case uses."
+                # F13 (2026-08-30): "no test data plan" named no field, and the
+                # export's Test Data column -- which renders STEP-level
+                # test_data and is routinely FULL on a suite that trips this --
+                # made the same tester read a 100%-missing warning beside a
+                # populated column. Both are true; they measure different
+                # fields. "case-level" is six characters and says which. The
+                # remediation is unchanged, and so is the budget this bullet is
+                # measured against: a longer explanation was written, measured
+                # at +56 chars, and pushed the finalize reply past
+                # _SUMMARY_CAP -- cutting this advisory AND the duplicate
+                # prescreen's CONTRADICTED headline. Do not re-add it here; the
+                # place for the long version is the workbook.
+                f"- {pct}% of {total_cases} case(s) have no case-level "
+                f"test_data (threshold {threshold_pct}%; {len(empty_data)} "
+                "also lack preconditions) — add a test_data entry per field "
+                "the case uses."
             )
         if unanchored:
             # The ids go to the log, not the reply: see FINDABILITY_MAX_LOGGED.
