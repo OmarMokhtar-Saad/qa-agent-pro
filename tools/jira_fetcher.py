@@ -72,6 +72,7 @@ from tools.jira_mcp import (  # noqa: F401
     selected_issue_key,
     verify_jira_access,
 )
+from tools.net_guard import embedded_v4_non_public
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +204,7 @@ async def _resolve_public_ip(hostname: str) -> tuple[str | None, str | None]:
     first_public: str | None = None
     for info in infos:
         addr = ipaddress.ip_address(info[4][0])
-        if not addr.is_global:
+        if not addr.is_global or embedded_v4_non_public(addr):
             return None, "Blocked: non-public address"
         if first_public is None:
             first_public = info[4][0]

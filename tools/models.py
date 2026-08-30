@@ -276,6 +276,33 @@ class TestCase(BaseModel):
         "for a case that manipulates no data.",
     )
 
+    @field_validator("title", mode="after")
+    @classmethod
+    def strip_and_check_title(cls, v: str) -> str:
+        """Mirror of TestStep.strip_and_check_not_empty, for the same reason.
+
+        2026-08-30 audit F7: pydantic measures ``min_length=10`` against the RAW
+        string, so a title of twelve spaces was accepted -- and then had a
+        stable_id derived from it, was risk-scored, renumbered and written into
+        the tester's workbook as a blank row heading. Stripping also keeps the
+        content stable_id stable: a padded and an unpadded copy of one case must
+        not read as two cases.
+
+        Deliberately WHITESPACE-ONLY, not a re-check of ``min_length`` against
+        the stripped value (review round 2, M1). Re-checking would NARROW the
+        constraint, and ``tools/suite_store._load_suite`` retries a failed
+        validation only after dropping unknown keys -- its own comment says
+        "additive drift only; a narrowed constraint still fails below". A suite
+        stored with a padded short title would then come back with that case
+        silently missing on the next ``qa_export_suite`` / ``qa_push_suite``.
+        Rejecting a blank title costs nothing on the read path, because no case
+        with a blank title was ever worth reloading.
+        """
+        v = v.strip()
+        if not v:
+            raise ValueError("Field cannot be empty or whitespace only")
+        return v
+
     @field_validator("steps", mode="after")
     @classmethod
     def validate_step_numbering(cls, steps: list[TestStep]) -> list[TestStep]:

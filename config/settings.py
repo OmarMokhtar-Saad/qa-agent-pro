@@ -41,9 +41,11 @@ _FALSY_TOKENS = ("0", "false", "no", "off", "")
 #   * qa_rag_recency_half_life_days / qa_rag_max_entries — 0 is a documented
 #     "disable" / "unlimited" sentinel.
 #   * the byte/char/image/comment CAPS (jira_max_comments, jira_max_images,
-#     jira_max_image_bytes, qa_max_chat_images, qa_max_chat_image_bytes)
-#     — 0 there is a legitimate "allow none" cap; bounding them would be
-#     a behaviour change out of scope for this hygiene batch.
+#     jira_max_image_bytes) — 0 there is a legitimate "allow none" cap;
+#     bounding them would be a behaviour change out of scope for this
+#     hygiene batch. qa_max_chat_images / qa_max_chat_image_bytes were named
+#     here until 2026-08-30, when both fields were deleted with the last of
+#     the backend settings.
 #     qa_max_spec_bytes / qa_max_spec_chars were on this list until
 #     2026-08-15, when batch D1 deleted them with tools/doc_ingest.py.
 _POSITIVE_INT_FIELDS = frozenset(
@@ -129,17 +131,20 @@ class Settings(BaseSettings):
     # P2-G1 gave `QA_CHECKLIST_MATCH_LOW` / `_MAX_PAIRS`, and it is pinned in
     # `tests/test_settings.py`.
     #
-    # `qa_classifier_model` below is deliberately NOT in that set: it still has
-    # two live readers in `tools/mcp_handlers.py` (the ambiguity gate's model
-    # label). Restoring a server-side model call is a NEW implementation and an
-    # architectural decision -- see CLAUDE.md's host-boomerang house rule -- so
-    # it would bring its own settings with it rather than reviving these.
-
-    # Cheaper/faster model for the intent router's classification pass (T-04 /
-    # I-027). Empty string means "use the host's own model" (no override).
-    # Still LIVE: `tools/mcp_handlers` reads it twice, to label which model the
-    # ambiguity gate would name.
-    qa_classifier_model: str = "claude-haiku-4-5"
+    # 2026-08-30 (audit finding 8 follow-up): `qa_classifier_model` was the
+    # THIRTEENTH field of that P2-I set, held back at the time because
+    # `tools/mcp_handlers.py` still read it twice to label which model the
+    # ambiguity gate would name. Both reads went with the server-side ambiguity
+    # gate in P2-J (2026-08-16), so it named a model nothing could call. It is
+    # DELETED here together with `qa_max_chat_images` / `qa_max_chat_image_bytes`
+    # below, on the same reasoning P2-I recorded: a settings name that promises
+    # a model choice this server cannot act on is the stale-flag class
+    # `tests/test_no_deleted_flag_in_output.py` exists to catch. No backend
+    # remains anywhere in this tree -- every generative step runs in the
+    # tester's own chat model -- so there is no model, key, timeout or model
+    # choice left for `.env` to offer. Restoring a server-side call would be a
+    # NEW implementation and an architectural decision (CLAUDE.md's
+    # host-boomerang house rule), bringing its own settings with it.
 
     # ---- Structured JSON via forced tool use (api backend only) -------------
     # UNCONDITIONAL since 2026-08-13 (flag-surface reduction, batch 8a):
@@ -314,12 +319,15 @@ class Settings(BaseSettings):
     # reach a model only when a tester attaches them to the chat. See
     # docs/FEATURE_FLAGS.md.
 
-    # Direct chat image uploads (screenshots/mockups attached to a message,
-    # independent of Jira) — see tools/image_description.py -> llm.ask_vision()
-    # (api backend only, same pipeline as Jira ticket images). These two caps
-    # bound what the pipeline will actually read from an uploaded image.
-    qa_max_chat_images: int = 3
-    qa_max_chat_image_bytes: int = 5_000_000  # Anthropic's own per-image vision cap
+    # Direct chat image uploads: `QA_MAX_CHAT_IMAGES` / `QA_MAX_CHAT_IMAGE_BYTES`
+    # were DELETED on 2026-08-30 with `QA_CLASSIFIER_MODEL` above. They capped
+    # what `tools/image_description.py` would read from an upload before handing
+    # it to `llm.ask_vision()` on the `api` backend; that call site migrated to
+    # the host on 2026-08-15 and the coroutine and every backend went in P2-G on
+    # 2026-08-16, leaving both fields with no reader at all. Attached screenshots
+    # now ride to the tester's OWN chat model as MCP image content, whose limits
+    # are that client's, not this server's -- a cap here could not have been
+    # enforced and telling an operator otherwise was the false part.
     # Mobile device capture -> test cases -- UNCONDITIONAL since 2026-08-13
     # (flag-surface reduction, batch 7 (needs-config)): QA_MOBILE_CAPTURE was
     # DELETED and the behaviour hardcoded to the value the DISTRIBUTION ships
@@ -329,10 +337,14 @@ class Settings(BaseSettings):
     # screens; tools/mcp_handlers._mobile_capture() returns the True constant.
     # qa_capture_screens makes NO server-side vision call (the screens ride to
     # the tester's own chat model as MCP image content), so that path needs no
-    # credential; the Feature-Analysis mobile modes still call llm.ask_vision(),
-    # which needs ANTHROPIC_API_KEY regardless of QA_LLM_BACKEND. Device
-    # discovery/capture is bounded by the two timeouts below. See
-    # docs/FEATURE_FLAGS.md.
+    # credential. CORRECTED 2026-08-30 (audit finding 8): this comment used to
+    # add that "the Feature-Analysis mobile modes still call llm.ask_vision(),
+    # which needs ANTHROPIC_API_KEY regardless of QA_LLM_BACKEND". All three
+    # names are gone -- `image_description.describe_images` migrated to the
+    # host on 2026-08-15, and P2-G deleted `ask_vision` and both settings on
+    # 2026-08-16. NO mode of Feature Analysis reaches a server-side model, and
+    # no key is needed for any of this. Device discovery/capture is bounded by
+    # the two timeouts below. See docs/FEATURE_FLAGS.md.
 
     # Timeout (seconds) for device-discovery commands (adb devices / simctl list).
     qa_device_command_timeout: int = 20
@@ -1292,8 +1304,6 @@ class Settings(BaseSettings):
         "jira_max_parent_chars",
         "jira_max_sibling_chars",
         "jira_max_sibling_stories",
-        "qa_max_chat_images",
-        "qa_max_chat_image_bytes",
         "qa_device_command_timeout",
         "qa_device_screenshot_timeout",
         "qa_rag_recency_half_life_days",

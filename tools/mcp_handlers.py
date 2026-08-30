@@ -6678,6 +6678,7 @@ def _merge_category_rows(rows: list) -> "tuple[dict, int, dict]":
     id_map) where id_map maps each pre-merge tc_id to the global
     TC-NNNN assigned here."""
     merged_cases: list = []
+    case_row: list[int] = []
     used = 0
     for row in rows or []:
         if not isinstance(row, dict):
@@ -6704,17 +6705,101 @@ def _merge_category_rows(rows: list) -> "tuple[dict, int, dict]":
                 c["category"] = canon or None
                 c["category_source"] = "server" if canon else None
                 merged_cases.append(c)
+                # Which ROW (category) this case came from. Needed below because
+                # a `chained_from` written by the host names a case in ITS OWN
+                # category, and every category numbers from TC-001 -- so the
+                # mapping from old id to new id is only unambiguous per row.
+                case_row.append(used - 1)
     renumbered = []
     id_map: dict = {}
+    row_maps: dict[int, dict] = {}
     for i, c in enumerate(merged_cases, 1):
         c = dict(c)
         old_id = c.get("tc_id")
         new_id = f"TC-{i:04d}"
         if isinstance(old_id, str) and old_id:
             id_map.setdefault(old_id, new_id)
+            row_maps.setdefault(case_row[i - 1], {})[old_id] = new_id
         c["tc_id"] = new_id
         renumbered.append(c)
+    # 2026-08-30, review round 2 (C1/H2): THIS renumber is what used to break a
+    # chained test-data reference, and it had to be fixed here rather than
+    # downstream. `chained_from` holds a tc_id the host wrote, valid only inside
+    # its own category; this loop rewrites every tc_id to a global TC-0001..N
+    # sequence and left `chained_from` alone, so by the time anything downstream
+    # saw it the id named either nothing (cleared, prerequisite lost) or -- worse,
+    # when the host emitted 4-digit ids -- an UNRELATED case in another category.
+    # Remapped per ROW, so a Negative case's ref to its own TC-001 can never land
+    # on the Positive category's TC-001. A ref naming no case in its own category
+    # is cleared and downgraded to `static`, matching the contract
+    # tools/quality_checks' two chained-ref helpers already state: a dangling
+    # chain must never reach an exporter as a broken prerequisite.
+    for idx, c in enumerate(renumbered):
+        _remap_chained_from(c, row_maps.get(case_row[idx]) or {})
     return {"test_cases": renumbered}, used, id_map
+
+
+def _remap_chained_from(case: dict, row_map: dict) -> None:
+    """Rewrite one merged case's ``chained_from`` ids through *row_map*, in place.
+
+    Operates on RAW DICTS: at merge time the cases are still the JSON the host
+    submitted, so `tools/quality_checks.resolve_chained_refs_to_stable` -- which
+    needs a validated `TestCase` and its `stable_id` -- cannot be used yet. The
+    two are complementary rather than redundant: this one carries a ref across
+    the MERGE renumber (per category, where a tc_id is unambiguous), the other
+    carries it across the FINAL risk-order renumber (whole suite, where tc_ids
+    are already globally unique).
+
+    A ref naming no case in this category is cleared and its strategy downgraded
+    to ``static``, so no exporter renders a broken prerequisite. Never raises: a
+    disclosure- or cosmetic-level field must not be able to fail a submit.
+
+    Replaces the ``test_data`` LIST with fresh item dicts rather than editing the
+    items in place. ``_merge_category_rows`` copies each case with ``dict(c)``,
+    which is SHALLOW -- the item dicts are still the caller's, straight out of
+    the submitted row payload -- so an in-place edit reached back into the
+    caller's rows and a second merge over those same rows saw refs this pass had
+    already rewritten, and cleared them outright. No live path merges the same
+    rows twice today (``prep_store.load_submissions`` re-reads from SQLite on
+    every call, and the merge sites are mutually exclusive branches), which is
+    why nothing failed; a merge that quietly edits its input is a trap for the
+    next caller regardless.
+    """
+    try:
+        items = case.get("test_data")
+        if not isinstance(items, list):
+            return
+        new_items: list = []
+        changed = False
+        for item in items:
+            ref = item.get("chained_from") if isinstance(item, dict) else None
+            if (
+                not isinstance(item, dict)
+                or item.get("strategy") != "chained"
+                or not isinstance(ref, str)
+                or not ref
+            ):
+                new_items.append(item)
+                continue
+            mapped = row_map.get(ref)
+            item = dict(item)
+            if mapped is None:
+                logger.info(
+                    "merge: clearing chained_from %r on %s -- no such case in "
+                    "its own category",
+                    ref,
+                    case.get("tc_id"),
+                )
+                item["chained_from"] = None
+                item["strategy"] = "static"
+            else:
+                item["chained_from"] = mapped
+            changed = True
+            new_items.append(item)
+        if changed:
+            case["test_data"] = new_items
+    except Exception:
+        logger.debug("merge: chained_from remap failed", exc_info=True)
 
 
 def _version_skew_note(staged: str, running: str) -> str:
@@ -8859,6 +8944,33 @@ async def handle_submit_suite(
             time.monotonic() - _t_emit,
         )
         suite_id = (saved.get("content") or {}).get("suite_id", "") or suite.suite_id
+        # 2026-08-30 audit F3: `saved` was read for its suite_id and NOTHING
+        # else. save_suite never raises -- it returns the standard
+        # {"error": ..., "content": None} -- so a store failure fell straight
+        # through the `or suite.suite_id` fallback to the IN-MEMORY id, and the
+        # tester got a success-shaped reply (a suite_id, an .xlsx path, a case
+        # table) for a suite nothing had persisted. The damage is deferred:
+        # `qa_export_suite` and `qa_push_suite` both look the suite up by id and
+        # cannot find it, days later and with no clue why. Disclosed the same
+        # way a failed workbook write is disclosed in _auto_export_xlsx -- say
+        # what was lost, name what still works -- and PROTECTED in the reply
+        # below, because it states that the deliverable is not what it appears
+        # to be. "" on every healthy run, so those replies stay byte-identical.
+        persist_note = ""
+        _persist_error = saved.get("error")
+        if _persist_error:
+            logger.warning("submit tail: save_suite failed -- %s", _persist_error)
+            persist_note = (
+                "> \u26a0\ufe0f  **This suite was NOT saved to the suite store** "
+                f"({_persist_error}). The cases below are complete and any "
+                "exported file was still written, but `"
+                f"{suite_id}` is an in-memory id only -- `qa_export_suite` and "
+                "`qa_push_suite` will NOT find this suite later. Keep the "
+                "exported file, and re-submit if you need the suite stored."
+                # assemble_finalize_reply is a bare join -- each section owns
+                # its own separators or it runs into the next one's heading.
+                "\n\n"
+            )
         # F5/F6/F7 (2026-08-15): carry this run's SHORTFALLS into the workbook.
         # Every one of these was already disclosed in the reply, and every one
         # was measured surviving into a finalized, exported suite anyway: the
@@ -9171,6 +9283,11 @@ async def handle_submit_suite(
                 checklist_note if checklist_gap else "",
                 protected=True,
             ),
+            # F3: ahead of the Excel path for the reason the comment block
+            # above the return gives -- a host model summarising this reply
+            # keeps the path and drops what follows it, and "your suite was
+            # not stored" must not be what gets dropped.
+            ReplySection("suite persistence", persist_note, protected=True),
             ReplySection("Excel export", export_note, protected=True),
             ReplySection("server version", version_note, protected=True),
             ReplySection("dropped cases", dropped_note, protected=True),

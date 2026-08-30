@@ -34,6 +34,8 @@ import logging
 import socket
 from urllib.parse import urlparse
 
+from tools.net_guard import embedded_v4_non_public
+
 logger = logging.getLogger(__name__)
 
 _NAV_TIMEOUT_MS = 30_000
@@ -104,7 +106,10 @@ async def _validate_public_host(url: str) -> tuple[str | None, str | None, str |
         validated_ip: str | None = None
         for info in infos:
             addr = ipaddress.ip_address(info[4][0])
-            if not addr.is_global:
+            # Same NAT64 / IPv4-mapped gap as tools/jira_fetcher's guard, and
+            # the same helper closes it -- shared rather than duplicated, so
+            # the two SSRF guards cannot drift apart.
+            if not addr.is_global or embedded_v4_non_public(addr):
                 return None, None, "Blocked: non-public address"
             if validated_ip is None:
                 validated_ip = info[4][0]
