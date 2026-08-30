@@ -1,0 +1,39 @@
+# Paths a PAST release installed and a LATER release deleted.
+#
+# WHY THIS FILE EXISTS. tools/updater._prunable normally admits a path only
+# when the install's OLD MANIFEST.sha256 lists it -- condition (c), the safety
+# property that stops the prune pass deleting a tester's own file. That
+# condition cannot reach a file STRANDED by a release that predates the prune:
+# it was installed by an older release whose manifest listed it, and that
+# manifest has since been overwritten, so no evidence of it survives on the
+# client. This file is that evidence, shipped forward -- the release states
+# plainly what it expects gone.
+#
+# It REPLACES condition (c) with a different safety property: an explicit,
+# human-authored, code-reviewed list inside a SIGNED release, rather than an
+# inference from client state. Every other guard still applies to every entry
+# below -- a listed path is deleted only when it is absent from the new release
+# tree, is not protected/derived/never-prune, and the release tree carried its
+# own MANIFEST.sha256. Each deletion is backed up before unlink and restored if
+# the swap fails.
+#
+# THE RITUAL: a dead-code batch that deletes a SHIPPED module adds its dist
+# path here in the SAME commit. Forgetting re-creates exactly the bug this
+# closes -- see operations/runbook.md -> "Files a release removes".
+#
+# FORMAT: one install-relative POSIX path per line. Blank lines and #-comments
+# are ignored. Absolute paths, drive letters, backslashes and any `..`
+# component are DROPPED with a warning, never honoured.
+
+# --- 2026-08-30: stranded on every install built before the prune pass -------
+# Measured on the live 1.60.4 install. None appear in the 1.60.4 manifest, so
+# the forward-looking pass can never see them. Several were deleted so the
+# capability could not be revived (docs/RETIRED_CAPABILITIES.md).
+tools/comment_reconciler.py
+tools/image_description.py
+tools/jira_attachments.py
+tools/requirement_analyzer.py
+tools/test_plan_report.py
+tools/token_meter.py
+tools/web_search.py
+tools/zephyr_exporter.py

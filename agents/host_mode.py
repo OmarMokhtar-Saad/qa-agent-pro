@@ -2660,8 +2660,10 @@ _IMAGE_PREVENTION_CLAUSE = (
     "report the `no` verdict in `image_descriptions`: your verdict is a record, "
     "not a permission slip, and the reply shows it to them again. If this server "
     "is configured to REFUSE such a submission it will say so, name the screens "
-    "and tell you to resubmit the SAME suite with the SAME prep_id and "
-    "`image_relevance_ack=true`. That flag is IGNORED on the first submit by "
+    "and tell you to resubmit with the SAME prep_id and "
+    "`image_relevance_ack=true` -- on the per-category route that means a "
+    "finalize with an EMPTY `suite_json`, not a resend of the cases the "
+    "server already holds. That flag is IGNORED on the first submit by "
     "design and only the TESTER may ask for it -- never send it on your own "
     "judgement.\n"
 )
@@ -4591,7 +4593,7 @@ def _flagged_issues(cases) -> dict:
 
 
 def build_gap_response(
-    coverage, cases, prep_id: str, *, categories_to_regenerate=None
+    coverage, cases, prep_id: str, *, categories_to_regenerate=None, staged: int = 0
 ) -> str:
     """The structured reply that drives the chat-side remediation loop.
 
@@ -4606,6 +4608,14 @@ def build_gap_response(
     and must NOT drive a remediation round: this returns the UNRELIABLE notice
     with the percentage suppressed and NO resubmit call-to-action, mirroring
     tools.rtm.checklist_tally_line's degraded wording.
+
+    ``staged`` is how many per-category rows the server already holds (0 on the
+    merged route, where they were not used). It changes the NEXT-STEP wording
+    only: "resubmit the COMPLETE suite" is the right instruction when the server
+    holds nothing, and pure waste when it holds eight categories -- the host
+    regenerates every category to fix two, at the cost of a second full pass and
+    of silently changing cases the tester already reviewed (MEASURED; see
+    tools.mcp_handlers._staged_resubmit_hint).
     """
     if coverage is not None and getattr(coverage, "degraded", False):
         return _DEGRADED_GAP_NOTICE
@@ -4638,13 +4648,31 @@ def build_gap_response(
                 lines.append(f"- {tc_id}: {msg}")
         lines.append("")
 
-    lines += [
-        "### Next step",
-        "",
-        "Correct the suite (regenerate the categories/requirements above and fix "
-        "the flagged cases), then resubmit the COMPLETE suite by calling the "
-        f"`qa_submit_suite` tool with prep_id `{prep_id}` and your corrected JSON.",
-    ]
+    if staged:
+        next_step = (
+            "Correct ONLY what is listed above. **Do not resend the categories "
+            f"you already sent** -- {staged} categor"
+            + ("y is" if staged == 1 else "ies are")
+            + f" already staged on prep `{prep_id}`. Re-send just the affected "
+            "categories with `qa_submit_category` (a repeat call REPLACES that "
+            "category's staged row, so send that category's full set), then "
+            f"call `qa_submit_suite` with prep_id `{prep_id}` and an EMPTY "
+            "`suite_json` -- the finalize rebuilds the suite from the staged "
+            "rows. Regenerating every category instead costs a second full pass "
+            "AND silently changes cases the tester already reviewed. If "
+            "correcting a category legitimately REMOVES cases (dropping a "
+            "flagged duplicate, say), that re-send shrinks the staged row and "
+            "is refused by the shrink guard -- send it with "
+            "`replace_smaller=true`, which the refusal also names."
+        )
+    else:
+        next_step = (
+            "Correct the suite (regenerate the categories/requirements above and "
+            "fix the flagged cases), then resubmit the COMPLETE suite by calling "
+            f"the `qa_submit_suite` tool with prep_id `{prep_id}` and your "
+            "corrected JSON."
+        )
+    lines += ["### Next step", "", next_step]
     return "\n".join(lines)
 
 

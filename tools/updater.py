@@ -634,11 +634,122 @@ def download_and_extract(
     return subdirs[0] if len(subdirs) == 1 else extract_dir
 
 
+# Files apply_update must NEVER prune, even when a release drops them from its
+# tree: release metadata plus the launcher the client spawns (`python
+# launcher.py` must keep working across a bad release). Operator state -- .env,
+# data/, corpus/, .claude/ -- is already covered by _is_protected.
+_NEVER_PRUNE = frozenset(_LOCK_EXTRA) | {".env.example"}
+
+#: Name of the release-shipped list of paths a PAST release installed and a
+#: LATER release deleted. Hashed into ``MANIFEST.sha256`` and covered by
+#: ``MANIFEST.sig`` like any other shipped file, so it cannot be edited on a
+#: client without failing the integrity gates.
+_REMOVED_PATHS_NAME = "REMOVED_PATHS"
+
+
+def load_removed_paths(tree: Path) -> set:
+    """Parse ``<tree>/REMOVED_PATHS`` -- one install-relative POSIX path per
+    line, blanks and ``#`` comments ignored.
+
+    WHY IT EXISTS: ``_prunable``'s condition (c) -- "the install's OLD manifest
+    lists it" -- is what makes the forward-looking prune safe, and it is also
+    what makes it unable to reach a file STRANDED by a release predating the
+    prune. Such a file was installed by an older release whose manifest listed
+    it, and that manifest has since been overwritten, so no evidence of it
+    survives on the client. This file is that evidence, shipped forward.
+
+    It REPLACES condition (c) with a different safety property -- an explicit,
+    human-authored, code-reviewed list inside a SIGNED release, rather than an
+    inference from client state. The other guards are UNCHANGED and still
+    apply to every entry: a listed path is deleted only when it is absent from
+    the new tree, is not protected/derived/never-prune, and the release tree
+    carried its own manifest.
+
+    Lines that could escape the install root are DROPPED, not honoured:
+    absolute paths, drive letters, backslashes, and any ``..`` component. A
+    malformed line is a no-op, never a traversal. Never raises -- a missing or
+    unreadable file yields an empty set, which simply means "prune nothing
+    extra"."""
+    out: set = set()
+    try:
+        raw = (tree / _REMOVED_PATHS_NAME).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return out
+    for line in raw.splitlines():
+        rel = line.split("#", 1)[0].strip()
+        if not rel:
+            continue
+        if "\\" in rel or rel.startswith("/") or ":" in rel:
+            logger.warning("REMOVED_PATHS: ignoring non-relative entry %r.", rel)
+            continue
+        parts = [p for p in rel.split("/") if p and p != "."]
+        if not parts or ".." in parts:
+            logger.warning("REMOVED_PATHS: ignoring traversing entry %r.", rel)
+            continue
+        out.add("/".join(parts))
+    return out
+
+
+def _prunable(
+    old_manifest: dict,
+    new_rels: set,
+    install_dir: Path,
+    removed: Optional[set] = None,
+) -> list:
+    """Install files a PREVIOUS release installed that the NEW release dropped.
+
+    Three conditions, all required, and (c) is the safety property:
+    (a) the file is on disk in the install, (b) it is absent from the new
+    release tree, and (c) the install's OLD ``MANIFEST.sha256`` lists it. (c) is
+    what restricts deletion to files this updater itself installed, so a
+    tester's own scratch file -- or anything under ``data/`` / ``corpus/`` --
+    can never be a candidate whatever else is true of it.
+
+    WHY: ``apply_update`` was a pure OVERLAY, so a module a release DELETED
+    stayed on every installed machine forever. The MOTIVATING SYMPTOM, measured
+    on the live install after it self-updated 1.60.3 -> 1.60.4: eight unlisted
+    ``.py`` files in ``tools/`` -- ``comment_reconciler``, ``image_description``,
+    ``jira_attachments``, ``requirement_analyzer``, ``test_plan_report``,
+    ``token_meter``, ``web_search``, ``zephyr_exporter``. Several were deleted
+    specifically so the capability could not be revived
+    (docs/RETIRED_CAPABILITIES.md), which leaving them installed defeats -- and
+    ``verify_integrity`` cannot see them either, because it only walks manifest
+    ENTRIES.
+
+    Condition (c) alone is FORWARD-LOOKING and could never reach those eight:
+    they are absent from the CURRENT manifest, having been installed by an
+    older release whose manifest was overwritten. ``removed`` is the second
+    admission route that does reach them -- the release-shipped
+    ``REMOVED_PATHS`` list (see ``load_removed_paths``), which substitutes an
+    explicit signed declaration for the client-state inference of (c). Every
+    OTHER guard applies identically to both routes: absent from the new tree,
+    not protected/derived/never-prune, backed up before unlink. See
+    operations/runbook.md -> *Files a release removes*.
+
+    Honours ``_is_protected`` and ``_is_derived_artifact`` exactly as the copy
+    loop does, so the two skip sets stay identical. Pure; never raises."""
+    out = []
+    for rel in sorted(set(old_manifest) | set(removed or ())):
+        if rel in new_rels or rel in _NEVER_PRUNE:
+            continue
+        if _is_protected(rel) or _is_derived_artifact(rel):
+            continue
+        target = install_dir / rel
+        if target.is_file() and not target.is_symlink():
+            out.append(rel)
+    return out
+
+
 def _rollback(
-    install_dir: Path, backup_dir: Path, overwritten: list, created: list
+    install_dir: Path,
+    backup_dir: Path,
+    overwritten: list,
+    created: list,
+    pruned: Optional[list] = None,
 ) -> None:
     """Undo a partial swap: delete newly-created files, restore overwritten ones
-    from the backup. Best-effort — individual failures are logged, not raised."""
+    from the backup, and put back anything the prune pass removed. Best-effort —
+    individual failures are logged, not raised."""
     for rel in created:
         try:
             (install_dir / rel).unlink(missing_ok=True)
@@ -652,24 +763,86 @@ def _rollback(
                 shutil.copy2(backup, install_dir / rel)
             except OSError as exc:  # pragma: no cover - defensive
                 logger.warning("Rollback: could not restore %s (%s).", rel, exc)
+    for rel in pruned or ():
+        backup = backup_dir / rel
+        if backup.exists():
+            try:
+                (install_dir / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(backup, install_dir / rel)
+            except OSError as exc:  # pragma: no cover - defensive
+                logger.warning("Rollback: could not restore pruned %s (%s).", rel, exc)
 
 
 def apply_update(new_tree: Path, install_dir: Path, version: str = "update") -> Path:
-    """Overlay the new release tree onto the install, skipping every protected
-    path. Backs each replaced/created file up under ``backups/pre-update-*`` and
-    rolls the whole swap back on any error (then re-raises). Returns the backup
-    directory on success."""
+    """Swap the new release tree into the install, skipping every protected
+    path. PRUNES files a previous release installed that this one dropped (see
+    ``_prunable``), then overlays the new tree. Backs each pruned/replaced/
+    created file up under ``backups/pre-update-*`` and rolls the whole swap back
+    on any error (then re-raises). Returns the backup directory on success."""
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     backup_dir = install_dir / "backups" / f"pre-update-{version}-{ts}"
     overwritten: list = []
     created: list = []
+    pruned: list = []
+    # Read BEFORE anything is written: the swap below overwrites
+    # MANIFEST.sha256 with the NEW release's copy, and the old listing is the
+    # only record of what this updater put on disk.
+    old_manifest = load_manifest(install_dir)
     try:
+        plan = []
         for src in sorted(new_tree.rglob("*")):
             if not src.is_file():
                 continue
             rel = src.relative_to(new_tree).as_posix()
             if _is_protected(rel) or _is_derived_artifact(rel):
                 continue
+            plan.append((src, rel))
+        # PRUNE FIRST, so a failure anywhere in the copy below rolls the
+        # deletions back along with everything else -- a half-swapped install
+        # must not also be missing modules. Each deletion is individually
+        # guarded: one un-deletable orphan is logged and skipped, never allowed
+        # to fail an otherwise good update.
+        #
+        # ...but ONLY against a release tree that carries its own manifest.
+        # `new_rels` is the evidence that decides what gets DELETED, so an
+        # incomplete or mis-rooted `new_tree` does not merely under-copy, it
+        # over-deletes: every path in the old manifest that the tree happens
+        # not to contain satisfies all three of _prunable's conditions.
+        # _manifest_binding_ok has exactly ONE permissive branch -- a tree with
+        # no MANIFEST.sha256, waved through to "preserve current behavior" --
+        # and that permission was written when the current behaviour was a pure
+        # OVERLAY, which is non-destructive by construction. Prune changes what
+        # it grants, so it does not inherit it. Note the two hazards coincide:
+        # download_and_extract picks its root by counting DIRECTORIES only, so
+        # a mis-rooted tree also has no manifest at its root and is caught here.
+        new_rels = {rel for _src, rel in plan}
+        if not (new_tree / _MANIFEST_NAME).is_file():
+            logger.warning(
+                "Release tree has no %s -- skipping the prune pass (the copy "
+                "still runs). Nothing is deleted on an unvalidated tree.",
+                _MANIFEST_NAME,
+            )
+            prunable: list = []
+        else:
+            prunable = _prunable(
+                old_manifest,
+                new_rels,
+                install_dir,
+                load_removed_paths(new_tree),
+            )
+        for rel in prunable:
+            dest = install_dir / rel
+            try:
+                bdest = backup_dir / rel
+                bdest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(dest, bdest)
+                _make_writable(dest)
+                dest.unlink()
+            except OSError as exc:
+                logger.warning("Could not prune %s (%s).", rel, exc)
+                continue
+            pruned.append(rel)
+        for src, rel in plan:
             dest = install_dir / rel
             if dest.exists():
                 bdest = backup_dir / rel
@@ -695,16 +868,17 @@ def apply_update(new_tree: Path, install_dir: Path, version: str = "update") -> 
                 st_mode = os.stat(dest).st_mode
                 os.chmod(dest, st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         logger.info(
-            "Applied update: %d file(s) (%d new, %d replaced). Backup at %s",
+            "Applied update: %d file(s) (%d new, %d replaced, %d pruned). Backup at %s",
             len(created) + len(overwritten),
             len(created),
             len(overwritten),
+            len(pruned),
             backup_dir,
         )
         return backup_dir
     except Exception:
         logger.warning("Update swap failed mid-way — rolling back from backup.")
-        _rollback(install_dir, backup_dir, overwritten, created)
+        _rollback(install_dir, backup_dir, overwritten, created, pruned)
         raise
 
 

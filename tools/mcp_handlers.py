@@ -6107,6 +6107,7 @@ def _volume_floor_note(
     *,
     ack: bool = False,
     post_dedup: bool = False,
+    staged: int = 0,
 ) -> "tuple[str, str]":
     """Verdict on the generation VOLUME of a finalizing suite.
 
@@ -6188,6 +6189,13 @@ def _volume_floor_note(
     because no run before it was free to vary per category -- the two known-good
     2026-08-04 runs bottom out at exactly the floor. Calibrate it against the
     first such suites; do not read it as evidence-backed today.
+
+    ``staged`` is how many per-category rows the server ALREADY holds for this
+    prep (0 on the merged route, where they were deliberately not used). It
+    reorders the refusal's options ONLY -- no verdict turns on it. Leading with
+    "resubmit the COMPLETE suite" when eight categories are staged buys a second
+    full generation pass for nothing and silently rewrites cases the tester
+    already reviewed; that cost is MEASURED -- see ``_staged_resubmit_hint``.
 
     ``post_dedup=True`` is the WARNING-ONLY channel used once the suite is
     finalized: it returns a warning where it would otherwise refuse, and
@@ -6294,6 +6302,67 @@ def _volume_floor_note(
                 "each case's `category` to one of the payload's own category "
                 "names."
             )
+        opt_complete = (
+            "Generate the missing cases and resubmit the COMPLETE "
+            f"suite with the SAME prep_id `{prep_id}` -- the suite needs "
+            f"{floor_total} case(s) overall. `categories[].min_cases` asks "
+            f"{floor} per category and that is the right target for each, "
+            "but a category with genuinely less to test may come in under "
+            "it PROVIDED another covers the difference; what may not stand "
+            "is the total, an empty category, or one below half its share. "
+            "The number came from THIS feature's own complexity, not a "
+            "fixed floor."
+        )
+        opt_topup = (
+            "Or top up per category: call `qa_submit_category` again for "
+            "each short category (a repeat call REPLACES that category's "
+            "staged row, so send its full set), then finalize with an empty "
+            "`suite_json`. `qa_prep_status` shows the set."
+        )
+        opt_ack = (
+            "Or, ONLY if the tester has seen these numbers and confirms "
+            "a smaller suite is right for this feature, resubmit unchanged "
+            "with `volume_floor_ack=true`. Ask them first -- do not decide "
+            "that on your own judgement."
+        )
+        if staged:
+            # The server already HOLDS the cases, so the top-up route LEADS and
+            # the full rebuild is demoted to the fallback it is.
+            opt_topup = (
+                "**Top up per category -- this is the route here.** "
+                f"{staged} categor"
+                + ("y is" if staged == 1 else "ies are")
+                + f" already staged on prep `{prep_id}`, so **do NOT resend "
+                "the cases you already sent**. Call `qa_submit_category` "
+                "again for the SHORT categories ONLY (a repeat call REPLACES "
+                "that category's staged row, so send that category's full "
+                f"set), then call `qa_submit_suite` with prep_id `{prep_id}` "
+                "and an EMPTY `suite_json` -- the finalize rebuilds the suite "
+                "from the staged rows. `qa_prep_status` shows the set. "
+                "Regenerating the whole suite instead costs a second full "
+                "pass AND silently changes cases the tester already reviewed."
+            )
+            opt_complete = (
+                "Or, only if you would rather rebuild every category from "
+                "scratch: generate the missing cases and resubmit the "
+                f"COMPLETE suite with the SAME prep_id `{prep_id}` -- the "
+                f"suite needs {floor_total} case(s) overall. "
+                f"`categories[].min_cases` asks {floor} per category and that "
+                "is the right target for each, but a category with genuinely "
+                "less to test may come in under it PROVIDED another covers "
+                "the difference; what may not stand is the total, an empty "
+                "category, or one below half its share. The number came from "
+                "THIS feature's own complexity, not a fixed floor."
+            )
+        picks = "".join(
+            f"{i}. {opt}\n"
+            for i, opt in enumerate(
+                [opt_topup, opt_complete, opt_ack]
+                if staged
+                else [opt_complete, opt_topup, opt_ack],
+                1,
+            )
+        )
         if mode == "refuse":
             ignored_ack = ""
             if ack and not refused_before:
@@ -6313,24 +6382,7 @@ def _volume_floor_note(
                 + f"\n\nNothing was discarded and prep `{prep_id}` is intact -- "
                 "the prepared context and every staged category are still "
                 "there, and no remediation round was used.\n\n"
-                "**Pick one:**\n"
-                "1. Generate the missing cases and resubmit the COMPLETE "
-                f"suite with the SAME prep_id `{prep_id}` -- the suite needs "
-                f"{floor_total} case(s) overall. `categories[].min_cases` asks "
-                f"{floor} per category and that is the right target for each, "
-                "but a category with genuinely less to test may come in under "
-                "it PROVIDED another covers the difference; what may not stand "
-                "is the total, an empty category, or one below half its share. "
-                "The number came from THIS feature's own complexity, not a "
-                "fixed floor.\n"
-                "2. Or top up per category: call `qa_submit_category` again for "
-                "each short category (a repeat call REPLACES that category's "
-                "staged row, so send its full set), then finalize with an empty "
-                "`suite_json`. `qa_prep_status` shows the set.\n"
-                "3. Or, ONLY if the tester has seen these numbers and confirms "
-                "a smaller suite is right for this feature, resubmit unchanged "
-                "with `volume_floor_ack=true`. Ask them first -- do not decide "
-                "that on your own judgement."
+                "**Pick one:**\n" + picks
             )
         # F5: the shortfall goes in the HEAD line, named and quantified. The
         # facts below were always right, but the old head said only "Volume
@@ -6440,6 +6492,7 @@ def _image_relevance_gate(
     prep_id: str,
     *,
     ack: bool = False,
+    staged_hint: str = "",
 ) -> "tuple[str, str]":
     """Verdict on the IMAGE RELEVANCE of a finalizing submission.
 
@@ -6582,12 +6635,24 @@ def _image_relevance_gate(
             "without it. Cases grounded on the wrong screen are the defect "
             "this refusal exists to catch.\n"
             "2. If you did read the screens and simply did not report it, "
-            f"resubmit the SAME suite with the SAME prep_id `{prep_id}` and a "
-            "top-level `image_descriptions` array carrying one `relevant` "
-            "verdict per image (the bare string `yes`, `no` or `unsure`) plus a "
-            "one-line `relevance_reason`. On the per-category route send it in "
-            "the finalize sidecar.\n"
-            "3. Or, ONLY if the TESTER has seen the finding above and confirms "
+            + (
+                # Staged route: the cases are already on the server, so the
+                # retry carries the missing field ALONE. The wording is REUSED
+                # from _staged_resubmit_hint rather than paraphrased, so this
+                # refusal and the ambiguity one read the same way to a host.
+                # The array's SHAPE is handed to that helper (`field_shape`)
+                # rather than appended here: appended, it landed after the
+                # hint's closing "...cases the tester already reviewed" and so
+                # after "and nothing else", dangling off the wrong noun.
+                staged_hint + ".\n"
+                if staged_hint
+                else f"resubmit the SAME suite with the SAME prep_id `{prep_id}` "
+                "and a top-level `image_descriptions` array carrying one "
+                "`relevant` verdict per image (the bare string `yes`, `no` or "
+                "`unsure`) plus a one-line `relevance_reason`. On the "
+                "per-category route send it in the finalize sidecar.\n"
+            )
+            + "3. Or, ONLY if the TESTER has seen the finding above and confirms "
             "the suite is right anyway, resubmit it unchanged with "
             "`image_relevance_ack=true`. Ask them first -- do not decide that on "
             "your own judgement."
@@ -7257,7 +7322,37 @@ async def handle_submit_category(
         return f"⚠️ Recording the category failed: {exc}"
 
 
-async def _staged_resubmit_hint(prep_id: str, extra_field: str = "") -> str:
+async def _staged_row_count(prep_id: str) -> int:
+    """How many per-category rows the server ALREADY holds for this prep.
+
+    The refusal WORDING turns on it -- never a verdict. Telling a host to
+    "resubmit the COMPLETE suite" when eight categories are already staged buys
+    a second full generation pass for nothing and silently rewrites cases the
+    tester has already reviewed; ``_staged_resubmit_hint`` carries the measured
+    audit.db evidence for that cost.
+
+    Reads defensively: an unreadable store returns 0, which degrades to the
+    resend wording rather than claiming work is held when it is not."""
+    try:
+        rows_res = await prep_store.load_submissions(prep_id)
+        rows = (rows_res or {}).get("content") or []
+        return sum(
+            1
+            for r in rows
+            if isinstance(r, dict) and str(r.get("category_name") or "").strip()
+        )
+    except Exception:
+        logger.debug("staged row count failed", exc_info=True)
+        return 0
+
+
+async def _staged_resubmit_hint(
+    prep_id: str,
+    extra_field: str = "",
+    *,
+    field_shape: str = "",
+    staged_count: "int | None" = None,
+) -> str:
     """How a refused host should come back, given what the server already holds.
 
     MEASURED (audit.db, prep 2b0de0011a44, SHYJ-3541): eight categories staged at
@@ -7273,20 +7368,37 @@ async def _staged_resubmit_hint(prep_id: str, extra_field: str = "") -> str:
     returns the instruction that matches reality; ``extra_field`` names the
     top-level key the caller needs back (empty for an ack-only retry).
 
+    ``field_shape`` describes what goes INSIDE that key, and it is not
+    cosmetic: without it the sentence renders ``suite_json={"k": ...}`` and
+    nothing else``, and a caller that appends its own shape sentence afterwards
+    lands it AFTER "and nothing else", dangling off the wrong noun. The shape
+    belongs next to the key it describes.
+
+    ``staged_count`` lets a caller that has ALREADY counted the rows pass the
+    number in instead of forcing a second ``load_submissions``. It also removes
+    a drift hazard: ``handle_submit_suite`` deliberately reports ZERO staged
+    rows on the merged route (``has_full`` -- those rows were not used, so
+    pointing a host at them would finalize a different suite from the one it
+    just sent), and a re-read here would silently disagree with that and tell
+    the host its cases are held when the submission superseded them.
+
     Never raises: an unreadable store falls back to the resend wording, which
     costs a regeneration but never claims work is held when it is not.
     """
-    try:
-        rows_res = await prep_store.load_submissions(prep_id)
-        rows = (rows_res or {}).get("content") or []
-        staged = [
-            str(r.get("category_name") or "").strip()
-            for r in rows
-            if isinstance(r, dict) and str(r.get("category_name") or "").strip()
-        ]
-    except Exception:
-        logger.debug("staged-rows resubmit hint failed", exc_info=True)
-        staged = []
+    if staged_count is not None:
+        staged = [""] * max(0, int(staged_count))
+    else:
+        try:
+            rows_res = await prep_store.load_submissions(prep_id)
+            rows = (rows_res or {}).get("content") or []
+            staged = [
+                str(r.get("category_name") or "").strip()
+                for r in rows
+                if isinstance(r, dict) and str(r.get("category_name") or "").strip()
+            ]
+        except Exception:
+            logger.debug("staged-rows resubmit hint failed", exc_info=True)
+            staged = []
     if not staged:
         if extra_field:
             return (
@@ -7294,7 +7406,11 @@ async def _staged_resubmit_hint(prep_id: str, extra_field: str = "") -> str:
                 f"`{extra_field}`"
             )
         return f"resubmit the SAME suite with prep_id `{prep_id}`"
-    sidecar = '{"' + extra_field + '": ...}' if extra_field else '"" (empty)'
+    sidecar = (
+        '{"' + extra_field + '": ' + (field_shape or "...") + "}"
+        if extra_field
+        else '"" (empty)'
+    )
     return (
         f"**do NOT resend the cases** -- all {len(staged)} staged categor"
         f"{'y is' if len(staged) == 1 else 'ies are'} already held on prep "
@@ -7852,6 +7968,13 @@ async def handle_submit_suite(
             )
 
         all_cases = list(parsed.suite.test_cases)
+        # How many per-category rows the server ALREADY holds. Read ONCE here
+        # and PASSED to every refusal and hand-back below (none of them re-reads
+        # the store), so they all describe the same reality. ZERO on the merged
+        # route: `has_full` means the staged rows were explicitly NOT used, so
+        # pointing a host at them would finalize a different suite from the one
+        # it just sent.
+        staged_rows = 0 if has_full else await _staged_row_count(prep_id)
         # Snapshot of what the HOST actually sent, taken before anything narrows
         # `all_cases`. The duplicate and coverage reviews resolve the ids they were
         # given against this list, so it has to keep meaning "the submission" even
@@ -7904,7 +8027,11 @@ async def handle_submit_suite(
         # the post-dedup re-check after finalize.
         volume_note = ""
         _vmode, _vmd = _volume_floor_note(
-            meta, all_cases, prep_id, ack=bool(volume_floor_ack)
+            meta,
+            all_cases,
+            prep_id,
+            ack=bool(volume_floor_ack),
+            staged=staged_rows,
         )
         if _vmode == "refuse":
             # TWO-BEAT ack (the image gate's pattern): mark the prep as refused
@@ -8078,7 +8205,13 @@ async def handle_submit_suite(
                         "severity": amb_result.severity or "absent",
                     },
                 )
-                _how = await _staged_resubmit_hint(prep_id, "ambiguity_result")
+                # staged_count is passed, not re-read: on the MERGED route the
+                # staged rows were superseded by this very submission, and a
+                # re-read here would tell the host its cases are safely held
+                # when finalizing from them would build a different suite.
+                _how = await _staged_resubmit_hint(
+                    prep_id, "ambiguity_result", staged_count=staged_rows
+                )
                 return (
                     f"{amb_note}⛔ **Submission refused:** `QA_HOST_AMBIGUITY_REQUIRE_RESULT` is on and this submission "
                     "carries no cleared ambiguity preflight. Run step 0 of "
@@ -8240,7 +8373,28 @@ async def handle_submit_suite(
             # the refusal, and version_note for the same reason the two gates
             # above prefix it.
             _imode, _imd = _image_relevance_gate(
-                meta, _img_result, prep_id, ack=bool(image_relevance_ack)
+                meta,
+                _img_result,
+                prep_id,
+                ack=bool(image_relevance_ack),
+                # Same defect class as the volume refusal: on the staged route
+                # the cases are already on the server, so option 2 must ask for
+                # the missing verdicts ALONE. Computed only when rows exist, so
+                # a merged submit's reply is byte-identical to today's.
+                staged_hint=(
+                    await _staged_resubmit_hint(
+                        prep_id,
+                        "image_descriptions",
+                        field_shape=(
+                            "[one entry per image, each with `relevant` (the "
+                            "bare string `yes`, `no` or `unsure`) and a "
+                            "one-line `relevance_reason`]"
+                        ),
+                        staged_count=staged_rows,
+                    )
+                    if staged_rows
+                    else ""
+                ),
             )
             if _imode == "refuse":
                 # TWO-BEAT ack, copied from the volume gate: mark the prep as
@@ -8620,7 +8774,9 @@ async def handle_submit_suite(
                         prep_id,
                         _upd.get("error"),
                     )
-                gap_md = host_mode.build_gap_response(view, suite.test_cases, prep_id)
+                gap_md = host_mode.build_gap_response(
+                    view, suite.test_cases, prep_id, staged=staged_rows
+                )
                 await _audit(
                     "mcp_submit_suite_gap",
                     entity_id=prep_id,
@@ -10772,33 +10928,101 @@ _TC_SOURCE_PROMPTS = {
     "swagger": "Paste the Swagger/OpenAPI spec URL:",
 }
 
+# The two screen-capture sources are the ONLY ones that route to a tool this
+# server does not always register: both call `qa_feature_analysis` and then
+# `qa_submit_feature_analysis`, which mcp_server registers inside
+# `if not mcp_handlers._test_cases_only():`. The public distribution IS
+# test-cases-only, so on it these two options told the client to call a tool
+# that is not there, mid-flow, in front of a tester -- the identical silent
+# failure mcp_server already guards for tools/guidance.py, which this menu
+# escaped only because it lives here rather than in that module.
+_TC_FULL_EDITION_SOURCES = ("mobile", "jira_mobile")
+
+#: One menu line per source, keyed by the source id so the NUMBERS are derived
+#: from the list actually emitted rather than written into the prose.
+_TC_SOURCE_MENU_LINES = {
+    "describe": "**Describe the feature** — user types it in plain language",
+    "jira": "**Jira ticket** — user pastes the issue URL",
+    "web": "**Web page** — user pastes the page URL (the live UI is read)",
+    "swagger": "**Swagger/OpenAPI link** — user pastes the spec URL (API test cases)",
+    "mobile": "**Mobile screens** — capture from a connected device",
+    "jira_mobile": "**Jira + mobile screens** — merge the ticket with captured screens",
+}
+
+_TC_COUNT_WORDS = {2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
+
+
+def _tc_sources() -> dict:
+    """The ``{label: source_id}`` map this EDITION can actually serve.
+
+    The condition MIRRORS the registration site
+    (``mcp_server``: ``if _feature_analysis_enabled() and not
+    mcp_handlers._test_cases_only():``) rather than restating half of it. The
+    edition check alone is not enough: both gates have to hold for the pair to
+    exist, so a menu gated on the edition only goes stale again the moment the
+    Feature-Analysis seam is turned off -- which is exactly what this module's
+    own ``_feature_analysis_enabled`` seam is for. mcp_server's copy of that
+    seam cannot be read from here (nothing in this direction may import the
+    transport), and the two are documented as checked in both places.
+
+    Note `qa_capture_screens` is registered on BOTH editions and is NOT what is
+    gated here -- the missing tool is `qa_feature_analysis`, not device capture.
+    """
+    if _feature_analysis_enabled() and not _test_cases_only():
+        return dict(_TC_SOURCE_LABELS)
+    return {
+        label: src
+        for label, src in _TC_SOURCE_LABELS.items()
+        if src not in _TC_FULL_EDITION_SOURCES
+    }
+
 
 def _tc_source_menu_markdown() -> str:
     """Fallback when the native dialog is unavailable or was auto-dismissed.
 
-    Written as an instruction to the HOST assistant: present our six options
-    as a structured multiple-choice question (editors render those reliably,
-    unlike MCP elicitation dialogs), then call back with the answer."""
+    Written as an instruction to the HOST assistant: present the options THIS
+    edition can serve as a structured multiple-choice question (editors render
+    those reliably, unlike MCP elicitation dialogs), then call back with the
+    answer.
+
+    The count word, the numbering and the mapping paragraph are all DERIVED
+    from ``_tc_sources()``. The text says "EXACTLY these N options" and "Do not
+    invent different options", so N and the numbers have to move with the list
+    or the instruction contradicts itself."""
+    srcs = list(_tc_sources().values())
+    number = {src: i for i, src in enumerate(srcs, 1)}
+    count = _TC_COUNT_WORDS.get(len(srcs), str(len(srcs)))
+    body = "".join(f"{number[s]}. {_TC_SOURCE_MENU_LINES[s]}\n" for s in srcs)
+    typed = [s for s in srcs if s not in _TC_FULL_EDITION_SOURCES]
+    span = (
+        f"options {number[typed[0]]}-{number[typed[-1]]}"
+        if len(typed) > 1
+        else f"option {number[typed[0]]}"
+    )
+    mapping = (
+        f"After the user picks: for {span} call `qa_generate_test_cases` "
+        "with `feature_or_url` set to their text/URL"
+    )
+    if "mobile" in number:
+        mapping += (
+            f"; for option {number['mobile']} call `qa_feature_analysis` with "
+            f"`mode=mobile`; for option {number['jira_mobile']} call "
+            "`qa_feature_analysis` with `mode=jira_mobile`. Options "
+            f"{number['mobile']} and {number['jira_mobile']} are a TWO-step "
+            "chat-only flow: `qa_feature_analysis` hands YOU a task envelope "
+            "to answer, then you call `qa_submit_feature_analysis` with its "
+            "`task_id` and your JSON."
+        )
+    else:
+        mapping += "."
     return (
         "## Ask the user: where is the feature coming from?\n\n"
-        "Present EXACTLY these six options to the user as a multiple-choice "
-        "question (use your ask-user/questions UI, not prose), then follow "
-        "the mapping below. Do not invent different options.\n\n"
-        "1. **Describe the feature** — user types it in plain language\n"
-        "2. **Jira ticket** — user pastes the issue URL\n"
-        "3. **Web page** — user pastes the page URL (the live UI is read)\n"
-        "4. **Swagger/OpenAPI link** — user pastes the spec URL (API test "
-        "cases)\n"
-        "5. **Mobile screens** — capture from a connected device\n"
-        "6. **Jira + mobile screens** — merge the ticket with captured "
-        "screens\n\n"
-        "After the user picks: for options 1-4 call `qa_generate_test_cases` "
-        "with `feature_or_url` set to their text/URL; for option 5 call "
-        "`qa_feature_analysis` with `mode=mobile`; for option 6 call "
-        "`qa_feature_analysis` with `mode=jira_mobile`. Options 5 and 6 are a "
-        "TWO-step chat-only flow: `qa_feature_analysis` hands YOU a task "
-        "envelope to answer, then you call `qa_submit_feature_analysis` with "
-        "its `task_id` and your JSON."
+        f"Present EXACTLY these {count} options to the user as a "
+        "multiple-choice question (use your ask-user/questions UI, not prose), "
+        "then follow the mapping below. Do not invent different options.\n\n"
+        + body
+        + "\n"
+        + mapping
     )
 
 
@@ -10814,8 +11038,9 @@ async def _guided_test_cases(
     link / mobile screens / Jira + mobile — collects the missing input, and
     runs the full generation. Dialogs where the client supports elicitation;
     a markdown menu otherwise. Never raises."""
+    sources = _tc_sources()
     source = await _elicit_choice(
-        choose, "Where is the feature coming from?", list(_TC_SOURCE_LABELS)
+        choose, "Where is the feature coming from?", list(sources)
     )
     if source.status == DECLINED:
         # Some clients (Cursor 3.12) auto-cancel enum dialogs but still render
@@ -10833,7 +11058,7 @@ async def _guided_test_cases(
             "ℹ️ The picker dialog was dismissed — no problem, here are the "
             "options:\n\n" + _tc_source_menu_markdown()
         )
-    src = _TC_SOURCE_LABELS.get(source.value or "", "")
+    src = sources.get(source.value or "", "")
     if source.status != CHOSEN or not src:
         # No choice dialogs — degrade to the simple typed-feature path.
         asked = await _elicit_text(

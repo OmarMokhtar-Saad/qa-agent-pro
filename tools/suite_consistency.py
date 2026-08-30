@@ -884,7 +884,8 @@ def consistency_warning_section(
                 "the source never promises** \u2014 the tester compares "
                 "the product against copy nobody wrote, so any wording "
                 "difference reads as a defect. Assert what the message "
-                'MUST SAY ("an error naming the SAR 100 minimum") instead '
+                'MUST SAY ("an error that names the field and the limit it '
+                'broke") instead '
                 "of its exact text, or get the real copy into the ticket:"
             )
             for span in sorted(by_span)[:_MAX_REPORTED]:
