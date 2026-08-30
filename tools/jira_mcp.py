@@ -1317,6 +1317,63 @@ def _parent_body(parent_issue: object) -> dict:
         return {}
 
 
+def _linked_parent_ref(fields: dict, parent_issue: object) -> dict | None:
+    """Parent-shaped ref for a requirements story reached by an ISSUE LINK.
+
+    WHY: ``_extract_parent_ref`` reads ``fields.parent`` only, and the merge of
+    the client's second fetch is guarded by ``if parent:``. A ticket whose
+    requirements hang off a LINK rather than a hierarchy therefore had the
+    submitted ``parent_issue`` -- description, acceptance criteria and all --
+    dropped on the floor, silently, while the link's one-line TITLE still
+    appeared in the context because ``_extract_issuelinks`` reads it separately.
+    The suite was then generated from whatever thin text the task ticket
+    carried, and invented the rest.
+
+    MEASURED on SHYJ-10884 (2026-08-30): a `[BE]` task whose own description is
+    three lines pointing at unreadable attachments, linked by a Polaris
+    "implements" relation to SHYJ-10418, whose description IS the requirement --
+    the notification table with the exact Ar/En title, body and button copy.
+    None of that table reached the model. An earlier run on the same ticket
+    duly asserted 'How was your visit?' and 'Rate Now' as UI strings "the source
+    never promises"; the source promised them, on the story next door.
+
+    SAFETY: the submitted body is accepted ONLY when its key is already among
+    THIS issue's own ``issuelinks``. The client cannot introduce an arbitrary
+    ticket as requirements -- the link has to exist in the ticket the tester
+    asked about. Everything downstream is unchanged: the text is still routed
+    through ``wrap_untrusted`` and still labelled BACKGROUND ONLY.
+
+    Returns None when there is no usable link/body pair. Never raises."""
+    try:
+        body = _parent_body(parent_issue)
+        if not body or not (body.get("description") or "").strip():
+            return None
+        raw_key = parent_issue.get("key") if isinstance(parent_issue, dict) else None
+        key = _valid_issue_key(raw_key)
+        if not key:
+            return None
+        linked = {
+            item.get("key"): item
+            for item in _extract_issuelinks(fields)
+            if isinstance(item, dict)
+        }
+        if key not in linked:
+            logger.info(
+                "parent_issue %s is not linked from this ticket -- ignoring it.", key
+            )
+            return None
+        ref = linked[key]
+        return {
+            "key": key,
+            "summary": str(ref.get("summary") or "").strip(),
+            "issuetype": str(ref.get("issuetype") or "").strip(),
+            **body,
+        }
+    except Exception:
+        logger.exception("Resolving a linked requirements story failed - omitting it")
+        return None
+
+
 def _issue_fields(issue: object) -> dict:
     """The ``fields`` mapping of an issue payload (or {} ). Never raises."""
     try:
@@ -1893,7 +1950,13 @@ def build_fetch_directive(url: str, issue_key: str = "") -> str:
             lines.append(
                 f"{step}. If the result has a `fields.parent`, call "
                 f"`{prefix}getJiraIssue` a SECOND time for that parent key "
-                "(its description usually holds the real requirements)."
+                "(its description usually holds the real requirements). "
+                "If there is NO `fields.parent` but `fields.issuelinks` names "
+                "an issue this one *implements* (or that it *is implemented "
+                "by*), fetch THAT issue the same way and pass it as "
+                "`parent_issue` -- on a backend/task ticket the requirement "
+                "usually lives there, and its one-line link title is not "
+                "enough. Send at most one."
             )
             step += 1
         if want_parent and settings.jira_fetch_sibling_stories:
@@ -2100,6 +2163,11 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
             issuelinks = _extract_issuelinks(fields)
             if parent:
                 parent = {**parent, **_parent_body(payload.get("parent_issue"))}
+            else:
+                # No `fields.parent`, but the client may still have fetched the
+                # story this ticket IMPLEMENTS. Accepted only when that key is
+                # already linked from here -- see _linked_parent_ref.
+                parent = _linked_parent_ref(fields, payload.get("parent_issue"))
             siblings = _extract_sibling_bodies(payload, key)
             parent_context = _build_parent_context(
                 parent,
