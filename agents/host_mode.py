@@ -1559,8 +1559,19 @@ _AC_JOB_INSTRUCTIONS = (
     "derive at LEAST one criterion per entry and NEVER merge two entries into "
     "one criterion -- a merged criterion leaves every case that verifies the "
     "other half with no id to point at, and those cases drop out of "
-    "traceability entirely. Derive at least 3, and at most 20 (past 20 this "
-    "server truncates the list and says so). Stay grounded in the material: do NOT invent "
+    "traceability entirely.\n"
+    "   HOW MANY: exactly as many as the material states -- there is no minimum "
+    "to reach and no quota to fill. If it states only one or two requirements, "
+    "return one or two; do NOT pad to a number, because an invented criterion "
+    "gets an AC id that cases then tag, producing traceability that LOOKS "
+    "populated against requirements the ticket never made. That is worse than "
+    "an empty list, which at least says so.\n"
+    "   IF THE SOURCE STATES MORE THAN 60: this server keeps the first 60 and "
+    "says it truncated. Do not resolve the excess by merging entries -- that "
+    "hides the loss inside a criterion that looks complete. List the first 60 "
+    "one-per-requirement, and say in AC-060's description that the material "
+    "continues beyond it, so the gap is attributed rather than silent.\n"
+    "   Stay grounded in the material: do NOT invent "
     "requirements the ticket does not imply. Then (a) set every generated case's "
     "`requirement_id` to the AC id it primarily verifies (JSON null when none "
     "applies), and (b) add ONE optional top-level field to the merged JSON you "
@@ -1584,7 +1595,9 @@ _AC_JOB_SPEC: dict = {
     "instructions": (
         "Derive one short, testable acceptance criterion per DISTINCT "
         "requirement stated in user_context -- count from the source, never "
-        "merge two requirements into one criterion; at least 3, at most 20 -- "
+        "merge two requirements into one criterion, and never pad to a minimum; "
+        "past 60 the list is truncated, so say so in AC-060 rather than "
+        "merging -- "
         "BEFORE generating cases, numbered AC-001, AC-002, ... Tag each case's "
         "requirement_id with the id it verifies, and return the list as a "
         "top-level `acceptance_criteria` array on the merged submission."
@@ -1631,7 +1644,16 @@ AC_JOB = HostJob(
 # and the 3-8 bound it justified was itself the defect: a source enumerating 12
 # use cases legitimately needs 12 criteria, and capping the ask at 8 made at
 # least four of them untraceable.
-_AC_MAX_ITEMS = 20
+#
+# Raised 20 -> 60 on the same day, after an independent review pointed out that
+# 20 was the SAME defect one bound higher: the prompt said both "NEVER merge two
+# entries" and "at most 20", which for a 21-requirement source are unsatisfiable
+# together, with no tiebreak stated. A 25-requirement epic is ordinary. 60 is a
+# malformed-input bound, not a quality judgement -- and the prompt now tells the
+# host what to do when the material exceeds it (say so in the last criterion)
+# instead of leaving it to merge silently. Prompt and enforcement must move
+# together: _AC_JOB_INSTRUCTIONS quotes this number.
+_AC_MAX_ITEMS = 60
 _AC_MAX_DESC_CHARS = 300
 _AC_MIN_DESC_CHARS = 5
 _AC_MAX_NOTES = 10
