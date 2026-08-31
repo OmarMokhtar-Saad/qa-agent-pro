@@ -8175,9 +8175,19 @@ async def handle_submit_suite(
                     "row(s) (no full suite_json was submitted).\n\n"
                 )
         except host_mode.PrepSerdeError as exc:
+            # 2026-08-31: "Fix the JSON" is right for a parse failure and WRONG
+            # for a validation failure -- there the JSON parsed perfectly and
+            # every case was rejected on a FIELD rule, so a host reading this
+            # went looking for a syntax error that was not there. The reason
+            # text now names the fields; steer the reader at them.
+            _fix = (
+                "Fix the fields named above on each case and resubmit"
+                if "failed validation" in str(exc)
+                else "Fix the JSON and resubmit"
+            )
             return (
                 f"⚠️ Could not read the submitted suite: {exc}\n\n"
-                f"Fix the JSON and resubmit with the same prep_id `{prep_id}`."
+                f"{_fix} with the same prep_id `{prep_id}`."
             )
 
         all_cases = list(parsed.suite.test_cases)
