@@ -3489,8 +3489,35 @@ def _validate_suite(data: dict) -> ParsedSubmission:
         seen_ids.add(tc.tc_id)
         valid.append(tc)
     if not valid:
+        # 2026-08-31: this raised with the COUNT alone and discarded `dropped`
+        # -- the per-case field/rule detail F15 had just built one loop above.
+        # The all-dropped case is where that detail matters MOST: every case
+        # failing at once is what ONE systematic schema mistake looks like, so
+        # a single reason usually fixes the whole suite. Without it the host
+        # was told "(8 dropped)" and had to re-derive the schema by guessing.
+        # Measured: 8 cases missing `module` and `type` reported nothing but
+        # the number.
+        # Collapsed by REASON, not listed per case. Every case failing at once
+        # is almost always ONE systematic mistake, and repeating an identical
+        # sentence eighty times buries the single fact that fixes the suite --
+        # while costing the host's context to read it.
+        _by_reason: dict[str, list[str]] = {}
+        for _d in dropped:
+            _id, _, _reason = str(_d).partition(": ")
+            _by_reason.setdefault(_reason or str(_d), []).append(_id)
+        _parts: list[str] = []
+        for _reason, _ids in list(_by_reason.items())[:_MAX_DROPPED_REASONS]:
+            if len(_ids) == 1:
+                _parts.append(f"{_ids[0]}: {_reason}")
+            else:
+                _parts.append(f"{len(_ids)} cases ({_ids[0]}..{_ids[-1]}): {_reason}")
+        _why = "; ".join(_parts)
+        _more = len(_by_reason) - _MAX_DROPPED_REASONS
+        if _more > 0:
+            _why += f" (+{_more} more distinct reason(s))"
         raise PrepParseError(
-            f"no valid test cases in the submitted suite ({len(dropped)} dropped)"
+            f"no valid test cases in the submitted suite ({len(dropped)} "
+            f"dropped). Why: {_why}"
         )
     try:
         suite = TestSuite(test_cases=valid)
