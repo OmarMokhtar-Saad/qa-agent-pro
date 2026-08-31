@@ -4088,6 +4088,57 @@ async def _condensed_payload_note(source_text: str, updated: str, chars: int) ->
         return ""
 
 
+def _pending_image_gate_hint(
+    text: str,
+    source_plan: str,
+    jira_content_json: str,
+    attached_images: object,
+    attached_image_count: object,
+    capture_ids: object,
+) -> str:
+    """A heads-up that the Jira image gate is STILL AHEAD, for appending to a
+    duplicate-prep / duplicate-suite clarify.
+
+    Both duplicate guards deliberately run BEFORE the image gate -- an
+    already-open prep is the cheaper, more urgent signal -- but that ordering
+    MASKED the gate: a tester re-running a ticket got the duplicate warning and
+    never the screens question, so the gate only appeared after a retry with
+    `proceed_anyway=true`, costing a further round trip (found in the
+    2026-08-31 live sweep, where it hid every Jira use case). This keeps the
+    ordering and removes the masking.
+
+    Returns "" whenever the gate would not fire anyway, so a non-Jira source, a
+    caller that already stated a plan, and one that already supplied screens are
+    never told about a question they will not be asked. Mirrors the gate's own
+    condition below; `capture_ids` counts as screens supplied because they are
+    merged into `attached_images` before the gate runs. Never raises."""
+    try:
+        if _normalize_source_plan(source_plan):
+            return ""
+        # MIRRORS the gate's C10 strip: whitespace is not a ticket, so a
+        # whitespace-only payload leaves the gate armed and the hint must fire.
+        if str(jira_content_json or "").strip() or attached_images or capture_ids:
+            return ""
+        try:
+            if int(attached_image_count or 0) > 0:
+                return ""
+        except (TypeError, ValueError):
+            pass
+        if not _gate_jira_source(text):
+            return ""
+        return (
+            "\n\n> \U0001f4f8 **Heads-up: I have not asked about this ticket's "
+            "SCREENS yet.** That question comes next, so a bare retry spends "
+            "another round trip on it. If the user has already said where the "
+            "screens come from, send `source_plan` on the SAME retry -- `jira` "
+            "(ticket text only), `jira_attach`, `jira_device`, `jira_both` or "
+            "`device`. Do NOT guess it if they have not said."
+        )
+    except Exception:  # pragma: no cover - a hint never breaks a prepare
+        logger.debug("_pending_image_gate_hint failed", exc_info=True)
+        return ""
+
+
 async def _find_recent_duplicate_suite(source_text: str) -> dict | None:
     """Best-effort lookup for a recently-finalized suite generated from the
     SAME source_url. Never raises and never blocks prepare on a store error --
@@ -4263,6 +4314,14 @@ async def handle_prepare_test_cases(
                 "prep_id (`qa_prep_status` shows what is still missing). To "
                 "deliberately start over, call `qa_prepare_test_cases` again "
                 "with `proceed_anyway=true`."
+                + _pending_image_gate_hint(
+                    text,
+                    source_plan,
+                    jira_content_json,
+                    attached_images,
+                    attached_image_count,
+                    capture_ids,
+                )
             )
         )
     # The two clarifies here stay dismissible by `proceed_anyway=true`; only
@@ -4285,6 +4344,14 @@ async def handle_prepare_test_cases(
                 "needed. Otherwise ask the tester whether they actually want a "
                 "fresh regeneration before proceeding; if they confirm yes, "
                 "call `qa_prepare_test_cases` again with `proceed_anyway=true`."
+                + _pending_image_gate_hint(
+                    text,
+                    source_plan,
+                    jira_content_json,
+                    attached_images,
+                    attached_image_count,
+                    capture_ids,
+                )
             )
         )
     # Deferred REVIVE (review M3). NOTHING above this point may move a
@@ -4304,7 +4371,15 @@ async def handle_prepare_test_cases(
         _revive_captures(capture_ids)
     # --- Jira image gate, BEAT 1 (QA_IMAGE_GATE_ENABLED) ------------------- #
     # Placed AFTER the duplicate-prep guard (an already-open prep is the
-    # cheaper, more urgent signal) and BEFORE the fetch -- which is the whole
+    # cheaper, more urgent signal) and BEFORE the fetch
+    #
+    # 2026-08-31 (F3): that ordering is still right, but it MASKED this gate
+    # -- a tester re-running a ticket saw only the duplicate warning and never
+    # the screens question, which then cost a further round trip after the
+    # proceed_anyway retry. Both duplicate clarifies now append
+    # _pending_image_gate_hint, whose condition MIRRORS the `if` below. Change
+    # one and you must change the other, or the hint promises a question that
+    # never comes (or stays silent about one that does). -- which is the whole
     # point: the "I cannot read Jira images" disclosure used to be appended to a
     # payload the host had ALREADY been told to generate from.
     #
