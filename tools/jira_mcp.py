@@ -1636,7 +1636,9 @@ def _local_atlassian_entry_exists(
     return False
 
 
-def connect_hint_line(workspace_roots: list[Path] | None = None) -> str:
+def connect_hint_line(
+    workspace_roots: list[Path] | None = None, *, verify_offered: bool = False
+) -> str:
     """One-line, client-aware Jira-connect hint for compact reports (e.g.
     qa-doctor's optional-items list).
 
@@ -1671,6 +1673,13 @@ def connect_hint_line(workspace_roots: list[Path] | None = None) -> str:
         except Exception:
             already_configured = False
         if already_configured:
+            if verify_offered:
+                # 2026-08-31: the caller already emits a "Fix now" item that
+                # tells the agent how to SETTLE this in one read-only call.
+                # Repeating "I can't tell from here" beside it makes the
+                # report answer and shrug at the same question, and buries
+                # the actionable item under a redundant optional one.
+                return ""
             return (
                 "An `atlassian` MCP entry is already configured on disk for "
                 f"{key.replace('-', ' ').title()}. I can't tell from here whether "

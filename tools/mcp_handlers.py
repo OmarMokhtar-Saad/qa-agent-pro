@@ -1819,6 +1819,16 @@ _IMAGE_SOURCE_LABELS = {
     "Device screens only -- ignore the ticket text": "device",
 }
 
+# STABLE MARKERS (2026-08-31). Two release-gate checks used to assert
+# on raw sentences from the strings below. That makes a copy edit
+# indistinguishable from a regression at the gate -- exactly the false
+# alarm the release-verification work was undertaken to remove. Naming
+# the fragments does not freeze the wording: it freezes the PHRASE the
+# checker keys on, which a rewrite may carry unchanged. Dropping one is
+# then a deliberate edit to a named symbol, not an accident.
+_MARK_UNREADABLE_ANSWER = "could not read the answer"
+_MARK_UNNAMED_REMAINDER = "does not name the remaining"
+
 # The line that is ALWAYS shown -- in both beats and in the markdown fallback.
 _IMAGE_GATE_LINE = (
     "**I cannot read images out of Jira -- only text.** Jira is read through "
@@ -1977,7 +1987,7 @@ def _image_gate_menu_markdown(elicit_status: str = "", rejected_plan: str = "") 
         # server's own words. Checked FIRST because such a status also carries
         # the enum tier's "unavailable"/"declined" label, which used to win.
         _cause = (
-            "was answered, but I could not read the answer as one of the "
+            f"was answered, but I {_MARK_UNREADABLE_ANSWER} as one of the "
             "five plans below"
         )
     elif elicit_status.startswith("disabled"):
@@ -2945,8 +2955,9 @@ def _image_gate_second_beat(
             # empty, so the tester was told "2 of 5" and nothing about the 3.
             if not _missing and _want > _have:
                 _which = (
-                    f" The ticket does not name the remaining {_want - _have}, "
-                    "so send whichever ones you have not already given me."
+                    f" The ticket {_MARK_UNNAMED_REMAINDER} "
+                    f"{_want - _have}, so send whichever ones you have not "
+                    "already given me."
                 )
             return (
                 "## ⏸️ One decision before I generate: the REST of the "
@@ -4089,6 +4100,43 @@ async def _condensed_payload_note(source_text: str, updated: str, chars: int) ->
         return ""
 
 
+def _image_gate_would_fire(
+    text: str,
+    plan: str,
+    jira_content_json: str,
+    attached_images: object,
+    attested: object,
+) -> bool:
+    """THE condition for the Jira image gate -- one definition, two callers.
+
+    2026-08-31: this lived as an inline `if` at the gate, mirrored BY HAND
+    inside _pending_image_gate_hint. The copies drifted three times in one day:
+    a `.strip()` added on the gate side only (C10), an empty-entry filter added
+    on the gate side only (C5), and `capture_ids` counted as screens by the hint
+    when the gate counts only the ones that RESOLVE. Each drift silenced the
+    hint on a call the gate then stopped. A parity test was tried as the
+    mitigation and pinned two of the drifts as correct, which is what settled
+    the argument for extracting this.
+
+    Callers pass ALREADY-normalized values -- `plan` is "" when unusable,
+    `attested` an int, `attached_images` the merged, empty-filtered list -- so
+    this never has to guess what shape it was handed. Whitespace is not a
+    ticket: `"   "` is truthy and used to suppress the pre-fetch ask on what is
+    still a first call. Never raises.
+    """
+    try:
+        return bool(
+            not plan
+            and not str(jira_content_json or "").strip()
+            and not attached_images
+            and not attested
+            and _gate_jira_source(text)
+        )
+    except Exception:  # pragma: no cover - defensive; a gate never breaks a prepare
+        logger.debug("_image_gate_would_fire failed", exc_info=True)
+        return False
+
+
 def _pending_image_gate_hint(
     text: str,
     source_plan: str,
@@ -4110,22 +4158,34 @@ def _pending_image_gate_hint(
 
     Returns "" whenever the gate would not fire anyway, so a non-Jira source, a
     caller that already stated a plan, and one that already supplied screens are
-    never told about a question they will not be asked. Mirrors the gate's own
-    condition below; `capture_ids` counts as screens supplied because they are
-    merged into `attached_images` before the gate runs. Never raises."""
+    never told about a question they will not be asked. It does NOT re-derive
+    that condition -- it normalizes its arguments the way the gate does and asks
+    _image_gate_would_fire, because the hand-written mirror this replaced
+    drifted three times in a day. Never raises."""
     try:
-        if _normalize_source_plan(source_plan):
-            return ""
-        # MIRRORS the gate's C10 strip: whitespace is not a ticket, so a
-        # whitespace-only payload leaves the gate armed and the hint must fire.
-        if str(jira_content_json or "").strip() or attached_images or capture_ids:
-            return ""
         try:
-            if int(attached_image_count or 0) > 0:
-                return ""
+            attested = max(0, int(attached_image_count or 0))
         except (TypeError, ValueError):
-            pass
-        if not _gate_jira_source(text):
+            attested = 0
+        # Normalize EXACTLY as the gate does before asking, or the predicate is
+        # shared in name only:
+        #   * drop empty entries (C5) -- [None] / [b""] / [""] is not a screen;
+        #   * count only captures that RESOLVE. _peek_captures is read-only and
+        #     never raises; an unknown, expired or over-cap id comes back in
+        #     `missing` and contributes nothing, so the gate still asks. Treating
+        #     a stale id as a supplied screen is what silenced this hint on the
+        #     commonest capture failure there is.
+        supplied = [i for i in (attached_images or []) if i]
+        if not supplied and capture_ids:
+            _resolved, _labels, _missing = _peek_captures(list(capture_ids))
+            supplied = [i for i in (_resolved or []) if i]
+        if not _image_gate_would_fire(
+            text,
+            _normalize_source_plan(source_plan),
+            jira_content_json,
+            supplied,
+            attested,
+        ):
             return ""
         return (
             "\n\n> \U0001f4f8 **Heads-up: I have not asked about this ticket's "
@@ -4444,14 +4504,12 @@ async def handle_prepare_test_cases(
     except Exception:  # pragma: no cover - a count never breaks a prepare
         logger.debug("counting captured screens failed", exc_info=True)
         _captured = 0
-    if (
-        not _plan
-        # 2026-08-31 (C10): whitespace is not a ticket. `"   "` is truthy and
-        # used to suppress the pre-fetch ask on what is still a first call.
-        and not str(jira_content_json or "").strip()
-        and not attached_images
-        and not _attested
-        and _gate_jira_source(text)
+    if _image_gate_would_fire(
+        text,
+        _plan,
+        jira_content_json,
+        attached_images,
+        _attested,
     ):
         # Jira sources only, FIRST call only. A plain feature / web / Swagger
         # source skips this entirely, and a caller that already stated a plan or
@@ -12984,7 +13042,15 @@ async def handle_setup_check(
         # disk" instead of telling the tester to add what was just added.
         _atlassian_lines, _atlassian_advisories = await _atlassian_autofix()
         recommended.extend(_atlassian_advisories)
-        optional.append(connect_hint_line(workspace_roots=workspace_roots))
+        # verify_offered=True: _verify_item above is an unconditional
+        # "Fix now" that settles the same question, so the on-disk hint
+        # returns "" rather than shrugging beside it. The CONNECT wording
+        # (no entry on disk) is unaffected and still appears.
+        _hint = connect_hint_line(
+            workspace_roots=workspace_roots, verify_offered=True
+        )
+        if _hint:
+            optional.append(_hint)
         # Fix 7 / M3 (2026-08-03): the ONLY discoverable path to registration.
         # QA_AUTO_REGISTER_CLIENTS defaults OFF (it writes outside the install
         # dir), and even ON it cannot bootstrap the FIRST client -- if no editor is
