@@ -1085,14 +1085,22 @@ def _count_sibling_candidates(payload: dict, target_key: str = "") -> int:
         items = container
         total_hint = 0
         if isinstance(container, dict):
-            items = container.get("issues")
+            items = _issue_nodes(container) or container.get("issues")
             # The live Atlassian MCP server returns `totalCount`; REST v3 and
             # older tool versions return `total`. Accept either rather than
-            # silently falling back to "however many you sent me".
-            for field in ("totalCount", "total"):
-                raw_total = container.get(field)
-                if isinstance(raw_total, int) and not isinstance(raw_total, bool):
-                    total_hint = max(total_hint, raw_total)
+            # silently falling back to "however many you sent me". 2026-08-31
+            # (F8): on the live shape both the count and the nodes sit INSIDE
+            # `issues`, so read that level too -- otherwise the disclosure fell
+            # back to counting a list it had failed to find.
+            _levels = [container]
+            _inner = container.get("issues")
+            if isinstance(_inner, dict):
+                _levels.append(_inner)
+            for _level in _levels:
+                for field in ("totalCount", "total"):
+                    raw_total = _level.get(field)
+                    if isinstance(raw_total, int) and not isinstance(raw_total, bool):
+                        total_hint = max(total_hint, raw_total)
         if not isinstance(items, list):
             return total_hint
         target = _valid_issue_key(target_key)
@@ -1133,9 +1141,15 @@ def _extract_sibling_bodies(payload: dict, target_key: str = "") -> list[dict]:
             return []
         items = payload.get("sibling_issues") if isinstance(payload, dict) else None
         if isinstance(items, dict):
-            # Accept the RAW JQL response shape ({"issues": [...]}) as well as a
-            # bare list, so a host that pastes the tool result unmodified works.
-            items = items.get("issues")
+            # Accept the RAW JQL response shape as well as a bare list, so a
+            # host that pastes the tool result unmodified works. 2026-08-31
+            # (F8): the LIVE server nests one level deeper -- {"issues":
+            # {"totalCount": n, "nodes": [...]}} -- so this unwrapped to a DICT,
+            # failed the list check below and dropped every sibling BODY, while
+            # _count_sibling_candidates (which does read totalCount) kept
+            # reporting how many siblings existed. The count and the bodies
+            # disagreed by construction.
+            items = _issue_nodes(items) or items.get("issues")
         if not isinstance(items, list):
             return []
         target = _valid_issue_key(target_key)
@@ -1374,11 +1388,40 @@ def _linked_parent_ref(fields: dict, parent_issue: object) -> dict | None:
         return None
 
 
+def _issue_nodes(payload: object) -> list:
+    """Issue objects inside the LIVE Atlassian MCP envelope, or [].
+
+    2026-08-31 (F8). ``getJiraIssue`` and ``searchJiraIssuesUsingJql`` both
+    return ``{"issues": {"totalCount": n, "nodes": [ {key, fields} ]}}``, while
+    the fetch DIRECTIVE asks the host to pass that result RAW and unmodified.
+    Nothing unwrapped it, so obeying the directive was refused with "that Jira
+    payload has no `fields` object -- call getJiraIssue again and pass its RAW
+    result", which loops. Accepts the older ``{"issues": [...]}`` shape too.
+    Never raises.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return []
+        container = payload.get("issues")
+        if isinstance(container, dict):
+            container = container.get("nodes")
+        if not isinstance(container, list):
+            return []
+        return [item for item in container if isinstance(item, dict)]
+    except Exception:
+        return []
+
+
 def _issue_fields(issue: object) -> dict:
     """The ``fields`` mapping of an issue payload (or {} ). Never raises."""
     try:
         if not isinstance(issue, dict):
             return {}
+        # F8: unwrap the live envelope before looking for `fields`.
+        if "fields" not in issue:
+            nodes = _issue_nodes(issue)
+            if nodes:
+                issue = nodes[0]
         fields = issue.get("fields")
         if isinstance(fields, dict):
             return fields
