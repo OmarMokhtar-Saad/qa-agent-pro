@@ -1,6 +1,6 @@
 [project]
 name = "qa-agent-pro"
-version = "1.70.2"
+version = "1.70.3"
 requires-python = ">=3.10"
 dependencies = [
     "pyyaml>=6.0",  # contracts + OpenAPI specs are YAML (api_test agent)
@@ -66,9 +66,19 @@ asyncio_default_fixture_loop_scope = "function"
 # Pydantic models named Test* (TestCase, TestSuite, ...) are not test classes.
 python_classes = ["Test*Case", "*Tests", "*TestCase"]
 filterwarnings = ["ignore::pytest.PytestCollectionWarning"]
-# No custom markers. The `eval` marker lived here until 2026-08-15, when
-# dead-code deletion Phase 2 (Decision A) deleted evals/ and the nightly CI job
-# that was its only user.
+# The `eval` marker lived here until 2026-08-15, when dead-code deletion Phase 2
+# (Decision A) deleted evals/ and the nightly CI job that was its only user.
+#
+# `live` (2026-08-31) marks tests/live -- sweeps that drive a RUNNING MCP server
+# through a real chat model. Registered so `-m live` works and the mark is not
+# an unknown-marker warning. There is deliberately NO `addopts` deselecting it:
+# an addopts filter would rewrite every pytest invocation in the repo, and a
+# future `-m` of someone else's would silently fight it. The skip lives in
+# tests/live/conftest.py, gated on QA_LIVE_SWEEP=1, where it can affect nothing
+# outside that directory.
+markers = [
+    "live: drives a running MCP server through a real chat model; costs model calls. Needs QA_LIVE_SWEEP=1.",
+]
 
 [tool.ruff]
 target-version = "py310"

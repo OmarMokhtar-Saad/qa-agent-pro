@@ -69,6 +69,7 @@ from tools.jira_mcp import (
     not_connected_message,
     verify_directive,
     verify_result_message,
+    verify_tool_name,
 )
 from tools.playwright_exporter import generate_playwright_script
 from tools.rag_store import (
@@ -13179,8 +13180,26 @@ async def handle_setup_check(
             "### Verify the Jira (Atlassian) connection",
             verify_directive(),
         ]
+        # 2026-08-31: the verify directive above is unconditional, but it lived
+        # in a section while the only Jira-shaped ACTION item was the on-disk
+        # hint tagged "Optional" -- so agents reported the guess and never made
+        # the probe call. An unverified OAuth session is now an open "Fix now"
+        # item, listed FIRST, naming both calls. It is advice to the AGENT, not
+        # to the tester, and costs one read-only call.
+        _verify_item = (
+            "Agent: the Atlassian (Jira) connection above is a GUESS from "
+            "on-disk config -- an entry can be present and unauthorized, or "
+            "absent and working through a hosted connector. Verify it now, "
+            "before you summarise this report and without asking the tester: "
+            f"call `{verify_tool_name()}` (read-only, no parameters), then "
+            "`qa_configure_jira` with `atlassian_verify_json` set to that "
+            "call's raw JSON -- or to `{\"error\": \"<what happened>\"}` if the "
+            "tool is missing or fails. See *Verify the Jira (Atlassian) "
+            "connection* above."
+        )
         items = (
-            [("Fix now", item) for item in blockers]
+            [("Fix now", _verify_item)]
+            + [("Fix now", item) for item in blockers]
             + [("Recommended", item) for item in recommended]
             + [("Optional", item) for item in optional]
         )
