@@ -1633,10 +1633,11 @@ AC_JOB = HostJob(
     spec=_AC_JOB_SPEC,
 )
 
-# Shape caps on the UNTRUSTED `acceptance_criteria` field. 20 is the number the
-# AC job's own instructions quote to the host, so the two must move TOGETHER:
-# _AC_JOB_INSTRUCTIONS says "at most 20" precisely because anything past this is
-# truncated here (with a note).
+# Shape caps on the UNTRUSTED `acceptance_criteria` field. This number is the one
+# the AC job's own instructions quote to the host, so the two must move TOGETHER
+# -- _AC_JOB_INSTRUCTIONS names it precisely because anything past it is
+# truncated here (with a note). Do not restate the value in prose: this comment
+# said "at most 20" for twelve lines after the constant became 60.
 #
 # 2026-08-31: the justification this comment used to carry -- that _AC_GEN_SYSTEM
 # asked a server-side synthesizer for 3-8 criteria, so 20 was already generous --
