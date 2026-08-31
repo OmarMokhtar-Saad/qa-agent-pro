@@ -1832,29 +1832,68 @@ _IMAGE_PLAN_ALIASES = {
     "text_only": "jira",
     "ticket": "jira",
     "ticket_only": "jira",
+    "ticket_text": "jira",
+    "ticket_text_only": "jira",
+    "no_screens": "jira",
     "jira_only": "jira",
     "attach": "jira_attach",
     "attachment": "jira_attach",
     "attachments": "jira_attach",
+    "screenshot": "jira_attach",
+    "screenshots": "jira_attach",
     "chat": "jira_attach",
     "capture": "jira_device",
     "mobile": "jira_device",
     "jira_mobile": "jira_device",
     "device_only": "device",
+    "device_screens": "device",
+    "device_screens_only": "device",
     "both": "jira_both",
+    "attach_capture": "jira_both",
+}
+
+# 2026-08-31: the MENU ORDINALS, in the order _image_gate_menu_markdown prints
+# them. A tester answering the tier-2 free-text prompt types "1", and a host
+# relaying the markdown menu may echo the number the tester picked rather than
+# the bracketed token. Both used to normalize to "" and cost another round trip.
+_IMAGE_PLAN_ORDINALS = {
+    "1": "jira",
+    "2": "jira_attach",
+    "3": "jira_device",
+    "4": "jira_both",
+    "5": "device",
 }
 
 
 def _normalize_source_plan(plan: str) -> str:
     """Coerce a host/tester-supplied ``source_plan`` to one of
     _IMAGE_SOURCE_PLANS, or "" when it is unusable -- which RE-ASKS rather than
-    guessing which channel the tester meant. Never raises."""
+    guessing which channel the tester meant. Never raises.
+
+    2026-08-31: accepts the three shapes a real caller sends that this used to
+    refuse -- the five _IMAGE_SOURCE_LABELS verbatim (a host relaying the tier-3
+    markdown may echo the LABEL the tester clicked, not the bracketed token),
+    the menu ordinals 1-5, and an "option N" prefix. The labels are matched on
+    the RAW lowercased string, before the separator mangling turns their "--"
+    into underscores."""
     try:
         raw = (plan or "").strip().lower()
-        for ch in (" ", "-", "+", "/"):
+        if not raw:
+            return ""
+        for label, mapped in _IMAGE_SOURCE_LABELS.items():
+            if raw == label.strip().lower():
+                return mapped
+        for _lead in ("option ", "option_", "#"):
+            if raw.startswith(_lead):
+                raw = raw[len(_lead) :].strip()
+        raw = raw.strip(".) ")
+        if raw in _IMAGE_PLAN_ORDINALS:
+            return _IMAGE_PLAN_ORDINALS[raw]
+        for ch in (" ", "-", "+", "/", ".", ":", "\t"):
             raw = raw.replace(ch, "_")
         while "__" in raw:
             raw = raw.replace("__", "_")
+        raw = raw.strip("_")
         raw = _IMAGE_PLAN_ALIASES.get(raw, raw)
         return raw if raw in _IMAGE_SOURCE_PLANS else ""
     except Exception:
@@ -1883,7 +1922,32 @@ def _gate_jira_source(url: str) -> bool:
         return False
 
 
-def _image_gate_menu_markdown(elicit_status: str = "") -> str:
+def _rejected_plan_note(raw: str) -> str:
+    """One line naming a `source_plan` this server could not recognise, or ""
+    when there is nothing to disclose. Host-supplied text, so it is stripped of
+    line breaks and backticks and hard-capped before it is echoed. Never
+    raises."""
+    try:
+        val = (raw or "").strip()
+        if not val or _normalize_source_plan(val):
+            return ""
+        for ch in ("\r", "\n", "`"):
+            val = val.replace(ch, " ")
+        val = " ".join(val.split())[:60]
+        if not val:
+            return ""
+        return (
+            "> \u26a0\ufe0f  **I did not recognise `source_plan='" + val + "'`, so "
+            "it was ignored** -- I am asking the question below instead of "
+            "guessing which channel you meant. It must be EXACTLY one of "
+            "`jira`, `jira_attach`, `jira_device`, `jira_both`, `device`.\n\n"
+        )
+    except Exception:  # pragma: no cover - a disclosure never breaks a prepare
+        logger.debug("_rejected_plan_note failed for %r", raw, exc_info=True)
+        return ""
+
+
+def _image_gate_menu_markdown(elicit_status: str = "", rejected_plan: str = "") -> str:
     """BEAT 1 tier-3 fallback: the menu as an instruction to the HOST assistant.
 
     Same shape as _tc_source_menu_markdown -- editors render a structured
@@ -1903,13 +1967,25 @@ def _image_gate_menu_markdown(elicit_status: str = "") -> str:
     Defaults to "" (cause unknown), which words it as a plain statement of fact
     with no cause attributed. Never raises."""
     _cause = "could not be shown to you inline"
-    if elicit_status.startswith("disabled"):
+    if elicit_status.endswith("/chosen"):
+        # 2026-08-31: the tester ANSWERED -- the text tier reported CHOSEN and
+        # the caller still got "" back, which can only mean the reply did not
+        # normalize to one of the five plans. Reporting a client limitation here
+        # is an over-claim (the dialog tiers are not why we are in the fallback)
+        # and it hides the one thing the tester can act on: say it again, in the
+        # server's own words. Checked FIRST because such a status also carries
+        # the enum tier's "unavailable"/"declined" label, which used to win.
+        _cause = (
+            "was answered, but I could not read the answer as one of the "
+            "five plans below"
+        )
+    elif elicit_status.startswith("disabled"):
         _cause = (
             "was not shown inline because this call arrived with no elicitation "
             "channel (your client offered none for this call)"
         )
     elif "declined" in elicit_status:
-        _cause = "was shown inline and dismissed, so I am repeating it as text"
+        _cause = "was shown inline and dismissed"
     elif "unavailable" in elicit_status:
         _cause = (
             "could not be shown inline because your MCP client does not support "
@@ -1917,7 +1993,10 @@ def _image_gate_menu_markdown(elicit_status: str = "") -> str:
         )
     return (
         "## Before I read the ticket: how do I get its screens?\n\n"
-        "> ℹ️ " + _IMAGE_GATE_LINE + "\n\n"
+        + _rejected_plan_note(rejected_plan)
+        + "> ℹ️ "
+        + _IMAGE_GATE_LINE
+        + "\n\n"
         "Present EXACTLY these five options to the user as a multiple-choice "
         "question (use your ask-user/questions UI, not prose), then call the "
         "SAME tool again with the SAME `feature_or_url` plus `source_plan` set "
@@ -2820,6 +2899,13 @@ def _image_gate_second_beat(
     try:
         if kind not in ("attachments", "embedded"):
             return ""
+        # 2026-08-31 (C12): menu option 5 reads "Device screens only -- IGNORE
+        # the ticket text". Demanding the ticket's attachments from a tester who
+        # picked it and has already captured contradicts the choice they were
+        # offered. Only once a capture actually arrived: `device` with nothing
+        # supplied is still a plan that promised images and delivered none.
+        if plan == "device" and have_images > 0:
+            return ""
         # COMPLETENESS, not presence (2026-08-09): ONE image out of three used
         # to silence this gate, so generation started on a SUBSET of the
         # screens. `count` is the ticket's OWN claim and is clamped to
@@ -2852,6 +2938,15 @@ def _image_gate_second_beat(
                 if _missing
                 else ""
             )
+            # 2026-08-31 (C13): a ticket can claim more images than it NAMES --
+            # embedded refs outnumber parsed labels, or the label list was capped
+            # at 8. The ratio was still quoted while the outstanding clause went
+            # empty, so the tester was told "2 of 5" and nothing about the 3.
+            if not _missing and _want > _have:
+                _which = (
+                    f" The ticket does not name the remaining {_want - _have}, "
+                    "so send whichever ones you have not already given me."
+                )
             return (
                 "## ⏸️ One decision before I generate: the REST of the "
                 "ticket's screens\n\n"
@@ -4228,12 +4323,24 @@ async def handle_prepare_test_cases(
     # helpers above are all never-raising; the two coercions that touch
     # host-supplied values therefore guard themselves.
     try:
+        # 2026-08-31 (C5): drop empty entries, on EVERY call. A host that sends
+        # [{}] or [b""] supplied NO screen, but a non-empty list silently
+        # satisfied the beat-1 guard below and skipped the disclosure entirely.
+        # This deliberately sits OUTSIDE the `if _cap_images:` branch: the first
+        # cut put it inside, where it only ran when capture ids were also
+        # present -- i.e. never on the path the defect actually took. The gate's
+        # own pin caught that, which is the whole reason it exists.
+        # `or None` preserves the pre-existing None-vs-[] distinction for every
+        # downstream reader, so filtering cannot change a call that had nothing
+        # to filter.
+        attached_images = [i for i in (attached_images or []) if i] or None
         if _cap_images:
+            attached_images = list(attached_images or [])
             # Captured device screens join the chat attachments, so they flow
             # through _ground_and_gate -> host_images -> _select_prepare_images
             # and inherit the existing byte budget and drop disclosure with no
             # new capping code.
-            attached_images = list(attached_images or []) + _cap_images
+            attached_images = attached_images + _cap_images
     except Exception:
         logger.debug("merging captured screens failed", exc_info=True)
         attached_images = _cap_images or None
@@ -4263,7 +4370,9 @@ async def handle_prepare_test_cases(
         _captured = 0
     if (
         not _plan
-        and not jira_content_json
+        # 2026-08-31 (C10): whitespace is not a ticket. `"   "` is truthy and
+        # used to suppress the pre-fetch ask on what is still a first call.
+        and not str(jira_content_json or "").strip()
         and not attached_images
         and not _attested
         and _gate_jira_source(text)
@@ -4296,10 +4405,45 @@ async def handle_prepare_test_cases(
             # FIX 3 (review H4): the status decides HOW the fallback explains
             # itself. It must not assert a client limitation when elicitation was
             # simply turned off on this server, or when the tester declined.
-            return PreparePayloadResult(
-                clarify=_image_gate_menu_markdown(_elicit_status)
-            )
+            _md = _image_gate_menu_markdown(_elicit_status, source_plan)
+            # 2026-08-31 (C11): ids WERE sent and none resolved. That is a
+            # different situation from "never captured anything", and the generic
+            # menu never said so -- the tester re-reads five options wondering
+            # why option 3, which they already did, was ignored.
+            if _cap_missing:
+                _md += (
+                    "\n\n> \u26a0\ufe0f  The `capture_ids` on this call resolved to "
+                    "NOTHING: "
+                    + ", ".join(f"`{c}`" for c in list(_cap_missing)[:8])
+                    + ". Captured screens expire, so these are most likely stale "
+                    "-- run `qa_capture_screens` again and send the NEW ids with "
+                    "`source_plan='jira_device'`."
+                )
+            return PreparePayloadResult(clarify=_md)
         _plan = _picked
+    elif (
+        not _plan
+        and not str(jira_content_json or "").strip()
+        and not attached_images
+        and _attested
+        and _gate_jira_source(text)
+    ):
+        # 2026-08-31 (finding 1): beat 1 was skipped on ATTESTATION ALONE -- a
+        # count with no bytes behind it and no plan. The chat attachments stay
+        # in the host's context by design, so this server can never verify the
+        # number; what it can do is stop the skip being invisible. The honest
+        # bypass (`image_gate_ack=true`) is disclosed in the finished payload,
+        # so the unverifiable one should not be quieter than the honest one.
+        await _audit(
+            "mcp_image_gate_beat1",
+            detail={
+                "resolved": False,
+                "plan": "",
+                "skipped": True,
+                "skip_reason": "attested_without_bytes",
+                "attested": _attested,
+            },
+        )
     if _plan and not image_gate_ack:
         # Plan-completion nudge: a plan that PROMISED images and has not
         # delivered them yet gets ONE actionable instruction per missing channel,
@@ -4399,7 +4543,21 @@ async def handle_prepare_test_cases(
             _img_n, _img_names, _img_kind = _ticket_image_evidence(grounded.url_content)
             # N4 (2026-08-10): bound, not inlined -- the audit row could not tell
             # "no screens at all" from "3 of 4 arrived" without the ratio.
-            _have_images = len(attached_images or []) + _attested
+            # 2026-08-31 (C2): NOT a sum. `attached_images` already contains the
+            # device captures (merged above) and, on hosts that forward them, the
+            # SAME chat screens `_attested` counts -- so summing double-counted
+            # one channel and let 2-of-3 read as 3-of-3, re-opening the exact
+            # subset-generation hole the completeness rule was added to close.
+            # Chat bytes vs chat attestation: take the larger, they are one
+            # channel. Device captures are a genuinely separate channel and add.
+            # RESIDUAL, accepted: a host that folds its device captures INTO
+            # attached_image_count over-counts by the overlap. Unfixable here --
+            # the count is an unverifiable host claim either way (see the
+            # attested_without_bytes audit stamp below) -- and it is a much
+            # narrower hole than the one it replaces, which needed no
+            # misreporting at all to fire.
+            _chat_side = max(0, len(attached_images or []) - _captured)
+            _have_images = max(_chat_side, _attested) + _captured
             _beat2 = _image_gate_second_beat(
                 count=_img_n,
                 names=_img_names,
@@ -12564,8 +12722,19 @@ async def handle_setup_check(
                     encoding="utf-8"
                 )
             )
+            # 2026-08-31: `except (OSError, ValueError)` covers an unreadable or
+            # unparseable file, but NOT a file holding valid JSON that is not an
+            # object -- `null` or `[]` reached `.get` and raised AttributeError.
+            # The outer handler then replaced the ENTIRE report with "Setup
+            # check failed: 'list' object has no attribute 'get'", so a tester
+            # on a machine with one torn sidecar lost every other diagnosis in
+            # the tool that exists to give them one. This file is written by a
+            # different process and can be truncated mid-write, which is exactly
+            # how a half-flushed object becomes something else.
+            if not isinstance(state, dict):
+                raise ValueError("session-state.json is not a JSON object")
             client_v = str(state.get("client_schema_version") or "")
-        except (OSError, ValueError):
+        except (OSError, ValueError, AttributeError, TypeError):
             client_v = ""
         if client_v:
             from tools.updater import _parse_version
