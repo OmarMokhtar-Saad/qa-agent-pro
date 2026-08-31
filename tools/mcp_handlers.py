@@ -322,6 +322,53 @@ def _schedule_reload(reason: str = "") -> None:
 _PROCESS_START = time.time()
 
 
+def _drift_advisory() -> str:
+    """qa-doctor's drift line for an install that cannot reload itself.
+
+    2026-08-31 (qa-doctor/qa-restart use-case sweep): the two drift checks
+    below were reachable ONLY from inside `if _test_cases_only() and
+    _DIST_UPDATE_REPO:`. `_DIST_UPDATE_REPO` is "" in every private checkout
+    and in any dist build without an update repo, so on those installs
+    qa-doctor rendered settings from the `.env` it BOOTED with and said
+    nothing -- the exact staleness those checks exist to catch, silent on the
+    installs where a developer edits `.env` most often.
+
+    It is an ADVISORY here, not a reload, and that difference is the whole
+    reason this is a separate function: `_schedule_reload` hard-exits the
+    process, which is safe only because a supervising launcher respawns it and
+    replays the handshake. An unsupervised server that exited would be marked
+    `failed` by the client and respawned by nobody, so turning a stale-config
+    notice into a dead session is strictly worse than reporting it. Recommended
+    rather than blocking: the server still answers every tool call correctly,
+    it is just answering on older configuration.
+
+    Returns "" when nothing drifted, which is the normal case."""
+    try:
+        code = _code_changed_since_start()
+        env = _env_changed_since_start()
+    except Exception:  # pragma: no cover - an advisory must never break qa-doctor
+        logger.debug("drift advisory failed", exc_info=True)
+        return ""
+    if code:
+        return (
+            "**This server is running older code than is on disk.** Another "
+            "process updated this install after this one started, so it is "
+            "serving stale modules -- and anything reported below describes "
+            "the OLD code. Restart the MCP server (`python3 "
+            ".claude/operations/scripts/qa-restart.py`, or reconnect it in "
+            "your client) to pick the new code up."
+        )
+    if env:
+        return (
+            "**`.env` was edited after this server started.** The settings "
+            "reported above are the ones this process booted with, NOT what "
+            "the file says now. Restart the MCP server (`python3 "
+            ".claude/operations/scripts/qa-restart.py`, or reconnect it in "
+            "your client) to apply them."
+        )
+    return ""
+
+
 # ops-6 (bug 3): cap on an elicited folder answer before it is treated as a path.
 _MAX_EXPORT_DIR_CHARS = 400
 
@@ -12518,6 +12565,16 @@ async def handle_setup_check(
         # Recommended, not blocking -- the server still answers.
         if reload_action:
             recommended.append(reload_action)
+        # The same hazard on an install that cannot reload itself. Guarded by
+        # the NEGATION of the reload gate above, deliberately: where the reload
+        # path runs it has already returned a `_reloading_message`, so reaching
+        # here at all means no reload was scheduled and the drift would
+        # otherwise go unreported. See _drift_advisory for why this is a
+        # message rather than an exit.
+        if not (_test_cases_only() and _DIST_UPDATE_REPO):
+            _drift = _drift_advisory()
+            if _drift:
+                recommended.append(_drift)
 
         py_version = sys.version.split()[0]
         py_ok = sys.version_info >= (3, 10)
