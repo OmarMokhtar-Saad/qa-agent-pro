@@ -159,7 +159,13 @@ _SOURCE_PATTERNS = (
     # This admits an IDENTIFIER shape, never free text, so the control the
     # allowlist exists to be is unchanged: "SHYJ-10974 Proposed Change" still
     # folds, and so does "AC1: APPROVED BY SECURITY".
-    re.compile(r"^AC[-_ ]?\d{1,4}$", re.IGNORECASE),
+    # 2026-08-31 (F10): this was AC-ONLY, so `BR01` and `MSG01` -- the labels a
+    # Business Rules ticket actually uses, and two of the very shapes the
+    # comment above names as acceptable ("AC-003, AF03, BR12, REQ-7") -- folded
+    # to "unattributed", and the workbook's Source column rendered one constant
+    # across all seventeen items. Still an IDENTIFIER shape only, never free
+    # text, so the control the allowlist exists to be is unchanged.
+    re.compile(r"^[A-Z]{2,5}[-_ ]?\d{1,4}$", re.IGNORECASE),
     re.compile(rf"^description{_SOURCE_REF}$", re.IGNORECASE),
     re.compile(r"^comment(#\d{1,4})?$", re.IGNORECASE),
     re.compile(r"^amendment(#\d{1,4})?$", re.IGNORECASE),

@@ -133,10 +133,26 @@ def looks_like_requirement_text(text: object) -> bool:
 # The trailing paragraph is what disabled the recovery path: the single-newline
 # fallback fired only when the paragraph split produced <= 1 chunk, so any
 # trailing prose -- Notes, links, a sign-off -- silently switched it off.
-_AC_LABEL_RE = re.compile(r"(?m)^\s*AC\s*-?\s*\d{1,3}\s*[:.)\]-]\s+")
+# 2026-08-31 (F3): the label was AC-ONLY. A ticket whose criteria are written
+# `BR01:`..`BR14:` -- inline, on ONE line, which is exactly what a Business
+# Rules table flattens to -- matched nothing, split nothing, and produced ONE
+# criterion. The traceability sheet then read "0/1 traced, 66 orphans" over a
+# fourteen-rule ticket (measured, SHYJ-10051). The 2026-08-30 fix for this
+# failure was written for the `ACn` INSTANCE; this is the class.
+#
+# Two guards keep the wider label safe: an inline split is only taken when at
+# least two labels are present (so a lone "BR01" quoted in prose cannot shatter
+# a paragraph), and only an `ACn` marker is STRIPPED from the resulting text --
+# a `BR07:` prefix is deliberately KEPT so _trace_map can match a case tagged
+# "BR07" back to the criterion it names.
+_LABEL_BODY = r"[A-Z]{2,5}\s*-?\s*\d{1,3}\s*[:.)\]-]\s+"
+_AC_LABEL_RE = re.compile(rf"(?m)^\s*{_LABEL_BODY}")
+_ANY_LABEL_RE = re.compile(_LABEL_BODY)
+_INLINE_LABEL_SPLIT_RE = re.compile(rf"(?=\b{_LABEL_BODY})")
+_MIN_INLINE_LABELS = 2
 _AC_SPLIT_RE = (
     r"(?m)(?:^\s*[-*•]\s+|^\s*\d+[.)\]]\s+"
-    r"|^\s*AC\s*-?\s*\d{1,3}\s*[:.)\]-]\s+)|\n{2,}"
+    rf"|^\s*{_LABEL_BODY})|\n{{2,}}"
 )
 
 # Section labels that introduce prose ABOUT the ticket rather than a criterion.
@@ -146,6 +162,17 @@ _AC_SPLIT_RE = (
 _NON_AC_PREFIX_RE = re.compile(
     r"^\s*(notes?|links?|references?|out of scope|scope|assumptions?|context)\s*:",
     re.IGNORECASE,
+)
+
+
+# 2026-08-31 (F3): splitting a Business-Rules table inline leaves the table's
+# own heading as the first chunk ("Business Rules:" with nothing after it). It
+# is a section label, not a criterion. Matched ONLY when the line is the bare
+# heading: a UC-table row reading "Business Rules: BR02: not all products have
+# a cancelation service" carries a real requirement after the colon and must
+# survive -- an earlier revision of this fix dropped it and cost a criterion.
+_BARE_SECTION_RE = re.compile(
+    r"^\s*(business rules?|acceptance criteria|rules?)\s*:?\s*$", re.IGNORECASE
 )
 
 
@@ -177,6 +204,20 @@ def parse_acceptance_criteria(raw: str) -> list[AcceptanceCriterion]:
         ):
             lines = raw.splitlines()
 
+        # 2026-08-31 (F3): a Business-Rules table flattens to ONE line carrying
+        # every `BRnn:` label, so neither split above separates anything. Split
+        # on the label itself -- only where at least two are present.
+        expanded: list[str] = []
+        for _ln in lines:
+            _text = _ln if isinstance(_ln, str) else ""
+            if len(_ANY_LABEL_RE.findall(_text)) >= _MIN_INLINE_LABELS:
+                expanded += [
+                    p for p in _INLINE_LABEL_SPLIT_RE.split(_text) if p.strip()
+                ]
+            else:
+                expanded.append(_text)
+        lines = expanded
+
         items: list[str] = []
         for line in lines:
             line = line.strip()
@@ -193,6 +234,9 @@ def parse_acceptance_criteria(raw: str) -> list[AcceptanceCriterion]:
                 continue
             # A trailing "Notes:"/"Links:" paragraph is prose ABOUT the ticket,
             # not a criterion -- see _NON_AC_PREFIX_RE.
+            if _BARE_SECTION_RE.match(line):
+                logger.debug("Dropping bare section heading: %.60r", line)
+                continue
             if _NON_AC_PREFIX_RE.match(line):
                 logger.debug("Dropping non-criterion section label: %.60r", line)
                 continue
@@ -217,6 +261,33 @@ def parse_acceptance_criteria(raw: str) -> list[AcceptanceCriterion]:
         return []
 
 
+def _norm_label(raw: object) -> str:
+    """Canonicalise a non-AC criterion label (BR07, br-7, MSG01) or "".
+
+    Mirrors ``normalize_ac_id``'s zero-padding for any short uppercase prefix,
+    so "BR-7" and "BR07" compare equal. Returns "" for anything that is not
+    label-shaped, which keeps free text out of the trace index. Never raises.
+    """
+    try:
+        s = str(raw or "").strip().upper().replace(" ", "")
+        m = re.match(r"^([A-Z]{2,5})[-_]?0*(\d{1,3})$", s)
+        return f"{m.group(1)}-{int(m.group(2)):03d}" if m else ""
+    except Exception:
+        return ""
+
+
+def _leading_label(text: object) -> str:
+    """The normalised label a criterion's own text starts with, or "".
+
+    ``BR07: System shall ...`` -> ``BR-007``. Never raises.
+    """
+    try:
+        m = _ANY_LABEL_RE.match(str(text or "").strip())
+        return _norm_label(re.sub(r"[\s:.)\]-]+$", "", m.group(0))) if m else ""
+    except Exception:
+        return ""
+
+
 def _trace_map(
     acs: list[AcceptanceCriterion], test_cases: list[TestCase]
 ) -> tuple[dict, list]:
@@ -231,9 +302,21 @@ def _trace_map(
     norm_to_canonical: dict[str, str] = {
         normalize_ac_id(ac.ac_id): ac.ac_id for ac in acs
     }
+    # 2026-08-31 (F4): a criterion parsed out of `BR07: ...` keeps its own label
+    # in the text, and a generator asked to cite "the acceptance criterion this
+    # verifies" cites THAT label, not the synthetic AC-00n id it has never been
+    # shown. Both indexes are consulted, so `requirement_id: "BR07"` traces --
+    # instead of the workbook printing BR07 in the Requirement ID column and
+    # declaring, two sheets later, that no case carries a usable one.
+    for _ac in acs:
+        _label = _leading_label(getattr(_ac, "description", ""))
+        if _label:
+            norm_to_canonical.setdefault(_label, _ac.ac_id)
     orphan_tc_ids: list[str] = []
     for tc in test_cases:
-        canonical = norm_to_canonical.get(normalize_ac_id(tc.requirement_id))
+        canonical = norm_to_canonical.get(
+            normalize_ac_id(tc.requirement_id)
+        ) or norm_to_canonical.get(_norm_label(tc.requirement_id))
         if canonical:
             ac_to_tcs[canonical].append(tc.tc_id)
         else:
@@ -1083,9 +1166,13 @@ async def match_checklist(
 
         if degraded:
             high = _LEXICAL_HIGH
+            medium = _LEXICAL_HIGH
             cov.notes.append(_DEGRADED_NOTE)
         else:
             high = float(getattr(settings, "qa_checklist_match_high", 0.75) or 0.75)
+            medium = float(getattr(settings, "qa_checklist_match_medium", 0.62) or 0.62)
+            # A misconfigured band must never invert the tiers.
+            medium = min(medium, high)
 
         if not_presented:
             cov.notes.append(
@@ -1115,30 +1202,39 @@ async def match_checklist(
         # than deleted -- it is the ONLY channel by which the degradation
         # reaches the exported artifact, so without it a one-line revival
         # would silently ship an undisclosed degraded measurement.
-        if not tiers_on and (_nli_tier_enabled() or _adjudicate_tier_enabled()):
+        # 2026-08-31 (F7): this note was guarded by the two tier seams, both of
+        # which are hardcoded False -- so it could NEVER fire, and the coverage
+        # percentage shipped to the workbook with no caveat at all. The
+        # limitation it describes is the shipped configuration, not a revived
+        # seam, so it is now unconditional.
+        # Not on a degraded run: _DEGRADED_NOTE already says the numbers
+        # understate and suppresses the percentage outright, and the finalize
+        # reply has a 4000-char body cap that a second paragraph saying the
+        # same thing pushes past -- measured, the reply truncated at 4386.
+        if not tiers_on and not degraded:
             cov.notes.append(
-                "The OPTIONAL entailment / adjudication tiers were NOT run for "
-                "this measurement, so the ambiguous similarity band is reported "
-                "as uncovered instead of being re-judged and the coverage "
-                "figure may UNDERSTATE real coverage. On a host-mode submit "
-                "this is deliberate: those tiers are only worth something when "
-                "a model OTHER than the one that wrote the cases re-judges "
-                "them, and in host mode the generator is the chat model "
-                "itself."
+                "Matching is deterministic similarity only: the entailment and "
+                "adjudication tiers that re-judged the ambiguous band were "
+                "deleted on 2026-08-16. Links under the HIGH band are reported "
+                "at MEDIUM confidence rather than discarded (2026-08-31), but "
+                "a genuine paraphrase can still fall under both bands, so this "
+                "figure UNDERSTATES coverage. Read NOT COVERED as 'no match "
+                "found', never as 'not tested'."
             )
 
         for i, row in enumerate(matrix):
             for j, score in enumerate(row):
-                if score >= high:
-                    links.append(
-                        MatchLink(
-                            item_id=scored[i].item_id,
-                            tc_id=test_cases[j].tc_id,
-                            score=float(score),
-                            confidence="MEDIUM" if degraded else "HIGH",
-                            tier=tier,
-                        )
+                if score < medium:
+                    continue
+                links.append(
+                    MatchLink(
+                        item_id=scored[i].item_id,
+                        tc_id=test_cases[j].tc_id,
+                        score=float(score),
+                        confidence=("MEDIUM" if degraded or score < high else "HIGH"),
+                        tier=tier,
                     )
+                )
 
         covered = {ln.item_id for ln in links}
         mapped_tcs = {ln.tc_id for ln in links}

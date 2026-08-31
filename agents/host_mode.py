@@ -1314,6 +1314,11 @@ class ParsedSubmission:
     suite: TestSuite
     dropped_count: int = 0
     dropped_reasons: list = dataclasses.field(default_factory=list)
+    # 2026-08-31 (F9): cases KEPT after their OPTIONAL `test_data` plan failed
+    # validation. Deliberately distinct from dropped_reasons -- the case is in
+    # the suite and the plan is not, and saying exactly that is the difference
+    # between a disclosure and a silent partial accept.
+    salvaged_reasons: list = dataclasses.field(default_factory=list)
     # Piece 1: the host's OPTIONAL cross-category duplicate review, SHAPE-validated
     # against this suite's tc_ids (see _extract_duplicate_groups). Still unscreened
     # -- screen_duplicate_groups applies the safety bounds before anything is
@@ -3467,22 +3472,47 @@ def _validate_suite(data: dict) -> ParsedSubmission:
     valid: list[TestCase] = []
     seen_ids: set[str] = set()
     dropped: list[str] = []
+    salvaged: list[str] = []
     for c in cases:
         if not isinstance(c, dict):
             dropped.append("a non-object entry in test_cases")
             continue
+        tc = None
         try:
             tc = TestCase(**c)
         except Exception as exc:
             raw_id = c.get("tc_id")
             tcid = raw_id if isinstance(raw_id, str) else "?"
-            # F15 (2026-08-30): the class name alone ("failed validation
-            # (ValidationError)") does not say WHICH field or WHICH rule, so a
-            # host cannot fix the case without re-deriving the schema. Name up
-            # to two field/message pairs; the messages are pydantic's own text,
-            # never the rejected VALUE, so nothing untrusted is echoed back.
-            dropped.append(f"{tcid}: failed validation ({_validation_detail(exc)})")
-            continue
+            # 2026-08-31 (F9): `test_data` is an OPTIONAL per-case provisioning
+            # plan, and ONE wrong key inside it ("example" for `example_value`,
+            # "seed account" for `seed_account`) used to discard the whole case.
+            # Measured: 4 of 9 cases lost, the category then accepted at 5 with
+            # a success-shaped reply. TestDataItem's own docstring justifies the
+            # strict enum by "the per-category retry regenerates it" -- there is
+            # no retry on this path. Salvage the CASE, drop only the plan, and
+            # say so.
+            if isinstance(c.get("test_data"), list) and c.get("test_data"):
+                try:
+                    tc = TestCase(
+                        **{k: v for k, v in c.items() if k != "test_data"}
+                    )
+                except Exception:
+                    tc = None
+            if tc is None:
+                # F15 (2026-08-30): the class name alone ("failed validation
+                # (ValidationError)") does not say WHICH field or WHICH rule,
+                # so a host cannot fix the case without re-deriving the schema.
+                # Name up to two field/message pairs; the messages are
+                # pydantic's own text, never the rejected VALUE, so nothing
+                # untrusted is echoed back.
+                dropped.append(
+                    f"{tcid}: failed validation ({_validation_detail(exc)})"
+                )
+                continue
+            salvaged.append(
+                f"{tcid}: kept, but its `test_data` plan was dropped "
+                f"({_validation_detail(exc)})"
+            )
         if tc.tc_id in seen_ids:
             dropped.append(f"{tc.tc_id}: duplicate tc_id")
             continue
@@ -3530,6 +3560,7 @@ def _validate_suite(data: dict) -> ParsedSubmission:
         suite=suite,
         dropped_count=len(dropped),
         dropped_reasons=dropped[:_MAX_DROPPED_REASONS],
+        salvaged_reasons=salvaged[:_MAX_DROPPED_REASONS],
         duplicate_groups=groups,
         duplicate_notes=dup_notes,
         duplicate_review_offered=dup_offered,

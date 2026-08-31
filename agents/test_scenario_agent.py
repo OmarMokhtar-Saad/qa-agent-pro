@@ -1605,17 +1605,34 @@ async def _prepare_generation(
         # thread appended to it. The grounding checks read this.
         target_description = _strip_html(url_content.get("description", "") or "")
         if jira_context_text:
+            # 2026-08-31 (F1): this was `jira_context_text[:3000]`. Slicing
+            # BEFORE wrap_untrusted defeated its own "...[truncated]" marker,
+            # so a 4.6 KB ticket lost its message table, its design link and
+            # all sixteen comments with nothing said anywhere. Hand the cap to
+            # wrap_untrusted instead and let it disclose the cut.
             parts.append(
                 "## Feature Documentation\n"
-                + wrap_untrusted("jira_or_web_content", jira_context_text[:3000])
+                + wrap_untrusted(
+                    "jira_or_web_content",
+                    jira_context_text,
+                    limit=settings.jira_max_context_chars or 12000,
+                )
             )
         # _raw_ac_text is the SAME _strip_html(acceptance_criteria) value,
         # hoisted above the enrichment gather for Pass 1 — computed once here
         # rather than maintained in two places.
         if _raw_ac_text:
+            # 2026-08-31 (F2): same defect, same fix -- the 2000-char slice cut
+            # SHYJ-10051's acceptance criteria mid-word at "BR07: Upon", so
+            # seven of fourteen rules never reached the model OR the coverage
+            # report, undisclosed.
             parts.append(
                 "## Acceptance Criteria\n"
-                + wrap_untrusted("jira_acceptance_criteria", _raw_ac_text[:2000])
+                + wrap_untrusted(
+                    "jira_acceptance_criteria",
+                    _raw_ac_text,
+                    limit=settings.jira_max_ac_chars or 6000,
+                )
             )
         if parent_context:
             # Its OWN untrusted label, never folded into jira_or_web_content:

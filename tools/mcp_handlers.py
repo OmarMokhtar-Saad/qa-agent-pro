@@ -5667,13 +5667,30 @@ def _dropped_note(parsed) -> str:
     ops-3c review finding was that dropped_count must never be swallowed at this
     layer. dropped_reasons is already capped upstream (parse_host_suite)."""
     n = getattr(parsed, "dropped_count", 0) or 0
-    if not n:
+    salvaged = getattr(parsed, "salvaged_reasons", None) or []
+    if not n and not salvaged:
         return ""
-    reasons = getattr(parsed, "dropped_reasons", None) or []
-    lines = [
-        f"> ⚠️  {n} submitted case(s) were dropped as malformed and are not included:"
-    ]
-    lines += [f">   - {r}" for r in reasons]
+    lines: list[str] = []
+    if n:
+        reasons = getattr(parsed, "dropped_reasons", None) or []
+        lines.append(
+            f"> ⚠️  {n} submitted case(s) were dropped as malformed and are "
+            "not included:"
+        )
+        lines += [f">   - {r}" for r in reasons]
+    if salvaged:
+        # 2026-08-31 (F9): these cases ARE in the suite -- only their optional
+        # test-data plan was rejected. Reporting them under the "dropped" line
+        # would be worse than silence: it would say a case is missing when it
+        # is not.
+        if lines:
+            lines.append(">")
+        lines.append(
+            f"> ℹ️  {len(salvaged)} case(s) were KEPT with their optional "
+            "`test_data` plan removed, because that plan failed validation. "
+            "The steps and expected results are unchanged:"
+        )
+        lines += [f">   - {r}" for r in salvaged]
     return "\n".join(lines) + "\n\n"
 
 

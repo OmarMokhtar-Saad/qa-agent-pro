@@ -233,6 +233,19 @@ class Settings(BaseSettings):
     # huge epic description can never crowd out the sub-task under test. 0
     # means "emit no background block" (same convention as jira_max_comments),
     # which is why this field is deliberately NOT in _POSITIVE_INT_FIELDS.
+    # 2026-08-31 (F1/F2): the whole ticket used to be head-sliced at a
+    # hardcoded 3000 chars BEFORE wrap_untrusted, so its "...[truncated]"
+    # marker never fired and the appended comment thread silently never
+    # reached a model. Both caps are now passed INTO wrap_untrusted, which
+    # marks the cut, and both are raised: the atomic checklist already reads
+    # 12000 chars of the SAME description, so a smaller generation budget
+    # guaranteed the coverage denominator held requirements the generator was
+    # never shown. 0 keeps the wrap_untrusted default rather than emitting
+    # nothing, so a mis-set value cannot blank the prompt.
+    jira_max_context_chars: int = 12000
+    # Same fix for the acceptance-criteria block, cut at 2000. Measured on
+    # SHYJ-10051 that dropped BR08..BR14 of a fourteen-rule ticket, mid-word.
+    jira_max_ac_chars: int = 6000
     jira_max_parent_chars: int = 2500
 
     # 2026-08-03 (user-approved) -- the sibling USER STORIES under the same
@@ -736,6 +749,17 @@ class Settings(BaseSettings):
     # fallback uses its own fixed constants in tools/rtm.py because its scores
     # live on a different scale.
     qa_checklist_match_high: float = 0.75
+    # 2026-08-31 (F6): scores in [medium, high) were reported as UNCOVERED
+    # because the two LLM re-judging tiers that owned that band were deleted
+    # on 2026-08-16 and nothing replaced them. Measured on suite
+    # ff45816692044c4a: 10 of 17 items were called gaps and at least 6 were
+    # near-verbatim matches -- "send the objection request and comment to
+    # Seha" against "Objection request and comment are sent to Seha on
+    # successful submission" -- while every match that DID land scored
+    # 0.75..0.80, i.e. the true matches lived right under the cut-off. The
+    # band is now reported as MEDIUM-confidence links that COUNT as covered,
+    # and every renderer prints the confidence so a weak link stays visible.
+    qa_checklist_match_medium: float = 0.62
     # Phase-0 granularity gate. Below this the decomposition is reported as
     # probably inflated / under-split -- ADVISORY only, it never blocks
     # generation (house rule: log and degrade).
@@ -1202,6 +1226,7 @@ class Settings(BaseSettings):
 
     @field_validator(
         "qa_checklist_match_high",
+        "qa_checklist_match_medium",
         "qa_checklist_min_granularity",
         "qa_rag_similar_min_score",
         mode="before",
@@ -1293,6 +1318,8 @@ class Settings(BaseSettings):
         "jira_max_comments",
         "jira_max_images",
         "jira_max_image_bytes",
+        "jira_max_context_chars",
+        "jira_max_ac_chars",
         "jira_max_parent_chars",
         "jira_max_sibling_chars",
         "jira_max_sibling_stories",
