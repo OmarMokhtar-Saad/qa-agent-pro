@@ -352,7 +352,14 @@ _UC_AC_LABELS = frozenset(
 # Confluence/Jira rich-text leaves these inline nodes in the markdown export.
 _UC_CUSTOM_TAG_RE = re.compile(r"<custom\b[^>]*>.*?</custom>|<custom\b[^>]*/?>", re.S)
 _UC_MAX_CRITERIA = 12
-_UC_MAX_CRITERION_CHARS = 600
+# 2026-08-31 (F2, corrected): 600 was the cap that actually cut SHYJ-10051's
+# acceptance criteria mid-word at "BR07: Upon" -- the block-level slice in
+# agents/test_scenario_agent got the blame first, and raising it alone changed
+# nothing, because a UC table puts EVERY business rule in ONE row and this cap
+# is per row. Fourteen rules need roughly 2000 characters. The total stays
+# bounded (_UC_MAX_CRITERIA rows) and the composed block is capped again, with
+# a visible marker, by wrap_untrusted at settings.jira_max_ac_chars.
+_UC_MAX_CRITERION_CHARS = 2500
 
 
 def _extract_ac_from_uc_table(description: str) -> str:
