@@ -11,8 +11,11 @@ the install current WITHOUT restarting the editor:
    itself once no tool is running (within one check interval) and the
    recorded MCP initialize handshake is replayed — the editor keeps its
    session, nothing to do. Set QA_DRIFT_RESTART_ENABLED=false to disable.
-3. If the server ever crashes it is respawned the same way.
-4. qa-doctor is retried across such a reload automatically: the
+3. On SIGUSR1: the same reload, immediately, instead of waiting for the
+   next poll -- this is what `qa-restart` sends. It still waits for the
+   session to go idle, so a running generation is never interrupted.
+4. If the server ever crashes it is respawned the same way.
+5. qa-doctor is retried across such a reload automatically: the
    client makes ONE call and gets the final, post-reload report.
 
 stdout carries the MCP protocol; every log line goes to stderr. A network
@@ -23,6 +26,7 @@ import json
 import logging
 import os
 import random
+import signal
 import subprocess
 import sys
 import threading
@@ -709,6 +713,34 @@ class Supervisor:
                 log.warning("Background update check failed (%s) — will retry.", exc)
 
 
+def _manual_restart(sup) -> None:
+    """Reload the server because something asked us to, not because the
+    update poll noticed a change: `qa-restart` (and anything else that can
+    send SIGUSR1) gets an immediate reload instead of waiting up to
+    QA_UPDATE_INTERVAL_MINUTES for the next tick.
+
+    The idle wait is kept deliberately: restart_child() terminate()s the
+    child and the child's in-flight drain does NOT apply to a launcher
+    SIGTERM, so an immediate kill could destroy a running generation. The
+    editor keeps its session either way -- spawn(replay=True) re-plays the
+    recorded handshake."""
+    reason = "manual restart request"
+    try:
+        # The watchdog may already be swapping the child; a second pass
+        # would only restart what is about to be fresh anyway.
+        if getattr(sup, "restarting", False):
+            log.info("%s ignored — a restart is already in progress.", reason)
+            return
+        # Logged only once the wait SUCCEEDS: a launcher that is closing
+        # never restarts, and claiming it did would misread the log.
+        if not sup.wait_for_idle(reason):
+            return
+        log.info("%s — restarting the MCP server now.", reason)
+        sup.restart_child(reason)
+    except Exception as exc:  # a failed manual restart must not end the session
+        log.warning("Manual restart failed (%s) — the current server keeps serving.", exc)
+
+
 def main() -> int:
     # stderr is rendered as '[error] ...' by MCP clients (Cursor showed
     # every updater INFO line as an error on the v1.38.0 validation run),
@@ -778,6 +810,17 @@ def main() -> int:
         sup.spawn(replay=True)
     else:
         sup.spawn(replay=False)
+    def _on_restart_signal(_sig, _frame):
+        # Signal handlers must return immediately; the restart (which waits
+        # for an idle session) belongs on its own thread.
+        threading.Thread(target=_manual_restart, args=(sup,), daemon=True).start()
+
+    try:
+        signal.signal(signal.SIGUSR1, _on_restart_signal)
+    except (AttributeError, ValueError, OSError):
+        # Windows has no SIGUSR1, and a non-main thread cannot register one.
+        # An install without on-demand restart still self-updates on its poll.
+        log.debug("SIGUSR1 restart trigger unavailable on this platform")
     threading.Thread(target=sup.watchdog, daemon=True).start()
     sup.pump_client_in()  # blocks until the editor disconnects
     return 0
