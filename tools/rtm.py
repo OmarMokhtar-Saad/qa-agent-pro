@@ -810,13 +810,14 @@ def rtm_oneline(
     try:
         if not acs:
             return ""
-        ac_norm_ids = {normalize_ac_id(ac.ac_id) for ac in acs}
-        covered_ids = {
-            normalize_ac_id(tc.requirement_id)
-            for tc in test_cases
-            if normalize_ac_id(tc.requirement_id) in ac_norm_ids
-        }
-        covered = len(covered_ids)
+        # 2026-08-31 (F4): this used to re-derive its own id match from
+        # normalize_ac_id, which is the ONE thing _trace_map's docstring says it
+        # exists to prevent. The two then disagreed inside a single reply: the
+        # orphan line said 19 of 66 cases were untraced and this line, four
+        # lines above it, said 66 of 66 were -- because only _trace_map had
+        # learned to match a case tagged `BR07` to the criterion that IS BR07.
+        ac_to_tcs, orphan_tc_ids = _trace_map(list(acs), list(test_cases or []))
+        covered = sum(1 for tcs in ac_to_tcs.values() if tcs)
         total = len(acs)
         orphans = total - covered
         kind = "MODEL-DERIVED acceptance criteria" if derived else "acceptance criteria"
@@ -833,12 +834,8 @@ def rtm_oneline(
         # cases at all, which keeps the stored-suite re-render byte-identical.
         cases = list(test_cases or [])
         if cases:
-            traced = sum(
-                1
-                for tc in cases
-                if normalize_ac_id(getattr(tc, "requirement_id", None)) in ac_norm_ids
-            )
-            untraced = len(cases) - traced
+            untraced = len(orphan_tc_ids)
+            traced = len(cases) - untraced
             line += f" {traced} of {len(cases)} case(s) trace to one of them"
             line += f"; {untraced} trace to none." if untraced else "."
         if derived:
