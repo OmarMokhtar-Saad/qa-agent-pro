@@ -952,6 +952,19 @@ _LEXICAL_HIGH = 0.45
 # would silently understate coverage; the work is simply offloaded to a thread.
 _MATRIX_CELL_WARN = 20000
 
+# 2026-08-31 (F7). Emitted on EVERY non-degraded measurement -- see the call
+# site for why it may not be conditioned on the deleted tiers or on the caller's
+# allow_llm_tiers argument.
+DETERMINISTIC_ONLY_NOTE = (
+    "Matching is deterministic similarity only: the entailment and "
+    "adjudication tiers that re-judged the ambiguous band were "
+    "deleted on 2026-08-16. Links under the HIGH band are reported "
+    "at MEDIUM confidence rather than discarded (2026-08-31), but "
+    "a genuine paraphrase can still fall under both bands, so this "
+    "figure UNDERSTATES coverage. Read NOT COVERED as 'no match "
+    "found', never as 'not tested'."
+)
+
 _DEGRADED_NOTE = (
     "No embeddings backend was available, so requirement matching used the "
     "pure-lexical TF-IDF fallback. TF-IDF cosine between an EARS requirement and "
@@ -1184,7 +1197,6 @@ async def match_checklist(
             )
 
         links: list[MatchLink] = []
-        tiers_on = bool(allow_llm_tiers)
         # Phase 3b: `notes` is this module's OWN established channel for "this
         # measurement was degraded" (see _DEGRADED_NOTE) and is the only one
         # that survives into render_checklist_section, coverage_to_dict, the
@@ -1208,16 +1220,15 @@ async def match_checklist(
         # understate and suppresses the percentage outright, and the finalize
         # reply has a 4000-char body cap that a second paragraph saying the
         # same thing pushes past -- measured, the reply truncated at 4386.
-        if not tiers_on and not degraded:
-            cov.notes.append(
-                "Matching is deterministic similarity only: the entailment and "
-                "adjudication tiers that re-judged the ambiguous band were "
-                "deleted on 2026-08-16. Links under the HIGH band are reported "
-                "at MEDIUM confidence rather than discarded (2026-08-31), but "
-                "a genuine paraphrase can still fall under both bands, so this "
-                "figure UNDERSTATES coverage. Read NOT COVERED as 'no match "
-                "found', never as 'not tested'."
-            )
+        # 2026-08-31, third pass. Guarding this on `tiers_on` reproduced the very
+        # defect F7 is about, one level up: the real submit path passes
+        # allow_llm_tiers=not host_suppress_llm_tiers, which is True on a normal
+        # finalize, so the note STILL never reached a workbook -- verified by
+        # replaying SHYJ-10051 and finding no "Matcher note" row. The tiers were
+        # DELETED in 2026-08-16 and cannot run at any flag value, so whether the
+        # caller would have allowed them says nothing about this measurement.
+        if not degraded:
+            cov.notes.append(DETERMINISTIC_ONLY_NOTE)
 
         for i, row in enumerate(matrix):
             for j, score in enumerate(row):
