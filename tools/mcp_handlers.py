@@ -4170,15 +4170,21 @@ def _pending_image_gate_hint(
         # Normalize EXACTLY as the gate does before asking, or the predicate is
         # shared in name only:
         #   * drop empty entries (C5) -- [None] / [b""] / [""] is not a screen;
-        #   * count only captures that RESOLVE. _peek_captures is read-only and
-        #     never raises; an unknown, expired or over-cap id comes back in
-        #     `missing` and contributes nothing, so the gate still asks. Treating
-        #     a stale id as a supplied screen is what silenced this hint on the
-        #     commonest capture failure there is.
+        #   * resolve captures the way the gate WILL see them. This is the
+        #     subtle one and it has now been wrong in both directions.
+        #     _peek_captures reads the TRAY only, but the gate runs after
+        #     _revive_captures has pulled re-sent ids back off the carry-forward
+        #     SHELF -- so a shelved id (the documented "re-send the SAME
+        #     capture_ids" path, which _carry_forward_or_refuse also injects
+        #     into capture_ids) looked unresolvable here and resolvable there:
+        #     the hint promised a screens question that never came. That FALSE
+        #     PROMISE is worse than the false negative it replaced, because a
+        #     tester acts on it. _resolvable_captures answers tray-OR-shelf
+        #     without moving anything, which is what this pre-clarify position
+        #     requires.
         supplied = [i for i in (attached_images or []) if i]
         if not supplied and capture_ids:
-            _resolved, _labels, _missing = _peek_captures(list(capture_ids))
-            supplied = [i for i in (_resolved or []) if i]
+            supplied = list(_resolvable_captures(list(capture_ids)))
         if not _image_gate_would_fire(
             text,
             _normalize_source_plan(source_plan),
