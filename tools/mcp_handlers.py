@@ -70,7 +70,7 @@ from tools.jira_mcp import (
     looks_like_jira_url,
     not_connected_message,
     verify_directive,
-    verify_result_message,
+    verify_outcome,
     verify_tool_name,
 )
 from tools.playwright_exporter import generate_playwright_script
@@ -1739,7 +1739,10 @@ async def handle_configure_jira(
     in ``atlassian_verify_json`` it parses the blob defensively (size-capped,
     ``json.loads`` only, never eval, no assumed schema) and reports a REAL
     verified / not-connected verdict. That blob is read once, never persisted
-    and never logged -- only its PRESENCE reaches the audit record.
+    and never logged -- only its PRESENCE reaches the audit record, and only the
+    resulting yes/no, its timestamp and the probe tool's NAME reach the verdict
+    store (``tools/verify_store.py``). No account id, email or display name is
+    kept, which is what the tester-facing reply promises.
     """
     try:
         host = ""
@@ -1773,8 +1776,40 @@ async def handle_configure_jira(
             # Return half of the live check: the AGENT already made the
             # read-only atlassianUserInfo call with its OWN Atlassian MCP
             # connection, so all that is left here is parsing what it handed
-            # back. No LLM call, no HTTP request, nothing stored.
-            return verify_result_message(verification)
+            # back. No LLM call, no HTTP request.
+            status, message = verify_outcome(verification)
+            # 2026-09-01 (item A): the VERDICT is persisted, the payload is not.
+            # Only {verified, at, tool} reaches the store -- never the account
+            # id, the email, the display name, or any fragment of the raw JSON
+            # -- so the "we did not keep that identity" promise this reply makes
+            # still holds, while qa-doctor stops re-raising a question that was
+            # just answered (and can therefore reach "Ready" again).
+            #
+            # "unknown" establishes NOTHING and deliberately does not overwrite
+            # an earlier verdict: an agent that fumbles the hand-back must not
+            # be able to erase a good result.
+            if status in ("verified", "failed"):
+                from tools.verify_store import record_verdict
+
+                _stored = await record_verdict(
+                    status == "verified", verify_tool_name()
+                )
+                # verify_store never raises -- it reports. A discarded report is
+                # how the reply came to promise a week of remembered state that
+                # a locked suites.db had not written.
+                if not (isinstance(_stored, dict) and _stored.get("content")):
+                    logger.warning(
+                        "verify_store: the verdict was not recorded (%s)",
+                        (_stored or {}).get("error"),
+                    )
+                    message = message.replace(
+                        "It records only that a check succeeded, when, and "
+                        "which tool was called, so `qa-doctor` stops asking "
+                        "again for the next week.",
+                        "I could not write this result down, so `qa-doctor` "
+                        "will ask again -- the check itself still stands.",
+                    )
+            return message
         preamble = (
             "\u2139\ufe0f **Nothing was saved -- and nothing needs to be.**\n\n"
             if (email or api_token)
@@ -1997,6 +2032,22 @@ def _rejected_plan_note(raw: str) -> str:
         return ""
 
 
+def _gated_not_unsupported() -> bool:
+    """True when THIS client's dialogs are switched off by the strike gate
+    rather than absent from the client.
+
+    Both states reach _image_gate_menu_markdown as "unavailable", and only
+    one of them is a statement about the client's capabilities. Never raises
+    -- a read failure means "not gated", which falls back to the wording that
+    was already there.
+    """
+    try:
+        return bool(elicit_client_gated())
+    except Exception:
+        logger.debug("gated-cause read failed", exc_info=True)
+        return False
+
+
 def _image_gate_menu_markdown(elicit_status: str = "", rejected_plan: str = "") -> str:
     """BEAT 1 tier-3 fallback: the menu as an instruction to the HOST assistant.
 
@@ -2015,7 +2066,18 @@ def _image_gate_menu_markdown(elicit_status: str = "", rejected_plan: str = "") 
     2026-08-13 and hardcoded ON, so _elicit_enabled() is the True constant and
     the only surviving cause is both callbacks being absent.
     Defaults to "" (cause unknown), which words it as a plain statement of fact
-    with no cause attributed. Never raises."""
+    with no cause attributed.
+
+    2026-09-01: the "unavailable" label is NOT proof of a client limitation.
+    A client gated by ``elicit_client_gated()`` arrives with both callbacks
+    None and is labelled ``unavailable/unavailable`` ON PURPOSE, so the
+    mcp_image_gate_beat1 audit row stays byte-identical (see
+    _elicit_source_plan_status). Translating that into "your MCP client does
+    not support elicitation dialogs" is false for the very client that earns
+    the gate -- Cursor SHOWED the dialog and dismissed it -- and it is the
+    over-claim this function was written to remove. The gate is asked
+    directly rather than inferred from a label that never carried capability.
+    Never raises."""
     _cause = "could not be shown to you inline"
     if elicit_status.endswith("/chosen"):
         # 2026-08-31: the tester ANSWERED -- the text tier reported CHOSEN and
@@ -2036,6 +2098,11 @@ def _image_gate_menu_markdown(elicit_status: str = "", rejected_plan: str = "") 
         )
     elif "declined" in elicit_status:
         _cause = "was shown inline and dismissed"
+    elif "unavailable" in elicit_status and _gated_not_unsupported():
+        _cause = (
+            "was not asked again -- an earlier dialog this session was dismissed "
+            "without an answer, so I stopped spending round trips on dialogs"
+        )
     elif "unavailable" in elicit_status:
         _cause = (
             "could not be shown inline because your MCP client does not support "
@@ -12925,6 +12992,56 @@ def _update_rate_limit_advisory(status: str) -> str:
     )
 
 
+def _jira_status_text(state: str, view: dict | None) -> str:
+    """The Integrations row for Jira, as one of four states.
+
+    Every other row in that table leads with a state glyph -- Python, Excel
+    auto-export, and each feature gate -- so the Jira row's blankness was the
+    only cell in a table of verdicts that carried none, and absence reads as
+    "nothing to flag". This server genuinely cannot see the tester's Atlassian
+    OAuth session, so the honest default is "not checked yet", never "working"
+    and never "broken".
+
+    Pure and total: no store read, no clock, no settings, so freshness is
+    decided once by the caller and never re-derived here. Never raises.
+    """
+    head = "\U0001f517 **Jira** \u2014 "
+    tail = (
+        "Jira is read through YOUR Atlassian MCP connection (OAuth, Jira "
+        "Cloud) \u2014 nothing to configure on this machine."
+    )
+    # _ago_label tops out at hours, and "stale" means a WEEK by definition, so
+    # the state this matters most for would have read "168 hour(s) ago". Days
+    # are formatted here rather than in the shared helper, whose other callers
+    # report minutes-old preps and want its existing behaviour.
+    _age_s = float((view or {}).get("age_s") or 0)
+    if _age_s >= 48 * 3600:
+        _days = int(_age_s // (24 * 3600))
+        age = f"{_days} day{'s' if _days != 1 else ''}"
+    else:
+        age = _ago_label(_age_s)
+    if state == "verified":
+        return f"{head}\u2705 checked and working ({age} ago). {tail}"
+    if state == "stale":
+        return (
+            f"{head}\u26a0\ufe0f checked {age} ago and not re-checked since. "
+            f"{tail} An OAuth session can expire or be revoked in that time, so "
+            "I'll re-check it."
+        )
+    if state == "failed":
+        return (
+            f"{head}\u274c the last check ({age} ago) did not come back "
+            f"connected. {tail} Paste a ticket URL, or run `qa_configure_jira`, "
+            "and I'll show the exact connection steps for your client."
+        )
+    return (
+        f"{head}\u26a0\ufe0f not checked yet. {tail} I can't see that connection "
+        "from here, so I haven't confirmed it's signed in \u2014 it's probably "
+        "fine; if a ticket URL fails I'll show the exact connection steps for "
+        "your client."
+    )
+
+
 def _overall_verdict(
     blocker_count: int, recommended_count: int, unverified_count: int
 ) -> str:
@@ -12951,8 +13068,7 @@ def _overall_verdict(
         return "\u26a0\ufe0f **Ready, with warnings** \u2014 see Action items below"
     if unverified_count:
         return (
-            "\u26a0\ufe0f **Ready \u2014 one check unverified**, "
-            "see Action items below"
+            "\u26a0\ufe0f **Ready \u2014 one check unverified**, see Action items below"
             if unverified_count == 1
             else f"\u26a0\ufe0f **Ready \u2014 {unverified_count} checks "
             "unverified**, see Action items below"
@@ -13231,13 +13347,47 @@ async def handle_setup_check(
         # BEFORE connect_hint_line, deliberately: that helper re-reads the config
         # from disk, so a fresh write flips its message to "already configured on
         # disk" instead of telling the tester to add what was just added.
+        # 2026-09-01 (item A): the verdict recorded by a previous
+        # qa_configure_jira probe, for THIS client. Read ONCE, here, because
+        # three separate sites need it -- the on-disk hint below, the
+        # Integrations row, and the report headline -- and a report whose three
+        # Jira statements disagree with each other is worse than one guess.
+        #
+        # Guarded: verify_store never raises, and this makes a broken read
+        # degrade to "never verified", which is exactly the pre-A behaviour. It
+        # must not reach this function's outer `except`, which would replace the
+        # ENTIRE report with a failure line over a verdict lookup.
+        _verdict_view = None
+        try:
+            from tools.verify_store import load_verdict
+
+            _verdict_view = (await load_verdict()).get("content")
+        except Exception:
+            logger.debug("atlassian verdict lookup skipped", exc_info=True)
+        if not _verdict_view:
+            _verdict_state = "unverified"
+        elif not _verdict_view.get("verified"):
+            _verdict_state = "failed"
+        elif _verdict_view.get("fresh"):
+            _verdict_state = "verified"
+        else:
+            _verdict_state = "stale"
         _atlassian_lines, _atlassian_advisories = await _atlassian_autofix()
         recommended.extend(_atlassian_advisories)
-        # verify_offered=True: _verify_item above is an unconditional
-        # "Fix now" that settles the same question, so the on-disk hint
-        # returns "" rather than shrugging beside it. The CONNECT wording
-        # (no entry on disk) is unaffected and still appears.
-        _hint = connect_hint_line(workspace_roots=workspace_roots, verify_offered=True)
+        # verify_offered: the on-disk hint returns "" rather than shrugging
+        # beside an answer this report has already given. A "Fix now" item
+        # settles it in the unverified state; the Integrations row states it in
+        # the other three. The CONNECT wording (no entry on disk) is unaffected
+        # and still appears.
+        _hint = connect_hint_line(
+            workspace_roots=workspace_roots,
+            # True in EVERY verdict state: unverified carries a Fix-now item,
+            # and verified / stale / failed each state the answer on the
+            # Integrations row. There is no state in which this report both
+            # says nothing and leaves an entry on disk unexplained, so the
+            # hedge would always contradict something already printed.
+            verify_offered=True,
+        )
         if _hint:
             optional.append(_hint)
         # Fix 7 / M3 (2026-08-03): the ONLY discoverable path to registration.
@@ -13255,12 +13405,7 @@ async def handle_setup_check(
             "idempotent, preserves your other MCP servers, and backs up any file "
             "it changes."
         )
-        _jira_status_line = (
-            "\U0001f517 **Jira** \u2014 read through YOUR Atlassian MCP "
-            "connection (OAuth, Jira Cloud). Nothing to configure here; if a "
-            "ticket URL fails I'll show the exact connection steps for your "
-            "client."
-        )
+        _jira_status_line = _jira_status_text(_verdict_state, _verdict_view)
 
         export_line = ""
         export_dir = _resolved_export_dir()
@@ -13354,12 +13499,65 @@ async def handle_setup_check(
         except Exception:
             logger.debug("flag-registry expiry check skipped", exc_info=True)
 
-        # The Atlassian probe item is unconditional and tagged "Fix now", so it
-        # counts here even though it is in neither list -- see _overall_verdict.
-        # The "✅ Ready" branch is unreachable while the probe can never be
-        # settled from this process; it returns when a verified verdict is
-        # persisted (item A) and the probe item drops out.
-        verdict = _overall_verdict(len(blockers), len(recommended), 1)
+        # 2026-09-01 (item A): FOUR states, not one. Re-raising "Fix now:
+        # verify" a minute after a successful probe trains agents to ignore the
+        # item, and an item that can never be satisfied is not an action item --
+        # it is what pinned the headline off "Ready" on every install.
+        #
+        # This block is deliberately ABOVE the headline: the stale and failed
+        # states append to `recommended`, which _overall_verdict counts. Built
+        # at the action-item site instead, the headline would ignore an item
+        # printed below it -- the defect 0b5b0f77 fixed.
+        _verify_ask = (
+            f"call `{verify_tool_name()}` (read-only, no parameters), then "
+            "`qa_configure_jira` with `atlassian_verify_json` set to that "
+            'call\'s raw JSON -- or to `{"error": "<what happened>"}` if the '
+            "tool is missing or fails. See *Verify the Jira (Atlassian) "
+            "connection* above."
+        )
+        _verify_items: list[tuple[str, str]] = []
+        if _verdict_state == "verified":
+            pass  # Answered, and recently. The Integrations row states it.
+        elif _verdict_state == "stale":
+            # RECOMMENDED, not Fix now: something did work, so this is a nudge,
+            # not a fault.
+            recommended.append(
+                "Agent: the Atlassian (Jira) connection verified at "
+                f"{(_verdict_view or {}).get('at')} and has not been re-checked "
+                "since -- an OAuth grant can be revoked or rotated in that "
+                "time. Re-verify now, without asking the tester: " + _verify_ask
+            )
+        elif _verdict_state == "failed":
+            # Known-broken and actionable to the TESTER, so a warning rather
+            # than an unsettled question. Not a blocker: generation from a typed
+            # feature description is entirely unaffected.
+            recommended.append(
+                "The Atlassian (Jira) connection failed its last check "
+                f"({(_verdict_view or {}).get('at')}), so ticket URLs will not "
+                "work until it is reconnected in your editor. Test generation "
+                "from a typed feature description is unaffected. Agent: "
+                "re-check it now, without asking the tester: " + _verify_ask
+            )
+        else:
+            _verify_items = [
+                (
+                    "Fix now",
+                    "Agent: the Atlassian (Jira) connection above is a GUESS "
+                    "from on-disk config -- an entry can be present and "
+                    "unauthorized, or absent and working through a hosted "
+                    "connector. Verify it now, before you summarise this "
+                    "report and without asking the tester: " + _verify_ask,
+                )
+            ]
+        # Only the "unverified" state is an unsettled question. A stale or
+        # failed verdict is something KNOWN, and its item is in `recommended`,
+        # where it reads as "Ready, with warnings" rather than "unverified".
+        # This is the line that makes "✅ Ready" reachable again.
+        verdict = _overall_verdict(
+            len(blockers),
+            len(recommended),
+            1 if _verdict_state == "unverified" else 0,
+        )
 
         lines = [
             "## Setup check",
@@ -13438,19 +13636,8 @@ async def handle_setup_check(
         # the probe call. An unverified OAuth session is now an open "Fix now"
         # item, listed FIRST, naming both calls. It is advice to the AGENT, not
         # to the tester, and costs one read-only call.
-        _verify_item = (
-            "Agent: the Atlassian (Jira) connection above is a GUESS from "
-            "on-disk config -- an entry can be present and unauthorized, or "
-            "absent and working through a hosted connector. Verify it now, "
-            "before you summarise this report and without asking the tester: "
-            f"call `{verify_tool_name()}` (read-only, no parameters), then "
-            "`qa_configure_jira` with `atlassian_verify_json` set to that "
-            'call\'s raw JSON -- or to `{"error": "<what happened>"}` if the '
-            "tool is missing or fails. See *Verify the Jira (Atlassian) "
-            "connection* above."
-        )
         items = (
-            [("Fix now", _verify_item)]
+            _verify_items
             + [("Fix now", item) for item in blockers]
             + [("Recommended", item) for item in recommended]
             + [("Optional", item) for item in optional]

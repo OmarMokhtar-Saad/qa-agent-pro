@@ -295,14 +295,23 @@ def _keyless_node_text(node: dict) -> str:
     return ""
 
 
-def _extract_adf_text(node: dict, depth: int = 0) -> str:
+def _extract_adf_text(node: dict, depth: int = 0, truncated: list | None = None) -> str:
     """Recursively extract plain text from Atlassian Document Format.
 
     The Atlassian MCP server returns the SAME ADF documents the REST API did, so
     this is unchanged. Guards against pathologically deep / self-referential
     blobs by capping recursion at _MAX_ADF_DEPTH.
+
+    ``truncated`` is an optional SINK: when the depth cap fires, a marker is
+    appended to it. The cap is a security control and stays, but it used to be
+    SILENT -- a description nested past the limit came back as "" and the caller
+    could not tell that from a genuinely empty body, so a whole suite could be
+    written from the summary alone with no disclosure. Default ``None`` keeps
+    every existing call site byte-identical.
     """
     if depth > _MAX_ADF_DEPTH:
+        if truncated is not None:
+            truncated.append(True)
         return ""
     if not isinstance(node, dict):
         return ""
@@ -318,7 +327,7 @@ def _extract_adf_text(node: dict, depth: int = 0) -> str:
             return keyless
     if not isinstance(content, list):
         return ""
-    parts = [_extract_adf_text(child, depth + 1) for child in content]
+    parts = [_extract_adf_text(child, depth + 1, truncated) for child in content]
     sep = (
         "\n"
         if node.get("type")
@@ -326,6 +335,23 @@ def _extract_adf_text(node: dict, depth: int = 0) -> str:
         else " "
     )
     return sep.join(p for p in parts if p.strip())
+
+
+def adf_text_with_depth_flag(value: object) -> tuple[str, bool]:
+    """``(text, hit_depth_cap)`` for a field that may be ADF.
+
+    The second element is what :func:`_as_text` cannot say: whether the text is
+    short because the ticket is short, or because _MAX_ADF_DEPTH stopped the
+    walk. Never raises.
+    """
+    try:
+        if isinstance(value, dict):
+            sink: list = []
+            return _extract_adf_text(value, truncated=sink), bool(sink)
+        return _as_text(value), False
+    except Exception:
+        logger.exception("adf_text_with_depth_flag failed - dropping the value")
+        return "", False
 
 
 def _as_text(value: object) -> str:
@@ -741,6 +767,19 @@ _IMAGE_LABEL_RE = re.compile(r"(?:\*\*|#+\s*)([^*\n]{1,48}?)\s*(?:\*\*)?\s*$")
 _LABEL_SAFE_RE = re.compile(r"^[\w #.\-/()\[\]]{1,32}$")
 _MAX_IMAGE_LABELS = 8
 
+# The label can only be on the line ABOVE the reference, so only that much text
+# needs looking at. Slicing body[: m.start()] instead made the walk quadratic in
+# the untrusted description (1.2s at 40k refs, against 0.012s for the counter
+# over the same body). 8 KB is ~68x the 120 characters actually read.
+#
+# HONEST ABOUT THE BOUND: this is narrower than the old walk, not equivalent.
+# Two shapes lose a label they used to find -- a label separated from its image
+# by more than 8 KB of whitespace, and a first label appearing after reference
+# #500. Neither is a ticket a human wrote (_MAX_IMAGE_REFS is 50), and the
+# failure direction is a missing label, never a wrong one.
+_LABEL_LOOKBEHIND_CHARS = 8192
+_MAX_LABEL_SCAN_REFS = 500
+
 
 def _image_ref_labels(text: object) -> list:
     """Short labels the DESCRIPTION gives its embedded images ("UI#01"), in
@@ -753,8 +792,12 @@ def _image_ref_labels(text: object) -> list:
         if not body:
             return []
         labels: list = []
-        for m in _IMAGE_REF_RE.finditer(body):
-            window = body[: m.start()].rstrip()[-120:]
+        for scanned, m in enumerate(_IMAGE_REF_RE.finditer(body)):
+            if scanned >= _MAX_LABEL_SCAN_REFS:
+                break
+            start = m.start()
+            window = body[max(0, start - _LABEL_LOOKBEHIND_CHARS) : start]
+            window = window.rstrip()[-120:]
             last_line = window.splitlines()[-1].strip() if window else ""
             lm = _IMAGE_LABEL_RE.search(last_line)
             if not lm:
@@ -1795,6 +1838,17 @@ _VERIFY_TOOL = "atlassianUserInfo"
 # by Atlassian MCP version, so every lookup below is best-effort and
 # STRING-only: an unfamiliar payload must yield "" (and the honest "identity
 # payload received") rather than a fabricated name.
+# Fields that ESTABLISH an identity, whether or not they can be rendered as a
+# name. atlassianUserInfo answers with account_id and no display name at all, so
+# judging verification on _identity_label alone would refuse a real connection.
+_IDENTITY_PRESENCE_KEYS = (
+    "account_id",
+    "accountId",
+    "account_type",
+    "accountType",
+    "self",
+    "key",
+)
 _IDENTITY_NAME_KEYS = ("name", "displayName", "display_name", "nickname")
 _IDENTITY_EMAIL_KEYS = ("email", "emailAddress", "email_address")
 _ERROR_KEYS = ("error", "errors", "errorMessages", "errorMessage", "isError")
@@ -1836,8 +1890,10 @@ def verify_directive() -> str:
                 "-- I'll turn that into the exact connection steps for this "
                 "editor.",
                 "",
-                "Nothing from that result is stored: it is read once, reported "
-                "back in the same turn, and discarded.",
+                "Your identity is not stored: the result is read once, reported "
+                "back in the same turn, and discarded. Only the yes/no, the "
+                "time, and the name of the tool called are recorded, so this "
+                "check is not repeated on every report.",
             ]
         )
     except Exception:
@@ -1884,6 +1940,27 @@ def _unwrap_mcp_content(payload: dict) -> dict:
         return payload
 
 
+def _has_identity(payload: object) -> bool:
+    """True when the payload carries a field that identifies an ACCOUNT.
+
+    Presence, not prettiness: a payload this returns False for establishes
+    nothing and must not be recorded as a verified connection. Never raises.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return False
+        if _identity_label(payload):
+            return True
+        return any(
+            isinstance(payload.get(key), (str, int))
+            and str(payload.get(key)).strip()
+            for key in _IDENTITY_PRESENCE_KEYS
+        )
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("_has_identity failed", exc_info=True)
+        return False
+
+
 def _identity_label(payload: dict) -> str:
     """Best-effort ``Name (email)`` for an identity payload, or "".
 
@@ -1909,6 +1986,47 @@ def _identity_label(payload: dict) -> str:
     except Exception:
         logger.exception("_identity_label failed - omitting the identity")
         return ""
+
+
+# The reason _error_text reports when a failure key is present but carries no
+# readable message. Named so a caller can tell "Jira said why" from "Jira only
+# said no".
+_NO_IDENTITY = "the call did not come back with an identity"
+
+
+def _jira_failure_reason(payload: dict) -> str:
+    """The readable Jira/MCP failure text on a payload, or "" when there is none.
+
+    Never raises. Returns "" for the message-less case so the caller keeps its
+    own wording rather than printing an identity-probe phrase at a tester.
+    """
+    try:
+        text = _error_text(payload if isinstance(payload, dict) else {})
+    except Exception:  # pragma: no cover - _error_text never raises
+        return ""
+    return "" if text == _NO_IDENTITY else text
+
+
+def _carries_error_key(payload: object) -> bool:
+    """True when the payload carries a failure MARKER at all, however empty.
+
+    _error_text deliberately skips an empty value so a message-less marker does
+    not print as a reason -- but ``{"error": ""}`` is exactly what this server
+    ASKS an agent to send when the call failed, and reading it as success is how
+    an unconnected client came to be recorded as verified. Presence is the
+    signal here; the text is a separate question. Never raises.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return False
+        return any(
+            key in payload and payload.get(key) is not None
+            and payload.get(key) is not False
+            for key in _ERROR_KEYS
+        )
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("_carries_error_key failed", exc_info=True)
+        return False
 
 
 def _error_text(payload: dict) -> str:
@@ -1942,15 +2060,35 @@ def _error_text(payload: dict) -> str:
                 text = _sanitize_echo(value.get("message"), _MAX_ERROR_ECHO_CHARS)
             else:
                 text = _sanitize_echo(value, _MAX_ERROR_ECHO_CHARS)
-            return text or "the call did not come back with an identity"
+            return text or _NO_IDENTITY
         return ""
     except Exception:
         logger.exception("_error_text failed - reporting a generic failure")
-        return "the call did not come back with an identity"
+        return _NO_IDENTITY
 
 
 def verify_result_message(raw: object) -> str:
+    """The tester-facing message half of :func:`verify_outcome`.
+
+    Kept as the public name every existing caller and test uses; the verdict
+    itself is now available separately so it can be PERSISTED without parsing
+    the untrusted payload a second time.
+    """
+    return verify_outcome(raw)[1]
+
+
+def verify_outcome(raw: object) -> tuple[str, str]:
     """Turn the agent's raw ``atlassianUserInfo`` result into a verdict.
+
+    Returns ``(status, message)`` where status is one of:
+
+    * ``"verified"`` -- an identity payload came back;
+    * ``"failed"``   -- an error marker came back (really not connected);
+    * ``"unknown"``  -- nothing supplied, unreadable, oversized, or empty.
+
+    Only ``"verified"`` and ``"failed"`` are worth persisting. ``"unknown"``
+    means nothing was established, so it must NOT overwrite an earlier verdict:
+    an agent that fumbles the hand-back must not be able to erase a good result.
 
     Five outcomes, none of which raises and none of which is a dead end:
 
@@ -1967,15 +2105,16 @@ def verify_result_message(raw: object) -> str:
     try:
         text = str(raw or "").strip()
         if not text:
-            return verify_directive()
+            return ("unknown", verify_directive())
         if len(text) > _MAX_VERIFY_CHARS:
             return (
+                "unknown",
                 "\u26a0\ufe0f **That verification result was too long to "
                 f"read** (over {_MAX_VERIFY_CHARS} characters). "
                 f"`{verify_tool_name()}` returns a small identity object -- "
                 "re-run it and pass its raw result, or pass "
                 '`atlassian_verify_json={"error": "<what happened>"}` if the '
-                "call failed.\n\n" + connect_hint_line()
+                "call failed.\n\n" + connect_hint_line(),
             )
         if text.startswith("```"):
             text = text.split("\n", 1)[-1]
@@ -1987,39 +2126,66 @@ def verify_result_message(raw: object) -> str:
             payload = None
         if not isinstance(payload, dict):
             return (
+                "unknown",
                 "\u26a0\ufe0f **I couldn't read that verification result**, so "
                 "I still can't confirm the Atlassian connection either way. "
                 f"Re-run `{verify_tool_name()}` and pass its RAW JSON result "
                 "as `atlassian_verify_json`, or pass "
                 '`{"error": "<what happened>"}` if the call failed.\n\n'
-                + connect_hint_line()
+                + connect_hint_line(),
             )
         payload = _unwrap_mcp_content(payload)
         failure = _error_text(payload)
-        if failure:
+        if failure or _carries_error_key(payload):
             return (
+                "failed",
                 "\u274c **Not connected** -- that Atlassian call did not "
-                f"return an identity: {failure}\n\n" + connect_steps()
+                f"return an identity: {failure or _NO_IDENTITY}\n\n"
+                + connect_steps(),
             )
         if not payload:
             return (
+                "unknown",
                 "\u26a0\ufe0f **That verification result was empty**, so I "
                 "still can't confirm the Atlassian connection. Re-run "
                 f"`{verify_tool_name()}` and pass its RAW JSON result as "
-                "`atlassian_verify_json`.\n\n" + connect_hint_line()
+                "`atlassian_verify_json`.\n\n" + connect_hint_line(),
             )
-        who = _identity_label(payload) or "connected (identity payload received)"
+        # A payload with no error and no identity establishes NOTHING. It used
+        # to report "verified -- connected (identity payload received)", which
+        # was a guess dressed as a result; now that the verdict is persisted for
+        # a week, that guess would silence the real question for seven days. An
+        # unrecognized shape is "unknown": the caller writes nothing, and the
+        # tester is told what is missing.
+        who = _identity_label(payload) or (
+            "connected (identity payload received)" if _has_identity(payload) else ""
+        )
+        if not who:
+            return (
+                "unknown",
+                "\u26a0\ufe0f **That result carried no identity**, so I still "
+                "can't confirm the Atlassian connection. A working "
+                f"`{verify_tool_name()}` call returns your account details. "
+                "Re-run it and pass its RAW JSON result as "
+                "`atlassian_verify_json`, or pass "
+                '`{"error": "<what happened>"}` if the call failed.\n\n'
+                + connect_hint_line(),
+            )
         return (
+            "verified",
             f"\u2705 **Atlassian verified** -- connected as {who}.\n\n"
             "Jira ticket URLs will be read through this connection, with your "
-            "own Jira permissions. Nothing was stored: this server holds no "
-            "Jira credential, and it did not keep that identity either."
+            "own Jira permissions. This server holds no Jira credential and did "
+            "NOT keep that identity -- no account id, email or name. It records "
+            "only that a check succeeded, when, and which tool was called, so "
+            "`qa-doctor` stops asking again for the next week.",
         )
     except Exception:
-        logger.exception("verify_result_message failed - falling back")
+        logger.exception("verify_outcome failed - falling back")
         return (
+            "unknown",
             "\u26a0\ufe0f I couldn't read that verification result.\n\n"
-            + connect_steps()
+            + connect_steps(),
         )
 
 
@@ -2229,14 +2395,39 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
                 "needs_jira_mcp": load_error == "empty",
             }
 
+        # Some clients return the MCP envelope rather than the tool's result.
+        # Unwrap ONE level -- but ONLY as a fallback, when the payload does not
+        # already carry an issue. _unwrap_mcp_content returns the inner object
+        # whenever ANY top-level content[*].text parses as JSON, discarding the
+        # rest, so applying it unconditionally turned two payloads that generate
+        # today into refusals: one carrying a top-level `content` list ALONGSIDE
+        # a real issue, and a flattened one whose ADF text node happened to be
+        # JSON-shaped (an API ticket pasting a snippet). Guarding on the happy
+        # path costs one condition and makes this a true no-op everywhere else.
+        if not _issue_fields(
+            payload.get("issue") if isinstance(payload.get("issue"), dict) else payload
+        ):
+            payload = _unwrap_mcp_content(payload)
         issue = (
             payload.get("issue") if isinstance(payload.get("issue"), dict) else payload
         )
         fields = _issue_fields(issue)
         if not fields:
+            # A payload with no `fields` is USUALLY a trimmed result -- but it is
+            # also exactly what Jira returns when the caller cannot READ the
+            # issue, and telling that tester to "call getJiraIssue again" is an
+            # instruction to repeat a call that will fail the same way. Say what
+            # Jira actually said when Jira said anything.
+            reason = _jira_failure_reason(payload) or _jira_failure_reason(
+                issue if isinstance(issue, dict) else {}
+            )
             return {
                 "error": (
-                    "⚠️ That Jira payload has no `fields` object, so there "
+                    f"⚠️ Jira did not return that issue: {reason}. Check the "
+                    "issue key and that your Atlassian account can see it, then "
+                    "re-run `getJiraIssue`."
+                    if reason
+                    else "⚠️ That Jira payload has no `fields` object, so there "
                     "is nothing to generate from. Call `getJiraIssue` again and pass "
                     "its RAW result (the whole object, including `fields`)."
                 ),
@@ -2252,12 +2443,27 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
         # "grounded" purely because the issue KEY was substituted for the title,
         # and a whole suite would then be generated from nothing.
         summary_src = str(fields.get("summary") or "").strip()
-        description_src = _as_text(fields.get("description")).strip()
-        ac_src = _as_text(fields.get(settings.jira_ac_field)).strip()
+        description_raw, description_truncated = adf_text_with_depth_flag(
+            fields.get("description")
+        )
+        description_src = description_raw.strip()
+        # The AC field is ADF too, so the same cap can empty it silently -- the
+        # very defect this fix exists to close, one field over.
+        ac_raw, ac_truncated = adf_text_with_depth_flag(
+            fields.get(settings.jira_ac_field)
+        )
+        ac_src = ac_raw.strip()
+        # `description_truncated` keeps its literal meaning; `any_truncated`
+        # drives the disclosure, because an unread AC field is just as silent.
+        any_truncated = description_truncated or ac_truncated
         if not (summary_src or description_src or ac_src):
             return {
                 "error": (
-                    "⚠️ That Jira issue came back with no summary, no "
+                    "⚠️ That Jira issue's text is nested deeper than I parse, "
+                    "so none of it reached me and there is nothing to generate "
+                    "from. Paste the ticket text and I'll work from that."
+                    if any_truncated
+                    else "⚠️ That Jira issue came back with no summary, no "
                     "description and no acceptance criteria, so there is nothing to "
                     "generate from. Check the issue key, or paste the ticket text "
                     "and I'll work from that."
@@ -2316,6 +2522,15 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
         issuetype_name = _sanitize_echo(_name_of(fields.get("issuetype")), 40)
         status_name = _sanitize_echo(_name_of(fields.get("status")), 40)
         meta_lines = []
+        if any_truncated:
+            # Never silent: the generator and the tester both have to know that
+            # part of the ticket did not reach them, or thin coverage reads as a
+            # thin ticket.
+            meta_lines.append(
+                "Ticket text: PARTIALLY UNREAD -- part of this ticket is nested "
+                "deeper than I parse, so some of it is missing below. Treat gaps "
+                "as unknown, not as absent, and ask for the missing section."
+            )
         if issuetype_name:
             meta_lines.append(f"Issue type: {issuetype_name}")
         if status_name:
@@ -2377,6 +2592,9 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
             # Embedded-in-description images. Independent of `attachment`, so a
             # host that trims the issue JSON cannot silence the disclosure -- the
             # 22:17 live run had three UI screens and said nothing.
+            # True when _MAX_ADF_DEPTH stopped the description walk, so a caller
+            # can tell a short ticket from an unread one (B1, 2026-09-01).
+            "description_truncated": description_truncated,
             "description_image_refs": _count_image_refs(description),
             "description_image_labels": _image_ref_labels(description),
             # Additive key (2026-08-09): ADF media nodes found in the
