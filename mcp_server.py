@@ -676,6 +676,12 @@ def build_server():
         description, a Jira/issue URL, a web page URL, or a Swagger/OpenAPI
         spec URL.
 
+        For a Jira URL the first reply is a DIRECTIVE: fetch the issue with
+        your own mcp__atlassian__getJiraIssue and call again with
+        `jira_content_json` set to its raw result as a JSON STRING
+        (`json.dumps(result)` -- that parameter is typed `str`, and an object
+        is rejected by schema validation before this server sees the ticket).
+
         When the user asks for test cases WITHOUT saying where the feature
         comes from, call this immediately with feature_or_url omitted — I will
         ask them myself (describe / Jira / web / Swagger / mobile screens /
