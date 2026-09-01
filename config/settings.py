@@ -184,11 +184,21 @@ class Settings(BaseSettings):
     # must be adjustable rather than hardcoded. Empty falls back to the Claude
     # form. Not a feature flag -- it changes wording, never behaviour.
     qa_jira_mcp_tool_prefix: str = "mcp__atlassian__"
-    # Jira custom-field id that holds Acceptance Criteria. Defaults to the common
-    # Jira Software default; different instances use different ids, so make it
-    # configurable (QW-11 / I-023 / B-015). When empty on a ticket, jira_fetcher
-    # falls back to scanning the description for an "Acceptance Criteria" heading.
-    jira_ac_field: str = "customfield_10016"
+    # Jira custom-field id that holds Acceptance Criteria. Different instances use
+    # different ids, so this is configurable (QW-11 / I-023 / B-015). When it is
+    # empty -- on a ticket or by configuration -- jira_fetcher falls back to
+    # scanning the description for an "Acceptance Criteria" heading, AC_JOB
+    # derives criteria on the host, and build_fetch_directive drops the field from
+    # the request rather than asking Jira for an empty field name.
+    #
+    # 2026-08-31: the default used to be "customfield_10016", and this tree
+    # already documented in four places (rtm.py, jira_mcp.py x2, mcp_handlers.py)
+    # that on a real workspace that id is a DATE field -- whose timestamp once
+    # became the only "acceptance criterion" on a live run. A live Cursor session
+    # confirmed every unconfigured install still ships it inside the fetch
+    # directive AND the sibling JQL. Guessing a field id we have evidence is
+    # wrong is worse than asking for none.
+    jira_ac_field: str = ""
 
     # Searching the OTHER custom fields for one whose value reads like
     # requirements when the configured `jira_ac_field` does not is OFF, and
