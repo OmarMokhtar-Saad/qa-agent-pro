@@ -64,6 +64,7 @@ from tools.gherkin_exporter import generate_feature_file
 from tools.jira_fetcher import fetch_url_content, verify_jira_access
 from tools.jira_mcp import (
     _ac_field_discovery_on,
+    _valid_issue_key,
     connect_hint_line,
     connect_steps,
     looks_like_jira_url,
@@ -846,6 +847,21 @@ async def _resolve_device(device_id: str) -> dict | None:
 # between is the signal.
 _ELICIT_GATE_STRIKES = 2
 
+# A DECLINE that comes back faster than a human could have READ the dialog
+# is not a dismissal -- it is a client auto-declining because there is no
+# one there to answer. Observed live on 2026-08-31 in a headless
+# `cursor-agent -p` session: the image gate was elicited, instantly
+# declined, and re-asked as markdown, costing a full round trip on the
+# FIRST Jira call of every session. It never stopped, because each instant
+# decline reset the very strike record that would have gated the dialog --
+# note_elicit_answered treats DECLINED as proof the tester saw it.
+#
+# 1.5s is deliberately generous: a real human needs seconds to read a
+# multi-option prompt and click, so this cannot mistake a fast tester for a
+# robot, and being wrong costs only that the gate stays open one more
+# dialog. Two such declines in a row still gate; a single one never does.
+_INSTANT_DECLINE_S = 1.5
+
 # client name (lower-cased, from the handshake) -> CONSECUTIVE timeouts.
 # Any answer resets the entry to 0, so this counts a run, not a lifetime total.
 _elicit_client_strikes: dict[str, int] = {}
@@ -929,16 +945,36 @@ def note_elicit_answered(name=None) -> None:
         logger.debug("elicit answer note failed", exc_info=True)
 
 
-def _note_elicit_outcome(result) -> None:
+def _note_elicit_outcome(result, elapsed_s=None) -> None:
     """Feed one completed dialog result into the per-client record.
 
     ONLY a CHOSEN or DECLINED result counts as evidence that the tester saw the
     dialog. UNAVAILABLE does not: it is what a raising ctx.elicit degrades to,
     which says nothing about the human, and clearing strikes on it would make a
     client whose transport raises every time permanently ungatable.
+
+    2026-09-01: with ONE exception, and it is the reason the gate never closed
+    on a headless client. A DECLINED that came back in under
+    ``_INSTANT_DECLINE_S`` is a strike, not an answer -- nobody read it. A
+    CHOSEN always clears, however fast: a value came back, so something
+    answered. *elapsed_s* is None from callers that did not time the round
+    trip, and those keep the old behaviour exactly.
     Never raises."""
     try:
-        if getattr(result, "status", None) in (CHOSEN, DECLINED):
+        _status = getattr(result, "status", None)
+        if (
+            _status == DECLINED
+            and elapsed_s is not None
+            and elapsed_s < _INSTANT_DECLINE_S
+        ):
+            logger.debug(
+                "mcp elicit declined in %.2fs -- too fast to have been read; "
+                "counting a strike rather than an answer",
+                elapsed_s,
+            )
+            note_elicit_timeout()
+            return
+        if _status in (CHOSEN, DECLINED):
             note_elicit_answered()
             # A3 re-arm (2026-08-21). The status carve-out is NOT widened: it is
             # load-bearing and separately pinned -- an UNAVAILABLE result is a
@@ -1154,6 +1190,7 @@ async def _elicit_choice(choose: ChooseCb, message: str, options: list) -> Choic
         _log_elicit_skip("elicit_choice", choose, message)
         return ChoiceResult(UNAVAILABLE, budget_skipped=True)
     _mark_elicit_asked(choose)
+    _started = time.monotonic()
     try:
         result = await asyncio.wait_for(choose(message, list(options)), timeout=wait_s)
     except asyncio.TimeoutError:
@@ -1177,7 +1214,7 @@ async def _elicit_choice(choose: ChooseCb, message: str, options: list) -> Choic
         logger.debug("mcp elicit_choice failed for %r", message, exc_info=True)
         return ChoiceResult(UNAVAILABLE)
     if isinstance(result, ChoiceResult):
-        _note_elicit_outcome(result)
+        _note_elicit_outcome(result, time.monotonic() - _started)
         return result
     return ChoiceResult(UNAVAILABLE)
 
@@ -1200,6 +1237,7 @@ async def _elicit_text(ask_text: AskCb, message: str) -> ChoiceResult:
         _log_elicit_skip("elicit_text", ask_text, message)
         return ChoiceResult(UNAVAILABLE, budget_skipped=True)
     _mark_elicit_asked(ask_text)
+    _started = time.monotonic()
     try:
         result = await asyncio.wait_for(ask_text(message), timeout=wait_s)
     except asyncio.TimeoutError:
@@ -1212,7 +1250,7 @@ async def _elicit_text(ask_text: AskCb, message: str) -> ChoiceResult:
         logger.debug("mcp elicit_text failed for %r", message, exc_info=True)
         return ChoiceResult(UNAVAILABLE)
     if isinstance(result, ChoiceResult):
-        _note_elicit_outcome(result)
+        _note_elicit_outcome(result, time.monotonic() - _started)
         return result
     return ChoiceResult(UNAVAILABLE)
 
@@ -2217,6 +2255,64 @@ def _safe_fetch_reason(raw) -> str:
             :200
         ].strip()
     except Exception:
+        return ""
+
+
+def _safe_host(raw) -> str:
+    """Hostname of *raw* when it is a URL, else "". Never raises."""
+    try:
+        return urlparse(str(raw or "")).hostname or ""
+    except Exception:
+        return ""
+
+
+def _grounding_source_note(
+    source_text: str, url_content: dict | None, openapi_text=None
+) -> str:
+    """One line naming WHAT the suite will be generated from.
+
+    2026-09-01. The prepare reply disclosed a great deal -- images it could
+    not read, the ticket snapshot, condensed payloads -- but never the one
+    fact that would have caught the worst defect found so far: a Jira BOARD
+    url was scraped as an ordinary web page and its ``<title>`` (the single
+    word "Jira") became the whole feature description, with eight categories
+    generated from it. Nothing in the reply was false; the source was simply
+    never named, so the error was invisible until someone read the cases.
+
+    Static, derived from what grounding already returned -- no fetch, no
+    model call. Never raises: a note is a disclosure, and failing to build
+    one must never cost the tester their suite.
+    """
+    try:
+        content = url_content or {}
+        if openapi_text:
+            where = _safe_host(source_text)
+            return (
+                "> \U0001f9ed Grounded on the **OpenAPI/Swagger spec**"
+                + (f" at `{where}`" if where else "")
+                + "."
+            )
+        if content.get("source") == "atlassian_mcp":
+            key = _valid_issue_key(content.get("issue_key"))
+            named = f"Jira ticket `{key}`" if key else "the Jira ticket"
+            return (
+                f"> \U0001f9ed Grounded on {named}, read through YOUR Atlassian "
+                "MCP connection -- this server never fetched it."
+            )
+        if content.get("content"):
+            where = _safe_host(source_text)
+            return (
+                "> \U0001f9ed Grounded on the **web page**"
+                + (f" at `{where}`" if where else " you gave me")
+                + " -- not a Jira ticket. If you meant a ticket, paste its "
+                "`/browse/KEY-123` url and I'll read that instead."
+            )
+        return (
+            "> \U0001f9ed Grounded on the **feature description you gave me** "
+            "-- no ticket and no page were read."
+        )
+    except Exception:
+        logger.debug("grounding source note failed", exc_info=True)
         return ""
 
 
@@ -5333,6 +5429,11 @@ async def handle_prepare_test_cases(
                 "so nothing they show is reflected in the cases below."
             )
             _notice = (_notice + "\n\n" + _cap_note) if _notice else _cap_note
+        # WHAT these cases are grounded on -- always, not only when something
+        # went wrong. See _grounding_source_note. APPEND, never assign.
+        _src_note = _grounding_source_note(text, _url_content, grounded.openapi_text)
+        if _src_note:
+            _notice = (_notice + "\n\n" + _src_note) if _notice else _src_note
         # I2b (2026-08-10): WHICH snapshot these cases were generated from, so a
         # reused cached payload is visible instead of silent. APPEND, never
         # assign -- see PreparePayloadResult.
@@ -11344,10 +11445,22 @@ def _revive_captures(capture_ids: list | None) -> list:
     revived: list = []
     try:
         _sweep_carry_shelf()
-        for raw in list(capture_ids or [])[:_CAPTURE_TRAY_MAX]:
+        # NORMALISE, THEN cap -- in that order. This used to slice the RAW list
+        # first, while _peek_captures and _resolvable_captures both strip blanks
+        # and collapse duplicates before counting. A caller sending 24 blanks or
+        # repeats followed by a real shelved id therefore had it revived by
+        # neither, while the probes still reported it resolvable: the hint went
+        # silent and the gate asked. Same list, same order, same cap, or the
+        # shared predicate is shared in name only (third-round review, M1).
+        seen: set = set()
+        normalised: list = []
+        for raw in list(capture_ids or []):
             cid = str(raw or "").strip()
-            if not cid:
+            if not cid or cid in seen:
                 continue
+            seen.add(cid)
+            normalised.append(cid)
+        for cid in normalised[:_CAPTURE_TRAY_MAX]:
             if cid in _CAPTURE_TRAY:
                 revived.append(cid)
                 continue
@@ -12588,28 +12701,47 @@ def _tooling_lines() -> list[str]:
 def _ac_field_section() -> list[str]:
     """Disclose which Jira field is configured as the acceptance-criteria source.
 
-    ``settings.jira_ac_field`` is a per-instance GUESS. Its default,
-    ``customfield_10016``, is a DATE field on at least one real workspace, and the
-    timestamp it returned became a suite's only "acceptance criterion" -- which
-    also suppressed the host job that would otherwise have derived real ones. The
-    failure was invisible until someone read 98 generated cases.
+    ``settings.jira_ac_field`` is a per-instance GUESS. It USED to default to
+    ``customfield_10016``, which is a DATE field on at least one real workspace,
+    and the timestamp it returned became a suite's only "acceptance criterion"
+    -- which also suppressed the host job that would otherwise have derived real
+    ones. The failure was invisible until someone read 98 generated cases.
 
-    So the field id is now printed on every setup check, alongside what happens
-    when it holds nothing usable. Static text only: no ticket is fetched here, so
-    this cannot fail or slow the report down.
+    2026-08-31: that default is GONE -- the field is unset unless an install
+    names one, so the shipped behaviour no longer guesses. This section says so
+    rather than warning about a default that no longer exists, and explains
+    what unset MEANS, which is not "broken": the description scan, the use-case
+    table and the host AC job all still run.
+
+    Static text only: no ticket is fetched here, so this cannot fail or slow
+    the report down.
     """
     try:
-        field = str(getattr(settings, "jira_ac_field", "") or "(unset)")
+        raw_field = str(getattr(settings, "jira_ac_field", "") or "").strip()
         discovery = _ac_field_discovery_on()
         out = [
             "### Acceptance-criteria field",
             "",
-            f"- Configured field: `{field}` (`JIRA_AC_FIELD`)",
-            "- This id differs per Jira instance. It is used ONLY when its value "
-            "reads like requirement text -- a date, a bare number or a single "
-            "token is rejected, because on one workspace this default is a DATE "
-            "field and the timestamp became the suite's only acceptance criterion.",
         ]
+        if raw_field:
+            out += [
+                f"- Configured field: `{raw_field}` (`JIRA_AC_FIELD`)",
+                "- This id differs per Jira instance. It is used ONLY when its "
+                "value reads like requirement text -- a date, a bare number or a "
+                "single token is rejected, because on one workspace a guessed id "
+                "turned out to be a DATE field and the timestamp became the "
+                "suite's only acceptance criterion.",
+            ]
+        else:
+            out += [
+                "- Configured field: **none** (`JIRA_AC_FIELD` is unset -- the "
+                "shipped default since 2026-08-31).",
+                "- This is not a gap. No id is guessed, so nothing is requested "
+                "from Jira that this install has not named, and no wrong field's "
+                "value can be mistaken for requirements. Criteria come from the "
+                "ticket description and its use-case table, and your chat model "
+                "derives them when neither yields any.",
+            ]
         if discovery:
             out.append(
                 "- Custom-field discovery is **on**: when the configured field "
@@ -12791,6 +12923,41 @@ def _update_rate_limit_advisory(status: str) -> str:
         "only if you keep seeing this -- an unauthenticated check shares 60 "
         "requests/hour with everything else on this machine, a token gets 5,000."
     )
+
+
+def _overall_verdict(
+    blocker_count: int, recommended_count: int, unverified_count: int
+) -> str:
+    """The qa-doctor headline, decided from what the Action items will SAY.
+
+    Pure and total on purpose (D-E1, 2026-09-01). The verdict used to be an
+    inline if/elif over ``blockers``/``recommended`` while a third category --
+    the unconditional Atlassian probe item -- was appended to ``items``
+    downstream of it, so "all required checks passed" shipped four lines above
+    an open "Fix now" entry on every run, healthy installs included. A headline
+    that its own report contradicts trains the reader to skip the headline.
+
+    ``unverified_count`` is the third category: checks this server cannot
+    settle from here and has asked the calling agent to settle for it. They are
+    not blockers (nothing is known to be broken) and not warnings (no action is
+    recommended to the TESTER), so neither existing branch fits.
+    """
+    if blocker_count:
+        return (
+            f"\u274c **Not ready** \u2014 {blocker_count} blocking issue(s), "
+            "see Action items below"
+        )
+    if recommended_count:
+        return "\u26a0\ufe0f **Ready, with warnings** \u2014 see Action items below"
+    if unverified_count:
+        return (
+            "\u26a0\ufe0f **Ready \u2014 one check unverified**, "
+            "see Action items below"
+            if unverified_count == 1
+            else f"\u26a0\ufe0f **Ready \u2014 {unverified_count} checks "
+            "unverified**, see Action items below"
+        )
+    return "\u2705 **Ready** \u2014 all required checks passed"
 
 
 async def handle_setup_check(
@@ -13187,15 +13354,12 @@ async def handle_setup_check(
         except Exception:
             logger.debug("flag-registry expiry check skipped", exc_info=True)
 
-        if blockers:
-            verdict = (
-                f"❌ **Not ready** — {len(blockers)} blocking issue(s), "
-                "see Action items below"
-            )
-        elif recommended:
-            verdict = "⚠️ **Ready, with warnings** — see Action items below"
-        else:
-            verdict = "✅ **Ready** — all required checks passed"
+        # The Atlassian probe item is unconditional and tagged "Fix now", so it
+        # counts here even though it is in neither list -- see _overall_verdict.
+        # The "✅ Ready" branch is unreachable while the probe can never be
+        # settled from this process; it returns when a verified verdict is
+        # persisted (item A) and the probe item drops out.
+        verdict = _overall_verdict(len(blockers), len(recommended), 1)
 
         lines = [
             "## Setup check",
