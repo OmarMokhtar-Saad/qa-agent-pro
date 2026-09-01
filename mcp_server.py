@@ -369,6 +369,15 @@ async def _tracked(name, ctx, coro):
         _inflight_exit()
 
 
+# A progress ping is a NOTIFICATION: the tool does not need its result and
+# must never wait on it. Bounded well below the client-side tool timeout the
+# ping exists to reset, so a stalled client costs one dropped ping rather
+# than the call. Same reasoning and same order of magnitude as
+# _ROOTS_TIMEOUT_S; kept separate because they answer to different clients'
+# capabilities and should be tunable apart.
+_PROGRESS_TIMEOUT_S = 5.0
+
+
 def _make_progress(ctx):
     """Adapt a FastMCP Context into the handlers' ``(message)->awaitable`` callback.
 
@@ -376,6 +385,19 @@ def _make_progress(ctx):
     device run resets the MCP client's tool-call timeout (progress notifications
     keep the stream alive). Best-effort — a transport hiccup never breaks the
     tool.
+
+    2026-09-01: "never breaks the tool" was true only for a client that
+    RAISES. A client that accepts the notification and never completes the
+    await is not an exception, and the ``except Exception`` below cannot see
+    it -- the tool call simply hung, forever, on a best-effort progress ping.
+    Every other client round trip in this file is already bounded
+    (:func:`_workspace_roots` by ``_ROOTS_TIMEOUT_S``, both elicitation tiers
+    by ``asyncio.wait_for``); this was the one that was not, and it is the
+    most frequent of them by a wide margin. The timeout feeds the SAME
+    ``except`` clause -- ``asyncio.TimeoutError`` is an ``Exception`` on every
+    version this project supports -- so a slow client degrades to exactly the
+    behaviour a raising one always had: the ping is dropped, logged at DEBUG,
+    and the tool continues.
     """
     _note_client(ctx)  # every tool builds one of these — cheap host detection
     state = {"n": 0}
@@ -383,7 +405,10 @@ def _make_progress(ctx):
     async def progress(message: str) -> None:
         state["n"] += 1
         try:
-            await ctx.report_progress(progress=state["n"], total=None, message=message)
+            await asyncio.wait_for(
+                ctx.report_progress(progress=state["n"], total=None, message=message),
+                timeout=_PROGRESS_TIMEOUT_S,
+            )
         except Exception:
             logger.debug("mcp report_progress failed for %r", message, exc_info=True)
 
