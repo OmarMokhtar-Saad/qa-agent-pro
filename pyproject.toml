@@ -1,6 +1,6 @@
 [project]
 name = "qa-agent-pro"
-version = "1.70.5"
+version = "1.71.0"
 requires-python = ">=3.10"
 dependencies = [
     "pyyaml>=6.0",  # contracts + OpenAPI specs are YAML (api_test agent)

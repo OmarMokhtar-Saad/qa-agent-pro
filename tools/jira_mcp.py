@@ -163,19 +163,38 @@ def looks_like_jira_url(url: str) -> bool:
         return False
     if not host:
         return False
-    host_ok = "atlassian.net" in host or host.startswith("jira.") or ".jira." in host
-    if not host_ok:
-        try:
-            configured = (urlparse(settings.jira_base_url or "").hostname or "").lower()
-        except Exception:
-            configured = ""
-        host_ok = bool(configured) and host == configured
-    if not host_ok:
+    if not is_jira_host(url):
         return False
     path = (parsed.path or "").rstrip("/")
     if "/browse/" in path or "/issues/" in path:
         return True
     return bool(selected_issue_key(url))
+
+
+def is_jira_host(url: str) -> bool:
+    """True when *url*'s HOST is Jira (Cloud, or the configured JIRA_BASE_URL
+    host), whether or not the path names an issue.
+
+    Split out of :func:`looks_like_jira_url` on 2026-08-31. That function
+    deliberately answers a narrower question -- "does this name a TICKET?" -- and
+    everything else on the host fell through to the SSRF-hardened generic
+    fetcher. For a Jira host that is wrong in a way no tester can see: the fetch
+    SUCCEEDS, returns the SPA shell, and its ``<title>`` becomes the feature
+    description. Callers use this to refuse instead of scrape. Never raises.
+    """
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if "atlassian.net" in host or host.startswith("jira.") or ".jira." in host:
+        return True
+    try:
+        configured = (urlparse(settings.jira_base_url or "").hostname or "").lower()
+    except Exception:
+        configured = ""
+    return bool(configured) and host == configured
 
 
 def issue_key_from_url(url: str) -> str:
@@ -1699,14 +1718,50 @@ def connect_hint_line(
 
 def not_connected_message(host: str = "") -> str:
     """Actionable message for a tester whose agent has no Atlassian MCP
-    connection. Never raises, never blames the tester, never a dead end."""
+    connection. Never raises, never blames the tester, never a dead end.
+
+    2026-08-31: this used to splice in ``_CONNECT_STEPS`` -- all four editors --
+    while :func:`connect_steps` narrowed to the ONE client the initialize
+    handshake named. A live Cursor session proved the split: ``qa_configure_jira``
+    showed Cursor only, and the very same session's fetch directive showed Claude
+    Code, Claude Desktop, Cursor and Gemini CLI. One narrowing helper now serves
+    both, so a tester is never handed steps for editors they do not run.
+    """
     where = f" (`{host}`)" if host else ""
     return (
         f"⚠️ **I can't read that Jira ticket{where} yet.**\n\n"
         "Jira access now runs through **your own Atlassian MCP connection** "
         "(OAuth, in your editor) instead of an API token stored on this machine. "
         "I could not find a connected `atlassian` MCP server in this session.\n\n"
-        + _CONNECT_STEPS
+        + connect_steps()
+    )
+
+
+def jira_page_without_issue_message(url: str) -> str:
+    """Refusal for a URL on a Jira host that names no ISSUE. Never raises.
+
+    Board, backlog, dashboard and Confluence URLs carry no issue key. They used
+    to fall through to the generic fetcher, which scraped the anonymous Jira SPA
+    shell and handed its ``<title>`` -- the single word "Jira" -- back as the
+    whole feature description; eight categories of test cases were then generated
+    from that one word with no disclosure at all. Refusing by name is the
+    behaviour :func:`tools.jira_fetcher.fetch_url_content` already documented.
+    """
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        host = ""
+    where = f" (`{host}`)" if host else ""
+    return (
+        f"⚠️ **That's a Jira page{where}, but not a Jira TICKET.**\n\n"
+        "Board, backlog, dashboard and Confluence URLs carry no issue key, and an "
+        "anonymous Jira page is an empty JavaScript shell -- reading it would give "
+        "me its page title and nothing else, so any suite I generated from it "
+        "would be invented. **Nothing was generated.**\n\n"
+        "Do one of these instead:\n"
+        "- Open the ticket from that board and paste ITS url -- it looks like "
+        "`https://<site>.atlassian.net/browse/KEY-123`.\n"
+        "- Or describe the feature in your own words, and I'll work from that."
     )
 
 

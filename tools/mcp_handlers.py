@@ -66,6 +66,7 @@ from tools.jira_mcp import (
     _ac_field_discovery_on,
     connect_hint_line,
     connect_steps,
+    looks_like_jira_url,
     not_connected_message,
     verify_directive,
     verify_result_message,
@@ -3689,6 +3690,19 @@ async def _ground_and_gate(
                 hint = _jira_config_hint(text)
                 if hint:
                     return hint
+                # 2026-08-31. Every OTHER error used to fall through to
+                # generation. That silently swallowed the two anti-fabrication
+                # refusals normalize_issue_payload raises with
+                # needs_jira_mcp=False -- "that payload has no `fields` object"
+                # and "no summary, no description and no acceptance criteria" --
+                # and a full suite was written from nothing. When the SOURCE is
+                # Jira, an unreadable source is a refusal, not a warning. A
+                # generic page that failed to fetch still falls through: the
+                # tester's own words may carry the feature.
+                if looks_like_jira_url(text) or url_content.get(
+                    "jira_page_without_issue"
+                ):
+                    return str(url_content.get("error"))
             if _skip_ui_extraction(text, attached_images):
                 logger.info(
                     "ui_extractor: skipped -- %s carries no app UI to extract",
@@ -12061,8 +12075,12 @@ async def handle_feature_analysis(
                 # Relay the Atlassian-MCP fetch directive verbatim rather than
                 # analysing a ticket we could not read.
                 return str(url_content.get("error") or not_connected_message())
-            if not url_content.get("error"):
-                jira_text = url_content.get("content") or ""
+            if url_content.get("error"):
+                # 2026-08-31, the same defect as the prepare path: mode="jira"
+                # means the TICKET is the input, so an unreadable one is a
+                # refusal. This used to fall through and analyse an empty string.
+                return str(url_content.get("error"))
+            jira_text = url_content.get("content") or ""
 
         screen_descriptions = ""
         forwarded_screens: list = []
@@ -13052,9 +13070,7 @@ async def handle_setup_check(
         # "Fix now" that settles the same question, so the on-disk hint
         # returns "" rather than shrugging beside it. The CONNECT wording
         # (no entry on disk) is unaffected and still appears.
-        _hint = connect_hint_line(
-            workspace_roots=workspace_roots, verify_offered=True
-        )
+        _hint = connect_hint_line(workspace_roots=workspace_roots, verify_offered=True)
         if _hint:
             optional.append(_hint)
         # Fix 7 / M3 (2026-08-03): the ONLY discoverable path to registration.
@@ -13265,7 +13281,7 @@ async def handle_setup_check(
             "before you summarise this report and without asking the tester: "
             f"call `{verify_tool_name()}` (read-only, no parameters), then "
             "`qa_configure_jira` with `atlassian_verify_json` set to that "
-            "call's raw JSON -- or to `{\"error\": \"<what happened>\"}` if the "
+            'call\'s raw JSON -- or to `{"error": "<what happened>"}` if the '
             "tool is missing or fails. See *Verify the Jira (Atlassian) "
             "connection* above."
         )

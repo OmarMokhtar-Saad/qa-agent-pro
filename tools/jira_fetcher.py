@@ -66,7 +66,9 @@ from tools.jira_mcp import (  # noqa: F401
     _extract_subtasks,
     _strip_urls,
     _valid_issue_key,
+    is_jira_host,
     jira_mcp_required_result,
+    jira_page_without_issue_message,
     looks_like_jira_url,
     normalize_issue_payload,
     selected_issue_key,
@@ -162,6 +164,14 @@ async def fetch_url_content(url: str, jira_content: object = None) -> dict:
     Deliberately there is NO HTML-scrape fallback for a Jira host: an anonymous
     Jira Cloud page is an empty SPA shell, and generating from it fabricated
     test cases. Refusing is the safe behaviour.
+
+    2026-08-31: that promise only covered URLs that name an ISSUE. A board,
+    backlog, dashboard or Confluence URL on the same host is not
+    ``looks_like_jira_url``, so it fell through to :func:`_fetch_generic`, which
+    scraped the shell and returned its ``<title>`` -- "Jira" -- as the page
+    content. A live run turned that one word into eight categories of test cases
+    with no disclosure. Such a URL now refuses with
+    ``jira_page_without_issue: True``.
     """
     try:
         hostname, _resolved_ip, block_error = await _validate_public_url(url)
@@ -172,6 +182,24 @@ async def fetch_url_content(url: str, jira_content: object = None) -> dict:
             if jira_content:
                 return normalize_issue_payload(jira_content, source_url=url)
             return jira_mcp_required_result(url)
+
+        if is_jira_host(url) and "/wiki/" not in (urlparse(url).path or ""):
+            # A Jira HOST carrying no issue key: a board, backlog, dashboard or
+            # the site root. Scraping it yields the SPA shell's <title>, which a
+            # caller cannot tell apart from real requirements -- so this is a
+            # refusal, not a degraded fetch.
+            #
+            # Confluence (`/wiki/...`) is deliberately EXEMPT: looks_like_jira_url
+            # already documents that a Confluence page must fall through to the
+            # SSRF-hardened generic fetcher, and a published space really does
+            # serve readable HTML. Only the Jira APP pages fabricate.
+            return {
+                "error": jira_page_without_issue_message(url),
+                "content": None,
+                "needs_jira_mcp": False,
+                "jira_page_without_issue": True,
+                "source_url": url,
+            }
 
         return await _fetch_generic(url)
 
