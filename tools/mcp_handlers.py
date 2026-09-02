@@ -5576,6 +5576,109 @@ async def handle_prepare_test_cases(
         )
 
 
+def _finalize_route_phrase(short: bool = False) -> str:
+    """How to finalize, in one place, resolved on the live seam.
+
+    Five separate replies used to spell this out, and with the duplicate review
+    ON, four of them named the route that FORFEITS it and never mentioned the
+    sidecar -- one calling it "the route here". Each was correct when written
+    and none was wrong in isolation; the defect was that five authors could
+    disagree. agents/host_mode.py owns which route is right (it gets both seam
+    states right, and _FINALIZE_SENTINEL exists because run3/SHYJ-5645 lost the
+    review across 98 cases by leading with the empty one), so callers ask here
+    rather than stating it.
+
+    ``short`` gives the clause form for mid-sentence use. Never raises.
+    """
+    try:
+        review_on = host_mode._dedup_review_on()
+    except Exception:  # pragma: no cover - a reply must never break on this
+        logger.debug("finalize-route seam unreadable", exc_info=True)
+        review_on = False
+    if not review_on:
+        return (
+            "an EMPTY `suite_json`"
+            if short
+            else "finalize with `qa_submit_suite` and an EMPTY `suite_json`"
+        )
+    clause = (
+        "a small JSON SIDECAR carrying `duplicate_groups` (an empty list if "
+        "you found none) and NO test_cases -- that KEEPS the duplicate "
+        "review; an EMPTY `suite_json` also finalizes but FORFEITS it"
+    )
+    return clause if short else f"finalize with `qa_submit_suite` and {clause}"
+
+
+def _next_call_block(payload: object, prep_id: str) -> list:
+    """The route + volume contract, stated ABOVE the payload body.
+
+    2026-08-12. A prep result is tens of KB and clients preview the first ~2 KB,
+    so anything stated only inside the JSON is, in practice, unread: one session
+    never called ``qa_get_category_job`` at all, submitted 27 cases against a
+    64-case contract, was refused three times, and shipped a hand-written CSV.
+    The floor and the fan-out route are the two facts a host must have BEFORE it
+    starts generating, so they go in the header.
+
+    ``category_name="all"`` is REQUIRED, not optional: handle_get_category_job
+    refuses an empty name outright, and the batch form is gated on
+    ``category_name.lower() in ("all", "*")``. Advertising the call without it
+    would recreate the dead-end read this block exists to prevent.
+
+    The batch packet builder is flag-independent, and handle_submit_category
+    serves an incremental host as well, so this route is valid on a default
+    install where the payload itself carries no ``orchestration`` block.
+
+    Pure. Returns [] whenever this payload carries no per-category floor, so a
+    payload without a volume contract is byte-identical to today's output.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return []
+        cats = payload.get("categories")
+        if not isinstance(cats, list) or not cats:
+            return []
+        floors = []
+        for c in cats:
+            if not isinstance(c, dict):
+                continue
+            try:
+                n = int(c.get("min_cases") or 0)
+            except (TypeError, ValueError):
+                n = 0
+            if n > 0:
+                floors.append(n)
+        if not floors or len(floors) != len(cats):
+            return []
+        floor = min(floors)
+        total = floor * len(cats)
+        return [
+            "",
+            f"**NEXT CALL -- do not skip.** This suite is expected to reach "
+            f"{floor} case(s) per category \u00d7 {len(cats)} categories = "
+            f"**{total} cases**.",
+            "",
+            f"1. Call `qa_get_category_job` with prep_id `{prep_id}` and "
+            '`category_name="all"` -- ONE call returns every category packet.',
+            f"2. Generate each category to at least {floor} cases.",
+            # The route named here is the one the host will take: this block is
+            # the first thing it reads, by design. Which route is correct is
+            # NOT this function's decision -- host_mode owns it, and gets it
+            # right for both seam states -- so ask, never hardcode.
+            "3. Call `qa_submit_category` once per category, then "
+            + _finalize_route_phrase()
+            + ".",
+            "",
+            "Merging everything into a single `qa_submit_suite` call is also "
+            f"allowed, but a suite materially below {total} cases is refused "
+            "-- a partly-generated suite is the usual cause. If the tester has "
+            "seen the shortfall and wants the smaller suite anyway, that "
+            "refusal can be acknowledged; do not decide it yourself.",
+        ]
+    except Exception:  # pragma: no cover - a header must never break a prepare
+        logger.debug("next-call block failed", exc_info=True)
+        return []
+
+
 def render_prepare_payload(result: PreparePayloadResult) -> str:
     """Render a PreparePayloadResult as a single markdown/JSON text block for a
     string-only caller (a legacy MCP client, or the host-mode branch of
@@ -5592,6 +5695,7 @@ def render_prepare_payload(result: PreparePayloadResult) -> str:
         "## Host-mode generation -- run this in your own chat, then submit it back",
         "",
         f"**prep_id:** `{result.prep_id}` (pass this to `qa_submit_suite`).",
+        *_next_call_block(result.payload, str(result.prep_id or "")),
         "",
         "Generate the suite from the payload below, then call `qa_submit_suite` "
         "with this prep_id and your merged JSON:",
@@ -5843,6 +5947,7 @@ def _split_prepare_text_blocks(payload: dict, prep_id: str, notice: str) -> list
         f"## Host-mode generation payload -- delivered across {4 + len(cats)} labeled parts",
         "",
         f"**prep_id:** `{prep_id}` (pass this to `qa_submit_suite`).",
+        *_next_call_block(payload, str(prep_id or "")),
         "",
         "This grounded payload exceeded the single-block size budget, so it is "
         "split across the labeled blocks below WITHOUT truncation. Reassemble ONE "
@@ -6880,6 +6985,23 @@ def _volume_floor_note(
             "or one below half its share.",
             f"- **Below that floor:** {shown or '(none)'}.",
         ]
+        # Refusal channel ONLY. post_dedup measures the FINAL suite after the
+        # server's own de-duplication, so a smaller number there is the server's
+        # doing, not the host's, and the suite is already finalized -- the
+        # top-up advice would be wrong on both counts. On the `acked` beat the
+        # tester has just signed the smaller suite off, so nagging about it is
+        # equally wrong.
+        try:
+            _last = int(meta.get("volume_last_count") or 0)
+        except (TypeError, ValueError):
+            _last = 0
+        if _last > total and not post_dedup and mode == "refuse":
+            facts.append(
+                f"- **\u26a0\ufe0f This submission is SMALLER than the one "
+                f"refused a moment ago ({_last} \u2192 {total} cases).** Cases "
+                "are being removed, not added, and generating fewer is not a "
+                "way through a volume refusal. Take one of the routes below."
+            )
         if unknown:
             facts.append(
                 f"- **{unknown} case(s) carried no recognisable `category`**"
@@ -6906,8 +7028,9 @@ def _volume_floor_note(
         opt_topup = (
             "Or top up per category: call `qa_submit_category` again for "
             "each short category (a repeat call REPLACES that category's "
-            "staged row, so send its full set), then finalize with an empty "
-            "`suite_json`. `qa_prep_status` shows the set."
+            "staged row, so send its full set), then "
+            + _finalize_route_phrase()
+            + ". `qa_prep_status` shows the set."
         )
         opt_ack = (
             "Or, ONLY if the tester has seen these numbers and confirms "
@@ -6927,7 +7050,9 @@ def _volume_floor_note(
                 "again for the SHORT categories ONLY (a repeat call REPLACES "
                 "that category's staged row, so send that category's full "
                 f"set), then call `qa_submit_suite` with prep_id `{prep_id}` "
-                "and an EMPTY `suite_json` -- the finalize rebuilds the suite "
+                "and "
+                + _finalize_route_phrase(short=True)
+                + " -- the finalize rebuilds the suite "
                 "from the staged rows. `qa_prep_status` shows the set. "
                 "Regenerating the whole suite instead costs a second full "
                 "pass AND silently changes cases the tester already reviewed."
@@ -6972,7 +7097,12 @@ def _volume_floor_note(
                 + f"\n\nNothing was discarded and prep `{prep_id}` is intact -- "
                 "the prepared context and every staged category are still "
                 "there, and no remediation round was used.\n\n"
-                "**Pick one:**\n" + picks
+                "**Pick one:**\n" + picks + "\n"
+                "Do **not** write the suite to a file yourself. A hand-authored "
+                "CSV or XLSX skips de-duplication, the coverage critic, "
+                "requirements traceability, risk scoring, the auto-export and "
+                "the audit log, and it has no `suite_id` -- it is not a "
+                "substitute for finalizing here, whatever the tester agreed to."
             )
         # F5: the shortfall goes in the HEAD line, named and quantified. The
         # facts below were always right, but the old head said only "Volume
@@ -8013,7 +8143,7 @@ async def handle_submit_category(
         else:
             route = (
                 "When every category is in, call `qa_submit_suite` with this "
-                'prep_id and an EMPTY `suite_json` (`suite_json=""`) -- the rows '
+                "prep_id and " + _finalize_route_phrase(short=True) + " -- the rows "
                 "staged above are merged for you.\n\n"
                 "> \u26a0\ufe0f  Do NOT also send a full merged `suite_json`: a "
                 "non-empty one is authoritative, so every row staged here is "
@@ -8776,7 +8906,19 @@ async def handle_submit_suite(
             try:
                 _mark = await prep_store.update_prep(
                     prep_id,
-                    {**envelope, "meta": {**meta, "volume_refused": True}},
+                    {
+                        **envelope,
+                        "meta": {
+                            **meta,
+                            "volume_refused": True,
+                            # 2026-08-12: the count is stamped so the NEXT
+                            # refusal can say the resubmission got smaller.
+                            # One session went 27 -> 26 -> 24 cases across
+                            # three refusals that read identically, because
+                            # the gate recomputes from scratch every time.
+                            "volume_last_count": len(all_cases),
+                        },
+                    },
                 )
                 if (_mark or {}).get("error"):
                     logger.warning(
@@ -8867,7 +9009,9 @@ async def handle_submit_suite(
                         )
                         or []
                     )
-                    else " and an EMPTY `suite_json` -- the staged categories are "
+                    else " and "
+                    + _finalize_route_phrase(short=True)
+                    + " -- the staged categories are "
                     "held server-side, so do not resend them"
                 )
                 return (
@@ -10431,6 +10575,7 @@ async def handle_export_suite(
     fmt: str,
     *,
     output_dir: str = "",
+    prep_id: str = "",
     choose: ChooseCb = None,
     progress: ProgressCb = None,
 ) -> str:
@@ -10446,6 +10591,29 @@ async def handle_export_suite(
     single-file exporters, which since batch D4 deleted the Zephyr pair
     (2026-08-15) is every format there is. Never raises.
     """
+    # 2026-08-12: a prep_id is not a suite id, and the two are easy to confuse
+    # right after a volume refusal -- the point at which a host is most likely to
+    # give up on the tool path. Answer with the next call rather than an error.
+    # suite_id wins when both arrive, so no existing caller changes behaviour.
+    # The id is host-supplied: cap it and strip backticks/newlines so it cannot
+    # break out of the code span it is rendered in.
+    _prep_only = (prep_id or "").strip()
+    if _prep_only and not (suite_id or "").strip():
+        _safe = "".join(
+            ch for ch in _prep_only[:64] if ch not in "`\n\r" and ch.isprintable()
+        )
+        return (
+            f"\u26a0\ufe0f `prep_id` is not a suite id, so nothing was exported "
+            f"and prep `{_safe}` is intact.\n\n"
+            "A prep becomes exportable only once `qa_submit_suite` finalizes it: "
+            "that call returns the `suite_id` this tool needs, and it already "
+            "auto-exports the .xlsx for you.\n\n"
+            "- Still short of the volume floor? Top up the short categories with "
+            "`qa_submit_category`, then " + _finalize_route_phrase() + ".\n"
+            "- `qa_prep_status` shows what is staged for this prep.\n\n"
+            "Do NOT write the suite to a file yourself -- see the refusal note "
+            "on `qa_submit_suite`."
+        )
     fmt = (fmt or "").strip().lower()
     if not fmt and _elicit_enabled():
         picked = await _elicit_choice(

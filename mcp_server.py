@@ -951,11 +951,13 @@ def build_server():
     @mcp.tool()
     async def qa_prep_status(ctx: Context, prep_id: str = "") -> str:
         """Show which categories are staged for a host-mode prep_id and whether
-        Path A (empty suite_json) finalize is allowed yet.
+        the per-category (Path A) finalize is allowed yet.
 
         Use while staging categories with qa_submit_category. ready=yes means you
-        may call qa_submit_suite with suite_json="". Path B (full merged
-        suite_json) does not require ready=yes.
+        may call qa_submit_suite with a small review SIDECAR carrying
+        duplicate_groups -- or with suite_json="", which also finalizes but
+        carries no review. Path B (full merged suite_json) does not require
+        ready=yes.
         """
         return await _tracked(
             "qa_prep_status",
@@ -1024,7 +1026,11 @@ def build_server():
 
     @mcp.tool()
     async def qa_export_suite(
-        ctx: Context, suite_id: str = "", format: str = "", output_dir: str = ""
+        ctx: Context,
+        suite_id: str = "",
+        format: str = "",
+        output_dir: str = "",
+        prep_id: str = "",
     ) -> str:
         """Export a previously generated suite (by suite_id) to one of:
         csv | xlsx | gherkin | playwright | testrail.
@@ -1039,6 +1045,14 @@ def build_server():
         Zephyr pair was deleted on 2026-08-15 is every format there is.
         The .xlsx that generation auto-exports is unaffected: it always
         lands in QA_EXPORT_DIR with no question asked.
+
+        `prep_id` is NOT an export key and exports nothing on its own. It is
+        accepted only so that a host holding a prep that was never finalized
+        gets told the next call instead of a raw validation error -- 2026-08-12,
+        after a session answered three volume refusals by calling this tool with
+        a prep_id, reading the pydantic error as a dead end, and hand-writing a
+        CSV outside the pipeline. A prep becomes exportable only once
+        `qa_submit_suite` finalizes it and returns a suite_id.
         """
         return await _tracked(
             "qa_export_suite",
@@ -1047,6 +1061,7 @@ def build_server():
                 suite_id,
                 format,
                 output_dir=output_dir,
+                prep_id=prep_id,
                 choose=_make_chooser(ctx),
                 progress=_make_progress(ctx),
             ),
