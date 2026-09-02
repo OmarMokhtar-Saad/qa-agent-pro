@@ -2739,8 +2739,9 @@ _IMAGE_PREVENTION_CLAUSE = (
     "is configured to REFUSE such a submission it will say so, name the screens "
     "and tell you to resubmit with the SAME prep_id and "
     "`image_relevance_ack=true` -- on the per-category route that means a "
-    "finalize with an EMPTY `suite_json`, not a resend of the cases the "
-    "server already holds. That flag is IGNORED on the first submit by "
+    "finalize with the review SIDECAR described above -- or an EMPTY "
+    "`suite_json` if you have no review to carry -- not a resend of the "
+    "cases the server already holds. That flag is IGNORED on the first submit by "
     "design and only the TESTER may ask for it -- never send it on your own "
     "judgement.\n"
 )
@@ -3532,9 +3533,7 @@ def _validate_suite(data: dict) -> ParsedSubmission:
             # say so.
             if isinstance(c.get("test_data"), list) and c.get("test_data"):
                 try:
-                    tc = TestCase(
-                        **{k: v for k, v in c.items() if k != "test_data"}
-                    )
+                    tc = TestCase(**{k: v for k, v in c.items() if k != "test_data"})
                 except Exception:
                     tc = None
             if tc is None:
@@ -3544,9 +3543,7 @@ def _validate_suite(data: dict) -> ParsedSubmission:
                 # Name up to two field/message pairs; the messages are
                 # pydantic's own text, never the rejected VALUE, so nothing
                 # untrusted is echoed back.
-                dropped.append(
-                    f"{tcid}: failed validation ({_validation_detail(exc)})"
-                )
+                dropped.append(f"{tcid}: failed validation ({_validation_detail(exc)})")
                 continue
             salvaged.append(
                 f"{tcid}: kept, but its `test_data` plan was dropped "
@@ -4946,8 +4943,9 @@ def build_gap_response(
             + f" already staged on prep `{prep_id}`. Re-send just the affected "
             "categories with `qa_submit_category` (a repeat call REPLACES that "
             "category's staged row, so send that category's full set), then "
-            f"call `qa_submit_suite` with prep_id `{prep_id}` and an EMPTY "
-            "`suite_json` -- the finalize rebuilds the suite from the staged "
+            f"call `qa_submit_suite` with prep_id `{prep_id}` and the review "
+            "SIDECAR (or an EMPTY `suite_json` if you have no review to carry) "
+            "-- the finalize rebuilds the suite from the staged "
             "rows. Regenerating every category instead costs a second full pass "
             "AND silently changes cases the tester already reviewed. If "
             "correcting a category legitimately REMOVES cases (dropping a "
