@@ -901,6 +901,15 @@ def build_server():
         SAME prep_id. Relay the file path to the user as the deliverable; do not
         ask which export format they want.
 
+        Two routes finalize, and this description used to name only the first.
+        PATH B is the merged `suite_json` above. PATH A is per-category: stage
+        each category with `qa_submit_category`, then call this with the same
+        prep_id and a small review SIDECAR -- a JSON object carrying
+        `duplicate_groups` (an empty list if you found none) and NO
+        `test_cases`. The sidecar is what KEEPS the cross-category duplicate
+        review; finalizing with `suite_json=""` also works and is equally
+        crash-safe, but FORFEITS that review.
+
         If the reply refuses the submission for being below the per-category
         volume this prep's payload asked for, generate the missing cases and
         resubmit the COMPLETE suite under the same prep_id. `volume_floor_ack`

@@ -3710,6 +3710,37 @@ def _dup_title_tokens(case: object) -> frozenset:
         return frozenset()
 
 
+# A prep_id is a uuid4 hex (tools/prep_store.py). Anything else is not one --
+# and a host-supplied string rendered inside a code span in instructions the
+# model then follows is an injection surface: `PID` INJECTED **bold** followed
+# by a `## Fake heading` broke out of the span on two separate surfaces.
+# Gating the SHAPE here makes every echo site safe by construction; sanitising
+# the sites instead leaves the fortieth site one edit away.
+_PREP_ID_RE = re.compile(r"\A[0-9a-fA-F]{8,64}\Z")
+
+
+def safe_prep_id(value: object) -> str:
+    """``value`` if it is shaped like a prep_id, else a sanitised stand-in.
+
+    Never raises, and never returns something that can close a code span or
+    start a markdown block. An id that fails the shape check is still ECHOED --
+    a host that sent a typo needs to see what it sent -- but stripped and
+    capped, so it can only ever read as a wrong id, never as instructions.
+    """
+    try:
+        text = str(value or "").strip()
+        if _PREP_ID_RE.match(text):
+            return text
+        flattened = "".join(
+            " " if ch in "`\n\r\t" else ch
+            for ch in text[:64]
+            if ch.isprintable() or ch in "\n\r\t"
+        )
+        return " ".join(flattened.split())
+    except Exception:  # pragma: no cover - defensive
+        return ""
+
+
 def _shortlist_safe(text: object, cap: int) -> str:
     """Sanitise UNTRUSTED host text for interpolation into the reply: strip
     backticks and newlines (backtick-span breakout) and cap the length."""
@@ -4904,6 +4935,10 @@ def build_gap_response(
     of silently changing cases the tester already reviewed (MEASURED; see
     tools.mcp_handlers._staged_resubmit_hint).
     """
+    # Sanitise ONCE, here: this function renders the host-supplied id into three
+    # separate instructions below, and fixing them one at a time is how the
+    # second and third were missed.
+    prep_id = safe_prep_id(prep_id)
     if coverage is not None and getattr(coverage, "degraded", False):
         return _DEGRADED_GAP_NOTICE
 

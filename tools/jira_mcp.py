@@ -2119,8 +2119,21 @@ def access_verdict(sites: object) -> str:
             return "sites_error"
         if not isinstance(sites, list):
             return "unreadable"
-        hosts = [h for h in (_site_host(e) for e in sites) if h]
+        hosts = []
+        # A host is EXPLICIT when the client structured it -- a dict entry, or a
+        # string carrying a scheme. A bare dotted hostname is our inference, and
+        # an inference may confirm a match but must never establish a miss.
+        explicit = []
+        for entry in sites:
+            host = _site_host(entry)
+            if not host:
+                continue
+            hosts.append(host)
+            if isinstance(entry, dict) or (isinstance(entry, str) and "://" in entry):
+                explicit.append(host)
         if not hosts:
+            # ("inferred" joins "unreadable" as a non-accusing outcome: both
+            # report the sign-in and decline to judge the site.)
             # A list we could not read is NOT proof the account reaches nothing.
             # Reporting it as such told a correctly-connected tester to sign in
             # as someone else, with no way to disagree. Only a genuinely empty
@@ -2129,7 +2142,11 @@ def access_verdict(sites: object) -> str:
         configured = _configured_jira_host()
         if not configured:
             return "no_host"
-        return "match" if configured in hosts else "no_match"
+        if configured in hosts:
+            return "match"
+        # Missed. Say so only if the list we compared against was the client's
+        # own -- otherwise the miss is a claim about strings we interpreted.
+        return "no_match" if explicit else "inferred"
     except Exception:
         logger.exception("access_verdict failed - reporting unreadable")
         return "unreadable"
@@ -2577,6 +2594,14 @@ def verify_outcome(raw: object) -> tuple[str, str]:
             "unreadable": (
                 "the list of Atlassian sites came back in a shape I could not "
                 "read, so I checked the sign-in only"
+            ),
+            # Distinct from the above, and the difference matters to the reader:
+            # here the list WAS read. It just was not labelled, so treating a
+            # miss as proof would be accusing a tester on our own inference.
+            "inferred": (
+                "your editor sent the site list as bare text rather than "
+                "labelled entries -- I could read it, but not safely enough to "
+                "tell you your site is missing, so I checked the sign-in only"
             ),
             "no_host": (
                 "no Jira host is configured here to compare against -- set "
