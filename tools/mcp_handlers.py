@@ -5632,6 +5632,10 @@ def _next_call_block(payload: object, prep_id: str) -> list:
     payload without a volume contract is byte-identical to today's output.
     """
     try:
+        # Sanitise ONCE, here, rather than at each interpolation below: the id
+        # is host-supplied and lands inside a code span in the first
+        # instruction a host reads.
+        prep_id = host_mode.safe_prep_id(prep_id)
         if not isinstance(payload, dict):
             return []
         cats = payload.get("categories")
@@ -5649,17 +5653,33 @@ def _next_call_block(payload: object, prep_id: str) -> list:
                 floors.append(n)
         if not floors or len(floors) != len(cats):
             return []
+        # The contract is per-category, so the suite total is their SUM. Using
+        # min(floors) x len(cats) understated a non-uniform contract -- floors
+        # of 4 and 12 rendered "8 cases" when the payload asked for 16 -- and
+        # the same wrong number was repeated as the refusal threshold.
         floor = min(floors)
-        total = floor * len(cats)
+        uniform = len(set(floors)) == 1
+        total = sum(floors)
+        per_category = (
+            f"{floor} case(s) per category \u00d7 {len(cats)} categories = "
+            f"**{total} cases**"
+            if uniform
+            else f"**{total} cases**, per the per-category floors in the payload "
+            f"(from {floor} to {max(floors)})"
+        )
         return [
             "",
             f"**NEXT CALL -- do not skip.** This suite is expected to reach "
-            f"{floor} case(s) per category \u00d7 {len(cats)} categories = "
-            f"**{total} cases**.",
+            f"{per_category}.",
             "",
             f"1. Call `qa_get_category_job` with prep_id `{prep_id}` and "
             '`category_name="all"` -- ONE call returns every category packet.',
-            f"2. Generate each category to at least {floor} cases.",
+            (
+                f"2. Generate each category to at least {floor} cases."
+                if uniform
+                else "2. Generate each category to at least its own "
+                "`min_cases` -- they differ."
+            ),
             # The route named here is the one the host will take: this block is
             # the first thing it reads, by design. Which route is correct is
             # NOT this function's decision -- host_mode owns it, and gets it
@@ -7697,7 +7717,12 @@ def _prep_status_finalized_reply(prep_id: str, finalized_note: str) -> str:
 
 async def handle_prep_status(prep_id: str) -> str:
     """Report staged vs expected categories for a prep_id. Never raises."""
-    prep_id = (prep_id or "").strip()
+    # UNTRUSTED at every one of these entry points: the id is whatever the
+    # host sent, and it is echoed back in refusals and next-step
+    # instructions, so an unsanitised one can close its code span and write
+    # markdown into text the model then follows. Gated HERE, once, rather
+    # than at the eighteen interpolations downstream.
+    prep_id = host_mode.safe_prep_id(prep_id)
     if not prep_id:
         return "⚠️ Missing prep_id."
     try:
@@ -7760,7 +7785,12 @@ async def handle_prep_status(prep_id: str) -> str:
 
 async def handle_get_category_job(prep_id: str, category_name: str) -> str:
     """Return one self-contained category job packet as fenced JSON. Never raises."""
-    prep_id = (prep_id or "").strip()
+    # UNTRUSTED at every one of these entry points: the id is whatever the
+    # host sent, and it is echoed back in refusals and next-step
+    # instructions, so an unsanitised one can close its code span and write
+    # markdown into text the model then follows. Gated HERE, once, rather
+    # than at the eighteen interpolations downstream.
+    prep_id = host_mode.safe_prep_id(prep_id)
     category_name = (category_name or "").strip()
     if not prep_id:
         return "⚠️ Missing prep_id."
@@ -7887,7 +7917,12 @@ async def handle_submit_category(
     prep_store.save_submission. That row is INSERT OR REPLACE, so re-submitting the
     same category REPLACES the earlier one (newest wins) -- the reply says so.
     Never raises."""
-    prep_id = (prep_id or "").strip()
+    # UNTRUSTED at every one of these entry points: the id is whatever the
+    # host sent, and it is echoed back in refusals and next-step
+    # instructions, so an unsanitised one can close its code span and write
+    # markdown into text the model then follows. Gated HERE, once, rather
+    # than at the eighteen interpolations downstream.
+    prep_id = host_mode.safe_prep_id(prep_id)
     category_name = (category_name or "").strip()
     if not prep_id:
         return (
@@ -8496,7 +8531,12 @@ async def handle_submit_suite(
     finalize it deterministically, and return EITHER a gap report to fix and
     resubmit (SAME prep_id) OR the finished suite + export path. Performs EXACTLY
     ONE gap round per call. Never raises."""
-    prep_id = (prep_id or "").strip()
+    # UNTRUSTED at every one of these entry points: the id is whatever the
+    # host sent, and it is echoed back in refusals and next-step
+    # instructions, so an unsanitised one can close its code span and write
+    # markdown into text the model then follows. Gated HERE, once, rather
+    # than at the eighteen interpolations downstream.
+    prep_id = host_mode.safe_prep_id(prep_id)
     if not prep_id:
         return (
             "⚠️ Missing prep_id. Run `qa_prepare_test_cases` first, then "
@@ -10597,11 +10637,13 @@ async def handle_export_suite(
     # suite_id wins when both arrive, so no existing caller changes behaviour.
     # The id is host-supplied: cap it and strip backticks/newlines so it cannot
     # break out of the code span it is rendered in.
-    _prep_only = (prep_id or "").strip()
+    # One sanitiser, not two. The inline version this replaced dropped newlines
+    # instead of replacing them -- concatenating the fragments either side --
+    # which is the same bug the shared one had and fixed. A rule with two
+    # implementations has two behaviours, eventually.
+    _prep_only = host_mode.safe_prep_id(prep_id)
     if _prep_only and not (suite_id or "").strip():
-        _safe = "".join(
-            ch for ch in _prep_only[:64] if ch not in "`\n\r" and ch.isprintable()
-        )
+        _safe = _prep_only
         return (
             f"\u26a0\ufe0f `prep_id` is not a suite id, so nothing was exported "
             f"and prep `{_safe}` is intact.\n\n"
