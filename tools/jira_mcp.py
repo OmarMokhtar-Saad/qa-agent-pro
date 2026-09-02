@@ -1824,7 +1824,7 @@ def jira_page_without_issue_message(url: str) -> str:
 # The verification blob is UNTRUSTED, but tiny by nature (an identity object or
 # a one-line error marker), so it is capped far below _MAX_PAYLOAD_BYTES before
 # json.loads ever sees it.
-_MAX_VERIFY_CHARS = 4000
+_MAX_VERIFY_CHARS = 12000
 
 # Only short, sanitized FRAGMENTS of that blob are ever echoed to a tester.
 _MAX_ECHO_CHARS = 200
@@ -1834,6 +1834,25 @@ _MAX_ERROR_ECHO_CHARS = 300
 # so a failure here really does mean "not connected".
 _VERIFY_TOOL = "atlassianUserInfo"
 
+# The ACCESS half (2026-09-01). atlassianUserInfo proves a SESSION EXISTS and
+# says nothing about whether it can reach THIS tester's Jira site. Also
+# read-only and parameterless.
+_ACCESS_TOOL = "getAccessibleAtlassianResources"
+
+# At most this many site NAMES are ever echoed back, each sanitized.
+_MAX_ECHO_SITES = 5
+
+# Envelope keys this server ASKS the agent for. A bare identity object -- the
+# pre-2026-09-01 shape, and what a client with a cached tool list keeps sending
+# -- is still accepted, and reported as identity-only rather than as access.
+_ENVELOPE_USER_KEYS = ("user", "userInfo", "identity")
+_ENVELOPE_SITES_KEYS = ("resources", "sites", "accessibleResources")
+
+# Same best-effort, STRING-only discipline as the identity keys below: an
+# unfamiliar entry yields "" rather than a fabricated host.
+_SITE_URL_KEYS = ("url", "siteUrl", "self", "baseUrl")
+_SITE_NAME_KEYS = ("name", "displayName")
+
 # The real response shape is not confirmed in this repo and varies by client and
 # by Atlassian MCP version, so every lookup below is best-effort and
 # STRING-only: an unfamiliar payload must yield "" (and the honest "identity
@@ -1841,17 +1860,279 @@ _VERIFY_TOOL = "atlassianUserInfo"
 # Fields that ESTABLISH an identity, whether or not they can be rendered as a
 # name. atlassianUserInfo answers with account_id and no display name at all, so
 # judging verification on _identity_label alone would refuse a real connection.
+#
+# `key` is deliberately NOT here. A Jira ISSUE key says nothing about an account,
+# and a raw getJiraIssue payload is the single likeliest wrong hand-back -- this
+# same server asks for one, by name, a few paragraphs away.
 _IDENTITY_PRESENCE_KEYS = (
     "account_id",
     "accountId",
     "account_type",
     "accountType",
-    "self",
-    "key",
 )
+
+# WHERE an identity may legitimately sit: the root, or one hop under one of
+# these. Identity fields do arrive nested in practice -- under
+# `structuredContent` (MCP 2025-06-18), under `user` -- but "nested somewhere"
+# is not the same as "nested here", and treating them as the same is what let a
+# Jira issue's reporter prove the caller's account.
+_IDENTITY_WRAPPER_KEYS = (
+    "structuredContent",
+    "user",
+    "account",
+    "myself",
+    "currentUser",
+    "data",
+    "result",
+)
+
+# PROSE IS NEVER EVIDENCE. An earlier revision accepted a text part that
+# "mentioned an account" and subtracted the failures with a phrase denylist.
+# Both halves failed: a getJiraIssue result rendered as prose verified, and so
+# did "session has expired", "token was revoked" and "The team is accountable
+# for this". A denylist over free English cannot be completed, and each phrase
+# added makes the next miss quieter. A text part whose content PARSES to JSON
+# is still read -- see _unwrap_mcp_content -- which is the shape clients
+# actually send; anything else re-asks. A re-ask is recoverable, a false
+# "verified" persisted for a week is not.
 _IDENTITY_NAME_KEYS = ("name", "displayName", "display_name", "nickname")
 _IDENTITY_EMAIL_KEYS = ("email", "emailAddress", "email_address")
 _ERROR_KEYS = ("error", "errors", "errorMessages", "errorMessage", "isError")
+
+
+def access_tool_name() -> str:
+    """Fully-qualified name of the read-only ACCESS probe the AGENT must call.
+
+    Same client-configurable prefix as :func:`verify_tool_name`, so the default
+    is exactly ``mcp__atlassian__getAccessibleAtlassianResources``.
+    """
+    return f"{_tool_prefix()}{_ACCESS_TOOL}"
+
+
+def probe_provenance() -> str:
+    """The tool-name string a verdict recorded by TODAY's probe carries.
+
+    Recorded on every persisted verdict and re-checked on every read, so a
+    verdict produced by an OLDER probe cannot masquerade as a current one. A
+    plain string rather than a version number because that is what the store's
+    column already holds, and because someone reading the database should be
+    able to see which checks actually ran.
+    """
+    return f"{verify_tool_name()}+{access_tool_name()}"
+
+
+def probe_provenance_accepted() -> frozenset:
+    """Provenance strings a stored verdict may carry and still count as CURRENT.
+
+    Exactly one entry today. The identity-only string is deliberately NOT in it:
+    a verdict recorded before this change proved a session EXISTS, never that it
+    could reach the configured Jira site, which is the question this change
+    added. Those rows re-ask once and self-heal.
+    """
+    return frozenset({probe_provenance()})
+
+
+def _looks_like_site_url(value: str) -> bool:
+    """True for a string that can be read as a site URL rather than guessed at.
+
+    Either it carries a scheme, or it is a bare hostname: a dot, no whitespace,
+    and no path-ish or ARI punctuation. "acme.atlassian.net" passes; "Acme Team
+    Site", "ari:cloud:jira::site/1234-abcd" and a bare cloudId do not.
+    """
+    try:
+        candidate = value.strip()
+        if not candidate or any(ch.isspace() for ch in candidate):
+            return False
+        if "://" in candidate:
+            return True
+        if ":" in candidate or "/" in candidate:
+            return False
+        return "." in candidate and not candidate.startswith(".")
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("_looks_like_site_url failed", exc_info=True)
+        return False
+
+
+def _site_host(entry: object) -> str:
+    """Lowercased hostname of one accessible-resource entry, or "".
+
+    STRING fields only; an unfamiliar shape yields "" rather than a guess, and a
+    value with no scheme is probed as https so a bare "acme.atlassian.net" still
+    resolves. Never raises.
+    """
+    try:
+        if isinstance(entry, str):
+            # A plain list of site URLs is a legitimate shape, and reading only
+            # dicts turned it into "no readable sites" -- which used to be a
+            # hard negative. But only a URL-SHAPED string may be read as one:
+            # coercing every string produced a readable-looking host from a site
+            # NAME or a cloudId, and a host that misses is a hard negative
+            # persisted for a week. An unrecognised string is "" -> unreadable,
+            # which is the honest answer and costs the tester nothing.
+            entry = {"url": entry} if _looks_like_site_url(entry) else {}
+        if not isinstance(entry, dict):
+            return ""
+        for key in _SITE_URL_KEYS:
+            value = entry.get(key)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            candidate = value.strip()
+            if "://" not in candidate:
+                candidate = "https://" + candidate
+            try:
+                host = (urlparse(candidate).hostname or "").lower()
+            except ValueError:
+                continue
+            if host:
+                return host
+        return ""
+    except Exception:
+        logger.exception("_site_host failed - dropping the entry")
+        return ""
+
+
+def _site_label(entry: object) -> str:
+    """Sanitized, URL-free display name for one site entry.
+
+    Never renders the site URL and never renders the cloudId: a UUID is an
+    identifier the tester did not ask to see, and the URL is the untrusted half
+    of the payload. ``_sanitize_echo`` strips URLs, so a NAME that is itself a
+    URL degrades to "" and the caller says "an unnamed site".
+    """
+    try:
+        if not isinstance(entry, dict):
+            return ""
+        for key in _SITE_NAME_KEYS:
+            value = entry.get(key)
+            if isinstance(value, str) and value.strip():
+                cleaned = _sanitize_echo(value, _MAX_ECHO_CHARS)
+                if cleaned:
+                    return cleaned
+        return ""
+    except Exception:
+        logger.exception("_site_label failed - omitting the name")
+        return ""
+
+
+def _configured_jira_host() -> str:
+    """Hostname of the configured ``JIRA_BASE_URL``, or "".
+
+    getattr with a default, so a settings object without the field cannot raise.
+    """
+    try:
+        base = str(getattr(settings, "jira_base_url", "") or "").strip()
+        if not base:
+            return ""
+        candidate = base if "://" in base else "https://" + base
+        return (urlparse(candidate).hostname or "").lower()
+    except Exception:
+        logger.exception("_configured_jira_host failed")
+        return ""
+
+
+def _split_envelope(payload: dict) -> tuple:
+    """Split the agent's blob into ``(identity, sites, envelope_seen)``.
+
+    A bare identity object returns ``(payload, None, False)`` so every existing
+    client keeps working. When an envelope IS seen, the identity half is
+    isolated from the sites half -- otherwise ``_error_text`` and
+    ``_identity_label`` would run against a dict that still carries the site
+    list, and a string inside a site entry could be read as an identity.
+    Never raises.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return ({}, None, False)
+        sites = None
+        seen = False
+        for key in _ENVELOPE_SITES_KEYS:
+            if key in payload:
+                sites = payload.get(key)
+                seen = True
+                break
+        identity = payload
+        for key in _ENVELOPE_USER_KEYS:
+            value = payload.get(key)
+            if isinstance(value, dict):
+                identity = _unwrap_mcp_content(value)
+                seen = True
+                break
+        else:
+            if seen:
+                # Sites present, no user key: keep everything EXCEPT the sites
+                # half, so the identity check judges identity fields only.
+                identity = {
+                    k: v for k, v in payload.items() if k not in _ENVELOPE_SITES_KEYS
+                }
+        if isinstance(sites, dict):
+            unwrapped = _unwrap_mcp_content(sites)
+            sites = unwrapped.get("values", unwrapped)
+        return (identity if isinstance(identity, dict) else {}, sites, seen)
+    except Exception:
+        logger.exception("_split_envelope failed - treating as identity only")
+        return (payload if isinstance(payload, dict) else {}, None, False)
+
+
+def _render_sites(sites: object) -> str:
+    """At most ``_MAX_ECHO_SITES`` sanitized site NAMES plus a count. Never a
+    URL, never a cloudId."""
+    try:
+        if not isinstance(sites, list):
+            return ""
+        names = [
+            _site_label(entry) or "an unnamed site" for entry in sites[:_MAX_ECHO_SITES]
+        ]
+        rendered = ", ".join(n for n in names if n)
+        extra = len(sites) - len(names)
+        if extra > 0:
+            rendered += f", and {extra} more"
+        return rendered
+    except Exception:
+        logger.exception("_render_sites failed - omitting the list")
+        return ""
+
+
+def access_verdict(sites: object) -> str:
+    """One of ``not_supplied``, ``sites_error``, ``unreadable``, ``empty``,
+    ``no_host``, ``no_match``, ``match``.
+
+    The SINGLE parse of the access half: the rendered message and the persisted
+    verdict both come from it, because two parsers of one payload is how a
+    stored verdict drifts from the one the tester was shown.
+
+    ``no_host`` is a deliberate departure from the original design, which
+    accepted any host that merely LOOKED like Jira when ``JIRA_BASE_URL`` was
+    unset. Every ``*.atlassian.net`` satisfies that, including the personal
+    account this probe exists to catch, so the fallback would have rubber-stamped
+    the failure case. With nothing to compare against, "I could not check" is the
+    only honest answer. Never raises.
+    """
+    try:
+        if sites is None:
+            return "not_supplied"
+        # An error marker on the sites half is a REPORTED reason ("insufficient
+        # scope"), not an unreadable shape. Flattening it to "unreadable" would
+        # discard the one sentence that tells the tester what to fix.
+        if isinstance(sites, dict) and (
+            _error_text(sites) or _carries_error_key(sites)
+        ):
+            return "sites_error"
+        if not isinstance(sites, list):
+            return "unreadable"
+        hosts = [h for h in (_site_host(e) for e in sites) if h]
+        if not hosts:
+            # A list we could not read is NOT proof the account reaches nothing.
+            # Reporting it as such told a correctly-connected tester to sign in
+            # as someone else, with no way to disagree. Only a genuinely empty
+            # list is that answer.
+            return "empty" if not sites else "unreadable"
+        configured = _configured_jira_host()
+        if not configured:
+            return "no_host"
+        return "match" if configured in hosts else "no_match"
+    except Exception:
+        logger.exception("access_verdict failed - reporting unreadable")
+        return "unreadable"
 
 
 def verify_tool_name() -> str:
@@ -1874,6 +2155,7 @@ def verify_directive() -> str:
     """
     try:
         tool = verify_tool_name()
+        access = access_tool_name()
         return "\n".join(
             [
                 "\U0001f9ea **Want a verified answer instead of a guess?** "
@@ -1881,19 +2163,25 @@ def verify_directive() -> str:
                 "",
                 f"1. Call `{tool}` (no parameters). It is read-only and only "
                 "reports who your Atlassian connection is authenticated as.",
-                "2. Call `qa_configure_jira` again with `atlassian_verify_json` "
-                "set to that call's RAW JSON result (do not summarise, reword "
-                "or truncate it).",
-                f"3. If `{tool}` is not in your tool list, or the call fails, "
+                f"2. Call `{access}` (no parameters) too. Also read-only: it "
+                "lists the Atlassian sites that sign-in can actually reach, "
+                "which is what catches a session on the wrong account. Skip "
+                "this one if it is not in your tool list.",
+                "3. Call `qa_configure_jira` again with `atlassian_verify_json` "
+                'set to `{"user": <result 1>, "resources": <result 2>}`, both '
+                "RAW (do not summarise, reword or truncate them). Send just "
+                "result 1 if you could not make the second call.",
+                f"4. If `{tool}` is not in your tool list, or the call fails, "
                 "call `qa_configure_jira` with "
                 '`atlassian_verify_json={"error": "<what happened>"}` instead '
                 "-- I'll turn that into the exact connection steps for this "
                 "editor.",
                 "",
-                "Your identity is not stored: the result is read once, reported "
-                "back in the same turn, and discarded. Only the yes/no, the "
-                "time, and the name of the tool called are recorded, so this "
-                "check is not repeated on every report.",
+                "Your identity is not stored, and neither is any site address: "
+                "the results are read once, reported back in the same turn, and "
+                "discarded. Only the yes/no, the time, and the names of the "
+                "tools called are recorded, so this check is not repeated on "
+                "every report.",
             ]
         )
     except Exception:
@@ -1931,7 +2219,14 @@ def _unwrap_mcp_content(payload: dict) -> dict:
             text = part.get("text")
             if not isinstance(text, str) or not text.strip():
                 continue
-            inner = json.loads(text)
+            try:
+                inner = json.loads(text)
+            except ValueError:
+                # A part we cannot parse is SKIPPED, exactly like a part with no
+                # text. Letting it escape the loop abandoned every later part,
+                # so a client that sends "Here is your user info:" before the
+                # JSON was unreadable purely because of ORDER.
+                continue
             if isinstance(inner, dict):
                 return inner
         return payload
@@ -1940,22 +2235,62 @@ def _unwrap_mcp_content(payload: dict) -> dict:
         return payload
 
 
+def _identity_candidates(payload: object) -> list:
+    """The dicts that may legitimately HOLD the caller's identity.
+
+    The root, plus one hop under a named identity wrapper. Deliberately NOT a
+    walk: searching every node within four levels is what let an issue's
+    reporter, a status ``name`` and a bare ``self`` URL all read as proof of the
+    caller's account. Depth is not the control -- POSITION is.
+
+    This is the WHOLE defence. An earlier revision also refused issue-shaped
+    payloads by name (`fields`, `issues`, an issue-key regex); mutation showed
+    every branch of it could be disabled with the suite green, because a
+    getJiraIssue result has no account field at a position this returns. A
+    redundant shape check beside a position rule only invites the belief that
+    shape is what decides -- which is the belief that cost three rounds.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return []
+        nodes = [payload]
+        for key in _IDENTITY_WRAPPER_KEYS:
+            value = payload.get(key)
+            if isinstance(value, dict):
+                nodes.append(_unwrap_mcp_content(value))
+        return nodes
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("_identity_candidates failed", exc_info=True)
+        return []
+
+
+def _identity_value(value: object) -> bool:
+    """True for a value that can actually name an account.
+
+    STRINGS only, and `bool` is excluded explicitly -- it is a subclass of int,
+    so ``{"account_id": true}`` would otherwise establish an identity.
+    """
+    return (
+        isinstance(value, str) and not isinstance(value, bool) and bool(value.strip())
+    )
+
+
 def _has_identity(payload: object) -> bool:
-    """True when the payload carries a field that identifies an ACCOUNT.
+    """True when the CALLER's account is identified at an identity position.
 
     Presence, not prettiness: a payload this returns False for establishes
     nothing and must not be recorded as a verified connection. Never raises.
     """
     try:
-        if not isinstance(payload, dict):
-            return False
-        if _identity_label(payload):
-            return True
-        return any(
-            isinstance(payload.get(key), (str, int))
-            and str(payload.get(key)).strip()
-            for key in _IDENTITY_PRESENCE_KEYS
-        )
+        for node in _identity_candidates(payload):
+            if any(_identity_value(node.get(key)) for key in _IDENTITY_PRESENCE_KEYS):
+                return True
+            # An EMAIL identifies an account. A bare display name does not:
+            # a status, a priority and a project all have `name`, and reading
+            # it as identity reported "connected as High".
+            if any(_identity_value(node.get(key)) for key in _IDENTITY_EMAIL_KEYS):
+                return True
+        return False
     except Exception:  # pragma: no cover - defensive
         logger.debug("_has_identity failed", exc_info=True)
         return False
@@ -2020,7 +2355,8 @@ def _carries_error_key(payload: object) -> bool:
         if not isinstance(payload, dict):
             return False
         return any(
-            key in payload and payload.get(key) is not None
+            key in payload
+            and payload.get(key) is not None
             and payload.get(key) is not False
             for key in _ERROR_KEYS
         )
@@ -2040,7 +2376,10 @@ def _error_text(payload: dict) -> str:
             if key not in payload:
                 continue
             value = payload.get(key)
-            if value is None or value is False:
+            # `is False` only catches the JSON literal. A client that stringifies
+            # or int-codes the flag sends "false" / 0, and reading either as a
+            # FAILURE is the same over-eager mistake in the other direction.
+            if value is None or value is False or value in (0, "false", "False"):
                 continue
             if isinstance(value, (str, list, dict)) and not value:
                 continue
@@ -2082,9 +2421,17 @@ def verify_outcome(raw: object) -> tuple[str, str]:
 
     Returns ``(status, message)`` where status is one of:
 
-    * ``"verified"`` -- an identity payload came back;
-    * ``"failed"``   -- an error marker came back (really not connected);
-    * ``"unknown"``  -- nothing supplied, unreadable, oversized, or empty.
+    * ``"verified"``           -- identity proven AND the session can reach the
+      configured Jira site;
+    * ``"verified_no_access"`` -- identity proven, access NOT checked: no site
+      list supplied, no ``JIRA_BASE_URL`` to compare against, or the list came
+      back unusable. This is the pre-2026-09-01 guarantee, stated honestly;
+    * ``"wrong_site"``         -- identity proven, and the sites that session
+      can reach do not include the configured Jira host: ticket URLs will fail;
+    * ``"failed"``             -- an error marker came back (really not
+      connected);
+    * ``"unknown"``            -- nothing supplied, unreadable, oversized, or
+      empty.
 
     Only ``"verified"`` and ``"failed"`` are worth persisting. ``"unknown"``
     means nothing was established, so it must NOT overwrite an earlier verdict:
@@ -2135,15 +2482,29 @@ def verify_outcome(raw: object) -> tuple[str, str]:
                 + connect_hint_line(),
             )
         payload = _unwrap_mcp_content(payload)
-        failure = _error_text(payload)
-        if failure or _carries_error_key(payload):
+        # The blob may now carry BOTH probe results. `probe` is the half
+        # that answers "is there a session"; every identity check below
+        # runs on it rather than on the whole envelope, so a string inside
+        # a site entry can never be read as an identity.
+        identity, sites, envelope = _split_envelope(payload)
+        probe = identity if envelope else payload
+        # THE INVARIANT, in the order it has to be applied:
+        #   1. an error marker carrying TEXT is a failure, whatever else is here;
+        #   2. otherwise identity evidence wins -- an EMPTY errorMessages/errors
+        #      container is what a SUCCESSFUL Jira envelope carries, and letting
+        #      it beat a valid account_id persisted "not connected" for a week
+        #      about a working connection;
+        #   3. an error marker with no text and no identity is still a failure;
+        #   4. anything else establishes nothing -- "unknown", never written.
+        failure = _error_text(probe)
+        identified = _has_identity(probe)
+        if failure or (_carries_error_key(probe) and not identified):
             return (
                 "failed",
                 "\u274c **Not connected** -- that Atlassian call did not "
-                f"return an identity: {failure or _NO_IDENTITY}\n\n"
-                + connect_steps(),
+                f"return an identity: {failure or _NO_IDENTITY}\n\n" + connect_steps(),
             )
-        if not payload:
+        if not probe:
             return (
                 "unknown",
                 "\u26a0\ufe0f **That verification result was empty**, so I "
@@ -2157,8 +2518,14 @@ def verify_outcome(raw: object) -> tuple[str, str]:
         # a week, that guess would silence the real question for seven days. An
         # unrecognized shape is "unknown": the caller writes nothing, and the
         # tester is told what is missing.
-        who = _identity_label(payload) or (
-            "connected (identity payload received)" if _has_identity(payload) else ""
+        # `identified` DECIDES; the label only renders. Written the other way
+        # round -- label first, evidence as the fallback -- a bare `name` was
+        # its own proof, which is how a Jira status called "High" reported
+        # "connected as High" while _has_identity said False.
+        who = (
+            (_identity_label(probe) or "connected (identity payload received)")
+            if identified
+            else ""
         )
         if not who:
             return (
@@ -2171,14 +2538,63 @@ def verify_outcome(raw: object) -> tuple[str, str]:
                 '`{"error": "<what happened>"}` if the call failed.\n\n'
                 + connect_hint_line(),
             )
+        # The kept/not-kept sentence is shared by all three success shapes. Its
+        # wording is load-bearing twice over: handle_configure_jira REPLACES the
+        # last sentence when the store refuses the write (4ef175a0), so the two
+        # must be edited together.
+        _kept = (
+            "This server holds no Jira credential and did NOT keep that identity "
+            "-- no account id, email, name or site address. It records only that "
+            "a check succeeded, when, and which tool was called, so `qa-doctor` "
+            "stops asking again for the next week."
+        )
+        access = access_verdict(sites)
+        if access == "match":
+            return (
+                "verified",
+                f"\u2705 **Atlassian verified** -- connected as {who}, and that "
+                "connection can reach your Jira site.\n\nTicket URLs will be "
+                "read through it, with your own Jira permissions. " + _kept,
+            )
+        if access in ("no_match", "empty"):
+            _reachable = _render_sites(sites) or "no Atlassian site at all"
+            return (
+                "wrong_site",
+                f"\u274c **Connected as {who} -- but to the wrong Atlassian "
+                f"account.** That sign-in can reach {_reachable}, and your Jira "
+                "site is not among them, so ticket URLs will fail until you "
+                "connect the account that has it.\n\n" + connect_steps(),
+            )
+        _why = {
+            "not_supplied": (
+                "your editor did not send the list of Atlassian sites this "
+                f"account can reach -- if `{access_tool_name()}` is in your "
+                "tool list, call it too and send both results together"
+            ),
+            # NOT eagerly evaluated below: _error_text(None) logs a traceback,
+            # and sites is None on every identity-only hand-back.
+            "sites_error": "",
+            "unreadable": (
+                "the list of Atlassian sites came back in a shape I could not "
+                "read, so I checked the sign-in only"
+            ),
+            "no_host": (
+                "no Jira host is configured here to compare against -- set "
+                "`JIRA_BASE_URL` in the install's `.env` and I can confirm this "
+                "account reaches YOUR site, which is what catches a sign-in on "
+                "a personal Atlassian account"
+            ),
+        }.get(access, "I could not check which Atlassian sites it can reach")
+        if access == "sites_error":
+            _why = "that list could not be read: " + (
+                _error_text(sites) or _NO_IDENTITY
+            )
         return (
-            "verified",
-            f"\u2705 **Atlassian verified** -- connected as {who}.\n\n"
-            "Jira ticket URLs will be read through this connection, with your "
-            "own Jira permissions. This server holds no Jira credential and did "
-            "NOT keep that identity -- no account id, email or name. It records "
-            "only that a check succeeded, when, and which tool was called, so "
-            "`qa-doctor` stops asking again for the next week.",
+            "verified_no_access",
+            f"\u2705 **Signed in to Atlassian** as {who} -- but I could not "
+            f"confirm it can reach your Jira site, because {_why}.\n\nTicket "
+            "URLs will probably work; if they do not, this is the first thing "
+            "to check. " + _kept,
         )
     except Exception:
         logger.exception("verify_outcome failed - falling back")

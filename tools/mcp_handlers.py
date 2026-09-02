@@ -1788,11 +1788,24 @@ async def handle_configure_jira(
             # "unknown" establishes NOTHING and deliberately does not overwrite
             # an earlier verdict: an agent that fumbles the hand-back must not
             # be able to erase a good result.
-            if status in ("verified", "failed"):
+            # 2026-09-01: five statuses, not three. wrong_site is a NEGATIVE
+            # verdict -- the sign-in works and cannot reach this tester's Jira --
+            # so it persists as verified=False and reads as "failed" downstream.
+            # verified_no_access is a positive identity with the access half
+            # unchecked, recorded so the report can say which of the two it is.
+            _persistable = {
+                "verified": (True, True),
+                "verified_no_access": (True, False),
+                "wrong_site": (False, True),
+                "failed": (False, False),
+            }
+            if status in _persistable:
+                from tools.jira_mcp import probe_provenance
                 from tools.verify_store import record_verdict
 
+                _verified_flag, _site_checked = _persistable[status]
                 _stored = await record_verdict(
-                    status == "verified", verify_tool_name()
+                    _verified_flag, probe_provenance(), _site_checked
                 )
                 # verify_store never raises -- it reports. A discarded report is
                 # how the reply came to promise a week of remembered state that
@@ -13028,6 +13041,25 @@ def _jira_status_text(state: str, view: dict | None) -> str:
             f"{tail} An OAuth session can expire or be revoked in that time, so "
             "I'll re-check it."
         )
+    if state == "access_unconfirmed":
+        return (
+            f"{head}\u2705 signed in ({age} ago) \u2014 but I could not confirm "
+            f"it can reach your Jira site. {tail} A ticket URL may still fail; "
+            "if one does, that is the first thing to check."
+        )
+    if state == "probe_outdated":
+        return (
+            f"{head}\u26a0\ufe0f checked {age} ago, but only that you were "
+            f"signed in \u2014 not that the account can reach your Jira site. "
+            f"{tail} I'll re-check it."
+        )
+    if state == "wrong_site":
+        return (
+            f"{head}\u274c signed in ({age} ago), but to an Atlassian account "
+            f"that cannot reach your Jira site. {tail} Ticket URLs will fail "
+            "until you connect the account that has it -- run "
+            "`qa_configure_jira` and I'll show the exact steps for your client."
+        )
     if state == "failed":
         return (
             f"{head}\u274c the last check ({age} ago) did not come back "
@@ -13364,14 +13396,27 @@ async def handle_setup_check(
             _verdict_view = (await load_verdict()).get("content")
         except Exception:
             logger.debug("atlassian verdict lookup skipped", exc_info=True)
+        # Provenance is checked BEFORE freshness: a day-old verdict from the
+        # identity-only probe and a week-old verdict from the current one need
+        # different words, and only the first can be fixed by re-running a
+        # better check.
         if not _verdict_view:
             _verdict_state = "unverified"
         elif not _verdict_view.get("verified"):
-            _verdict_state = "failed"
-        elif _verdict_view.get("fresh"):
-            _verdict_state = "verified"
-        else:
+            # A negative verdict whose ACCESS half was checked means the sign-in
+            # worked and reached the wrong Atlassian account -- a different
+            # sentence and a different remedy from "not connected".
+            _verdict_state = (
+                "wrong_site" if _verdict_view.get("site_checked") else "failed"
+            )
+        elif not _verdict_view.get("current_probe"):
+            _verdict_state = "probe_outdated"
+        elif not _verdict_view.get("fresh"):
             _verdict_state = "stale"
+        elif not _verdict_view.get("site_checked"):
+            _verdict_state = "access_unconfirmed"
+        else:
+            _verdict_state = "verified"
         _atlassian_lines, _atlassian_advisories = await _atlassian_autofix()
         recommended.extend(_atlassian_advisories)
         # verify_offered: the on-disk hint returns "" rather than shrugging
@@ -13411,10 +13456,33 @@ async def handle_setup_check(
         export_dir = _resolved_export_dir()
         if export_dir:
             dest = Path(export_dir).expanduser()
-            probe = dest if dest.is_absolute() else Path.cwd() / dest
-            while not probe.exists() and probe.parent != probe:
-                probe = probe.parent
-            export_ok = os.access(probe, os.W_OK)
+            target = dest if dest.is_absolute() else Path.cwd() / dest
+            # A real write, not os.access on whichever ancestor happens to
+            # exist: that answered a different question ('is some parent
+            # writable') and printed a green tick for it. os.access also
+            # consults permission bits only, which is the wrong answer on a
+            # read-only mount or an ACL-governed share.
+            export_exists = target.is_dir()
+            export_ok = False
+            if export_exists:
+                _probe_file = target / f".qa-write-probe-{os.getpid()}"
+                try:
+                    _probe_file.write_text("", encoding="utf-8")
+                    export_ok = True
+                except Exception:
+                    export_ok = False
+                finally:
+                    try:
+                        _probe_file.unlink()
+                    except Exception:
+                        logger.debug("export write-probe cleanup failed", exc_info=True)
+            else:
+                # Not created yet: the honest claim is about the parent, and the
+                # label says so rather than implying the folder is ready.
+                _parent = target
+                while not _parent.exists() and _parent.parent != _parent:
+                    _parent = _parent.parent
+                export_ok = os.access(_parent, os.W_OK)
             export_line = (
                 # K5 (2026-08-10): this said "you choose where each file is
                 # saved" -- but F1a gates the save-folder dialog on an
@@ -13424,7 +13492,22 @@ async def handle_setup_check(
                 f"- {'✅' if export_ok else '⚠️'} **Excel auto-export** — "
                 f"files are saved to `{dest}` (set `QA_EXPORT_DIR`, or pass "
                 "`output_dir` to `qa_export_suite`)"
-                + ("" if export_ok else " — not writable")
+                + (
+                    (
+                        " — checked by writing to it just now"
+                        if export_exists
+                        else " — the folder does not exist yet and will be "
+                        "created on the first export; its parent is writable"
+                    )
+                    if export_ok
+                    else (
+                        " — not writable: a test file could not be created "
+                        "there just now"
+                        if export_exists
+                        else " — not writable: the folder does not exist and "
+                        "its parent cannot be written to either"
+                    )
+                )
             )
             if not export_ok:
                 recommended.append(
@@ -13527,6 +13610,34 @@ async def handle_setup_check(
                 "since -- an OAuth grant can be revoked or rotated in that "
                 "time. Re-verify now, without asking the tester: " + _verify_ask
             )
+        elif _verdict_state == "probe_outdated":
+            recommended.append(
+                "Agent: the Atlassian (Jira) connection verified at "
+                f"{(_verdict_view or {}).get('at')}, but only that someone was "
+                "signed in -- not that the account can reach this tester's Jira "
+                "site, which is the check that catches a sign-in on a personal "
+                "Atlassian account. Re-verify now, without asking the tester: "
+                + _verify_ask
+            )
+        # access_unconfirmed raises NO action item, deliberately. A client
+        # whose toolset lacks the access probe can never satisfy one, so it
+        # would repeat on every report forever -- the nag loop with no exit
+        # that 3e66fabf removed. The Integrations row states it instead, and
+        # the headline stays green: nothing is known to be wrong.
+        elif _verdict_state == "access_unconfirmed":
+            pass  # Deliberately no item. See above -- and note that OMITTING
+            # this branch does not produce silence, it falls through to the
+            # unverified "Fix now" below, which is the loudest thing in the
+            # report and wrong about a working connection.
+        elif _verdict_state == "wrong_site":
+            recommended.append(
+                "The Atlassian account signed in here cannot reach this "
+                "tester's Jira site "
+                f"({(_verdict_view or {}).get('at')}), so ticket URLs will fail "
+                "until the right account is connected in your editor. Test "
+                "generation from a typed feature description is unaffected. "
+                "Agent: re-check after they reconnect: " + _verify_ask
+            )
         elif _verdict_state == "failed":
             # Known-broken and actionable to the TESTER, so a warning rather
             # than an unsettled question. Not a blocker: generation from a typed
@@ -13605,9 +13716,34 @@ async def handle_setup_check(
                 True,
             ),
         ]
+        # Say what was OBSERVED, in the label. A bare tick on an empty
+        # corpus advertises grounding that this server's own docstring
+        # calls a silent no-op, and the count is observable right here.
+        _corpus_entries = 0
+        try:
+            from tools.rag_store import corpus_entry_count
+
+            _corpus_entries = await corpus_entry_count()
+        except Exception:
+            logger.debug("corpus count skipped", exc_info=True)
         gates += [
-            ("RAG corpus (always on since 2026-08-13)", _rag_enabled()),
-            ("Wizard dialogs (always on since 2026-08-13)", _elicit_enabled()),
+            (
+                f"RAG corpus \u2014 grounding on {_corpus_entries} past "
+                f"case(s) from this install"
+                if _corpus_entries
+                else "RAG corpus \u2014 empty so far, so nothing is "
+                "grounded on past work yet; it fills as you generate",
+                _rag_enabled(),
+            ),
+            (
+                # The seam's own docstring concedes this is client-dependent:
+                # "a client that cannot show dialogs is UNAFFECTED... renders
+                # the menu". So state what is true of the SERVER, and what the
+                # tester sees when their client cannot.
+                "Wizard dialogs \u2014 offered to every client; one without "
+                "dialog support gets the same choices as a numbered menu",
+                _elicit_enabled(),
+            ),
         ]
         for label, value in gates:
             lines.append(f"- {'✅' if value else '⬜'} {label}")

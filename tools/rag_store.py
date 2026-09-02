@@ -446,6 +446,21 @@ def _corpus_path(entry_type: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
+async def corpus_entry_count(entry_type: str = "test_case") -> int:
+    """Roughly how many entries this corpus holds. 0 on any error.
+
+    Reuses the newline scan the prune gate already uses -- no JSON parsing, so
+    it stays cheap on a 5,000-entry corpus. Added 2026-09-01 so qa-doctor can
+    say what it OBSERVED ("grounding on 459 past cases") instead of printing a
+    green tick for a feature that is a silent no-op on an empty corpus.
+    """
+    try:
+        return await asyncio.to_thread(_count_entries_sync, _corpus_path(entry_type))
+    except Exception:
+        logger.debug("corpus_entry_count failed", exc_info=True)
+        return 0
+
+
 async def add_to_corpus(entry_type: str, content: str, metadata: dict) -> dict:
     """Append a new entry to the corpus.
 

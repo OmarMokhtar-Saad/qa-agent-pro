@@ -54,12 +54,21 @@ _BUSY_TIMEOUT_S = 5.0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS atlassian_verifications (
-    client    TEXT PRIMARY KEY,
-    verified  INTEGER NOT NULL,
-    at_epoch  REAL NOT NULL,
-    tool      TEXT NOT NULL
+    client       TEXT PRIMARY KEY,
+    verified     INTEGER NOT NULL,
+    at_epoch     REAL NOT NULL,
+    tool         TEXT NOT NULL,
+    site_checked INTEGER NOT NULL DEFAULT 0
 );
 """
+
+# Databases created before 2026-09-01 predate site_checked. Added here rather
+# than by a migration script: an additive column with a default is the whole
+# change, and a failed ALTER on an already-migrated database is expected, not an
+# error.
+_MIGRATIONS = (
+    "ALTER TABLE atlassian_verifications ADD COLUMN site_checked INTEGER NOT NULL DEFAULT 0",
+)
 
 
 def _db_path() -> Path:
@@ -81,6 +90,11 @@ def _connect() -> sqlite3.Connection:
             "verify_store: WAL/busy_timeout pragmas unavailable", exc_info=True
         )
     conn.executescript(_SCHEMA)
+    for statement in _MIGRATIONS:
+        try:
+            conn.execute(statement)
+        except sqlite3.OperationalError:
+            pass  # Already applied - the column exists.
     return conn
 
 
@@ -111,17 +125,26 @@ def _iso(epoch: float) -> str:
         return ""
 
 
-def _save_sync(client: str, verified: bool, tool: str, at_epoch: float) -> None:
+def _save_sync(
+    client: str, verified: bool, tool: str, at_epoch: float, site_checked: bool
+) -> None:
     conn = _connect()
     try:
         with conn:
             conn.execute(
                 "INSERT INTO atlassian_verifications "
-                "(client, verified, at_epoch, tool) VALUES (?, ?, ?, ?) "
+                "(client, verified, at_epoch, tool, site_checked) "
+                "VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT(client) DO UPDATE SET "
                 "verified=excluded.verified, at_epoch=excluded.at_epoch, "
-                "tool=excluded.tool",
-                (client, 1 if verified else 0, float(at_epoch), str(tool)[:120]),
+                "tool=excluded.tool, site_checked=excluded.site_checked",
+                (
+                    client,
+                    1 if verified else 0,
+                    float(at_epoch),
+                    str(tool)[:120],
+                    1 if site_checked else 0,
+                ),
             )
     finally:
         conn.close()
@@ -131,8 +154,8 @@ def _load_sync(client: str) -> dict | None:
     conn = _connect()
     try:
         row = conn.execute(
-            "SELECT verified, at_epoch, tool FROM atlassian_verifications "
-            "WHERE client = ?",
+            "SELECT verified, at_epoch, tool, site_checked "
+            "FROM atlassian_verifications WHERE client = ?",
             (client,),
         ).fetchone()
     finally:
@@ -143,15 +166,27 @@ def _load_sync(client: str) -> dict | None:
         "verified": bool(row[0]),
         "at": _iso(row[1]),
         "tool": str(row[2] or ""),
+        "site_checked": bool(row[3]),
         "age_s": max(0.0, time.time() - float(row[1])),
     }
 
 
-async def record_verdict(verified: bool, tool: str) -> dict:
-    """Persist ONLY {verified, at, tool} for THIS client. Never raises."""
+async def record_verdict(verified: bool, tool: str, site_checked: bool = False) -> dict:
+    """Persist ONLY {verified, at, tool, site_checked} for THIS client.
+
+    ``site_checked`` is a BOOLEAN: whether the access half was actually checked,
+    never WHICH site or what it was called. Never raises.
+    """
     try:
         client = _client_key()
-        await asyncio.to_thread(_save_sync, client, bool(verified), tool, time.time())
+        await asyncio.to_thread(
+            _save_sync,
+            client,
+            bool(verified),
+            tool,
+            time.time(),
+            bool(site_checked),
+        )
         return {"error": None, "content": True}
     except Exception as exc:
         logger.debug("verify_store: recording the verdict failed", exc_info=True)
@@ -172,6 +207,20 @@ async def load_verdict() -> dict:
         rec = await asyncio.to_thread(_load_sync, client)
         if rec is not None:
             rec["fresh"] = rec["age_s"] <= VERDICT_FRESH_S
+            # Provenance is a SECOND, independent freshness axis: a verdict can
+            # be minutes old and still not be evidence, because the probe that
+            # produced it did not ask the question we now ask. Evaluated on READ
+            # like `fresh`, so widening the accepted set re-judges existing rows
+            # rather than stranding them. Defaults False on any failure -- that
+            # re-asks one cheap read-only question, where True would certify
+            # access nobody checked.
+            try:
+                from tools.jira_mcp import probe_provenance_accepted
+
+                rec["current_probe"] = rec["tool"] in probe_provenance_accepted()
+            except Exception:
+                logger.debug("verify_store: provenance check skipped", exc_info=True)
+                rec["current_probe"] = False
         return {"error": None, "content": rec}
     except Exception as exc:
         logger.debug("verify_store: loading the verdict failed", exc_info=True)
