@@ -80,7 +80,11 @@ def validate_public_url_sync(url: str) -> tuple:
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):
-            return None, None, "Blocked: scheme '" + str(parsed.scheme) + "' not allowed"
+            return (
+                None,
+                None,
+                "Blocked: scheme '" + str(parsed.scheme) + "' not allowed",
+            )
         hostname = parsed.hostname
         if not hostname:
             return None, None, "Blocked: invalid hostname"

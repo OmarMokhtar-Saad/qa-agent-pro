@@ -2295,6 +2295,103 @@ def _mobile_capture() -> bool:
     return True
 
 
+def _mobile_lane_enabled() -> bool:
+    """The ONE condition that decides whether the mobile lane exists.
+
+    Both conjuncts are load-bearing and neither may be re-expressed anywhere
+    else -- ``mcp_server`` calls THIS, and a test asserts the registration site
+    holds nothing but a call to it. The failure mode being designed out is a
+    gate copied with one of its two terms, which this project has shipped before.
+
+    * ``qa_mobile_run_enabled`` is the contract's category-1 kill-switch:
+      default OFF forever, because a run installs an app, drives an emulator and
+      writes to a shared cache.
+    * ``not _test_cases_only()`` is a CORRECTNESS term, not a policy one:
+      ``tools/mobile/`` is deliberately absent from
+      ``scripts/build_dist.py TOOL_FILES``, so on a distribution install its
+      modules do not exist and a registered tool whose first line cannot import
+      is worse than an absent tool.
+
+    Read fresh on every call, never cached: the flag is read from ``settings``,
+    which a test may flip, and a cached answer would make the off-path
+    unobservable.
+    """
+    return bool(settings.qa_mobile_run_enabled) and not _test_cases_only()
+
+
+_MOBILE_LANE_OFF = (
+    "ℹ️ The mobile emulator lane is off on this install. Add "
+    "`QA_MOBILE_RUN_ENABLED=true` to `.env` and restart the MCP server (quit "
+    "and reopen the editor) to turn it on. Nothing else here is affected."
+)
+
+
+#: How long qa-doctor's ONE device probe may take. Small, because this report is
+#: what a tester runs when nothing works.
+_MOBILE_PROBE_S = 8.0
+
+
+async def _mobile_doctor_section() -> list:
+    """The qa-doctor lines for the mobile lane. Never raises, never blocks.
+
+    Bounded on purpose: qa-doctor is the FIRST thing a tester runs on a new
+    machine, and a device probe that hangs turns the one diagnostic tool into
+    the symptom. The probe is wrapped in ``asyncio.wait_for``; a timeout is
+    reported as "not checked", never as absent hardware -- telling a tester
+    their emulator is missing because our probe was slow is exactly the class of
+    untrue tester-facing text this file has been corrected for before.
+    """
+    if not _mobile_lane_enabled():
+        return []
+    lines = ["### Mobile emulator lane"]
+    try:
+        from tools.mobile import ime, sdk_locator
+
+        located = (sdk_locator.locate_sdk() or {}).get("content") or {}
+        root = str(located.get("sdk_root") or "")
+        lines.append(
+            "- ✅ Android SDK found at `"
+            + root
+            + "` ("
+            + str(located.get("source") or "?")
+            + ")"
+            if root
+            else "- ⬜ No Android SDK found yet — the first mobile run "
+            "provisions one into `~/.qa-agents/mobile/` (about 2.2 GB)"
+        )
+        pinned = (ime.manifest_status() or {}).get("content") or {}
+        lines.append(
+            "- ✅ QA input method pinned (" + str(pinned.get("version") or "?") + ")"
+            if pinned.get("pinned")
+            else "- ⬜ QA input method not pinned yet, so typing into the app "
+            "is unavailable; taps and assertions work"
+        )
+    except Exception:
+        logger.debug("qa-doctor mobile sdk/ime section skipped", exc_info=True)
+        lines.append("- ⬜ Mobile support modules could not be inspected")
+    try:
+        from tools.mobile import emulator, provisioner
+
+        found = await asyncio.wait_for(
+            emulator.find_running(provisioner.AVD_NAME), timeout=_MOBILE_PROBE_S
+        )
+        serial = str((found.get("content") or {}).get("serial") or "")
+        lines.append(
+            "- ✅ Emulator `" + provisioner.AVD_NAME + "` is running as " + serial
+            if serial
+            else "- ⬜ No emulator running — `qa_mobile_test` starts one"
+        )
+    except Exception:
+        # Includes asyncio.TimeoutError, which IS an Exception on every version
+        # this project supports. "not checked" is the honest word here.
+        logger.debug("qa-doctor emulator probe skipped", exc_info=True)
+        lines.append(
+            "- ⬜ Emulator state not checked (the device probe did not answer "
+            "in time); `qa_mobile_status` reports it on demand"
+        )
+    return lines
+
+
 def _rag_enabled() -> bool:
     """Always True -- RAG corpus grounding is ON, unconditionally.
 
@@ -10610,6 +10707,702 @@ async def handle_push_suite(
         return "\u26a0\ufe0f Push to " + target + " failed: " + _safe(str(exc), 200)
 
 
+async def handle_mobile_test(
+    source: str = "",
+    suite_id: str = "",
+    goal: str = "",
+    cases: str = "",
+    app: str = "",
+    package: str = "",
+    run_id: str = "",
+    session_token: str = "",
+    apply: bool = False,
+    continue_run: bool = False,
+    *,
+    choose: ChooseCb = None,
+    ask_text: AskCb = None,
+    progress: ProgressCb = None,
+) -> str:
+    """Drive the mobile emulator lane. Returns markdown; never raises.
+
+    The state machine itself lives in ``tools/mobile/session.py`` and every
+    string in ``tools/mobile/render.py`` -- this function gates, delegates,
+    renders and audits, and holds no state of its own. That matters because the
+    MCP process restarts on every code and `.env` edit: any state kept here
+    would be lost by exactly the event that makes a tester resume.
+
+    Two independent guards, like ``handle_push_suite``: the lane's kill-switch
+    AND ``apply=true`` on any step that installs, downloads or launches. A
+    flag-OFF call carrying ``apply=true`` REFUSES BY NAME rather than quietly
+    doing a dry run, because a success-shaped reply for a step that never ran is
+    the worse failure.
+
+    Every ``tools.mobile`` import below is function-local, exactly as
+    ``handle_push_suite`` imports its pushers: those modules are absent from the
+    distribution build, so a module-scope import would break it at import time
+    on an install no test in this repo can observe.
+    """
+    from agents.api_test_agent import _safe
+
+    if not _mobile_lane_enabled():
+        from tools.mobile import render as mobile_render
+
+        if apply:
+            return mobile_render.flag_refusal("Running the emulator lane")
+        return _MOBILE_LANE_OFF
+
+    from tools.mobile import render as mobile_render
+    from tools.mobile import run_store, session
+
+    try:
+        budget = session.new_budget()
+        await _audit(
+            "mcp_mobile_test",
+            entity_id=run_id or None,
+            detail=session.audit_detail(
+                run_id=run_id, step=(source or "menu"), apply=apply
+            ),
+        )
+
+        # --- an existing run: lease first, then the next packet ------------
+        if run_id:
+            claimed = session.claim(run_id, session_token, force=not session_token)
+            if claimed.get("error"):
+                return "⚠️ " + _safe(claimed["error"], 300)
+            held = claimed.get("content") or {}
+            if held.get("state") != run_store.HELD:
+                return mobile_render.takeover_block(
+                    run_store.takeover_message(run_id, str(held.get("holder") or "?"))
+                )
+            token = str(held.get("session_token") or "")
+            # A resume can arrive days later, in a new chat, on a machine that
+            # has rebooted since: check the DEVICE before producing a packet for
+            # it. Deliberately AFTER the lease check, so a displaced chat can
+            # never boot an emulator it does not own.
+            device = await _mobile_resume_device_stage(run_id, budget=budget)
+            if device:
+                return device
+            _mobile_start_heartbeat(run_id, token)
+            resolved = session.resolve(run_id, token)
+            if resolved.get("error"):
+                return "⚠️ " + _safe(resolved["error"], 400)
+            body = resolved["content"] or {}
+            if body.get("gate") and not continue_run:
+                return mobile_render.gate_block(
+                    {
+                        "done": body.get("done"),
+                        "total": body.get("total"),
+                        "failed": body.get("failed"),
+                    }
+                )
+            # `past_gate` rides along: without it the gate is re-decided inside
+            # _mobile_next, which does not know the tester already answered, and
+            # the run never advances past case 20.
+            return await _mobile_next(
+                run_id,
+                token,
+                progress=progress,
+                past_gate=continue_run,
+                budget=budget,
+            )
+
+        # --- a new run: device, app, preflight, then the menu --------------
+        staged, serial = await _mobile_device_stage(apply, progress=progress)
+        if staged:
+            return staged
+        app_stage, target = await _mobile_app_stage(
+            serial, package, source, app, apply, progress=progress
+        )
+        if app_stage:
+            return app_stage
+        checked = await session.preflight_for({"package": target, "serial": serial})
+        if checked.get("error"):
+            return "⚠️ " + _safe(checked["error"], 300)
+        from tools.mobile import preflight as mobile_preflight
+
+        pf = checked.get("content") or {}
+        if not pf.get("ok"):
+            return mobile_render.preflight_block(pf, mobile_preflight.render(pf))
+        picked = await _mobile_pick_source(source, choose=choose)
+        if not picked:
+            return mobile_render.source_menu_markdown()
+        return await _mobile_start(
+            picked,
+            suite_id=suite_id,
+            goal=goal,
+            cases=cases,
+            package=target,
+            serial=serial,
+            progress=progress,
+        )
+    except Exception as exc:  # never-raise contract
+        logger.exception("mcp mobile_test failed")
+        _capture_error(exc, "qa_mobile_test")
+        return "⚠️ The mobile run could not continue: " + _safe(str(exc), 200)
+
+
+async def _mobile_pick_source(source: str, *, choose: ChooseCb = None) -> str:
+    """Resolve the start-menu choice: an argument, a dialog, or ``""``.
+
+    ``""`` means "show the menu", and the menu is the tested path: MCP
+    elicitation arrives collapsed-and-required in some editors, so the dialog is
+    an optimisation and the numbered menu is the product. A number is accepted
+    too, because a tester answering a markdown menu says "3".
+    """
+    from tools.mobile import render as mobile_render
+
+    given = str(source or "").strip()
+    if given:
+        return mobile_render.source_for_label(given) or mobile_render.source_for_number(
+            given
+        )
+    picked = await _elicit_choice(
+        choose, "What should the emulator run?", mobile_render.source_labels()
+    )
+    if picked.status == CHOSEN:
+        return mobile_render.source_for_label(picked.value or "")
+    return ""
+
+
+async def _mobile_device_stage(apply: bool, *, progress: ProgressCb = None) -> tuple:
+    """Provisioning and boot. Returns ``(markdown_to_send_back, serial)``.
+
+    A tuple rather than a string because the caller needs the serial and asking
+    for it twice would mean two device probes per call -- and, worse, two
+    answers that could disagree.
+
+    Neither step is allowed to block this call: provisioning runs as a detached
+    OS process and the emulator is started and then polled with an explicit
+    bounded budget, so the reply is always a pointer to ``qa_mobile_status``
+    rather than a tool call the client kills at its own timeout.
+    """
+    from tools.mobile import render as mobile_render
+    from tools.mobile import session
+
+    plan = session.provision_plan()
+    steps = (plan.get("content") or {}).get("steps") or []
+    pending = [s for s in steps if str(s.get("state") or "") == "pending"]
+    if pending:
+        if not apply:
+            return (
+                mobile_render.apply_refusal(
+                    "Provisioning the Android SDK and an emulator image",
+                    str(len(pending)) + " step(s), up to about 2.2 GB of downloads",
+                ),
+                "",
+            )
+        await _emit(progress, "⚙️ Starting the provisioner…")
+        started = session.start_provisioning()
+        if started.get("error"):
+            return "⚠️ " + str(started["error"])[:300], ""
+        return (
+            "## Provisioning started\n\n"
+            + mobile_render.provisioning_line(
+                (session.provision_progress() or {}).get("content")
+            )
+            + "\n\nIt runs OUTSIDE this server, so nothing here is waiting on "
+            "it. Call `qa_mobile_status` for progress; it can take several "
+            "minutes on a first run.",
+            "",
+        )
+    ready = await session.ensure_device()
+    if ready.get("error"):
+        return "⚠️ " + str(ready["error"])[:300], ""
+    state = ready.get("content") or {}
+    serial = str(state.get("serial") or "")
+    if str(state.get("state") or "") != "ready":
+        return mobile_render.device_pending_block(state), serial
+    return "", serial
+
+
+async def _mobile_app_stage(
+    serial: str,
+    package: str,
+    source: str,
+    app: str,
+    apply: bool,
+    *,
+    progress: ProgressCb = None,
+) -> tuple:
+    """Get the app under test onto the device. ``(markdown_or_empty, package)``.
+
+    The resolved package comes back because the ``installed_package`` source
+    carries it in ``app`` rather than in ``package`` -- deriving it twice, once
+    here and once in the caller, is how the preflight ends up checking a
+    different app from the one that was installed.
+
+    Every branch that touches the device needs ``apply=true``, and the refusal
+    names the step. The Play-Store branches only OPEN a URL inside the emulator
+    -- Firebase App Tester is reached through the emulator's own Play Store and
+    is never redistributed by this project.
+    """
+    from tools.mobile import adb as mobile_adb
+    from tools.mobile import render as mobile_render
+    from tools.mobile import session
+
+    chosen = str(source or "").strip()
+    value = str(app or "").strip()
+    install_source = mobile_render.install_source_for_number(chosen) or (
+        chosen if chosen in dict(mobile_render.INSTALL_SOURCES) else ""
+    )
+    target = str(package or "").strip()
+    if not target and install_source == "installed_package":
+        target = value
+
+    if target:
+        state = await session.install_state(serial, target)
+        body = state.get("content") or {}
+        if body.get("installed"):
+            return "", target
+        if body.get("pending"):
+            return (
+                "## The install is still running\n\n`"
+                + target
+                + "` has not appeared on the device yet. Nothing in this call "
+                "is waiting on it — call `qa_mobile_status` in a few seconds.",
+                target,
+            )
+    if not install_source:
+        return mobile_render.install_menu_markdown(target), target
+    if not apply:
+        return (
+            mobile_render.apply_refusal(
+                "Installing the app (" + install_source + ")", value
+            ),
+            target,
+        )
+    if install_source == "local_apk":
+        if not target:
+            return (
+                "⚠️ Give the app's `package` name as well as the .apk path: it "
+                "is what the preflight and every relaunch check, and this "
+                "server cannot read it out of the file. Nothing was installed.",
+                "",
+            )
+        await _emit(progress, "\U0001f4e6 Starting the install…")
+        started = session.start_install(serial, value, target)
+        if started.get("error"):
+            return "⚠️ " + str(started["error"])[:300], target
+        return (
+            "## Installing `"
+            + target
+            + "`\n\nThe install runs outside this call (a large APK takes "
+            "longer than a tool call may last). Call `qa_mobile_status`; when "
+            "the package shows as installed, call `qa_mobile_test` again.",
+            target,
+        )
+    if install_source == "installed_package":
+        return (
+            "⚠️ `"
+            + (target or "(none given)")
+            + "` is not installed on the emulator, so there is nothing to run. "
+            "Pick another install source, or install it and try again.",
+            target,
+        )
+    url = value
+    if install_source == "play_store":
+        url = (
+            value
+            if value.startswith("market://")
+            else "market://details?id=" + (value or target)
+        )
+    if install_source == "app_tester":
+        url = "market://details?id=com.google.android.apps.firebase.appdistribution"
+    opened = await mobile_adb.open_url(serial, url)
+    if opened.get("error"):
+        return "⚠️ " + str(opened["error"])[:300], target
+    return (
+        "## Opened on the emulator\n\nFinish the install in the emulator's own "
+        "UI, then call `qa_mobile_test` again with the app's `package` name and "
+        "`source=installed_package`. Nothing was downloaded by this server.",
+        target,
+    )
+
+
+async def _mobile_start(
+    picked: str,
+    *,
+    suite_id: str,
+    goal: str,
+    cases: str,
+    package: str,
+    serial: str,
+    progress: ProgressCb = None,
+) -> str:
+    """Turn a start-menu choice into a planned run and its first packet."""
+    from agents.api_test_agent import _safe
+    from tools.mobile import importers as mobile_importers
+    from tools.mobile import render as mobile_render
+    from tools.mobile import session
+
+    if picked == "resume":
+        return "⚠️ To resume, call `qa_mobile_test` with the `run_id`. " + _safe(
+            (
+                "Recent runs: "
+                + ", ".join(
+                    "`" + str(row.get("run_id")) + "`"
+                    for row in ((session.list_runs(5) or {}).get("content") or [])
+                )
+            )
+            or "No runs have been recorded on this machine yet.",
+            400,
+        )
+    if picked == "explore":
+        planned = session.plan_explore_run(goal, package=package, serial=serial)
+        if planned.get("error"):
+            return "⚠️ " + _safe(planned["error"], 300)
+        run_id = str((planned.get("content") or {}).get("run_id") or "")
+        claimed = session.claim(run_id, "", force=True)
+        return await _mobile_next(
+            run_id,
+            str((claimed.get("content") or {}).get("session_token") or ""),
+            progress=progress,
+        )
+
+    collected: list = []
+    filters: dict = {}
+    if picked in ("stored_suite", "current_suite"):
+        # ONE branch for two menu options, deliberately. This server has no
+        # notion of "this chat": the suite generated a moment ago is reached by
+        # the same suite_id as one from last week, and the recent-suites picker
+        # lists it first. Two code paths would only differ in their wording,
+        # and would drift.
+        if not suite_id:
+            return await _recent_suites_markdown("qa_mobile_test")
+        loaded = await load_suite(suite_id)
+        if loaded.get("error") or loaded.get("content") is None:
+            return "⚠️ Could not load suite `" + _safe(suite_id, 80) + "`."
+        collected = list(getattr(loaded["content"], "test_cases", []) or [])
+    elif picked == "own_cases":
+        imported = session.import_cases(cases)
+        if imported.get("error"):
+            return "⚠️ " + _safe(imported["error"], 400)
+        body = imported.get("content") or {}
+        collected = list(body.get("cases") or [])
+        rejections = mobile_importers.render_rejections(body)
+        if not collected:
+            return (
+                "⚠️ No case could be read from that, so no run was "
+                "created.\n\n" + rejections
+            )
+        if rejections:
+            await _emit(progress, "⚠️ Some rows were not imported.")
+    elif picked == "rerun_failures":
+        runs = (session.list_runs(1) or {}).get("content") or []
+        if not runs:
+            return "⚠️ There is no previous run to re-run failures from."
+        previous = str(runs[0].get("run_id") or "")
+        loaded = session.load_run_cases(previous)
+        if loaded.get("error"):
+            return "⚠️ " + _safe(loaded["error"], 300)
+        collected = list(loaded.get("content") or [])
+        filters = {"failed_last_run": previous}
+    else:
+        return mobile_render.source_menu_markdown()
+
+    planned = session.plan_suite_run(
+        collected, package=package, serial=serial, source=picked, filters=filters
+    )
+    if planned.get("error"):
+        return "⚠️ " + _safe(planned["error"], 400)
+    run_id = str((planned.get("content") or {}).get("run_id") or "")
+    claimed = session.claim(run_id, "", force=True)
+    return await _mobile_next(
+        run_id,
+        str((claimed.get("content") or {}).get("session_token") or ""),
+        progress=progress,
+    )
+
+
+def _mobile_start_heartbeat(run_id: str, token: str) -> None:
+    """Keep the run's lease fresh while the tester thinks. Never raises.
+
+    Best-effort by design: the heartbeat is a courtesy to the OTHER chat, and a
+    run must not fail because a background writer could not start.
+    """
+    try:
+        from tools.mobile import heartbeat as mobile_heartbeat
+
+        mobile_heartbeat.start(run_id, token)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("mobile heartbeat could not start", exc_info=True)
+
+
+async def _mobile_resume_device_stage(run_id: str, *, budget: object = None) -> str:
+    """``""`` to carry on, or the markdown a resumed run must be answered with.
+
+    Two failures this closes: an emulator that died between chats made every
+    adb call fail with a device error the tester could not act on, and a
+    re-booted emulator can come back on a DIFFERENT serial -- so the preflight
+    has to run again before a packet is produced against it.
+    """
+    from tools.mobile import render as mobile_render
+    from tools.mobile import session
+
+    ready = await session.ensure_run_device(run_id, budget=budget)
+    if ready.get("error"):
+        return "\u26a0\ufe0f " + str(ready["error"])[:300]
+    state = ready.get("content") or {}
+    if str(state.get("state") or "") != "ready":
+        return mobile_render.device_pending_block(state)
+    if not state.get("rebooted"):
+        return ""
+    resolved = session.resolve(run_id)
+    if resolved.get("error"):
+        return "\u26a0\ufe0f " + str(resolved["error"])[:300]
+    checked = await session.preflight_for(resolved.get("content") or {})
+    if checked.get("error"):
+        return "\u26a0\ufe0f " + str(checked["error"])[:300]
+    from tools.mobile import preflight as mobile_preflight
+
+    pf = checked.get("content") or {}
+    if not pf.get("ok"):
+        return mobile_render.preflight_block(pf, mobile_preflight.render(pf))
+    return ""
+
+
+async def _mobile_next(
+    run_id: str,
+    session_token: str,
+    *,
+    progress: ProgressCb = None,
+    past_gate: bool = False,
+    budget: object = None,
+) -> str:
+    """Render the next packet, the gate, or the summary. One place, three states."""
+    from tools.mobile import render as mobile_render
+    from tools.mobile import session
+
+    await _emit(progress, "\U0001f4f1 Preparing the next step…")
+    bounded = budget if budget is not None else session.new_budget()
+    result = await session.next_packet(
+        run_id, session_token, past_gate=past_gate, budget=bounded
+    )
+    if result.get("error"):
+        return "⚠️ " + str(result["error"])[:400]
+    body = result.get("content") or {}
+    state = str(body.get("state") or "")
+    if state == session.STATE_BUSY:
+        return mobile_render.busy_block(run_id, str(body.get("tc_id") or ""))
+    if state == session.STATE_REPORT:
+        listed = session.summary(run_id)
+        report_path = ""
+        report_opened = False
+        report_failed = ""
+        try:
+            from tools.mobile import open_report as mobile_open
+            from tools.mobile import report as mobile_report
+
+            produced = mobile_report.render(run_id)
+            if produced.get("error"):
+                report_failed = str(produced["error"])
+            else:
+                report_path = str((produced.get("content") or {}).get("path") or "")
+                opened = (mobile_open.open_report(report_path) or {}).get("content")
+                report_opened = bool((opened or {}).get("opened"))
+        except Exception:  # never-raise: a report is not a verdict
+            logger.exception("mcp mobile report render failed")
+            report_failed = (
+                "the report renderer failed; the verdicts below are unaffected"
+            )
+        return mobile_render.summary_block(
+            listed.get("content") or [],
+            run_id=run_id,
+            partial=False,
+            report_path=report_path,
+            report_opened=report_opened,
+            report_error=report_failed,
+        )
+    if state == session.STATE_GATE:
+        resolved = body.get("resolved") or {}
+        return mobile_render.gate_block(
+            {
+                "done": resolved.get("done"),
+                "total": resolved.get("total"),
+                "failed": resolved.get("failed"),
+            }
+        )
+    header = (
+        "## Mobile run `"
+        + run_id
+        + "`"
+        + (" — " + str(body.get("tc_id")) if body.get("tc_id") else "")
+        + "\n\nPlan the actions for the screen below and send them straight back "
+        "with `qa_submit_mobile_step`.\n\n"
+    )
+    return header + mobile_render.packet_block(
+        body.get("packet"), session_token=session_token
+    )
+
+
+async def handle_submit_mobile_step(
+    run_id: str,
+    tc_id: str = "",
+    script: str = "",
+    tester_input: str = "",
+    tester_input_field: str = "",
+    session_token: str = "",
+    *,
+    progress: ProgressCb = None,
+) -> str:
+    """Replay the actions YOU planned, then hand back the verdict and next packet.
+
+    ``tester_input`` is a value the TESTER typed in chat for one named field. It
+    is typed to the device through the IME on stdin and goes nowhere else: not
+    into the reply, the trace, the checkpoint or the audit row. The audit detail
+    is built by ``session.audit_detail``, which has NO parameter that could
+    carry a value -- ``audit_log.record_event`` writes ``detail`` verbatim, and
+    ``run_store.redact`` alone would not mask a value under a field name the
+    tester chose.
+    """
+    from agents.api_test_agent import _safe
+
+    if not _mobile_lane_enabled():
+        return _MOBILE_LANE_OFF
+
+    from tools.mobile import render as mobile_render
+    from tools.mobile import run_store, session
+
+    try:
+        # Created here, so the time the replay itself spends counts against the
+        # budget the NEXT packet is produced under.
+        budget = session.new_budget()
+        claimed = session.claim(run_id, session_token)
+        if claimed.get("error"):
+            return "⚠️ " + _safe(claimed["error"], 300)
+        held = claimed.get("content") or {}
+        if held.get("state") != run_store.HELD:
+            return mobile_render.takeover_block(
+                run_store.takeover_message(run_id, str(held.get("holder") or "?"))
+            )
+        token = str(held.get("session_token") or "")
+        _mobile_start_heartbeat(run_id, token)
+        result = await session.submit(
+            run_id,
+            tc_id,
+            script,
+            session_token=token,
+            tester_input=tester_input,
+            tester_input_field=tester_input_field,
+        )
+        if result.get("error"):
+            return "⚠️ " + _safe(result["error"], 400)
+        body = result.get("content") or {}
+        case = body.get("case") or {}
+        await _audit(
+            "mcp_mobile_step",
+            entity_id=run_id,
+            detail=session.audit_detail(
+                run_id=run_id,
+                tc_id=str(case.get("tc_id") or tc_id),
+                verdict=str(case.get("verdict") or ""),
+                status=str(case.get("status") or ""),
+                field=str(tester_input_field or ""),
+            ),
+        )
+        line = mobile_render.verdict_line(case)
+        notice = str(body.get("notice") or "")
+        if body.get("packet"):
+            return (
+                line
+                + (("\n\n" + notice) if notice else "")
+                + "\n\n"
+                + mobile_render.packet_block(body["packet"], session_token=token)
+            )
+        tail = await _mobile_next(run_id, token, progress=progress, budget=budget)
+        return line + (("\n\n" + notice) if notice else "") + "\n\n" + tail
+    except Exception as exc:  # never-raise contract
+        logger.exception("mcp submit_mobile_step failed")
+        _capture_error(exc, "qa_submit_mobile_step")
+        return "⚠️ That step could not be replayed: " + _safe(str(exc), 200)
+
+
+async def handle_mobile_status(
+    run_id: str = "",
+    session_token: str = "",
+    report_now: bool = False,
+    *,
+    progress: ProgressCb = None,
+) -> str:
+    """Where everything stands, read from disk only. Never drives the device.
+
+    Deliberately the one tool in this lane that never touches the emulator: it
+    is what a tester calls after a provisioning kick, an install or a boot, all
+    three of which outlive a tool call by design.
+
+    ``report_now=True`` is the one thing here that WRITES: it renders the run's
+    standalone HTML report -- mid-run is fine and is labelled partial -- into
+    that run's own directory and names the path. It does NOT open it, and it
+    still touches no device. Default False, so a plain status poll changes
+    nothing on disk.
+    """
+    from agents.api_test_agent import _safe
+
+    if not _mobile_lane_enabled():
+        return _MOBILE_LANE_OFF
+
+    from tools.mobile import render as mobile_render
+    from tools.mobile import session
+
+    try:
+        lines: list = []
+        progress_body = (session.provision_progress() or {}).get("content")
+        if progress_body:
+            lines += [
+                "### Provisioning",
+                "- " + mobile_render.provisioning_line(progress_body),
+                "",
+            ]
+        if not run_id:
+            runs = (session.list_runs(10) or {}).get("content") or []
+            if not runs:
+                return "\n".join(lines) + (
+                    "## No mobile runs yet\n\nCall `qa_mobile_test` to start one."
+                )
+            listed = "\n".join(
+                "- `"
+                + str(row.get("run_id"))
+                + "` — "
+                + str((row.get("manifest") or {}).get("lane") or "?")
+                + " lane, "
+                + str((row.get("manifest") or {}).get("total") or 0)
+                + " case(s)"
+                for row in runs
+            )
+            return "\n".join(lines) + "## Mobile runs on this machine\n\n" + listed
+        resolved = session.resolve(run_id, session_token)
+        if resolved.get("error"):
+            return "⚠️ " + _safe(resolved["error"], 400)
+        body = resolved["content"] or {}
+        listed = session.summary(run_id)
+        report_path = ""
+        report_failed = ""
+        if report_now:
+            from tools.mobile import report as mobile_report
+
+            produced = mobile_report.render(run_id)
+            if produced.get("error"):
+                report_failed = str(produced["error"])
+            else:
+                report_path = str((produced.get("content") or {}).get("path") or "")
+        return (
+            "\n".join(lines)
+            + mobile_render.status_block(body)
+            + "\n\n"
+            + mobile_render.summary_block(
+                listed.get("content") or [],
+                run_id=run_id,
+                partial=not body.get("finished"),
+                report_path=report_path,
+                report_error=report_failed,
+            )
+        )
+    except Exception as exc:  # never-raise contract
+        logger.exception("mcp mobile_status failed")
+        _capture_error(exc, "qa_mobile_status")
+        return "⚠️ The mobile status could not be read: " + _safe(str(exc), 200)
+
+
 async def handle_export_suite(
     suite_id: str,
     fmt: str,
@@ -13920,7 +14713,16 @@ async def handle_setup_check(
                     )
                 ]
             ),
-            ("Mobile capture (always on since 2026-08-13)", _mobile_capture()),
+            (
+                "Mobile capture (always on since 2026-08-13)",
+                _mobile_capture(),
+            ),  # The emulator LANE, which is not the same capability as capture
+            # above: capture takes a screenshot to ground generation, this
+            # runs cases on a device. Named on every edition, on or off, so a
+            # tester reading qa-doctor learns the capability exists -- and the
+            # label carries no recipe, because the per-install detail is in
+            # the section further down and only when the lane is on.
+            ("Mobile emulator lane (opt-in kill-switch)", _mobile_lane_enabled()),
             (
                 "Swagger/OpenAPI links (always on since 2026-08-13)",
                 True,
@@ -13956,7 +14758,16 @@ async def handle_setup_check(
             ),
         ]
         for label, value in gates:
-            lines.append(f"- {'✅' if value else '⬜'} {label}")
+            lines.append(
+                f"- {'✅' if value else '⬜'} {label}"
+            )  # The mobile lane's own section: SDK, IME and emulator state. Empty
+        # (not a "disabled" line) when the lane is off -- the gate row above
+        # already said so, and a second telling is noise on every install that
+        # will never use it.
+        _mobile_lines = await _mobile_doctor_section()
+        if _mobile_lines:
+            lines += ["", *_mobile_lines]
+
         # Item 2b: unfinished host-mode preps (disclosure only, flag-gated;
         # empty string when QA_PREP_DISCLOSE_UNFINISHED is off or none exist).
         _unfinished = await _unfinished_preps_note()

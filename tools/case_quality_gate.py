@@ -60,6 +60,7 @@ _KIND_LABELS = {
     DUPLICATE_TITLE: "duplicate case title",
 }
 
+
 class _Enough(Exception):
     """Internal: the finding cap was reached. Never escapes this module."""
 
