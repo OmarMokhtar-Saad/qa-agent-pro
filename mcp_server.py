@@ -630,7 +630,9 @@ def _prepare_payload_to_content(result):
     return blocks
 
 
-def _register_prompts(mcp, *, test_cases_only: bool, api_tests: bool) -> None:
+def _register_prompts(
+    mcp, *, test_cases_only: bool, api_tests: bool, mobile: bool = False
+) -> None:
     """Register one MCP Prompt per guidance workflow this edition can support.
 
     A loop rather than N decorated functions on purpose: the gate deciding
@@ -641,7 +643,7 @@ def _register_prompts(mcp, *, test_cases_only: bool, api_tests: bool) -> None:
     the LAST body, silently.
     """
     for name, body in guidance.prompt_texts(
-        test_cases_only=test_cases_only, api_tests=api_tests
+        test_cases_only=test_cases_only, api_tests=api_tests, mobile=mobile
     ).items():
 
         def _make(text: str):
@@ -675,13 +677,23 @@ def build_server():
     # fails mid-workflow in front of a tester -- so the text and the
     # registration must not be able to disagree.
     edition_test_cases_only = mcp_handlers._test_cases_only()
-    edition_api_tests = bool(settings.qa_api_test_enabled)
+    edition_api_tests = bool(
+        settings.qa_api_test_enabled
+    )  # The mobile lane's gate is a single named predicate rather than an
+    # expression, and it is read here for the same reason as the two above: the
+    # guidance names three tools and must not be able to name them on an
+    # edition that does not register them. Its own definition carries BOTH
+    # terms (the kill-switch and not-test-cases-only), so nothing at the
+    # registration site below may add a second one -- a test asserts that site
+    # holds nothing but a call to this.
+    edition_mobile = mcp_handlers._mobile_lane_enabled()
 
     mcp = FastMCP(
         SERVER_NAME,
         instructions=guidance.server_instructions(
             test_cases_only=edition_test_cases_only,
             api_tests=edition_api_tests,
+            mobile=edition_mobile,
         ),
     )
 
@@ -1075,6 +1087,115 @@ def build_server():
                 progress=_make_progress(ctx),
             ),
         )
+
+    # The mobile emulator lane. ONE call, and nothing else may join it here:
+    # `_mobile_lane_enabled()` already carries both terms (the
+    # QA_MOBILE_RUN_ENABLED kill-switch AND not-test-cases-only, because
+    # tools/mobile is deliberately absent from the distribution build), and a
+    # gate copied with one of its two conjuncts has shipped in this project
+    # before. tests/mobile/test_mobile_registration.py parses this file and
+    # fails if this `if` becomes anything other than a call to that predicate.
+    if mcp_handlers._mobile_lane_enabled():
+
+        @mcp.tool()
+        async def qa_mobile_test(
+            ctx: Context,
+            source: str = "",
+            suite_id: str = "",
+            goal: str = "",
+            cases: str = "",
+            app: str = "",
+            package: str = "",
+            run_id: str = "",
+            session_token: str = "",
+            apply: bool = False,
+            continue_run: bool = False,
+        ) -> str:
+            """Run test cases, or explore freely, on an Android emulator.
+
+            Call with NO arguments to start: it answers with whatever the machine
+            needs next (provisioning, an install source, a preflight list, or the
+            start menu) and asks the tester itself. Every step that installs,
+            downloads or launches needs apply=true, and nothing is installed or
+            downloaded without it. Pass run_id to continue a run in ANY chat --
+            that takes the run over and the previous chat is told. It hands you
+            ONE packet at a time; answer each with qa_submit_mobile_step.
+            """
+            return await _tracked(
+                "qa_mobile_test",
+                ctx,
+                mcp_handlers.handle_mobile_test(
+                    source,
+                    suite_id,
+                    goal,
+                    cases,
+                    app,
+                    package,
+                    run_id,
+                    session_token,
+                    apply,
+                    continue_run,
+                    **_make_elicitors(ctx),
+                    progress=_make_progress(ctx),
+                ),
+            )
+
+        @mcp.tool()
+        async def qa_submit_mobile_step(
+            run_id: str,
+            ctx: Context,
+            tc_id: str = "",
+            script: str = "",
+            tester_input: str = "",
+            tester_input_field: str = "",
+            session_token: str = "",
+        ) -> str:
+            """Submit the action script YOU planned for a mobile packet.
+
+            The server validates it against the action vocabulary, replays it on
+            the device, and returns the verdict plus the NEXT packet. When a
+            packet asked for a credential, ask the TESTER for that one field and
+            pass it as tester_input with tester_input_field set to the field
+            name: it is typed into the app and stored nowhere -- not in the
+            report, the checkpoint or the audit log.
+            """
+            return await _tracked(
+                "qa_submit_mobile_step",
+                ctx,
+                mcp_handlers.handle_submit_mobile_step(
+                    run_id,
+                    tc_id,
+                    script,
+                    tester_input,
+                    tester_input_field,
+                    session_token,
+                    progress=_make_progress(ctx),
+                ),
+            )
+
+        @mcp.tool()
+        async def qa_mobile_status(
+            ctx: Context,
+            run_id: str = "",
+            session_token: str = "",
+            report_now: bool = False,
+        ) -> str:
+            """Where a mobile run stands, read from disk. Touches no device.
+
+            Provisioning progress, the emulator, the lease holder and the cases
+            done/failed/remaining. Call this after anything that outlives a tool
+            call -- provisioning, a large install, a cold boot. With no run_id it
+            lists the runs on this machine. Pass report_now=true to also write
+            that run's standalone HTML report and get its path back; a mid-run
+            report is fine and says it is partial.
+            """
+            return await _tracked(
+                "qa_mobile_status",
+                ctx,
+                mcp_handlers.handle_mobile_status(
+                    run_id, session_token, report_now, progress=_make_progress(ctx)
+                ),
+            )
 
     # Full edition only — the distribution build exposes test-case tools alone.
     if not mcp_handlers._test_cases_only():
@@ -1537,6 +1658,7 @@ def build_server():
         mcp,
         test_cases_only=edition_test_cases_only,
         api_tests=edition_api_tests,
+        mobile=edition_mobile,
     )
 
     return mcp

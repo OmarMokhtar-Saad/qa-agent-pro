@@ -373,6 +373,29 @@ class Settings(BaseSettings):
     qa_device_command_timeout: int = 20
     # Timeout (seconds) for a single screenshot capture (larger -- image transfer).
     qa_device_screenshot_timeout: int = 60
+    # --- Mobile emulator testing (mobile programme, Phase 1) --------------
+    # KILL-SWITCH (flag policy category 1), default OFF forever. ON lets the
+    # mobile lane download an Android SDK / JRE / system image onto this
+    # machine, install packages onto a device and drive that device -- every
+    # one of those effects lands outside this process. It gates tool
+    # REGISTRATION in mcp_server (Phase 3); every install, download or launch
+    # additionally requires apply=true on the call, and a flag-OFF apply=true
+    # REFUSES BY NAME rather than silently dry-running, exactly as
+    # mcp_handlers.handle_push_suite does. See docs/FEATURE_FLAGS.md and
+    # tools/flag_registry.py, which carry the same rationale verbatim.
+    qa_mobile_run_enabled: bool = False
+    # Shared cache root for everything the mobile lane downloads or writes
+    # (SDK, JRE, the verified IME APK, run checkpoints, locks). Empty means
+    # ~/.qa-agents/mobile. This is NOT a gate -- an unset value has a working
+    # default -- which is why it carries no FLAG_REGISTRY entry.
+    qa_mobile_cache_dir: str = ""
+    # Seconds to wait for sys.boot_completed after starting an AVD. A cold
+    # first boot of a Play-Store system image genuinely takes minutes, and
+    # `adb wait-for-device` returns long before the launcher exists.
+    qa_mobile_boot_timeout_s: int = 240
+    # Ceiling (GB) on what provisioning may download. Checked BEFORE the first
+    # byte is requested; exceeding it refuses by name with both numbers.
+    qa_mobile_download_max_gb: float = 4.0
 
     # --- Mobile Device Testing (Maestro) -- DELETED 2026-08-15. ---
     # Batch 7 (2026-08-13) retired the feature and kept seven QA_MAESTRO_* tuning
@@ -1207,6 +1230,7 @@ class Settings(BaseSettings):
         "qa_host_ambiguity_require_result",
         "qa_host_image_require_relevant",
         "qa_host_dedup_apply",
+        "qa_mobile_run_enabled",
         mode="before",
     )
     @classmethod
@@ -1313,6 +1337,42 @@ class Settings(BaseSettings):
             )
             return default
 
+    @field_validator("qa_mobile_download_max_gb", mode="before")
+    @classmethod
+    def _coerce_mobile_gb(cls, v: object, info) -> float:
+        """Lenient, never-raising float coercer for the download ceiling.
+
+        It gets its own validator rather than joining _coerce_checklist_float
+        (which CLAMPS to [0, 1] -- wrong for a gigabyte count) or
+        _coerce_reconcile_threshold (whose name is historical and whose group
+        is a set of ratios). The value is floored at 0.5 GB: a ceiling below
+        the smallest component would refuse every provision by name, which
+        reads as a bug rather than as a policy.
+        """
+        default = cls.model_fields[info.field_name].default
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            parsed = float(v)
+        else:
+            try:
+                parsed = float(str(v).strip())
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid %s=%r — using default %s",
+                    info.field_name.upper(),
+                    v,
+                    default,
+                )
+                return default
+        if parsed < 0.5:
+            logger.warning(
+                "%s=%r is below the 0.5 GB floor — using %s",
+                info.field_name.upper(),
+                parsed,
+                default,
+            )
+            return default
+        return parsed
+
     @field_validator("qa_rag_top_k", mode="before")
     @classmethod
     def _coerce_top_k(cls, v: object) -> int:
@@ -1347,6 +1407,7 @@ class Settings(BaseSettings):
         "qa_host_dedup_max_group_size",
         "qa_host_duplicate_prep_window_s",
         "qa_host_duplicate_suite_window_s",
+        "qa_mobile_boot_timeout_s",
         mode="before",
     )
     @classmethod
