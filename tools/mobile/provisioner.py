@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 
 from config.settings import settings
-from tools.mobile import downloader, paths, platform_info, sdk_locator
+from tools.mobile import downloader, locks, paths, platform_info, sdk_locator
 
 logger = logging.getLogger(__name__)
 
@@ -337,6 +337,17 @@ def run(apply: bool = False) -> dict:
     spawned -- not even a version probe -- which is what makes ``--dry-run``
     safe to offer a tester who has not yet agreed to a 2.2GB download.
     """
+    # ONE LABEL, ONE HOLDER. `"provisioner:" + pid` is per PROCESS, and
+    # `locks.acquire` grants a matching label REENTRANTLY -- so two in-process
+    # callers would both be told they acquired it, and whichever finished first
+    # would release the other's hold in its `finally`. Production spawns one
+    # process per provisioner so it was not reachable there; the in-process path
+    # the `finally` below names (the tests) is. Same defect, same fix, as the
+    # emulator lane's pre-run placeholder.
+    provision_owner = locks.new_provisioning_owner().replace(
+        "provisioning:", "provisioner:", 1
+    )
+    held_provision_lock = False
     try:
         # The kill-switch belongs HERE, not only at start_detached: this is the
         # function that downloads 2.2GB and creates an AVD, and `python -m
@@ -390,6 +401,59 @@ def run(apply: bool = False) -> dict:
                     "content": None,
                 }
         paths.ensure_tree()
+        if apply:
+            # THE WORKER HOLDS ITS OWN LOCK. `start_detached` has no guard
+            # against being called twice (verified: its only refusals are the
+            # kill-switch and the cache-ownership check), so two chats polling
+            # with apply=true both spawn a provisioner, and two of these writing
+            # one SDK tree is a corrupted download.
+            #
+            # The lock belongs HERE, in the process that does the work, and not
+            # in the chat that started it: this process's own exit releases it,
+            # so a crashed or killed provisioner needs no reaper and cannot
+            # wedge the lane. A chat holding it across this multi-minute
+            # download could not release it at all -- it has no run and no lease
+            # heartbeat -- which is the trade
+            # `.claude/plans/plan-emulator-lock-2026-09-04.md` §5.5 refuses.
+            #
+            # A loser DECLINES cleanly rather than erroring: the tester is
+            # already polling the progress file, so a truthful line there is the
+            # right answer, and exiting 0 keeps a spawn from looking like a
+            # failure.
+            taken = (
+                locks.acquire(
+                    locks.PROVISION_LOCK,
+                    owner=provision_owner,
+                )
+                or {}
+            ).get("content") or {}
+            if not taken.get("acquired"):
+                _publish(
+                    {
+                        "phase": "starting",
+                        "pct": 0,
+                        "bytes": 0,
+                        "message": (
+                            "another provisioner is already running; this one "
+                            "did nothing"
+                        ),
+                        "error": None,
+                        "pid": os.getpid(),
+                        "started": time.time(),
+                        "updated": time.time(),
+                    }
+                )
+                return {
+                    "error": None,
+                    "content": {
+                        "executed": [],
+                        "would_run": [],
+                        "blocked": [],
+                        "steps": [],
+                        "declined": "another provisioner is already running",
+                    },
+                }
+            held_provision_lock = True
         built = plan()
         if built.get("error"):
             return built
@@ -541,6 +605,12 @@ def run(apply: bool = False) -> dict:
     except Exception as exc:
         logger.exception("mobile.provisioner.run failed")
         return {"error": str(exc), "content": None}
+    finally:
+        if held_provision_lock:
+            # Explicit even though process exit would do it: this function is
+            # also called in-process by the tests, and a lock left held there
+            # would look like contention to the next one.
+            locks.release(locks.PROVISION_LOCK, owner=provision_owner, as_holder=True)
 
 
 def _run_command(command: list[str], stdin_text: str | None) -> tuple[int, str, str]:

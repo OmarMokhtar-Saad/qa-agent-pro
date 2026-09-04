@@ -540,3 +540,84 @@ def device_pending_block(state: object) -> str:
         "nothing. Call `qa_mobile_status` in a few seconds; when it reports the "
         "device ready, call `qa_mobile_test` again."
     )
+
+
+def device_busy_block(refusal: object) -> str:
+    """Another run holds the emulator. Say WHO, and say how to get it.
+
+    A refusal that does not name a way forward is a dead end, and this one has
+    two: take that run over (which is what makes the holder let go), or wait for
+    it to finish. It deliberately does NOT offer to break the lock -- a lock
+    broken under a live holder is two chats driving one device, which is the
+    defect this whole mechanism exists to prevent.
+
+    ONE lock covers the whole lane rather than one per serial, and the reason is
+    stated here rather than hidden: the device stage is what picks, boots and
+    provisions the device, so there is no serial to key a lock on until after
+    the most contended step has already run. A tester with two devices is
+    serialised across both; that is a known cost, not a bug.
+    """
+    from tools.mobile import run_store
+
+    body = refusal if isinstance(refusal, dict) else {}
+    who = str(body.get("holder") or "").strip()
+    same = bool(body.get("same_process"))
+    # `holder` IS AN OWNER LABEL, NEVER PROSE. A caller once passed a refusal
+    # REASON here ("held by mrun-...") and this block dutifully told the tester
+    # to call `qa_mobile_test` with `run_id="held by mrun-..."` -- an
+    # instruction that cannot work. Rather than trusting every present and
+    # future call site to pass the right thing, the takeover branch is entered
+    # only for a label that IS a run id; anything else falls to the generic
+    # line, which asks for nothing the tester cannot do.
+    if (
+        who
+        and not who.startswith("provisioning:")
+        and not run_store.looks_like_a_run_id(who)
+    ):
+        # THE GRAMMAR, not `valid_run_id`. That one asks whether a string is
+        # safe as a path segment and says yes to every single-token status
+        # string in this lane -- `handoff_failed`, `already_held`, `not_held` --
+        # so it would have let one of them through as something a tester was
+        # told to pass back. Two different questions, two predicates.
+        who = ""
+    if str(body.get("reason") or "") == "no_lock_facility":
+        return (
+            "## The emulator lane cannot guarantee one run at a time here\n\n"
+            "This platform offers neither `fcntl` nor `msvcrt`, so nothing can "
+            "stop a second chat driving the same device — and two runs on one "
+            "emulator produce two reports that each describe a run that did not "
+            "happen as recorded. Refusing is the safe answer; nothing was "
+            "started."
+        )
+    lines = ["## Another run is using the emulator\n"]
+    if who.startswith("provisioning:"):
+        lines.append(
+            "A run is being set up on this device right now"
+            + (" in this same server" if same else " by another chat")
+            + " — the emulator is being picked, booted or the app installed. "
+            "That step finishes within the call that started it, so call "
+            "`qa_mobile_test` again in a moment."
+        )
+    elif who:
+        lines.append(
+            "Run `" + who + "` holds it. Two options, and nothing here will "
+            "break its hold:\n\n"
+            "1. **Take that run over** — call `qa_mobile_test` with "
+            '`run_id="' + who + '"` and no `session_token`. The chat that '
+            "holds it lets the device go within about half a minute of losing "
+            "the run, so a retry straight after may still be refused once.\n"
+            "2. **Wait for it to finish** — `qa_mobile_status` with that run id "
+            "shows where it is."
+        )
+    else:
+        lines.append(
+            "Another process on this machine holds it. `qa_mobile_status` lists "
+            "the runs this install knows about; taking one over with "
+            "`qa_mobile_test run_id=...` is what releases the device."
+        )
+    lines.append(
+        "\nOne lock covers the whole lane, not one per device: the emulator is "
+        "chosen and booted before any serial exists, so there is nothing to key "
+        "a per-device lock on at the moment it matters most."
+    )
+    return "\n".join(lines)

@@ -72,6 +72,35 @@ def _beat_once(run_id: str, session_token: str) -> bool:
         return False
 
 
+def _release_device_lock(run_id: str, session_token: str = "") -> None:
+    """Give the emulator back when THIS process loses *run_id*'s lease.
+
+    THE HOLDER RELEASING ITS OWN LOCK, not a reaper. The emulator lock is held
+    by this process under this run's id, and losing the lease is the moment this
+    process learns it is no longer the chat driving the run -- so it is the
+    moment to stop holding the device. Another chat that took the run over gets
+    it on its next attempt, at most one beat interval later.
+
+    Bound to ``lease_lost`` ONLY, and that is deliberate: ``max_beats`` is a
+    test-only bound and releasing there would drop a live run's lock under test,
+    and ``stop``/``stop_all`` have no production caller (only this package's test
+    teardown), so releasing there would only surprise a test.
+
+    Never raises: a lock that could not be given back is a log line, and process
+    exit gives it back regardless -- the kernel owns liveness.
+    """
+    try:
+        from tools.mobile import locks
+
+        locks.release(
+            locks.EMULATOR_LOCK, owner=str(run_id), lease=str(session_token or "")
+        )
+    except Exception:  # pragma: no cover - defensive
+        logger.warning(
+            "mobile.heartbeat: could not release the emulator lock for %s", run_id
+        )
+
+
 class _Writer:
     """One run's beating thread. Private: nothing outside this module holds one."""
 
@@ -110,6 +139,7 @@ class _Writer:
         while True:
             if not _beat_once(self.run_id, self.session_token):
                 self.stop_reason = "lease_lost"
+                _release_device_lock(self.run_id, self.session_token)
                 break
             self.beats += 1
             if self.max_beats and self.beats >= self.max_beats:

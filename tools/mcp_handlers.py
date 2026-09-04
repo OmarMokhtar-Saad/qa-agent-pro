@@ -2619,6 +2619,48 @@ async def _mobile_doctor_section() -> list:
             else "- ⬜ No Android SDK found yet — the first mobile run "
             "provisions one into `~/.qa-agents/mobile/` (about 2.2 GB)"
         )
+        # THE DEVICE LOCK. The design's honest bound (plan §5.6) is that a
+        # holder whose heartbeat writer never started is NOT force-released --
+        # breaking a live holder's lock is the two-holder defect the whole
+        # mechanism deletes -- and that the cost of that choice is disclosed
+        # instead. This line IS that disclosure, and until it existed the
+        # claim in `locks.HELD_TOO_LONG_S`'s comment was simply untrue:
+        # `locks.holder()` had no production caller at all, so nothing surfaced
+        # it anywhere. An executing code review caught that.
+        from tools.mobile import locks as mobile_locks
+
+        probed = mobile_locks.holder() or {}
+        device = probed.get("content") or {}
+        if probed.get("error") or probed.get("content") is None:
+            # FAILS CLOSED. "No run holds the emulator" would be a guess, and
+            # the wrong one -- the same reasoning the adb probe below already
+            # applies in this file, and the opposite of what this line did when
+            # it collapsed a `{"error": ..., "content": None}` return into `{}`
+            # and fell through to the definite negative.
+            lines.append(
+                "- ⚠️ Could not check whether a run holds the emulator: "
+                + str(probed.get("error") or "the lock could not be inspected")[:160]
+            )
+        elif device.get("held_too_long"):
+            lines.append(
+                "- ⚠️ The emulator has been held by pid "
+                + str(device.get("pid") or "?")
+                + " for "
+                + str(int(device.get("age") or 0))
+                + "s (run `"
+                + str(device.get("owner") or "?")
+                + "`). Nothing here will break that hold — a lock taken from a "
+                "live holder means two runs on one device. If that process is "
+                "wedged, quit the editor holding it."
+            )
+        elif device.get("held"):
+            lines.append(
+                "- ✅ The emulator is in use by run `"
+                + str(device.get("owner") or "?")
+                + "` — one run drives a device at a time"
+            )
+        else:
+            lines.append("- ✅ No run holds the emulator")
         pinned = (ime.manifest_status() or {}).get("content") or {}
         lines.append(
             "- ✅ QA input method " + str(pinned.get("detail") or "pinned")
@@ -11304,6 +11346,23 @@ async def handle_mobile_test(
                 return "⚠️ " + _safe(claimed["error"], 300)
             held = claimed.get("content") or {}
             if held.get("state") != run_store.HELD:
+                # Displaced. Give the device back NOW rather than waiting
+                # for this process's heartbeat writer to notice on its next
+                # beat: this is the holder releasing its own lock,
+                # synchronously, in the call that learned it lost the run.
+                #
+                # PRESENT THIS CHAT'S OWN LEASE. This branch has just been told
+                # it lost the run, so it must NOT claim holder authority: if the
+                # lock is held under this chat's token the release is right, and
+                # if it is held under the NEW holder's token it must be refused.
+                # Passing nothing used to mean `as_holder=True`, which released
+                # the lock the current holder was driving under.
+                session.release_device_lock(
+                    run_id,
+                    lease=str(
+                        (claimed.get("content") or {}).get("session_token") or ""
+                    ),
+                )
                 return mobile_render.takeover_block(
                     run_store.takeover_message(run_id, str(held.get("holder") or "?"))
                 )
@@ -11312,10 +11371,35 @@ async def handle_mobile_test(
             # has rebooted since: check the DEVICE before producing a packet for
             # it. Deliberately AFTER the lease check, so a displaced chat can
             # never boot an emulator it does not own.
+            # THE DEVICE LOCK, RE-ACQUIRED ON EVERY RESUME. The MCP process
+            # restarts on every code and `.env` edit and a run survives that on
+            # disk, so a resumed run has to take the lock again -- the kernel
+            # dropped the old one when the old process died. Idempotent for a
+            # run this process already holds: no syscall, no write.
+            #
+            # AFTER the lease check, for the reason the comment below gives: a
+            # displaced chat must never be able to take the device.
+            # THE HEARTBEAT STARTS BEFORE THE LOCK, and the order is the
+            # fix, not a detail. It used to start after
+            # `_mobile_resume_device_stage`, which returns POINTER replies ("the
+            # emulator is still starting", a re-run preflight) -- so a resume
+            # that hit one of those held the device with `heartbeat._WRITERS`
+            # still empty, and nothing in this process could ever give it back.
+            # Abandon that chat and the emulator is dead to every other process
+            # until the server restarts, which is precisely the hazard this
+            # design refuses to accept for the pre-run phase.
+            #
+            # Starting it first is safe: this chat already holds the run's LEASE
+            # (checked above), which is the only thing the writer refreshes.
+            _mobile_start_heartbeat(run_id, token)
+            taken = (session.take_device_lock(run_id, lease=token) or {}).get(
+                "content"
+            ) or {}
+            if not taken.get("acquired"):
+                return mobile_render.device_busy_block(taken)
             device = await _mobile_resume_device_stage(run_id, budget=budget)
             if device:
                 return device
-            _mobile_start_heartbeat(run_id, token)
             resolved = session.resolve(run_id, token)
             if resolved.get("error"):
                 return "⚠️ " + _safe(resolved["error"], 400)
@@ -11340,36 +11424,75 @@ async def handle_mobile_test(
             )
 
         # --- a new run: device, app, preflight, then the menu --------------
-        staged, serial = await _mobile_device_stage(
-            apply, serial=serial, avd=avd, choose=choose, progress=progress
-        )
-        if staged:
-            return staged
-        app_stage, target = await _mobile_app_stage(
-            serial, package, source, app, apply, progress=progress
-        )
-        if app_stage:
-            return app_stage
-        checked = await session.preflight_for({"package": target, "serial": serial})
-        if checked.get("error"):
-            return "⚠️ " + _safe(checked["error"], 300)
-        from tools.mobile import preflight as mobile_preflight
+        # THE LOCK IS TAKEN BEFORE THE DEVICE STAGE. Booting, downloading and
+        # installing are device-touching too, and they run before any run_id
+        # exists -- so the lock is held under a label THIS CALL mints, and
+        # handed to the run inside `_mobile_start` the moment there is a run to
+        # hand it to.
+        #
+        # PER CALL, not per process. It was per process, and `acquire` grants a
+        # matching label reentrantly, so two concurrent new-run calls in one MCP
+        # server both got `acquired=True` and both drove the emulator -- and
+        # whichever returned first released the other's hold in its `finally`.
+        # An owner label must identify exactly ONE holder.
+        #
+        # HELD FOR EXACTLY THIS ONE CALL, and that is the deliberate part. A
+        # placeholder owner has no run and no lease heartbeat, so nothing could
+        # release it if this chat vanished mid-provisioning, and the device
+        # would stay dead until the editor was restarted. Once the run is
+        # planned the identity IS durable -- on disk, resumable,
+        # heartbeat-backed -- and the lock is then kept across calls.
+        #
+        # Holding it ACROSS the pointer replies would not close the double-spawn
+        # it looks like it should: the next call decides from the same
+        # `adb devices` answer, so serialising two calls that read the same
+        # state produces the same outcome twice. See
+        # `.claude/plans/plan-emulator-lock-2026-09-04.md` §5.2.
+        pre_run_owner = session.new_provisioning_owner()
+        taken = (session.take_device_lock(pre_run_owner) or {}).get("content") or {}
+        if not taken.get("acquired"):
+            return mobile_render.device_busy_block(taken)
+        handed_off = False
+        try:
+            staged, serial = await _mobile_device_stage(
+                apply, serial=serial, avd=avd, choose=choose, progress=progress
+            )
+            if staged:
+                return staged
+            app_stage, target = await _mobile_app_stage(
+                serial, package, source, app, apply, progress=progress
+            )
+            if app_stage:
+                return app_stage
+            checked = await session.preflight_for({"package": target, "serial": serial})
+            if checked.get("error"):
+                return "⚠️ " + _safe(checked["error"], 300)
+            from tools.mobile import preflight as mobile_preflight
 
-        pf = checked.get("content") or {}
-        if not pf.get("ok"):
-            return mobile_render.preflight_block(pf, mobile_preflight.render(pf))
-        picked = await _mobile_pick_source(source, choose=choose)
-        if not picked:
-            return mobile_render.source_menu_markdown()
-        return await _mobile_start(
-            picked,
-            suite_id=suite_id,
-            goal=goal,
-            cases=cases,
-            package=target,
-            serial=serial,
-            progress=progress,
-        )
+            pf = checked.get("content") or {}
+            if not pf.get("ok"):
+                return mobile_render.preflight_block(pf, mobile_preflight.render(pf))
+            picked = await _mobile_pick_source(source, choose=choose)
+            if not picked:
+                return mobile_render.source_menu_markdown()
+            reply, handed_off = await _mobile_start(
+                picked,
+                suite_id=suite_id,
+                goal=goal,
+                cases=cases,
+                package=target,
+                serial=serial,
+                pre_run_owner=pre_run_owner,
+                progress=progress,
+            )
+            return reply
+        finally:
+            if not handed_off:
+                # Only ever THIS call's own label, so a sibling call's hold
+                # cannot be released here. `as_holder` is stated because the
+                # placeholder has no lease to present -- this call minted the
+                # label and is unambiguously its owner.
+                session.release_device_lock(pre_run_owner, as_holder=True)
     except Exception as exc:  # never-raise contract
         logger.exception("mcp mobile_test failed")
         _capture_error(exc, "qa_mobile_test")
@@ -11676,37 +11799,52 @@ async def _mobile_start(
     cases: str,
     package: str,
     serial: str,
+    pre_run_owner: str,
     progress: ProgressCb = None,
-) -> str:
-    """Turn a start-menu choice into a planned run and its first packet."""
+) -> tuple:
+    """Turn a start-menu choice into a planned run and its first packet.
+
+    Returns ``(markdown, handed_off)``. ``handed_off`` is True once the device
+    lock has been RELABELLED from *pre_run_owner* to this run's id -- the
+    caller's signal to stop owning it, because the run does now and keeps it
+    across calls. Every other return leaves it False so the caller's ``finally``
+    gives the device straight back: a pointer reply must not strand the
+    emulator. It is also False when the relabel FAILED, which is what stops a
+    failed hand-off leaving a lock nothing owns.
+
+    The relabel happens HERE rather than in the caller because ``_mobile_next``
+    below may release the lock (a run that lands straight on its report), and a
+    release under a stale owner label would silently fail and leak the hold.
+    """
     from agents.api_test_agent import _safe
     from tools.mobile import importers as mobile_importers
     from tools.mobile import render as mobile_render
     from tools.mobile import session
 
     if picked == "resume":
-        return "⚠️ To resume, call `qa_mobile_test` with the `run_id`. " + _safe(
-            (
-                "Recent runs: "
-                + ", ".join(
-                    "`" + str(row.get("run_id")) + "`"
-                    for row in ((session.list_runs(5) or {}).get("content") or [])
+        return (
+            "\u26a0\ufe0f To resume, call `qa_mobile_test` with the `run_id`. "
+            + _safe(
+                (
+                    "Recent runs: "
+                    + ", ".join(
+                        "`" + str(row.get("run_id")) + "`"
+                        for row in ((session.list_runs(5) or {}).get("content") or [])
+                    )
                 )
+                or "No runs have been recorded on this machine yet.",
+                400,
             )
-            or "No runs have been recorded on this machine yet.",
-            400,
-        )
+        ), False
     if picked == "explore":
         planned = session.plan_explore_run(
             goal, package=package, serial=serial, avd=await _mobile_avd_of(serial)
         )
         if planned.get("error"):
-            return "⚠️ " + _safe(planned["error"], 300)
-        run_id = str((planned.get("content") or {}).get("run_id") or "")
-        claimed = session.claim(run_id, "", force=True)
-        return await _mobile_next(
-            run_id,
-            str((claimed.get("content") or {}).get("session_token") or ""),
+            return "\u26a0\ufe0f " + _safe(planned["error"], 300), False
+        return await _mobile_hand_off(
+            str((planned.get("content") or {}).get("run_id") or ""),
+            pre_run_owner=pre_run_owner,
             progress=progress,
         )
 
@@ -11719,37 +11857,41 @@ async def _mobile_start(
         # lists it first. Two code paths would only differ in their wording,
         # and would drift.
         if not suite_id:
-            return await _recent_suites_markdown("qa_mobile_test")
+            return await _recent_suites_markdown("qa_mobile_test"), False
         loaded = await load_suite(suite_id)
         if loaded.get("error") or loaded.get("content") is None:
-            return "⚠️ Could not load suite `" + _safe(suite_id, 80) + "`."
+            return "\u26a0\ufe0f Could not load suite `" + _safe(
+                suite_id, 80
+            ) + "`.", False
         collected = list(getattr(loaded["content"], "test_cases", []) or [])
     elif picked == "own_cases":
         imported = session.import_cases(cases)
         if imported.get("error"):
-            return "⚠️ " + _safe(imported["error"], 400)
+            return "\u26a0\ufe0f " + _safe(imported["error"], 400), False
         body = imported.get("content") or {}
         collected = list(body.get("cases") or [])
         rejections = mobile_importers.render_rejections(body)
         if not collected:
             return (
-                "⚠️ No case could be read from that, so no run was "
+                "\u26a0\ufe0f No case could be read from that, so no run was "
                 "created.\n\n" + rejections
-            )
+            ), False
         if rejections:
-            await _emit(progress, "⚠️ Some rows were not imported.")
+            await _emit(progress, "\u26a0\ufe0f Some rows were not imported.")
     elif picked == "rerun_failures":
         runs = (session.list_runs(1) or {}).get("content") or []
         if not runs:
-            return "⚠️ There is no previous run to re-run failures from."
+            return (
+                "\u26a0\ufe0f There is no previous run to re-run failures from."
+            ), False
         previous = str(runs[0].get("run_id") or "")
         loaded = session.load_run_cases(previous)
         if loaded.get("error"):
-            return "⚠️ " + _safe(loaded["error"], 300)
+            return "\u26a0\ufe0f " + _safe(loaded["error"], 300), False
         collected = list(loaded.get("content") or [])
         filters = {"failed_last_run": previous}
     else:
-        return mobile_render.source_menu_markdown()
+        return mobile_render.source_menu_markdown(), False
 
     planned = session.plan_suite_run(
         collected,
@@ -11760,14 +11902,101 @@ async def _mobile_start(
         avd=await _mobile_avd_of(serial),
     )
     if planned.get("error"):
-        return "⚠️ " + _safe(planned["error"], 400)
-    run_id = str((planned.get("content") or {}).get("run_id") or "")
-    claimed = session.claim(run_id, "", force=True)
-    return await _mobile_next(
-        run_id,
-        str((claimed.get("content") or {}).get("session_token") or ""),
+        return "\u26a0\ufe0f " + _safe(planned["error"], 400), False
+    return await _mobile_hand_off(
+        str((planned.get("content") or {}).get("run_id") or ""),
+        pre_run_owner=pre_run_owner,
         progress=progress,
     )
+
+
+async def _mobile_hand_off(
+    run_id: str, *, pre_run_owner: str, progress: ProgressCb = None
+) -> tuple:
+    """Claim a freshly planned run and give it the device lock. ``(markdown, True)``.
+
+    ONE place, because the explore and suite branches above both reach it and
+    two copies of a lock hand-off is how the two drift -- the same argument
+    ``session.claim``'s docstring makes about the two handlers.
+
+    Three things happen here, in this order, and the order matters:
+
+    1. ``claim`` -- a fresh run, so this always succeeds and mints the token.
+    2. ``relabel_device_lock`` -- the run exists on disk now, so its id is a
+       DURABLE identity: it can be found again from any chat, and its heartbeat
+       can give the device back. The lock therefore moves from the caller's
+       per-process placeholder to the run, keeping the SAME file descriptor and
+       so the same kernel lock -- not released and retaken, which would open a
+       window for another process.
+    3. ``_mobile_start_heartbeat`` -- a brand-new run had NO heartbeat writer
+       until now, which left its device lock with no agent that could ever
+       release it. Starting it here is what makes the lock's lifetime the
+       writer's lifetime.
+
+    The relabel comes BEFORE ``_mobile_next``, which may release the lock when a
+    run lands straight on its report: a release under the placeholder label
+    would silently fail and leak the hold.
+    """
+    from tools.mobile import render as mobile_render
+    from tools.mobile import session
+
+    claimed = session.claim(run_id, "", force=True)
+    token = str((claimed.get("content") or {}).get("session_token") or "")
+    if claimed.get("error") or not token:
+        # A claim on a freshly planned run is documented to always succeed, so
+        # this is a "cannot happen" -- which is exactly why it was never
+        # inspected, and exactly the shape that strands a device: with no token
+        # the heartbeat refuses to start, and a lock with no writer and no lease
+        # authority is held until the process exits. Give the device back and
+        # say so rather than proceeding on an empty authority.
+        logger.warning(
+            "mcp mobile: could not claim %s after planning it (%s)",
+            run_id,
+            str(claimed.get("error") or "no session token")[:200],
+        )
+        return (
+            "\u26a0\ufe0f Run `"
+            + run_id
+            + "` was planned but could not be claimed, so nothing was started "
+            "and the emulator was not taken. Call `qa_mobile_test` with that "
+            "`run_id` to pick it up.",
+            False,
+        )
+    moved = (session.relabel_device_lock(pre_run_owner, run_id) or {}).get(
+        "content"
+    ) or {}
+    if moved.get("relabelled"):
+        # The lock is the RUN's now, so record the lease it is held under:
+        # the writer started below is the only thing that may release it, and a
+        # later chat's writer for the same run must not be able to.
+        session.take_device_lock(run_id, lease=token)
+    if not moved.get("relabelled"):
+        # THE HAND-OFF IS CHECKED. It used to return True unconditionally, so a
+        # failed relabel left the caller's `finally` skipped and the lock held
+        # under a label nothing would ever release again -- while the run drove
+        # the device owning nothing. Reporting False hands the device back and
+        # refuses the run, which is the truthful answer: this call could not
+        # take ownership of the device it was about to drive.
+        logger.warning(
+            "mcp mobile: could not hand the emulator lock to %s (%s)",
+            run_id,
+            moved.get("reason") or "no reason given",
+        )
+        return (
+            mobile_render.device_busy_block(
+                {
+                    # The real owner LABEL, which `relabel` now returns. The
+                    # reason string used to go here and the reply then told the
+                    # tester to pass it as a `run_id`.
+                    "holder": str(moved.get("holder") or ""),
+                    "same_process": True,
+                    "reason": "handoff_failed",
+                }
+            ),
+            False,
+        )
+    _mobile_start_heartbeat(run_id, token)
+    return await _mobile_next(run_id, token, progress=progress), True
 
 
 def _mobile_start_heartbeat(run_id: str, token: str) -> None:
@@ -11841,6 +12070,12 @@ async def _mobile_next(
     if state == session.STATE_BUSY:
         return mobile_render.busy_block(run_id, str(body.get("tc_id") or ""))
     if state == session.STATE_REPORT:
+        # The run is over: give the emulator back. THE HOLDER releasing its
+        # own lock -- there is no reaper in this lane, and nothing here could
+        # take a lock from another process even if it wanted to. Under the
+        # lease this call is driving with, so a chat that has been displaced
+        # since cannot free the new holder's device on its way out.
+        session.release_device_lock(run_id, lease=str(session_token or ""))
         listed = session.summary(run_id)
         report_path = ""
         report_opened = False
@@ -11928,11 +12163,30 @@ async def handle_submit_mobile_step(
             return "⚠️ " + _safe(claimed["error"], 300)
         held = claimed.get("content") or {}
         if held.get("state") != run_store.HELD:
+            # Displaced: give the device back in this call rather than
+            # waiting for the heartbeat writer's next beat -- under THIS chat's
+            # own lease, never as the holder, because this branch has just been
+            # told it is not.
+            session.release_device_lock(
+                run_id,
+                lease=str((claimed.get("content") or {}).get("session_token") or ""),
+            )
             return mobile_render.takeover_block(
                 run_store.takeover_message(run_id, str(held.get("holder") or "?"))
             )
         token = str(held.get("session_token") or "")
         _mobile_start_heartbeat(run_id, token)
+        # THE REPLAY IS THE DEVICE-TOUCHING STEP. `session.submit` replays the
+        # tester's action script through adb, so this entry takes the lock too
+        # -- it is not enough that the call which produced the packet held it.
+        # In the ordinary case this process already holds it for this run and
+        # the acquire is REENTRANT: no syscall, no write. After a server restart
+        # it acquires for real, which is what has to happen anyway.
+        taken = (session.take_device_lock(run_id, lease=token) or {}).get(
+            "content"
+        ) or {}
+        if not taken.get("acquired"):
+            return mobile_render.device_busy_block(taken)
         result = await session.submit(
             run_id,
             tc_id,

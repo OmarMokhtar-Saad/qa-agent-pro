@@ -120,6 +120,26 @@ def valid_run_id(value: object) -> bool:
     return bool(isinstance(value, str) and _RUN_ID_RE.match(value))
 
 
+#: The SHAPE :func:`session.mint_run_id` produces: ``mrun-YYYYmmdd-HHMMSS-hex6``.
+#: Deliberately separate from :func:`valid_run_id`, which answers a DIFFERENT
+#: question -- "is this safe to use as a path segment" -- and therefore accepts
+#: every single-token status string in this lane (`handoff_failed`, `not_held`,
+#: `already_held`). Using the safety check as an identity check put
+#: `run_id="handoff_failed"` one key name away from a tester's screen, and it is
+#: the same conflation that made a bare `run_id` a bad lock-owner label.
+_RUN_ID_SHAPE_RE = re.compile(r"^mrun-\d{8}-\d{6}-[0-9a-f]{6}$")
+
+
+def looks_like_a_run_id(value: object) -> bool:
+    """True when *value* has the shape of a run id this lane MINTS.
+
+    For deciding whether a string may be shown to a tester as something they can
+    pass back as ``run_id``. :func:`valid_run_id` remains the right check for
+    "may this reach the filesystem", and a real run id satisfies both.
+    """
+    return bool(isinstance(value, str) and _RUN_ID_SHAPE_RE.match(value))
+
+
 def valid_tc_id(value: object) -> bool:
     return bool(isinstance(value, str) and _TC_ID_RE.match(value))
 
