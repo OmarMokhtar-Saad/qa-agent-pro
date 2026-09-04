@@ -2678,11 +2678,19 @@ async def _mobile_doctor_section() -> list:
         logger.debug("qa-doctor mobile sdk/ime section skipped", exc_info=True)
         lines.append("- ⬜ Mobile support modules could not be inspected")
     try:
-        from tools.mobile import emulator, provisioner
+        # `provisioner` went with the AVD_NAME filter below: this probe no
+        # longer asks about ONE hardcoded AVD, so its only two uses in this
+        # scope are gone and leaving the import would fail ruff (F401).
+        from tools.mobile import emulator
 
-        found = await asyncio.wait_for(
-            emulator.find_running(provisioner.AVD_NAME), timeout=_MOBILE_PROBE_S
-        )
+        # EVERY booted emulator, not just ours. `find_running(AVD_NAME)` filters
+        # to the hardcoded AVD, which is the D1 defect -- and it survived here
+        # after the device stage was fixed: on 2026-09-04 this line reported
+        # "No emulator running" while S25_Ultra_API35 was booted on
+        # emulator-5554 and the lane went on to drive it successfully. Telling a
+        # tester nothing is running, and that the tool will start one, is the
+        # message that made them abort the run in the first place.
+        found = await asyncio.wait_for(emulator.list_running(), timeout=_MOBILE_PROBE_S)
         if found.get("error"):
             # "No emulator running" would be a guess, and the wrong one: the
             # probe itself failed, so this says nothing about what is booted.
@@ -2690,12 +2698,18 @@ async def _mobile_doctor_section() -> list:
                 "- ⚠️ Could not ask adb what is running: " + str(found["error"])[:160]
             )
             return lines
-        serial = str((found.get("content") or {}).get("serial") or "")
-        lines.append(
-            "- ✅ Emulator `" + provisioner.AVD_NAME + "` is running as " + serial
-            if serial
-            else "- ⬜ No emulator running — `qa_mobile_test` starts one"
-        )
+        booted = found.get("content") or []
+        if not booted:
+            lines.append("- ⬜ No emulator running — `qa_mobile_test` starts one")
+        else:
+            for item in booted:
+                serial = str((item or {}).get("serial") or "")
+                avd = str((item or {}).get("avd") or "") or "unknown AVD"
+                lines.append("- ✅ Emulator `" + avd + "` is running as " + serial)
+            if len(booted) > 1:
+                lines.append(
+                    "  Pass `serial` to `qa_mobile_test` to say which one to use."
+                )
     except Exception:
         # Includes asyncio.TimeoutError, which IS an Exception on every version
         # this project supports. "not checked" is the honest word here.

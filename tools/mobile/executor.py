@@ -323,21 +323,31 @@ def _screen_has(screen: object, needle: str) -> bool:
 def _has_verification(trace: list[dict]) -> bool:
     """True when *trace* holds evidence a ``done verdict=pass`` can stand on.
 
-    Either an explicit ``assert_pass``, or a mutating op whose screen changed
-    (``before_screen_id != after_screen_id`` on an ``ok`` entry) counts. A
-    trace with neither is not proof of anything, however confident the
-    model's own ``reason`` text sounds.
+    ONE thing counts: an ``assert_pass``. Something has to have been CHECKED.
+
+    **2026-09-04 -- a screen change used to count too, and that was wrong.**
+    The rule read "an ``assert_pass``, or a mutating op whose screen changed",
+    on the reasoning that a screen that moved is evidence the app did
+    something. It is evidence of ACTIVITY, not of verification, and any
+    navigation satisfies it. Measured on the released build, both of these
+    were recorded as ``pass``:
+
+    * ``mrun-20260904-181558-ae196e`` -- a single ``tap``. One op, no assert.
+    * ``mrun-20260904-181254-98dfbe`` -- ``[tap, back, wait]``. It pressed
+      BACK and passed.
+
+    Neither did the work its case described (send two Arabic questions, check
+    the assistant answered), and a tester reading either report would have
+    been told the app behaved. That is worse than no report. The original D3
+    defect was ``[wait, done pass]``; closing it while leaving this branch
+    open just moved the bar from "nothing at all" to "any tap".
+
+    The cost is deliberate: a script that drives the app correctly but asserts
+    nothing is now ``unverified`` rather than ``pass``. That is the honest
+    answer -- nothing was verified -- and the vocabulary already carries
+    ``assert`` for saying so.
     """
-    for item in trace:
-        outcome = str(item.get("outcome") or "")
-        if outcome == "assert_pass":
-            return True
-        if outcome == "ok":
-            before = str(item.get("before_screen_id") or "")
-            after = str(item.get("after_screen_id") or "")
-            if before and after and before != after:
-                return True
-    return False
+    return any(str(item.get("outcome") or "") == "assert_pass" for item in trace)
 
 
 async def _wait_until_text(
@@ -427,8 +437,8 @@ async def replay(script: object, ctx: Context) -> dict:
                     verdict = STATUS_UNVERIFIED
                     reason = (
                         "verdict=pass was not accepted: this case's trace has "
-                        "no assert_pass and no screen change, so nothing was "
-                        "verified. " + reason
+                        "no assert_pass, so nothing was verified. Add an "
+                        "`assert` for what the case is supposed to show. " + reason
                     ).strip()
                 entry["outcome"] = "done"
                 entry["detail"] = reason
@@ -648,8 +658,9 @@ async def replay(script: object, ctx: Context) -> dict:
                 + (
                     ""
                     if ended_verified
-                    else " Nothing in it asserted anything or changed the screen,"
-                    " so there is no evidence this case passed."
+                    else " Nothing in it asserted anything, so there is no"
+                    " evidence this case passed -- a screen that moved is"
+                    " activity, not verification."
                 ),
                 len(items) - 1,
             ),
