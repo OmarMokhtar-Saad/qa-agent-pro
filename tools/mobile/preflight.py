@@ -318,7 +318,10 @@ async def check(target_package: str = "", serial: str = "") -> dict:
                 else:
                     current = await ime.current_ime(resolved_serial)
                     active = str(current.get("content") or "")
-                    ok = bool(ime_id) and active == ime_id
+                    # By component identity: Android reports `pkg/.Class` and
+                    # the manifest pins `pkg/pkg.Class`. `==` refused every run
+                    # on a correctly configured device (2026-09-04, live).
+                    ok = ime.same_component(active, ime_id)
                     checks.append(
                         _record(
                             "ime_selected",
