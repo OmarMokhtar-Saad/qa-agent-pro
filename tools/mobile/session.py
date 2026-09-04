@@ -885,9 +885,76 @@ async def preflight_for(resolved: object) -> dict:
     )
 
 
-def take_device_lock(run_id: str) -> dict:
-    """One run drives the emulator at a time. A refusal is CONTENT, not an error."""
-    return locks.acquire(locks.EMULATOR_LOCK, owner=str(run_id))
+#: Re-exported so a handler never imports ``locks`` itself: the pre-run phase
+#: has no ``run_id`` to own the device with, so it holds the lock under this
+#: per-process label and :func:`relabel_device_lock` hands it to the run.
+def new_provisioning_owner() -> str:
+    """A fresh pre-run owner label. See :func:`locks.new_provisioning_owner`.
+
+    Re-exported as a FUNCTION so a handler never imports ``locks`` itself and
+    cannot hold a shared label by mistake: the pre-run phase has no ``run_id``
+    to own the device with, so it holds under one of these until
+    :func:`relabel_device_lock` hands the lock to the run.
+    """
+    return locks.new_provisioning_owner()
+
+
+def take_device_lock(owner: str, *, lease: str = "") -> dict:
+    """One run drives the emulator at a time. A refusal is CONTENT, not an error.
+
+    *owner* is a ``run_id`` once there is one, and a label from
+    :func:`new_provisioning_owner`
+    before that. Acquisition is idempotent for the same owner in the same
+    process -- it performs no syscall at all -- which is what lets every
+    device-touching entry take the lock without counting who took it first.
+    """
+    return locks.acquire(locks.EMULATOR_LOCK, owner=str(owner), lease=str(lease or ""))
+
+
+def release_device_lock(
+    owner: str, *, lease: str = "", as_holder: bool = False, force: bool = False
+) -> dict:
+    """Give the emulator back. THE HOLDER releases; there is no reaper anywhere.
+
+    Releasing is safe to call speculatively: a lock this process does not hold,
+    or holds under a different owner, is reported as ``released: False`` rather
+    than taken from whoever does hold it.
+
+    **AUTHORITY IS OPT-IN, and this default used to be the other way round.**
+    ``as_holder=True`` means "I have just claimed this run's lease, so I am its
+    authority" -- and while it defaulted to True, a bare call asserted that on
+    the caller's behalf. The two DISPLACED branches call this at the exact point
+    the handler has been told it LOST the lease, so they asserted authority they
+    had just been refused, and a non-holder released the lock the CURRENT holder
+    was driving under. Found by an executing release-gate review, demonstrated
+    end to end through both handlers, and guarded by nothing.
+
+    So every caller now says which authority it has:
+
+    * a chat that holds (or held) the run's lease passes ``lease=`` and is
+      checked against the lock's recorded lease;
+    * the pre-run phase passes ``as_holder=True`` for the placeholder it minted
+      itself, which has no lease to present.
+    """
+    return locks.release(
+        locks.EMULATOR_LOCK,
+        owner=str(owner),
+        lease=str(lease or ""),
+        as_holder=bool(as_holder) and not lease,
+        force=bool(force),
+    )
+
+
+def relabel_device_lock(from_owner: str, to_owner: str) -> dict:
+    """Hand the device from the provisioning phase to the run that now owns it.
+
+    The SAME file descriptor keeps the SAME kernel lock. Deliberately not
+    release-then-reacquire, which would open a window in which another process
+    could take the device between the two.
+    """
+    return locks.relabel(
+        locks.EMULATOR_LOCK, from_owner=str(from_owner), to_owner=str(to_owner)
+    )
 
 
 # ---------------------------------------------------------------------------
