@@ -308,6 +308,13 @@ A reply naming "booting" or "provisioning" is not something to retry by
 calling `qa_mobile_test` again: call `qa_mobile_status` instead and keep
 polling it until it reports ready, then continue with the `run_id`.
 
+Resuming works on an UNFINISHED run. A run whose cases have all reached a
+verdict is complete, and `unverified` and `blocked` are verdicts -- so resuming
+it hands back the report, not more work. To attempt such a case again, start a
+new run for it, and give the script an `assert`: `unverified` means nothing was
+checked, and a script that checks nothing cannot pass however many times it is
+run.
+
 7. When the run finishes, this server writes a self-contained HTML report next
    to the run's own files and opens it. Relay the PATH it names. A report can be
    built at any time, mid-run included, with `qa_mobile_status` and

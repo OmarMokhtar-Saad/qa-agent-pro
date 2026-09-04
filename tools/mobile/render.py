@@ -510,7 +510,55 @@ def summary_block(
     tail = "\n\n" + report_line(
         report_path, partial=partial, opened=report_opened, error=report_error
     )
-    return head + body + lines + tail
+    return head + body + lines + _retry_note(rows, partial=partial) + tail
+
+
+#: Verdicts that are TERMINAL but not an ANSWER. A pass or a fail settles the
+#: case; these two say the case did not settle, and the tester's next move is
+#: to run it again rather than to read the result.
+INCONCLUSIVE_VERDICTS: frozenset = frozenset({"unverified", "blocked"})
+
+
+def _retry_note(rows: list, *, partial: bool) -> str:
+    """Name the cases that did not settle, and say what happens next.
+
+    2026-09-04: a live session started EIGHT runs in fourteen minutes, and it
+    was read as the chat model ignoring the guidance to resume. It was not.
+    Resuming a run whose cases have all reached a terminal verdict returns
+    "finished" and the report -- correctly, since `unverified` and `blocked`
+    ARE terminal and the scheduler must not re-serve them -- so a fresh run was
+    the only move available, and nothing said so. The model invented the next
+    step, and invented the same one eight times.
+
+    This does not add a retry path; re-attempting a case inside its own run is
+    a feature with lease, scheduler and report consequences, and is recorded as
+    a follow-up rather than improvised here. What it removes is the silence: a
+    tester (and a model) is told which cases did not settle and that another
+    attempt is a new run, which is the truth about this lane today.
+    """
+    if partial:
+        return ""
+    unsettled = [
+        str(row.get("tc_id") or "?")
+        for row in rows
+        if str(row.get("verdict") or "") in INCONCLUSIVE_VERDICTS
+    ]
+    if not unsettled:
+        return ""
+    return (
+        "\n\n**"
+        + ", ".join(unsettled[:12])
+        + (" and others" if len(unsettled) > 12 else "")
+        + " did not reach a pass or a fail.** `unverified` means the script"
+        " asserted nothing, so nothing was checked; `blocked` means it could"
+        " not get far enough to try. Neither is a result you can report.\n\n"
+        "This run is complete and those cases will not be handed out again in"
+        " it. To attempt one, start a NEW run scoped to it -- `qa_mobile_test`"
+        " takes a `cases` filter, so you need not replay the ones that already"
+        " settled -- and give the script an `assert` for what the case is"
+        " supposed to show, because that is what turns an attempt into a"
+        " verdict."
+    )
 
 
 def takeover_block(message: str) -> str:
