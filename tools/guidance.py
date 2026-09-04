@@ -121,17 +121,23 @@ def server_instructions(
     the SAME expressions that gate registration, so a tool can never be named
     here and absent there.
 
-    ``mobile`` defaults to False so an existing caller keeps its behaviour, and
-    its gate already carries the not-test-cases-only term, which is why there is
-    no second edition test on it here.
+    ``mobile`` defaults to False so an existing caller keeps its behaviour. Its
+    block is a SIBLING of the full block, never nested inside it: the caller's
+    ``mobile`` argument is already ``_mobile_lane_enabled()``, so nesting it
+    under ``not test_cases_only`` was a SECOND copy of an edition gate -- the
+    same defect that kept the lane off every distribution build until
+    2026-09-04, and it would have survived that fix, leaving a dist tester with
+    three registered tools and an instructions block that never names them.
+    ``prompt_texts`` gates the ``qa_mobile_run`` prompt on ``mobile`` alone;
+    these two now agree.
     """
     parts = [_INSTRUCTIONS_CORE]
     if not test_cases_only:
         parts.append(_INSTRUCTIONS_FULL)
         if api_tests:
             parts.append(_INSTRUCTIONS_API)
-        if mobile:
-            parts.append(_INSTRUCTIONS_MOBILE)
+    if mobile:
+        parts.append(_INSTRUCTIONS_MOBILE)
     return "\n\n".join(p.strip("\n") for p in parts)
 
 

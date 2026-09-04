@@ -2558,25 +2558,31 @@ def _mobile_lane_enabled() -> bool:
     * ``qa_mobile_run_enabled`` is the contract's category-1 kill-switch:
       default OFF forever, because a run installs an app, drives an emulator and
       writes to a shared cache.
-    * ``not _test_cases_only()`` is a CORRECTNESS term, not a policy one:
-      ``tools/mobile/`` is deliberately absent from
-      ``scripts/build_dist.py TOOL_FILES`` on a build with no qa-ime release
-      pinned, so on such a distribution install its modules do not exist and a
-      registered tool whose first line cannot import is worse than an absent
-      tool.
-    * ``_mobile_modules_present()`` is the same correctness term made ACTUAL
-      rather than assumed: it checks the modules are really on disk instead of
-      inferring it from the edition.
+    * ``_mobile_modules_present()`` is the CORRECTNESS term: a build whose
+      checkout had no ``tools/mobile/ime_manifest.py`` ships no ``tools/mobile``
+      at all (``scripts/build_dist.py`` excludes it), and a registered tool
+      whose first line cannot import is worse than an absent tool. It checks
+      the modules are really on disk rather than inferring it from anything.
+
+    **2026-09-04 -- ``not _test_cases_only()`` was a THIRD conjunct here, and it
+    made the lane unreachable on every distribution build.** It was documented
+    as a second statement of the correctness term above, but it does not state
+    that: ``_test_cases_only()`` is ``qa_dist_mode or not _FULL_EDITION``, and
+    ``_FULL_EDITION`` is False on a dist because the bug-report and
+    exploratory-coach agents are not shipped -- a fact about two unrelated
+    agents. Measured on the published v1.77.0 install with
+    ``QA_MOBILE_RUN_ENABLED=true``: 12 tools registered, none of them mobile,
+    while the README promised three. Neutralising this one term in that same
+    install produced all three. The whole point of shipping the lane and
+    pinning the IME was to reach a tester, so the term is gone and
+    ``_mobile_modules_present()`` carries the argument alone -- which is what
+    ``.claude/plans/mobile-programme.md`` specified in the first place.
 
     Read fresh on every call, never cached: the flag is read from ``settings``,
     which a test may flip, and a cached answer would make the off-path
     unobservable.
     """
-    return (
-        bool(settings.qa_mobile_run_enabled)
-        and not _test_cases_only()
-        and _mobile_modules_present()
-    )
+    return bool(settings.qa_mobile_run_enabled) and _mobile_modules_present()
 
 
 _MOBILE_LANE_OFF = (
@@ -11317,7 +11323,13 @@ async def handle_mobile_test(
     distribution build, so a module-scope import would break it at import time
     on an install no test in this repo can observe.
     """
-    from agents.api_test_agent import _safe
+    # tools.untrusted, NOT agents.api_test_agent: `_safe` there is a bare alias
+    # of `single_line` (api_test_agent.py:423) and that module is deliberately
+    # absent from scripts/build_dist.AGENT_FILES. The import was harmless only
+    # while the lane could not register on a distribution build; fixing that
+    # (2026-09-04) made all three mobile tools raise ModuleNotFoundError on a
+    # dist -- confirmed by calling them on the published v1.77.0 install.
+    from tools.untrusted import single_line as _safe
 
     if not _mobile_lane_enabled():
         from tools.mobile import render as mobile_render
@@ -11816,10 +11828,11 @@ async def _mobile_start(
     below may release the lock (a run that lands straight on its report), and a
     release under a stale owner label would silently fail and leak the hold.
     """
-    from agents.api_test_agent import _safe
+    # tools.untrusted, not agents.api_test_agent -- see handle_mobile_test.
     from tools.mobile import importers as mobile_importers
     from tools.mobile import render as mobile_render
     from tools.mobile import session
+    from tools.untrusted import single_line as _safe
 
     if picked == "resume":
         return (
@@ -12146,7 +12159,10 @@ async def handle_submit_mobile_step(
     ``run_store.redact`` alone would not mask a value under a field name the
     tester chose.
     """
-    from agents.api_test_agent import _safe
+    # tools.untrusted, not agents.api_test_agent -- see handle_mobile_test.
+    # Note this import precedes the lane check below, so an unshipped module
+    # here takes out the REFUSAL path too, not just the working one.
+    from tools.untrusted import single_line as _safe
 
     if not _mobile_lane_enabled():
         return _MOBILE_LANE_OFF
@@ -12246,7 +12262,8 @@ async def handle_mobile_status(
     still touches no device. Default False, so a plain status poll changes
     nothing on disk.
     """
-    from agents.api_test_agent import _safe
+    # tools.untrusted, not agents.api_test_agent -- see handle_mobile_test.
+    from tools.untrusted import single_line as _safe
 
     if not _mobile_lane_enabled():
         return _MOBILE_LANE_OFF
