@@ -152,6 +152,24 @@ async def devices() -> dict:
     result = await raw(["devices"])
     if result.get("error"):
         return result
+    # A NON-ZERO EXIT IS A FAILED PROBE, NOT AN EMPTY MACHINE. `raw` only sets
+    # `error` when adb could not be run at all (spawn failure, timeout); a
+    # command that ran and failed arrives here with error=None and rc!=0, and
+    # its stdout carries no serials. Reporting that as an empty list told the
+    # caller "nothing is booted", which is how a broken adb server ended up
+    # spawning a second emulator over the tester's own (D1, 2026-09-03).
+    body = result.get("content") or {}
+    rc = int(body.get("rc") or 0)
+    if rc != 0:
+        detail = (
+            str(body.get("err") or "").strip() or str(body.get("out") or "").strip()
+        )
+        return {
+            "error": "adb devices failed ("
+            + (detail[:200] if detail else "exit " + str(rc))
+            + ").",
+            "content": None,
+        }
     serials: list[str] = []
     for line in str((result["content"] or {}).get("out") or "").splitlines():
         parts = line.strip().split()
@@ -417,3 +435,182 @@ async def pm_select(serial: str, ime_id: str) -> dict:
             "content": None,
         }
     return await shell(serial, ["ime", "set", text])
+
+
+# ── app-log evidence transport (plan mobile-app-evidence, P2) ───────────────
+#
+# Every function below is TRANSPORT, gated by the lifecycle function that calls
+# it (`tools/mobile_evidence/capture.py` reads both flags before any of these),
+# in the same position as `launch` and `uiautomator_dump`. Two of them are named
+# in tests/mobile/test_mobile_killswitch_surface.py's EFFECT_CALLS so a FUTURE
+# public function in this package that calls them directly is seen by the scan.
+
+#: An on-device path this module will read for the run's own package: absolute,
+#: a bounded charset, and no `..` segment. A profile or a listing can only ever
+#: hand this module something that matches.
+_DEVICE_PATH_RE = re.compile(r"^/[A-Za-z0-9_./-]{1,200}$")
+
+#: A logcat tag as `-s` accepts it.
+_LOGCAT_TAG_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+
+_EPOCH_MS_RE = re.compile(r"^\d{13}$")
+
+
+def _valid_device_path(path: object) -> bool:
+    text = str(path or "")
+    return bool(_DEVICE_PATH_RE.match(text)) and ".." not in text.split("/")
+
+
+def _capped(text: str, max_bytes: int) -> tuple[str, bool]:
+    """*text* cut to at most *max_bytes* UTF-8 bytes, and whether it was cut."""
+    raw = text.encode("utf-8", errors="replace")
+    limit = max(0, int(max_bytes))
+    if len(raw) <= limit:
+        return text, False
+    return raw[:limit].decode("utf-8", errors="replace"), True
+
+
+async def logcat_clear(serial: str) -> dict:
+    """``adb -s <serial> logcat -c``: empty the ring buffer before a case starts."""
+    return await _device(serial, ["logcat", "-c"])
+
+
+async def logcat_dump(
+    serial: str,
+    *,
+    tag: str = "",
+    pid: int | None = None,
+    max_bytes: int = MAX_DUMP_BYTES,
+) -> dict:
+    """``logcat -d -v threadtime``, narrowed to *tag* and/or *pid*, byte-capped.
+
+    ``{"error", "content": {"text", "truncated"}}``. The text is never logged: a
+    logcat slice is the app's own output and may carry anything the app printed.
+    """
+    args = ["logcat", "-d", "-v", "threadtime"]
+    if pid is not None:
+        try:
+            number = int(pid)
+        except (TypeError, ValueError):
+            return {"error": "Refusing logcat pid " + repr(pid)[:40], "content": None}
+        if number <= 0:
+            return {"error": "Refusing logcat pid " + repr(pid)[:40], "content": None}
+        args.append("--pid=" + str(number))
+    if tag:
+        if not _LOGCAT_TAG_RE.match(str(tag)):
+            return {
+                "error": "Refusing logcat tag " + repr(str(tag)[:40]),
+                "content": None,
+            }
+        args += ["-s", str(tag)]
+    result = await _device(serial, args, timeout=DUMP_TIMEOUT_S)
+    if result.get("error"):
+        return result
+    text, truncated = _capped(
+        str((result["content"] or {}).get("out") or ""), max_bytes
+    )
+    return {"error": None, "content": {"text": text, "truncated": truncated}}
+
+
+async def pidof(serial: str, package: str) -> int | None:
+    """The app's pid, or None when it is not running or the name is refused."""
+    if not valid_package_name(package):
+        return None
+    result = await shell(serial, ["pidof", "-s", str(package)])
+    if result.get("error"):
+        return None
+    out = str((result["content"] or {}).get("out") or "").strip().split()
+    if not out or not out[0].isdigit():
+        return None
+    number = int(out[0])
+    return number if number > 0 else None
+
+
+async def device_epoch_ms(serial: str) -> int | None:
+    """The device's wall clock as epoch milliseconds, or None.
+
+    ``date +%s%3N`` on a toybox that lacks ``%N`` prints the literal, which is
+    not thirteen digits and therefore reads as None -- never a guessed zero.
+    """
+    result = await shell(serial, ["date", "+%s%3N"])
+    if result.get("error"):
+        return None
+    text = str((result["content"] or {}).get("out") or "").strip()
+    return int(text) if _EPOCH_MS_RE.match(text) else None
+
+
+def _run_as_refused(rc: int, out: str, err: str) -> str | None:
+    text = (out + "\n" + err).strip()
+    if rc != 0 or "run-as:" in text.lower():
+        return text[:300] or ("run-as exited " + str(rc))
+    return None
+
+
+async def run_as_ls(serial: str, package: str, path: str) -> dict:
+    """``run-as <package> ls -1 <path>``: the entry names, or the refusal as error.
+
+    Only the run's own *package* may be named; *path* must be absolute with no
+    ``..``. A release (non-debuggable) build makes ``run-as`` refuse, and that
+    refusal is the error text so the caller can state it.
+    """
+    if not valid_package_name(package):
+        return {
+            "error": "Refusing run-as for " + repr(str(package)[:60]),
+            "content": None,
+        }
+    if not _valid_device_path(path):
+        return {
+            "error": "Refusing device path " + repr(str(path)[:80]),
+            "content": None,
+        }
+    result = await shell(serial, ["run-as", str(package), "ls", "-1", str(path)])
+    if result.get("error"):
+        return result
+    body = result["content"] or {}
+    refused = _run_as_refused(
+        int(body.get("rc") or 0), str(body.get("out") or ""), str(body.get("err") or "")
+    )
+    if refused is not None:
+        return {"error": refused, "content": None}
+    names = [
+        line.strip().rsplit("/", 1)[-1]
+        for line in str(body.get("out") or "").splitlines()
+        if line.strip()
+    ]
+    return {"error": None, "content": names}
+
+
+async def run_as_cat(
+    serial: str, package: str, path: str, max_bytes: int = MAX_DUMP_BYTES
+) -> dict:
+    """``exec-out run-as <package> cat <path>``, byte-capped.
+
+    ``exec-out`` rather than ``shell`` because ``shell`` is a pty and mangles line
+    endings. ``{"error", "content": {"data", "truncated"}}``; the data is never
+    logged.
+    """
+    if not valid_package_name(package):
+        return {
+            "error": "Refusing run-as for " + repr(str(package)[:60]),
+            "content": None,
+        }
+    if not _valid_device_path(path):
+        return {
+            "error": "Refusing device path " + repr(str(path)[:80]),
+            "content": None,
+        }
+    result = await _device(
+        serial,
+        ["exec-out", "run-as", str(package), "cat", str(path)],
+        timeout=DUMP_TIMEOUT_S,
+    )
+    if result.get("error"):
+        return result
+    body = result["content"] or {}
+    refused = _run_as_refused(
+        int(body.get("rc") or 0), str(body.get("out") or ""), str(body.get("err") or "")
+    )
+    if refused is not None:
+        return {"error": refused, "content": None}
+    data, truncated = _capped(str(body.get("out") or ""), max_bytes)
+    return {"error": None, "content": {"data": data, "truncated": truncated}}

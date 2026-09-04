@@ -1001,14 +1001,36 @@ FINDABILITY_MAX_LOGGED = 40
 # runs on every finalize over model-produced text, and the try/except in
 # find_unanchored_first_steps catches exceptions -- it cannot catch a hang.
 # Round 8 found it; the fix is a deletion, and the behaviour is identical.
+# Round 8 deleted a second, redundant alternative from the repetition below
+# because two branches matching the same input made it the ambiguous
+# `(a|a)*?`. The 2026-09-02 audit (F11) found the SAME class one level up, in
+# the two quantifiers round 8 left unbounded. `^[\s'\u2019"-]*` accepts both a
+# space and a hyphen, so the tail `"- " * 4000` let the leading class start at
+# any of 8,000 offsets and made the lazy word repetition re-derive from each:
+# 9.0 s measured through find_unanchored_first_steps, x4 per doubling, on every
+# finalize, over model-produced text. That function's try/except catches an
+# exception; it cannot catch a hang.
+#
+# So both quantifiers are BOUNDED. A compound noun that ends in a control noun
+# is a handful of words ("the merchant site terms of service checkbox" is six),
+# and no real step opens with a dozen quote/hyphen characters, so nothing that
+# used to match stops matching -- and a compound longer than the bound resolves
+# toward SILENCE about the compound, which flags the step, the direction this
+# advisory check already chooses everywhere else.
 _CONTROL_SUFFIX = re.compile(
-    r"^[\s'\u2019\"-]*"
+    r"^[\s'\u2019\"-]{0,12}"
     # ... across nominal words: not a break word, not a participle, no digit
     r"(?:(?!(?:" + _NP_BREAK + r")\b)(?![\w-]*\d)(?![\w-]*ing\b)"
-    r"[\w\u2019'-]+\s+)*?"
+    r"[\w\u2019'-]+\s+){0,12}?"
     r"(?:" + "|".join(sorted(_KNOWN_NOUNS)) + r")\b",
     re.IGNORECASE,
 )
+
+# The input bound that sits alongside the bounded pattern above: twelve words
+# plus their separators cannot exceed this, so a control noun that the pattern
+# could still reach is never outside the window, and one that is outside it was
+# already beyond the repetition's reach.
+_MAX_CONTROL_TAIL_CHARS = 300
 
 # The phrase that STARTS at a given offset, using the same opener, tail and
 # boundary as the three place patterns. _names_a_screen needs it: a screen noun
@@ -1040,7 +1062,7 @@ def _is_modifier_of_a_control(tail: str) -> bool:
     a word that was modifying a control -- structurally the same bare-keyword
     class this detector eradicated for "terminal" in round 3.
     """
-    return bool(_CONTROL_SUFFIX.match(tail))
+    return bool(_CONTROL_SUFFIX.match(tail[:_MAX_CONTROL_TAIL_CHARS]))
 
 
 def _screen_noun_heads_a_place(probe: str, start: int) -> bool:
@@ -1414,14 +1436,14 @@ def _qualifier_prefix_merges(counts: dict[str, int]) -> dict[str, str]:
 
     2026-08-03. normalize_module_names' first pass merges only CASING/whitespace
     variants, so a real suite shipped one feature under two labels:
-    "Cancel Order" (86 cases) and "Sehhaty Store - Cancel Order" (12) --
+    "Cancel Order" (86 cases) and "Client Store - Cancel Order" (12) --
     different bucket keys, never merged, and every "group by module" view (Jira,
     TestRail, the XLSX pivot) fragmented for what is one feature.
 
     Merges ONLY on TAIL containment -- the bare label must be the TRAILING segment
     of the qualified one, after a separator:
 
-        "Cancel Order"  <- "Sehhaty Store - Cancel Order"   MERGE
+        "Cancel Order"  <- "Client Store - Cancel Order"   MERGE
 
     and NEVER on HEAD containment, which is how a genuine SUB-module is named:
 
@@ -1452,8 +1474,8 @@ def _qualifier_prefix_merges(counts: dict[str, int]) -> dict[str, str]:
     # Keyed CASEFOLDED, and the winner within a key is the spelling used by the
     # MOST cases. 2026-08-03: this lookup used to be exact-text, which silently
     # defeated the whole rule the first time a real suite disagreed on case. The
-    # observed split was "Cancel Order" (49) + "Sehhaty Cancel Order" (10) +
-    # "Sehhaty Store - Cancel order" (20): the qualified label's tail is
+    # observed split was "Cancel Order" (49) + "Client Cancel Order" (10) +
+    # "Client Store - Cancel order" (20): the qualified label's tail is
     # "Cancel order" but the bare label present is "Cancel Order", so the exact
     # match failed and _qualifier_prefix_merges returned {} for exactly the
     # three-way split it exists to close. Majority spelling matches what the
@@ -1465,8 +1487,8 @@ def _qualifier_prefix_merges(counts: dict[str, int]) -> dict[str, str]:
         if cur is None or counts.get(label, 0) > counts.get(cur, 0):
             bare_by_key[key] = label
 
-    # Qualifier tokens seen in SEPARATOR-qualified labels, e.g. "Sehhaty Store - X"
-    # contributes {sehhaty, store}. Used only to decide whether a SEPARATOR-LESS
+    # Qualifier tokens seen in SEPARATOR-qualified labels, e.g. "Client Store - X"
+    # contributes {client, store}. Used only to decide whether a SEPARATOR-LESS
     # label is a product-qualified variant; see the guard below.
     known_qualifiers: set = set()
     # tail_key -> {qualified label: the token set that was REMOVED to reach the tail}.
@@ -1487,12 +1509,12 @@ def _qualifier_prefix_merges(counts: dict[str, int]) -> dict[str, str]:
                 idx = norm.find(token, idx + 1)
 
     # A SEPARATOR-LESS label can still be a product-qualified variant:
-    # "Sehhaty Cancel Order" is "Cancel Order" with a product name glued on. But
+    # "Client Cancel Order" is "Cancel Order" with a product name glued on. But
     # plain suffix containment is exactly the dangerous rule -- "Order" is a suffix
     # of "Cancel Order" and merging those would be wrong. The discriminator is
     # WHAT was removed: allow it only when every removed prefix token is already a
     # known qualifier token from a separator-qualified label in this same suite.
-    # "Sehhaty" qualifies via "Sehhaty Store - ...", so it is allowed; "Cancel"
+    # "Client" qualifies via "Client Store - ...", so it is allowed; "Cancel"
     # never appears as a qualifier, so "Order" <- "Cancel Order" stays refused.
     for label in counts:
         norm = _norm(label)
@@ -1519,11 +1541,11 @@ def _qualifier_prefix_merges(counts: dict[str, int]) -> dict[str, str]:
         # ONE qualifier family, or rivals? 2026-08-03: the previous rule refused any
         # tail claimed by more than one qualified label, which correctly rejects
         # "Admin - Login" + "User - Login" but ALSO rejected the real observed
-        # split -- "Sehhaty Cancel Order" + "Sehhaty Store - Cancel order" both
+        # split -- "Client Cancel Order" + "Client Store - Cancel order" both
         # point at "Cancel Order", and those are three spellings of ONE module, not
         # two sub-modules. The discriminator is the REMOVED tokens: a shared token
         # across every claimant means one product prefix spelled at different
-        # depths (sehhaty / sehhaty+store), while disjoint tokens (admin vs user)
+        # depths (client / client+store), while disjoint tokens (admin vs user)
         # encode a distinction that merging would destroy.
         if len(others) > 1:
             common = frozenset.intersection(*others.values()) if others else frozenset()

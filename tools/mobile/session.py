@@ -78,6 +78,7 @@ from tools.mobile import (
     run_store,
     scheduler,
 )
+from tools.mobile_evidence import capture
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,12 @@ STATE_REPORT = "report"
 STATE_TAKEN_OVER = "taken_over"
 STATE_BUSY = "busy"
 
+#: An unfinished run whose lease heartbeat stopped (2026-09-03, D7). NOT a
+#: takeover: nobody else holds it, the chat that did simply went away -- so the
+#: tester is told it can be picked up rather than that it is gone. Distinct
+#: from STATE_TAKEN_OVER, which names a run another chat IS driving.
+STATE_ABANDONED = "abandoned"
+
 #: Every state a handler can be in, in flow order. Also the set the tests assert
 #: against, so a state that silently stops being reachable fails the suite.
 STATES: tuple[str, ...] = (
@@ -104,6 +111,7 @@ STATES: tuple[str, ...] = (
     STATE_MENU,
     STATE_RUNNING,
     STATE_GATE,
+    STATE_ABANDONED,
     STATE_REPORT,
     STATE_TAKEN_OVER,
     STATE_BUSY,
@@ -263,7 +271,9 @@ def claim(run_id: str, session_token: str = "", *, force: bool = False) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def ensure_device(*, avd: str = "", budget_s: int = DEVICE_WAIT_BUDGET_S) -> dict:
+async def ensure_device(
+    *, avd: str = "", serial: str = "", budget_s: int = DEVICE_WAIT_BUDGET_S
+) -> dict:
     """Attach to a booted emulator, or start one and hand back a pointer.
 
     ``{"error", "content": {"state", "serial", "detail"}}`` with ``state`` one of
@@ -278,6 +288,23 @@ async def ensure_device(*, avd: str = "", budget_s: int = DEVICE_WAIT_BUDGET_S) 
     try:
         name = str(avd or provisioner.AVD_NAME)
         budget = max(1, int(budget_s or DEVICE_WAIT_BUDGET_S))
+        if serial:
+            # A tester-chosen (or already-adopted) device: never probe for
+            # the hardcoded AVD and never spawn a second emulator under it.
+            waited = await emulator.wait_boot(serial, timeout=budget)
+            if waited.get("error"):
+                return {
+                    "error": None,
+                    "content": {
+                        "state": STATE_BOOTING,
+                        "serial": serial,
+                        "detail": str(waited["error"])[:400],
+                    },
+                }
+            return {
+                "error": None,
+                "content": {"state": "ready", "serial": serial, "detail": ""},
+            }
         running = await emulator.find_running(name)
         if running.get("error"):
             return running
@@ -799,6 +826,21 @@ def resolve(run_id: str, session_token: str = "") -> dict:
                 state = STATE_REPORT
             elif point.get("gate"):
                 state = STATE_GATE
+        # D7 (2026-09-03): an unfinished run whose heartbeat stopped. Two runs
+        # from the audit -- mrun-20260903-103316-b09ee4 (TC-003 stuck in
+        # "planning", TC-004 never started) and ...103359-5b01fc -- still held
+        # a lease, had no report, and `qa_mobile_status` reported them as
+        # plain "running", so a tester had no way to tell a run that was
+        # thinking from one nothing was driving. The lease's own heartbeat age
+        # is the signal; STALE is the same threshold a takeover uses, so the
+        # state and the takeover rule cannot drift apart.
+        lease_age = float(lease.get("age") or 0.0)
+        if (
+            state not in (STATE_REPORT, STATE_GATE)
+            and str(lease.get("state") or run_store.NONE) != run_store.NONE
+            and lease_age > run_store.LEASE_STALE_S
+        ):
+            state = STATE_ABANDONED
         return {
             "error": None,
             "content": {
@@ -818,6 +860,7 @@ def resolve(run_id: str, session_token: str = "") -> dict:
                 "explore": explore,
                 "holder": str(lease.get("holder") or ""),
                 "lease_state": str(lease.get("state") or run_store.NONE),
+                "lease_age": lease_age,
             },
         }
     except Exception as exc:  # pragma: no cover - defensive
@@ -899,6 +942,7 @@ async def next_packet(
                 },
             }
         if body.get("finished"):
+            await _finish_evidence(run_id, body)
             return {
                 "error": None,
                 "content": {
@@ -942,6 +986,57 @@ async def next_packet(
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.session.next_packet failed")
         return {"error": str(exc), "content": None}
+
+
+async def _finish_evidence(run_id: str, resolved: object) -> None:
+    """Pull the app's own event log ONCE, when a run reaches its report.
+
+    Idempotent on the manifest: a run whose manifest already records an
+    ``events_source`` is not pulled again, so a resumed chat that lands on the
+    finished state a second time makes no adb call. ``capture.pull_events``
+    itself skips, with a reason, when the package has no profile, the flag is
+    off, or ``run-as`` is refused (a release build) -- and whatever it says is
+    recorded so the report can show it (plan D8). Nothing here can change the
+    run's state or a verdict: every exception ends in this function.
+    """
+    try:
+        body = resolved if isinstance(resolved, dict) else {}
+        manifest = (run_store.read_manifest(run_id) or {}).get("content") or {}
+        if not isinstance(manifest, dict) or manifest.get("events_source"):
+            return
+        pulled = await capture.pull_events(
+            str(body.get("serial") or manifest.get("serial") or ""),
+            str(body.get("package") or manifest.get("package") or ""),
+            run_id,
+        )
+        content = pulled.get("content") if isinstance(pulled, dict) else None
+        content = content if isinstance(content, dict) else {}
+        # RE-READ after the await: a state or lease write may have landed while
+        # the device was being read, and the copy taken before the pull would
+        # roll it back. Only the three evidence keys are merged into the fresh copy.
+        fresh = (run_store.read_manifest(run_id) or {}).get("content")
+        fresh = fresh if isinstance(fresh, dict) else manifest
+        fresh["events_source"] = str(content.get("events_source") or "none")
+        fresh["events_reason"] = str(
+            content.get("reason")
+            or (pulled.get("error") if isinstance(pulled, dict) else "")
+            or ""
+        )[:400]
+        fresh["events_segments"] = content.get("segments")
+        run_store.write_manifest(run_id, fresh)
+    except Exception:  # never-raise: evidence is not a verdict
+        logger.exception("mobile.session._finish_evidence failed")
+
+
+async def finish_evidence(run_id: str, resolved: object) -> None:
+    """The public face of :func:`_finish_evidence`, for callers outside this module.
+
+    ``qa_mobile_status(report_now=True)`` renders a run's report from another chat
+    and must pull the app's event log first, once; it goes through here so that a
+    module boundary is crossed by a public name, not a private one. Same contract:
+    idempotent on the manifest, never raises, never changes state or a verdict.
+    """
+    await _finish_evidence(run_id, resolved)
 
 
 def _persist_explore(run_id: str, state: object) -> None:
@@ -992,20 +1087,23 @@ async def submit(
             return result
         content = dict(result.get("content") or {})
         follow = (scheduler.next_case(run_id) or {}).get("content") or {}
+        state = (
+            STATE_RUNNING
+            if content.get("packet")
+            else (
+                STATE_REPORT
+                if follow.get("finished")
+                else STATE_GATE
+                if follow.get("gate")
+                else STATE_RUNNING
+            )
+        )
+        if state == STATE_REPORT:
+            await _finish_evidence(run_id, body)
         return {
             "error": None,
             "content": {
-                "state": (
-                    STATE_RUNNING
-                    if content.get("packet")
-                    else (
-                        STATE_REPORT
-                        if follow.get("finished")
-                        else STATE_GATE
-                        if follow.get("gate")
-                        else STATE_RUNNING
-                    )
-                ),
+                "state": state,
                 "case": content,
                 "packet": content.get("packet"),
                 "next": follow,
@@ -1047,6 +1145,8 @@ async def _submit_explore(
         return folded
     turn = folded.get("content") or {}
     _persist_explore(run_id, turn.get("state"))
+    if str(turn.get("status") or "") != explore_runner.RUNNING:
+        await _finish_evidence(run_id, resolved)
     return {
         "error": None,
         "content": {

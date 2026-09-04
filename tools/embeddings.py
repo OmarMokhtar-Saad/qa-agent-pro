@@ -50,6 +50,37 @@ def backend_enabled() -> bool:
     return _backend() in ("local", "voyage")
 
 
+def warm_local_model_background() -> None:
+    """Load the local sentence-transformers model on a background thread.
+
+    Fire-and-forget: the FIRST real ``embed_texts`` call used to pay the whole
+    model-load cost (about 8s of a tester's first ``qa_prepare_test_cases``
+    call, measured 2026-09-03). Warming it off the serving path, at server
+    start, moves that cost to a moment nothing is waiting on it.
+
+    No flag: this is strictly an improvement over the lazy-load default, never
+    a behaviour change -- the model is still loaded at most once (the existing
+    lock in :func:`_load_local_model` makes the warm thread and a real request
+    that races it converge on the same load). A no-op when the backend is not
+    ``local``, and every failure (missing extra, disk, import error) is caught
+    and logged at DEBUG so an absent optional dependency never blocks or
+    crashes startup.
+    """
+    if _backend() != "local":
+        return
+
+    def _warm() -> None:
+        try:
+            _load_local_model()
+        except Exception:
+            logger.debug("embeddings: background warm-up skipped", exc_info=True)
+
+    try:
+        threading.Thread(target=_warm, daemon=True, name="qa-embeddings-warm").start()
+    except Exception:
+        logger.debug("embeddings: could not start the warm-up thread", exc_info=True)
+
+
 def _model_name(default: str) -> str:
     name = str(getattr(settings, "qa_embeddings_model", "") or "").strip()
     return name or default

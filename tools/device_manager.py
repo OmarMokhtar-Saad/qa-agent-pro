@@ -85,7 +85,10 @@ async def _run(cmd: list[str], timeout: int) -> tuple[int, bytes, bytes]:
         try:
             await asyncio.wait_for(proc.communicate(), timeout=1)
         except Exception:
-            pass
+            # The kill is what matters; draining after it is courtesy. Logged
+            # rather than passed so a device that cannot be reaped leaves a
+            # trace -- the warning below only says the command timed out.
+            logger.debug("device_manager: drain after kill failed", exc_info=True)
         logger.warning("device_manager: command timed out: %s", cmd[0])
         raise
     return proc.returncode or 0, stdout or b"", stderr or b""

@@ -128,7 +128,10 @@ async def find_running(avd: str = provisioner.AVD_NAME) -> dict:
     try:
         listed = await adb.devices()
         if listed.get("error"):
-            return {"error": None, "content": {"serial": "", "avd": str(avd)}}
+            # NOT `serial: ""`. A failed probe is not the same fact as "no
+            # emulator is running", and callers that spawn on the second answer
+            # would otherwise start a device because adb was unreachable.
+            return {"error": str(listed["error"]), "content": None}
         for serial in listed.get("content") or []:
             if not str(serial).startswith("emulator-"):
                 continue
@@ -138,6 +141,39 @@ async def find_running(avd: str = provisioner.AVD_NAME) -> dict:
         return {"error": None, "content": {"serial": "", "avd": str(avd)}}
     except Exception as exc:
         logger.exception("mobile.emulator.find_running failed")
+        return {"error": str(exc), "content": None}
+
+
+async def list_running() -> dict:
+    """Every booted ``emulator-*`` serial on this machine, with its AVD name.
+
+    Unlike :func:`find_running`, this does NOT filter by AVD -- it is how the
+    device-selection stage sees a FOREIGN emulator (one not named
+    ``provisioner.AVD_NAME``) that a tester already has running, so a run can
+    adopt it instead of always spawning the hardcoded default.
+
+    ``{"error", "content": [{"serial": ..., "avd": ...}, ...]}``.
+    """
+    try:
+        listed = await adb.devices()
+        if listed.get("error"):
+            # An empty list means "nothing is booted", which sends the device
+            # stage on to provisioning and a spawn. A broken adb must not be
+            # able to say that: it reported "The emulator is still starting"
+            # while starting a SECOND emulator over the tester's own (D1,
+            # 2026-09-03). The caller already branches on `error`.
+            return {"error": str(listed["error"]), "content": None}
+        out: list[dict] = []
+        for serial in listed.get("content") or []:
+            if not str(serial).startswith("emulator-"):
+                continue
+            named = await avd_name_of(serial)
+            out.append(
+                {"serial": serial, "avd": str((named or {}).get("content") or "")}
+            )
+        return {"error": None, "content": out}
+    except Exception as exc:
+        logger.exception("mobile.emulator.list_running failed")
         return {"error": str(exc), "content": None}
 
 
@@ -256,7 +292,14 @@ async def boot(avd: str = provisioner.AVD_NAME, timeout: int = 0) -> dict:
     """
     try:
         ensure_adb_first_on_path()
-        running = (await find_running(avd)).get("content") or {}
+        # A FAILED probe is not "no emulator": `or {}` collapsed the two, and
+        # this function's next move is to spawn one. That is D1 exactly -- a
+        # broken adb starting a second emulator over the tester's own -- and it
+        # is latent here only because nothing calls boot() in production today.
+        probe = await find_running(avd)
+        if probe.get("error"):
+            return probe
+        running = probe.get("content") or {}
         if running.get("serial"):
             waited = await wait_boot(str(running["serial"]), timeout)
             if waited.get("error"):

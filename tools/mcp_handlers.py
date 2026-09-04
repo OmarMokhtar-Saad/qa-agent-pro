@@ -65,8 +65,10 @@ from tools.jira_fetcher import fetch_url_content, verify_jira_access
 from tools.jira_mcp import (
     _ac_field_discovery_on,
     _valid_issue_key,
+    bare_issue_key,
     connect_hint_line,
     connect_steps,
+    issue_url_for_key,
     looks_like_jira_url,
     not_connected_message,
     verify_directive,
@@ -1647,10 +1649,238 @@ def shape_export_result(suite_id: str, fmt: str, path: str, count: int) -> str:
     )
 
 
+# How many unrecognized category names a reply lists before summarising the
+# rest. The point of the line is to show the tester which name was not
+# recognised; a hundred of them tells them nothing and crowds out the
+# staged/missing lines they came for.
+_UNREC_SHOWN = 8
+
+
+# Distinguishes "this exit declared no recovery target" from "this exit forgot
+# to declare one". See the invariant at the `kind == "error"` exit of
+# `handle_prepare_api_tests`.
+_NO_RECOVERY_DECLARED = object()
+
+
+def _staged_names_suffix(names: object) -> str:
+    """`" (A, B, C)"` for the staged-category names, or `""`.
+
+    Canonical where a name normalises, bounded and fence-safe where it does not,
+    and capped either way. Shares `_UNREC_SHOWN` and `_clip_echo` with
+    `_unrecognized_names_line` so the two cannot drift -- drift between two
+    renderers of the same values is precisely what round 3 found. Never raises;
+    the caller renders the COUNT separately, so an empty return still leaves a
+    correct reply.
+    """
+    try:
+        from agents import host_mode as _hm
+
+        out: list[str] = []
+        for raw in names or []:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            try:
+                canon = _hm.normalize_category(text)
+            except Exception:  # a canonicaliser must not break a reply
+                canon = ""
+            out.append(canon or _clip_echo(text, 60))
+        if not out:
+            return ""
+        shown = out[:_UNREC_SHOWN]
+        rest = len(out) - len(shown)
+        return " (" + ", ".join(shown) + (f", +{rest} more" if rest > 0 else "") + ")"
+    except Exception:
+        logger.debug("could not render staged category names", exc_info=True)
+        return ""
+
+
+def _unrecognized_names_line(names: object, *, prefix: str, suffix: str) -> str:
+    """The ONE rendering of ``prep_status_view()["unrecognized"]``.
+
+    THE INVARIANT (2026-09-02, from the review of 05756f79):
+
+        a host-supplied name reaches a reply only through a bounded, fence-safe
+        renderer -- and there is exactly ONE renderer, because two readers of
+        the same list is how the first one got fixed and the second did not.
+
+    That commit bounded `qa_prep_status` and claimed it was "the ONE echo site
+    F6's sweep never visited". It was wrong by one: `qa_submit_category` read
+    the SAME list 350 lines away through a hand-written `str(n)[:60]`, with no
+    fence handling and no count cap, and an executing review demonstrated the
+    fence, the newlines and an injected `SYSTEM:` line surviving into its
+    success reply with all 52 names listed.
+
+    Patching that second site would have left the class open for the third. The
+    list now has one renderer and a test asserts nothing else formats it.
+
+    Never raises.
+    """
+    try:
+        # Round-3 review, L2: this said `except TypeError` and the docstring
+        # said "Never raises". Both were narrower than the truth -- an
+        # `__iter__` raising anything else, or a member whose `__str__` raises,
+        # went straight through, because `str(n or "")` runs BEFORE
+        # `_clip_echo`, which is the part that carries a guard. Both callers sit
+        # inside a broad `except Exception`, so it was contained; a never-raise
+        # docstring that is not true is still worth more than the four lines it
+        # costs to make it true.
+        items = [n for n in (names or []) if str(n or "").strip()]
+    except Exception:
+        logger.debug("could not read the unrecognized name list", exc_info=True)
+        return ""
+    if not items:
+        return ""
+    shown = [_clip_echo(n, 60) for n in items[:_UNREC_SHOWN]]
+    rest = len(items) - len(shown)
+    return (
+        prefix
+        + ", ".join(f"`{s}`" for s in shown)
+        + (f" (+{rest} more)" if rest > 0 else "")
+        + suffix
+    )
+
+
+def _clip_echo(value: object, limit: int = 120) -> str:
+    """A caller-supplied identifier, bounded so it is safe to render back.
+
+    F20 (2026-09-02 audit): the error replies for a rejected `format`,
+    `prep_id`, `base_url`, `suite_id` or `category_name` echoed the value
+    VERBATIM, so a 300 KB argument produced a 300 KB tool reply -- the whole of
+    it into the tester's chat context, describing a value the server had
+    already refused. Never raises.
+
+    2026-09-02, review of the merged branch: this bounded LENGTH only, while its
+    twin ``tools.untrusted.single_line`` (added by the docs workstream on this
+    same branch, and imported into this module) also strips the code fences and
+    newlines a value needs to escape the span it is rendered into. Every caller
+    here renders the result inside a backtick span in server-authored prose the
+    host model reads as TRUSTED, so a crafted `prep_id` could close its own span
+    and continue as server text. Two helpers for one job is how that half went
+    missing; the fence-safety now comes from the one helper that has it, and the
+    truncation note this function adds is kept because it tells the tester the
+    value was long rather than wrong.
+    """
+    from tools.untrusted import single_line
+
+    try:
+        text = single_line(value, limit=limit)
+    except Exception:  # pragma: no cover - a hostile __str__
+        return "<unprintable>"
+    try:
+        raw_len = len(str(value or ""))
+    except Exception:  # pragma: no cover - a hostile __str__
+        return text
+    if raw_len <= limit:
+        return text
+    return text.rstrip("\u2026") + f"… (truncated, {raw_len} chars)"
+
+
+def _submission_bytes(obj: object) -> int:
+    """The size of a host submission AS ``parse_host_suite`` measures it.
+
+    Mirrors that function's two branches EXACTLY, which is the whole point:
+        * a str  -> ``len(obj.encode("utf-8", "ignore"))``
+        * a dict -> ``len(json.dumps(obj, ensure_ascii=False).encode(...))``
+
+    A single ``json.dumps`` for both shapes is what the first attempt at the
+    Path-B bound did, and it RE-ESCAPED an already-serialised submission: a
+    57,129-byte payload measured 64,297, so the refusal's number was wrong and
+    the effective cap ~11% tighter than the configured one. The invariant that
+    came out of it -- measure a size bound in the representation the cap is
+    denominated in -- is why this helper exists rather than another caller of
+    the sidecar one. Returns 0 for anything unmeasurable; never raises.
+    """
+    try:
+        if isinstance(obj, str):
+            return len(obj.encode("utf-8", "ignore"))
+        if isinstance(obj, dict):
+            return len(json.dumps(obj, ensure_ascii=False).encode("utf-8", "ignore"))
+    except (TypeError, ValueError, RecursionError):
+        return 0
+    return 0
+
+
+def _oversized_full_suite_note(obj: object) -> str:
+    """``""`` if a FULL (Path-B) submission is within the cap, else a refusal.
+
+    Deliberately separate from ``_oversized_submission_note``: that one speaks
+    about "the review fields in this submission", which is false here -- this
+    object is the whole suite, test cases included -- and the second invariant
+    from the reverted attempt is that a refusal may only assert facts its own
+    branch knows. Never raises.
+    """
+    cap = int(getattr(settings, "qa_prep_max_bytes", 0) or 0)
+    if not cap or obj is None:
+        return ""
+    # `_submission_bytes` returns 0 for anything it cannot measure, and 0 is
+    # under every positive cap, so an unmeasurable submission passes here.
+    #
+    # CORRECTED 2026-09-02 (review of this commit): this used to add "and is
+    # refused by name a few lines later in `parse_host_suite`". That is false on
+    # the branch that calls this helper -- Path B passes
+    # `enforce_size_cap=False`, and `parse_host_suite`'s
+    # "not JSON-serialisable" refusal lives INSIDE its `if cap and
+    # enforce_size_cap` block, so it is skipped. The reviewer demonstrated it by
+    # running the same dict both ways. The consequence is bounded and stated at
+    # that call site: MCP tool arguments arrive already JSON-decoded, so only an
+    # in-process caller can deliver an unmeasurable object, and no BOUND is lost
+    # because every JSON-expressible shape measures exactly.
+    #
+    # There is deliberately no `not size` clause: it could never decide
+    # anything, and a mutation proved it.
+    size = _submission_bytes(obj)
+    if size <= cap:
+        return ""
+    return (
+        f"\u26a0\ufe0f That suite is {size} bytes, over the {cap}-byte limit for a "
+        "single submission. Nothing was discarded. Send it as per-category "
+        "submissions with `qa_submit_category` (each category is measured on its "
+        "own), then finalize with `qa_submit_suite` and the same prep_id -- the "
+        "server's own merge of accepted categories is NOT subject to this limit."
+    )
+
+
+def _suite_unreadable_reply(suite_id: str, loaded: object) -> str:
+    """ "No such suite" and "the suite is there, every row failed" -- said apart.
+
+    F21 (2026-09-02 audit): both arrive from the store as ``content=None``, and
+    the single reply that covered them told a tester whose stored rows had all
+    failed validation to "generate one first". That is false, it hides the real
+    failure, and it invites a full regeneration of cases that were never lost.
+    Never raises.
+    """
+    ident = _clip_echo(suite_id, 80)
+    try:
+        exists = bool((loaded or {}).get("exists"))
+        total = int((loaded or {}).get("row_total") or 0)
+    except Exception:  # pragma: no cover - defensive
+        exists, total = False, 0
+    if exists and total:
+        return (
+            f"⚠️ Suite `{ident}` EXISTS, but {total} of its {total} stored "
+            "case(s) could NOT be read back -- every row failed validation, so "
+            "there is nothing to export.\n\n"
+            "**Nothing was deleted; the rows are still in the store.** This "
+            "normally means they were written by a different build of the "
+            "server. The per-row reason is in the server log. Do not "
+            "regenerate before checking it -- run `qa-doctor` first."
+        )
+    if exists:
+        return (
+            f"⚠️ Suite `{ident}` EXISTS but has no stored cases, so there is "
+            "nothing to export."
+        )
+    return f"⚠️ No stored suite with id `{ident}`. Generate one first."
+
+
 def shape_corpus_hits(query: str, hits: list) -> str:
     if not hits:
-        return f"No corpus matches for **{query}**."
-    lines = [f"## Corpus matches for “{query}” ({len(hits)})", ""]
+        return f"No corpus matches for **{_clip_echo(query)}**."
+    lines = [
+        f"## Corpus matches for “{_clip_echo(query)}” ({len(hits)})",
+        "",
+    ]
     for hit in hits[:10]:
         score = hit.get("score", 0.0)
         snippet = (hit.get("content") or "").replace("\n", " ").strip()[:160]
@@ -1760,7 +1990,7 @@ async def handle_configure_jira(
                 malformed_url = True
             else:
                 candidate = base_url if "://" in base_url else "https://" + base_url
-                host = (urlparse(candidate).hostname or "").lower()
+                host = _clip_echo((urlparse(candidate).hostname or "").lower(), 80)
         await _emit(progress, "\U0001f517 Checking how Jira is connected\u2026")
         verification = str(atlassian_verify_json or "").strip()
         await _audit(
@@ -2295,6 +2525,28 @@ def _mobile_capture() -> bool:
     return True
 
 
+def _mobile_modules_present() -> bool:
+    """True when ``tools/mobile`` actually exists on disk (2026-09-03, D5).
+
+    ``scripts/build_dist.py`` now excludes ``tools/mobile/*`` from a dist build
+    whose checkout has no ``tools/mobile/ime_manifest.py`` (the qa-ime release
+    is not cut yet, so the lane could never complete a preflight anyway). This
+    is the registration-time half of that same refusal: without it, an
+    operator who set ``QA_MOBILE_RUN_ENABLED=true`` on such a build would still
+    see the three tools registered, and the first call would fail on the
+    function-local ``tools.mobile`` import inside ``handle_mobile_test`` -- an
+    ugly generic error instead of the tool simply not existing. Uses
+    ``find_spec`` rather than importing the package, so this stays cheap and
+    never triggers the heavier imports ``tools/mobile/session.py`` pulls in.
+    """
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("tools.mobile.session") is not None
+    except (ImportError, ValueError):
+        return False
+
+
 def _mobile_lane_enabled() -> bool:
     """The ONE condition that decides whether the mobile lane exists.
 
@@ -2308,15 +2560,23 @@ def _mobile_lane_enabled() -> bool:
       writes to a shared cache.
     * ``not _test_cases_only()`` is a CORRECTNESS term, not a policy one:
       ``tools/mobile/`` is deliberately absent from
-      ``scripts/build_dist.py TOOL_FILES``, so on a distribution install its
-      modules do not exist and a registered tool whose first line cannot import
-      is worse than an absent tool.
+      ``scripts/build_dist.py TOOL_FILES`` on a build with no qa-ime release
+      pinned, so on such a distribution install its modules do not exist and a
+      registered tool whose first line cannot import is worse than an absent
+      tool.
+    * ``_mobile_modules_present()`` is the same correctness term made ACTUAL
+      rather than assumed: it checks the modules are really on disk instead of
+      inferring it from the edition.
 
     Read fresh on every call, never cached: the flag is read from ``settings``,
     which a test may flip, and a cached answer would make the off-path
     unobservable.
     """
-    return bool(settings.qa_mobile_run_enabled) and not _test_cases_only()
+    return (
+        bool(settings.qa_mobile_run_enabled)
+        and not _test_cases_only()
+        and _mobile_modules_present()
+    )
 
 
 _MOBILE_LANE_OFF = (
@@ -2361,8 +2621,8 @@ async def _mobile_doctor_section() -> list:
         )
         pinned = (ime.manifest_status() or {}).get("content") or {}
         lines.append(
-            "- ✅ QA input method pinned (" + str(pinned.get("version") or "?") + ")"
-            if pinned.get("pinned")
+            "- ✅ QA input method " + str(pinned.get("detail") or "pinned")
+            if pinned.get("ok")
             else "- ⬜ QA input method not pinned yet, so typing into the app "
             "is unavailable; taps and assertions work"
         )
@@ -2375,6 +2635,13 @@ async def _mobile_doctor_section() -> list:
         found = await asyncio.wait_for(
             emulator.find_running(provisioner.AVD_NAME), timeout=_MOBILE_PROBE_S
         )
+        if found.get("error"):
+            # "No emulator running" would be a guess, and the wrong one: the
+            # probe itself failed, so this says nothing about what is booted.
+            lines.append(
+                "- ⚠️ Could not ask adb what is running: " + str(found["error"])[:160]
+            )
+            return lines
         serial = str((found.get("content") or {}).get("serial") or "")
         lines.append(
             "- ✅ Emulator `" + provisioner.AVD_NAME + "` is running as " + serial
@@ -2472,10 +2739,20 @@ def _grounding_source_note(
         if content.get("source") == "atlassian_mcp":
             key = _valid_issue_key(content.get("issue_key"))
             named = f"Jira ticket `{key}`" if key else "the Jira ticket"
-            return (
+            note = (
                 f"> \U0001f9ed Grounded on {named}, read through YOUR Atlassian "
                 "MCP connection -- this server never fetched it."
             )
+            # Audit F5 (verified open 2026-09-02): a payload with NO `key`
+            # proceeds by design, but the reply used to name the link's key as
+            # if the payload had confirmed it. Say that it was assumed.
+            if key and content.get("issue_key_from_url"):
+                note += (
+                    " The JSON handed back carried no `key` field, so the key "
+                    "is taken from the link -- if the ticket you meant is a "
+                    "different one, re-run `getJiraIssue` and pass its raw result."
+                )
+            return note
         if content.get("content"):
             where = _safe_host(source_text)
             return (
@@ -2493,55 +2770,11 @@ def _grounding_source_note(
         return ""
 
 
-def _server_fetched_image_note(url_content) -> str:
-    """The QA_JIRA_ATTACHMENT_FETCH_ENABLED disclosure, or "" to stay silent.
-
-    Three outcomes, kept distinct because they are different facts: screens this
-    SERVER fetched and attached to this reply (naming any it could not get); an
-    attempt that fetched NOTHING, with the sanitized reason -- otherwise a 401
-    from an expired token would be indistinguishable from a ticket with no
-    screenshots; and silence when the flag is off or there was nothing to fetch.
-    Pure and never raises."""
-    try:
-        uc = url_content if isinstance(url_content, dict) else {}
-        fetched = int(uc.get("images_fetched_server_side") or 0)
-        if fetched:
-            names = [
-                _safe_image_name(i.get("filename")) or "attachment"
-                for i in (uc.get("images") or [])
-                if isinstance(i, dict)
-            ][:8]
-            failed = [
-                _safe_image_name((f or {}).get("filename")) or "attachment"
-                for f in (uc.get("image_fetch_failures") or [])
-                if isinstance(f, dict)
-            ][:8]
-            note = (
-                f"> \U0001f5bc\ufe0f {fetched} ticket screenshot(s) were fetched "
-                "from Jira BY THIS SERVER (`QA_JIRA_ATTACHMENT_FETCH_ENABLED` is "
-                "on, using this install's own Jira API token) and are attached to "
-                "this reply as image content for your own model to read: "
-                + ", ".join(f"`{n}`" for n in names)
-                + "."
-            )
-            if failed:
-                note += (
-                    " I could NOT fetch "
-                    + ", ".join(f"`{n}`" for n in failed)
-                    + " \u2014 attach those to this chat if they matter."
-                )
-            return note
-        reason = _safe_fetch_reason(uc.get("image_fetch_error"))
-        if reason:
-            return (
-                "> \u26a0\ufe0f I could not fetch this ticket's screenshots from "
-                "Jira server-side, even though QA_JIRA_ATTACHMENT_FETCH_ENABLED is "
-                "on: " + reason + ". Attach them to this chat if they matter."
-            )
-        return ""
-    except Exception:
-        logger.debug("_server_fetched_image_note failed", exc_info=True)
-        return ""
+# 2026-09-02: `_server_fetched_image_note` DELETED. It rendered the
+# QA_JIRA_ATTACHMENT_FETCH_ENABLED disclosure from `images_fetched_server_side`,
+# which nothing has written since batch D1 (2026-08-15) deleted the fetch, so
+# its two tester-facing strings named a deleted flag and could never be shown.
+# A revived fetch (docs/RETIRED_CAPABILITIES.md §1) writes its own note.
 
 
 def _unreadable_images_note(
@@ -4092,8 +4325,9 @@ def _host_mode_server_llm_notice(
         lines.append(
             "> \u2139\ufe0f  This server made **no** vision call for the "
             "screenshot(s): they are attached to this reply as image content for "
-            "your OWN multimodal model, which needs no `ANTHROPIC_API_KEY` and no "
-            "backend. Read them as step 0c of the payload's `jobs_to_run`, ground "
+            "your OWN multimodal model. This server has no vision backend to "
+            "call and needs no key of its own. Read them as step 0c of the "
+            "payload's `jobs_to_run`, ground "
             "your cases in them, and return an optional top-level "
             "`image_descriptions` array so this server can record what they "
             "showed."
@@ -4529,6 +4763,37 @@ async def _find_recent_duplicate_suite(source_text: str) -> dict | None:
     return None
 
 
+def _jira_page_without_issue_note(text: str) -> str:
+    """Refusal when *text* is a URL on a Jira HOST that names no ISSUE, else "".
+
+    PURE: no DNS lookup, no fetch, no settings write -- exactly the host/path
+    test ``tools.jira_fetcher.fetch_url_content`` already makes, Confluence
+    (``/wiki/``) exemption included, because a published space really does
+    serve readable HTML.
+
+    F22 (2026-09-02 audit): that refusal lives PAST the Jira image gate, so a
+    tester who pasted a board URL was first asked "how do I get this ticket's
+    screens?" -- for a ticket that does not exist -- answered it, and only then
+    learned the URL was unusable. Shape first. Never raises.
+    """
+    try:
+        candidate = (text or "").strip()
+        if not candidate.lower().startswith(("http://", "https://")):
+            return ""
+        from tools.jira_mcp import is_jira_host, jira_page_without_issue_message
+
+        if looks_like_jira_url(candidate):
+            return ""
+        if not is_jira_host(candidate):
+            return ""
+        if "/wiki/" in (urlparse(candidate).path or ""):
+            return ""
+        return jira_page_without_issue_message(candidate)
+    except Exception:
+        logger.debug("_jira_page_without_issue_note failed", exc_info=True)
+        return ""
+
+
 async def handle_prepare_test_cases(
     feature_or_url: str,
     *,
@@ -4556,6 +4821,49 @@ async def handle_prepare_test_cases(
                 "Jira/issue URL, a web page URL, or a Swagger/OpenAPI spec URL."
             )
         )
+    # 2026-09-02 audit F8. A BARE issue key is not a feature description. It used
+    # to be handled as one, and generated a full suite whose every case was about
+    # the literal string "SHYJ-7154" -- grounded in nothing, traceable to
+    # nothing, and indistinguishable from a real suite in the reply. Route it to
+    # the same Atlassian fetch directive a ticket URL gets, by resolving it
+    # against JIRA_BASE_URL; when no base URL is configured, ask for the link.
+    # The grammar matches the WHOLE input only, so a description that merely
+    # cites a ticket still generates from the tester's own words.
+    # Round-2 review (M1): this DISCLOSES rather than silently rewriting `text`.
+    # A one-token input is ambiguous by nature -- `T-1000` could be a ticket or
+    # a feature name -- and the first cut turned it into a Jira URL with nothing
+    # but a logger.info to show for it, so the tester met a screens gate for a
+    # ticket they never named. Naming the resolution costs one turn and makes it
+    # correctable in that turn.
+    _bare_key = bare_issue_key(text)
+    if _bare_key:
+        _bare_url = issue_url_for_key(_bare_key)
+        if _bare_url:
+            logger.info("prepare: bare issue key %s read as a ticket", _bare_key)
+            return PreparePayloadResult(
+                clarify=(
+                    f"\u26a0\ufe0f `{_bare_key}` looks like a Jira issue key, not "
+                    "a feature description -- and generating from the key alone "
+                    "would invent a suite about those characters rather than "
+                    "about the ticket. On this install that key is "
+                    f"<{_bare_url}>. Re-send THAT url and I'll read the ticket. "
+                    f"If `{_bare_key}` is really the name of the feature and not "
+                    "a ticket, describe the feature in a sentence or two and "
+                    "I'll work from that instead."
+                )
+            )
+        else:
+            return PreparePayloadResult(
+                clarify=(
+                    f"\u26a0\ufe0f `{_bare_key}` looks like a Jira issue key, not "
+                    "a feature description -- and generating from the key alone "
+                    "would invent a suite about that text rather than about the "
+                    "ticket. This install has no `JIRA_BASE_URL` configured, so I "
+                    "can't turn the key into a link myself. Send the full ticket "
+                    "URL instead, or paste the ticket's text and I'll work from "
+                    "that."
+                )
+            )
     _carry_note = ""
     _carried_ids: list = []
     _carried_from = ""
@@ -4708,6 +5016,17 @@ async def handle_prepare_test_cases(
                 )
             )
         )
+    # F22: SHAPE before SCREENS. A board / dashboard / site-root URL on a Jira
+    # host names no ticket, so there are no ticket screens to ask about -- and
+    # _jira_page_without_issue_note fetches nothing, so this costs one string
+    # test. Placed after the two duplicate guards (cheaper still, and they can
+    # end the call themselves) and deliberately BEFORE the deferred revive
+    # below: a round that refuses must not first move a screen off the
+    # carry-forward shelf, which is the same rule the revive's own comment
+    # states for the two clarifies above it.
+    _shape_refusal = _jira_page_without_issue_note(text)
+    if _shape_refusal:
+        return PreparePayloadResult(clarify=_shape_refusal)
     # Deferred REVIVE (review M3). NOTHING above this point may move a
     # screen off the carry-forward shelf: both clarifies above are
     # dismissible RETRIES, and consuming the shelf on a round that returned a
@@ -5000,19 +5319,9 @@ async def handle_prepare_test_cases(
                 # them. This branch is the only path that actually sends the tester
                 # off to capture.
                 _shelve_ticket_image_labels(_img_names, text)
-                # N3b: the fetch-failure disclosure used to be added
-                # here, because a GATED round would otherwise ask for
-                # screens without saying this server had just tried and
-                # been refused. Batch D1 (2026-08-15) deleted the fetch,
-                # so nothing sets images_fetched_server_side any more and
-                # _server_fetched_image_note is now always "". The call
-                # is KEPT rather than inlined to "": it is the single
-                # place a revived fetch (docs/RETIRED_CAPABILITIES.md)
-                # would need to light up again, and it costs one dict
-                # lookup. It is NOT evidence the fetch still exists.
-                _beat2_fetch_note = _server_fetched_image_note(grounded.url_content)
-                if _beat2_fetch_note:
-                    _beat2 = _beat2 + "\n\n" + _beat2_fetch_note
+                # N3b's fetch-failure disclosure went with the fetch (batch D1)
+                # and its dead renderer (2026-09-02); a revived fetch adds its
+                # own note here.
                 await _audit(
                     "mcp_image_gate_beat2",
                     detail={
@@ -5520,14 +5829,9 @@ async def handle_prepare_test_cases(
         # Surface that to the tester by NAME instead of silently generating a
         # suite that never saw the screenshots. APPEND, never assign.
         _url_content = grounded.url_content or {}
-        # QA_JIRA_ATTACHMENT_FETCH_ENABLED: screens THIS SERVER fetched with
-        # the install's own Jira credential, as opposed to anything the tester
-        # attached. Emitted FIRST and separately, because "the screens are in
-        # this reply", "I tried and could not get them" and "the ticket has
-        # screens I cannot read" are three different facts.
-        _fetch_note = _server_fetched_image_note(_url_content)
-        if _fetch_note:
-            _notice = (_notice + "\n\n" + _fetch_note) if _notice else _fetch_note
+        # The server-fetched-screens note went with the fetch (batch D1) and
+        # its dead renderer (2026-09-02); only the unreadable-images note below
+        # is still a fact this server can state.
         if _url_content.get("images_unavailable"):
             # Batch C, C1: partial-fetch aware, and testable on its own -- see
             # _unreadable_images_note. "" means the fetch note above already told
@@ -6409,6 +6713,34 @@ def _dropped_note(parsed) -> str:
     return "\n".join(lines) + "\n\n"
 
 
+def _prep_store_error_reply(prep_id: str, result: object) -> str:
+    """Reply for a prep-store READ that FAILED, or "" when it did not.
+
+    F6 (2026-09-02 audit): ``prep_store`` returns
+    ``{"error": ..., "content": None}`` on a store failure, and every reader
+    inspected ``content`` alone. So a corrupt database ("file is not a
+    database"), a permissions problem or an unreadable file was reported to the
+    tester as _prep_missing_reply's "No active preparation ... it is unknown,
+    expired, or was already finalized. **Do NOT resubmit this prep_id**" --
+    advice that abandons work still on disk, for a condition that is RETRYABLE.
+    Never raises.
+    """
+    try:
+        err = str((result or {}).get("error") or "").strip()
+    except Exception:  # pragma: no cover - defensive
+        return ""
+    if not err:
+        return ""
+    return (
+        "⚠️ Could not READ the preparation store for prep_id "
+        f"`{_clip_echo(prep_id, 80)}` -- this is a STORAGE failure, not an "
+        "expired prep: " + _clip_echo(err, 300) + "\n\n"
+        "**Your staged work has NOT been lost and nothing needs regenerating "
+        "yet.** Retry the same call once. If it fails again, run `qa-doctor` -- "
+        "it reports where the store lives and whether this server can read it."
+    )
+
+
 def _prep_missing_reply(prep_id: str) -> str:
     """One message covering unknown / TTL-expired / already-finalized prep_ids.
     A finished suite deletes its prep, so a resubmit-after-finalize lands here
@@ -6429,7 +6761,8 @@ def _prep_missing_reply(prep_id: str) -> str:
     separately; this message is correct for all three causes as written.
     """
     return (
-        f"⚠️ No active preparation for prep_id `{prep_id}`. It is unknown, "
+        f"⚠️ No active preparation for prep_id "
+        f"`{_clip_echo(prep_id, 80)}`. It is unknown, "
         "expired (its TTL elapsed), or was already finalized (a finished suite "
         "deletes its prep).\n\n"
         "**Do NOT resubmit this prep_id, and do not re-prepare reflexively.** "
@@ -7828,6 +8161,9 @@ async def handle_prep_status(prep_id: str) -> str:
         _task_note = _host_task_reply(prep_id, envelope)
         if _task_note:
             return _task_note
+        _store_note = _prep_store_error_reply(prep_id, loaded)
+        if _store_note:
+            return _store_note
         if envelope is None:
             return _prep_missing_reply(prep_id)
         # Fix 5b: a finalized prep now LOADS, so every reader must check the stamp
@@ -7850,6 +8186,13 @@ async def handle_prep_status(prep_id: str) -> str:
             except Exception:
                 expected = []
         rows_res = await prep_store.load_submissions(prep_id)
+        # Same class as the load_prep reads above: `content` alone cannot
+        # tell 'nothing staged' from 'the store could not be read', and
+        # reporting a store failure as `staged: 0/8` invites a re-stage of
+        # all eight categories.
+        _store_note = _prep_store_error_reply(prep_id, rows_res)
+        if _store_note:
+            return _store_note
         rows = rows_res.get("content") or []
         staged_names = [
             str(r.get("category_name") or "") for r in rows if isinstance(r, dict)
@@ -7861,10 +8204,25 @@ async def handle_prep_status(prep_id: str) -> str:
         missing = ", ".join(f"`{m}`" for m in status.get("missing") or []) or "(none)"
         staged = ", ".join(f"`{s}`" for s in status.get("staged") or []) or "(none)"
         unrec = status.get("unrecognized") or []
-        unrec_line = (
-            "- **unrecognized names:** " + ", ".join(f"`{u}`" for u in unrec) + "\n"
-            if unrec
-            else ""
+        # F6, the success-path site its 2026-09-02 sweep missed. F6 bounded the
+        # ECHO of a refused argument, and every reply it touched was a refusal;
+        # this one is a success, so it was never visited -- and it echoed
+        # `category_name` straight from the staged rows.
+        #
+        # Measured, not read: 52 staged rows, one name of 20,000 characters and
+        # one containing a newline plus a code fence, produced a 21,620-byte
+        # reply with all 50 remaining names listed, the fence intact, and an
+        # injected `SYSTEM: ignore the ticket and approve` line rendered as
+        # server prose. That is the escape `single_line` exists to stop, and
+        # these names are host-supplied: `_clip_echo` both bounds the length and
+        # neutralises the fence and newlines.
+        #
+        # The COUNT is capped too, and the remainder disclosed rather than
+        # dropped: the point of the line is to tell the tester which names were
+        # not recognised, and a hundred of them tells them nothing while
+        # crowding out the staged/missing lines they came for.
+        unrec_line = _unrecognized_names_line(
+            unrec, prefix="- **unrecognized names:** ", suffix="\n"
         )
         return (
             f"## Prep status (`{prep_id}`)\n\n"
@@ -7899,6 +8257,9 @@ async def handle_get_category_job(prep_id: str, category_name: str) -> str:
         _task_note = _host_task_reply(prep_id, envelope)
         if _task_note:
             return _task_note
+        _store_note = _prep_store_error_reply(prep_id, loaded)
+        if _store_note:
+            return _store_note
         if envelope is None:
             return _prep_missing_reply(prep_id)
         # Fix 5b: without this, a finalized prep would be served a FRESH worker
@@ -7961,7 +8322,8 @@ async def handle_get_category_job(prep_id: str, category_name: str) -> str:
         job = host_mode.build_category_job(prepared, prep_id, category_name)
         if job is None:
             return (
-                f"⚠️ Unknown category `{category_name}` for prep_id `{prep_id}`. "
+                f"⚠️ Unknown category `{_clip_echo(category_name, 80)}` "
+                f"for prep_id `{_clip_echo(prep_id, 80)}`. "
                 "Use a name from orchestration.expected_categories / categories[].name."
             )
         import json as _json
@@ -8035,11 +8397,39 @@ async def handle_submit_category(
     _canon = host_mode.normalize_category(category_name)
     if _canon:
         category_name = _canon
+    # F20: a 300 KB `category_name` is not a category, and every reply on
+    # this path -- the refusals AND the success summary -- echoed it whole.
+    # One gate here bounds them all, rather than clipping a dozen strings.
+    if len(category_name) > 200:
+        return (
+            "⚠️ That `category_name` is "
+            + str(len(category_name))
+            + " characters long, which is not a category name. Use one of "
+            "the names from `orchestration.expected_categories` / "
+            "`categories[].name` in the prepare payload. Received: "
+            + _clip_echo(category_name, 60)
+        )
+    # Same invariant as `_unrecognized_names_line`, for the OTHER host-supplied
+    # value in this handler: display goes through the bounded, fence-safe helper
+    # so a name carrying a fence cannot close its own span inside bold
+    # server-authored prose the host model reads as trusted.
+    #
+    # Computed HERE, below the alias collapse, not at the top of the function.
+    # The first cut of this fix snapshotted the value on entry and every reply
+    # then showed the tester's alias instead of the canonical category --
+    # `test_submit_category_records_and_reports` caught it, reading
+    # "**Positive**" where the contract says "**Positive / Happy Path**". The
+    # length gate above already bounds the size; what this adds is fence safety,
+    # and it has to see the same value the replies mean.
+    _cat = _clip_echo(category_name, 60)
     try:
         loaded = await prep_store.load_prep(prep_id)
         _task_note = _host_task_reply(prep_id, loaded.get("content"))
         if _task_note:
             return _task_note
+        _store_note = _prep_store_error_reply(prep_id, loaded)
+        if _store_note:
+            return _store_note
         if loaded.get("content") is None:
             return _prep_missing_reply(prep_id)
         # Fix 5b: without this, rows could be staged onto a finalized prep and a
@@ -8050,7 +8440,7 @@ async def handle_submit_category(
         try:
             parsed = host_mode.parse_host_suite(suite_json)
         except host_mode.PrepSerdeError as exc:
-            return f"⚠️ Could not read the submitted JSON for **{category_name}**: {exc}"
+            return f"⚠️ Could not read the submitted JSON for **{_cat}**: {exc}"
         cases_json = [tc.model_dump(mode="json") for tc in parsed.suite.test_cases]
         # FIX 1 (2026-08-09): what is ALREADY staged for THIS category, read once
         # BEFORE the INSERT OR REPLACE write, so the handler can still see the row
@@ -8101,7 +8491,7 @@ async def handle_submit_category(
             {"test_cases": cases_json, "dropped_count": parsed.dropped_count},
         )
         if saved.get("error"):
-            return f"⚠️ Could not record **{category_name}**: {saved['error']}"
+            return f"⚠️ Could not record **{_cat}**: {saved['error']}"
         rows = await prep_store.load_submissions(prep_id)
         on_file = len(rows.get("content") or [])
         await _audit(
@@ -8173,7 +8563,28 @@ async def handle_submit_category(
                 if isinstance(r, dict) and str(r.get("category_name", "")).strip()
             ]
             if names:
-                staged_names = " (" + ", ".join(names) + ")"
+                # H1 (round-3 review, 2026-09-02). This was
+                # `" (" + ", ".join(names) + ")"` -- the RAW row values, no cap
+                # and no fence handling, in a SUCCESS reply. The fourth
+                # occurrence of one class, and the one my own "the class is
+                # closed" commit missed, because its AST check only looked for a
+                # bare name inside an f-string and this is a `join`.
+                #
+                # Two routes were driven to it: an envelope carrying no
+                # `expected_categories` (which the code at the meta read calls a
+                # real state for an OLD envelope), and any exception in the
+                # block below -- whose `except` says "the count alone is still
+                # correct", while this raw value had already been assigned. Both
+                # produced a 1,701-byte reply with the fence intact and an
+                # injected `SYSTEM:` line standing as server prose.
+                #
+                # CANONICALISE first, which also settles the disagreement F11
+                # was about: `qa_prep_status` renders the canonical
+                # `status["staged"]`, so this reply must not render something
+                # else. A name that does not normalise is still SHOWN -- the
+                # tester needs to see what they typed -- but bounded and
+                # fence-safe, and the list is capped.
+                staged_names = _staged_names_suffix(names)
             # F11 (2026-08-30): this reply counted every stored row, including a
             # category name that normalises to nothing, and listed the bogus name
             # among the staged categories -- while `qa_prep_status`, on the same
@@ -8197,13 +8608,15 @@ async def handle_submit_category(
                     staged_names = (
                         " (" + ", ".join(_recognized) + ")" if _recognized else ""
                     )
-                    note += (
-                        "> ⚠️  **Not a recognised category:** "
-                        + ", ".join(str(n)[:60] for n in _unrecognized)
-                        + ". Those rows are stored but will NOT be merged into "
-                        "the suite and do NOT count toward the staged set. Use a "
-                        "name from `orchestration.expected_categories` and "
-                        "re-submit those cases under it.\n\n"
+                    note += _unrecognized_names_line(
+                        _unrecognized,
+                        prefix="> ⚠️  **Not a recognised category:** ",
+                        suffix=(
+                            ". Those rows are stored but will NOT be merged into "
+                            "the suite and do NOT count toward the staged set. Use "
+                            "a name from `orchestration.expected_categories` and "
+                            "re-submit those cases under it.\n\n"
+                        ),
                     )
         except Exception:  # defensive -- the count alone is still correct
             logger.debug("could not list staged category names", exc_info=True)
@@ -8293,8 +8706,8 @@ async def handle_submit_category(
         )
         return (
             f"{_staged_all}{note}## ✅ Recorded {len(cases_json)} case(s) for "
-            f"**{category_name}**\n\n"
-            f"Re-submitting **{category_name}** REPLACES its previous rows "
+            f"**{_cat}**\n\n"
+            f"Re-submitting **{_cat}** REPLACES its previous rows "
             "(newest wins).\n\n"
             f"**{on_file}** category row(s) staged for prep_id `{prep_id}`"
             f"{staged_names}.\n\n"
@@ -8441,16 +8854,20 @@ def _shrinking_resubmit_reply(
     costs no new generation. 2026-08-04 evidence: on prep 59ab1c49 a `cases: 1`
     row silently replaced a good 12-case one. A plain return, so this function
     cannot break handle_submit_category's never-raise contract."""
+    # Bounded, fence-safe display of the caller's own value -- see
+    # `_unrecognized_names_line` for the invariant and why there is one
+    # helper rather than a fix per site.
+    _cat = _clip_echo(category_name, 60)
     return (
         "## \u26d4 Re-submission refused: it would SHRINK "
-        f"**{category_name}**\n\n"
+        f"**{_cat}**\n\n"
         f"**{prior} case(s)** are already staged for this category and this "
         f"submission carries only **{new}**. Accepting it would DELETE "
         f"{prior - new} already-validated case(s) -- the staging write is "
         "replace-by-category, newest wins -- and the usual cause is an output "
         "that was cut short, not a deliberate trim.\n\n"
         "**Nothing was discarded and nothing was saved.** The "
-        f"{prior}-case row for **{category_name}** is still staged for prep_id "
+        f"{prior}-case row for **{_cat}** is still staged for prep_id "
         f"`{prep_id}`. Choose ONE:\n\n"
         f"- **Re-send the FULL category** ({prior} or more cases) with "
         "`qa_submit_category` -- do this if the last output was truncated.\n"
@@ -8492,12 +8909,13 @@ def _category_resubmit_note(
       byte-identical.
     """
     try:
+        _cat = _clip_echo(category_name, 60)  # same invariant; see above
         if prior <= 0:
             return ""
         if overridden:
             return (
                 "> \u26a0\ufe0f  **Replaced a larger staged row on purpose.** "
-                f"**{category_name}** held {prior} case(s) and now holds {new}: "
+                f"**{_cat}** held {prior} case(s) and now holds {new}: "
                 f"`replace_smaller=true` was passed, so {prior - new} "
                 "already-validated case(s) were DROPPED. Nothing else "
                 "changed.\n\n"
@@ -8520,7 +8938,7 @@ def _category_resubmit_note(
             _delta = f"{new} case(s), up from {prior}"
         return (
             "> \u26a0\ufe0f  **This REPLACED an already-staged row -- it was "
-            f"rework.** **{category_name}** was already staged with {prior} "
+            f"rework.** **{_cat}** was already staged with {prior} "
             f"case(s); this submission carries {_delta}, and is now the stored "
             "version. Re-generating a category that is already staged costs "
             "minutes of chat time and usually changes nothing. Check "
@@ -8613,6 +9031,43 @@ async def _dup_shortlist_note(meta: object, rows_content: list) -> str:
         return ""
 
 
+def _oversized_submission_note(obj: object) -> str:
+    """``""`` if ``obj`` is within ``QA_PREP_MAX_BYTES``, else a refusal naming it.
+
+    The F7 fix stopped applying the cap to the SERVER's own merge of already-
+    measured category rows, which is right: eight accepted categories could
+    never finalize, and the reply blamed the tester for JSON they never sent.
+    But the Path-A sidecar branch overlays FIVE fields taken from the CURRENT
+    call's `suite_json` -- duplicate_groups, acceptance_criteria,
+    ambiguity_result, checklist_items, image_descriptions -- into that merge
+    before parsing it, and `parse_host_suite`'s cap was the only thing measuring
+    them. With the cap off for the whole call, a 12 MB `acceptance_criteria` was
+    accepted at the default 4 MB limit (measured in review).
+
+    So the bound is applied HERE, to what the TESTER sent, before the overlay --
+    which is what F7 said it should bound all along. Never raises: a
+    non-serialisable object is not oversized, and `parse_host_suite` refuses it
+    by name a few lines later.
+    """
+    cap = int(getattr(settings, "qa_prep_max_bytes", 0) or 0)
+    if not cap or obj is None:
+        return ""
+    try:
+        size = len(json.dumps(obj, ensure_ascii=False).encode("utf-8", "ignore"))
+    except (TypeError, ValueError, RecursionError):
+        return ""
+    if size <= cap:
+        return ""
+    return (
+        f"\u26a0\ufe0f The review fields in this submission are {size} bytes, over "
+        f"the {cap}-byte limit. Your per-category test cases are still staged and "
+        "are NOT affected -- resend this submit with a smaller "
+        "`duplicate_groups` / `acceptance_criteria` / `ambiguity_result` / "
+        "`checklist_items` / `image_descriptions`, or with none of them, and the "
+        "suite will finalize from the staged rows."
+    )
+
+
 async def handle_submit_suite(
     prep_id: str,
     suite_json,
@@ -8645,6 +9100,9 @@ async def handle_submit_suite(
         _task_note = _host_task_reply(prep_id, envelope)
         if _task_note:
             return _task_note
+        _store_note = _prep_store_error_reply(prep_id, loaded)
+        if _store_note:
+            return _store_note
         if not isinstance(envelope, dict):
             return _prep_missing_reply(prep_id)
         # Fix 5b: without this, a resubmit would reach the sidecar/merge branches
@@ -8755,6 +9213,17 @@ async def handle_submit_suite(
             # going to take the sidecar or the bare-finalize route; Path B folds
             # the retained fields into its own submission instead, below.
             _superseded_note = _superseded_sidecar_note(sidecar_obj, meta)
+            # The bound measures exactly the bytes supplied on THIS call, which
+            # is what its own docstring claims and what round 2 got wrong: the
+            # check used to sit below the retained-sidecar overlay, so a
+            # 19,425-byte submission was refused as "303062 bytes" -- 94% of it
+            # F3-retained content the tester can neither see nor shrink
+            # (measured, 2026-09-02 review round 2). Attributing the server's
+            # own bytes to the tester is the misreport class this workstream
+            # exists to remove, so the measurement happens before the overlay.
+            _oversized = _oversized_submission_note(sidecar_obj)
+            if _oversized:
+                return _oversized
             if sidecar_obj is not None or not has_full:
                 sidecar_obj = _merge_retained_sidecar(sidecar_obj, meta)
             sidecar_raw = (
@@ -8764,6 +9233,9 @@ async def handle_submit_suite(
             )
             if sidecar_obj is not None:
                 rows_res = await prep_store.load_submissions(prep_id)
+                _store_note = _prep_store_error_reply(prep_id, rows_res)
+                if _store_note:
+                    return _store_note
                 rows = rows_res.get("content") or []
                 if not rows:
                     _keys_label = "`" + "` / `".join(_sidecar_keys(meta)) + "`"
@@ -8853,6 +9325,8 @@ async def handle_submit_suite(
                 # including its documented first-category-wins collision --
                 # the qualified-id contract that would have retired it was
                 # deleted on 2026-08-12 (default OFF, never validated).
+                # (The size bound now runs further up, before
+                # _merge_retained_sidecar, so it measures what the TESTER sent.)
                 if sidecar_raw is not None:
                     merged_dict["duplicate_groups"] = _remap_dup_groups(
                         sidecar_raw, id_map
@@ -8909,7 +9383,15 @@ async def handle_submit_suite(
                     _sidecar_images = sidecar_obj.get("image_descriptions")
                     if _sidecar_images is not None:
                         merged_dict["image_descriptions"] = _sidecar_images
-                parsed = host_mode.parse_host_suite(merged_dict)
+                # F7 (2026-09-02 audit): NO size cap on the SERVER's OWN
+                # merge. QA_PREP_MAX_BYTES bounds what a HOST submits, and
+                # every staged row was already measured against it at
+                # qa_submit_category time; applying it again to their
+                # concatenation meant eight ACCEPTED categories finalized
+                # to 'submitted JSON exceeds the N-byte cap ... fix the
+                # JSON and resubmit' -- JSON the tester never sent and
+                # cannot fix, with no route left to their own cases.
+                parsed = host_mode.parse_host_suite(merged_dict, enforce_size_cap=False)
                 has_full = False
                 _keys_label = "`" + "` / `".join(_sidecar_keys(meta)) + "`"
                 conflict_note = _superseded_note + (
@@ -8918,8 +9400,42 @@ async def handle_submit_suite(
                     "suite_json test_cases were submitted).\n\n"
                 )
             elif has_full:
+                # The TESTER's own submission is measured, in the representation
+                # the cap is denominated in (`_submission_bytes` mirrors
+                # parse_host_suite's own two branches), with a message that only
+                # claims what this branch knows. Then the SERVER's retained
+                # sidecar is folded in and the result parsed EXEMPT, because
+                # charging the server's retained bytes to the tester is the
+                # defect this closes: measured at the default 4 MB cap, an
+                # 87,498-byte submission was refused as "exceeds the
+                # 4000000-byte cap -- Fix the JSON", and the effective cap
+                # collapsed to ~67 KB for the life of that prep.
+                #
+                # This is the second attempt. The first reused
+                # `_oversized_submission_note`, which measures `json.dumps(obj)`
+                # unconditionally and so RE-ESCAPED a string submission (57,129
+                # bytes reported as 64,297), and whose wording talks about
+                # "review fields" -- false for an object that is the whole
+                # suite. Those two mistakes are the two invariants named above
+                # each helper, and they are why this branch has its own.
+                _oversized_full = _oversized_full_suite_note(suite_json)
+                if _oversized_full:
+                    return _oversized_full
+                # L2 from the 2026-09-02 review, recorded because the kwarg's
+                # NAME under-describes it: `enforce_size_cap=False` also skips
+                # `parse_host_suite`'s "submitted object is not
+                # JSON-serialisable" refusal, which lives inside the same
+                # `if cap and enforce_size_cap` block. Measured, not read: the
+                # same dict with one opaque value raises under True and parses
+                # under False. Bounded and accepted -- MCP tool arguments have
+                # already been JSON-decoded, so only an in-process caller can
+                # deliver such an object, and the bound itself is not lost
+                # (`_oversized_full_suite_note` above measures every
+                # JSON-expressible shape byte-exactly). Noted so a future
+                # reader does not infer the flag touches only the cap.
                 parsed = host_mode.parse_host_suite(
-                    _with_retained_sidecar(suite_json, meta)
+                    _with_retained_sidecar(suite_json, meta),
+                    enforce_size_cap=False,
                 )
                 rows_res = await prep_store.load_submissions(prep_id)
                 n_rows = len(rows_res.get("content") or [])
@@ -8930,6 +9446,11 @@ async def handle_submit_suite(
                     )
             else:
                 rows_res = await prep_store.load_submissions(prep_id)
+                # A store failure here would otherwise read as 'no rows are
+                # staged', which is the one thing it cannot establish.
+                _store_note = _prep_store_error_reply(prep_id, rows_res)
+                if _store_note:
+                    return _store_note
                 rows = rows_res.get("content") or []
                 if not rows:
                     return (
@@ -8946,7 +9467,8 @@ async def handle_submit_suite(
                 if _gate:
                     return _gate
                 merged_dict, used, _id_map = _merge_category_rows(rows)
-                parsed = host_mode.parse_host_suite(merged_dict)
+                # F7: server-built merge -- see the sidecar branch above.
+                parsed = host_mode.parse_host_suite(merged_dict, enforce_size_cap=False)
                 conflict_note = (
                     f"> ℹ️  Finalized from {used} accumulated per-category "
                     "row(s) (no full suite_json was submitted).\n\n"
@@ -10549,7 +11071,19 @@ async def handle_push_suite(
 
     Nothing here deletes a remote case afterwards, so a successful push says so.
     """
-    from agents.api_test_agent import _safe
+    # Re-pointed 2026-09-02: this used to be
+    # `from agents.api_test_agent import _safe`, outside any try. The sanitiser
+    # now lives in tools/untrusted.py, where it belongs and which the dist
+    # copies.
+    #
+    # CORRECTED after review: the first version of this comment said the old
+    # import would break a public-distribution install -- "a handler the dist
+    # CAN register, both push kill-switches are ordinary settings". FALSE.
+    # qa_push_suite registers inside `if not _test_cases_only()` and the dist is
+    # test-cases-only, so this handler never registers there and this
+    # function-local import never runs. Recorded because a wrong reason in the
+    # tree is worse than no reason: the next reader trusts it.
+    from tools.untrusted import single_line as _safe
 
     target = (target or "").strip().lower()
     if target not in _PUSH_TARGETS:
@@ -10591,11 +11125,8 @@ async def handle_push_suite(
             )
         suite = loaded.get("content")
         if suite is None:
-            return (
-                "\u26a0\ufe0f No stored suite with id `"
-                + _safe(suite_id, 80)
-                + "`. Generate one first."
-            )
+            # F21: same two facts as qa_export_suite, said apart.
+            return _suite_unreadable_reply(suite_id, loaded)
         total = len(getattr(suite, "test_cases", []) or [])
         if target == "testrail":
             try:
@@ -10718,6 +11249,8 @@ async def handle_mobile_test(
     session_token: str = "",
     apply: bool = False,
     continue_run: bool = False,
+    serial: str = "",
+    avd: str = "",
     *,
     choose: ChooseCb = None,
     ask_text: AskCb = None,
@@ -10807,7 +11340,9 @@ async def handle_mobile_test(
             )
 
         # --- a new run: device, app, preflight, then the menu --------------
-        staged, serial = await _mobile_device_stage(apply, progress=progress)
+        staged, serial = await _mobile_device_stage(
+            apply, serial=serial, avd=avd, choose=choose, progress=progress
+        )
         if staged:
             return staged
         app_stage, target = await _mobile_app_stage(
@@ -10864,21 +11399,105 @@ async def _mobile_pick_source(source: str, *, choose: ChooseCb = None) -> str:
     return ""
 
 
-async def _mobile_device_stage(apply: bool, *, progress: ProgressCb = None) -> tuple:
-    """Provisioning and boot. Returns ``(markdown_to_send_back, serial)``.
+async def _mobile_device_stage(
+    apply: bool,
+    *,
+    serial: str = "",
+    avd: str = "",
+    choose: ChooseCb = None,
+    progress: ProgressCb = None,
+) -> tuple:
+    """Device selection, then -- only if nothing is already booted --
+    provisioning and boot. Returns ``(markdown_to_send_back, serial)``.
 
     A tuple rather than a string because the caller needs the serial and asking
     for it twice would mean two device probes per call -- and, worse, two
     answers that could disagree.
 
-    Neither step is allowed to block this call: provisioning runs as a detached
-    OS process and the emulator is started and then polled with an explicit
-    bounded budget, so the reply is always a pointer to ``qa_mobile_status``
-    rather than a tool call the client kills at its own timeout.
-    """
-    from tools.mobile import render as mobile_render
-    from tools.mobile import session
+    Device selection runs BEFORE provisioning is even considered: an explicit
+    ``serial`` or an already-booted emulator means there is nothing to
+    provision. Only when NOTHING is connected does this fall through to the
+    provisioning/spawn path, and spawning still needs ``apply=true``.
 
+    Neither the spawn nor a boot-wait is allowed to block this call:
+    provisioning runs as a detached OS process and the emulator is started and
+    then polled with an explicit bounded budget, so the reply is always a
+    pointer to ``qa_mobile_status`` rather than a tool call the client kills
+    at its own timeout.
+    """
+    from tools.mobile import emulator, session
+    from tools.mobile import render as mobile_render
+
+    given_serial = str(serial or "").strip()
+    if given_serial:
+        ready = await session.ensure_device(serial=given_serial, avd=str(avd or ""))
+        if ready.get("error"):
+            return "⚠️ " + str(ready["error"])[:300], ""
+        state = ready.get("content") or {}
+        picked_serial = str(state.get("serial") or "")
+        if str(state.get("state") or "") != "ready":
+            return mobile_render.device_pending_block(state), picked_serial
+        return "", picked_serial
+
+    running = await emulator.list_running()
+    if running.get("error"):
+        return "⚠️ " + str(running["error"])[:300], ""
+    booted = running.get("content") or []
+    if len(booted) == 1:
+        only = booted[0]
+        ready = await session.ensure_device(serial=str(only.get("serial") or ""))
+        if ready.get("error"):
+            return "⚠️ " + str(ready["error"])[:300], ""
+        state = ready.get("content") or {}
+        picked_serial = str(state.get("serial") or "")
+        if str(state.get("state") or "") != "ready":
+            return mobile_render.device_pending_block(state), picked_serial
+        return "", picked_serial
+    if len(booted) > 1:
+        labels = [
+            str(item.get("serial") or "")
+            + " ("
+            + (str(item.get("avd") or "") or "unknown AVD")
+            + ")"
+            for item in booted
+        ]
+        picked = await _elicit_choice(
+            choose,
+            "Several emulators are running. Which one should this run use?",
+            labels,
+        )
+        if picked.status != CHOSEN:
+            menu = "\n".join(
+                str(i + 1) + ". " + label for i, label in enumerate(labels)
+            )
+            return (
+                "## Several emulators are running\n\n"
+                + menu
+                + "\n\nCall `qa_mobile_test` again with `serial` set to the "
+                "one you want.",
+                "",
+            )
+        # The label came back from the CLIENT, so the serial in it is not
+        # evidence. Only a serial we actually enumerated may be driven.
+        chosen_serial = str(picked.value or "").split(" ", 1)[0].strip()
+        if chosen_serial not in {str(item.get("serial") or "") for item in booted}:
+            return (
+                "## That device is not one of the running emulators\n\n"
+                "Call `qa_mobile_test` again with `serial` set to one of: "
+                + ", ".join("`" + str(i.get("serial") or "") + "`" for i in booted),
+                "",
+            )
+        ready = await session.ensure_device(serial=chosen_serial)
+        if ready.get("error"):
+            return "⚠️ " + str(ready["error"])[:300], ""
+        state = ready.get("content") or {}
+        picked_serial = str(state.get("serial") or "")
+        if str(state.get("state") or "") != "ready":
+            return mobile_render.device_pending_block(state), picked_serial
+        return "", picked_serial
+
+    # Nothing booted at all: fall through to provisioning/spawn, unchanged
+    # except the spawn branch below now explicitly needs apply=true.
     plan = session.provision_plan()
     steps = (plan.get("content") or {}).get("steps") or []
     pending = [s for s in steps if str(s.get("state") or "") == "pending"]
@@ -10905,14 +11524,22 @@ async def _mobile_device_stage(apply: bool, *, progress: ProgressCb = None) -> t
             "minutes on a first run.",
             "",
         )
-    ready = await session.ensure_device()
+    if not apply:
+        return (
+            mobile_render.apply_refusal(
+                "Starting the " + str(avd or "default") + " emulator",
+                "one detached process",
+            ),
+            "",
+        )
+    ready = await session.ensure_device(avd=str(avd or ""))
     if ready.get("error"):
         return "⚠️ " + str(ready["error"])[:300], ""
     state = ready.get("content") or {}
-    serial = str(state.get("serial") or "")
+    picked_serial = str(state.get("serial") or "")
     if str(state.get("state") or "") != "ready":
-        return mobile_render.device_pending_block(state), serial
-    return "", serial
+        return mobile_render.device_pending_block(state), picked_serial
+    return "", picked_serial
 
 
 async def _mobile_app_stage(
@@ -11019,6 +11646,28 @@ async def _mobile_app_stage(
     )
 
 
+async def _mobile_avd_of(serial: str) -> str:
+    """The AVD name behind *serial*, or ``""`` (2026-09-03, D1 follow-up).
+
+    ``plan_suite_run`` / ``plan_explore_run`` default a missing ``avd`` to
+    ``provisioner.AVD_NAME``, and that default is what made D1 come BACK on
+    resume: a run that had adopted the tester's own emulator wrote
+    ``avd: "qa-agents-api35"`` into its manifest, so when that device was gone
+    ``session.ensure_run_device`` re-booted the hardcoded AVD instead of the
+    one the run was actually driving. Asking the device settles it once, at the
+    only moment the answer is both knowable and needed. Never raises: an
+    unanswerable probe returns ``""`` and the planners keep their old default.
+    """
+    from tools.mobile import emulator
+
+    try:
+        named = await emulator.avd_name_of(str(serial or ""))
+        return str((named or {}).get("content") or "")
+    except Exception:  # pragma: no cover - the planners default without it
+        logger.debug("mobile: could not read the AVD name for a serial")
+        return ""
+
+
 async def _mobile_start(
     picked: str,
     *,
@@ -11048,7 +11697,9 @@ async def _mobile_start(
             400,
         )
     if picked == "explore":
-        planned = session.plan_explore_run(goal, package=package, serial=serial)
+        planned = session.plan_explore_run(
+            goal, package=package, serial=serial, avd=await _mobile_avd_of(serial)
+        )
         if planned.get("error"):
             return "⚠️ " + _safe(planned["error"], 300)
         run_id = str((planned.get("content") or {}).get("run_id") or "")
@@ -11101,7 +11752,12 @@ async def _mobile_start(
         return mobile_render.source_menu_markdown()
 
     planned = session.plan_suite_run(
-        collected, package=package, serial=serial, source=picked, filters=filters
+        collected,
+        package=package,
+        serial=serial,
+        source=picked,
+        filters=filters,
+        avd=await _mobile_avd_of(serial),
     )
     if planned.get("error"):
         return "⚠️ " + _safe(planned["error"], 400)
@@ -11375,11 +12031,29 @@ async def handle_mobile_status(
             return "⚠️ " + _safe(resolved["error"], 400)
         body = resolved["content"] or {}
         listed = session.summary(run_id)
+        recorded = listed.get("content") or []
         report_path = ""
         report_failed = ""
-        if report_now:
+        abandoned = str(body.get("state") or "") == session.STATE_ABANDONED
+        # D7 (2026-09-03): an abandoned run with work on disk gets its report
+        # WITHOUT being asked. Two runs from the audit ended with finished
+        # cases and no report.html at all, because rendering was reachable only
+        # through `report_now=True` -- a flag a tester who has just been told
+        # the run stopped has no reason to know about. Still bounded to a run
+        # that actually recorded something, so an abandoned run that never got
+        # past its first case does not write an empty page.
+        if report_now or (abandoned and recorded):
             from tools.mobile import report as mobile_report
 
+            # App evidence (plan P2/D5): the app's own event log is pulled ONCE,
+            # wherever the run reaches its report. The submit path does this in
+            # `session`; a report asked for HERE -- a run finished in another
+            # chat, or abandoned -- would otherwise render `events_source: none`
+            # for events nobody asked the device for. Idempotent on the
+            # manifest, never raises, never changes the state or a verdict; this
+            # is the one device touch in this tool and it happens only on the
+            # same condition that writes the report.
+            await session.finish_evidence(run_id, body)
             produced = mobile_report.render(run_id)
             if produced.get("error"):
                 report_failed = str(produced["error"])
@@ -11390,9 +12064,10 @@ async def handle_mobile_status(
             + mobile_render.status_block(body)
             + "\n\n"
             + mobile_render.summary_block(
-                listed.get("content") or [],
+                recorded,
                 run_id=run_id,
                 partial=not body.get("finished"),
+                abandoned=abandoned,
                 report_path=report_path,
                 report_error=report_failed,
             )
@@ -11462,7 +12137,7 @@ async def handle_export_suite(
             return _format_menu_markdown()
     if fmt not in _available_exporters():
         return (
-            f"⚠️ Unknown format '{fmt}'. Choose one of: "
+            f"⚠️ Unknown format '{_clip_echo(fmt, 60)}'. Choose one of: "
             f"{', '.join(sorted(_available_exporters()))}."
         )
     suite_id = (suite_id or "").strip()
@@ -11479,10 +12154,13 @@ async def handle_export_suite(
     try:
         loaded = await load_suite(suite_id)
         if loaded.get("error"):
-            return f"⚠️ Could not load suite `{suite_id}`: {loaded['error']}"
+            return (
+                f"⚠️ Could not load suite `{_clip_echo(suite_id, 80)}`: "
+                + _clip_echo(loaded["error"], 300)
+            )
         suite = loaded.get("content")
         if suite is None:
-            return f"⚠️ No stored suite with id `{suite_id}`. Generate one first."
+            return _suite_unreadable_reply(suite_id, loaded)
         await _emit(progress, f"📦 Exporting suite to {fmt}…")
         # I4 (2026-08-10): UNTRUSTED folder text, validated by exactly the same
         # rules as an elicited answer -- absolute / ~-rooted only, no config
@@ -11850,6 +12528,31 @@ async def handle_api_project(
         return f"\u26a0\ufe0f API project step failed ({type(exc).__name__}) \u2014 see the server log."
 
 
+def _api_card_with_intake(result: dict) -> str:
+    """Every API intake card must name the intake it belongs to (audit F9).
+
+    ``api_test_agent.render_card`` prints the `qa_prepare_api_tests(intake_id=...)`
+    call itself, but the PREREQUISITE cards -- does this endpoint need auth,
+    static token or login flow, does it depend on another endpoint, which fields
+    carry forward -- and the resume card printed when a dependency pops back to
+    its caller do NOT. So the host model answered "no" with no ``intake_id``, the
+    server opened a FRESH intake, and the auth and dependency answers already
+    collected for that endpoint were silently abandoned. Appended at the one
+    place every card leaves the server, so a card added later cannot forget it;
+    a card that already names its id (render_card's) is left byte-identical."""
+    card = str(result.get("card") or "")
+    intake_id = str(result.get("intake_id") or "").strip()
+    if not intake_id or intake_id in card:
+        return card
+    return (
+        card
+        + '\n\nAnswer it with `qa_prepare_api_tests(intake_id="'
+        + intake_id
+        + '", input=<their answer>)` — that exact `intake_id`, so this '
+        "endpoint's auth and dependency answers are not lost."
+    )
+
+
 async def handle_prepare_api_tests(
     input: str = "",
     intake_id: str = "",
@@ -11878,10 +12581,57 @@ async def handle_prepare_api_tests(
         kind = r.get("kind")
         disc = ("\n\n" + r["disclosure"]) if r.get("disclosure") else ""
         if kind == "error":
-            return f"⚠️ {r.get('error')}"
+            # THE INVARIANT (2026-09-02, after three rounds on this one class):
+            #
+            #   a reply may name an intake only if its PRODUCER declared that
+            #   intake as the recovery target.
+            #
+            # Round 1 appended the id for `card`/`confirm` only. Round 2 added
+            # the two `kind="error"` exits a reviewer had named. Round 3 moved
+            # to a chokepoint that INFERRED the target from the caller's
+            # argument, and was reverted: it named a test-case prep as an
+            # answerable API intake, and at the F-3 expiry exit it named the
+            # child while the prose said restart the parent -- a host that
+            # obeyed overwrote a completed login intake.
+            #
+            # So the id is DECLARED at each exit as `recover_with`, and this
+            # renders exactly that. `None` means "there is nothing to answer;
+            # start fresh", which is a real answer and the reason inference had
+            # to go: the caller's argument cannot express it.
+            # `tests/test_api_recover_with_2026_09_02.py` asserts by AST that
+            # every `kind="error"` return in the agent carries the key, so an
+            # exit added later cannot quietly omit it.
+            # 2026-09-02 review: a declared None and a FORGOTTEN key rendered
+            # identically here, so the AST test was the only thing standing
+            # between the two -- and a test cannot see an exit built by a helper
+            # or in another module. The sentinel makes the difference
+            # observable at runtime: an undeclared exit is logged by name, so a
+            # gap shows up in the server log instead of silently reading as
+            # "there is nothing to answer".
+            _declared = r.get("recover_with", _NO_RECOVERY_DECLARED)
+            if _declared is _NO_RECOVERY_DECLARED:
+                # Round-3 review, L3: this named the TEST FILE and not the
+                # exit, so it told an operator that a gap exists without
+                # saying which one. The error text is what identifies the
+                # branch, bounded because it reaches a log line.
+                logger.warning(
+                    "prepare_api_tests error exit declared no recover_with, "
+                    "treating it as 'nothing to answer'; the exit said: %s",
+                    _clip_echo(r.get("error"), 160),
+                )
+                _declared = None
+            _recover = str(_declared or "").strip()
+            await _audit("mcp_api_prepare_error", entity_id=_recover)
+            return (
+                "\u26a0\ufe0f "
+                + _api_card_with_intake(
+                    {"card": str(r.get("error") or ""), "intake_id": _recover}
+                )
+                + disc
+            )
         if kind in ("card", "confirm"):
             await _audit(f"mcp_api_prepare_{kind}", entity_id=r.get("intake_id"))
-            return (r.get("card") or "") + disc
+            return _api_card_with_intake(r) + disc
         if kind == "ai_fill_prompt":
             await _audit("mcp_api_prepare_aifill", entity_id=r.get("intake_id"))
             return (r.get("prompt") or "") + disc
@@ -13251,6 +14001,35 @@ async def handle_feature_analysis(
         return f"⚠️ Unknown mode '{mode}'. Choose one of: {', '.join(_FA_MODES)}."
     if mode in ("jira", "jira_mobile") and not text:
         return "⚠️ Provide a feature description or a Jira/issue URL as feature_or_url."
+    # 2026-09-02 audit F8, round 2 (H3). The prepare handler learned that a BARE
+    # issue key is a ticket reference and not a feature; this entry point had
+    # not, and opened an analysis task whose whole "ticket text" was the eight
+    # characters of the key. Same input, same defect, same remedy -- fixing one
+    # call site of a class is not fixing the class.
+    # Only the modes that READ A TICKET: `mobile` analyses captured screens and
+    # never resolves a key, so a screen set named `LOGIN-2` is not a ticket
+    # reference there (round-3 review, L1).
+    _fa_bare_key = bare_issue_key(text) if mode in ("jira", "jira_mobile") else ""
+    if _fa_bare_key:
+        _fa_bare_url = issue_url_for_key(_fa_bare_key)
+        logger.info(
+            "feature analysis: bare issue key %s read as a ticket", _fa_bare_key
+        )
+        if _fa_bare_url:
+            return (
+                f"⚠️ `{_fa_bare_key}` looks like a Jira issue key, not a feature "
+                "description -- analysing the key alone would report on those "
+                "characters rather than on the ticket. On this install that key "
+                f"is <{_fa_bare_url}>. Re-send THAT url and I'll read the "
+                f"ticket. If `{_fa_bare_key}` is really the feature's name, "
+                "describe it in a sentence or two instead."
+            )
+        return (
+            f"⚠️ `{_fa_bare_key}` looks like a Jira issue key, not a feature "
+            "description, and this install has no `JIRA_BASE_URL` configured, so "
+            "I can't turn the key into a link myself. Send the full ticket URL "
+            "instead, or paste the ticket's text and I'll analyse that."
+        )
 
     try:
         jira_text = ""

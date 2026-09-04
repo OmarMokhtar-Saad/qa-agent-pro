@@ -1,7 +1,7 @@
 """Requirement units for use-case-table stories (grounding Phase 2).
 
 A Jira story does not have to carry an "Acceptance Criteria" heading to be fully
-specified. The Sehhaty Store tickets express their requirements as a use-case
+specified. The client's app-store tickets express their requirements as a use-case
 TABLE -- UC / Description / Actor / Pre-condition / Post-condition / Basic Flow /
 Alternative Flow / Business Rules -- followed by data-field tables (DF01, DF02,
 ...) that pin the exact on-screen strings. Nothing in that layout reaches
@@ -111,7 +111,47 @@ _TABLE_ROW_RE = re.compile(r"^\s*\|(?P<body>.+)\|\s*$")
 # A separator row: | --- | --- |
 _TABLE_SEP_RE = re.compile(r"^\s*\|[\s:|-]+\|\s*$")
 # A standalone data-field / UI section marker, e.g. **DF01** or **UI#02**
-_SECTION_ID_RE = re.compile(r"^\s*\**\s*(?P<id>(?:DF|UI#?)\s*\d+)\s*\**\s*$", re.I)
+#
+# 2026-09-02 audit F10: every quantifier here is BOUNDED, and that is the whole
+# point of the shape. The pattern used to read `^\s*\**\s*...\s*\**\s*$`, which
+# put two unbounded whitespace runs either side of an unbounded optional one. A
+# line of N leading spaces then cost O(N**2) just to be REFUSED -- 40,000 spaces
+# measured 16 s, x4 per doubling -- and this pattern is matched once per source
+# line by BOTH parse_data_field_tables and parse_requirement_units, on every
+# finalize, over Jira description text nobody in this tree authored.
+#
+# A real marker is `**DF01**`. The bounds below are an order of magnitude more
+# slack than any real one needs, so no marker that used to match stops matching,
+# and the refusal is now constant-cost.
+#
+# `[^\S\r\n]` rather than `[ \t]`: it is `\s` MINUS the line terminators, so a
+# Jira-pasted marker indented with a NON-BREAKING space still matches, exactly as
+# it did under `\s`. A plain `[ \t]` was the first draft of this fix and it
+# narrowed real behaviour -- \xa0 is ordinary in text that came through a
+# rich-text editor. Excluding \r and \n costs nothing (these lines come from
+# splitlines() and are rstrip()ped, so no terminator survives) and keeps the
+# class unable to span a line.
+_SECTION_ID_RE = re.compile(
+    r"^[^\S\r\n]{0,20}\*{0,4}[^\S\r\n]{0,20}"
+    r"(?P<id>(?:DF|UI#?)[^\S\r\n]{0,4}\d{1,6})"
+    r"[^\S\r\n]{0,20}\*{0,4}[^\S\r\n]{0,20}$",
+    re.I,
+)
+# 2026-09-02 review: a `_MAX_MARKER_LINE_CHARS = 120` bound stood here, and it
+# was SEMANTICALLY unreachable -- though not free, and the round-2 review was
+# right that the first wording read as "it did nothing". It was a ~230x
+# CONSTANT-FACTOR shave on lines indented past 20 characters (11.2 us -> 0.05 us,
+# measured) and it fired on 27,332 real lines in this repo. That constant is
+# deliberately given up, because what the cap could never do is change an
+# ANSWER: The bounded pattern above cannot match a string longer than
+# 101 characters (20+4+20+13+20+4+20, and the longest matchable string measured
+# 85), so no line the cap rejected could ever have reached the pattern anyway --
+# a mutation that disabled the cap left every test green, because the pattern
+# was doing the work. It is deleted rather than lowered: keeping it would tell
+# the next reader that the quantifier bounds have a backstop, and they do not.
+# The bounds ARE the guard, and they are pinned by
+# tests/test_parser_growth_bounds.py::test_the_marker_test_cost_is_linear_in_the_width_of_ordinary_lines
+# (mutation: unbound them and that test reads 3.50x per doubling).
 # A declared business-rule id inside prose, e.g. **BR02**: or BR2.
 _RULE_ID_RE = re.compile(r"\*{0,2}(?P<id>BR\s*\d+)\*{0,2}\s*[:.\)-]?", re.I)
 # A numbered / bulleted flow, which is the conventional way to write one and is
@@ -210,6 +250,19 @@ def _clean_cell(raw: str) -> str:
         return ""
 
 
+def _section_id_match(line: str) -> re.Match[str] | None:
+    """The single entry point for the marker test.
+
+    Retained after the length bound it used to apply was deleted as unreachable
+    (see the note above ``_SECTION_ID_RE``): one call site for the pattern is
+    still worth having, because the 2026-09-02 audit found this pattern
+    reachable from a Jira description through TWO call sites (:269 and :491) and
+    a future bound applied at one of them would be forgotten at the other.
+    Never raises.
+    """
+    return _SECTION_ID_RE.match(line)
+
+
 def _join_wrapped_rows(description: str) -> list[str]:
     """Lines of the description with wrapped table rows re-joined.
 
@@ -266,7 +319,7 @@ def _join_wrapped_rows(description: str) -> list[str]:
             while consumed < _MAX_WRAP_ABSORB and index + 1 + consumed < len(lines):
                 nxt = lines[index + 1 + consumed].rstrip()
                 # A "**DF01**"-style marker starts a new table; never absorb it.
-                if _SECTION_ID_RE.match(nxt) or not nxt.strip():
+                if _section_id_match(nxt) or not nxt.strip():
                     break
                 merged = merged + " " + nxt.lstrip()
                 consumed += 1
@@ -488,7 +541,7 @@ def parse_data_field_tables(description: str) -> list[DataFieldTable]:
                     _MAX_TABLES,
                 )
                 break
-            section = _SECTION_ID_RE.match(line)
+            section = _section_id_match(line)
             if section:
                 flush()
                 rows = []

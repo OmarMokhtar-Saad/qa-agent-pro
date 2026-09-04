@@ -67,15 +67,18 @@ FORBIDDEN_MARKERS = ("untrusted_content", "SECURITY NOTE:")
 #: something bypassed ``perception`` entirely.
 RAW_XML = ("<hierarchy", "<node ", 'bounds="[', "NAF=")
 
-#: One self-contained file: a CDN font or a stylesheet link would break
-#: silently for a tester offline, which is exactly when a report is read.
-#: These are FETCH constructs, not URL strings, and the difference was
-#: measured rather than assumed: a screen that legitimately displays
-#: "https://example.com" would make a URL-text pin red on a HEALTHY tree,
-#: and a guard that is red on a healthy tree gets deleted. Every needle here
-#: needs a raw "<" that escaping makes unreachable from app text; "@import"
-#: is CSS-only and kept because a real one is a real offline break.
-EXTERNAL = ("<link", "<img", "<iframe", "<script", "<object", "<embed", "@import")
+#: One self-contained file, bar the shell's typefaces: an image, a frame or
+#: an @import would break silently for a tester offline, which is exactly when
+#: a report is read. These are FETCH constructs, not URL strings, and the
+#: difference was measured rather than assumed: a screen that legitimately
+#: displays "https://example.com" would make a URL-text pin red on a HEALTHY
+#: tree, and a guard that is red on a healthy tree gets deleted. Every needle
+#: here needs a raw "<" that escaping makes unreachable from app text;
+#: "@import" is CSS-only and kept because a real one is a real offline break.
+#: ``<link`` and ``<script`` are NOT needles any more: the shell carries one
+#: script and three font links by design, so both are checked for IDENTITY
+#: instead -- see :func:`_pin_script` and :func:`_pin_links`.
+EXTERNAL = ("<img", "<iframe", "<object", "<embed", "@import")
 
 #: The renderer never JSON-dumps a trace and never prints an action's text,
 #: so a QUOTED "secret" key has no route into the page. Quoted deliberately:
@@ -101,8 +104,11 @@ class _Page(HTMLParser):
         self.end: dict = {}
         self.styles: list = []
         self.scripts = 0
+        self.script_text: list = []
+        self.links: list = []
         self.handlers: list = []
         self._in_style = False
+        self._in_script = False
 
     def handle_starttag(self, tag, attrs) -> None:
         pairs = {
@@ -111,6 +117,9 @@ class _Page(HTMLParser):
         }
         if tag == "script":
             self.scripts += 1
+            self._in_script = True
+        if tag == "link":
+            self.links.append(pairs.get("href", ""))
         if tag == "style":
             self._in_style = True
         for name in pairs:
@@ -126,10 +135,14 @@ class _Page(HTMLParser):
     def handle_endtag(self, tag) -> None:
         if tag == "style":
             self._in_style = False
+        if tag == "script":
+            self._in_script = False
 
     def handle_data(self, data) -> None:
         if self._in_style:
             self.styles.append(data)
+        if self._in_script:
+            self.script_text.append(data)
 
 
 def _pin(name: str, ok: bool, detail: str) -> dict:
@@ -207,6 +220,42 @@ def _pin_terminator(end: dict, cards: list) -> dict:
     )
 
 
+def _pin_script(page: "_Page") -> dict:
+    """Exactly ONE script element, and its text IS the shell's script.
+
+    An identity pin rather than an absence pin: the shell's behaviour (theme,
+    filter, sort, deep links) is a script by necessity, and a page whose script
+    differs from the constant by one byte has been interpolated into. A second
+    script element, or any ``on*`` attribute, fails the same pin.
+    """
+    same = "".join(page.script_text) == report.SHELL_SCRIPT
+    return _pin(
+        PIN_NO_SCRIPT,
+        page.scripts == 1 and same and not page.handlers,
+        "script elements="
+        + str(page.scripts)
+        + (" text=shell" if same else " text=DIFFERS FROM THE SHELL")
+        + " handlers="
+        + ",".join(page.handlers[:6]),
+    )
+
+
+def _pin_links(page: "_Page", text: str) -> dict:
+    """Every ``<link>`` points at a font host, and no other fetch construct exists."""
+    strays = [
+        href for href in page.links if not str(href).startswith(report.FONT_HOSTS)
+    ]
+    found = [needle for needle in EXTERNAL if needle in text]
+    return _pin(
+        PIN_NO_ASSET,
+        not strays and not found,
+        "links off the font hosts="
+        + ",".join(strays[:4])
+        + " fetch constructs="
+        + ",".join(found),
+    )
+
+
 def _pin_absent(name: str, text: str, needles: tuple) -> dict:
     hits = sorted({needle for needle in needles if needle in text})
     return _pin(
@@ -250,15 +299,8 @@ def check(run_id: str, html_path: str = "") -> dict:
             _pin_terminator(page.end, page.cards),
             _pin_absent(PIN_NO_MARKERS, text, FORBIDDEN_MARKERS),
             _pin_absent(PIN_NO_XML, text, RAW_XML),
-            _pin(
-                PIN_NO_SCRIPT,
-                page.scripts == 0 and not page.handlers,
-                "script elements="
-                + str(page.scripts)
-                + " handlers="
-                + ",".join(page.handlers[:6]),
-            ),
-            _pin_absent(PIN_NO_ASSET, text, EXTERNAL),
+            _pin_script(page),
+            _pin_links(page, text),
             _pin_absent(PIN_NO_SECRET, text, SECRET_TOKENS),
             _pin(
                 PIN_SIZE,

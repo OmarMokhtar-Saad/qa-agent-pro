@@ -479,6 +479,14 @@ def list_runs(limit: int = 50, *, gc: bool = True) -> dict:
         return {"error": str(exc), "content": None}
 
 
+#: A verdict that means the case is FINISHED -- it will not be handed out
+#: again. Defined here, at the layer that decides what "done" means, and
+#: imported by `report.DONE_VERDICTS`; `case_runner` accepts exactly these
+#: plus the empty string it normalises away. One definition, because the last
+#: verdict to be added reached two of the three copies and hung the run.
+DONE_VERDICTS: tuple[str, ...] = ("pass", "fail", "blocked", "unverified")
+
+
 def resume_point(run_id: str) -> dict:
     """``{done, failed, verdicts, next_index}`` for a resumed run."""
     try:
@@ -494,7 +502,11 @@ def resume_point(run_id: str) -> dict:
             if not tc_id:
                 continue
             verdicts[tc_id] = verdict
-            if verdict in ("pass", "fail", "blocked"):
+            # The SAME tuple report.py renders from and case_runner accepts.
+            # It was three separate literals, and `unverified` reached two of
+            # them: a case that proved nothing never counted as done, so the
+            # scheduler re-served it forever and the run could not finish.
+            if verdict in DONE_VERDICTS:
                 done.append(tc_id)
             if verdict == "fail":
                 failed.append(tc_id)
@@ -712,3 +724,121 @@ def takeover_message(run_id: str, holder: str) -> str:
         "session `" + str(holder)[:40] + "`. Continue there, or start a new run "
         "here."
     )
+
+
+# ---------------------------------------------------------------------------
+# App-log evidence (plan mobile-app-evidence, P2)
+# ---------------------------------------------------------------------------
+
+EVIDENCE_DIR = "evidence"
+
+#: A file name inside ``evidence/``: one path segment, bounded charset.
+_EVIDENCE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$")
+
+
+def _write_text(target: Path, text: str) -> None:
+    """The same tmp + ``os.replace`` + 0600 discipline as :func:`_write_json`.
+
+    NO redaction here, and stated: :func:`redact` is dict-key based and cannot
+    see free text. The caller (``tools/mobile_evidence/capture.py``) scrubs every
+    line through the value, key and pair nets BEFORE calling this.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(str(text or ""))
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, target)
+
+
+def _evidence_path(run_id: str, tc_id: object, name: str) -> Path | None:
+    if not valid_run_id(run_id):
+        return None
+    if not (isinstance(name, str) and _EVIDENCE_NAME_RE.match(name)):
+        return None
+    root = run_path(run_id) / EVIDENCE_DIR
+    if tc_id is None or tc_id == "":
+        return root / name
+    if not valid_tc_id(tc_id):
+        return None
+    return root / str(tc_id) / name
+
+
+def write_evidence_text(run_id: str, tc_id: object, name: str, text: str) -> dict:
+    """Write one scrubbed text file under ``evidence/`` (``tc_id`` None = run-level)."""
+    try:
+        target = _evidence_path(run_id, tc_id, name)
+        if target is None:
+            return {
+                "error": "Refusing evidence path "
+                + repr((str(run_id)[:40], str(tc_id)[:20], str(name)[:60])),
+                "content": None,
+            }
+        _write_text(target, text)
+        return {"error": None, "content": {"path": str(target)}}
+    except Exception as exc:
+        logger.exception("mobile.run_store.write_evidence_text failed")
+        return {"error": str(exc), "content": None}
+
+
+def write_evidence_json(run_id: str, tc_id: object, name: str, payload: object) -> dict:
+    """Write one JSON document under ``evidence/`` through the redacting writer."""
+    try:
+        target = _evidence_path(run_id, tc_id, name)
+        if target is None:
+            return {
+                "error": "Refusing evidence path "
+                + repr((str(run_id)[:40], str(tc_id)[:20], str(name)[:60])),
+                "content": None,
+            }
+        _write_json(target, payload)
+        return {"error": None, "content": {"path": str(target)}}
+    except Exception as exc:
+        logger.exception("mobile.run_store.write_evidence_json failed")
+        return {"error": str(exc), "content": None}
+
+
+def list_evidence(run_id: str) -> dict:
+    """``{tc_id or "": [names]}`` for everything under ``evidence/``."""
+    try:
+        if not valid_run_id(run_id):
+            return {"error": "Invalid run id.", "content": None}
+        root = run_path(run_id) / EVIDENCE_DIR
+        out: dict = {}
+        if root.is_dir():
+            for child in sorted(root.iterdir()):
+                if child.is_file() and _EVIDENCE_NAME_RE.match(child.name):
+                    out.setdefault("", []).append(child.name)
+                elif child.is_dir() and valid_tc_id(child.name):
+                    out[child.name] = sorted(
+                        grandchild.name
+                        for grandchild in child.iterdir()
+                        if grandchild.is_file()
+                        and _EVIDENCE_NAME_RE.match(grandchild.name)
+                    )
+        return {"error": None, "content": out}
+    except Exception as exc:
+        logger.exception("mobile.run_store.list_evidence failed")
+        return {"error": str(exc), "content": None}
+
+
+def read_evidence_text(run_id: str, tc_id: object, name: str) -> dict:
+    """One evidence file as text, or ``content: None`` when it does not exist."""
+    try:
+        target = _evidence_path(run_id, tc_id, name)
+        if target is None:
+            return {"error": "Invalid evidence path.", "content": None}
+        if not target.is_file():
+            return {"error": None, "content": None}
+        return {
+            "error": None,
+            "content": target.read_text(encoding="utf-8", errors="replace"),
+        }
+    except Exception as exc:
+        logger.exception("mobile.run_store.read_evidence_text failed")
+        return {"error": str(exc), "content": None}

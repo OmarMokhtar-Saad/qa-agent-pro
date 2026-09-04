@@ -71,7 +71,23 @@ _MAX_ADF_DEPTH = 200
 #
 # \Z (not $) so a trailing newline cannot slip past the anchor; the {0,63} bound
 # keeps an absurdly long project prefix out of the directive entirely.
-_ISSUE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_]{0,63}-\d+\Z")
+#
+# 2026-09-02 audit F19: the grammar is ASCII-ONLY and explicit about every
+# class, because this value is spliced into an export FILENAME
+# (mcp_handlers._export_ticket_slug) and into tester-facing text. The previous
+# pattern used `\d`, which in Python matches EVERY Unicode decimal -- so
+# "SHYJ-\u0661" was a "valid key", passed the slug helper's `ch.isalnum()`
+# re-check (true for Arabic-Indic digits) and landed in a path. `_` went for
+# the same reason: no Jira project key contains one, so accepting it only
+# widened what could be echoed. The project part is ASCII letters/digits, the
+# number part is [0-9] only.
+#
+# This encodes the Jira CLOUD key grammar, which is what this server reads
+# (through the host's mcp.atlassian.com connection). A Jira DATA CENTER install
+# whose `jira.projectkey.pattern` has been customised to allow an underscore
+# would find such a key unreadable here -- deliberate, and named so it is
+# recognised rather than re-derived.
+_ISSUE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,63}-[0-9]{1,10}\Z")
 
 # Every http(s) URL is stripped out of parent/linked-issue text before it
 # reaches a prompt. That text is authored by OTHER people, so it is a strictly
@@ -116,14 +132,81 @@ def _tool_prefix() -> str:
 
 
 def _valid_issue_key(value: object) -> str:
-    """Return *value* when it is a syntactically valid Jira issue key, else "".
+    """Return *value* UPPERCASED when it is a syntactically valid Jira issue
+    key, else "".
 
     Security gate for every key that comes back inside a host-submitted payload
     and is later echoed into text. Never raises.
+
+    2026-09-02 audit F19: the return is now the canonical UPPERCASE form. Jira
+    issue keys are uppercase by definition, so "shyj-1" and "SHYJ-1" name one
+    ticket -- but they are two different strings, which is exactly what let a
+    lowercase copy reach an export filename and would have defeated the key
+    comparison in :func:`normalize_issue_payload`. Canonicalizing here gives
+    every caller one spelling; a lowercase URL a tester pasted still resolves.
     """
     if not isinstance(value, str):
         return ""
-    return value if _ISSUE_KEY_RE.match(value) else ""
+    return value.upper() if _ISSUE_KEY_RE.match(value) else ""
+
+
+def bare_issue_key(value: object) -> str:
+    """The issue key when *value* is a BARE key and nothing else, else "".
+
+    ``qa_prepare_test_cases("SHYJ-7154")`` used to be treated as a feature
+    DESCRIPTION and generated a full suite about the literal string -- cases
+    grounded in nothing (2026-09-02 audit F8). Callers use this to route such an
+    input to the Atlassian fetch directive instead. The WHOLE input must be the
+    key: a key cited inside a sentence is a description that mentions a ticket,
+    and must keep generating from the tester's own words. Never raises.
+
+    THE INVARIANT (round 3, after two rounds of moving this defect around):
+    **casing is not evidence.** Round 2 required the token to be uppercase, so
+    that `Phase-2` and `iOS-17` would not be mistaken for tickets -- and
+    `shyj-7154` promptly generated a 96-case suite about seven characters,
+    which is audit F8 verbatim. The same module already treats `shyj-1` as a
+    key everywhere else, so a case rule here contradicts the rest of the file.
+    What actually resolves the ambiguity is that this branch ASKS: recognising
+    a key-SHAPED whole input costs one clarify turn and no fetch, and the
+    clarify offers both readings, so a false positive is cheap and a false
+    negative ships an ungrounded suite. Recognition is therefore
+    case-INSENSITIVE and the caller must DISCLOSE rather than act.
+    """
+    if not isinstance(value, str):
+        return ""
+    return _valid_issue_key(value.strip())
+
+
+def issue_url_for_key(key: object) -> str:
+    """``<JIRA_BASE_URL>/browse/<KEY>`` for a valid key, or "" when the key is
+    not a key or no base URL is configured.
+
+    The base URL is an install setting, never host-submitted, and the key has
+    already passed :func:`_valid_issue_key`, so the result cannot carry a
+    traversal or a separator. Never raises.
+
+    Round-3 review (L2): a base carrying EMBEDDED CREDENTIALS
+    (``https://user:pw@host``) is refused, because as of round 2 this URL is
+    printed to the tester and a password does not belong in chat. An operator
+    configuring credentials here has bigger problems, but a value that would
+    leak one must not be echoed.
+    """
+    valid = _valid_issue_key(key if isinstance(key, str) else "")
+    if not valid:
+        return ""
+    try:
+        base = str(settings.jira_base_url or "").strip().rstrip("/")
+    except Exception:  # pragma: no cover - settings is lenient by contract
+        base = ""
+    if not base.lower().startswith(("http://", "https://")):
+        return ""
+    try:
+        parsed = urlparse(base)
+        if parsed.username or parsed.password or "@" in (parsed.netloc or ""):
+            return ""
+    except Exception:  # pragma: no cover - urlparse on an http(s) string
+        return ""
+    return f"{base}/browse/{valid}"
 
 
 def selected_issue_key(url: str) -> str:
@@ -1481,16 +1564,37 @@ def _issue_nodes(payload: object) -> list:
         return []
 
 
+def _issue_node(issue: object) -> dict:
+    """The issue object the CONTENT will be read from, unwrapping the live
+    Atlassian MCP envelope. ``{}`` for a non-dict. Never raises.
+
+    2026-09-02 audit F5, round 2. This used to be three lines inside
+    :func:`_issue_fields`, which meant the fields came from ``issues[0]`` while
+    :func:`normalize_issue_payload` read ``key`` from the OUTER dict -- so an
+    envelope payload for the wrong ticket had ``payload_key == ""`` and slid
+    straight past the mismatch guard. Any check on the identity of a payload
+    MUST read the same node the content comes from, so both callers now share
+    this one selector.
+    """
+    try:
+        if not isinstance(issue, dict):
+            return {}
+        if "fields" not in issue:
+            nodes = _issue_nodes(issue)
+            if nodes:
+                return nodes[0]
+        return issue
+    except Exception:
+        return {}
+
+
 def _issue_fields(issue: object) -> dict:
     """The ``fields`` mapping of an issue payload (or {} ). Never raises."""
     try:
         if not isinstance(issue, dict):
             return {}
         # F8: unwrap the live envelope before looking for `fields`.
-        if "fields" not in issue:
-            nodes = _issue_nodes(issue)
-            if nodes:
-                issue = nodes[0]
+        issue = _issue_node(issue) or issue
         fields = issue.get("fields")
         if isinstance(fields, dict):
             return fields
@@ -2876,7 +2980,78 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
                 "needs_jira_mcp": False,
             }
 
-        key = _valid_issue_key(issue.get("key")) or issue_key_from_url(source_url)
+        # The key is read from the SAME node the fields came from (see
+        # _issue_node): on the live `{"issues": {"nodes": [...]}}` envelope the
+        # outer dict has no `key` at all, and reading it there made the guard
+        # below unreachable for exactly the payload shape the host really sends.
+        _key_node = _issue_node(issue)
+        # Presence is decided BEFORE any truthiness collapse: `or ""` turned
+        # `key: 0` / `False` / `[]` / `{}` -- present and unreadable, state 3 --
+        # into state 1 and let them through (round-3 review).
+        _raw_key_value = (_key_node or {}).get("key")
+        _raw_payload_key = "" if _raw_key_value is None else str(_raw_key_value).strip()
+        payload_key = _valid_issue_key(_raw_payload_key)
+        url_key = issue_key_from_url(source_url)
+        # 2026-09-02 audit F5. The host fetches the ticket with its OWN
+        # Atlassian MCP connection and hands the JSON back, so nothing but this
+        # comparison ties the payload to the URL the tester actually gave. When
+        # they disagree the whole downstream reply is wrong in a way no tester
+        # can see: the ticket key, the export filename and the traceability
+        # table come from one issue while every requirement in the prompt comes
+        # from the other. Refuse by NAME rather than pick a winner -- either key
+        # could be the intended one, and only the tester knows which.
+        # There are THREE states here, and collapsing the last two is what the
+        # first cut of this guard got wrong (round-2 review, H2):
+        #   absent       -- no `key` field at all. A trimmed result; the URL's
+        #                   key remains the only claim on the record. Proceed.
+        #   readable     -- compare it. Disagreement is a refusal.
+        #   unreadable   -- a `key` IS present but does not parse as an issue
+        #                   key (`SHYJ_9999`, an 11-digit number, a non-ASCII
+        #                   digit). Treating that as absent meant the payload
+        #                   claimed one ticket, the record named another, and
+        #                   nothing compared them -- silently, which is the
+        #                   whole defect. It is unverifiable, so refuse.
+        # Refuse by NAME rather than pick a winner in either case: only the
+        # tester knows which ticket they meant.
+        if _raw_payload_key and not payload_key and url_key:
+            return {
+                "error": (
+                    "\u26a0\ufe0f I can't tell which ticket that Jira payload is "
+                    f"for. The URL names `{url_key}`, but the JSON's own `key` "
+                    "field is not a readable Jira issue key, so I cannot check "
+                    "that the two agree -- and generating anyway would stamp "
+                    f"`{url_key}` on requirements that may come from a different "
+                    "ticket. Call `getJiraIssue` again and pass its RAW, "
+                    "unmodified result as `jira_content_json`."
+                ),
+                "content": None,
+                "needs_jira_mcp": False,
+            }
+        if payload_key and url_key and payload_key != url_key:
+            return {
+                "error": (
+                    "\u26a0\ufe0f That Jira payload is for a different ticket "
+                    f"than the link. The URL names `{url_key}`, but the JSON "
+                    f"handed back is `{payload_key}`. I won't generate from a "
+                    "ticket the tester didn't ask for, and I can't tell which "
+                    "one they meant. If the ticket you want is "
+                    f"`{payload_key}`, start again with ITS url and pass this "
+                    "same JSON. If you want "
+                    f"`{url_key}`, re-run `getJiraIssue` for `{url_key}` and "
+                    "pass THAT raw JSON -- but note that an issue MOVED between "
+                    f"projects keeps its old key as an alias, so if `{url_key}` "
+                    f"keeps coming back as `{payload_key}` then `{payload_key}` "
+                    "is the live key and the first route is the one to take."
+                ),
+                "content": None,
+                "needs_jira_mcp": False,
+            }
+        key = payload_key or url_key
+        # 2026-09-02 verification of audit F5: the ABSENT state above proceeds by
+        # design (a trimmed result must not be refused), but it proceeded
+        # SILENTLY -- the reply then named the URL's key as if the payload had
+        # confirmed it. Record the assumption so the grounding note can say so.
+        key_assumed_from_url = bool(url_key) and not payload_key
 
         # Emptiness is judged on the SOURCE fields, BEFORE any fallback value is
         # applied to `title`. Judging it afterwards (on `title` / `raw_text`)
@@ -3064,6 +3239,9 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
             "raw_text": raw_text,
             "content": raw_text,
             "issue_key": key,
+            # Additive key (2026-09-02): True when the payload carried no `key`
+            # and the URL's key was assumed. Read by _grounding_source_note.
+            "issue_key_from_url": key_assumed_from_url,
             # Additive key (2026-08-10). Downstream consumers read the
             # historical key set and are unaffected.
             "updated": updated,

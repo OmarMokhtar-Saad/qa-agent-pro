@@ -6,24 +6,39 @@ no ``suite_store``, no in-memory state left by a previous call. That is what
 makes a MID-RUN report possible: a half-finished run is simply a run whose
 checkpoints are not all terminal yet, and the page says so (``partial``).
 
+**The page is the Sara report shell.** ``report_shell.html`` beside this module
+is the design file the reference device-run report is drawn with -- the
+same tokens, the same appbar, masthead, KPI tiles, filter toolbar, expandable
+case cards and phone frames, and the same script behind them -- so a reader who
+has learned that page can read this one without relearning anything. This
+module owns the DATA only: it fills the shell's ``{{SLOT}}``s with markup built
+from the run's files. A colour never belongs here, and a number never belongs
+in the shell.
+
 **Every string in here was chosen by an app on the device.** A dump's ``text``,
 ``content-desc`` and ``resource-id`` are attacker-influenced, and this is an
 HTML document, so the exposure is XSS in the tester's browser rather than only
 prompt spoofing. ``perception._clean`` caps length and neutralises the guard
 markers; it does NOT escape HTML. Three layers answer that, in this order:
 
-1. **There is no ``script`` element in the document and no event-handler
-   attribute is ever emitted.** The report is static; nothing here needs
-   JavaScript. So that injection CONTEXT does not exist rather than being
-   defended.
-2. **The one ``style`` element's text is :data:`_CSS`, with no interpolation of
-   any kind** -- no f-string, no ``%``, no ``.format``. The CSS context is
-   likewise absent by construction, and a test asserts the page's style text
-   equals the constant, so any attacker byte reaching it makes the two differ.
+1. **The one ``script`` element's text is :data:`SHELL_SCRIPT`, read from the
+   shell file, with no interpolation of any kind -- and no event-handler
+   attribute is ever emitted.** The script is the shell's own behaviour (theme
+   switch, filter, sort, deep links); nothing a store value carries can reach
+   it, and a test asserts the page's script text equals the constant, so any
+   attacker byte reaching it makes the two differ. The store islands the shell
+   supports (``<script type="text/plain">``) are NEVER emitted by this lane.
+2. **The one ``style`` element's text is :data:`SHELL_STYLE`, likewise read
+   from the shell, with no interpolation** -- no f-string, no ``%``, no
+   ``.format``. The CSS context is absent by construction, and a test asserts
+   the page's style text equals the constant.
 3. **Every interpolated value goes through :func:`esc`** =
    ``html.escape(_text(value), quote=True)``. ``quote=True`` is load-bearing:
    attribute values are quoted and ``&quot;``/``&#x27;`` is what stops a value
    closing its own attribute.
+
+Slots are filled in ONE regex pass over the template (:func:`_fill`), so a
+value that happens to contain ``{{SECTIONS}}`` is never itself expanded.
 
 Geometry is the one thing not escaped and does not need to be: a rect's
 ``style`` carries only ``int``s this module computed (:func:`scale_bounds`),
@@ -54,19 +69,28 @@ it has no entry point of its own.
 
 from __future__ import annotations
 
+import hashlib
 import html
 import logging
 import os
 import re
 import time
+from collections import Counter
 from pathlib import Path
 
 from config.settings import settings
-from tools.mobile import paths, run_store
+from tools.mobile import paths, run_store, screen_phone
+from tools.mobile_evidence import exchanges as ev_exchanges
+from tools.mobile_evidence import profiles as ev_profiles
+from tools.mobile_evidence import render as ev_render
 
 logger = logging.getLogger(__name__)
 
 REPORT_FILE = "report.html"
+
+#: The design file. Read once, at import: a shell that cannot be read is a
+#: broken install, and it should fail loudly here rather than on the first run.
+SHELL_PATH = Path(__file__).with_name("report_shell.html")
 
 #: The phone frame every screen is scaled into. Fixed on purpose: a report whose
 #: frames differ per screen cannot be compared by eye, which is the only thing a
@@ -89,18 +113,62 @@ END_ID = "qa-report-end"
 #: The verdicts that mean a case is finished. An empty verdict is NOT one of
 #: them, and :func:`_verdict_of` never invents one -- a case shown as passed
 #: because a field was missing is the worst artifact a report can produce.
-DONE_VERDICTS = ("pass", "fail", "blocked")
+#: Re-exported from `run_store`, which is the layer that decides whether a
+#: case will be handed out again. Two literals drifted once already.
+DONE_VERDICTS = run_store.DONE_VERDICTS
 
 #: Tiles always rendered, in this order, so a zero is visible rather than absent.
 TILES = (
     "pass",
     "fail",
     "blocked",
+    "unverified",
     "needs_tester",
     "needs_model",
     "planning",
     "unknown",
 )
+
+#: How each verdict reads on the page: (swatch, segment, pill, label). Status
+#: colours are reserved for state, and every colour ships with its word.
+VERDICT_TONE = {
+    "pass": ("ok", "s-pass", "p-ok", "Passed"),
+    "fail": ("def", "s-def", "p-def", "Failed"),
+    "blocked": ("gap", "s-gap", "p-gap", "Blocked"),
+    "unverified": ("gap", "s-gap", "p-gap", "Not verified"),
+    "needs_tester": ("void", "s-void", "p-void", "Needs the tester"),
+    "needs_model": ("void", "s-void", "p-void", "Needs the model"),
+    "planning": ("void", "s-void", "p-void", "Planning"),
+    "unknown": ("void", "s-void", "p-void", "No verdict"),
+}
+_OTHER_TONE = ("void", "s-void", "p-void", "")
+RAIL = {"pass": "ok", "fail": "def", "blocked": "gap", "unverified": "gap"}
+
+#: The same three bands the reference report uses for a case's wall clock.
+LAT_BUCKETS = (
+    ("fast", "under 3s", 3000),
+    ("ok", "3-8s", 8000),
+    ("slow", "over 8s", None),
+)
+
+#: The row kind a trace op is drawn as. The kinds are the shell's own vocabulary
+#: (``.seq.is-<kind>`` is what the stylesheet colours by).
+OP_KIND = {
+    "tap": "tap",
+    "press": "tap",
+    "back": "tap",
+    "type": "step",
+    "set": "step",
+    "clear": "step",
+    "swipe": "step",
+    "scroll": "step",
+    "assert": "event",
+    "wait": "log",
+    "done": "done",
+    "escape": "note",
+    "ask": "note",
+    "needs": "note",
+}
 
 FLAG_NAME = "QA_MOBILE_RUN_ENABLED"
 
@@ -113,60 +181,28 @@ FLAG_REFUSAL = (
 NOT_CAPTURED = "this screen was not captured"
 
 _SAFE_TOKEN = re.compile(r"[^a-z0-9_]+")
+_SLOT = re.compile(r"\{\{([A-Z_]+)\}\}")
+_SLUG = re.compile(r"[^A-Za-z0-9_-]+")
 
-#: No interpolation. Ever. See layer 2 in the module docstring.
-_CSS = """
-:root { color-scheme: light dark; --bg:#ffffff; --fg:#1b1f24; --mut:#5b636c;
-  --line:#d7dbe0; --card:#f6f7f9; --pass:#1f7a3d; --fail:#b3261e;
-  --blocked:#8a6d00; --other:#4b5563; --rect:#c9d3de; --tap:#8fb3d9;
-  --edit:#c8a2c8; }
-@media (prefers-color-scheme: dark) {
-  :root { --bg:#14171a; --fg:#e6e9ec; --mut:#9aa4ae; --line:#2c3238;
-    --card:#1c2126; --rect:#39424c; --tap:#3d5a7a; --edit:#5c3f5c; }
-}
-* { box-sizing: border-box; }
-body { margin:0; padding:24px; background:var(--bg); color:var(--fg);
-  font:14px/1.5 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
-h1 { font-size:20px; margin:0 0 4px; }
-h2 { font-size:16px; margin:28px 0 8px; }
-h3 { font-size:15px; margin:0 0 6px; }
-.mut { color:var(--mut); }
-.meta { color:var(--mut); margin:2px 0; }
-dl.head { display:grid; grid-template-columns:max-content 1fr; gap:2px 14px;
-  margin:12px 0 0; }
-dl.head dt { color:var(--mut); }
-dl.head dd { margin:0; }
-.tiles { display:flex; flex-wrap:wrap; gap:10px; margin:14px 0 0; }
-.tile { border:1px solid var(--line); border-radius:10px; padding:10px 14px;
-  min-width:96px; background:var(--card); }
-.tile .n { display:block; font-size:22px; font-weight:600; }
-.tile .k { display:block; color:var(--mut); font-size:12px; }
-.case { border:1px solid var(--line); border-radius:12px; padding:14px;
-  margin:14px 0; background:var(--card); }
-.badge { display:inline-block; border-radius:999px; padding:1px 10px;
-  font-size:12px; border:1px solid var(--line); margin:0 0 8px; }
-.v-pass .badge { color:var(--pass); }
-.v-fail .badge { color:var(--fail); }
-.v-blocked .badge { color:var(--blocked); }
-.reason { margin:6px 0; }
-table.steps { border-collapse:collapse; width:100%; margin:10px 0; }
-table.steps th, table.steps td { border-bottom:1px solid var(--line);
-  padding:5px 8px; text-align:left; vertical-align:top; font-size:13px; }
-table.steps th { color:var(--mut); font-weight:500; }
-.screens { display:flex; flex-wrap:wrap; gap:18px; margin:10px 0 0; }
-.cap { color:var(--mut); font-size:12px; margin:0 0 4px; }
-.frame { position:relative; width:360px; height:800px; border:1px solid var(--line);
-  border-radius:18px; overflow:hidden; background:var(--bg); }
-.frame.missing { display:flex; align-items:center; justify-content:center; }
-.rect { position:absolute; border:1px solid var(--rect); border-radius:3px;
-  font-size:9px; line-height:1.1; overflow:hidden; padding:1px 2px;
-  color:var(--fg); }
-.rect.tap { border-color:var(--tap); }
-.rect.edit { border-color:var(--edit); }
-.note { color:var(--mut); }
-footer { margin:28px 0 0; padding-top:12px; border-top:1px solid var(--line);
-  color:var(--mut); font-size:12px; }
-"""
+
+def _read_shell() -> str:
+    return SHELL_PATH.read_text(encoding="utf-8")
+
+
+def _between(text: str, open_tag: str, close_tag: str) -> str:
+    start = text.index(open_tag) + len(open_tag)
+    return text[start : text.index(close_tag, start)]
+
+
+#: The design, verbatim. Neither constant is ever interpolated into.
+SHELL = _read_shell()
+SHELL_STYLE = _between(SHELL, "<style>", "</style>")
+SHELL_SCRIPT = _between(SHELL, "\n<script>", "</script>")
+
+#: The only external references the shell makes: the typefaces the reference
+#: report is set in. Each face carries a system fallback, so the page still
+#: opens offline -- in a different face, with the same layout.
+FONT_HOSTS = ("https://fonts.googleapis.com", "https://fonts.gstatic.com")
 
 
 def _text(value: object, limit: int = MAX_TEXT) -> str:
@@ -233,6 +269,12 @@ def _token(value: object) -> str:
     return reduced[:24] or "unknown"
 
 
+def _slug(value: object) -> str:
+    """A case id as a DOM id / URL fragment: ``[A-Za-z0-9_-]`` only, capped."""
+    reduced = _SLUG.sub("-", _text(value, 40)).strip("-")
+    return reduced[:40] or "case"
+
+
 def _verdict_of(case: object) -> str:
     """The verdict to show, never invented.
 
@@ -246,6 +288,11 @@ def _verdict_of(case: object) -> str:
         return verdict
     status = _text(body.get("status"), 40)
     return _token(status) if status else "unknown"
+
+
+def _tone(verdict: str) -> tuple:
+    sw, seg, pill_cls, label = VERDICT_TONE.get(verdict, _OTHER_TONE)
+    return sw, seg, pill_cls, (label or verdict.replace("_", " "))
 
 
 def tally(cases: object) -> dict:
@@ -369,13 +416,201 @@ def wireframe(screen: object) -> dict:
     return {"rects": rects, "device": [dev_w, dev_h], "scaled": True}
 
 
+# ── numbers ────────────────────────────────────────────────────────────────────
+
+
+def _ms(value: object) -> int | None:
+    """A duration from a store field, or None when it is not a measurement.
+
+    A ZERO is not a measurement either. The runner writes ``ms: 0`` for an action
+    it did not time -- a 4000 ms wait carries it -- and a bar of width zero would
+    be a measurement of zero, which is the one thing this page must not draw.
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number <= 0 or number != number:  # NaN
+        return None
+    return int(min(number, 10**9))
+
+
+def fmt_ms(ms: object) -> str:
+    """``412 ms`` under a second, ``2.3s`` at a second and over, ``1.4m`` past a minute."""
+    number = _ms(ms)
+    if number is None:
+        return "—"
+    if number < 1000:
+        return str(number) + " ms"
+    if number < 60000:
+        return "%.1fs" % (number / 1000.0)
+    return "%.1fm" % (number / 60000.0)
+
+
+def _lat_bucket(ms: object) -> str:
+    number = _ms(ms)
+    if number is None:
+        return ""
+    for key, _label, ceiling in LAT_BUCKETS:
+        if ceiling is None or number < ceiling:
+            return key
+    return LAT_BUCKETS[-1][0]
+
+
+def _percentile(values: list, share: float) -> int:
+    ordered = sorted(values)
+    if not ordered:
+        return 0
+    index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * share))))
+    return int(ordered[index])
+
+
+def _stamp(value: object) -> str:
+    try:
+        moment = float(value or 0)
+    except (TypeError, ValueError):
+        return "unknown"
+    if moment <= 0:
+        return "unknown"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(moment))
+
+
+def _short_stamp(value: object) -> str:
+    try:
+        moment = float(value or 0)
+    except (TypeError, ValueError):
+        return "unknown"
+    if moment <= 0:
+        return "unknown"
+    return time.strftime("%d %b %Y %H:%M", time.localtime(moment))
+
+
+# ── the shell's vocabulary, as the reference generator spells it ───────────────
+
+
+def _pill(cls: str, label: object) -> str:
+    return '<span class="pill ' + esc(cls, 24) + '">' + esc(label, 60) + "</span>"
+
+
+def _metric(value: object, label: str, cls: str = "") -> str:
+    return (
+        '<span class="m '
+        + esc(cls, 24)
+        + '"><b>'
+        + esc(value, 40)
+        + "</b><i>"
+        + esc(label, 40)
+        + "</i></span>"
+    )
+
+
+MSEP = '<span class="msep"></span>'
+
+
+def _kpi(
+    value: str, label: str, detail: str = "", tone: str = "", hero: bool = False
+) -> str:
+    """``value`` and ``detail`` arrive as markup already built through :func:`esc`."""
+    return (
+        '<div class="kpi'
+        + (" hero" if hero else "")
+        + '"><div class="kv'
+        + ((" " + esc(tone, 24)) if tone else "")
+        + '">'
+        + value
+        + '</div><div class="kl">'
+        + esc(label, 80)
+        + "</div>"
+        + (('<div class="kd">' + detail + "</div>") if detail else "")
+        + "</div>"
+    )
+
+
+def _chip(group: str, value: str, label: str, count: int, sw: str = "") -> str:
+    return (
+        '<button type="button" class="chip" data-group="'
+        + esc(group, 24)
+        + '" data-v="'
+        + esc(value, 60)
+        + '" aria-pressed="false">'
+        + (('<i class="sw ' + esc(sw, 24) + '"></i>') if sw else "")
+        + esc(label, 60)
+        + "<i>"
+        + str(int(count))
+        + "</i></button>"
+    )
+
+
+def _all_chip(group: str, count: int) -> str:
+    return (
+        '<button type="button" class="chip on" data-group="'
+        + esc(group, 24)
+        + '" data-v="*" aria-pressed="true">All<i>'
+        + str(int(count))
+        + "</i></button>"
+    )
+
+
+def _filter_group(label: str, chips: str) -> str:
+    if not chips:
+        return ""
+    return (
+        '<div class="fg"><span class="fgl">'
+        + esc(label, 40)
+        + "</span>"
+        + chips
+        + "</div>"
+    )
+
+
+def _sec_block(
+    title: str, body: str, count: object = None, note: str = "", open_: bool = False
+) -> str:
+    return (
+        '<div class="apis"><details class="sec"'
+        + (" open" if open_ else "")
+        + '><summary><span class="chev" aria-hidden="true"></span>'
+        + esc(title, 80)
+        + (
+            ('<span class="cnt">' + str(int(count)) + "</span>")
+            if count not in (None, "")
+            else ""
+        )
+        + (('<span class="mt">' + esc(note, 160) + "</span>") if note else "")
+        + '</summary><div class="secbody">'
+        + body
+        + "</div></details></div>"
+    )
+
+
+def _sechead(sid: str, title: str, label: str, lede: str, body: str) -> str:
+    """``lede`` is markup built through :func:`esc`; the ids are constants."""
+    return (
+        '\n  <section id="'
+        + sid
+        + '">\n    <div class="sechead"><h2>'
+        + esc(title, 80)
+        + '</h2><span class="label">'
+        + esc(label, 80)
+        + "</span></div>\n"
+        + (('    <p class="lede">' + lede + "</p>\n") if lede else "")
+        + body
+        + "\n  </section>\n"
+    )
+
+
+# ── the wireframe phone ────────────────────────────────────────────────────────
+
+
 def _frame_html(screen_id: object, screens: object) -> str:
-    """One phone frame, or an honest empty one when the screen was not stored."""
+    """One frame, or an honest empty one when the screen was not stored."""
     ident = _text(screen_id, 40)
     library = screens if isinstance(screens, dict) else {}
     if not ident:
         return (
-            '<div class="frame missing"><p class="note">'
+            '<div class="frame missing"><p class="wirenote">'
             + esc(NOT_CAPTURED)
             + "</p></div>"
         )
@@ -384,7 +619,7 @@ def _frame_html(screen_id: object, screens: object) -> str:
         return (
             '<div class="frame missing" data-screen="'
             + esc(ident, 40)
-            + '"><p class="note">'
+            + '"><p class="wirenote">'
             + esc(NOT_CAPTURED)
             + "</p></div>"
         )
@@ -402,7 +637,7 @@ def _frame_html(screen_id: object, screens: object) -> str:
         + str(int(rect["h"]))
         + 'px" title="'
         + esc(rect["label"], 40)
-        + '">'
+        + '" dir="auto">'
         + esc(rect["label"], 40)
         + "</div>"
         for rect in frame["rects"]
@@ -418,6 +653,58 @@ def _frame_html(screen_id: object, screens: object) -> str:
         + rects
         + "</div>"
     )
+
+
+def _phone_html(
+    title: str, sub: str, screen_id: object, screens: object, app: str
+) -> str:
+    """The screen as the app drew it, with the element map folded beneath it.
+
+    Both pictures come from the same pruned dump. ``screen_phone.compose`` reads
+    the elements' text, labels and bounds into the app bar, bubbles, cards, chips
+    and composer the user saw; the wireframe keeps the exact rectangles for
+    anyone who needs them. Neither is a screenshot, and the caption says so.
+    """
+    ident = _text(screen_id, 40)
+    library = screens if isinstance(screens, dict) else {}
+    screen = library.get(ident) if ident else None
+    if isinstance(screen, dict):
+        drawn = screen_phone.compose(screen, esc=esc, app=app)
+        fold = (
+            '<details class="sec"><summary><span class="chev" aria-hidden="true"></span>'
+            'Element map<span class="mt">the same screen as its element rectangles</span></summary>'
+            '<div class="secbody"><div class="phone wire"><div class="ph-scroll">'
+            + _frame_html(screen_id, screens)
+            + "</div></div>"
+            + _WIRE_LEGEND
+            + "</div></details>"
+        )
+    else:
+        drawn = (
+            '<div class="phone" dir="auto"><div class="ph-scroll"><div class="ph-empty">'
+            + esc(NOT_CAPTURED)
+            + "</div></div></div>"
+        )
+        fold = ""
+    return (
+        '<div class="phone-col"><h4>'
+        + esc(title, 40)
+        + '<span class="mt">'
+        + esc(sub, 80)
+        + "</span></h4>"
+        + drawn
+        + fold
+        + "</div>"
+    )
+
+
+_WIRE_LEGEND = (
+    '<ul class="wirelegend"><li><i class="sw tap"></i>tappable</li>'
+    '<li><i class="sw edit"></i>editable</li><li><i class="sw"></i>other element</li></ul>'
+)
+
+
+# ── the trace ──────────────────────────────────────────────────────────────────
 
 
 def _action_line(action: object) -> str:
@@ -471,12 +758,15 @@ def _trace_rows(trace: object) -> list:
         # rendered; the proof lives on the structural control, not here.
         safe = run_store.redact(entry)
         safe = safe if isinstance(safe, dict) else {}
+        action = safe.get("action")
+        action = action if isinstance(action, dict) else {}
         rows.append(
             {
                 "index": _text(safe.get("index"), 8),
+                "op": _text(action.get("op"), 24) or "?",
                 "action": _action_line(safe.get("action")),
                 "outcome": _text(safe.get("outcome"), 40) or "-",
-                "ms": _text(safe.get("ms"), 12),
+                "ms": _ms(safe.get("ms")),
                 "detail": _text(safe.get("detail"), MAX_TEXT),
                 "before": _text(safe.get("before_screen_id"), 40),
                 "after": _text(safe.get("after_screen_id"), 40),
@@ -485,130 +775,612 @@ def _trace_rows(trace: object) -> list:
     return rows
 
 
-def _case_card(case: object, screens: object) -> str:
-    """One case card: verdict, reason, every step, and two wireframes."""
+def _outcome_pill(outcome: str) -> str:
+    low = outcome.lower()
+    if low in ("ok", "done", "pass") or low.endswith("_pass") or low.endswith("_ok"):
+        cls = "p-ok"
+    elif low in ("-", "", "skipped", "pending"):
+        cls = "p-void"
+    elif "fail" in low or "error" in low or "blocked" in low or "refus" in low:
+        cls = "p-def"
+    elif "escape" in low or "needs" in low or "ask" in low or "wait" in low:
+        cls = "p-gap"
+    else:
+        cls = "p-void"
+    return _pill(cls, outcome)
+
+
+def _steps_table(rows: list) -> str:
+    body = "".join(
+        '<tr><td class="n">'
+        + esc(row["index"], 8)
+        + '</td><td class="said" dir="auto"><q>'
+        + esc(row["action"], 160)
+        + "</q></td>"
+        + '<td class="outc">'
+        + _outcome_pill(row["outcome"])
+        + '</td><td class="num">'
+        + esc(fmt_ms(row["ms"]), 16)
+        + '</td><td class="said" dir="auto">'
+        + (
+            esc(row["detail"])
+            if row["detail"]
+            else '<span class="mt">no detail recorded</span>'
+        )
+        + '</td><td><span class="cap'
+        + ("" if (row["before"] or row["after"]) else " none")
+        + '">'
+        + (esc(row["before"], 40) or "—")
+        + " → "
+        + (esc(row["after"], 40) or "—")
+        + "</span></td></tr>"
+        for row in rows
+    )
+    return (
+        '<div class="tablewrap"><table class="cov turns"><thead><tr>'
+        '<th scope="col">#</th><th scope="col">Action</th><th scope="col">Outcome</th>'
+        '<th scope="col" class="num">Took</th><th scope="col">Detail</th>'
+        '<th scope="col">Screen before → after</th>'
+        "</tr></thead><tbody>" + body + "</tbody></table></div>"
+        '<p class="hint">Took: the replay clock for that one action, as the server measured it. '
+        "An action never prints what it typed — a typed value is the one field that could "
+        "carry a credential, so the page has no route to it.</p>"
+    )
+
+
+def _seq_rows(rows: list, screens: object = None, app: str = "") -> str:
+    """The run sequence: one row per action, in the order it ran.
+
+    A row whose screen CHANGED carries the new screen's frame in its fold, so
+    the sequence reads as what the tester would have seen, step by step."""
+    if not rows:
+        return ""
+    longest = max((row["ms"] or 0) for row in rows) or 0
+    clock = 0
+    out = []
+    for row in rows:
+        kind = OP_KIND.get(row["op"].lower(), "step")
+        label = "0.0s" if clock == 0 else "+%.1fs" % (clock / 1000.0)
+        bar = ""
+        if row["ms"] is not None and longest:
+            bar = (
+                '<span class="seqbar k-tool" title="'
+                + str(int(row["ms"]))
+                + " ms of the "
+                + str(int(longest))
+                + ' ms longest step in this case"><i style="width:%.1f%%"></i></span>'
+                % max(3.0, min(100.0, row["ms"] / float(longest) * 100.0))
+            )
+        head = (
+            '<span class="seqk">'
+            + esc(row["op"], 24)
+            + '</span><span class="seqtx" dir="auto">'
+            + esc(row["action"], 160)
+            + "</span>"
+            + (
+                ('<span class="mt">' + esc(fmt_ms(row["ms"]), 16) + "</span>")
+                if row["ms"] is not None
+                else ""
+            )
+            + _outcome_pill(row["outcome"])
+        )
+        detail = ""
+        if row["detail"]:
+            detail = '<p class="seqfull" dir="auto">' + esc(row["detail"]) + "</p>"
+        if row["before"] or row["after"]:
+            detail += (
+                '<div class="chipnote"><i>screen</i>'
+                + (esc(row["before"], 40) or "—")
+                + " → "
+                + (esc(row["after"], 40) or "—")
+                + "</div>"
+            )
+        if row["after"] and row["after"] != row["before"]:
+            detail += (
+                '<div class="phonewide">'
+                + _phone_html(
+                    "Screen after",
+                    "what this action left on screen",
+                    row["after"],
+                    screens,
+                    app,
+                )
+                + "</div>"
+            )
+        if detail:
+            out.append(
+                '<li class="seq is-'
+                + kind
+                + '"><details class="seqfold"><summary><span class="chev" aria-hidden="true"></span>'
+                '<span class="seqt">'
+                + label
+                + '</span><div class="seqmain">'
+                + head
+                + "</div>"
+                + bar
+                + '</summary><div class="seqdetail">'
+                + detail
+                + "</div></details></li>"
+            )
+        else:
+            out.append(
+                '<li class="seq is-'
+                + kind
+                + '"><span class="chev ghost" aria-hidden="true"></span><span class="seqt">'
+                + label
+                + '</span><div class="seqmain">'
+                + head
+                + "</div>"
+                + bar
+                + "</li>"
+            )
+        clock += row["ms"] or 0
+    return '<ul class="seqlist">' + "".join(out) + "</ul>"
+
+
+# ── one case ───────────────────────────────────────────────────────────────────
+
+
+def _planned_case(manifest: dict, tc_id: str) -> dict:
+    """The suite's own record of the case, when the manifest carries one."""
+    for entry in manifest.get("cases") or []:
+        if isinstance(entry, dict) and _text(entry.get("tc_id"), 40) == tc_id:
+            return entry
+    return {}
+
+
+def _expected_of(planned: dict) -> str:
+    parts = []
+    for step in planned.get("steps") or []:
+        if isinstance(step, dict):
+            expected = _text(step.get("expected_result"), 160)
+            if expected:
+                parts.append(expected)
+    return " · ".join(parts)
+
+
+def _case_wall(rows: list) -> int | None:
+    measured = [row["ms"] for row in rows if row["ms"] is not None]
+    return sum(measured) if measured else None
+
+
+def _case_facts(case: object, manifest: dict) -> dict:
+    """Everything a card, a table row, a chip and a KPI need, computed ONCE."""
     raw = case if isinstance(case, dict) else {}
     safe = run_store.redact(raw)
     safe = safe if isinstance(safe, dict) else {}
     tc_id = _text(safe.get("tc_id"), 40)
-    verdict = _verdict_of(safe)
     rows = _trace_rows(safe.get("trace"))
+    planned = _planned_case(manifest, tc_id)
     first_before = rows[0]["before"] if rows else _text(safe.get("screen_id"), 40)
     last_after = ""
     for row in reversed(rows):
         if row["after"]:
             last_after = row["after"]
             break
-    steps = "".join(
-        "<tr><td>"
-        + esc(row["index"], 8)
-        + "</td><td>"
-        + esc(row["action"], 160)
-        + '</td><td class="outcome">'
-        + esc(row["outcome"], 40)
-        + "</td><td>"
-        + esc(row["ms"], 12)
-        + "</td><td>"
-        + esc(row["detail"])
-        + "</td></tr>"
-        for row in rows
-    )
-    table = (
-        '<table class="steps"><thead><tr><th>#</th><th>action</th>'
-        "<th>outcome</th><th>ms</th><th>detail</th></tr></thead><tbody>"
-        + steps
-        + "</tbody></table>"
-        if rows
-        else '<p class="note">No step has been replayed for this case yet.</p>'
-    )
-    reason = _text(safe.get("reason"), 400)
-    return (
-        '<section class="case v-'
-        + esc(verdict, 24)
-        + '" data-tc="'
-        + esc(tc_id, 40)
-        + '" data-verdict="'
-        + esc(verdict, 24)
-        + '" data-steps="'
-        + str(len(rows))
-        + '"><h3>'
-        + esc(tc_id, 40)
-        + " "
-        + esc(safe.get("title"), 120)
-        + '</h3><p class="badge">'
-        + esc(verdict, 24)
-        + "</p>"
-        + (('<p class="reason">' + esc(reason, 400) + "</p>") if reason else "")
-        + '<p class="meta">escape-hatch turns: '
-        + esc(safe.get("escapes") or 0, 8)
-        + "</p>"
-        + table
-        + '<div class="screens"><div><p class="cap">first screen</p>'
-        + _frame_html(first_before, screens)
-        + '</div><div><p class="cap">last screen</p>'
-        + _frame_html(last_after, screens)
-        + "</div></div></section>"
-    )
-
-
-def _stamp(value: object) -> str:
+    screens_seen = {row["before"] for row in rows} | {row["after"] for row in rows}
+    screens_seen.discard("")
     try:
-        moment = float(value or 0)
+        escapes = int(safe.get("escapes") or 0)
     except (TypeError, ValueError):
-        return "unknown"
-    if moment <= 0:
-        return "unknown"
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(moment))
+        escapes = 0
+    wall = _case_wall(rows)
+    return {
+        "tc_id": tc_id,
+        "slug": _slug(tc_id),
+        "title": _text(safe.get("title"), 120),
+        "verdict": _verdict_of(safe),
+        "status": _text(safe.get("status"), 40),
+        "reason": _text(safe.get("reason"), 400),
+        "escapes": max(0, escapes),
+        # Planning turns by the tester's own chat model: the first plan plus every
+        # escape-hatch re-plan. A case still planning has taken none yet.
+        "plans": (1 + max(0, escapes)) if rows else 0,
+        "updated": safe.get("updated"),
+        "rows": rows,
+        "first": first_before,
+        "last": last_after,
+        "screens": len(screens_seen),
+        "wall": wall,
+        "lat": _lat_bucket(wall),
+        "module": _text(planned.get("module"), 60) or "(unfiled)",
+        "priority": _text(planned.get("priority"), 24) or "(unset)",
+        "type": _text(planned.get("type"), 24) or "(unset)",
+        "expected": _expected_of(planned),
+    }
 
 
-def _header_html(run_id: str, manifest: dict, lease: dict, partial: bool) -> str:
+def _vstrip(facts: dict) -> str:
+    verdict = facts["verdict"]
+    _sw, _seg, pill_cls, label = _tone(verdict)
+    tone = {"pass": "v-pass", "fail": "v-fail", "unverified": "v-fail"}.get(verdict, "")
+    if verdict in DONE_VERDICTS:
+        why = (
+            ("<b>" + esc(facts["reason"], 400) + "</b>")
+            if facts["reason"]
+            else "the run recorded no reason for this verdict"
+        )
+    else:
+        why = (
+            "this case has not reached a verdict — its status is <b>"
+            + esc(facts["status"] or "unknown", 40)
+            + "</b>, so nothing here is final yet"
+        )
+    return (
+        '<div class="vstrip '
+        + tone
+        + '"><span class="label">Verdict</span>'
+        + _pill(pill_cls, label.lower())
+        + '<span class="vwhy">'
+        + why
+        + "</span></div>"
+    )
+
+
+def _ended_block(facts: dict) -> str:
+    def row(label, value):
+        return (
+            '<div class="erow"><span class="elab">'
+            + esc(label, 40)
+            + "</span>"
+            + value
+            + "</div>"
+        )
+
+    rows = (
+        row(
+            "status",
+            '<span class="cap">' + esc(facts["status"] or "unknown", 40) + "</span>",
+        )
+        + row(
+            "verdict",
+            _pill(_tone(facts["verdict"])[2], _tone(facts["verdict"])[3].lower()),
+        )
+        + row(
+            "escape-hatch turns",
+            '<span class="cap">' + str(facts["escapes"]) + "</span>",
+        )
+        + row(
+            "last checkpoint",
+            '<span class="cap">' + esc(_stamp(facts["updated"]), 40) + "</span>",
+        )
+        + row(
+            "last screen",
+            '<span class="cap'
+            + ("" if facts["last"] else " none")
+            + '">'
+            + (esc(facts["last"], 40) or "none recorded")
+            + "</span>",
+        )
+    )
+    return (
+        '<div class="cmeta"><div><h4>Ended at</h4><div class="estate">'
+        + rows
+        + "</div></div></div>"
+    )
+
+
+def _case_card(
+    case: object, screens: object, manifest: dict | None = None, app: str = ""
+) -> str:
+    """One case card in the shell's anatomy: expected -> verdict -> screens -> steps -> sequence -> ended at."""
+    facts = _case_facts(case, manifest if isinstance(manifest, dict) else {})
+    return _card_html(facts, screens, app)
+
+
+def _card_html(
+    facts: dict, screens: object, app: str, loaded: dict | None = None
+) -> str:
+    verdict = facts["verdict"]
+    _sw, _seg, pill_cls, label = _tone(verdict)
+    rows = facts["rows"]
+    first_action = rows[0]["action"] if rows else ""
+    snippet = ""
+    if first_action or facts["reason"]:
+        snippet = (
+            '<span class="csnip">'
+            + (
+                ('<q dir="auto">' + esc(first_action, 64) + "</q>")
+                if first_action
+                else ""
+            )
+            + (
+                '<span class="arr" aria-hidden="true">→</span>'
+                if first_action and facts["reason"]
+                else ""
+            )
+            + (
+                ('<q class="sara" dir="auto">' + esc(facts["reason"], 64) + "</q>")
+                if facts["reason"]
+                else ""
+            )
+            + "</span>"
+        )
+    bits = [_pill(pill_cls, label), MSEP, _metric(len(rows), "steps")]
+    if facts["wall"] is not None:
+        bits += [MSEP, _metric(fmt_ms(facts["wall"]), "wall")]
+    bits += [
+        MSEP,
+        _metric(facts["plans"], "LLM turns"),
+        _metric(facts["escapes"], "escape hatch"),
+        _metric(facts["screens"], "screens"),
+    ]
+    if loaded:
+        # The app's side of the same case: LLM / API / tool counts, tokens, cost.
+        bits += ev_render.card_metrics(loaded, facts["tc_id"])
+    search = " ".join(
+        [
+            facts["tc_id"],
+            facts["title"],
+            facts["module"],
+            facts["priority"],
+            facts["type"],
+            verdict,
+            facts["reason"],
+        ]
+        + [row["action"] for row in rows]
+        + [row["detail"] for row in rows]
+    ).lower()[:4000]
+    data = {
+        "data-tc": facts["tc_id"],
+        "data-verdict": verdict,
+        "data-module": facts["module"],
+        "data-priority": facts["priority"],
+        "data-type": facts["type"],
+        "data-steps": str(len(rows)),
+        "data-wall": str(facts["wall"]) if facts["wall"] is not None else "",
+        "data-escapes": str(facts["escapes"]),
+        "data-plans": str(facts["plans"]),
+        "data-lat": facts["lat"],
+        "data-search": search,
+    }
+    if loaded:
+        data.update(ev_render.card_data(loaded, facts["tc_id"]))
+    attrs = " ".join(
+        name + '="' + esc(value, 4000) + '"'
+        for name, value in data.items()
+        if value not in (None, "")
+    )
+    expected = (
+        esc(facts["expected"], 600)
+        if facts["expected"]
+        else "the suite states no expected result for this case"
+    )
+    # ONE phone when the case began and ended on the same screen: two identical
+    # frames side by side read as a diff with nothing in it.
+    if facts["first"] and facts["first"] == facts["last"]:
+        frames = _phone_html(
+            "On screen",
+            "the case began and ended on this screen",
+            facts["first"],
+            screens,
+            app,
+        )
+    else:
+        frames = _phone_html(
+            "First screen", "the screen the case began on", facts["first"], screens, app
+        ) + _phone_html(
+            "Last screen", "the screen the case ended on", facts["last"], screens, app
+        )
+    phones = (
+        '<div class="phonewide"><div class="phonepair">'
+        + frames
+        + "</div>"
+        + '<p class="hint">Every screen here is composed from the screen\'s element list — the '
+        "text, labels and rectangles the server already held — drawn the way the app lays them "
+        "out; no screenshot is ever taken of the emulator, by design, so fonts, colours and "
+        "icons are not the app's own. The element map under each phone holds the exact "
+        "rectangles. A phone that says the screen was not captured is a step whose screen the "
+        "run did not store — not a step that did not happen.</p></div>"
+    )
+    # What the app heard and answered inside this case's window (plan P3).
+    turns = ev_render.turns_table(loaded, facts["tc_id"]) if loaded else ""
+    steps = (
+        _sec_block(
+            "Steps",
+            _steps_table(rows),
+            count=len(rows),
+            note="every action replayed, in order",
+            open_=True,
+        )
+        if rows
+        else _sec_block(
+            "Steps",
+            '<p class="empty-note big">No step has been replayed for this case yet.</p>',
+            note="nothing replayed yet",
+            open_=True,
+        )
+    )
+    # The merged stream: the app's records and the lane's actions on one clock,
+    # when the case has app evidence; the lane's own rows otherwise.
+    merged = (
+        ev_exchanges.seqlist(ev_render.sequence_items(loaded, facts["tc_id"], rows))
+        if loaded
+        else ""
+    )
+    sequence = _sec_block(
+        "Run sequence",
+        merged
+        or _seq_rows(rows, screens, app)
+        or '<p class="empty-note big">No step has been replayed for this case yet.</p>',
+        count=len(rows) if rows else None,
+        note="everything in the order it ran"
+        + (
+            " — the app's records and the lane's actions on one clock" if merged else ""
+        ),
+        open_=True,
+    )
+    return (
+        '\n<details class="case rail-'
+        + RAIL.get(verdict, "none")
+        + '" id="case-'
+        + esc(facts["slug"], 40)
+        + '" '
+        + attrs
+        + '>\n  <summary>\n    <span class="cid">'
+        + esc(facts["tc_id"], 40)
+        + '</span>\n    <span class="cuse"><span class="cuc" dir="auto">'
+        + (esc(facts["title"], 120) or "(untitled case)")
+        + '</span><span class="carea">'
+        + esc(facts["module"], 60)
+        + " · "
+        + esc(facts["priority"], 24)
+        + " · "
+        + esc(facts["type"], 24)
+        + "</span>"
+        + snippet
+        + '</span>\n    <span class="cstate">'
+        + _pill(pill_cls, label)
+        + '</span>\n    <a class="plink" href="#case-'
+        + esc(facts["slug"], 40)
+        + '" title="Copy a link to this record">#</a>\n    <div class="smetrics">'
+        + "".join(bits)
+        + '</div>\n  </summary>\n  <div class="cbody"><p class="cexp"><b>Expected</b> — '
+        + expected
+        + "</p>"
+        + _vstrip(facts)
+        + phones
+        + turns
+        + steps
+        + sequence
+        + _ended_block(facts)
+        + "</div>\n</details>"
+    )
+
+
+# ── the sections ───────────────────────────────────────────────────────────────
+
+
+def _app_label(manifest: dict) -> str:
+    package = _text(manifest.get("package"), 80)
+    return package or "(no app)"
+
+
+def _facts_strip(
+    run_id: str,
+    manifest: dict,
+    lease: dict,
+    partial: bool,
+    loaded: dict | None = None,
+) -> str:
     holder = _text(lease.get("session_id"), 40)
     displaced = _text(lease.get("taken_over_from"), 40)
-    rows = [
-        ("run", esc(run_id, 64)),
-        ("lane", esc(manifest.get("lane") or "suite", 24)),
-        ("app", esc(manifest.get("package") or "(none)", 80)),
-        ("device", esc(manifest.get("serial") or "(not attached)", 40)),
-        ("avd", esc(manifest.get("avd") or "(unknown)", 40)),
-        ("started from", esc(manifest.get("source") or "(unrecorded)", 40)),
-        ("created", esc(_stamp(manifest.get("created")), 40)),
-        ("planned cases", esc(manifest.get("total") or 0, 12)),
-        ("state", "in progress" if partial else "finished"),
+    items = [
+        (
+            "device",
+            esc(manifest.get("serial") or "(not attached)", 40),
+            esc(manifest.get("avd") or "(unknown avd)", 40) + " · emulator",
+            "",
+        ),
+        ("app", esc(_app_label(manifest), 80), "the package under test", ""),
+        (
+            "lane",
+            esc(manifest.get("lane") or "suite", 24),
+            "started from " + esc(manifest.get("source") or "(unrecorded)", 40),
+            "",
+        ),
+        (
+            "created",
+            esc(_stamp(manifest.get("created")), 40),
+            "run " + esc(run_id, 64),
+            "",
+        ),
+        (
+            "state",
+            "in progress" if partial else "finished",
+            "some cases have no verdict yet"
+            if partial
+            else "every planned case reached a verdict",
+            "gap" if partial else "ok",
+        ),
     ]
+    if loaded:
+        items.extend(ev_render.facts_cells(loaded))
     if holder:
-        rows.append(
+        items.append(
             (
                 "lease",
-                "held by session "
-                + esc(holder, 40)
-                + " (heartbeat "
-                + esc(_stamp(lease.get("heartbeat")), 40)
-                + ")",
+                "held by session " + esc(holder, 40),
+                "heartbeat " + esc(_stamp(lease.get("heartbeat")), 40),
+                "",
             )
         )
     if displaced:
-        rows.append(("taken over from", esc(displaced, 40)))
-    body = "".join(
-        "<dt>" + name + "</dt><dd>" + value + "</dd>" for name, value in rows
-    )
-    return (
-        "<h1>Mobile run "
-        + esc(run_id, 64)
-        + '</h1><p class="mut">'
-        + (
-            "Partial report: this run is still in progress, so some cases have no "
-            "verdict yet."
-            if partial
-            else "Complete report: every planned case reached a verdict."
+        items.append(
+            (
+                "taken over from",
+                esc(displaced, 40),
+                "an earlier chat that was told to stop",
+                "",
+            )
         )
-        + '</p><dl class="head">'
-        + body
-        + "</dl>"
+    cells = "".join(
+        '<div class="rf"><span class="rfl">'
+        + label
+        + '</span><span class="rfv">'
+        + (('<i class="sw ' + tone + '"></i>') if tone else "")
+        + value
+        + (("<small>" + sub + "</small>") if sub else "")
+        + "</span></div>"
+        for label, value, sub, tone in items
+    )
+    return '<div class="runstrip" aria-label="Run facts">' + cells + "</div>"
+
+
+def _segbar(counts: dict) -> str:
+    total = sum(int(n) for n in counts.values()) or 1
+    ordered = [(name, int(counts.get(name) or 0)) for name in TILES]
+    ordered += [
+        (name, int(n)) for name, n in sorted(counts.items()) if name not in TILES
+    ]
+    segs, legend = [], []
+    for name, n in ordered:
+        if not n:
+            continue
+        sw, seg, _pill_cls, label = _tone(name)
+        pct = n / total * 100
+        if pct >= (len(label) + 3) * 1.6:
+            text = "<b>" + str(n) + "</b>" + esc(label.lower(), 40)
+        elif pct >= 5:
+            text = "<b>" + str(n) + "</b>"
+        else:
+            text = ""
+        segs.append(
+            '<span class="'
+            + seg
+            + '" style="flex:'
+            + str(n)
+            + '" title="'
+            + str(n)
+            + " "
+            + esc(label.lower(), 40)
+            + '">'
+            + text
+            + "</span>"
+        )
+        legend.append(
+            '<li><button type="button" data-jump-group="verdict" data-jump-value="'
+            + esc(name, 24)
+            + '"><i class="sw '
+            + sw
+            + '"></i><b>'
+            + str(n)
+            + "</b>"
+            + esc(label, 40)
+            + "</button></li>"
+        )
+    return (
+        '<figure class="seg"><figcaption><b>Outcomes</b><span>what each case came to</span></figcaption>'
+        '<div class="segbar">'
+        + "".join(segs)
+        + '</div><ul class="seglegend">'
+        + "".join(legend)
+        + "</ul></figure>"
     )
 
 
 def _summary_html(tally: dict, total: int) -> str:
-    """The tiles, plus the machine-readable totals the selfcheck compares."""
+    """The machine-readable totals the selfcheck compares, wrapping the outcome tiles."""
     ordered = [(name, int(tally.get(name) or 0)) for name in TILES]
     ordered += [
         (name, int(count)) for name, count in sorted(tally.items()) if name not in TILES
@@ -617,15 +1389,18 @@ def _summary_html(tally: dict, total: int) -> str:
         " data-" + name.replace("_", "-") + '="' + str(int(count)) + '"'
         for name, count in ordered
     )
-    tiles = "".join(
-        '<div class="tile t-'
-        + esc(name, 24)
-        + '"><span class="n">'
-        + str(int(count))
-        + '</span><span class="k">'
-        + esc(name, 24)
-        + "</span></div>"
-        for name, count in ordered
+    hero = _kpi(
+        str(int(total)),
+        "cases checkpointed",
+        (
+            str(int(tally.get("pass") or 0))
+            + " passed · "
+            + str(int(tally.get("fail") or 0))
+            + " failed · "
+            + str(int(tally.get("blocked") or 0))
+            + ' blocked · <a href="#cases">all cases →</a>'
+        ),
+        hero=True,
     )
     return (
         '<div id="'
@@ -634,26 +1409,425 @@ def _summary_html(tally: dict, total: int) -> str:
         + str(int(total))
         + '"'
         + attrs
-        + '><div class="tiles">'
-        + tiles
+        + '><div class="outcome">'
+        + hero
+        + _segbar(tally)
         + "</div></div>"
     )
 
 
-def _footer_html() -> str:
-    return (
-        "<footer><p>Every screen above is a WIREFRAME drawn from the element "
-        "bounds the server already held; no screenshot is ever taken of the "
-        "emulator, by design. A frame that says the screen was not captured is "
-        "a step whose screen the run did not store -- not a step that did not "
-        "happen.</p><p>Credential values are masked: the run store writes "
-        "<code>***</code> for a marked value and for a credential-named key, "
-        "and this page masks again and never prints an action's typed text. It "
-        "cannot mask a value written under an unrecognised key with no marker; "
-        "that limit is the run store's, and it is stated rather than papered "
-        "over.</p><p>This is one self-contained file. It references nothing "
-        "external, so it opens offline and forever.</p></footer>"
+def _overview(
+    facts: list,
+    tally: dict,
+    manifest: dict,
+    partial: bool,
+    screens: object = None,
+    app: str = "",
+    loaded: dict | None = None,
+) -> str:
+    steps = sum(len(f["rows"]) for f in facts)
+    walls = [f["wall"] for f in facts if f["wall"] is not None]
+    step_ms = [row["ms"] for f in facts for row in f["rows"] if row["ms"] is not None]
+    escapes = sum(f["escapes"] for f in facts)
+    plans = sum(f["plans"] for f in facts)
+    # NOT `screens`: that name is the screen LIBRARY parameter, and a count
+    # bound to it made every opening frame below render as not captured.
+    captured = sum(f["screens"] for f in facts)
+    planned = 0
+    try:
+        planned = int(manifest.get("total") or 0)
+    except (TypeError, ValueError):
+        planned = 0
+    run_tiles = [
+        _kpi(
+            str(steps),
+            "actions replayed",
+            "across "
+            + str(len(facts))
+            + " case card"
+            + ("" if len(facts) == 1 else "s"),
+        ),
+        _kpi(
+            esc(fmt_ms(sum(walls)), 16) if walls else '<span class="kv-gap">n/a</span>',
+            "replay time",
+            "the sum of every measured action"
+            if walls
+            else "no action carried a measured duration",
+        ),
+        _kpi(
+            esc(fmt_ms(max(step_ms)), 16)
+            if step_ms
+            else '<span class="kv-gap">n/a</span>',
+            "slowest action",
+            'the worst single action in the run · <a href="#perf">timings →</a>'
+            if step_ms
+            else "nothing was timed",
+        ),
+        _kpi(
+            str(plans),
+            "LLM turns",
+            "planning turns by the tester\u2019s own chat model \u2014 one plan per case plus "
+            "every escape-hatch re-plan. Tokens and cost are not shown: no model call "
+            "passes through this server, so it has nothing to meter",
+        ),
+        _kpi(
+            str(escapes),
+            "escape-hatch turns",
+            "times the model was asked for a plan mid-case"
+            if escapes
+            else "every case ran its script through",
+            tone="c-gap" if escapes else "",
+        ),
+        _kpi(
+            str(captured),
+            "screens captured",
+            "distinct pruned screens referenced by the steps",
+        ),
+        _kpi(
+            str(planned),
+            "cases planned",
+            (
+                "in progress — "
+                + str(max(0, planned - len(facts)))
+                + " not yet checkpointed"
+            )
+            if partial
+            else "every planned case reached a verdict",
+            tone="c-gap" if partial else "c-pass",
+        ),
+    ]
+    note = (
+        '<details class="note fold"><summary><h3>What this report can and cannot tell you</h3>'
+        '<span class="mt">how to read every figure above</span></summary><div class="notebody">'
+        "<p>A case is <b>passed</b> when the model that planned it said so after the last action it "
+        "asked for; <b>failed</b> and <b>blocked</b> likewise. The server replays actions and reports "
+        "outcomes; it never judges a screen itself. A case in flight shows its status, never a verdict.</p>"
+        "<p><b>LLM turns</b> counts the planning turns the tester\u2019s own chat model took: one "
+        "plan per case plus every escape-hatch re-plan. There is no token or cost figure because "
+        "no model call passes through this server \u2014 the model runs in the tester\u2019s chat, "
+        "and this page can only count the plans it was handed.</p>"
+        "<p>Every screen is <b>composed</b> from the element list the server already held — text, labels and bounds. "
+        "No screenshot is ever taken of the emulator, by design, so a frame shows where controls "
+        "were and what they said — not how they looked.</p>"
+        "<p>Credential values are masked: the run store writes <code>***</code> for a marked value "
+        "and for a credential-named key, and this page masks again and never prints an action's "
+        "typed text. It cannot mask a value written under an unrecognised key with no marker; that "
+        "limit is the run store's, and it is stated rather than papered over.</p></div></details>"
     )
+    # The reference's "screen every case opened on": the first screen the run
+    # saw, drawn once, with how many distinct opening screens there were.
+    opening = ""
+    first_ids = [f["first"] for f in facts if f["first"]]
+    if first_ids:
+        distinct = len(set(first_ids))
+        opening = _sec_block(
+            "The screen every case opened on"
+            if distinct == 1
+            else "The screen the first case opened on",
+            '<div class="phonewide">'
+            + _phone_html(
+                "Opening screen", "as the run first saw it", first_ids[0], screens, app
+            )
+            + "</div>",
+            count=distinct,
+            note=(
+                "one opening screen, shared by every case"
+                if distinct == 1
+                else str(distinct) + " distinct opening screens across the cases"
+            ),
+        )
+    return (
+        _summary_html(tally, len(facts))
+        + '<div class="kpis run">'
+        + "".join(run_tiles)
+        + ("".join(ev_render.overview_tiles(loaded)) if loaded else "")
+        + "</div>"
+        + opening
+        + (
+            (ev_render.session_block(loaded) + ev_render.trust_block(loaded))
+            if loaded
+            else ""
+        )
+        + note
+    )
+
+
+def _coverage(facts: list) -> str:
+    if not facts:
+        return '<p class="empty-note big">No case has been checkpointed yet.</p>'
+    rows = ""
+    for f in facts:
+        _sw, _seg, pill_cls, label = _tone(f["verdict"])
+        rows += (
+            '<tr class="jumpable" data-jump-case="'
+            + esc(f["slug"], 40)
+            + '" tabindex="0" data-stc="'
+            + esc(f["tc_id"], 40)
+            + '" data-stitle="'
+            + esc(f["title"], 120)
+            + '" data-smodule="'
+            + esc(f["module"], 60)
+            + '" data-sverdict="'
+            + esc(f["verdict"], 24)
+            + '" data-ssteps="'
+            + str(len(f["rows"]))
+            + '" data-swall="'
+            + (str(f["wall"]) if f["wall"] is not None else "-1")
+            + '"><td class="uc">'
+            + esc(f["tc_id"], 40)
+            + "<small>"
+            + esc(f["module"], 60)
+            + '</small></td><td dir="auto">'
+            + (esc(f["title"], 120) or "(untitled case)")
+            + "</td><td>"
+            + _pill(pill_cls, label)
+            + '</td><td class="num">'
+            + str(len(f["rows"]))
+            + '</td><td class="num">'
+            + esc(fmt_ms(f["wall"]), 16)
+            + '</td><td><span class="goto">open →</span></td></tr>'
+        )
+    return (
+        '<div class="tablewrap"><table class="cov" id="covtable"><thead><tr>'
+        '<th data-sort="tc" scope="col">Case</th><th data-sort="title" scope="col">Title</th>'
+        '<th data-sort="verdict" scope="col">Verdict</th><th data-sort="steps" scope="col" class="num">Actions</th>'
+        '<th data-sort="wall" scope="col" class="num">Replay time</th>'
+        '<th scope="col"><span class="visually-hidden">Open case</span></th>'
+        "</tr></thead><tbody>" + rows + "</tbody></table></div>"
+    )
+
+
+def _perf(facts: list, loaded: dict | None = None) -> str:
+    step_ms = [row["ms"] for f in facts for row in f["rows"] if row["ms"] is not None]
+    walls = [(f, f["wall"]) for f in facts if f["wall"] is not None]
+    if not step_ms:
+        return (
+            '<p class="empty-note big">Nothing here carried a measured duration yet — the tiles '
+            "and the figure appear once an action has been replayed.</p>"
+        ) + (ev_render.perf_extra(loaded) if loaded else "")
+    tiles = [
+        _kpi(
+            esc(fmt_ms(_percentile(step_ms, 0.5)), 16),
+            "How long an action took",
+            '<span class="kstat">usually '
+            + esc(fmt_ms(_percentile(step_ms, 0.5)), 16)
+            + ", between "
+            + esc(fmt_ms(min(step_ms)), 16)
+            + " and "
+            + esc(fmt_ms(max(step_ms)), 16)
+            + '</span><span class="kstat">across '
+            + str(len(step_ms))
+            + " actions</span>"
+            '<details class="kwhy"><summary>what this means</summary><p>measured by the replay '
+            "clock around one action — the tap or the wait itself, not the model's planning turn, "
+            "which happens in the tester's own chat</p></details>",
+        ),
+    ]
+    if walls:
+        wall_values = [w for _f, w in walls]
+        tiles.append(
+            _kpi(
+                esc(fmt_ms(_percentile(wall_values, 0.5)), 16),
+                "How long a case took",
+                '<span class="kstat">usually '
+                + esc(fmt_ms(_percentile(wall_values, 0.5)), 16)
+                + ", between "
+                + esc(fmt_ms(min(wall_values)), 16)
+                + " and "
+                + esc(fmt_ms(max(wall_values)), 16)
+                + '</span><span class="kstat">across '
+                + str(len(wall_values))
+                + " cases</span>"
+                '<details class="kwhy"><summary>what this means</summary><p>the sum of that case\'s '
+                "measured actions, a FLOOR rather than the whole truth: the turns the model spent "
+                "planning between actions are nobody's measurement here</p></details>",
+            )
+        )
+    figure = ""
+    if walls:
+        top = max(w for _f, w in walls) or 1
+        ordered = sorted(walls, key=lambda pair: -pair[1])
+        items = "".join(
+            '<li class="runrow"><button type="button" data-jump-case="'
+            + esc(f["slug"], 40)
+            + '"><span class="rname"><b>'
+            + esc(f["tc_id"], 40)
+            + "</b>"
+            + (esc(f["title"], 80) or "(untitled case)")
+            + '</span><span class="rval">'
+            + esc(fmt_ms(w), 16)
+            + '</span><span class="rtrack"><i class="sw-lat-'
+            + (f["lat"] or "fast")
+            + '" style="width:%.1f%%"></i></span></button></li>'
+            % max(1.0, w / float(top) * 100.0)
+            for f, w in ordered
+        )
+        buckets = Counter(f["lat"] for f, _w in walls)
+        legend = "".join(
+            '<li><button type="button" data-jump-group="lat" data-jump-value="'
+            + key
+            + '"><i class="sw sw-lat-'
+            + key
+            + '"></i><b>'
+            + str(buckets.get(key, 0))
+            + "</b>"
+            + label
+            + "</button></li>"
+            for key, label, _ceiling in LAT_BUCKETS
+        )
+        figure = (
+            '<figure class="hist"><figcaption><b>How long a case took</b><span>'
+            + str(len(walls))
+            + " case"
+            + ("" if len(walls) == 1 else "s")
+            + ', each one shown · click one to open it</span></figcaption><ul class="runs">'
+            + items
+            + '</ul><ul class="seglegend">'
+            + legend
+            + "</ul></figure>"
+        )
+    return (
+        '<p class="hint">Every action the server replays is timed on its own clock, so these are '
+        "real elapsed times — for the action alone. The model's planning between actions runs in "
+        "the tester's chat and is not measured here.</p>"
+        '<div class="kpis">'
+        + "".join(tiles)
+        + "</div>"
+        + figure
+        + (ev_render.perf_extra(loaded) if loaded else "")
+    )
+
+
+def _toolbar(facts: list, loaded: dict | None = None) -> str:
+    verdicts = Counter(f["verdict"] for f in facts)
+    modules = Counter(f["module"] for f in facts)
+    priorities = Counter(f["priority"] for f in facts)
+    types = Counter(f["type"] for f in facts)
+    lats = Counter(f["lat"] for f in facts if f["lat"])
+    ordered_verdicts = [name for name in TILES if verdicts.get(name)] + sorted(
+        name for name in verdicts if name not in TILES
+    )
+    groups = [
+        (
+            "Verdict",
+            _all_chip("area", len(facts))
+            + "".join(
+                _chip("verdict", name, _tone(name)[3], verdicts[name], _tone(name)[0])
+                for name in ordered_verdicts
+            ),
+        ),
+        (
+            "Module",
+            "".join(
+                _chip("module", name, name, n) for name, n in modules.most_common()
+            ),
+        ),
+        (
+            "Priority",
+            "".join(
+                _chip("priority", name, name, n) for name, n in priorities.most_common()
+            ),
+        ),
+        (
+            "Type",
+            "".join(_chip("type", name, name, n) for name, n in types.most_common()),
+        ),
+        (
+            "Latency",
+            "".join(
+                _chip("lat", key, label, lats[key], "lat-" + key)
+                for key, label, _c in LAT_BUCKETS
+                if lats.get(key)
+            ),
+        ),
+    ]
+    if loaded:
+        groups += ev_render.toolbar_groups(loaded, facts)
+    sorts = (
+        ("order", "case order"),
+        ("steps", "actions, most first"),
+        ("wall", "replay time, longest first"),
+        ("plans", "LLM turns, most first"),
+        ("escapes", "escape-hatch turns, most first"),
+    ) + (tuple(ev_render.extra_sorts(loaded)) if loaded else ())
+    opts = "".join(
+        '<option value="' + k + '">' + label + "</option>" for k, label in sorts
+    )
+    fgs = "".join(_filter_group(label, chips) for label, chips in groups)
+    total = str(len(facts))
+    return (
+        '\n    <div class="toolbar" id="toolbar">\n      <div class="tb-row">\n        <label class="search">\n'
+        '          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3"/></svg>\n'
+        '          <input id="q" type="search" placeholder="Search id, title, module, actions, reasons…" autocomplete="off" spellcheck="false" aria-label="Search cases">\n'
+        '          <button class="x" id="qx" type="button" aria-label="Clear search" hidden>×</button>\n'
+        "          <kbd>/</kbd>\n        </label>\n"
+        '        <span class="tb-count"><b id="shown">'
+        + total
+        + "</b> of "
+        + total
+        + "</span>\n"
+        '        <span class="active-uc" id="active-uc" hidden><b></b><button type="button" aria-label="Clear use case">×</button></span>\n'
+        '        <button type="button" class="chip" id="fbtn" aria-expanded="false" title="Show the filter groups">Filters<i id="fcount">0</i></button>\n'
+        '        <label class="selectwrap">Sort\n          <select id="sort">'
+        + opts
+        + "</select>\n        </label>\n"
+        '        <span class="bulk">\n          <button type="button" class="chip" id="expand-all">Expand shown</button>\n'
+        '          <button type="button" class="chip" id="collapse-all">Collapse</button>\n        </span>\n      </div>\n'
+        '      <div class="tb-row fgroups">\n        ' + fgs + "\n"
+        '        <button type="button" class="chip ghost" id="clear" data-clear hidden>Clear filters</button>\n'
+        "      </div>\n    </div>"
+    )
+
+
+def _cases_section(
+    facts: list, screens: object, app: str, loaded: dict | None = None
+) -> str:
+    cards = "".join(_card_html(f, screens, app, loaded) for f in facts)
+    done = sum(1 for f in facts if f["verdict"] in DONE_VERDICTS)
+    lede = (
+        str(len(facts))
+        + " case"
+        + ("" if len(facts) == 1 else "s")
+        + " checkpointed, "
+        + str(done)
+        + " of them with a verdict. Open a case for its screens, every action and the reason it "
+        "ended the way it did. Press <kbd>/</kbd> to search."
+    )
+    body = (
+        _toolbar(facts, loaded)
+        + '\n<div class="cases" id="caselist">'
+        + (
+            cards
+            or '\n<p class="empty-note big">No case has been checkpointed yet.</p>'
+        )
+        + '</div>\n    <div class="noresults" id="noresults" hidden>\n      No cases match these filters.\n'
+        '      <div><button class="chip ghost" type="button" data-clear>Clear filters</button></div>\n    </div>'
+    )
+    return _sechead("cases", "Every case", "what ran, and what it came to", lede, body)
+
+
+def _footer_html(run_id: str, manifest: dict) -> str:
+    return (
+        "Runner: <code>tools/mobile/case_runner.py</code> · Run: <code>"
+        + esc(run_id, 64)
+        + "</code> · Driven against <code>"
+        + esc(manifest.get("serial") or "(not attached)", 40)
+        + "</code><br>Rendered "
+        + esc(_short_stamp(time.time()), 40)
+        + " from <code>manifest.json</code>, <code>cases/*.json</code> and <code>screens/*.json</code> "
+        "in the run's own directory by <code>tools/mobile/report.py</code> on the shared shell in "
+        "<code>tools/mobile/report_shell.html</code>. This is one self-contained page: it references "
+        "nothing but its typefaces, and it opens offline in the system face."
+    )
+
+
+def _fill(template: str, slots: dict) -> str:
+    """Every ``{{SLOT}}`` in ONE pass, so a filled value is never itself expanded."""
+
+    def one(match):
+        return slots[match.group(1)]
+
+    return _SLOT.sub(one, template)
 
 
 def _document(
@@ -666,25 +1840,138 @@ def _document(
     tally: dict,
     partial: bool,
 ) -> str:
-    cards = "".join(_case_card(case, screens) for case in cases)
-    return (
-        '<!DOCTYPE html>\n<html lang="en"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        "<title>"
-        + esc("Mobile run " + str(run_id), 120)
-        + "</title><style>"
-        + _CSS
-        + "</style></head><body>"
-        + _header_html(run_id, manifest, lease, partial)
-        + _summary_html(tally, len(cases))
-        + "<h2>Cases</h2>"
-        + (cards or '<p class="note">No case has been checkpointed yet.</p>')
-        + _footer_html()
+    facts = [_case_facts(case, manifest) for case in cases]
+    app = _app_label(manifest)
+    # The app's side of the run (plan P3): read ONCE, joined to the cases, and
+    # handed to every section. Never raises; a run without a capture, or a
+    # package without a profile, renders every evidence fragment as a stated gap.
+    loaded = ev_render.load_run_evidence(
+        run_id, manifest, cases, ev_profiles.profile_for(manifest.get("package"))
+    )
+    steps = sum(len(f["rows"]) for f in facts)
+    title = "Mobile run " + str(run_id)
+    nav = "".join(
+        '<a href="#' + sid + '" data-nav="' + sid + '">' + label + "</a>"
+        for sid, label in (
+            ("overview", "Overview"),
+            ("coverage", "Coverage"),
+            ("apis", "APIs"),
+            ("perf", "Performance"),
+            ("cases", "Cases"),
+        )
+    )
+    meta = "".join(
+        "<span><b>" + k + "</b> " + v + "</span>"
+        for k, v in (
+            (
+                "Suite",
+                str(len(facts))
+                + " case"
+                + ("" if len(facts) == 1 else "s")
+                + " checkpointed · "
+                + esc(manifest.get("total") or 0, 12)
+                + " planned",
+            ),
+            (
+                "This run",
+                str(steps)
+                + " action"
+                + ("" if steps == 1 else "s")
+                + " replayed · rendered "
+                + esc(_short_stamp(time.time()), 40),
+            ),
+            (
+                "Driven against",
+                esc(app, 80)
+                + " on "
+                + esc(manifest.get("serial") or "(not attached)", 40),
+            ),
+            (
+                "State",
+                "in progress — some cases have no verdict yet"
+                if partial
+                else "finished — every planned case reached a verdict",
+            ),
+        )
+    )
+    sections = (
+        _sechead(
+            "overview",
+            "At a glance",
+            "the run in numbers",
+            "Every figure here is about what the emulator DID with a case. Whether the app is right is the tester's question, not this one.",
+            _overview(facts, tally, manifest, partial, screens, app, loaded),
+        )
+        + _sechead(
+            "coverage",
+            "Coverage by case",
+            "how far each one got",
+            "Every checkpointed case and where it stands. Sort any column; open a row for its card.",
+            _coverage(facts),
+        )
+        + _sechead(
+            "apis",
+            "API surface",
+            "every endpoint the app reached, on the real wire",
+            "Every endpoint the app called from inside a case, against the real backend rather than a fixture.",
+            ev_render.apis_section(loaded),
+        )
+        + _sechead(
+            "perf",
+            "Performance",
+            "what the replay could time",
+            "How long things took, from the clock around each replayed action — and, when the app's own log was captured, from the moments the app wrote down itself.",
+            _perf(facts, loaded),
+        )
+        + _cases_section(facts, screens, app, loaded)
         + '<div id="'
         + END_ID
         + '" data-cards="'
         + str(len(cases))
-        + '"></div></body></html>\n'
+        + '"></div>'
+    )
+    digest = hashlib.sha1(
+        (
+            str(run_id)
+            + ":"
+            + str(manifest.get("created") or "")
+            + ":"
+            + str(len(cases))
+        ).encode("utf-8")
+    ).hexdigest()[:12]
+    try:
+        body = _fill(
+            SHELL,
+            {
+                "DOC_TITLE": esc(title, 120),
+                "BRAND": "Mobile Run",
+                "BRAND_SUB": "QA Agents",
+                "NAV": nav,
+                "EYEBROW": "QA Agents · mobile lane · one run on the emulator",
+                "TITLE": esc(app, 80) + " on device, one run end to end",
+                "STANDFIRST": (
+                    "Every planned case replayed on the emulator from the screen it saw, one action at a "
+                    "time, and on the same card what the run did underneath: every tap, every field, every "
+                    "assertion and the screen before and after."
+                ),
+                "META": meta,
+                "FACTS": _facts_strip(run_id, manifest, lease, partial, loaded),
+                "SECTIONS": sections,
+                "FOOTER_META": _footer_html(run_id, manifest),
+                "SOURCE_STAMP": esc(str(run_id) + ":" + digest, 80),
+                # Never used by this lane: nothing here is big enough to park.
+                "STORES": "",
+            },
+        )
+    finally:
+        # The learned-value net stays armed only while the page is being built --
+        # and not a moment longer when the build raises.
+        ev_render.release()
+    return (
+        '<!DOCTYPE html>\n<html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1"></head><body>\n'
+        + body
+        + "\n</body></html>\n"
     )
 
 

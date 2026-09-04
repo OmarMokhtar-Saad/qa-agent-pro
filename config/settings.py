@@ -384,6 +384,18 @@ class Settings(BaseSettings):
     # mcp_handlers.handle_push_suite does. See docs/FEATURE_FLAGS.md and
     # tools/flag_registry.py, which carry the same rationale verbatim.
     qa_mobile_run_enabled: bool = False
+    # App-log evidence for the mobile lane -- OPERATOR-CHOICE (flag policy
+    # category 4), default ON. ON: while a case runs, the lane keeps the app's own
+    # logcat slice and pulls its event log (`run-as`, debuggable builds only), both
+    # scrubbed before disk, so the report can show the app's model round-trips and
+    # endpoint calls beside each case. OFF: nothing from the app's own output is
+    # written to this machine, even redacted -- a legitimate choice for a site
+    # that must not persist health-shaped content locally. Both values are right
+    # somewhere, which is what makes this a toggle and not a kill-switch; the
+    # kill-switch above still gates every device effect. Only a package with a
+    # profile in tools/mobile_evidence/profiles/ (or ~/.qa-agents/mobile/profiles/)
+    # is ever captured. See docs/FEATURE_FLAGS.md.
+    qa_mobile_app_evidence: bool = True
     # Shared cache root for everything the mobile lane downloads or writes
     # (SDK, JRE, the verified IME APK, run checkpoints, locks). Empty means
     # ~/.qa-agents/mobile. This is NOT a gate -- an unset value has a working
@@ -556,7 +568,7 @@ class Settings(BaseSettings):
     # had shipped it `true` since v1.39.3 and tools/env_heal repaired installs
     # still carrying the superseded shipped `false`.
     # tools/quality_checks.normalize_module_names buckets on a CASEFOLDED key, so
-    # "Sehhaty Store - Cancel Order" and "Cancel Order" were different keys and
+    # "Client Store - Cancel Order" and "Cancel Order" were different keys and
     # never merged: a real 2026-08-03 run shipped ONE feature split 12 / 86
     # across exactly those two labels, fragmenting every group-by-module view
     # (Jira, TestRail, the XLSX pivot).
@@ -1231,6 +1243,7 @@ class Settings(BaseSettings):
         "qa_host_image_require_relevant",
         "qa_host_dedup_apply",
         "qa_mobile_run_enabled",
+        "qa_mobile_app_evidence",
         mode="before",
     )
     @classmethod

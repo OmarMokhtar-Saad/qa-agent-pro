@@ -320,6 +320,28 @@ def _load_suite_sync(suite_id: str) -> TestSuite | None:
     return suite
 
 
+def _case_row_stats_sync(suite_id: str) -> tuple[bool, int]:
+    """(does the suite ROW exist, how many case rows it has).
+
+    F21 (2026-09-02 audit): _load_suite_sync returns None both for an
+    unknown id and for a suite whose every case row failed validation, so
+    its callers could only ever report the first. This answers the question
+    that separates them, and it is asked ONLY on the None path, so a normal
+    load costs nothing.
+    """
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT id FROM suites WHERE id = ?", (suite_id,)).fetchone()
+        if row is None:
+            return False, 0
+        counted = conn.execute(
+            "SELECT COUNT(*) FROM cases WHERE suite_id = ?", (suite_id,)
+        ).fetchone()
+        return True, int((counted or (0,))[0] or 0)
+    finally:
+        conn.close()
+
+
 def _load_suite_meta_sync(suite_id: str) -> dict | None:
     conn = _connect()
     try:
@@ -404,6 +426,20 @@ async def load_suite(suite_id: str) -> dict:
         if not suite_id:
             return {"error": None, "content": None}
         suite = await asyncio.to_thread(_load_suite_sync, suite_id)
+        if suite is None:
+            # F21: say WHICH kind of nothing this is. `exists` True with a
+            # non-zero `row_total` means the suite IS on disk and every one
+            # of its rows failed to load -- reporting that as 'no stored
+            # suite, generate one first' told the tester their cases were
+            # gone when they were not.
+            exists, row_total = await asyncio.to_thread(_case_row_stats_sync, suite_id)
+            return {
+                "error": None,
+                "content": None,
+                "skipped": row_total if exists else 0,
+                "exists": bool(exists),
+                "row_total": int(row_total),
+            }
         # Carry the shortfall OUT of the loader so a caller can disclose it;
         # silently exporting fewer cases than were stored is the failure mode.
         return {
