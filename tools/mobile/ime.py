@@ -222,6 +222,40 @@ async def install(serial: str) -> dict:
     return await adb.install(serial, str((fetched["content"] or {})["path"]))
 
 
+def same_component(left: object, right: object) -> bool:
+    """Do two Android component ids name the SAME component?
+
+    `pkg/.Class` and `pkg/pkg.Class` are the same thing: a class name beginning
+    with `.` is relative to the package. Android accepts either and STORES the
+    shorthand -- measured 2026-09-04 on a real device, setting the fully
+    qualified id and reading `settings get secure default_input_method` back:
+
+        set: io.qaagents.ime/io.qaagents.ime.QaImeService
+        got: io.qaagents.ime/.QaImeService
+
+    So a string comparison against the pinned id is false on every install, and
+    `preflight`'s `ime_selected` check refused every run on a device where the
+    QA keyboard was correctly installed, enabled and active. The whole suite was
+    green because the fake answered with the expanded form, which no device
+    ever returns.
+
+    Blank never matches blank: an absent id is not evidence of anything, and two
+    unknowns are not the same component.
+    """
+
+    def _expand(value: object) -> str:
+        text = str(value or "").strip()
+        package, sep, cls = text.partition("/")
+        if not sep or not cls:
+            return text
+        if cls.startswith("."):
+            cls = package + cls
+        return package + "/" + cls
+
+    a, b = _expand(left), _expand(right)
+    return bool(a) and a == b
+
+
 async def current_ime(serial: str) -> dict:
     """The device's currently selected input method id, or ``""``."""
     result = await adb.shell(
@@ -252,7 +286,12 @@ async def remember_previous(serial: str) -> dict:
         "error": None,
         "content": {
             "previous": previous,
-            "was_ours": bool(ours) and previous == ours,
+            # By component identity, not spelling: the device reports the
+            # shorthand `pkg/.Class` and the manifest pins the expanded form,
+            # so `==` answered "that is not our keyboard" about our own
+            # keyboard -- and the run would then try to 'restore' it as if it
+            # were the tester's.
+            "was_ours": same_component(previous, ours),
         },
     }
 
@@ -298,7 +337,7 @@ async def restore_previous(serial: str, previous: str) -> dict:
                 ),
             },
         }
-    if ours and target == ours:
+    if same_component(target, ours):
         return {
             "error": None,
             "content": {
