@@ -58,12 +58,28 @@ def _comment(text: str) -> str:
     return " ".join((text or "").split())
 
 
+def _docstring(text: str) -> str:
+    r"""One-line, DOCSTRING-safe rendering of a value.
+
+    2026-09-02 audit: the title is the one case value that lands INSIDE a triple
+    double-quoted literal rather than behind a ``#`` -- the steps and the
+    preconditions are comments and are safe as they are. A title containing a
+    triple double-quote closed the docstring early and produced a file that does
+    not parse, and one containing ``\x``, ``\u`` or ``\N`` produced
+    ``(unicode error) truncated \xXX escape``: in both cases the ENTIRE exported
+    skeleton -- every other case in it -- was lost to one title. Backslashes are
+    doubled and double quotes become apostrophes, so the text survives readably
+    and the file always compiles.
+    """
+    return _comment(text).replace("\\", "\\\\").replace('"', "'")
+
+
 def _test_block(tc: TestCase, slug: str) -> str:
     lines: list[str] = []
     marker = tc.type.value.lower()
     lines.append(f"@pytest.mark.{re.sub(r'[^a-z0-9_]', '_', marker)}")
     lines.append(f"def test_{slug}(page: Page) -> None:")
-    lines.append(f'    """{_comment(tc.title)} [{tc.tc_id} / {tc.stable_id}]"""')
+    lines.append(f'    """{_docstring(tc.title)} [{tc.tc_id} / {tc.stable_id}]"""')
     # F06: the acceptance criterion this skeleton belongs to. Omitted entirely
     # when the case carries no usable tag -- a comment reading "Requirement:"
     # with nothing after it is worse than no line.

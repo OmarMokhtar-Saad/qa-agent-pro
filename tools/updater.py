@@ -30,10 +30,12 @@ read-only so manual/editor edits fail to save and never survive a restart.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import logging
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -773,6 +775,247 @@ def _rollback(
                 logger.warning("Rollback: could not restore pruned %s (%s).", rel, exc)
 
 
+_UPDATE_LOCK_FILE = ".update.lock"
+
+#: How long a holder may keep the lock before a loser reports it as wedged.
+#: An ESTIMATE, not a measurement -- no swap on this install has ever been
+#: timed. It is deliberately far above any plausible swap so the CRITICAL line
+#: below means "something is wrong, look at this" and never "this is busy".
+HELD_TOO_LONG_S = 600
+
+
+class LockUnsupported(Exception):
+    """Neither OS locking primitive is available on this interpreter."""
+
+
+def _os_lock(fd: int) -> bool:
+    """Take an exclusive, NON-BLOCKING OS lock on *fd*. ``True`` if we got it.
+
+    THE KERNEL OWNS LIVENESS. An advisory lock is released when the holding
+    process exits -- cleanly, killed, or crashed -- so there is no such thing
+    as a stale lock: nothing to detect, nothing to steal, and no check-then-act
+    window in which two processes both decide to steal. Three review rounds of
+    pid-and-timestamp bookkeeping were deleted rather than corrected, because
+    each of their defects came from asking the lock FILE a question only the
+    kernel can answer, and each fix for one direction opened the other.
+
+    Non-blocking on purpose: this runs on the launcher's update poll, and a
+    loser must skip the pass rather than hold the poll thread.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        pass
+    else:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+    try:
+        import msvcrt
+    except ImportError as exc:  # pragma: no cover - neither primitive exists
+        raise LockUnsupported("neither fcntl nor msvcrt is available") from exc
+    # WINDOWS, UNVERIFIED: no Windows machine has run this code, the same
+    # standing disclosure the mobile lane carries. `msvcrt.locking` locks a
+    # byte REGION from the current file position and that region has to
+    # EXIST, so this is not the POSIX call under another name -- the caller
+    # guarantees the file is at least one byte before we get here.
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        return True
+    except OSError:
+        return False
+
+
+def _os_unlock(fd: int) -> None:
+    """Release what :func:`_os_lock` took. Never raises: the close below, and
+    ultimately process exit, releases it regardless."""
+    try:
+        import fcntl
+    except ImportError:
+        pass
+    else:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            logger.debug("tools.updater: could not release the update lock")
+        return
+    try:
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    except (ImportError, OSError):  # pragma: no cover - Windows only
+        logger.debug("tools.updater: could not release the update lock")
+
+
+def _lock_holder_note(lock_path: Path) -> str:
+    """A human-readable description of who holds the lock, for LOGS ONLY.
+
+    Nothing branches on this. That is the whole point: the previous design read
+    this body to decide whether the holder was alive and whether the lock could
+    be taken, and got a defect in each direction. It is diagnostics now, and a
+    wrong or missing answer costs a less specific log line and nothing else.
+    """
+    try:
+        body = lock_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "unknown holder"
+    head, _, stamp = body.partition(" ")
+    try:
+        held = max(0.0, time.time() - float(stamp))
+    except ValueError:
+        return "holder " + (head[:40] or "unknown")
+    return (
+        "holder " + (head[:40] or "unknown") + ", holding for " + str(int(held)) + "s"
+    )
+
+
+def _held_too_long(lock_path: Path) -> float:
+    """Seconds the current holder has held the lock, or ``0.0`` if unknown."""
+    try:
+        body = lock_path.read_text(encoding="utf-8").strip()
+        return max(0.0, time.time() - float(body.partition(" ")[2]))
+    except (OSError, ValueError):
+        return 0.0
+
+
+@contextlib.contextmanager
+def _update_lock(install_dir: Path):
+    """Serialise ``apply_update`` ACROSS PROCESSES with an OS lock.
+
+    Three launcher pids on the same install_dir can start an update at once --
+    observed 2026-09-03: two of three aborted with "release tree does not match
+    its MANIFEST.sha256", because the swap is not atomic against a concurrent
+    overlay.
+
+    Yields ``True`` when the lock was taken (released on exit from this
+    context), ``False`` otherwise -- and never raises for any of it. A caller
+    that cannot even reach the lock is contention's twin: a read-only or absent
+    install_dir, or a directory sitting on the lock path, must cost one update
+    poll rather than the launcher.
+
+    The lock FILE is never unlinked and never read to make a decision. It
+    exists so the kernel has something to lock and so a human has something to
+    read; its contents are diagnostics.
+    """
+    lock_path = install_dir / _UPDATE_LOCK_FILE
+    if lock_path.is_dir():
+        logger.warning(
+            "tools.updater: %s is a DIRECTORY, so no update can take the lock. "
+            "Remove it to let updates resume.",
+            lock_path,
+        )
+        yield False
+        return
+    fd = None
+    locked = False
+    try:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            # The region msvcrt will lock has to exist, and an empty file has
+            # no byte 0. Written BEFORE the lock and overwritten after it, so
+            # the identity in the file is always the winner's.
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+        except OSError as exc:
+            logger.warning(
+                "tools.updater: could not open an update lock in %s (%s); "
+                "skipping this pass.",
+                install_dir,
+                exc,
+            )
+            yield False
+            return
+        try:
+            locked = _os_lock(fd)
+        except LockUnsupported as exc:  # pragma: no cover - unreachable on CPython
+            # FAIL CLOSED. A skipped update costs one poll interval; a
+            # concurrent overlay corrupts the install tree.
+            logger.warning(
+                "tools.updater: no OS file locking on this platform (%s), so an "
+                "update cannot be serialised; skipping this pass.",
+                exc,
+            )
+            yield False
+            return
+        if not locked:
+            held = _held_too_long(lock_path)
+            if held > HELD_TOO_LONG_S:
+                # NOT a force-release: breaking a lock whose holder may be
+                # mid-swap is the concurrent overlay this exists to prevent,
+                # and "is the holder wedged" is the same liveness question the
+                # file has already proved it cannot answer. So this reports,
+                # and a human decides.
+                logger.critical(
+                    "tools.updater: the update lock in %s has been held for "
+                    "%.0fs (%s). This install has stopped updating; check "
+                    "whether that process is wedged.",
+                    install_dir,
+                    held,
+                    _lock_holder_note(lock_path),
+                )
+            else:
+                logger.info(
+                    "tools.updater: another process is applying an update to "
+                    "%s (%s); skipping this pass.",
+                    install_dir,
+                    _lock_holder_note(lock_path),
+                )
+            yield False
+            return
+        # Ours. Record who we are, for the log line above in some OTHER
+        # process -- never for a decision here.
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            os.write(
+                fd,
+                (
+                    str(os.getpid())
+                    + ":"
+                    + secrets.token_hex(8)
+                    + " "
+                    + str(time.time())
+                ).encode("utf-8"),
+            )
+        except OSError:
+            logger.debug("tools.updater: could not stamp the update lock")
+        yield True
+    finally:
+        if fd is not None:
+            if locked:
+                _os_unlock(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def apply_update_locked(
+    new_tree: Path, install_dir: Path, version: str = "update"
+) -> Optional[Path]:
+    """``apply_update``, serialised across OS processes (2026-09-03, D6).
+
+    Only ONE racing process actually applies; the others log a clear line and
+    return ``None`` WITHOUT raising, so a race never surfaces as a
+    "MANIFEST.sha256 does not match" abort -- it surfaces as nothing, because
+    the winner already did the work. A real apply failure still propagates
+    from :func:`apply_update` unchanged.
+    """
+    with _update_lock(install_dir) as acquired:
+        if not acquired:
+            logger.info(
+                "tools.updater: another process is already applying an update "
+                "to %s; skipping this pass.",
+                install_dir,
+            )
+            return None
+        return apply_update(new_tree, install_dir, version=version)
+
+
 def apply_update(new_tree: Path, install_dir: Path, version: str = "update") -> Path:
     """Swap the new release tree into the install, skipping every protected
     path. PRUNES files a previous release installed that this one dropped (see
@@ -1035,7 +1278,13 @@ def run_update_check(
                 # that manifest to the actual tree bytes before trusting the swap.
                 if not _manifest_binding_ok(new_tree):
                     return "error"
-                apply_update(new_tree, install_dir, version=str(remote).lstrip("vV"))
+                if (
+                    apply_update_locked(
+                        new_tree, install_dir, version=str(remote).lstrip("vV")
+                    )
+                    is None
+                ):
+                    return "update-skipped"
             _pip_install(install_dir)
             migrate_env(install_dir)
             if lock:
@@ -1068,12 +1317,14 @@ def run_update_check(
                         require=settings.qa_update_require_signature,
                         context="self-heal",
                     ) and _manifest_binding_ok(new_tree):
-                        apply_update(
+                        healed_backup = apply_update_locked(
                             new_tree,
                             install_dir,
                             version="heal-" + str(remote).lstrip("vV"),
                         )
-                        status = "healed"
+                        status = (
+                            "healed" if healed_backup is not None else "heal-skipped"
+                        )
                     else:
                         logger.warning(
                             "Self-heal aborted: release signature/manifest not "

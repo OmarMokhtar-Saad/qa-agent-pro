@@ -278,6 +278,7 @@ def verdict_line(case: object) -> str:
         "pass": "✅",
         "fail": "❌",
         "blocked": "⛔",
+        "unverified": "⚠️",
         "needs_tester": "❓",
         "needs_model": "\U0001f501",
     }
@@ -373,6 +374,20 @@ def status_block(resolved: object) -> str:
         holder = str(body.get("holder") or "")
         if holder:
             lines.append("- lease: held by session `" + holder[:40] + "`")
+        if str(body.get("state") or "") == "abandoned":
+            # Deliberately NOT the takeover wording: no other chat holds this
+            # run, so "taken over" would send a tester looking for a session
+            # that does not exist. What they need is the one call that picks
+            # it back up, spelled out.
+            lines += [
+                "",
+                "**Nothing has driven this run for "
+                + str(int(float(body.get("lease_age") or 0)))
+                + "s, so it looks abandoned.** Its finished cases are safe on "
+                "disk. To pick it up, call `qa_mobile_test` with "
+                '`run_id="' + _field(body.get("run_id"), "?") + '"` and '
+                "`continue_run=true`.",
+            ]
         explore = body.get("explore")
         if isinstance(explore, dict) and explore:
             lines.append(
@@ -457,7 +472,7 @@ def report_line(
             else "Open it in a browser: it is one self-contained file with no "
             "external assets, so it works offline. "
         )
-        + "Every screen in it is a wireframe drawn from the element bounds the "
+        + "Every screen in it is composed from the element list the "
         "server already held — no screenshot is ever taken of the emulator."
     )
 
@@ -467,6 +482,7 @@ def summary_block(
     *,
     run_id: str = "",
     partial: bool = False,
+    abandoned: bool = False,
     report_path: str = "",
     report_opened: bool = False,
     report_error: str = "",
@@ -484,7 +500,7 @@ def summary_block(
         tally[key] = tally.get(key, 0) + 1
     head = (
         "## Mobile run "
-        + ("progress" if partial else "finished")
+        + ("abandoned" if abandoned else ("progress" if partial else "finished"))
         + (" — `" + str(run_id) + "`" if run_id else "")
         + "\n\n"
     )

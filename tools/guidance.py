@@ -254,7 +254,10 @@ Generate REST-Assured / TestNG API tests into a Java project.
    WITHOUT `apply` first and show the tester the dry run. A real write needs
    `apply=true` AND a framework path AND this install configured for real
    writes -- installs ship dry-run-first, so `apply=true` alone still returns a
-   dry run. `qa-doctor` reports which of those this machine has.
+   dry run. The dry run itself names which of the three this machine is
+   missing, so read its reply rather than guessing -- `qa-doctor` does NOT
+   report the API framework path or the write flags (measured 2026-09-02; it
+   used to be pointed at here, and did not carry the answer).
 
 Never write into the tester's repo without showing them the dry run first.
 """
@@ -288,6 +291,16 @@ that only after the tester has said go, on a later turn.
    `qa_mobile_test` with the `run_id` and no session token: that takes the run
    over, and the other chat is told at its next call. `qa_mobile_status` reads
    the whole run back from disk and changes nothing.
+
+Device selection: if the tester already has an emulator running, pass its adb
+serial (e.g. `emulator-5554`) in `serial` on your NEXT `qa_mobile_test` call
+rather than letting the server guess or start a second one. Several booted
+devices come back as a numbered menu -- put it to the tester and resend with
+their pick.
+
+A reply naming "booting" or "provisioning" is not something to retry by
+calling `qa_mobile_test` again: call `qa_mobile_status` instead and keep
+polling it until it reports ready, then continue with the `run_id`.
 
 7. When the run finishes, this server writes a self-contained HTML report next
    to the run's own files and opens it. Relay the PATH it names. A report can be

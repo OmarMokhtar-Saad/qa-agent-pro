@@ -1110,6 +1110,8 @@ def build_server():
             session_token: str = "",
             apply: bool = False,
             continue_run: bool = False,
+            serial: str = "",
+            avd: str = "",
         ) -> str:
             """Run test cases, or explore freely, on an Android emulator.
 
@@ -1120,6 +1122,13 @@ def build_server():
             downloaded without it. Pass run_id to continue a run in ANY chat --
             that takes the run over and the previous chat is told. It hands you
             ONE packet at a time; answer each with qa_submit_mobile_step.
+
+            If the tester already has an emulator running, pass its adb serial
+            (e.g. `emulator-5554`) in `serial` -- that skips provisioning
+            entirely and never spawns a second one underneath it. `avd` names
+            which AVD to boot when none is running and more than one is
+            configured; leave both empty to let the server look and, if it
+            finds exactly one booted device, use it.
             """
             return await _tracked(
                 "qa_mobile_test",
@@ -1135,6 +1144,8 @@ def build_server():
                     session_token,
                     apply,
                     continue_run,
+                    serial=serial,
+                    avd=avd,
                     **_make_elicitors(ctx),
                     progress=_make_progress(ctx),
                 ),
@@ -1757,6 +1768,16 @@ def main() -> None:
     # `except` around it is exactly why this had to be deleted deliberately
     # rather than left to fail silently.
     threading.Thread(target=_drift_watch, daemon=True).start()
+    # Warm the (optional) local embeddings model off the serving path too --
+    # see tools/embeddings.warm_local_model_background. Guarded the same way
+    # as the disclosure above: an absent optional dependency must never block
+    # or crash startup.
+    try:
+        from tools.embeddings import warm_local_model_background
+
+        warm_local_model_background()
+    except Exception:  # pragma: no cover - a warm-up must never block boot
+        logger.debug("embeddings warm-up unavailable", exc_info=True)
     logger.info("Starting the qa-agents MCP server over stdio…")
     server.run(show_banner=False)
 

@@ -87,6 +87,17 @@ STATUS_NEEDS_MODEL = "needs_model"
 STATUS_NEEDS_TESTER = "needs_tester"
 STATUS_ERROR = "error"
 
+#: A "done" carrying verdict=pass that recorded no assert_pass and no screen
+#: change is not evidence of anything -- see ``_has_verification``.
+STATUS_UNVERIFIED = "unverified"
+
+#: How often ``wait`` with ``until_text`` re-dumps the screen while polling.
+WAIT_POLL_S = 1.0
+
+#: The bound for ``wait`` with ``until_text`` and no explicit ``ms`` -- keeps a
+#: script that forgot to set ms from polling forever.
+DEFAULT_WAIT_UNTIL_TEXT_S = 20.0
+
 
 @dataclasses.dataclass
 class Context:
@@ -263,13 +274,28 @@ async def _dump(ctx: Context) -> dict:
     return perception.prune(raw.get("content"), ctx.activity)
 
 
+#: The wall clock, bound at import. Tests replace `executor.time` with a fake
+#: that carries only `monotonic` to drive the duration stamp; the absolute `at`
+#: below must keep reading the REAL clock under that fake, and must stay the
+#: same clock `run_store` stamps `started`/`updated` with.
+_wall_clock = time.time
+
+
 def _entry(index: int, action: object, before: str, started: float) -> dict:
     return {
         "index": int(index),
         "action": actions_mod.redact_action(action),
         "before_screen_id": str(before or ""),
         "after_screen_id": "",
-        "ms": int(max(0.0, (time.monotonic() - started)) * 1000),
+        # Stamped by ``_append``, AFTER the action ran. Computing it here read
+        # the clock at creation, so every real run carried ``ms: 0`` -- a
+        # 4000 ms wait included -- and the report could time nothing.
+        "ms": 0,
+        "_started": float(started),
+        # Host wall clock at the moment the action BEGAN, the same clock the
+        # case checkpoint's `started`/`updated` use, so app-log evidence can be
+        # placed between actions by absolute time (plan mobile-app-evidence D6).
+        "at": _wall_clock(),
         "outcome": "",
         "detail": "",
     }
@@ -292,6 +318,50 @@ def _screen_has(screen: object, needle: str) -> bool:
             if want in " ".join(str(element.get(field) or "").split()).lower():
                 return True
     return False
+
+
+def _has_verification(trace: list[dict]) -> bool:
+    """True when *trace* holds evidence a ``done verdict=pass`` can stand on.
+
+    Either an explicit ``assert_pass``, or a mutating op whose screen changed
+    (``before_screen_id != after_screen_id`` on an ``ok`` entry) counts. A
+    trace with neither is not proof of anything, however confident the
+    model's own ``reason`` text sounds.
+    """
+    for item in trace:
+        outcome = str(item.get("outcome") or "")
+        if outcome == "assert_pass":
+            return True
+        if outcome == "ok":
+            before = str(item.get("before_screen_id") or "")
+            after = str(item.get("after_screen_id") or "")
+            if before and after and before != after:
+                return True
+    return False
+
+
+async def _wait_until_text(
+    ctx: Context, screen: object, text: str, ms: int
+) -> tuple[bool, object, bool]:
+    """Poll the screen until *text* appears or the budget runs out.
+
+    Returns ``(found, latest_screen, timed_out)``. ``ms`` is the caller's cap;
+    ``0`` falls back to :data:`DEFAULT_WAIT_UNTIL_TEXT_S` so a script that
+    forgot to set it does not poll forever.
+    """
+    budget = (ms / 1000.0) if ms else DEFAULT_WAIT_UNTIL_TEXT_S
+    deadline = time.monotonic() + budget
+    current = screen
+    while True:
+        if _screen_has(current, text):
+            return True, current, False
+        if time.monotonic() >= deadline:
+            return False, current, True
+        await _sleep(WAIT_POLL_S)
+        dumped = await _dump(ctx)
+        if dumped.get("error"):
+            return False, current, True
+        current = dumped.get("content")
 
 
 def _center(element: dict) -> tuple[int, int] | None:
@@ -351,8 +421,17 @@ async def replay(script: object, ctx: Context) -> dict:
 
             # --- terminal ops -------------------------------------------------
             if op == "done":
+                verdict = str(getattr(action, "verdict", ""))
+                reason = str(getattr(action, "reason", ""))[:400]
+                if verdict == "pass" and not _has_verification(trace):
+                    verdict = STATUS_UNVERIFIED
+                    reason = (
+                        "verdict=pass was not accepted: this case's trace has "
+                        "no assert_pass and no screen change, so nothing was "
+                        "verified. " + reason
+                    ).strip()
                 entry["outcome"] = "done"
-                entry["detail"] = str(getattr(action, "reason", ""))[:400]
+                entry["detail"] = reason
                 entry["after_screen_id"] = _screen_id(screen)
                 _append(trace, entry)
                 return {
@@ -361,8 +440,8 @@ async def replay(script: object, ctx: Context) -> dict:
                         STATUS_DONE,
                         trace,
                         screen,
-                        str(getattr(action, "verdict", "")),
-                        entry["detail"],
+                        verdict,
+                        reason,
                         index,
                     ),
                 }
@@ -481,6 +560,43 @@ async def replay(script: object, ctx: Context) -> dict:
                     ),
                 }
 
+            # --- wait / until_text ---------------------------------------------
+            if op == "wait":
+                until_text = str(getattr(action, "until_text", "") or "").strip()
+                ms = int(getattr(action, "ms", 0) or 0)
+                if until_text:
+                    found, screen, _timed_out = await _wait_until_text(
+                        ctx, screen, until_text, ms
+                    )
+                    entry["outcome"] = "ok" if found else "wait_timeout"
+                    entry["detail"] = (
+                        "found " + repr(until_text[:120])
+                        if found
+                        else "timed out waiting for " + repr(until_text[:120])
+                    )
+                    entry["after_screen_id"] = _screen_id(screen)
+                    _append(trace, entry)
+                    if found:
+                        continue
+                    return {
+                        "error": None,
+                        "content": _result(
+                            STATUS_NEEDS_MODEL,
+                            trace,
+                            screen,
+                            "",
+                            entry["detail"],
+                            index,
+                        ),
+                    }
+                if ms:
+                    await _sleep(ms / 1000.0)
+                entry["outcome"] = "ok"
+                entry["detail"] = "waited " + str(ms) + "ms"
+                entry["after_screen_id"] = _screen_id(screen)
+                _append(trace, entry)
+                continue
+
             # --- device ops ---------------------------------------------------
             outcome = await _perform(op, action, element, ctx)
             if outcome.get("error"):
@@ -498,6 +614,7 @@ async def replay(script: object, ctx: Context) -> dict:
             entry["detail"] = str((outcome.get("content") or {}).get("detail") or "")
 
             if op in actions_mod.MUTATING_OPS:
+                before_id = str(entry.get("before_screen_id") or "")
                 dumped = await _dump(ctx)
                 if dumped.get("error"):
                     entry["outcome"] = "dump_failed"
@@ -510,17 +627,30 @@ async def replay(script: object, ctx: Context) -> dict:
                         ),
                     }
                 screen = dumped.get("content")
+                if _screen_id(screen) == before_id:
+                    entry["outcome"] = "no_change"
             entry["after_screen_id"] = _screen_id(screen)
             _append(trace, entry)
 
+        # A script that never calls done() lands here. It used to hand back an
+        # empty verdict, which `case_runner` reads as PASS -- so omitting one
+        # word bypassed the whole verification rule the done() branch enforces.
+        # The same rule applies on both exits or it is not a rule.
+        ended_verified = _has_verification(trace)
         return {
             "error": None,
             "content": _result(
                 STATUS_DONE,
                 trace,
                 screen,
-                "",
-                "The script finished without a done() action.",
+                "" if ended_verified else STATUS_UNVERIFIED,
+                "The script finished without a done() action."
+                + (
+                    ""
+                    if ended_verified
+                    else " Nothing in it asserted anything or changed the screen,"
+                    " so there is no evidence this case passed."
+                ),
                 len(items) - 1,
             ),
         }
@@ -530,6 +660,11 @@ async def replay(script: object, ctx: Context) -> dict:
 
 
 def _append(trace: list[dict], entry: dict) -> None:
+    """Stamp the action's duration and keep the entry. The private ``_started``
+    mark never reaches the trace: it is popped here, on every path."""
+    started = entry.pop("_started", None)
+    if started is not None:
+        entry["ms"] = int(max(0.0, time.monotonic() - float(started)) * 1000)
     if len(trace) < MAX_TRACE:
         trace.append(entry)
 

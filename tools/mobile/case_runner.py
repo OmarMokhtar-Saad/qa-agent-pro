@@ -21,6 +21,7 @@ import time
 
 from tools.mobile import actions as actions_mod
 from tools.mobile import adb, executor, perception, run_store
+from tools.mobile_evidence import capture
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,11 @@ MAX_ESCAPES = 3
 VERDICT_PASS = "pass"
 VERDICT_FAIL = "fail"
 VERDICT_BLOCKED = "blocked"
+#: Ran, but proved nothing: no assert passed and no action moved the screen.
+#: Deliberately NOT folded into `blocked`, which means the case could not be
+#: attempted -- this one WAS attempted and produced no evidence, and a tester
+#: reading "blocked" would go looking for an obstacle that does not exist.
+VERDICT_UNVERIFIED = "unverified"
 NEEDS_MODEL = "needs_model"
 NEEDS_TESTER = "needs_tester"
 
@@ -115,6 +121,13 @@ async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
         stopped = await adb.force_stop(ctx.serial, ctx.package)
         if stopped.get("error"):
             return stopped
+        # App evidence (plan D5): the ring buffer is cleared BETWEEN the stop
+        # and the launch, so a slice begins with the app's own start-up. With
+        # no profile for this package, or the flag off, ``begin_case`` makes
+        # no adb call and says why; a failure here never blocks the case.
+        evidence = _evidence_record(
+            await capture.begin_case(ctx.serial, ctx.package, run_id, tc_id)
+        )
         launched = await adb.launch(ctx.serial, ctx.package)
         if launched.get("error"):
             return launched
@@ -149,6 +162,7 @@ async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
                 "escapes": used,
                 "screen_id": screen.get("screen_id") or "",
                 "started": time.time(),
+                "evidence": evidence,
             },
         )
         return {
@@ -219,12 +233,22 @@ async def submit_case(
         used = escapes_used(run_id, tc_id)
         if new_screen:
             run_store.write_screen(run_id, new_screen)
+        # App evidence (plan D5): ONE slice per replay, after the trace is
+        # final and before the checkpoint that carries the record forward.
+        # The refused-script path above never reaches here: nothing ran, so
+        # there is nothing to slice.
+        await _slice_evidence(run_id, tc_id, ctx)
 
         from agents import mobile_run
 
         if status == executor.STATUS_DONE:
             verdict = str(result.get("verdict") or "") or VERDICT_PASS
-            if verdict not in (VERDICT_PASS, VERDICT_FAIL, VERDICT_BLOCKED):
+            if verdict not in (
+                VERDICT_PASS,
+                VERDICT_FAIL,
+                VERDICT_BLOCKED,
+                VERDICT_UNVERIFIED,
+            ):
                 verdict = VERDICT_BLOCKED
             return {
                 "error": None,
@@ -346,6 +370,13 @@ def _checkpoint(
     ALSO returned to the caller and rendered, and only one of those two paths
     goes through the store.
     """
+    # Carried FORWARD from the planning checkpoint, which this body replaces
+    # whole: the case's start time and its evidence record (plan D6). Without
+    # this, ``started`` survived only until the first submit -- and the join
+    # window needs both ends.
+    prior = (run_store.read_case(run_id, tc_id) or {}).get("content")
+    prior = prior if isinstance(prior, dict) else {}
+    now = time.time()
     body = {
         "tc_id": tc_id,
         "title": view.get("title") or "",
@@ -354,10 +385,85 @@ def _checkpoint(
         "reason": str(reason or "")[:1200],
         "trace": trace,
         "escapes": int(escapes),
-        "updated": time.time(),
+        "started": prior.get("started") or now,
+        "updated": now,
+        "evidence": _evidence_record(prior.get("evidence")),
     }
     written = run_store.write_case(run_id, tc_id, body)
     payload = dict(body)
     payload["packet"] = packet
     payload["checkpoint_error"] = written.get("error")
     return payload
+
+
+def _evidence_record(source: object) -> dict:
+    """The case's evidence record, normalised from ``capture.begin_case``'s
+    reply OR from a record already on disk. Every key present, so the report
+    never reads a missing one, and the slice counter is an int."""
+    holder = source if isinstance(source, dict) else {}
+    body = holder.get("content") if "content" in holder else holder
+    body = body if isinstance(body, dict) else {}
+    try:
+        slices = max(0, int(body.get("slices") or 0))
+    except (TypeError, ValueError):
+        slices = 0
+    written = body.get("slices_written")
+    return {
+        "profile": body.get("profile"),
+        "clock_offset_ms": body.get("clock_offset_ms"),
+        "pid": body.get("pid"),
+        "skipped": body.get("skipped") or holder.get("error") or None,
+        "slices": slices,
+        "slices_written": list(written) if isinstance(written, list) else [],
+    }
+
+
+async def _slice_evidence(run_id: str, tc_id: str, ctx: executor.Context) -> None:
+    """Take this replay's logcat slice and record it on the case (plan D5).
+
+    Reads the record ``start_case`` left, asks ``capture`` for the slice --
+    which redacts the tester's typed values BEFORE anything reaches disk (plan
+    D4) -- and writes the updated record back so the checkpoint that follows
+    carries it forward. A skipped or failed slice is stored as such; it can
+    never change a verdict, which is why every exception ends here.
+    """
+    try:
+        prior = (run_store.read_case(run_id, tc_id) or {}).get("content")
+        prior = prior if isinstance(prior, dict) else {}
+        evidence = _evidence_record(prior.get("evidence"))
+        if evidence.get("skipped"):
+            return
+        # H2: the typed values must ALSO be known at run end, when the app's own
+        # event log is pulled; remembered in memory only, never on disk.
+        capture.remember_typed(run_id, (ctx.tester_inputs or {}).values())
+        sliced = await capture.slice_case(
+            ctx.serial,
+            ctx.package,
+            run_id,
+            tc_id,
+            evidence["slices"],
+            begin=evidence,
+            tester_inputs=ctx.tester_inputs,
+        )
+        content = sliced.get("content") if isinstance(sliced, dict) else None
+        content = content if isinstance(content, dict) else {}
+        evidence["slices"] += 1
+        evidence["slices_written"].append(
+            {
+                "index": evidence["slices"] - 1,
+                "path": str(content.get("path") or ""),
+                "lines": content.get("lines"),
+                "truncated": bool(content.get("truncated")),
+                "skipped": content.get("skipped")
+                or (sliced.get("error") if isinstance(sliced, dict) else None),
+            }
+        )
+        # NEVER write a document read before an await. A checkpoint may have
+        # landed while the device was being read; the fresh copy carries its
+        # verdict and trace, and only the evidence record is spliced in.
+        fresh = (run_store.read_case(run_id, tc_id) or {}).get("content")
+        fresh = fresh if isinstance(fresh, dict) else prior
+        fresh["evidence"] = evidence
+        run_store.write_case(run_id, tc_id, fresh)
+    except Exception:  # never-raise: evidence is not a verdict
+        logger.exception("mobile.case_runner._slice_evidence failed")
