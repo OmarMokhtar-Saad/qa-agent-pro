@@ -1090,11 +1090,18 @@ def build_server():
 
     # The mobile emulator lane. ONE call, and nothing else may join it here:
     # `_mobile_lane_enabled()` already carries both terms (the
-    # QA_MOBILE_RUN_ENABLED kill-switch AND not-test-cases-only, because
-    # tools/mobile is deliberately absent from the distribution build), and a
-    # gate copied with one of its two conjuncts has shipped in this project
-    # before. tests/mobile/test_mobile_registration.py parses this file and
-    # fails if this `if` becomes anything other than a call to that predicate.
+    # QA_MOBILE_RUN_ENABLED kill-switch AND `_mobile_modules_present()`, which
+    # checks tools/mobile is really on disk -- a build made before the qa-ime
+    # release was pinned ships none of it), and a gate copied with one of its
+    # two conjuncts has shipped in this project before.
+    # tests/mobile/test_mobile_registration.py parses this file and fails if
+    # this `if` becomes anything other than a call to that predicate.
+    #
+    # It carried a THIRD term, `not _test_cases_only()`, until 2026-09-04. That
+    # is an edition label decided by whether the bug-report and coach agents
+    # shipped, and it made the lane unreachable on every distribution build:
+    # v1.77.0 registered none of these three tools while its own README
+    # promised all three. Do not re-add it here or in the predicate.
     if mcp_handlers._mobile_lane_enabled():
 
         @mcp.tool()
