@@ -52,7 +52,13 @@ from agents.test_scenario_agent import (
     _prepare_generation,
 )
 from config.settings import settings
-from tools import case_quality_gate, prep_store, step_assertion, telemetry
+from tools import (
+    case_quality_gate,
+    handover_cost,
+    prep_store,
+    step_assertion,
+    telemetry,
+)
 from tools.audit_log import record_event
 from tools.build_fingerprint import code_fingerprint
 from tools.csv_exporter import generate_test_case_csv
@@ -6187,6 +6193,19 @@ def render_prepare_payload(result: PreparePayloadResult) -> str:
         body,
         "```",
     ]
+    # What this handover will cost the TESTER's own chat model. Computed from
+    # the payload being returned in THIS call -- there is no meter and nothing
+    # accumulates, which is the shape difference from the deleted
+    # tools/token_meter.py (see tools/handover_cost.py's module docstring).
+    # Image figures come from `_kept_image_bytes`, i.e. POST-budget: the raw
+    # attachment list is not what ships.
+    _img_n, _img_b = _kept_image_bytes(result.images)
+    parts += [
+        "",
+        handover_cost.handover_line(
+            result.payload, image_count=_img_n, image_bytes=_img_b
+        ),
+    ]
     if result.notice:
         parts += ["", result.notice]
     return "\n".join(parts)
@@ -6252,6 +6271,35 @@ def _budget_keep_flags(images: list) -> tuple[list[bool], list[str]]:
         kept_n += 1
         flags.append(True)
     return flags, dropped
+
+
+def _kept_image_bytes(images: list) -> tuple[int, int]:
+    """``(count, raw_bytes)`` for the images that will ACTUALLY ride on this
+    reply.
+
+    Decided by ``_budget_keep_flags`` -- the very function that later drops
+    them -- so the handover disclosure cannot bill the tester for an
+    attachment the per-result byte budget or the ``jira_max_images`` count cap
+    refuses. A second copy of those rules would drift; this has no copy at all.
+    Never raises: a count may not break a prepare, and 0 under-reports rather
+    than inventing bytes.
+    """
+    try:
+        imgs = list(images or [])
+        flags, _dropped = _budget_keep_flags(imgs)
+        total = 0
+        kept = 0
+        for img, ok in zip(imgs, flags):
+            if not ok:
+                continue
+            kept += 1
+            data = img.get("data")
+            if isinstance(data, (bytes, bytearray)):
+                total += len(data)
+        return (kept, total)
+    except Exception:  # pragma: no cover - a count never breaks a prepare
+        logger.debug("counting the images that ship failed", exc_info=True)
+        return (0, 0)
 
 
 def _shipped_capture_count(images: list, captured: list) -> int:
@@ -6488,6 +6536,20 @@ def assemble_prepare_payload(
         text_blocks = _split_prepare_text_blocks(
             result.payload, result.prep_id, result.notice
         )
+        # The split path does NOT go through render_prepare_payload, so the
+        # handover-cost block has to be attached here as well -- otherwise the
+        # LARGEST payloads, the ones actually worth disclosing, are the only
+        # ones that disclose nothing. Single-block payloads get it from the
+        # renderer, so it is never added twice.
+        _split_img_n, _split_img_b = _kept_image_bytes(result.images)
+        text_blocks = [
+            *text_blocks,
+            handover_cost.handover_line(
+                result.payload,
+                image_count=_split_img_n,
+                image_bytes=_split_img_b,
+            ),
+        ]
     if disclosure:
         text_blocks = [*text_blocks, disclosure]
     return (text_blocks, image_specs)
@@ -10081,8 +10143,8 @@ async def handle_submit_suite(
         if _nli_suppressed and list(getattr(prepared, "checklist_items", None) or []):
             nli_note = (
                 "> \u2139\ufe0f  The OPTIONAL checklist **entailment / "
-                "adjudication** tiers did **not** run: they are server-side LLM "
-                "calls and this is a host-mode submit. Requirement coverage "
+                "adjudication** tiers did **not** run: they are retired and no "
+                "submit of any kind can reach them. Requirement coverage "
                 "below is the DETERMINISTIC matcher's own measurement, so the "
                 "ambiguous similarity band is reported as uncovered instead of "
                 "being re-judged -- you may see MORE gaps than with those tiers "
@@ -10258,9 +10320,8 @@ async def handle_submit_suite(
         ):
             fa_skip_note = (
                 "> \u2139\ufe0f  Feature Analysis report SKIPPED for this "
-                "host-mode submit (it is a server-side LLM call -- 42.0s on the "
-                "2026-07-30 run). Call `qa_feature_analysis` on demand if you "
-                "want it.\n\n"
+                "host-mode submit. Call `qa_feature_analysis` on demand if "
+                "you want it -- it is chat-only, like everything else here.\n\n"
             )
         summary, _x, _c, _t, status = await _finalize_generation(
             prepared,
@@ -11510,10 +11571,14 @@ async def handle_mobile_test(
                 # Two start arguments implying different lanes ask the NARROW
                 # question; nothing given asks the menu. One entry point, so a
                 # conflict cannot be rendered by an untested path.
+                # `source` reaches here ONLY when it matched no option key --
+                # `_mobile_pick_source` returns the key for everything it
+                # recognises -- so passing it cannot mislabel a good answer.
                 return mobile_render.source_menu_markdown(
                     conflict=mobile_render.implied_sources(
                         suite_id=suite_id, goal=goal, cases=cases
-                    )
+                    ),
+                    unmatched=source,
                 )
             reply, handed_off = await _mobile_start(
                 picked,

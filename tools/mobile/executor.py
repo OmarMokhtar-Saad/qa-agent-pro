@@ -396,10 +396,32 @@ AMBIGUOUS_ROLE_PREFIX = "That role matched "
 
 
 def ambiguous_role_detail(count: object) -> str:
-    """Their message, kept verbatim: the role was SEEN and not narrowed."""
+    """Their message, kept verbatim: the role was SEEN and not narrowed.
+
+    ``count`` is coerced rather than trusted. It used to be ``str(int(count))``,
+    and this module's contract is that it never raises -- a fuzz over 20 inputs
+    raised on 18 of them. No caller can reach that today (the only one passes
+    ``resolution["candidates"]``, already an int), so this changes no shipped
+    message; it removes a way for a future caller to turn a helpful refusal
+    into an unhandled exception halfway through a replay.
+
+    An unusable count degrades to the word rather than to a NUMBER: "matched 0
+    tappable controls" would be a false statement, and the one thing actually
+    known when the count cannot be read is that there was more than one.
+    """
+    try:
+        shown = str(int(count))
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is the one this batch's own fuzz caught, in the FIX
+        # rather than in the original: `int(float("inf"))` raises it, and it
+        # is neither a TypeError nor a ValueError, so a two-exception guard
+        # written for a never-raise contract still raised. `nan` goes to
+        # ValueError and was already covered, which is exactly why reading
+        # the guard was not enough to judge it.
+        shown = "several"
     return (
         AMBIGUOUS_ROLE_PREFIX
-        + str(int(count))
+        + shown
         + " tappable controls on this screen, so the replay stopped rather "
         "than guessing which you meant. Name one of them by its label, its "
         "rid or its short id."
@@ -1256,7 +1278,13 @@ def _actuated(trace: object) -> bool:
     case ``MAX_FREE_STOPS`` was added to protect, while this docstring claimed
     the opposite.
     """
-    for entry in list(trace or []):
+    # `list(trace)` RAISES on a non-iterable -- `_actuated(5)` was a TypeError,
+    # against this module's never-raise contract. The coercion is the same
+    # shape every other reader here uses: anything that is not a sequence of
+    # entries is no entries. Unreachable from today's callers, which pass the
+    # trace list they just built.
+    entries = trace if isinstance(trace, (list, tuple)) else []
+    for entry in entries:
         if not isinstance(entry, dict):
             continue
         if str(entry.get("outcome") or "") not in ("ok", "no_change"):

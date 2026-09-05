@@ -807,12 +807,16 @@ def resolve_target(target: object, pruned: object) -> dict:
                 "content": _miss(stale=True, supplied=supplied, stale_selectors=missed),
             }
 
-        # Elements satisfying EVERY supplied selector, compared by content.
-        seeds: set | None = None
+        # Elements satisfying EVERY supplied selector. Compared by the ASSIGNED
+        # id (see `_identity`): the content seed omits `clickable`, so a
+        # clickable wrapper and its non-clickable child are one bucket to it,
+        # and a target could be answered by an element only ONE of its
+        # selectors matched.
+        agreed_ids: set | None = None
         for group in matched.values():
-            group_seeds = {_seed(element) for element in group}
-            seeds = group_seeds if seeds is None else (seeds & group_seeds)
-        if not seeds:
+            group_ids = {_identity(element) for element in group}
+            agreed_ids = group_ids if agreed_ids is None else (agreed_ids & group_ids)
+        if not agreed_ids:
             return {
                 "error": None,
                 "content": _miss(conflict=True, supplied=supplied),
@@ -820,7 +824,7 @@ def resolve_target(target: object, pruned: object) -> dict:
 
         order = {name: index for index, name in enumerate(SELECTORS)}
         narrowest = min(matched, key=lambda name: (len(matched[name]), order[name]))
-        agreed = [e for e in matched[narrowest] if _seed(e) in seeds]
+        agreed = [e for e in matched[narrowest] if _identity(e) in agreed_ids]
         # THEIR clickable preference: the tap target is the wrapper, and the
         # element carrying the word is often its non-clickable child.
         tappable = [e for e in agreed if e.get("clickable")]
@@ -846,18 +850,48 @@ def resolve_target(target: object, pruned: object) -> dict:
         return {"error": str(exc), "content": None}
 
 
-def _seed(element: object) -> str:
-    """One element's content identity, from ``perception``'s own expression.
+def _identity(element: object) -> str:
+    """One element's identity WITHIN one dump, for the cross-selector check.
+
+    A CONTENT comparison rather than ``is``: a screen that has round-tripped
+    through the run store's JSON is the same screen, and object identity would
+    call two views of one element a conflict.
+
+    **It is the ASSIGNED id, not the content seed, and the difference is a
+    confirmed defect.** ``perception.element_seed`` is five observables --
+    ``cls``, ``text``, ``desc``, ``rid``, ``bounds`` -- and it omits
+    ``clickable``, ``role`` and ``label``. Two elements CAN share all five: the
+    clickable wrapper of a chat Send control and the non-clickable child it
+    wraps do, which is the very shape ``perception.label_of``'s docstring
+    describes on the 2026-09-04 screen. ``label_of`` borrows a label only for a
+    TAPPABLE element, so those seed twins get DIFFERENT roles -- and a seed
+    intersection then treats them as one element. Measured on such a screen
+    before this change: ``{"id": <child>, "role": "send"}`` returned the child,
+    ``clickable=False`` and ``role=""``, with ``how="id"`` and
+    ``conflict=False`` -- an element the ``role`` selector does not match at
+    all. Six of 34 hits over the full selector enumeration were that shape.
+
+    ``_assign_ids`` runs inside ``prune``, BEFORE anything resolves, and gives
+    a colliding element an ordinal suffix (``eX``, ``eX-2``), so the id is
+    unique per dump BY CONSTRUCTION. Intersecting on it makes "a hit means
+    every supplied selector agreed" true rather than merely documented; the
+    twin pair above now answers ``conflict``, which is what two selectors
+    naming different elements has always meant.
+
+    Falls back to the seed when an element carries no id, so a hand-built
+    screen that never went through ``prune`` still compares by content rather
+    than collapsing every element into one empty bucket.
 
     Imported inside the function because ``actions`` must stay importable on
     its own. ``perception`` does not import ``actions``, so there is no cycle.
-    A CONTENT comparison rather than ``is``: a screen that has round-tripped
-    through the run store's JSON is the same screen, and identity would call
-    two views of one element a conflict.
     """
     from tools.mobile import perception
 
-    return perception.element_seed(element)
+    body = element if isinstance(element, dict) else {}
+    assigned = str(body.get("id") or "").strip()
+    if assigned:
+        return "id:" + assigned
+    return "seed:" + perception.element_seed(element)
 
 
 def _hit(element: dict, how: str, candidates: int) -> dict:

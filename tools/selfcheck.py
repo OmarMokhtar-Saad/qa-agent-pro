@@ -219,6 +219,22 @@ _MODEL = re.compile(
     re.I,
 )
 
+#: A reply that CLAIMS this server runs, or would run, a model. Distinct from
+#: ``_MODEL``, which catches a model being NAMED: these are claims about where
+#: the work happens, and both live instances said a feature was skipped or
+#: unavailable BECAUSE of a server-side call that has not existed since P2-G.
+#:
+#: Precise on purpose. Measured over the 24 surfaces a real pass collects: this
+#: form matches ZERO of the three live denials (``instructions``,
+#: ``tool:qa_bug_report``, ``tool:qa_explore_step``, all "no model call"), while
+#: broadening it to ``model call`` matches all three. An earlier design tried to
+#: keep the loose form and exclude negations; measured, the exclusion suppressed
+#: nothing, so precision does the work instead of machinery.
+_SERVER_MODEL_CLAIM = re.compile(
+    r"server[- ]side (?:LLM|model) call|server (?:LLM|model) call",
+    re.I,
+)
+
 #: Hosts the egress guard lets through. ``adb`` reaches its server on
 #: 127.0.0.1:5037 and device listing is a reply surface worth scanning.
 _LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost", ""})
@@ -234,6 +250,7 @@ KINDS: tuple = (
     "dead_module",
     "absent_llm_symbol",
     "model_reference",
+    "server_model_claim",
     "unregistered_tool",
     "invocation_error",
 )
@@ -633,6 +650,9 @@ def scan(
         for hit in sorted({m.group(0) for m in _MODEL.finditer(text)}):
             model_tokens.add(hit)
             findings.append(Finding("model_reference", surface, hit))
+        for hit in sorted({m.group(0) for m in _SERVER_MODEL_CLAIM.finditer(text)}):
+            model_tokens.add(hit)
+            findings.append(Finding("server_model_claim", surface, hit))
         for name in sorted(set(_TOOL.findall(text))):
             tool_mentions.add(name)
             if name not in registered:
