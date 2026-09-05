@@ -469,7 +469,7 @@ def orphan_case_ids(acs: list, test_cases: list, *, cap: int = 20) -> list:
         _ac_to_tcs, orphan_tc_ids = _trace_map(acs, test_cases)
         try:
             limit = max(0, int(cap))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             limit = 20
         return [str(t) for t in orphan_tc_ids][:limit]
     except Exception:

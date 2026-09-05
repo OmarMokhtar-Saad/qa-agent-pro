@@ -866,11 +866,10 @@ def _lock_holder_note(lock_path: Path) -> str:
     head, _, stamp = body.partition(" ")
     try:
         held = max(0.0, time.time() - float(stamp))
-    except ValueError:
+        seconds = str(int(held))
+    except (ValueError, OverflowError):
         return "holder " + (head[:40] or "unknown")
-    return (
-        "holder " + (head[:40] or "unknown") + ", holding for " + str(int(held)) + "s"
-    )
+    return "holder " + (head[:40] or "unknown") + ", holding for " + seconds + "s"
 
 
 def _held_too_long(lock_path: Path) -> float:

@@ -4045,7 +4045,7 @@ def build_dup_shortlist_section(pairs: list) -> str:
             t_b = _shortlist_safe(p.get("title_b"), _DUP_SHORTLIST_TITLE_CHARS)
             try:
                 ratio = float(p.get("ratio") or 0.0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 ratio = 0.0
             lines.append(
                 f'- `{id_a}` "{t_a}" ~ `{id_b}` "{t_b}" (lexical agreement {ratio:.2f})'
@@ -4120,7 +4120,7 @@ def build_dup_contradiction_headline(found: int, total: int) -> str:
     """
     try:
         n = int(found)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return ""
     if n <= 0:
         return ""
@@ -4134,7 +4134,7 @@ def build_dup_contradiction_headline(found: int, total: int) -> str:
                 f" {int(total)} pair(s) cleared the bar in all; only the "
                 f"closest {n} are listed."
             )
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         more = ""
     return (
         "> \u267b\ufe0f  **That duplicate review is CONTRADICTED by the "
@@ -4180,7 +4180,7 @@ def build_dup_contradiction_pairs(pairs: list) -> str:
         for p in rows[:_DUP_SHORTLIST_MAX_PAIRS]:
             try:
                 ratio = float(p.get("ratio") or 0.0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 ratio = 0.0
             id_a = _shortlist_safe(p.get("id_a"), 16)
             id_b = _shortlist_safe(p.get("id_b"), 16)
@@ -4213,7 +4213,7 @@ def _removal_ratio() -> float:
                 settings, "qa_host_dedup_max_removal_ratio", _DUP_REMOVAL_RATIO_DEFAULT
             )
         )
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         cfg = _DUP_REMOVAL_RATIO_DEFAULT
     return max(0.0, min(_DUP_REMOVAL_RATIO_CEILING, cfg))
 
@@ -4225,7 +4225,7 @@ def _low_text_ratio() -> float:
         cfg = float(
             getattr(settings, "qa_host_dedup_low_text_ratio", _DUP_LOW_TEXT_DEFAULT)
         )
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         cfg = _DUP_LOW_TEXT_DEFAULT
     return max(0.0, min(1.0, cfg))
 
@@ -4352,14 +4352,14 @@ def _extract_duplicate_groups(raw, valid_ids) -> tuple[list, list]:
                 getattr(settings, "qa_host_dedup_max_groups", _DUP_MAX_GROUPS)
                 or _DUP_MAX_GROUPS
             )
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             cfg_groups = _DUP_MAX_GROUPS
         try:
             cfg_size = int(
                 getattr(settings, "qa_host_dedup_max_group_size", _DUP_MAX_GROUP_SIZE)
                 or _DUP_MAX_GROUP_SIZE
             )
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             cfg_size = _DUP_MAX_GROUP_SIZE
         max_groups = min(_DUP_MAX_GROUPS, max(1, cfg_groups))
         max_size = min(_DUP_MAX_GROUP_SIZE, max(2, cfg_size))

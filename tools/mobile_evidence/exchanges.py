@@ -56,9 +56,11 @@ def dur_ms(ms: object) -> str:
         return ""
     try:
         number = float(ms)
-    except (TypeError, ValueError):
+        # Inside the guard: `round` is a coercer too, and a value the
+        # guard just admitted may be infinite.
+        return "%d ms" % round(number) if number < 1000 else "%.1fs" % (number / 1000.0)
+    except (TypeError, ValueError, OverflowError):
         return ""
-    return "%d ms" % round(number) if number < 1000 else "%.1fs" % (number / 1000.0)
 
 
 def fmt_ms(ms: object) -> str:
@@ -66,7 +68,7 @@ def fmt_ms(ms: object) -> str:
         return "\u2014"
     try:
         number = float(ms)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return "\u2014"
     if number < 60000:
         return "%.1fs" % (number / 1000)

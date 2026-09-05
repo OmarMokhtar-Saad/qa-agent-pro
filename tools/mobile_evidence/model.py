@@ -83,7 +83,7 @@ def price(
         rate_in, rate_out = float(pair[0]), float(pair[1])
         count_in = float(tokens_in or 0)
         count_out = float(tokens_out or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return count_in / 1e6 * rate_in + count_out / 1e6 * rate_out
 

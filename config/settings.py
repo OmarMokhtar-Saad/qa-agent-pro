@@ -14,6 +14,7 @@ and so on.
 from __future__ import annotations
 
 import logging
+import math
 
 from dotenv import load_dotenv
 from pydantic import ValidationError, field_validator
@@ -1262,20 +1263,8 @@ class Settings(BaseSettings):
             v, info.field_name, raw_default if isinstance(raw_default, bool) else False
         )
 
-    @field_validator("qa_rag_similarity_threshold", mode="before")
-    @classmethod
-    def _coerce_threshold(cls, v: object) -> float:
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            return float(v)
-        try:
-            return float(str(v).strip())
-        except (TypeError, ValueError):
-            logger.warning(
-                "Invalid QA_RAG_SIMILARITY_THRESHOLD=%r — using default 0.3", v
-            )
-            return 0.3
-
     @field_validator(
+        "qa_rag_similarity_threshold",
         "qa_checklist_match_high",
         "qa_checklist_match_medium",
         "qa_checklist_min_granularity",
@@ -1289,6 +1278,15 @@ class Settings(BaseSettings):
         2026-07-30 -- it belongs here rather than with the reconciler
         thresholds precisely BECAUSE this group clamps).
 
+        QA_RAG_SIMILARITY_THRESHOLD joined this group rather than
+        keeping its own validator, which had no range check at all.
+        Measured: a finite, perfectly parseable
+        QA_RAG_SIMILARITY_THRESHOLD=75 made every `score >= threshold`
+        False -- the same silent grounding shutdown the finiteness
+        guard below was written for, reached through a wider door on
+        the same field. It is a similarity SCORE, so the property that
+        binds it is the same one that binds the others.
+
         Mirrors _coerce_jira_int: an unparseable value is logged and replaced
         with the field's declared default rather than raising.
 
@@ -1300,20 +1298,38 @@ class Settings(BaseSettings):
         for a perfectly good suite.
         """
         default = cls.model_fields[info.field_name].default
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            parsed = float(v)
-        else:
-            try:
+        try:
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                parsed = float(v)
+            else:
                 parsed = float(str(v).strip())
-            except (TypeError, ValueError):
-                logger.warning(
-                    "Invalid %s=%r — using default %s",
-                    info.field_name.upper(),
-                    v,
-                    default,
-                )
-                return default
-        if parsed < 0.0 or parsed > 1.0:
+        except (TypeError, ValueError, OverflowError):
+            logger.warning(
+                "Invalid %s=%r — using default %s",
+                info.field_name.upper(),
+                v,
+                default,
+            )
+            return default
+        if not math.isfinite(parsed):
+            # A string never overflows float(), it returns inf or nan -- and
+            # nan fails EVERY comparison, so a range check alone lets it
+            # through. QA_RAG_SIMILARITY_THRESHOLD=nan made every
+            # `score >= threshold` False and turned RAG grounding off in
+            # silence, because the coercer had succeeded.
+            logger.warning(
+                "Invalid %s=%r (not a finite number) — using default %s",
+                info.field_name.upper(),
+                v,
+                default,
+            )
+            return default
+        # A TOTAL comparison rather than `parsed < 0.0 or parsed > 1.0`, which NaN
+        # defeats by failing both halves. Defence in depth only, and measured as
+        # such: with the finiteness guard above running first, reverting this
+        # line to the partial form changes nothing and no test can kill it.
+        # It is here for the day the guards are reordered, not as a bound.
+        if not (0.0 <= parsed <= 1.0):
             clamped = min(1.0, max(0.0, parsed))
             logger.warning(
                 "%s=%r is outside the valid [0, 1] range — clamping to %s",
@@ -1341,11 +1357,12 @@ class Settings(BaseSettings):
         surviving fields' coercion behaviour is unchanged.
         """
         default = cls.model_fields[info.field_name].default
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            return float(v)
         try:
-            return float(str(v).strip())
-        except (TypeError, ValueError):
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                parsed = float(v)
+            else:
+                parsed = float(str(v).strip())
+        except (TypeError, ValueError, OverflowError):
             logger.warning(
                 "Invalid %s=%r — using default %s",
                 info.field_name.upper(),
@@ -1353,6 +1370,20 @@ class Settings(BaseSettings):
                 default,
             )
             return default
+        if not math.isfinite(parsed):
+            # A string never overflows float(), it returns inf or nan -- and
+            # nan fails EVERY comparison, so a range check alone lets it
+            # through. QA_RAG_SIMILARITY_THRESHOLD=nan made every
+            # `score >= threshold` False and turned RAG grounding off in
+            # silence, because the coercer had succeeded.
+            logger.warning(
+                "Invalid %s=%r (not a finite number) — using default %s",
+                info.field_name.upper(),
+                v,
+                default,
+            )
+            return default
+        return parsed
 
     @field_validator("qa_mobile_download_max_gb", mode="before")
     @classmethod
@@ -1367,19 +1398,32 @@ class Settings(BaseSettings):
         reads as a bug rather than as a policy.
         """
         default = cls.model_fields[info.field_name].default
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            parsed = float(v)
-        else:
-            try:
+        try:
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                parsed = float(v)
+            else:
                 parsed = float(str(v).strip())
-            except (TypeError, ValueError):
-                logger.warning(
-                    "Invalid %s=%r — using default %s",
-                    info.field_name.upper(),
-                    v,
-                    default,
-                )
-                return default
+        except (TypeError, ValueError, OverflowError):
+            logger.warning(
+                "Invalid %s=%r — using default %s",
+                info.field_name.upper(),
+                v,
+                default,
+            )
+            return default
+        if not math.isfinite(parsed):
+            # A string never overflows float(), it returns inf or nan -- and
+            # nan fails EVERY comparison, so a range check alone lets it
+            # through. QA_RAG_SIMILARITY_THRESHOLD=nan made every
+            # `score >= threshold` False and turned RAG grounding off in
+            # silence, because the coercer had succeeded.
+            logger.warning(
+                "Invalid %s=%r (not a finite number) — using default %s",
+                info.field_name.upper(),
+                v,
+                default,
+            )
+            return default
         if parsed < 0.5:
             logger.warning(
                 "%s=%r is below the 0.5 GB floor — using %s",
@@ -1397,7 +1441,7 @@ class Settings(BaseSettings):
             return v
         try:
             return int(str(v).strip())
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             logger.warning("Invalid QA_RAG_TOP_K=%r — using default 5", v)
             return 5
 
@@ -1435,7 +1479,7 @@ class Settings(BaseSettings):
         else:
             try:
                 parsed = int(str(v).strip())
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 logger.warning(
                     "Invalid %s=%r — using default %d",
                     info.field_name.upper(),

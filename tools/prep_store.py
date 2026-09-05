@@ -86,9 +86,12 @@ def _ttl_seconds() -> float:
     val = getattr(settings, "qa_prep_ttl_s", _DEFAULT_TTL_S)
     try:
         val = int(val)
-    except (TypeError, ValueError):
+        # Inside the guard: int(10**400) is exact, and float() of it is
+        # the OverflowError. Measured -- this function promised never to
+        # raise and did.
+        return float(val) if val > 0 else float(_DEFAULT_TTL_S)
+    except (TypeError, ValueError, OverflowError):
         return float(_DEFAULT_TTL_S)
-    return float(val) if val > 0 else float(_DEFAULT_TTL_S)
 
 
 def _has_touched_at(conn: sqlite3.Connection) -> bool:
@@ -153,9 +156,9 @@ def _max_lifetime_s() -> float:
     val = getattr(settings, "qa_prep_max_lifetime_s", _DEFAULT_MAX_LIFETIME_S)
     try:
         val = int(val)
-    except (TypeError, ValueError):
+        return float(val) if val > 0 else float(_DEFAULT_MAX_LIFETIME_S)
+    except (TypeError, ValueError, OverflowError):
         return float(_DEFAULT_MAX_LIFETIME_S)
-    return float(val) if val > 0 else float(_DEFAULT_MAX_LIFETIME_S)
 
 
 def _expired(created_at: float, touched_at: object) -> bool:
@@ -170,7 +173,7 @@ def _expired(created_at: float, touched_at: object) -> bool:
         if _sliding_ttl_on():
             try:
                 t = float(touched_at or 0.0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 t = 0.0
             anchor = max(created_at, t)
             if (now - created_at) > _max_lifetime_s():
@@ -185,7 +188,7 @@ def _max_bytes() -> int:
     val = getattr(settings, "qa_prep_max_bytes", _DEFAULT_MAX_BYTES)
     try:
         val = int(val)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return _DEFAULT_MAX_BYTES
     return val if val > 0 else _DEFAULT_MAX_BYTES
 
@@ -464,7 +467,7 @@ def _list_unfinished_sync(limit: int) -> list[dict]:
             logger.debug("could not read prep %s for a finalized check", pid)
         try:
             touched_f = float(touched or 0.0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             touched_f = 0.0
         anchor = max(created_f, touched_f)
         if _sliding_ttl_on():
@@ -654,7 +657,7 @@ def _find_recent_prep_sync(source_url: str, window_s: float) -> dict | None:
     for pid, payload_json, created in rows:
         try:
             created_f = float(created)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if window_s and (now - created_f) > window_s:
             break  # ordered DESC, so everything older is out of the window too
@@ -689,11 +692,11 @@ def _find_recent_prep_sync(source_url: str, window_s: float) -> dict | None:
         ][:8]
         try:
             captured_n = max(0, min(99, int(meta.get("captured_image_count") or 0)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             captured_n = 0
         try:
             attached_n = max(0, min(99, int(meta.get("attached_image_count") or 0)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             attached_n = 0
         return {
             "prep_id": pid,
@@ -759,7 +762,7 @@ def _find_prep_snapshot_sync(source_url: str, window_s: float) -> dict | None:
     for pid, payload_json, created in rows:
         try:
             created_f = float(created)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if window_s and (now - created_f) > window_s:
             break  # ordered DESC, so everything older is out of the window too
@@ -778,7 +781,7 @@ def _find_prep_snapshot_sync(source_url: str, window_s: float) -> dict | None:
             # last time. 0 for an envelope written before this key existed,
             # which the caller reads as "no baseline" and stays silent about.
             content_chars = int(meta.get("jira_content_chars") or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             content_chars = 0
         return {
             "prep_id": pid,

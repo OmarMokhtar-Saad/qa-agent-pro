@@ -3145,7 +3145,7 @@ def _reprep_image_loss_refusal(
         )
         try:
             _mins = max(0, int(float(age_s or 0) / 60))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             _mins = 0
         _ago = f"{_mins} minute(s) ago" if _mins else "less than a minute ago"
         _named = [str(x).strip() for x in list(labels or [])[:8] if str(x).strip()]
@@ -3364,7 +3364,7 @@ def _carry_forward_or_refuse(
         merged_ids = call_ids + [c for c in revived_ids if c not in call_ids]
         try:
             _age = float(_prep.get("age_s") or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             _age = 0.0
         if short_total <= 0:
             if not recovered_cap:
@@ -4754,7 +4754,7 @@ def _pending_image_gate_hint(
     try:
         try:
             attested = max(0, int(attached_image_count or 0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             attested = 0
         # Normalize EXACTLY as the gate does before asking, or the predicate is
         # shared in name only:
@@ -5162,7 +5162,7 @@ async def handle_prepare_test_cases(
         attached_images = _cap_images or None
     try:
         _attested = max(0, int(attached_image_count or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         _attested = 0
     # 2026-08-09: DEVICE-captured screens are the SECOND intake channel and were
     # counted NOWHERE. Only the chat-ATTESTED count was stamped, so a
@@ -6116,7 +6116,7 @@ def _next_call_block(payload: object, prep_id: str) -> list:
                 continue
             try:
                 n = int(c.get("min_cases") or 0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 n = 0
             if n > 0:
                 floors.append(n)
@@ -6719,7 +6719,7 @@ def _rtm_orphan_note(suite: object) -> str:
             return ""
         try:
             orphans = int(trace.get("orphan_cases", 0) or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return ""
         if orphans <= 0:
             return ""
@@ -7480,7 +7480,7 @@ def _volume_floor_note(
             return "", ""
         try:
             floor = int(meta.get("volume_min_cases") or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             floor = 0
         names = [
             str(n).strip()
@@ -7567,7 +7567,7 @@ def _volume_floor_note(
         # equally wrong.
         try:
             _last = int(meta.get("volume_last_count") or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             _last = 0
         if _last > total and not post_dedup and mode == "refuse":
             facts.append(
@@ -7747,7 +7747,7 @@ def _volume_shortfall_detail(meta: object, cases: list) -> str:
             return ""
         try:
             floor = int(meta.get("volume_min_cases") or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return ""
         names = [
             str(n).strip()
@@ -7847,7 +7847,7 @@ def _image_relevance_gate(
             forwarded = int(meta.get("captured_image_count") or 0) + int(
                 meta.get("attached_image_count") or 0
             )
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             forwarded = 0
         if forwarded <= 0:
             return "", ""
@@ -9282,7 +9282,7 @@ async def handle_submit_suite(
             logger.debug("prep version check failed", exc_info=True)
         try:
             round_no = int(meta.get("round", 0) or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             round_no = 0
 
         # CONFLICT RULE (item 4): a non-empty suite_json is AUTHORITATIVE and any
@@ -11254,7 +11254,7 @@ async def handle_push_suite(
         if target == "testrail":
             try:
                 project_id = int(project_id or 0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 project_id = 0
             if project_id <= 0:
                 return (
@@ -13970,7 +13970,7 @@ async def handle_capture_screens(
                 return (await _device_menu_markdown("qa_capture_screens"), [])
         try:
             _want_raw = max(1, int(count or 1))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             _want_raw = 1
         want = min(_want_raw, _CAPTURE_COUNT_MAX)
         clamp_note = ""
