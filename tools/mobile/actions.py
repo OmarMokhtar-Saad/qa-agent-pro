@@ -418,6 +418,70 @@ OPS = (
 )
 
 
+#: The turn fields the EXPLORE packet advertises alongside ``actions``, WITH
+#: their schema -- this table is the single source, and ``mobile_run`` builds
+#: the packet's ``response_schema`` properties from it.
+#:
+#: They are not part of :class:`Script` (``extra="forbid"``, on purpose, so an
+#: invented op cannot ride in on a typo), which is exactly why the reply has to
+#: be split before it reaches ``parse_script`` rather than after.
+#:
+#: Single-sourced because the alternative was measured: v1.79.0 advertised
+#: ``finding`` in one place and refused it in another for a whole release. A
+#: field added here is advertised AND split; a field added to the packet alone
+#: fails the schema test rather than reaching a tester as a refusal.
+TURN_FIELD_SCHEMA: dict = {
+    "finding": {"type": "string", "maxLength": 600},
+    "goal_reached": {"type": "boolean"},
+    "request_extension": {"type": "boolean"},
+    "extension_reason": {"type": "string", "maxLength": 400},
+}
+
+#: Just the names, for callers that only need to know what rides beside the
+#: actions.
+TURN_FIELDS: tuple[str, ...] = tuple(TURN_FIELD_SCHEMA)
+
+
+def decode_reply(raw: object) -> dict:
+    """A model's reply, decoded ONCE into a dict at the transport boundary.
+
+    The MCP tool declares ``script: str``, so on every real client path this
+    function receives TEXT, and a caller that tested ``isinstance(raw, dict)``
+    saw ``{}`` -- which is how the explore lane advertised ``finding`` in its
+    ``response_schema``, asked for one every turn in ``worker_instructions``,
+    and then refused it at the transport (v1.79.0, found on a live run; every
+    test passed a dict, so nothing caught it).
+
+    Accepts the same three shapes ``parse_script`` promises -- ``{"actions":
+    [...]}``, a bare list, or a JSON string of either -- and always returns a
+    dict with an ``actions`` key. Undecodable input is passed THROUGH under
+    ``actions`` rather than rejected here, so the caller still gets
+    ``parse_script``'s own wording rather than a second, competing error.
+    """
+    try:
+        payload = raw
+        if isinstance(payload, (bytes, bytearray)):
+            payload = payload.decode("utf-8", errors="replace")
+        if isinstance(payload, str):
+            text = payload.strip()
+            if not text:
+                return {"actions": raw}
+            try:
+                payload = json.loads(text)
+            except ValueError:
+                return {"actions": raw}
+        if isinstance(payload, list):
+            return {"actions": payload}
+        if isinstance(payload, dict):
+            out = dict(payload)
+            out.setdefault("actions", [])
+            return out
+        return {"actions": raw}
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("mobile.actions.decode_reply failed")
+        return {"actions": raw}
+
+
 def parse_script(raw: object) -> dict:
     """A model's reply -> a validated :class:`Script`. Never raises.
 

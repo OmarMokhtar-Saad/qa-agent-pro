@@ -338,19 +338,23 @@ def build_explore_turn(
                 "guard_destructive": bool(body.get("guard", True)),
                 "screen_block": _screen_block(screen),
                 "instruction": _EXPLORE_INSTRUCTION,
+                # The turn fields come from `actions.TURN_FIELD_SCHEMA`, the
+                # same table `decode_reply` splits on. They were literals here,
+                # and v1.79.0 shipped a release in which this packet advertised
+                # `finding` while the transport refused it -- one source is
+                # what stops the two drifting again.
                 "response_schema": {
                     "type": "object",
                     "additionalProperties": False,
                     "required": ["actions"],
-                    "properties": {
-                        "actions": actions_mod.response_schema()
-                        .get("properties", {})
-                        .get("actions", {"type": "array"}),
-                        "finding": {"type": "string", "maxLength": 600},
-                        "goal_reached": {"type": "boolean"},
-                        "request_extension": {"type": "boolean"},
-                        "extension_reason": {"type": "string", "maxLength": 400},
-                    },
+                    "properties": dict(
+                        {
+                            "actions": actions_mod.response_schema()
+                            .get("properties", {})
+                            .get("actions", {"type": "array"})
+                        },
+                        **actions_mod.TURN_FIELD_SCHEMA,
+                    ),
                 },
                 "worker_instructions": (
                     "Keep each turn small: the budget is turns, not actions. "
