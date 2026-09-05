@@ -1484,8 +1484,15 @@ async def _submit_explore(
     """One exploratory turn: replay the actions, then fold the reply."""
     from tools.mobile import actions as actions_mod
 
-    payload = raw if isinstance(raw, dict) else {}
-    parsed = actions_mod.parse_script(payload.get("actions", raw))
+    # DECODED, not type-tested. `qa_submit_mobile_step` declares `script: str`,
+    # so this used to be `{}` on every real client path: the whole JSON string
+    # went to `parse_script`, `Script`'s `extra="forbid"` refused the advertised
+    # `finding` key, and nothing replayed -- and when a model retried with a
+    # bare actions array, `apply_turn_result` below got `{}` and never read the
+    # finding. Two failures, one cause, and no test saw either because every
+    # test passed a dict into this helper.
+    payload = actions_mod.decode_reply(raw)
+    parsed = actions_mod.parse_script(payload.get("actions"))
     if parsed.get("error"):
         return {
             "error": None,
