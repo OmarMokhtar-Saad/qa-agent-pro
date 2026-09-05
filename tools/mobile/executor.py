@@ -92,11 +92,14 @@ DESTRUCTIVE_LEXICON = (
     #
     # THE RESIDUAL, stated rather than implied, exactly as the no-label residual
     # below is: a send control on a money screen whose own label says only
-    # "Send" is not stopped by this lexicon. Widening the guard to the whole
-    # screen was considered and refused -- a chat message mentioning "pay"
-    # would then stop the send, and the tester-request packet cannot get past
-    # this guard, so the case would dead-end. That was the defect the bare
-    # token caused, and trading it back for a broader net is not a fix.
+    # "Send" is not stopped by this lexicon. For a TAP the guard stays on the
+    # named element and the control under the finger -- widening it to the
+    # whole screen would stop the Send of a chat whose message mentions "pay",
+    # and a stop is terminal for a scripted case. The ONE op judged against
+    # every element the packet carries is `press` (see `screen_hit`), because
+    # the control its key reaches is not in the dump at all; the cost there is
+    # one wasted turn, not a dead end, since the tap on the same screen's Send
+    # is still allowed and the detail names the term so the model re-plans.
     "send money",
     "send payment",
     "send transfer",
@@ -115,6 +118,19 @@ DESTRUCTIVE_LEXICON = (
 GUARD_DETAIL = (
     "Stopped before a control that looks irreversible. Nothing was tapped. "
     "Confirm with the tester, then resubmit the script with the same action."
+)
+
+#: The same stop for a screen the packet does not carry in full. A SEPARATE
+#: sentence because both halves of :data:`GUARD_DETAIL` are false here: no
+#: control was found -- none could be looked for -- and resubmitting the same
+#: press re-truncates the same screen and stops again, forever. The remedy that
+#: works is a tap, which is judged by the control's own label rather than by a
+#: screen scan.
+GUARD_DETAIL_NOT_FULLY_SEEN = (
+    "Stopped before a press: this screen has more elements than one packet "
+    "carries, so what the press would submit cannot be judged. Nothing was "
+    "touched. Re-sending the same press stops here again -- tap the control "
+    "this case means instead, which is judged by its own label."
 )
 
 #: Packages whose screen is an OVERLAY: the app under test is still running
@@ -319,6 +335,45 @@ def _contained_text(element: dict, screen: object) -> list[str]:
             if value:
                 out.append(value)
     return out
+
+
+#: The ``guard_term`` a ``press`` gets on a screen the packet does not carry in
+#: full. ``perception.prune`` caps the element list at ``MAX_ELEMENTS`` and
+#: flags ``truncated``; a control below the cap is not in the packet, so "no
+#: element on the screen is irreversible" cannot be said about that screen.
+#: Measured by an executing review: a form with 200 filler rows above its
+#: "Confirm payment" button pruned the button away, and a press on the amount
+#: field sent KEYCODE_ENTER with the scan green.
+#: A TERM, not a sentence, because it travels as one: ``build_tester_request``
+#: caps ``guard_term`` at 60 characters -- a cap sized for "confirm" and "send
+#: money" -- and the sentence this used to be reached the tester cut mid-word.
+#: The sentence lives in :data:`GUARD_DETAIL_NOT_FULLY_SEEN`, which rides in
+#: ``detail`` where there is room for it.
+SCREEN_NOT_FULLY_SEEN = "screen not fully seen"
+
+
+def screen_hit(screen: object) -> str:
+    """The lexicon term some element on *screen* carries in its OWN strings, or
+    :data:`SCREEN_NOT_FULLY_SEEN` when the packet is truncated, or ``""``.
+
+    What a ``press`` is judged against, because the control its key reaches is
+    not in the dump. Judged ELEMENT BY ELEMENT, never as one joined string: a
+    multi-word lexicon term matches a contiguous token run, and a join put
+    ``CallLog`` beside "out of office" and read "log out" across the seam --
+    the same false stop the actuated-node path avoids. Each element
+    contributes ``element_label`` WITHOUT containment; a wrapper's contained
+    text belongs to other elements, which are judged on their own turn. Never
+    raises.
+    """
+    if not isinstance(screen, dict):
+        return ""
+    if screen.get("truncated"):
+        return SCREEN_NOT_FULLY_SEEN
+    for element in screen.get("elements") or []:
+        hit = destructive_hit(element_label(element))
+        if hit:
+            return hit
+    return ""
 
 
 def destructive_hit(text: object) -> str:
@@ -1208,9 +1263,23 @@ async def replay(script: object, ctx: Context) -> dict:
                         labels.append(element_label(actuated))
                 label = " ".join(labels).strip()
                 hit = destructive_hit(label)
+                if not hit and op == "press":
+                    # The key fires the FORM's IME action, and no dump names the
+                    # control that action reaches (uiautomator emits no
+                    # imeOptions). The actuated node is unknown BY CONSTRUCTION,
+                    # so the scope is every element the packet carries -- and a
+                    # packet that does not carry the whole screen cannot clear
+                    # it. Measured before this line existed: `tap {"text":
+                    # "Confirm payment"}` was refused while `press enter
+                    # {"rid": amount}` on the same form sent KEYCODE_ENTER.
+                    hit = screen_hit(screen)
                 if hit:
                     entry["outcome"] = "guard_stop"
-                    entry["detail"] = GUARD_DETAIL + " Matched: " + hit
+                    entry["detail"] = (
+                        GUARD_DETAIL_NOT_FULLY_SEEN
+                        if hit == SCREEN_NOT_FULLY_SEEN
+                        else GUARD_DETAIL + " Matched: " + hit
+                    )
                     entry["after_screen_id"] = _screen_id(screen)
                     _append(trace, entry)
                     return {
@@ -1654,6 +1723,21 @@ async def _perform(op: str, action: object, element: object, ctx: Context) -> di
         if not center:
             return {"error": "That element has no usable bounds.", "content": None}
         return await adb.tap(serial, center[0], center[1])
+    if op == "press":
+        # The key goes to whatever holds FOCUS, so the target is not decorative:
+        # tap it first, exactly as `type` and `clear` do. The keycode comes from
+        # `actions.PRESS_KEYS` -- our own allowlist, never the model's string --
+        # and `adb.keyevent` validates it a second time.
+        code = actions_mod.PRESS_KEYS.get(str(getattr(action, "key", "") or ""))
+        if not code:
+            return {"error": "Unsupported press key.", "content": None}
+        center = _center(element) if isinstance(element, dict) else None
+        if not center:
+            return {"error": "That field has no usable bounds.", "content": None}
+        focused = await adb.tap(serial, center[0], center[1])
+        if focused.get("error"):
+            return focused
+        return await adb.keyevent(serial, code)
     if op in ("type", "clear"):
         center = _center(element) if isinstance(element, dict) else None
         if not center:

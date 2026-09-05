@@ -274,6 +274,40 @@ def build_escape_job(
         return {}
 
 
+def _guard_ask(guard_term: str) -> str:
+    """What the model is told about a guard stop, per REASON.
+
+    Two stops reach here and only one of them is about a control. A screen the
+    packet cannot carry in full has no matched control to name, and the
+    "re-submit the same script if the tester agrees" remedy is deterministically
+    wrong for it: the same press re-truncates the same screen and stops again,
+    so the only door that wording leaves open is turning the guard off for the
+    whole script -- including a real Confirm button. The remedy that works is a
+    TAP, which is judged by the control's own label and not by a screen scan.
+
+    Imported lazily: ``executor`` owns the term, this module owns the wording,
+    and a module-level import would put an agent's import at the top of a file
+    the executor's own callers import.
+    """
+    from tools.mobile import executor as executor_mod
+
+    if guard_term == executor_mod.SCREEN_NOT_FULLY_SEEN:
+        return (
+            "The replay stopped before a press: this screen has more elements "
+            "than one packet carries, so what that press would submit cannot "
+            "be judged. Nothing was touched. Re-sending the same press stops "
+            "here again -- plan a TAP on the control this case means instead, "
+            "which is judged by its own label. Ask the tester only if you "
+            "cannot tell which control that is."
+        )
+    return (
+        "The replay stopped in front of a control that looks irreversible ("
+        + guard_term
+        + "). Nothing was tapped. Ask the tester whether to go ahead, and "
+        "re-submit the same script only if they say yes."
+    )
+
+
 def build_tester_request(
     field: str, prompt: str, *, run_id: str, tc_id: str, guard_term: str = ""
 ) -> dict:
@@ -292,13 +326,7 @@ def build_tester_request(
             "prompt": str(prompt or "")[:600],
             "guard_term": str(guard_term or "")[:60],
             "ask_the_tester": (
-                (
-                    "The replay stopped in front of a control that looks "
-                    "irreversible ("
-                    + str(guard_term)
-                    + "). Nothing was tapped. Ask the tester whether to go "
-                    "ahead, and re-submit the same script only if they say yes."
-                )
+                _guard_ask(str(guard_term or ""))
                 if str(guard_term or "")
                 else (
                     "Ask the tester for this one field, in chat, and pass the "
