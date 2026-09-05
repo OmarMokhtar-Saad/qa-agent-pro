@@ -22,6 +22,14 @@ The destructive guard matches WHOLE WORDS, not substrings. "Confirm" stops;
 "Deleted items" does not, because its token is ``deleted`` and the lexicon holds
 ``delete``. A guard that stops everything is exactly as broken as one that stops
 nothing, which is why both directions are pinned.
+
+The guard judges the node the action ACTUATES, not the node it NAMES. Android
+delivers a touch to the nearest CLICKABLE ancestor of whatever is under the
+finger, so the guard judges :func:`actuated_element` at the point ``_perform``
+will touch as well as the resolved element, and a targeted swipe is confined to
+the element it names. Three bypasses had the same shape before that rule --
+``clear``, a targeted ``scroll`` and ``press`` -- and a fourth patch would have
+moved the defect rather than removed the class.
 """
 
 from __future__ import annotations
@@ -791,6 +799,151 @@ _SWIPE = {
     "right": (200, 1000, 900, 1000),
 }
 
+#: How far inside a named element's edge a confined swipe starts and ends, in
+#: pixels. Keeps the finger off the border, where a touch belongs to the
+#: neighbour as often as to the element.
+_SWIPE_INSET = 10
+
+#: The shortest gesture that is still a SWIPE to Android. Below touch slop
+#: (8-32 px by density) the framework delivers a click, and a 300 ms press is
+#: under the long-press threshold -- so a 2 px "swipe" on a 22 px element was
+#: a tap on it, measured by an executing review. Chosen from the platform's
+#: slop, not from :data:`_SWIPE_INSET`; the two are unrelated quantities.
+_MIN_SWIPE_PX = 24
+
+#: Why a targeted swipe was handed back rather than collapsed into a press.
+TOO_SMALL_TO_SWIPE = (
+    "That element is too small to swipe on: a swipe confined to its visible "
+    "part would not move far enough to be a swipe, and a gesture that does not "
+    "move is a tap. Nothing was touched. Scroll without a target, or name the "
+    "scrollable list that contains it."
+)
+
+
+def _swipe_points(direction: str, element: object) -> tuple | None:
+    """The swipe ``_perform`` issues for *direction*, confined to *element*.
+
+    A target-less pan uses the :data:`_SWIPE` table as it is. A TARGETED swipe
+    is centred on the element on BOTH axes and its extent is clipped to the
+    element's bounds minus :data:`_SWIPE_INSET`, so the whole gesture happens
+    on the node the action named. The shipped code shifted the table by the
+    element's X only: ``scroll left`` naming a row at y 700-800 swiped along
+    y=1000, never touched the row, and crossed a "Slide to confirm payment"
+    control the guard had judged nothing about. A short element gets a short
+    swipe rather than one that leaves it.
+
+    THE INVARIANT, stated once and checked LAST: the gesture returned moves at
+    least :data:`_MIN_SWIPE_PX` along its axis, or ``None`` is returned. It is
+    checked after every adjustment because the order was the defect twice: a
+    ``half <= 0`` refusal placed BEFORE a ``>= 0`` clamp let a mostly off-screen
+    element clamp both ends onto the screen edge and ship ``input swipe 0 950
+    0 950 300`` -- a press -- with the refusal green. So the swipe is computed
+    from the element's VISIBLE part (bounds clipped at the screen edge, where
+    the finger can actually go) and the post-condition is on the final tuple.
+
+    Returns ``None`` for an unknown direction, and for an element whose
+    visible part is too small to swipe on; ``_perform`` tells the two apart
+    and reports each.
+    """
+    points = _SWIPE.get(str(direction or ""))
+    if not points:
+        return None
+    if not isinstance(element, dict):
+        return points
+    center = _center(element)
+    if center is None:
+        return points
+    x1, y1, x2, y2 = (int(v) for v in element["bounds"])
+    # The VISIBLE part: an element partly off-screen has a negative edge, and
+    # the finger cannot go there (`adb._coord` refuses a negative coordinate).
+    # Everything below is computed from this box, so no later clamp can move
+    # an endpoint after the invariant has been checked.
+    x1, y1 = max(0, x1), max(0, y1)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+    if direction in ("up", "down"):
+        half = min(
+            abs(points[1] - points[3]) // 2, max(0, (y2 - y1) // 2 - _SWIPE_INSET)
+        )
+        if direction == "up":
+            swipe = (cx, cy + half, cx, cy - half)
+        else:
+            swipe = (cx, cy - half, cx, cy + half)
+    else:
+        half = min(
+            abs(points[0] - points[2]) // 2, max(0, (x2 - x1) // 2 - _SWIPE_INSET)
+        )
+        if direction == "left":
+            swipe = (cx + half, cy, cx - half, cy)
+        else:
+            swipe = (cx - half, cy, cx + half, cy)
+    # The post-condition, on the FINAL tuple: a gesture that moves less than
+    # touch slop is delivered as a click on the element the script asked to
+    # scroll. Handed back instead, so the model names the list.
+    if abs(swipe[2] - swipe[0]) + abs(swipe[3] - swipe[1]) < _MIN_SWIPE_PX:
+        return None
+    return swipe
+
+
+def _touch_point(op: str, action: object, element: object) -> tuple | None:
+    """Where the finger lands FIRST for *op* on *element* -- the point the
+    destructive guard judges. Derived from the same helpers ``_perform`` uses,
+    so the guard and the device cannot disagree about where the touch is."""
+    if op == "scroll":
+        points = _swipe_points(str(getattr(action, "dir", "") or ""), element)
+        return (points[0], points[1]) if points else None
+    if isinstance(element, dict):
+        return _center(element)
+    return None
+
+
+def actuated_element(screen: object, point: object) -> dict | None:
+    """The element Android delivers a touch at *point* to, as far as a flat
+    dump can tell. Never raises.
+
+    A touch goes to the DEEPEST clickable view under the finger: a
+    non-clickable child does not consume it, so it bubbles to the nearest
+    clickable ancestor, and among nested clickables the innermost wins. A
+    pruned screen carries bounds but no tree, so "deepest" is approximated by
+    the SMALLEST clickable element whose bounds contain the point. Z-order is
+    not in the dump either; overlapping siblings are resolved by area, and an
+    EQUAL-area tie goes to the LATER element, because uiautomator lists
+    siblings in draw order and Android hit-tests the top-most first. A larger
+    sheet drawn over a smaller chip still loses to the chip -- a stated limit,
+    not a claim.
+
+    ``None`` when nothing clickable is under the point -- an EditText in a
+    plain layout, say -- in which case the resolved element is all there is to
+    judge.
+    """
+    if not isinstance(screen, dict):
+        return None
+    if not (isinstance(point, (list, tuple)) and len(point) == 2):
+        return None
+    try:
+        x, y = int(point[0]), int(point[1])
+    except (TypeError, ValueError):
+        return None
+    best: dict | None = None
+    best_area = 0
+    for other in screen.get("elements") or []:
+        if not isinstance(other, dict) or not other.get("clickable"):
+            continue
+        box = other.get("bounds")
+        if not (isinstance(box, (list, tuple)) and len(box) == 4):
+            continue
+        try:
+            x1, y1, x2, y2 = (int(v) for v in box)
+        except (TypeError, ValueError):
+            continue
+        if x < x1 or x > x2 or y < y1 or y > y2:
+            continue
+        area = max(0, x2 - x1) * max(0, y2 - y1)
+        if best is None or area <= best_area:
+            best, best_area = other, area
+    return best
+
 
 def _budget_seconds(ctx: Context) -> float:
     """This replay's wall-clock bound, always positive.
@@ -994,24 +1147,66 @@ async def replay(script: object, ctx: Context) -> dict:
                     }
 
             # --- destructive guard -------------------------------------------
-            # DENY BY DEFAULT. This was an allow-list of ops believed to tap,
-            # and it was wrong twice: 'clear' taps to focus the field, and a
-            # TARGETED 'scroll' re-centres its swipe on the resolved element,
-            # so "Slide to confirm payment" was actuated while the same control
-            # under 'tap' was stopped. The guard exists to stop an IRREVERSIBLE
-            # ACTION; which primitive delivers it is incidental, and an
-            # allow-list must be remembered every time one is added.
+            # DENY BY DEFAULT, and judge the node the action ACTUATES, not the
+            # node it NAMES. Both halves were learned by shipping the failure.
             #
-            # So every op is guarded unless it is declared inert. A target-less
-            # pan still passes: it resolves no element and there is no
-            # destructive text in "scroll down".
+            # The op half: this was an allow-list of ops believed to tap, and it
+            # was wrong twice -- 'clear' taps to focus the field, and a TARGETED
+            # 'scroll' swipes on the resolved element. So every op is guarded
+            # unless it is declared inert in NON_ACTUATING_OPS.
+            #
+            # The node half: the guard judged the RESOLVED element, and Android
+            # does not deliver a touch to the resolved element. A tap on a
+            # non-clickable child goes to the nearest CLICKABLE ancestor, so
+            # `tap {"text": "OK"}` on the child of a `btn_delete_account`
+            # wrapper reached the device while `tap {"rid": ...}` on the wrapper
+            # itself was stopped; and a targeted swipe re-centred only its X, so
+            # `scroll left` naming a benign row swiped across "Slide to confirm
+            # payment" at the table's Y. Measured through adb._run_argv, both.
+            # So the guard ALSO judges `actuated_element` at the very point
+            # `_perform` will touch, and a targeted swipe is confined to the
+            # element it names (see `_swipe_points`).
+            #
+            # The property this buys: acting on X through a child gets the SAME
+            # verdict as acting on X directly, so no new false-positive class --
+            # a wrapper that stops a tap on its child already stopped a tap on
+            # itself.
+            #
+            # A target-less pan names nothing and is judged on nothing. THE
+            # RESIDUAL, stated: the finger starts at the table point, and a
+            # slide-to-confirm control lying there would be actuated. Widening
+            # to that point would stop every pan over a transactions list whose
+            # row reads "Transfer to ...", and a guard stop is terminal for a
+            # scripted case, so the pan stays unjudged and the decision is
+            # pinned in both directions by tests/mobile.
             if ctx.guard_destructive and op not in NON_ACTUATING_OPS:
-                label = " ".join(
-                    [
-                        actions_mod.action_text(action),
-                        element_label(element, screen),
-                    ]
-                ).strip()
+                labels = [
+                    actions_mod.action_text(action),
+                    element_label(element, screen),
+                ]
+                if element is not None:
+                    actuated = actuated_element(
+                        screen, _touch_point(op, action, element)
+                    )
+                    # The actuated node is judged on its OWN strings -- no
+                    # `screen`, so no containment. It is an ANCESTOR by
+                    # construction, and an ancestor's contained text is every
+                    # word inside it: with containment, tapping "Notifications"
+                    # inside a clickable settings list that also held "Delete
+                    # account" was refused (an executing review measured it).
+                    # The named element keeps its containment rule; the residual
+                    # is a wrapper with no strings of its own whose destructive
+                    # word lives only in a SIBLING of the child that was named.
+                    # Appended only when it IS a different node. When the named
+                    # element is itself the smallest clickable under the finger
+                    # (the common case) appending it again would join its label
+                    # to itself, and `destructive_hit` matches multi-word terms
+                    # as a token RUN: "Money ... send" followed by "Money ..."
+                    # manufactures "send money" at the seam -- a false stop, and
+                    # a stop is terminal for a scripted case.
+                    if actuated is not None and actuated is not element:
+                        labels.append(element_label(actuated))
+                label = " ".join(labels).strip()
                 hit = destructive_hit(label)
                 if hit:
                     entry["outcome"] = "guard_stop"
@@ -1441,19 +1636,18 @@ async def _perform(op: str, action: object, element: object, ctx: Context) -> di
             await _sleep(ms / 1000.0)
         return {"error": None, "content": {"detail": "waited " + str(ms) + "ms"}}
     if op == "scroll":
-        points = _SWIPE.get(str(getattr(action, "dir", "") or ""))
-        if not points:
+        direction = str(getattr(action, "dir", "") or "")
+        if direction not in _SWIPE:
             return {"error": "Unknown scroll direction.", "content": None}
-        if isinstance(element, dict):
-            center = _center(element)
-            if center:
-                dx = center[0] - 540
-                points = (
-                    points[0] + dx,
-                    points[1],
-                    points[2] + dx,
-                    points[3],
-                )
+        points = _swipe_points(direction, element)
+        if not points:
+            return {
+                "error": TOO_SMALL_TO_SWIPE,
+                "content": None,
+                # A re-plan, not a device failure: the model can drop the
+                # target or name the scrollable list instead.
+                "needs_model": True,
+            }
         return await adb.swipe(serial, *points)
     if op == "tap":
         center = _center(element) if isinstance(element, dict) else None
