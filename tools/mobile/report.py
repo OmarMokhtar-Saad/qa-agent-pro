@@ -322,7 +322,7 @@ def _bounds_of(element: object) -> tuple | None:
             return None
         try:
             numbers.append(int(float(value)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
     left, right = sorted((numbers[0], numbers[2]))
     top, bottom = sorted((numbers[1], numbers[3]))
@@ -375,7 +375,7 @@ def scale_bounds(box: object, dev_w: int, dev_h: int) -> tuple | None:
         w = min(w, FRAME_W - x)
         h = min(h, FRAME_H - y)
         return (x, y, w, h)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -431,7 +431,7 @@ def _ms(value: object) -> int | None:
         return None
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if number <= 0 or number != number:  # NaN
         return None
@@ -471,7 +471,7 @@ def _percentile(values: list, share: float) -> int:
 def _stamp(value: object) -> str:
     try:
         moment = float(value or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return "unknown"
     if moment <= 0:
         return "unknown"
@@ -481,7 +481,7 @@ def _stamp(value: object) -> str:
 def _short_stamp(value: object) -> str:
     try:
         moment = float(value or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return "unknown"
     if moment <= 0:
         return "unknown"
@@ -996,11 +996,11 @@ def _case_facts(case: object, manifest: dict) -> dict:
     screens_seen.discard("")
     try:
         escapes = int(safe.get("escapes") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         escapes = 0
     try:
         free_stops = max(0, int(safe.get("free_stops") or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         free_stops = 0
     wall = _case_wall(rows)
     return {
@@ -1483,7 +1483,7 @@ def _overview(
     planned = 0
     try:
         planned = int(manifest.get("total") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         planned = 0
     run_tiles = [
         _kpi(
@@ -1911,7 +1911,7 @@ def _findings_section(manifest: dict, turns: int) -> str:
     ]
     try:
         replayed = max(0, int(turns or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         replayed = 0
     # Counted by DISTINCT turn, never by row. A turn resubmitted with a finding
     # appends a second row while leaving ONE checkpoint, so a row count read
@@ -1921,7 +1921,7 @@ def _findings_section(manifest: dict, turns: int) -> str:
     for note in notes:
         try:
             spoke.add(int(note.get("turn") or 0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
     silent = max(0, replayed - len(spoke))
     stop = _text(explore.get("stop"), 40)
@@ -2163,7 +2163,7 @@ def _is_partial(manifest: dict, cases: list, tally: dict) -> bool:
     planned = 0
     try:
         planned = int(manifest.get("total") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         planned = 0
     return bool(not cases or done < max(planned, len(cases)))
 

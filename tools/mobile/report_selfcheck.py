@@ -152,7 +152,7 @@ def _pin(name: str, ok: bool, detail: str) -> dict:
 def _as_int(value: object) -> int:
     try:
         return int(str(value).strip())
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return -1
 
 
