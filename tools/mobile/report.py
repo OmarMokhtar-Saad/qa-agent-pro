@@ -79,6 +79,7 @@ from collections import Counter
 from pathlib import Path
 
 from config.settings import settings
+from tools.mobile import actions as actions_mod
 from tools.mobile import paths, run_store, screen_phone
 from tools.mobile_evidence import exchanges as ev_exchanges
 from tools.mobile_evidence import profiles as ev_profiles
@@ -708,31 +709,45 @@ _WIRE_LEGEND = (
 
 
 def _action_line(action: object) -> str:
-    """One human line for a trace action.
+    """One human line for a trace action, including what it typed.
 
-    Deliberately NOT a JSON dump, and deliberately WITHOUT the action's ``text``:
-    a typed literal is the one field that could carry a credential, and a
-    rendering that cannot reach it beats one that masks it afterwards. It is
-    also why the token ``secret`` never appears in the page.
+    **This docstring described the opposite rule until 2026-09-04, and the rule
+    it described was itself the defect.** The typed ``text`` was never rendered,
+    on the reasoning that a rendering which cannot reach a credential beats one
+    that masks it. The cost was that a chat case's report showed ``type -> e14``
+    and no tester could tell which question had been asked -- for a lane whose
+    whole job is to evidence that the app answered, that is not a report.
 
-    **This absence is the load-bearing secret control in this module**, measured
-    rather than assumed: with it in place, deleting the ``run_store.redact``
-    call in :func:`_trace_rows` changes no byte of the page. So the mutation
-    proof for "a credential cannot reach the report" belongs HERE -- add
-    ``body.get("text")`` to *extra* below and
-    ``test_the_page_never_carries_the_secret_marker_or_a_typed_literal`` goes
-    red.
+    So the control moved from absence to masking, and it is doubled:
+
+    * :func:`tools.mobile.actions.redact_action` masks at the SOURCE -- on the
+      ``secret`` marker and on ``CREDENTIAL_TERMS`` -- so the packet, the audit
+      log and the checkpoint are covered, not only this page;
+    * this function masks again at the RENDER boundary, because a checkpoint
+      written by an older build was never through that rule.
+
+    The mutation proof lives on the mask below -- delete it, or either half of
+    its condition, and the secret tests in tests/mobile/test_mobile_report.py
+    and test_mobile_report_chat.py go red. It does NOT live on the
+    ``run_store.redact`` call in :func:`_trace_rows`: deleting that still
+    changes no byte of the page, measured, because the mask here fires first.
+    Said plainly because the first version of this docstring claimed otherwise.
     """
     body = action if isinstance(action, dict) else {}
     if not body:
         return _text(action, 80)
     target = body.get("target")
     target = target if isinstance(target, dict) else {}
+    # `rid` first, then what was on screen, and the short `id` LAST -- the same
+    # order `actions.resolve_target` uses, and for the reader's sake rather
+    # than the resolver's: an id is a content hash, so a step table that put it
+    # first read `tap -> e9f3a1b2` where the model had also given a resource id
+    # a tester could recognise.
     hint = _text(
-        target.get("id")
-        or target.get("rid")
+        target.get("rid")
         or target.get("text")
-        or target.get("desc"),
+        or target.get("desc")
+        or target.get("id"),
         60,
     )
     extra = _text(body.get("kind") or body.get("field") or body.get("dir"), 40)
@@ -741,7 +756,19 @@ def _action_line(action: object) -> str:
         parts.append("-> " + hint)
     if extra:
         parts.append("(" + extra + ")")
+    typed = _typed_literal(body)
+    if typed:
+        parts.append("\u201c" + typed + "\u201d")
     return " ".join(parts)
+
+
+def _typed_literal(body: dict) -> str:
+    """What a ``type`` action sent, or the mask. ``""`` for any other op."""
+    if str(body.get("op") or "") != "type":
+        return ""
+    if body.get("secret") or actions_mod.is_credential_action(body):
+        return actions_mod.SECRET_MASK
+    return _text(body.get("text"), 160)
 
 
 def _trace_rows(trace: object) -> list:
@@ -750,12 +777,18 @@ def _trace_rows(trace: object) -> list:
     for entry in list(trace or [])[:MAX_ROWS]:
         if not isinstance(entry, dict):
             continue
-        # Belt and braces, and HONESTLY not canary-provable: measured by
-        # mutation, deleting this line changes no byte of the page, because
-        # the load-bearing control is structural -- _action_line never
-        # renders an action's `text` at all, so a typed literal has no route
-        # here to be masked ON. It is kept for the day a new field IS
-        # rendered; the proof lives on the structural control, not here.
+        # STILL NOT canary-provable, and this comment says so because MUTATION
+        # SAID SO -- not because anyone reasoned about it. The claim written
+        # here first was that rendering a typed literal had made this line
+        # load-bearing. Deleting it and running the suite kept every test
+        # green, because `_action_line` masks on the `secret` marker and on
+        # CREDENTIAL_TERMS ITSELF, before this ever mattered. The structural
+        # control is still the one that holds.
+        #
+        # It is kept as depth for the day a field IS rendered that only
+        # key-based redaction covers, and the honest note is the point: a
+        # security comment that overstates its own line is how a control gets
+        # trusted for something it does not do.
         safe = run_store.redact(entry)
         safe = safe if isinstance(safe, dict) else {}
         action = safe.get("action")
@@ -823,8 +856,9 @@ def _steps_table(rows: list) -> str:
         '<th scope="col">Screen before → after</th>'
         "</tr></thead><tbody>" + body + "</tbody></table></div>"
         '<p class="hint">Took: the replay clock for that one action, as the server measured it. '
-        "An action never prints what it typed — a typed value is the one field that could "
-        "carry a credential, so the page has no route to it.</p>"
+        "A type action shows what it sent, so a chat case can be read as the exchange it "
+        "was — unless the value was marked secret or the field is named as a credential, "
+        "in which case it is masked here and at every earlier step that wrote it down.</p>"
     )
 
 
@@ -964,6 +998,10 @@ def _case_facts(case: object, manifest: dict) -> dict:
         escapes = int(safe.get("escapes") or 0)
     except (TypeError, ValueError):
         escapes = 0
+    try:
+        free_stops = max(0, int(safe.get("free_stops") or 0))
+    except (TypeError, ValueError):
+        free_stops = 0
     wall = _case_wall(rows)
     return {
         "tc_id": tc_id,
@@ -973,9 +1011,18 @@ def _case_facts(case: object, manifest: dict) -> dict:
         "status": _text(safe.get("status"), 40),
         "reason": _text(safe.get("reason"), 400),
         "escapes": max(0, escapes),
-        # Planning turns by the tester's own chat model: the first plan plus every
-        # escape-hatch re-plan. A case still planning has taken none yet.
-        "plans": (1 + max(0, escapes)) if rows else 0,
+        "free_stops": free_stops,
+        # Planning turns by the tester's own chat model: the first plan, every
+        # escape-hatch re-plan, AND every uncharged stale-selector stop. A case
+        # still planning has taken none yet.
+        #
+        # `free_stops` was written to the checkpoint by `case_runner` and read by
+        # NOTHING -- not this module, not the submit reply, not `qa_mobile_status`
+        # -- so a case that spent two uncharged stops and one escape reported two
+        # planning turns for four round trips. The disclosure is this number,
+        # which the card already showed, rather than a new column: a count that is
+        # wrong is worse than one that is missing.
+        "plans": (1 + max(0, escapes) + free_stops) if rows else 0,
         "updated": safe.get("updated"),
         "rows": rows,
         "first": first_before,
@@ -1467,7 +1514,8 @@ def _overview(
             str(plans),
             "LLM turns",
             "planning turns by the tester\u2019s own chat model \u2014 one plan per case plus "
-            "every escape-hatch re-plan. Tokens and cost are not shown: no model call "
+            "every escape-hatch re-plan, and every stop the server did not charge "
+            "as an escape. Tokens and cost are not shown: no model call "
             "passes through this server, so it has nothing to meter",
         ),
         _kpi(
@@ -1503,7 +1551,10 @@ def _overview(
         "asked for; <b>failed</b> and <b>blocked</b> likewise. The server replays actions and reports "
         "outcomes; it never judges a screen itself. A case in flight shows its status, never a verdict.</p>"
         "<p><b>LLM turns</b> counts the planning turns the tester\u2019s own chat model took: one "
-        "plan per case plus every escape-hatch re-plan. There is no token or cost figure because "
+        "plan per case, every escape-hatch re-plan, and every stop the server did not charge "
+        "as an escape -- so it can exceed the <b>escapes</b> figure beside it, and the "
+        "difference is the stops this run was given for free. "
+        "There is no token or cost figure because "
         "no model call passes through this server \u2014 the model runs in the tester\u2019s chat, "
         "and this page can only count the plans it was handed.</p>"
         "<p>Every screen is <b>composed</b> from the element list the server already held — text, labels and bounds. "
@@ -1830,6 +1881,99 @@ def _fill(template: str, slots: dict) -> str:
     return _SLOT.sub(one, template)
 
 
+def _findings_section(manifest: dict, turns: int) -> str:
+    """What an exploratory run FOUND. ``""`` for any other lane.
+
+    ``explore_runner.apply_turn_result`` has always accumulated
+    ``manifest["explore"]["findings"]`` and NOTHING read it -- not this module,
+    not the shell -- so a 20-minute session's entire output was invisible.
+
+    Two honesty rules this section keeps, both of which the page already
+    applies elsewhere:
+
+    * an explore run with no ``explore.stop`` is PARTIAL (``_is_partial``), so
+      the reader is told the list is incomplete rather than shown a conclusion;
+    * a turn that recorded NO finding is counted out loud. The packet asks for
+      one every turn, so silence is a gap in the evidence rather than a turn
+      with nothing to report, and a reader who is not told cannot tell the two
+      apart.
+
+    Every interpolated value goes through :func:`esc`, and the table carries no
+    ``id`` and no ``data-sort`` -- both are wired to the shell's own script.
+    """
+    body = manifest if isinstance(manifest, dict) else {}
+    if str(body.get("lane") or "") != "explore":
+        return ""
+    explore = body.get("explore")
+    explore = explore if isinstance(explore, dict) else {}
+    notes = [
+        note for note in list(explore.get("findings") or []) if isinstance(note, dict)
+    ]
+    try:
+        replayed = max(0, int(turns or 0))
+    except (TypeError, ValueError):
+        replayed = 0
+    # Counted by DISTINCT turn, never by row. A turn resubmitted with a finding
+    # appends a second row while leaving ONE checkpoint, so a row count read
+    # "2 findings over 1 turn" and drove the silent count negative into its own
+    # clamp -- which hid the miscount instead of reporting it.
+    spoke = set()
+    for note in notes:
+        try:
+            spoke.add(int(note.get("turn") or 0))
+        except (TypeError, ValueError):
+            continue
+    silent = max(0, replayed - len(spoke))
+    stop = _text(explore.get("stop"), 40)
+    lede = (
+        "Goal: "
+        + (esc(explore.get("goal"), 400) or "(not recorded)")
+        + ". "
+        + str(len(spoke))
+        + " finding"
+        + ("" if len(spoke) == 1 else "s")
+        + " recorded over "
+        + str(replayed)
+        + " turn"
+        + ("" if replayed == 1 else "s")
+        + (
+            ", and "
+            + str(silent)
+            + " turn"
+            + ("" if silent == 1 else "s")
+            + " recorded none \u2014 every turn is asked for one, so those are "
+            "gaps in the evidence rather than turns with nothing to report"
+            if silent
+            else ""
+        )
+        + ". "
+        + (
+            "This session ended: " + esc(stop, 40) + "."
+            if stop
+            else "This session has NOT ended, so this list is incomplete."
+        )
+    )
+    rows = "".join(
+        '<tr><td class="num">'
+        + esc(note.get("turn"), 8)
+        + '</td><td dir="auto">'
+        + esc(note.get("note"), 600)
+        + "</td></tr>"
+        for note in notes
+    )
+    table = (
+        '<div class="tablewrap"><table class="cov"><thead><tr>'
+        '<th scope="col" class="num">Turn</th>'
+        '<th scope="col">What the turn reported</th>'
+        "</tr></thead><tbody>" + rows + "</tbody></table></div>"
+        if rows
+        else '<p class="empty-note big">No turn recorded a finding.</p>'
+    )
+    return _sechead(
+        "findings", "What exploring found", "one line per turn", lede, table
+    )
+
+
 def _document(
     *,
     run_id: str,
@@ -1850,15 +1994,21 @@ def _document(
     )
     steps = sum(len(f["rows"]) for f in facts)
     title = "Mobile run " + str(run_id)
+    # Built ONCE and reused: the nav must not offer a section this page does
+    # not emit, and the findings section exists only for the explore lane.
+    findings = _findings_section(manifest, len(facts))
+    nav_items = [
+        ("overview", "Overview"),
+        ("coverage", "Coverage"),
+        ("apis", "APIs"),
+        ("perf", "Performance"),
+    ]
+    if findings:
+        nav_items.append(("findings", "Findings"))
+    nav_items.append(("cases", "Cases"))
     nav = "".join(
         '<a href="#' + sid + '" data-nav="' + sid + '">' + label + "</a>"
-        for sid, label in (
-            ("overview", "Overview"),
-            ("coverage", "Coverage"),
-            ("apis", "APIs"),
-            ("perf", "Performance"),
-            ("cases", "Cases"),
-        )
+        for sid, label in nav_items
     )
     meta = "".join(
         "<span><b>" + k + "</b> " + v + "</span>"
@@ -1923,6 +2073,7 @@ def _document(
             "How long things took, from the clock around each replayed action — and, when the app's own log was captured, from the moments the app wrote down itself.",
             _perf(facts, loaded),
         )
+        + findings
         + _cases_section(facts, screens, app, loaded)
         + '<div id="'
         + END_ID

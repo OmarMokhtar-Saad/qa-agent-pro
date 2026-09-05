@@ -37,6 +37,7 @@ from config.settings import settings  # noqa: E402, I001
 from tools import guidance  # noqa: E402
 from tools import mcp_handlers  # noqa: E402
 from tools import telemetry  # noqa: E402
+from tools import selfcheck as selfcheck_module  # noqa: E402
 
 logger = logging.getLogger("qa_agents.mcp")
 
@@ -1119,6 +1120,7 @@ def build_server():
             continue_run: bool = False,
             serial: str = "",
             avd: str = "",
+            new_run: bool = False,
         ) -> str:
             """Run test cases, or explore freely, on an Android emulator.
 
@@ -1136,6 +1138,12 @@ def build_server():
             which AVD to boot when none is running and more than one is
             configured; leave both empty to let the server look and, if it
             finds exactly one booted device, use it.
+
+            If the same cases are already an unfinished run of the same app,
+            this answers with THAT run's id instead of starting another one.
+            Pass new_run=true only when the tester has asked for a fresh run:
+            a second run of the same cases produces a second report of the
+            same work.
             """
             return await _tracked(
                 "qa_mobile_test",
@@ -1153,6 +1161,7 @@ def build_server():
                     continue_run,
                     serial=serial,
                     avd=avd,
+                    new_run=new_run,
                     **_make_elicitors(ctx),
                     progress=_make_progress(ctx),
                 ),
@@ -1586,6 +1595,29 @@ def build_server():
             "qa-doctor",
             ctx,
             mcp_handlers.handle_setup_check(progress=progress, workspace_roots=roots),
+        )
+
+    @mcp.tool(name=selfcheck_module.SELF_TOOL_NAME)
+    async def qa_selfcheck(ctx: Context) -> str:
+        """Check whether THIS build's own replies still describe it: call every
+        registered tool with its declared defaults and report any reply that
+        names a deleted setting, a deleted module, a model this server cannot
+        call, or a tool this edition does not register.
+
+        Read-only for your data and incapable of an external write: every
+        handler is called with its own defaults, so no acknowledgement and no
+        `apply=true` is ever sent, and outbound connections are blocked for the
+        duration. Complements `qa-doctor`, which reports on the MACHINE rather
+        than on the build's own text.
+
+        The live server is passed in from here because it is the only reference
+        to the built registry -- and it is the CONFIGURED edition, so the answer
+        is about the install in front of you.
+        """
+        return await _tracked(
+            selfcheck_module.SELF_TOOL_NAME,
+            ctx,
+            mcp_handlers.handle_selfcheck(server=mcp),
         )
 
     # Optional tool — only in the FULL edition, and only when the Feature

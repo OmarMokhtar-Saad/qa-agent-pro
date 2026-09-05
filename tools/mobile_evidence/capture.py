@@ -54,6 +54,11 @@ EVIDENCE_FLAG_NAME = "QA_MOBILE_APP_EVIDENCE"
 #: hundreds of times that and the same cap the screen dump has.
 MAX_SLICE_BYTES = 4 * 1024 * 1024
 
+#: One slice from the GENERIC profile, which has no logcat tag and is therefore
+#: narrowed by pid alone. A quarter of the profiled cap, because a dump nobody
+#: filtered by tag is broader and its value per byte is lower.
+MAX_GENERIC_SLICE_BYTES = 1 * 1024 * 1024
+
 #: The whole pulled event log for one run.
 MAX_EVENTS_BYTES = 4 * 1024 * 1024
 
@@ -153,6 +158,20 @@ def _profile(package: object) -> profiles.Profile | None:
         return None
 
 
+def _profile_or_generic(package: object) -> profiles.Profile:
+    """The package's own profile, or the generic one. Never None.
+
+    The fallback is decided HERE rather than inside ``profile_for``, so "this
+    package has no profile" stays an observable fact and the record can say
+    which of the two was used.
+    """
+    return _profile(package) or profiles.generic_profile(package)
+
+
+def _is_generic(profile: object) -> bool:
+    return getattr(profile, "source", "") == profiles.GENERIC_PROFILE_NAME
+
+
 def _profile_label(profile: profiles.Profile) -> str:
     return str(profile.name or profile.package or profile.source)[:80]
 
@@ -169,9 +188,9 @@ async def begin_case(serial: str, package: str, run_id: str, tc_id: str) -> dict
         refusal = _refusal()
         if refusal:
             return {"error": refusal, "content": None}
-        profile = _profile(package)
-        if profile is None:
-            return _skipped("no profile for " + str(package)[:80])
+        # No profile is no longer a reason to capture nothing: the app still has
+        # a pid, and its logcat filtered to that pid is its own output.
+        profile = _profile_or_generic(package)
         cleared = await adb.logcat_clear(serial)
         if cleared.get("error"):
             logger.info(
@@ -240,23 +259,47 @@ async def slice_case(
                     "truncated": False,
                 },
             }
-        profile = _profile(package)
-        if profile is None:
+        profile = _profile_or_generic(package)
+        pid = began.get("pid")
+        # RE-READ THE PID HERE, and this is the fix rather than a tidy-up.
+        # `case_runner` calls force_stop -> begin_case -> launch, so `pidof` at
+        # begin time asks about an app that is NOT RUNNING and answers nothing.
+        # The pid was therefore always None on the real path, and the refusal
+        # below -- added to stop a device-wide dump -- skipped the slice for
+        # every unprofiled app instead. Its test was green because it injected
+        # a pid that ordering cannot produce.
+        #
+        # By slice time the app has been launched and driven, so this is the
+        # one moment the question has an answer.
+        if not (isinstance(pid, int) and pid > 0):
+            pid = await adb.pidof(serial, package)
+        # THE GENERIC PROFILE HAS NO TAG, so the pid is the ONLY thing
+        # narrowing the dump. Without it `logcat -d` carries neither `--pid`
+        # nor `-s` and a megabyte of every app on the device is written into
+        # this run's evidence and shown in its report -- confirmed by a review
+        # that ran it. A real profile still has its tag, so this bound is on
+        # the generic path alone.
+        if _is_generic(profile) and not (isinstance(pid, int) and pid > 0):
             return {
                 "error": None,
                 "content": {
-                    "skipped": "no profile for " + str(package)[:80],
+                    "skipped": (
+                        "the app was not running when the slice was taken, so "
+                        "its log could not be told apart from every other "
+                        "app's; nothing was captured"
+                    ),
                     "path": None,
                     "lines": 0,
                     "truncated": False,
                 },
             }
-        pid = began.get("pid")
         dumped = await adb.logcat_dump(
             serial,
             tag=str(profile.logcat_tag or ""),
             pid=int(pid) if isinstance(pid, int) and pid > 0 else None,
-            max_bytes=MAX_SLICE_BYTES,
+            max_bytes=(
+                MAX_GENERIC_SLICE_BYTES if _is_generic(profile) else MAX_SLICE_BYTES
+            ),
         )
         if dumped.get("error"):
             return dumped
@@ -329,11 +372,21 @@ async def pull_events(
         refusal = _refusal()
         if refusal:
             return {"error": refusal, "content": None}
-        profile = _profile(package)
-        if profile is None:
-            return _logcat_only("no profile for " + str(package)[:80])
+        profile = _profile_or_generic(package)
         log_dir = profile.log_dir()
         if not log_dir:
+            # The generic profile always lands here: it names no on-device log,
+            # so there is no event stream to pull and the slices are the whole
+            # of the evidence. Said in the reason rather than left as a blank.
+            if _is_generic(profile):
+                return _logcat_only(
+                    "no profile for "
+                    + str(package)[:80]
+                    + "; a "
+                    + profiles.GENERIC_PROFILE_NAME
+                    + " captured the app's own logcat by pid instead, and there "
+                    "is no on-device event log to pull"
+                )
             return _logcat_only("the profile names no on-device log directory")
         try:
             segment_re = re.compile(str(profile.segment_name_regex or ""))
