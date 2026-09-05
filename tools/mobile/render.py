@@ -9,10 +9,16 @@ properties checkable at all.
 
 Two rules this module exists to keep:
 
-1. **The menu derives its own numbering.** ``source_menu_markdown`` says "EXACTLY
-   these N options" and then lists them, so N, the numbers and the mapping
-   paragraph are all computed from :data:`MOBILE_SOURCES`. A hand-written count
-   is how a seventh source becomes unreachable while the text still claims six.
+1. **An option is identified by its KEY, never by its position.** The host
+   assistant re-presents these options in its OWN ask-user UI, and that UI is
+   free to relabel them (Cursor renders a/b/c/d) and to reorder them -- a tester
+   saw "4 2 1 3". A position that came back from a reordered list used to select
+   a lane by index, so "explore" shown first started ``current_suite``. So every
+   option line PRINTS its key, the instruction names the key to send, and there
+   is no number-to-key mapping left to be applied to the wrong list. The count
+   word is still DERIVED from :data:`MOBILE_SOURCES`: a hand-written count is
+   how a seventh source becomes unreachable while the text still claims six, and
+   that half of the old rule was never the problem.
 2. **A packet is rendered, never rebuilt.** ``packet_block`` embeds the dict
    ``agents/mobile_run`` produced and adds nothing to it. The pruned screen is
    already the only screen representation in there; the raw uiautomator XML has
@@ -79,9 +85,78 @@ def _count_word(number: int) -> str:
     return _COUNT_WORDS.get(int(number), str(int(number)))
 
 
-def _numbered(options: tuple[tuple[str, str], ...]) -> str:
-    return "".join(
-        str(index) + ". " + line + "\n" for index, (_key, line) in enumerate(options, 1)
+def _keyed(options: tuple[tuple[str, str], ...]) -> str:
+    """One line per option, each carrying the KEY the host must send back.
+
+    Deliberately NOT numbered. The numbers were re-rendered by the host's own
+    question UI, which relabels and reorders, and a returned position then
+    selected a lane by index.
+    """
+    return "".join("- `" + key + "` \u2014 " + line + "\n" for key, line in options)
+
+
+#: Which start-menu source each start ARGUMENT implies. One argument, one lane:
+#: a tester who pasted their own cases has already answered the menu question,
+#: and asking it again is what made the lane read as broken. Order is the order
+#: a conflict is reported in.
+SOURCE_IMPLICATIONS: tuple[tuple[str, str], ...] = (
+    ("cases", "own_cases"),
+    ("goal", "explore"),
+    ("suite_id", "stored_suite"),
+)
+
+
+def implied_sources(**arguments: object) -> list[str]:
+    """The source keys implied by non-empty start arguments, in menu order.
+
+    Empty when nothing was given (so ask the menu), ONE when the tester has
+    already said what they want, and more than one when two arguments disagree
+    -- which is a narrower QUESTION, never a guess. ``run_id`` is deliberately
+    not in the table: it is already owned by ``handle_mobile_test``'s own resume
+    branch, and one argument with two owners is how the two drift.
+    """
+    out: list[str] = []
+    for name, key in SOURCE_IMPLICATIONS:
+        if str(arguments.get(name) or "").strip():
+            out.append(key)
+    return out
+
+
+def _conflict_keys(conflict: object) -> list:
+    """The source keys a caller passed as a *conflict*, coerced. Never raises.
+
+    This is a new PUBLIC parameter, so it takes whatever a caller sends, and
+    the obvious expression raised on 6 of 16 fuzzed junk values: ``list(-1)``,
+    ``list(3.5)``, ``list(True)`` and ``list(object())`` are all TypeErrors,
+    and ``key in dict(...)`` raises for an unhashable key such as a dict. None
+    of that is reachable from today's single caller -- which is exactly the
+    kind of latent raise a renderer whose whole contract is "never raises"
+    should not be holding.
+    """
+    keys = dict(MOBILE_SOURCES)
+    if isinstance(conflict, (str, bytes)) or not isinstance(
+        conflict, (list, tuple, set, frozenset)
+    ):
+        return []
+    return [key for key in conflict if isinstance(key, str) and key in keys]
+
+
+def _conflict_markdown(keys: list) -> str:
+    """The NARROW question, when two start arguments each imply a lane.
+
+    Showing the six-way menu here would throw away what the tester already
+    said, and picking one of the two would be a guess about which. So the
+    question asked back is exactly the ambiguity.
+    """
+    lines = dict(MOBILE_SOURCES)
+    return (
+        "## Two of these were given, and they mean different runs\n\n"
+        "Ask the user which one they meant -- present EXACTLY these "
+        + _count_word(len(keys))
+        + " options as a multiple-choice question:\n\n"
+        + _keyed(tuple((key, lines[key]) for key in keys))
+        + "\nThen call `qa_mobile_test` again with `source` set to that key. "
+        "Nothing has started and nothing on the device has changed."
     )
 
 
@@ -104,54 +179,41 @@ def source_for_label(label: str) -> str:
     return ""
 
 
-def source_for_number(value: object) -> str:
-    """The source KEY for a 1-based menu number, or ``""``."""
-    try:
-        index = int(str(value).strip())
-    except (TypeError, ValueError):
-        return ""
-    if 1 <= index <= len(MOBILE_SOURCES):
-        return MOBILE_SOURCES[index - 1][0]
-    return ""
-
-
-def source_menu_markdown() -> str:
+def source_menu_markdown(conflict: object = ()) -> str:
     """The start menu as an instruction to the HOST assistant.
 
     Same shape and same reason as ``mcp_handlers._tc_source_menu_markdown``:
     editors render a structured multiple-choice question reliably and MCP
     elicitation dialogs do not (a Cursor dialog arrives collapsed and required),
     so the menu is the product and the dialog is the optimisation.
+
+    *conflict* is the list of source keys two disagreeing start arguments
+    implied. With two or more, the NARROW question is asked instead of this
+    menu, through this one entry point -- so a conflict cannot be rendered by a
+    path the menu's own tests do not cover.
     """
-    number = {key: index for index, (key, _line) in enumerate(MOBILE_SOURCES, 1)}
+    narrow = _conflict_keys(conflict)
+    if len(narrow) > 1:
+        return _conflict_markdown(narrow)
     return (
         "## Ask the user: what should the emulator run?\n\n"
         "Present EXACTLY these "
         + _count_word(len(MOBILE_SOURCES))
         + " options to the user as a multiple-choice question (use your "
-        "ask-user/questions UI, not prose), then follow the mapping below. Do "
-        "not invent different options and do not pick one for them.\n\n"
-        + _numbered(MOBILE_SOURCES)
+        "ask-user/questions UI, not prose). Do not invent different options and "
+        "do not pick one for them. Your UI may relabel or reorder them; the key "
+        "shown on each line is what identifies it.\n\n"
+        + _keyed(MOBILE_SOURCES)
         + "\nAfter the user picks, call `qa_mobile_test` again with `source` set "
-        "to the matching key: "
-        + ", ".join(
-            str(number[key]) + " -> `" + key + "`" for key, _line in MOBILE_SOURCES
-        )
-        + ". Option "
-        + str(number["stored_suite"])
-        + " also needs `suite_id`, option "
-        + str(number["own_cases"])
-        + " needs the table or path in `cases`, option "
-        + str(number["explore"])
-        + " needs `goal`, and option "
-        + str(number["resume"])
-        + " needs `run_id`."
+        "to that option's key EXACTLY as printed above -- never a number, and "
+        "never the option's wording. `stored_suite` also needs `suite_id`, "
+        "`own_cases` needs the table or path in `cases`, `explore` needs `goal`, "
+        "and `resume` needs `run_id`."
     )
 
 
 def install_menu_markdown(package: str = "") -> str:
-    """The install-source menu, with the same derived numbering discipline."""
-    number = {key: index for index, (key, _line) in enumerate(INSTALL_SOURCES, 1)}
+    """The install-source menu, keyed for the same reason the start menu is."""
     head = "## The app under test is not on the emulator yet\n\n"
     if package:
         head = "## `" + str(package)[:80] + "` is not installed on the emulator\n\n"
@@ -159,25 +221,32 @@ def install_menu_markdown(package: str = "") -> str:
         head
         + "Ask the user how they want it installed -- present EXACTLY these "
         + _count_word(len(INSTALL_SOURCES))
-        + " options as a multiple-choice question:\n\n"
-        + _numbered(INSTALL_SOURCES)
-        + "\nThen call `qa_mobile_test` with `source` set to the matching key ("
-        + ", ".join(
-            str(number[key]) + " -> `" + key + "`" for key, _line in INSTALL_SOURCES
-        )
-        + "), the value in `app` (a path, a URL or a package name) and "
-        "`apply=true`. Nothing is installed, downloaded or opened without "
-        "`apply=true` -- ask the user first, on their turn, not on this one."
+        + " options as a multiple-choice question. Your UI may relabel or "
+        "reorder them; the key shown on each line is what identifies it.\n\n"
+        + _keyed(INSTALL_SOURCES)
+        + "\nThen call `qa_mobile_test` with `source` set to that option's key "
+        "EXACTLY as printed above (never a number), the value in `app` (a path, "
+        "a URL or a package name) and `apply=true`. Nothing is installed, "
+        "downloaded or opened without `apply=true` -- ask the user first, on "
+        "their turn, not on this one."
     )
 
 
-def install_source_for_number(value: object) -> str:
-    try:
-        index = int(str(value).strip())
-    except (TypeError, ValueError):
-        return ""
-    if 1 <= index <= len(INSTALL_SOURCES):
-        return INSTALL_SOURCES[index - 1][0]
+def install_source_for_label(label: str) -> str:
+    """The install-source KEY for a key or a displayed line, or ``""``.
+
+    Symmetric with :func:`source_for_label`, and for the same reason: the host
+    sends back what it was shown, and only a KEY survives a UI that relabels
+    and reorders. It replaced a POSITIONAL lookup that also closed a second,
+    quieter defect: the start menu and this menu share the ``source`` argument,
+    and the install stage tried its own number lookup FIRST -- so a start-menu
+    answer of "3" (``own_cases``) was read here as ``app_tester``, whether or
+    not the host had preserved the order.
+    """
+    wanted = str(label or "").strip()
+    for key, line in INSTALL_SOURCES:
+        if line == wanted or key == wanted:
+            return key
     return ""
 
 

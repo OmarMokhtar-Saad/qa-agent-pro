@@ -27,6 +27,22 @@ logger = logging.getLogger(__name__)
 
 MAX_ESCAPES = 3
 
+#: How many times ONE case may be stopped by the submit budget before it is
+#: ended anyway. A budget stop is not an escape -- the script was legal and the
+#: model is being asked to continue rather than to re-plan -- but exempting it
+#: outright removed the ONLY bound on the model/server loop for a case: nothing
+#: else caps submits, so a model re-sending the same over-budget script never
+#: terminates and the run never finishes. Cheap, then, but not free.
+MAX_BUDGET_STOPS = 8
+
+BUDGET_CAP_REASON = (
+    "This case was stopped by the per-submit time budget "
+    + str(MAX_BUDGET_STOPS)
+    + " times without finishing, so it is recorded as blocked rather than "
+    "continued again. Each script it was given needed more device time than "
+    "one submit allows; the trace shows how far it got."
+)
+
 VERDICT_PASS = "pass"
 VERDICT_FAIL = "fail"
 VERDICT_BLOCKED = "blocked"
@@ -37,6 +53,55 @@ VERDICT_BLOCKED = "blocked"
 VERDICT_UNVERIFIED = "unverified"
 NEEDS_MODEL = "needs_model"
 NEEDS_TESTER = "needs_tester"
+
+#: Boomerangs that may be spent WITHOUT charging an escape, per case, when the
+#: stop was caused by one of our own selectors going stale and nothing had
+#: touched the device yet.
+#:
+#: The precedent is this module's own, one branch below: "A refused script is
+#: NOT an escape: nothing was replayed, so the planner gets the same screen
+#: back and one of its escapes is not spent on our own validation." A stale id
+#: is the same category of stop -- ``perception`` mints the id, and the app
+#: moving the element is not the tester's case failing.
+#:
+#: It is CAPPED rather than free, because an uncapped uncharged stop is a loop
+#: with the tester's tokens in it. After this many, a stale-id stop is charged
+#: like any other boomerang, so ``MAX_ESCAPES`` still terminates the case.
+#:
+#: It does NOT cover the post-``type`` case, and that is measured rather than
+#: assumed: a ``type`` actuates the device, so a stale-id stop after one has
+#: ``actuated=True`` and IS charged. The answer there is the packet's own
+#: instruction to target by ``rid``/text after a ``type`` -- see
+#: ``tests/mobile/test_mobile_escape_budget.py``, which measures both.
+MAX_FREE_STOPS = 2
+
+#: The two reasons a stop is not charged, and the cap on each. ONE counter with
+#: a bound PER REASON: a single bound cannot be both "not laxer than 2 for a
+#: stale selector" and "not stricter than 8 for a budget stop", and each number
+#: has its own evidence behind it.
+REASON_BUDGET = "budget"
+REASON_SELECTOR = "selector"
+UNCHARGED_CAPS = {
+    REASON_BUDGET: MAX_BUDGET_STOPS,
+    REASON_SELECTOR: MAX_FREE_STOPS,
+}
+
+
+def uncharged_stops(run_id: str, tc_id: str) -> dict:
+    """Every uncharged stop this case has spent, by reason, read from disk.
+
+    On disk for the same reason ``escapes`` is: the MCP server restarts on every
+    code and ``.env`` edit, and an in-memory counter would mean "free forever,
+    one restart at a time".
+
+    Reads the merged ``uncharged_stops`` dict, and falls back to the two flat
+    keys a checkpoint written by either branch before the merge would carry --
+    so a run started on either side is still counted correctly.
+    """
+    body = (run_store.read_case(run_id, tc_id) or {}).get("content")
+    body = body if isinstance(body, dict) else {}
+    return _prior_uncharged(body)
+
 
 ESCAPE_CAP_REASON = (
     "This case was handed back to the planner "
@@ -83,6 +148,22 @@ def case_view(case: object) -> dict:
         return {"tc_id": "", "title": "", "steps": []}
 
 
+def budget_stops_used(run_id: str, tc_id: str) -> int:
+    """How many times the submit budget has already ended this case, from disk.
+
+    On the checkpoint for the same reason the escape count is: the MCP server
+    restarts on every code and `.env` edit, and a counter held in memory would
+    mean "loop forever, one restart at a time".
+    """
+    body = (run_store.read_case(run_id, tc_id) or {}).get("content")
+    if not isinstance(body, dict):
+        return 0
+    try:
+        return uncharged_stops(run_id, tc_id)[REASON_BUDGET]
+    except (TypeError, ValueError):
+        return 0
+
+
 def escapes_used(run_id: str, tc_id: str) -> int:
     """How many times this case has already boomeranged, read from disk."""
     body = (run_store.read_case(run_id, tc_id) or {}).get("content")
@@ -90,6 +171,22 @@ def escapes_used(run_id: str, tc_id: str) -> int:
         return 0
     try:
         return max(0, int(body.get("escapes") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def free_stops_used(run_id: str, tc_id: str) -> int:
+    """Uncharged stale-selector stops this case has already spent, from disk.
+
+    On disk for the same reason ``escapes`` is: the MCP server restarts on every
+    code and ``.env`` edit, and an in-memory counter would mean "free forever,
+    one restart at a time".
+    """
+    body = (run_store.read_case(run_id, tc_id) or {}).get("content")
+    if not isinstance(body, dict):
+        return 0
+    try:
+        return uncharged_stops(run_id, tc_id)[REASON_SELECTOR]
     except (TypeError, ValueError):
         return 0
 
@@ -305,7 +402,60 @@ async def submit_case(
             }
 
         # needs_model -- the escape hatch. Invariant 2.
-        used += 1
+        #
+        # TWO reasons a stop is not charged as an escape, ONE mechanism.
+        #
+        # A BUDGET STOP IS NOT AN ESCAPE. The executor stops a replay that would
+        # outlive the client's tool timeout; the script was legal, the actions
+        # that ran are in the trace, and the model is being asked to continue
+        # rather than to re-plan. Charging one of three escapes for obeying our
+        # own bound turns a correct case into `blocked`.
+        #
+        # A STALE-SELECTOR STOP IS NOT AN ESCAPE EITHER, when nothing touched
+        # the device first: `perception` mints the id, and the app moving an
+        # element is not the tester's case failing to make progress.
+        #
+        # The caps differ because the evidence differs -- a long case
+        # legitimately budget-stops many times, a plan whose own selector went
+        # stale should not get many retries -- so they are held per reason in
+        # UNCHARGED_CAPS rather than as one number. One counter, one disclosure,
+        # one carry-forward; two bounds, neither laxer than it was alone.
+        uncharged = uncharged_stops(run_id, tc_id)
+        reason_key = ""
+        if result.get("budget_stop"):
+            reason_key = REASON_BUDGET
+        elif bool(result.get("selector_stale")) and not result.get("actuated"):
+            reason_key = REASON_SELECTOR
+        if reason_key and uncharged[reason_key] < UNCHARGED_CAPS[reason_key]:
+            uncharged[reason_key] += 1
+            # ONE number per reason. This used to read MAX_BUDGET_STOPS while
+            # the exemption above read UNCHARGED_CAPS, so for the budget reason
+            # the dict entry was INERT -- measured 2026-09-04: raising it to 99
+            # changed no behaviour and passed all 1410 mobile tests, while
+            # raising the constant was caught by the peer's own static guard. A
+            # redundant bound that reads as authoritative is how a later retune
+            # of the unified counter silently does nothing.
+            if (
+                reason_key == REASON_BUDGET
+                and uncharged[reason_key] >= UNCHARGED_CAPS[reason_key]
+            ):
+                return {
+                    "error": None,
+                    "content": _checkpoint(
+                        run_id,
+                        tc_id,
+                        view,
+                        verdict=VERDICT_BLOCKED,
+                        status=VERDICT_BLOCKED,
+                        reason=BUDGET_CAP_REASON,
+                        trace=trace,
+                        escapes=used,
+                        packet=None,
+                        uncharged=uncharged,
+                    ),
+                }
+        else:
+            used += 1
         if used >= MAX_ESCAPES:
             return {
                 "error": None,
@@ -315,12 +465,21 @@ async def submit_case(
                     view,
                     verdict=VERDICT_BLOCKED,
                     status=VERDICT_BLOCKED,
+                    # No `uncharged=` here, and that is deliberate rather
+                    # than an omission. This exit is only reached by ORDINARY
+                    # escapes, on whose branch the counter is read straight
+                    # from disk and never incremented -- so passing it is
+                    # identical
+                    # to the carry-forward default, which mutation proved by
+                    # deleting it and changing no result. The cap exit above
+                    # passes it because that is the branch that increments.
                     reason=ESCAPE_CAP_REASON
                     + " Last stop: "
                     + str(result.get("reason") or ""),
                     trace=trace,
                     escapes=used,
                     packet=None,
+                    uncharged=uncharged,
                 ),
             }
         packet = mobile_run.build_escape_job(
@@ -344,6 +503,7 @@ async def submit_case(
                 trace=trace,
                 escapes=used,
                 packet=packet,
+                uncharged=uncharged,
             ),
         }
     except Exception as exc:  # pragma: no cover - defensive
@@ -362,6 +522,7 @@ def _checkpoint(
     trace: list,
     escapes: int,
     packet: object,
+    uncharged: object = None,
 ) -> dict:
     """Write the case checkpoint and return the caller's payload.
 
@@ -385,6 +546,16 @@ def _checkpoint(
         "reason": str(reason or "")[:1200],
         "trace": trace,
         "escapes": int(escapes),
+        # ONE carry-forward for both reasons. Every terminal checkpoint
+        # replaces this body whole, so a count this call did not compute must
+        # survive -- and `_prior_uncharged` guards the read on BOTH sides,
+        # because a corrupt count on disk (a hand-edited checkpoint, a file from
+        # another build) used to raise inside every later checkpoint for that
+        # case, which `submit_case`'s own except then reported as a handled
+        # error with no verdict written.
+        "uncharged_stops": (
+            dict(uncharged) if isinstance(uncharged, dict) else _prior_uncharged(prior)
+        ),
         "started": prior.get("started") or now,
         "updated": now,
         "evidence": _evidence_record(prior.get("evidence")),
@@ -394,6 +565,29 @@ def _checkpoint(
     payload["packet"] = packet
     payload["checkpoint_error"] = written.get("error")
     return payload
+
+
+def _prior_uncharged(prior: object) -> dict:
+    """A checkpoint's uncharged-stop counts, by reason, never raising.
+
+    Guarded because the carry-forward used to do a bare ``int()`` on whatever
+    was on disk, so a corrupt count broke every later checkpoint for that case.
+    Reads the merged key first, then the two pre-merge flat keys.
+    """
+    body = prior if isinstance(prior, dict) else {}
+    merged = body.get("uncharged_stops")
+    merged = merged if isinstance(merged, dict) else {}
+    out = {}
+    for reason, legacy in (
+        (REASON_BUDGET, "budget_stops"),
+        (REASON_SELECTOR, "free_stops"),
+    ):
+        raw = merged.get(reason, body.get(legacy))
+        try:
+            out[reason] = max(0, int(raw or 0))
+        except (TypeError, ValueError):
+            out[reason] = 0
+    return out
 
 
 def _evidence_record(source: object) -> dict:

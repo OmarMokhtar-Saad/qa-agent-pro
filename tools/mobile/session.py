@@ -591,6 +591,127 @@ def _case_dumps(cases: object) -> list[dict]:
     return out
 
 
+def case_signature(package: object, cases: object) -> str:
+    """An identity for "this app, these cases", stable across chats.
+
+    Derived from the package and the SORTED (tc_id, title) pairs, so the order
+    the cases were pasted in does not make a second run look like a new one,
+    and a genuinely different set never collides.
+
+    It exists because on 2026-09-04 a session started EIGHT runs of one case in
+    seventeen minutes: nothing could tell the model that the run it had just
+    abandoned was the one to go back to, so it planned another.
+    """
+    import hashlib
+
+    pairs = []
+    for case in list(cases or []):
+        try:
+            body = case.model_dump(mode="json") if hasattr(case, "model_dump") else case
+        except Exception:  # pragma: no cover - defensive
+            continue
+        if not isinstance(body, dict):
+            continue
+        # THE STEPS TOO, not only the id and the title. Hashing the name alone
+        # meant a tester who EDITED TC-001's steps and re-submitted was offered
+        # the previous run -- which then executed the old steps and reported
+        # them under the new case's name. A silently wrong result is worse than
+        # a duplicate run, which is all this signature exists to avoid.
+        steps = []
+        for step in body.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            steps.append(
+                str(step.get("action") or "")
+                + "\u0000"
+                + str(step.get("test_data") or "")
+                + "\u0000"
+                + str(step.get("expected_result") or "")
+            )
+        pairs.append(
+            str(body.get("tc_id") or "")
+            + "\u0000"
+            + str(body.get("title") or "")
+            + "\u0000"
+            + "\u0003".join(steps)
+        )
+    seed = str(package or "") + "\u0001" + "\u0002".join(sorted(pairs))
+    return hashlib.sha256(seed.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def run_signature(run_id: str) -> str:
+    """The signature recorded on a run's manifest, or ``""``."""
+    manifest = (run_store.read_manifest(run_id) or {}).get("content") or {}
+    return str(manifest.get("case_signature") or "")
+
+
+def find_resumable_run(signature: str, limit: int = 60) -> dict | None:
+    """The newest UNFINISHED run of the same app and the same cases, or None.
+
+    Deliberately keyed on package plus case set and NOT on the serial. A run is
+    a durable thing on disk; a serial is which emulator happened to be attached
+    when it started. A tester whose emulator was restarted, or who is resuming
+    from another chat, still wants the run they were in the middle of --
+    ``_mobile_resume_device_stage`` re-checks the device on every resume, and
+    the lane's device lock already serialises concurrent starts, so ignoring
+    the serial here adds no hazard.
+
+    The *limit* is a real bound, stated rather than hidden: the newest 60 runs
+    are considered, and a resumable run older than that is not offered. It is
+    an offer, not a guarantee, and `qa_mobile_status` still lists everything.
+
+    Never raises: this decides whether to OFFER something, and a lookup that
+    failed must fall through to planning a run rather than refusing one.
+    """
+    try:
+        wanted = str(signature or "")
+        if not wanted:
+            return None
+        for row in (list_runs(limit) or {}).get("content") or []:
+            manifest = row.get("manifest") or {}
+            # THE KEPT SIGNATURE, and only that one.
+            #
+            # There was a second comparison here against `source_signature` --
+            # the cases the tester supplied before the filters -- so that a
+            # re-run of failures could recognise its own earlier run. Round 3
+            # showed it had to be conditioned on "that run was started with no
+            # filter", because otherwise a tester who ran five cases filtered
+            # to two and then started the whole suite was told the earlier run
+            # was "running the same cases": it was running two of five, and
+            # accepting the offer finishes with three never executed and a
+            # report that looks complete.
+            #
+            # And with that condition the clause is DEAD, which mutation then
+            # proved: a run started with no filter has the two signatures EQUAL
+            # by construction, so the kept comparison has already matched
+            # whenever the source one could. An unkillable guard is not a
+            # guard, so it is gone and `source_signature` stays on the manifest
+            # as the record of what was asked for.
+            if wanted != str(manifest.get("case_signature") or ""):
+                continue
+            # NO package argument at all. There was a package comparison here
+            # and mutation proved it unreachable -- `case_signature` is seeded
+            # WITH the package, so a signature match already implies it -- and
+            # round 2 then pointed out that keeping the PARAMETER after
+            # deleting its use is a trap for a caller who passes a package that
+            # did not build the signature. The binding is in the signature, and
+            # `test_a_different_package_gives_a_different_signature` pins it.
+            run_id = str(row.get("run_id") or "")
+            resolved = (resolve(run_id) or {}).get("content") or {}
+            if not resolved or resolved.get("finished"):
+                continue
+            return {
+                "run_id": run_id,
+                "state": str(resolved.get("state") or ""),
+                "done": int(resolved.get("done") or 0),
+                "total": int(resolved.get("total") or 0),
+            }
+        return None
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("mobile.session.find_resumable_run failed")
+        return None
+
+
 def plan_suite_run(
     cases: object,
     *,
@@ -630,6 +751,17 @@ def plan_suite_run(
                 "serial": str(serial or ""),
                 "avd": str(avd or provisioner.AVD_NAME),
                 "source": str(source or ""),
+                "case_signature": case_signature(package, kept),
+                # The cases the TESTER supplied, before the filters -- the
+                # RECORD of what was asked for, and nothing more.
+                #
+                # It was added so a re-run of failures could recognise its own
+                # earlier run, and `find_resumable_run` no longer reads it: that
+                # match had to be conditioned on "started with no filter", and
+                # with that condition it was dead. The flow survives anyway,
+                # because a run's manifest stores the KEPT cases, so a second
+                # re-run hashes those and matches `case_signature`.
+                "source_signature": case_signature(package, cases),
                 "cases": _case_dumps(kept),
             },
         )
@@ -1106,13 +1238,176 @@ async def finish_evidence(run_id: str, resolved: object) -> None:
     await _finish_evidence(run_id, resolved)
 
 
-def _persist_explore(run_id: str, state: object) -> None:
-    """Write the exploratory state back into the manifest, in place."""
+#: What an exploratory turn is checkpointed as. An explore run used to write NO
+#: case record at all: ``_submit_explore`` replayed the turn, folded the reply
+#: and returned, while ``tools/mobile/report.py`` is case-driven from
+#: ``cases/TC-*.json`` -- so a real four-turn run
+#: (``mrun-20260904-194622-bd5142``) produced a 147 KB report reading "0 cases
+#: checkpointed" and "No case has been checkpointed yet". A turn IS the unit of
+#: work in this lane, so it is checkpointed as one, through the same
+#: ``run_store`` path the suite lane uses. That is why the existing report
+#: machinery draws it with no change to what a "case" means on disk.
+EXPLORE_MODULE = "Exploration"
+EXPLORE_TITLE_PREFIX = "Exploratory turn "
+
+
+def explore_turn_tc_id(turn: object) -> str:
+    """The synthetic, STABLE case id for one exploratory turn.
+
+    Stable is the load-bearing word: the same turn submitted twice (a refused
+    script, a resumed chat) must reuse its id, or the report grows a duplicate
+    card per retry. The turn number is the only identifier a turn has that
+    survives an MCP restart, and ``run_store.valid_tc_id`` already accepts
+    exactly this shape -- so no store contract moves for this fix.
+    """
+    try:
+        number = int(turn or 0)
+    except (TypeError, ValueError):
+        number = 0
+    return "TC-%03d" % max(1, min(number, 999999))
+
+
+def _latest_finding(state: object) -> str:
+    """The finding recorded for the CURRENT turn, or ``""``.
+
+    Matched on the turn number rather than taken as the last entry: findings
+    are appended only when a turn reports one, so "the last note" would make a
+    silent turn inherit the previous turn's finding and report evidence that
+    turn never produced.
+    """
+    body = state if isinstance(state, dict) else {}
+    try:
+        turn = int(body.get("turn") or 0)
+    except (TypeError, ValueError):
+        return ""
+    notes = [f for f in list(body.get("findings") or []) if isinstance(f, dict)]
+    for entry in reversed(notes):
+        try:
+            if int(entry.get("turn") or 0) == turn:
+                return str(entry.get("note") or "")
+        except (TypeError, ValueError):
+            continue
+    return ""
+
+
+def _explore_planned_case(tc_id: str, state: object, finding: str = "") -> dict:
+    """The turn as a MINIMAL valid ``TestCase`` dump, for ``manifest["cases"]``.
+
+    Valid rather than ad-hoc because :func:`load_case` and
+    :func:`load_run_cases` rehydrate every entry of that list through
+    ``TestCase(**body)``: a shape that failed validation would be dropped with
+    a warning, and the re-run-failures source would silently lose the run. It
+    is also what lets the report's ``_planned_case`` print what the turn was
+    FOR.
+    """
+    body = state if isinstance(state, dict) else {}
+    goal = " ".join(str(body.get("goal") or "").split())[:400] or "not recorded"
+    try:
+        turn = max(1, int(body.get("turn") or 1))
+    except (TypeError, ValueError):
+        turn = 1
+    note = " ".join(str(finding or "").split())[:400]
+    return {
+        "tc_id": tc_id,
+        "module": EXPLORE_MODULE,
+        "title": (EXPLORE_TITLE_PREFIX + str(turn) + " \u2014 " + goal)[:250],
+        "priority": "Medium",
+        "type": "Exploratory",
+        "preconditions": "The app was open at the previous turn's screen.",
+        "steps": [
+            {
+                "step_number": 1,
+                "action": "Explore towards the goal: " + goal,
+                "expected_result": (
+                    "Recorded finding: " + note
+                    if note
+                    else (
+                        "An exploratory turn has no expected result; it records "
+                        "what was found."
+                    )
+                ),
+            }
+        ],
+        "automation_status": "Manual",
+    }
+
+
+def _checkpoint_explore_turn(
+    run_id: str, state: object, outcome: object, finding: str = ""
+) -> dict:
+    """Write ONE exploratory turn as a case-shaped record. Never raises.
+
+    Best-effort exactly like ``run_store.write_screen``: a lost checkpoint may
+    never lose a turn's replay, so nothing here can return an error into the
+    submit path. Returns the body it wrote (or tried to), because the caller
+    reports the same id and title back to the tester.
+
+    The record carries a STATUS and no verdict, deliberately. An exploratory
+    turn has no expected result, so it has no verdict to earn;
+    ``report._verdict_of`` then shows the status and explicitly never invents a
+    pass, which is the honest rendering of a turn that simply happened.
+    """
+    body = state if isinstance(state, dict) else {}
+    result = outcome if isinstance(outcome, dict) else {}
+    try:
+        turn = max(1, int(body.get("turn") or 1))
+    except (TypeError, ValueError):
+        turn = 1
+    tc_id = explore_turn_tc_id(turn)
+    goal = " ".join(str(body.get("goal") or "").split())[:200] or "no goal recorded"
+    now = time.time()
+    written = {
+        "tc_id": tc_id,
+        "title": (EXPLORE_TITLE_PREFIX + str(turn) + " \u2014 " + goal)[:250],
+        "verdict": "",
+        "status": str(result.get("status") or ""),
+        "reason": str(result.get("reason") or "")[:1200],
+        "trace": list(result.get("trace") or []),
+        "escapes": 0,
+        "finding": " ".join(str(finding or "").split())[:600],
+        "started": now,
+        "updated": now,
+        # Shaped like `case_runner._evidence_record`'s output so the report's
+        # evidence join reads a record rather than a missing key.
+        "evidence": {
+            "profile": None,
+            "clock_offset_ms": None,
+            "pid": None,
+            "skipped": "an exploratory turn takes no app-log slice",
+            "slices": 0,
+            "slices_written": [],
+        },
+    }
+    try:
+        run_store.write_case(run_id, tc_id, written)
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("mobile.session: could not checkpoint an explore turn")
+    return written
+
+
+def _persist_explore(run_id: str, state: object, planned: object = None) -> None:
+    """Write the exploratory state back into the manifest, in place.
+
+    *planned* is one ``TestCase``-shaped dict for the turn just submitted. It
+    goes in the SAME read-modify-write as the state: this function writes the
+    WHOLE manifest, so two separate writes would have the second clobber the
+    first.
+    """
     try:
         manifest = (run_store.read_manifest(run_id) or {}).get("content") or {}
         if not isinstance(manifest, dict):
             return
         manifest["explore"] = state if isinstance(state, dict) else {}
+        if isinstance(planned, dict) and planned.get("tc_id"):
+            cases = [
+                body
+                for body in list(manifest.get("cases") or [])
+                if isinstance(body, dict)
+                and str(body.get("tc_id") or "") != str(planned["tc_id"])
+            ]
+            cases.append(planned)
+            manifest["cases"] = cases
+            manifest["total"] = len(cases)
         run_store.write_manifest(run_id, manifest)
     except Exception:  # pragma: no cover - defensive
         logger.warning("mobile.session: could not persist explore state")
@@ -1211,7 +1506,18 @@ async def _submit_explore(
     if folded.get("error"):
         return folded
     turn = folded.get("content") or {}
-    _persist_explore(run_id, turn.get("state"))
+    # The turn just replayed, checkpointed as a case. ``resolved["explore"]``
+    # carries the turn NUMBER this submit answered (``next_turn`` incremented
+    # and persisted it before the packet went out), so the id is the turn's own
+    # and is the same on a resubmit.
+    before = resolved.get("explore") or {}
+    finding = _latest_finding(turn.get("state"))
+    checkpoint = _checkpoint_explore_turn(run_id, before, outcome, finding)
+    _persist_explore(
+        run_id,
+        turn.get("state"),
+        planned=_explore_planned_case(checkpoint["tc_id"], before, finding),
+    )
     if str(turn.get("status") or "") != explore_runner.RUNNING:
         await _finish_evidence(run_id, resolved)
     return {
@@ -1223,8 +1529,8 @@ async def _submit_explore(
                 else STATE_RUNNING
             ),
             "case": {
-                "tc_id": "",
-                "title": "exploratory turn",
+                "tc_id": checkpoint["tc_id"],
+                "title": checkpoint["title"],
                 "status": str(outcome.get("status") or ""),
                 "verdict": "",
                 "reason": str(outcome.get("reason") or ""),

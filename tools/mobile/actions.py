@@ -8,10 +8,34 @@ with ``extra="forbid"`` -- an unknown key is a refusal, not a warning -- and
 every one of them lands on an ``adb`` helper that validates its own arguments
 again.
 
-Target resolution order is ``id`` > ``rid`` > exact text/desc > contains, and a
-MISS IS NOT A FAILURE: it is the boomerang point. The model planned from screen
-N and the app is on screen N+1; the honest answer is to hand the new screen back
-and ask for the rest of the script, not to fail the tester's case.
+Target resolution order is ``rid`` > exact text/desc > ``contains`` > ``id``,
+and that order is a fix rather than a preference. It used to put ``id`` FIRST,
+while ids were row numbers in the current dump and the executor re-dumps after
+every mutating op -- so a ``type`` that made a chat app grow a send control
+shifted every later row by one and the next tap landed on the neighbouring
+widget with ``how="id"`` and ``candidates=1``: a confident, unique, wrong
+answer. ``perception.element_id`` now derives an id from the element's own
+content, which makes the shift unrepresentable. The ORDERING is not a second
+guard on top of that, and calling it one would overstate it: ``how`` has no
+production reader, and a target carrying only a ``rid`` resolves to the same
+element under either order. What the order buys is that the packet, the prompt
+and the resolver all recommend the selectors the APP chose -- ``rid`` and the
+on-screen text -- so a model that follows the guidance is not relying on an id
+at all. The safety comes from content-derived ids and from the refusals below.
+
+A MISS IS NOT A FAILURE: it is the boomerang point. The model planned from
+screen N and the app is on screen N+1; the honest answer is to hand the new
+screen back and ask for the rest of the script, not to fail the tester's case.
+
+**A target's selectors are cross-checked against EACH OTHER, all of them.** A
+plan whose selectors name different elements, or one of whose selectors matches
+nothing while another matches, is a plan built on an older screen, and this
+module refuses to pick one of them. The first version of that check covered
+``id`` only, so ``{"rid": ..., "text": ...}`` naming two different elements
+tapped one of them and reported a unique hit -- the same defect as the row
+numbers, one selector pair over. The check is now driven by
+:func:`candidates_for` and pinned by a property test over
+``Target.model_fields``, so it cannot miss the next pair either.
 """
 
 from __future__ import annotations
@@ -26,12 +50,82 @@ logger = logging.getLogger(__name__)
 
 MAX_ACTIONS = 40
 MAX_WAIT_MS = 10000
+
+#: The wall clock ONE submit may spend replaying, in ms. A client kills a tool
+#: call at around 60 s: measured on 2026-09-04, where `qa_submit_mobile_step`
+#: returned "ok in 60040 ms" to a client that had already given up, and the
+#: model started a fresh run rather than resuming. 40 s leaves the reply, the
+#: checkpoint write and the packet render inside the window.
+#:
+#: It lives HERE, next to the vocabulary, and not in ``executor``, because the
+#: packet quotes it to the model and ``agents/mobile_run`` may not import the
+#: executor. ``executor.SUBMIT_BUDGET_S`` is derived from this one value.
+SUBMIT_BUDGET_MS = 40000
+
+#: The SUM of every wait in one script. A single wait is already capped at
+#: :data:`MAX_WAIT_MS`, but nothing capped the total, and two 5 s waits plus two
+#: types and two asserts took a submit past the client's kill. Refusing costs
+#: the tester nothing: a refused script is not an escape, so the model resends a
+#: shorter one against the same screen.
+MAX_TOTAL_WAIT_MS = 25000
+
+#: What a ``wait`` carrying only ``until_text`` counts as, for the total above:
+#: the bound the executor actually applies to it. Mirrored rather than imported
+#: -- ``actions`` must not import ``executor`` -- and pinned equal to
+#: ``executor.DEFAULT_WAIT_UNTIL_TEXT_S`` by a test, so the two cannot drift.
+UNTIL_TEXT_DEFAULT_MS = 20000
 MAX_TEXT_CHARS = 4000
 MAX_ERROR_CHARS = 600
 SECRET_MASK = "***"
 
+#: Words that make a field a CREDENTIAL by name, whatever the model marked.
+#:
+#: The list is enumerated rather than described because a vague rule is not an
+#: implementable one. It is checked as WHOLE WORDS -- camel-case split first --
+#: against the action's ``field`` and its target's ``rid``, ``text`` and ``id``,
+#: so ``com.x:id/pass`` matches ``pass`` and ``Compass`` matches nothing.
+#:
+#: Deliberately broad in the SAFE direction: a promo ``code`` field is masked in
+#: the report, which costs a tester one detail, and a leaked one-time code costs
+#: more. It exists because a model that forgets ``secret: true`` must not be
+#: able to put a credential into a checkpoint, an audit line or a page.
+CREDENTIAL_TERMS: frozenset = frozenset(
+    {
+        "password",
+        "passwd",
+        "pass",
+        "passcode",
+        "pin",
+        "otp",
+        "code",
+        "token",
+        "secret",
+        "credential",
+        "credentials",
+        "cvv",
+        "ssn",
+        "apikey",
+        "auth",
+        "login",
+        # Added 2026-09-04 from a review that executed the code: `passphrase`
+        # is ONE token and so was never covered by `pass`.
+        "passphrase",
+        "phrase",
+        "seed",
+        "mnemonic",
+        "security",
+        "recovery",
+    }
+)
+
 SCROLL_DIRECTIONS = ("up", "down", "left", "right")
-ASSERT_KINDS = ("text_present", "text_absent", "element", "screen_changed")
+ASSERT_KINDS = (
+    "text_present",
+    "text_absent",
+    "element",
+    "new_text",
+    "screen_changed",
+)
 VERDICTS = ("pass", "fail", "blocked")
 URL_SCHEMES = ("https", "http", "market")
 
@@ -43,18 +137,38 @@ MUTATING_OPS = frozenset(
 
 
 class Target(BaseModel):
-    """Which element an action acts on. At least one selector is required."""
+    """Which element an action acts on. At least one selector is required.
+
+    ``id`` IS NOT STABLE, and that is not a detail. ``perception`` numbers
+    elements positionally on every dump, and the executor re-dumps after every
+    screen-changing action -- so an ``id`` planned from screen N means something
+    else on screen N+1. Both blocked runs of 2026-09-04 died on exactly that:
+    ``[clear e14, type e14, wait, tap e17]`` reached ``missing_element``,
+    because typing into the composer changed the element list.
+
+    ``role`` and ``label`` are computed by this server from the element's own
+    content, so they survive a renumber. For any action that follows another
+    action, they are the right selector.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(default="", max_length=16)
     text: str = Field(default="", max_length=200)
     rid: str = Field(default="", max_length=200)
+    role: str = Field(default="", max_length=32)
+    label: str = Field(default="", max_length=200)
 
     @model_validator(mode="after")
     def at_least_one_selector(self) -> "Target":
-        if not (self.id.strip() or self.text.strip() or self.rid.strip()):
-            raise ValueError("a target needs one of id, text or rid")
+        if not (
+            self.id.strip()
+            or self.text.strip()
+            or self.rid.strip()
+            or self.role.strip()
+            or self.label.strip()
+        ):
+            raise ValueError("a target needs one of id, rid, role, label or text")
         return self
 
 
@@ -153,9 +267,25 @@ class OpenUrlAction(_Base):
 
 
 class AssertAction(_Base):
+    """Check something about the screen. Five kinds, and one of them is weak.
+
+    ``new_text`` is the kind to reach for when a case says "the app replies":
+    it passes only when text is on the screen that was NOT on the previous one,
+    which is what an answer arriving looks like. ``contains`` narrows it to a
+    reply mentioning a particular string.
+
+    ``screen_changed`` is kept and is WEAK on purpose: it compares screen IDs,
+    so ANY navigation satisfies it and it is never evidence that an answer
+    arrived. The 2026-09-04 live run asserted it after each send and read the
+    result as "the assistant replied"; it was not.
+    """
+
     op: Literal["assert"]
-    kind: Literal["text_present", "text_absent", "element", "screen_changed"]
+    kind: Literal[
+        "text_present", "text_absent", "element", "new_text", "screen_changed"
+    ]
     text: str = Field(default="", max_length=200)
+    contains: str = Field(default="", max_length=200)
     target: Optional[Target] = None
 
     @model_validator(mode="after")
@@ -232,12 +362,44 @@ Action = Annotated[
 ]
 
 
+def total_wait_ms(actions: object) -> int:
+    """Device time every ``wait`` in *actions* may spend, in ms.
+
+    A ``wait`` carrying only ``until_text`` polls until the text appears, so its
+    worst case is :data:`UNTIL_TEXT_DEFAULT_MS` rather than zero. Counting it as
+    zero is how a two-wait script still blew the submit budget.
+    """
+    total = 0
+    for action in list(actions or []):
+        if str(getattr(action, "op", "") or "") != "wait":
+            continue
+        ms = int(getattr(action, "ms", 0) or 0)
+        if not ms and str(getattr(action, "until_text", "") or "").strip():
+            ms = UNTIL_TEXT_DEFAULT_MS
+        total += ms
+    return total
+
+
 class Script(BaseModel):
     """One case's bounded plan."""
 
     model_config = ConfigDict(extra="forbid")
 
     actions: list[Action] = Field(min_length=1, max_length=MAX_ACTIONS)
+
+    @model_validator(mode="after")
+    def waits_fit_one_submit(self) -> "Script":
+        total = total_wait_ms(self.actions)
+        if total > MAX_TOTAL_WAIT_MS:
+            raise ValueError(
+                "the waits in this script total "
+                + str(total)
+                + " ms, over the "
+                + str(MAX_TOTAL_WAIT_MS)
+                + " ms one submit allows; split the case into shorter scripts "
+                "-- the server hands the screen back between them"
+            )
+        return self
 
 
 OPS = (
@@ -304,6 +466,80 @@ def parse_script(raw: object) -> dict:
         return {"error": str(exc), "content": None}
 
 
+#: The ops whose action can hold a value a tester typed. Everything else is
+#: read-only as far as a credential is concerned, so the mask has no business
+#: touching it.
+VALUE_BEARING_OPS: frozenset = frozenset({"type", "ask_tester"})
+
+
+def is_credential_action(action: object) -> bool:
+    """True when this action's own names say it carries a credential.
+
+    Independent of the ``secret`` marker on purpose: the marker is the model's
+    claim, and this is the server's own reading of the field it typed into.
+
+    The tokeniser is ``perception``'s, so this package asks the question ONE
+    way -- the destructive lexicon, the role vocabulary and this mask all split
+    camel case and match whole words with the same code. ``perception`` imports
+    nothing from here, so the direction is safe.
+    """
+    from tools.mobile import perception
+
+    if isinstance(action, BaseModel):
+        try:
+            payload = action.model_dump(mode="json")
+        except Exception:  # pragma: no cover - defensive
+            return True
+    elif isinstance(action, dict):
+        payload = action
+    else:
+        return False
+    # ONLY AN OP THAT CARRIES A VALUE. An `assert` cannot hold a typed literal,
+    # so flagging one by its target's label masked its expected text for
+    # nothing -- and `until_text`, on an action the same rule flagged, stayed
+    # clear anyway. Inconsistent rather than unsafe, and the scope is the fix.
+    if str(payload.get("op") or "") not in VALUE_BEARING_OPS:
+        return False
+    target = payload.get("target")
+    target = target if isinstance(target, dict) else {}
+    surface = [
+        payload.get("field"),
+        target.get("rid"),
+        target.get("text"),
+        target.get("id"),
+        target.get("label"),
+    ]
+    # THE WHOLE SURFACE, and this reverses a narrowing that lasted one round.
+    #
+    # It was narrowed to `field` alone because applying it to a target's label
+    # masked the tester's own Arabic QUESTION in the report that exists to show
+    # it. That is a real cost and it is still real. But the narrowing reopened
+    # the leak for every credential field whose dump does not carry
+    # `password="true"` -- a PIN, an OTP, a custom view -- and a reviewer
+    # confirmed a password rendered in clear in report.html under an Arabic
+    # label. Between hiding a question and showing a credential, the credential
+    # wins: masking costs a tester one line of evidence, and it is avoidable by
+    # targeting with `rid`, a short id or a `role`, which the packet asks for
+    # anyway.
+    #
+    # The element-level control added alongside it stays -- a plain `type` into
+    # a password input is still refused -- because it catches the case where
+    # the NAME says nothing at all. Neither is sufficient alone.
+    if perception.has_unreadable_text(*surface):
+        return True
+    # FAIL CLOSED ON A NAME THIS SERVER CANNOT READ. `words` tokenises ASCII,
+    # so a wholly non-Latin field name yields NO tokens and could never match
+    # this list -- by construction, for every language. A reviewer confirmed a
+    # value under an Arabic field name reaching report.html in clear, on the
+    # lane whose validated app is an Arabic one.
+    #
+    # The invariant, stated because it recurs: a lexicon of names is not a
+    # security boundary. "Matched nothing in my list" and "is not in an
+    # alphabet I can read" are different answers, and only the first clears a
+    # value for printing.
+    return bool(set(perception.words(*surface)) & CREDENTIAL_TERMS)
+
+
 def action_text(action: object) -> str:
     """The on-screen label an action is aiming at, for the destructive guard."""
     target = getattr(action, "target", None)
@@ -328,7 +564,11 @@ def redact_action(action: object) -> dict:
             payload = dict(action)
         else:
             return {"op": str(action)[:40]}
-        if payload.get("secret"):
+        # TWO reasons to mask, and the second is the one that matters now that
+        # the report renders a typed literal: the model's own `secret` marker,
+        # and this server's reading of what the field is CALLED. A model that
+        # forgets the marker used to put the value straight through.
+        if payload.get("secret") or is_credential_action(payload):
             if "text" in payload:
                 payload["text"] = SECRET_MASK
             if "value" in payload:
@@ -343,70 +583,259 @@ def _norm(value: object) -> str:
     return " ".join(str(value or "").split()).strip().lower()
 
 
+#: The selector fields a ``Target`` may carry, in the PREFERENCE order the
+#: resolver reports. THEIR order, kept verbatim: ``id`` > ``rid`` > ``role`` >
+#: ``label`` > ``text``. Preference decides which element is acted on when
+#: several agree, and which selector is named in ``how``; it never decides
+#: whether the others are consulted -- see :func:`resolve_target`.
+#:
+#: A property test enumerates ``Target.model_fields`` against this tuple, so a
+#: selector added to the vocabulary without a resolver fails immediately rather
+#: than silently skipping the agreement check. That is what forced this tuple to
+#: grow from three to five when the two branches met.
+SELECTORS: tuple[str, ...] = ("id", "rid", "role", "label", "text")
+
+#: The selectors this SERVER mints, as opposed to the ones the app or the plan
+#: chose. ``perception.element_id`` derives an ``id`` from the element's own
+#: content, so an id that no longer resolves is OUR bookkeeping going stale --
+#: after a ``type`` the keyboard opens and every id moves at once -- and
+#: ``case_runner``'s uncharged-stop budget declines to charge the case for it.
+#: A ``rid``, a ``role``, a ``label`` or a text that matches nothing is the
+#: PLANNER naming something absent, and that is charged like any other
+#: boomerang. The exemption is narrow on purpose: an uncharged stop for any
+#: miss would be a free retry.
+#:
+#: ``role`` and ``label`` are computed by this server too, but from content that
+#: is ALREADY in the element -- they do not go stale on a re-layout the way a
+#: bounds-derived id does, which is the whole reason they exist. They are the
+#: planner's to get right, so they are not in here.
+OURS: frozenset[str] = frozenset({"id"})
+
+
+def _selector_values(target: object) -> dict:
+    """The selectors this target actually carries, normalised."""
+    out: dict = {}
+    for name in SELECTORS:
+        raw = (
+            target.get(name) if isinstance(target, dict) else getattr(target, name, "")
+        )
+        value = _norm(raw)
+        if value:
+            out[name] = value
+    return out
+
+
+def _rid_candidates(elements: list, want: str) -> list:
+    exact = [e for e in elements if _norm(e.get("rid")) == want]
+    if exact:
+        return exact
+    # A rid given without its package prefix is a documented convenience.
+    return [e for e in elements if _norm(e.get("rid")).endswith("/" + want)]
+
+
+def _labelled_candidates(elements: list, key: str, want: str, contains: str) -> tuple:
+    """Exact before contains, for one string selector. Their tiering."""
+    exact = [e for e in elements if _norm(e.get(key)) == want]
+    if exact:
+        return key, exact
+    return contains, [e for e in elements if want in _norm(e.get(key))]
+
+
+def _text_candidates(elements: list, want: str) -> tuple:
+    exact = [
+        e
+        for e in elements
+        if _norm(e.get("text")) == want or _norm(e.get("desc")) == want
+    ]
+    if exact:
+        return "text", exact
+    return "contains", [
+        e
+        for e in elements
+        if want in _norm(e.get("text")) or want in _norm(e.get("desc"))
+    ]
+
+
+def candidates_for(target: object, pruned: object) -> dict:
+    """``{selector: (how, [every element that selector ALONE matches])}``.
+
+    Public because :func:`resolve_target` is implemented on top of it and a
+    property test enumerates ``Target.model_fields`` against it. That is the
+    mechanical half of the agreement rule: the rule iterates whatever this
+    returns, so it cannot forget a selector the way an id-only check did -- and
+    when ``role`` and ``label`` arrived from another branch, the test named them
+    rather than letting them through unchecked.
+    """
+    screen = pruned if isinstance(pruned, dict) else {}
+    if isinstance(screen.get("content"), dict):
+        screen = screen["content"]
+    # A new PUBLIC entry point, and the property test calls it directly, so it
+    # takes whatever a caller sends: 16 of 112 junk screens raised TypeError
+    # here before this line.
+    raw = screen.get("elements")
+    elements = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+    out: dict = {}
+    for name, want in _selector_values(target).items():
+        if name == "rid":
+            out[name] = ("rid", _rid_candidates(elements, want))
+        elif name == "role":
+            out[name] = ("role", [e for e in elements if _norm(e.get("role")) == want])
+        elif name == "label":
+            out[name] = _labelled_candidates(elements, "label", want, "label_contains")
+        elif name == "text":
+            out[name] = _text_candidates(elements, want)
+        else:
+            out[name] = ("id", [e for e in elements if _norm(e.get("id")) == want])
+    return out
+
+
 def resolve_target(target: object, pruned: object) -> dict:
     """Find *target* on the pruned screen. A miss is content, not an error.
 
-    ``{"error": None, "content": {"element": <element|None>, "how": str,
-    "candidates": int}}``. ``how`` is ``""`` on a miss so a caller can branch on
-    a constant rather than on the absence of a key.
+    ``{"error": None, "content": {"element", "how", "candidates", "stale",
+    "conflict", "supplied", "stale_selectors"}}``. ``how`` is ``""`` on a miss
+    so a caller can branch on a constant rather than on the absence of a key.
+
+    **An element is returned only when it is among the matches of EVERY
+    selector the target supplied.** Preference order (:data:`SELECTORS`)
+    decides which element is acted on among those that agree, and which
+    selector ``how`` names; it never decides whether the others are consulted.
+    Outcomes:
+
+    * every supplied selector matched and they agree -> a HIT. The narrowest
+      selector picks the element, and a CLICKABLE candidate is preferred, so a
+      role resolves the tappable wrapper rather than the child that carries the
+      word.
+    * a ``role`` that still matches more than one TAPPABLE control after every
+      other selector has narrowed it -> a miss carrying that count. Ambiguity is
+      not a coin toss: picking the first in dump order is how "Send voice
+      message" was tapped instead of Send. Checked AFTER the intersection so a
+      target carrying its own tie-break -- ``{"role": "input", "label":
+      "Message"}`` -- is still answered.
+    * a supplied selector matched NOTHING while another matched something ->
+      ``stale``: the plan was built on a screen that no longer exists.
+    * two supplied selectors both matched, but no element satisfies both ->
+      ``conflict``.
+    * nothing matched at all -> ``stale`` when one of :data:`OURS` was supplied
+      and missed, otherwise a plain miss. ``case_runner`` charges those two
+      differently.
     """
     try:
-        screen = pruned if isinstance(pruned, dict) else {}
-        if isinstance(screen.get("content"), dict):
-            screen = screen["content"]
-        elements = [e for e in (screen.get("elements") or []) if isinstance(e, dict)]
+        found = candidates_for(target, pruned)
+        if not found:
+            return {"error": None, "content": _miss()}
+        supplied = tuple(name for name in SELECTORS if name in found)
+        matched = {name: group for name, (_how, group) in found.items() if group}
+        missed = tuple(name for name in supplied if name not in matched)
+        if not matched:
+            ours_missed = tuple(name for name in missed if name in OURS)
+            return {
+                "error": None,
+                "content": _miss(
+                    stale=bool(ours_missed),
+                    supplied=supplied,
+                    stale_selectors=missed,
+                ),
+            }
+        if missed:
+            return {
+                "error": None,
+                "content": _miss(stale=True, supplied=supplied, stale_selectors=missed),
+            }
 
-        if isinstance(target, dict):
-            want_id = _norm(target.get("id"))
-            want_text = _norm(target.get("text"))
-            want_rid = _norm(target.get("rid"))
-        else:
-            want_id = _norm(getattr(target, "id", ""))
-            want_text = _norm(getattr(target, "text", ""))
-            want_rid = _norm(getattr(target, "rid", ""))
+        # Elements satisfying EVERY supplied selector, compared by content.
+        seeds: set | None = None
+        for group in matched.values():
+            group_seeds = {_seed(element) for element in group}
+            seeds = group_seeds if seeds is None else (seeds & group_seeds)
+        if not seeds:
+            return {
+                "error": None,
+                "content": _miss(conflict=True, supplied=supplied),
+            }
 
-        if want_id:
-            for element in elements:
-                if _norm(element.get("id")) == want_id:
-                    return _hit(element, "id", 1)
-        if want_rid:
-            matches = [e for e in elements if _norm(e.get("rid")) == want_rid]
-            if not matches:
-                matches = [
-                    e for e in elements if _norm(e.get("rid")).endswith("/" + want_rid)
-                ]
-            if matches:
-                return _hit(matches[0], "rid", len(matches))
-        if want_text:
-            exact = [
-                e
-                for e in elements
-                if _norm(e.get("text")) == want_text
-                or _norm(e.get("desc")) == want_text
-            ]
-            if exact:
-                return _hit(exact[0], "text", len(exact))
-            partial = [
-                e
-                for e in elements
-                if want_text in _norm(e.get("text"))
-                or want_text in _norm(e.get("desc"))
-            ]
-            if partial:
-                return _hit(partial[0], "contains", len(partial))
+        order = {name: index for index, name in enumerate(SELECTORS)}
+        narrowest = min(matched, key=lambda name: (len(matched[name]), order[name]))
+        agreed = [e for e in matched[narrowest] if _seed(e) in seeds]
+        # THEIR clickable preference: the tap target is the wrapper, and the
+        # element carrying the word is often its non-clickable child.
+        tappable = [e for e in agreed if e.get("clickable")]
+
+        # THEIR ambiguity rule, applied to what SURVIVED the cross-check rather
+        # than to the role's own matches -- which is their own "ambiguity falls
+        # through" intent, generalised: any other selector may narrow it, and
+        # only a role still ambiguous at the end is a miss.
+        if "role" in matched and len(tappable) > 1:
+            return {
+                "error": None,
+                "content": _miss(supplied=supplied, candidates=len(tappable)),
+            }
+
+        chosen = (tappable or agreed)[0]
+        preferred = min(matched, key=lambda name: order[name])
         return {
             "error": None,
-            "content": {"element": None, "how": "", "candidates": 0},
+            "content": _hit(chosen, found[preferred][0], len(matched[preferred])),
         }
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.actions.resolve_target failed")
         return {"error": str(exc), "content": None}
 
 
+def _seed(element: object) -> str:
+    """One element's content identity, from ``perception``'s own expression.
+
+    Imported inside the function because ``actions`` must stay importable on
+    its own. ``perception`` does not import ``actions``, so there is no cycle.
+    A CONTENT comparison rather than ``is``: a screen that has round-tripped
+    through the run store's JSON is the same screen, and identity would call
+    two views of one element a conflict.
+    """
+    from tools.mobile import perception
+
+    return perception.element_seed(element)
+
+
 def _hit(element: dict, how: str, candidates: int) -> dict:
+    """A resolution. ``stale`` and ``conflict`` are ALWAYS False here.
+
+    A hit means every selector the target supplied agreed. They were briefly
+    settable on a hit, which was dead information AND meant an action could be
+    performed on an element only one selector named.
+    """
     return {
-        "error": None,
-        "content": {"element": element, "how": how, "candidates": int(candidates)},
+        "element": element,
+        "how": how,
+        "candidates": int(candidates),
+        "stale": False,
+        "conflict": False,
+        "supplied": (),
+        "stale_selectors": (),
+    }
+
+
+def _miss(
+    *,
+    stale: bool = False,
+    conflict: bool = False,
+    supplied: tuple = (),
+    stale_selectors: tuple = (),
+    candidates: int = 0,
+) -> dict:
+    """No element, and WHY -- so the boomerang can say something useful.
+
+    ``candidates`` is non-zero only for an ambiguous ``role``: it is how many
+    TAPPABLE controls carried it, and ``executor.missing_element_detail`` turns
+    that into "name one of them" rather than "nothing matched".
+    """
+    return {
+        "element": None,
+        "how": "",
+        "candidates": int(candidates),
+        "stale": bool(stale),
+        "conflict": bool(conflict),
+        "supplied": tuple(supplied),
+        "stale_selectors": tuple(stale_selectors),
     }
 
 
@@ -415,7 +844,18 @@ def describe_vocabulary() -> dict:
     return {
         "max_actions": MAX_ACTIONS,
         "ops": list(OPS),
-        "target": "one of {id, text, rid}; prefer the short id from the screen block",
+        "target": (
+            "one of {id, rid, role, label, text}, and they are CROSS-CHECKED: "
+            "send two that name different elements, or one that matches "
+            "nothing beside one that matches, and the action is handed back "
+            "rather than guessed. Prefer `role` or `label` for any action that "
+            "follows another -- the server computes them from the element's "
+            "own content and they survive a re-layout. `rid` is next. The "
+            "short id is THIS SCREEN ONLY: it describes the element as it was "
+            "on the screen you were given, bounds included, so it stops "
+            "matching when that element moves. It can never match a DIFFERENT "
+            "element, but being handed back still costs you a turn."
+        ),
         "notes": [
             "tap/type/clear/scroll act on a target; back/home/launch take none.",
             "type carries secret=true ONLY for a value the tester supplied; never "
@@ -425,11 +865,30 @@ def describe_vocabulary() -> dict:
             + ") or until_text; assert kinds are "
             + ", ".join(ASSERT_KINDS)
             + ".",
+            "To check that the app REPLIED, use assert new_text (optionally with "
+            "contains): it passes only when text appeared that was not on the "
+            "previous screen. screen_changed is WEAK -- any navigation "
+            "satisfies it -- so it is never evidence that an answer arrived.",
+            "One submit replays for at most "
+            + str(SUBMIT_BUDGET_MS)
+            + " ms of device time and the waits in one script may total at most "
+            + str(MAX_TOTAL_WAIT_MS)
+            + " ms. Over the wait total the script is REFUSED; over the submit "
+            "budget the replay stops before the next action and hands you the "
+            "screen, so plan short scripts rather than one long one.",
             "ask_tester(prompt, field) stops the replay and asks the tester for "
             "that one field. The value is typed and never stored.",
             "end with done(verdict, reason); verdict is one of "
             + ", ".join(VERDICTS)
             + ".",
+            "Never send two selectors that point at different elements -- an "
+            "`id` and a `text`, a `rid` and a `text`, any pair: the action is "
+            "handed back rather than guessed, and so is a target one of whose "
+            "selectors matches nothing while another matches. Never reuse an "
+            "`id` for an action you plan AFTER a "
+            "`type` in the same script: typing opens the keyboard and re-lays "
+            "out the screen, so every id from the previous screen goes stale "
+            "at once. `rid` and the on-screen text survive that; ids do not.",
             "Plan from the screen you were given. If an element you need is not "
             "on it, stop the script there -- the server hands you the next "
             "screen and you continue. Do not guess coordinates.",

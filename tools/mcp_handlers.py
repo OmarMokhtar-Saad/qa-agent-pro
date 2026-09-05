@@ -37,7 +37,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable, NamedTuple, Optional
+from typing import Any, Awaitable, Callable, NamedTuple, Optional
 from urllib.parse import urlparse
 
 from agents import host_mode
@@ -11313,6 +11313,7 @@ async def handle_mobile_test(
     continue_run: bool = False,
     serial: str = "",
     avd: str = "",
+    new_run: bool = False,
     *,
     choose: ChooseCb = None,
     ask_text: AskCb = None,
@@ -11498,9 +11499,22 @@ async def handle_mobile_test(
             pf = checked.get("content") or {}
             if not pf.get("ok"):
                 return mobile_render.preflight_block(pf, mobile_preflight.render(pf))
-            picked = await _mobile_pick_source(source, choose=choose)
+            picked = await _mobile_pick_source(
+                source,
+                suite_id=suite_id,
+                goal=goal,
+                cases=cases,
+                choose=choose,
+            )
             if not picked:
-                return mobile_render.source_menu_markdown()
+                # Two start arguments implying different lanes ask the NARROW
+                # question; nothing given asks the menu. One entry point, so a
+                # conflict cannot be rendered by an untested path.
+                return mobile_render.source_menu_markdown(
+                    conflict=mobile_render.implied_sources(
+                        suite_id=suite_id, goal=goal, cases=cases
+                    )
+                )
             reply, handed_off = await _mobile_start(
                 picked,
                 suite_id=suite_id,
@@ -11510,6 +11524,7 @@ async def handle_mobile_test(
                 serial=serial,
                 pre_run_owner=pre_run_owner,
                 progress=progress,
+                new_run=new_run,
             )
             return reply
         finally:
@@ -11525,21 +11540,47 @@ async def handle_mobile_test(
         return "⚠️ The mobile run could not continue: " + _safe(str(exc), 200)
 
 
-async def _mobile_pick_source(source: str, *, choose: ChooseCb = None) -> str:
-    """Resolve the start-menu choice: an argument, a dialog, or ``""``.
+async def _mobile_pick_source(
+    source: str,
+    *,
+    suite_id: str = "",
+    goal: str = "",
+    cases: str = "",
+    choose: ChooseCb = None,
+) -> str:
+    """Resolve the start choice: an argument, what the tester already said, a
+    dialog, or ``""``.
 
-    ``""`` means "show the menu", and the menu is the tested path: MCP
+    ``""`` means "ask", and the markdown menu is the tested path: MCP
     elicitation arrives collapsed-and-required in some editors, so the dialog is
-    an optimisation and the numbered menu is the product. A number is accepted
-    too, because a tester answering a markdown menu says "3".
+    an optimisation and the menu is the product.
+
+    **A NUMBER is no longer accepted.** The host re-presents that menu in its
+    own question UI, which relabels (a/b/c/d) and reorders it, so a returned
+    POSITION selected a lane by index -- "explore" shown first started
+    ``current_suite``, and a tester saw "4 2 1 3". Only a key identifies an
+    option, and ``render.source_for_label`` accepts the key or the exact line
+    and nothing else.
+
+    **An argument the tester has ALREADY given decides the source.** This read
+    only ``source``, so a tester who pasted their own cases or described a goal
+    was shown the six-way menu anyway while the answer sat unread in the call.
+    ``cases``, ``goal`` and ``suite_id`` each name exactly one lane
+    (``render.SOURCE_IMPLICATIONS``), so the menu is asked only when NONE of
+    them is set. When two disagree this returns ``""`` and the caller renders
+    the NARROWER question rather than the menu -- guessing which one the tester
+    meant is the failure this whole function exists to avoid.
     """
     from tools.mobile import render as mobile_render
 
     given = str(source or "").strip()
     if given:
-        return mobile_render.source_for_label(given) or mobile_render.source_for_number(
-            given
-        )
+        return mobile_render.source_for_label(given)
+    implied = mobile_render.implied_sources(suite_id=suite_id, goal=goal, cases=cases)
+    if len(implied) == 1:
+        return implied[0]
+    if implied:
+        return ""
     picked = await _elicit_choice(
         choose, "What should the emulator run?", mobile_render.source_labels()
     )
@@ -11718,9 +11759,10 @@ async def _mobile_app_stage(
 
     chosen = str(source or "").strip()
     value = str(app or "").strip()
-    install_source = mobile_render.install_source_for_number(chosen) or (
-        chosen if chosen in dict(mobile_render.INSTALL_SOURCES) else ""
-    )
+    # A KEY only. This used to try a POSITIONAL lookup first, and the start menu
+    # shares this argument, so a start-menu answer of "3" resolved here to
+    # `app_tester`.
+    install_source = mobile_render.install_source_for_label(chosen)
     target = str(package or "").strip()
     if not target and install_source == "installed_package":
         target = value
@@ -11827,6 +11869,7 @@ async def _mobile_start(
     serial: str,
     pre_run_owner: str,
     progress: ProgressCb = None,
+    new_run: bool = False,
 ) -> tuple:
     """Turn a start-menu choice into a planned run and its first packet.
 
@@ -11920,6 +11963,26 @@ async def _mobile_start(
     else:
         return mobile_render.source_menu_markdown(), False
 
+    # E5 (2026-09-04): the same cases against the same app, again. Eight runs
+    # of ONE case were started in seventeen minutes because nothing said that
+    # the run just abandoned was the one to go back to. Answer that here,
+    # before a ninth is planned -- and only for a start that carries cases, so
+    # an explore run and a resume are untouched.
+    # Every case-bearing start, filters included.
+    #
+    # A re-run of failures is covered without a special case: the run it would
+    # duplicate stores the cases it KEPT, so a second re-run hashes that same
+    # set and matches `case_signature`. An earlier version of this comment said
+    # the match came from `source_signature`; that clause was proved dead and
+    # deleted, and the sentence is corrected rather than left describing code
+    # that is gone.
+    if not new_run:
+        existing = session.find_resumable_run(
+            session.case_signature(package, collected)
+        )
+        if existing:
+            return _mobile_repeat_offer(existing), False
+
     planned = session.plan_suite_run(
         collected,
         package=package,
@@ -11934,6 +11997,39 @@ async def _mobile_start(
         str((planned.get("content") or {}).get("run_id") or ""),
         pre_run_owner=pre_run_owner,
         progress=progress,
+    )
+
+
+def _mobile_repeat_offer(existing: dict) -> str:
+    """These cases are already a run. Say which, and how to pick it up.
+
+    It offers rather than refuses: a tester who really does want a fresh run
+    says so with `new_run=true`, which is named here so the next call needs no
+    guesswork.
+    """
+    run_id = str(existing.get("run_id") or "")
+    state = str(existing.get("state") or "unknown")
+    done = int(existing.get("done") or 0)
+    total = int(existing.get("total") or 0)
+    return (
+        "## These cases are already a run\n\n"
+        "`" + run_id + "` is running the same cases against the same app and is "
+        "not finished — state **"
+        + state
+        + "**, "
+        + str(done)
+        + " of "
+        + str(total)
+        + " case(s) done. Nothing new was started.\n\n"
+        '- **Carry on with it** — call `qa_mobile_test` with `run_id="'
+        + run_id
+        + '"`. Every case it already finished is on disk and is not '
+        "handed out again.\n"
+        "- **See where it stands first** — `qa_mobile_status` with that run id "
+        "reads it back from disk and changes nothing.\n"
+        "- **Start a fresh run anyway** — the same call again with "
+        "`new_run=true`. Do that only if the tester asked for it: a second run "
+        "of the same cases produces a second report of the same work."
     )
 
 
@@ -12300,16 +12396,7 @@ async def handle_mobile_status(
                 return "\n".join(lines) + (
                     "## No mobile runs yet\n\nCall `qa_mobile_test` to start one."
                 )
-            listed = "\n".join(
-                "- `"
-                + str(row.get("run_id"))
-                + "` — "
-                + str((row.get("manifest") or {}).get("lane") or "?")
-                + " lane, "
-                + str((row.get("manifest") or {}).get("total") or 0)
-                + " case(s)"
-                for row in runs
-            )
+            listed = "\n".join(_mobile_run_row(row) for row in runs)
             return "\n".join(lines) + "## Mobile runs on this machine\n\n" + listed
         resolved = session.resolve(run_id, session_token)
         if resolved.get("error"):
@@ -12361,6 +12448,51 @@ async def handle_mobile_status(
         logger.exception("mcp mobile_status failed")
         _capture_error(exc, "qa_mobile_status")
         return "⚠️ The mobile status could not be read: " + _safe(str(exc), 200)
+
+
+def _mobile_run_row(row: object) -> str:
+    """One line of the run listing: what it is, where it stands, what it said.
+
+    E5 (2026-09-04): the listing gave the lane and a case count, so a tester
+    looking for the run they had abandoned could not tell it from the seven
+    others -- and neither could the model, which started an eighth. The state
+    and the newest verdict are what distinguish them.
+
+    Never raises and never lets a bad run break the listing: a row that cannot
+    be resolved falls back to the plain line it always had.
+    """
+    from tools.mobile import session
+
+    body = row if isinstance(row, dict) else {}
+    manifest = body.get("manifest") or {}
+    run_id = str(body.get("run_id") or "?")
+    line = (
+        "- `"
+        + run_id
+        + "` — "
+        + str(manifest.get("lane") or "?")
+        + " lane, "
+        + str(manifest.get("total") or 0)
+        + " case(s)"
+    )
+    try:
+        resolved = (session.resolve(run_id) or {}).get("content") or {}
+        if resolved:
+            line += ", state **" + str(resolved.get("state") or "unknown") + "**"
+        recorded = [
+            case
+            for case in ((session.summary(run_id) or {}).get("content") or [])
+            if isinstance(case, dict)
+        ]
+        verdicts = [str(case.get("verdict") or "") for case in recorded]
+        verdicts = [verdict for verdict in verdicts if verdict]
+        if verdicts:
+            line += ", last verdict " + verdicts[-1]
+        elif recorded:
+            line += ", no verdict yet"
+    except Exception:  # pragma: no cover - a listing must never raise
+        logger.info("mcp mobile: could not enrich the listing row for %s", run_id)
+    return line
 
 
 async def handle_export_suite(
@@ -13958,33 +14090,36 @@ def _tc_source_menu_markdown() -> str:
     those reliably, unlike MCP elicitation dialogs), then call back with the
     answer.
 
-    The count word, the numbering and the mapping paragraph are all DERIVED
-    from ``_tc_sources()``. The text says "EXACTLY these N options" and "Do not
-    invent different options", so N and the numbers have to move with the list
-    or the instruction contradicts itself."""
+    The count word and the mapping paragraph are DERIVED from ``_tc_sources()``.
+    The text says "EXACTLY these N options" and "Do not invent different
+    options", so N has to move with the list or the instruction contradicts
+    itself.
+
+    **The options are keyed, not numbered** (2026-09-04), for the reason
+    ``tools/mobile/render.py``'s module docstring gives: the host re-presents
+    them in its own question UI, which relabels (a/b/c/d) and reorders, so a
+    position addressed the wrong option. These numbers never round-tripped as
+    an argument -- the host is told to call a tool directly -- but the mapping
+    paragraph named options by position, and a reordering UI would have sent
+    the wrong one to `mode=mobile`."""
     srcs = list(_tc_sources().values())
-    number = {src: i for i, src in enumerate(srcs, 1)}
     count = _TC_COUNT_WORDS.get(len(srcs), str(len(srcs)))
-    body = "".join(f"{number[s]}. {_TC_SOURCE_MENU_LINES[s]}\n" for s in srcs)
+    body = "".join(f"- `{s}` \u2014 {_TC_SOURCE_MENU_LINES[s]}\n" for s in srcs)
     typed = [s for s in srcs if s not in _TC_FULL_EDITION_SOURCES]
-    span = (
-        f"options {number[typed[0]]}-{number[typed[-1]]}"
-        if len(typed) > 1
-        else f"option {number[typed[0]]}"
-    )
     mapping = (
-        f"After the user picks: for {span} call `qa_generate_test_cases` "
-        "with `feature_or_url` set to their text/URL"
+        "After the user picks: for "
+        + ", ".join(f"`{s}`" for s in typed)
+        + " call `qa_generate_test_cases` with `feature_or_url` set to their "
+        "text/URL"
     )
-    if "mobile" in number:
+    if "mobile" in srcs:
         mapping += (
-            f"; for option {number['mobile']} call `qa_feature_analysis` with "
-            f"`mode=mobile`; for option {number['jira_mobile']} call "
-            "`qa_feature_analysis` with `mode=jira_mobile`. Options "
-            f"{number['mobile']} and {number['jira_mobile']} are a TWO-step "
-            "chat-only flow: `qa_feature_analysis` hands YOU a task envelope "
-            "to answer, then you call `qa_submit_feature_analysis` with its "
-            "`task_id` and your JSON."
+            "; for `mobile` call `qa_feature_analysis` with `mode=mobile`; for "
+            "`jira_mobile` call `qa_feature_analysis` with `mode=jira_mobile`. "
+            "`mobile` and `jira_mobile` are a TWO-step chat-only flow: "
+            "`qa_feature_analysis` hands YOU a task envelope to answer, then "
+            "you call `qa_submit_feature_analysis` with its `task_id` and your "
+            "JSON."
         )
     else:
         mapping += "."
@@ -13992,10 +14127,9 @@ def _tc_source_menu_markdown() -> str:
         "## Ask the user: where is the feature coming from?\n\n"
         f"Present EXACTLY these {count} options to the user as a "
         "multiple-choice question (use your ask-user/questions UI, not prose), "
-        "then follow the mapping below. Do not invent different options.\n\n"
-        + body
-        + "\n"
-        + mapping
+        "then follow the mapping below. Do not invent different options. Your "
+        "UI may relabel or reorder them; the key on each line is what "
+        "identifies it.\n\n" + body + "\n" + mapping
     )
 
 
@@ -15173,6 +15307,52 @@ def _overall_verdict(
             "unverified**, see Action items below"
         )
     return "\u2705 **Ready** \u2014 all required checks passed"
+
+
+async def handle_selfcheck(*, server: Any) -> str:
+    """Invoke every registered handler and report what the replies NAME.
+
+    The composition root for ``tools/selfcheck.py``: this is the only place
+    that can supply the LIVE server object, because the Constitution forbids a
+    ``tools/`` module from importing ``mcp_server`` and ``qa_selfcheck``'s
+    closure is the one thing holding a reference to the built ``FastMCP``.
+    Everything the check needs is injected here and nothing is discovered by
+    import.
+
+    Read-only for the tester's data and structurally incapable of an external
+    write -- see the four layers documented in ``tools/selfcheck``. It answers
+    the question ``qa-doctor`` cannot: ``qa-doctor`` reports whether this
+    MACHINE is ready, while this reports whether this BUILD's own replies still
+    describe it. Never raises.
+    """
+    await _audit("mcp_selfcheck")
+    try:
+        import llm
+        from tools import selfcheck
+
+        report = await selfcheck.run(
+            server=server,
+            settings_cls=type(settings),
+            llm_module=llm,
+            root=_INSTALL_ROOT,
+        )
+        await _audit(
+            "mcp_selfcheck_result",
+            detail={
+                "findings": len(report.get("findings") or ()),
+                "skips": len(report.get("skips") or ()),
+                "scanned": report.get("scanned") or {},
+                "floors": report.get("floors") or [],
+            },
+        )
+        return selfcheck.render(report)
+    except Exception:
+        logger.exception("self-check failed")
+        return (
+            "\u26a0\ufe0f The self-check could not complete, so it has NO "
+            "verdict for you -- do not read this as clean. The failure is in "
+            "this install's log (`data/logs/`). Nothing was changed."
+        )
 
 
 async def handle_setup_check(

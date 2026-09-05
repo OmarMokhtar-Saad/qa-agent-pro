@@ -44,14 +44,31 @@ _SYSTEM_PROMPT = (
     "what happens two taps from now.\n"
     "\n"
     "How to be good at this:\n"
-    "- Target elements by the short id from the screen block wherever you can; "
-    "fall back to exact text, and only then to a distinctive substring. Never "
-    "invent coordinates: you cannot see the screen, only its structure.\n"
+    "- Type into the element listed under `fields`; tap the control listed "
+    "under `controls` whose label is the one you want. A control labelled "
+    "Voice, Record or Mic is NEVER the Send control, however close to it it "
+    "sits on the screen.\n"
+    "- Target by `role` or `label` for anything that follows another action: those "
+    "are computed by the server from the element's own content and survive a "
+    "re-layout. `rid` is next best. The short ids are THIS SCREEN ONLY -- an id "
+    "describes the element as it was on the screen you were given, bounds "
+    "included, so it stops matching the moment that element moves. It can never "
+    "match a DIFFERENT element, so a stale one is handed back rather than "
+    "mistapped -- but being handed back costs you a turn.\n"
+    "- Never send TWO selectors that name different elements -- any pair, not "
+    "just an id with a text -- and never send one that matches nothing "
+    "alongside one that matches: both read as a plan built on an older screen "
+    "and are handed back. Never invent coordinates: you cannot see the screen, "
+    "only its structure.\n"
     "- Plan only as far as you can SEE. Stop the script at the first action "
     "whose target is not on this screen. Being handed the next screen costs one "
     "round trip; a wrong tap costs the tester a re-run.\n"
     "- Assert what the case says to verify, using assert actions, not prose. An "
     "assert that fails comes back to you with the screen that failed it.\n"
+    "- For 'the app replies', assert new_text (optionally with contains), or "
+    "text_present naming something the reply must say. NEVER screen_changed: "
+    "it only says the screen moved, which any navigation does, and it is not "
+    "evidence that an answer arrived.\n"
     "- If the app needs a credential, an OTP or any personal value, do NOT "
     "invent one and do NOT ask the tester in prose: emit ask_tester(prompt, "
     "field), then reference that same field name from a type action with "
@@ -59,6 +76,40 @@ _SYSTEM_PROMPT = (
     "- Finish with done(verdict, reason). 'pass' means you verified the case's "
     "expected results; 'fail' means you verified they did not hold; 'blocked' "
     "means you could not tell. Guessing 'pass' is the worst answer available."
+)
+
+#: Both bounds, in the model's own words, taken from the vocabulary module so
+#: the packet can never quote a number the server does not enforce.
+_BUDGET_NOTE = (
+    "One submit replays for at most "
+    + str(actions_mod.SUBMIT_BUDGET_MS)
+    + " ms of device time, and the waits in one script may total at most "
+    + str(actions_mod.MAX_TOTAL_WAIT_MS)
+    + " ms -- over that total the whole script is refused. Split a long case "
+    "into several short scripts: the server hands you the screen back between "
+    "them, which costs one round trip and never a re-run."
+)
+
+#: The two recoveries, offered on EVERY escape rather than only when the
+#: executor classified one: the advice is correct whenever the screen above is
+#: not the app's, and a conditional string is one more thing to drift out of
+#: step with the outcome that would have triggered it.
+_RECOVERY_NOTE = (
+    "If the screen above belongs to another app or is a system permission "
+    "dialog, the case has not failed: send `back` to dismiss a dialog, or "
+    "`launch` to bring the app under test back to the front, and then carry "
+    "on with the case. "
+)
+
+#: Said on the packet BEFORE the last hand-back, not after it. A model that
+#: learns the budget is spent only when the case is already `blocked` has been
+#: told nothing it could act on.
+_LAST_ESCAPE_NOTE = (
+    "This is the LAST hand-back for this case: if it is not finished from "
+    "here, it is recorded blocked and will not be handed out again in this "
+    "run. Either finish it, or end it with done(verdict='blocked') saying "
+    "what stopped it -- an honest blocked is worth more than a fourth attempt "
+    "you do not get. "
 )
 
 _CASE_INSTRUCTION = (
@@ -157,7 +208,7 @@ def build_case_job(
                 "worker_instructions": (
                     "One JSON object, key `actions`. Every action's `op` must be "
                     "one of the listed ops. Stop the script where the screen "
-                    "stops telling you what happens next."
+                    "stops telling you what happens next. " + _BUDGET_NOTE
                 ),
             }
         )
@@ -210,7 +261,10 @@ def build_escape_job(
                 "worker_instructions": (
                     "One JSON object, key `actions`. If this case cannot be "
                     "completed from here, say so with done(verdict='blocked', "
-                    "reason=...) rather than retrying the same action."
+                    "reason=...) rather than retrying the same action. "
+                    + _RECOVERY_NOTE
+                    + (_LAST_ESCAPE_NOTE if max(0, 3 - int(escapes or 0)) <= 1 else "")
+                    + _BUDGET_NOTE
                 ),
             }
         )

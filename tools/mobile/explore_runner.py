@@ -39,6 +39,21 @@ EXTENSION_REFUSAL = (
     "An extension needs a stated reason naming what is still unexplored. "
     "Nothing was extended."
 )
+
+#: Shown when a turn reply carried no ``finding``, although the packet's
+#: ``worker_instructions`` asks for one EVERY turn.
+#:
+#: It is a DISCLOSURE and not a refusal, and that is the deliberate choice: by
+#: the time this runs the turn's actions have already been replayed on the
+#: device, so refusing the turn would report a device that DID move as a turn
+#: that did not, and boomeranging for a prose field would spend one of the
+#: session's stops on it. The report says the same thing from the other end --
+#: it counts the turns that recorded nothing -- so the gap stays visible even
+#: if this line is ignored in chat.
+NO_FINDING_NOTICE = (
+    "This turn recorded no `finding`, so the report has nothing to show for it. "
+    "Add one sentence next turn, even when the turn went fine."
+)
 EXTENSION_SPENT = (
     "This session has already used its one extension, so the budget stands. "
     "Report what was found and stop."
@@ -176,6 +191,11 @@ def apply_turn_result(state: object, raw: object, *, now: float | None = None) -
             findings = list(body.get("findings") or [])
             findings.append({"turn": int(body.get("turn") or 0), "note": finding})
             body["findings"] = findings[:MAX_TURNS]
+        else:
+            # Disclosed, never refused -- see NO_FINDING_NOTICE. An extension
+            # verdict overwrites this below, on purpose: that one is about the
+            # budget, which matters more than a nudge.
+            notice = NO_FINDING_NOTICE
 
         if bool(reply.get("goal_reached")):
             body["stop"] = STOP_GOAL

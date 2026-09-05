@@ -82,8 +82,8 @@ argument named. Setup: `qa_configure_jira`. Prior work: `qa_search_corpus`.
 
 REPLIES THAT ARE NOT THE ANSWER, and the only correct response to each:
 * a DIRECTIVE -- run the named call, return with its raw result;
-* a numbered markdown menu -- your client could not show a dialog; put it to
-  the TESTER, re-call with the number THEY pick;
+* a markdown menu -- put it to the TESTER, then re-call with what it says to
+  send back: a `key`, a `device_id`, a `serial`, or the number it asks for;
 * a refusal naming an acknowledgement argument (`proceed_anyway`,
   `image_gate_ack`, ...) -- explain the concern, re-send with that argument
   only after they say go, never on the turn you were refused.
@@ -158,9 +158,11 @@ paragraph of behaviour is enough, and a link to a ticket is better.
 2. If the reply is a DIRECTIVE (a ticket URL was given), follow it first: call
    the Atlassian tool it names, pass the RAW JSON straight back into the
    argument it names, and re-call `qa_prepare_test_cases`.
-3. If the reply is a numbered menu, your client could not show a dialog. Put
-   the menu to the TESTER, get their number, re-call with it. Never pick one
-   for them.
+3. If the reply is a markdown menu, your client could not show a dialog. Put
+   the menu to the TESTER, then follow the mapping the menu itself prints --
+   each option carries the backticked `key` that identifies it, and the menu
+   says which tool and argument that key means. Never send a position, and
+   never pick an option for them.
 4. If the reply REFUSES and names an acknowledgement argument -- an ambiguity
    gate (`proceed_anyway`), a missing or stale screenshot (`image_gate_ack`,
    `image_carry_ack`), a suspected duplicate run -- summarise the concern in
@@ -226,8 +228,9 @@ Write a structured bug report from what the tester describes.
 3. Write the report yourself against the brief. You are the model here.
 4. Call `qa_submit_bug_report` with the task_id and your report text.
 
-If the reply is a numbered menu, your client could not show a dialog: put the
-menu to the tester and re-call with their choice.
+If the reply is a markdown menu, your client could not show a dialog: put the
+menu to the tester and re-call with the identifier that menu names -- a
+backticked `key`, a `device_id` or an adb `serial`, whichever it prints.
 """
 
 _P_EXPLORE = """\
@@ -278,8 +281,14 @@ that only after the tester has said go, on a later turn.
 1. Call `qa_mobile_test` with no arguments. It answers with whatever the
    machine needs next -- a provisioning preview, an install menu, a preflight
    list with a fix per failed check, or the start menu.
-2. A numbered markdown menu means your client could not show a dialog. Put it
-   to the TESTER, and re-call with the option THEY pick. Never choose for them.
+2. A markdown menu means your client could not show a dialog. Put it to the
+   TESTER, and re-call with the identifier THEIR option prints -- a backticked
+   `key` in `source`, or an adb `serial` for a device. THIS lane never accepts
+   a position, whatever your question UI shows: it may relabel the options
+   a/b/c/d and it may reorder them, so a tester who answered "the fourth one"
+   would start a different run. (Other tools DO take a number where their own
+   reply asks for one in so many words -- read the reply, do not generalise
+   from this rule.) Never choose for them.
 3. Once a run starts you get ONE packet: a case (or an exploratory goal), the
    pruned screen, and the exact action vocabulary you may use. Plan the whole
    case as a short action script and send it straight back with
@@ -301,12 +310,33 @@ that only after the tester has said go, on a later turn.
 Device selection: if the tester already has an emulator running, pass its adb
 serial (e.g. `emulator-5554`) in `serial` on your NEXT `qa_mobile_test` call
 rather than letting the server guess or start a second one. Several booted
-devices come back as a numbered menu -- put it to the tester and resend with
-their pick.
+devices come back as a menu of serials -- put it to the tester and resend with
+the `serial` they choose, not with its position in the list.
 
 A reply naming "booting" or "provisioning" is not something to retry by
 calling `qa_mobile_test` again: call `qa_mobile_status` instead and keep
 polling it until it reports ready, then continue with the `run_id`.
+
+Do not start a second run of cases you have already started. If the same
+cases are already an unfinished run of the same app, `qa_mobile_test` answers
+with that run's id -- carry on with it by passing that `run_id`, rather than
+re-sending the cases. `new_run=true` starts a fresh one and is for when the
+tester asks for it.
+
+Keep each script inside the budget the packet states: one submit replays for a
+bounded time and the waits in one script have a total cap. If a reply comes
+back saying the budget was reached, nothing was lost -- the actions that ran
+are recorded and the screen you were given is the current one; send the rest
+as a second, shorter script.
+
+To check that the app REPLIED, use `assert new_text` (optionally with
+`contains`), or `text_present` naming something the reply must say. Never
+`screen_changed`: it only says the screen moved, which any navigation does.
+
+The short element ids belong to the screen you were given and are renumbered
+every time the server re-reads the screen. Use one for the FIRST action of a
+script; for anything after it, target by `role` (send, voice, input, back,
+close), by `rid`, or by `label`.
 
 Resuming works on an UNFINISHED run. A run whose cases have all reached a
 verdict is complete, and `unverified` and `blocked` are verdicts -- so resuming
