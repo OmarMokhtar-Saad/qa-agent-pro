@@ -164,7 +164,7 @@ def token_band(chars: int) -> tuple[int, int]:
     """
     try:
         c = max(0, int(chars or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return (0, 0)
     return (c // _CHARS_PER_TOKEN_OPTIMISTIC, c // _CHARS_PER_TOKEN_PESSIMISTIC)
 

@@ -226,7 +226,7 @@ def _drift_watch() -> None:
     # NETWORK check keeps its own 15-minute clock in the launcher's watchdog.
     try:
         interval = max(5.0, float(os.environ.get("QA_DRIFT_CHECK_SECONDS", "30")))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         interval = 30.0
     deferrals = 0
     blocked = 0

@@ -218,11 +218,19 @@ def _ms(value):
         return None
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
-    if number <= 0:
+    if number <= 0 or number != number:  # NaN
         return None
     # A seconds stamp is ~1.7e9; an ms stamp ~1.7e12.
+    #
+    # CLAMPED before the second coercion, exactly as the twin
+    # `tools.mobile.report._ms` already did. The guard above admits an
+    # infinity -- `float(inf)` does not raise -- and `int(inf)` then
+    # raised OUT of this function, which a run-store checkpoint carrying
+    # `Infinity` reaches through `case_windows`. Widening the except
+    # tuple could not have caught it: the coercion is not in the try.
+    number = min(number, 1e15)
     return int(number * 1000) if number < 1e11 else int(number)
 
 
