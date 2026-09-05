@@ -310,7 +310,7 @@ def _contained_text(element: dict, screen: object) -> list[str]:
         return []
     try:
         x1, y1, x2, y2 = (int(v) for v in box)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return []
     own_area = (x2 - x1) * (y2 - y1)
     out: list[str] = []
@@ -324,7 +324,7 @@ def _contained_text(element: dict, screen: object) -> list[str]:
             continue
         try:
             a1, b1, a2, b2 = (int(v) for v in inner)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if a1 < x1 or b1 < y1 or a2 > x2 or b2 > y2:
             continue
@@ -513,7 +513,7 @@ def missing_element_detail(resolved: object) -> str:
     body = resolved if isinstance(resolved, dict) else {}
     try:
         candidates = int(body.get("candidates") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         candidates = 0
     if candidates > 1:
         return ambiguous_role_detail(candidates)
@@ -842,7 +842,7 @@ def _center(element: dict) -> tuple[int, int] | None:
         return None
     try:
         x1, y1, x2, y2 = (int(v) for v in bounds)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return (x1 + x2) // 2, (y1 + y2) // 2
 
@@ -893,11 +893,19 @@ def _swipe_points(direction: str, element: object) -> tuple | None:
     ``half <= 0`` refusal placed BEFORE a ``>= 0`` clamp let a mostly off-screen
     element clamp both ends onto the screen edge and ship ``input swipe 0 950
     0 950 300`` -- a press -- with the refusal green. So the swipe is computed
-    from the element's VISIBLE part (bounds clipped at the screen edge, where
-    the finger can actually go) and the post-condition is on the final tuple.
+    from the element's ON-SCREEN part and the post-condition is on the final
+    tuple.
+
+    "On-screen part" is exactly the TOP-LEFT clamp, ``x1``/``y1`` raised to 0,
+    and no more: a negative edge is where ``adb._coord`` refuses to put the
+    finger, and that is the only edge that needs moving. The far edges are left
+    alone because ``perception.prune`` drops a node lying entirely outside the
+    root bounds, so an element that survives into a packet has its far edges
+    inside the window already. Stated exactly rather than as "clipped to the
+    screen", which claims four clamps where the code has two.
 
     Returns ``None`` for an unknown direction, and for an element whose
-    visible part is too small to swipe on; ``_perform`` tells the two apart
+    on-screen part is too small to swipe on; ``_perform`` tells the two apart
     and reports each.
     """
     points = _SWIPE.get(str(direction or ""))
@@ -909,10 +917,12 @@ def _swipe_points(direction: str, element: object) -> tuple | None:
     if center is None:
         return points
     x1, y1, x2, y2 = (int(v) for v in element["bounds"])
-    # The VISIBLE part: an element partly off-screen has a negative edge, and
-    # the finger cannot go there (`adb._coord` refuses a negative coordinate).
-    # Everything below is computed from this box, so no later clamp can move
-    # an endpoint after the invariant has been checked.
+    # The ON-SCREEN part, near edges only: an element partly off-screen has a
+    # negative edge and the finger cannot go there (`adb._coord` refuses a
+    # negative coordinate). The far edges need no clamp -- `perception.prune`
+    # drops a node lying entirely outside the root bounds. Everything below is
+    # computed from this box, so no later clamp can move an endpoint after the
+    # invariant has been checked.
     x1, y1 = max(0, x1), max(0, y1)
     if x2 <= x1 or y2 <= y1:
         return None
@@ -978,7 +988,7 @@ def actuated_element(screen: object, point: object) -> dict | None:
         return None
     try:
         x, y = int(point[0]), int(point[1])
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     best: dict | None = None
     best_area = 0
@@ -990,7 +1000,7 @@ def actuated_element(screen: object, point: object) -> dict | None:
             continue
         try:
             x1, y1, x2, y2 = (int(v) for v in box)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if x < x1 or x > x2 or y < y1 or y > y2:
             continue
@@ -1010,9 +1020,36 @@ def _budget_seconds(ctx: Context) -> float:
     """
     try:
         value = float(getattr(ctx, "budget_s", None) or SUBMIT_BUDGET_S)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         value = SUBMIT_BUDGET_S
     return value if value > 0 else SUBMIT_BUDGET_S
+
+
+#: What the model is told when a TARGETED scroll's target did not resolve.
+#: ``scroll`` is the one op whose target miss is not handed back -- panning is a
+#: sensible default and is what a tester would do -- but the degradation was
+#: SILENT: measured, a resolved scroll, a stale-target scroll and a target-less
+#: pan all reported ``no_change`` with an empty detail, so the model could not
+#: tell that the element it named was gone and planned its next turn as though
+#: it had scrolled it. The stop itself is unchanged; only the record is.
+#:
+#: "DID NOT RESOLVE", never "was not on this screen". ``resolve_target``
+#: answers None for a CONFLICT and for an ambiguous ROLE as well as for a plain
+#: miss, and in both of those the elements ARE present -- which is why
+#: :func:`missing_element_detail` puts its ambiguity branch first and says as
+#: much. A note claiming absence would be false in two of the five cases.
+#:
+#: It carries no per-case remedy, and that is a length decision made against
+#: two hard caps downstream: ``report.MAX_TEXT`` (200) truncates this string in
+#: the HTML row, and ``mobile_run._trace_block`` caps it at 300 in the escape
+#: packet -- the surface it exists for. The 285-character first draft was cut
+#: mid-sentence by the first of them and left 15 characters for the device's
+#: own detail. Unlike a boomerang the action ALREADY HAPPENED, and the reply
+#: carries the new screen, so the remedy is the same whatever the miss was.
+SCROLL_TARGET_MISSED = (
+    "That target did not resolve, so the screen was panned instead of the "
+    "element you named. Re-read the screen before planning from it."
+)
 
 
 def budget_stop_reason(ran: int, total: int) -> str:
@@ -1091,6 +1128,9 @@ async def replay(script: object, ctx: Context) -> dict:
             started = time.monotonic()
             entry = _entry(index, action, _screen_id(screen), started)
             op = str(getattr(action, "op", "") or "")
+            # Per ACTION, not per replay: a scroll whose target missed must not
+            # colour the note of a later scroll that resolved.
+            scroll_missed = False
             # The BEFORE set for ``assert new_text``, captured for every op that
             # can change the screen -- ``wait`` included, which is the whole
             # point: the reply a case is waiting for arrives during the wait.
@@ -1164,6 +1204,10 @@ async def replay(script: object, ctx: Context) -> dict:
                 # that was absent got a re-plan, three spent escapes and a
                 # ``blocked`` case rather than the failure they asked for.
                 # ``_evaluate_assert`` decides presence itself.
+                # The DEGRADATION below is deliberate and stays; what changes
+                # is that it is now visible. Recorded before the branch so the
+                # flag cannot drift from the condition that produces it.
+                scroll_missed = element is None and op == "scroll"
                 if element is None and op not in ("scroll", "assert"):
                     resolution = (resolved or {}).get("content") or {}
                     entry["outcome"] = "missing_element"
@@ -1400,6 +1444,8 @@ async def replay(script: object, ctx: Context) -> dict:
                 }
             entry["outcome"] = "ok"
             entry["detail"] = str((outcome.get("content") or {}).get("detail") or "")
+            if scroll_missed:
+                entry["detail"] = (SCROLL_TARGET_MISSED + " " + entry["detail"]).strip()
 
             if op in actions_mod.MUTATING_OPS:
                 screen, stop = await _settle(

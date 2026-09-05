@@ -373,7 +373,7 @@ def download(
             mode = "ab" if start else "wb"
             try:
                 declared = int(response.headers.get("Content-Length") or 0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 declared = 0
             total = start + declared
             got = start

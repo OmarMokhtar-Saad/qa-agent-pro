@@ -280,7 +280,7 @@ def _bounds_tuple(element: object) -> tuple | None:
         return None
     try:
         return tuple(int(value) for value in box)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -443,7 +443,7 @@ def _dominant_package(elements: object) -> str:
             continue
         try:
             x1, y1, x2, y2 = (int(value) for value in bounds)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         area = max(0, x2 - x1) * max(0, y2 - y1)
         if area > best_area:

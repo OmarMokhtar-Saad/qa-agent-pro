@@ -1262,7 +1262,7 @@ def explore_turn_tc_id(turn: object) -> str:
     """
     try:
         number = int(turn or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         number = 0
     return "TC-%03d" % max(1, min(number, 999999))
 
@@ -1278,14 +1278,14 @@ def _latest_finding(state: object) -> str:
     body = state if isinstance(state, dict) else {}
     try:
         turn = int(body.get("turn") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return ""
     notes = [f for f in list(body.get("findings") or []) if isinstance(f, dict)]
     for entry in reversed(notes):
         try:
             if int(entry.get("turn") or 0) == turn:
                 return str(entry.get("note") or "")
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
     return ""
 
@@ -1304,7 +1304,7 @@ def _explore_planned_case(tc_id: str, state: object, finding: str = "") -> dict:
     goal = " ".join(str(body.get("goal") or "").split())[:400] or "not recorded"
     try:
         turn = max(1, int(body.get("turn") or 1))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         turn = 1
     note = " ".join(str(finding or "").split())[:400]
     return {
@@ -1351,7 +1351,7 @@ def _checkpoint_explore_turn(
     result = outcome if isinstance(outcome, dict) else {}
     try:
         turn = max(1, int(body.get("turn") or 1))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         turn = 1
     tc_id = explore_turn_tc_id(turn)
     goal = " ".join(str(body.get("goal") or "").split())[:200] or "no goal recorded"

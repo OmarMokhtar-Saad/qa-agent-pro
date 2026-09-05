@@ -171,7 +171,7 @@ def escapes_used(run_id: str, tc_id: str) -> int:
         return 0
     try:
         return max(0, int(body.get("escapes") or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 
@@ -626,7 +626,7 @@ def _evidence_record(source: object) -> dict:
     body = body if isinstance(body, dict) else {}
     try:
         slices = max(0, int(body.get("slices") or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         slices = 0
     written = body.get("slices_written")
     return {

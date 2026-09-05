@@ -358,7 +358,7 @@ async def uiautomator_dump(serial: str) -> dict:
 def _coord(value: object) -> int | None:
     try:
         number = int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if 0 <= number <= _SWIPE_MAX:
         return number
@@ -491,7 +491,7 @@ async def logcat_dump(
     if pid is not None:
         try:
             number = int(pid)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return {"error": "Refusing logcat pid " + repr(pid)[:40], "content": None}
         if number <= 0:
             return {"error": "Refusing logcat pid " + repr(pid)[:40], "content": None}
