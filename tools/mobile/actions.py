@@ -131,9 +131,40 @@ URL_SCHEMES = ("https", "http", "market")
 
 # Which operations change the device, and therefore force a re-dump. ``wait`` is
 # in here because a wait exists precisely to let the screen change.
+#
+# ``press`` is in here for the same reason it exists: the keyboard's action key
+# SUBMITS the focused field, so the screen after it is a different screen.
+# ``executor.ACTUATING_OPS`` is derived from this set minus ``wait``, so a press
+# also counts as having touched the device for the escape budget -- correct,
+# because it taps to focus and then sends a key.
 MUTATING_OPS = frozenset(
-    {"tap", "type", "clear", "back", "home", "scroll", "launch", "open_url", "wait"}
+    {
+        "tap",
+        "type",
+        "clear",
+        "back",
+        "home",
+        "scroll",
+        "launch",
+        "open_url",
+        "wait",
+        "press",
+    }
 )
+
+#: The keys ``press`` may send, and the ONLY ones -- name -> Android keycode.
+#:
+#: Deliberately NOT ``adb.KEYEVENT_RE``. That regex is the right bound for
+#: ``adb.keyevent``, whose callers are this package's own code, but it admits
+#: every ``KEYCODE_*`` name and every bare numeric code 0-999 -- ``KEYCODE_POWER``,
+#: the volume and call keys, three-digit codes nobody enumerated. A model-facing
+#: vocabulary cannot inherit that surface: the model chooses the value, and
+#: "anything the device understands" is not a bound. So ``press`` carries its
+#: own allowlist and ``adb`` validates again behind it.
+#:
+#: One key on purpose. ``enter`` IS the IME action on a single-line field.
+#: Each addition is one line here plus one behavioural test.
+PRESS_KEYS: dict[str, str] = {"enter": "KEYCODE_ENTER"}
 
 
 class Target(BaseModel):
@@ -230,6 +261,37 @@ class BackAction(_Base):
 
 class HomeAction(_Base):
     op: Literal["home"]
+
+
+# ``PressAction``'s docstring ships to the model inside ``response_schema()``
+# on every turn, so it carries the CONTRACT only. The reasoning lives here.
+#
+# ``target`` is the FIELD, and it is required so the key lands where the model
+# meant: the executor taps it to focus it first, the same two steps ``type``
+# and ``clear`` take, and that focus tap is judged by the destructive guard
+# exactly like any tap -- named element AND the control under the finger.
+#
+# What the key then does is the APP's decision, not the field's. ``enter``
+# delivers the form's IME action (send / go / done), and no dump names the
+# control that action fires -- uiautomator emits no ``imeOptions``. So the
+# guard judges a press against every element the packet carries (and refuses
+# on a packet that does not carry the whole screen): on a screen holding an
+# irreversible control the press is handed to the tester, and the model is told
+# to tap the control it means instead, which IS guarded by name. A press was
+# shipped once with "requiring the field is what makes the guard see it";
+# measured, `press enter {"rid": amount}` sent KEYCODE_ENTER on a form whose
+# button `tap` refused. The field's label was never the node the key actuated.
+
+
+class PressAction(_Base):
+    """Press a keyboard key against the named FIELD: tap it to focus, then
+    send ``key``. ``enter`` is the keyboard's action key; what it submits is
+    the app's decision, so a press is judged against every control on the
+    screen and handed to the tester when any looks irreversible."""
+
+    op: Literal["press"]
+    key: Literal["enter"]
+    target: Target
 
 
 class ScrollAction(_Base):
@@ -350,6 +412,7 @@ Action = Annotated[
         ClearAction,
         BackAction,
         HomeAction,
+        PressAction,
         ScrollAction,
         WaitAction,
         LaunchAction,
@@ -408,6 +471,7 @@ OPS = (
     "clear",
     "back",
     "home",
+    "press",
     "scroll",
     "wait",
     "launch",
@@ -955,7 +1019,19 @@ def describe_vocabulary() -> dict:
             "element, but being handed back still costs you a turn."
         ),
         "notes": [
-            "tap/type/clear/scroll act on a target; back/home/launch take none.",
+            "tap/type/clear/scroll/press act on a target; back/home/launch take none.",
+            "press(key, target) taps the field to focus it and then sends that "
+            "key; key is one of "
+            + ", ".join(sorted(PRESS_KEYS))
+            + ". `enter` is the keyboard's ACTION key and WHAT IT SUBMITS IS "
+            "DECIDED BY THE APP, not by the field you name -- so a press is "
+            "judged against every element on the screen, ordinary text and "
+            "widget names included (a message reading 'did you transfer it?' "
+            "counts, and so does a control whose class or resource id contains "
+            "one of these words), and "
+            "on a screen holding anything irreversible (confirm, pay, delete, "
+            "...) it is handed to the tester. On such a screen tap the button "
+            "you mean instead; that is judged by its own label.",
             "type carries secret=true ONLY for a value the tester supplied; never "
             "invent a credential and never put one in a plan.",
             "wait needs ms (<= "
