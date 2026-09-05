@@ -184,10 +184,11 @@ _EDGE_CASES_SCRIPTED_NOTE = (
 def effective_categories() -> list[tuple[str, str, str]]:
     """CATEGORIES with the Edge Cases retype applied. Pure and never raises.
 
-    Always returns a NEW list: the retype is unconditional since 2026-08-12, and
-    tests/fixtures/server_mode_equivalence/ (which records the 8 category system
-    prompts verbatim) was RE-CAPTURED against it. The module-level CATEGORIES
-    list is never mutated. Read by BOTH halves: the server fan-out, and
+    Always returns a NEW list: the retype is unconditional since 2026-08-12.
+    (A fixture directory recording the 8 category system prompts verbatim was
+    re-captured against it at the time; that fixture set no longer exists in
+    the repo, so nothing pins the prompts byte-for-byte today.) The
+    module-level CATEGORIES list is never mutated. Read by BOTH halves: the server fan-out, and
     prepared.categories, which is what host mode builds its per-category
     instructions from.
     """
@@ -1922,9 +1923,9 @@ def _host_suppression_section(
         if find_vague_steps(cases) or find_vague_expected(cases):
             lines.append(
                 "- **Vague step text was flagged, not rewritten.** The pass that "
-                "rewrites 'an appropriate error message' into a concrete, "
-                "checkable outcome is a server-side LLM call, and host mode does "
-                "not make it. The Data Quality Notes above count every one and "
+                "rewrote 'an appropriate error message' into a concrete, "
+                "checkable outcome was retired and no longer exists in any "
+                "mode. The Data Quality Notes above count every one and "
                 "list examples -- tighten those steps (or ask me to) before "
                 "anyone executes the suite."
             )
@@ -2405,8 +2406,10 @@ async def _finalize_generation(
     # disclosed next to the deterministic quality block they relate to and
     # AHEAD of the two variable-length sections -- the same reply-cap reason
     # ops-4c moved quality_section here. "" on every server route, so no
-    # non-host caller's summary changes by a byte (pinned by
-    # tests/test_server_mode_equivalence.py's golden fixtures).
+    # non-host caller's summary changes by a byte. (That invariant used to be
+    # pinned by a server-mode equivalence test with golden fixtures; both the
+    # test and the fixtures are gone, so it is now asserted by this comment
+    # only.)
     host_suppress_section = _host_suppression_section(
         renumbered,
         deterministic_coverage=bool(checklist_section),

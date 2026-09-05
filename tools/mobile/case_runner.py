@@ -572,7 +572,14 @@ def _prior_uncharged(prior: object) -> dict:
 
     Guarded because the carry-forward used to do a bare ``int()`` on whatever
     was on disk, so a corrupt count broke every later checkpoint for that case.
-    Reads the merged key first, then the two pre-merge flat keys.
+    Reads the merged key first, then the two pre-merge flat keys -- and reads
+    the legacy one when the merged value is UNREADABLE as well as when it is
+    missing. ``merged.get(reason, body.get(legacy))`` only did the second, so a
+    corrupt merged value discarded a good legacy one: measured,
+    ``{"uncharged_stops": {"budget": "x"}, "budget_stops": 3}`` returned
+    ``budget: 0``, which hands that one case a full cap of extra uncharged
+    stops. Not a loop -- the next checkpoint writes a clean merged dict -- and
+    not laxer than the pre-merge behaviour, but wrong.
     """
     body = prior if isinstance(prior, dict) else {}
     merged = body.get("uncharged_stops")
@@ -582,12 +589,32 @@ def _prior_uncharged(prior: object) -> dict:
         (REASON_BUDGET, "budget_stops"),
         (REASON_SELECTOR, "free_stops"),
     ):
-        raw = merged.get(reason, body.get(legacy))
-        try:
-            out[reason] = max(0, int(raw or 0))
-        except (TypeError, ValueError):
-            out[reason] = 0
+        value = _uncharged_count(merged.get(reason))
+        if value is None:
+            value = _uncharged_count(body.get(legacy))
+        out[reason] = 0 if value is None else value
     return out
+
+
+def _uncharged_count(raw: object) -> int | None:
+    """One stored count, coerced, or ``None`` when it cannot be read.
+
+    ``None`` rather than ``0`` for the failure, because the caller has to tell
+    "unreadable, try the other key" from "the stored count really is zero" --
+    conflating the two is the defect this helper exists to remove.
+
+    ``""`` counts as unreadable: a blank string on disk is corruption, not a
+    zero. ``OverflowError`` is caught alongside the other two because
+    ``int(float("inf"))`` raises it (``int(float("nan"))`` raises ValueError),
+    and this function's whole contract is that it never raises into a
+    checkpoint.
+    """
+    try:
+        if raw is None or raw == "":
+            return None
+        return max(0, int(raw))
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _evidence_record(source: object) -> dict:

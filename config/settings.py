@@ -559,8 +559,12 @@ class Settings(BaseSettings):
     # 2026-07-30 run exported 8 scripted cases as Exploratory and the XLSX
     # Summary reported "Exploratory 8 / Performance 0" -- test-type metrics
     # describing unscripted charter testing for a suite that contains none.
-    # This is a PROMPT change, so tests/fixtures/server_mode_equivalence/ (which
-    # records the 8 category prompts VERBATIM) was RE-CAPTURED with it applied.
+    # This is a PROMPT change: the 8 category prompts are no longer
+    # byte-identical to the pre-flag ones. The verbatim capture that recorded
+    # them belonged to the server-mode equivalence programme and is not in this
+    # tree -- git tracks no empty directory, so the path it lived at has never
+    # existed in a clone. effective_categories() is pinned directly instead,
+    # by tests/test_test_scenario_agent.py.
 
     # A QUALIFIER-PREFIXED module label is merged onto the bare label it
     # qualifies. UNCONDITIONAL since 2026-08-12:
