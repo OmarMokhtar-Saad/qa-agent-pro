@@ -689,6 +689,7 @@ def _advisory_omission_marker(names: list[str]) -> str:
 # raising it takes effect instead of silently doing nothing.
 _MIN_ROWS_SHOWN = 1
 
+
 #: The trim ladder, derived so that _MIN_ROWS_SHOWN is always its last rung and
 #: no rung ever sits at or below the floor. At the shipped floor this is
 #: (12, 8, 6, 4, 3, 2, 1); at a floor of 5 it is (12, 8, 6, 5) -- binding in

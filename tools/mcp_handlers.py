@@ -13659,10 +13659,17 @@ def _render_missing(missing: list | None, sent: list | None) -> str:
         # Only the over-cap ids the slice did NOT already name are counted in
         # the tail: an id shown with its reason inline and counted again was
         # double reporting (round-6 review).
-        present = set(str(m or "") for m in list(missing or []))
+        #
+        # No "is it in `missing`?" filter here, and that is deliberate:
+        # `_peek_captures` appends EVERY id past `_CAPTURE_TRAY_MAX` to
+        # `missing`, so the over-cap ids of a call are always a subset of that
+        # call's missing list and the filter could never reject anything. It
+        # graded DEAD -- removing it left the whole non-mobile suite green
+        # (independent verification, 2026-09-07) -- and a guard that cannot
+        # fire is the defect rounds 13/14 removed from `wireframe` and
+        # `scale_bounds`, not a defence.
         named = set(str(m or "") for m in list(missing or [])[:_MAX_MISSING_SHOWN])
-        over_all = [c for c in _over_cap_ids(sent) if c in present]
-        over_hidden = [c for c in over_all if c not in named]
+        over_hidden = [c for c in _over_cap_ids(sent) if c not in named]
         tail = ""
         if rest > 0:
             tail = f", and {rest} more"
