@@ -1,6 +1,6 @@
 [project]
 name = "qa-agent-pro"
-version = "1.79.8"
+version = "1.79.9"
 requires-python = ">=3.10"
 dependencies = [
     "pyyaml>=6.0",  # contracts + OpenAPI specs are YAML (api_test agent)
@@ -34,7 +34,14 @@ dev = [
     "pytest-cov>=5.0",
     "pytest-xdist>=3.5",
     "respx>=0.21",
-    "ruff>=0.4",
+    # PINNED to one minor series, not an open floor. `ruff format --check .` is a
+    # GATE, and the formatter's output changes between minor releases, so `>=0.4`
+    # meant whichever ruff happened to be installed decided whether the gate was
+    # green: measured at v1.79.8 with ruff 0.15.6, two files nobody had touched
+    # came back "would reformat" (line joins only) at a commit whose author had
+    # run the gate clean. Raise the ceiling deliberately, reformatting in the same
+    # commit, so the reformat is reviewed rather than discovered.
+    "ruff>=0.15,<0.16",
     "openpyxl>=3.1",
     "pyyaml>=6.0",
 ]
