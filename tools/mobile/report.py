@@ -358,13 +358,19 @@ def _device_size(screen: object) -> tuple:
     are the size: the origin is always ``(0, 0)``, so the extent measured from
     it is what :func:`scale_bounds` maps against.
 
-    Where the device could not answer, ``prune`` stores the extent of everything
-    the dump lays out instead, which is why a scrollable screen no longer
-    squeezes: the display bounds it either way. ``[]`` only when the dump laid
-    out nothing at all.
+    Where the device could not answer AND no depth-1 window was measurable, the
+    panel is genuinely unknown and ``root_bounds`` is ``[]`` -- which since the
+    panel stopped borrowing the frame's rule is reachable with a FULL element
+    list, not just on an empty dump. So ``frame_bounds`` is read next: the
+    rectangle ``prune`` actually filtered with, which is at least as large as
+    everything laid out. It is not the display and does not claim to be; it is a
+    scale the PRODUCER derived rather than one this function improvises.
 
-    The ``max()`` walk survives here as the fallback for one caller that still
-    happens: a screen stored by a build that did not write the key.
+    The ``max()`` walk survives below as the last resort for one caller that
+    still happens: a screen stored by a build that wrote neither key. It must
+    not become the ordinary path for an unknown panel -- it walks the pruned
+    ELEMENTS, so on a scrollable screen it returns the container's content
+    height, and that is the squeeze described above.
 
     This is a store file -- an outside input by the time it is read -- so a wrong
     type, a wrong length, a bool, a non-number, a negative origin or a zero-area
@@ -375,21 +381,26 @@ def _device_size(screen: object) -> tuple:
     documented behaviour and it is pinned by test rather than changed here.
     """
     body = screen if isinstance(screen, dict) else {}
-    root = _bounds_of({"bounds": body.get("root_bounds")})
-    if (
-        root is not None
-        and root[0] >= 0
-        and root[1] >= 0
-        and 0 < root[2] <= MAX_DEVICE_EXTENT
-        and 0 < root[3] <= MAX_DEVICE_EXTENT
-    ):
-        # Each clause is reachable on its own, which is what makes it a guard
-        # rather than decoration. `_bounds_of` SORTS, so `root[2] >= root[0]`
-        # always holds -- but with the origin only required to be non-negative,
-        # `[0,0,0,2400]` still reaches and fails `root[2] > 0`, and
-        # `[0,0,1080,0]` still reaches and fails `root[3] > 0`. A negative
-        # origin fails the first two and never reaches either.
-        return root[2], root[3]
+    # In priority order, and derived ONCE: the display if the producer knew it,
+    # then the frame it filtered with, then the walk. Two sources, one set of
+    # clauses -- checking them twice is how a second copy drifts from the first.
+    for key in ("root_bounds", "frame_bounds"):
+        rect = _bounds_of({"bounds": body.get(key)})
+        if (
+            rect is not None
+            and rect[0] >= 0
+            and rect[1] >= 0
+            and 0 < rect[2] <= MAX_DEVICE_EXTENT
+            and 0 < rect[3] <= MAX_DEVICE_EXTENT
+        ):
+            # Each clause is reachable on its own, which is what makes it a
+            # guard rather than decoration. `_bounds_of` SORTS, so
+            # `rect[2] >= rect[0]` always holds -- but with the origin only
+            # required to be non-negative, `[0,0,0,2400]` still reaches and
+            # fails `rect[2] > 0`, and `[0,0,1080,0]` still reaches and fails
+            # `rect[3] > 0`. A negative origin fails the first two and never
+            # reaches either.
+            return rect[2], rect[3]
     width = 0
     height = 0
     for element in body.get("elements") or []:
@@ -410,13 +421,18 @@ def scale_bounds(box: object, dev_w: int, dev_h: int) -> tuple | None:
     frame or raise.
     """
     try:
-        if int(dev_w) <= 0 or int(dev_h) <= 0:
-            return None
         left, top, right, bottom = (int(value) for value in box)
         left = min(max(0, left), int(dev_w))
         right = min(max(0, right), int(dev_w))
         top = min(max(0, top), int(dev_h))
         bottom = min(max(0, bottom), int(dev_h))
+        # THE guard. A zero or negative device collapses every clamped box to
+        # right <= left (or bottom <= top), so this one check is what refuses
+        # it -- and it is the only reachable one. Two explicit zero-device
+        # checks (here and in wireframe) sat in front of it and both graded
+        # dead under mutation (round-14): removing either changed nothing.
+        # The division below is reached only when right > left, which needs
+        # dev_w > 0.
         if right <= left or bottom <= top:
             return None
         scale = min(FRAME_W / float(dev_w), FRAME_H / float(dev_h))
@@ -434,23 +450,45 @@ def scale_bounds(box: object, dev_w: int, dev_h: int) -> tuple | None:
 
 
 def wireframe(screen: object) -> dict:
-    """``{"rects", "device", "scaled"}`` for one pruned screen.
+    """``{"rects", "device", "scaled", "clipped", "outside"}`` for one pruned
+    screen. ``clipped`` counts elements drawn as the sliver that fits the
+    display; ``outside`` counts elements with area but none of it on the
+    display, which are not drawn; the page discloses both.
 
     ``scaled`` is False when the dump had no usable geometry -- the report then
     draws a labelled empty frame rather than a plausible-looking wrong one.
     """
     body = screen if isinstance(screen, dict) else {}
     dev_w, dev_h = _device_size(body)
-    if dev_w <= 0 or dev_h <= 0:
-        return {"rects": [], "device": [dev_w, dev_h], "scaled": False}
+    # No zero-device check HERE: `scale_bounds` refuses a zero device for every
+    # box and the loop then produces no rects, which is the same frame the
+    # removed early return built by hand. Two checks for one condition was a
+    # second copy waiting to drift (round-13 review, R3/R6).
     rects = []
+    clipped = 0
+    outside = 0
     for element in list(body.get("elements") or [])[:MAX_RECTS]:
         box = _bounds_of(element)
         if box is None:
             continue
+        # Two names for two facts, counted BEFORE the scale decides whether
+        # anything is drawn (round-14 review, H1: counting after the
+        # `placed is None` skip omitted every element that lay entirely off
+        # the display, so a screen that lost 2 of 4 elements said "1").
+        #   clipped -- has area inside the display but reaches past it; drawn
+        #              as the sliver that fits.
+        #   outside -- has area, none of it on the display; not drawn at all.
+        # A degenerate (zero-area) box is neither: there is nothing to draw
+        # and nothing was lost.
+        has_area = box[2] > box[0] and box[3] > box[1]
+        past_edge = box[0] < 0 or box[1] < 0 or box[2] > dev_w or box[3] > dev_h
         placed = scale_bounds(box, dev_w, dev_h)
         if placed is None:
+            if has_area and dev_w > 0 and dev_h > 0:
+                outside += 1
             continue
+        if past_edge:
+            clipped += 1
         holder = element if isinstance(element, dict) else {}
         label = _text(holder.get("text") or holder.get("desc") or holder.get("rid"), 40)
         kind = "plain"
@@ -474,7 +512,13 @@ def wireframe(screen: object) -> dict:
     # all lie outside the display -- reachable since the visibility frame was
     # widened past it -- scales every one of them to nothing and would otherwise
     # return an empty frame claiming to be a real one.
-    return {"rects": rects, "device": [dev_w, dev_h], "scaled": bool(rects)}
+    return {
+        "rects": rects,
+        "device": [dev_w, dev_h],
+        "scaled": bool(rects),
+        "clipped": clipped,
+        "outside": outside,
+    }
 
 
 # ── numbers ────────────────────────────────────────────────────────────────────
@@ -710,10 +754,40 @@ def _frame_html(screen_id: object, screens: object) -> str:
         + str(len(frame["rects"]))
         + '" data-scaled="'
         + ("1" if frame["scaled"] else "0")
+        + '" data-clipped="'
+        + str(int(frame.get("clipped") or 0))
+        + '" data-outside="'
+        + str(int(frame.get("outside") or 0))
         + '">'
         + rects
+        + _geometry_note(frame)
         + "</div>"
     )
+
+
+def _geometry_note(frame: dict) -> str:
+    """The frame's disclosure of what the picture could not show, or ''.
+
+    Rendered as ``.frame .wirenote.geom`` -- the shell styles it (round-14
+    review, H3: the first version emitted an unstyled class in-flow under the
+    absolutely positioned rects, where nobody could read it) and pins it to the
+    frame's foot above the rects. Both counts are ints this module computed, so
+    the interpolation is the one kind that needs no escaping.
+    """
+    clipped = int(frame.get("clipped") or 0)
+    outside = int(frame.get("outside") or 0)
+    if not clipped and not outside:
+        return ""
+    parts = []
+    if clipped:
+        parts.append(
+            str(clipped) + " element(s) extend past the display and are drawn clipped"
+        )
+    if outside:
+        parts.append(
+            str(outside) + " element(s) lie entirely off the display and are not drawn"
+        )
+    return '<p class="wirenote geom">' + "; ".join(parts) + "</p>"
 
 
 def _phone_html(

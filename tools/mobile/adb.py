@@ -354,8 +354,11 @@ async def force_stop(serial: str, package: str) -> dict:
 # The digit guards are load-bearing: without them `\d{1,7}` happily matches a
 # SEVEN-digit slice of an eight-digit number, so a device reporting a size
 # too large to be representable would be read as a plausible one instead of
-# refused. Bounded on both sides, an over-long run matches nothing.
-_DISPLAY_RE = re.compile(r"(?<!\d)(\d{1,7})x(\d{1,7})(?!\d)")
+# refused. Bounded on both sides, an over-long run matches nothing. The
+# lookbehind also refuses a leading minus: `-1080x2400` used to match from the
+# digit after the sign and be read as a positive 1080 (round-13 review), when a
+# negative width is an answer this function must not trust.
+_DISPLAY_RE = re.compile(r"(?<![\d-])(\d{1,7})x(\d{1,7})(?!\d)")
 #: How long a display answer is reused before the device is asked again. Not
 #: forever: a SERIAL is not a device identity. Emulator serials are recycled, so
 #: a phone AVD and a tablet AVD both arrive as `emulator-5554`; a foldable

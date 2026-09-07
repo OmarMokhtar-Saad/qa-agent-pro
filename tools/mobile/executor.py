@@ -1086,6 +1086,59 @@ def _display_box(display: object) -> tuple | None:
     return (x1, y1, x2, y2)
 
 
+def _panel_far_edges(display: object) -> tuple:
+    """The far edges the panel is known to have, as ``(x_far, y_far)``.
+
+    Either may be ``None``, meaning "this axis is unknown, so do not clamp it" --
+    the same safe direction :func:`_display_box` already takes for a whole
+    missing rectangle, applied one axis at a time. Clamping to a guess is what
+    shrinks a legitimate gesture out of existence; clamping to nothing is what
+    let a swipe leave the panel. Per axis, neither is forced.
+
+    Accepts BOTH shapes on purpose. Two numbers is the packet's ``panel_axes``,
+    where ``0`` marks an axis the panel's own rule could not answer. Four is the
+    older ``root_bounds``, which is all-or-nothing by construction, so a packet
+    from a build that does not publish ``panel_axes`` clamps exactly as it does
+    today. Anything else clamps nothing.
+
+    Never raises: a stored packet is an outside input by the time it is read.
+    """
+    if isinstance(display, (list, tuple)) and len(display) == 2:
+        edges: list = []
+        for value in display:
+            if isinstance(value, bool):
+                # `int(True)` is a 1-pixel panel, which would clamp every
+                # gesture to nothing -- the shrinking direction this must never
+                # take.
+                edges.append(None)
+                continue
+            try:
+                number = int(value)
+            except (TypeError, ValueError, OverflowError):
+                edges.append(None)
+                continue
+            edges.append(number if number > 0 else None)
+        return (edges[0], edges[1])
+    box = _display_box(display)
+    if box is None:
+        return (None, None)
+    return (box[2], box[3])
+
+
+def _clamp_source(screen: object) -> object:
+    """What the clamp reads out of a packet: the per-axis panel, else the rect.
+
+    Both call sites go through here so the two cannot disagree about which key
+    wins -- deriving that answer twice in two places is how mirrored conditions
+    drift, and this pair of call sites has already been found out of step once.
+    """
+    body = screen if isinstance(screen, dict) else {}
+    axes = body.get("panel_axes")
+    if isinstance(axes, (list, tuple)) and len(axes) == 2:
+        return axes
+    return body.get("root_bounds")
+
+
 def _swipe_points(
     direction: str, element: object, display: object = None
 ) -> tuple | None:
@@ -1160,8 +1213,20 @@ def _swipe_points(
     x1, y1 = max(0, x1), max(0, y1)
     frame = _display_box(display)
     if frame is not None:
+        # Near edges from the whole rectangle when there is one. A panel's origin
+        # is always (0, 0), so this only ever matters for a stored packet that
+        # carries something else.
         x1, y1 = max(x1, frame[0]), max(y1, frame[1])
-        x2, y2 = min(x2, frame[2]), min(y2, frame[3])
+    # FAR edges PER AXIS. An axis the panel's own rule could not answer is left
+    # unclamped rather than clamped to a guess -- and before this, ONE
+    # unanswerable axis cost the clamp BOTH, so a window laid out above the
+    # display produced a swipe to x=2300 against a 1080 panel that the device
+    # silently ignored while the step reported success.
+    x_far, y_far = _panel_far_edges(display)
+    if x_far is not None:
+        x2 = min(x2, x_far)
+    if y_far is not None:
+        y2 = min(y2, y_far)
     if x2 <= x1 or y2 <= y1:
         return None
     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
@@ -1530,9 +1595,7 @@ async def replay(script: object, ctx: Context) -> dict:
                 if element is not None:
                     actuated = actuated_element(
                         screen,
-                        _touch_point(
-                            op, action, element, (screen or {}).get("root_bounds")
-                        ),
+                        _touch_point(op, action, element, _clamp_source(screen)),
                     )
                     # The actuated node is judged on its OWN strings -- no
                     # `screen`, so no containment. It is an ANCESTOR by
@@ -1670,9 +1733,7 @@ async def replay(script: object, ctx: Context) -> dict:
             # ONE rectangle for the guard and the device -- see
             # `_swipe_points`. Both read this packet's own root_bounds
             # rather than each asking adb, whose answer expires.
-            outcome = await _perform(
-                op, action, element, ctx, (screen or {}).get("root_bounds")
-            )
+            outcome = await _perform(op, action, element, ctx, _clamp_source(screen))
             if outcome.get("error"):
                 if outcome.get("mask_text") and isinstance(entry.get("action"), dict):
                     for key in ("text", "value"):

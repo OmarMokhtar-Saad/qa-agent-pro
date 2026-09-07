@@ -52,6 +52,29 @@ MAX_DUMP_BYTES = 4 * 1024 * 1024
 # a 900-node ScrollView would crowd out the case it is meant to execute.
 MAX_ELEMENTS = 150
 
+# HEADROOM on the packet, for elements the panel puts off-display. They are
+# carried at all only because the panel is an estimate that can be wrong -- a
+# stale device size classifies the tester's own controls as off-display -- so
+# off-panel crowding must never delete an on-panel control.
+#
+# Four passes at spending ONE budget between the two classes each fixed the
+# previous pass's worst case and created a new one further out, because at a
+# fixed cap "every on-panel element survives" and "every element the dump listed
+# first survives" are jointly unsatisfiable -- a counting fact, not a
+# rule-design problem. So the TOTAL is what grew, and `prune` walks in DOCUMENT
+# order: nothing downstream sees a reordering, and `element_seed`/`hash`, the
+# rendered lines the model plans from, and the guard's equal-area tie-break all
+# read the dump's own order, as they did before any of this.
+#
+# It bounds the TOTAL and is NOT a cap on the off-panel class. Capping that
+# class was measured deleting 25 of the tester's own controls out of a
+# 110-element tablet dump under a stale panel -- a dump today's code carries
+# whole -- because the class we have decided we cannot trust the membership of
+# is the one place a bound cannot be justified by the classification: if the
+# panel is wrong, that class IS the screen. With the total bounded instead, no
+# dump loses more elements than it loses today, whatever the panel says.
+MAX_PACKET_HEADROOM = MAX_ELEMENTS // 2
+
 # Per-attribute cap. Long enough for a paragraph of on-screen copy, short enough
 # that one hostile node cannot dominate the packet.
 MAX_ATTR_CHARS = 200
@@ -449,7 +472,8 @@ def _is_editable(full_class: str) -> bool:
 
 
 def _display_rect(tree: object, display: object, rotation: object) -> tuple:
-    """``(display, frame)`` -- the screen, and the region an element may occupy.
+    """``(display, frame, axes)`` -- the screen, the region an element may
+    occupy, and what is known of the screen PER AXIS.
 
     **These are two answers, not one, and conflating them is what this function
     exists to stop.** They differ only when the dump lays something out beyond
@@ -463,7 +487,12 @@ def _display_rect(tree: object, display: object, rotation: object) -> tuple:
       rectangle actions are clamped to. A window is a display-sized thing and a
       child is not, which is why an overhanging ROW must not widen it -- a row
       dragged out to its own far edge would turn the executor's swipe clamp into
-      a no-op and send a gesture the device silently ignores.
+      a no-op and send a gesture the device silently ignores. It is ``None``
+      when neither source could answer, and that is an ANSWER rather than a
+      hole: the panel is derived from the panel's own node set or NOT AT ALL,
+      because a fallback that borrows the frame's rule is the overhanging row
+      declaring the screen again. Both axes come from one decision over that one
+      set for the same reason.
     * ``frame`` -- ``display`` widened to cover everything the dump lays out.
       This is the off-screen VISIBILITY FILTER. Getting it too small deletes the
       tester's screen from the packet the model plans with and the destructive
@@ -517,8 +546,17 @@ def _display_rect(tree: object, display: object, rotation: object) -> tuple:
 
     ``display`` is device output and untrusted: exactly two values, bools
     rejected before ``int()`` (``int(True)`` is a 1-pixel screen), each within
-    :data:`MAX_DISPLAY_EXTENT`. Anything else, and the display IS the dump
-    extent. ``(None, None)`` when the dump lays out nothing at all.
+    :data:`MAX_DISPLAY_EXTENT`. Anything else, and the panel falls to the window
+    walk -- never to the dump extent, which is the frame's rule and not the
+    panel's.
+
+    Returns ``(panel, frame, axes)``. *panel* is the rectangle when BOTH axes are
+    known and ``None`` otherwise, because a scale must be a whole rectangle or
+    absent. *axes* is what is known PER AXIS, ``0`` for one this walk could not
+    answer -- the gesture clamp can bind one axis and leave the other, and
+    forcing that through the rectangle is what made a window laid out above the
+    display lose a clamp it should have had. *frame* is ``None`` only when no
+    positive-area node has a positive right or bottom edge.
     """
     right = 0
     bottom = 0
@@ -589,12 +627,66 @@ def _display_rect(tree: object, display: object, rotation: object) -> tuple:
             turned = False
         width, height = (size[1], size[0]) if turned else (size[0], size[1])
     else:
-        # The panel estimate, NOT the full extent: see the second walk above.
-        width, height = panel_right or right, panel_bottom or bottom
+        # The window walk's answer and NOTHING ELSE -- never `or right`, which
+        # handed the panel the FRAME's rule (the all-node extent) whenever a
+        # depth-1 window was zero-area, carried unparseable bounds, or carried
+        # no bounds at all. One overhanging row then declared the screen 3000px
+        # wide on a 1080 panel, which is the exact incident the two walks exist
+        # to prevent. A fallback may not substitute the answer of a DIFFERENT
+        # rule.
+        #
+        # There is deliberately NO test here on whether the walk answered. One
+        # decision below settles whether this is a panel at all; asking in both
+        # places made neither question gradable, because a mutant loosening
+        # either was caught by the other and reported as a survivor.
+        #
+        # THE COST, because it is not free and it is not only the pathological
+        # dump: where such a window's children happen to lie INSIDE the screen,
+        # the extent was the right answer by luck, and that luck is now
+        # declined. The report falls to the stored frame for its scale and the
+        # executor's far swipe clamps stop binding (its documented path for an
+        # absent display). Both are worse than a correct panel and better than a
+        # confidently wrong one, and neither is reached at all when the device
+        # answers `wm size` -- which it did on every device this has been run
+        # against.
+        width, height = panel_right, panel_bottom
 
-    if width <= 0 or height <= 0:
-        return None, None
-    return (0, 0, width, height), (0, 0, max(width, right), max(height, bottom))
+    # The FRAME is derived whether or not the panel is known, and is returned
+    # even when the panel is not. `prune` takes the first positive-area node as
+    # its visibility filter when the frame is None, and that node being mistaken
+    # for the screen is the round-1 defect -- a status bar became the display and
+    # everything below it was discarded. So `(None, None)` means one thing only:
+    # no positive-area node has a positive right OR a positive bottom edge. That
+    # is NOT "the dump laid out nothing" -- a node at `[-200,-100][-100,0]` has
+    # positive area and reaches the packet while both rectangles are empty --
+    # and the looser claim was in three docstrings.
+    frame_right, frame_bottom = max(width, right), max(height, bottom)
+    if frame_right <= 0 or frame_bottom <= 0:
+        # Three values on EVERY path. Nothing is known here -- no panel, no
+        # frame, and neither axis -- and `(0, 0)` is how that is said in the
+        # per-axis shape.
+        return None, None, (0, 0)
+    # THE ONE PLACE THE PANEL IS DECIDED. Both axes or neither: a rectangle with
+    # one axis from the windows and the other from every node is one neither
+    # rule would have chosen, and the dump that produces it is a window with
+    # positive AREA whose right edge is not positive -- laid out entirely at
+    # negative x, so it contributes a bottom and no right.
+    panel = (0, 0, width, height) if width > 0 and height > 0 else None
+    # PER AXIS, decided in the same breath as the rectangle so the two cannot
+    # drift. A rectangle cannot say "width known, height unknown", and that is
+    # the whole cause of two rounds of defects: round 4 filled a missing axis
+    # from the FRAME and let an overhanging child declare the screen 3000px
+    # wide; round 7 refused to fill it and threw away the axis this walk HAD
+    # answered, so `root_bounds` went empty, the swipe clamp had nothing to
+    # clamp to, and the destructive guard judged a node with no strings instead
+    # of the control under the finger. Publishing what is actually known, per
+    # axis, is the only answer that is neither.
+    #
+    # No `max(0, ...)` clamp here: both branches above leave these at zero or
+    # more, so it would be an unreachable condition -- which reads as a
+    # safeguard and grades as nothing, the defect `ed7b1ecf` deleted from
+    # `label_of` in this same file.
+    return panel, (0, 0, frame_right, frame_bottom), (width, height)
 
 
 def _dominant_package(elements: object) -> str:
@@ -746,7 +838,7 @@ def prune(xml: object, activity: str = "", display: object = None) -> dict:
         # the display widened to cover everything the dump lays out, and is the
         # visibility filter, because a filter smaller than the dump deletes the
         # tester's screen in silence. See `_display_rect`.
-        selected, frame = _display_rect(root, display, root.get("rotation"))
+        selected, frame, panel_axes = _display_rect(root, display, root.get("rotation"))
         root_bounds = frame
         elements: list[dict] = []
         texts: list[str] = []
@@ -808,38 +900,133 @@ def prune(xml: object, activity: str = "", display: object = None) -> dict:
                 }
             )
 
-        # THE BUDGET IS SPENT ON THE DISPLAY FIRST.
+        # OFF-PANEL CROWDING MAY NEVER DELETE AN ON-PANEL CONTROL.
         #
         # The frame above is the display WIDENED to cover everything the dump
         # lays out, which is what stops a stale device size deleting the
-        # tester's screen. But widening admits off-display elements into the
-        # same `MAX_ELEMENTS` budget, and they are appended in DOCUMENT order --
-        # so an adjacent pager page or an incoming activity, laid out one screen
-        # width away at positive coordinates, could fill the cap and evict the
-        # control the tester is actually looking at. Measured: 150 rows of an
-        # incoming activity listed first, and `Delete account` on the visible
-        # screen was gone from the packet, with a CORRECT display.
+        # tester's screen. But widening admits off-display elements into the same
+        # `MAX_ELEMENTS` budget in DOCUMENT order, so an adjacent pager page or
+        # an incoming activity laid out one screen width away could fill the cap
+        # and evict the control the tester is looking at. Measured: 150 rows of
+        # an incoming activity listed first, and `Delete account` gone from the
+        # packet, with a CORRECT display.
         #
-        # That is the round-3 defect wearing the round-5 fix's clothes, so the
-        # answer is an ordering rule rather than another adjustment to the
-        # rectangle: what the tester can SEE is never displaced by what they
-        # cannot. Off-display elements keep whatever budget is left, in document
-        # order, because they are still worth carrying -- see `_display_rect`.
+        # Promoting what intersects the panel fixed that and broke its mirror
+        # image. Measured the other way: a tablet dump under a STALE phone size
+        # -- the case the widening above exists for -- classified `Delete
+        # account` at document index 0 as off-display and evicted it, while both
+        # the correct display and the dump-derived fallback kept it.
+        #
+        # The two cannot be told apart from here. A panel narrower than the dump
+        # extent is either a stale panel (keep the extra) or an app drawing
+        # off-screen (drop it), and the geometry is identical in kind -- rounds 3
+        # and 4 already made that trade in both directions.
+        #
+        # FOUR passes at spending one budget between the two classes each fixed
+        # the previous pass's worst case and created a new one further out:
+        # document order lost the visible control behind a full cap of off-panel
+        # rows; promotion lost the control a STALE panel misclassified;
+        # reserving half the budget for document order lost 25 visible controls
+        # behind 75 off-panel ones; reinstating that reserve lost 35 at 130.
+        # Each was measured, and the pattern is the point -- at a fixed cap,
+        # "every on-panel element survives" and "every element the dump listed
+        # first survives" are JOINTLY UNSATISFIABLE. That is a counting fact and
+        # no ordering rule repeals it.
+        #
+        # So the fix leaves the ordering axis: the packet's TOTAL grew by
+        # :data:`MAX_PACKET_HEADROOM`, the inside class keeps its own cap, the
+        # outside class takes what the total leaves, and the walk preserves
+        # DOCUMENT order. The headroom is spent only when the dump disagrees
+        # with the panel, so an ordinary screen is capped exactly as it was.
+        #
+        # When something IS dropped, `dropped_inside_panel` /
+        # `dropped_outside_panel` say which side of the panel it was on, because
+        # a screen thinned without saying so is one the model plans against
+        # believing it is complete.
+        #
+        # The properties that hold over ANY dump, which are the ones worth
+        # grading: off-panel crowding never removes an on-panel element, and no
+        # dump loses more elements than it loses without any of this.
+        # UNCHANGED MEANING, deliberately: "the dump offered more than
+        # `MAX_ELEMENTS`". `screen_hit` refuses a press on a truncated packet --
+        # a CLAUDE.md hard rule, because the control a key reaches is not in the
+        # dump at all -- so redefining this flag as "something was dropped"
+        # would relax a destructive guard as a side effect of a budget change,
+        # on a lane that reaches real installs. The new counts below carry the
+        # better information without touching what this gates.
         truncated = len(elements) > MAX_ELEMENTS
-        if selected is not None and truncated:
-            on_display = []
-            off_display = []
+        dropped_inside = 0
+        dropped_outside = 0
+        dropped_unclassified = 0
+        if selected is not None:
+            # Classified ONCE, into a list, because the same visibility test
+            # written twice is two conditions that drift apart -- and the box is
+            # bound once per element for the same reason.
+            classified = []
             for element in elements:
                 box = element.get("bounds") or []
-                visible = len(box) == 4 and not (
-                    box[0] >= selected[2]
-                    or box[1] >= selected[3]
-                    or box[2] <= selected[0]
-                    or box[3] <= selected[1]
+                classified.append(
+                    (
+                        element,
+                        len(box) == 4
+                        and not (
+                            box[0] >= selected[2]
+                            or box[1] >= selected[3]
+                            or box[2] <= selected[0]
+                            or box[3] <= selected[1]
+                        ),
+                    )
                 )
-                (on_display if visible else off_display).append(element)
-            elements = on_display + off_display
-        elements = elements[:MAX_ELEMENTS]
+            inside_count = sum(1 for _, visible in classified if visible)
+            # THE TOTAL IS BOUNDED; THE OUTSIDE CLASS IS NOT CAPPED.
+            #
+            # Outside elements get whatever the total leaves after the inside
+            # class has taken its own cap. Capping the outside class instead
+            # deleted content from dumps that FIT -- 110 elements on a tablet
+            # under a stale panel lost 25 of the tester's controls, where
+            # today's code carries all 110 -- and it deleted them from the one
+            # class whose membership we have already decided we cannot trust.
+            #
+            # `min(inside_count, MAX_ELEMENTS)` IS THE INVARIANT. Delete the
+            # clamp and this term keeps growing with the inside class, so inside
+            # overflow starts eating the outside budget and the two classes are
+            # competing again -- which is the defect all four ordering rules
+            # died of. With the clamp, the budget is pinned at the headroom once
+            # the inside class is full, so inside overflow adds NOTHING to
+            # outside loss.
+            outside_budget = (
+                MAX_ELEMENTS + MAX_PACKET_HEADROOM - min(inside_count, MAX_ELEMENTS)
+            )
+            kept: list[dict] = []
+            used_inside = 0
+            used_outside = 0
+            for element, visible in classified:
+                # DOCUMENT ORDER, and the independence is ONE-DIRECTIONAL: an
+                # inside decision reads only the inside counter and its own cap,
+                # so nothing the outside class does can evict an inside element.
+                # The reverse is not true and does not need to be -- the outside
+                # budget is a function of `inside_count` -- and the clamp above
+                # is what stops that dependence turning back into competition.
+                if visible:
+                    if used_inside >= MAX_ELEMENTS:
+                        dropped_inside += 1
+                        continue
+                    used_inside += 1
+                else:
+                    if used_outside >= outside_budget:
+                        dropped_outside += 1
+                        continue
+                    used_outside += 1
+                kept.append(element)
+            elements = kept
+        else:
+            # No panel, so no classification to make: one budget, document
+            # order, and the drops are counted under their own name. Attributing
+            # them to the inside class would be inventing a classification from
+            # a rectangle we do not have, which is the mistake this function's
+            # whole history is made of.
+            dropped_unclassified = max(0, len(elements) - MAX_ELEMENTS)
+            elements = elements[:MAX_ELEMENTS]
         _assign_ids(elements)
         # AFTER the cap and the ids, so a label is only ever borrowed from an
         # element the model can actually see and name. It reads cls/text/desc
@@ -878,6 +1065,49 @@ def prune(xml: object, activity: str = "", display: object = None) -> dict:
             # window at all, so the key means exactly one thing and a reader can
             # treat an empty value and an older build's missing value alike.
             "root_bounds": list(selected) if selected else [],
+            # The FRAME, under its OWN name because it answers a different
+            # question: `root_bounds` is the display, and this is the region an
+            # element may occupy -- at least as large as everything the dump
+            # lays out. Stored because the report needs a scale even when the
+            # panel is unknown, and the alternative was `report._device_size`
+            # improvising one from a max() walk over the elements, which returns
+            # a scroll container's CONTENT height: the one value that whole
+            # function documents as the thing the scale must never be. Two
+            # rectangles, two names, one meaning each.
+            #
+            # From `frame`, NOT from the local `root_bounds` above -- that local
+            # is reassigned to the first positive-area node when the frame is
+            # None, so storing it would put a node's own box under a name that
+            # promises the frame, which is the one-name-two-meanings defect this
+            # key exists to end.
+            "frame_bounds": list(frame) if frame else [],
+            # WHICH class lost elements, because "truncated" alone cannot say
+            # whether the tester's own screen was thinned or an adjacent pager
+            # page was. A model told only that something was cut plans against a
+            # screen it believes is complete.
+            #
+            # NAMED FOR THE PANEL, NOT FOR THE TESTER'S EYES, because the panel
+            # can be wrong and these inherit its error. Under a stale display a
+            # control the tester is looking at falls OUTSIDE the panel, so
+            # `dropped_outside_panel` would have been read as "only an adjacent
+            # page was thinned" when the opposite is true. "Inside"/"outside"
+            # says what was actually measured -- which side of a rectangle -- and
+            # `root_bounds == []` tells a reader that rectangle was never known.
+            # A count named after what the tester can SEE would be presenting
+            # the panel's guess as provenance, which is the confident wrongness
+            # the rest of this function exists to avoid.
+            "dropped_inside_panel": dropped_inside,
+            "dropped_outside_panel": dropped_outside,
+            # No panel at all: not attributable to either side.
+            "dropped_unclassified": dropped_unclassified,
+            # The panel PER AXIS, `0` for an axis its own rule could not answer.
+            # `root_bounds` above is the same panel when BOTH axes are known and
+            # `[]` otherwise, which is what the report needs -- a scale must be a
+            # whole rectangle or absent. The gesture clamp needs the other shape:
+            # it can bind one axis while leaving the other alone, and collapsing
+            # that into the rectangle is what cost a real clamp on a window laid
+            # out above the display. Two consumers, two values, one meaning each.
+            "panel_axes": list(panel_axes),
             "truncated": truncated,
             "considered": considered,
         }
@@ -914,6 +1144,24 @@ def element_line(element: dict) -> str:
         if element.get(name):
             parts.append(name)
     return " ".join(parts)
+
+
+def _count(value: object) -> int:
+    """A drop count from a packet, or 0 -- never an exception.
+
+    A stored packet is an outside input by the time it is read, and a bare
+    ``int()`` on a field an older build never wrote (or a hostile one wrote as a
+    string) would discard the ENTIRE screen block through the caller's
+    `except`. Losing the screen to a malformed count is the shape this whole
+    file's history is made of.
+    """
+    if isinstance(value, bool):
+        return 0
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return number if number > 0 else 0
 
 
 def to_prompt_block(pruned: object) -> str:
@@ -973,14 +1221,140 @@ def to_prompt_block(pruned: object) -> str:
                     for element in controls[:20]
                 )
             )
-        lines.extend(element_line(element) for element in elements)
-        if content.get("truncated"):
-            lines.append(
-                "...[only the first "
-                + str(MAX_ELEMENTS)
-                + " elements of this screen are shown]"
-            )
-        return wrap_untrusted("screen", "\n".join(lines), limit=MAX_BLOCK_CHARS)
+        # BEFORE the element lines, because `wrap_untrusted` caps the block at
+        # :data:`MAX_BLOCK_CHARS` and a 225-element packet runs past it -- so a
+        # notice appended at the END was cut off on exactly the packets that
+        # dropped the most, which are the only ones it exists for. Measured
+        # while writing the fixture that grades it. It also reads better here: a
+        # planner learns the screen is incomplete before it reads 225 rows
+        # rather than after.
+        #
+        # WHAT ACTUALLY HAPPENED, not what the old single budget would have done.
+        # "Only the first MAX_ELEMENTS are shown" became false in both
+        # directions once the packet gained headroom: it denied elements it was
+        # rendering on a screen that dropped nothing, and it understated a
+        # 224-element loss as 150. And `truncated` alone cannot say WHICH side of
+        # the panel was thinned, which is the difference between "ask for a
+        # scroll" and "plan against this screen as if it were complete".
+        inside = int(_count(content.get("dropped_inside_panel")))
+        outside = int(_count(content.get("dropped_outside_panel")))
+        unknown = int(_count(content.get("dropped_unclassified")))
+
+        # THE BLOCK OWNS ITS OWN SIZE, so the count in the notice is true by
+        # construction rather than by hoping nothing downstream trims it.
+        #
+        # There are TWO truncations here: the element budget in `prune`, and
+        # `wrap_untrusted`'s character cap. A notice derived from the packet
+        # knows only the first. Round 8f moved this notice ABOVE the element
+        # lines so the cap would stop cutting the notice -- and the cap then cut
+        # the LINES while the notice went on claiming them. Measured: 225
+        # claimed, 181 present, and 45 on-panel elements absent while the notice
+        # said 20 were lost on screen, which understates the tester's own loss
+        # worse than the message that was replaced.
+        #
+        # So the lines are trimmed HERE, to what the budget can actually carry,
+        # and the notice reports what was emitted. The cap can no longer cut an
+        # element line, so `wrap_untrusted` cannot make this message false.
+        rendered = [element_line(element) for element in elements]
+
+        def _notice(shown_count: int, too_big: int) -> str:
+            """The notice for a given outcome -- recomputed, never patched.
+
+            It has to be a function of the count because the count is what the
+            fixed point below changes: drop a line and both the shown number and
+            the not-carried number move, so a notice composed once and reused is
+            a notice about a block that no longer exists.
+            """
+            missing = inside + outside + unknown + too_big
+            if missing:
+                note = "...[%d elements shown; %d not carried" % (
+                    shown_count,
+                    missing,
+                )
+                if inside:
+                    # The one a planner must act on: the screen it can SEE is
+                    # incomplete, so the next step should scroll, not assume.
+                    note += ", %d of them on this screen" % inside
+                if outside:
+                    note += ", %d off the display" % outside
+                if unknown:
+                    note += ", %d with no display to place them" % unknown
+                if too_big:
+                    # Deliberately NOT split by side of the panel: the split for
+                    # the budget drops is known, this one is not, and claiming a
+                    # precision we do not have is the defect this message has
+                    # already had twice.
+                    note += (
+                        ", %d beyond the size of this message (some of those may "
+                        "be on this screen too)" % too_big
+                    )
+                return note + "]"
+            if content.get("truncated"):
+                # `truncated` still means "the dump offered more than
+                # MAX_ELEMENTS" -- it gates `screen_hit`'s press refusal and is
+                # deliberately unchanged -- so it can be true while the headroom
+                # carried everything. Say that, rather than claim a loss that
+                # did not happen.
+                return (
+                    "...[%d elements shown; this screen exceeded the usual cap "
+                    "but nothing was dropped]" % shown_count
+                )
+            return ""
+
+        # A FIXED POINT, because the artifact must be measured AFTER the notice
+        # is written. The previous version reserved a guessed number of
+        # characters for the notice and trimmed against it -- and the notice grew
+        # past the guess at three-digit counts, so `wrap_untrusted` cut an
+        # element line after the count had already been printed. The cut landed
+        # mid-`at[...]`, which hands the planner a rectangle in the SHRINKING
+        # direction: worse than the false count it was meant to prevent.
+        #
+        # So: compose the whole block, measure it, drop the LAST element line,
+        # and recompose -- until it fits. Terminates because `shown` strictly
+        # shrinks. The header is dropped only as a last resort, and the notice is
+        # never what goes: a notice the cap cuts off is not a notice.
+        head = list(lines)
+        # BOUNDED BEFORE THE LOOP. The loop re-joins the body each iteration, so
+        # it is quadratic in the number of lines: measured 0.001s at 225
+        # elements and 50s at 60000, which a stored packet can carry even though
+        # `prune` cannot produce it. No live packet exceeds this bound, so the
+        # cut costs nothing that was going to be rendered anyway.
+        rendered = rendered[: MAX_ELEMENTS + MAX_PACKET_HEADROOM]
+        shown = list(rendered)
+        while True:
+            note = _notice(len(shown), len(rendered) - len(shown))
+            body = head + ([note] if note else []) + shown
+            text = "\n".join(body)
+            if len(text) <= MAX_BLOCK_CHARS:
+                break
+            if shown:
+                shown.pop()
+                continue
+            if len(head) > 1:
+                # THE FREED ROOM BELONGS TO THE ELEMENTS. Dropping a header line
+                # without restoring them spent 11793 characters on nothing:
+                # measured 0 of 20 elements emitted where 18 fitted, so the
+                # planner got a screen with no actionable element and scrolled
+                # or gave up instead of tapping.
+                #
+                # Controls first, FIELDS only if that was not enough -- the
+                # fields summary is the only thing that says which element takes
+                # typing, and it exists because a model tapped Voice mode as
+                # Send. Neither is a convenience, but one is cheaper to lose.
+                head = head[:-1]
+                shown = list(rendered)
+                continue
+            # LAST RESORT: one header line that still will not fit. Returning the
+            # text measured as too long let `wrap_untrusted` slice it and take
+            # the notice with it -- 5 elements and no warning at all, which is
+            # the very failure the header drop above was added to prevent. So
+            # make room for the notice explicitly and compose what is returned.
+            note = _notice(0, len(rendered))
+            keep = MAX_BLOCK_CHARS - len(note) - 1
+            head = [head[0][:keep]] if keep > 0 else []
+            text = "\n".join(head + ([note] if note else []))
+            break
+        return wrap_untrusted("screen", text, limit=MAX_BLOCK_CHARS)
     except Exception:  # pragma: no cover - defensive
         logger.exception("mobile.perception.to_prompt_block failed")
         return ""

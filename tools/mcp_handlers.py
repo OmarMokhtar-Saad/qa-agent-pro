@@ -4459,22 +4459,30 @@ async def _audit_image_plan_nudge(plan: str, channel: str, missing_ids) -> None:
     already produced and deduped them.
     """
     try:
-        ids = [str(x)[:64] for x in list(missing_ids or [])][:8]
+        all_ids = list(missing_ids or [])
+        ids = [str(x)[:64] for x in all_ids][:_MAX_MISSING_SHOWN]
+        # The COUNT is the real total; the id LIST is the capped sample. The
+        # row used to write len(ids) -- the capped number -- as
+        # `unresolved_captures`, so a 27-id miss read as 8 in telemetry
+        # (round-6 review): a message must describe the artifact the reader
+        # gets, on the audit side as much as the tester's.
+        unresolved = len(all_ids)
         safe_plan = str(plan or "")[:32]
         await _audit(
             "mcp_image_plan_nudge",
             detail={
                 "plan": safe_plan,
                 "channel": channel,
-                "unresolved_captures": len(ids),
+                "unresolved_captures": unresolved,
                 "capture_ids": ids,
+                "capture_ids_truncated": unresolved > len(ids),
             },
         )
         logger.info(
             "image-plan nudge: plan=%s channel=%s unresolved=%d",
             safe_plan,
             channel,
-            len(ids),
+            unresolved,
         )
     except Exception:  # pragma: no cover - a disclosure never breaks a prepare
         logger.debug("image-plan nudge audit failed", exc_info=True)
@@ -13642,20 +13650,27 @@ def _render_missing(missing: list | None, sent: list | None) -> str:
     replies that name them (the image-gate clarify and the prepare notice).
     Bounded to ``_MAX_MISSING_SHOWN`` names; the remainder is COUNTED, and the
     over-cap ids -- which ``_peek_captures`` appends LAST, so an 8-name slice
-    of a 27-id call could never show one (round-5 review) -- are counted by
-    name whether or not they made the slice. Never raises."""
+    of a 27-id call could never show one (round-5 review) -- are counted in
+    the tail only when the slice did not already name them. Never raises."""
     try:
         described = _describe_missing(missing, sent)
         shown = ", ".join(f"`{c}`" for c in described[:_MAX_MISSING_SHOWN])
         rest = len(described) - _MAX_MISSING_SHOWN
-        over = len([c for c in _over_cap_ids(sent) if c in set(missing or [])])
+        # Only the over-cap ids the slice did NOT already name are counted in
+        # the tail: an id shown with its reason inline and counted again was
+        # double reporting (round-6 review).
+        present = set(str(m or "") for m in list(missing or []))
+        named = set(str(m or "") for m in list(missing or [])[:_MAX_MISSING_SHOWN])
+        over_all = [c for c in _over_cap_ids(sent) if c in present]
+        over_hidden = [c for c in over_all if c not in named]
         tail = ""
         if rest > 0:
             tail = f", and {rest} more"
-        if over:
+        if over_hidden:
             tail += (
-                f" ({over} of the ids sent were beyond the {_CAPTURE_TRAY_MAX}-screen "
-                "per-call cap -- send fewer capture_ids per prepare)"
+                f" ({len(over_hidden)} of the ids sent were beyond the "
+                f"{_CAPTURE_TRAY_MAX}-screen per-call cap -- send fewer capture_ids "
+                "per prepare)"
             )
         return shown + tail
     except Exception:
