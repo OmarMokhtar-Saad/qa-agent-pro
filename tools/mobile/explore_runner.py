@@ -140,8 +140,11 @@ async def next_turn(
         dumped = await adb.uiautomator_dump(getattr(ctx, "serial", ""))
         if dumped.get("error"):
             return dumped
+        sized = await adb.display_size(getattr(ctx, "serial", ""))
         pruned = perception.prune(
-            dumped.get("content"), str(getattr(ctx, "activity", "") or "")
+            dumped.get("content"),
+            str(getattr(ctx, "activity", "") or ""),
+            display=sized.get("content"),
         )
         if pruned.get("error"):
             return pruned
