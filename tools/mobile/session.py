@@ -1613,6 +1613,12 @@ def provision_plan() -> dict:
     return provisioner.plan()
 
 
-def screen_of(dump: object, activity: str = "") -> dict:
-    """Prune a dump. Here so a handler never touches raw XML itself."""
-    return perception.prune(dump, activity)
+def screen_of(dump: object, activity: str = "", display: object = None) -> dict:
+    """Prune a dump. Here so a handler never touches raw XML itself.
+
+    ``display`` is the device's natural size where the caller has it. Without it
+    `prune` derives the frame from the dump's own windows, which over-estimates
+    rather than under-estimates and so cannot lose the screen -- see
+    `perception._display_frame`.
+    """
+    return perception.prune(dump, activity, display=display)

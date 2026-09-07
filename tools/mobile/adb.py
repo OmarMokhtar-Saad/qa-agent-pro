@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from pathlib import Path
 
 from config.settings import settings
@@ -211,6 +212,38 @@ async def getprop(serial: str, name: str) -> dict:
     }
 
 
+async def current_activity(serial: str) -> dict:
+    """The focused activity as ``package/Activity``, or "" when unknowable.
+
+    The uiautomator dump does NOT carry the activity, so `perception` took it as
+    a parameter and every caller passed the empty default -- the value was
+    threaded end to end with no producer anywhere. `screen_id` therefore hashed
+    the package and the top three texts only, and two screens of one app with
+    similar wording could share an identity, which the report dedupes on and
+    `assert screen_changed` compares.
+
+    ``mCurrentFocus`` is read rather than ``dumpsys activity activities``: it is
+    one short line, it names the window that actually has focus (which is what a
+    tap will hit), and it does not depend on the activity-stack format, which
+    differs across Android versions.
+
+    An empty answer is a NORMAL result, not an error: a dialog or a system
+    window can leave no resolvable component, and a screen identity that is
+    weaker than it could be is far better than a refused dump.
+    """
+    result = await shell(serial, ["dumpsys", "window"], timeout=20)
+    if result.get("error"):
+        return {"error": None, "content": ""}
+    text = str((result["content"] or {}).get("out") or "")
+    for line in text.splitlines():
+        if "mCurrentFocus" not in line:
+            continue
+        found = re.search(r"([A-Za-z0-9_.]+/[A-Za-z0-9_.$]+)", line)
+        if found:
+            return {"error": None, "content": found.group(1)[:200]}
+    return {"error": None, "content": ""}
+
+
 async def install(serial: str, apk_path: str) -> dict:
     """``adb install -r -g <apk>`` for a local file that must already exist.
 
@@ -316,6 +349,78 @@ async def force_stop(serial: str, package: str) -> dict:
     if not valid_package_name(package):
         return {"error": "Refusing to stop " + repr(str(package)[:60]), "content": None}
     return await shell(serial, ["am", "force-stop", str(package)])
+
+
+# The digit guards are load-bearing: without them `\d{1,7}` happily matches a
+# SEVEN-digit slice of an eight-digit number, so a device reporting a size
+# too large to be representable would be read as a plausible one instead of
+# refused. Bounded on both sides, an over-long run matches nothing.
+_DISPLAY_RE = re.compile(r"(?<!\d)(\d{1,7})x(\d{1,7})(?!\d)")
+#: How long a display answer is reused before the device is asked again. Not
+#: forever: a SERIAL is not a device identity. Emulator serials are recycled, so
+#: a phone AVD and a tablet AVD both arrive as `emulator-5554`; a foldable
+#: changes size mid-run; `wm size WxH` can be set mid-session. Caching for the
+#: life of the process made each of those a stale answer that no later call
+#: could correct. The window is short enough that a device swap self-heals and
+#: long enough that a burst of actions costs one round trip.
+DISPLAY_CACHE_TTL_S = 60
+#: Per serial: `(monotonic deadline, size or None)`. A FAILED answer is cached
+#: too -- a `wm` hiccup must not cost a round trip on every action -- but only
+#: for the same window, so it retries rather than degrading for the whole run.
+_DISPLAY_CACHE: dict = {}
+
+
+async def display_size(serial: str) -> dict:
+    """The device's NATURAL display size as ``[w, h]``, or ``None`` content.
+
+    ``wm size`` prints ``Physical size: 1080x2400`` and, where the display has
+    been resized, an additional ``Override size:`` line. The override is what is
+    actually being drawn to, so it wins where both appear.
+
+    This exists because **the display rectangle is not in a uiautomator dump**.
+    Four rounds of `perception._select_viewport` tried to infer it from window
+    geometry and each fixed the previous round's fix; docs/DECISIONS.md ->
+    *The display size is not in the dump* has the measured record. It is a
+    device fact, so it is read from the device.
+
+    Never raises and never refuses loudly: a device that cannot answer gets
+    ``{"error": None, "content": None}``, and `prune` falls back to a frame
+    derived from the dump's own windows. A missing display size must degrade the
+    report's scale, never lose the tester's screen.
+    """
+    key = str(serial or "")
+    now = time.monotonic()
+    cached = _DISPLAY_CACHE.get(key)
+    if cached is not None and now < cached[0]:
+        return {"error": None, "content": cached[1]}
+    result = await shell(key, ["wm", "size"])
+    size = None
+    overridden = False
+    if not result.get("error"):
+        text = str((result.get("content") or {}).get("out") or "")
+        for line in text.splitlines():
+            lowered = line.strip().lower()
+            override = lowered.startswith("override size:")
+            if not override and not lowered.startswith("physical size:"):
+                continue
+            match = _DISPLAY_RE.search(lowered)
+            if not match:
+                continue
+            width, height = int(match.group(1)), int(match.group(2))
+            if width <= 0 or height <= 0:
+                continue
+            if overridden and not override:
+                # An override REPLACES the physical size and is what is being
+                # drawn to, so it wins on its own merit rather than by being
+                # printed second. AOSP prints physical first, but "the last line
+                # wins" would silently take the wrong one on a build that does
+                # not -- and a report scaled to the panel while the device draws
+                # an override is at the wrong scale for the whole run.
+                continue
+            size = [width, height]
+            overridden = overridden or override
+    _DISPLAY_CACHE[key] = (now + DISPLAY_CACHE_TTL_S, size)
+    return {"error": None, "content": size}
 
 
 async def uiautomator_dump(serial: str) -> dict:

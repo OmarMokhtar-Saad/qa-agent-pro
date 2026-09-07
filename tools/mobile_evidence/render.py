@@ -34,7 +34,14 @@ from tools.mobile_evidence import evidence, exchanges, model, scrub
 logger = logging.getLogger(__name__)
 
 EVENTS_FILE = "events.ndjson"
-MAX_TEXT = 200
+#: The bound that actually applies to a rendered cell. `MAX_TEXT = 200` used to
+#: sit here and was DEAD: it was the default argument of `_flat` and `ev_esc`,
+#: and an AST scan found 0 of 65 call sites using the default -- every one passes
+#: an explicit literal. Mutating it across nine orders of magnitude left the
+#: rendered output byte-identical, so it asserted coverage of the report's cell
+#: width while providing none, and hid the real widths, of which this is the
+#: largest: host-supplied reply text going into the self-contained HTML.
+MAX_REPLY_TEXT = 4000
 MAX_ROWS = 400
 CLIP = 64
 
@@ -70,7 +77,7 @@ def _neutralize(text: str) -> str:
     return out
 
 
-def _flat(value: object, limit: int = MAX_TEXT) -> str:
+def _flat(value: object, limit: int) -> str:
     raw = "" if value is None else str(value)
     kept = "".join(
         " " if c in "\t\r\n" else c for c in raw if c == " " or c.isprintable()
@@ -81,7 +88,7 @@ def _flat(value: object, limit: int = MAX_TEXT) -> str:
     return kept
 
 
-def ev_esc(value: object, limit: int = MAX_TEXT) -> str:
+def ev_esc(value: object, limit: int) -> str:
     """scrub -> neutralise guard markers -> escape. The ONE way a value reaches markup."""
     return html.escape(_neutralize(scrub.scrub_text(_flat(value, limit))), quote=True)
 
@@ -92,7 +99,7 @@ def _guard(markup: str) -> str:
 
 
 def _clip(text: object, n: int = CLIP) -> str:
-    flat = _flat(text, 4000)
+    flat = _flat(text, MAX_REPLY_TEXT)
     return flat if len(flat) <= n else flat[: n - 1].rstrip() + "…"
 
 
@@ -1545,7 +1552,9 @@ def sequence_items(
                         key,
                         exchanges.SEQ_RANK["reply"],
                         "reply",
-                        _guard(exchanges.seq_reply(ev_esc(rec.get("text"), 4000))),
+                        _guard(
+                            exchanges.seq_reply(ev_esc(rec.get("text"), MAX_REPLY_TEXT))
+                        ),
                     )
                 )
     # The lane's own actions, on the same clock.

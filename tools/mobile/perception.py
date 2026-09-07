@@ -77,6 +77,13 @@ _WS_RE = re.compile(r"[ \t]{2,}")
 # cannot turn every screen into one giant redaction.
 MAX_GUARD_SENTINEL_CHARS = 60
 
+# The largest display dimension accepted from the device. `adb.display_size`
+# parses it out of `wm size`, which is device output rather than something this
+# process computed, so it is bounded like every other untrusted number here. It
+# matches the seven digits `_BOUNDS_RE` allows a dump to carry, so a display and
+# the windows on it cannot disagree about what a representable coordinate is.
+MAX_DISPLAY_EXTENT = 9999999
+
 
 def _guard_sentinel() -> str:
     """The opening LABEL of ``untrusted._GUARD``, derived rather than copied.
@@ -294,11 +301,36 @@ def label_of(element: object, elements: object) -> str:
     reason.
 
     Only an element with no label of its own borrows one, only if it is itself
-    TAPPABLE, and only from a strictly-contained element whose own area covers
-    at least :data:`MIN_LABEL_AREA_SHARE` of it. Both bounds are load-bearing:
-    without them the root FrameLayout of the fixture -- which contains every
-    word on the screen -- took the label of whichever contained element was
+    TAPPABLE, and only from a CONTAINED element whose own area covers at least
+    :data:`MIN_LABEL_AREA_SHARE` of it. The lower bound is load-bearing:
+    without it the root FrameLayout of the fixture -- which contains every word
+    on the screen -- took the label of whichever contained element was
     smallest, and the packet then named the whole screen "Send".
+
+    CONTAINED, NOT STRICTLY SMALLER. An equal-bounds child counts, and used not
+    to. ``match_parent`` x ``match_parent`` is the commonest button shape on
+    Android -- a clickable wrapper with an empty label around a TextView filling
+    it exactly -- so excluding equal area excluded the ordinary case, and the
+    control reached the packet unlabelled while the tester was looking straight
+    at its name.
+
+    There is no upper AREA bound, because there cannot be one that does
+    anything: the containment test above already requires the child to lie
+    inside this element, and a box inside another box cannot have the larger
+    area. The rule carried ``area >= own_area`` for exactly one reachable case
+    -- equal area -- and once that became legitimate the clause was dead. A
+    mutation removing it survived, which is how it was found: an unreachable
+    condition reads as a safeguard and grades as nothing. What actually bounds
+    this from above is CONTAINMENT, and that is where the test aims.
+
+    This rule and the destructive guard's (``executor.contained_texts``) read
+    the same geometry for different purposes, and they DIVERGED here: the guard
+    was fixed to include equal area after a transfer CTA tapped through
+    unguarded, and this mirror of it was not. No safety gap -- the guard reads
+    containment itself and never consults this -- but the packet the model
+    plans from disagreed with the packet the guard judged. Pinned by
+    ``tests/mobile/test_mobile_label_containment.py``, which asserts the two
+    rules agree rather than asserting each one separately.
     """
     own = _own_label(element)
     if own:
@@ -322,7 +354,7 @@ def label_of(element: object, elements: object) -> str:
         if a1 < x1 or b1 < y1 or a2 > x2 or b2 > y2:
             continue
         area = max(0, a2 - a1) * max(0, b2 - b1)
-        if area >= own_area or area < own_area * MIN_LABEL_AREA_SHARE:
+        if area < own_area * MIN_LABEL_AREA_SHARE:
             continue
         text = _own_label(other)
         if not text:
@@ -414,6 +446,155 @@ def _short_class(full: str) -> str:
 def _is_editable(full_class: str) -> bool:
     text = str(full_class or "")
     return any(hint in text for hint in EDITABLE_CLASS_HINTS)
+
+
+def _display_rect(tree: object, display: object, rotation: object) -> tuple:
+    """``(display, frame)`` -- the screen, and the region an element may occupy.
+
+    **These are two answers, not one, and conflating them is what this function
+    exists to stop.** They differ only when the dump lays something out beyond
+    the display the device reported, and that disagreement is unresolvable from
+    here: either the device size is stale, or the app drew off-screen. So each
+    consumer gets the answer its own failure mode requires.
+
+    * ``display`` -- what the device says it is showing, rotated by the dump's
+      own ``rotation``, or, where the device could not say, the union of the
+      dump's depth-1 WINDOWS. This is the panel: the report's SCALE, and the
+      rectangle actions are clamped to. A window is a display-sized thing and a
+      child is not, which is why an overhanging ROW must not widen it -- a row
+      dragged out to its own far edge would turn the executor's swipe clamp into
+      a no-op and send a gesture the device silently ignores.
+    * ``frame`` -- ``display`` widened to cover everything the dump lays out.
+      This is the off-screen VISIBILITY FILTER. Getting it too small deletes the
+      tester's screen from the packet the model plans with and the destructive
+      guard reads, silently, with ``truncated`` still False.
+
+    The two answers diverging is the point, and it took a second consumer to see
+    it. An earlier version derived BOTH from every laid-out node, on the
+    reasoning that "which node counts" is the question four defective rounds
+    came from. That is right for the frame and wrong for the panel: it let a
+    single overhanging row declare the screen 3000px wide, and the gesture clamp
+    downstream — which had its own tests — went green while issuing swipes off
+    the panel.
+
+    The widening is not a nicety. A display cached against a recycled emulator
+    serial, a foldable measured before it folded, a `wm size` override set
+    mid-session: each hands back a rectangle SMALLER than the screen the dump
+    describes, and a review demonstrated a `Delete account` control vanishing
+    from a tablet's packet under a stale phone size while the dump-derived
+    fallback got the same dump right. An authoritative-looking value that is
+    trusted further than the evidence it must contain is worse than no value.
+
+    So the invariant is one line and holds on every path: **the frame is never
+    smaller than what the dump lays out.**
+
+    Say plainly what that costs, because it is not free: since the frame covers
+    everything laid out, the off-screen filter below no longer DROPS anything
+    laid out at a positive coordinate. It still drops a node placed entirely at
+    negative coordinates, and that is now its whole job. A window laid out past
+    the display therefore reaches the model as an element it may believe it can
+    tap.
+
+    That is the direction to fail in, and the trade is not close. An over-reach
+    carries a row the tester cannot see -- still judged by the destructive guard,
+    still flagged by ``truncated`` -- and a widened element set makes the guard
+    MORE likely to stop, which is the safe way to be wrong. An under-reach
+    deletes the row the tester is about to tap, silently, and leaves the guard
+    nothing to refuse. Every defect this code has had was an under-reach.
+
+    **The over-reached rows share the element budget, and that is a cost, not a
+    containment.** Saying they are "counted against ``MAX_ELEMENTS``" reads like
+    a bound and is the opposite: an adjacent pager page listed first can fill the
+    cap and evict the control the tester is looking at. :func:`prune` therefore
+    spends the budget on what intersects the DISPLAY first, and gives the
+    remainder to what does not.
+
+    Note where the cost actually lands. When the dump fits inside the display --
+    the ordinary case -- the frame IS the display and nothing changes. The
+    widening only happens when the dump and the device DISAGREE, which is exactly
+    the case where we cannot tell a stale display from an app drawing off-screen,
+    and so exactly the case where guessing is what we must not do.
+
+    ``display`` is device output and untrusted: exactly two values, bools
+    rejected before ``int()`` (``int(True)`` is a 1-pixel screen), each within
+    :data:`MAX_DISPLAY_EXTENT`. Anything else, and the display IS the dump
+    extent. ``(None, None)`` when the dump lays out nothing at all.
+    """
+    right = 0
+    bottom = 0
+    panel_right = 0
+    panel_bottom = 0
+    try:
+        laid_out = list(tree.iter("node"))
+        windows = [child for child in tree if getattr(child, "tag", None) == "node"]
+    except (TypeError, AttributeError):
+        laid_out = []
+        windows = []
+    for node in laid_out:
+        # EVERY node for the FRAME. "At least as large as everything laid out on
+        # it" is the promise, and a child laid out beyond its own window is
+        # still laid out.
+        bounds = parse_bounds(node.get("bounds"))
+        if bounds is None or _area(bounds) <= 0:
+            continue
+        right = max(right, bounds[2])
+        bottom = max(bottom, bounds[3])
+    for node in windows:
+        # The depth-1 WINDOWS for the panel estimate, which is a different
+        # question with a different consumer. A window is a display-sized thing
+        # and a child is not, so when the device could not tell us the display,
+        # the union of the windows is the closest honest guess at the panel --
+        # and an overhanging row must NOT be allowed to define it. Actions clamp
+        # to this rectangle: `executor` will not swipe outside the panel, and a
+        # row dragged out to its own far edge would silently turn that clamp
+        # into a no-op and send a gesture the device ignores.
+        bounds = parse_bounds(node.get("bounds"))
+        if bounds is None or _area(bounds) <= 0:
+            continue
+        panel_right = max(panel_right, bounds[2])
+        panel_bottom = max(panel_bottom, bounds[3])
+
+    size = None
+    if isinstance(display, (list, tuple)) and len(display) == 2:
+        numbers = []
+        for value in display:
+            if isinstance(value, bool):
+                numbers = []
+                break
+            try:
+                numbers.append(int(value))
+            except (TypeError, ValueError, OverflowError):
+                numbers = []
+                break
+        # `numbers` rather than `len(numbers) == 2`: the arity is decided ONCE,
+        # by the `len(display) == 2` above. Checking it twice meant neither
+        # check was graded -- a mutant dropping either one was caught by the
+        # other and SURVIVED, which reads as a verification gap and is really a
+        # second layer doing the first layer's job.
+        if numbers and all(0 < n <= MAX_DISPLAY_EXTENT for n in numbers):
+            size = numbers
+
+    if size is not None:
+        try:
+            # `in (1, 3)`, NOT `% 4 in (1, 3)`. A rotation is 0..3; anything else
+            # is not a rotation this dump can have and must be treated as no
+            # turn. The modulo was worse than useless -- it made `-1` and a
+            # twenty-digit number into a quarter turn, so the frame's axes
+            # swapped on garbage. A value out of range is one we cannot read --
+            # and because an unreadable rotation would otherwise leave the frame
+            # narrower than a landscape dump, the widening below is what stops
+            # that being a lost screen too.
+            turned = int(rotation) in (1, 3)
+        except (TypeError, ValueError, OverflowError):
+            turned = False
+        width, height = (size[1], size[0]) if turned else (size[0], size[1])
+    else:
+        # The panel estimate, NOT the full extent: see the second walk above.
+        width, height = panel_right or right, panel_bottom or bottom
+
+    if width <= 0 or height <= 0:
+        return None, None
+    return (0, 0, width, height), (0, 0, max(width, right), max(height, bottom))
 
 
 def _dominant_package(elements: object) -> str:
@@ -536,7 +717,7 @@ def _assign_ids(elements: list) -> None:
         element["id"] = base if count == 1 else base + "-" + str(count)
 
 
-def prune(xml: object, activity: str = "") -> dict:
+def prune(xml: object, activity: str = "", display: object = None) -> dict:
     """Untrusted dump -> ``{"screen_id", "elements", "hash", "package", ...}``.
 
     Returns the ``{"error", "content"}`` shape every module in this package
@@ -556,7 +737,17 @@ def prune(xml: object, activity: str = "") -> dict:
         except ElementTree.ParseError:
             return {"error": NOT_XML_REFUSAL, "content": None}
 
-        root_bounds = None
+        # The DISPLAY -- from the device where the caller had it, and from the
+        # extent of the dump's own windows where it did not. Never inferred from
+        # which window "looks like" the display: that question has no answer in
+        # a dump, and four rounds of asking it are in docs/DECISIONS.md.
+        # TWO rectangles, because the two readers fail in opposite directions.
+        # `selected` is the display and becomes the report's scale; `frame` is
+        # the display widened to cover everything the dump lays out, and is the
+        # visibility filter, because a filter smaller than the dump deletes the
+        # tester's screen in silence. See `_display_rect`.
+        selected, frame = _display_rect(root, display, root.get("rotation"))
+        root_bounds = frame
         elements: list[dict] = []
         texts: list[str] = []
         package = ""
@@ -617,7 +808,37 @@ def prune(xml: object, activity: str = "") -> dict:
                 }
             )
 
+        # THE BUDGET IS SPENT ON THE DISPLAY FIRST.
+        #
+        # The frame above is the display WIDENED to cover everything the dump
+        # lays out, which is what stops a stale device size deleting the
+        # tester's screen. But widening admits off-display elements into the
+        # same `MAX_ELEMENTS` budget, and they are appended in DOCUMENT order --
+        # so an adjacent pager page or an incoming activity, laid out one screen
+        # width away at positive coordinates, could fill the cap and evict the
+        # control the tester is actually looking at. Measured: 150 rows of an
+        # incoming activity listed first, and `Delete account` on the visible
+        # screen was gone from the packet, with a CORRECT display.
+        #
+        # That is the round-3 defect wearing the round-5 fix's clothes, so the
+        # answer is an ordering rule rather than another adjustment to the
+        # rectangle: what the tester can SEE is never displaced by what they
+        # cannot. Off-display elements keep whatever budget is left, in document
+        # order, because they are still worth carrying -- see `_display_rect`.
         truncated = len(elements) > MAX_ELEMENTS
+        if selected is not None and truncated:
+            on_display = []
+            off_display = []
+            for element in elements:
+                box = element.get("bounds") or []
+                visible = len(box) == 4 and not (
+                    box[0] >= selected[2]
+                    or box[1] >= selected[3]
+                    or box[2] <= selected[0]
+                    or box[3] <= selected[1]
+                )
+                (on_display if visible else off_display).append(element)
+            elements = on_display + off_display
         elements = elements[:MAX_ELEMENTS]
         _assign_ids(elements)
         # AFTER the cap and the ids, so a label is only ever borrowed from an
@@ -650,6 +871,13 @@ def prune(xml: object, activity: str = "") -> dict:
             "package": package,
             "dialog_package": dialog,
             "activity": _clean(activity),
+            # The DISPLAY. Stored because the tallest element bottom is NOT
+            # the viewport: a scroll container reports its CONTENT height, and
+            # deriving the device size from a max() walk shrank every element on
+            # every scrollable screen. `[]` when the dump carried no positive-area
+            # window at all, so the key means exactly one thing and a reader can
+            # treat an empty value and an older build's missing value alike.
+            "root_bounds": list(selected) if selected else [],
             "truncated": truncated,
             "considered": considered,
         }

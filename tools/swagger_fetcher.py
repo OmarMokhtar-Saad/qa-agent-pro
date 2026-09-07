@@ -41,10 +41,36 @@ _HTTP_METHODS = ("get", "post", "put", "patch", "delete", "head", "options")
 _URL_HINTS = ("swagger", "openapi", "api-docs", "api_docs")
 _SPEC_SUFFIXES = (".json", ".yaml", ".yml")
 
-# A fetched spec is held in memory and may be stored for the endpoint picker,
-# so cap it well inside QA_PREP_MAX_BYTES (4 MB). OPT-IN: fetch_openapi_spec
-# passes no cap, so the shipped test-case-grounding caller is unbounded exactly
-# as before; only the API agent asks for this bound (round 1, #5).
+# A fetched spec is held IN MEMORY while the API agent parses it. OPT-IN:
+# fetch_openapi_spec passes no cap, so the shipped test-case-grounding caller is
+# unbounded exactly as before; only the API agent asks for this bound.
+#
+# WHAT THIS BOUNDS, and what it does not. The raw document is parsed once
+# (agents/api_test_agent -> process_intake -> parse_document) and every
+# endpoint the tester can pick is extracted and REDACTED from it while it is
+# still only in memory; the picker state persisted to prep_store is built by
+# _make_pending, which its own docstring says is "NEVER the raw source" and is
+# bounded by _MAX_PENDING_BYTES. The raw spec therefore never reaches the
+# store, and this cap bounds ONE thing: the text the parser and the extractor
+# hold in memory for the duration of a single call.
+#
+# Two repairs of this number on 2026-09-06 sized it against prep_store --
+# first at 4 bytes per character for ensure_ascii=False, then at 12 for
+# prep_store's own escaping -- and cut it to 320_000. An independent review
+# the same day measured a 150-operation pure-ASCII OpenAPI 3 document at
+# 512_690 characters as served: REFUSED, with the tester told to paste one
+# endpoint at a time, for a payload that is never persisted at all. A cap
+# sized against a consumer that does not consume it is wrong at every value.
+# Real public specs as served: Petstore ~30 KB, GitHub ~9 MB, Stripe ~6 MB,
+# Kubernetes ~4 MB. The parser cost is roughly ten times the text in Python
+# objects, transiently, in a single-tester stdio process; four million
+# characters admits every mid-size internal API and refuses the pathological
+# document by name, and is where this cap stood before it was mis-sized.
+# tests/test_bounds_upper.py drives the fetcher at the shipped value with a
+# realistic large spec (the floor) and drives the agent to prove the store
+# receives the picker, not the spec (the relation); comparing this integer to
+# the store's byte cap is the mistake both repairs made and is what the AST
+# guard in tests/test_bounds_reasons.py refuses.
 _MAX_SPEC_CHARS = 4_000_000
 
 

@@ -97,8 +97,10 @@ _BUDGET_NOTE = (
 _RECOVERY_NOTE = (
     "If the screen above belongs to another app or is a system permission "
     "dialog, the case has not failed: send `back` to dismiss a dialog, or "
-    "`launch` to bring the app under test back to the front, and then carry "
-    "on with the case. "
+    "`launch` to bring the app under test back to the front. Put that "
+    "recovery FIRST IN THE SAME SCRIPT as the rest of your plan -- a script "
+    "that reaches its end without done() ENDS the case, so a recovery sent on "
+    "its own finishes the case instead of continuing it. "
 )
 
 #: Said on the packet BEFORE the last hand-back, not after it. A model that
@@ -274,16 +276,72 @@ def build_escape_job(
         return {}
 
 
+#: The fail-safe ask for a sentinel no consumer registered. A NAMED constant so
+#: the ratchet can assert a registered sentinel does NOT get it: a mutation that
+#: bypassed the registry entirely landed every sentinel here, and every wording
+#: assertion passed, because this text is deliberately inoffensive. "Not false"
+#: is the floor, not the bar -- the specific remedy is the product.
+GUARD_ASK_SCREEN_GENERIC = (
+    "The replay stopped before a press: this screen cannot be vouched for, so "
+    "what that press would submit cannot be judged. Nothing was touched. "
+    "Re-sending the same press stops here again -- read the stop's `detail` "
+    "for what was seen, and plan a different action."
+)
+
+
+def screen_asks(executor_mod) -> dict:
+    """Sentinel -> what the MODEL is told, for every screen-level stop.
+
+    A REGISTRY, matching ``executor.screen_stop_details`` at the other
+    consumer. Keyed off the passed-in module rather than a module-level import,
+    because the import here is deliberately lazy -- see :func:`_guard_ask`.
+
+    Every sentence must survive the 60-character truncation
+    ``build_tester_request`` applies to the TERM, name a move that can actually
+    work, and avoid the two claims that are false for any screen stop. The
+    ratchet grades this dict against :func:`executor.screen_sentinels`.
+    """
+    return {
+        executor_mod.SCREEN_NOT_THE_APP: (
+            "The replay stopped before a press: the screen in front is not the "
+            "app under test, so what that press would submit cannot be judged. "
+            "Nothing was touched. Re-sending the same press stops here again -- "
+            "bring the app back with `launch`, or send `back` if a dialog is in "
+            "front of it, and then carry on in the same script. The stop's "
+            "`detail` names both packages."
+        ),
+        executor_mod.SCREEN_NOT_FULLY_SEEN: (
+            "The replay stopped before a press: this screen has more elements "
+            "than one packet carries, so what that press would submit cannot "
+            "be judged. Nothing was touched. Re-sending the same press stops "
+            "here again -- plan a TAP on the control this case means instead, "
+            "which is judged by its own label. Ask the tester only if you "
+            "cannot tell which control that is."
+        ),
+    }
+
+
 def _guard_ask(guard_term: str) -> str:
     """What the model is told about a guard stop, per REASON.
 
-    Two stops reach here and only one of them is about a control. A screen the
-    packet cannot carry in full has no matched control to name, and the
-    "re-submit the same script if the tester agrees" remedy is deterministically
-    wrong for it: the same press re-truncates the same screen and stops again,
-    so the only door that wording leaves open is turning the guard off for the
-    whole script -- including a real Confirm button. The remedy that works is a
-    TAP, which is judged by the control's own label and not by a screen scan.
+    Only ONE of the stops that reach here is about a control -- a matched
+    lexicon term. Every SCREEN-LEVEL stop (the ``SCREEN_*`` sentinels the
+    executor exports) is about the screen instead, so the fallback's two claims
+    are both false for it: there is no control to name, and "re-submit the same
+    script if the tester agrees" is deterministically wrong -- the same press
+    meets the same screen and stops again, so the only door that wording leaves
+    open is turning the guard off for the whole script, including a real
+    Confirm button. Each sentinel therefore needs its OWN branch, naming a
+    remedy that can actually work.
+
+    NO COUNT IN THIS DOCSTRING, deliberately. It said "two stops" while three
+    reached here: ``SCREEN_NOT_THE_APP`` was added at the producer
+    (``executor.screen_hit``) and wired into only one of that value's two
+    consumers, and this one fell through to the control wording -- telling the
+    model a non-existent control had been hit and to re-send a script that
+    re-stops. The ratchet that now fails at authoring time instead is
+    ``tests/mobile/test_mobile_sentinel_ratchet.py``, which derives the
+    sentinel list from the executor rather than listing it.
 
     Imported lazily: ``executor`` owns the term, this module owns the wording,
     and a module-level import would put an agent's import at the top of a file
@@ -291,15 +349,17 @@ def _guard_ask(guard_term: str) -> str:
     """
     from tools.mobile import executor as executor_mod
 
-    if guard_term == executor_mod.SCREEN_NOT_FULLY_SEEN:
-        return (
-            "The replay stopped before a press: this screen has more elements "
-            "than one packet carries, so what that press would submit cannot "
-            "be judged. Nothing was touched. Re-sending the same press stops "
-            "here again -- plan a TAP on the control this case means instead, "
-            "which is judged by its own label. Ask the tester only if you "
-            "cannot tell which control that is."
-        )
+    said = screen_asks(executor_mod).get(guard_term)
+    if said is not None:
+        return said
+    if not guard_term or executor_mod.destructive_hit(guard_term) != guard_term:
+        # A term this module has no words for, and one the lexicon does not
+        # match either -- so it is not a control, and the fallback's two
+        # claims would both be false. True and unhelpful beats false and
+        # actionable. See executor.guard_detail, which asks the same question
+        # at the other consumer.
+        logger.error("mobile_run: screen sentinel %r has no ask registered", guard_term)
+        return GUARD_ASK_SCREEN_GENERIC
     return (
         "The replay stopped in front of a control that looks irreversible ("
         + guard_term

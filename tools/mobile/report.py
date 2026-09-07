@@ -329,13 +329,67 @@ def _bounds_of(element: object) -> tuple | None:
     return (left, top, right, bottom)
 
 
+# The largest device extent this module accepts out of a store file. The WRITER
+# cannot produce more -- `perception.parse_bounds` matches at most seven digits
+# -- so a larger value in a store file did not come from a dump this server
+# pruned. `scale_bounds` keeps its no-raise guarantee either way; this is the
+# repo's "every cap is bounded from above" convention applied to a value whose
+# own docstring calls it untrusted input.
+MAX_DEVICE_EXTENT = 9999999
+
+
 def _device_size(screen: object) -> tuple:
-    """The device viewport, derived from the screen's own elements.
+    """The device viewport: the stored display rectangle, or the elements' extent.
 
     Not a hardcoded phone size: a tablet AVD is legitimate. ``(0, 0)`` when the
     dump carries no usable geometry, which is what stops the divide.
+
+    **The stored root is preferred because ``max()`` is not the viewport.** A
+    ``RecyclerView``/``ScrollView`` reports its CONTENT height, so on a scrollable
+    screen the lowest element bottom routinely exceeds the display -- and
+    :func:`scale_bounds`, which scales by ``min(FRAME_W/dev_w, FRAME_H/dev_h)``,
+    then shrinks EVERY element to fit a device taller than the real one. The
+    visible result is every scrollable screen squeezed into the top of its frame.
+
+    ``perception.prune`` stores that rectangle as ``root_bounds``: the device's
+    own display, from ``adb.display_size``, oriented by the dump's ``rotation``
+    -- NOT a window chosen out of the dump. Four rounds of choosing one are in
+    docs/DECISIONS.md -> *The display size is not in the dump*. RIGHT and BOTTOM
+    are the size: the origin is always ``(0, 0)``, so the extent measured from
+    it is what :func:`scale_bounds` maps against.
+
+    Where the device could not answer, ``prune`` stores the extent of everything
+    the dump lays out instead, which is why a scrollable screen no longer
+    squeezes: the display bounds it either way. ``[]`` only when the dump laid
+    out nothing at all.
+
+    The ``max()`` walk survives here as the fallback for one caller that still
+    happens: a screen stored by a build that did not write the key.
+
+    This is a store file -- an outside input by the time it is read -- so a wrong
+    type, a wrong length, a bool, a non-number, a negative origin or a zero-area
+    rect must all DEGRADE to the fallback rather than raise or hand back a zero
+    divisor. An INVERTED rect does not degrade: :func:`_bounds_of` sorts
+    left/right and top/bottom deliberately, so ``[1080, 2400, 0, 0]`` normalises
+    to ``(0, 0, 1080, 2400)`` and is accepted. That is the helper's existing,
+    documented behaviour and it is pinned by test rather than changed here.
     """
     body = screen if isinstance(screen, dict) else {}
+    root = _bounds_of({"bounds": body.get("root_bounds")})
+    if (
+        root is not None
+        and root[0] >= 0
+        and root[1] >= 0
+        and 0 < root[2] <= MAX_DEVICE_EXTENT
+        and 0 < root[3] <= MAX_DEVICE_EXTENT
+    ):
+        # Each clause is reachable on its own, which is what makes it a guard
+        # rather than decoration. `_bounds_of` SORTS, so `root[2] >= root[0]`
+        # always holds -- but with the origin only required to be non-negative,
+        # `[0,0,0,2400]` still reaches and fails `root[2] > 0`, and
+        # `[0,0,1080,0]` still reaches and fails `root[3] > 0`. A negative
+        # origin fails the first two and never reaches either.
+        return root[2], root[3]
     width = 0
     height = 0
     for element in body.get("elements") or []:
@@ -414,7 +468,13 @@ def wireframe(screen: object) -> dict:
                 "kind": kind,
             }
         )
-    return {"rects": rects, "device": [dev_w, dev_h], "scaled": True}
+    # `scaled` is a claim about the PICTURE, not about the geometry that went
+    # into it: this function's contract is that a False draws a labelled empty
+    # frame rather than a plausible-looking wrong one. A screen whose elements
+    # all lie outside the display -- reachable since the visibility frame was
+    # widened past it -- scales every one of them to nothing and would otherwise
+    # return an empty frame claiming to be a real one.
+    return {"rects": rects, "device": [dev_w, dev_h], "scaled": bool(rects)}
 
 
 # ── numbers ────────────────────────────────────────────────────────────────────

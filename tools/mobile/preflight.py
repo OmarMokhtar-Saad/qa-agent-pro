@@ -56,8 +56,29 @@ _FLAG_FIX = (
 )
 
 
+#: Checks whose failure disables a CAPABILITY rather than the run. The four IME
+#: checks are advisory because a lane with no pinned keyboard can still tap,
+#: swipe, scroll, assert and produce a report -- which is exactly what
+#: qa-doctor tells the tester. Before this split, `ok` was `not failing` over
+#: every check, so an unpinned keyboard refused the whole run and the product
+#: contradicted its own advice.
+#:
+#: Named here rather than passed at each of the ten `_record` call sites: a flag
+#: threaded through ten places is a flag someone forgets at the eleventh, and
+#: the SET is the thing a reviewer needs to see in one glance.
+ADVISORY_CHECKS: frozenset = frozenset(
+    {"ime_pinned", "ime_installed", "ime_selected", "ime_oracle"}
+)
+
+
 def _record(name: str, ok: bool, detail: str, fix: str = "") -> dict:
-    return {"name": str(name), "ok": bool(ok), "detail": str(detail), "fix": str(fix)}
+    return {
+        "name": str(name),
+        "ok": bool(ok),
+        "detail": str(detail),
+        "fix": str(fix),
+        "blocking": str(name) not in ADVISORY_CHECKS,
+    }
 
 
 async def check(target_package: str = "", serial: str = "") -> dict:
@@ -152,7 +173,29 @@ async def check(target_package: str = "", serial: str = "") -> dict:
                 ) or {}
                 resolved_serial = str(running.get("serial") or "")
             if not resolved_serial and serials:
-                resolved_serial = serials[0]
+                # NEVER serials[0]. adb's order is not stable, and this lane
+                # installs, types, taps and force-stops -- so picking the
+                # first attached device can drive a tester's own phone. An
+                # emulator is the only device this lane may choose for itself.
+                emulators = [s for s in serials if str(s).startswith("emulator-")]
+                if len(emulators) == 1:
+                    resolved_serial = emulators[0]
+                elif len(serials) == 1:
+                    resolved_serial = serials[0]
+                else:
+                    ambiguous = ", ".join(str(s) for s in serials[:6])
+                    checks.append(
+                        _record(
+                            "device_choice",
+                            False,
+                            "more than one device is attached and none could be "
+                            "chosen safely: " + ambiguous,
+                            "Name the device explicitly, because this lane "
+                            "installs apps and taps the screen and must never "
+                            "guess which one. Pass the emulator's serial, or "
+                            "detach the others.",
+                        )
+                    )
             if not resolved_serial:
                 checks.append(
                     _record(
@@ -396,10 +439,22 @@ async def check(target_package: str = "", serial: str = "") -> dict:
             checks.append(_record("free_disk", False, "check failed: " + str(exc)))
 
         failing = [record["name"] for record in checks if not record["ok"]]
+        # `ok` is "nothing that BLOCKS a run failed". `failing` stays every
+        # failure, because the renderer still shows an advisory one with its fix
+        # -- a tester should read that typing is unavailable, and then be allowed
+        # to run anyway.
+        blocking = [
+            record["name"]
+            for record in checks
+            if not record["ok"] and record.get("blocking", True)
+        ]
+        advisory = [name for name in failing if name not in blocking]
         return {
             "error": None,
             "content": {
-                "ok": not failing,
+                "ok": not blocking,
+                "blocking": blocking,
+                "advisory": advisory,
                 "serial": resolved_serial,
                 "checks": checks,
                 "failing": failing,

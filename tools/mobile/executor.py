@@ -328,7 +328,18 @@ def _contained_text(element: dict, screen: object) -> list[str]:
             continue
         if a1 < x1 or b1 < y1 or a2 > x2 or b2 > y2:
             continue
-        if (a2 - a1) * (b2 - b1) >= own_area:
+        # STRICTLY LARGER is skipped; EQUAL is a child.
+        #
+        # This was `>=`, and the reason it was wrong is that it was doing a job
+        # already done: the two checks above exclude an element from being its
+        # own child, by identity and by id. What `>=` actually excluded was an
+        # ordinary `match_parent` x `match_parent` label inside a clickable
+        # wrapper -- the commonest button shape on Android -- so a transfer
+        # CTA whose child said "Send money" was judged on
+        # 'com.bank.app:id/cta Frame Layout' and tapped through unguarded.
+        # Confirmed live by a review that ran it, and unpinned in BOTH
+        # directions: flipping the operator left 1697 tests green.
+        if (a2 - a1) * (b2 - b1) > own_area:
             continue
         for key in ("text", "desc"):
             value = str(other.get(key) or "")
@@ -351,10 +362,147 @@ def _contained_text(element: dict, screen: object) -> list[str]:
 #: ``detail`` where there is room for it.
 SCREEN_NOT_FULLY_SEEN = "screen not fully seen"
 
+#: The guard term for a screen that belongs to ANOTHER APP. A separate sentinel
+#: from the truncation one because the two need different sentences: the
+#: truncation text says the packet holds only part of the screen and offers a
+#: tap instead, and BOTH clauses are false here -- the packet carried this
+#: screen whole, and tapping a control on the wrong app does not help.
+#:
+#: It is reachable without any earlier diagnosis: `open_url` and `home` are in
+#: :data:`LEAVES_ON_PURPOSE`, so the left-app rule deliberately stays quiet on
+#: them, and this refusal is then the only thing the tester is told.
+SCREEN_NOT_THE_APP = "screen belongs to another app"
 
-def screen_hit(screen: object) -> str:
-    """The lexicon term some element on *screen* carries in its OWN strings, or
-    :data:`SCREEN_NOT_FULLY_SEEN` when the packet is truncated, or ``""``.
+
+def not_the_app_detail(package: object, expected: object) -> str:
+    return (
+        "the screen in front belongs to "
+        + str(package or "another app")[:80]
+        + ", not to "
+        + str(expected or "the app under test")[:80]
+        + ", so what this key would submit cannot be judged and nothing was "
+        "sent. Bring the app back with `launch` -- or send `back` if a dialog "
+        "is in front of it -- and then carry on in the same script."
+    )
+
+
+#: The generic screen-level stop, for a ``SCREEN_*`` sentinel that reached a
+#: consumer with no entry of its own. Unreachable while the ratchet is green --
+#: it exists because the SAFE answer to "a sentinel nobody registered" is a true
+#: sentence about the screen, not :data:`GUARD_DETAIL`, whose two claims (a
+#: control was found, re-sending may work) are false for every screen stop.
+GUARD_DETAIL_SCREEN_GENERIC = (
+    "Stopped before a press: this screen cannot be vouched for, so what the "
+    "press would submit cannot be judged. Nothing was touched. Re-sending the "
+    "same press stops here again -- read the trace for what was seen, and plan "
+    "a different action."
+)
+
+
+def screen_sentinels() -> frozenset:
+    """Every screen-level guard sentinel, FROM THE REGISTRY THAT HANDLES THEM.
+
+    THE ONE DERIVATION. Both consumers and the ratchet that grades them read
+    this rather than each deriving the set again -- mirrored conditions drift.
+
+    It used to scan ``globals()`` for names starting with ``SCREEN_``, and a
+    review refuted that in one mutation: the authority on what a screen-level
+    stop IS is not the spelling of a module constant, it is what
+    :func:`screen_hit` returns. A stop named ``PACKET_ROOT_DROPPED`` -- a
+    failure mode this module's own comments describe as measured and real --
+    was invisible to the scan, so it reached the model with the control wording
+    at BOTH consumers while 1813 tests stayed green.
+
+    Registration is now the definition: a sentinel exists here because a
+    handler exists for it. What keeps the PRODUCER honest is a separate,
+    mechanical check -- ``test_every_screen_level_stop_screen_hit_can_return_
+    is_registered`` reads the returns out of :func:`screen_hit` itself, so a
+    stop with no row fails at authoring time whatever it is called.
+    """
+    return frozenset(screen_stop_details())
+
+
+#: Sentinel -> the ``detail`` that stop carries, as ``(screen, expected)``.
+#: A REGISTRY, not an if/elif chain: the chain's ``else`` is what silently gave
+#: a new sentinel the control wording, and an unregistered key is visible here
+#: (``screen_stop_details()`` vs :func:`screen_sentinels`) where a missing
+#: branch in a chain is not. Adding a sentinel without a row fails the ratchet.
+def screen_stop_details() -> dict:
+    return {
+        SCREEN_NOT_FULLY_SEEN: lambda screen, expected: GUARD_DETAIL_NOT_FULLY_SEEN,
+        SCREEN_NOT_THE_APP: lambda screen, expected: not_the_app_detail(
+            (screen or {}).get("package"), expected
+        ),
+    }
+
+
+def guard_detail(hit: str, screen: object, expected: object) -> str:
+    """The ``detail`` for ANY guard stop -- the ONE place that decides.
+
+    A registered sentinel gets its own sentence. A term that IS a lexicon
+    entry really is a control, so it keeps :data:`GUARD_DETAIL`. ANYTHING ELSE
+    -- including an unregistered screen stop, whatever it is named and however
+    it is phrased -- gets the generic screen sentence and an error log: saying
+    something true and unhelpful beats saying something false and actionable.
+
+    The middle test is IDENTITY with the lexicon, not containment; the
+    containment form let a stop phrased "the app was reset between actions"
+    read as a control. Identity needs the EMPTY guard explicitly, and the
+    switch to it did not have one: ``destructive_hit("") != ""`` is False, so
+    an empty term fell through to the control wording -- "a control that looks
+    irreversible ()" -- where containment had given the generic sentence. A
+    fail-safe whose degenerate input fails OPEN is the wrong way round, and
+    this docstring claimed the opposite in the same commit that broke it. Never raises -- this is on the replay path, and a guard
+    that crashes is a guard that is off.
+    """
+    try:
+        handler = screen_stop_details().get(hit)
+        if handler is not None:
+            return handler(screen if isinstance(screen, dict) else {}, expected)
+        if not hit or destructive_hit(hit) != hit:
+            # NOT "is it a known sentinel" -- that question cannot be asked
+            # honestly here, because registration now DEFINES the sentinel set,
+            # so the answer is yes exactly when a handler was found above.
+            # The question that survives is the one GUARD_DETAIL actually
+            # claims: is this a CONTROL? A term the lexicon does not match is
+            # not one, whatever it is called, so the control wording would be
+            # false and the generic screen sentence is what is true.
+            #
+            # IDENTITY, not containment. `not destructive_hit(hit)` was the
+            # first form and a review broke it in one line: a stop phrased "the
+            # app was reset between actions" CONTAINS the lexicon token "reset",
+            # so it read as a control and got the control wording. What arrives
+            # here from the guard is the lexicon TERM itself (see the call site
+            # -- `hit = destructive_hit(label)`), so a genuine term is its own
+            # match and a sentence that merely mentions one is not.
+            # This is the runtime half of the producer check in the ratchet: a
+            # screen-level stop nobody registered fails safe HERE even if it
+            # reached a shipped build.
+            # ERROR, not warning: a guard quietly degrading to a generic
+            # sentence is the exact failure mode this whole chain is about, and
+            # a warning in a replay log is a line nobody reads.
+            logger.error(
+                "mobile.executor: guard term %r is neither a registered screen "
+                "stop nor a lexicon match",
+                hit,
+            )
+            return GUARD_DETAIL_SCREEN_GENERIC
+    except Exception:  # pragma: no cover - defensive; the guard must not crash
+        logger.error("mobile.executor.guard_detail failed", exc_info=True)
+        return GUARD_DETAIL_SCREEN_GENERIC
+    return GUARD_DETAIL + " Matched: " + str(hit)
+
+
+def screen_hit(screen: object, expected_package: str = "") -> str:
+    """The lexicon term some element on *screen* carries in its OWN strings, a
+    ``SCREEN_*`` sentinel, or ``""``.
+
+    The sentinels are :data:`SCREEN_NOT_FULLY_SEEN`, when the packet is
+    truncated, and :data:`SCREEN_NOT_THE_APP`, when the dominant package is not
+    the app under test. Both are guard TERMS that travel on to the model, and
+    each needs its own branch in every consumer that reads one -- pinned by
+    ``tests/mobile/test_mobile_sentinel_ratchet.py``, which derives the list
+    from this module. This docstring is a claim; that file is the check.
 
     What a ``press`` is judged against, because the control its key reaches is
     not in the dump. Judged ELEMENT BY ELEMENT, never as one joined string: a
@@ -369,6 +517,20 @@ def screen_hit(screen: object) -> str:
         return ""
     if screen.get("truncated"):
         return SCREEN_NOT_FULLY_SEEN
+    # TRUNCATION IS ONE WAY THE PACKET CAN FAIL TO CARRY THE SCREEN, NOT THE
+    # ONLY ONE. `prune` takes its root bounds from the first node carrying
+    # them and drops everything outside; on a multi-window dump whose systemui
+    # window sorts first, the app's whole window is dropped and `truncated`
+    # stays False. Measured: one element kept (a clock), and the press guard
+    # cleared a screen holding "Confirm payment" that it had never seen.
+    #
+    # So a screen whose dominant package is not the app under test cannot be
+    # vouched for. An EMPTY `expected_package` means the caller did not say
+    # which app it is driving, and a refusal invented on no evidence would be
+    # its own defect -- so that case keeps today's answer.
+    seen = str(screen.get("package") or "")
+    if expected_package and seen and seen != str(expected_package):
+        return SCREEN_NOT_THE_APP
     for element in screen.get("elements") or []:
         hit = destructive_hit(element_label(element))
         if hit:
@@ -406,7 +568,37 @@ async def _dump(ctx: Context) -> dict:
     raw = await adb.uiautomator_dump(ctx.serial)
     if raw.get("error"):
         return raw
-    return perception.prune(raw.get("content"), ctx.activity)
+    # The display is a DEVICE fact, so it is read from the device rather than
+    # inferred from the dump; `display_size` caches it per serial and never
+    # refuses, so this costs one round trip per session and cannot fail a dump.
+    sized = await adb.display_size(ctx.serial)
+    return perception.prune(
+        raw.get("content"), await _activity(ctx), display=sized.get("content")
+    )
+
+
+async def _activity(ctx: Context) -> str:
+    """The focused activity for this context, read once and remembered.
+
+    A caller that already knows the activity keeps priority: this only fills the
+    gap that made `screen_id` hash two dimensions instead of three. Memoised on
+    the context so a replay pays for one probe rather than one per action, and a
+    failed probe is remembered as "unknown" rather than retried on every dump.
+    """
+    if ctx.activity:
+        return ctx.activity
+    if getattr(ctx, "_activity_probed", False):
+        return ""
+    probed = await adb.current_activity(ctx.serial)
+    found = str(probed.get("content") or "")
+    try:
+        ctx._activity_probed = True
+        if found:
+            ctx.activity = found
+    except Exception:
+        # A frozen or slotted context must not fail a dump over a cache write.
+        return found
+    return found
 
 
 #: The wall clock, bound at import. Tests replace `executor.time` with a fake
@@ -875,7 +1067,28 @@ TOO_SMALL_TO_SWIPE = (
 )
 
 
-def _swipe_points(direction: str, element: object) -> tuple | None:
+def _display_box(display: object) -> tuple | None:
+    """*display* as ``(x1, y1, x2, y2)``, or ``None`` when it cannot be used.
+
+    NEVER RAISES and never guesses. A packet with no ``root_bounds``, a
+    malformed one, or a degenerate rectangle all return ``None``, which means
+    "do not clamp the far edges" -- the pre-existing behaviour. Refusing to
+    clamp is the safe direction here: clamping to a wrong or stale rectangle
+    would shrink a legitimate gesture out of existence, which is the mistake
+    the display work itself had to reverse one round earlier.
+    """
+    try:
+        x1, y1, x2, y2 = (int(v) for v in display)  # type: ignore[misc]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def _swipe_points(
+    direction: str, element: object, display: object = None
+) -> tuple | None:
     """The swipe ``_perform`` issues for *direction*, confined to *element*.
 
     A target-less pan uses the :data:`_SWIPE` table as it is. A TARGETED swipe
@@ -896,13 +1109,34 @@ def _swipe_points(direction: str, element: object) -> tuple | None:
     from the element's ON-SCREEN part and the post-condition is on the final
     tuple.
 
-    "On-screen part" is exactly the TOP-LEFT clamp, ``x1``/``y1`` raised to 0,
-    and no more: a negative edge is where ``adb._coord`` refuses to put the
-    finger, and that is the only edge that needs moving. The far edges are left
-    alone because ``perception.prune`` drops a node lying entirely outside the
-    root bounds, so an element that survives into a packet has its far edges
-    inside the window already. Stated exactly rather than as "clipped to the
-    screen", which claims four clamps where the code has two.
+    "On-screen part" is FOUR clamps when the caller knows the display, and two
+    when it does not.
+
+    It used to be two, justified like this: "the far edges are left alone
+    because ``perception.prune`` drops a node lying entirely outside the root
+    bounds, so an element that survives into a packet has its far edges inside
+    the window already." The premise is true and the conclusion does not
+    follow. ``prune`` drops a node lying ENTIRELY outside; a node lying PARTLY
+    outside survives with its far edges untouched. Measured on a 1080x2400
+    display with a row at ``[900,700][3000,800]``: the row survives pruning,
+    ``scroll left`` returns ``(2300,750)->(1600,750)``, both x past the right
+    edge, ``adb._coord`` accepts them because ``_SWIPE_MAX`` is 20000 and not a
+    display bound, and the device silently ignores the gesture while the step
+    reports success. A no-op that reports success is worse than a refusal.
+
+    That inference was already wrong before the display work; what changed is
+    how often it is reached. The visibility frame is now the display widened to
+    cover everything the dump lays out, so the off-screen filter no longer drops
+    anything at a positive coordinate -- a partly-visible row is the NORMAL
+    case now, not the odd one.
+
+    *display* is the packet's own ``root_bounds``, passed by the caller so the
+    guard and the device read one number: ``adb.display_size`` expires per
+    serial, so two reads on one gesture can disagree, and a guard judging a
+    different rectangle from the one the finger uses is the bug this function's
+    history is made of. When it is absent or unusable the far clamps are
+    SKIPPED rather than guessed -- a stale or missing size must never shrink a
+    real gesture out of existence.
 
     Returns ``None`` for an unknown direction, and for an element whose
     on-screen part is too small to swipe on; ``_perform`` tells the two apart
@@ -917,13 +1151,17 @@ def _swipe_points(direction: str, element: object) -> tuple | None:
     if center is None:
         return points
     x1, y1, x2, y2 = (int(v) for v in element["bounds"])
-    # The ON-SCREEN part, near edges only: an element partly off-screen has a
-    # negative edge and the finger cannot go there (`adb._coord` refuses a
-    # negative coordinate). The far edges need no clamp -- `perception.prune`
-    # drops a node lying entirely outside the root bounds. Everything below is
-    # computed from this box, so no later clamp can move an endpoint after the
-    # invariant has been checked.
+    # The ON-SCREEN part. Near edges always: a negative edge is where
+    # `adb._coord` refuses to put the finger. Far edges too WHEN the caller
+    # knows the display, because a partly-visible node keeps its far edges and
+    # a gesture built from them lands off the panel and silently no-ops.
+    # Everything below is computed from this box, so no later clamp can move an
+    # endpoint after the invariant has been checked.
     x1, y1 = max(0, x1), max(0, y1)
+    frame = _display_box(display)
+    if frame is not None:
+        x1, y1 = max(x1, frame[0]), max(y1, frame[1])
+        x2, y2 = min(x2, frame[2]), min(y2, frame[3])
     if x2 <= x1 or y2 <= y1:
         return None
     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
@@ -951,12 +1189,18 @@ def _swipe_points(direction: str, element: object) -> tuple | None:
     return swipe
 
 
-def _touch_point(op: str, action: object, element: object) -> tuple | None:
+def _touch_point(
+    op: str, action: object, element: object, display: object = None
+) -> tuple | None:
     """Where the finger lands FIRST for *op* on *element* -- the point the
     destructive guard judges. Derived from the same helpers ``_perform`` uses,
-    so the guard and the device cannot disagree about where the touch is."""
+    so the guard and the device cannot disagree about where the touch is.
+
+    *display* rides along for exactly that reason: it changes where a clamped
+    swipe STARTS, so the guard has to judge the clamped point, not the
+    unclamped one."""
     if op == "scroll":
-        points = _swipe_points(str(getattr(action, "dir", "") or ""), element)
+        points = _swipe_points(str(getattr(action, "dir", "") or ""), element, display)
         return (points[0], points[1]) if points else None
     if isinstance(element, dict):
         return _center(element)
@@ -1285,7 +1529,10 @@ async def replay(script: object, ctx: Context) -> dict:
                 ]
                 if element is not None:
                     actuated = actuated_element(
-                        screen, _touch_point(op, action, element)
+                        screen,
+                        _touch_point(
+                            op, action, element, (screen or {}).get("root_bounds")
+                        ),
                     )
                     # The actuated node is judged on its OWN strings -- no
                     # `screen`, so no containment. It is an ANCESTOR by
@@ -1316,14 +1563,14 @@ async def replay(script: object, ctx: Context) -> dict:
                     # it. Measured before this line existed: `tap {"text":
                     # "Confirm payment"}` was refused while `press enter
                     # {"rid": amount}` on the same form sent KEYCODE_ENTER.
-                    hit = screen_hit(screen)
+                    hit = screen_hit(screen, ctx.package)
                 if hit:
                     entry["outcome"] = "guard_stop"
-                    entry["detail"] = (
-                        GUARD_DETAIL_NOT_FULLY_SEEN
-                        if hit == SCREEN_NOT_FULLY_SEEN
-                        else GUARD_DETAIL + " Matched: " + hit
-                    )
+                    # ONE call, not a chain. The chain that was here handled two
+                    # sentinels and gave every future one the control wording --
+                    # the same half-wiring at the other consumer is what round 3
+                    # fixed, and this site still had it.
+                    entry["detail"] = guard_detail(hit, screen, ctx.package)
                     entry["after_screen_id"] = _screen_id(screen)
                     _append(trace, entry)
                     return {
@@ -1420,7 +1667,12 @@ async def replay(script: object, ctx: Context) -> dict:
                 continue
 
             # --- device ops ---------------------------------------------------
-            outcome = await _perform(op, action, element, ctx)
+            # ONE rectangle for the guard and the device -- see
+            # `_swipe_points`. Both read this packet's own root_bounds
+            # rather than each asking adb, whose answer expires.
+            outcome = await _perform(
+                op, action, element, ctx, (screen or {}).get("root_bounds")
+            )
             if outcome.get("error"):
                 if outcome.get("mask_text") and isinstance(entry.get("action"), dict):
                     for key in ("text", "value"):
@@ -1732,7 +1984,13 @@ def _evaluate_assert(
     )
 
 
-async def _perform(op: str, action: object, element: object, ctx: Context) -> dict:
+async def _perform(
+    op: str,
+    action: object,
+    element: object,
+    ctx: Context,
+    display: object = None,
+) -> dict:
     """One device op. Every argv is built by ``adb``, which validates again."""
     serial = ctx.serial
     if op == "back":
@@ -1754,7 +2012,7 @@ async def _perform(op: str, action: object, element: object, ctx: Context) -> di
         direction = str(getattr(action, "dir", "") or "")
         if direction not in _SWIPE:
             return {"error": "Unknown scroll direction.", "content": None}
-        points = _swipe_points(direction, element)
+        points = _swipe_points(direction, element, display)
         if not points:
             return {
                 "error": TOO_SMALL_TO_SWIPE,

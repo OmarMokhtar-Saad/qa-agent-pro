@@ -27,6 +27,43 @@ logger = logging.getLogger(__name__)
 
 MAX_ESCAPES = 3
 
+#: How long to wait for the app to actually reach the FOREGROUND after the
+#: clean launch, and how often to look. `adb.launch` returns as soon as the
+#: intent is delivered, not when the app is drawn -- so the first dump raced it
+#: and a case opened on whatever was in front before. On 2026-09-06 that was
+#: the Settings app on its Reset options page, and the planning packet offered
+#: a model "Erase all data (factory reset)" as the place to begin.
+FOREGROUND_TIMEOUT_S = 8.0
+FOREGROUND_POLL_S = 0.5
+
+#: How many dumps that wait may make, WHATEVER THE CLOCK SAYS. The deadline is
+#: the bound that should fire; this is the one that cannot be argued out of
+#: firing. A deadline is arithmetic on a clock, and a deadline recomputed inside
+#: the loop is never reached -- the wait then spins forever, which no test can
+#: turn red: it HANGS, and a hung job has no attribution. A count is monotonic
+#: by construction. ``FOREGROUND_TIMEOUT_S / FOREGROUND_POLL_S`` is 16, so this
+#: only binds once the clock has stopped telling the truth.
+MAX_FOREGROUND_POLLS = 24
+
+#: The whole case's trace, across every submit. It is capped because a case may
+#: be handed back many times -- three escapes plus eight budget stops -- and an
+#: unbounded list would grow on disk and in the report.
+MAX_CASE_TRACE = 240
+
+
+def _foreground_refusal(seen: str, expected: str) -> str:
+    return (
+        "The app did not come to the foreground: after launching "
+        + str(expected)[:80]
+        + " the screen still belongs to "
+        + str(seen or "an unknown package")[:80]
+        + ". Nothing was planned against it -- a case that starts on another "
+        "app's screen plans against that app. Bring "
+        + str(expected)[:80]
+        + " to the front and run the case again."
+    )
+
+
 #: How many times ONE case may be stopped by the submit budget before it is
 #: ended anyway. A budget stop is not an escape -- the script was legal and the
 #: model is being asked to continue rather than to re-plan -- but exempting it
@@ -164,6 +201,75 @@ def budget_stops_used(run_id: str, tc_id: str) -> int:
         return 0
 
 
+async def _sleep(seconds: float) -> None:
+    """Named so a test can replace it; a real sleep is the slowest thing here."""
+    import asyncio
+
+    await asyncio.sleep(seconds)
+
+
+def merge_traces(prior: object, new: object) -> list:
+    """One case's trace across every submit, renumbered as a single sequence.
+
+    It used to be REPLACED on each checkpoint, and the 2026-09-06 live run is
+    what that costs: a budget stop -- cheap and therefore common by design --
+    left the report's steps table showing only the final script, so the nine
+    actions that typed and sent both questions were gone from the evidence the
+    report exists to give. A refused script was worse still: it contributed an
+    empty list and wiped everything.
+
+    WHICH entries the cap drops is the part that matters. The sends are at the
+    start and the verdict is at the end, so the MIDDLE goes and a marker says
+    how many -- dropping the head would lose exactly the evidence this is for.
+    """
+    merged = [item for item in list(prior or []) if isinstance(item, dict)]
+    merged += [item for item in list(new or []) if isinstance(item, dict)]
+    if len(merged) > MAX_CASE_TRACE:
+        keep = (MAX_CASE_TRACE - 1) // 2
+        # EVERY action ever dropped, not just this pass's. The count came from
+        # the current list, which already held the previous marker as a single
+        # entry -- so each re-trim forgot what the last one dropped and the
+        # evidence said 61 where 182 were gone. Budget stops are cheap and
+        # therefore common, so a second trim is the expected path.
+        already = 0
+        for entry in merged:
+            if str(entry.get("outcome") or "") != "trimmed":
+                continue
+            try:
+                already += int(str(entry.get("detail") or "0").split()[0])
+            except (TypeError, ValueError, IndexError):
+                continue
+        merged = [
+            entry for entry in merged if str(entry.get("outcome") or "") != "trimmed"
+        ]
+        # No `+ 1`: the marker this pass strips was never an ACTION, so counting
+        # it as one over-reported by exactly the number of trims. Caught by the
+        # test that compares the marker against the real arithmetic instead of
+        # against itself.
+        dropped = already + len(merged) - (keep * 2)
+        merged = (
+            merged[:keep]
+            + [
+                {
+                    "action": {"op": "..."},
+                    "outcome": "trimmed",
+                    "detail": (
+                        str(dropped)
+                        + " actions in the middle of this case were dropped to "
+                        "bound the trace; the start and the end are kept"
+                    ),
+                    "before_screen_id": "",
+                    "after_screen_id": "",
+                    "ms": 0,
+                }
+            ]
+            + merged[-keep:]
+        )
+    for index, entry in enumerate(merged):
+        entry["index"] = index
+    return merged
+
+
 def escapes_used(run_id: str, tc_id: str) -> int:
     """How many times this case has already boomeranged, read from disk."""
     body = (run_store.read_case(run_id, tc_id) or {}).get("content")
@@ -229,13 +335,47 @@ async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
         if launched.get("error"):
             return launched
 
-        dumped = await adb.uiautomator_dump(ctx.serial)
-        if dumped.get("error"):
-            return dumped
-        pruned = perception.prune(dumped.get("content"), ctx.activity)
-        if pruned.get("error"):
-            return pruned
-        screen = pruned.get("content") or {}
+        # WAIT FOR THE APP TO BE IN FRONT. `adb.launch` returns when the intent
+        # is delivered, not when the app is drawn, so this dump used to race it.
+        # THE WALL CLOCK, not the sum of the sleeps. `waited` accumulated only
+        # the poll interval, so a constant named as an 8-second budget also
+        # bought 17 full uiautomator dumps -- 15-40s on a real device, inside
+        # the tool call the client is timing. The dumps are the expensive part,
+        # so the budget has to measure the thing that actually elapses.
+        # The MODULE-LEVEL `time`, not a function-local alias. The alias
+        # shadowed it and defeated `monkeypatch.setattr(case_runner, "time",
+        # ...)`, which is the ordinary seam -- and with no seam the deadline
+        # could only be pinned by grepping this function's source for the word
+        # "monotonic", a check any deadline bug that keeps the word survives.
+        deadline = time.monotonic() + FOREGROUND_TIMEOUT_S
+        polls = 0
+        screen = {}
+        seen = ""
+        while True:
+            dumped = await adb.uiautomator_dump(ctx.serial)
+            if dumped.get("error"):
+                return dumped
+            sized = await adb.display_size(ctx.serial)
+            pruned = perception.prune(
+                dumped.get("content"), ctx.activity, display=sized.get("content")
+            )
+            if pruned.get("error"):
+                return pruned
+            screen = pruned.get("content") or {}
+            seen = str(screen.get("package") or "")
+            if not seen or seen == ctx.package:
+                # An empty package is a dump that named none -- not evidence of
+                # another app, so it is accepted rather than waited out.
+                break
+            # TWO bounds, and the second is not redundant: the first is only
+            # as honest as the clock it reads. See MAX_FOREGROUND_POLLS.
+            if time.monotonic() >= deadline or polls >= MAX_FOREGROUND_POLLS:
+                return {
+                    "error": _foreground_refusal(seen, ctx.package),
+                    "content": None,
+                }
+            polls += 1
+            await _sleep(FOREGROUND_POLL_S)
 
         # The report joins a trace's screen ids to this library. A failure
         # here may never change a verdict, so the result is deliberately
@@ -544,7 +684,8 @@ def _checkpoint(
         "verdict": verdict,
         "status": status,
         "reason": str(reason or "")[:1200],
-        "trace": trace,
+        # ACCUMULATED, not replaced -- see `merge_traces`.
+        "trace": merge_traces(prior.get("trace"), trace),
         "escapes": int(escapes),
         # ONE carry-forward for both reasons. Every terminal checkpoint
         # replaces this body whole, so a count this call did not compute must
