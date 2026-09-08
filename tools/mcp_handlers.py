@@ -12276,6 +12276,18 @@ async def _mobile_next(
         # since cannot free the new holder's device on its way out.
         session.release_device_lock(run_id, lease=str(session_token or ""))
         listed = session.summary(run_id)
+        # The SECOND consumer of the verdict-coverage value, and the one a
+        # tester reads to answer "did this run pass". Without it,
+        # ``summary_block``'s tally reads ``verdict or status`` and a STATUS
+        # stands in for a VERDICT at exactly the moment the question is asked
+        # -- the defect this change exists to delete, at the highest-visibility
+        # reply in the lane. ``resolved`` is carried by BOTH STATE_REPORT paths
+        # (``session.next_packet``), so this costs no extra disk read.
+        resolved = body.get("resolved")
+        coverage = session.coverage_line(
+            resolved if isinstance(resolved, dict) else {},
+            listed.get("content") or [],
+        )
         report_path = ""
         report_opened = False
         report_failed = ""
@@ -12297,7 +12309,15 @@ async def _mobile_next(
             )
         return mobile_render.summary_block(
             listed.get("content") or [],
+            coverage_line=coverage,
             run_id=run_id,
+            # ``partial`` stays a hardcoded LIFECYCLE fact here, and it is true
+            # at this point: the branch is reached only when ``next_packet``
+            # reports STATE_REPORT -- the scheduler has no case left, or the
+            # explore run recorded its stop. It decides ONE word of the heading
+            # ("finished" rather than "progress") and no longer claims anything
+            # about verdicts; that claim is the coverage line above. Separating
+            # the two values is the whole point.
             partial=False,
             report_path=report_path,
             report_opened=report_opened,
@@ -12429,6 +12449,39 @@ async def handle_submit_mobile_step(
         return "⚠️ That step could not be replayed: " + _safe(str(exc), 200)
 
 
+def _mobile_device_in_use(session, run_id: str, session_token: str = "") -> bool:
+    """Does the run this status is about already HAVE a device, right now?
+
+    The one question `render.provisioning_section` needs: it decides whether a
+    provisioning REFUSAL recorded on this machine is about this reader's
+    situation at all. Two clauses, both load-bearing:
+
+    * a recorded serial -- a run that never got one was never provisioned FOR,
+      so a refusal is exactly its explanation and must be shown;
+    * a LIVE state -- a finished or abandoned run's old serial says nothing
+      about whether a refusal the tester hit a minute ago was needed, and that
+      refusal is the thing they are looking for.
+
+    No run id (the run listing) is not a run and cannot answer either clause:
+    False, so the section renders as it always did. `session` is passed in
+    rather than imported so this module keeps its lazy-import discipline.
+    """
+    if not str(run_id or "").strip():
+        return False
+    try:
+        resolved = session.resolve(run_id, session_token)
+        if resolved.get("error"):
+            return False
+        body = resolved.get("content") or {}
+        return bool(body.get("serial")) and str(body.get("state") or "") in (
+            session.STATE_RUNNING,
+            session.STATE_GATE,
+        )
+    except Exception:  # never-raise: a status is not a verdict
+        logger.exception("mcp mobile provisioning-section state failed")
+        return False
+
+
 async def handle_mobile_status(
     run_id: str = "",
     session_token: str = "",
@@ -12460,12 +12513,10 @@ async def handle_mobile_status(
     try:
         lines: list = []
         progress_body = (session.provision_progress() or {}).get("content")
-        if progress_body:
-            lines += [
-                "### Provisioning",
-                "- " + mobile_render.provisioning_line(progress_body),
-                "",
-            ]
+        lines += mobile_render.provisioning_section(
+            progress_body,
+            device_in_use=_mobile_device_in_use(session, run_id, session_token),
+        )
         if not run_id:
             runs = (session.list_runs(10) or {}).get("content") or []
             if not runs:
@@ -12480,6 +12531,10 @@ async def handle_mobile_status(
         body = resolved["content"] or {}
         listed = session.summary(run_id)
         recorded = listed.get("content") or []
+        # ONE producer for "how far did this run get", handed to BOTH blocks of
+        # this reply. They used to derive it separately -- one from verdicts,
+        # one from statuses -- and contradict each other three lines apart.
+        coverage = session.coverage_line(body, recorded)
         report_path = ""
         report_failed = ""
         abandoned = str(body.get("state") or "") == session.STATE_ABANDONED
@@ -12509,10 +12564,11 @@ async def handle_mobile_status(
                 report_path = str((produced.get("content") or {}).get("path") or "")
         return (
             "\n".join(lines)
-            + mobile_render.status_block(body)
+            + mobile_render.status_block(body, coverage)
             + "\n\n"
             + mobile_render.summary_block(
                 recorded,
+                coverage_line=coverage,
                 run_id=run_id,
                 partial=not body.get("finished"),
                 abandoned=abandoned,

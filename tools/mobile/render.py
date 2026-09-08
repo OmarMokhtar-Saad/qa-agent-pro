@@ -359,6 +359,43 @@ def provisioning_line(progress: object) -> str:
     )
 
 
+def provisioning_section(progress: object, *, device_in_use: bool = False) -> list:
+    """The provisioning section's markdown lines, or ``[]`` for no section.
+
+    THE ONE PLACE that decides whether there is a section at all.
+
+    `provisioner.read_progress` publishes a single machine-wide file with no
+    timestamp and no run identity, so its content answers "what did the last
+    provisioning attempt ON THIS MACHINE do", NOT "what is happening to this
+    run". Rendering it whenever the file exists is how a run already replaying
+    against an attached emulator printed "### Provisioning / - Provisioning
+    stopped: kill-switch off" (mrun-20260905-051728) -- nothing was being
+    provisioned, and to a tester it reads like the run failed.
+
+    Two meanings, both handled HERE rather than re-derived at each caller:
+
+    * ATTEMPTED AND REFUSED (or failed) -- an ``error``. Real, necessary, and
+      NOT deleted: it still renders whenever the reader could act on it. It is
+      withheld from exactly one reader -- a run that already HAS a device and is
+      still live -- for whom provisioning was never needed, so the refusal is
+      about something else entirely. It stays reachable for them:
+      `qa_mobile_status` with no run id shows it.
+    * ATTEMPTED AND RUNNING/SUCCEEDED -- a ``phase``. ALWAYS rendered, device or
+      no device. A 2.2 GB download in flight is a fact about the machine that a
+      tester needs whatever else is going on, and suppressing it would be the
+      same defect pointing the other way.
+
+    The third state -- never attempted at all -- is the empty body, and it has
+    always rendered nothing.
+    """
+    body = progress if isinstance(progress, dict) else {}
+    if not body:
+        return []
+    if body.get("error") and device_in_use:
+        return []
+    return ["### Provisioning", "- " + provisioning_line(body), ""]
+
+
 def preflight_block(content: object, rendered: str = "") -> str:
     """The preflight checks, failures first, each with its fix.
 
@@ -473,8 +510,22 @@ def _field(value: object, fallback: str = "") -> str:
         return fallback
 
 
-def status_block(resolved: object) -> str:
-    """What ``qa_mobile_status`` prints: where the run is, from disk only."""
+def _count(value: object) -> int:
+    """A disk-sourced counter as a non-negative int. Never raises."""
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def status_block(resolved: object, coverage_line: str = "") -> str:
+    """What ``qa_mobile_status`` prints: where the run is, from disk only.
+
+    *coverage_line* is the ONE verdict-coverage sentence, produced by
+    ``run_store.coverage_phrase`` and handed in by the composition root -- the
+    same string ``summary_block`` prints, so the two blocks of one reply cannot
+    disagree about how far the run got. This module still imports nothing.
+    """
     try:
         body = resolved if isinstance(resolved, dict) else {}
         lines = [
@@ -489,8 +540,26 @@ def status_block(resolved: object) -> str:
             "- app: `" + _field(body.get("package"), "(none)") + "`",
             "- device: " + _field(body.get("serial"), "(not attached)"),
         ]
-        total = int(body.get("total") or 0)
-        if total:
+        explore = body.get("explore")
+        explore = explore if isinstance(explore, dict) else {}
+        total = _count(body.get("total"))
+        if str(body.get("lane") or "") == "explore":
+            # The counter line below is SUITE vocabulary: it describes a PLAN,
+            # and an exploratory run has none -- its turns are not planned
+            # cases. Printing it here is how one reply said "0 done, 3
+            # remaining of 3" three lines above a list of three finished turns:
+            # a verdict-derived count beside a status-derived one. This lane
+            # gets the counter it actually has, plus the one coverage sentence.
+            lines.append(
+                "- turns: "
+                + str(_count(explore.get("turn")))
+                + " replayed of a "
+                + str(_count(explore.get("turns_budget")))
+                + "-turn budget"
+            )
+            if coverage_line:
+                lines.append("- " + _field(coverage_line))
+        elif total:
             lines.append(
                 "- cases: "
                 + str(int(body.get("done") or 0))
@@ -610,6 +679,7 @@ def report_line(
 def summary_block(
     cases: object,
     *,
+    coverage_line: str = "",
     run_id: str = "",
     partial: bool = False,
     abandoned: bool = False,
@@ -634,8 +704,17 @@ def summary_block(
         + (" — `" + str(run_id) + "`" if run_id else "")
         + "\n\n"
     )
+    # The tally counts a verdict OR a status under one heading, which is how
+    # "3 done" came to sit three lines under "0 done, 3 remaining of 3": a
+    # status was standing in for a verdict in one count and not in the other.
+    # The coverage sentence goes first, from the one producer, so a status
+    # count can never be read as a verdict count.
     counts = ", ".join(str(count) + " " + name for name, count in sorted(tally.items()))
-    body = (counts or "no cases recorded yet") + "\n\n"
+    body = (
+        ((coverage_line + "\n\n") if coverage_line else "")
+        + (counts or "no cases recorded yet")
+        + "\n\n"
+    )
     lines = "\n".join(verdict_line(row) for row in rows)
     tail = "\n\n" + report_line(
         report_path, partial=partial, opened=report_opened, error=report_error

@@ -82,6 +82,11 @@ def new_state(
         "goal": " ".join(str(goal or "").split())[:MAX_GOAL_CHARS],
         "watch_for": items,
         "turn": 0,
+        # The last turn number a replay actually SPENT. ``turn`` is the highest
+        # number ALLOCATED and keeps that meaning for every reader it already
+        # has; this is a second value with a second name, and its one job is to
+        # decide which number the next packet may re-use. See ``next_turn``.
+        "committed_turn": 0,
         "turns_budget": MAX_TURNS,
         "started": started,
         "deadline": started + DEADLINE_S,
@@ -154,7 +159,60 @@ async def next_turn(
         # stored best-effort, never able to stop a turn.
         run_store.write_screen(run_id, screen)
 
-        body["turn"] = int(body.get("turn") or 0) + 1
+        # A turn number is consumed by a replay HAVING HAPPENED, not by a packet
+        # having gone out. This increment was unconditional and
+        # ``session.next_packet`` persists the result immediately, so the number
+        # was durable the moment the packet was built: run
+        # mrun-20260905-051728-bd1777 shows TC-001, TC-002, TC-004 with its third
+        # turn titled "turn 4" -- the refusal had no number to decline, because
+        # the number was already spent on disk.
+        #
+        # So the number handed out here is PROVISIONAL. It is re-derived
+        # identically on every packet build until a submit that actually replayed
+        # something commits it (``session._submit_explore``), which is also what
+        # keeps ``session.explore_turn_tc_id`` stable across a refused script or a
+        # resumed chat -- ``committed + 1`` is a pure function of a value that did
+        # not change.
+        #
+        # ``turn`` keeps its MEANING -- the highest number allocated -- so
+        # ``stop_reason``, ``remaining`` and everything downstream of them (the
+        # packet's ``turns_left``, the renderer, the report) are unchanged in code
+        # and read it exactly as before. Its VALUE differs from the old behaviour
+        # in TWO places, both deliberate. First: a REFUSED turn no longer advances the
+        # ladder, so ``turns_left`` reads 2, 2, 2 across two refusals where it
+        # used to read 3, 2, 1. That is the correction -- the ladder bounds work
+        # done ON THE DEVICE and a refused script does none -- and it means the
+        # bound on a model that keeps emitting malformed scripts is the
+        # wall-clock deadline rather than ``turns_budget``. Second: a refusal on
+        # the LAST rung still ends the run, so that number is never committed and
+        # no record is written for it -- the run stops one card short rather than
+        # writing a card for a turn that did nothing. Pinned by ``test_l8``, whose
+        # docstring states it; this comment used to omit it.
+        #
+        # This function is also the MIGRATION writer, and the write below is
+        # UNCONDITIONAL on every build by design -- do not "simplify" it into a
+        # write-only-when-absent. The line after it bumps ``turn``, so a seed
+        # that was derived and not written back would be re-derived from the
+        # bumped value on the next build and drift one higher on every re-issue
+        # of a legacy run's packet. Writing the same value again is idempotent;
+        # not writing it is a numbering leak.
+        #
+        # An ABSENT key is a state written before this ledger existed and is read
+        # as fully committed. A CORRUPT key falls back to the same place, never
+        # to 0: a live run at turn 7 restarted at TC-001 would have
+        # ``run_store.write_case`` overwrite the cards it already wrote. If
+        # ``turn`` is junk too this raises and ``next_turn``'s handler answers
+        # with an error -- the same answer ``stop_reason`` above already gives for
+        # that state, which is why there is no third fallback here.
+        committed = body.get("committed_turn")
+        if committed is None:
+            committed = body.get("turn")
+        try:
+            committed = int(committed or 0)
+        except (TypeError, ValueError, OverflowError):
+            committed = int(body.get("turn") or 0)
+        body["committed_turn"] = committed
+        body["turn"] = committed + 1
         left = remaining(body, now=now)
 
         from agents import mobile_run
