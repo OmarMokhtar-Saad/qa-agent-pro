@@ -21,7 +21,7 @@ import time
 
 from tools.mobile import actions as actions_mod
 from tools.mobile import adb, executor, perception, run_store
-from tools.mobile_evidence import capture
+from tools.mobile_evidence import capture, crash_detector
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +90,42 @@ VERDICT_BLOCKED = "blocked"
 VERDICT_UNVERIFIED = "unverified"
 NEEDS_MODEL = "needs_model"
 NEEDS_TESTER = "needs_tester"
+
+
+def _merge_crash(prior: object, fresh: object) -> dict:
+    """The case's crash record across submits: FIRST crash wins.
+
+    A case is submitted many times -- three escapes plus eight budget stops --
+    and the app died on whichever replay it died on. The terminal submit's own
+    slice may be perfectly clean, so a last-write-wins record would forget the
+    death that already happened. Never raises.
+    """
+    for candidate in (prior, fresh):
+        if isinstance(candidate, dict) and candidate.get("detected"):
+            return candidate
+    return {}
+
+
+def _crash_override(verdict: str, reason: str, crash: object) -> tuple[str, str]:
+    """``(verdict, reason)`` after the app's own death is taken into account.
+
+    THE one place a detected crash overrides a verdict, and it is deliberately a
+    function of three values with no I/O: nothing else in this tree re-derives
+    it, and the report and the chat read the STORED verdict and reason instead.
+
+    * It fires ONLY on ``pass``. A ``fail``/``blocked``/``unverified`` has nothing
+      to downgrade, and rewriting its reason would destroy the model's own
+      finding.
+    * It runs AFTER the ``VERDICT_*`` normalisation, so a verdict this server
+      could not read stays ``blocked``: a crash must never promote an unreadable
+      verdict into a judgement.
+    * The reason it writes says the SERVER made the call, first, and quotes the
+      model's own words last -- see ``crash_detector.server_reason``.
+    """
+    body = crash if isinstance(crash, dict) else {}
+    if verdict != VERDICT_PASS or not body.get("detected"):
+        return verdict, reason
+    return VERDICT_FAIL, crash_detector.server_reason(body, reason)
 
 #: Boomerangs that may be spent WITHOUT charging an escape, per case, when the
 #: stop was caused by one of our own selectors going stale and nothing had
@@ -331,6 +367,14 @@ async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
         evidence = _evidence_record(
             await capture.begin_case(ctx.serial, ctx.package, run_id, tc_id)
         )
+        # The wire, beside the log (plan mobile-network-capture). Started HERE
+        # for the same reason the ring buffer is cleared here: the capture has
+        # to cover the app own start-up. A physical device, a console that
+        # refused, or a flag that is off all land as a record which SAYS so --
+        # none of them can block the case, and none of them can be a blank.
+        evidence["network"] = _network_record(
+            await capture.begin_network(ctx.serial, ctx.package, run_id, tc_id, 0)
+        )
         launched = await adb.launch(ctx.serial, ctx.package)
         if launched.get("error"):
             return launched
@@ -356,8 +400,15 @@ async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
             if dumped.get("error"):
                 return dumped
             sized = await adb.display_size(ctx.serial)
+            # The density is a DEVICE fact for the same reason the size is, and
+            # is cached per serial the same way -- so the accessibility audit
+            # measures 48dp against THIS device rather than assuming a density.
+            dpi = await adb.display_density(ctx.serial)
             pruned = perception.prune(
-                dumped.get("content"), ctx.activity, display=sized.get("content")
+                dumped.get("content"),
+                ctx.activity,
+                display=sized.get("content"),
+                density=dpi.get("content"),
             )
             if pruned.get("error"):
                 return pruned
@@ -474,7 +525,7 @@ async def submit_case(
         # final and before the checkpoint that carries the record forward.
         # The refused-script path above never reaches here: nothing ran, so
         # there is nothing to slice.
-        await _slice_evidence(run_id, tc_id, ctx)
+        crash = await _slice_evidence(run_id, tc_id, ctx)
 
         from agents import mobile_run
 
@@ -487,6 +538,14 @@ async def submit_case(
                 VERDICT_UNVERIFIED,
             ):
                 verdict = VERDICT_BLOCKED
+            # A model-declared `pass` over a case whose app DIED is a false pass,
+            # and the lane captured the proof and then never read it. The
+            # override happens here and nowhere else: this is already the one
+            # place a terminal verdict is normalised, so a second site would be a
+            # second answer to the same question.
+            verdict, done_reason = _crash_override(
+                verdict, str(result.get("reason") or ""), crash
+            )
             return {
                 "error": None,
                 "content": _checkpoint(
@@ -495,7 +554,7 @@ async def submit_case(
                     view,
                     verdict=verdict,
                     status=executor.STATUS_DONE,
-                    reason=str(result.get("reason") or ""),
+                    reason=done_reason,
                     trace=trace,
                     escapes=used,
                     packet=None,
@@ -770,6 +829,7 @@ def _evidence_record(source: object) -> dict:
     except (TypeError, ValueError, OverflowError):
         slices = 0
     written = body.get("slices_written")
+    crash = body.get("crash")
     return {
         "profile": body.get("profile"),
         "clock_offset_ms": body.get("clock_offset_ms"),
@@ -777,24 +837,78 @@ def _evidence_record(source: object) -> dict:
         "skipped": body.get("skipped") or holder.get("error") or None,
         "slices": slices,
         "slices_written": list(written) if isinstance(written, list) else [],
+        # Present whatever is on disk, so the report never reads a missing key
+        # and a record written before this feature reads as "no crash" rather
+        # than raising inside a checkpoint.
+        "crash": crash if isinstance(crash, dict) and crash.get("detected") else {},
+        # Carried forward the same way the crash is, and normalised by its own
+        # accessor: a checkpoint written before this feature has no such key,
+        # and the report must read a shape rather than a KeyError.
+        "network": _network_record(body.get("network")),
     }
 
 
-async def _slice_evidence(run_id: str, tc_id: str, ctx: executor.Context) -> None:
-    """Take this replay's logcat slice and record it on the case (plan D5).
+def _network_record(source: object) -> dict:
+    """The case network record, normalised from ``capture.begin_network`` or
+    ``finish_network``, OR from a record already on disk.
+
+    EVERY KEY PRESENT, including on a checkpoint written before this feature
+    existed, where each one is its empty value. The report reads these keys; a
+    missing one is a KeyError inside a page, which is not a gap the page can
+    state. Never raises: a corrupt count on disk is a zero here, not an
+    exception inside a checkpoint."""
+    holder = source if isinstance(source, dict) else {}
+    body = holder.get("content") if "content" in holder else holder
+    body = body if isinstance(body, dict) else {}
+
+    def count(value):
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    uid = body.get("uid")
+    started_ms = body.get("started_ms")
+    rows = body.get("rows")
+    return {
+        "skipped": body.get("skipped") or holder.get("error") or None,
+        "stage": str(body.get("stage") or ""),
+        "started": bool(body.get("started")),
+        "file": str(body.get("file") or ""),
+        "uid": uid if isinstance(uid, int) else None,
+        "rows": [row for row in (rows or ()) if isinstance(row, dict)],
+        "packets": count(body.get("packets")),
+        "samples": count(body.get("samples")),
+        "truncated": bool(body.get("truncated")),
+        "note": str(body.get("note") or ""),
+        "path": str(body.get("path") or ""),
+        "started_ms": started_ms if isinstance(started_ms, int) else None,
+    }
+
+
+async def _slice_evidence(run_id: str, tc_id: str, ctx: executor.Context) -> dict:
+    """Take this replay's logcat slice, record it, and return the case's crash.
 
     Reads the record ``start_case`` left, asks ``capture`` for the slice --
     which redacts the tester's typed values BEFORE anything reaches disk (plan
-    D4) -- and writes the updated record back so the checkpoint that follows
-    carries it forward. A skipped or failed slice is stored as such; it can
-    never change a verdict, which is why every exception ends here.
+    D4) and judges the scrubbed text for a fatal event -- and writes the updated
+    record back so the checkpoint that follows carries it forward. A skipped or
+    failed slice is stored as such.
+
+    **The STORING can never change or block a verdict**, which is why every
+    exception still ends here. The returned value is a separate thing: the crash
+    record for the CASE (first crash wins, ``_merge_crash``), which the caller
+    hands to ``_crash_override`` one branch later. On any failure at all -- a
+    detector that raised, a slice that was never taken, a store that would not
+    read -- this returns ``{}``, i.e. "no crash proven", so an evidence fault
+    leaves the model's verdict exactly as it was.
     """
     try:
         prior = (run_store.read_case(run_id, tc_id) or {}).get("content")
         prior = prior if isinstance(prior, dict) else {}
         evidence = _evidence_record(prior.get("evidence"))
         if evidence.get("skipped"):
-            return
+            return _merge_crash(evidence.get("crash"), None)
         # H2: the typed values must ALSO be known at run end, when the app's own
         # event log is pulled; remembered in memory only, never on disk.
         capture.remember_typed(run_id, (ctx.tester_inputs or {}).values())
@@ -810,6 +924,8 @@ async def _slice_evidence(run_id: str, tc_id: str, ctx: executor.Context) -> Non
         content = sliced.get("content") if isinstance(sliced, dict) else None
         content = content if isinstance(content, dict) else {}
         evidence["slices"] += 1
+        this_crash = content.get("crash")
+        this_crash = this_crash if isinstance(this_crash, dict) else {}
         evidence["slices_written"].append(
             {
                 "index": evidence["slices"] - 1,
@@ -818,7 +934,24 @@ async def _slice_evidence(run_id: str, tc_id: str, ctx: executor.Context) -> Non
                 "truncated": bool(content.get("truncated")),
                 "skipped": content.get("skipped")
                 or (sliced.get("error") if isinstance(sliced, dict) else None),
+                "crash": this_crash,
             }
+        )
+        evidence["crash"] = _merge_crash(evidence.get("crash"), this_crash)
+        # The wire is stopped, parsed and attributed at the SAME checkpoint the
+        # log slice is taken, and spliced in beside it. Nothing branches on the
+        # result: an evidence fault can no more change a verdict here than a
+        # failed slice can, which is why this sits after the crash merge and
+        # before the write rather than anywhere a return could skip it.
+        evidence["network"] = _network_record(
+            await capture.finish_network(
+                ctx.serial,
+                ctx.package,
+                run_id,
+                tc_id,
+                max(0, evidence["slices"] - 1),
+                evidence.get("network"),
+            )
         )
         # NEVER write a document read before an await. A checkpoint may have
         # landed while the device was being read; the fresh copy carries its
@@ -827,5 +960,7 @@ async def _slice_evidence(run_id: str, tc_id: str, ctx: executor.Context) -> Non
         fresh = fresh if isinstance(fresh, dict) else prior
         fresh["evidence"] = evidence
         run_store.write_case(run_id, tc_id, fresh)
+        return _merge_crash(evidence.get("crash"), None)
     except Exception:  # never-raise: evidence is not a verdict
         logger.exception("mobile.case_runner._slice_evidence failed")
+        return {}

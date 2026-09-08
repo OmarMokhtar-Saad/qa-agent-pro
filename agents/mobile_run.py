@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 
 from tools.mobile import actions as actions_mod
-from tools.mobile import perception
+from tools.mobile import perception, screen_audit
 from tools.untrusted import _GUARD, wrap_untrusted
 
 logger = logging.getLogger(__name__)
@@ -151,8 +151,28 @@ def _packet_base(run_id: str, tc_id: str = "") -> dict:
 
 
 def _screen_block(screen: object) -> str:
-    """The pruned screen as a wrapped prompt block. Never the raw XML."""
-    return perception.to_prompt_block(screen)
+    """The pruned screen as a wrapped prompt block. Never the raw XML.
+
+    The accessibility audit rides ALONGSIDE it, in its own wrapper, because the
+    two are different claims: the element lines say what is on the screen, and
+    the audit says whether a person could use it. It is emitted even when
+    `to_prompt_block` returns "" -- a canvas screen has no element lines and is
+    exactly the screen whose audit says "no nodes, nothing was audited, look at
+    the picture instead".
+
+    The names it quotes are DEVICE text, so it goes through `wrap_untrusted`
+    like everything else here. Nothing in this block is a verdict, and the
+    summary says so in its own words.
+    """
+    body = screen if isinstance(screen, dict) else {}
+    if isinstance(body.get("content"), dict):
+        body = body["content"]
+    block = perception.to_prompt_block(screen)
+    note = screen_audit.summary_text(body.get("accessibility"))
+    wrapped = wrap_untrusted("accessibility", note, limit=4000) if note else ""
+    if block and wrapped:
+        return block + "\n" + wrapped
+    return block or wrapped
 
 
 def _case_block(view: object) -> str:

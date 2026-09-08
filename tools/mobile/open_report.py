@@ -25,10 +25,10 @@ import logging
 import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 from config.settings import settings
+from tools.mobile import platform_info
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +51,14 @@ def _opener() -> str:
     Private, so the kill-switch invariant test skips it -- and correctly: it
     resolves a path and performs no effect.
     """
-    if sys.platform == "darwin":
+    # `platform_info.is_windows()` rather than this module's old
+    # `sys.platform.startswith("win")`. Both are true on every real Windows
+    # host, so this is not a behaviour change -- it deletes a SECOND definition
+    # of Windows, and it sat in the one module whose Windows branch
+    # (`os.startfile`) has never actually executed.
+    if platform_info.is_macos():
         return shutil.which("open") or ""
-    if sys.platform.startswith("win"):
+    if platform_info.is_windows():
         return WINDOWS
     return shutil.which("xdg-open") or ""
 

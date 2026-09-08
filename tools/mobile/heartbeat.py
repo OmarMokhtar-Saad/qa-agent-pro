@@ -92,9 +92,15 @@ def _release_device_lock(run_id: str, session_token: str = "") -> None:
     try:
         from tools.mobile import locks
 
-        locks.release(
-            locks.EMULATOR_LOCK, owner=str(run_id), lease=str(session_token or "")
-        )
+        # THE DEVICE THIS RUN ACTUALLY HOLDS, asked of the fd table rather than
+        # named. A fixed name here would release a lock this run never took --
+        # silently, since `release` answers "not held" and nothing branches on
+        # it -- and leave the real device held until the process exited. The
+        # lease is still presented, so a writer whose lease was superseded is
+        # refused exactly as before: this changes WHICH lock is asked, never who
+        # is allowed to release it.
+        for name in locks.names_held_by(str(run_id)):
+            locks.release(name, owner=str(run_id), lease=str(session_token or ""))
     except Exception:  # pragma: no cover - defensive
         logger.warning(
             "mobile.heartbeat: could not release the emulator lock for %s", run_id

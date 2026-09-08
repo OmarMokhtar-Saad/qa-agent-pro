@@ -17,10 +17,10 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-import sys
 from pathlib import Path
 
 from config.settings import settings
+from tools.mobile import platform_info
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +116,12 @@ def ownership(target: Path | None = None) -> dict:
     hidden.** ``os.stat().st_uid`` is 0 for every file there, so a uid
     comparison would pass unconditionally -- which is worse than not checking,
     because a caller cannot tell the two apart. ``checked=False`` is the
-    disclosure, and ``docs/MOBILE_TESTING.md`` repeats it. The Windows
+    disclosure -- and it had NO consumer until ``preflight``'s
+    ``cache_ownership`` check was added to render it: both readers of this
+    function (``provisioner.run`` and ``provisioner.start_detached``) branch on
+    ``ok`` alone, so on Windows the disclosure reached no tester at all while
+    this docstring claimed otherwise. ``docs/MOBILE_TESTING.md`` now repeats it
+    too. The Windows
     equivalent is the ACL on the user's own profile directory, where the default
     cache lives; enforcing an ACL from here is separate work with no coverage
     available on a POSIX host.
@@ -126,7 +131,7 @@ def ownership(target: Path | None = None) -> dict:
     """
     try:
         root = Path(target) if target is not None else cache_root()
-        if sys.platform == "win32":
+        if platform_info.is_windows():
             return {
                 "error": None,
                 "content": {

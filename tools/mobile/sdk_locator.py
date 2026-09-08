@@ -14,7 +14,6 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-import sys
 from pathlib import Path
 
 from tools.mobile import paths, platform_info
@@ -35,6 +34,93 @@ SCRIPT_TOOLS: frozenset[str] = frozenset({"sdkmanager", "avdmanager"})
 
 TOOL_NAMES: tuple[str, ...] = ("adb", "emulator", "sdkmanager", "avdmanager")
 
+#: WinGet unpacks a package into
+#: ``%LOCALAPPDATA%\Microsoft\WinGet\Packages\<id>_<publisher-hash>\`` and puts
+#: NOTHING on PATH. Our own qa-doctor tells a Windows tester to run
+#: ``winget install --id Google.PlatformTools -e``, so without this the tool the
+#: product asked for is one the product cannot find -- a tester had to go
+#: hunting for it by hand. The publisher-hash segment is a GLOB: it is not
+#: derivable, and it carries no version ordering either, which is what decides
+#: the tie-break below.
+WINGET_PACKAGE_GLOB = "Google.PlatformTools_*"
+
+#: Package directories ONE ``locate_sdk()`` call may examine. This runs per adb
+#: invocation (``adb.resolve_adb``), so the bound is paid on every call made on
+#: a machine that has no adb yet -- which is the only machine that reaches it.
+WINGET_MAX_PACKAGE_DIRS = 16
+
+
+def _winget_adb_candidates() -> list[tuple[str, Path]]:
+    """``(source label, adb path)`` for a WinGet-installed platform-tools.
+
+    DETERMINISTIC, and the determinism is the whole claim: the matching package
+    directories are sorted by casefolded path and the first with an adb in it
+    wins. The publisher-hash segment carries no version, so "newest" is not
+    derivable from the name and inventing an ordering would be a second
+    producer of meaning; "the same one every run, named in the label" is what a
+    tester can actually act on. Directory iteration order is NOT that -- it
+    differs between machines and between runs.
+
+    Both layouts are probed because which one WinGet writes cannot be verified
+    off Windows: the zip's own ``platform-tools/`` folder, and a flat
+    extraction. No ``winget`` process is ever spawned; this is a filesystem
+    glob.
+    """
+    if not platform_info.is_windows():
+        return []
+    base_raw = (os.environ.get("LOCALAPPDATA") or "").strip()
+    if not base_raw:
+        return []
+    base = Path(base_raw) / "Microsoft" / "WinGet" / "Packages"
+    leaf = platform_info.exe("adb")
+    try:
+        matches = sorted(
+            (item for item in base.glob(WINGET_PACKAGE_GLOB) if item.is_dir()),
+            key=lambda item: str(item).casefold(),
+        )[:WINGET_MAX_PACKAGE_DIRS]
+    except OSError:
+        return []
+    out: list[tuple[str, Path]] = []
+    for pkg in matches:
+        for candidate in (pkg / "platform-tools" / leaf, pkg / leaf):
+            try:
+                if candidate.is_file():
+                    out.append(("winget:" + pkg.name, candidate))
+                    break
+            except OSError:
+                continue
+    return out
+
+
+def _with_winget_adb(candidate: dict) -> dict:
+    """Fill a MISSING ``adb`` from WinGet, and change nothing else.
+
+    ``sdk_root``, ``source`` and ``found`` keep describing the SDK. A WinGet
+    platform-tools package is not one -- it has no emulator and no
+    cmdline-tools -- and qa-doctor prints ``sdk_root`` as "Android SDK found
+    at", so calling it a root would make that line false. What moves is
+    ``tools["adb"]``, which every consumer reads as a PATH TO AN EXECUTABLE
+    (``adb.resolve_adb`` and, through it, the whole device lane), plus
+    ``missing``, which is derived from ``tools`` and must stay derived from it.
+    ``adb_source`` states where the path came from.
+
+    Called only where the selected candidate has NO adb, so a machine with a
+    real SDK pays one dict lookup.
+    """
+    tools = dict(candidate.get("tools") or {})
+    if tools.get("adb"):
+        return candidate
+    found = _winget_adb_candidates()
+    if not found:
+        return candidate
+    label, path = found[0]
+    tools["adb"] = str(path)
+    out = dict(candidate)
+    out["tools"] = tools
+    out["adb_source"] = label
+    out["missing"] = sorted(name for name, value in tools.items() if not value)
+    return out
+
 
 def _candidate_sdk_roots() -> list[tuple[str, Path]]:
     """(source label, root) in priority order. Ours is deliberately LAST."""
@@ -43,7 +129,7 @@ def _candidate_sdk_roots() -> list[tuple[str, Path]]:
         raw = (os.environ.get(var) or "").strip()
         if raw:
             out.append((var, Path(raw).expanduser()))
-    if sys.platform == "win32":
+    if platform_info.is_windows():
         local = (os.environ.get("LOCALAPPDATA") or "").strip()
         if local:
             out.append(("LOCALAPPDATA", Path(local) / "Android" / "Sdk"))
@@ -115,16 +201,18 @@ def locate_sdk() -> dict:
             if best is None or len(missing) < len(best["missing"]):
                 best = candidate
         if best is not None:
-            return {"error": None, "content": best}
+            return {"error": None, "content": _with_winget_adb(best)}
         return {
             "error": None,
-            "content": {
-                "sdk_root": "",
-                "source": "",
-                "tools": dict.fromkeys(TOOL_NAMES, ""),
-                "missing": sorted(TOOL_NAMES),
-                "found": False,
-            },
+            "content": _with_winget_adb(
+                {
+                    "sdk_root": "",
+                    "source": "",
+                    "tools": dict.fromkeys(TOOL_NAMES, ""),
+                    "missing": sorted(TOOL_NAMES),
+                    "found": False,
+                }
+            ),
         }
     except Exception as exc:
         logger.exception("mobile.sdk_locator.locate_sdk failed")
@@ -137,7 +225,7 @@ def _candidate_java_paths() -> list[tuple[str, Path]]:
     home = (os.environ.get("JAVA_HOME") or "").strip()
     if home:
         out.append(("JAVA_HOME", Path(home).expanduser() / "bin" / leaf))
-    if sys.platform == "darwin":
+    if platform_info.is_macos():
         out.append(
             (
                 "android-studio-jbr",
@@ -145,7 +233,7 @@ def _candidate_java_paths() -> list[tuple[str, Path]]:
                 / leaf,
             )
         )
-    elif sys.platform == "win32":
+    elif platform_info.is_windows():
         for var in ("ProgramFiles", "LOCALAPPDATA"):
             base = (os.environ.get(var) or "").strip()
             if base:
@@ -210,9 +298,9 @@ def studio_present() -> bool:
     on their behalf.
     """
     try:
-        if sys.platform == "darwin":
+        if platform_info.is_macos():
             return Path("/Applications/Android Studio.app").is_dir()
-        if sys.platform == "win32":
+        if platform_info.is_windows():
             for var in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
                 base = (os.environ.get(var) or "").strip()
                 if base and (Path(base) / "Android" / "Android Studio").is_dir():

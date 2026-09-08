@@ -272,7 +272,11 @@ def claim(run_id: str, session_token: str = "", *, force: bool = False) -> dict:
 
 
 async def ensure_device(
-    *, avd: str = "", serial: str = "", budget_s: int = DEVICE_WAIT_BUDGET_S
+    *,
+    avd: str = "",
+    serial: str = "",
+    budget_s: int = DEVICE_WAIT_BUDGET_S,
+    locale: str = "",
 ) -> dict:
     """Attach to a booted emulator, or start one and hand back a pointer.
 
@@ -298,7 +302,13 @@ async def ensure_device(
                     "content": {
                         "state": STATE_BOOTING,
                         "serial": serial,
-                        "detail": str(waited["error"])[:400],
+                        # 1200, not 400: wait_boot's message may carry the
+                        # virtualization note, which is 295 chars on top of a
+                        # ~173-char timeout line. At 400 every delivery of that
+                        # note was cut mid-parenthesis and lost the half that
+                        # says WHERE to enable it -- a producer composing a
+                        # message no consumer delivers whole.
+                        "detail": str(waited["error"])[:1200],
                     },
                 }
             return {
@@ -317,14 +327,18 @@ async def ensure_device(
                     "content": {
                         "state": STATE_BOOTING,
                         "serial": serial,
-                        "detail": str(waited["error"])[:400],
+                        # Same 1200 as the sibling above, same reason.
+                        "detail": str(waited["error"])[:1200],
                     },
                 }
             return {
                 "error": None,
                 "content": {"state": "ready", "serial": serial, "detail": ""},
             }
-        started = await emulator.start(name)
+        # Only this branch spawns, so only this branch can set the locale from
+        # the first frame. A device we ADOPTED (either branch above) is handled
+        # by `apply_locale`, which reads back rather than assuming.
+        started = await emulator.start(name, locale=str(locale or ""))
         if started.get("error"):
             return started
         return {
@@ -546,17 +560,40 @@ def start_install(serial: str, apk_path: str, package: str) -> dict:
 
 
 async def install_state(serial: str, package: str) -> dict:
-    """``{installed, pending, apk, started}`` -- answered by the DEVICE."""
+    """``{probed, installed, pending, apk, started}`` -- answered by the DEVICE.
+
+    ``probed`` IS THE POINT. Whether the device answered is a fact only this
+    function can know, so it SAYS so rather than leaving callers to infer it
+    from the envelope. They cannot: this function's own ``error`` is set only
+    in the defensive branch below, so on the failure it exists to catch it is
+    ``None`` and ``probed = not state.get("error")`` reads True. A caller then
+    printed "`pkg` is not installed on the emulator" off a probe that never
+    answered (2026-09-08, round 2).
+
+    ONE PIECE OF EVIDENCE, and it is exact: ``adb.installed_packages`` reports
+    an ``error`` when adb could not be run at all AND when the command ran and
+    failed (a non-zero exit -- surfaced there, in the one producer of this
+    list, rather than guessed at here from an empty result). So the whole rule
+    is the envelope of that call, and there is no second, weaker derivation of
+    it in this module.
+
+    ``installed`` and ``pending`` are POSITIVE claims, made only from an
+    answered probe: an unprobed call returns both False, so no caller can turn
+    "we do not know" into "the install is still running".
+    """
     try:
         record = _read_install_record()
-        installed = False
         listed = await adb.installed_packages(serial)
-        if not listed.get("error"):
-            installed = str(package) in list(listed.get("content") or [])
-        pending = bool(record.get("package") == str(package) and not installed)
+        probed = not listed.get("error")
+        names = list(listed.get("content") or [])
+        installed = bool(probed and str(package) in names)
+        pending = bool(
+            probed and record.get("package") == str(package) and not installed
+        )
         return {
             "error": None,
             "content": {
+                "probed": bool(probed),
                 "installed": installed,
                 "pending": pending,
                 "apk": str(record.get("apk") or ""),
@@ -720,6 +757,8 @@ def plan_suite_run(
     source: str = "",
     filters: object = None,
     avd: str = "",
+    device: object = None,
+    locale: object = None,
 ) -> dict:
     """Order, persist and create a suite run. ``{"error", "content": {...}}``."""
     try:
@@ -749,6 +788,17 @@ def plan_suite_run(
                 "lane": LANE_SUITE,
                 "package": str(package or ""),
                 "serial": str(serial or ""),
+                # WHAT LANGUAGE THIS RAN IN, on the manifest for the same reason
+                # `device` is: a finished run must still say so after the device
+                # is gone, and two readers asking the device again could get two
+                # answers.
+                "locale": locale_record(locale),
+                # WHAT HARDWARE THIS RAN ON, recorded once at planning time.
+                # On the manifest rather than re-read per status call because a
+                # finished run must still say what it ran on after the device is
+                # unplugged, and because two readers asking the device again
+                # could get two answers.
+                "device": device_record(device),
                 "avd": str(avd or provisioner.AVD_NAME),
                 "source": str(source or ""),
                 "case_signature": case_signature(package, kept),
@@ -785,6 +835,8 @@ def plan_explore_run(
     serial: str,
     watch_for: object = (),
     avd: str = "",
+    device: object = None,
+    locale: object = None,
 ) -> dict:
     """Create an exploratory run whose whole state is one manifest dict."""
     try:
@@ -805,6 +857,8 @@ def plan_explore_run(
                 "lane": LANE_EXPLORE,
                 "package": str(package or ""),
                 "serial": str(serial or ""),
+                "device": device_record(device),
+                "locale": locale_record(locale),
                 "avd": str(avd or provisioner.AVD_NAME),
                 "order": [],
                 "total": 0,
@@ -987,6 +1041,7 @@ def resolve(run_id: str, session_token: str = "") -> dict:
                 "lane": str(manifest.get("lane") or LANE_SUITE),
                 "package": str(manifest.get("package") or ""),
                 "serial": str(manifest.get("serial") or ""),
+                "device": device_record(manifest.get("device")),
                 "avd": str(manifest.get("avd") or provisioner.AVD_NAME),
                 "source": str(manifest.get("source") or ""),
                 "total": int(manifest.get("total") or 0),
@@ -1064,16 +1119,90 @@ def new_provisioning_owner() -> str:
     return locks.new_provisioning_owner()
 
 
-def take_device_lock(owner: str, *, lease: str = "") -> dict:
-    """One run drives the emulator at a time. A refusal is CONTENT, not an error.
+def serial_of(run_id: str) -> str:
+    """The device a run is on, from its manifest. ``""`` when it has none.
+
+    THE ONE PRODUCER of that fact for the locking path. Every other route to it
+    -- a resolved body, a packet, a context -- reads the same manifest field, so
+    this is not a second source; it is the one call the lock helpers may use
+    without dragging a whole ``resolve`` through the pre-packet path.
+    """
+    try:
+        manifest = (run_store.read_manifest(str(run_id)) or {}).get("content") or {}
+        return str(manifest.get("serial") or "")
+    except Exception:  # pragma: no cover - defensive; a status is not a verdict
+        logger.exception("mobile.session.serial_of failed")
+        return ""
+
+
+def take_select_lock(owner: str) -> dict:
+    """Serialise DEVICE SELECTION, which is a question about the MACHINE.
+
+    Selection reads ``adb devices``, may adopt a foreign emulator and may spawn
+    the shared default one, and it runs BEFORE any serial exists -- so it cannot
+    be keyed by a device and must not be. This is the lock this lane has always
+    taken at the top of a new run; what changed is that it is given back the
+    moment a device has been named, instead of covering the install, the
+    preflight and the run.
+    """
+    return locks.acquire(locks.EMULATOR_LOCK, owner=str(owner))
+
+
+def release_select_lock(owner: str) -> dict:
+    """Give selection back. The caller minted the label, so it IS the holder."""
+    return locks.release(locks.EMULATOR_LOCK, owner=str(owner), as_holder=True)
+
+
+def take_device_lock(owner: str, *, serial: str = "", lease: str = "") -> dict:
+    """Hold ONE DEVICE. A refusal is CONTENT, not an error.
 
     *owner* is a ``run_id`` once there is one, and a label from
-    :func:`new_provisioning_owner`
-    before that. Acquisition is idempotent for the same owner in the same
-    process -- it performs no syscall at all -- which is what lets every
-    device-touching entry take the lock without counting who took it first.
+    :func:`new_provisioning_owner` before that. Acquisition is idempotent for
+    the same owner in the same process -- it performs no syscall at all -- which
+    is what lets every device-touching entry take the lock without counting who
+    took it first.
+
+    ``serial`` DEFAULTS TO THE RUN'S OWN DEVICE, and that default is the design
+    rather than a convenience. Every caller that has a ``run_id`` already has
+    the answer on disk; making each of them look it up would put four copies of
+    "which device is this run on" in the handlers, and mirrored derivations
+    drift. The pre-run phase, which has no run yet, is the one caller that names
+    a serial explicitly.
+
+    A serial that names no device is REFUSED BY NAME rather than falling back to
+    a lane-wide lock: a fallback would silently re-serialise every device on the
+    machine, which is the behaviour this change exists to remove, and it would
+    do it invisibly.
     """
-    return locks.acquire(locks.EMULATOR_LOCK, owner=str(owner), lease=str(lease or ""))
+    label = str(owner or "")
+    wanted = str(serial or "") or serial_of(label)
+    name = locks.device_lock_name(wanted)
+    if not name:
+        return {
+            "error": None,
+            "content": {
+                "acquired": False,
+                "owner": label,
+                "holder": "",
+                "reentrant": False,
+                "same_process": False,
+                "reason": "no_device",
+            },
+        }
+    took = locks.acquire(name, owner=label, lease=str(lease or ""))
+    if ((took or {}).get("content") or {}).get("acquired"):
+        # ONE DEVICE PER OWNER, enforced at the moment a device is taken. An
+        # emulator that reboots comes back on a different serial, so a resumed
+        # run can otherwise end up holding the lock of a device it is no longer
+        # driving -- and nothing would ever release it, because every release
+        # route asks what this owner holds and would find two answers. The
+        # SELECT lock is deliberately excluded: the pre-run phase holds it
+        # alongside the device it has just taken, for the one line it takes to
+        # give it back.
+        for other in locks.names_held_by(label):
+            if other not in (name, locks.EMULATOR_LOCK):
+                locks.release(other, owner=label, force=True)
+    return took
 
 
 def release_device_lock(
@@ -1101,13 +1230,37 @@ def release_device_lock(
     * the pre-run phase passes ``as_holder=True`` for the placeholder it minted
       itself, which has no lease to present.
     """
-    return locks.release(
-        locks.EMULATOR_LOCK,
-        owner=str(owner),
-        lease=str(lease or ""),
-        as_holder=bool(as_holder) and not lease,
-        force=bool(force),
-    )
+    label = str(owner or "")
+    names = locks.names_held_by(label)
+    if not names:
+        return {"error": None, "content": {"released": False, "reason": "not held"}}
+    # BY OWNER, NOT BY NAME. The caller does not always know the serial -- the
+    # displaced branches know only that they lost the run -- and asking them to
+    # derive one would be a second producer of "which device is this run on".
+    # The owner label already identifies exactly one holder, which is the
+    # invariant `new_provisioning_owner` exists to keep true, so "everything
+    # this label holds" is precisely this caller's own holds and nobody else's.
+    released = False
+    refusal = ""
+    for name in names:
+        body = (
+            locks.release(
+                name,
+                owner=label,
+                lease=str(lease or ""),
+                as_holder=bool(as_holder) and not lease,
+                force=bool(force),
+            )
+            or {}
+        ).get("content") or {}
+        if body.get("released"):
+            released = True
+        elif not refusal:
+            refusal = str(body.get("reason") or "")
+    return {
+        "error": None,
+        "content": {"released": released, "reason": "" if released else refusal},
+    }
 
 
 def relabel_device_lock(from_owner: str, to_owner: str) -> dict:
@@ -1117,8 +1270,247 @@ def relabel_device_lock(from_owner: str, to_owner: str) -> dict:
     release-then-reacquire, which would open a window in which another process
     could take the device between the two.
     """
-    return locks.relabel(
-        locks.EMULATOR_LOCK, from_owner=str(from_owner), to_owner=str(to_owner)
+    old = str(from_owner or "")
+    # THE SELECT LOCK IS NEVER HANDED TO A RUN. It is the machine's, not the
+    # run's, and a run that inherited it would serialise every other device on
+    # the machine for its whole life. Releasing it here rather than trusting the
+    # caller to have done it keeps the hand-off total: after this call the
+    # pre-run label holds nothing, whatever path reached it.
+    if locks.EMULATOR_LOCK in locks.names_held_by(old):
+        locks.release(locks.EMULATOR_LOCK, owner=old, as_holder=True)
+    names = [n for n in locks.names_held_by(old) if n != locks.EMULATOR_LOCK]
+    if not names:
+        return {
+            "error": None,
+            "content": {"relabelled": False, "reason": "not held", "holder": ""},
+        }
+    for name in names:
+        moved = locks.relabel(name, from_owner=old, to_owner=str(to_owner))
+        if not ((moved or {}).get("content") or {}).get("relabelled"):
+            return moved
+    return {"error": None, "content": {"relabelled": True, "reason": "", "holder": ""}}
+
+
+#: ``locale.source`` -- the one sentinel this module invents for the language
+#: fact, with exactly three values. Consumers: the manifest written by the two
+#: planners, ``report._locale_cell`` (which branches on all three) and
+#: :func:`locale_phrase` (which deliberately does NOT branch on it -- a tester
+#: reading the chat line needs the language and whether it took, not how it got
+#: there, and that is the right ``else`` rather than an oversight).
+LOCALE_FROM_BOOT = "boot"
+LOCALE_FROM_SETPROP = "setprop"
+LOCALE_FROM_DEVICE = "device"
+
+
+def _same_language(actual: object, wanted: object) -> bool:
+    """Does *actual* satisfy the request *wanted*?
+
+    A request WITH a region must match exactly: a tester who asked for ``ar-EG``
+    and got ``ar-SA`` has different date, number and currency formats, which is
+    frequently the thing under test. A request without one is satisfied by any
+    region of that language. Empty on either side is never a match -- an unknown
+    locale is not a satisfied one.
+    """
+    got = str(actual or "").strip()
+    ask = str(wanted or "").strip()
+    if not got or not ask:
+        return False
+    if "-" in ask:
+        return got == ask
+    return got.split("-")[0] == ask
+
+
+def _locale_body(
+    requested: object, actual: object, persisted: object, source: object, detail: object
+) -> dict:
+    """THE shape of the language record, built in one place.
+
+    ``matched`` is a POSITIVE claim made only from a read-back that answered:
+    an unanswerable probe leaves it False, so no consumer can turn "we could not
+    ask" into "the run was in Arabic". Same rule, same reason, as
+    ``install_state.probed``.
+    """
+    return {
+        "requested": str(requested or ""),
+        "actual": str(actual or ""),
+        "persisted": str(persisted or ""),
+        "source": str(source or LOCALE_FROM_DEVICE),
+        "matched": (
+            _same_language(actual, requested) if requested else bool(str(actual or ""))
+        ),
+        "detail": str(detail or "")[:200],
+    }
+
+
+def locale_record(body: object) -> dict:
+    """Normalise a language record for the manifest. Never raises.
+
+    The counterpart of :func:`device_record`: one shape written by the two
+    planners and read by every consumer, so a reader never has to ask which of
+    two spellings a manifest used.
+    """
+    given = body if isinstance(body, dict) else {}
+    return _locale_body(
+        given.get("requested"),
+        given.get("actual"),
+        given.get("persisted"),
+        given.get("source"),
+        given.get("detail"),
+    )
+
+
+async def apply_locale(
+    serial: str, requested: str = "", *, booted_with: str = ""
+) -> dict:
+    """Put the device into *requested* and report what it is ACTUALLY in.
+
+    ``{"error", "content": {requested, actual, persisted, source, matched, detail}}``
+
+    Three outcomes, and they are deliberately not one:
+
+    * nothing requested -> one read, and the record says what the device was
+      already in (``source=device``);
+    * requested and the device is already in it -> confirmed, no write;
+    * requested and not -> ``adb.set_locale`` is attempted and the answer is
+      whatever the device says afterwards, never the exit code.
+
+    This function never refuses; it REPORTS. The refusal is the caller's, in
+    ``mcp_handlers._mobile_locale_stage``, because only the caller knows whether
+    a run is about to be started on the strength of it.
+    """
+    try:
+        wanted = str(requested or "").strip()
+        seen = await adb.runtime_locale(serial)
+        if seen.get("error"):
+            return {
+                "error": None,
+                "content": _locale_body(
+                    wanted, "", "", LOCALE_FROM_DEVICE, str(seen["error"])[:200]
+                ),
+            }
+        actual = str(seen.get("content") or "")
+        if not wanted:
+            return {
+                "error": None,
+                "content": _locale_body("", actual, "", LOCALE_FROM_DEVICE, ""),
+            }
+        source = (
+            LOCALE_FROM_BOOT
+            if str(booted_with or "").strip() == wanted
+            else LOCALE_FROM_SETPROP
+        )
+        if _same_language(actual, wanted):
+            persisted = await adb.persisted_locale(serial)
+            return {
+                "error": None,
+                "content": _locale_body(
+                    wanted,
+                    actual,
+                    (
+                        ""
+                        if persisted.get("error")
+                        else str(persisted.get("content") or "")
+                    ),
+                    source,
+                    "",
+                ),
+            }
+        changed = await adb.set_locale(serial, wanted)
+        if changed.get("error"):
+            return {
+                "error": None,
+                "content": _locale_body(
+                    wanted, actual, "", source, str(changed["error"])[:200]
+                ),
+            }
+        body = changed.get("content") or {}
+        return {
+            "error": None,
+            "content": _locale_body(
+                wanted,
+                str(body.get("runtime") or ""),
+                str(body.get("persisted") or ""),
+                source,
+                "",
+            ),
+        }
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("mobile.session.apply_locale failed")
+        return {"error": str(exc), "content": None}
+
+
+def locale_phrase(resolved: object) -> str:
+    """The language clause of the device line, or ``""``.
+
+    Read from the RECORD, never from the device again: two readers asking the
+    device could get two answers, and a finished run must still say what it ran
+    in after the emulator is gone.
+    """
+    body = resolved if isinstance(resolved, dict) else {}
+    record = body.get("locale") if isinstance(body.get("locale"), dict) else {}
+    actual = str(record.get("actual") or "")
+    requested = str(record.get("requested") or "")
+    if not actual and not requested:
+        return ""
+    if requested and not record.get("matched"):
+        return ", NOT in " + requested + (" but in " + actual if actual else "")
+    return ", in " + actual if actual else ""
+
+
+def device_record(facts: object) -> dict:
+    """Normalise ``adb.device_facts`` content for the manifest. Never raises.
+
+    One shape, written by the two planners and read by every consumer, so a
+    reader never has to ask which of two spellings a manifest used. An unknown
+    kind stays ``""`` rather than defaulting to ``emulator``: guessing here
+    would put a claim about the EVIDENCE VALUE of a run into the report, and a
+    confident wrong answer is worse than a blank.
+    """
+    body = facts if isinstance(facts, dict) else {}
+    kind = str(body.get("kind") or "")
+    return {
+        "kind": kind if kind in ("emulator", "physical") else "",
+        "model": str(body.get("model") or "")[:60],
+        "api": str(body.get("api") or "")[:8],
+    }
+
+
+def device_line(resolved: object) -> str:
+    """The tester-facing "what hardware was this?" line, or ``""``.
+
+    ``""`` for a run with no serial and for a manifest written before this field
+    existed, so an older run renders EXACTLY as it did -- an empty line is the
+    honest answer when the record does not say, and the alternative ("emulator",
+    assumed) would be a claim about evidence nobody made.
+    """
+    body = resolved if isinstance(resolved, dict) else {}
+    serial = str(body.get("serial") or "")
+    if not serial:
+        return ""
+    device = body.get("device") if isinstance(body.get("device"), dict) else {}
+    kind = str(device.get("kind") or "")
+    if not kind:
+        return (
+            "\n\n- Device: `"
+            + serial
+            + "` (kind not recorded for this run)"
+            + locale_phrase(body)
+        )
+    detail = ", ".join(
+        part
+        for part in (
+            str(device.get("model") or ""),
+            ("API " + str(device.get("api"))) if device.get("api") else "",
+        )
+        if part
+    )
+    return (
+        "\n\n- Device: `"
+        + serial
+        + "` — "
+        + ("an emulator" if kind == "emulator" else "a physical device")
+        + ((" (" + detail + ")") if detail else "")
+        + locale_phrase(body)
     )
 
 
@@ -1731,9 +2123,16 @@ def provision_progress() -> dict:
     return provisioner.read_progress()
 
 
-def start_provisioning() -> dict:
-    """Kick the DETACHED provisioner. Nothing downloads inside this process."""
-    return provisioner.start_detached()
+def start_provisioning(virtualization_ack: bool = False) -> dict:
+    """Kick the DETACHED provisioner. Nothing downloads inside this process.
+
+    ``virtualization_ack`` is CARRIED, not judged: this layer holds no state and
+    makes no decision, and the one place the acknowledgement means anything is
+    the preflight inside ``provisioner.run``. A default here that silently
+    dropped it would report a consent that was never applied, which is worse
+    than never accepting one.
+    """
+    return provisioner.start_detached(virtualization_ack=virtualization_ack)
 
 
 def provision_plan() -> dict:

@@ -21,12 +21,18 @@ import logging
 import os
 import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 
 from config.settings import settings
-from tools.mobile import adb, paths, platform_info, provisioner, sdk_locator
+from tools.mobile import (
+    adb,
+    paths,
+    platform_info,
+    provisioner,
+    render,
+    sdk_locator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +204,27 @@ async def wait_boot(serial: str, timeout: int = 0) -> dict:
             if not prop.get("error") and str(prop.get("content") or "").strip() == "1":
                 return {"error": None, "content": {"serial": serial, "booted": True}}
             await asyncio.sleep(POLL_INTERVAL_S)
+        # ONE PRODUCER: `render` decides both whether this machine has a CURRENT
+        # record of an overridden negative virtualization verdict and what to
+        # say about it. This function composes no sentence of its own -- and it
+        # is empty on every machine that did not override one, because a message
+        # that always blamed virtualization is the same defect pointing the
+        # other way.
+        # WHICH DEVICE FAILED. `avd_name_of` asks the emulator CONSOLE, which
+        # answers long before `sys.boot_completed`. STATED EXACTLY: it yields ""
+        # when `raw` sets an error (adb missing, timeout, exception), and
+        # otherwise the first non-OK line of STDOUT -- a NON-ZERO rc is NOT an
+        # error there, so a physical handset (whose console reply goes to
+        # stderr) normally yields "" but is not guaranteed to. Either way the
+        # downstream match is POSITIVE: "" and any junk both fail to equal the
+        # provisioned AVD name, so the note stays silent. One extra call, only
+        # on a path where a boot has already timed out.
+        named = await avd_name_of(serial)
+        note = render.virtualization_override_note(
+            (provisioner.read_progress() or {}).get("content"),
+            time.time(),
+            str((named or {}).get("content") or ""),
+        )
         return {
             "error": (
                 "The emulator did not finish booting within "
@@ -207,7 +234,7 @@ async def wait_boot(serial: str, timeout: int = 0) -> dict:
                 + "="
                 + repr(last[:60])
                 + "). Raise QA_MOBILE_BOOT_TIMEOUT_S, or start the AVD from "
-                "Android Studio once to warm its snapshot."
+                "Android Studio once to warm its snapshot." + note
             ),
             "content": None,
         }
@@ -216,8 +243,11 @@ async def wait_boot(serial: str, timeout: int = 0) -> dict:
         return {"error": str(exc), "content": None}
 
 
-async def start(avd: str = provisioner.AVD_NAME) -> dict:
+async def start(avd: str = provisioner.AVD_NAME, *, locale: str = "") -> dict:
     """Spawn *avd* detached and return AT ONCE. ``{"error", "content": {"pid"}}``.
+
+    ``locale`` is keyword-only and defaults empty, so every existing caller --
+    including :func:`boot`, which passes ``avd`` positionally -- is unchanged.
 
     Extracted from :func:`boot` (2026-09-02, Phase 3) because a caller inside an
     MCP tool call cannot afford ``boot``'s poll: it runs to
@@ -261,6 +291,18 @@ async def start(avd: str = provisioner.AVD_NAME) -> dict:
             "-no-snapshot-save",
             "-no-boot-anim",
         ]
+        # THE ONE MECHANISM THAT WORKS UNPRIVILEGED. `persist.sys.locale` is a
+        # `persist.*` property, so `adb shell setprop` needs root that the
+        # `google_apis_playstore` user build does not give -- and even where the
+        # write lands, the running system keeps its old configuration until it
+        # restarts. Set at SPAWN, the device comes up in the language from its
+        # first frame, and it survives every later reboot of that AVD.
+        #
+        # APPENDED, never inserted: `test_boot_spawns_detached_when_nothing_is_
+        # running` reads `cmd[1:3]` by index.
+        wanted = str(locale or "").strip()
+        if wanted and adb.LOCALE_TAG.match(wanted):
+            command += ["-prop", adb.PERSIST_LOCALE_PROP + "=" + wanted]
         kwargs = {
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.DEVNULL,
@@ -363,6 +405,8 @@ async def stop(serial: str) -> dict:
     return {"error": None, "content": {"serial": str(serial), "stopped": True}}
 
 
-def python_is_windows() -> bool:
-    """Small readable seam for the Windows branches the tests monkeypatch."""
-    return sys.platform == "win32"
+# `python_is_windows()` USED TO LIVE HERE and was deleted: a sixth spelling of
+# `sys.platform == "win32"` whose only caller in the whole tree was a test
+# asserting it existed. `platform_info.is_windows()` is the one producer, and
+# `tests/mobile/test_mobile_platform_support.py` fails by file name if a second
+# one reappears anywhere under `tools/mobile/`.

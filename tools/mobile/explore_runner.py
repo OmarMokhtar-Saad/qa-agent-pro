@@ -146,10 +146,13 @@ async def next_turn(
         if dumped.get("error"):
             return dumped
         sized = await adb.display_size(getattr(ctx, "serial", ""))
+        # Same device fact, same cache, same reason as the case lane's.
+        dpi = await adb.display_density(getattr(ctx, "serial", ""))
         pruned = perception.prune(
             dumped.get("content"),
             str(getattr(ctx, "activity", "") or ""),
             display=sized.get("content"),
+            density=dpi.get("content"),
         )
         if pruned.get("error"):
             return pruned

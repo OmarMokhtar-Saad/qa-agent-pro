@@ -1121,16 +1121,32 @@ def build_server():
             serial: str = "",
             avd: str = "",
             new_run: bool = False,
-        ) -> str:
+            virtualization_ack: bool = False,
+            locale: str = "",
+        ) -> list[ContentBlock]:
             """Run test cases, or explore freely, on an Android emulator.
 
             Call with NO arguments to start: it answers with whatever the machine
             needs next (provisioning, an install source, a preflight list, or the
             start menu) and asks the tester itself. Every step that installs,
             downloads or launches needs apply=true, and nothing is installed or
-            downloaded without it. Pass run_id to continue a run in ANY chat --
+            downloaded without it. If provisioning refuses because this machine
+            reports no usable hardware virtualization, that probe can be wrong
+            on a locked-down machine: put the concern to the tester, and only
+            after they say go, call again with virtualization_ack=true. Never on
+            the turn you were refused, and it dismisses that probe alone. Pass run_id to continue a run in ANY chat --
             that takes the run over and the previous chat is told. It hands you
             ONE packet at a time; answer each with qa_submit_mobile_step.
+
+            `locale` sets the DEVICE's language for the run -- `ar`, `ar-EG`,
+            `en-US`. It is applied before anything is installed, read back off
+            the device, and shown in the report header, so a run always states
+            the language it actually ran in. When the device will not take it
+            the call REFUSES and says what the device is in rather than running
+            under the wrong language. Needs apply=true. It takes effect from the
+            first frame only on an emulator this server booted itself; on one
+            the tester already started, `persist.sys.locale` usually needs root,
+            and the refusal says so and how to set it by hand.
 
             If the tester already has an emulator running, pass its adb serial
             (e.g. `emulator-5554`) in `serial` -- that skips provisioning
@@ -1144,11 +1160,20 @@ def build_server():
             Pass new_run=true only when the tester has asked for a fresh run:
             a second run of the same cases produces a second report of the
             same work.
+
+            A PNG of the current screen is attached to every packet reply as
+            image content: LOOK AT IT before you plan. The element list comes
+            from the accessibility tree and an app that draws its own UI puts
+            almost nothing there, so on those apps the picture is the only
+            description of the screen you get. Coordinates still come from the
+            element list. If a capture did not succeed the packet says so.
             """
-            return await _tracked(
+            from mcp.types import TextContent
+
+            text, specs = await _tracked(
                 "qa_mobile_test",
                 ctx,
-                mcp_handlers.handle_mobile_test(
+                mcp_handlers.handle_mobile_test_content(
                     source,
                     suite_id,
                     goal,
@@ -1162,10 +1187,22 @@ def build_server():
                     serial=serial,
                     avd=avd,
                     new_run=new_run,
+                    virtualization_ack=virtualization_ack,
+                    locale=locale,
                     **_make_elicitors(ctx),
                     progress=_make_progress(ctx),
                 ),
             )
+            # The qa_capture_screens shape, deliberately identical: one text
+            # block plus one image block per captured screen, with that
+            # helper's NEVER-silent text fallback when the fastmcp Image API is
+            # unavailable. A packet with no picture yields the text block alone
+            # and SAYS so in its own `screen_image` note -- the reply never
+            # implies an image that is not there.
+            return [
+                TextContent(type="text", text=text),
+                *_image_content_blocks(specs),
+            ]
 
         @mcp.tool()
         async def qa_submit_mobile_step(
@@ -1176,7 +1213,7 @@ def build_server():
             tester_input: str = "",
             tester_input_field: str = "",
             session_token: str = "",
-        ) -> str:
+        ) -> list[ContentBlock]:
             """Submit the action script YOU planned for a mobile packet.
 
             The server validates it against the action vocabulary, replays it on
@@ -1185,11 +1222,18 @@ def build_server():
             pass it as tester_input with tester_input_field set to the field
             name: it is typed into the app and stored nowhere -- not in the
             report, the checkpoint or the audit log.
+
+            The NEXT packet arrives with a PNG of the screen attached as image
+            content: look at it before you plan the next script. If a capture
+            did not succeed the packet says so rather than leaving you to
+            wonder.
             """
-            return await _tracked(
+            from mcp.types import TextContent
+
+            text, specs = await _tracked(
                 "qa_submit_mobile_step",
                 ctx,
-                mcp_handlers.handle_submit_mobile_step(
+                mcp_handlers.handle_submit_mobile_step_content(
                     run_id,
                     tc_id,
                     script,
@@ -1199,6 +1243,11 @@ def build_server():
                     progress=_make_progress(ctx),
                 ),
             )
+            # Same shape as qa_mobile_test above and as qa_capture_screens.
+            return [
+                TextContent(type="text", text=text),
+                *_image_content_blocks(specs),
+            ]
 
         @mcp.tool()
         async def qa_mobile_status(

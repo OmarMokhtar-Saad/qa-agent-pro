@@ -31,6 +31,17 @@ from tools.mobile import (
 
 logger = logging.getLogger(__name__)
 
+
+class _Answered(Exception):
+    """Leave one check's block early without leaving the others unreported.
+
+    Every check runs in its own ``try`` and appends its own record; the
+    ``ime_selected`` branch needs to stop after appending an "it did not answer"
+    record, and its ``try`` already catches ``Exception`` and would then append a
+    SECOND, contradictory record for the same name. Caught by name, immediately,
+    ahead of that handler.
+    """
+
 #: Check names, in report order. Also the set the tests assert against, so a
 #: check that silently stops being emitted fails the suite.
 CHECK_NAMES: tuple[str, ...] = (
@@ -44,6 +55,7 @@ CHECK_NAMES: tuple[str, ...] = (
     "ime_selected",
     "ime_oracle",
     "free_disk",
+    "cache_ownership",
 )
 
 #: Free space the lane wants available before a RUN (not a provision): room for
@@ -66,8 +78,22 @@ _FLAG_FIX = (
 #: Named here rather than passed at each of the ten `_record` call sites: a flag
 #: threaded through ten places is a flag someone forgets at the eleventh, and
 #: the SET is the thing a reviewer needs to see in one glance.
+#: ``cache_ownership`` is advisory for a DIFFERENT reason than the IME four, and
+#: the reason is a considered trade rather than a softening: ``paths.ownership``
+#: answers ``ok=False`` when the owner cannot be DETERMINED at all, so a blocking
+#: check would newly refuse runs on POSIX installs that proceed today. The gate
+#: that must block already blocks -- ``provisioner.run`` and
+#: ``provisioner.start_detached`` both refuse on ``ok=False`` before anything is
+#: written into the cache. What was missing was telling the TESTER, which is what
+#: this check does. ``test_the_ownership_check_cannot_block_a_run`` pins it.
 ADVISORY_CHECKS: frozenset = frozenset(
-    {"ime_pinned", "ime_installed", "ime_selected", "ime_oracle"}
+    {
+        "ime_pinned",
+        "ime_installed",
+        "ime_selected",
+        "ime_oracle",
+        "cache_ownership",
+    }
 )
 
 
@@ -79,6 +105,43 @@ def _record(name: str, ok: bool, detail: str, fix: str = "") -> dict:
         "fix": str(fix),
         "blocking": str(name) not in ADVISORY_CHECKS,
     }
+
+
+def _unanswered(name: str, result: object, fix: str = "") -> dict | None:
+    """The record for a probe that DID NOT ANSWER, or None when it did.
+
+    ONE SHAPE, because this file has now produced the same defect three times:
+    ``package_installed`` read ``adb.installed_packages(...).get("content")``
+    with no look at ``error`` and printed "`pkg` is NOT installed" off a probe
+    that failed, and ``ime_installed`` and ``ime_selected`` did the identical
+    thing with ``ime.installed`` and ``ime.current_ime``. The same class had
+    already been fixed at ``session.install_state`` (44c2be95) and
+    ``render.install_menu_markdown`` (d7e0fff2), so this is the third and the
+    fix is a SHAPE rather than three more patches.
+
+    ``ok`` is False -- a probe that did not answer has not passed -- but the
+    DETAIL says the check could not be made, so a tester is never told to
+    install an app that may well be there. ``blocking`` follows the check's own
+    name via :func:`_record`, unchanged: this says nothing new about severity.
+
+    ``tests/mobile/test_mobile_probe_envelopes.py`` is the other half. This
+    removes the duplication inside this file; the scanner is what stops a
+    FOURTH site somewhere else.
+    """
+    body = result if isinstance(result, dict) else {}
+    problem = str(body.get("error") or "")
+    if not problem:
+        return None
+    return _record(
+        name,
+        False,
+        "could not be checked -- the device did not answer: " + problem[:200],
+        fix
+        or (
+            "Check the emulator is still up (`qa_list_devices`) and run the "
+            "preflight again. Nothing is known about this check either way."
+        ),
+    )
 
 
 async def check(target_package: str = "", serial: str = "") -> dict:
@@ -175,8 +238,26 @@ async def check(target_package: str = "", serial: str = "") -> dict:
             if not resolved_serial and serials:
                 # NEVER serials[0]. adb's order is not stable, and this lane
                 # installs, types, taps and force-stops -- so picking the
-                # first attached device can drive a tester's own phone. An
-                # emulator is the only device this lane may choose for itself.
+                # first attached device can drive a tester's own phone.
+                #
+                # The rule has TWO halves and both are pinned, because each one
+                # alone reads like a bug to whoever meets it next:
+                #
+                #  * AMBIGUOUS set -> an emulator is the only device this lane
+                #    may choose for itself, and two of them refuse by name
+                #    rather than guess (`test_a_phone_is_never_chosen_over_an_
+                #    emulator`, `test_two_emulators_refuse_by_name_rather_than_
+                #    guess`).
+                #  * EXACTLY ONE attached device -> it is chosen, emulator or
+                #    not. Nothing is ambiguous about one device, and a tester
+                #    who runs the lane against a single physical handset on
+                #    purpose is a supported case; refusing it would be a guard
+                #    that stops the supported flow
+                #    (`test_a_single_attached_device_is_still_allowed`).
+                #
+                # Reaching either branch at all requires a caller that resolved
+                # no serial of its own; every production caller resolves one
+                # first, so this is the fallback, not the usual path.
                 emulators = [s for s in serials if str(s).startswith("emulator-")]
                 if len(emulators) == 1:
                     resolved_serial = emulators[0]
@@ -268,21 +349,26 @@ async def check(target_package: str = "", serial: str = "") -> dict:
                 )
             else:
                 installed = await adb.installed_packages(resolved_serial)
-                present = package in (installed.get("content") or [])
-                checks.append(
-                    _record(
-                        "package_installed",
-                        present,
-                        package + (" is installed" if present else " is NOT installed"),
-                        (
-                            ""
-                            if present
-                            else "Install the app first: give the mobile lane an "
-                            "APK path or a download URL, or open its Play Store "
-                            "listing on the emulator."
-                        ),
+                unanswered = _unanswered("package_installed", installed)
+                if unanswered:
+                    checks.append(unanswered)
+                else:
+                    present = package in (installed.get("content") or [])
+                    checks.append(
+                        _record(
+                            "package_installed",
+                            present,
+                            package
+                            + (" is installed" if present else " is NOT installed"),
+                            (
+                                ""
+                                if present
+                                else "Install the app first: give the mobile lane an "
+                                "APK path or a download URL, or open its Play Store "
+                                "listing on the emulator."
+                            ),
+                        )
                     )
-                )
         except Exception as exc:
             checks.append(
                 _record("package_installed", False, "check failed: " + str(exc))
@@ -334,21 +420,29 @@ async def check(target_package: str = "", serial: str = "") -> dict:
                     )
                 else:
                     present = (await ime.installed(resolved_serial)) or {}
-                    ok = bool((present.get("content") or {}).get("installed"))
-                    checks.append(
-                        _record(
-                            "ime_installed",
-                            ok,
-                            str(manifest.get("package"))
-                            + (" is installed" if ok else " is NOT installed"),
-                            (
-                                ""
-                                if ok
-                                else "The mobile lane installs the QA keyboard "
-                                "itself on the next run with apply=true."
-                            ),
+                    # `ime.installed` propagates `adb.installed_packages`'s
+                    # envelope verbatim (ime.py:197-198), so the evidence is
+                    # here and used to be dropped: a failed probe rendered
+                    # "is NOT installed" with a fix line about the next run.
+                    unanswered = _unanswered("ime_installed", present)
+                    if unanswered:
+                        checks.append(unanswered)
+                    else:
+                        ok = bool((present.get("content") or {}).get("installed"))
+                        checks.append(
+                            _record(
+                                "ime_installed",
+                                ok,
+                                str(manifest.get("package"))
+                                + (" is installed" if ok else " is NOT installed"),
+                                (
+                                    ""
+                                    if ok
+                                    else "The mobile lane installs the QA keyboard "
+                                    "itself on the next run with apply=true."
+                                ),
+                            )
                         )
-                    )
             except Exception as exc:
                 checks.append(
                     _record("ime_installed", False, "check failed: " + str(exc))
@@ -360,6 +454,14 @@ async def check(target_package: str = "", serial: str = "") -> dict:
                     )
                 else:
                     current = await ime.current_ime(resolved_serial)
+                    # THE SAME HOLE AS THE TWO ABOVE, found while checking the
+                    # neighbour: `ime.current_ime` returns its adb envelope
+                    # verbatim (ime.py:264-265), and reading only `content` made
+                    # a failed probe render "active input method: (none)".
+                    unanswered = _unanswered("ime_selected", current)
+                    if unanswered:
+                        checks.append(unanswered)
+                        raise _Answered
                     active = str(current.get("content") or "")
                     # By component identity: Android reports `pkg/.Class` and
                     # the manifest pins `pkg/pkg.Class`. `==` refused every run
@@ -378,6 +480,8 @@ async def check(target_package: str = "", serial: str = "") -> dict:
                             ),
                         )
                     )
+            except _Answered:
+                pass
             except Exception as exc:
                 checks.append(
                     _record("ime_selected", False, "check failed: " + str(exc))
@@ -437,6 +541,36 @@ async def check(target_package: str = "", serial: str = "") -> dict:
             )
         except Exception as exc:
             checks.append(_record("free_disk", False, "check failed: " + str(exc)))
+
+        # 11. cache ownership ------------------------------------------------
+        # ONE PRODUCER, ONE MEANING, EVERY CONSUMER. `paths.ownership()` has
+        # produced a `checked` field since Phase 5 and NOTHING read it: both
+        # consumers branch on `ok` alone, so on Windows -- where a POSIX uid
+        # comparison carries no meaning, and the function therefore answers
+        # `ok=True, checked=False` -- the disclosure that distinguishes "checked
+        # and fine" from "not checked at all" reached no tester, while
+        # `paths.ownership`'s own docstring claimed the docs repeated it. This is
+        # the consumer that renders it, and the bracketed suffix is what makes
+        # the two states distinguishable in the tester-facing line.
+        try:
+            owned = (paths.ownership() or {}).get("content") or {}
+            checks.append(
+                _record(
+                    "cache_ownership",
+                    bool(owned.get("ok")),
+                    str(owned.get("detail") or "")
+                    + (
+                        ""
+                        if bool(owned.get("checked"))
+                        else " [not verified on this host]"
+                    ),
+                    str(owned.get("fix") or ""),
+                )
+            )
+        except Exception as exc:
+            checks.append(
+                _record("cache_ownership", False, "check failed: " + str(exc))
+            )
 
         failing = [record["name"] for record in checks if not record["ok"]]
         # `ok` is "nothing that BLOCKS a run failed". `failing` stays every
