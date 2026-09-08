@@ -205,6 +205,27 @@ class Context:
     # Per-call wall-clock bound for the replay. ``None`` means
     # :data:`SUBMIT_BUDGET_S`; a test shortens it rather than sleeping.
     budget_s: float | None = None
+    # Whether an EARLIER unit of the same run already recorded an
+    # ``assert_pass``. Defaults False, which is the SCRIPTED lane's rule
+    # unchanged: there the case IS the unit that earns the verdict and its own
+    # trace must carry the check. The explore lane sets it, because there one
+    # turn is one case and the unit that earns a verdict is the RUN -- so the
+    # turn that calls ``done`` can never carry the assert an earlier turn made.
+    # An explicit input, never a store read: this module drives a device and
+    # knows nothing about runs.
+    prior_verified: bool = False
+    # Whether a script that asserts NOTHING is an omission worth naming. True
+    # is the scripted lane: there the case IS the unit that earns the verdict,
+    # so a script with no assert has skipped the only thing that could have
+    # earned one, and saying so is what stops an empty verdict reading as a
+    # pass. The explore lane sets it False, because there one turn is one case
+    # and a turn that only taps and types is the NORMAL case -- printing the
+    # scripted sentence on the majority path trains the reader to ignore it.
+    #
+    # A fact about what a trace is EXPECTED to carry, not a lane name: this
+    # module still knows nothing about runs, and the default leaves the
+    # scripted rule untouched and unweakened.
+    asserts_expected: bool = True
 
 
 #: The ONLY ops the destructive guard skips, because none can actuate anything:
@@ -608,12 +629,33 @@ async def _activity(ctx: Context) -> str:
 _wall_clock = time.time
 
 
-def _entry(index: int, action: object, before: str, started: float) -> dict:
+def _screen_hash(screen: object) -> str:
+    """``perception.prune``'s CONTENT hash for a screen, or ``""``.
+
+    A DIFFERENT value from ``screen_id`` and deliberately named apart: the id
+    is package + activity + the top three texts, which is what makes a scrolled
+    list "the same screen" -- and what made every chat reply ``no_change``. The
+    hash is seeded from every element. Two questions, two names.
+    """
+    body = screen if isinstance(screen, dict) else {}
+    return str(body.get("hash") or "")
+
+
+def _entry(
+    index: int, action: object, before: str, started: float, before_hash: str = ""
+) -> dict:
     return {
         "index": int(index),
         "action": actions_mod.redact_action(action),
         "before_screen_id": str(before or ""),
         "after_screen_id": "",
+        # The CONTENT hashes, beside the ids. ``after_screen_hash`` is stamped
+        # only where the replay SETTLES, which is the one place that judges
+        # ``no_change``; entries stamped elsewhere leave it empty, because
+        # nothing reads it there and a half-filled field that looks general is
+        # how a sentinel gets trusted for something it does not carry.
+        "before_screen_hash": str(before_hash or ""),
+        "after_screen_hash": "",
         # Stamped by ``_append``, AFTER the action ran. Computing it here read
         # the clock at creation, so every real run carried ``ms: 0`` -- a
         # 4000 ms wait included -- and the report could time nothing.
@@ -931,6 +973,50 @@ def _has_verification(trace: list[dict]) -> bool:
     return any(str(item.get("outcome") or "") == "assert_pass" for item in trace)
 
 
+def _verified(trace: list[dict], ctx: Context) -> bool:
+    """Whether a ``done verdict=pass`` can stand for THIS unit of work.
+
+    Two disjuncts, and each is the only evidence available in one lane:
+
+    * this trace carries an ``assert_pass`` -- the scripted lane's rule,
+      unchanged and unweakened, because ``prior_verified`` defaults to False;
+    * an earlier turn of the same RUN did -- the explore lane, where one turn
+      is one case and the goal is what earns the verdict. Measured:
+      ``mrun-20260907-174354-758700`` recorded asserts on TC-016 and TC-018 and
+      its closing turn TC-019 was still told nothing had been verified, which
+      no script could have fixed.
+    """
+    return _has_verification(trace) or bool(ctx.prior_verified)
+
+
+def _unchanged(
+    before_hash: str, after_hash: str, before_id: str, after_id: str
+) -> bool:
+    """Whether an action left the screen's CONTENT as it was.
+
+    Judged on the content hash when BOTH ends have one. ``screen_id`` is the
+    wrong instrument and was the one used: it is seeded from package, activity
+    and the top THREE texts (``perception._screen_id``), deliberately, so a
+    scrolled list stays the same screen -- and so a chat that received a whole
+    new assistant reply reported ``no_change``. Measured on every send of
+    ``mrun-20260907-174354-758700``, including the one the model then proved
+    with an ``assert_pass``.
+
+    With either hash missing the ID comparison is KEPT, which is exactly
+    today's behaviour. ``no_change`` is what tells a model its tap did nothing,
+    and dropping the signal on a screen that carries no hash would replace an
+    occasionally coarse answer with no answer at all.
+
+    ``assert screen_changed`` still reads the ID and stays documented as WEAK
+    (``_evaluate_assert``): two consumers want two different questions answered,
+    so they get two values with two names, not one value with a caveat. The
+    destructive guard reads the ID and the elements too, and neither moves.
+    """
+    if before_hash and after_hash:
+        return before_hash == after_hash
+    return str(after_id) == str(before_id)
+
+
 async def _settle(
     ctx: Context,
     entry: dict,
@@ -960,6 +1046,7 @@ async def _settle(
     "your tap did nothing", and a wait that changes nothing is the normal case.
     """
     before_id = str(entry.get("before_screen_id") or "")
+    before_hash = str(entry.get("before_screen_hash") or "")
     if redump:
         dumped = await _dump(ctx)
         if dumped.get("error"):
@@ -970,7 +1057,10 @@ async def _settle(
                 STATUS_ERROR, trace, screen, "", entry["detail"], index
             )
         screen = dumped.get("content")
-    if mark_no_change and _screen_id(screen) == before_id:
+    entry["after_screen_hash"] = _screen_hash(screen)
+    if mark_no_change and _unchanged(
+        before_hash, entry["after_screen_hash"], before_id, _screen_id(screen)
+    ):
         entry["outcome"] = "no_change"
 
     # The app is not where the script thinks it is. Recorded on the ACTION that
@@ -1435,7 +1525,9 @@ async def replay(script: object, ctx: Context) -> dict:
                     ),
                 }
             started = time.monotonic()
-            entry = _entry(index, action, _screen_id(screen), started)
+            entry = _entry(
+                index, action, _screen_id(screen), started, _screen_hash(screen)
+            )
             op = str(getattr(action, "op", "") or "")
             # Per ACTION, not per replay: a scroll whose target missed must not
             # colour the note of a later scroll that resolved.
@@ -1450,12 +1542,13 @@ async def replay(script: object, ctx: Context) -> dict:
             if op == "done":
                 verdict = str(getattr(action, "verdict", ""))
                 reason = str(getattr(action, "reason", ""))[:400]
-                if verdict == "pass" and not _has_verification(trace):
+                if verdict == "pass" and not _verified(trace, ctx):
                     verdict = STATUS_UNVERIFIED
                     reason = (
-                        "verdict=pass was not accepted: this case's trace has "
-                        "no assert_pass, so nothing was verified. Add an "
-                        "`assert` for what the case is supposed to show. " + reason
+                        "verdict=pass was not accepted: nothing in this run "
+                        "has recorded an assert_pass, so nothing was verified. "
+                        "Add an `assert` for what the case is supposed to "
+                        "show. " + reason
                     ).strip()
                 entry["outcome"] = "done"
                 entry["detail"] = reason
@@ -1780,24 +1873,52 @@ async def replay(script: object, ctx: Context) -> dict:
         # empty verdict, which `case_runner` reads as PASS -- so omitting one
         # word bypassed the whole verification rule the done() branch enforces.
         # The same rule applies on both exits or it is not a rule.
-        ended_verified = _has_verification(trace)
+        # ``_verified``, not ``_has_verification``: the done() branch above asks
+        # the run-wide question (:1533) and this exit asked the narrower one, so
+        # an explore run whose earlier turn DID assert was still told nothing had
+        # been verified whenever a turn omitted done(). That is the refusal
+        # ``prior_verified`` exists to remove, surviving on the other exit -- and
+        # the scripted lane is unmoved, because that field defaults to False.
+        ended_verified = _verified(trace, ctx)
         # A VERIFIED run must say what it verified. The reason used to open
         # "The script finished without a done() action" on BOTH exits, so a
         # tester reading a pass was told about an omission in the script rather
         # than about the app. The omission is still disclosed -- second
         # sentence -- because it is why there is no model-written reason here.
+        # FOUR branches, because two questions are being answered: was anything
+        # verified, and -- if not -- is that an omission in THIS unit of work?
+        #
+        # The verified branch is split. ``_verification_summary`` describes THIS
+        # trace, so when the evidence came from an earlier turn of the run there
+        # is nothing for it to summarise, and the old fallback ("the asserts in
+        # this script passed") would make a per-script claim about run-wide
+        # evidence -- inaccurate on exactly the path ``_verified`` opens here.
+        summary = _verification_summary(trace)
         reason = (
             (
                 "Verified: "
-                + (_verification_summary(trace) or "the asserts in this script passed")
+                + summary
                 + ". The script ended without a done() action, so this verdict "
                 "rests on the asserts above."
+            )
+            if ended_verified and summary
+            else (
+                "This turn ended without a done() action. It asserted nothing "
+                "itself; an earlier turn of this run did, and that is what the "
+                "verdict rests on."
             )
             if ended_verified
             else (
                 "The script finished without a done() action. Nothing in it "
                 "asserted anything, so there is no evidence this case passed "
                 "-- a screen that moved is activity, not verification."
+            )
+            if ctx.asserts_expected
+            else (
+                "This turn ended without a done() action and asserted nothing, "
+                "which is ordinary for an exploratory turn -- it recorded what "
+                "the screen did. No verdict is claimed for it. The run's "
+                "verdict comes from the turn that judges the goal."
             )
         )
         return {

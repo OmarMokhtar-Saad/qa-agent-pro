@@ -426,28 +426,84 @@ async def display_size(serial: str) -> dict:
     return {"error": None, "content": size}
 
 
+#: ONE device shell command, not two adb round trips.
+#:
+#: Worth ~2.1s per action, measured on mrun-20260905-051728: a `wait 500` took
+#: 2564ms and a `wait 3000` took 5086ms. A wait sends no input at all, so the
+#: ~2.06s both overshoot by is fixed overhead, and it was being paid once per
+#: action.
+#:
+#: The dumper's STDOUT goes to /dev/null because it prints "UI hierchary dumped
+#: to: <path>" and adb interleaves that line with the XML -- which is the whole
+#: reason `uiautomator dump /dev/tty` was tried and REVERTED. That path is not
+#: re-taken here: the XML still comes from `cat` of a staged file.
+#:
+#: `2>&1` is on the CAT, not on the dump, on purpose: it is what lets a run that
+#: produced no file say so in the device's own words ("cat: ...: No such file")
+#: instead of being reported as a secure window.
+#:
+#: Passed as ONE argv element. `shell` builds an argv LIST run by
+#: `create_subprocess_exec`, so NO host shell is ever spawned on any platform
+#: and `;` and `>` are never interpreted locally -- they reach the device's sh,
+#: which is the point. One element rather than several because newer adb
+#: shell-escapes individual arguments, which would turn `>/dev/null` into a
+#: literal; a single quoted string is the universally supported form and is what
+#: Windows' list2cmdline round-trips correctly through adb.exe.
+_DUMP_COMMAND = (
+    "uiautomator dump " + DUMP_REMOTE_PATH + " >/dev/null 2>&1; "
+    "cat " + DUMP_REMOTE_PATH + " 2>&1"
+)
+
+
 async def uiautomator_dump(serial: str) -> dict:
     """The current screen's uiautomator XML, as a string.
 
-    Two calls: dump to a device path, then ``cat`` it back. Piping straight to
-    ``/dev/tty`` is shorter and unreliable -- adb interleaves the dumper's own
-    progress line with the XML.
+    ONE adb round trip -- see :data:`_DUMP_COMMAND` for why it is shaped the way
+    it is, and for the `/dev/tty` path this deliberately does NOT take.
+
+    The two halves no longer have separate error RETURNS, because there is one
+    call and adb reports one transport failure. What still distinguishes them is
+    the device's own output, and it is quoted back rather than swallowed: a dump
+    that never wrote a file leaves `cat` to speak, and those words LEAD the
+    error rather than trailing an explanation that contradicts them; the secure
+    window is named after them, as one cause. Only a dump that produced no
+    output AT ALL is reported as a secure window first, because nothing else is
+    known in that branch. `rc`
+    was ignored on both calls before and is ignored now; with `;` it would be
+    `cat`'s rc either way.
     """
-    staged = await shell(
-        serial, ["uiautomator", "dump", DUMP_REMOTE_PATH], timeout=DUMP_TIMEOUT_S
-    )
-    if staged.get("error"):
-        return staged
-    read = await shell(serial, ["cat", DUMP_REMOTE_PATH], timeout=DUMP_TIMEOUT_S)
+    read = await shell(serial, [_DUMP_COMMAND], timeout=DUMP_TIMEOUT_S)
     if read.get("error"):
         return read
     xml = str((read["content"] or {}).get("out") or "")
     if not xml.lstrip().startswith("<"):
+        said = " ".join(xml.split())[:200]
+        if said:
+            # The device SPOKE, so its words LEAD. `cat: ...: No such file`
+            # means the dumper never wrote a file, and a reply that opens with
+            # "a secure window blocks the dump" sends the tester's model to
+            # change screens when the cause is elsewhere -- it reads the first
+            # sentence. The secure window is named after, as one cause.
+            return {
+                "error": (
+                    "The device said: "
+                    + said
+                    + " -- uiautomator produced no XML for this screen. If "
+                    "those words name a missing dump file, the dumper did not "
+                    "run; a secure window (a password field or a payment "
+                    "sheet) is one cause, and moving past it or using a screen "
+                    "that allows accessibility is the fix."
+                ),
+                "content": None,
+            }
+        # Nothing came back at all. There are no device words to lead with, so
+        # the likeliest cause is all this branch has to offer.
         return {
             "error": (
-                "uiautomator returned no XML for this screen. A secure window "
-                "(a password field or a payment sheet) blocks the dump; move "
-                "past it or use a screen that allows accessibility."
+                "uiautomator returned no XML for this screen and the device "
+                "said nothing. A secure window (a password field or a payment "
+                "sheet) blocks the dump; move past it or use a screen that "
+                "allows accessibility."
             ),
             "content": None,
         }

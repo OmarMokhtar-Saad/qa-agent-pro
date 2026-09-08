@@ -117,6 +117,12 @@ END_ID = "qa-report-end"
 #: Re-exported from `run_store`, which is the layer that decides whether a
 #: case will be handed out again. Two literals drifted once already.
 DONE_VERDICTS = run_store.DONE_VERDICTS
+#: Re-exported for the same reason ``DONE_VERDICTS`` is: ONE producer of
+#: "reached a verdict", in the layer that owns what a verdict means, read here
+#: and by the chat surface. A local copy is how the last such value came to
+#: have three definitions.
+verdict_coverage = run_store.verdict_coverage
+coverage_phrase = run_store.coverage_phrase
 
 #: Tiles always rendered, in this order, so a zero is visible rather than absent.
 TILES = (
@@ -1185,7 +1191,7 @@ def _vstrip(facts: dict) -> str:
         why = (
             "this case has not reached a verdict — its status is <b>"
             + esc(facts["status"] or "unknown", 40)
-            + "</b>, so nothing here is final yet"
+            + "</b>, so its own record is not a judgement"
         )
     return (
         '<div class="vstrip '
@@ -1443,6 +1449,7 @@ def _facts_strip(
     lease: dict,
     partial: bool,
     loaded: dict | None = None,
+    coverage: dict | None = None,
 ) -> str:
     holder = _text(lease.get("session_id"), 40)
     displaced = _text(lease.get("taken_over_from"), 40)
@@ -1466,13 +1473,16 @@ def _facts_strip(
             "run " + esc(run_id, 64),
             "",
         ),
+        # TWO values, TWO names. The cell's VALUE is the run LIFECYCLE
+        # (``partial``); its sub-line is VERDICT COVERAGE, which is a different
+        # question -- a finished run can have reached no verdict at all, and
+        # this cell used to claim the opposite in exactly that case. The tone
+        # follows either being a gap, because either is.
         (
             "state",
             "in progress" if partial else "finished",
-            "some cases have no verdict yet"
-            if partial
-            else "every planned case reached a verdict",
-            "gap" if partial else "ok",
+            esc(coverage_phrase(coverage), 200),
+            "gap" if (partial or not (coverage or {}).get("complete")) else "ok",
         ),
     ]
     if loaded:
@@ -1560,7 +1570,7 @@ def _segbar(counts: dict) -> str:
     )
 
 
-def _summary_html(tally: dict, total: int) -> str:
+def _summary_html(tally: dict, total: int, coverage: dict | None = None) -> str:
     """The machine-readable totals the selfcheck compares, wrapping the outcome tiles."""
     ordered = [(name, int(tally.get(name) or 0)) for name in TILES]
     ordered += [
@@ -1579,7 +1589,9 @@ def _summary_html(tally: dict, total: int) -> str:
             + str(int(tally.get("fail") or 0))
             + " failed · "
             + str(int(tally.get("blocked") or 0))
-            + ' blocked · <a href="#cases">all cases →</a>'
+            + " blocked · "
+            + esc(coverage_phrase(coverage), 200)
+            + ' · <a href="#cases">all cases →</a>'
         ),
         hero=True,
     )
@@ -1605,6 +1617,7 @@ def _overview(
     screens: object = None,
     app: str = "",
     loaded: dict | None = None,
+    coverage: dict | None = None,
 ) -> str:
     steps = sum(len(f["rows"]) for f in facts)
     walls = [f["wall"] for f in facts if f["wall"] is not None]
@@ -1669,13 +1682,20 @@ def _overview(
             str(planned),
             "cases planned",
             (
-                "in progress — "
-                + str(max(0, planned - len(facts)))
-                + " not yet checkpointed"
+                (
+                    "in progress — "
+                    + str(max(0, planned - len(facts)))
+                    + " not yet checkpointed · "
+                )
+                if partial
+                else ""
             )
-            if partial
-            else "every planned case reached a verdict",
-            tone="c-gap" if partial else "c-pass",
+            + esc(coverage_phrase(coverage), 200),
+            tone=(
+                "c-gap"
+                if (partial or not (coverage or {}).get("complete"))
+                else "c-pass"
+            ),
         ),
     ]
     note = (
@@ -1722,7 +1742,7 @@ def _overview(
             ),
         )
     return (
-        _summary_html(tally, len(facts))
+        _summary_html(tally, len(facts), coverage)
         + '<div class="kpis run">'
         + "".join(run_tiles)
         + ("".join(ev_render.overview_tiles(loaded)) if loaded else "")
@@ -1965,17 +1985,22 @@ def _toolbar(facts: list, loaded: dict | None = None) -> str:
 
 
 def _cases_section(
-    facts: list, screens: object, app: str, loaded: dict | None = None
+    facts: list,
+    screens: object,
+    app: str,
+    loaded: dict | None = None,
+    coverage: dict | None = None,
 ) -> str:
     cards = "".join(_card_html(f, screens, app, loaded) for f in facts)
-    done = sum(1 for f in facts if f["verdict"] in DONE_VERDICTS)
+    # NOT re-counted here. This lede and the four surfaces around it are ONE
+    # number with one meaning, produced once by ``verdict_coverage``.
     lede = (
         str(len(facts))
         + " case"
         + ("" if len(facts) == 1 else "s")
-        + " checkpointed, "
-        + str(done)
-        + " of them with a verdict. Open a case for its screens, every action and the reason it "
+        + " checkpointed — "
+        + esc(coverage_phrase(coverage), 200)
+        + ". Open a case for its screens, every action and the reason it "
         "ended the way it did. Press <kbd>/</kbd> to search."
     )
     body = (
@@ -2047,6 +2072,21 @@ def _findings_section(manifest: dict, turns: int) -> str:
         replayed = max(0, int(turns or 0))
     except (TypeError, ValueError, OverflowError):
         replayed = 0
+    # The CARD count under-counts turns: a turn whose script failed to parse
+    # returns before it is checkpointed (``session._submit_explore``), while
+    # ``explore_runner.next_turn`` had already incremented and persisted the
+    # turn number -- so mrun-20260907-174354-758700 replayed 19 turns, wrote 17
+    # cards, and this lede said "17 turns" with no silent turns at all.
+    # The manifest's own counter is taken when it is LARGER; a smaller value
+    # (an older build that never wrote one, a manifest not yet persisted) would
+    # under-count in the other direction, and the lede must never claim fewer
+    # turns than there are cards on the page.
+    try:
+        recorded = max(0, int(explore.get("turn") or 0))
+    except (TypeError, ValueError, OverflowError):
+        recorded = 0
+    if recorded > replayed:
+        replayed = recorded
     # Counted by DISTINCT turn, never by row. A turn resubmitted with a finding
     # appends a second row while leaving ONE checkpoint, so a row count read
     # "2 findings over 1 turn" and drove the silent count negative into its own
@@ -2117,8 +2157,14 @@ def _document(
     lease: dict,
     tally: dict,
     partial: bool,
+    coverage: dict | None = None,
 ) -> str:
     facts = [_case_facts(case, manifest) for case in cases]
+    # Defaulted rather than required, so a caller that has not computed it still
+    # gets THE producer's answer and never a locally invented one.
+    coverage = (
+        coverage if isinstance(coverage, dict) else verdict_coverage(cases, manifest)
+    )
     app = _app_label(manifest)
     # The app's side of the run (plan P3): read ONCE, joined to the cases, and
     # handed to every section. Never raises; a run without a capture, or a
@@ -2172,9 +2218,9 @@ def _document(
             ),
             (
                 "State",
-                "in progress — some cases have no verdict yet"
-                if partial
-                else "finished — every planned case reached a verdict",
+                ("in progress" if partial else "finished")
+                + " — "
+                + esc(coverage_phrase(coverage), 200),
             ),
         )
     )
@@ -2184,7 +2230,7 @@ def _document(
             "At a glance",
             "the run in numbers",
             "Every figure here is about what the emulator DID with a case. Whether the app is right is the tester's question, not this one.",
-            _overview(facts, tally, manifest, partial, screens, app, loaded),
+            _overview(facts, tally, manifest, partial, screens, app, loaded, coverage),
         )
         + _sechead(
             "coverage",
@@ -2208,7 +2254,7 @@ def _document(
             _perf(facts, loaded),
         )
         + findings
-        + _cases_section(facts, screens, app, loaded)
+        + _cases_section(facts, screens, app, loaded, coverage)
         + '<div id="'
         + END_ID
         + '" data-cards="'
@@ -2240,7 +2286,9 @@ def _document(
                     "assertion and the screen before and after."
                 ),
                 "META": meta,
-                "FACTS": _facts_strip(run_id, manifest, lease, partial, loaded),
+                "FACTS": _facts_strip(
+                    run_id, manifest, lease, partial, loaded, coverage
+                ),
                 "SECTIONS": sections,
                 "FOOTER_META": _footer_html(run_id, manifest),
                 "SOURCE_STAMP": esc(str(run_id) + ":" + digest, 80),
@@ -2342,6 +2390,7 @@ def render(run_id: str) -> dict:
         # so the module looks alive and returns nothing. Found by EXECUTING.
         counts = tally(cases)
         partial = _is_partial(manifest, cases, counts)
+        coverage = verdict_coverage(cases, manifest)
         page = _document(
             run_id=str(run_id),
             manifest=manifest,
@@ -2350,6 +2399,7 @@ def render(run_id: str) -> dict:
             lease=lease,
             tally=counts,
             partial=partial,
+            coverage=coverage,
         )
         target = paths.run_dir(str(run_id)) / REPORT_FILE
         written = _write_page(target, page)
@@ -2360,6 +2410,7 @@ def render(run_id: str) -> dict:
             "content": {
                 "path": str(target),
                 "partial": partial,
+                "verdict_coverage": coverage,
                 "cards": len(cases),
                 "totals": counts,
                 "bytes": len(page.encode("utf-8")),

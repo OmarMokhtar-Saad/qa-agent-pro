@@ -340,6 +340,22 @@ class AssertAction(_Base):
     so ANY navigation satisfies it and it is never evidence that an answer
     arrived. The 2026-09-04 live run asserted it after each send and read the
     result as "the assistant replied"; it was not.
+
+    THE OPERAND. For ``text_present`` and ``text_absent``, the string to look
+    for may be given EITHER as ``text`` OR as ``target.text`` -- that is,
+    ``target: {"text": "..."}``, the same shape every other op uses to name
+    something on screen. Whichever you send, the check is identical; if you
+    send both, ``text`` wins. Sending neither is refused.
+
+    ``target.text`` is spelled here exactly as the REFUSAL spells it, and that
+    is deliberate rather than cosmetic. This docstring IS the schema the model
+    is handed, so prose that describes the rule without ever naming the key
+    leaves the model guessing the spelling -- which is the position that
+    produced the original defect. One name, spelled one way, in the schema and
+    in the error.
+
+    A ``target`` carrying no selector at all is refused one layer lower, by
+    ``Target`` itself, and never reaches this rule.
     """
 
     op: Literal["assert"]
@@ -352,8 +368,33 @@ class AssertAction(_Base):
 
     @model_validator(mode="after")
     def kind_has_its_operand(self) -> "AssertAction":
-        if self.kind in ("text_present", "text_absent") and not self.text.strip():
-            raise ValueError(self.kind + " needs text")
+        if self.kind in ("text_present", "text_absent"):
+            # ADOPT `target.text` as the operand rather than reword the refusal.
+            # `target: {"text": ...}` is the shape EVERY OTHER op uses to name
+            # something on screen, so a model reasonably reaches for it here too
+            # -- and a live run did: mrun-20260905-051728 was refused with
+            # "text_present requires text", spent a turn, and retried with the
+            # bare field. Rewording removes that one instance; widening removes
+            # the class.
+            #
+            # Normalised HERE, at the model, and that placement is the whole
+            # design: `executor._evaluate_assert` reads `.text` and nothing else
+            # for these two kinds, so it sees the canonical shape and needs no
+            # change. There is no second site to keep in step, and therefore no
+            # half-wired consumer. `target` is deliberately LEFT in place: the
+            # executor already resolves a target on an assert and already falls
+            # through when it does not match (`op not in ("scroll", "assert")`),
+            # so leaving it keeps the shipped path byte-for-byte.
+            #
+            # Both fields cap at 200, so an adopted operand cannot overflow the
+            # field it lands in.
+            if not self.text.strip() and self.target is not None:
+                self.text = self.target.text
+            if not self.text.strip():
+                raise ValueError(
+                    self.kind + " needs the text to look for, in `text` or in "
+                    "`target.text`"
+                )
         if self.kind == "element" and self.target is None:
             raise ValueError("assert element needs a target")
         return self
@@ -1038,7 +1079,9 @@ def describe_vocabulary() -> dict:
             + str(MAX_WAIT_MS)
             + ") or until_text; assert kinds are "
             + ", ".join(ASSERT_KINDS)
-            + ".",
+            + ". text_present/text_absent take the string to look for in "
+            "`text` OR in `target.text` -- either is accepted, and `text` "
+            "wins if you send both.",
             "To check that the app REPLIED, use assert new_text (optionally with "
             "contains): it passes only when text appeared that was not on the "
             "previous screen. screen_changed is WEAK -- any navigation "

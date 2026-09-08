@@ -915,6 +915,12 @@ def context_for(resolved: object) -> executor.Context:
         serial=str(body.get("serial") or ""),
         package=str(body.get("package") or ""),
         activity=str(body.get("activity") or ""),
+        # The lane decides whether a script that asserted nothing is an
+        # omission worth naming. Set HERE, at the one production construction
+        # site, which both explore entry points (``next_packet`` and
+        # ``submit``) already go through -- so the value cannot reach the
+        # executor by one path and not the other.
+        asserts_expected=str(body.get("lane") or "") != LANE_EXPLORE,
     )
 
 
@@ -1003,6 +1009,33 @@ def resolve(run_id: str, session_token: str = "") -> dict:
 def summary(run_id: str) -> dict:
     """Every checkpoint body for a run, newest verdicts included."""
     return run_store.list_cases(run_id)
+
+
+def coverage_line(resolved: object, cases: object) -> str:
+    """The ONE verdict-coverage sentence for a resolved run. Never raises.
+
+    Thin on purpose. The producer is ``run_store.verdict_coverage`` /
+    ``coverage_phrase`` -- the same pair ``report.py`` renders from -- and this
+    is only the seam that lets the chat surface reach it without ``render.py``
+    importing a store: that module imports nothing internal, and the two blocks
+    of one status reply must print the SAME string rather than two counts that
+    disagree about whether a status may stand in for a verdict.
+    """
+    try:
+        body = resolved if isinstance(resolved, dict) else {}
+        return run_store.coverage_phrase(
+            run_store.verdict_coverage(
+                cases,
+                {
+                    "lane": body.get("lane"),
+                    "total": body.get("total"),
+                    "explore": body.get("explore"),
+                },
+            )
+        )
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("mobile.session: could not summarise verdict coverage")
+        return ""
 
 
 def list_runs(limit: int = 10) -> dict:
@@ -1290,6 +1323,38 @@ def _latest_finding(state: object) -> str:
     return ""
 
 
+def _explore_prior_verified(run_id: str) -> bool:
+    """True when an EARLIER turn of this run recorded an ``assert_pass``.
+
+    The explore lane checkpoints one turn as one case, so the turn that calls
+    ``done`` has a trace of its own that can never carry the check an earlier
+    turn made. The unit that earns a verdict here is the RUN -- the goal -- so
+    the evidence is read run-wide and handed to the executor as an explicit
+    input (``executor.Context.prior_verified``). The executor still knows
+    nothing about runs, and the scripted lane is untouched because that field
+    defaults to False.
+
+    The OUTCOME is what counts, not the presence of an assert: a run whose only
+    check FAILED has verified nothing.
+
+    Never raises: an unreadable case store is "no prior evidence".
+    """
+    try:
+        listed = run_store.list_cases(run_id) or {}
+        for body in listed.get("content") or []:
+            if not isinstance(body, dict):
+                continue
+            for item in list(body.get("trace") or []):
+                if (
+                    isinstance(item, dict)
+                    and str(item.get("outcome") or "") == "assert_pass"
+                ):
+                    return True
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("mobile.session: could not read this run's prior evidence")
+    return False
+
+
 def _explore_planned_case(tc_id: str, state: object, finding: str = "") -> dict:
     """The turn as a MINIMAL valid ``TestCase`` dump, for ``manifest["cases"]``.
 
@@ -1333,7 +1398,11 @@ def _explore_planned_case(tc_id: str, state: object, finding: str = "") -> dict:
 
 
 def _checkpoint_explore_turn(
-    run_id: str, state: object, outcome: object, finding: str = ""
+    run_id: str,
+    state: object,
+    outcome: object,
+    finding: str = "",
+    verdict: str = "",
 ) -> dict:
     """Write ONE exploratory turn as a case-shaped record. Never raises.
 
@@ -1342,10 +1411,13 @@ def _checkpoint_explore_turn(
     submit path. Returns the body it wrote (or tried to), because the caller
     reports the same id and title back to the tester.
 
-    The record carries a STATUS and no verdict, deliberately. An exploratory
-    turn has no expected result, so it has no verdict to earn;
-    ``report._verdict_of`` then shows the status and explicitly never invents a
-    pass, which is the honest rendering of a turn that simply happened.
+    The record carries a STATUS and, on every turn but one, no verdict. An
+    exploratory turn has no expected result, so it has none to earn, and
+    ``report._verdict_of`` shows the status instead -- never inventing a pass.
+    The exception is a turn whose ``done()`` judged the goal: the unit that
+    earns a verdict in this lane is the RUN, and the caller passes that verdict
+    in so the case-driven report has one to render, in the same field the suite
+    lane uses.
     """
     body = state if isinstance(state, dict) else {}
     result = outcome if isinstance(outcome, dict) else {}
@@ -1359,7 +1431,7 @@ def _checkpoint_explore_turn(
     written = {
         "tc_id": tc_id,
         "title": (EXPLORE_TITLE_PREFIX + str(turn) + " \u2014 " + goal)[:250],
-        "verdict": "",
+        "verdict": str(verdict or ""),
         "status": str(result.get("status") or ""),
         "reason": str(result.get("reason") or "")[:1200],
         "trace": list(result.get("trace") or []),
@@ -1505,6 +1577,9 @@ async def _submit_explore(
                 "resolved": resolved,
             },
         }
+    # Run-wide evidence, read from the checkpoints this run already wrote and
+    # passed in EXPLICITLY. See ``_explore_prior_verified``.
+    ctx.prior_verified = _explore_prior_verified(run_id)
     replayed = await executor.replay(parsed["content"], ctx)
     if replayed.get("error"):
         return replayed
@@ -1519,10 +1594,62 @@ async def _submit_explore(
     # and is the same on a resubmit.
     before = resolved.get("explore") or {}
     finding = _latest_finding(turn.get("state"))
-    checkpoint = _checkpoint_explore_turn(run_id, before, outcome, finding)
+    # ONE producer for this turn's verdict, computed once from the replay and
+    # read by BOTH consumers below -- the DISK record and the CHAT reply. They
+    # are two artifacts with two lifetimes, so they stay two sites; what was
+    # wrong is that each was its own producer, writing "" unconditionally.
+    #
+    # Only a turn whose ``done()`` judged the goal writes a verdict; every
+    # other turn keeps "" plus its status, because an exploratory turn has no
+    # expected result to be judged against. It lands in the ordinary
+    # ``verdict`` field, exactly as the suite lane writes it, so
+    # ``run_store.DONE_VERDICTS`` and every reader of it work unchanged and no
+    # verdict reaches the report by a second route.
+    #
+    # The condition is STATED, not inferred from the producer. The premise this
+    # line used to rest on -- "the executor returns a verdict only from a
+    # ``done`` op" -- is false: ``executor.replay``'s no-done exit returns
+    # ``unverified`` too, so reading the field alone recorded a turn that
+    # merely acted as one that had reached a verdict. ``unverified`` IS in
+    # ``DONE_VERDICTS``, so that would have made D1's coverage count true and
+    # meaningless in the same breath -- every turn "with a verdict", none of
+    # them judged.
+    ended = any(
+        str((entry.get("action") or {}).get("op") or "") == "done"
+        for entry in list(outcome.get("trace") or [])
+        if isinstance(entry, dict)
+    )
+    verdict = str(outcome.get("verdict") or "") if ended else ""
+    checkpoint = _checkpoint_explore_turn(
+        run_id, before, outcome, finding, verdict=verdict
+    )
+    # The replay HAPPENED, so the number this turn was handed is now earned.
+    # This is the only writer that ADVANCES ``committed_turn`` to a number the
+    # ladder has not already earned, and it
+    # sits below every path that ends without a replay: the parse refusal above
+    # returns before ``executor.replay``, a replay error returns before this
+    # line, and a packet nobody ever answers never reaches this module at all.
+    # Each of those leaves the ledger where it was, so
+    # ``explore_runner.next_turn`` re-allocates the SAME number next time and the
+    # report grows neither a gap nor a duplicate card.
+    #
+    # No coercion guard here, and no ``# pragma``. ``apply_turn_result`` above
+    # calls ``explore_runner.stop_reason``, which coerces this same ``turn``, so
+    # on every path where ``state["stop"]`` is empty a junk turn number has
+    # already been answered with a refusal before this line -- a guard here would
+    # be a branch no test can enter, an ungraded clause wearing a note.
+    #
+    # Where ``stop`` is NOT empty, ``stop_reason`` returns before its coercion
+    # and this line does raise; ``submit``'s own try/except contains it and the
+    # caller gets an error dict, never an exception. That corner is why the guard
+    # is deleted rather than corrected: it used to answer with
+    # ``committed_turn = 0``, which restarts numbering at TC-001 over cards the
+    # run already wrote.
+    committed_state = dict(turn.get("state") or {})
+    committed_state["committed_turn"] = int(committed_state.get("turn") or 0)
     _persist_explore(
         run_id,
-        turn.get("state"),
+        committed_state,
         planned=_explore_planned_case(checkpoint["tc_id"], before, finding),
     )
     if str(turn.get("status") or "") != explore_runner.RUNNING:
@@ -1539,7 +1666,7 @@ async def _submit_explore(
                 "tc_id": checkpoint["tc_id"],
                 "title": checkpoint["title"],
                 "status": str(outcome.get("status") or ""),
-                "verdict": "",
+                "verdict": verdict,
                 "reason": str(outcome.get("reason") or ""),
                 "trace": list(outcome.get("trace") or []),
             },
