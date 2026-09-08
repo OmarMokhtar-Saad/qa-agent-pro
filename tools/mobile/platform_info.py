@@ -60,6 +60,140 @@ DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_NO_WINDOW = 0x08000000
 
+# --- THE PLATFORM-SUPPORT TABLE: ONE PRODUCER --------------------------------
+#
+# Every "is this Windows?" in the mobile lane resolves HERE. Five modules used to
+# spell it themselves -- this one, `paths` and `sdk_locator` with
+# `== "win32"`, `open_report` with `.startswith("win")`, and
+# `emulator.python_is_windows`, which had no production caller at all. Five
+# derivations of one boolean in two different spellings is the mirrored-condition
+# drift class, and the copy that differed sat in the one module whose Windows
+# branch (`os.startfile`) has never executed.
+#
+# `tests/mobile/test_mobile_platform_support.py` asserts `sys.platform` is read
+# in no other module under `tools/mobile/`, so a new call site fails BY FILE NAME
+# rather than joining the drift.
+
+MACOS = "macos"
+WINDOWS = "windows"
+
+#: Tester-facing spelling of each os name. The internal keys stay lowercase
+#: because `host_info` has always returned them that way and callers branch on
+#: them; only prose uses these.
+DISPLAY: dict[str, str] = {MACOS: "macOS", WINDOWS: "Windows"}
+
+#: The EVIDENCE vocabulary. Two values, no third: either a real machine has run
+#: the lane end to end or it has not. "Partly" is the answer that let the Windows
+#: claim drift across four documents for a whole phase.
+VALIDATED = "validated-on-hardware"
+SIMULATED = "simulated-only"
+
+#: os name -> evidence. THE ONLY PLACE the project states what has actually been
+#: exercised. :func:`support_statement` DERIVES the disclosure sentence from it,
+#: and that sentence must appear verbatim in CLAUDE.md, docs/MOBILE_TESTING.md,
+#: tools/mobile/__init__.py and scripts/build_dist.py -- so flipping a value here
+#: turns four documents red instead of leaving them quietly wrong.
+SUPPORT: dict[str, str] = {
+    MACOS: VALIDATED,
+    WINDOWS: SIMULATED,
+}
+
+#: What Windows raises when CreateProcess is handed a file that is not an
+#: executable image -- which is what a `.bat` wrapper is. `sdkmanager` and
+#: `avdmanager` ARE `.bat` files there (`sdk_locator.SCRIPT_TOOLS`), and they are
+#: invoked as a bare argv with no shell, so this is the most likely first failure
+#: of a real Windows provisioning run. It is UNPROVEN either way: Microsoft
+#: documents CreateProcess as needing `cmd.exe /c` for a batch file, and no
+#: machine here can settle it.
+#:
+#: IT IS NOT SILENTLY WORKED AROUND. Wrapping the argv in `cmd.exe /c` would hand
+#: the tester's SDK path -- which may legally contain `&`, `^` and `%` -- to cmd's
+#: own parser, and `subprocess.list2cmdline` does not escape those. A guess would
+#: trade an unproven failure for an unproven INJECTION. So the failure is NAMED
+#: instead: which binary, which cause, and that the path is unproven and should be
+#: reported rather than patched around.
+WIN_BATCH_MARKERS: tuple[str, ...] = ("winerror 193", "not a valid win32 application")
+BATCH_SUFFIXES: tuple[str, ...] = (".bat", ".cmd")
+
+
+def is_windows() -> bool:
+    """True on native Windows. THE one producer of that fact in this lane."""
+    return sys.platform == "win32"
+
+
+def is_macos() -> bool:
+    """True on macOS. Same rule as :func:`is_windows`: one producer, one meaning."""
+    return sys.platform == "darwin"
+
+
+def raw_platform() -> str:
+    """The host's own platform string, for REPORTING it -- never for branching.
+
+    `is_windows`/`is_macos` answer every question the lane branches on. This
+    exists because `windows_probe` has to tell a Windows tester what their
+    machine actually calls itself, and a probe that cannot name the host is
+    useless. Keeping the read here rather than in the probe is what lets
+    `tests/mobile/test_mobile_platform_support.py` keep asserting that exactly
+    one module reads `sys.platform`, with no per-file exemption to widen.
+    """
+    return str(sys.platform)
+
+
+def support_statement(os_name: str = WINDOWS) -> str:
+    """The one-sentence support disclosure for *os_name*, DERIVED from :data:`SUPPORT`.
+
+    Derived, never written twice. A pin greps the returned sentence out of every
+    document that carries the claim, so promoting Windows to :data:`VALIDATED`
+    without a real run leaves four documents holding a sentence this function no
+    longer produces -- and the pin names each one. That is what makes the claim
+    checkable in BOTH directions instead of being prose somebody has to remember
+    to update.
+    """
+    name = str(os_name or "")
+    shown = DISPLAY.get(name, name)
+    evidence = SUPPORT.get(name, "")
+    if evidence == VALIDATED:
+        return "The mobile lane has been run end to end on " + shown + " hardware."
+    if evidence == SIMULATED:
+        return (
+            "The mobile lane's "
+            + shown
+            + " branches are exercised only by tests that fake the platform; no "
+            + shown
+            + " machine has run the lane."
+        )
+    return "The mobile lane does not support " + (shown or "that host") + "."
+
+
+def _os_error_detail(cmd: list[str], exc: OSError) -> str:
+    """*exc* as a message, NAMING the Windows batch-wrapper case when it is one.
+
+    Three clauses, and each is graded by a fixture where only IT can reject the
+    impostor: the platform, the `.bat` suffix, and the Win32 marker text. A
+    non-batch OSError on Windows and a batch-shaped OSError on POSIX both fall
+    through to the raw string, because dressing up an error we have not
+    identified is how a wrong diagnosis gets believed.
+    """
+    raw = str(exc)
+    binary = str(cmd[0]) if cmd else ""
+    lowered = (raw + " " + str(getattr(exc, "strerror", "") or "")).lower()
+    looks_like_batch = binary.lower().endswith(BATCH_SUFFIXES)
+    marked = any(marker in lowered for marker in WIN_BATCH_MARKERS)
+    if is_windows() and looks_like_batch and marked:
+        return (
+            "Windows refused to run "
+            + binary
+            + " directly: a .bat wrapper is not an executable image, so "
+            "CreateProcess rejected it ("
+            + raw
+            + "). THIS PATH IS UNPROVEN -- no Windows machine has run this lane. "
+            "Please report this line together with the full path above, and do "
+            "not work around it by editing the file. To tell our invocation "
+            "apart from a broken SDK, run the same command yourself in a Command "
+            "Prompt: if it works there, the fault is ours."
+        )
+    return raw
+
 
 def _run_sync(cmd: list[str], timeout: int = TIMEOUT_S) -> tuple[int, str, str]:
     """Run *cmd* with no shell and a mandatory timeout.
@@ -82,7 +216,7 @@ def _run_sync(cmd: list[str], timeout: int = TIMEOUT_S) -> tuple[int, str, str]:
     except subprocess.TimeoutExpired:
         return 124, "", "timed out after " + str(timeout) + "s"
     except OSError as exc:
-        return 126, "", str(exc)
+        return 126, "", _os_error_detail(cmd, exc)
     out = (proc.stdout or b"").decode(errors="replace")
     err = (proc.stderr or b"").decode(errors="replace")
     return int(proc.returncode or 0), out, err
@@ -100,12 +234,12 @@ def normalize_arch(machine: str) -> str:
 
 def exe(name: str) -> str:
     """Executable file name for this host: ``adb`` -> ``adb.exe`` on Windows."""
-    return name + ".exe" if sys.platform == "win32" else name
+    return name + ".exe" if is_windows() else name
 
 
 def script(name: str) -> str:
     """cmdline-tools ship ``.bat`` wrappers on Windows (sdkmanager, avdmanager)."""
-    return name + ".bat" if sys.platform == "win32" else name
+    return name + ".bat" if is_windows() else name
 
 
 def detach_kwargs() -> dict:
@@ -116,7 +250,7 @@ def detach_kwargs() -> dict:
     process group, which is the equivalent, and ``CREATE_NO_WINDOW`` so no
     console flashes in the tester's face.
     """
-    if sys.platform == "win32":
+    if is_windows():
         return {
             "creationflags": DETACHED_PROCESS
             | CREATE_NEW_PROCESS_GROUP
@@ -138,7 +272,7 @@ def no_window_kwargs() -> dict:
     ``subprocess`` tolerates the zero, but ``asyncio.create_subprocess_exec``
     does not accept the keyword at all there, and ``adb`` is an async caller.
     """
-    if sys.platform == "win32":
+    if is_windows():
         return {"creationflags": CREATE_NO_WINDOW}
     return {}
 
@@ -193,23 +327,28 @@ def host_info() -> dict:
     try:
         plat = sys.platform
         arch = normalize_arch(platform.machine())
-        if plat == "darwin":
-            os_name = "macos"
-        elif plat == "win32":
-            os_name = "windows"
+        if is_macos():
+            os_name = MACOS
+        elif is_windows():
+            os_name = WINDOWS
         else:
             os_name = plat or "unknown"
         image_abi = ARM64_ABI if arch == "arm64" else X86_64_ABI
         emulator_ok = True
         reason = ""
-        if os_name == "windows" and arch == "arm64":
+        # The ARCH clause stays an EXPLICIT refusal rather than becoming
+        # `arch in SUPPORT[os_name]["arches"]`. A table-driven arch test would
+        # newly refuse a host whose `normalize_arch` answered "unknown", which
+        # proceeds today -- a behaviour change with no Windows evidence behind
+        # it. OS membership is derived (below); the arch decision is not.
+        if os_name == WINDOWS and arch == "arm64":
             emulator_ok = False
             reason = (
                 "Windows on ARM is not supported by the mobile lane: Google "
                 "publishes no Android emulator build for it, so there is "
                 "nothing to download. Use an x86_64 Windows machine or a Mac."
             )
-        elif os_name not in ("macos", "windows"):
+        elif os_name not in SUPPORT:
             emulator_ok = False
             reason = (
                 "The mobile lane supports macOS and native Windows only; this "

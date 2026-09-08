@@ -31,7 +31,14 @@ import time
 from pathlib import Path
 
 from config.settings import settings
-from tools.mobile import downloader, locks, paths, platform_info, sdk_locator
+from tools.mobile import (
+    downloader,
+    locks,
+    paths,
+    platform_info,
+    render,
+    sdk_locator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +61,55 @@ WORST_CASE_BYTES = int(2.6 * 1024 * 1024 * 1024)
 
 #: Per-command timeout. sdkmanager unpacks a system image, which is slow.
 STEP_TIMEOUT_S = 1800
+
+#: The acknowledgement, in the two spellings it travels in. ONE PRODUCER: the
+#: argv token is DERIVED from the tool argument's name, because these two are
+#: the same consent in two transports and a hand-written pair drifts -- the
+#: refusal would then name an argument the child does not parse.
+VIRT_ACK_ARG = "virtualization_ack"
+VIRT_ACK_FLAG = "--" + VIRT_ACK_ARG.replace("_", "-")
+
+#: Longest a virtualization refusal may be. It is published into the
+#: provisioning record and rendered field-by-field, and ``render._MAX_FIELD_CHARS``
+#: is 360 -- a longer refusal is one whose TAIL the tester never reads. The
+#: message therefore names the override BEFORE the detail it truncates.
+VIRT_REFUSAL_MAX_CHARS = 300
+
+#: Did THIS PROCESS proceed past a NEGATIVE virtualization verdict because the
+#: tester acknowledged it? Process-scoped and ASSIGNED, never or-ed, so a later
+#: clean check in the same process clears it.
+#:
+#: It is state rather than a parameter because the two ends are not in one
+#: process: ``start_detached`` re-enters ``run()`` in a CHILD, and a run resumed
+#: by ``run_id`` from another chat is a third process again. The fact reaches
+#: ``emulator.wait_boot`` through the record ``_publish`` writes, which is the
+#: only thing those processes share -- and which is already aged.
+_virt_overridden = False
+
+
+def _note_virtualization_override(virt: dict, ack: bool) -> bool:
+    """Remember that a NEGATIVE verdict was dismissed by an acknowledgement.
+
+    Both clauses matter and each is graded on its own row: an ack on a machine
+    the probe PASSED overrode nothing, and a negative verdict with no ack never
+    got past the refusal below. Fed the same ``virt`` dict the refusal reads --
+    derived once, never re-probed, because two derivations of one answer drift.
+    """
+    global _virt_overridden
+    _virt_overridden = bool(ack) and not (virt or {}).get("ok", False)
+    return _virt_overridden
+
+
+def _virtualization() -> dict:
+    """The virtualization-probe seam. One producer, called -- not re-derived.
+
+    ``platform_info.virtualization`` already queries ``HypervisorPlatform`` on
+    Windows and ``kern.hv_support`` on macOS and is already read by
+    ``preflight.check`` / ``handle_mobile_status``. It was simply never
+    consulted by the function that spends 2.2GB. This wrapper exists so the
+    mobile suite can stay hermetic, not to add logic.
+    """
+    return (platform_info.virtualization() or {}).get("content") or {}
 
 
 def download_cap_bytes() -> int:
@@ -311,7 +367,41 @@ def _progress_path() -> Path:
 
 
 def _publish(payload: dict) -> None:
-    downloader.write_progress(_progress_path(), payload)
+    """Write the machine-wide progress record, STAMPED with the time.
+
+    THE ONE PRODUCER of ``written_at``. This record has no run identity and
+    lives at a single machine-wide path, so its only defence against being read
+    as "what is happening now" is its age -- and until 2026-09-08 it carried
+    none. A five-day-old ``{"error": "kill-switch off"}`` was printed as the
+    FIRST line of ``qa_mobile_status`` on a machine where the lane was ENABLED
+    and seven runs had already started; two independent tester agents read it,
+    concluded the kill-switch was closed, and abandoned the task.
+
+    Set UNCONDITIONALLY, never ``setdefault``: one producer, one meaning. A
+    caller-supplied stamp would make the field mean "when somebody said so",
+    and ``render.provisioning_section`` -- the one consumer that ages it --
+    has no way to tell the two apart.
+
+    ``downloader.write_progress`` is deliberately NOT the site. It is shared:
+    ``session._install_state_path()`` writes the install-state record through
+    it, and ``downloader`` writes its own in-download progress through it. Both
+    have their own readers, and neither is answering the question this stamp
+    exists for.
+    """
+    body = dict(payload) if isinstance(payload, dict) else {}
+    body["written_at"] = time.time()
+    # Stamped on the same line of code as the age, so no record can ever carry
+    # the claim without the thing that expires it. Absent -- not False -- when
+    # this process overrode nothing, so a clean run erases a previous one.
+    if _virt_overridden:
+        body[render.VIRT_OVERRIDE_FIELD] = True
+        # WHICH emulator the override was spent on, stamped on the same branch
+        # so the claim and its scope cannot come apart. `render` emits its
+        # sentence only when this name matches the AVD of the device that
+        # actually failed to boot -- an overridden probe explains nothing about
+        # a tester's USB phone or somebody else's AVD.
+        body[render.VIRT_OVERRIDE_AVD_FIELD] = AVD_NAME
+    downloader.write_progress(_progress_path(), body)
 
 
 def read_progress() -> dict:
@@ -329,7 +419,7 @@ def read_progress() -> dict:
         return {"error": str(exc), "content": None}
 
 
-def run(apply: bool = False) -> dict:
+def run(apply: bool = False, virtualization_ack: bool = False) -> dict:
     """Execute the pending steps (``apply=True``) or report them.
 
     ``{"error", "content": {"executed": [...], "would_run": [...],
@@ -488,6 +578,66 @@ def run(apply: bool = False) -> dict:
             }
 
         if pending:
+            # NOTHING IS DOWNLOADED ONTO A HOST THAT CANNOT RUN AN EMULATOR.
+            # The detector for this already existed and was read by
+            # `qa_mobile_status`; the function that spends the bytes never
+            # asked. On a real machine (VT-x off in firmware, no admin rights)
+            # the whole 2.2GB was wasted and the failure surfaced minutes later
+            # at launch.
+            #
+            # HERE, and only here, for three reasons that are each pinned:
+            # `run()` is the ONLY function that spends bytes -- `--apply` on the
+            # command line and the child `start_detached` spawns both re-enter
+            # it -- so one gate cannot be walked around; `apply=False` never
+            # reaches it, so the dry run a tester decides from still spawns
+            # nothing; and nothing pending never reaches it, so a provisioned
+            # machine and an unsupported host (whose plan returns early with no
+            # pending steps) pay ZERO. Cost in the good case: one
+            # `kern.hv_support` read in milliseconds, or one PowerShell query
+            # bounded by POWERSHELL_TIMEOUT_S, against a multi-minute download.
+            #
+            # BELOW THE TWO REAL GUARDS, DELIBERATELY. The kill-switch check at
+            # the top of this function and `apply` itself are already passed by
+            # the time this runs, so the acknowledgement cannot reach anything
+            # they refuse: it dismisses an ambiguous VIRTUALIZATION PROBE and
+            # nothing else.
+            #
+            # OVERRIDABLE, deliberately. `_windows_virtualization` says in its
+            # own words that a failed query is "NOT proof the feature is off",
+            # and the locked-down corporate box that motivated this is exactly
+            # the machine that takes that branch. A refusal that cannot be
+            # overridden turns an ambiguous probe into a verdict and strands a
+            # tester whose machine works -- the same class of defect as the one
+            # being fixed. So it takes the shape this repo already teaches every
+            # calling agent: a refusal that NAMES its acknowledgement argument,
+            # accepted on a LATER call and never on the turn it was refused.
+            virt = _virtualization()
+            # Recorded BEFORE the branch and from the SAME verdict, so the
+            # overriding path -- the one that falls through -- cannot forget it.
+            _note_virtualization_override(virt, virtualization_ack)
+            if not virt.get("ok", False) and not virtualization_ack:
+                message = (
+                    "Nothing was downloaded: this machine reports no usable "
+                    "hardware virtualization, so no emulator can start. Enable "
+                    "it in firmware/BIOS, or call qa_mobile_test again with "
+                    "apply=true and "
+                    + VIRT_ACK_ARG
+                    + "=true to provision anyway. Reported: "
+                    + str(virt.get("detail") or "unknown")
+                )[:VIRT_REFUSAL_MAX_CHARS]
+                _publish(
+                    {
+                        "phase": "error",
+                        "pct": 0,
+                        "bytes": 0,
+                        "message": message,
+                        "error": message,
+                        "pid": os.getpid(),
+                        "started": time.time(),
+                        "updated": time.time(),
+                    }
+                )
+                return {"error": message, "content": None}
             cap = download_cap_bytes()
             if WORST_CASE_BYTES > cap:
                 message = (
@@ -619,6 +769,16 @@ def _run_command(command: list[str], stdin_text: str | None) -> tuple[int, str, 
     ``sdkmanager --licenses`` is interactive and reads ``y`` per licence from
     stdin. The acceptances travel on STDIN rather than as arguments for the
     same reason the IME's secret payload does: argv is world-readable.
+
+    THE CREATION FLAGS ARE NOT OPTIONAL HERE. Every other synchronous child in
+    the lane reaches ``platform_info._run_sync``, which splats
+    ``no_window_kwargs()``; this branch called ``subprocess.run`` directly and
+    passed none, so on Windows the ONE interactive, long-running provisioning
+    step popped a console window over the tester's editor -- while
+    docs/MOBILE_TESTING.md promised in writing that no child process does. The
+    existing test covered the other runner, so the suite was green over a
+    documented falsehood. Pinned at this CALL SITE, not on the helper's return
+    value, because deleting the splat is the mutation that has to go red.
     """
     if stdin_text is None:
         return _run_sync(command)
@@ -629,13 +789,19 @@ def _run_command(command: list[str], stdin_text: str | None) -> tuple[int, str, 
             capture_output=True,
             timeout=STEP_TIMEOUT_S,
             check=False,
+            **platform_info.no_window_kwargs(),
         )
     except FileNotFoundError:
         return 127, "", "not found: " + (command[0] if command else "")
     except subprocess.TimeoutExpired:
         return 124, "", "timed out"
     except OSError as exc:
-        return 126, "", str(exc)
+        # `sdkmanager`/`avdmanager` are `.bat` wrappers on Windows and this is
+        # where a CreateProcess refusal of one lands. Same helper as
+        # `platform_info._run_sync`, so the two runners cannot diagnose the same
+        # failure differently -- cross-module use of the private name follows
+        # the precedent `_run_sync` above already sets.
+        return 126, "", platform_info._os_error_detail(command, exc)
     return (
         int(proc.returncode or 0),
         (proc.stdout or b"").decode(errors="replace"),
@@ -643,7 +809,7 @@ def _run_command(command: list[str], stdin_text: str | None) -> tuple[int, str, 
     )
 
 
-def start_detached() -> dict:
+def start_detached(virtualization_ack: bool = False) -> dict:
     """Launch ``-m tools.mobile.provisioner --apply`` as a detached process.
 
     Returns ``{"error", "content": {"pid", "progress"}}``. The caller returns
@@ -675,6 +841,19 @@ def start_detached() -> dict:
             }
         paths.ensure_tree()
         command = [sys.executable, "-m", "tools.mobile.provisioner", "--apply"]
+        if virtualization_ack:
+            # The acknowledgement travels to the CHILD, because the child is
+            # where the preflight runs. This function probes nothing itself: on
+            # Windows that probe is a PowerShell call bounded at 60s, and this
+            # one runs INSIDE the MCP call. The refusal reaches the tester
+            # through the progress file, which is the channel the handler
+            # already tells them to poll and the one every other run() refusal
+            # already uses.
+            #
+            # AFTER the kill-switch refusal above, which it therefore cannot
+            # reach past: an acknowledged call with the flag off still refuses
+            # by name, and is pinned to.
+            command.append(VIRT_ACK_FLAG)
         kwargs = {
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.DEVNULL,
@@ -750,8 +929,20 @@ def main(argv: list[str] | None = None) -> int:
         help="print the plan for this machine and change nothing",
     )
     group.add_argument("--apply", action="store_true", help="execute the pending steps")
+    parser.add_argument(
+        VIRT_ACK_FLAG,
+        dest=VIRT_ACK_ARG,
+        action="store_true",
+        help=(
+            "provision even though this host reports no usable hardware "
+            "virtualization (the probe can be wrong on a locked-down machine)"
+        ),
+    )
     args = parser.parse_args(argv)
-    result = run(apply=bool(args.apply))
+    result = run(
+        apply=bool(args.apply),
+        virtualization_ack=bool(getattr(args, VIRT_ACK_ARG, False)),
+    )
     content = result.get("content") or {}
     if content:
         logger.info("\n%s", render_plan(content))

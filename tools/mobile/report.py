@@ -80,7 +80,8 @@ from pathlib import Path
 
 from config.settings import settings
 from tools.mobile import actions as actions_mod
-from tools.mobile import paths, run_store, screen_phone
+from tools.mobile import paths, run_store, screen_audit, screen_phone
+from tools.mobile_evidence import crash_detector
 from tools.mobile_evidence import exchanges as ev_exchanges
 from tools.mobile_evidence import profiles as ev_profiles
 from tools.mobile_evidence import render as ev_render
@@ -1118,6 +1119,13 @@ def _case_wall(rows: list) -> int | None:
     return sum(measured) if measured else None
 
 
+def _network_of(safe: dict) -> dict:
+    """The case network capture record, or an empty dict. The ONE reader."""
+    holder = safe.get("evidence") if isinstance(safe, dict) else None
+    body = (holder or {}).get("network") if isinstance(holder, dict) else None
+    return body if isinstance(body, dict) else {}
+
+
 def _case_facts(case: object, manifest: dict) -> dict:
     """Everything a card, a table row, a chip and a KPI need, computed ONCE."""
     raw = case if isinstance(case, dict) else {}
@@ -1148,6 +1156,15 @@ def _case_facts(case: object, manifest: dict) -> dict:
         "slug": _slug(tc_id),
         "title": _text(safe.get("title"), 120),
         "verdict": _verdict_of(safe),
+        # Read through the detector's own accessor, never by walking the record
+        # here: two walks are two derivations of "where a crash lives".
+        "crash": crash_detector.crash_of_case(safe),
+        # The wire this case reached, read off the checkpoint through ONE
+        # accessor. A second walk of the record inside the card would be a
+        # second derivation of where the network record lives, and mirrored
+        # conditions drift. Absent on a checkpoint written before this feature,
+        # which is an empty dict the renderer states rather than a crash.
+        "network": _network_of(safe),
         "status": _text(safe.get("status"), 40),
         "reason": _text(safe.get("reason"), 400),
         "escapes": max(0, escapes),
@@ -1177,6 +1194,30 @@ def _case_facts(case: object, manifest: dict) -> dict:
     }
 
 
+def _crash_block(crash: object) -> str:
+    """The app's own death, as evidence rather than as a verdict.
+
+    ``cerr`` is an EXISTING rule in ``report_shell.html`` -- mono, pre-wrap,
+    defect-coloured, which is exactly a log excerpt. No new class name is
+    introduced on purpose: this module emits class names that the shell must
+    style, and a class with no rule renders unstyled with nothing failing.
+    ``esc`` neutralises guard markers before escaping, so device text cannot
+    forge prompt scaffolding on the page either.
+    """
+    body = crash if isinstance(crash, dict) else {}
+    if not body.get("detected"):
+        return ""
+    return (
+        '<div class="cerr">'
+        + esc(body.get("label") or "the app under test died", 160)
+        + " — "
+        + esc(body.get("marker"), 200)
+        + "\n"
+        + esc(body.get("excerpt"), 1200)
+        + "</div>"
+    )
+
+
 def _vstrip(facts: dict) -> str:
     verdict = facts["verdict"]
     _sw, _seg, pill_cls, label = _tone(verdict)
@@ -1201,6 +1242,7 @@ def _vstrip(facts: dict) -> str:
         + '<span class="vwhy">'
         + why
         + "</span></div>"
+        + _crash_block(facts.get("crash"))
     )
 
 
@@ -1311,6 +1353,10 @@ def _card_html(
     data = {
         "data-tc": facts["tc_id"],
         "data-verdict": verdict,
+        # The kind, so the toolbar can filter on it and
+        # `report_selfcheck._pin_crashes` can pin the page against the store.
+        # Empty means no crash: falsy values are dropped from the attributes.
+        "data-crash": str((facts.get("crash") or {}).get("kind") or ""),
         "data-module": facts["module"],
         "data-priority": facts["priority"],
         "data-type": facts["type"],
@@ -1362,6 +1408,11 @@ def _card_html(
     )
     # What the app heard and answered inside this case's window (plan P3).
     turns = ev_render.turns_table(loaded, facts["tc_id"]) if loaded else ""
+    # The wire, beside what the app own log said. NOT gated on `loaded`: the
+    # capture is written onto the checkpoint by the case runner, so a run with
+    # no app profile at all still has one -- which is the whole point of a
+    # capture that needs no app-specific anything.
+    network = ev_render.case_network(facts.get("network"))
     steps = (
         _sec_block(
             "Steps",
@@ -1428,6 +1479,7 @@ def _card_html(
         + _vstrip(facts)
         + phones
         + turns
+        + network
         + steps
         + sequence
         + _ended_block(facts)
@@ -1441,6 +1493,48 @@ def _card_html(
 def _app_label(manifest: dict) -> str:
     package = _text(manifest.get("package"), 80)
     return package or "(no app)"
+
+
+def _locale_cell(manifest: dict) -> tuple | None:
+    """The "what language did this run in?" fact, or None when unrecorded.
+
+    None rather than "(unknown)" for every run written before this field
+    existed, and for a device that would not answer: a cell claiming a language
+    nobody recorded is worse than an absent one, which is the rule
+    ``session.device_line`` already follows for the hardware kind.
+
+    The VALUE is what the device said it was RENDERING in; the sub-line names
+    what was asked for and how it got there. Those are different facts, and a
+    run whose request did not take has to say so in the header a tester reads
+    first -- with the ``gap`` tone, because it is one.
+    """
+    body = manifest.get("locale")
+    record = body if isinstance(body, dict) else {}
+    actual = str(record.get("actual") or "")
+    requested = str(record.get("requested") or "")
+    if not actual and not requested:
+        return None
+    if not requested:
+        return ("language", esc(actual, 24), "the device was already in it", "")
+    if not record.get("matched"):
+        return (
+            "language",
+            esc(actual or "(not confirmed)", 24),
+            esc(requested, 24) + " was asked for and the device did not take it",
+            "gap",
+        )
+    return (
+        "language",
+        esc(actual, 24),
+        "asked for "
+        + esc(requested, 24)
+        + (
+            " and set at boot"
+            if str(record.get("source") or "") == "boot"
+            else " and set on the running device"
+        ),
+        "",
+    )
 
 
 def _facts_strip(
@@ -1485,6 +1579,9 @@ def _facts_strip(
             "gap" if (partial or not (coverage or {}).get("complete")) else "ok",
         ),
     ]
+    locale_cell = _locale_cell(manifest)
+    if locale_cell:
+        items.append(locale_cell)
     if loaded:
         items.extend(ev_render.facts_cells(loaded))
     if holder:
@@ -2148,6 +2245,157 @@ def _findings_section(manifest: dict, turns: int) -> str:
     )
 
 
+def _a11y_rows(screen_id: str, result: dict) -> str:
+    """One screen's findings as table rows, or one honest row saying why not."""
+    if not result.get("auditable"):
+        return (
+            '<tr><td class="num">'
+            + esc(screen_id, 40)
+            + '</td><td class="cap">nothing to audit</td><td dir="auto">'
+            + esc(result.get("note") or screen_audit.NO_NODES_NOTE, 400)
+            + "</td></tr>"
+        )
+    findings = [f for f in (result.get("findings") or []) if isinstance(f, dict)]
+    if not findings:
+        return (
+            '<tr><td class="num">'
+            + esc(screen_id, 40)
+            + '</td><td class="cap">no finding</td><td dir="auto">'
+            + esc(result.get("note") or "", 400)
+            + "</td></tr>"
+        )
+    out = []
+    for finding in findings:
+        kind = str(finding.get("kind") or "")
+        detail = str(finding.get("detail") or "")
+        name = str(finding.get("name") or "")
+        out.append(
+            '<tr><td class="num">'
+            + esc(screen_id, 40)
+            + '</td><td class="cap">'
+            + esc(screen_audit.KIND_LABELS.get(kind, kind), 80)
+            + '</td><td dir="auto">'
+            + (("<b>" + esc(name, 120) + "</b> — ") if name else "")
+            + esc(detail, screen_audit.MAX_FINDING_CHARS)
+            + " <span class=\"cap\">"
+            + esc(" ".join(str(v) for v in (finding.get("ids") or [])), 120)
+            + "</span></td></tr>"
+        )
+    return "".join(out)
+
+
+def _a11y_section(screens: object) -> str:
+    """What the run's own screens say about whether the app is USABLE.
+
+    The findings come from ``screen_audit``, which ``perception.prune`` runs over
+    every screen this lane ever pruned -- one producer, and this section reads the
+    stored answer rather than deriving a second one.
+
+    THREE outcomes that must never render alike, which is the whole point of the
+    section: a screen with findings, a screen that was audited and had none, and a
+    screen with no accessibility nodes AT ALL (a canvas app), where an empty list
+    means nothing was looked at. A screen stored by a build older than the audit
+    is a fourth: it carries no result, and this says so rather than counting it
+    clean.
+
+    Every interpolated value goes through :func:`esc` -- the labels are device
+    text -- and only class names ``report_shell.html`` already styles are used.
+    A finding NEVER touches a verdict: nothing here is read by
+    ``_case_facts``, and the verdict producers do not import this module.
+    """
+    library = screens if isinstance(screens, dict) else {}
+    audited = 0
+    unauditable = 0
+    unaudited = 0
+    partial = 0
+    assumed = 0
+    total = 0
+    rows = []
+    for screen_id in sorted(str(key) for key in library.keys()):
+        screen = library.get(screen_id)
+        if not isinstance(screen, dict):
+            continue
+        result = screen.get("accessibility")
+        if not isinstance(result, dict) or not result.get("present"):
+            unaudited += 1
+            rows.append(
+                '<tr><td class="num">'
+                + esc(screen_id, 40)
+                + '</td><td class="cap">not audited</td><td dir="auto">'
+                + "this screen was stored before the accessibility audit existed, "
+                "so no finding here is evidence about it"
+                + "</td></tr>"
+            )
+            continue
+        if result.get("auditable"):
+            audited += 1
+            if not result.get("complete"):
+                partial += 1
+            if result.get("density_source") != screen_audit.DENSITY_DEVICE:
+                assumed += 1
+        else:
+            unauditable += 1
+        total += len([f for f in (result.get("findings") or []) if isinstance(f, dict)])
+        rows.append(_a11y_rows(screen_id, result))
+    if not rows:
+        return ""
+    lede = (
+        str(total)
+        + " finding"
+        + ("" if total == 1 else "s")
+        + " over "
+        + str(audited)
+        + " audited screen"
+        + ("" if audited == 1 else "s")
+        + ". These are usability defects, not functional ones: an accessibility "
+        "finding NEVER changes a case's verdict, and no case here passed or "
+        "failed because of one."
+        + (
+            " "
+            + str(unauditable)
+            + " screen(s) exposed no accessibility nodes at all, so they were not "
+            "audited -- an empty list there means nothing was looked at, not that "
+            "nothing is wrong."
+            if unauditable
+            else ""
+        )
+        + (
+            " " + str(partial) + " audited screen(s) were PARTIAL: elements were "
+            "dropped before the audit ran, so those rows describe part of a screen."
+            if partial
+            else ""
+        )
+        + (
+            " " + str(unaudited) + " screen(s) carry no audit at all."
+            if unaudited
+            else ""
+        )
+        + (
+            " On "
+            + str(assumed)
+            + " screen(s) the device did not report its display density, so any "
+            "touch-target finding there rests on an ASSUMED density and can be a "
+            "false alarm on low-density hardware -- each such finding says so."
+            if assumed
+            else ""
+        )
+        + " Colour contrast, jank and start-up time are NOT checked here."
+    )
+    table = (
+        '<div class="tablewrap"><table class="cov"><thead><tr>'
+        '<th scope="col" class="num">Screen</th>'
+        '<th scope="col">What</th>'
+        '<th scope="col">Detail</th>'
+        "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>"
+    )
+    return _sechead(
+        "a11y",
+        "Accessibility",
+        "what the screens themselves say",
+        lede,
+        table,
+    )
+
 def _document(
     *,
     run_id: str,
@@ -2177,12 +2425,17 @@ def _document(
     # Built ONCE and reused: the nav must not offer a section this page does
     # not emit, and the findings section exists only for the explore lane.
     findings = _findings_section(manifest, len(facts))
+    # The audit's own section, built ONCE like `findings` above so the nav
+    # cannot offer a section this page does not emit.
+    a11y = _a11y_section(screens)
     nav_items = [
         ("overview", "Overview"),
         ("coverage", "Coverage"),
         ("apis", "APIs"),
         ("perf", "Performance"),
     ]
+    if a11y:
+        nav_items.append(("a11y", "Accessibility"))
     if findings:
         nav_items.append(("findings", "Findings"))
     nav_items.append(("cases", "Cases"))
@@ -2244,7 +2497,7 @@ def _document(
             "API surface",
             "every endpoint the app reached, on the real wire",
             "Every endpoint the app called from inside a case, against the real backend rather than a fixture.",
-            ev_render.apis_section(loaded),
+            ev_render.apis_section(loaded) + ev_render.network_section(cases),
         )
         + _sechead(
             "perf",
@@ -2253,6 +2506,7 @@ def _document(
             "How long things took, from the clock around each replayed action — and, when the app's own log was captured, from the moments the app wrote down itself.",
             _perf(facts, loaded),
         )
+        + a11y
         + findings
         + _cases_section(facts, screens, app, loaded, coverage)
         + '<div id="'

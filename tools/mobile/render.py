@@ -28,6 +28,10 @@ Two rules this module exists to keep:
 from __future__ import annotations
 
 import json
+import time
+
+from tools.mobile_evidence import crash_detector
+from tools.untrusted import wrap_untrusted
 
 #: The start-menu sources, in menu order: ``(key, line)``. The key is what a
 #: handler branches on and what the mapping paragraph names, so the two cannot
@@ -273,11 +277,37 @@ def source_menu_markdown(conflict: object = (), unmatched: object = "") -> str:
     )
 
 
-def install_menu_markdown(package: str = "") -> str:
-    """The install-source menu, keyed for the same reason the start menu is."""
-    head = "## The app under test is not on the emulator yet\n\n"
-    if package:
+def install_menu_markdown(package: str = "", *, probed: bool = True) -> str:
+    """The install-source menu, keyed for the same reason the start menu is.
+
+    THREE HEADINGS, one per state the server can actually justify. This used to
+    head UNCONDITIONALLY with "The app under test is not on the emulator yet",
+    and its only caller runs the ``session.install_state`` probe only when a
+    ``package`` was given -- so on the first call, with no package and no
+    source, nothing had been probed and the server asserted the app was absent
+    anyway. A tester agent repeated it back as fact (2026-09-08).
+
+    * no *package* -- ASK which app to test. Claim nothing about the device.
+    * a *package* that was probed -- today's line, and it is now earned.
+    * a *package* whose probe DID NOT ANSWER (``probed=False``) -- say the
+      check failed. The caller reads that from ``install_state``'s
+      ``content["probed"]``, which is the one witness of it. It is NOT derived
+      from the envelope: ``install_state`` returns ``error: None`` with a
+      populated ``content`` even when adb failed, so an envelope test asserted
+      absence on exactly the failure it was written to catch.
+
+    ``probed`` defaults to True so a caller that HAS confirmed absence reads
+    naturally, and the existing single-argument callers are unchanged.
+    """
+    head = "## Which app should this run test?\n\n"
+    if package and probed:
         head = "## `" + str(package)[:80] + "` is not installed on the emulator\n\n"
+    elif package:
+        head = (
+            "## Could not check whether `"
+            + str(package)[:80]
+            + "` is on the emulator\n\n"
+        )
     return (
         head
         + "Ask the user how they want it installed -- present EXACTLY these "
@@ -342,6 +372,157 @@ def apply_refusal(step: str, detail: str = "") -> str:
     )
 
 
+#: SECONDS any provisioning record may be old and still be printed as the state
+#: of this machine -- a failure, a phase, or a decline. The record is
+#: machine-wide and carries no run identity, so past this age it describes an
+#: attempt the reader never made, WHATEVER field it carries. Biased LONG on
+#: purpose: the lane-off case is already answered upstream
+#: (``mcp_handlers._MOBILE_LANE_OFF``), so the only thing too small a value can
+#: cost is hiding a genuinely recent record a tester could act on, while the
+#: defect at the other end needed days (the field record was five days old).
+#: Read by :func:`_record_is_current`; bounded from above in
+#: ``tests/mobile/test_mobile_bounds_upper.py``.
+_RECORD_MAX_AGE_S = 21600
+
+
+def _record_is_current(body: dict, now: float) -> bool:
+    """Is this RECORD recent enough to describe the machine NOW?
+
+    It judges the record, not one of its fields, and that is the whole rule:
+    the file is machine-wide with no run identity, so its age governs every
+    claim it makes. A five-day-old ``phase: system-image -- 33%`` and a
+    five-day-old ``starting -- another provisioner is already running`` are the
+    same false assertion as a five-day-old ``error``, and both printed as the
+    first line of ``qa_mobile_status`` while the age rule was scoped to the
+    error field alone.
+
+    ``provisioner._publish`` is the ONE producer that writes this file, and it
+    stamps ``written_at`` unconditionally, so every record this consumer can
+    receive is stamped. (``downloader.write_progress`` is shared, but its own
+    in-flight record and ``session``'s install record go to different files
+    with different readers.)
+
+    A record with NO stamp is not current. That is the load-bearing half: every
+    record already on disk in the field was written before the stamp existed,
+    so treating "no timestamp" as fresh would leave the defect exactly where it
+    was on every install that has one. A stamp in the FUTURE is not evidence of
+    freshness either -- a changed or broken clock is not a recent attempt -- and
+    neither is a non-numeric one (``bool`` is excluded explicitly: it is an
+    ``int`` subclass, and ``True`` would otherwise read as the epoch).
+
+    THE NUMBERS THAT ARE NOT AGES, each measured rather than assumed:
+
+    * an oversized ``int`` (a corrupted or hostile record) raised
+      ``OverflowError`` out of ``float()`` and blanked the ENTIRE status reply,
+      so it is caught here and reads as stale;
+    * ``nan`` compares False against everything, so it already reads as stale;
+    * ``inf``/``-inf`` give an infinite age of one sign or the other, both
+      outside the window, so they read as stale too.
+
+    Every one of them lands on "not current", which is the safe direction: the
+    section is withheld rather than asserted.
+    """
+    stamp = body.get("written_at")
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+        return False
+    try:
+        age = float(now) - float(stamp)
+    except (OverflowError, ValueError):
+        return False
+    return 0 <= age <= _RECORD_MAX_AGE_S
+
+#: The record field that says THIS MACHINE proceeded past a NEGATIVE
+#: virtualization verdict on an acknowledgement. The name lives HERE, on the
+#: consumer side, and ``provisioner`` imports it, because two hand-written
+#: spellings of one key drift -- the same failure ``provisioner.VIRT_ACK_ARG``
+#: exists to prevent for the acknowledgement's own two transports.
+VIRT_OVERRIDE_FIELD = "virtualization_overridden"
+
+#: WHICH AVD that override was spent on. Written on the same branch and the
+#: same line of code as the flag above, so no record can carry the claim
+#: without the identity that scopes it -- exactly as it already cannot carry it
+#: without the ``written_at`` that expires it. The name lives HERE, on the
+#: consumer side, for the same anti-drift reason as its sibling.
+VIRT_OVERRIDE_AVD_FIELD = "virtualization_overridden_avd"
+
+#: THE ONE SENTENCE anywhere in this tree that connects a boot failure to an
+#: overridden virtualization verdict. It says "check this first", not "this is
+#: the cause": the probe that was overridden can itself be wrong (a locked-down
+#: Windows box cannot see the feature without an elevated shell), and no Windows
+#: machine has run this lane. It quotes no probe detail, so it needs no cap --
+#: the refusal the tester answered already carried that detail, capped.
+_VIRT_OVERRIDE_NOTE = (
+    " Before this was provisioned, the virtualization probe on this machine said"
+    " NO and that refusal was overridden with virtualization_ack=true -- so a"
+    " hypervisor that really is off is the first thing to check (enable VT-x /"
+    " AMD-V in firmware, or Hyper-V/WHPX on Windows), ahead of a longer timeout."
+)
+
+
+def virtualization_override_note(progress: object, now: float, avd: object) -> str:
+    """The sentence a boot failure adds, or ``""`` -- composed ONCE, here.
+
+    THREE independent conditions, and the silent direction is the default. A
+    boot timeout on a healthy hypervisor has other causes, so a message that
+    always named virtualization would be the same defect pointing the other way.
+
+    ``avd`` is the AVD name resolved from the device that actually failed, and
+    it has NO DEFAULT on purpose: a default is how a bound clause gets silenced
+    at a call site nobody re-reads.
+
+    * the record must CARRY the override. ``provisioner._publish`` is its one
+      writer, and it rewrites the whole file, so a later clean provisioning
+      erases the claim rather than leaving it behind.
+    * the record must be CURRENT, judged by :func:`_record_is_current` -- the
+      same judge, the same window, no second rule. A machine fixed in firmware
+      since must not be told for ever that its hypervisor is the suspect; that
+      is exactly the defect a days-old provisioning record already caused once.
+
+    * the device must BE the emulator the record is about -- a POSITIVE match
+      between ``VIRT_OVERRIDE_AVD_FIELD`` and the name resolved from the serial
+      that failed, both non-empty. ``wait_boot`` is not emulator-only:
+      ``session.ensure_device`` calls it for a tester-supplied serial and the
+      only upstream filter rejects iOS, so an attached Galaxy S21 reached this
+      sentence and was told to enable VT-x in its firmware. Matching
+      ``emulator-*`` on the serial would not do: that is the ABSENCE of
+      evidence for a phone, and it still speaks about a DIFFERENT emulator
+      running a foreign AVD. An overridden probe says nothing whatsoever about
+      a device this machine did not provision.
+
+    A stale record, an absent record, an unnamed device and a device we cannot
+    identify all therefore read as UNKNOWN and say nothing -- one direction for
+    every unknown, which is the rule the freshness clause already follows.
+
+    WHAT IT CANNOT DISTINGUISH: a second emulator started from the SAME AVD (it
+    is the same AVD on the same machine, so the sentence is still about the
+    right hypervisor), and a tester-created AVD that happens to share the name.
+    It also withholds a TRUE positive when the emulator console will not answer
+    -- a missing hint costs a slower diagnosis, a wrong hint sent a tester into
+    their firmware over a USB phone.
+    """
+    body = progress if isinstance(progress, dict) else {}
+    if not body.get(VIRT_OVERRIDE_FIELD):
+        return ""
+    if not _record_is_current(body, now):
+        return ""
+    provisioned = str(body.get(VIRT_OVERRIDE_AVD_FIELD) or "").strip()
+    failed = str(avd or "").strip()
+    # ONE non-empty check, not two. A record written before this field existed
+    # carries "", a device whose console said nothing resolves to "", and
+    # `"" == ""` would turn two unknowns into a match -- so the emptiness test
+    # is load-bearing. But `not failed` was ALSO here, and either clause alone
+    # rejects the both-empty case, so no mutant dropping one could ever die and
+    # NEITHER was graded (CLAUDE.md: where two clauses would both do the job,
+    # neither is graded). Measured: dropping either survived the whole matrix.
+    # `not failed` is the one deleted because it is strictly implied -- when
+    # `provisioned` is non-empty and equal to `failed`, `failed` is non-empty
+    # too. What remains is graded: drop `not provisioned` and R4 fires; drop
+    # the comparison and R2 fires.
+    if not provisioned or provisioned != failed:
+        return ""
+    return _VIRT_OVERRIDE_NOTE
+
+
 def provisioning_line(progress: object) -> str:
     """One line for the detached provisioner's state. Never a stack trace."""
     body = progress if isinstance(progress, dict) else {}
@@ -380,20 +561,69 @@ def provisioning_section(progress: object, *, device_in_use: bool = False) -> li
       still live -- for whom provisioning was never needed, so the refusal is
       about something else entirely. It stays reachable for them:
       `qa_mobile_status` with no run id shows it.
-    * ATTEMPTED AND RUNNING/SUCCEEDED -- a ``phase``. ALWAYS rendered, device or
-      no device. A 2.2 GB download in flight is a fact about the machine that a
-      tester needs whatever else is going on, and suppressing it would be the
-      same defect pointing the other way.
+    * ATTEMPTED AND RUNNING/SUCCEEDED -- a ``phase``. Rendered device or no
+      device, for as long as it is CURRENT. A 2.2 GB download in flight is a
+      fact about the machine that a tester needs whatever else is going on, and
+      suppressing it would be the same defect pointing the other way -- which is
+      exactly why the age, not the field, is the discriminator: a download that
+      is really in flight rewrites this record every few seconds and is always
+      fresh, while a five-day-old ``phase`` means the process died.
 
     The third state -- never attempted at all -- is the empty body, and it has
     always rendered nothing.
+
+    THE AGE OF THE RECORD. "Withheld from a live run that has a device" was not
+    enough, and the reader it missed is the commonest one there is: a tester's
+    FIRST ``qa_mobile_status`` call, which passes no run id and so can answer
+    neither clause of ``_mobile_device_in_use``. Those callers were shown a
+    five-day-old ``kill-switch off`` on a machine where the lane was enabled and
+    seven runs had already started, and two of them abandoned the task on it.
+
+    So the record is aged out by ``_record_is_current``, ONCE, before any field
+    is read -- not per field. Scoping that rule to the ``error`` branch left
+    every other record rendering forever, and a stale ``phase`` or a stale
+    ``starting -- another provisioner is already running`` is the same failure
+    wearing a different key. There is one age JUDGE here -- ``_record_is_current``
+    -- and every consumer of this record calls it; none re-derives freshness.
+
+    Nothing actionable is lost. ``handle_mobile_status`` answers the
+    genuinely-off lane upstream with ``_MOBILE_LANE_OFF`` before this function
+    is ever reached, so a stale kill-switch line here is ALWAYS false about the
+    current state; a record the tester actually just produced is fresh and still
+    renders; and a stale non-kill-switch failure -- a disk-full from this
+    morning -- is REGENERABLE: the next provisioning attempt republishes it
+    inside the cap, and that attempt is the very thing the tester is about to
+    make. A dated "7 hours ago" line was considered and rejected: the measured
+    failure is that a model repeats such a line as the current state.
+
+    THE RECONCILING CLAUSE is part of the section rather than of one caller,
+    for the reason the rest of this docstring gives: one place decides what this
+    section says. ``qa_list_devices`` showing a live emulator while this reports
+    a stopped provisioner are answers to two different questions -- any attached
+    device versus the SDK/AVD this server provisions -- and both Arabic probes
+    flagged the pair as a contradiction, unprompted.
     """
     body = progress if isinstance(progress, dict) else {}
     if not body:
         return []
+    # ONE age check, on the WHOLE record, before any field is read.
+    if not _record_is_current(body, time.time()):
+        return []
+    # A SECOND, INDEPENDENT question, and neither guard subsumes the other:
+    # this one asks whether provisioning was ever needed by THIS reader, and it
+    # applies only to a failure -- a phase is a fact about the machine either
+    # way.
     if body.get("error") and device_in_use:
         return []
-    return ["### Provisioning", "- " + provisioning_line(body), ""]
+    return [
+        "### Provisioning",
+        "- " + provisioning_line(body),
+        "- This is about the Android SDK and emulator THIS SERVER provisions "
+        "into `~/.qa-agents/mobile/`. It says nothing about devices already "
+        "attached to this machine -- `qa_list_devices` answers that one, and "
+        "the two can differ without either being wrong.",
+        "",
+    ]
 
 
 def preflight_block(content: object, rendered: str = "") -> str:
@@ -438,8 +668,46 @@ def packet_block(packet: object, *, session_token: str = "") -> str:
     return "```json\n" + text + "\n```\n\n" + NO_ECHO
 
 
+def crash_note(case: object) -> str:
+    """The line that tells the tester's model the app itself died. Never raises.
+
+    Nobody should have to open the HTML report to learn that the app under test
+    crashed, so the disclosure goes in the reply the model already gets.
+
+    **The marker and the excerpt are DEVICE OUTPUT reaching a model**, so they go
+    through ``tools/untrusted.wrap_untrusted`` -- the hard rule, and the same
+    treatment ``perception`` gives a screen dump. The HTML report deliberately
+    does NOT wrap them: it is not a model surface, and
+    ``report_selfcheck``'s ``no_untrusted_markers`` pin forbids the string on the
+    page. Two surfaces, two treatments. The wrapped body needs no cap of its own:
+    it is bounded at its producer by ``crash_detector.MAX_MARKER_CHARS`` and
+    ``MAX_EXCERPT_CHARS``, both of which carry a CEILINGS row.
+    """
+    crash = crash_detector.crash_of_case(case)
+    if not crash:
+        return ""
+    head = (
+        "\U0001f6d1 **The app under test died during this case** — "
+        + _field(crash.get("label"), "it stopped running")
+        + ". The SERVER set this case to `fail` on the run's own logcat; that is "
+        "not your judgement of the case, and re-submitting the same script will "
+        "not change it."
+    )
+    block = wrap_untrusted(
+        "device logcat",
+        str(crash.get("marker") or "") + "\n" + str(crash.get("excerpt") or ""),
+    )
+    return head + (("\n\n" + block) if block else "")
+
+
 def verdict_line(case: object) -> str:
-    """ONE line per case. A run of 200 cases is 200 lines, not 200 sections."""
+    """ONE line per case. A run of 200 cases is 200 lines, not 200 sections.
+
+    A case the SERVER failed because the app died carries its disclosure here --
+    both chat surfaces reach this function (the submit reply directly, and
+    ``status_block``'s rows through it), so the crash is stated once and shown
+    twice.
+    """
     body = case if isinstance(case, dict) else {}
     marks = {
         "pass": "✅",
@@ -454,6 +722,7 @@ def verdict_line(case: object) -> str:
     # `tc_id` sits in the same single backticks that a planted fence escaped.
     verdict = _field(body.get("verdict") or body.get("status"))
     reason = _field(body.get("reason"))[:160]
+    note = crash_note(case)
     return (
         marks.get(verdict, "•")
         + " `"
@@ -464,6 +733,7 @@ def verdict_line(case: object) -> str:
         + (verdict or "unknown")
         + "**"
         + ((" — " + reason) if reason else "")
+        + (("\n\n" + note) if note else "")
     )
 
 

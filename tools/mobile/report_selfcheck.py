@@ -46,6 +46,7 @@ PIN_NO_SCRIPT = "no_script_or_handler"
 PIN_NO_ASSET = "no_external_asset"
 PIN_NO_SECRET = "no_secret_marker"
 PIN_SIZE = "page_under_8mb"
+PIN_CRASH = "crashes_disclosed"
 
 PINS = (
     PIN_CASES,
@@ -58,6 +59,7 @@ PINS = (
     PIN_NO_ASSET,
     PIN_NO_SECRET,
     PIN_SIZE,
+    PIN_CRASH,
 )
 
 #: A forged guard note is as dangerous as a real tag, so both are refused.
@@ -100,6 +102,9 @@ class _Page(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.cards: list = []
+        #: ``tc_id -> data-crash``, collected beside the cards so the crash pin
+        #: can be an EQUALITY against the store rather than a containment.
+        self.crashes: dict = {}
         self.summary: dict = {}
         self.end: dict = {}
         self.styles: list = []
@@ -127,6 +132,7 @@ class _Page(HTMLParser):
                 self.handlers.append(tag + "@" + name)
         if "data-tc" in pairs:
             self.cards.append(pairs["data-tc"])
+            self.crashes[pairs["data-tc"]] = pairs.get("data-crash", "")
         if pairs.get("id") == report.SUMMARY_ID:
             self.summary = pairs
         if pairs.get("id") == report.END_ID:
@@ -263,6 +269,40 @@ def _pin_absent(name: str, text: str, needles: tuple) -> dict:
     )
 
 
+def _pin_crashes(page_crashes: object, cases: object) -> dict:
+    """Every crash the STORE recorded is disclosed on the page, and no other.
+
+    An EQUALITY, per this module's own discipline: a page that dropped the
+    disclosure fails, and so does one that invented a crash the store never
+    recorded. The store side goes through ``crash_detector.crash_of_case``, so
+    this pin cannot disagree with the renderer about where a crash lives.
+    """
+    from tools.mobile_evidence import crash_detector
+
+    page = {
+        str(tc): str(kind)
+        for tc, kind in (page_crashes or {}).items()
+        if str(kind or "")
+    }
+    store = {}
+    for case in list(cases or []):
+        crash = crash_detector.crash_of_case(case)
+        if crash:
+            store[str((case or {}).get("tc_id") or "")] = str(crash.get("kind") or "")
+    missing = sorted(tc for tc in store if page.get(tc) != store[tc])
+    invented = sorted(tc for tc in page if tc not in store)
+    return _pin(
+        PIN_CRASH,
+        not missing and not invented,
+        "store="
+        + str(len(store))
+        + " page="
+        + str(len(page))
+        + (" undisclosed=" + ",".join(missing[:8]) if missing else "")
+        + (" unexpected=" + ",".join(invented[:8]) if invented else ""),
+    )
+
+
 def check(run_id: str, html_path: str = "") -> dict:
     """Every pin against the page for *run_id*. Never raises.
 
@@ -307,6 +347,7 @@ def check(run_id: str, html_path: str = "") -> dict:
                 size <= report.MAX_PAGE_BYTES,
                 str(size) + " bytes of " + str(report.MAX_PAGE_BYTES),
             ),
+            _pin_crashes(page.crashes, cases),
         ]
         return {
             "error": None,

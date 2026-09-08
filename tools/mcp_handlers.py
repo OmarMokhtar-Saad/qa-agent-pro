@@ -35,6 +35,7 @@ import sys
 import threading
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, NamedTuple, Optional
@@ -808,7 +809,14 @@ def _capture_error(exc: BaseException, tool: str) -> None:
 
 
 async def _resolve_device(device_id: str) -> dict | None:
-    """Look up a full device dict (platform/kind) by id from live discovery."""
+    """Look up a full device dict (platform/kind) by id from live discovery.
+
+    THE SEAM. Six call sites use this and ten tests patch it by name, so it
+    stays the one lookup: a sibling that duplicated the search would take the
+    call away from the patch, the tests would exercise real discovery without
+    saying so, and that is the defect this branch already fixed once in
+    `device_manager` (a patched `_list_android` that stopped being called).
+    """
     if not device_id:
         return None
     result = await list_devices()
@@ -816,6 +824,39 @@ async def _resolve_device(device_id: str) -> dict | None:
         if dev.get("id") == device_id:
             return dev
     return None
+
+
+async def _resolve_device_with_reason(device_id: str) -> tuple[dict | None, str]:
+    """``(device, why_not)`` -- :func:`_resolve_device` plus WHY a miss happened.
+
+    ``why_not`` is "" unless the device list was TRUNCATED, in which case a miss
+    is not evidence the device is absent: `adb devices` output past the cap is
+    never parsed, so an attached device can be missing from ``content``, and a
+    bare "not found" tells the tester their id is wrong while pointing them at a
+    list that cannot contain it either.
+
+    It delegates rather than searching again, so the lookup keeps ONE
+    implementation and one seam. The count comes from a second call, and that is
+    deliberate: only the miss path pays for it, and the count is advisory text,
+    not the answer. If discovery changes between the two calls the worst case is
+    a caveat that no longer applies -- never a wrong device.
+    """
+    device = await _resolve_device(device_id)
+    if device is not None or not device_id:
+        return device, ""
+    result = await list_devices()
+    try:
+        dropped = max(0, int(result.get("adb_dropped_lines") or 0))
+    except (TypeError, ValueError, OverflowError):
+        dropped = 0
+    if dropped:
+        return None, (
+            " adb listed more device lines than this server reads, so "
+            + str(dropped)
+            + " were not parsed -- yours may be among them, and the list will"
+            + " not show it either. Unplug what you are not testing and retry."
+        )
+    return None, ""
 
 
 # --------------------------------------------------------------------------- #
@@ -1370,10 +1411,20 @@ async def _device_menu_markdown(tool: str) -> str:
     """Markdown fallback for the device picker: the live device list plus a
     re-call instruction for *tool*."""
     result = await list_devices()
-    devices = result.get("content") or []
-    return shape_devices(devices) + (
-        f"\n\nRe-call `{tool}` with the chosen `device_id`."
-    )
+    # The SAME rows as `qa_list_devices`. One renderer with two behaviours would
+    # be two meanings wearing one name, and "which emulator is this?" is exactly
+    # the question a picker exists to answer.
+    devices = await _android_device_details(result.get("content") or [])
+    # The unusable rows travel with the picker too: a tester whose phone is not
+    # in the choices is owed the reason IN THE PLACE THEY ARE CHOOSING, not
+    # only in `qa_list_devices`.
+    # The truncation count travels with the PICKER too: a tester whose phone is
+    # not among the choices is owed the reason in the place they are choosing.
+    return shape_devices(
+        devices,
+        result.get("unusable") or [],
+        result.get("adb_dropped_lines") or 0,
+    ) + (f"\n\nRe-call `{tool}` with the chosen `device_id`.")
 
 
 def _format_menu_markdown() -> str:
@@ -1897,19 +1948,204 @@ def shape_corpus_hits(query: str, hits: list) -> str:
     return "\n".join(lines)
 
 
-def shape_devices(devices: list) -> str:
-    if not devices:
+#: What a device row that is not a dict becomes. It is NOT dropped: the audit
+#: count and the rendered listing both follow the row count, so a silent drop
+#: makes both under-report what `device_manager` produced.
+_UNREADABLE_ROW = {
+    "id": "",
+    "name": "unreadable device row",
+    "platform": "",
+    "kind": "",
+}
+
+
+async def _android_device_details(devices: list) -> list:
+    """*devices* with ``avd`` / ``api`` filled in for Android rows. Never raises.
+
+    A tester asked which emulator was running and could not be told: the row
+    said `sdk gphone64 arm64` and nothing else -- no AVD name, no API level
+    (2026-09-08).
+
+    NO NEW PRODUCER. ``tools.mobile.emulator.avd_name_of`` stays the one
+    producer of an AVD name and ``tools.mobile.adb.device_facts`` the one
+    producer of the API level; nothing is re-derived here, because two
+    derivations of one fact drift.
+
+    THE STATED ELSE: a build with no ``tools/mobile`` on disk (the
+    test-cases-only edition -- ``_mobile_modules_present`` is this file's single
+    predicate for that) gets its rows EXACTLY as before, rather than a second,
+    duplicate `adb` probe written here. A probe that fails, times out or finds
+    nothing also leaves its row untouched: ``device_manager`` never raises, and
+    this must not be the thing that changes that. Each probe is bounded by
+    ``_MOBILE_PROBE_S`` for the reason ``_mobile_doctor_section`` states -- a
+    device probe that hangs turns a listing into the symptom.
+
+    Returns COPIES, so no caller's dicts are mutated under it, and the added
+    keys are purely additive for every other reader of a device row.
+
+    ONE ROW OUT PER ROW IN. A row this server cannot read used to be DROPPED,
+    and `handle_list_devices` audits `len(devices)` -- so the count followed the
+    drop and the listing under-reported what `device_manager` produced, with no
+    trace. It is normalised instead, and rendered as unreadable.
+
+    THE BUDGET GATES STARTING WORK, NEVER THE WORK ALREADY STARTED. Each probe
+    was bounded and the LISTING was not: five hanging devices cost five budgets
+    inside a single MCP call (40s measured). A device that is ADMITTED keeps
+    both of its own full `_MOBILE_PROBE_S` probes, so a single slow-but-working
+    device answers exactly as it does today -- sharing one budget ACROSS a
+    row's two probes would time the second one out where it succeeds now, which
+    is a regression this bound is not worth. What is bounded is the listing:
+    once the budget is spent no further device is probed, so the worst case is
+    one budget plus one probe whatever the device count. A device reached after
+    that keeps its row exactly as it arrived -- the same degradation a failed or
+    timed-out probe already had.
+    """
+    rows = [
+        dict(dev) if isinstance(dev, dict) else dict(_UNREADABLE_ROW)
+        for dev in (devices or [])
+    ]
+    if not rows or not _mobile_modules_present():
+        return rows
+    try:
+        from tools.mobile import adb as mobile_adb
+        from tools.mobile import emulator as mobile_emulator
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("mobile modules unavailable for device detail", exc_info=True)
+        return rows
+    deadline = time.monotonic() + _MOBILE_PROBE_S
+    for row in rows:
+        serial = str(row.get("id") or "")
+        if not serial or str(row.get("platform") or "") != "android":
+            continue
+        # The one gate, and it is per ROW: see the docstring. An admitted row
+        # keeps its probes' own bounds; a listing whose budget is gone stops
+        # asking.
+        if time.monotonic() >= deadline:
+            continue
+        try:
+            if str(row.get("kind") or "") == "emulator":
+                named = await asyncio.wait_for(
+                    mobile_emulator.avd_name_of(serial), timeout=_MOBILE_PROBE_S
+                )
+                row["avd"] = str((named or {}).get("content") or "")[:60]
+            facts = await asyncio.wait_for(
+                mobile_adb.device_facts(serial), timeout=_MOBILE_PROBE_S
+            )
+            row["api"] = str(((facts or {}).get("content") or {}).get("api") or "")[:8]
+        except Exception:
+            logger.info("device detail probe failed for one device", exc_info=True)
+    return rows
+
+
+def shape_devices(
+    devices: list, unusable: list | None = None, adb_dropped_lines: int = 0
+) -> str:
+    """The device list a tester reads. *unusable* is rendered SEPARATELY.
+
+    WHY A SEPARATE SECTION rather than a row in the list above it: this list is
+    also the PICK LIST -- `_device_menu_markdown` renders these very rows as the
+    tester's choices. An `unauthorized` phone offered as a choice fails opaquely
+    inside a capture or a mobile run, and would push the non-`device` case into
+    four more consumers whose right answer is "ignore". A separate section is
+    informational by construction: impossible to select, impossible to miss.
+
+    And the empty text is conditional on BOTH lists, which is the whole defect:
+    a tester must never read "No devices detected" while a phone is plugged in.
+    """
+    attached = list(unusable or [])
+    try:
+        dropped = max(0, int(adb_dropped_lines or 0))
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is not decoration: `int(float("inf"))` raises it, this
+        # function promises never to raise, and the value arrives from a dict
+        # a caller assembled. Falling to 0 means the notice is omitted rather
+        # than the whole device list being lost to a traceback.
+        dropped = 0
+    # OUR PROSE, and deliberately OUTSIDE the untrusted block below, exactly
+    # like the remediation text: this is the sentence the tester acts on and no
+    # device may dress its own words as it. The parameter has a default only
+    # because a one-argument call is pinned; both production call sites pass it
+    # explicitly and a test asserts they do, so the default cannot silence it.
+    notice = (
+        (
+            "\n\n> \u26a0\ufe0f adb listed more transports than this server "
+            "reads, so " + str(dropped) + " line(s) were not parsed. A device "
+            "missing from this list may be one of them \u2014 unplug what you "
+            "are not using, or run `adb kill-server`, then retry "
+            "`qa_list_devices`."
+        )
+        if dropped
+        else ""
+    )
+    if not devices and not attached:
+        # The notice belongs on THIS branch most of all: 200+ unparseable lines
+        # yield zero rows, and "No devices detected" while a phone is plugged
+        # in is the very defect this section exists to prevent.
         return (
             "No devices detected. Connect an Android device/emulator or boot an "
             "iOS simulator, then retry `qa_list_devices`."
-        )
-    lines = [f"## Devices ({len(devices)})", ""]
+        ) + notice
+    lines: list[str] = []
+    if not devices:
+        lines = ["## Devices (0)", "", "Nothing is usable yet — see below."]
+    else:
+        lines = [f"## Devices ({len(devices)})", ""]
     for dev in devices:
-        lines.append(
+        row = (
             f"- `{dev.get('id')}` — {dev.get('name')} "
             f"({dev.get('platform')}/{dev.get('kind')})"
         )
-    return "\n".join(lines)
+        # Printed only when a producer answered. An absent AVD name or API
+        # level renders the row exactly as it did before, which is what makes
+        # the enrichment safe to fail.
+        detail = ", ".join(
+            part
+            for part in (
+                ("AVD `" + str(dev.get("avd"))[:60] + "`") if dev.get("avd") else "",
+                ("API " + str(dev.get("api"))[:8]) if dev.get("api") else "",
+            )
+            if part
+        )
+        lines.append(row + (" — " + detail if detail else ""))
+    if attached:
+        lines.extend(
+            [
+                "",
+                f"## Detected but not usable yet ({len(attached)})",
+                "",
+                "These are plugged in, but this server cannot drive them until "
+                "the step below is done — so they are not offered as a choice.",
+                "",
+            ]
+        )
+        reported: list[str] = []
+        steps: list[str] = []
+        for dev in attached:
+            serial = str(dev.get("id") or "?")[:80]
+            state = str(dev.get("raw_state") or dev.get("state") or "unknown")[:80]
+            reported.append(serial + " — adb reports: " + state)
+            fix = str(dev.get("remediation") or "").strip()
+            if fix and fix not in steps:
+                steps.append(fix)
+        # THE DEVICE'S OWN WORDS, WRAPPED. The serial and the state token are
+        # read off a USB device this server does not control, and this reply
+        # goes straight to the tester's chat model, so they are
+        # externally-sourced text under the same hard rule as fetched URLs and
+        # Jira content. No exemption was available: the bounded state
+        # vocabulary constrains `state`, NOT `raw_state` on the unknown branch
+        # and not `-l` metadata, so escaping alone is not the standard here.
+        # Wrapping also strips a device that tries to close the block itself --
+        # the raw-state cap is wider than the closing tag.
+        lines.append(
+            wrap_untrusted("attached_devices_adb", "\n".join(reported), limit=2000)
+        )
+        # OUR text, deliberately OUTSIDE the block and de-duplicated: this is
+        # what the tester acts on, and a device must never be able to dress its
+        # own words as the instruction.
+        if steps:
+            lines.extend(["", "**What to do**", ""])
+            lines.extend("- " + step for step in steps)
+    return "\n".join(lines) + notice
 
 
 def shape_explore_step(session_id: str, sess: dict, step: str) -> str:
@@ -2598,9 +2834,209 @@ _MOBILE_LANE_OFF = (
 )
 
 
+_MOBILE_LANE_ABSENT = (
+    "\u2139\ufe0f This build does not include the mobile emulator lane's "
+    "modules, so there is nothing here to switch on -- a setting cannot enable "
+    "code that is not installed. An install built with the lane included is "
+    "what changes this. Nothing else here is affected."
+)
+
+
+def _mobile_lane_state() -> str:
+    """``"on"``, ``"flag_off"`` or ``"absent"``. Never raises.
+
+    ONE PRODUCER, and it invents no condition: it CALLS the two predicates
+    ``_mobile_lane_enabled()`` is made of rather than re-expressing either, so
+    it cannot drift from the gate that decides registration. A second copy of a
+    two-conjunct gate is the failure this file has shipped before.
+
+    What it ADDS is the distinction the gate deliberately does not draw. A
+    single boolean is the RIGHT answer for registration -- both Falses register
+    nothing -- and the WRONG answer for a tester, because the two Falses have
+    different owners: ``flag_off`` is the operator's, fixable in one line of
+    ``.env``; ``absent`` is the build's, and nothing on the machine can change
+    it. Telling the second tester to edit ``.env`` sends them to change a file
+    that will alter no behaviour, which is why ``absent`` is tested FIRST: with
+    no modules on disk the flag decides nothing at all.
+
+    Consumers, all of them: ``_mobile_lane_off_message`` (the three tool-call
+    refusals), ``_mobile_gate_row`` (qa-doctor's Feature-gates row) and
+    ``_mobile_lane_disclosure`` (qa-doctor's own section). ``mcp_server``'s
+    registration and ``tools/guidance.py`` are deliberately NOT consumers --
+    both only ever ask "may I name these tools", and the boolean gate is the
+    right answer to that question.
+    """
+    if not _mobile_modules_present():
+        return "absent"
+    return "on" if _mobile_lane_enabled() else "flag_off"
+
+
+def _mobile_lane_off_message() -> str:
+    """The refusal a mobile tool returns when the lane will not run.
+
+    ``_MOBILE_LANE_OFF`` keeps its name and its exact text -- ``tools/mobile/
+    render.py`` refers to it in prose twice, and both statements stay true --
+    but it is now the answer to ONE of the two off states rather than to both.
+    A build with no ``tools/mobile`` gets ``_MOBILE_LANE_ABSENT`` instead,
+    because a refusal that names a setting the tester can set, on an install
+    where setting it changes nothing, sends them to edit a file for no reason.
+
+    Total on purpose. The ``"on"`` branch is unreachable from all three call
+    sites (each is guarded by ``if not _mobile_lane_enabled():``) but a
+    function whose whole job is to produce tester-facing words must have a true
+    sentence for every state rather than an empty string for one.
+    """
+    state = _mobile_lane_state()
+    if state == "absent":
+        return _MOBILE_LANE_ABSENT
+    if state == "flag_off":
+        return _MOBILE_LANE_OFF
+    return (
+        "\u2139\ufe0f The mobile emulator lane is available on this install. "
+        "Nothing was refused -- call the mobile tool again."
+    )
+
+
+def _mobile_gate_row(state: str) -> tuple[str, bool]:
+    """qa-doctor's Feature-gates row for the emulator lane: LABEL and tick.
+
+    The row read "Mobile emulator lane (opt-in kill-switch)" beside a blank
+    box. That names no setting, describes no capability and offers no action:
+    a Windows tester with an Android phone attached read it, learned the lane
+    existed but not what it was or how to reach it, and hand-wrote adb scripts
+    for two hours instead. The label now says what the lane DOES and, where
+    that is true, what to change to get it.
+
+    NAMES NO TOOL, in any state. The lane's three tools are not registered in
+    either off state, and a report that prints a call the tester cannot make is
+    the same class of untrue tester-facing text as the row it replaces. The
+    capability is described in plain words instead.
+    """
+    if state == "on":
+        return (
+            "Mobile emulator lane \u2014 on: it runs your test cases on an "
+            "attached Android device or an emulator and writes an HTML report",
+            True,
+        )
+    if state == "absent":
+        return (
+            "Mobile emulator lane \u2014 not included in this build. It runs "
+            "test cases on an Android device, but its modules are not "
+            "installed here, so nothing on this machine can switch it on",
+            False,
+        )
+    return (
+        "Mobile emulator lane \u2014 OFF on this install. It runs your test "
+        "cases on an attached Android device or an emulator, taps and types "
+        "and checks the screen for you, and writes an HTML report. To turn it "
+        "on, add `QA_MOBILE_RUN_ENABLED=true` to this install's `.env` and "
+        "restart the MCP server (quit and reopen your editor)",
+        False,
+    )
+
+
+def _mobile_lane_disclosure(state: str, adb_path: str | None) -> list[str]:
+    """qa-doctor's section for a lane that is NOT running. Never raises.
+
+    STATIC TEXT AND ONE ALREADY-COMPUTED PATH. It makes no subprocess call and
+    starts no daemon, and that is a rule rather than an optimisation: the
+    kill-switch is OFF in this branch, and running `adb devices` here to say
+    "you have a phone attached" would start an adb server on a machine whose
+    operator switched this lane off -- a side effect produced by a DISCLOSURE.
+    The signal is taken from ``_optional_tool_paths()`` instead, a PATH lookup
+    that starts nothing and is the same value the tooling row above prints, so
+    the two cannot disagree.
+
+    Empty for ``"on"``: that state is served by ``_mobile_doctor_section``,
+    which probes because a running lane is what the tester asked for.
+    """
+    if state == "on":
+        return []
+    if state == "absent":
+        return [
+            "### Mobile emulator lane",
+            "- \u2b1c Not included in this build, so there is nothing here to "
+            "turn on. Test-case generation, exports and device listing are "
+            "unaffected.",
+        ]
+    out = [
+        "### Mobile emulator lane (off)",
+        "- \u2b1c This install can run your test cases on an attached Android "
+        "device or an emulator: it taps, types and checks the screen for you, "
+        "and writes an HTML report with a screenshot per step. It is off until "
+        "someone turns it on, and it starts nothing by itself.",
+        "- To turn it on: add `QA_MOBILE_RUN_ENABLED=true` to this install's "
+        "`.env`, then quit and reopen your editor so the server reloads it.",
+    ]
+    if adb_path:
+        out.append(
+            "- \u2705 `adb` is already installed here ("
+            + str(adb_path)
+            + "), so this machine has what the lane needs. If you are driving "
+            "an Android device by hand, this is the switch you are looking for."
+        )
+    return out
+
+
 #: How long qa-doctor's ONE device probe may take. Small, because this report is
 #: what a tester runs when nothing works.
 _MOBILE_PROBE_S = 8.0
+
+
+async def _mobile_non_android(serial: str) -> str:
+    """The refusal when *serial* names a device this lane cannot drive, else "".
+
+    THE MOBILE LANE ONLY, and that is the whole design. ``qa_list_devices``
+    keeps every platform and ``qa_capture_screens`` keeps full iOS support
+    (simctl, devicectl, the idevicescreenshot fallback, app enumeration, both
+    screenshot paths); neither ``shape_devices`` nor
+    ``device_manager.list_devices`` is touched, because both are SHARED
+    producers and an iOS row is the right answer for their other readers. This
+    is the emulator lane's own device-selection path, which replays uiautomator
+    scripts over `adb` and can drive nothing else.
+
+    POSITIVE IDENTIFICATION ONLY. It refuses when live discovery names this
+    exact id as a non-Android device, and in NO other case: an unknown id, a
+    probe that fails or times out, or no discovery at all returns "" and the
+    call proceeds exactly as it does today. That direction is deliberate -- an
+    emulator that is still booting is in no list yet, and refusing it would be a
+    new defect traded for the old noise.
+    """
+    wanted = str(serial or "").strip()
+    if not wanted:
+        return ""
+    try:
+        found = await asyncio.wait_for(list_devices(), timeout=_MOBILE_PROBE_S)
+    except Exception:
+        logger.info("mobile lane platform probe did not finish", exc_info=True)
+        return ""
+    for row in (found or {}).get("content") or []:
+        # The loop is OUTSIDE the try, so a row that is not a dict raised
+        # AttributeError straight through a function whose whole contract is to
+        # fail open. A row this server cannot read names no platform, and only a
+        # POSITIVE identification refuses.
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("id") or "") != wanted:
+            continue
+        platform = str(row.get("platform") or "")
+        if not platform or platform == "android":
+            return ""
+        return (
+            "## `"
+            + wanted[:80]
+            + "` is not an Android device\n\nThe mobile emulator lane drives "
+            "Android only: it replays uiautomator scripts over `adb`, and this "
+            "server has no equivalent for "
+            + platform[:20]
+            + ". Nothing was started and nothing was installed.\n\nThat device "
+            "is still fully supported elsewhere -- `qa_capture_screens` takes "
+            "its screenshots and `qa_list_devices` keeps listing it. To use "
+            "this lane, pass an Android emulator serial (like `emulator-5554`) "
+            "in `serial`, or call `qa_mobile_test` with no `serial` and let it "
+            "adopt or provision one."
+        )
+    return ""
 
 
 async def _mobile_doctor_section() -> list:
@@ -2631,48 +3067,75 @@ async def _mobile_doctor_section() -> list:
             else "- ⬜ No Android SDK found yet — the first mobile run "
             "provisions one into `~/.qa-agents/mobile/` (about 2.2 GB)"
         )
-        # THE DEVICE LOCK. The design's honest bound (plan §5.6) is that a
-        # holder whose heartbeat writer never started is NOT force-released --
-        # breaking a live holder's lock is the two-holder defect the whole
-        # mechanism deletes -- and that the cost of that choice is disclosed
-        # instead. This line IS that disclosure, and until it existed the
-        # claim in `locks.HELD_TOO_LONG_S`'s comment was simply untrue:
-        # `locks.holder()` had no production caller at all, so nothing surfaced
-        # it anywhere. An executing code review caught that.
+        # THE DEVICE LOCKS, ONE PER DEVICE, ASKED BY NAME. The design's honest
+        # bound (plan §5.6) is that a holder whose heartbeat writer never
+        # started is NOT force-released -- breaking a live holder's lock is the
+        # two-holder defect the whole mechanism deletes -- and that the cost of
+        # that choice is disclosed instead. This section IS that disclosure.
+        #
+        # IT MUST NAME THE DEVICE. This was `holder()` with no argument, taking
+        # the module default; once a lock is keyed by the device it holds, that
+        # probe reads a lock nobody ever takes and reports "free" while a device
+        # is being driven -- the same consumer-left-behind failure this file's
+        # `content is None` branch already exists for, one layer up.
+        from tools.mobile import adb as mobile_adb
         from tools.mobile import locks as mobile_locks
 
-        probed = mobile_locks.holder() or {}
-        device = probed.get("content") or {}
-        if probed.get("error") or probed.get("content") is None:
-            # FAILS CLOSED. "No run holds the emulator" would be a guess, and
-            # the wrong one -- the same reasoning the adb probe below already
-            # applies in this file, and the opposite of what this line did when
-            # it collapsed a `{"error": ..., "content": None}` return into `{}`
-            # and fell through to the definite negative.
-            lines.append(
-                "- ⚠️ Could not check whether a run holds the emulator: "
-                + str(probed.get("error") or "the lock could not be inspected")[:160]
+        try:
+            attached = await asyncio.wait_for(
+                mobile_adb.devices(), timeout=_MOBILE_PROBE_S
             )
-        elif device.get("held_too_long"):
+        except Exception as exc:  # a slow probe is not an absent device
+            attached = {
+                "error": "the device probe did not finish (" + str(exc)[:80] + ")",
+                "content": None,
+            }
+        if attached.get("error") or attached.get("content") is None:
+            # FAILS CLOSED, for the same reason it always did: "no run holds a
+            # device" would be a guess, and the wrong one.
             lines.append(
-                "- ⚠️ The emulator has been held by pid "
-                + str(device.get("pid") or "?")
-                + " for "
-                + str(int(device.get("age") or 0))
-                + "s (run `"
-                + str(device.get("owner") or "?")
-                + "`). Nothing here will break that hold — a lock taken from a "
-                "live holder means two runs on one device. If that process is "
-                "wedged, quit the editor holding it."
-            )
-        elif device.get("held"):
-            lines.append(
-                "- ✅ The emulator is in use by run `"
-                + str(device.get("owner") or "?")
-                + "` — one run drives a device at a time"
+                "- ⚠️ Could not check which devices are attached, so nothing "
+                "here says whether a run holds one: "
+                + str(attached.get("error") or "the probe failed")[:160]
             )
         else:
-            lines.append("- ✅ No run holds the emulator")
+            serials = [str(s) for s in (attached.get("content") or [])]
+            if not serials:
+                lines.append("- ⬜ No device is attached, so no run holds one")
+            for row in mobile_locks.device_holders(serials):
+                where = str(row.get("serial") or "?")
+                if row.get("error"):
+                    lines.append(
+                        "- ⚠️ Could not check whether a run holds "
+                        + where
+                        + ": "
+                        + str(row.get("error"))[:160]
+                    )
+                elif row.get("held_too_long"):
+                    lines.append(
+                        "- ⚠️ "
+                        + where
+                        + " has been held by pid "
+                        + str(row.get("pid") or "?")
+                        + " (run `"
+                        + str(row.get("owner") or "?")
+                        + "`) for "
+                        + str(int(row.get("age") or 0))
+                        + "s. Nothing here will break that hold — a lock taken "
+                        "from a live holder means two runs on one device. If "
+                        "that process is wedged, quit the editor holding it."
+                    )
+                elif row.get("held"):
+                    lines.append(
+                        "- ✅ "
+                        + where
+                        + " is in use by run `"
+                        + str(row.get("owner") or "?")
+                        + "` — one run drives a device at a time, and the other "
+                        "devices below are unaffected"
+                    )
+                else:
+                    lines.append("- ✅ " + where + " is free")
         pinned = (ime.manifest_status() or {}).get("content") or {}
         lines.append(
             "- ✅ QA input method " + str(pinned.get("detail") or "pinned")
@@ -11386,6 +11849,8 @@ async def handle_mobile_test(
     serial: str = "",
     avd: str = "",
     new_run: bool = False,
+    virtualization_ack: bool = False,
+    locale: str = "",
     *,
     choose: ChooseCb = None,
     ask_text: AskCb = None,
@@ -11423,7 +11888,7 @@ async def handle_mobile_test(
 
         if apply:
             return mobile_render.flag_refusal("Running the emulator lane")
-        return _MOBILE_LANE_OFF
+        return _mobile_lane_off_message()
 
     from tools.mobile import render as mobile_render
     from tools.mobile import run_store, session
@@ -11491,6 +11956,9 @@ async def handle_mobile_test(
             # Starting it first is safe: this chat already holds the run's LEASE
             # (checked above), which is the only thing the writer refreshes.
             _mobile_start_heartbeat(run_id, token)
+            # The device this run is on comes from its own manifest, inside
+            # `take_device_lock`: a resume must hold the device it recorded, not
+            # whatever is attached now.
             taken = (session.take_device_lock(run_id, lease=token) or {}).get(
                 "content"
             ) or {}
@@ -11499,6 +11967,17 @@ async def handle_mobile_test(
             device = await _mobile_resume_device_stage(run_id, budget=budget)
             if device:
                 return device
+            # A REBOOTED EMULATOR COMES BACK ON A DIFFERENT SERIAL, and the
+            # stage above writes the fresh one to the manifest. The lock taken a
+            # moment ago names the OLD device, so re-take: the acquire is a
+            # no-op when nothing moved, and when something did it takes the real
+            # device and drops the stale hold rather than driving a device this
+            # run does not own.
+            retaken = (session.take_device_lock(run_id, lease=token) or {}).get(
+                "content"
+            ) or {}
+            if not retaken.get("acquired"):
+                return mobile_render.device_busy_block(retaken)
             resolved = session.resolve(run_id, token)
             if resolved.get("error"):
                 return "⚠️ " + _safe(resolved["error"], 400)
@@ -11548,16 +12027,49 @@ async def handle_mobile_test(
         # state produces the same outcome twice. See
         # `.claude/plans/plan-emulator-lock-2026-09-04.md` §5.2.
         pre_run_owner = session.new_provisioning_owner()
-        taken = (session.take_device_lock(pre_run_owner) or {}).get("content") or {}
+        # SELECTION FIRST, THEN THE DEVICE. Choosing is a question about the
+        # machine -- it reads `adb devices` and may spawn the shared emulator --
+        # so it is serialised under the lane's select lock, which is the lock
+        # this line has always taken. Driving is a question about ONE device, so
+        # the moment the stage names one this call takes that device's own lock
+        # and hands selection back. Two runs on two devices then overlap through
+        # the install, the preflight and the whole run; two runs on ONE device
+        # still serialise, on the device lock, exactly as they did before.
+        taken = (session.take_select_lock(pre_run_owner) or {}).get("content") or {}
         if not taken.get("acquired"):
             return mobile_render.device_busy_block(taken)
         handed_off = False
         try:
             staged, serial = await _mobile_device_stage(
-                apply, serial=serial, avd=avd, choose=choose, progress=progress
+                apply,
+                serial=serial,
+                avd=avd,
+                virtualization_ack=virtualization_ack,
+                locale=locale,
+                choose=choose,
+                progress=progress,
             )
             if staged:
                 return staged
+            held = (session.take_device_lock(pre_run_owner, serial=serial) or {}).get(
+                "content"
+            ) or {}
+            if not held.get("acquired"):
+                return mobile_render.device_busy_block(held)
+            # Given back BEFORE the long steps, not after, or the concurrency
+            # this sequencing exists for would be nominal: install and preflight
+            # are the minutes, and they touch only the device now named.
+            session.release_select_lock(pre_run_owner)
+            # THE LANGUAGE, applied and CONFIRMED before anything is installed or
+            # replayed. A run whose report says Arabic over English screens is
+            # the success-shaped reply this lane refuses everywhere else, so a
+            # request that did not take stops here instead. Inside the same
+            # `try`, so the `finally` below still gives the device back.
+            locale_stage, locale_taken = await _mobile_locale_stage(
+                serial, locale, apply
+            )
+            if locale_stage:
+                return locale_stage
             app_stage, target = await _mobile_app_stage(
                 serial, package, source, app, apply, progress=progress
             )
@@ -11601,6 +12113,7 @@ async def handle_mobile_test(
                 pre_run_owner=pre_run_owner,
                 progress=progress,
                 new_run=new_run,
+                locale=locale_taken,
             )
             return reply
         finally:
@@ -11668,8 +12181,10 @@ async def _mobile_pick_source(
 async def _mobile_device_stage(
     apply: bool,
     *,
+    virtualization_ack: bool = False,
     serial: str = "",
     avd: str = "",
+    locale: str = "",
     choose: ChooseCb = None,
     progress: ProgressCb = None,
 ) -> tuple:
@@ -11696,6 +12211,12 @@ async def _mobile_device_stage(
 
     given_serial = str(serial or "").strip()
     if given_serial:
+        # BEFORE the device is touched: a serial the tester copied out of
+        # `qa_list_devices` may name an iOS simulator or phone, which this lane
+        # cannot drive. Fails open -- see `_mobile_non_android`.
+        refusal = await _mobile_non_android(given_serial)
+        if refusal:
+            return refusal, ""
         ready = await session.ensure_device(serial=given_serial, avd=str(avd or ""))
         if ready.get("error"):
             return "⚠️ " + str(ready["error"])[:300], ""
@@ -11777,7 +12298,13 @@ async def _mobile_device_stage(
                 "",
             )
         await _emit(progress, "⚙️ Starting the provisioner…")
-        started = session.start_provisioning()
+        # The tester's acknowledgement of an AMBIGUOUS virtualization probe,
+        # carried to the only place it means anything. It rides BELOW both real
+        # guards and weakens neither: the lane's kill-switch is checked by
+        # `_mobile_lane_enabled()` at the top of this handler and again inside
+        # `provisioner.run`, and the `apply` refusal is a few lines above. It
+        # dismisses one probe that says of itself it may be wrong.
+        started = session.start_provisioning(virtualization_ack=virtualization_ack)
         if started.get("error"):
             return "⚠️ " + str(started["error"])[:300], ""
         return (
@@ -11798,7 +12325,10 @@ async def _mobile_device_stage(
             ),
             "",
         )
-    ready = await session.ensure_device(avd=str(avd or ""))
+    # THE ONLY BRANCH THAT SPAWNS, so the only one that can set the language
+    # from the first frame. Every branch above ADOPTED a device somebody else
+    # booted; `_mobile_locale_stage` handles those by reading back.
+    ready = await session.ensure_device(avd=str(avd or ""), locale=str(locale or ""))
     if ready.get("error"):
         return "⚠️ " + str(ready["error"])[:300], ""
     state = ready.get("content") or {}
@@ -11806,6 +12336,66 @@ async def _mobile_device_stage(
     if str(state.get("state") or "") != "ready":
         return mobile_render.device_pending_block(state), picked_serial
     return "", picked_serial
+
+
+async def _mobile_locale_stage(serial: str, locale: str, apply: bool) -> tuple:
+    """Put the device into the requested language. ``(markdown_or_empty, record)``.
+
+    Three outcomes:
+
+    * nothing requested -> empty markdown, and a record saying what the device
+      was already in, so the report can still state the language;
+    * requested and confirmed -> empty markdown and the record;
+    * requested and NOT confirmed -> a refusal that NAMES what the device is
+      actually in and the two ways to fix it. This is the ORDINARY outcome on an
+      emulator the tester started themselves: `persist.sys.locale` is a root
+      property on the `google_apis_playstore` user build, so the write does not
+      land, and letting the run proceed would produce a report headed with a
+      language the screenshots are not in.
+
+    Changing the device's language is an effect on the tester's device, so a
+    REQUEST needs `apply=true`, exactly as an install does. A call with no
+    `locale` touches nothing and needs nothing.
+    """
+    from tools.mobile import render as mobile_render
+    from tools.mobile import session
+
+    wanted = str(locale or "").strip()
+    if wanted and not apply:
+        return (
+            mobile_render.apply_refusal(
+                "Setting the device language to " + wanted,
+                "one property write on the emulator",
+            ),
+            None,
+        )
+    applied = await session.apply_locale(serial, wanted)
+    if applied.get("error"):
+        return "\u26a0\ufe0f " + str(applied["error"])[:300], None
+    record = applied.get("content") or {}
+    if wanted and not record.get("matched"):
+        actual = str(record.get("actual") or "")
+        detail = str(record.get("detail") or "")
+        return (
+            "## The emulator is not in "
+            + wanted
+            + "\n\nIt is in `"
+            + (actual or "a language it would not report")
+            + "`"
+            + ((" (" + detail + ")") if detail else "")
+            + ". Nothing was run: a report headed "
+            + wanted
+            + " over screens in another language is worse than no run at "
+            + "all.\n\nTwo ways forward:\n\n"
+            + "1. Let the lane boot its own emulator with the language set from "
+            + "the first frame -- call `qa_mobile_test` with `locale` and no "
+            + "`serial`, with no emulator already running. That is the only "
+            + "mechanism that works without root.\n"
+            + "2. Set it by hand on this emulator (Settings > System > "
+            + "Languages) and call `qa_mobile_test` again.",
+            None,
+        )
+    return "", record
 
 
 async def _mobile_app_stage(
@@ -11843,9 +12433,18 @@ async def _mobile_app_stage(
     if not target and install_source == "installed_package":
         target = value
 
+    # WHETHER THE DEVICE ANSWERED, read from the one witness that knows.
+    # `session.install_state` publishes `probed` on its CONTENT; this used to
+    # ask the envelope instead (`not state.get("error")`), and that function
+    # sets `error` only in a defensive branch, so it read True on exactly the
+    # adb failure it was written to catch and the menu asserted the app was
+    # absent off a probe that never ran. `install_state` runs only for a
+    # non-empty target, so a first call leaves this False and the menu ASKS.
+    probed = False
     if target:
         state = await session.install_state(serial, target)
         body = state.get("content") or {}
+        probed = bool(body.get("probed"))
         if body.get("installed"):
             return "", target
         if body.get("pending"):
@@ -11857,7 +12456,7 @@ async def _mobile_app_stage(
                 target,
             )
     if not install_source:
-        return mobile_render.install_menu_markdown(target), target
+        return mobile_render.install_menu_markdown(target, probed=probed), target
     if not apply:
         return (
             mobile_render.apply_refusal(
@@ -11886,6 +12485,19 @@ async def _mobile_app_stage(
             target,
         )
     if install_source == "installed_package":
+        # The SECOND absence assertion on this path, and it is reachable with an
+        # unanswered probe exactly as the menu was. Same rule: only a probe that
+        # answered may say the app is not there.
+        if not probed:
+            return (
+                "⚠️ Could not check whether `"
+                + (target or "(none given)")
+                + "` is on the emulator -- the device did not answer, so this "
+                "server will not say either way. Check the emulator is still "
+                "running (`qa_list_devices`) and call `qa_mobile_test` again. "
+                "Nothing was installed or started.",
+                target,
+            )
         return (
             "⚠️ `"
             + (target or "(none given)")
@@ -11946,6 +12558,7 @@ async def _mobile_start(
     pre_run_owner: str,
     progress: ProgressCb = None,
     new_run: bool = False,
+    locale: object = None,
 ) -> tuple:
     """Turn a start-menu choice into a planned run and its first packet.
 
@@ -11982,9 +12595,22 @@ async def _mobile_start(
                 400,
             )
         ), False
+    # ONE PRODUCER, at the one moment a run is created. Kind, model and API
+    # level are read here and STORED on the manifest; every later reader --
+    # status, the report, a resume in another chat -- reads that record instead
+    # of asking the device again, so two readers cannot disagree and a finished
+    # run still says what it ran on after the device is gone.
+    from tools.mobile import adb as mobile_adb
+
+    device_facts = (await mobile_adb.device_facts(serial) or {}).get("content") or {}
     if picked == "explore":
         planned = session.plan_explore_run(
-            goal, package=package, serial=serial, avd=await _mobile_avd_of(serial)
+            goal,
+            package=package,
+            serial=serial,
+            avd=await _mobile_avd_of(serial),
+            device=device_facts,
+            locale=locale,
         )
         if planned.get("error"):
             return "\u26a0\ufe0f " + _safe(planned["error"], 300), False
@@ -12066,6 +12692,8 @@ async def _mobile_start(
         source=picked,
         filters=filters,
         avd=await _mobile_avd_of(serial),
+        device=device_facts,
+        locale=locale,
     )
     if planned.get("error"):
         return "\u26a0\ufe0f " + _safe(planned["error"], 400), False
@@ -12340,8 +12968,8 @@ async def _mobile_next(
         + "\n\nPlan the actions for the screen below and send them straight back "
         "with `qa_submit_mobile_step`.\n\n"
     )
-    return header + mobile_render.packet_block(
-        body.get("packet"), session_token=session_token
+    return header + await _mobile_packet_text(
+        body.get("packet"), session_token, body.get("resolved")
     )
 
 
@@ -12371,7 +12999,7 @@ async def handle_submit_mobile_step(
     from tools.untrusted import single_line as _safe
 
     if not _mobile_lane_enabled():
-        return _MOBILE_LANE_OFF
+        return _mobile_lane_off_message()
 
     from tools.mobile import render as mobile_render
     from tools.mobile import run_store, session
@@ -12439,7 +13067,7 @@ async def handle_submit_mobile_step(
                 line
                 + (("\n\n" + notice) if notice else "")
                 + "\n\n"
-                + mobile_render.packet_block(body["packet"], session_token=token)
+                + await _mobile_packet_text(body["packet"], token, body.get("resolved"))
             )
         tail = await _mobile_next(run_id, token, progress=progress, budget=budget)
         return line + (("\n\n" + notice) if notice else "") + "\n\n" + tail
@@ -12447,6 +13075,119 @@ async def handle_submit_mobile_step(
         logger.exception("mcp submit_mobile_step failed")
         _capture_error(exc, "qa_submit_mobile_step")
         return "⚠️ That step could not be replayed: " + _safe(str(exc), 200)
+
+
+#: THIS CALL's captured screens, as ``_image_content_blocks`` specs.
+#:
+#: A ContextVar rather than a module list, and that is not a style choice: two
+#: chats can drive two runs through this process at once (which is why
+#: ``mcp_server._inflight_enter`` exists), and a module-level accumulator would
+#: attach one run's screen to the other run's reply. Each ``*_content`` entry
+#: point below sets its OWN empty list, so a spec can only ever be read by the
+#: call that produced it.
+#:
+#: ``None`` -- the default -- is a THIRD state and it is meaningful: it says
+#: "this caller cannot carry image content", which is true of every caller of the
+#: ``str``-returning names. ``_mobile_packet_text`` reads that as "do not even
+#: ask the device", so the ~100 existing callers of those names pay no extra adb
+#: round trip and see no behaviour change at all.
+#:
+#: WHY A SINK AT ALL, rather than returning tuples: the packet text is produced
+#: deep inside ``_mobile_next`` and ``handle_submit_mobile_step``, behind roughly
+#: forty ``return`` statements between them -- the lease check, the takeover
+#: path, the device-lock refusal, the kill-switch refusal, the never-raise exit.
+#: Threading a tuple back would have rewritten every one of those, for a value
+#: only the outermost frame uses. ONE producer writes here and exactly two
+#: readers drain it.
+_MOBILE_IMAGE_SPECS: ContextVar = ContextVar("_MOBILE_IMAGE_SPECS", default=None)
+
+
+async def _mobile_packet_text(
+    packet: object, session_token: str, resolved: object
+) -> str:
+    """The rendered packet, PLUS this turn's screen captured and recorded.
+
+    THE ONE PLACE either mobile tool turns a packet into text. Both call sites
+    go through here so the picture, the note that says it is attached and the
+    note that says it is not cannot disagree between the two tools -- and cannot
+    drift, which is what a second copy of this logic at the other call site
+    would do.
+
+    ``resolved`` is the run body ``session.next_packet`` / ``session.submit``
+    already carry on ``content["resolved"]``; ``serial`` is read from it rather
+    than re-resolved, so this costs no extra disk read.
+
+    Never raises and never loses the packet: a capture that fails, times out,
+    or blows up leaves the note saying so and the packet otherwise untouched.
+    """
+    from tools.mobile import adb as mobile_adb
+    from tools.mobile import render as mobile_render
+    from tools.mobile import screenshot as mobile_screenshot
+
+    body = resolved if isinstance(resolved, dict) else {}
+    sink = _MOBILE_IMAGE_SPECS.get()
+    serial = str(body.get("serial") or "")
+    spec = None
+    if sink is None:
+        # No image channel on this path. NOT an attempt that failed -- so no
+        # device call is made and the note says exactly that.
+        note = mobile_screenshot.NO_IMAGE_CHANNEL_NOTE
+    elif not serial:
+        # A run with no device yet (an explore turn before provisioning). There
+        # is nothing to capture FROM, and asking adb would produce a refusal
+        # about a device id where a packet belongs.
+        note = mobile_screenshot.CAPTURE_FAILED_NOTE
+    else:
+        note = mobile_screenshot.CAPTURE_FAILED_NOTE
+        try:
+            shot = await mobile_adb.screencap(serial)
+            spec = mobile_screenshot.to_spec(
+                (shot or {}).get("content"),
+                run_id=body.get("run_id"),
+                tc_id=(packet.get("tc_id") if isinstance(packet, dict) else ""),
+            )
+        except Exception:  # never-raise: a picture is not a verdict
+            logger.exception("mcp mobile screen capture failed")
+            spec = None
+        if spec is not None:
+            note = mobile_screenshot.ATTACHED_NOTE
+            sink.append(spec)
+    shown = packet
+    if isinstance(shown, dict):
+        # A COPY: the packet is the caller's own dict, and a note written into
+        # it would outlive this reply.
+        shown = dict(shown)
+        shown["screen_image"] = note
+    return mobile_render.packet_block(shown, session_token=session_token)
+
+
+async def handle_mobile_test_content(*args, **kwargs) -> tuple:
+    """``handle_mobile_test``'s text PLUS the image specs of the screens it took.
+
+    ``(markdown, [{filename, mime, data}, ...])`` -- the shape
+    ``mcp_server._image_content_blocks`` consumes, and the shape
+    ``handle_capture_screens`` already returns. THE entry point for the tool
+    layer; the ``str``-returning name stays exactly what it was for every other
+    caller and is this function's text, projected.
+
+    Opening the sink is what ARMS the capture: see ``_MOBILE_IMAGE_SPECS``.
+    """
+    token = _MOBILE_IMAGE_SPECS.set([])
+    try:
+        text = await handle_mobile_test(*args, **kwargs)
+        return text, list(_MOBILE_IMAGE_SPECS.get() or [])
+    finally:
+        _MOBILE_IMAGE_SPECS.reset(token)
+
+
+async def handle_submit_mobile_step_content(*args, **kwargs) -> tuple:
+    """``handle_submit_mobile_step``'s text plus its screens. See above."""
+    token = _MOBILE_IMAGE_SPECS.set([])
+    try:
+        text = await handle_submit_mobile_step(*args, **kwargs)
+        return text, list(_MOBILE_IMAGE_SPECS.get() or [])
+    finally:
+        _MOBILE_IMAGE_SPECS.reset(token)
 
 
 def _mobile_device_in_use(session, run_id: str, session_token: str = "") -> bool:
@@ -12505,7 +13246,7 @@ async def handle_mobile_status(
     from tools.untrusted import single_line as _safe
 
     if not _mobile_lane_enabled():
-        return _MOBILE_LANE_OFF
+        return _mobile_lane_off_message()
 
     from tools.mobile import render as mobile_render
     from tools.mobile import session
@@ -12565,6 +13306,11 @@ async def handle_mobile_status(
         return (
             "\n".join(lines)
             + mobile_render.status_block(body, coverage)
+            # WHICH HARDWARE. A pass on an emulator is weaker evidence than a
+            # pass on the phone, so the run says which it ran on -- from the
+            # record written when it was planned, not from a fresh probe, so a
+            # finished run still answers and two readers cannot disagree.
+            + session.device_line(body)
             + "\n\n"
             + mobile_render.summary_block(
                 recorded,
@@ -13559,9 +14305,13 @@ async def handle_list_devices(*, progress: ProgressCb = None) -> str:
         result = await list_devices()
         if result.get("error"):
             return f"⚠️ Device discovery failed: {result['error']}"
-        devices = result.get("content") or []
-        await _audit("mcp_list_devices", detail={"count": len(devices)})
-        return shape_devices(devices)
+        devices = await _android_device_details(result.get("content") or [])
+        unusable = result.get("unusable") or []
+        await _audit(
+            "mcp_list_devices",
+            detail={"count": len(devices), "unusable": len(unusable)},
+        )
+        return shape_devices(devices, unusable, result.get("adb_dropped_lines") or 0)
     except Exception as exc:
         logger.exception("handle_list_devices failed")
         _capture_error(exc, "qa_list_devices")
@@ -14286,11 +15036,11 @@ async def handle_capture_screens(
         device = None
         device_id = (device_id or "").strip()
         if device_id and not rescan:
-            device = await _resolve_device(device_id)
+            device, why_not = await _resolve_device_with_reason(device_id)
             if device is None:
                 return (
                     f"⚠️ Device `{device_id}` not found. Run `qa_list_devices` "
-                    "and retry with an id from that list.",
+                    "and retry with an id from that list." + why_not,
                     [],
                 )
         if device is None:
@@ -14951,11 +15701,11 @@ async def handle_feature_analysis(
                         return "👍 Cancelled — no device selected."
                     else:
                         return await _device_menu_markdown(tool="qa_feature_analysis")
-                device = await _resolve_device(device_id)
+                device, why_not = await _resolve_device_with_reason(device_id)
                 if device is None:
                     return (
                         f"⚠️ Device `{device_id}` not found. Run qa_list_devices to "
-                        "see connected devices, then pass a listed id."
+                        "see connected devices, then pass a listed id." + why_not
                     )
                 screens, capture_error = await _fa_capture_screens(
                     device, choose=choose, progress=progress
@@ -15385,7 +16135,46 @@ _TOOL_INFO: dict[str, dict] = {
 }
 
 
-def _binary_line(name: str) -> str:
+def _optional_tool_paths() -> dict[str, str | None]:
+    """WHERE each optional command-line tool is on this machine, or ``None``.
+
+    THE ONE LOOKUP, and the reason it exists as a function. Two consumers read
+    it -- the "Command-line tooling" rows and the headline's "not available on
+    this machine" list -- and neither calls ``shutil.which`` again. Asking the
+    same binary twice in two places is the mirrored-condition defect CLAUDE.md
+    names: the day one of them grows an SDK fallback, the report contradicts
+    its own headline and nothing fails.
+
+    ``xcrun`` is asked for on macOS only, for the reason ``_tooling_lines``
+    states: it can never exist elsewhere, so a cross there is noise, not news.
+    That rule lives HERE, once, because this dict is now what decides which
+    rows render.
+    """
+    names = ["adb"] + (["xcrun"] if sys.platform == "darwin" else [])
+    return {name: shutil.which(name) for name in names}
+
+
+def _tooling_gaps(paths: dict[str, str | None]) -> list[str]:
+    """One phrase per optional tool that is ABSENT, naming what it would serve.
+
+    Reads the purpose out of ``_TOOL_INFO`` -- the same field the row prints --
+    so the headline and the row can never describe one binary two ways.
+
+    Feeds NO count in ``_overall_verdict``, deliberately: a missing optional
+    tool must never become a blocker, because nothing here is needed to
+    generate test cases. It changes what the headline SAYS, not which verdict
+    it reaches.
+    """
+    out: list[str] = []
+    for name, path in paths.items():
+        if path:
+            continue
+        purpose = str((_TOOL_INFO.get(name) or {}).get("purpose") or name)
+        out.append(f"{purpose} (`{name}` is not installed)")
+    return out
+
+
+def _binary_line(name: str, path: str | None) -> str:
     """One tooling row: state, what it is FOR, and how to install it here.
 
     2026-08-04. This printed a red cross and the words "not found", nothing more.
@@ -15398,7 +16187,11 @@ def _binary_line(name: str) -> str:
     info = _TOOL_INFO.get(name) or {}
     purpose = str(info.get("purpose") or "")
     tail = f" ({purpose})" if purpose else ""
-    path = shutil.which(name)
+    # The path is PASSED IN, never looked up here: ``_optional_tool_paths`` is
+    # the one lookup, and a second ``shutil.which`` in this function is exactly
+    # the drift that would let a row and the headline disagree about one
+    # binary. A required parameter rather than an optional one, so a caller
+    # that forgets it fails loudly instead of silently re-deriving.
     if path:
         return f"- ✅ `{name}`{tail} — {path}"
     cmd = str((info.get("install") or {}).get(sys.platform) or "")
@@ -15407,7 +16200,7 @@ def _binary_line(name: str) -> str:
     )
 
 
-def _tooling_lines() -> list[str]:
+def _tooling_lines(paths: dict[str, str | None]) -> list[str]:
     """The whole "Command-line tooling" section, as report lines.
 
     A function rather than an inline list literal in the report builder, because
@@ -15416,18 +16209,19 @@ def _tooling_lines() -> list[str]:
     report. Same reason the header now says "optional" out loud: a tester read
     three crosses as three things they had to fix.
     """
-    rows: list[str] = []
     # A binary earns a row only if something here USES it. The `cursor-agent`
     # row was dropped on 2026-08-20: it served the `cursor` server-side LLM
     # backend, which P2-G deleted on 2026-08-16, so the row was offering an
     # install command for a capability no edition has. Its gate was an EDITION
     # check, which is why it kept rendering on a full checkout long after the
     # backend was gone.
-    # adb stays in both editions: qa_list_devices ships in the dist too.
-    rows.append(_binary_line("adb"))
-    # xcrun can NEVER exist off macOS, so a cross there is noise, not news.
-    if sys.platform == "darwin":
-        rows.append(_binary_line("xcrun"))
+    #
+    # adb stays in both editions (qa_list_devices ships in the dist too), and
+    # xcrun can NEVER exist off macOS so a cross there is noise, not news --
+    # both rules now live in ``_optional_tool_paths``, which is what decides
+    # which binaries were asked about at all. This loop renders whatever that
+    # ONE lookup found, in its order, and derives nothing of its own.
+    rows: list[str] = [_binary_line(name, path) for name, path in paths.items()]
     return [
         "### Command-line tooling (all optional)",
         "_None of this is needed to generate test cases. A ❌ limits only the "
@@ -15733,7 +16527,11 @@ def _jira_status_text(state: str, view: dict | None) -> str:
 
 
 def _overall_verdict(
-    blocker_count: int, recommended_count: int, unverified_count: int
+    blocker_count: int,
+    recommended_count: int,
+    unverified_count: int,
+    *,
+    limited: tuple[str, ...] = (),
 ) -> str:
     """The qa-doctor headline, decided from what the Action items will SAY.
 
@@ -15750,20 +16548,33 @@ def _overall_verdict(
     recommended to the TESTER), so neither existing branch fits.
     """
     if blocker_count:
-        return (
+        head = (
             f"\u274c **Not ready** \u2014 {blocker_count} blocking issue(s), "
             "see Action items below"
         )
-    if recommended_count:
-        return "\u26a0\ufe0f **Ready, with warnings** \u2014 see Action items below"
-    if unverified_count:
-        return (
+    elif recommended_count:
+        head = "\u26a0\ufe0f **Ready, with warnings** \u2014 see Action items below"
+    elif unverified_count:
+        head = (
             "\u26a0\ufe0f **Ready \u2014 one check unverified**, see Action items below"
             if unverified_count == 1
             else f"\u26a0\ufe0f **Ready \u2014 {unverified_count} checks "
             "unverified**, see Action items below"
         )
-    return "\u2705 **Ready** \u2014 all required checks passed"
+    else:
+        head = "\u2705 **Ready** \u2014 all required checks passed"
+    if not limited:
+        return head
+    # APPENDED, never counted. `limited` names what this machine cannot do --
+    # a missing optional tool, a Jira connection known not to work, an Android
+    # lane switched off -- and it must not be able to move the branch above:
+    # `adb` is not needed to generate a single test case, so an install without
+    # it is READY, and saying otherwise would train the reader to ignore the
+    # one line the report leads with. What was wrong before is narrower and is
+    # fixed here: the headline said "Ready" and never named what had stopped
+    # working, so a machine with no Android tooling and a dead Jira read
+    # exactly like a healthy one.
+    return head + " \u00b7 Not available on this machine: " + "; ".join(limited)
 
 
 async def handle_selfcheck(*, server: Any) -> str:
@@ -15933,6 +16744,34 @@ async def handle_setup_check(
         blockers: list[str] = []
         recommended: list[str] = []
         optional: list[str] = []
+        # The FOURTH list, and it is not a fourth severity: `limited` names
+        # what this machine CANNOT DO and feeds no count in `_overall_verdict`
+        # (see there). Everything in it is true of the machine, actionable
+        # nowhere in this report, and invisible in the headline until now.
+        limited: list[str] = []
+        # THE ONE LOOKUP for the optional binaries, read twice below -- by the
+        # Command-line tooling rows and by `limited` -- and derived once, here.
+        _tool_paths = _optional_tool_paths()
+        # The lane's THREE states, from the one producer. Read once: the
+        # Feature-gates row, the mobile section and the headline all branch on
+        # this same value, so they cannot describe the lane three ways.
+        _mobile_state = _mobile_lane_state()
+        limited += _tooling_gaps(_tool_paths)
+        # The lane reaches the HEADLINE only where this machine could plausibly
+        # run it today: modules on disk, the switch off, and `adb` already
+        # here. Two reasons for that bound. Where `adb` is missing the gap
+        # above already names Android tooling, so exactly one Android-shaped
+        # phrase can ever appear; and where the lane is merely off on a machine
+        # with no Android tooling at all, a permanent headline suffix on every
+        # report forever is the nag-with-no-exit this function was corrected
+        # for on 2026-09-01. The DISCLOSURE itself is unconditional -- it is in
+        # the Feature-gates row and in the section below on every install.
+        if _mobile_state == "flag_off" and _tool_paths.get("adb"):
+            limited.append(
+                "running test cases on the Android device this machine can "
+                "already see (the emulator lane is off \u2014 see Feature "
+                "gates below)"
+            )
         # A reload that did not take effect is not passive information: the
         # server may be serving stale code, so it belongs in the action items.
         # Recommended, not blocking -- the server still answers.
@@ -16334,6 +17173,14 @@ async def handle_setup_check(
             # unverified "Fix now" below, which is the loudest thing in the
             # report and wrong about a working connection.
         elif _verdict_state == "wrong_site":
+            # Same branch, so ONE derivation with two consumers: the action
+            # item says what to do, `limited` makes the headline say what has
+            # stopped working. `stale` and `probe_outdated` get no `limited`
+            # entry -- nothing is KNOWN to be broken in those states.
+            limited.append(
+                "importing Jira tickets (the connected Atlassian account "
+                "cannot reach this tester's site)"
+            )
             recommended.append(
                 "The Atlassian account signed in here cannot reach this "
                 "tester's Jira site "
@@ -16346,6 +17193,10 @@ async def handle_setup_check(
             # Known-broken and actionable to the TESTER, so a warning rather
             # than an unsettled question. Not a blocker: generation from a typed
             # feature description is entirely unaffected.
+            limited.append(
+                "importing Jira tickets (the Atlassian connection failed its "
+                "last check)"
+            )
             recommended.append(
                 "The Atlassian (Jira) connection failed its last check "
                 f"({(_verdict_view or {}).get('at')}), so ticket URLs will not "
@@ -16372,6 +17223,10 @@ async def handle_setup_check(
             len(blockers),
             len(recommended),
             1 if _verdict_state == "unverified" else 0,
+            # KEYWORD, and pinned at this call site by its own test: the
+            # parameter has a default, so nothing about the function alone can
+            # catch this argument being dropped.
+            limited=tuple(limited),
         )
 
         lines = [
@@ -16392,7 +17247,7 @@ async def handle_setup_check(
             "### Integrations",
             "- " + _jira_status_line,
             "",
-            *_tooling_lines(),
+            *_tooling_lines(_tool_paths),
             "",
             "### Feature gates",
         ]
@@ -16423,7 +17278,7 @@ async def handle_setup_check(
             # tester reading qa-doctor learns the capability exists -- and the
             # label carries no recipe, because the per-install detail is in
             # the section further down and only when the lane is on.
-            ("Mobile emulator lane (opt-in kill-switch)", _mobile_lane_enabled()),
+            _mobile_gate_row(_mobile_state),
             (
                 "Swagger/OpenAPI links (always on since 2026-08-13)",
                 True,
@@ -16465,9 +17320,25 @@ async def handle_setup_check(
         # (not a "disabled" line) when the lane is off -- the gate row above
         # already said so, and a second telling is noise on every install that
         # will never use it.
-        _mobile_lines = await _mobile_doctor_section()
-        if _mobile_lines:
-            lines += ["", *_mobile_lines]
+        # BRANCH ON THE STATE, never on the section being empty. "An empty list
+        # means the lane is off" is an inference, and a future early return
+        # inside `_mobile_doctor_section` would silently turn a running lane
+        # into an off-lane disclosure. `_mobile_doctor_section` keeps its own
+        # `_mobile_lane_enabled()` guard as well: two independent checks of the
+        # same state, neither of which is load-bearing alone.
+        if _mobile_state == "on":
+            _mobile_lines = await _mobile_doctor_section()
+            if _mobile_lines:
+                lines += ["", *_mobile_lines]
+        else:
+            # The lane is present-but-off, or not in this build at all. It used
+            # to render as one blank checkbox that named no setting and no
+            # capability; a tester with an Android phone attached read that and
+            # learned nothing they could act on.
+            lines += [
+                "",
+                *_mobile_lane_disclosure(_mobile_state, _tool_paths.get("adb")),
+            ]
 
         # Item 2b: unfinished host-mode preps (disclosure only, flag-gated;
         # empty string when QA_PREP_DISCLOSE_UNFINISHED is off or none exist).

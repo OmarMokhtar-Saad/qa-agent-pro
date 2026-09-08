@@ -1,6 +1,6 @@
 [project]
 name = "qa-agent-pro"
-version = "1.80.0"
+version = "1.81.0"
 requires-python = ">=3.10"
 dependencies = [
     "pyyaml>=6.0",  # contracts + OpenAPI specs are YAML (api_test agent)
@@ -25,6 +25,17 @@ dependencies = [
     # Ed25519 release-signature verification in tools/updater.py (auto-update
     # trust root). Widely wheeled; the dist build pins it too via patch_pyproject.
     "cryptography>=41.0",
+    # Pillow: tools/mobile/screenshot.py downscales the attached screen PNG
+    # before it is base64'd into the reply, which is 76% off what the image
+    # channel costs the tester's own model (measured 1513 tokens at the long
+    # edge a vision model downscales to, against 363 at 768). Imported LAZILY
+    # and degraded around -- an install that predates this line attaches the
+    # full-size picture rather than losing it -- but a DIRECT dependency, not
+    # an optional extra, because the saving is the default behaviour and an
+    # extra nobody installs is an untested path. scripts/build_dist.py's
+    # patch_pyproject copies this dependency set verbatim, so qa-agent-pro
+    # picks it up with no second edit.
+    "pillow>=10.0",
 ]
 
 [project.optional-dependencies]

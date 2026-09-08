@@ -48,6 +48,7 @@ Never raises: every public function returns ``{"error", "content"}``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -67,11 +68,28 @@ class LockUnsupported(RuntimeError):
     """Neither locking primitive exists on this platform."""
 
 
-#: The lock the whole mobile lane takes. ONE lock for the lane, not one per
-#: serial: ``_mobile_device_stage`` is what picks, boots and provisions the
-#: device, so the serial does not exist until after the most contended step has
-#: already run, and a per-serial lock could not cover the step it most needs to.
+#: The lock the SELECTION phase takes -- the same file this lane has always
+#: used, held for a shorter window.
+#:
+#: TWO LOCKS, TWO QUESTIONS, and the division is the whole design. Picking a
+#: device is a question about the MACHINE: it reads ``adb devices``, may adopt a
+#: foreign emulator and may spawn the shared default one, and there is no serial
+#: yet to key a lock by -- which is exactly why this constant used to be the
+#: lane's only lock. Driving a device afterwards is a question about ONE DEVICE,
+#: and that is :func:`device_lock_name`. So the pre-run phase takes this, names
+#: a device, takes THAT device's lock, and gives this one back before the long
+#: steps (install, preflight, the run itself) begin. Two runs on two devices
+#: then overlap everywhere except the seconds of selection; two runs on ONE
+#: device still serialise, on the device lock, exactly as they did before.
+#:
+#: Provisioning and boot keep their own separate :data:`PROVISION_LOCK`, held by
+#: the detached worker -- the genuinely machine-wide act was already isolated
+#: from the per-run hold, which is what makes per-device keying safe.
 EMULATOR_LOCK = "emulator"
+
+#: Every device lock name starts here, so one ``startswith`` tells a device lock
+#: from :data:`EMULATOR_LOCK` or :data:`PROVISION_LOCK` without parsing.
+DEVICE_LOCK_PREFIX = "device-"
 
 #: The lock the DETACHED provisioner holds for its own lifetime. The worker
 #: holds it, never the chat that started the worker -- so the kernel releases it
@@ -704,6 +722,113 @@ def relabel(name: str = EMULATOR_LOCK, *, from_owner: str, to_owner: str) -> dic
     except Exception as exc:
         logger.exception("mobile.locks.relabel failed")
         return {"error": str(exc), "content": None}
+
+
+def device_lock_name(serial: object) -> str:
+    """The lock name for ONE device, or ``""`` when *serial* names no device.
+
+    THE ONE PLACE A SERIAL BECOMES A LOCK KEY. Every caller goes through here,
+    because a serial is attacker-influenceable text that becomes a FILENAME:
+    ``adb devices`` output, a ``serial=`` argument a client passed us, a
+    manifest written by an older build. Two properties are required and both are
+    delivered here rather than promised by the callers:
+
+    * IT CANNOT ESCAPE. Everything outside ``[A-Za-z0-9._-]`` is replaced, and
+      the result is prefixed, so ``lock_path`` always gets a name matching
+      ``_NAME_RE`` and the file always lands inside ``locks/``. A hostile
+      ``../../etc/passwd`` becomes an ordinary name in the lock directory --
+      and even if this slipped, :func:`lock_path` still raises, which is the
+      second layer, not the first.
+    * IT CANNOT COLLIDE. The readable part is lossy (a TCP serial's ``:`` and a
+      USB serial's ``_`` flatten to the same character, and it is truncated), so
+      readability alone would give two DIFFERENT devices one lock -- which reads
+      as "busy" for a device nobody is driving, or worse, as one hold covering
+      two phones. The digest is taken over the FULL serial and settles it.
+
+    An empty or over-long serial returns ``""``: no device is named, so there is
+    nothing to lock, and a caller must refuse rather than fall back to a shared
+    name. A shared fallback name is the collision this function exists to make
+    impossible.
+    """
+    text = str(serial or "").strip()
+    if not text or len(text) > 128:
+        return ""
+    readable = re.sub(r"[^A-Za-z0-9._-]", "_", text)[:24]
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:12]
+    return DEVICE_LOCK_PREFIX + readable + "-" + digest
+
+
+def names_held_by(owner: object) -> list[str]:
+    """Lock names THIS PROCESS holds under *owner*, sorted.
+
+    The answer to "which device is this run on" that does not need a serial and
+    cannot be wrong: ``_HELD`` is the fd table, and the fd IS the ownership. A
+    releaser that derived the serial for itself -- from a manifest, from a
+    packet -- would be a SECOND producer of that fact, and would give away the
+    wrong device on the day the two disagreed (an emulator that rebooted onto a
+    new serial is that day).
+    """
+    label = str(owner or "").strip()
+    if not label:
+        return []
+    with _MUTEX:
+        return sorted(name for name, held in _HELD.items() if held.owner == label)
+
+
+def device_holders(serials: object, *, now: float | None = None) -> list[dict]:
+    """``[{serial, held, owner, age, held_too_long, error}]``, one row per device.
+
+    The status surface, and the reason it takes a LIST. Once a lock is keyed by
+    the device, "is the emulator free?" is not a question with an answer -- and
+    a probe that kept asking it would read a lock nobody takes and report a busy
+    phone as free. Every attached device is asked by name, and a device whose
+    probe failed carries ``error`` rather than a guess, because "unknown" must
+    never render as "free".
+    """
+    rows: list[dict] = []
+    for serial in list(serials or []):
+        text = str(serial or "")
+        name = device_lock_name(text)
+        if not name:
+            rows.append(
+                {
+                    "serial": text,
+                    "held": False,
+                    "pid": 0,
+                    "owner": "",
+                    "age": 0.0,
+                    "held_too_long": False,
+                    "error": "that is not a device serial",
+                }
+            )
+            continue
+        probed = holder(name, now=now) or {}
+        body = probed.get("content")
+        if probed.get("error") or body is None:
+            rows.append(
+                {
+                    "serial": text,
+                    "held": False,
+                    "pid": 0,
+                    "owner": "",
+                    "age": 0.0,
+                    "held_too_long": False,
+                    "error": str(probed.get("error") or "the lock could not be read"),
+                }
+            )
+            continue
+        rows.append(
+            {
+                "serial": text,
+                "held": bool(body.get("held")),
+                "pid": int(body.get("pid") or 0),
+                "owner": str(body.get("owner") or ""),
+                "age": float(body.get("age") or 0.0),
+                "held_too_long": bool(body.get("held_too_long")),
+                "error": "",
+            }
+        )
+    return rows
 
 
 def held_names() -> list[str]:

@@ -263,7 +263,25 @@ async def current_ime(serial: str) -> dict:
     )
     if result.get("error"):
         return result
-    text = str((result["content"] or {}).get("out") or "").strip()
+    body = result.get("content") or {}
+    # A NON-ZERO EXIT IS A FAILED PROBE, NOT "(none)" -- the rule `adb.devices`
+    # and `adb.installed_packages` already state. `shell` does not inspect the
+    # exit code, so a `settings get` that RAN and failed arrived here with
+    # `error=None` and empty stdout, and preflight rendered
+    # "active input method: (none)" for a device whose keyboard it never asked.
+    # The consumer's guard cannot fire on evidence the producer never sets.
+    rc = int(body.get("rc") or 0)
+    if rc != 0:
+        detail = (
+            str(body.get("err") or "").strip() or str(body.get("out") or "").strip()
+        )
+        return {
+            "error": "adb settings get default_input_method failed ("
+            + (detail[:200] if detail else "exit " + str(rc))
+            + ").",
+            "content": None,
+        }
+    text = str(body.get("out") or "").strip()
     if text.lower() in ("", "null"):
         return {"error": None, "content": ""}
     return {"error": None, "content": text}

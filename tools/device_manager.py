@@ -99,42 +99,282 @@ async def _run(cmd: list[str], timeout: int) -> tuple[int, bytes, bytes]:
 # --------------------------------------------------------------------------- #
 
 
-async def _list_android() -> list[dict]:
-    """Devices/emulators visible to ``adb devices -l``. Empty list if adb missing."""
+#: Lines of ``adb devices`` output parsed. adb prints one line per transport,
+#: and a machine with a hub full of phones is a handful; this exists only so a
+#: wedged adb server streaming garbage cannot grow the work unboundedly.
+_MAX_ADB_LINES = 200
+
+#: Characters of a raw state token kept for the tester-facing text. adb's
+#: "no permissions ..." line carries a sentence AND a URL; the tester needs the
+#: state named, not the essay, and this string is rendered into a chat reply.
+_MAX_ADB_STATE_CHARS = 64
+
+#: adb transport states this server can name. ANYTHING ELSE is reported as
+#: ``unknown`` carrying its raw token -- an adb release can add a state, and a
+#: tester looking at a plugged-in phone must be told something rather than
+#: nothing. Silently dropping the line is the defect this parser exists to fix.
+#:
+#: THIS VOCABULARY BOUNDS ``state``, NOT ``raw_state``: the unknown branch keeps
+#: whatever adb printed, and ``-l`` metadata is arbitrary device-supplied text.
+#: That is why the renderer wraps those two fields as untrusted rather than
+#: claiming an exemption on the strength of this frozenset.
+_ADB_KNOWN_STATES = frozenset(
+    {
+        "device",
+        "unauthorized",
+        "offline",
+        "no_permissions",
+        "authorizing",
+        "connecting",
+        "bootloader",
+        "recovery",
+        "sideload",
+        "rescue",
+        "host",
+    }
+)
+
+#: Written for a tester who does not write code: what to DO, on the phone, now.
+_ADB_REMEDIATION = {
+    "unauthorized": (
+        "Unlock the phone's screen. It is asking 'Allow USB debugging?' -- tick "
+        "'Always allow from this computer' and tap Allow. If no dialog appears, "
+        "unplug the cable and plug it back in while the screen is unlocked."
+    ),
+    "authorizing": (
+        "The phone is still deciding whether to trust this computer. Unlock its "
+        "screen, answer the 'Allow USB debugging?' dialog, then run "
+        "`qa_list_devices` again."
+    ),
+    "offline": (
+        "The connection dropped. Unplug the cable and re-plug it -- a different "
+        "USB port or cable often fixes this -- then run `qa_list_devices` again."
+    ),
+    "connecting": (
+        "This computer is still connecting to the device. Wait a few seconds and "
+        "run `qa_list_devices` again."
+    ),
+    "no_permissions": (
+        "This computer is not allowed to talk to the device. On Linux the udev "
+        "rules are missing; on Windows it is the USB driver. Ask whoever "
+        "supports your machine for the Android USB rules/driver for this phone, "
+        "then re-plug it."
+    ),
+}
+
+_ADB_REMEDIATION_UNKNOWN = (
+    "This computer can see the device, but adb reports a state we do not "
+    "recognise, so we cannot say what it needs. Unlock the phone, re-plug the "
+    "cable and run `qa_list_devices` again; if it stays this way, send this "
+    "whole message to whoever supports your machine."
+)
+
+
+def adb_state_remediation(state: object, raw_state: object = "") -> str:
+    """The tester-facing next step for an adb state. ``""`` for ``device``.
+
+    ONE producer for this text: the renderer must not invent a second wording,
+    and a state with no entry gets the unknown text rather than silence. It is
+    OUR prose, which is why the renderer keeps it OUTSIDE the untrusted block.
+
+    ``raw_state`` is accepted and DELIBERATELY UNUSED. Selection keys off the
+    bounded ``_ADB_KNOWN_STATES`` vocabulary alone, so a hostile device can
+    choose WHICH canned sentence it sees but cannot write one. Wiring
+    ``raw_state`` into the lookup or into the returned text would put
+    device-supplied bytes inside the trusted region -- the untrusted-content
+    finding this design already answered once. Do not resolve the unused
+    argument by using it.
+    """
+    key = str(state or "")
+    if key == "device":
+        return ""
+    return _ADB_REMEDIATION.get(key, _ADB_REMEDIATION_UNKNOWN)
+
+
+class AdbRows(list):
+    """The parsed rows, PLUS how many input lines were never read.
+
+    A plain list can only report what it contains; the defect this closes is
+    what it silently does NOT -- 500 attached transports came back as 199 rows
+    with 301 dropped and no signal to the row list, the caller or the tester,
+    which is the exact failure the parser's own docstring says it exists to
+    prevent, surviving above the cap.
+
+    A synthetic trailing row was the alternative and was rejected: it would
+    flow into ``_android_row``, into the tester's pick list and into
+    ``mobile.adb.devices``' usable filter as a device-shaped lie told to fix a
+    device-list lie. ``len``, ``==``, iteration and slicing are unchanged here,
+    so no existing reader is disturbed.
+    """
+
+    #: Class-level default so the attribute EXISTS even on an instance some
+    #: future path builds without setting it -- absent is worse than zero.
+    dropped_lines: int = 0
+
+
+def parse_adb_devices(text: object) -> AdbRows:
+    """Classify every line of ``adb devices`` / ``adb devices -l`` output.
+
+    THE ONE PARSER. ``tools/mobile/adb.devices`` and ``_list_android_all`` both
+    read it, because the same answer derived twice in two places drifts -- and
+    it did: both sites carried ``parts[1] == "device"`` and both dropped an
+    ``unauthorized`` phone without a word, so a tester holding a plugged-in
+    handset was told "No devices detected."
+
+    Returns one dict per line::
+
+        {serial, state, raw_state, metadata, valid_id, usable}
+
+    ``state`` is a NAME from ``_ADB_KNOWN_STATES`` or ``"unknown"``;
+    ``raw_state`` is what adb actually printed, truncated; ``metadata`` holds
+    the ``key:value`` tokens ``adb devices -l`` appends (``model:``, ``usb:``,
+    ``transport_id:``, and -- the trap for a future rewrite -- ``device:``).
+    ``usable`` is true only for a ``device`` line whose serial passes the id
+    whitelist.
+
+    WINDOWS/CRLF, MEASURED: no carriage-return handling is needed or present.
+    ``splitlines()`` treats ``\\r\\n`` and a lone ``\\r`` as terminators, and the
+    ``strip()`` below removes a trailing one, so no ``\\r`` can reach a token.
+    An earlier revision carried a neutralisation clause here; deleting it -- and
+    even splitting on ``"\\n"`` instead -- was executed and produced BYTE-
+    IDENTICAL rows, so the clause was inert and is gone rather than left behind
+    with a mutant that cannot die.
+
+    Never raises. Anything unparseable is simply not a row.
+    """
+    # NOISE FIRST, THEN THE CAP. Counting raw lines made the header, blank
+    # padding and daemon chatter look like dropped transports: one emulator
+    # behind 250 blank lines reported 52 dropped and adb.devices REFUSED, which
+    # is the fail-closed path -- so a machine with a device plainly attached
+    # lost find_running, list_running, device_alive and the qa-doctor probe,
+    # and was told a sentence about transports that was not true.
+    candidates = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.lower().startswith("list of devices"):
+            continue
+        if line.startswith("*"):  # "* daemon started successfully *"
+            continue
+        candidates.append(line)
+    rows = AdbRows()
+    # ONE PRODUCER of "how much did we not read", computed at the one site that
+    # drops the lines. Deriving it a second time from the same text in a caller
+    # is how two answers of one question drift apart.
+    rows.dropped_lines = max(0, len(candidates) - _MAX_ADB_LINES)
+    for line in candidates[:_MAX_ADB_LINES]:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        serial = parts[0]
+        rest = parts[1:]
+        first = rest[0].lower()
+        # THE STATE IS THE TOKEN IMMEDIATELY AFTER THE SERIAL. Not a historical
+        # defect -- the code this replaces read `parts[1]`, one positional
+        # token, and was never fooled. The rule is stated, and fixtured, against
+        # a plausible REWRITE of this parser ("state = any token equal to
+        # device", an easy way to think you are handling -l), which would read
+        # an UNAUTHORIZED -l row carrying `device:emu64x` as usable.
+        if first == "no" and len(rest) > 1 and rest[1].lower().startswith("permission"):
+            state = "no_permissions"
+            consumed = 2
+        else:
+            state = first if first in _ADB_KNOWN_STATES else "unknown"
+            consumed = 1
+        raw_state = " ".join(rest[:consumed])[:_MAX_ADB_STATE_CHARS]
+        metadata: dict[str, str] = {}
+        for token in rest[consumed:]:
+            key, sep, value = token.partition(":")
+            if sep and key.isidentifier():
+                metadata[key] = value[:_MAX_ADB_STATE_CHARS]
+        valid_id = _valid_device_id(serial)
+        rows.append(
+            {
+                "serial": serial,
+                "state": state,
+                "raw_state": raw_state,
+                "metadata": metadata,
+                "valid_id": valid_id,
+                "usable": state == "device" and valid_id,
+            }
+        )
+    return rows
+
+
+def _android_row(parsed: dict) -> dict:
+    """One ``parse_adb_devices`` row as a device dict for the listing API.
+
+    EVERY row gains a ``state`` key, usable ones included (always ``device``).
+    That is ADDITIVE-SAFE, not byte-identical to the old shape: every consumer
+    of this list reads named fields through ``.get()`` and none iterates the
+    keys or compares whole dicts, so nothing is disturbed -- but the row is not
+    the same object it was, and a comment claiming otherwise would be a lie the
+    next reader trusts.
+    """
+    serial = str(parsed.get("serial") or "")
+    model = str((parsed.get("metadata") or {}).get("model") or "")
+    name = (model.replace("_", " ") or serial) if model else serial
+    kind = "emulator" if serial.startswith("emulator-") else "device"
+    row = {
+        "id": serial,
+        "name": name,
+        "platform": "android",
+        "kind": kind,
+        "state": str(parsed.get("state") or "unknown"),
+    }
+    if not parsed.get("usable"):
+        row["raw_state"] = str(parsed.get("raw_state") or "")
+        row["remediation"] = adb_state_remediation(
+            parsed.get("state"), parsed.get("raw_state")
+        )
+    return row
+
+
+async def _list_android_all() -> tuple[list[dict], list[dict], int]:
+    """``(usable, unusable)`` from ``adb devices -l``. ``([], [])`` if adb missing.
+
+    The UNUSABLE list is the point: a phone whose USB-debugging prompt has not
+    been accepted is physically attached and must be reported, with what to do
+    about it, rather than dropped. A serial that fails the id whitelist is
+    reported here too -- it is rendered (inside an untrusted block) and never
+    passed to a subprocess.
+    """
     try:
         rc, out, err = await _run(["adb", "devices", "-l"], _cmd_timeout())
     except FileNotFoundError:
         logger.info("device_manager: adb not installed -- skipping Android devices")
-        return []
+        return ([], [], 0)
     except asyncio.TimeoutError:
-        return []
+        return ([], [], 0)
     if rc != 0:
         logger.warning(
             "device_manager: adb devices failed: %s",
             err.decode(errors="replace")[:200],
         )
-        return []
-    devices: list[dict] = []
-    for raw in out.decode(errors="replace").splitlines():
-        line = raw.strip()
-        if not line or line.lower().startswith("list of devices"):
-            continue
-        parts = line.split()
-        if len(parts) < 2 or parts[1] != "device":
-            continue
-        serial = parts[0]
-        if not _valid_device_id(serial):
-            continue
-        name = serial
-        for token in parts[2:]:
-            if token.startswith("model:"):
-                name = token.split(":", 1)[1].replace("_", " ") or serial
-                break
-        kind = "emulator" if serial.startswith("emulator-") else "device"
-        devices.append(
-            {"id": serial, "name": name, "platform": "android", "kind": kind}
-        )
-    return devices
+        return ([], [], 0)
+    usable: list[dict] = []
+    unusable: list[dict] = []
+    rows = parse_adb_devices(out.decode(errors="replace"))
+    for parsed in rows:
+        (usable if parsed.get("usable") else unusable).append(_android_row(parsed))
+    # THE THIRD ELEMENT IS THE POINT: a list that is missing transports must
+    # not be reported as the whole truth. `list_devices` carries it to the
+    # renderer, which tells the tester in our own prose.
+    return (usable, unusable, rows.dropped_lines)
+
+
+async def _list_android() -> list[dict]:
+    """Devices/emulators ``adb`` can actually drive. Empty list if adb missing.
+
+    A thin filter over ``_list_android_all`` -- kept so callers that only ever
+    wanted drivable devices keep their exact contract.
+    """
+    # The dropped-line count is DELIBERATELY discarded here: this function's
+    # whole contract is "drivable devices, exactly the old shape", it has no
+    # production caller, and the reporting path is `list_devices`, which does
+    # carry it. Widening this signature would move the disclosure away from the
+    # one place a person reads.
+    usable, _unusable, _dropped = await _list_android_all()
+    return usable
 
 
 async def _list_ios_simulators() -> list[dict]:
@@ -223,22 +463,51 @@ async def _list_ios_physical() -> list[dict]:
 async def list_devices() -> dict:
     """Return every attached Android/iOS device, emulator, and simulator.
 
-    Shape: ``{"content": [{id, name, platform, kind}, ...], "error": None}``.
+    Shape: ``{"content": [{id, name, platform, kind, state}, ...], "unusable":
+    [{..., state, raw_state, remediation}, ...], "error": None}``.
+
+    ``content`` MEANS exactly what it always did -- devices this server can
+    drive -- and each Android row is additively extended with ``state`` (always
+    ``device`` there). ``unusable`` is the new sibling: Android transports that
+    are attached but not drivable yet (``unauthorized``, ``offline``, ``no
+    permissions``, an unrecognised state). It is informational ONLY and must
+    never be offered as a choice; its serial and raw state are device-supplied
+    text, so any renderer must wrap them via ``tools.untrusted``. The empty list
+    is always present, including on the error path, so no reader has to
+    special-case its absence.
     Never raises. A per-platform tool being missing is NOT an error -- that
     platform is simply skipped. Only a truly unexpected failure sets ``error``.
     """
     try:
         android, simulators, physical = await asyncio.gather(
-            _list_android(),
+            _list_android_all(),
             _list_ios_simulators(),
             _list_ios_physical(),
         )
-        devices = [*android, *simulators, *physical]
-        logger.info("device_manager: discovered %d device(s)", len(devices))
-        return {"content": devices, "error": None}
+        usable_android, unusable_android, dropped_lines = android
+        devices = [*usable_android, *simulators, *physical]
+        logger.info(
+            "device_manager: discovered %d device(s), %d attached but unusable",
+            len(devices),
+            len(unusable_android),
+        )
+        return {
+            "content": devices,
+            "unusable": unusable_android,
+            # Lines of `adb devices` output the parser did not read. Always
+            # present, including on the error path below, so no reader has to
+            # special-case its absence -- the same rule `unusable` follows.
+            "adb_dropped_lines": dropped_lines,
+            "error": None,
+        }
     except Exception as exc:
         logger.exception("device_manager: unexpected error listing devices")
-        return {"error": str(exc), "content": None}
+        return {
+            "error": str(exc),
+            "content": None,
+            "unusable": [],
+            "adb_dropped_lines": 0,
+        }
 
 
 # --------------------------------------------------------------------------- #

@@ -79,6 +79,47 @@ MAX_PACKET_HEADROOM = MAX_ELEMENTS // 2
 # that one hostile node cannot dominate the packet.
 MAX_ATTR_CHARS = 200
 
+# A repeated string shorter than this is printed in full at every element rather
+# than replaced by an `@id` reference. A reference costs four or five characters
+# plus a lookup the reader has to make, so below this length the dedupe spends
+# legibility to save nothing. The harmful direction is DOWNWARD -- see the
+# CEILINGS row in tests/mobile/test_mobile_bounds_upper.py, which names the floor
+# test that binds it.
+MIN_DEDUPE_CHARS = 24
+
+# How much of a control's label the `fields` / `controls` SUMMARIES print. The
+# element line beneath still prints it in full, so this can never hide a string
+# -- only fail to index it. Never applied in a way that lets two distinct
+# controls read the same: see `_summary_labels`.
+MAX_SUMMARY_LABEL_CHARS = 48
+
+#: Emitted in the block head, and ONLY when a reference is actually present, so
+#: a screen with no repetition pays nothing for the notation. It lives in the
+#: SCREEN BLOCK rather than the system prompt because the screen block is on
+#: every packet and the system prompt, since the per-chat contract landed, is
+#: not.
+REFERENCE_LEGEND = (
+    "note: `text=@e7` means this element's text is the SAME string that element "
+    "e7 prints in full above -- printed once to keep this screen readable. To "
+    "act on such an element, target it by its own id (or its rid or role); to "
+    "target it by text, copy the string from the line it is printed on. A "
+    "`label=` is never abbreviated this way."
+)
+
+#: The same fact in one line, for a block that cannot afford the paragraph.
+#:
+#: A reference and its explanation travel TOGETHER -- an unexplained `@e7` is
+#: worse than the bytes it saves. The first attempt at that rule dropped the
+#: REFERENCES instead when the legend would not fit, and paid for it in the
+#: currency that matters: measured 1 element line where the referenced form fit
+#: 11, because plain lines are three times longer. Degrading the explanation is
+#: cheap and degrading the notation is not, so this exists and is tried before
+#: either is abandoned.
+REFERENCE_LEGEND_SHORT = (
+    "note: `text=@e7` means the same string element e7 prints in full above; "
+    "target such an element by its id."
+)
+
 # Prompt-block cap handed to ``wrap_untrusted``.
 MAX_BLOCK_CHARS = 12000
 
@@ -809,7 +850,12 @@ def _assign_ids(elements: list) -> None:
         element["id"] = base if count == 1 else base + "-" + str(count)
 
 
-def prune(xml: object, activity: str = "", display: object = None) -> dict:
+def prune(
+    xml: object,
+    activity: str = "",
+    display: object = None,
+    density: object = None,
+) -> dict:
     """Untrusted dump -> ``{"screen_id", "elements", "hash", "package", ...}``.
 
     Returns the ``{"error", "content"}`` shape every module in this package
@@ -1111,22 +1157,51 @@ def prune(xml: object, activity: str = "", display: object = None) -> dict:
             "truncated": truncated,
             "considered": considered,
         }
+        # THE AUDIT, over the screen this function just produced and nothing
+        # else. One producer: the packet, the report and the run's stored screen
+        # all read this key rather than each deriving an answer of their own.
+        # Imported HERE rather than at module scope because `screen_audit`
+        # imports this module for its one tokeniser; by the time a prune runs,
+        # this module is fully loaded, so the cycle cannot bite.
+        from tools.mobile import screen_audit
+
+        content["accessibility"] = screen_audit.audit(content, density)
         return {"error": None, "content": content}
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.perception.prune failed")
         return {"error": str(exc), "content": None}
 
 
-def element_line(element: dict) -> str:
-    """One pruned element as a single compact line."""
+def element_line(element: dict, refs: dict | None = None) -> str:
+    """One pruned element as a single compact line.
+
+    ``refs`` maps a FIELD NAME to the id of the element that already printed
+    that field's value, and only :func:`render_lines` passes it. With the
+    default ``None`` this function is byte-for-byte what it always was, which is
+    what lets the pins that grade it keep grading it.
+
+    THE SUBSTITUTION HAPPENS ON THE PART, NEVER ON THE FINISHED LINE. Replacing
+    ``desc="V"`` in the joined string finds the FIRST occurrence of that
+    substring, and no attribute is escaped -- so an element whose *text* value
+    happens to read ``desc="V"`` had its TEXT rewritten to ``desc=@e1`` while
+    the duplicate desc was still printed in full. The model was handed a value
+    the app never displayed, on exactly the kind of screen this feature targets:
+    a chat carrying markup. Found by EXECUTING, in the adversarial review of the
+    commit that introduced it.
+    """
+    pointers = refs if isinstance(refs, dict) else {}
     parts = [str(element.get("id") or "?"), str(element.get("cls") or "?")]
     text = str(element.get("text") or "")
     desc = str(element.get("desc") or "")
     rid = str(element.get("rid") or "")
     if text:
-        parts.append('text="' + text + '"')
+        parts.append(
+            "text=@" + pointers["text"] if "text" in pointers else 'text="' + text + '"'
+        )
     if desc and desc != text:
-        parts.append('desc="' + desc + '"')
+        parts.append(
+            "desc=@" + pointers["desc"] if "desc" in pointers else 'desc="' + desc + '"'
+        )
     if rid:
         parts.append("rid=" + rid)
     label = str(element.get("label") or "")
@@ -1144,6 +1219,161 @@ def element_line(element: dict) -> str:
         if element.get(name):
             parts.append(name)
     return " ".join(parts)
+
+
+def _rows(elements: object) -> list[dict]:
+    """The element list as dicts, or ``[]`` -- never an exception.
+
+    ONE coercion, called by both consumers. ``list(elements or [])`` was written
+    at each of them and raises TypeError on an int, and a stored packet is an
+    outside input by the time it is read: the caller's ``except`` would discard
+    the ENTIRE screen block over a malformed field, which is the shape this
+    file's history is made of (see :func:`_count`). Two sites deriving one
+    coercion is also the mirrored-condition defect CLAUDE.md names -- they
+    drift, and the second one's fall-through is silent. Found by EXECUTING the
+    parametrised malformed-input test, not by reading it.
+    """
+    if not isinstance(elements, (list, tuple)):
+        return []
+    return [element for element in elements if isinstance(element, dict)]
+
+
+def render_lines(elements: object) -> list[str]:
+    """Every element as a line, with each LONG repeated string printed once.
+
+    :func:`element_line` dedupes ``text`` / ``desc`` / ``label`` WITHIN one node.
+    It cannot see across the list, and a chat screen is where that costs: on the
+    observed run mrun-20260905-051728-bd1777 (package
+    an Arabic-language chat app) one 200-character Arabic reply was
+    printed as a parent's ``label``, a child's ``desc``, a grandchild's ``text``
+    and again in the controls summary -- four copies of one string per bubble,
+    and every prior turn's bubbles persist, so the block grew with the length of
+    the conversation.
+
+    ``element_line`` is deliberately left ALONE and pure: it is a per-element
+    function two test modules pin directly, and the cross-element pass is a
+    different question about a different input. This function is the one
+    producer of the rendered list; ``to_prompt_block`` and the display-invariant
+    helpers both read it, so there is no second derivation to drift.
+
+    The clauses, each graded by its own fixture in
+    ``tests/mobile/screen_matrix.py``:
+
+    * **The anchor is always EARLIER in this list than the reference.**
+      ``to_prompt_block`` trims from the END, so a backward-only reference can
+      never be orphaned by the trim. A dangling ``@e7`` is worse than the
+      repetition it saved, and "recompute the dedupe after every trim" is the
+      alternative that makes a quadratic loop cubic.
+    * **``label=`` is never REPLACED, only ever used as an anchor.**
+      ``actions.SELECTORS`` makes a label a targeting selector and the system
+      prompt tells the model to prefer ``role`` or ``label``, so an abbreviated
+      label costs a turn every time it is sent back. It still anchors, because
+      the observed screen carried the sentence as a parent's label first and the
+      child's ``desc`` has to be able to point at it.
+    * **Short strings are left alone** (:data:`MIN_DEDUPE_CHARS`).
+
+    Every element keeps its ``id``, which is what makes a referenced element
+    still targetable rather than merely still described.
+    """
+    rows = _rows(elements)
+    anchors: dict = {}
+    out: list = []
+    for element in rows:
+        plain = element_line(element)
+        eid = str(element.get("id") or "")
+        refs: dict = {}
+        for field in ("text", "desc"):
+            value = str(element.get(field) or "")
+            if len(value) < MIN_DEDUPE_CHARS:
+                continue
+            if (field + '="' + value + '"') not in plain:
+                # Already suppressed by the within-node rule, or truncated to
+                # something this element does not literally print. Either way
+                # there is nothing here to replace, and replacing blind is how a
+                # reference ends up pointing at a string nobody printed.
+                continue
+            seen = anchors.get(value)
+            if seen and seen != eid:
+                # Recorded as a FIELD to point at, and rendered by
+                # `element_line` on the part itself. The previous version did a
+                # `str.replace` on this finished line and could rewrite an
+                # occurrence sitting inside a DIFFERENT attribute's value.
+                refs[field] = seen
+            elif eid:
+                anchors.setdefault(value, eid)
+        label = str(element.get("label") or "")
+        if (
+            len(label) >= MIN_DEDUPE_CHARS
+            and eid
+            and ('label="' + label + '"') in plain
+        ):
+            anchors.setdefault(label, eid)
+        out.append(element_line(element, refs) if refs else plain)
+    return out
+
+
+def _eid(element: object) -> str:
+    """The id string the summaries PRINT. ONE expression, every caller.
+
+    For DISPLAY only. It is emphatically not a key: `prune` guarantees unique
+    non-empty ids but a STORED packet does not, and two controls with no id
+    collide on one entry -- which is how both of them came to read ``Voice
+    mode``, the exact incident these summaries exist to prevent. Per-element
+    values are keyed by object identity instead; see :func:`_summary_labels`.
+    """
+    body = element if isinstance(element, dict) else {}
+    return str(body.get("id") or "")
+
+
+def _summary_labels(elements: object) -> dict:
+    """``id -> the label the summaries print``: abbreviated, never AMBIGUOUS.
+
+    The ``fields`` and ``controls`` summaries exist because a model read three
+    identical unlabelled Views and tapped Voice mode as Send. Nothing here may
+    make two controls read the same, so the abbreviation is applied first and
+    then any group whose SHORTENED labels collide while their FULL labels differ
+    is restored to full length -- all of the group, not the shorter of it,
+    because a reader comparing an abbreviation against a full string cannot tell
+    which is which.
+
+    Controls that genuinely share a label are left sharing it. That is the
+    screen's own ambiguity, and hiding it would be the lie this pair of
+    summaries was added to stop telling.
+
+    KEYED THROUGH :func:`_eid`, which its two consumers also call. The first
+    version wrote `str(id or "")` here and read `str(id)` there, so an element
+    with `id` absent or `None` was stored under `""` and looked up under
+    `"None"`: the lookup missed, the fallback was `""`, and the summary printed
+    two controls as `None ` and `None ` -- or, with two empty ids, both as
+    `Voice mode`. That is the incident these summaries exist to prevent,
+    reintroduced by deriving one key in two places. Found by EXECUTING.
+    """
+    rows = _rows(elements)
+    full = {}
+    short = {}
+    for element in rows:
+        # KEYED BY OBJECT IDENTITY, not by the element's id string. `prune`
+        # assigns unique non-empty ids, but a STORED packet is an outside input
+        # and this module already ships a fixture whose first element has none.
+        # Keyed by id string, two such controls shared one entry and the last
+        # one won: both printed `Voice mode`, which is the incident the fields
+        # and controls summaries exist to prevent. Found by EXECUTING.
+        key = id(element)
+        label = str(element.get("label") or "")
+        full[key] = label
+        short[key] = (
+            label[:MAX_SUMMARY_LABEL_CHARS] + "\u2026"
+            if len(label) > MAX_SUMMARY_LABEL_CHARS
+            else label
+        )
+    groups: dict = {}
+    for key, value in short.items():
+        groups.setdefault(value, []).append(key)
+    for keys in groups.values():
+        if len(keys) > 1 and len({full[key] for key in keys}) > 1:
+            for key in keys:
+                short[key] = full[key]
+    return short
 
 
 def _count(value: object) -> int:
@@ -1175,7 +1405,15 @@ def to_prompt_block(pruned: object) -> str:
         content = pruned if isinstance(pruned, dict) else {}
         if content.get("content") and isinstance(content.get("content"), dict):
             content = content["content"]
-        elements = content.get("elements") or []
+        # COERCED HERE, at the top, because this is the function whose `except`
+        # discards the screen. `_rows` was first called only inside
+        # `render_lines`, which sits BELOW the `fields` / `controls`
+        # comprehensions -- so a malformed element list still raised on
+        # `element.get` before the coercion was ever reached, and the tester's
+        # model got an empty block for a reason nothing named. The test that was
+        # supposed to grade this drove `render_lines` directly and never saw it.
+        # Measure at the transport, not at the function.
+        elements = _rows(content.get("elements"))
         if not elements:
             return ""
         header = [
@@ -1196,13 +1434,21 @@ def to_prompt_block(pruned: object) -> str:
             for element in elements
             if element.get("clickable") and element.get("label")
         ]
+        # Computed over ALL elements, not per summary: a field and a control
+        # whose abbreviations collide are as confusing as two controls, and the
+        # stricter input costs nothing.
+        summary_labels = _summary_labels(elements)
         if fields:
             lines.append(
                 "fields (type into these): "
                 + "; ".join(
-                    str(element.get("id"))
+                    _eid(element)
                     + " "
-                    + (str(element.get("label") or "") or "(unlabelled)")
+                    + (
+                        summary_labels.get(id(element))
+                        or str(element.get("label") or "")
+                        or "(unlabelled)"
+                    )
                     for element in fields[:10]
                 )
             )
@@ -1210,9 +1456,12 @@ def to_prompt_block(pruned: object) -> str:
             lines.append(
                 "controls (tap these): "
                 + "; ".join(
-                    str(element.get("id"))
+                    _eid(element)
                     + " "
-                    + str(element.get("label") or "")
+                    + (
+                        summary_labels.get(id(element))
+                        or str(element.get("label") or "")
+                    )
                     + (
                         " [" + str(element.get("role")) + "]"
                         if element.get("role")
@@ -1255,7 +1504,10 @@ def to_prompt_block(pruned: object) -> str:
         # So the lines are trimmed HERE, to what the budget can actually carry,
         # and the notice reports what was emitted. The cap can no longer cut an
         # element line, so `wrap_untrusted` cannot make this message false.
-        rendered = [element_line(element) for element in elements]
+        rendered = render_lines(elements)
+        # The SAME elements with no references, for the branch that cannot
+        # afford the legend. Built once; the loop chooses between them.
+        plain = [element_line(element) for element in elements]
 
         def _notice(shown_count: int, too_big: int) -> str:
             """The notice for a given outcome -- recomputed, never patched.
@@ -1313,24 +1565,77 @@ def to_prompt_block(pruned: object) -> str:
         # and recompose -- until it fits. Terminates because `shown` strictly
         # shrinks. The header is dropped only as a last resort, and the notice is
         # never what goes: a notice the cap cuts off is not a notice.
-        head = list(lines)
+        head_base = list(lines)
         # BOUNDED BEFORE THE LOOP. The loop re-joins the body each iteration, so
         # it is quadratic in the number of lines: measured 0.001s at 225
         # elements and 50s at 60000, which a stored packet can carry even though
         # `prune` cannot produce it. No live packet exceeds this bound, so the
         # cut costs nothing that was going to be rendered anyway.
         rendered = rendered[: MAX_ELEMENTS + MAX_PACKET_HEADROOM]
-        shown = list(rendered)
+        plain = plain[: MAX_ELEMENTS + MAX_PACKET_HEADROOM]
+        # REFERENCES ARE A PAIR: the `@id` notation and the legend that explains
+        # it travel together or neither travels. The first version decided the
+        # legend ONCE, from the full `rendered` list, and inserted it at head
+        # index 1 -- above both summaries. Two things followed, and an
+        # adversarial review measured both. Above the summaries, the head-drop
+        # path ate `controls`, then `fields`, then every element line before it
+        # touched the legend: 11 element lines with the legend suppressed, 0
+        # with it present, on the same packet. And decided from `rendered`
+        # rather than from what survives, it was emitted for references the tail
+        # trim had already removed, and omitted while 7 surviving lines still
+        # carried `text=@e0`.
+        #
+        # So the choice is made INSIDE the loop, from `shown`, and the pair
+        # degrades in the order that costs the tester least. An unexplained
+        # `@e0` is worse than the bytes it saves, but so is throwing the
+        # notation away: measured, dropping the references to keep the paragraph
+        # left ONE element line where the referenced form fit eleven, because a
+        # plain line is three times longer. So the EXPLANATION degrades first
+        # (paragraph, then one line), and only if even one line cannot be
+        # afforded do the references go -- `plain` is the same elements with
+        # none, which is why both lists are carried.
+        STAGES = ((True, REFERENCE_LEGEND), (True, REFERENCE_LEGEND_SHORT), (False, ""))
+
+        def _best(base: list) -> tuple:
+            """The (text, count) that shows the MOST element lines under `base`.
+
+            EVERY stage is measured and the widest wins -- it is not a
+            first-fit. First-fit does not work here and the failure is silent:
+            popping element lines eventually removes the last REFERENCE, at
+            which point the legend is no longer needed, the block fits, and the
+            loop stops -- with one element line, having never tried the cheaper
+            explanation that would have carried eight. Measured on a packet with
+            an 11540-character header. The tie goes to the earliest stage, which
+            is the fullest explanation.
+            """
+            best_text = ""
+            best_count = -1
+            for use_refs, legend_text in STAGES:
+                source = rendered if use_refs else plain
+                count = len(source)
+                while True:
+                    body = source[:count]
+                    legend = (
+                        [legend_text]
+                        if legend_text and any("=@" in x for x in body)
+                        else []
+                    )
+                    note = _notice(count, len(source) - count)
+                    text = "\n".join(base + legend + ([note] if note else []) + body)
+                    if len(text) <= MAX_BLOCK_CHARS:
+                        if count > best_count:
+                            best_text, best_count = text, count
+                        break
+                    if not count:
+                        break
+                    count -= 1
+            return best_text, best_count
+
         while True:
-            note = _notice(len(shown), len(rendered) - len(shown))
-            body = head + ([note] if note else []) + shown
-            text = "\n".join(body)
-            if len(text) <= MAX_BLOCK_CHARS:
+            text, count = _best(head_base)
+            if count >= 0 and (count or len(head_base) <= 1):
                 break
-            if shown:
-                shown.pop()
-                continue
-            if len(head) > 1:
+            if len(head_base) > 1:
                 # THE FREED ROOM BELONGS TO THE ELEMENTS. Dropping a header line
                 # without restoring them spent 11793 characters on nothing:
                 # measured 0 of 20 elements emitted where 18 fitted, so the
@@ -1341,18 +1646,17 @@ def to_prompt_block(pruned: object) -> str:
                 # fields summary is the only thing that says which element takes
                 # typing, and it exists because a model tapped Voice mode as
                 # Send. Neither is a convenience, but one is cheaper to lose.
-                head = head[:-1]
-                shown = list(rendered)
+                head_base = head_base[:-1]
                 continue
             # LAST RESORT: one header line that still will not fit. Returning the
             # text measured as too long let `wrap_untrusted` slice it and take
             # the notice with it -- 5 elements and no warning at all, which is
             # the very failure the header drop above was added to prevent. So
             # make room for the notice explicitly and compose what is returned.
-            note = _notice(0, len(rendered))
+            note = _notice(0, len(plain))
             keep = MAX_BLOCK_CHARS - len(note) - 1
-            head = [head[0][:keep]] if keep > 0 else []
-            text = "\n".join(head + ([note] if note else []))
+            head_base = [head_base[0][:keep]] if keep > 0 else []
+            text = "\n".join(head_base + ([note] if note else []))
             break
         return wrap_untrusted("screen", text, limit=MAX_BLOCK_CHARS)
     except Exception:  # pragma: no cover - defensive

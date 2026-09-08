@@ -593,8 +593,14 @@ async def _dump(ctx: Context) -> dict:
     # inferred from the dump; `display_size` caches it per serial and never
     # refuses, so this costs one round trip per session and cannot fail a dump.
     sized = await adb.display_size(ctx.serial)
+    # Cached per serial like the size above, so the accessibility floor is this
+    # device's 48dp rather than an assumed one, at no extra round trip.
+    dpi = await adb.display_density(ctx.serial)
     return perception.prune(
-        raw.get("content"), await _activity(ctx), display=sized.get("content")
+        raw.get("content"),
+        await _activity(ctx),
+        display=sized.get("content"),
+        density=dpi.get("content"),
     )
 
 
