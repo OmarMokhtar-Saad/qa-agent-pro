@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 
 from config.settings import settings
+from tools import host_privileges
 from tools.device_manager import valid_package_name
 from tools.mobile import (
     adb,
@@ -56,6 +57,7 @@ CHECK_NAMES: tuple[str, ...] = (
     "ime_oracle",
     "free_disk",
     "cache_ownership",
+    "host_privileges",
 )
 
 #: Free space the lane wants available before a RUN (not a provision): room for
@@ -86,6 +88,18 @@ _FLAG_FIX = (
 #: ``provisioner.start_detached`` both refuse on ``ok=False`` before anything is
 #: written into the cache. What was missing was telling the TESTER, which is what
 #: this check does. ``test_the_ownership_check_cannot_block_a_run`` pins it.
+#: ``host_privileges`` is advisory for the SAME reason as ``cache_ownership``,
+#: and the reason is a considered trade rather than a softening:
+#: ``host_privileges.probe`` answers ``undetermined`` when elevation cannot be
+#: DETERMINED at all, so a blocking check would newly refuse runs that proceed
+#: today -- on exactly the locked-down machines this check exists to help. And
+#: elevation is not a precondition of a RUN in the first place: once
+#: virtualization is on, a non-administrator account taps, swipes, asserts and
+#: gets a report. The gate that must block already blocks -- ``provisioner.run``
+#: and ``provisioner.start_detached`` refuse on their own preconditions before
+#: anything is written. What was missing was telling the TESTER, which is what
+#: this check does. ``test_the_privilege_check_cannot_block_a_run`` pins it the
+#: way ``test_the_ownership_check_cannot_block_a_run`` pins the one above.
 ADVISORY_CHECKS: frozenset = frozenset(
     {
         "ime_pinned",
@@ -93,6 +107,14 @@ ADVISORY_CHECKS: frozenset = frozenset(
         "ime_selected",
         "ime_oracle",
         "cache_ownership",
+        # WITHOUT this row the check is BLOCKING: `_record` computes
+        # `blocking = name not in ADVISORY_CHECKS` and `ok` is derived from the
+        # blocking failures, so a `can_elevate=False` -- or an UNDETERMINED --
+        # verdict would refuse every mobile run on exactly the locked-down
+        # machines this feature exists to help. The membership, not the
+        # docstring, is the mechanism; `test_the_privilege_check_cannot_block_a_run`
+        # pins it and mutant 9 reverts this line.
+        "host_privileges",
     }
 )
 
@@ -570,6 +592,36 @@ async def check(target_package: str = "", serial: str = "") -> dict:
         except Exception as exc:
             checks.append(
                 _record("cache_ownership", False, "check failed: " + str(exc))
+            )
+
+        # 12. host privileges -------------------------------------------------
+        # ONE PRODUCER, ONE MEANING, EVERY CONSUMER: the same verdict the
+        # qa_host_check tool and the virtualization fix text render. ADVISORY by
+        # construction (see ADVISORY_CHECKS above), so `ok` cannot see it.
+        # `undetermined` is reported as ok=True with the disclosure in `detail`:
+        # a probe that could not read the machine is not a finding about the
+        # machine, and rendering it as a failure is how a tester who CAN elevate
+        # gets sent to IT.
+        try:
+            priv = (host_privileges.probe() or {}).get("content") or {}
+            determined = not priv.get("undetermined", True)
+            elevatable = bool(priv.get("elevated") or priv.get("can_elevate"))
+            checks.append(
+                _record(
+                    "host_privileges",
+                    (not determined) or elevatable,
+                    str(priv.get("summary") or "no verdict")
+                    + ("" if determined else " [not verified on this host]"),
+                    ""
+                    if elevatable
+                    else "Nothing here is blocked. Prefer the admin-free "
+                    "install route, and call qa_host_check for the per-step "
+                    "list and the official download references.",
+                )
+            )
+        except Exception as exc:
+            checks.append(
+                _record("host_privileges", False, "check failed: " + str(exc))
             )
 
         failing = [record["name"] for record in checks if not record["ok"]]

@@ -80,7 +80,7 @@ from pathlib import Path
 
 from config.settings import settings
 from tools.mobile import actions as actions_mod
-from tools.mobile import paths, run_store, screen_audit, screen_phone
+from tools.mobile import explore_runner, paths, run_store, screen_audit, screen_phone
 from tools.mobile_evidence import crash_detector
 from tools.mobile_evidence import exchanges as ev_exchanges
 from tools.mobile_evidence import profiles as ev_profiles
@@ -580,23 +580,49 @@ def _percentile(values: list, share: float) -> int:
 
 
 def _stamp(value: object) -> str:
+    """A stored moment as ``YYYY-MM-DD HH:MM:SS``, or ``"unknown"``.
+
+    THE WHOLE CALL IS INSIDE THE GUARD, and the reason is a measured page loss,
+    not tidiness. The coercion was guarded and ``localtime`` was not, so a
+    manifest carrying a non-finite ``created`` -- ``json.loads`` accepts a bare
+    ``Infinity`` -- raised ``OverflowError`` out of ``_facts_strip``, through
+    ``_document``, into ``render``'s outer ``except``: NO PAGE AT ALL, over one
+    cell. A helper that promises "any moment" must be total for any moment, and
+    ``"unknown"`` is what it already returns for a moment it cannot read, so no
+    caller sees a new shape.
+
+    ``OSError`` joins the tuple because that is what ``localtime`` raises for an
+    out-of-range (rather than non-finite) value on some platforms, and
+    ``OverflowError`` must stay in it for `tests/test_coercion_guards.py`, whose
+    ``blind_guards`` rule rejects a handler whose names are a subset of
+    ``{TypeError, ValueError}``.
+    """
     try:
         moment = float(value or 0)
-    except (TypeError, ValueError, OverflowError):
+        if moment <= 0:
+            return "unknown"
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(moment))
+    except (TypeError, ValueError, OverflowError, OSError):
         return "unknown"
-    if moment <= 0:
-        return "unknown"
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(moment))
 
 
 def _short_stamp(value: object) -> str:
+    """The same moment, shorter, and total for the same reason.
+
+    NOT reachable with a disk value today: both call sites pass ``time.time()``.
+    It is hardened anyway because it is the same shape one function away, and
+    the reachability that protects it is a property of its CALLERS -- the next
+    one to pass a stored moment would reintroduce the defect this batch has now
+    fixed twice. Being unreachable, this half has no mutant, which is stated
+    rather than papered over with a kill it cannot earn.
+    """
     try:
         moment = float(value or 0)
-    except (TypeError, ValueError, OverflowError):
+        if moment <= 0:
+            return "unknown"
+        return time.strftime("%d %b %Y %H:%M", time.localtime(moment))
+    except (TypeError, ValueError, OverflowError, OSError):
         return "unknown"
-    if moment <= 0:
-        return "unknown"
-    return time.strftime("%d %b %Y %H:%M", time.localtime(moment))
 
 
 # ── the shell's vocabulary, as the reference generator spells it ───────────────
@@ -716,23 +742,131 @@ def _sechead(sid: str, title: str, label: str, lede: str, body: str) -> str:
 # ── the wireframe phone ────────────────────────────────────────────────────────
 
 
-def _frame_html(screen_id: object, screens: object) -> str:
-    """One frame, or an honest empty one when the screen was not stored."""
+#: Said instead of drawing the wrong look. "Not captured" would be false here:
+#: the screen WAS captured, several times, and this frame does not know which
+#: of them it means.
+AMBIGUOUS_LOOK = (
+    "This screen was seen more than once and this frame does not record which "
+    "look it means, so nothing is drawn rather than the most recent one."
+)
+
+
+def _look_is_ambiguous(ident: str, library: dict) -> bool:
+    """Does this BARE screen id stand for more than one stored look?
+
+    False for an observation key -- that already names its look, and the dash it
+    carries is what tells the two apart. Counting the observations belonging to
+    this screen is what lets a screen seen exactly once keep rendering, instead
+    of being suppressed by a guard too coarse to tell the cases apart.
+
+    THE DASH FAST PATH IS GONE, and its removal is the fix. It returned False
+    for any ident carrying a dash, which is right for an observation key and
+    WRONG for the screen id ``_document`` concedes is admissible: `_RUN_ID_RE`
+    accepts ``aabbccdd0011-000000000000``, and such an id with two stored looks
+    was answered "unambiguous" by the fast path and "ambiguous" by the count --
+    one question derived twice inside one function, disagreeing. The count is
+    the only derivation now. It still answers False for a real observation key,
+    because the prefix it scans for is that key plus another dash and no library
+    entry can start with it, so nothing about the ordinary case changed.
+    """
+    if not isinstance(ident, str):
+        return False
+    prefix = ident + "-"
+    seen = 0
+    for key in library if isinstance(library, dict) else {}:
+        if isinstance(key, str) and key.startswith(prefix):
+            seen += 1
+            if seen > 1:
+                return True
+    return False
+
+
+#: The three answers a frame key can get from the merged library. ONE producer,
+#: one meaning, EVERY consumer: `_frame_html` and `_phone_html` both ask
+#: :func:`_resolve_look` and neither derives the question again. Three review
+#: rounds were three consumers each deriving it separately, and each got it
+#: wrong somewhere else.
+LOOK_EXACT = "exact"
+LOOK_UNCAPTURED = "uncaptured"
+LOOK_AMBIGUOUS = "ambiguous"
+
+
+def _resolve_look(screen_id: object, screens: object) -> tuple[str, dict | None, str]:
+    """A frame key against the merged library: ``(ident, screen or None, verdict)``.
+
+    THE resolver. A bare screen id says WHICH screen and cannot say WHAT was on
+    it: the screen library holds the LAST look, and a screen observed more than
+    once has several. Resolving a frame against it draws the newest content
+    under whatever caption the caller wrote -- on a conversation, a reply the app
+    had not yet produced, shown to a non-technical tester as evidence of what
+    their own action did.
+
+    ``LOOK_AMBIGUOUS`` means TWO OR MORE stored looks. Exactly one is not
+    ambiguous -- the bare id and that single observation are the same bytes -- so
+    a settings walk and every single-look screen resolve as they always did.
+    That is what keeps this a guard and not a regression.
+
+    The verdict is returned rather than acted on because the two consumers
+    render it differently -- the fold draws an empty frame, the phone an empty
+    handset -- and the point of this function is that neither of them decides
+    the QUESTION.
+    """
     ident = _text(screen_id, 40)
     library = screens if isinstance(screens, dict) else {}
+    if not ident:
+        return "", None, LOOK_UNCAPTURED
+    screen = library.get(ident)
+    if not isinstance(screen, dict):
+        return ident, None, LOOK_UNCAPTURED
+    if _look_is_ambiguous(ident, library):
+        return ident, None, LOOK_AMBIGUOUS
+    return ident, screen, LOOK_EXACT
+
+
+def _frame_html(screen_id: object, screens: object) -> str:
+    """One frame, or an honest empty one when the screen was not stored."""
+    ident, screen, verdict = _resolve_look(screen_id, screens)
     if not ident:
         return (
             '<div class="frame missing"><p class="wirenote">'
             + esc(NOT_CAPTURED)
             + "</p></div>"
         )
-    screen = library.get(ident)
-    if not isinstance(screen, dict):
+    if verdict == LOOK_UNCAPTURED:
         return (
             '<div class="frame missing" data-screen="'
             + esc(ident, 40)
             + '"><p class="wirenote">'
             + esc(NOT_CAPTURED)
+            + "</p></div>"
+        )
+    if verdict == LOOK_AMBIGUOUS:
+        # THE INVARIANT, DECIDED IN `_resolve_look` AND HONOURED HERE.
+        #
+        # A bare screen id says WHICH screen. It cannot say WHAT was on it: the
+        # screen library holds the LAST look, and a screen observed more than
+        # once has several. Resolving a frame against it draws the newest
+        # content under whatever caption the caller wrote -- on a conversation,
+        # a reply the app had not yet produced, shown to a non-technical tester
+        # as evidence of what their action did.
+        #
+        # This is the THIRD consumer to make that mistake: the sequence row's
+        # "Screen after", the overview's opening-screen count, and the case
+        # card's "Last screen" -- each found in a separate review round, each
+        # patched separately, and two of them introduced by the change that
+        # created the second library in the first place. So the rule stops being
+        # something every caller must remember and becomes something no caller
+        # can get wrong.
+        #
+        # Ambiguous means TWO OR MORE stored looks. Exactly one is not
+        # ambiguous -- the bare id and that single observation are the same
+        # bytes -- so a settings walk and every single-look screen render as
+        # they always did. That is what keeps this a guard and not a regression.
+        return (
+            '<div class="frame missing" data-screen="'
+            + esc(ident, 40)
+            + '"><p class="wirenote">'
+            + esc(AMBIGUOUS_LOOK)
             + "</p></div>"
         )
     frame = wireframe(screen)
@@ -807,10 +941,8 @@ def _phone_html(
     and composer the user saw; the wireframe keeps the exact rectangles for
     anyone who needs them. Neither is a screenshot, and the caption says so.
     """
-    ident = _text(screen_id, 40)
-    library = screens if isinstance(screens, dict) else {}
-    screen = library.get(ident) if ident else None
-    if isinstance(screen, dict):
+    ident, screen, verdict = _resolve_look(screen_id, screens)
+    if screen is not None:
         drawn = screen_phone.compose(screen, esc=esc, app=app)
         fold = (
             '<details class="sec"><summary><span class="chev" aria-hidden="true"></span>'
@@ -822,14 +954,25 @@ def _phone_html(
             + "</div></details>"
         )
     else:
+        # THE PICTURE GETS THE SAME ANSWER AS THE FOLD BENEATH IT. Until this
+        # change the fold said the look was unknowable while the phone above it
+        # drew the newest one: one page contradicting itself, because this
+        # function resolved the library itself and the round-two guard governed
+        # only `_frame_html`, which is the fold. `ph-empty` is an existing rule
+        # in ``report_shell.html`` -- no new class name is introduced, because a
+        # class with no rule renders unstyled with nothing failing.
         drawn = (
             '<div class="phone" dir="auto"><div class="ph-scroll"><div class="ph-empty">'
-            + esc(NOT_CAPTURED)
+            + esc(AMBIGUOUS_LOOK if verdict == LOOK_AMBIGUOUS else NOT_CAPTURED)
             + "</div></div></div>"
         )
         fold = ""
     return (
-        '<div class="phone-col"><h4>'
+        '<div class="phone-col" data-look="'
+        + esc(verdict, 16)
+        + '" data-key="'
+        + esc(ident, 40)
+        + '"><h4>'
         + esc(title, 40)
         + '<span class="mt">'
         + esc(sub, 80)
@@ -934,6 +1077,12 @@ def _trace_rows(trace: object) -> list:
         safe = safe if isinstance(safe, dict) else {}
         action = safe.get("action")
         action = action if isinstance(action, dict) else {}
+        # Derived ONCE. The id that names a screen and the key that names a LOOK
+        # at that screen must come from the same normalisation: a truncation on
+        # one side and none on the other is two derivations of one id, which is
+        # a defect the neighbouring plan for this file has already shipped.
+        before_id = _text(safe.get("before_screen_id"), 40)
+        after_id = _text(safe.get("after_screen_id"), 40)
         rows.append(
             {
                 "index": _text(safe.get("index"), 8),
@@ -942,11 +1091,48 @@ def _trace_rows(trace: object) -> list:
                 "outcome": _text(safe.get("outcome"), 40) or "-",
                 "ms": _ms(safe.get("ms")),
                 "detail": _text(safe.get("detail"), MAX_TEXT),
-                "before": _text(safe.get("before_screen_id"), 40),
-                "after": _text(safe.get("after_screen_id"), 40),
+                "before": before_id,
+                "after": after_id,
+                # WHICH screen each end was, above; WHAT was on it, here. Two
+                # questions, two names, and the key is minted by the STORE's own
+                # producer so this reader cannot ask for a key the writer would
+                # not have written. An observation id is 25 characters -- a
+                # 12-hex screen id, a dash and 12 more -- so it survives the
+                # 40-character `_text` a frame applies to it, with no room for
+                # two observations to collide on a shared prefix.
+                "before_obs": _obs_key(before_id, safe.get("before_screen_hash")),
+                "after_obs": _obs_key(after_id, safe.get("after_screen_hash")),
             }
         )
     return rows
+
+
+def _obs_key(ident: object, screen_hash: object) -> str:
+    """The observation key for this end of a step, or ``""`` when there is none.
+
+    NOT `run_store.observation_key` directly. That function degrades to the bare
+    screen id when a screen carries no content hash, which is correct where it
+    lives -- a hashless screen IS its own single observation, and the store must
+    put it somewhere. At THIS boundary the degraded value is poison: it is
+    truthy, so `_changed`'s "do both ends have an observation?" guard passes,
+    and it is a screen id, so the comparison is then an observation key against
+    an id -- two namespaces, silently.
+
+    That is not a rare shape. `executor` stamps `before_screen_hash` on every
+    entry but `after_screen_hash` at ONE of fourteen sites, so "before hashed,
+    after not" is what thirteen of fourteen replay paths produce. Measured on a
+    four-turn chat: every "Screen after" frame rendered the FULL final
+    conversation, including a reply the app had not yet produced, captioned as
+    what the action left on screen. Before this feature the frame was suppressed;
+    drawing a fabricated one is strictly worse, and a tester cannot tell.
+
+    So: no hash, no observation key, and every reader falls back to the screen id
+    it used before. One producer, one meaning.
+    """
+    digest = str(screen_hash or "")
+    if not digest:
+        return ""
+    return run_store.observation_key(ident, digest)
 
 
 def _outcome_pill(outcome: str) -> str:
@@ -1003,6 +1189,20 @@ def _steps_table(rows: list) -> str:
     )
 
 
+def _changed(row: dict) -> bool:
+    """Did this action leave a DIFFERENT screen than it found?
+
+    CONTENT when both ends recorded a content hash, identity otherwise. The id
+    alone answers "a different screen", and on a chat every reply is the same
+    screen with different content -- so the frame this used to suppress was the
+    only evidence the reply ever arrived. The fallback is what a record written
+    before observations existed still gets, unchanged.
+    """
+    if row["before_obs"] and row["after_obs"]:
+        return row["after_obs"] != row["before_obs"]
+    return row["after"] != row["before"]
+
+
 def _seq_rows(rows: list, screens: object = None, app: str = "") -> str:
     """The run sequence: one row per action, in the order it ran.
 
@@ -1050,13 +1250,13 @@ def _seq_rows(rows: list, screens: object = None, app: str = "") -> str:
                 + (esc(row["after"], 40) or "—")
                 + "</div>"
             )
-        if row["after"] and row["after"] != row["before"]:
+        if row["after"] and _changed(row):
             detail += (
                 '<div class="phonewide">'
                 + _phone_html(
                     "Screen after",
                     "what this action left on screen",
-                    row["after"],
+                    row["after_obs"] or row["after"],
                     screens,
                     app,
                 )
@@ -1119,13 +1319,6 @@ def _case_wall(rows: list) -> int | None:
     return sum(measured) if measured else None
 
 
-def _network_of(safe: dict) -> dict:
-    """The case network capture record, or an empty dict. The ONE reader."""
-    holder = safe.get("evidence") if isinstance(safe, dict) else None
-    body = (holder or {}).get("network") if isinstance(holder, dict) else None
-    return body if isinstance(body, dict) else {}
-
-
 def _case_facts(case: object, manifest: dict) -> dict:
     """Everything a card, a table row, a chip and a KPI need, computed ONCE."""
     raw = case if isinstance(case, dict) else {}
@@ -1136,10 +1329,54 @@ def _case_facts(case: object, manifest: dict) -> dict:
     planned = _planned_case(manifest, tc_id)
     first_before = rows[0]["before"] if rows else _text(safe.get("screen_id"), 40)
     last_after = ""
+    last_obs = ""
     for row in reversed(rows):
         if row["after"]:
             last_after = row["after"]
+            last_obs = row["after_obs"]
             break
+    # THE LAST LOOK THIS CASE ITSELF RECORDED, for the case whose final action
+    # carries no after-hash -- which is what thirteen of `executor`'s fourteen
+    # stamp sites produce. The alternative was an honest blank; a blank is worse
+    # than the right picture here, because this case's own steps DID observe
+    # that screen, so the card can show the turn the case actually ran on rather
+    # than nothing. What it may never do is show a look this case never had,
+    # which is why the scan is confined to these rows and matches on the screen
+    # id -- a page-wide search would find the newest turn again, which is the
+    # defect.
+    last_look = last_obs
+    if not last_look and last_after:
+        for row in reversed(rows):
+            if row["after"] == last_after and row["after_obs"]:
+                last_look = row["after_obs"]
+                break
+            if row["before"] == last_after and row["before_obs"]:
+                last_look = row["before_obs"]
+                break
+    # WHAT `last_look` IS, stated positively, because the name invites a wrong
+    # reading and a disclaimer would not fix that:
+    #
+    #     the observation recorded by the LAST of this case's own rows that
+    #     touched the screen the case ended on, scanning those rows from the
+    #     end, taking an `after` observation in preference to a `before` one.
+    #
+    # It is NOT "the observation immediately before the final action". The scan
+    # matches on the screen id, so a trailing row with an empty `after` whose
+    # `before` names that same screen can supply it, and such a row may sit
+    # later in the trace than the row that set `last_after`. That is harmless
+    # for what this value is for -- every candidate is this case's own row at
+    # the right screen, so it can never draw another case's turn or a later
+    # turn of this one -- but a reader reconciling the card against the trace
+    # should know which row they are looking at.
+    #
+    # Substituted means an EARLIER look at the right screen, so the caption must
+    # say so rather than claim it is the end state. A record written before
+    # observations existed substitutes nothing and keeps its old caption.
+    last_substituted = bool(last_look) and last_look != last_obs
+    # The observation each end WAS, kept beside the id each end IS. A card that
+    # keys its frame on the id alone draws the last look at that screen, which
+    # on a conversation is somebody else's turn.
+    first_obs = rows[0]["before_obs"] if rows else ""
     screens_seen = {row["before"] for row in rows} | {row["after"] for row in rows}
     screens_seen.discard("")
     try:
@@ -1159,12 +1396,6 @@ def _case_facts(case: object, manifest: dict) -> dict:
         # Read through the detector's own accessor, never by walking the record
         # here: two walks are two derivations of "where a crash lives".
         "crash": crash_detector.crash_of_case(safe),
-        # The wire this case reached, read off the checkpoint through ONE
-        # accessor. A second walk of the record inside the card would be a
-        # second derivation of where the network record lives, and mirrored
-        # conditions drift. Absent on a checkpoint written before this feature,
-        # which is an empty dict the renderer states rather than a crash.
-        "network": _network_of(safe),
         "status": _text(safe.get("status"), 40),
         "reason": _text(safe.get("reason"), 400),
         "escapes": max(0, escapes),
@@ -1184,6 +1415,10 @@ def _case_facts(case: object, manifest: dict) -> dict:
         "rows": rows,
         "first": first_before,
         "last": last_after,
+        "first_obs": first_obs,
+        "last_obs": last_obs,
+        "last_look": last_look,
+        "last_substituted": last_substituted,
         "screens": len(screens_seen),
         "wall": wall,
         "lat": _lat_bucket(wall),
@@ -1381,19 +1616,52 @@ def _card_html(
     )
     # ONE phone when the case began and ended on the same screen: two identical
     # frames side by side read as a diff with nothing in it.
-    if facts["first"] and facts["first"] == facts["last"]:
+    first_key = facts["first_obs"] or facts["first"]
+    # `last_look`, NOT `last_obs`: the observation this case's own steps recorded
+    # at the screen it ended on, which is the right look when the final action
+    # was not captured again. `_resolve_look` still refuses anything ambiguous,
+    # so the fallback to the bare id cannot draw somebody else's turn.
+    last_key = facts["last_look"] or facts["last"]
+    # THE CAPTION IS CAPPED AT 80 CHARS BY `esc(sub, 80)` in `_phone_html`, and
+    # the cap TRUNCATES rather than refuses. A first draft of this sentence ran
+    # to 100 characters and lost "was not captured again" mid-word, leaving a
+    # dangling clause that still reads as an assertion. The truncation is not
+    # what hid the disclosure -- the same-screen branch below did that, by
+    # rendering no disclosure at all -- but a caption cut mid-word is its own
+    # small dishonesty, so both captions are kept under the cap and
+    # `test_the_substitution_caption_is_never_truncated` binds that at the
+    # rendered page rather than here. Re-measure anything added below.
+    last_sub = (
+        "the last look this case recorded at that screen"
+        if facts.get("last_substituted")
+        else "the screen the case ended on"
+    )
+    if first_key and first_key == last_key:
+        # THE SUBSTITUTION MUST BE DISCLOSED HERE TOO. One phone is drawn when
+        # the case began and ended on the same screen -- and that is exactly the
+        # shape a substituted look produces, because the fallback resolves to the
+        # screen the case started on. Saying only "the case began and ended on
+        # this screen" would assert the picture IS the end state while
+        # `last_substituted` says it is an earlier look, which is the defect this
+        # change exists to remove, surviving in the one branch that drops the
+        # caption.
         frames = _phone_html(
             "On screen",
-            "the case began and ended on this screen",
-            facts["first"],
+            (
+                # 69 chars, inside the 80-char caption cap. See `last_sub`.
+                "began and ended here; " + last_sub
+                if facts.get("last_substituted")
+                else "the case began and ended on this screen"
+            ),
+            first_key,
             screens,
             app,
         )
     else:
         frames = _phone_html(
-            "First screen", "the screen the case began on", facts["first"], screens, app
+            "First screen", "the screen the case began on", first_key, screens, app
         ) + _phone_html(
-            "Last screen", "the screen the case ended on", facts["last"], screens, app
+            "Last screen", last_sub, last_key, screens, app
         )
     phones = (
         '<div class="phonewide"><div class="phonepair">'
@@ -1408,11 +1676,6 @@ def _card_html(
     )
     # What the app heard and answered inside this case's window (plan P3).
     turns = ev_render.turns_table(loaded, facts["tc_id"]) if loaded else ""
-    # The wire, beside what the app own log said. NOT gated on `loaded`: the
-    # capture is written onto the checkpoint by the case runner, so a run with
-    # no app profile at all still has one -- which is the whole point of a
-    # capture that needs no app-specific anything.
-    network = ev_render.case_network(facts.get("network"))
     steps = (
         _sec_block(
             "Steps",
@@ -1479,7 +1742,6 @@ def _card_html(
         + _vstrip(facts)
         + phones
         + turns
-        + network
         + steps
         + sequence
         + _ended_block(facts)
@@ -1819,9 +2081,15 @@ def _overview(
     # The reference's "screen every case opened on": the first screen the run
     # saw, drawn once, with how many distinct opening screens there were.
     opening = ""
-    first_ids = [f["first"] for f in facts if f["first"]]
+    # TWO QUESTIONS, TWO NAMES. The frame needs the observation (which look);
+    # the sentence beneath it is about SCREENS (how many different screens the
+    # cases opened on). Counting observations there told a tester "4 distinct
+    # opening screens" for a four-turn chat that never left ONE screen, while
+    # the case cards on the same page said "1 screens".
+    first_ids = [f["first_obs"] or f["first"] for f in facts if f["first"]]
+    first_screens = [f["first"] for f in facts if f["first"]]
     if first_ids:
-        distinct = len(set(first_ids))
+        distinct = len(set(first_screens))
         opening = _sec_block(
             "The screen every case opened on"
             if distinct == 1
@@ -2147,8 +2415,11 @@ def _findings_section(manifest: dict, turns: int) -> str:
     Two honesty rules this section keeps, both of which the page already
     applies elsewhere:
 
-    * an explore run with no ``explore.stop`` is PARTIAL (``_is_partial``), so
-      the reader is told the list is incomplete rather than shown a conclusion;
+    * an explore run that ``explore_runner.stop_reason`` does not call stopped
+      is PARTIAL (``_is_partial``), so the reader is told the list is incomplete
+      rather than shown a conclusion. NOT ``explore.stop`` alone, which is one
+      of that producer's three clauses: a run whose deadline passed with no
+      final turn has stopped, and reading the field said otherwise forever;
     * a turn that recorded NO finding is counted out loud. The packet asks for
       one every turn, so silence is a gap in the evidence rather than a turn
       with nothing to report, and a reader who is not told cannot tell the two
@@ -2195,7 +2466,7 @@ def _findings_section(manifest: dict, turns: int) -> str:
         except (TypeError, ValueError, OverflowError):
             continue
     silent = max(0, replayed - len(spoke))
-    stop = _text(explore.get("stop"), 40)
+    stop = _text(explore_stop(body), 40)
     lede = (
         "Goal: "
         + (esc(explore.get("goal"), 400) or "(not recorded)")
@@ -2277,7 +2548,7 @@ def _a11y_rows(screen_id: str, result: dict) -> str:
             + '</td><td dir="auto">'
             + (("<b>" + esc(name, 120) + "</b> — ") if name else "")
             + esc(detail, screen_audit.MAX_FINDING_CHARS)
-            + " <span class=\"cap\">"
+            + ' <span class="cap">'
             + esc(" ".join(str(v) for v in (finding.get("ids") or [])), 120)
             + "</span></td></tr>"
         )
@@ -2323,8 +2594,7 @@ def _a11y_section(screens: object) -> str:
                 + esc(screen_id, 40)
                 + '</td><td class="cap">not audited</td><td dir="auto">'
                 + "this screen was stored before the accessibility audit existed, "
-                "so no finding here is evidence about it"
-                + "</td></tr>"
+                "so no finding here is evidence about it" + "</td></tr>"
             )
             continue
         if result.get("auditable"):
@@ -2396,6 +2666,41 @@ def _a11y_section(screens: object) -> str:
         table,
     )
 
+
+def _cases_html(
+    facts: list,
+    screens: object,
+    app: str,
+    loaded: dict | None,
+    coverage: dict | None,
+    observations: object,
+) -> str:
+    """The cases section, plus the store's own disclosure when the run reached
+    its observation limit.
+
+    Derived HERE and nowhere else. A truncated evidence set that renders as a
+    complete one is the failure this whole change exists to end, so the page
+    says the limit was reached rather than letting a frame read as "not
+    captured" for a reason nobody can see.
+    """
+    body = _cases_section(facts, screens, app, loaded, coverage)
+    kept = len(observations) if isinstance(observations, dict) else 0
+    if kept >= run_store.MAX_RUN_OBSERVATIONS:
+        # CONDITIONAL, because this function cannot tell whether anything was
+        # actually dropped. It sees how many observations were KEPT, and a run
+        # that ends exactly at the limit lost nothing -- the earlier wording
+        # said "a screen was not stored" and told such a tester their evidence
+        # was incomplete when it was whole. Saying what FOLLOWS from the limit
+        # is true in both cases; claiming a loss is only true in one.
+        body += (
+            '<p class="hint">This run reached the store\'s limit of '
+            + str(run_store.MAX_RUN_OBSERVATIONS)
+            + " kept screen observations. Any screen first seen after that point "
+            "is not stored, and its frame reads as not captured.</p>"
+        )
+    return body
+
+
 def _document(
     *,
     run_id: str,
@@ -2404,10 +2709,29 @@ def _document(
     screens: object,
     lease: dict,
     tally: dict,
+    observations: object = None,
     partial: bool,
     coverage: dict | None = None,
 ) -> str:
     facts = [_case_facts(case, manifest) for case in cases]
+    # TWO libraries, joined once. ``screens`` answers which screens the run
+    # visited and stays the accessibility audit's input -- one row per screen,
+    # not one per look at it. ``library`` adds every stored OBSERVATION and is
+    # what a FRAME resolves against, so a four-turn conversation draws four
+    # pictures instead of one. Merged rather than passed as a pair because the
+    # keys do not collide IN PRACTICE: `perception._screen_id` emits twelve hex
+    # characters and an observation id is that id plus a dash and up to twelve
+    # more, so no screen id has the shape of an observation key.
+    #
+    # NOT an invariant the code enforces, and the comment used to claim it was.
+    # `run_store._RUN_ID_RE` accepts up to 64 characters of [A-Za-z0-9._-], so a
+    # STORED screen id of "aabbccdd0011-000000000000" is admissible and would
+    # collide, with the observation silently winning this `update`. Nothing
+    # produces such an id today; if something ever does, the fix is two
+    # dictionaries rather than a longer comment. Stated because an invariant
+    # asserted in prose and unenforced in code is how a reader stops checking.
+    library = dict(screens if isinstance(screens, dict) else {})
+    library.update(observations if isinstance(observations, dict) else {})
     # Defaulted rather than required, so a caller that has not computed it still
     # gets THE producer's answer and never a locally invented one.
     coverage = (
@@ -2483,7 +2807,7 @@ def _document(
             "At a glance",
             "the run in numbers",
             "Every figure here is about what the emulator DID with a case. Whether the app is right is the tester's question, not this one.",
-            _overview(facts, tally, manifest, partial, screens, app, loaded, coverage),
+            _overview(facts, tally, manifest, partial, library, app, loaded, coverage),
         )
         + _sechead(
             "coverage",
@@ -2497,7 +2821,7 @@ def _document(
             "API surface",
             "every endpoint the app reached, on the real wire",
             "Every endpoint the app called from inside a case, against the real backend rather than a fixture.",
-            ev_render.apis_section(loaded) + ev_render.network_section(cases),
+            ev_render.apis_section(loaded),
         )
         + _sechead(
             "perf",
@@ -2508,7 +2832,7 @@ def _document(
         )
         + a11y
         + findings
-        + _cases_section(facts, screens, app, loaded, coverage)
+        + _cases_html(facts, library, app, loaded, coverage, observations)
         + '<div id="'
         + END_ID
         + '" data-cards="'
@@ -2585,6 +2909,35 @@ def _write_page(target: Path, page: str) -> dict:
         }
 
 
+def explore_stop(manifest: object) -> str:
+    """Why this exploratory run has stopped, or ``""``. ONE producer.
+
+    ``explore_runner.display_stop`` is the callee, and the producer underneath it
+    is ``stop_reason`` with THREE clauses: a recorded ``stop``, the turn budget,
+    and the wall-clock deadline. The two names are one core with two contracts:
+    ``display_stop`` is TOTAL because this is a RENDER path, while
+    ``stop_reason`` stays strict because ``session.resolve``'s containment gate
+    IS its raise. Reading
+    ``explore["stop"]`` alone -- which this module used to do -- answers only the
+    first, so a run whose deadline passed with no final turn read as still
+    running forever. Measured on mrun-20260908-061316-a41b2a: the page said "in
+    progress" 1h42m after the deadline, while ``session.resolve`` -- the other
+    consumer of the same fact, at the anchor
+    ``stop = explore_runner.stop_reason(explore)`` -- already said ``report``.
+    Cited by ANCHOR and not by line: several sessions are moving that file, and
+    source rots faster than a comment about it.
+
+    ``""`` for a suite run: the question does not apply there, and the caller's
+    own checkpoint arithmetic answers it.
+    """
+    # The RENDER contract, delegated rather than re-implemented. NOT
+    # `stop_reason`: that one is strict on purpose -- it is `session.resolve`'s
+    # containment gate -- and a manifest with a junk `deadline` reaching it from
+    # here raised through `_is_partial` into `render`'s outer `except`, which
+    # writes no page at all.
+    return explore_runner.display_stop(manifest)
+
+
 def _is_partial(manifest: dict, cases: list, tally: dict) -> bool:
     """Whether this run is still going, decided from the FILES.
 
@@ -2592,9 +2945,7 @@ def _is_partial(manifest: dict, cases: list, tally: dict) -> bool:
     build may not have one, and the checkpoints are the authority anyway.
     """
     if str(manifest.get("lane") or "") == "explore":
-        explore = manifest.get("explore")
-        explore = explore if isinstance(explore, dict) else {}
-        return not bool(explore.get("stop"))
+        return not bool(explore_stop(manifest))
     done = sum(int(count) for name, count in tally.items() if name in DONE_VERDICTS)
     planned = 0
     try:
@@ -2635,6 +2986,10 @@ def render(run_id: str) -> dict:
             if isinstance(case, dict)
         ]
         screens = (run_store.list_screens(run_id) or {}).get("content") or {}
+        # The evidence library, read beside the dedup library and never
+        # instead of it: the audit wants one row per screen, a frame wants
+        # the look the step actually took.
+        observations = (run_store.list_observations(run_id) or {}).get("content") or {}
         lease = (run_store.read_lease(run_id) or {}).get("content") or {}
         lease = lease if isinstance(lease, dict) else {}
         # NOT `tally = tally(cases)`: that binds `tally` as a local for the
@@ -2650,6 +3005,7 @@ def render(run_id: str) -> dict:
             manifest=manifest,
             cases=cases,
             screens=screens,
+            observations=observations,
             lease=lease,
             tally=counts,
             partial=partial,

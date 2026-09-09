@@ -175,8 +175,45 @@ STATUS_ERROR = "error"
 #: change is not evidence of anything -- see ``_has_verification``.
 STATUS_UNVERIFIED = "unverified"
 
-#: How often ``wait`` with ``until_text`` re-dumps the screen while polling.
-WAIT_POLL_S = 1.0
+#: How often a polling ``wait`` re-dumps the screen.
+#:
+#: THE DUMP IS THE RATE LIMITER, not this value. ``uiautomator dump`` blocks
+#: until the accessibility layer goes idle, and that wait dominates a poll
+#: iteration by a wide margin -- no flag reduces it. So a sleep on top of it
+#: bought nothing and lengthened EVERY iteration by its own full value, on a
+#: loop that may run until :data:`DEFAULT_WAIT_UNTIL_TEXT_S`. What is left here
+#: is only what stops a tight loop against a device that answers instantly,
+#: which is a fake in a test rather than a phone.
+#:
+#: The dump's cost is a DEVICE fact this tree does not own and no number for it
+#: is written here; ``tests/live/test_mobile_adb_latency_sweep.py`` measures it
+#: and asserts the ordering this reasoning rests on.
+WAIT_POLL_S = 0.25
+
+#: The shortest bare ``wait ms`` worth POLLING rather than sleeping through.
+#:
+#: Polling is not free: one iteration costs :data:`WAIT_POLL_S` plus a full
+#: dump. Below this a poll cannot return earlier than the sleep it replaced, so
+#: ``_wait_until_changed`` is not entered at all and the sleep runs exactly as
+#: it shipped. Graded by
+#: ``test_a_short_wait_is_not_polled_because_polling_it_is_slower``, which is
+#: the only fixture where THIS clause alone decides the outcome.
+POLL_MIN_WAIT_MS = 4000
+
+#: How much budget must remain before a polling ``wait`` starts one more
+#: iteration.
+#:
+#: A SEPARATE constant from the threshold above, and deliberately so: they gate
+#: different things, and while one value did both jobs neither clause could be
+#: graded -- every fixture that exercised one also satisfied the other, which is
+#: the shape this project calls a mutant that reports a kill it did not earn.
+#:
+#: The relation that decides it: this must EXCEED one dump, or the last
+#: iteration's dump lands after the deadline and the wait overruns the ms the
+#: script declared -- which would quietly make ``actions.MAX_TOTAL_WAIT_MS`` an
+#: underestimate of what one script can spend. Graded by
+#: ``test_a_polled_wait_never_starts_a_poll_it_cannot_finish``.
+MIN_POLL_MARGIN_MS = 2500
 
 #: The bound for ``wait`` with ``until_text`` and no explicit ``ms`` -- keeps a
 #: script that forgot to set ms from polling forever.
@@ -1124,6 +1161,62 @@ async def _wait_until_text(
         current = dumped.get("content")
 
 
+async def _wait_until_changed(
+    ctx: Context, screen: object, ms: int
+) -> tuple[object, bool]:
+    """Poll until the screen is no longer the one we started on. Never overruns.
+
+    Returns ``(latest_screen, changed)``. A bare ``wait`` exists because the
+    planner expects the screen to become something else; sleeping through the
+    whole ``ms`` after it already has is the cheapest thing this lane was
+    getting wrong -- observed on run mrun-20260908-061316-a41b2a, where fixed
+    sleeps sat between every action.
+
+    Three things it deliberately does NOT do:
+
+    * It is not entered below :data:`POLL_MIN_WAIT_MS`, where one poll costs
+      more than the sleep it would replace.
+    * It starts no iteration it cannot finish, so a polled wait never spends
+      longer than the ``ms`` the script declared. That is
+      :data:`MIN_POLL_MARGIN_MS`, and it is a separate clause from the
+      threshold on purpose -- see that constant.
+    * It does not decide the screen the model SEES. The caller still settles
+      with ``redump=True``, so an early return on an intermediate screen -- a
+      spinner replacing a button IS a change -- is re-read before it is handed
+      over. ``_wait_until_text`` keeps ``redump=False`` because it already
+      matched the thing it was waiting for.
+    """
+    before = _screen_id(screen)
+    deadline = time.monotonic() + (ms / 1000.0)
+    margin = MIN_POLL_MARGIN_MS / 1000.0
+    current = screen
+    while time.monotonic() + margin <= deadline:
+        await _sleep(WAIT_POLL_S)
+        dumped = await _dump(ctx)
+        if dumped.get("error"):
+            # WHY THIS `break` DOES NOT REPORT, where `_wait_until_text`'s
+            # same failure returns `timed_out`: the two have different next
+            # steps. That one returns to a branch which, on a timeout, hands
+            # the model the screen and stops -- so if it stayed silent the
+            # error would be the end of the story. This one returns to a
+            # branch that immediately calls `_settle(redump=True)`, whose OWN
+            # `_dump` runs against the same device: a device still failing is
+            # reported there as `dump_failed` / STATUS_ERROR, overwriting this
+            # action's outcome and detail, and a device that has recovered by
+            # then did not deserve a failed step. Escalating here as well
+            # would be the same answer derived twice, which is how mirrored
+            # conditions drift. Graded by
+            # `test_a_dump_error_during_a_polled_wait_is_not_lost`.
+            break
+        current = dumped.get("content")
+        if _screen_id(current) != before:
+            return current, True
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        await _sleep(remaining)
+    return current, False
+
+
 def _center(element: dict) -> tuple[int, int] | None:
     bounds = element.get("bounds") or []
     if len(bounds) != 4:
@@ -1808,10 +1901,23 @@ async def replay(script: object, ctx: Context) -> dict:
                             index,
                         ),
                     }
+                changed = False
                 if ms:
-                    await _sleep(ms / 1000.0)
+                    if ms >= POLL_MIN_WAIT_MS:
+                        screen, changed = await _wait_until_changed(ctx, screen, ms)
+                    else:
+                        await _sleep(ms / 1000.0)
                 entry["outcome"] = "ok"
-                entry["detail"] = "waited " + str(ms) + "ms"
+                # The detail says what the wait DID, not what it was allowed to
+                # do. Reporting "waited 8000ms" for a wait that came back in a
+                # quarter of a second is the true-shaped sentence this lane has
+                # been burned by before, and the trace is read back in the
+                # report and in the next packet.
+                entry["detail"] = (
+                    ("waited for the screen to change, inside the " + str(ms) + "ms")
+                    if changed
+                    else ("waited " + str(ms) + "ms")
+                )
                 screen, stop = await _settle(
                     ctx,
                     entry,

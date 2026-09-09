@@ -599,6 +599,26 @@ async def force_stop(serial: str, package: str) -> dict:
 # digit after the sign and be read as a positive 1080 (round-13 review), when a
 # negative width is an answer this function must not trust.
 _DISPLAY_RE = re.compile(r"(?<![\d-])(\d{1,7})x(\d{1,7})(?!\d)")
+#: The largest edge this lane will believe a device reported. The REGEX bounds
+#: the digit COUNT so a longer number is refused rather than sliced; this bounds
+#: the VALUE, which the regex cannot: `9999999x9999999` is seven digits each and
+#: parses as a plausible answer, and the only other check on this path is
+#: `width <= 0 or height <= 0` -- a floor with no ceiling.
+#:
+#: Why a ceiling is needed at all: this number is not decoration. It is read by
+#: `case_runner`, `explore_runner` and `executor` as the coordinate space a
+#: planned action lives in, and it scales the report. An absurd value does not
+#: fail loudly; it silently rescales, which is the same shape as the density
+#: multiplier two constants below -- and that one is bounded on both sides for
+#: exactly this reason.
+#:
+#: The constraint that decides the number, not the number itself: it must sit
+#: far above any panel this lane can drive (the largest in the fixtures is 3200,
+#: and 8K's long edge is 7680) and far below the point where a value stops being
+#: a plausible panel at all. Sizes above this are refused, and a refusal here
+#: means "no answer", which every consumer already handles -- the dump's own
+#: bounds remain the authority for targeting either way.
+MAX_DISPLAY_EDGE_PX = 32768
 #: How long a display answer is reused before the device is asked again. Not
 #: forever: a SERIAL is not a device identity. Emulator serials are recycled, so
 #: a phone AVD and a tablet AVD both arrive as `emulator-5554`; a foldable
@@ -720,6 +740,27 @@ async def display_size(serial: str) -> dict:
                 continue
             width, height = int(match.group(1)), int(match.group(2))
             if width <= 0 or height <= 0:
+                continue
+            # ONE clause over the longer edge, not two comparisons joined by
+            # `or`. A two-clause version is a clause that can be written
+            # halfway -- drop the height half and a tall absurd panel walks
+            # through -- and it would also collide with the zero-guard above in
+            # the clause ratchet's locator, which matches on the names a
+            # condition mentions. `max` cannot be half-applied.
+            longest_edge = max(width, height)
+            if longest_edge > MAX_DISPLAY_EDGE_PX:
+                # The regex bounds the digit COUNT, not the value: seven digits
+                # each means 9999999x9999999 parses as a plausible panel. Refuse
+                # it here rather than let it through as a coordinate space --
+                # `continue` means "no answer", which every consumer already
+                # handles, and the dump's own bounds stay the authority for
+                # targeting either way.
+                logger.debug(
+                    "refusing an implausible display size %dx%d from %s",
+                    width,
+                    height,
+                    serial,
+                )
                 continue
             if overridden and not override:
                 # An override REPLACES the physical size and is what is being
@@ -1168,124 +1209,3 @@ async def run_as_cat(
         return {"error": refused, "content": None}
     data, truncated = _capped(str(body.get("out") or ""), max_bytes)
     return {"error": None, "content": {"data": data, "truncated": truncated}}
-
-
-# ---- the emulator console, proxied by adb (plan mobile-network-capture) ------
-#
-# THE ONE SURFACE that can record a device's traffic without root: measured on
-# emulator-5554 on 2026-09-09, ``adb root`` is refused on a production build,
-# ``tcpdump`` is not on the system image and a release APK refuses ``run-as``.
-# The emulator console CAN, because it runs in the emulator process on the host
-# -- and ``adb ... emu <cmd>`` reaches it, carrying the console auth token
-# itself, so nothing in this tree reads, holds or logs that credential.
-
-#: What a run on a physical device is told, BY NAME. The lane supports a real
-#: phone; the emulator console does not exist there, so a capture is IMPOSSIBLE
-#: rather than empty -- and an empty section reads to a tester as "the app
-#: called nothing", which is the false claim this constant exists to prevent.
-NOT_AN_EMULATOR = (
-    "network capture needs an emulator; this run is on a physical device, so "
-    "the app network traffic was not recorded (its logcat still was)"
-)
-
-#: One word of a console command line. Deliberately narrower than the console
-#: itself accepts: every argument sent here is a literal in this tree or a file
-#: name this tree composed, so nothing needs a space, a quote or a newline.
-_EMU_WORD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$")
-
-_BARE_PCAP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}\.pcap$")
-
-
-def valid_capture_name(name: object) -> bool:
-    """True for a name the emulator console accepts as a bare file name.
-
-    Checked HERE, before adb is called, even though the console checks it too:
-    a name built from a run id must never be able to become a path this process
-    asks a co-process to write, and the console's own refusal EXITS ZERO.
-    """
-    text = str(name or "")
-    return bool(_BARE_PCAP_RE.match(text)) and ".." not in text
-
-
-async def emu(serial: str, *args: object) -> dict:
-    """``adb -s <serial> emu <args>``: the emulator console. Never raises.
-
-    ``{"error", "content": [<reply line>, ...]}`` -- the reply with its trailing
-    ``OK`` stripped, so a caller reads what the console SAID and not its
-    punctuation.
-
-    **THE EXIT CODE IS ALWAYS ZERO**, and this is the whole reason the function
-    exists rather than a bare ``raw`` call at each site. Measured on
-    emulator-5554 on 2026-09-09: ``emu network capture start ../x.pcap`` answers
-    ``KO: <file> must be a bare filename ...`` and STILL exits 0. So the verdict
-    is read from the TEXT and from nothing else -- a reply whose last non-empty
-    line is exactly ``OK`` succeeded; any line beginning ``KO`` is a failure
-    carrying its own reason. Branching on ``rc`` would report every refusal as a
-    success, which is the one failure shape a capture must not have: a run that
-    believes it is recording and is not.
-
-    A reply cut by :data:`MAX_DUMP_BYTES` is an ERROR, not a truncated success.
-    The terminator is the only evidence the command worked, and a reply whose
-    end was cut cannot carry it.
-
-    **The device must be an EMULATOR, and this is the ONE place that question is
-    asked on this path.** ``device_facts`` confirms it against ``ro.kernel.qemu``
-    rather than trusting the serial prefix, because an emulator reached over TCP
-    arrives as ``host:port``; a second check at a caller would be a second
-    derivation of one question, and mirrored conditions drift.
-    """
-    words = [str(word) for word in args]
-    if not words:
-        return {"error": "Refusing an empty emulator console command.", "content": None}
-    for word in words:
-        if not _EMU_WORD_RE.match(word):
-            return {
-                "error": "Refusing emulator console argument " + repr(word[:40]) + ".",
-                "content": None,
-            }
-    facts = await device_facts(serial)
-    kind = str(((facts or {}).get("content") or {}).get("kind") or "")
-    if kind != "emulator":
-        return {"error": NOT_AN_EMULATOR, "content": None}
-    result = await _device(serial, ["emu"] + words)
-    if result.get("error"):
-        return result
-    body = result["content"] or {}
-    joined = str(body.get("out") or "")
-    stderr = str(body.get("err") or "").strip()
-    if stderr:
-        joined = joined + "\n" + stderr
-    text, truncated = _capped(joined, MAX_DUMP_BYTES)
-    if truncated:
-        return {
-            "error": (
-                "The emulator console answered with more than "
-                + str(MAX_DUMP_BYTES)
-                + " bytes, so its reply could not be read to the end and `"
-                + " ".join(words)
-                + "` cannot be reported as having worked."
-            ),
-            "content": None,
-        }
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    for line in lines:
-        if line == "KO" or line.startswith("KO:"):
-            return {
-                "error": (
-                    "The emulator refused `"
-                    + " ".join(words)
-                    + "`: "
-                    + line[3:].strip()
-                ),
-                "content": None,
-            }
-    if not lines or lines[-1] != "OK":
-        return {
-            "error": (
-                "The emulator console did not confirm `"
-                + " ".join(words)
-                + "`; its reply did not end in OK."
-            ),
-            "content": None,
-        }
-    return {"error": None, "content": lines[:-1]}

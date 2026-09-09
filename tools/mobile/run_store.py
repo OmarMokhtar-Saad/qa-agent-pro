@@ -14,6 +14,19 @@ report's wireframes were unbuildable from this store. Keying on ``screen_id``
 makes dedup free (it is stable across a one-pixel scroll), so a 200-case run
 stores each distinct screen ONCE rather than once per case.
 
+**And one OBSERVATION library beside it.** ``observations/<screen_id>-<hash>.json``
+holds what was ON that screen each time a step looked. Two directories because
+two consumers want two different answers and CLAUDE.md is explicit that this is
+two values with two names, not one value with a caveat: the REPORT's dedup wants
+"which screen is this", and nineteen near-identical wireframes of a settings list
+are noise; the EVIDENCE wants "what did the model see when it chose that action",
+and on a chat the content IS the state. ``screen_id`` was made to be blind to
+content on purpose -- it hashes the top THREE texts, which on a chat are the
+toolbar -- so run mrun-20260905-051728-bd1777 stored ONE file for a four-turn
+conversation, each turn overwriting the last. Making the id finer-grained would
+have moved dedup for every non-chat screen too; adding the second key moves
+nothing for them, because an unchanged screen has an unchanged hash.
+
 **Redaction at the WRITE, not at the reader.** :func:`redact` runs inside every
 write path. It masks two things: any value under a key in
 ``SECRET_VALUE_KEYS`` inside an object marked ``secret: true``, and any value
@@ -53,6 +66,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -101,6 +115,17 @@ LEASE_FILE = "lease.json"
 MANIFEST_FILE = "manifest.json"
 CASES_DIR = "cases"
 SCREENS_DIR = "screens"
+OBSERVATIONS_DIR = "observations"
+
+#: How many DISTINCT observations one run may keep. An observation is a pruned
+#: screen, so ``perception.MAX_ELEMENTS`` and ``perception.MAX_ATTR_CHARS``
+#: bound one at roughly 45 KB worst case; this is the multiplier that turns that
+#: into a directory on the tester's own disk, kept until ``STALE_RUN_S``
+#: collects it. Reaching it stops storing NEW observations and nothing else: the
+#: canonical screen is still written, the run is untouched, and the report says
+#: the limit was reached rather than showing a stale picture as if it were the
+#: step's own.
+MAX_RUN_OBSERVATIONS = 400
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _TC_ID_RE = re.compile(r"^TC-\d{3,6}$")
@@ -307,8 +332,12 @@ def write_screen(run_id: str, screen: object) -> dict:
     """Store one PRUNED screen under its own ``screen_id``.
 
     Idempotent by design: the id is stable across a one-pixel scroll, so the
-    same screen re-observed rewrites one file rather than adding another. The
-    payload goes through the same redacting writer as everything else here.
+    same screen re-observed rewrites one file rather than adding another. That
+    is what the report dedupes on, and it is deliberately blind to content -- so
+    the same call ALSO keeps this look at the screen as its own observation,
+    under :func:`observation_key`, which is what a step's evidence joins to. One
+    producer, two files, two questions. The payload goes through the same
+    redacting writer as everything else here, both times.
 
     A refusal is CONTENT for the caller to ignore: the writers are mid-run
     lifecycle functions, and a report that lost a wireframe is a far lesser
@@ -329,7 +358,13 @@ def write_screen(run_id: str, screen: object) -> dict:
                 "content": None,
             }
         _write_json(run_path(run_id) / SCREENS_DIR / (screen_id + ".json"), body)
-        return {"error": None, "content": {"screen_id": screen_id}}
+        return {
+            "error": None,
+            "content": {
+                "screen_id": screen_id,
+                "observation_id": _write_observation(run_id, screen_id, body),
+            },
+        }
     except Exception as exc:
         logger.exception("mobile.run_store.write_screen failed")
         return {"error": str(exc), "content": None}
@@ -353,6 +388,97 @@ def list_screens(run_id: str) -> dict:
         return {"error": str(exc), "content": None}
 
 
+def observation_key(screen_id: object, screen_hash: object) -> str:
+    """The id of ONE observation: ``<screen_id>-<12 hex of the content hash>``.
+
+    THE one producer of this string. The writer here mints it and every reader
+    that joins a trace entry to a stored screen asks for it here, so a reader
+    cannot mint a key the writer would not have written.
+
+    A screen with no content hash -- a record written before observations
+    existed, a hand-built fixture -- is its own single observation, so the key
+    degrades to the bare screen id and every existing reader behaves exactly as
+    it did before.
+    """
+    ident = str(screen_id or "")
+    if not _RUN_ID_RE.match(ident):
+        return ""
+    digest = "".join(
+        char for char in str(screen_hash or "").lower() if char in "0123456789abcdef"
+    )[:12]
+    return (ident + "-" + digest) if digest else ident
+
+
+def observation_id(screen: object) -> str:
+    """:func:`observation_key` for a PRUNED screen, or ``""``."""
+    body = screen if isinstance(screen, dict) else {}
+    return observation_key(body.get("screen_id"), body.get("hash"))
+
+
+def _write_observation(run_id: str, screen_id: str, body: dict) -> str:
+    """Keep this look at the screen beside the canonical one. Never raises.
+
+    Returns the observation id, or ``""`` when there was nothing distinct to
+    keep, when the run has reached :data:`MAX_RUN_OBSERVATIONS`, or when the
+    write failed. Each of those is CONTENT for a caller that must ignore it:
+    the canonical screen is already on disk by the time this runs, and a lost
+    wireframe may never cost a case its verdict.
+
+    The cap is counted over the DIRECTORY rather than tracked in the manifest.
+    A run resumed from another chat has no in-memory count, and a cap that
+    resets on resume is not a cap.
+    """
+    try:
+        ident = observation_key(screen_id, body.get("hash"))
+        if not ident or ident == screen_id:
+            return ""
+        directory = run_path(run_id) / OBSERVATIONS_DIR
+        target = directory / (ident + ".json")
+        if not target.exists():
+            kept = len(list(directory.glob("*.json"))) if directory.is_dir() else 0
+            if kept >= MAX_RUN_OBSERVATIONS:
+                logger.warning(
+                    "mobile.run_store: run %s already keeps %d screen "
+                    "observations; this one is not stored",
+                    run_id,
+                    kept,
+                )
+                return ""
+        _write_json(target, body)
+        return ident
+    except Exception:
+        logger.exception("mobile.run_store._write_observation failed")
+        return ""
+
+
+def list_observations(run_id: str) -> dict:
+    """``{observation_id: screen}`` -- what a STEP's evidence joins against.
+
+    Separate from :func:`list_screens` on purpose. That one answers which
+    screens a run visited, one entry per screen, and is what the accessibility
+    audit iterates; this one answers what was on them each time a step looked.
+    A reader that wants "was this screen usable" wants the first; a reader that
+    wants "what did the model see when it chose that action" wants this one.
+    """
+    try:
+        if not valid_run_id(run_id):
+            return {"error": "Invalid run id.", "content": None}
+        directory = run_path(run_id) / OBSERVATIONS_DIR
+        out: dict = {}
+        if directory.is_dir():
+            for child in sorted(directory.glob("*.json")):
+                body = _read_json(child)
+                if not isinstance(body, dict):
+                    continue
+                key = observation_key(body.get("screen_id"), body.get("hash"))
+                if key:
+                    out[key] = body
+        return {"error": None, "content": out}
+    except Exception as exc:
+        logger.exception("mobile.run_store.list_observations failed")
+        return {"error": str(exc), "content": None}
+
+
 def _run_age(root: Path, manifest: dict, now: float) -> float:
     """Seconds since this run's NEWEST activity.
 
@@ -364,6 +490,22 @@ def _run_age(root: Path, manifest: dict, now: float) -> float:
     separate keep-reason in :func:`gc_stale_runs`, because a live lease is
     always fresh -- folding it in here would make that branch unreachable, and
     an unreachable branch cannot be tested or mutated.
+
+    NON-FINITE STAMPS ARE DISCARDED BEFORE ``max``, and that is load-bearing
+    rather than tidy. ``json.loads`` accepts a bare ``NaN`` literal and
+    ``_read_json`` passes no ``parse_constant``, so a manifest can carry one --
+    and a NaN SURVIVES ``max`` when it is compared first, because every
+    comparison against NaN is False. The NaN then propagates into the age, and
+    in :func:`gc_stale_runs` the clock-skew, freshness and lease checks are all
+    comparisons, so all three are False and a seconds-old run is deleted. That
+    is not hypothetical: ``list_runs`` runs the GC by default, so merely
+    LISTING a tester's runs was what destroyed them.
+
+    A discarded stamp cannot fabricate freshness either -- the remaining stamps
+    are real, and if every stamp is junk the run is treated as being from NOW,
+    which keeps it. Keeping a run that should have been collected costs disk;
+    deleting one that should have been kept costs a tester their evidence, and
+    the four keep-reasons in the collector already say which way this leans.
     """
     stamps = [float(manifest.get("created") or 0)]
     try:
@@ -375,7 +517,10 @@ def _run_age(root: Path, manifest: dict, now: float) -> float:
             stamps.append(float(child.stat().st_mtime))
     except OSError:  # pragma: no cover - defensive
         pass
-    return float(now) - max(stamps)
+    finite = [stamp for stamp in stamps if math.isfinite(stamp)]
+    if not finite:
+        return 0.0
+    return float(now) - max(finite)
 
 
 def gc_stale_runs(*, now: float | None = None, keep_s: float = STALE_RUN_S) -> dict:
@@ -436,6 +581,18 @@ def gc_stale_runs(*, now: float | None = None, keep_s: float = STALE_RUN_S) -> d
                 kept.append({"run_id": child.name, "reason": "lease_live"})
                 continue
             age = _run_age(child, manifest, moment)
+            if not math.isfinite(age):
+                # A SECOND LAYER, deliberately, and not redundant with the
+                # filter in `_run_age`. Every check below is a COMPARISON, and
+                # every comparison against NaN is False -- so a non-finite age
+                # falls through all of them to the `rmtree`. That is the one
+                # value where this function's default is to DELETE, which is
+                # exactly backwards for a collector whose four keep-reasons all
+                # exist because losing a resumable run costs a tester their
+                # evidence. `_run_age` should never produce this now; if it ever
+                # does again, the run survives and says so instead of vanishing.
+                kept.append({"run_id": child.name, "reason": "unreadable_age"})
+                continue
             if age < 0:
                 kept.append({"run_id": child.name, "reason": "clock_skew"})
                 continue
@@ -539,7 +696,12 @@ def verdict_coverage(cases: object, manifest: object = None) -> dict:
     * the EXPLORE lane earns ONE verdict for the whole run, on the turn that
       judges the goal. A turn has no expected result, so counting 17
       exploratory turns as 17 missing verdicts reports a gap that does not
-      exist. ``expected`` is 1 once ``explore.stop`` is set and 0 before it.
+      exist. ``expected`` is 1 once ``explore_runner.display_stop`` calls the
+      run stopped, and 0 before that. NOT ``explore.stop``, which is one of that
+      producer's three clauses: a run stopped by its deadline or its turn budget
+      never sets the field, so this counted it as still running and the page
+      printed "finished -- stopped: deadline_reached" and "this one has not
+      stopped yet" in a single sentence.
 
     Never raises: a junk ``total`` reads as 0.
     """
@@ -549,9 +711,22 @@ def verdict_coverage(cases: object, manifest: object = None) -> dict:
     with_verdict = sum(1 for case in items if _has_verdict(case))
     lane = str(body.get("lane") or "suite")
     if lane == "explore":
-        explore = body.get("explore")
-        explore = explore if isinstance(explore, dict) else {}
-        expected = 1 if explore.get("stop") else 0
+        # The two `explore` locals that used to stand here are GONE, not left
+        # behind: this replacement removed their last reader, and a local whose
+        # last reader is removed goes in the same op -- `ruff` selects F in
+        # pyproject, so F841 would fail the implement gate.
+        #
+        # LOCAL import, and not a cycle: `explore_runner` imports this module at
+        # module scope, so the edge must not be repaid at import time -- but by
+        # the time this function is CALLED both modules are fully loaded, and
+        # nothing in `explore_runner`'s module body calls back here.
+        #
+        # `display_stop`, not `stop_reason`: this is a RENDER path (the page and
+        # the status reply), and a coverage count that raised on a junk manifest
+        # would take the whole page with it.
+        from tools.mobile import explore_runner
+
+        expected = 1 if explore_runner.display_stop(body) else 0
     else:
         try:
             planned = int(body.get("total") or 0)

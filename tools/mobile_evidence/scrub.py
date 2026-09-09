@@ -217,41 +217,11 @@ def scrub_pairs(text: str) -> str:
     return TEXT_PAIR_RE.sub(one, text)
 
 
-# A key/value pair as it survives in a URL QUERY STRING or a form body: ``?token=abc`` /
-# ``&api_key=abc``. The pair net above reads JSON-shaped text and cannot see this shape,
-# which was found the moment a plaintext request line was captured off the wire: an app
-# that puts a token in a URL puts it exactly here. Bounded the same way -- the key is a
-# plain identifier of at most 41 characters and the value stops at the next separator.
-QUERY_PAIR_RE = re.compile(
-    r"(?P<lead>[?&;]|^|\s)(?P<k>[A-Za-z_][A-Za-z0-9_.\-]{0,40})=(?P<v>[^&;\s\"'<>#]{1,4000})"
-)
-
-
-def scrub_query(text: str) -> str:
-    """Mask a sensitive key's value where the pair survives as ``key=value``.
-
-    Like :func:`scrub_pairs`, this needs no arming: the key names itself. The ``=`` test
-    comes first so ordinary prose leaves without paying for the regex.
-    """
-    if "=" not in text:
-        return text
-
-    def one(match: re.Match) -> str:
-        if not SENSITIVE_KEY_RE.search(match.group("k")):
-            return match.group(0)
-        return (
-            match.group("lead") + match.group("k") + "=" + mask_value(match.group("v"))
-        )
-
-    return QUERY_PAIR_RE.sub(one, text)
-
-
 def scrub_text(text: object) -> str:
     """Mask every armed value wherever it appears in free text, every sensitive
-    key/value pair that survives as text (JSON-shaped OR query-shaped), and the
-    labelled prose values. NOT a no-op on an unarmed render: the pair, query and
-    prose passes always run."""
-    out = scrub_prose(scrub_query(scrub_pairs("" if text is None else str(text))))
+    key/value pair that survives as text, and the labelled prose values. NOT a no-op on
+    an unarmed render: the pair and prose passes always run."""
+    out = scrub_prose(scrub_pairs("" if text is None else str(text)))
     if not _SENSITIVE_VALUES:
         return out
     # Longest first, so a value that contains another is masked whole rather than being

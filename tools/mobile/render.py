@@ -566,8 +566,18 @@ def provisioning_section(progress: object, *, device_in_use: bool = False) -> li
       fact about the machine that a tester needs whatever else is going on, and
       suppressing it would be the same defect pointing the other way -- which is
       exactly why the age, not the field, is the discriminator: a download that
-      is really in flight rewrites this record every few seconds and is always
-      fresh, while a five-day-old ``phase`` means the process died.
+      is really in flight cannot outlive its own step, while a five-day-old
+      ``phase`` means the process died.
+
+      THE GUARANTEE IS A COUPLING BETWEEN TWO CONSTANTS, not a write rate.
+      This said "rewrites this record every few seconds", which is false --
+      measured, it is about two writes per step -- and a reader who believed it
+      could lower the cap to seconds and start suppressing live downloads. What
+      actually holds is ``provisioner.STEP_TIMEOUT_S`` (1800) <
+      ``_RECORD_MAX_AGE_S`` (21600): no single provisioning step may run longer
+      than the step timeout, so a step still in flight has written within that
+      window and is inside this cap with room to spare. Lowering this constant
+      below the step timeout would suppress a genuinely running download.
 
     The third state -- never attempted at all -- is the empty body, and it has
     always rendered nothing.
@@ -810,6 +820,30 @@ def status_block(resolved: object, coverage_line: str = "") -> str:
             "- app: `" + _field(body.get("package"), "(none)") + "`",
             "- device: " + _field(body.get("serial"), "(not attached)"),
         ]
+        # LEADS the block, on purpose, and that ordering is the whole point: a
+        # forward action below the fold is one a model does not act on.
+        # Observed -- a model that met a stopped run and got only a status
+        # dropped to 41 raw `adb` shell calls, bypassing the destructive guard,
+        # the IME, evidence capture and the step record, and then presented an
+        # earlier run's report as the report of that work.
+        #
+        # IT ASSERTS EXACTLY WHAT THE PRODUCER ESTABLISHED and nothing wider.
+        # `explore_runner.stop_reason` -- reaching here as `explore_stop` via
+        # `session.resolve` -- establishes THAT the run stopped and names it in
+        # its own words, so the restart instruction is sound and the reason is
+        # quoted rather than interpreted. A previous version added a cause
+        # ("its budget is spent"), which an executing review found false for a
+        # `goal_reached` run stopped at turn 4 of 30. There is deliberately no
+        # per-reason prose and no table to keep in step with the producer.
+        stopped = _field(body.get("explore_stop"))
+        if stopped:
+            lines[2:2] = [
+                "**This run has stopped — `"
+                + stopped
+                + "`.** It cannot be continued: call `qa_mobile_test` to start "
+                "a NEW run.",
+                "",
+            ]
         explore = body.get("explore")
         explore = explore if isinstance(explore, dict) else {}
         total = _count(body.get("total"))
@@ -865,8 +899,8 @@ def status_block(resolved: object, coverage_line: str = "") -> str:
                 + " of "
                 + str(int(explore.get("turns_budget") or 0))
                 + (
-                    " — stopped: " + str(explore.get("stop"))
-                    if explore.get("stop")
+                    " — stopped: " + _field(body.get("explore_stop"))
+                    if body.get("explore_stop")
                     else ""
                 )
             )

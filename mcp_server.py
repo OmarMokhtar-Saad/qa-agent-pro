@@ -1646,6 +1646,35 @@ def build_server():
             mcp_handlers.handle_setup_check(progress=progress, workspace_roots=roots),
         )
 
+    # ALL editions, NO flag: flag policy says a new feature ships ON, and this
+    # one falls into none of the four flag categories -- it makes no outbound
+    # call, needs no per-install config, is not an experiment, and there is no
+    # install where "do not tell the tester what this machine allows" is the
+    # right value. Registered UNCONDITIONALLY here and named in the ambient
+    # instructions block, which a test cross-checks per edition. Its producer is
+    # tools/host_privileges.py, top level, so this survives the test-cases-only
+    # edition, which ships no tools/mobile/ on disk.
+    @mcp.tool()
+    async def qa_host_check(ctx: Context, refresh: bool = False) -> str:
+        """What OS is this and can this account elevate? Call this BEFORE
+        proposing any install or provision command, so you offer the route the
+        tester can actually run: on a locked-down corporate laptop an elevated
+        command is a dead end they cannot diagnose.
+
+        ADVISORY ONLY -- it blocks no run, no provision and no install; it tells
+        you which steps are attemptable, names the admin-free route first, and
+        reports "cannot determine" as UNDETERMINED rather than as a refusal.
+
+        The probe never prompts for a password and stores no credential. The
+        verdict is cached for this server process and the reply says so; pass
+        `refresh=true` to probe again after IT changes something.
+        """
+        return await _tracked(
+            "qa_host_check",
+            ctx,
+            mcp_handlers.handle_host_check(refresh=bool(refresh)),
+        )
+
     @mcp.tool(name=selfcheck_module.SELF_TOOL_NAME)
     async def qa_selfcheck(ctx: Context) -> str:
         """Check whether THIS build's own replies still describe it: call every
