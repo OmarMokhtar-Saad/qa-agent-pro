@@ -373,7 +373,7 @@ async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
         # to cover the app own start-up. A physical device, a console that
         # refused, or a flag that is off all land as a record which SAYS so --
         # none of them can block the case, and none of them can be a blank.
-        evidence["network"] = _network_record(
+        evidence["network"] = network_record(
             await capture.begin_network(ctx.serial, ctx.package, run_id, tc_id, 0)
         )
         launched = await adb.launch(ctx.serial, ctx.package)
@@ -870,11 +870,11 @@ def _evidence_record(source: object) -> dict:
         # Carried forward the same way the crash is, and normalised by its own
         # accessor: a checkpoint written before this feature has no such key,
         # and the report must read a shape rather than a KeyError.
-        "network": _network_record(body.get("network")),
+        "network": network_record(body.get("network")),
     }
 
 
-def _network_record(source: object) -> dict:
+def network_record(source: object) -> dict:
     """The case network record, normalised from ``capture.begin_network`` or
     ``finish_network``, OR from a record already on disk.
 
@@ -969,7 +969,7 @@ async def _slice_evidence(run_id: str, tc_id: str, ctx: executor.Context) -> dic
         # result: an evidence fault can no more change a verdict here than a
         # failed slice can, which is why this sits after the crash merge and
         # before the write rather than anywhere a return could skip it.
-        evidence["network"] = _network_record(
+        evidence["network"] = network_record(
             await capture.finish_network(
                 ctx.serial,
                 ctx.package,

@@ -431,6 +431,7 @@ def _record_is_current(body: dict, now: float) -> bool:
         return False
     return 0 <= age <= _RECORD_MAX_AGE_S
 
+
 #: The record field that says THIS MACHINE proceeded past a NEGATIVE
 #: virtualization verdict on an acknowledgement. The name lives HERE, on the
 #: consumer side, and ``provisioner`` imports it, because two hand-written
@@ -1112,6 +1113,14 @@ def device_busy_block(refusal: object) -> str:
     broken under a live holder is two chats driving one device, which is the
     defect this whole mechanism exists to prevent.
 
+    THE TAKE-OVER IS OFFERED ONLY WHERE IT CAN BE ACCEPTED. A run that has
+    reached its report cannot be continued, so telling the tester to take it
+    over is a closed loop: the take-over is refused for being finished, the
+    device stays held, and this reply says the same thing again. A finished
+    holder is told what is true instead -- nothing is driving it, its own chat
+    hands the device back on its next heartbeat, and a fresh run is one argument
+    away.
+
     ONE lock covers the whole lane rather than one per serial, and the reason is
     stated here rather than hidden: the device stage is what picks, boots and
     provisions the device, so there is no serial to key a lock on until after
@@ -1150,6 +1159,21 @@ def device_busy_block(refusal: object) -> str:
             "happen as recorded. Refusing is the safe answer; nothing was "
             "started."
         )
+    # THE HOLDER'S OWN STATE, asked once, of the producer that answers the
+    # tester's `qa_mobile_status`. Only meaningful for a label that IS a run id,
+    # which the sanitisation above has already established.
+    finished = False
+    if who and not who.startswith("provisioning:"):
+        try:
+            from tools.mobile import session
+
+            resolved = session.resolve(who)
+            if not resolved.get("error"):
+                state = str((resolved.get("content") or {}).get("state") or "")
+                finished = state == session.STATE_REPORT
+        except Exception:  # pragma: no cover - a refusal may not fail to render
+            finished = False
+
     lines = ["## Another run is using the emulator\n"]
     if who.startswith("provisioning:"):
         lines.append(
@@ -1158,6 +1182,17 @@ def device_busy_block(refusal: object) -> str:
             + " — the emulator is being picked, booted or the app installed. "
             "That step finishes within the call that started it, so call "
             "`qa_mobile_test` again in a moment."
+        )
+    elif who and finished:
+        lines.append(
+            "Run `" + who + "` still holds it, but that run has FINISHED — "
+            "nothing is driving it. It cannot be taken over, because there is "
+            "nothing left to continue; the chat that ran it hands the device "
+            "back on its next heartbeat, within about half a minute.\n\n"
+            "1. **Call `qa_mobile_test` again shortly**, with `new_run=true` to "
+            "start a fresh run on that device.\n"
+            "2. **See what it did** — `qa_mobile_status` with "
+            '`run_id="' + who + '"`, and `report_now=true` for its HTML report.'
         )
     elif who:
         lines.append(

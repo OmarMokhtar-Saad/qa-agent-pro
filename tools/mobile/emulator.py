@@ -183,12 +183,21 @@ async def list_running() -> dict:
         return {"error": str(exc), "content": None}
 
 
-async def wait_boot(serial: str, timeout: int = 0) -> dict:
+async def wait_boot(serial: str, timeout: int = 0, *, tunable: bool = True) -> dict:
     """Poll until ``sys.boot_completed`` is ``1``.
 
     ``adb wait-for-device`` returns as soon as adbd answers, which is minutes
     before the launcher exists; every "the package is not installed" failure on
     a cold emulator traces back to trusting it.
+
+    ``tunable`` says whether ``QA_MOBILE_BOOT_TIMEOUT_S`` governs the budget
+    this call actually spent, and it changes the TIMEOUT MESSAGE only -- never
+    the waiting. True for every caller whose budget comes from that setting:
+    the default, and :func:`boot`, which slices its own remaining time off it.
+    False for a caller that imposed a bounded slice of its own and hands back a
+    pointer rather than waiting (:func:`session.ensure_device`, 20s). There the
+    setting cannot move this wait, and a remedy naming it sends the tester to
+    turn a knob that is not connected to anything they can see.
     """
     try:
         budget = int(timeout or boot_timeout_s())
@@ -225,6 +234,22 @@ async def wait_boot(serial: str, timeout: int = 0) -> dict:
             time.time(),
             str((named or {}).get("content") or ""),
         )
+        # The remedy, and the ONE thing that decides it: whose budget was this?
+        # Both branches name Android Studio, because warming the snapshot
+        # shortens the BOOT and so helps either way; only the first offers the
+        # setting, because only there does raising it change what happens next.
+        remedy = (
+            "Raise QA_MOBILE_BOOT_TIMEOUT_S, or start the AVD from "
+            "Android Studio once to warm its snapshot."
+            if tunable
+            else (
+                "Nothing is blocked on it: QA_MOBILE_BOOT_TIMEOUT_S does not "
+                "extend this slice, which is the most one tool call may spend "
+                "before it answers. A cold emulator commonly needs a minute or "
+                "two, so wait and ask again; start the AVD from Android Studio "
+                "once to warm its snapshot if it always takes this long."
+            )
+        )
         return {
             "error": (
                 "The emulator did not finish booting within "
@@ -233,8 +258,9 @@ async def wait_boot(serial: str, timeout: int = 0) -> dict:
                 + BOOT_PROP
                 + "="
                 + repr(last[:60])
-                + "). Raise QA_MOBILE_BOOT_TIMEOUT_S, or start the AVD from "
-                "Android Studio once to warm its snapshot." + note
+                + "). "
+                + remedy
+                + note
             ),
             "content": None,
         }

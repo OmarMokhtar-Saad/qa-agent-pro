@@ -940,17 +940,49 @@ def apis_section(loaded: object) -> str:
 # would be a second reader of the same bytes and a second place that knows the
 # evidence file layout.
 
-NETWORK_EMPTY = "no network capture for this case"
+#: What a case says when it carries no network record at all -- an older run,
+#: or a lane that does not capture. DISTINCT from an empty capture on purpose:
+#: "nothing was recorded" and "nothing was found" are opposite news for a
+#: tester, and only one of them means the app made no calls.
+NO_RECORD = (
+    "no packet capture was taken for this case, so nothing is known about what "
+    "the app called -- this is not a case that made no calls"
+)
+
+
+#: What a case says when its capture was begun and never stopped -- a turn
+#: whose replay failed, or a chat abandoned mid-turn. A third state, because it
+#: is neither "nothing was recorded" nor "nothing was found".
+NOT_STOPPED = (
+    "a capture was started for this case and never stopped, so nothing was read "
+    "back from it -- this is not a case that made no calls"
+)
 
 
 def _net(record: object) -> dict:
-    """One case network record, every key present. Never raises."""
+    """One case network record, every key present. Never raises.
+
+    ``present`` is the record describing a capture that was ATTEMPTED, and it is
+    read from the fields below rather than from the dict being non-empty. That
+    distinction is the whole point: ``case_runner.network_record`` normalises
+    ``None`` into a fully-populated record, so ``bool(body)`` was true for every
+    record on disk INCLUDING the blank one the failure paths write -- and the
+    honest branch it guards then fired only for a key that was missing
+    altogether. A blank record has no stage, was never started, and names no
+    reason; anything that actually happened sets one of them.
+    """
     body = record if isinstance(record, dict) else {}
     rows = body.get("rows")
+    stage = str(body.get("stage") or "")
+    skipped = str(body.get("skipped") or "") or None
+    started = bool(body.get("started"))
+    kept = [row for row in (rows or ()) if isinstance(row, dict)]
     return {
-        "skipped": str(body.get("skipped") or "") or None,
-        "stage": str(body.get("stage") or ""),
-        "rows": [row for row in (rows or ()) if isinstance(row, dict)],
+        "present": bool(stage or skipped or started or kept),
+        "started": started,
+        "skipped": skipped,
+        "stage": stage,
+        "rows": kept,
         "packets": body.get("packets"),
         "samples": body.get("samples"),
         "truncated": bool(body.get("truncated")),
@@ -1057,6 +1089,12 @@ def case_network(record: object) -> str:
     same to a tester, and only one of them is honest.
     """
     content = _net(record)
+    if not content["present"]:
+        return _sec_block(
+            "APIs the app called",
+            _empty(NO_RECORD),
+            note="no capture was taken",
+        )
     if content["skipped"]:
         return _sec_block(
             "APIs the app called",
@@ -1064,6 +1102,12 @@ def case_network(record: object) -> str:
             note="nothing was captured for this case",
         )
     rows = content["rows"]
+    if not rows and content["stage"] == "started":
+        return _sec_block(
+            "APIs the app called",
+            _empty(NOT_STOPPED),
+            note="the capture was never stopped",
+        )
     if not rows:
         return _sec_block(
             "APIs the app called",
@@ -1147,13 +1191,18 @@ def network_section(cases: object) -> str:
     ]
     if not rows:
         reasons = sorted({r["skipped"] for r in records if r["skipped"]})
+        if reasons:
+            said = reasons[0]
+        elif not any(r["present"] for r in records):
+            # NO case carried a record. Saying "captured nothing" here would
+            # report a capture that never ran, which is what the live explore
+            # run's report did.
+            said = NO_RECORD
+        else:
+            said = "no case in this run captured any network traffic"
         return _sec_block(
             "On the wire",
-            _empty(
-                reasons[0]
-                if reasons
-                else "no case in this run captured any network traffic"
-            ),
+            _empty(said),
             note="the emulator own packet capture",
         )
     rolled = {
