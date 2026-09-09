@@ -41,6 +41,14 @@ must mark it. ``tools/audit_log.record_event`` writes its ``detail`` verbatim wi
 redaction hook, so the same helper is what a handler must pass through before
 auditing.
 
+**A frame is pixels, and pixels cannot be redacted.** ``shots/<observation>.png``
+holds the screen as the device drew it, written RAW: :func:`redact` masks values
+in a JSON document and there is nothing in a PNG for it to hold on to. So a
+credential visible on screen, a real customer's name on a staging build, or a
+token printed into a debug banner IS in the file and IS in the HTML report that
+inlines it. That is a consequence of storing a picture at all, stated here
+rather than papered over, and it is disclosed again on the report page itself.
+
 **An injected clock.** Every lease function takes ``now``. Lease takeover is
 state-machine logic with a staleness threshold; asserting it against wall-clock
 sleeps would put the test below its own noise floor and make it both slow and
@@ -116,6 +124,16 @@ MANIFEST_FILE = "manifest.json"
 CASES_DIR = "cases"
 SCREENS_DIR = "screens"
 OBSERVATIONS_DIR = "observations"
+#: One PNG per OBSERVATION -- the same key ``observations/`` uses, minted by the
+#: same :func:`observation_key`, because a picture is a look at a screen and not
+#: a screen. Keying these on the bare ``screen_id`` would store ONE frame for a
+#: four-turn conversation and silently overwrite three, which is the defect
+#: a0217ab9 fixed for the wireframes.
+#:
+#: A SIBLING of both libraries under the same run directory -- which is what
+#: makes deletion free: ``gc_stale_runs`` rmtree's the whole run, so a frame can
+#: never outlive the run it describes.
+SHOTS_DIR = "shots"
 
 #: How many DISTINCT observations one run may keep. An observation is a pruned
 #: screen, so ``perception.MAX_ELEMENTS`` and ``perception.MAX_ATTR_CHARS``
@@ -126,6 +144,22 @@ OBSERVATIONS_DIR = "observations"
 #: the limit was reached rather than showing a stale picture as if it were the
 #: step's own.
 MAX_RUN_OBSERVATIONS = 400
+#: Stored screen PNGs kept for ONE run.
+#:
+#: A SECOND cap and not a reuse of the one above, because the two bound
+#: different axes: an observation is ~4 KB of JSON and a resized PNG is two
+#: orders of magnitude larger, so one number cannot state both constraints.
+#: Held at the same 400 so the two libraries stay in step -- a frame whose
+#: observation was dropped has nothing to attach to.
+#:
+#: Reaching it stops storing NEW frames and nothing else: the observation and
+#: the canonical screen are already written, and the report says per screen that
+#: no picture was stored rather than showing another screen's.
+#:
+#: Counted over the DIRECTORY, exactly as ``_write_observation`` counts: a run
+#: resumed from another chat has no in-memory count, and a cap that resets on
+#: resume is not a cap.
+MAX_RUN_SHOTS = 400
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _TC_ID_RE = re.compile(r"^TC-\d{3,6}$")
@@ -476,6 +510,117 @@ def list_observations(run_id: str) -> dict:
         return {"error": None, "content": out}
     except Exception as exc:
         logger.exception("mobile.run_store.list_observations failed")
+        return {"error": str(exc), "content": None}
+
+
+def _write_bytes(target: Path, data: bytes) -> None:
+    """The binary sibling of :func:`_write_json`: tmp file, fsync, ``os.replace``.
+
+    Atomic for the same reason every other write here is: a run killed mid-write
+    must leave the previous good file rather than a truncated PNG that a browser
+    renders as a broken image beside a caption promising a screenshot.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
+    with open(tmp, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, target)
+
+
+def write_shot(run_id: str, obs_id: str, data: object) -> dict:
+    """Store the PNG of ONE OBSERVATION. Never raises.
+
+    *obs_id* is what :func:`observation_key` minted -- a look at a screen, not a
+    screen. THAT IS THE WHOLE POINT OF THIS FUNCTION'S KEY: ``_screen_id``
+    hashes ``package|activity|texts[:3]``, and on a chat screen the top three
+    texts are the toolbar, so four turns of a conversation share one screen id.
+    Measured through the producer's own fixtures
+    (``tests/mobile/observation_matrix``): four chat turns give ONE screen id and
+    FOUR observation keys, while a three-step settings walk gives one of each.
+    Keying here on the screen id would keep the last turn and overwrite three,
+    the exact defect a0217ab9 fixed for the wireframes.
+
+    No key is minted here. The caller asks :func:`observation_id`, the one
+    producer, so the writer cannot store a key a reader would not ask for.
+
+    Idempotent: the same look re-observed rewrites one file, which is why
+    walking away from a screen and back costs one frame and not two.
+
+    A refusal is CONTENT for the caller to ignore -- a lost picture may never
+    cost a tester the packet, the same trade :func:`write_screen` makes.
+
+    The bytes go in RAW. :func:`redact` cannot mask pixels; see the module
+    docstring.
+    """
+    try:
+        if not valid_run_id(run_id):
+            return {"error": "Invalid run id.", "content": None}
+        ident = str(obs_id or "")
+        if not _RUN_ID_RE.match(ident):
+            return {
+                "error": (
+                    "Refusing "
+                    + repr(ident[:40])
+                    + " as an observation id; ask observation_key for one."
+                ),
+                "content": None,
+            }
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            # "There is no picture" and "here is a picture of nothing" are
+            # different answers, and only the first is true of empty bytes.
+            return {"error": "No image bytes to store.", "content": None}
+        directory = run_path(run_id) / SHOTS_DIR
+        target = directory / (ident + ".png")
+        if not target.exists():
+            kept = len(list(directory.glob("*.png"))) if directory.is_dir() else 0
+            if kept >= MAX_RUN_SHOTS:
+                logger.warning(
+                    "mobile.run_store: run %s already keeps %d screen frames; "
+                    "this one is not stored",
+                    run_id,
+                    kept,
+                )
+                return {
+                    "error": "This run already keeps its limit of frames.",
+                    "content": None,
+                }
+        payload = bytes(data)
+        _write_bytes(target, payload)
+        return {
+            "error": None,
+            "content": {"observation_id": ident, "bytes": len(payload)},
+        }
+    except Exception as exc:
+        logger.exception("mobile.run_store.write_shot failed")
+        return {"error": str(exc), "content": None}
+
+
+def read_shot(run_id: str, obs_id: str) -> dict:
+    """The stored PNG for one observation, or ``content=None``. Never raises.
+
+    ``None`` rather than empty bytes, for the reason above: the report renders
+    an ``<img>`` only from a non-empty answer here, so a capture that never
+    happened cannot leave the page claiming a picture exists.
+    """
+    try:
+        if not valid_run_id(run_id):
+            return {"error": "Invalid run id.", "content": None}
+        ident = str(obs_id or "")
+        if not _RUN_ID_RE.match(ident):
+            return {"error": "Invalid observation id.", "content": None}
+        target = run_path(run_id) / SHOTS_DIR / (ident + ".png")
+        if not target.is_file():
+            return {"error": None, "content": None}
+        data = target.read_bytes()
+        return {"error": None, "content": data or None}
+    except Exception as exc:
+        logger.exception("mobile.run_store.read_shot failed")
         return {"error": str(exc), "content": None}
 
 

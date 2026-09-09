@@ -64,6 +64,14 @@ MAX_GENERIC_SLICE_BYTES = 1 * 1024 * 1024
 #: The whole pulled event log for one run.
 MAX_EVENTS_BYTES = 4 * 1024 * 1024
 
+#: How old a capture file in the AVD directory must be before a LATER case
+#: deletes it as abandoned. It is not a guess about age but about OWNERSHIP: a
+#: case that is still running holds its file for the length of one tool call,
+#: and an hour is far longer than any of those, so a file this old belongs to a
+#: chat that closed. Deleting a live case's file would cost that case its
+#: evidence, which is why the bound is generous in that direction.
+ORPHAN_CAPTURE_TTL_S = 3600.0
+
 EVENTS_FILE = "events.ndjson"
 
 #: What the case carries when the device clock could not be read (plan D6).
@@ -740,6 +748,40 @@ def _pcap_path(avd_dir: object, name: object):
     return os.path.join(directory, "console_out", str(name))
 
 
+def _sweep_orphan_captures(directory: object, keep: object, *, now: float) -> int:
+    """Delete capture files no live case can own. Returns how many went.
+
+    Only files this tree names -- the prefix is ours -- and only ones older than
+    :data:`ORPHAN_CAPTURE_TTL_S`. *keep* is the file this call is about to read,
+    which is never swept however the clock reads. Never raises: a sweep is
+    housekeeping and may not cost a case its evidence.
+    """
+    removed = 0
+    try:
+        folder = os.path.join(str(directory or ""), "console_out")
+        if not os.path.isdir(folder):
+            return 0
+        for name in sorted(os.listdir(folder)):
+            if name == str(keep or "") or not adb.valid_capture_name(name):
+                continue
+            if not name.startswith(NETWORK_NAME_PREFIX):
+                continue
+            target = os.path.join(folder, name)
+            try:
+                if now - os.path.getmtime(target) <= ORPHAN_CAPTURE_TTL_S:
+                    continue
+                os.remove(target)
+            except OSError:
+                continue
+            removed += 1
+            logger.info(
+                "mobile_evidence.capture: removed an abandoned capture (%s)", name
+            )
+    except Exception:  # pragma: no cover - housekeeping never raises
+        logger.exception("mobile_evidence.capture: the orphan sweep failed")
+    return removed
+
+
 def _read_and_delete(path: str):
     """``(bytes, error)``. The file is removed on EVERY exit, read or not.
 
@@ -874,6 +916,11 @@ async def finish_network(
                 "directory the emulator named",
                 "locate",
             )
+        # The directory is open anyway, so this is the one place a capture left
+        # by a chat that closed can be found without a call of its own.
+        _sweep_orphan_captures(
+            located.get("content"), prior.get("file"), now=time.time()
+        )
         data, read_error = _read_and_delete(target)
         if read_error:
             return _network_skipped(read_error, "read")

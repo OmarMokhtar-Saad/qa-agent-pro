@@ -74,6 +74,17 @@ ONE_TURN_NOTE = (
     "is shown as one turn per case"
 )
 
+#: The same fallback, reached for a DIFFERENT reason, so it says a different
+#: thing. The log had turns, but every one of them belongs to an app session
+#: that is not this run -- an app log holds every session it ever wrote, and the
+#: measured file carried thirty-nine older ones. Saying "no turn-start marker"
+#: here would be false.
+NO_TURN_IN_ANY_CASE_NOTE = (
+    "the app log carries turns, but none of them falls inside a case of this run "
+    "-- they belong to earlier sessions of the app -- so every record inside a "
+    "case's window is shown as one turn per case"
+)
+
 
 # ── clocks ─────────────────────────────────────────────────────────────────────
 
@@ -461,6 +472,24 @@ def join(report, cases, windows=None):
     if unclocked:
         note_bits.append(
             "%d turn(s) carry no clock and could not be placed" % len(unclocked)
+        )
+    if not pairs and timed:
+        # NOT ONE TURN LANDED. Whatever turns the file holds describe other
+        # sessions of the app, so keeping them costs every case its evidence and
+        # gains nothing. The synthetic fallback attributes by the clock instead,
+        # which is the only thing these records and these cases share.
+        note_bits.append(NO_TURN_IN_ANY_CASE_NOTE)
+        return Join(
+            [(w["tc_id"], "case/" + w["tc_id"]) for w in timed if w["tc_id"]],
+            ambiguous,
+            outside,
+            unclocked,
+            empty,
+            confirmed,
+            unconfirmed,
+            mismatched,
+            True,
+            "; ".join(note_bits),
         )
     return Join(
         pairs,

@@ -976,8 +976,8 @@ def report_line(
             else "Open it in a browser: it is one self-contained file with no "
             "external assets, so it works offline. "
         )
-        + "Every screen in it is composed from the element list the "
-        "server already held — no screenshot is ever taken of the emulator."
+        + "Every screen in it is shown as the picture the lane captured, with a "
+        "drawing composed from the element list beneath it."
     )
 
 

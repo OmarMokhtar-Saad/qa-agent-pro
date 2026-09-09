@@ -1075,9 +1075,12 @@ def describe_vocabulary() -> dict:
             "you mean instead; that is judged by its own label.",
             "type carries secret=true ONLY for a value the tester supplied; never "
             "invent a credential and never put one in a plan.",
-            "wait needs ms (<= "
+            "wait takes until_text (PREFERRED) or ms (<= "
             + str(MAX_WAIT_MS)
-            + ") or until_text; assert kinds are "
+            + "). until_text names what you are waiting FOR and returns the moment "
+            "it appears; a flat ms always sleeps the whole amount whether or not "
+            "the reply already arrived, and pays a full screen re-read on top of "
+            "it. assert kinds are "
             + ", ".join(ASSERT_KINDS)
             + ". text_present/text_absent take the string to look for in "
             "`text` OR in `target.text` -- either is accepted, and `text` "

@@ -1918,6 +1918,17 @@ async def replay(script: object, ctx: Context) -> dict:
                     if changed
                     else ("waited " + str(ms) + "ms")
                 )
+                # `redump=True`, and the `redump=False` above is NOT reusable
+                # here. There the poll has just dumped, so its `screen` is
+                # post-wait; on this path the only screen in hand is the
+                # PRE-sleep one. Skipping the dump would stamp
+                # `after_screen_hash` from before the wait and hand the next
+                # action's target resolution and destructive guard a screen
+                # older than the wait itself -- the defect this function's
+                # docstring records, where every assert after a wait was
+                # evaluated against the pre-wait screen. The dump costs wall
+                # clock; the way to spend less of it is `wait until_text`,
+                # which returns early AND folds its dump into its last poll.
                 screen, stop = await _settle(
                     ctx,
                     entry,
