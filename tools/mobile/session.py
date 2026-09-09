@@ -1654,6 +1654,14 @@ async def next_packet(
                 return turn
             content = turn.get("content") or {}
             running = str(content.get("status") or "") == explore_runner.RUNNING
+            if running:
+                # WHEN THIS TURN BEGAN, in the same unit the suite lane uses for
+                # a case. The checkpoint is written when the turn ENDS, so
+                # without this the only instant it knows is the end and its
+                # evidence window collapses to the pad around it.
+                began = dict(content.get("state") or {})
+                began["turn_started"] = time.time()
+                content["state"] = began
             # The wire, for this turn. Started HERE, at the packet build, for
             # the same reason the suite lane starts it before its launch: the
             # capture has to cover what the turn is about to do. A stopped
@@ -1943,6 +1951,13 @@ def _checkpoint_explore_turn(
     tc_id = explore_turn_tc_id(turn)
     goal = " ".join(str(body.get("goal") or "").split())[:200] or "no goal recorded"
     now = time.time()
+    # The window this case's evidence is joined on is ``[started, updated]``.
+    # ``started`` is when the PACKET was built, not when this record is written,
+    # or the window is the pad around a single instant at the end of the turn
+    # and everything the app did during it falls outside.
+    began = body.get("turn_started")
+    if not isinstance(began, (int, float)) or isinstance(began, bool) or began <= 0:
+        began = now
     written = {
         "tc_id": tc_id,
         "title": (EXPLORE_TITLE_PREFIX + str(turn) + " \u2014 " + goal)[:250],
@@ -1952,7 +1967,7 @@ def _checkpoint_explore_turn(
         "trace": list(result.get("trace") or []),
         "escapes": 0,
         "finding": " ".join(str(finding or "").split())[:600],
-        "started": now,
+        "started": min(began, now),
         "updated": now,
         # Shaped like `case_runner._evidence_record`'s output so the report's
         # evidence join reads a record rather than a missing key.

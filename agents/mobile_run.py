@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 
 from tools.mobile import actions as actions_mod
-from tools.mobile import perception, screen_audit
+from tools.mobile import perception, run_store, screen_audit
 from tools.untrusted import _GUARD, wrap_untrusted
 
 logger = logging.getLogger(__name__)
@@ -225,6 +225,31 @@ def _case_block(view: object) -> str:
     return wrap_untrusted("test_case", "\n".join(lines), limit=8000)
 
 
+def _observation_key(screen: object) -> str:
+    """The key of THIS LOOK at the screen this packet describes, or ``""``.
+
+    Delegates to ``run_store.observation_id`` -- "THE one producer of this
+    string" -- and mints nothing. Three builders need the value, and three copies
+    of a hand-rolled ``screen_id + "-" + hash[:12]`` is precisely how the writer
+    and the reader end up keying on two different strings.
+
+    NOT the bare ``screen_id``: that is the DEDUP identity and is invariant
+    across the turns of a conversation, so it names a screen and never says what
+    was on it. A hashless screen degrades to the bare id inside the producer,
+    where every existing reader already expects that.
+
+    A ROUTING value, not packet content: ``mcp_handlers._mobile_packet_text``
+    reads it to file this turn's PNG under the key the report's frames resolve
+    on, and pops it off its own copy before the packet is rendered -- so nothing
+    here changes a byte of what the model reads.
+    """
+    try:
+        return run_store.observation_id(screen)
+    except Exception:  # pragma: no cover - the store never raises; a packet may not
+        logger.warning("mobile_run._observation_key failed", exc_info=True)
+        return ""
+
+
 def build_case_job(
     view: object, screen: object, *, run_id: str, tc_id: str, escapes: int = 0
 ) -> dict:
@@ -234,6 +259,7 @@ def build_case_job(
         packet.update(
             {
                 "kind": "case",
+                "observation_id": _observation_key(screen),
                 "case_block": _case_block(view),
                 "screen_block": _screen_block(screen),
                 "instruction": _CASE_INSTRUCTION,
@@ -285,6 +311,7 @@ def build_escape_job(
         packet.update(
             {
                 "kind": "escape",
+                "observation_id": _observation_key(screen),
                 "case_block": _case_block(view),
                 "screen_block": _screen_block(screen),
                 "trace": _trace_block(trace),
@@ -449,6 +476,7 @@ def build_explore_turn(
         packet.update(
             {
                 "kind": "explore",
+                "observation_id": _observation_key(screen),
                 "goal": wrap_untrusted("goal", str(body.get("goal") or ""), limit=1200),
                 "watch_for": list(body.get("watch_for") or []),
                 "turn": int(body.get("turn") or 0),

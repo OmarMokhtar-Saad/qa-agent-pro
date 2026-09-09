@@ -2970,7 +2970,7 @@ def _mobile_lane_disclosure(state: str, adb_path: str | None) -> list[str]:
         "### Mobile emulator lane (off)",
         "- \u2b1c This install can run your test cases on an attached Android "
         "device or an emulator: it taps, types and checks the screen for you, "
-        "and writes an HTML report with a screenshot per step. It is off until "
+        "and writes an HTML report of the screens it saw. It is off until "
         "someone turns it on, and it starts nothing by itself.",
         "- To turn it on: add `QA_MOBILE_RUN_ENABLED=true` to this install's "
         "`.env`, then quit and reopen your editor so the server reloads it.",
@@ -13159,12 +13159,41 @@ async def _mobile_packet_text(
         if spec is not None:
             note = mobile_screenshot.ATTACHED_NOTE
             sink.append(spec)
+            # ... and keep it, so the HTML report can show the screen rather
+            # than only a drawing of it. The SAME bytes the model was handed:
+            # one screenshot of one look, at one size, two consumers.
+            #
+            # Keyed on the packet's `observation_id` -- the look -- and never on
+            # a screen id, which is invariant across the turns of a chat and
+            # would keep one frame for a whole conversation.
+            #
+            # Best-effort exactly like `case_runner`'s `write_screen`: the
+            # result is deliberately not read and a failure is swallowed here,
+            # because a lost picture may never cost the tester the packet.
+            try:
+                from tools.mobile import run_store as mobile_run_store
+
+                mobile_run_store.write_shot(
+                    str(body.get("run_id") or ""),
+                    str(packet.get("observation_id") or "")
+                    if isinstance(packet, dict)
+                    else "",
+                    spec.get("data"),
+                )
+            except Exception:  # never-raise: a picture is not a verdict
+                logger.exception("mcp mobile screen store failed")
     shown = packet
     if isinstance(shown, dict):
         # A COPY: the packet is the caller's own dict, and a note written into
         # it would outlive this reply.
         shown = dict(shown)
         shown["screen_image"] = note
+        # The observation key is this module's routing value, not packet
+        # content: `render.packet_block` promises it adds nothing to what the
+        # builder made, and a 25-character hex id in the model's JSON is packet
+        # budget spent on a string the model has no use for. Popped from the
+        # COPY only -- the caller's packet still carries it for the writer above.
+        shown.pop("observation_id", None)
     return mobile_render.packet_block(shown, session_token=session_token)
 
 
@@ -16118,6 +16147,7 @@ async def handle_wizard(
     except Exception as exc:
         logger.exception("handle_wizard failed")
         return f"⚠️ Wizard failed: {exc}"
+
 
 async def handle_host_check(refresh: bool = False) -> str:
     """What OS is this, and can this account elevate? ADVISORY, never a refusal.

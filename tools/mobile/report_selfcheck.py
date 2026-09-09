@@ -80,7 +80,25 @@ RAW_XML = ("<hierarchy", "<node ", 'bounds="[', "NAF=")
 #: ``<link`` and ``<script`` are NOT needles any more: the shell carries one
 #: script and three font links by design, so both are checked for IDENTITY
 #: instead -- see :func:`_pin_script` and :func:`_pin_links`.
-EXTERNAL = ("<img", "<iframe", "<object", "<embed", "@import")
+#: ``<img`` is NOT here any more. The lane stores a PNG per observation and the
+#: report inlines it as a ``data:`` URI, which is self-contained -- the property
+#: this tuple exists to protect -- so an absence pin here would forbid the
+#: artifact rather than guard it. Images are checked for IDENTITY instead, in
+#: :func:`_pin_links`, exactly as the shell's one script and three font links
+#: already are. The remaining four are still absences: none of them has a
+#: legitimate form on this page.
+EXTERNAL = ("<iframe", "<object", "<embed", "@import")
+
+#: The one ``src`` prefix an image on this page may carry. Anything else is a
+#: FETCH: a path into the run directory dies the moment the report is emailed,
+#: which is the ordinary way a tester reads it.
+#:
+#: NOT a second literal. It is the EMITTER's constant, bound here, because a
+#: guard that restates the value it guards stops guarding on the day the value
+#: changes -- and this module already imports ``report``, so the definition can
+#: only live over there without a cycle. ``report.SHOT_SRC is SHOT_SRC`` is
+#: pinned in tests/mobile/test_mobile_report_shots.py.
+SHOT_SRC = report.SHOT_SRC
 
 #: The renderer never JSON-dumps a trace and never prints an action's text,
 #: so a QUOTED "secret" key has no route into the page. Quoted deliberately:
@@ -111,6 +129,8 @@ class _Page(HTMLParser):
         self.scripts = 0
         self.script_text: list = []
         self.links: list = []
+        #: Every ``img`` ``src``, so the asset pin can check IDENTITY.
+        self.images: list = []
         self.handlers: list = []
         self._in_style = False
         self._in_script = False
@@ -125,6 +145,8 @@ class _Page(HTMLParser):
             self._in_script = True
         if tag == "link":
             self.links.append(pairs.get("href", ""))
+        if tag == "img":
+            self.images.append(pairs.get("src", ""))
         if tag == "style":
             self._in_style = True
         for name in pairs:
@@ -247,9 +269,20 @@ def _pin_script(page: "_Page") -> dict:
 
 
 def _pin_links(page: "_Page", text: str) -> dict:
-    """Every ``<link>`` points at a font host, and no other fetch construct exists."""
+    """Every ``<link>`` is a font host, every ``<img>`` is inline, nothing fetches.
+
+    Three checks, one verdict, because they answer one question: can this file
+    be read by a tester who is offline, or who was emailed it? A stray ``href``,
+    an image ``src`` that is a PATH rather than a payload, and any of the
+    remaining fetch constructs each break that, and each is reported by name.
+    """
     strays = [
         href for href in page.links if not str(href).startswith(report.FONT_HOSTS)
+    ]
+    # IDENTITY, not absence: see the note on EXTERNAL. An image whose src is a
+    # file path or an http URL is exactly the offline break this pin exists for.
+    strays += [
+        str(src)[:60] for src in page.images if not str(src).startswith(SHOT_SRC)
     ]
     found = [needle for needle in EXTERNAL if needle in text]
     return _pin(

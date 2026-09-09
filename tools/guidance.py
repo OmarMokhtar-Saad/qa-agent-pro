@@ -335,6 +335,10 @@ back saying the budget was reached, nothing was lost -- the actions that ran
 are recorded and the screen you were given is the current one; send the rest
 as a second, shorter script.
 
+Wait for what the reply must SAY, not for a number: `wait until_text` polls and
+continues the moment that text appears, while a flat `wait ms` spends its whole
+amount even when the answer landed in the first second.
+
 To check that the app REPLIED, use `assert new_text` (optionally with
 `contains`), or `text_present` naming something the reply must say. Never
 `screen_changed`: it only says the screen moved, which any navigation does.

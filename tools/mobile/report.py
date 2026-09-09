@@ -69,6 +69,7 @@ it has no entry point of its own.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import html
 import logging
@@ -76,6 +77,7 @@ import os
 import re
 import time
 from collections import Counter
+from contextvars import ContextVar
 from pathlib import Path
 
 from config.settings import settings
@@ -108,6 +110,31 @@ MAX_ROWS = 400
 
 #: The selfcheck's page-size pin, shared so the two cannot drift.
 MAX_PAGE_BYTES = 8 * 1024 * 1024
+#: The total base64 TEXT this page may spend on inlined screen PNGs.
+#:
+#: MEASURED AT THE LAST CONSUMER -- the encoded characters that actually land in
+#: the document -- and NOT at the raw PNG, because base64 costs +33% and a cap
+#: sized on the pre-encoding bytes is wrong by exactly that much at the only
+#: place it matters.
+#:
+#: Half of :data:`MAX_PAGE_BYTES`, so the tables, the wireframes and the shell
+#: always keep the other half. That split is the constraint: a report that blew
+#: the page-size pin because of its pictures is a report the tester cannot open
+#: at all, and the case table is the product while the picture is the addition.
+#: At the ~200KB an encoded 768px screen weighs this funds roughly twenty
+#: OBSERVATIONS -- looks, not screens, because that is what a frame resolves on,
+#: so a long conversation spends far faster than a settings walk does.
+MAX_SHOT_B64_TOTAL = 4 * 1024 * 1024
+
+#: This document's funded frames, ``{"frames": {key: b64}, "dropped": [key]}``.
+#:
+#: A ContextVar rather than a parameter for the reason ``mcp_handlers``'
+#: ``_MOBILE_IMAGE_SPECS`` is one: the value is decided ONCE at the top of the
+#: build and read in exactly one leaf (:func:`_shot_html`) that four call sites
+#: reach through three intermediate builders, so threading it would rewrite five
+#: signatures for a value none of them use. Two reports rendered concurrently
+#: cannot see each other's frames.
+_SHOTS: ContextVar = ContextVar("_SHOTS", default=None)
 
 SUMMARY_ID = "qa-report-summary"
 END_ID = "qa-report-end"
@@ -823,6 +850,115 @@ def _resolve_look(screen_id: object, screens: object) -> tuple[str, dict | None,
     return ident, screen, LOOK_EXACT
 
 
+#: The prefix every ``img`` on this page carries, and THE definition of it.
+#:
+#: Declared here, in the emitter, and IMPORTED by the guard
+#: (``report_selfcheck.SHOT_SRC = report.SHOT_SRC``) rather than restated there.
+#: The direction is forced: ``report_selfcheck`` already does
+#: ``from tools.mobile import report``, so the reverse import would be a cycle.
+#: One object, one meaning -- a switch to another media type moves the emitter
+#: and its pin together, where two matching literals would silently desync and
+#: every test reading "its own module's constant" would drift along with them.
+SHOT_SRC = "data:image/png;base64,"
+
+#: An observation for which NOTHING was ever stored.
+#:
+#: A DIFFERENT name and different words from the note below, on purpose: "no
+#: picture was ever taken" and "a picture exists and this page declined it" are
+#: different facts about the run and only one of them is worth investigating.
+#: Collapsing them is the half-wired-sentinel failure this repository has
+#: already paid for -- the same three-state rule ``tools/mobile/screenshot.py``
+#: states for the packet's own note.
+SHOT_MISSING_NOTE = (
+    "No picture of this screen was stored: the capture did not succeed on that "
+    "turn, or this run is older than stored frames. The drawing below is "
+    "composed from the element list, which is all this page has."
+)
+
+#: ... and one that WAS stored and did not fit this page's image budget.
+SHOT_BUDGET_NOTE = (
+    "A picture of this screen was stored and is NOT shown here: this report "
+    "spent its whole image budget on other screens. Nothing failed, and the "
+    "PNG is still on disk beside the run."
+)
+
+
+def _shots(run_id: object, library: object) -> dict:
+    """``{"frames": {key: base64}, "dropped": [key]}``. Never raises.
+
+    ONE producer for every picture on this page.
+
+    *library* is the MERGED book :func:`_merged_library` builds -- screens AND
+    observations -- because that is what a frame resolves against, and a frame
+    the page cannot resolve is a frame no picture belongs under. Reading only
+    the screen library here would fund one frame per screen and leave every
+    turn of a conversation but the last with nothing.
+
+    THE BUDGET IS SPENT IN SORTED KEY ORDER, not in the order the document
+    happens to render. Choosing by render order would mean deriving the page's
+    screen selection a second time here, while ``_card_html``, ``_seq_rows`` and
+    ``_overview`` already own that answer -- and two derivations of one answer
+    drift. The consequence on a run too wide to fund (an arbitrary subset gets a
+    picture) is DISCLOSED per screen by :data:`SHOT_BUDGET_NOTE`, never hidden.
+
+    ``dropped`` is a separate list and not an absence, because absence already
+    means something else here -- see the two notes above.
+    """
+    frames: dict = {}
+    dropped: list = []
+    try:
+        book = library if isinstance(library, dict) else {}
+        spent = 0
+        for ident in sorted(str(key) for key in book):
+            data = (run_store.read_shot(str(run_id), ident) or {}).get("content")
+            if not isinstance(data, (bytes, bytearray)) or not data:
+                continue
+            encoded = base64.b64encode(bytes(data)).decode("ascii")
+            # Counted on `encoded`, never on `data`: see MAX_SHOT_B64_TOTAL.
+            if spent + len(encoded) > MAX_SHOT_B64_TOTAL:
+                dropped.append(ident)
+                continue
+            spent += len(encoded)
+            frames[ident] = encoded
+    except Exception:  # never-raise: a picture is not a verdict
+        logger.exception("mobile.report._shots failed")
+    return {"frames": frames, "dropped": dropped}
+
+
+def _shot_html(ident: str) -> str:
+    """The stored PNG of *ident* inlined, or the honest note for why it is not.
+
+    *ident* is what :func:`_resolve_look` RESOLVED, and this function is called
+    only on its ``LOOK_EXACT`` answer. That is load-bearing: under
+    ``LOOK_AMBIGUOUS`` the key is a bare screen id with two or more stored looks
+    behind it, and a picture drawn there would be one arbitrary look captioned as
+    the step's own -- the fabricated-evidence defect ``_resolve_look`` exists to
+    stop, in a form a tester is even less able to question because it is a
+    photograph.
+
+    A ``data:`` URI and never a path: this report is emailed and opened from
+    disk, where a ``src`` pointing into the run directory is already dead. The
+    self-check enforces that every ``img`` on the page is one of these --
+    ``report_selfcheck._pin_links`` checks IDENTITY, exactly as it already does
+    for the shell's one script and three font links.
+
+    The ``<img>`` is emitted ONLY from a non-empty entry in ``frames``, which
+    only a non-empty file on disk can produce, so a capture that failed can
+    never leave this page claiming a picture exists.
+    """
+    book = _SHOTS.get() or {}
+    encoded = str((book.get("frames") or {}).get(ident) or "")
+    if encoded:
+        return (
+            '<figure class="shot"><img alt="The screen as the device drew it" '
+            'src="' + SHOT_SRC + encoded + '"></figure>'
+        )
+    note = (
+        SHOT_BUDGET_NOTE if ident in (book.get("dropped") or []) else SHOT_MISSING_NOTE
+    )
+    return '<p class="wirenote shotnote">' + esc(note, 300) + "</p>"
+
+
 def _frame_html(screen_id: object, screens: object) -> str:
     """One frame, or an honest empty one when the screen was not stored."""
     ident, screen, verdict = _resolve_look(screen_id, screens)
@@ -939,11 +1075,22 @@ def _phone_html(
     Both pictures come from the same pruned dump. ``screen_phone.compose`` reads
     the elements' text, labels and bounds into the app bar, bubbles, cards, chips
     and composer the user saw; the wireframe keeps the exact rectangles for
-    anyone who needs them. Neither is a screenshot, and the caption says so.
+    anyone who needs them. Above both sits the PNG the lane captured at that
+    observation, when one was stored and this page could afford it; where it
+    could not, the note in its place says which of those two things happened.
     """
     ident, screen, verdict = _resolve_look(screen_id, screens)
     if screen is not None:
-        drawn = screen_phone.compose(screen, esc=esc, app=app)
+        # The photograph first, the composition under it: the drawing is an
+        # annotation of the screen, not a substitute for it, and a reader who
+        # sees the real thing first can tell which is which.
+        #
+        # INSIDE this branch and nowhere else. `_resolve_look` has already said
+        # this key names ONE stored look; on its `LOOK_AMBIGUOUS` answer the
+        # else-branch below draws an empty handset and says the look is
+        # unknowable, and a photograph hung above that sentence would contradict
+        # it with the one kind of evidence a tester cannot argue with.
+        drawn = _shot_html(ident) + screen_phone.compose(screen, esc=esc, app=app)
         fold = (
             '<details class="sec"><summary><span class="chev" aria-hidden="true"></span>'
             'Element map<span class="mt">the same screen as its element rectangles</span></summary>'
@@ -1673,19 +1820,20 @@ def _card_html(
     else:
         frames = _phone_html(
             "First screen", "the screen the case began on", first_key, screens, app
-        ) + _phone_html(
-            "Last screen", last_sub, last_key, screens, app
-        )
+        ) + _phone_html("Last screen", last_sub, last_key, screens, app)
     phones = (
         '<div class="phonewide"><div class="phonepair">'
         + frames
         + "</div>"
-        + '<p class="hint">Every screen here is composed from the screen\'s element list — the '
-        "text, labels and rectangles the server already held — drawn the way the app lays them "
-        "out; no screenshot is ever taken of the emulator, by design, so fonts, colours and "
-        "icons are not the app's own. The element map under each phone holds the exact "
-        "rectangles. A phone that says the screen was not captured is a step whose screen the "
-        "run did not store — not a step that did not happen.</p></div>"
+        + '<p class="hint">Each screen is shown twice: the PNG the lane captured at that '
+        "moment, and beneath it a drawing composed from the screen's element list — the text, "
+        "labels and rectangles the server already held. The picture is what the app looked "
+        "like; the drawing is what the accessibility tree said was there, which is what every "
+        "action was planned against, so the two disagreeing is itself a finding. The element "
+        "map under each phone holds the exact rectangles. Where a note stands in place of a "
+        "picture it says which of two things happened: nothing was stored for that moment, or "
+        "this page ran out of image budget. A phone that says the screen was not captured is a "
+        "step whose screen the run did not store — not a step that did not happen.</p></div>"
     )
     # What the app heard and answered inside this case's window (plan P3).
     turns = ev_render.turns_table(loaded, facts["tc_id"]) if loaded else ""
@@ -2089,9 +2237,19 @@ def _overview(
         "There is no token or cost figure because "
         "no model call passes through this server \u2014 the model runs in the tester\u2019s chat, "
         "and this page can only count the plans it was handed.</p>"
-        "<p>Every screen is <b>composed</b> from the element list the server already held — text, labels and bounds. "
-        "No screenshot is ever taken of the emulator, by design, so a frame shows where controls "
-        "were and what they said — not how they looked.</p>"
+        "<p>Every screen is shown as the <b>PNG</b> the lane captured at that moment, with a drawing "
+        "<b>composed</b> from the element list — text, labels and bounds — beneath it. The picture "
+        "is how the screen looked; the drawing is where the controls were and what they said, and "
+        "it is the description every action was planned against. Where a picture is missing the "
+        "page says which of two things happened: nothing was stored for that moment, or the "
+        "picture exists and this page ran out of image budget for it. A screen this page cannot "
+        "pin to one stored moment gets no picture at all, and says so.</p>"
+        "<p>Credential values are masked in TEXT: the run store writes <code>***</code> for a marked "
+        "value and for a credential-named key, and this page masks again and never prints an "
+        "action's typed text. It cannot mask a value written under an unrecognised key with no "
+        "marker. <b>It cannot mask the pictures at all</b> — a screenshot is pixels, so anything "
+        "visible on the screen at that moment is in this file. Treat the report as you would treat "
+        "the device. Both limits are stated rather than papered over.</p></div></details>"
         "<p>Credential values are masked: the run store writes <code>***</code> for a marked value "
         "and for a credential-named key, and this page masks again and never prints an action's "
         "typed text. It cannot mask a value written under an unrecognised key with no marker; that "
@@ -2720,7 +2878,58 @@ def _cases_html(
     return body
 
 
-def _document(
+def _merged_library(screens: object, observations: object) -> dict:
+    """The one book a FRAME resolves against: every screen and every look at it.
+
+    TWO libraries, joined once, HERE. ``screens`` answers which screens the run
+    visited and stays the accessibility audit's input -- one row per screen, not
+    one per look at it. Adding every stored OBSERVATION is what lets a four-turn
+    conversation draw four pictures instead of one.
+
+    Named rather than inlined because two consumers now need the SAME book: the
+    page body resolves frames against it and :func:`_shots` funds pictures for
+    it, and a picture funded against one book and resolved against another is a
+    caption with no image under it.
+
+    Merged rather than passed as a pair because the keys do not collide IN
+    PRACTICE: ``perception._screen_id`` emits twelve hex characters and an
+    observation id is that id plus a dash and up to twelve more, so no screen id
+    has the shape of an observation key. NOT an invariant the code enforces:
+    ``run_store._RUN_ID_RE`` accepts up to 64 characters of ``[A-Za-z0-9._-]``,
+    so a STORED screen id of ``aabbccdd0011-000000000000`` is admissible and
+    would collide, with the observation silently winning this ``update``.
+    Nothing produces such an id today; if something ever does, the fix is two
+    dictionaries rather than a longer comment. Stated because an invariant
+    asserted in prose and unenforced in code is how a reader stops checking.
+    """
+    library = dict(screens if isinstance(screens, dict) else {})
+    library.update(observations if isinstance(observations, dict) else {})
+    return library
+
+
+def _document(**kwargs) -> str:
+    """The page, with this run's inlined frames funded ONCE for the whole build.
+
+    A wrapper rather than a parameter on every builder: see :data:`_SHOTS`. The
+    signature is unchanged for every caller, and the book is RESET in ``finally``
+    so one report's frames can never be read by the next.
+
+    Funded against :func:`_merged_library` -- the same call the body makes -- so
+    the keys this pays for are exactly the keys the frames resolve on.
+    """
+    token = _SHOTS.set(
+        _shots(
+            str(kwargs.get("run_id") or ""),
+            _merged_library(kwargs.get("screens"), kwargs.get("observations")),
+        )
+    )
+    try:
+        return _document_body(**kwargs)
+    finally:
+        _SHOTS.reset(token)
+
+
+def _document_body(
     *,
     run_id: str,
     manifest: dict,
@@ -2749,8 +2958,7 @@ def _document(
     # produces such an id today; if something ever does, the fix is two
     # dictionaries rather than a longer comment. Stated because an invariant
     # asserted in prose and unenforced in code is how a reader stops checking.
-    library = dict(screens if isinstance(screens, dict) else {})
-    library.update(observations if isinstance(observations, dict) else {})
+    library = _merged_library(screens, observations)
     # Defaulted rather than required, so a caller that has not computed it still
     # gets THE producer's answer and never a locally invented one.
     coverage = (

@@ -1643,7 +1643,7 @@
   }
 
   /* ── the wireframe: element bounds drawn to scale inside the phone ───────
-     This lane takes no screenshot, by design. What it holds for every screen is
+     Beside the screenshot, and not instead of it: what this lane holds is also
      the pruned element list -- text, ids and rectangles -- so the phone shows those
      rectangles at their true proportions. A frame is 360x800 CSS px, fixed, so two
      screens can be compared by eye; the phone around it is widened to hold it. */
@@ -1668,6 +1668,18 @@
   .wirelegend i.sw.tap{border-color:var(--ph-accent);background:var(--ph-accent-soft)}
   .wirelegend i.sw.edit{border-color:var(--ph-info);background:var(--ph-info-fill)}
   .wirelegend ul{display:contents;margin:0;padding:0}
+  /* ── the stored screenshot, inlined as a data: URI ────────────────────────
+     The lane keeps one PNG per OBSERVATION -- per look at a screen, not per
+     screen -- and this page carries it IN the document rather than by path: a
+     report is emailed and opened from disk, where a path into the run directory
+     is already dead. Sized to its column so it reads as the same screen the
+     drawing beneath it describes. `.shotnote` is what stands in its place when
+     there is no picture, and it must never look like a caption on one. */
+  .shot{margin:0 0 10px;display:block}
+  .shot img{display:block;width:100%;height:auto;border-radius:10px;
+    border:1px solid var(--ph-border);background:var(--ph-surface)}
+  .wirenote.shotnote{color:var(--ph-muted);font-size:.78rem;font-style:italic;
+    margin:0 0 8px;max-width:none;text-align:center}
   .ph-top .ph-brand b{font-family:"IBM Plex Mono",monospace;font-weight:600;font-size:.78rem}
 </style>
 
