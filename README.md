@@ -174,8 +174,12 @@ reading all work without it -- `adb` is only for listing Android devices
 and capturing their screens. If you want that:
 
 ```powershell
-winget install --id Google.PlatformTools -e
+winget install --id Google.PlatformTools -e --scope user
 ```
+
+`--scope user` installs it for you alone and needs no Administrator
+rights. Drop that flag only if you want a machine-wide install AND you
+have admin on this machine.
 
 `run qa-doctor` lists the optional tools and prints the exact install
 command for whatever is missing **on your OS** -- it no longer reports

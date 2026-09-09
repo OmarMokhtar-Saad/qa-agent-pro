@@ -328,11 +328,30 @@ async def boot(avd: str = provisioner.AVD_NAME, timeout: int = 0) -> dict:
     ``preflight`` stay unguarded so a tester can still INSPECT with the lane
     off.
 
-    No guard of its own: this delegates to :func:`start`, and mutation showed a
-    copy here could be deleted with the suite green. Two copies of one rule is
-    two things to keep in sync, which this module has already been bitten by.
+    THE GUARD IS HERE, NOT ONLY IN :func:`start`, and the docstring above used
+    to claim the re-attach branch was refused while the code returned it. That
+    branch returns BEFORE ``start`` is ever reached, so delegating was a promise
+    this function did not keep: with the lane off, a machine that happened to
+    have an emulator running got a live serial back, and the caller's next moves
+    are to poll it and install the IME onto it.
+
+    An earlier note here said mutation showed a copy of the guard could be
+    deleted with the suite green. That was true, and it was evidence the guard
+    was UNTESTED rather than redundant -- the only test asserting it reached the
+    real ``adb``, so it passed on any machine with no emulator running and
+    failed on a tester's. It is hermetic now, and deleting either guard goes
+    red.
     """
     try:
+        if not settings.qa_mobile_run_enabled:
+            return {
+                "error": (
+                    "Refusing to boot an emulator: the mobile lane needs "
+                    "`QA_MOBILE_RUN_ENABLED=true` in `.env`. Nothing was "
+                    "launched, and no already-running emulator was attached to."
+                ),
+                "content": None,
+            }
         ensure_adb_first_on_path()
         # A FAILED probe is not "no emulator": `or {}` collapsed the two, and
         # this function's next move is to spawn one. That is D1 exactly -- a

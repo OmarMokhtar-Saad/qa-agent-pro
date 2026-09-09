@@ -56,6 +56,7 @@ from config.settings import settings
 from tools import (
     case_quality_gate,
     handover_cost,
+    host_privileges,
     prep_store,
     step_assertion,
     telemetry,
@@ -1996,7 +1997,13 @@ async def _android_device_details(devices: list) -> list:
     row's two probes would time the second one out where it succeeds now, which
     is a regression this bound is not worth. What is bounded is the listing:
     once the budget is spent no further device is probed, so the worst case is
-    one budget plus one probe whatever the device count. A device reached after
+    one budget plus ONE ROW'S TWO PROBES whatever the device count -- three
+    times ``_MOBILE_PROBE_S``, because the gate is checked BEFORE a row and a
+    row admitted just inside the budget still runs both of its own probes. This
+    said "one budget plus one probe", i.e. 16s; measured, it is 23.9s. A
+    documented bound that measurement contradicts is a false claim, and a
+    reader sizing a client timeout off it would size it short. A device reached
+    after
     that keeps its row exactly as it arrived -- the same degradation a failed or
     timed-out probe already had.
     """
@@ -16112,20 +16119,124 @@ async def handle_wizard(
         logger.exception("handle_wizard failed")
         return f"⚠️ Wizard failed: {exc}"
 
+async def handle_host_check(refresh: bool = False) -> str:
+    """What OS is this, and can this account elevate? ADVISORY, never a refusal.
+
+    Rendered from ``tools.host_privileges`` -- the ONE producer of the verdict,
+    so this report, the mobile preflight advisory, the virtualization fix text
+    and the tooling install rows cannot disagree. Nothing here blocks anything:
+    the point is that the calling agent stops proposing an elevated command to
+    a tester who cannot run it, and stops sending a tester who CAN elevate off
+    to IT.
+
+    Never raises. An ``error`` verdict degrades to one advisory line, because a
+    failed probe must not read as a denial.
+    """
+    reply = host_privileges.probe(refresh=bool(refresh))
+    if reply.get("error") or not reply.get("content"):
+        return (
+            "ℹ️ **Host privileges: could not be determined.** "
+            + str(reply.get("error") or "the probe returned nothing")
+            + ". This is UNDETERMINED, not a lack of administrator rights, and "
+            "it blocks nothing -- prefer the admin-free install route and say "
+            "so rather than assuming either answer."
+        )
+    content = reply["content"]
+    lines = [
+        "## Host check",
+        "",
+        "- **OS:** "
+        + host_privileges.DISPLAY.get(str(content.get("os")), "unknown")
+        + "  |  **arch:** "
+        + str(content.get("arch") or "unknown"),
+        "- **Verdict:** " + str(content.get("summary") or ""),
+        "- **How it was checked:** " + str(content.get("method") or ""),
+    ]
+    if content.get("cached"):
+        lines.append("- **Cached:** yes. " + str(content.get("refresh_hint") or ""))
+    else:
+        lines.append(
+            "- **Cached:** no, probed just now. "
+            + str(content.get("refresh_hint") or "")
+        )
+    lines += [
+        "",
+        "This is advisory. It does not block a run, a provision or an install.",
+        "",
+        "### Steps, admin-free route first",
+        "",
+    ]
+    for row in content.get("steps") or []:
+        lines.append(
+            "- **"
+            + str(row.get("step"))
+            + "** -- attemptable on this account: `"
+            + str(row.get("attemptable"))
+            + "`"
+            + (" (needs administrator rights)" if row.get("needs_admin") else "")
+        )
+        lines.append("  - " + str(row.get("admin_free_route")))
+        if row.get("needs_network"):
+            # `attemptable` is a PRIVILEGE answer and nothing else. Saying only
+            # "yes" to a tester behind an authenticating proxy or a
+            # TLS-inspecting middlebox sends them to retry a download that
+            # cannot work and tells them nothing about why -- the rights really
+            # are fine. Nothing here probes reachability, so this says what was
+            # checked rather than implying a check nobody ran.
+            lines.append(
+                "  - This step downloads from the internet. Nothing here checked "
+                "that the download can reach you: on a managed machine a proxy "
+                "or TLS inspection can refuse it while your account rights are "
+                "fine. If it fails with a certificate or proxy error, that is "
+                "not a permissions problem and elevating will not fix it."
+            )
+    return "\n".join(lines)
+
 
 # What each optional binary is FOR, and how to get it per platform. A row with no
 # command for this platform prints no command -- offering `brew` on Windows is
 # worse than offering nothing, and `xcrun` cannot exist off macOS at all.
 _TOOL_INFO: dict[str, dict] = {
     "adb": {
+        # NAMED FIRST in the rendered row, deliberately: an account that cannot
+        # elevate has no use for the package-manager line, and a tester reads
+        # the first option. Prose, because it is a route rather than a command
+        # -- and therefore outside the backticks.
+        "admin_free": {
+            "win32": "Unpack Google's platform-tools into your home directory "
+            "and add it to PATH (no administrator rights)",
+            "darwin": "Unpack Google's platform-tools into your home directory "
+            "and add it to PATH (no administrator rights)",
+        },
         # Deliberately NOT naming `qa_list_devices` here: a guard test asserts
         # that string never appears in the setup report, because the report must
         # not read as though it had enumerated the tester's devices.
         "purpose": "Android device listing and screen capture",
         "install": {
-            "win32": "winget install --id Google.PlatformTools -e",
+            # ADMIN-FREE ROUTE FIRST, then the package manager, then the
+            # official URL -- and the URL comes from tools.host_privileges so a
+            # stale link is fixed in ONE place. `--scope user` is what makes
+            # the winget line runnable on a locked-down corporate laptop; the
+            # literal prefix before it is pinned by a test, so it stays.
+            # A RUNNABLE COMMAND ONLY. `_binary_line` renders this inside
+            # backticks after the word "Install:", and its docstring promises
+            # the install command for THIS platform -- so a non-technical
+            # tester copy-pastes whatever is here. This carried a prose
+            # paragraph with two alternatives and a URL, which pastes into a
+            # shell error. The admin-free unzip route is not lost: it is the
+            # `admin_free_route` of the platform-tools step in
+            # `host_privileges.STEPS`, which is where a route rather than a
+            # command belongs. Linux has no entry at all and degrades to a row
+            # with no command clause; this now matches that shape.
+            "win32": "winget install --id Google.PlatformTools -e --scope user",
             "darwin": "brew install --cask android-platform-tools",
-            "linux": "sudo apt install android-tools-adb",
+            # No `linux` row, and its absence is the honest answer rather than
+            # an omission: the hosts in scope are macOS and Windows, mirroring
+            # tools/mobile/platform_info.SUPPORT. The deleted row read
+            # `sudo apt install android-tools-adb` -- an elevated command, for
+            # an unsupported host, handed to every tester regardless of
+            # whether they could run it. `_binary_line` prints no command when
+            # a platform has no row, which is what should happen here.
         },
     },
     "xcrun": {
@@ -16187,6 +16298,15 @@ def _binary_line(name: str, path: str | None) -> str:
     info = _TOOL_INFO.get(name) or {}
     purpose = str(info.get("purpose") or "")
     tail = f" ({purpose})" if purpose else ""
+    # THE ROUTE IS PROSE AND THE COMMAND IS A COMMAND, and the route comes
+    # FIRST. Both halves were previously one string inside the backticks, which
+    # made the thing a tester copy-pastes a paragraph with two alternatives and
+    # a URL in it -- it pastes into a shell error, and `_binary_line` promises
+    # "the install command for THIS platform". Splitting them keeps the
+    # ordering the locked-down case needs (winget alone is a dead end for an
+    # account that cannot elevate, so the admin-free route must be read first)
+    # without putting unrunnable text where a command is promised.
+    route = str((info.get("admin_free") or {}).get(sys.platform) or "")
     # The path is PASSED IN, never looked up here: ``_optional_tool_paths`` is
     # the one lookup, and a second ``shutil.which`` in this function is exactly
     # the drift that would let a row and the headline disagree about one
@@ -16195,8 +16315,10 @@ def _binary_line(name: str, path: str | None) -> str:
     if path:
         return f"- ✅ `{name}`{tail} — {path}"
     cmd = str((info.get("install") or {}).get(sys.platform) or "")
-    return f"- ❌ `{name}`{tail} — not installed" + (
-        f". Install: `{cmd}`" if cmd else ""
+    return (
+        f"- ❌ `{name}`{tail} — not installed"
+        + (f". {route}" if route else "")
+        + (f". Or install: `{cmd}`" if cmd else "")
     )
 
 

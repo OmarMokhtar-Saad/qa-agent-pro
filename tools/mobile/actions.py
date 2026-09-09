@@ -1082,6 +1082,10 @@ def describe_vocabulary() -> dict:
             + ". text_present/text_absent take the string to look for in "
             "`text` OR in `target.text` -- either is accepted, and `text` "
             "wins if you send both.",
+            "THE TWO WAITS ARE NOT EQUIVALENT: a wait carrying only `ms` spends "
+            "every millisecond of it, while `until_text` comes back the moment "
+            "that text is on the screen. Name what you are waiting FOR whenever "
+            "you can -- it is the same action for a fraction of the clock.",
             "To check that the app REPLIED, use assert new_text (optionally with "
             "contains): it passes only when text appeared that was not on the "
             "previous screen. screen_changed is WEAK -- any navigation "
@@ -1092,7 +1096,10 @@ def describe_vocabulary() -> dict:
             + str(MAX_TOTAL_WAIT_MS)
             + " ms. Over the wait total the script is REFUSED; over the submit "
             "budget the replay stops before the next action and hands you the "
-            "screen, so plan short scripts rather than one long one.",
+            "screen, so plan short scripts rather than one long one. What spends "
+            "that budget is the SCREEN RE-READ after every action that can "
+            "change the screen, not the tap itself -- so a script is bounded by "
+            "device time long before it is bounded by the action count above.",
             "ask_tester(prompt, field) stops the replay and asks the tester for "
             "that one field. The value is typed and never stored.",
             "end with done(verdict, reason); verdict is one of "

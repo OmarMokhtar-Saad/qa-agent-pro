@@ -98,7 +98,23 @@ def new_state(
 
 
 def stop_reason(state: object, *, now: float | None = None) -> str:
-    """Why this session must stop, or ``""``. Checked BEFORE each turn."""
+    """Why this session must stop, or ``""``. Checked BEFORE each turn.
+
+    THE STRICT ONE, and its strictness is load-bearing. It coerces ``turn``,
+    ``turns_budget`` and ``deadline``, and a state whose numbers are junk makes
+    it RAISE. That raise is the containment gate: ``session.resolve`` calls this
+    at the first statement of every entry point, its own handler turns the
+    ValueError into ``{"error": ...}``, and so a corrupt state is refused before
+    ``next_packet``, ``submit`` or ``qa_mobile_status`` can reach a device.
+    ``test_l11_...`` and ``test_l12_...`` in
+    ``tests/mobile/test_mobile_explore_turn_ledger.py`` pin exactly that -- L12
+    states that the replay and the commit line are never reached.
+
+    So DO NOT make this total. A render must never fail to draw a page because a
+    field on disk is junk, and a gate must refuse exactly then: that is two
+    contracts, and two contracts need two names over one core.
+    :func:`display_stop` is the other name.
+    """
     body = state if isinstance(state, dict) else {}
     if str(body.get("stop") or ""):
         return str(body["stop"])
@@ -107,6 +123,35 @@ def stop_reason(state: object, *, now: float | None = None) -> str:
     if _now(now) >= float(body.get("deadline") or 0):
         return STOP_DEADLINE
     return ""
+
+
+def display_stop(manifest: object, *, now: float | None = None) -> str:
+    """Why the run this MANIFEST describes has stopped, or ``""``. TOTAL.
+
+    THE RENDER CONTRACT, and the counterpart to :func:`stop_reason`'s strict
+    one. Same core -- it calls ``stop_reason`` -- with two differences that are
+    the contract:
+
+    * it takes the MANIFEST and does the lane check itself, so a consumer cannot
+      get "is this an explore run, and did it stop" half right;
+    * it NEVER raises. A state whose numbers will not coerce reads as NOT
+      stopped, which is the answer the page gave before any of this existed. The
+      alternative is measured and worse: ``report._is_partial`` calls this, and
+      ``report.render``'s outer ``except`` turns any raise into NO PAGE AT ALL.
+
+    Its callers are a page and a coverage count. The GATE keeps ``stop_reason``.
+    """
+    body = manifest if isinstance(manifest, dict) else {}
+    if str(body.get("lane") or "") != "explore":
+        return ""
+    explore = body.get("explore")
+    try:
+        return stop_reason(explore if isinstance(explore, dict) else {}, now=now)
+    except (TypeError, ValueError, OverflowError):
+        logger.warning(
+            "mobile.explore_runner: unreadable explore state, displaying as running"
+        )
+        return ""
 
 
 def remaining(state: object, *, now: float | None = None) -> dict:

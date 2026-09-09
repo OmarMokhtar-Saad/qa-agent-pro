@@ -44,14 +44,19 @@ from __future__ import annotations
 # session, so length is a real cost paid on every turn. ``MAX_INSTRUCTION_LINES``
 # is the budget, pinned by a test: an ambient block that grows without a ceiling
 # is how a helpful paragraph becomes a permanent tax.
-# 2026-09-02: 40 -> 42, and the arithmetic is the justification rather than
-# headroom-by-feel. Measured before the change: 36 lines (full), 39 (full +
-# api), 32 (test-cases-only). The mobile block is two lines of text and
-# ``server_instructions`` joins its parts with a blank line, so the new worst
-# case -- core + full + api + mobile -- is exactly 42. The block is edition
-# gated on a kill-switch that is OFF by default forever, so the ambient cost
-# for a default install is unchanged at 39.
-MAX_INSTRUCTION_LINES = 42
+# The arithmetic is the justification rather than headroom-by-feel. The mobile
+# block is two lines of text and ``server_instructions`` joins its parts with a
+# blank line, so the worst case is core + full + api + mobile. Measured before
+# the host-check line: 42 there, 39 for a default install (full + api, the
+# mobile kill-switch being OFF by default forever), 32 test-cases-only.
+#
+# The host-check line is ONE line and it lives in CORE, not in a gated block,
+# because ``qa_host_check`` is registered in every edition -- so it costs +1 on
+# every row: worst case 43, default install 40, test-cases-only 33. It buys the
+# one failure an ambient block can actually prevent here: an agent proposing an
+# elevated install command to a tester whose account cannot run it, which is a
+# dead end the tester cannot diagnose and the server used to print regardless.
+MAX_INSTRUCTION_LINES = 43
 
 
 _INSTRUCTIONS_CORE = """\
@@ -59,6 +64,7 @@ QA Agents turns a feature or a ticket into a professional test suite, a bug
 report, or a guided exploratory session, for testers who do not write code. NO
 model runs on this server: YOU generate every artifact and hand it back through
 the matching submit tool. New machine, or odd behaviour: `qa-doctor` first.
+Before proposing ANY install or provision command: `qa_host_check` first.
 
 TEST CASES -- in this order:
 1. `qa_prepare_test_cases` returns a prep_id, the prompts, and the per-category

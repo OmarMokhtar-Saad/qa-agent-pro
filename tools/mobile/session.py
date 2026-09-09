@@ -463,6 +463,55 @@ def _install_state_path() -> Path:
     return paths.state_file(INSTALL_FILE)
 
 
+#: SECONDS an install record may be old and still support the claim "the
+#: install is still running". The record lives at ONE machine-wide path with no
+#: run identity, exactly like the provisioning record ``render`` ages, so past
+#: this age it describes an install the reader never started. Sized off the
+#: thing it bounds: an `adb install -r -g` of a large APK over a slow emulator
+#: bridge is minutes, not hours, so an hour is generous for the real case and
+#: still far short of the days that produced the defect. Bounded from above in
+#: ``tests/mobile/test_mobile_bounds_upper.py``.
+INSTALL_PENDING_MAX_AGE_S = 3600
+
+
+def _started_seconds(record: dict) -> float:
+    """The record's start time as a float, or ``0.0`` for anything unusable.
+
+    This was ``float(record.get("started") or 0)`` inline. ``float()`` raises
+    OverflowError on a sufficiently large int and ValueError on a non-numeric
+    string, and the exception unwound into ``install_state``'s outer
+    ``except Exception`` -- so one corrupt field in a machine-wide file turned
+    a routine "is this app installed" answer into a FAILED CALL, which the
+    caller renders as a broken device rather than as a healthy no.
+
+    Found by strengthening the oversized-stamp test to assert the ENVELOPE
+    rather than only the verdict: the aging guard beside it was catching its
+    own OverflowError correctly, and this second coercion was not.
+    """
+    try:
+        return float(record.get("started") or 0)
+    except (OverflowError, ValueError, TypeError):
+        return 0.0
+
+
+def _install_is_recent(record: dict, now: float) -> bool:
+    """Did the install this record describes start recently enough to still run?
+
+    Same rule, same reason, as ``render._record_is_current``: a machine-wide
+    record with no identity is only as good as its age, so a MISSING or
+    non-numeric ``started`` is not recent -- an undated record cannot support a
+    claim about now -- and neither is a stamp in the future.
+    """
+    stamp = record.get("started")
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+        return False
+    try:
+        age = float(now) - float(stamp)
+    except (OverflowError, ValueError):
+        return False
+    return 0 <= age <= INSTALL_PENDING_MAX_AGE_S
+
+
 def _read_install_record() -> dict:
     """The last started install, or ``{}``.
 
@@ -567,6 +616,17 @@ async def install_state(serial: str, package: str) -> dict:
     from the envelope. They cannot: this function's own ``error`` is set only
     in the defensive branch below, so on the failure it exists to catch it is
     ``None`` and ``probed = not state.get("error")`` reads True. A caller then
+
+    ``pending`` ASSERTS EXACTLY WHAT THE RECORD ESTABLISHED, no wider. The
+    record is one machine-wide file naming a package, a serial and a start
+    time, so "the install is still running" needs all three to line up: the
+    same package, the SAME DEVICE, and a start recent enough that the install
+    could still be in flight. It used to need only the package name, so a
+    five-day-old record from a different emulator still told the tester an
+    install was in progress -- the same stale-machine-wide-record defect this
+    lane fixed for the provisioning record, in the commit that fixed it.
+    A record from another device is wrong at any age, which is why the serial
+    is matched as well as the age.
     printed "`pkg` is not installed on the emulator" off a probe that never
     answered (2026-09-08, round 2).
 
@@ -588,7 +648,11 @@ async def install_state(serial: str, package: str) -> dict:
         names = list(listed.get("content") or [])
         installed = bool(probed and str(package) in names)
         pending = bool(
-            probed and record.get("package") == str(package) and not installed
+            probed
+            and not installed
+            and record.get("package") == str(package)
+            and str(record.get("serial") or "") == str(serial)
+            and _install_is_recent(record, time.time())
         )
         return {
             "error": None,
@@ -597,7 +661,7 @@ async def install_state(serial: str, package: str) -> dict:
                 "installed": installed,
                 "pending": pending,
                 "apk": str(record.get("apk") or ""),
-                "started": float(record.get("started") or 0),
+                "started": _started_seconds(record),
             },
         }
     except Exception as exc:  # pragma: no cover - defensive
@@ -1009,9 +1073,15 @@ def resolve(run_id: str, session_token: str = "") -> dict:
         explore = explore if isinstance(explore, dict) else {}
         point: dict = {}
         state = STATE_RUNNING
-        if str(manifest.get("lane") or "") == LANE_EXPLORE:
-            stop = explore_runner.stop_reason(explore)
-            state = STATE_REPORT if stop else STATE_RUNNING
+        is_explore = str(manifest.get("lane") or "") == LANE_EXPLORE
+        # PUBLISHED, not just branched on. This value already decided `state`
+        # here while `report._is_partial` derived the same fact from the weaker
+        # `explore["stop"]` and disagreed with it on the very same manifest.
+        # Handing it out means every consumer reads the one producer.
+        explore_stop = ""
+        if is_explore:
+            explore_stop = explore_runner.stop_reason(explore)
+            state = STATE_REPORT if explore_stop else STATE_RUNNING
         else:
             point = (scheduler.next_case(run_id) or {}).get("content") or {}
             if point.get("finished"):
@@ -1049,7 +1119,15 @@ def resolve(run_id: str, session_token: str = "") -> dict:
                 "failed": list(point.get("failed") or []),
                 "next_tc_id": str(point.get("tc_id") or ""),
                 "gate": bool(point.get("gate")),
-                "finished": bool(point.get("finished")),
+                # The explore lane has no scheduler and therefore no `point`,
+                # so this key was False for the whole life of every exploratory
+                # run -- which is why a stopped run's summary was headed
+                # "Mobile run progress" and its report offered "ask again later
+                # for the rest". Its producer is `stop_reason`.
+                "finished": bool(explore_stop)
+                if is_explore
+                else bool(point.get("finished")),
+                "explore_stop": explore_stop,
                 "explore": explore,
                 "holder": str(lease.get("holder") or ""),
                 "lease_state": str(lease.get("state") or run_store.NONE),

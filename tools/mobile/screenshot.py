@@ -8,15 +8,32 @@ list of nothing. This module turns the PNG ``adb.screencap`` returned into the
 consumes for ``qa_capture_screens``, so the same proven transport carries the
 mobile lane's screen.
 
-**It declares ONE cap: the long edge** (:data:`MAX_LONG_EDGE_PX`), because the
-size of the picture a model is asked to read is a fact about perception and
-this is the only module that has the picture. The BYTES are still capped at the
-transport, in ``adb.MAX_SCREENSHOT_BYTES``, which is where the dump's cap lives
-too -- and that cap keeps its job: it bounds the raw device answer read into
-memory, and on the degraded path where Pillow is absent and the full-size
-capture rides along it is once again the only thing standing between a chat
-transport and a reply no client will render. Two caps, two constraints, a
-CEILINGS row each.
+**It declares TWO caps, on two different axes, and the second exists because
+this module now DECODES.** A cap bounds the axis it measures, and nothing else:
+
+* the LONG EDGE (:data:`MAX_LONG_EDGE_PX`) bounds what the model is asked to
+  read, because the size of the picture is a fact about perception and this is
+  the only module that has the picture;
+* the PIXEL COUNT (:data:`MAX_DECODE_PIXELS`) bounds what this process is asked
+  to DECODE, which is a different quantity with a different cost. Decode cost
+  is pixels, not bytes: a 690KB PNG -- comfortably inside the transport's byte
+  cap -- is 169M pixels and costs about 1.46GB of peak RSS and a second inside
+  ``_resized``. That band was reachable and unguarded, and every declared cap
+  stayed green over it, because a completeness sweep can only assert over caps
+  that EXIST and this axis had never been declared.
+
+This paragraph previously said the module declared ONE cap. That was true while
+the PNG was only ever forwarded -- bytes in, bytes out, never decoded -- and it
+is recorded here because the sentence outliving its truth is what made the
+missing axis invisible: a reader auditing whether this module was bounded found
+an explicit assurance that it was, and stopped.
+
+The BYTES are still capped at the transport, in ``adb.MAX_SCREENSHOT_BYTES``,
+which is where the dump's cap lives too -- and that cap keeps its job: it bounds
+the raw device answer read into memory, and on the degraded path where Pillow is
+absent and the full-size capture rides along it is once again the only thing
+standing between a chat transport and a reply no client will render. Three caps,
+three constraints, a CEILINGS row each.
 
 **Why a module of its own**, rather than beside the packet builders:
 ``agents/mobile_run.py`` builds PACKETS -- dicts the model answers -- and knows
@@ -88,6 +105,30 @@ MIME = "image/png"
 #: dump's ``bounds``, never from a pixel -- which :data:`ATTACHED_NOTE` already
 #: promises the model in words -- so resolution is a perception input only.
 MAX_LONG_EDGE_PX = 768
+
+#: PIXELS this process will DECODE. A different axis from every other cap here,
+#: and the ONLY bound anything on it has -- there is nothing upstream. A device
+#: reports its display size through ``adb._DISPLAY_RE``, which admits SEVEN
+#: digits per dimension by design, so ``9999999x9999999`` parses as a plausible
+#: answer: 10^14 pixels. A reader who assumes this is defence in depth and
+#: relaxes it is removing the whole defence, not a second layer.
+#:
+#: THE CONSTRAINT, not the number. The largest screen this lane can capture is
+#: 1440x3200 = 4.6M pixels (the real Galaxy S21 it is validated against is
+#: 1440x3120 = 4.5M), so this sits FIVE TIMES above anything genuine and cannot
+#: refuse a real capture -- which would be worse than the defect it prevents.
+#: At the measured ~8.6 bytes per pixel it caps peak decode near 200MB, which is
+#: the real constraint: this runs inside the MCP server process, on every turn.
+#: And it is seven times BELOW the 169M-pixel cost point, i.e. in the middle of
+#: the exposed band rather than at its top -- Pillow's own decompression-bomb
+#: error already fires around 178M, so a bound set there would protect nothing
+#: that was not already protected.
+#:
+#: REASONING FROM THE WIDEST SCREEN GIVES THE WRONG ANSWER: 2560x1600 is FEWER
+#: pixels than 1440x3200. Aspect ratio moves pixels around rather than adding
+#: them, so the tallest phone, not the widest tablet, is the shape that bounds
+#: this. Bounded from above in ``tests/mobile/test_mobile_bounds_upper.py``.
+MAX_DECODE_PIXELS = 24_000_000
 
 #: The value of the packet's ``screen_image`` key when the PNG rode along.
 #:
@@ -173,6 +214,21 @@ def _resized(data: bytes) -> bytes:
     A full-size picture is worth strictly more than no picture, and this
     function's job is bytes, not verdicts.
 
+    TOO MANY PIXELS TO DECODE is one of those "cannot do better" cases, and it
+    is refused BEFORE ``load()`` rather than after: the size is in the header,
+    the cost is in the decode, and the whole point is not to pay it. See
+    :data:`MAX_DECODE_PIXELS`.
+
+    RESAMPLING IS LANCZOS ONLY FOR CONTINUOUS-TONE MODES. Measured on Pillow
+    12.3.0: a ``P`` (palette) or ``1`` (bilevel) image resized with
+    ``Image.LANCZOS`` comes back byte-identical to the same resize with
+    ``Image.NEAREST`` -- Pillow downgrades silently and raises nothing. That
+    matters because the legibility case for a 768 long edge ASSUMES LANCZOS ran;
+    where it did not, the floor's argument does not hold. It is documented
+    rather than fixed because ``adb.screencap -p`` does not produce those modes,
+    and a conversion here would be an unreachable branch -- which this module
+    already refuses to add, for the reason stated at the end of this function.
+
     STILL PNG. JPEG would buy transport bytes we are not short of -- the model's
     cost depends on the dimensions above, not on the file size -- and its
     ringing lands on exactly the canvas-drawn screens where the picture is the
@@ -203,6 +259,19 @@ def _resized(data: bytes) -> bytes:
         return data
     try:
         with Image.open(io.BytesIO(data)) as image:
+            # SIZE BEFORE LOAD. `Image.open` reads only the header, so the
+            # dimensions are known before a single pixel is decoded -- which is
+            # the one moment this can be refused cheaply. `load()` below is the
+            # decode, and its cost is PIXELS.
+            width, height = image.size
+            if width * height > MAX_DECODE_PIXELS:
+                logger.warning(
+                    "mobile.screenshot: %dx%d is above MAX_DECODE_PIXELS, so "
+                    "this screen is attached at full size rather than decoded.",
+                    width,
+                    height,
+                )
+                return data
             image.load()
             longest = max(image.size)
             if longest <= MAX_LONG_EDGE_PX:

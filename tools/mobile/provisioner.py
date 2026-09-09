@@ -96,7 +96,34 @@ def _note_virtualization_override(virt: dict, ack: bool) -> bool:
     derived once, never re-probed, because two derivations of one answer drift.
     """
     global _virt_overridden
-    _virt_overridden = bool(ack) and not (virt or {}).get("ok", False)
+    # THREE CLAUSES. The third is the fix: the probe must have ANSWERED, and
+    # answered NO. ``not (virt or {}).get("ok", False)`` counted an unanswered
+    # probe as a negative verdict, so a crashed probe plus an ack produced a
+    # record asserting a verdict nothing ever returned -- and the note built
+    # from it named virtualization to a tester whose probe had merely failed.
+    #
+    # WHAT THIS DELIBERATELY DOES NOT CHANGE. ``{}`` -- a probe that ANSWERED
+    # with a reply carrying no ``ok`` key -- still counts as not-ok and still
+    # records an override. That is the author's stated intent, pinned in
+    # ``test_the_override_is_recorded_only_for_a_negative_verdict`` with the
+    # comment "An unreadable probe reply is not a pass: no `ok` key means not
+    # ok", and it is a reasonable reading: something replied, and what it said
+    # was not yes.
+    #
+    # The defect was never that rule. It was that ``_virtualization`` COLLAPSED
+    # a probe that did not answer at all into the same ``{}``, so an exception
+    # was indistinguishable from an unreadable reply. Separating the two at the
+    # producer fixes the bug and leaves the author's semantics standing --
+    # which matters because I could not reach them to ask, and a fix that also
+    # quietly reversed a decision they had written down would be the wrong
+    # trade.
+    #
+    # OPEN QUESTION FOR THAT AUTHOR: if you intended the crash case to be
+    # flagged too, the honest form is a separate sentence saying the probe
+    # could not be RUN, rather than the current one, which asserts in so many
+    # words that the probe "said NO". Nothing else here depends on that.
+    answered = virt is not None
+    _virt_overridden = bool(ack) and answered and not virt.get("ok", False)
     return _virt_overridden
 
 
@@ -109,7 +136,25 @@ def _virtualization() -> dict:
     consulted by the function that spends 2.2GB. This wrapper exists so the
     mobile suite can stay hermetic, not to add logic.
     """
-    return (platform_info.virtualization() or {}).get("content") or {}
+    # ``None`` MEANS THE PROBE DID NOT ANSWER, and it is a THIRD value, not a
+    # negative one. This ended ``or {}``, and ``{}.get("ok", False)`` is False,
+    # so a PowerShell timeout, a missing binary or any raised exception was
+    # indistinguishable from a hypervisor that is genuinely off --
+    # ``platform_info.virtualization`` returns ``content: None`` on any
+    # exception and that collapsed to the same value as ``{"ok": False}``.
+    #
+    # The consequence was tester-facing: the override record was written from
+    # that collapse, and a boot failure later told the tester "the
+    # virtualization probe on this machine said NO" when nothing had said
+    # anything. It lands hardest on Windows, where the probe is least reliable
+    # and where "could not see the feature" and "said no" would otherwise be
+    # the same value.
+    #
+    # ALL THREE CONSUMERS below take the new value deliberately: the refusal
+    # treats unknown as a refusal (fail-safe -- 2.2GB is about to be spent),
+    # its detail SAYS the probe did not answer rather than printing
+    # "unknown", and the override record demands a real ``ok is False``.
+    return (platform_info.virtualization() or {}).get("content")
 
 
 def download_cap_bytes() -> int:
@@ -612,10 +657,11 @@ def run(apply: bool = False, virtualization_ack: bool = False) -> dict:
             # calling agent: a refusal that NAMES its acknowledgement argument,
             # accepted on a LATER call and never on the turn it was refused.
             virt = _virtualization()
-            # Recorded BEFORE the branch and from the SAME verdict, so the
-            # overriding path -- the one that falls through -- cannot forget it.
-            _note_virtualization_override(virt, virtualization_ack)
-            if not virt.get("ok", False) and not virtualization_ack:
+            # UNKNOWN REFUSES, exactly like a negative. A probe that could not
+            # answer is not permission to spend 2.2GB, and this is the one
+            # consumer for which the two are legitimately the same -- stated
+            # here rather than left as a falsy accident.
+            if not (virt or {}).get("ok", False) and not virtualization_ack:
                 message = (
                     "Nothing was downloaded: this machine reports no usable "
                     "hardware virtualization, so no emulator can start. Enable "
@@ -623,7 +669,11 @@ def run(apply: bool = False, virtualization_ack: bool = False) -> dict:
                     "apply=true and "
                     + VIRT_ACK_ARG
                     + "=true to provision anyway. Reported: "
-                    + str(virt.get("detail") or "unknown")
+                    + (
+                        str((virt or {}).get("detail") or "unknown")
+                        if virt is not None
+                        else "the virtualization probe could not be run"
+                    )
                 )[:VIRT_REFUSAL_MAX_CHARS]
                 _publish(
                     {
@@ -682,6 +732,15 @@ def run(apply: bool = False, virtualization_ack: bool = False) -> dict:
                     }
                 )
                 return {"error": message, "content": None}
+
+            # STAMPED HERE, PAST EVERY REFUSAL, not before them. Recorded above
+            # the branch it now sits below, it was written even when the
+            # download cap or a full disk stopped provisioning outright -- so
+            # the note opened "Before this was provisioned..." on a machine
+            # where nothing was provisioned, and any boot failure there blamed
+            # virtualization for the next six hours. A record may claim only
+            # what actually happened, and past this line provisioning proceeds.
+            _note_virtualization_override(virt, virtualization_ack)
 
         started = time.time()
         total = len(pending) or 1

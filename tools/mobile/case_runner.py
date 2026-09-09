@@ -367,14 +367,6 @@ async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
         evidence = _evidence_record(
             await capture.begin_case(ctx.serial, ctx.package, run_id, tc_id)
         )
-        # The wire, beside the log (plan mobile-network-capture). Started HERE
-        # for the same reason the ring buffer is cleared here: the capture has
-        # to cover the app own start-up. A physical device, a console that
-        # refused, or a flag that is off all land as a record which SAYS so --
-        # none of them can block the case, and none of them can be a blank.
-        evidence["network"] = _network_record(
-            await capture.begin_network(ctx.serial, ctx.package, run_id, tc_id, 0)
-        )
         launched = await adb.launch(ctx.serial, ctx.package)
         if launched.get("error"):
             return launched
@@ -841,48 +833,6 @@ def _evidence_record(source: object) -> dict:
         # and a record written before this feature reads as "no crash" rather
         # than raising inside a checkpoint.
         "crash": crash if isinstance(crash, dict) and crash.get("detected") else {},
-        # Carried forward the same way the crash is, and normalised by its own
-        # accessor: a checkpoint written before this feature has no such key,
-        # and the report must read a shape rather than a KeyError.
-        "network": _network_record(body.get("network")),
-    }
-
-
-def _network_record(source: object) -> dict:
-    """The case network record, normalised from ``capture.begin_network`` or
-    ``finish_network``, OR from a record already on disk.
-
-    EVERY KEY PRESENT, including on a checkpoint written before this feature
-    existed, where each one is its empty value. The report reads these keys; a
-    missing one is a KeyError inside a page, which is not a gap the page can
-    state. Never raises: a corrupt count on disk is a zero here, not an
-    exception inside a checkpoint."""
-    holder = source if isinstance(source, dict) else {}
-    body = holder.get("content") if "content" in holder else holder
-    body = body if isinstance(body, dict) else {}
-
-    def count(value):
-        try:
-            return max(0, int(value or 0))
-        except (TypeError, ValueError, OverflowError):
-            return 0
-
-    uid = body.get("uid")
-    started_ms = body.get("started_ms")
-    rows = body.get("rows")
-    return {
-        "skipped": body.get("skipped") or holder.get("error") or None,
-        "stage": str(body.get("stage") or ""),
-        "started": bool(body.get("started")),
-        "file": str(body.get("file") or ""),
-        "uid": uid if isinstance(uid, int) else None,
-        "rows": [row for row in (rows or ()) if isinstance(row, dict)],
-        "packets": count(body.get("packets")),
-        "samples": count(body.get("samples")),
-        "truncated": bool(body.get("truncated")),
-        "note": str(body.get("note") or ""),
-        "path": str(body.get("path") or ""),
-        "started_ms": started_ms if isinstance(started_ms, int) else None,
     }
 
 
@@ -938,21 +888,6 @@ async def _slice_evidence(run_id: str, tc_id: str, ctx: executor.Context) -> dic
             }
         )
         evidence["crash"] = _merge_crash(evidence.get("crash"), this_crash)
-        # The wire is stopped, parsed and attributed at the SAME checkpoint the
-        # log slice is taken, and spliced in beside it. Nothing branches on the
-        # result: an evidence fault can no more change a verdict here than a
-        # failed slice can, which is why this sits after the crash merge and
-        # before the write rather than anywhere a return could skip it.
-        evidence["network"] = _network_record(
-            await capture.finish_network(
-                ctx.serial,
-                ctx.package,
-                run_id,
-                tc_id,
-                max(0, evidence["slices"] - 1),
-                evidence.get("network"),
-            )
-        )
         # NEVER write a document read before an await. A checkpoint may have
         # landed while the device was being read; the fresh copy carries its
         # verdict and trace, and only the evidence record is spliced in.
