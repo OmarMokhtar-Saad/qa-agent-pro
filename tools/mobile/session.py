@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import secrets
 import subprocess
 import time
@@ -288,6 +289,10 @@ async def ensure_device(
     client's tool timeout, so a tester would see a dead editor rather than a
     message. The bounded pair is ``emulator.start`` (spawn, detached, returns at
     once) plus ``emulator.wait_boot`` with an EXPLICIT budget.
+
+    That budget is :data:`DEVICE_WAIT_BUDGET_S`, and the setting does NOT move
+    it, so both waits below pass ``tunable=False``: the timeout message they
+    hand to the tester must not offer a knob that cannot change this wait.
     """
     try:
         name = str(avd or provisioner.AVD_NAME)
@@ -295,7 +300,7 @@ async def ensure_device(
         if serial:
             # A tester-chosen (or already-adopted) device: never probe for
             # the hardcoded AVD and never spawn a second emulator under it.
-            waited = await emulator.wait_boot(serial, timeout=budget)
+            waited = await emulator.wait_boot(serial, timeout=budget, tunable=False)
             if waited.get("error"):
                 return {
                     "error": None,
@@ -320,7 +325,7 @@ async def ensure_device(
             return running
         serial = str((running.get("content") or {}).get("serial") or "")
         if serial:
-            waited = await emulator.wait_boot(serial, timeout=budget)
+            waited = await emulator.wait_boot(serial, timeout=budget, tunable=False)
             if waited.get("error"):
                 return {
                     "error": None,
@@ -489,9 +494,19 @@ def _started_seconds(record: dict) -> float:
     own OverflowError correctly, and this second coercion was not.
     """
     try:
-        return float(record.get("started") or 0)
+        started = float(record.get("started") or 0)
     except (OverflowError, ValueError, TypeError):
         return 0.0
+    # A NON-FINITE VALUE DOES NOT RAISE, so the except above never sees it.
+    # `json.loads` accepts bare NaN, Infinity and -Infinity, and this record is
+    # a machine-wide file this process did not write. Every comparison against
+    # NaN is False, so a NaN returned here walks through the freshness checks
+    # downstream instead of tripping them -- the same shape that let a NaN
+    # timestamp make the run collector delete a live run. `or 0` is a default
+    # for a FALSY value and NaN is truthy, so it is not a guard either.
+    if not math.isfinite(started):
+        return 0.0
+    return started
 
 
 def _install_is_recent(record: dict, now: float) -> bool:
@@ -1096,7 +1111,14 @@ def resolve(run_id: str, session_token: str = "") -> dict:
         # thinking from one nothing was driving. The lease's own heartbeat age
         # is the signal; STALE is the same threshold a takeover uses, so the
         # state and the takeover rule cannot drift apart.
+        # A non-finite age reads as ZERO, i.e. "just refreshed", which is the
+        # SAFE direction here: it leaves the run alone rather than declaring
+        # somebody else's live session abandoned. Left unguarded, a NaN makes
+        # the comparison below False and the run could never be reclaimed at
+        # all, because every comparison against NaN is False.
         lease_age = float(lease.get("age") or 0.0)
+        if not math.isfinite(lease_age):
+            lease_age = 0.0
         if (
             state not in (STATE_REPORT, STATE_GATE)
             and str(lease.get("state") or run_store.NONE) != run_store.NONE
@@ -1631,8 +1653,30 @@ async def next_packet(
             if turn.get("error"):
                 return turn
             content = turn.get("content") or {}
-            _persist_explore(run_id, content.get("state"))
             running = str(content.get("status") or "") == explore_runner.RUNNING
+            # The wire, for this turn. Started HERE, at the packet build, for
+            # the same reason the suite lane starts it before its launch: the
+            # capture has to cover what the turn is about to do. A stopped
+            # session, a physical device or a flag that is off all land as a
+            # record which SAYS so, and none of them can block a turn.
+            # The budget is re-read HERE and not only before the turn: the
+            # capture adds two device round trips AFTER the only earlier check,
+            # and on a slow emulator that is what pushes the packet build past
+            # the client's timeout. Losing the capture costs a section that
+            # says why; losing the call costs the turn.
+            if running and not (budget is not None and budget.expired()):
+                content["state"] = await _explore_begin_network(
+                    run_id, content.get("state"), ctx
+                )
+            elif not running:
+                # The session has STOPPED. Any capture a previous packet build
+                # started is now never going to be read, so it is stopped and
+                # its file deleted here rather than left recording the tester's
+                # device until something else displaces it.
+                content["state"] = await _explore_abort_network(
+                    run_id, content.get("state"), ctx
+                )
+            _persist_explore(run_id, content.get("state"))
             return {
                 "error": None,
                 "content": {
@@ -1873,6 +1917,7 @@ def _checkpoint_explore_turn(
     outcome: object,
     finding: str = "",
     verdict: str = "",
+    network: object = None,
 ) -> dict:
     """Write ONE exploratory turn as a case-shaped record. Never raises.
 
@@ -1918,6 +1963,10 @@ def _checkpoint_explore_turn(
             "skipped": "an exploratory turn takes no app-log slice",
             "slices": 0,
             "slices_written": [],
+            # The app LOG is not captured for an exploratory turn; the WIRE is.
+            # Two different questions, so two keys and two answers -- the
+            # skipped line above is about the log alone.
+            "network": case_runner.network_record(network),
         },
     }
     try:
@@ -1925,6 +1974,92 @@ def _checkpoint_explore_turn(
     except Exception:  # pragma: no cover - defensive
         logger.warning("mobile.session: could not checkpoint an explore turn")
     return written
+
+
+async def _explore_begin_network(
+    run_id: str, state: object, ctx: executor.Context
+) -> dict:
+    """Start this turn's capture and put its record in the explore state.
+
+    Returns the state to persist. Never raises: a capture is evidence, and
+    evidence may not cost a turn.
+    """
+    body = dict(state if isinstance(state, dict) else {})
+    try:
+        tc_id = explore_turn_tc_id(body.get("turn"))
+        prior = body.get("network")
+        # A RE-ISSUED packet for the same turn (a refused script, a resumed
+        # chat) must not leave the first capture running: the console records
+        # until it is told to stop, and the second start would write the same
+        # file name over a capture nothing had read.
+        if isinstance(prior, dict) and prior.get("started"):
+            await capture.abort_network(ctx.serial, run_id, tc_id, prior)
+        body["network"] = case_runner.network_record(
+            await capture.begin_network(ctx.serial, ctx.package, run_id, tc_id, 0)
+        )
+    except Exception:  # never-raise: evidence is not a turn
+        logger.exception("mobile.session._explore_begin_network failed")
+    return body
+
+
+async def _explore_abort_network(
+    run_id: str, state: object, ctx: executor.Context
+) -> dict:
+    """Stop a capture whose turn will never be replayed, and drop its record.
+
+    Returns the state to persist. The record is REMOVED rather than kept: the
+    file is gone, so a record still saying ``started`` would have the next
+    begin abort something that no longer exists. Never raises.
+    """
+    body = dict(state if isinstance(state, dict) else {})
+    prior = body.get("network")
+    if not (isinstance(prior, dict) and prior.get("started")):
+        return body
+    try:
+        await capture.abort_network(
+            ctx.serial, run_id, explore_turn_tc_id(body.get("turn")), prior
+        )
+    except Exception:  # never-raise: evidence is not a turn
+        logger.exception("mobile.session._explore_abort_network failed")
+    body.pop("network", None)
+    return body
+
+
+async def _explore_finish_network(
+    run_id: str, state: object, ctx: executor.Context
+) -> dict:
+    """Stop this turn's capture and return its record for the checkpoint.
+
+    The record is READ from the state the packet build persisted, so a turn
+    submitted from another chat still finds its own capture.
+    """
+    body = state if isinstance(state, dict) else {}
+    try:
+        tc_id = explore_turn_tc_id(body.get("turn"))
+        return case_runner.network_record(
+            await capture.finish_network(
+                ctx.serial,
+                ctx.package,
+                run_id,
+                tc_id,
+                0,
+                body.get("network"),
+            )
+        )
+    except Exception as exc:  # never-raise: evidence is not a verdict
+        logger.exception("mobile.session._explore_finish_network failed")
+        # A BLANK record here is what made the report say the capture ran and
+        # found nothing. The failure names itself instead, so the page shows a
+        # reason rather than a false negative.
+        return case_runner.network_record(
+            {
+                "stage": "finish",
+                "skipped": (
+                    "the capture could not be stopped and read for this turn: "
+                    + str(exc)[:200]
+                ),
+            }
+        )
 
 
 def _persist_explore(run_id: str, state: object, planned: object = None) -> None:
@@ -2052,6 +2187,13 @@ async def _submit_explore(
     ctx.prior_verified = _explore_prior_verified(run_id)
     replayed = await executor.replay(parsed["content"], ctx)
     if replayed.get("error"):
+        # The turn is over and no checkpoint will be written for it, so the
+        # capture this turn started has no later reader. Stop it here or the
+        # console records the tester's device until something displaces it.
+        _persist_explore(
+            run_id,
+            await _explore_abort_network(run_id, resolved.get("explore") or {}, ctx),
+        )
         return replayed
     outcome = replayed.get("content") or {}
     folded = explore_runner.apply_turn_result(resolved.get("explore") or {}, payload)
@@ -2090,8 +2232,11 @@ async def _submit_explore(
         if isinstance(entry, dict)
     )
     verdict = str(outcome.get("verdict") or "") if ended else ""
+    # The turn HAS been replayed, so its capture is complete. Stopped before the
+    # checkpoint, because the checkpoint is what carries the record to the report.
+    net = await _explore_finish_network(run_id, before, ctx)
     checkpoint = _checkpoint_explore_turn(
-        run_id, before, outcome, finding, verdict=verdict
+        run_id, before, outcome, finding, verdict=verdict, network=net
     )
     # The replay HAPPENED, so the number this turn was handed is now earned.
     # This is the only writer that ADVANCES ``committed_turn`` to a number the
@@ -2117,6 +2262,10 @@ async def _submit_explore(
     # run already wrote.
     committed_state = dict(turn.get("state") or {})
     committed_state["committed_turn"] = int(committed_state.get("turn") or 0)
+    # This turn's capture is finished and its record now lives on the case
+    # record. Leaving it on the state would have the NEXT turn's begin treat it
+    # as a capture still running and abort a file that is already gone.
+    committed_state.pop("network", None)
     _persist_explore(
         run_id,
         committed_state,

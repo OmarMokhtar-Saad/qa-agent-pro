@@ -81,9 +81,11 @@ def _release_device_lock(run_id: str, session_token: str = "") -> None:
     moment to stop holding the device. Another chat that took the run over gets
     it on its next attempt, at most one beat interval later.
 
-    Bound to ``lease_lost`` ONLY, and that is deliberate: ``max_beats`` is a
-    test-only bound and releasing there would drop a live run's lock under test,
-    and ``stop``/``stop_all`` have no production caller (only this package's test
+    Bound to the two stops that mean THIS PROCESS IS DONE DRIVING: ``lease_lost``
+    (another chat took the run) and ``run_finished`` (the run reached its
+    report). Deliberately NOT the other two: ``max_beats`` is a test-only bound
+    and releasing there would drop a live run's lock under test, and
+    ``stop``/``stop_all`` have no production caller (only this package's test
     teardown), so releasing there would only surprise a test.
 
     Never raises: a lock that could not be given back is a log line, and process
@@ -105,6 +107,35 @@ def _release_device_lock(run_id: str, session_token: str = "") -> None:
         logger.warning(
             "mobile.heartbeat: could not release the emulator lock for %s", run_id
         )
+
+
+def _run_is_finished(run_id: str, session_token: str = "") -> bool:
+    """Has *run_id* reached its terminal state? ``False`` whenever unsure.
+
+    THE SAME PRODUCER the tester's own status reply reads -- ``session.resolve``
+    -- rather than a second derivation here. "Is this run over" answered in two
+    places drifts, and the copy that drifts is the one nobody is looking at.
+
+    Imported inside the call, like ``locks`` in the sibling above: this module is
+    loaded when the server starts and must not drag the session module in behind
+    it.
+
+    FAIL-SAFE IS KEEP BEATING. A writer that cannot tell holds the device it
+    already holds, which is exactly what it did before this existed; releasing on
+    an unreadable answer would hand a LIVE run's emulator to another chat, and
+    that is the failure the whole lease mechanism exists to prevent.
+    """
+    try:
+        from tools.mobile import session
+
+        resolved = session.resolve(str(run_id), str(session_token or ""))
+        if resolved.get("error"):
+            return False
+        body = resolved.get("content") or {}
+        return str(body.get("state") or "") == session.STATE_REPORT
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("mobile.heartbeat: could not read the state of %s", run_id)
+        return False
 
 
 class _Writer:
@@ -150,6 +181,23 @@ class _Writer:
             self.beats += 1
             if self.max_beats and self.beats >= self.max_beats:
                 self.stop_reason = "max_beats"
+                break
+            # THE RUN IS OVER, so stop holding its emulator.
+            #
+            # WHY THE BEAT ABOVE DOES NOT COVER THIS: `_beat_once` answers "is
+            # the lease still mine", and for a run that has reached its report
+            # the answer is yes forever -- so the writer beat on and the device
+            # stayed held until the process exited. Measured: a run that stopped
+            # at `deadline_reached` held the emulator for 35 minutes while every
+            # other chat was refused, and the refusal offered a take-over that a
+            # finished run cannot accept.
+            #
+            # AFTER `max_beats` so a bounded test writer still stops for the
+            # reason its test named, and BEFORE the wait so the device comes
+            # back on the next beat rather than at process exit.
+            if _run_is_finished(self.run_id, self.session_token):
+                self.stop_reason = "run_finished"
+                _release_device_lock(self.run_id, self.session_token)
                 break
             if self._stop.wait(self.interval_s):
                 self.stop_reason = self.stop_reason or "stopped"
