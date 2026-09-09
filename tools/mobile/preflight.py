@@ -43,6 +43,7 @@ class _Answered(Exception):
     ahead of that handler.
     """
 
+
 #: Check names, in report order. Also the set the tests assert against, so a
 #: check that silently stops being emitted fails the suite.
 CHECK_NAMES: tuple[str, ...] = (
@@ -50,6 +51,7 @@ CHECK_NAMES: tuple[str, ...] = (
     "adb_responds",
     "adb_first_on_path",
     "emulator_booted",
+    "device_dns",
     "package_installed",
     "ime_pinned",
     "ime_installed",
@@ -63,6 +65,61 @@ CHECK_NAMES: tuple[str, ...] = (
 #: Free space the lane wants available before a RUN (not a provision): room for
 #: dumps, checkpoints and a report.
 RUN_FREE_BYTES = 2 * 1024 * 1024 * 1024
+
+#: The name the DNS probe asks for. The platform's own connectivity check uses
+#: this host, so the probe adds no lookup the device was not already making.
+DNS_PROBE_HOST = "connectivitycheck.gstatic.com"
+
+#: The address the probe pings once a NAME has failed, to tell a broken resolver
+#: apart from a device with no route at all. A literal address is the whole
+#: point: resolving anything here would beg the question being asked.
+DNS_PROBE_IP = "8.8.8.8"
+
+#: Seconds the ADB CALL is given for ONE probe. This is the whole budget for a
+#: probe, and deliberately NOT a `ping -W`: `-W` bounds the wait for a REPLY,
+#: and a lookup that never resolves never gets as far as waiting for one.
+#: MEASURED on this lane's API 35 emulator against a stale resolver: a failing
+#: lookup costs 20.06-20.12s across 16 samples, and does not move at `-W 1` or
+#: `-W 10` -- what bounds it is Android's own resolver retry schedule, which
+#: `-W` cannot reach. The budget must therefore clear ~20s with room for a
+#: slower host. Under it the check reports its own timeout instead of the
+#: diagnosis it exists to give, which is exactly what a tester was left with.
+DNS_PROBE_TIMEOUT_S = 30
+
+#: Seconds `ping -W` waits for a REPLY. It bounds the ADDRESS probe, whose host
+#: needs no resolving, and is inert on the name probe as measured above. Kept
+#: small for that reason: an address that does not answer promptly is not
+#: routing, and waiting longer tells the tester nothing more.
+DNS_PING_WAIT_S = 3
+
+#: What the tester is told when names fail and packets still flow. The remedy is
+#: the emulator's own behaviour, not a guess: it reads the host's resolvers ONCE,
+#: at boot, so a host that changed network leaves the guest pointing at servers
+#: that are no longer there.
+DNS_EMULATOR_FIX = (
+    "The emulator reads the host's DNS servers once, when it starts, so "
+    "changing network on this machine leaves it pointing at resolvers that are "
+    "gone. Restart the emulator, or start it with `-dns-server 8.8.8.8,1.1.1.1`."
+)
+DNS_DEVICE_FIX = (
+    "The device answers pings but resolves no name. Check its own Wi-Fi or "
+    "mobile data, and any VPN or private-DNS setting on it."
+)
+DNS_NO_ROUTE_FIX = (
+    "The device reached nothing at all, by name or by address. Check that it is "
+    "on a network before running cases that need one."
+)
+
+#: What the tester is told when the lookup OUTLASTS the budget rather than
+#: failing outright. Reporting "adb did not answer within 30s" would be true and
+#: useless: the thing that did not answer is the RESOLVER, and no longer wait
+#: separates a resolver this slow from a broken one -- an app under test stalls
+#: on it the same way either way. So the check says that in its own words, and
+#: still sends the address probe, so the REMEDY is measured rather than guessed.
+DNS_SLOW_NOTE = (
+    "a resolver this slow cannot be told apart from a broken one by waiting "
+    "longer, and an app under test stalls on it the same way"
+)
 
 _FLAG_FIX = (
     "Add `QA_MOBILE_RUN_ENABLED=true` to `.env` and restart the MCP server "
@@ -107,6 +164,13 @@ ADVISORY_CHECKS: frozenset = frozenset(
         "ime_selected",
         "ime_oracle",
         "cache_ownership",
+        # ADVISORY, and the trade is the same one the two rows around it make: an
+        # app under test may be deliberately offline, and a run that only taps
+        # and asserts on local screens needs no resolver at all. Blocking here
+        # would refuse runs that work today in order to warn about a case that
+        # may not apply. What was missing was TELLING the tester, which is what
+        # this check does -- `test_the_dns_check_cannot_block_a_run` pins it.
+        "device_dns",
         # WITHOUT this row the check is BLOCKING: `_record` computes
         # `blocking = name not in ADVISORY_CHECKS` and `ok` is derived from the
         # blocking failures, so a `can_elevate=False` -- or an UNDETERMINED --
@@ -117,6 +181,22 @@ ADVISORY_CHECKS: frozenset = frozenset(
         "host_privileges",
     }
 )
+
+
+def _exit_code(body: object, default: int = 1) -> int:
+    """A probe's exit code, with ZERO read as zero.
+
+    ``int(body.get("rc") or 1)`` is the trap this exists to close: a successful
+    command exits 0, 0 is falsy, and the fallback then turns every success into
+    a failure. Written once because the same idiom was about to appear twice.
+    """
+    value = (body or {}).get("rc") if isinstance(body, dict) else None
+    if value is None or isinstance(value, bool):
+        return int(default)
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return int(default)
 
 
 def _record(name: str, ok: bool, detail: str, fix: str = "") -> dict:
@@ -336,6 +416,137 @@ async def check(target_package: str = "", serial: str = "") -> dict:
             checks.append(
                 _record("emulator_booted", False, "check failed: " + str(exc))
             )
+
+        # 4b. the device can resolve a name ---------------------------------
+        try:
+            if not resolved_serial:
+                checks.append(
+                    _record(
+                        "device_dns",
+                        False,
+                        "no device answered, so its resolver could not be asked",
+                        "Start the emulator (or attach a device) and try again; "
+                        "the checks above say which step is missing.",
+                    )
+                )
+            else:
+                # The ADB CALL carries the budget and `-W` is left to do the
+                # one job it can do -- see DNS_PROBE_TIMEOUT_S for the numbers
+                # that decide which is which.
+                named = await adb.shell(
+                    resolved_serial,
+                    [
+                        "ping",
+                        "-c",
+                        "1",
+                        "-W",
+                        str(DNS_PING_WAIT_S),
+                        DNS_PROBE_HOST,
+                    ],
+                    timeout=DNS_PROBE_TIMEOUT_S,
+                )
+                # A probe that OUTLASTED the budget is a FINDING, not a check
+                # that could not be made: adb was reachable enough to be left
+                # waiting on the resolver. So it does NOT go to `_unanswered`,
+                # whose "the device did not answer" is true and tells a tester
+                # nothing they can act on. It falls through to the same route
+                # probe as an outright failure, and only the DETAIL differs.
+                overran = bool(named.get("timed_out"))
+                unanswered = None if overran else _unanswered("device_dns", named)
+                if unanswered is not None:
+                    checks.append(unanswered)
+                else:
+                    body = named.get("content") or {}
+                    resolved = not named.get("error") and _exit_code(body) == 0
+                    if resolved:
+                        checks.append(
+                            _record(
+                                "device_dns",
+                                True,
+                                resolved_serial + " resolves " + DNS_PROBE_HOST,
+                            )
+                        )
+                    else:
+                        # WHICH failure this is decides the remedy, so it is
+                        # measured rather than assumed: a device with no route at
+                        # all is a different problem from one whose resolver is
+                        # stale, and telling a tester to restart the emulator
+                        # when the machine is simply offline wastes their time.
+                        routed = await adb.shell(
+                            resolved_serial,
+                            [
+                                "ping",
+                                "-c",
+                                "1",
+                                "-W",
+                                str(DNS_PING_WAIT_S),
+                                DNS_PROBE_IP,
+                            ],
+                            timeout=DNS_PROBE_TIMEOUT_S,
+                        )
+                        route_body = routed.get("content") or {}
+                        can_route = (
+                            not routed.get("error") and _exit_code(route_body) == 0
+                        )
+                        facts = await adb.device_facts(resolved_serial)
+                        kind = str((facts.get("content") or {}).get("kind") or "")
+                        # The REMEDY follows the route probe alone -- what
+                        # the tester must change is the same whether the name
+                        # failed fast or hung. The DETAIL is what carries the
+                        # difference, because a tester who is told "cannot
+                        # resolve" about a lookup that actually took 30s will
+                        # not recognise the stall they are about to sit through.
+                        if not can_route:
+                            fix = DNS_NO_ROUTE_FIX
+                        else:
+                            fix = (
+                                DNS_EMULATOR_FIX
+                                if kind == "emulator"
+                                else DNS_DEVICE_FIX
+                            )
+                        if overran and can_route:
+                            detail = (
+                                resolved_serial
+                                + " did not resolve "
+                                + DNS_PROBE_HOST
+                                + " within "
+                                + str(DNS_PROBE_TIMEOUT_S)
+                                + "s, while "
+                                + DNS_PROBE_IP
+                                + " answered: "
+                                + DNS_SLOW_NOTE
+                            )
+                        elif overran:
+                            detail = (
+                                resolved_serial
+                                + " did not resolve "
+                                + DNS_PROBE_HOST
+                                + " within "
+                                + str(DNS_PROBE_TIMEOUT_S)
+                                + "s and did not reach "
+                                + DNS_PROBE_IP
+                                + " either"
+                            )
+                        elif can_route:
+                            detail = (
+                                resolved_serial
+                                + " pings "
+                                + DNS_PROBE_IP
+                                + " but cannot resolve "
+                                + DNS_PROBE_HOST
+                                + ": packets route and names do not"
+                            )
+                        else:
+                            detail = (
+                                resolved_serial
+                                + " reached neither "
+                                + DNS_PROBE_HOST
+                                + " nor "
+                                + DNS_PROBE_IP
+                            )
+                        checks.append(_record("device_dns", False, detail, fix))
+        except Exception as exc:
+            checks.append(_record("device_dns", False, "check failed: " + str(exc)))
 
         # 5. target package installed --------------------------------------
         try:

@@ -145,8 +145,18 @@ async def raw(
             "content": None,
         }
     except asyncio.TimeoutError:
+        # `timed_out` is ADDITIVE and exists because "adb did not answer" is
+        # not always the finding. A caller that gave a probe a budget sized to
+        # the thing being probed -- `preflight`'s DNS check -- needs to tell an
+        # OVERRUN apart from adb being unusable, and the two arrive here as the
+        # same `error` string. Substring-matching that prose from another module
+        # would make the wording load-bearing, so the fact is stated as a field.
+        # Every OTHER consumer is unchanged and correct to ignore it: `error` is
+        # still set and still says what they need. `preflight` is the one reader
+        # that branches on it.
         return {
             "error": "adb did not answer within " + str(timeout) + "s.",
+            "timed_out": True,
             "content": None,
         }
     except Exception as exc:
