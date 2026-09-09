@@ -579,15 +579,25 @@ async def _sample_loop(serial: str, state: dict) -> None:
     """Poll the socket table while the case replays. Never raises past itself."""
     try:
         while state["taken"] < MAX_NETWORK_SAMPLES:
-            for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+            # ALL FOUR tables. The UDP pair was never read, so a DNS row could
+            # never be attributed to anyone -- every one of them reported "owner
+            # not sampled", which reads as bad luck rather than as a question
+            # this code had not asked.
+            for path, proto in (
+                ("/proc/net/tcp", "tcp"),
+                ("/proc/net/tcp6", "tcp"),
+                ("/proc/net/udp", "udp"),
+                ("/proc/net/udp6", "udp"),
+            ):
                 result = await adb.shell(serial, ["cat", path])
                 if result.get("error"):
                     continue
-                state["samples"] = netattr.merge_samples(
-                    state["samples"],
-                    netattr.parse_proc_net(
-                        str((result.get("content") or {}).get("out") or "")
-                    ),
+                rows = netattr.parse_proc_net(
+                    str((result.get("content") or {}).get("out") or ""), proto
+                )
+                state["samples"] = netattr.merge_samples(state["samples"], rows)
+                state["endpoints"] = netattr.merge_endpoints(
+                    state.get("endpoints"), rows, state.get("uid"), time.time() * 1000
                 )
             state["taken"] += 1
             await asyncio.sleep(NETWORK_SAMPLE_INTERVAL_S)
@@ -610,12 +620,14 @@ def _stop_sampler(key) -> dict:
     return state
 
 
-def _start_sampler(serial: str, run_id: object, tc_id: object) -> None:
+def _start_sampler(
+    serial: str, run_id: object, tc_id: object, uid: object = None
+) -> None:
     key = (str(run_id), str(tc_id))
     _stop_sampler(key)
     while len(_NET_SAMPLERS) >= MAX_LIVE_SAMPLERS:
         _stop_sampler(next(iter(_NET_SAMPLERS)))
-    state = {"samples": {}, "taken": 0, "task": None}
+    state = {"samples": {}, "endpoints": {}, "uid": uid, "taken": 0, "task": None}
     _NET_SAMPLERS[key] = state
     try:
         state["task"] = asyncio.ensure_future(_sample_loop(serial, state))
@@ -693,7 +705,10 @@ async def begin_network(
             stage = "device" if reason == adb.NOT_AN_EMULATOR else "start"
             return _network_skipped(reason, stage)
         uid = await _app_uid(serial, package)
-        _start_sampler(serial, run_id, tc_id)
+        # The uid is handed to the sampler, not looked up again inside it: the
+        # endpoint map is built for THIS app and a second lookup would be a
+        # second answer to the same question.
+        _start_sampler(serial, run_id, tc_id, uid)
         return {
             "error": None,
             "content": _network_record(
@@ -868,9 +883,19 @@ async def finish_network(
         body = parsed.get("content") or {}
         if body.get("note"):
             notes.append(str(body["note"]))
+        # THE UNION, and the wire comes first because only it can carry a name.
+        # The socket table contributes every endpoint the capture did not
+        # describe -- which on a real device, or on an emulator whose traffic
+        # does not cross the tapped interface, is all of them.
+        sampled = netattr.endpoint_rows(state.get("endpoints"))
         rows = _scrub_rows(
-            netattr.attribute(body.get("rows") or [], samples, prior.get("uid"))
+            netattr.merge_rows(
+                netattr.attribute(body.get("rows") or [], samples, prior.get("uid")),
+                sampled,
+            )
         )[:MAX_NETWORK_ROWS]
+        if sampled:
+            notes.append(netattr.SOCKET_NOTE)
         started_ms = prior.get("started_ms")
         for row in rows:
             first = row.get("first_ms")

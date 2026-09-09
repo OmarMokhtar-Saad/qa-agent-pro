@@ -492,6 +492,10 @@ def _rows(flows: dict) -> list:
             "last_ms": conv["last_ms"],
             "local_ports": [client[1]] if client else [],
             "connections": 1,
+            # The ADDRESS, beside whatever name this flow managed to learn. The
+            # socket table can state an address and never a name, so this is the
+            # only field the two sources can be joined on.
+            "server": server[0] if server else None,
             "undetermined": False,
         }
         if conv["qnames"]:

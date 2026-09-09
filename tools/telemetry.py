@@ -35,7 +35,7 @@ _TIMEOUT_S = 2.0
 
 # Baked by scripts/build_dist.py in the public distribution. Empty in the
 # private checkout, which keeps telemetry inert (fail-safe OFF) there.
-_DEFAULT_POSTHOG_KEY = "phc_your_key"
+_DEFAULT_POSTHOG_KEY = "phc_Bpq6EEL6LeBRgAiQTamtsEz5icUEGoR6nFkKsnmv3BoX"
 
 _MACHINE_ID_APP = "qa-agent-pro"
 _INSTALL_DIR = Path(__file__).resolve().parent.parent
