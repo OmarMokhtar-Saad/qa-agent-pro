@@ -45,6 +45,26 @@ MAX_PROC_LINES = 4000
 #: the map cannot be describing ports on one device.
 MAX_SAMPLED_PORTS = 65535
 
+#: Distinct endpoints remembered for one case. A case reaches a handful of
+#: hosts and the system image adds its own; past this a NEW endpoint is dropped
+#: and counted rather than silently merged, the same rule the packet parser
+#: uses for flows, and for the same reason: a page nobody can read is not a
+#: report.
+MAX_TRACKED_ENDPOINTS = 400
+
+#: What a row from the socket table says it is. The parser's own labels live in
+#: ``pcap.SOURCES``; this one has a different producer, so it is named here.
+SOURCE_SOCKET = "socket-table"
+
+#: What the page says about a socket-table row, so nobody reads an address as a
+#: host that could not be named. Stated once, here, because the reason is a
+#: property of the SOURCE and not of any one row.
+SOCKET_NOTE = (
+    "rows named socket-table come from the device's own socket list, which "
+    "records the address a connection went to and never the name asked for or "
+    "the path requested"
+)
+
 OWNER_APP = "this app"
 OWNER_OTHER = "other app on device"
 OWNER_UNSAMPLED = "owner not sampled"
@@ -89,8 +109,39 @@ def _hex_port(text: str) -> int | None:
     return value if 0 <= value <= 65535 else None
 
 
-def parse_proc_net(text: object) -> list:
-    """``/proc/net/tcp`` or ``tcp6`` as ``[{"local_port", "uid", "state"}]``.
+def _ip_from_hex(text: object) -> str:
+    """One ``/proc/net`` address as text, or ``""``.
+
+    The kernel prints the address as 32-bit words in HOST order, so each group
+    of eight hex characters is four bytes to be read backwards. A v4-mapped v6
+    address is printed as the v4 it is, for the same reason the packet parser
+    does it: one host must not become two rows on the page.
+    """
+    raw = str(text or "").strip()
+    if len(raw) not in (8, 32):
+        return ""
+    try:
+        octets: list = []
+        for start in range(0, len(raw), 8):
+            octets.extend(reversed(bytes.fromhex(raw[start : start + 8])))
+    except ValueError:
+        return ""
+    data = bytes(octets)
+    if len(data) == 4:
+        return ".".join(str(byte) for byte in data)
+    if data[:10] == b"\x00" * 10 and data[10:12] == b"\xff\xff":
+        return ".".join(str(byte) for byte in data[12:16])
+    return ":".join("%x" % ((data[i] << 8) | data[i + 1]) for i in range(0, 16, 2))
+
+
+def parse_proc_net(text: object, proto: str = "tcp") -> list:
+    """One ``/proc/net`` socket table as rows.
+
+    ``[{"local_port", "uid", "state", "remote_ip", "remote_port", "proto"}]``.
+    The remote end is read HERE because this table is the only place a real
+    device will say who the app talked to; *proto* is passed in rather than
+    guessed from the text, because the four tables are identical in shape and
+    only the caller knows which one it read.
 
     A malformed line is SKIPPED, never raised on and never counted as a socket:
     this text comes off a device, and one unreadable row must not cost the case
@@ -116,7 +167,17 @@ def parse_proc_net(text: object) -> list:
             continue
         if uid < 0:
             continue
-        rows.append({"local_port": port, "uid": uid, "state": str(fields[3])[:4]})
+        remote = str(fields[2]).split(":")
+        rows.append(
+            {
+                "local_port": port,
+                "uid": uid,
+                "state": str(fields[3])[:4],
+                "remote_ip": _ip_from_hex(remote[0]) if len(remote) == 2 else "",
+                "remote_port": _hex_port(remote[1]) if len(remote) == 2 else None,
+                "proto": str(proto or "tcp")[:8],
+            }
+        )
     return rows
 
 
@@ -143,6 +204,121 @@ def merge_samples(samples: object, rows: object) -> dict:
         elif uid not in held:
             held.append(uid)
     return merged
+
+
+def _connected(row: dict) -> bool:
+    """Did this socket have a peer? A listener and an unbound UDP socket did not.
+
+    Both print an all-zero remote address and port zero, so ONE test covers
+    both rather than a state whitelist per protocol -- the state codes differ
+    between the TCP and UDP tables and a whitelist would need two rules for one
+    question.
+    """
+    ip = str(row.get("remote_ip") or "")
+    port = row.get("remote_port")
+    if not ip or not isinstance(port, int) or port <= 0:
+        return False
+    return bool(ip.strip("0.:"))
+
+
+def merge_endpoints(store: object, rows: object, uid: object, now_ms: object) -> dict:
+    """Fold one sample's rows into the app's endpoint map.
+
+    ``{(ip, port, proto): {"first_ms", "last_ms", "local_ports", "samples"}}``,
+    and ONLY for *uid*: this map is evidence about the app under test, so a
+    socket belonging to anything else is not recorded here at all rather than
+    recorded and labelled later. Never raises.
+    """
+    kept = dict(store) if isinstance(store, dict) else {}
+    if not isinstance(uid, int):
+        return kept
+    try:
+        stamp = int(now_ms)
+    except (TypeError, ValueError, OverflowError):
+        return kept
+    for row in rows or ():
+        if not isinstance(row, dict) or row.get("uid") != uid or not _connected(row):
+            continue
+        key = (
+            str(row.get("remote_ip")),
+            int(row.get("remote_port")),
+            str(row.get("proto") or "tcp"),
+        )
+        held = kept.get(key)
+        if held is None:
+            if len(kept) >= MAX_TRACKED_ENDPOINTS:
+                continue
+            held = {
+                "first_ms": stamp,
+                "last_ms": stamp,
+                "local_ports": [],
+                "samples": 0,
+            }
+            kept[key] = held
+        held["last_ms"] = stamp
+        held["samples"] += 1
+        port = row.get("local_port")
+        if isinstance(port, int) and port not in held["local_ports"]:
+            held["local_ports"].append(port)
+    return kept
+
+
+def endpoint_rows(store: object) -> list:
+    """The app's endpoint map as report rows, in the shape the parser emits.
+
+    ``bytes`` and ``packets`` are ``None`` and not zero: this source counts
+    sockets, it does not weigh traffic, and a nought in those columns would read
+    as "it sent nothing". ``owner`` is the app BY CONSTRUCTION -- the map is
+    built from the app's own uid -- so it is set here rather than inferred later
+    from a port that a second sample might have seen under somebody else.
+    """
+    rows = []
+    for key, held in (store or {}).items():
+        if not isinstance(held, dict):
+            continue
+        ip, port, proto = key
+        rows.append(
+            {
+                "host": ip,
+                "server": ip,
+                "port": port,
+                "proto": proto,
+                "source": SOURCE_SOCKET,
+                "owner": OWNER_APP,
+                "connections": max(1, len(held.get("local_ports") or ())),
+                "local_ports": list(held.get("local_ports") or ()),
+                "packets": None,
+                "bytes": None,
+                "first_ms": held.get("first_ms"),
+                "last_ms": held.get("last_ms"),
+                "undetermined": False,
+            }
+        )
+    return sorted(rows, key=lambda row: (str(row["host"]), int(row["port"])))
+
+
+def merge_rows(named: object, sampled: object) -> list:
+    """Wire rows first, then every endpoint the wire did not already describe.
+
+    The join is on the SERVER ADDRESS and port, which is the one identity both
+    sources can state: a wire row may carry a name the socket table cannot know,
+    and the socket table may carry an endpoint the capture never saw. A wire row
+    with no server (nothing identified a client) matches nothing and is kept as
+    it is.
+    """
+    out = [row for row in (named or ()) if isinstance(row, dict)]
+    seen = {
+        (str(row.get("server") or ""), row.get("port"))
+        for row in out
+        if row.get("server")
+    }
+    for row in sampled or ():
+        if not isinstance(row, dict):
+            continue
+        if (str(row.get("server") or ""), row.get("port")) in seen:
+            continue
+        out.append(row)
+    return out
 
 
 def owner_of(local_ports: object, samples: object, uid: object) -> str:
