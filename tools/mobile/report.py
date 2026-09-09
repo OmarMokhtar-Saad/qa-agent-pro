@@ -1319,6 +1319,13 @@ def _case_wall(rows: list) -> int | None:
     return sum(measured) if measured else None
 
 
+def _network_of(safe: dict) -> dict:
+    """The case network capture record, or an empty dict. The ONE reader."""
+    holder = safe.get("evidence") if isinstance(safe, dict) else None
+    body = (holder or {}).get("network") if isinstance(holder, dict) else None
+    return body if isinstance(body, dict) else {}
+
+
 def _case_facts(case: object, manifest: dict) -> dict:
     """Everything a card, a table row, a chip and a KPI need, computed ONCE."""
     raw = case if isinstance(case, dict) else {}
@@ -1396,6 +1403,12 @@ def _case_facts(case: object, manifest: dict) -> dict:
         # Read through the detector's own accessor, never by walking the record
         # here: two walks are two derivations of "where a crash lives".
         "crash": crash_detector.crash_of_case(safe),
+        # The wire this case reached, read off the checkpoint through ONE
+        # accessor. A second walk of the record inside the card would be a
+        # second derivation of where the network record lives, and mirrored
+        # conditions drift. Absent on a checkpoint written before this feature,
+        # which is an empty dict the renderer states rather than a crash.
+        "network": _network_of(safe),
         "status": _text(safe.get("status"), 40),
         "reason": _text(safe.get("reason"), 400),
         "escapes": max(0, escapes),
@@ -1676,6 +1689,11 @@ def _card_html(
     )
     # What the app heard and answered inside this case's window (plan P3).
     turns = ev_render.turns_table(loaded, facts["tc_id"]) if loaded else ""
+    # The wire, beside what the app own log said. NOT gated on `loaded`: the
+    # capture is written onto the checkpoint by the case runner, so a run with
+    # no app profile at all still has one -- which is the whole point of a
+    # capture that needs no app-specific anything.
+    network = ev_render.case_network(facts.get("network"))
     steps = (
         _sec_block(
             "Steps",
@@ -1742,6 +1760,7 @@ def _card_html(
         + _vstrip(facts)
         + phones
         + turns
+        + network
         + steps
         + sequence
         + _ended_block(facts)
@@ -2821,7 +2840,7 @@ def _document(
             "API surface",
             "every endpoint the app reached, on the real wire",
             "Every endpoint the app called from inside a case, against the real backend rather than a fixture.",
-            ev_render.apis_section(loaded),
+            ev_render.apis_section(loaded) + ev_render.network_section(cases),
         )
         + _sechead(
             "perf",
