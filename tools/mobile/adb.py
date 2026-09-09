@@ -564,13 +564,84 @@ async def installed_packages(serial: str) -> dict:
     return {"error": None, "content": sorted(set(out))}
 
 
+#: A resolved launcher component, ``<package>/<class>``. The class may be
+#: dotted, relative (``.Main``) or an inner class (``Outer$Inner``); nothing
+#: else, because the string goes straight into an ``am start -n`` argument.
+_COMPONENT_RE = re.compile(
+    r"^([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)/([A-Za-z0-9_.$]{1,200})$"
+)
+
+
+async def resolve_launcher(serial: str, package: str) -> str:
+    """The launcher component of *package* as ``pkg/class``, or ``""``.
+
+    Read from ``cmd package resolve-activity --brief``, whose last line is the
+    component. A component that does not belong to *package* is discarded: the
+    answer decides what ``am start -n`` is given, and it comes off the device.
+    """
+    if not valid_package_name(package):
+        return ""
+    result = await shell(
+        serial,
+        [
+            "cmd",
+            "package",
+            "resolve-activity",
+            "--brief",
+            "-a",
+            "android.intent.action.MAIN",
+            "-c",
+            "android.intent.category.LAUNCHER",
+            str(package),
+        ],
+    )
+    body = result.get("content") or {}
+    if result.get("error") or int(body.get("rc") or 0) != 0:
+        return ""
+    lines = [line.strip() for line in str(body.get("out") or "").splitlines()]
+    last = lines[-1] if lines else ""
+    match = _COMPONENT_RE.match(last)
+    if not match or match.group(1) != str(package):
+        return ""
+    return last
+
+
 async def launch(serial: str, package: str) -> dict:
-    """Start *package*'s launcher activity via monkey (no activity name needed)."""
+    """Start *package*'s launcher activity.
+
+    BY COMPONENT FIRST, monkey second. ``am force-stop`` flags a package
+    STOPPED, and a stopped package is excluded from implicit intent resolution
+    -- which is all ``monkey -c LAUNCHER`` sends. Measured on the API 35 Play
+    image: after the lane's own force-stop, monkey injected no event and the
+    app never came up, so every case was refused as "did not come to the
+    foreground". An explicit ``am start -n <component>`` does not go through
+    implicit resolution and starts the app. Monkey remains the path when no
+    component resolves (a device that lacks ``cmd package``), so nothing that
+    launched before stops launching.
+    """
     if not valid_package_name(package):
         return {
             "error": "Refusing to launch " + repr(str(package)[:60]),
             "content": None,
         }
+    component = await resolve_launcher(serial, package)
+    if component:
+        started = await shell(
+            serial, ["am", "start", "-W", "-n", component], timeout=60
+        )
+        body = started.get("content") or {}
+        text = str(body.get("out") or "") + str(body.get("err") or "")
+        if started.get("error") or "Error" in text:
+            return {
+                "error": (
+                    "Could not start "
+                    + component
+                    + ": "
+                    + (str(started.get("error") or text).strip()[:300] or "no reply")
+                ),
+                "content": None,
+            }
+        return started
     return await shell(
         serial,
         [
@@ -1209,3 +1280,124 @@ async def run_as_cat(
         return {"error": refused, "content": None}
     data, truncated = _capped(str(body.get("out") or ""), max_bytes)
     return {"error": None, "content": {"data": data, "truncated": truncated}}
+
+
+# ---- the emulator console, proxied by adb (plan mobile-network-capture) ------
+#
+# THE ONE SURFACE that can record a device's traffic without root: measured on
+# emulator-5554 on 2026-09-09, ``adb root`` is refused on a production build,
+# ``tcpdump`` is not on the system image and a release APK refuses ``run-as``.
+# The emulator console CAN, because it runs in the emulator process on the host
+# -- and ``adb ... emu <cmd>`` reaches it, carrying the console auth token
+# itself, so nothing in this tree reads, holds or logs that credential.
+
+#: What a run on a physical device is told, BY NAME. The lane supports a real
+#: phone; the emulator console does not exist there, so a capture is IMPOSSIBLE
+#: rather than empty -- and an empty section reads to a tester as "the app
+#: called nothing", which is the false claim this constant exists to prevent.
+NOT_AN_EMULATOR = (
+    "network capture needs an emulator; this run is on a physical device, so "
+    "the app network traffic was not recorded (its logcat still was)"
+)
+
+#: One word of a console command line. Deliberately narrower than the console
+#: itself accepts: every argument sent here is a literal in this tree or a file
+#: name this tree composed, so nothing needs a space, a quote or a newline.
+_EMU_WORD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$")
+
+_BARE_PCAP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}\.pcap$")
+
+
+def valid_capture_name(name: object) -> bool:
+    """True for a name the emulator console accepts as a bare file name.
+
+    Checked HERE, before adb is called, even though the console checks it too:
+    a name built from a run id must never be able to become a path this process
+    asks a co-process to write, and the console's own refusal EXITS ZERO.
+    """
+    text = str(name or "")
+    return bool(_BARE_PCAP_RE.match(text)) and ".." not in text
+
+
+async def emu(serial: str, *args: object) -> dict:
+    """``adb -s <serial> emu <args>``: the emulator console. Never raises.
+
+    ``{"error", "content": [<reply line>, ...]}`` -- the reply with its trailing
+    ``OK`` stripped, so a caller reads what the console SAID and not its
+    punctuation.
+
+    **THE EXIT CODE IS ALWAYS ZERO**, and this is the whole reason the function
+    exists rather than a bare ``raw`` call at each site. Measured on
+    emulator-5554 on 2026-09-09: ``emu network capture start ../x.pcap`` answers
+    ``KO: <file> must be a bare filename ...`` and STILL exits 0. So the verdict
+    is read from the TEXT and from nothing else -- a reply whose last non-empty
+    line is exactly ``OK`` succeeded; any line beginning ``KO`` is a failure
+    carrying its own reason. Branching on ``rc`` would report every refusal as a
+    success, which is the one failure shape a capture must not have: a run that
+    believes it is recording and is not.
+
+    A reply cut by :data:`MAX_DUMP_BYTES` is an ERROR, not a truncated success.
+    The terminator is the only evidence the command worked, and a reply whose
+    end was cut cannot carry it.
+
+    **The device must be an EMULATOR, and this is the ONE place that question is
+    asked on this path.** ``device_facts`` confirms it against ``ro.kernel.qemu``
+    rather than trusting the serial prefix, because an emulator reached over TCP
+    arrives as ``host:port``; a second check at a caller would be a second
+    derivation of one question, and mirrored conditions drift.
+    """
+    words = [str(word) for word in args]
+    if not words:
+        return {"error": "Refusing an empty emulator console command.", "content": None}
+    for word in words:
+        if not _EMU_WORD_RE.match(word):
+            return {
+                "error": "Refusing emulator console argument " + repr(word[:40]) + ".",
+                "content": None,
+            }
+    facts = await device_facts(serial)
+    kind = str(((facts or {}).get("content") or {}).get("kind") or "")
+    if kind != "emulator":
+        return {"error": NOT_AN_EMULATOR, "content": None}
+    result = await _device(serial, ["emu"] + words)
+    if result.get("error"):
+        return result
+    body = result["content"] or {}
+    joined = str(body.get("out") or "")
+    stderr = str(body.get("err") or "").strip()
+    if stderr:
+        joined = joined + "\n" + stderr
+    text, truncated = _capped(joined, MAX_DUMP_BYTES)
+    if truncated:
+        return {
+            "error": (
+                "The emulator console answered with more than "
+                + str(MAX_DUMP_BYTES)
+                + " bytes, so its reply could not be read to the end and `"
+                + " ".join(words)
+                + "` cannot be reported as having worked."
+            ),
+            "content": None,
+        }
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in lines:
+        if line == "KO" or line.startswith("KO:"):
+            return {
+                "error": (
+                    "The emulator refused `"
+                    + " ".join(words)
+                    + "`: "
+                    + line[3:].strip()
+                ),
+                "content": None,
+            }
+    if not lines or lines[-1] != "OK":
+        return {
+            "error": (
+                "The emulator console did not confirm `"
+                + " ".join(words)
+                + "`; its reply did not end in OK."
+            ),
+            "content": None,
+        }
+    return {"error": None, "content": lines[:-1]}

@@ -1484,6 +1484,12 @@
   ul.flatapi{margin:0;padding:0;list-style:none;display:grid;gap:5px}
   ul.flatapi li{font-family:"IBM Plex Mono",monospace;font-size:.78rem;color:var(--ink);overflow-wrap:anywhere;padding:5px 9px;background:var(--panel-2);border-radius:5px}
   .hint{font-size:.85rem;color:var(--ink-2);font-style:italic;margin:9px 0 0}
+  /* The network capture own two words. `netcap` is the disclosure line under a
+     host table -- what the capture could NOT see -- and `netown` is the socket
+     owner beside each row. Neither name was in this file before; a class with
+     no rule renders unstyled and nothing else in the suite binds them. */
+  .netcap{font-size:.8rem;color:var(--ink-2);font-style:italic;margin:8px 0 0}
+  .netown{font-family:"IBM Plex Mono",monospace;font-size:.72rem;color:var(--ink-2);white-space:nowrap}
   .cerr{margin:14px 0 0;padding:11px 13px;background:var(--defect-soft);border:1px solid var(--defect);border-radius:6px;font-family:"IBM Plex Mono",monospace;font-size:.78rem;color:var(--defect);white-space:pre-wrap;overflow-x:auto}
 
   /* ── series tokens ────────────────────────────────────────────────────── */

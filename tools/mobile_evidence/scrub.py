@@ -71,8 +71,30 @@ _KEY_IDENTITY = (
     r"\bnid\b|\bpassport\w*"
 )
 _KEY_DEMOGRAPHICS = r"date_?of_?birth|\bdob\b|\bbirth_?date\b|\bgender\b|\bage\b"
+# `_` IS A WORD CHARACTER, so `\btoken\b` has no boundary to find in
+# `access_token` and matched only the BARE word. Every real-world spelling was
+# therefore unmasked -- access_token, refresh_token, id_token, auth_token,
+# bearer_token, session_token, csrf_token -- and the same `\b` bug left
+# `client_secret` and `app_secret` open while plain `secret` was masked. Measured
+# against a captured plaintext request line: a JWT in `?access_token=` reached
+# the report whole, while `?password=` beside it was redacted, which is the worst
+# possible shape -- the page LOOKS scrubbed.
+#
+# So these two are matched anywhere inside the key, not on word boundaries. The
+# test is applied to a KEY, which is a bare identifier, never to prose, so a
+# substring match here cannot shred an ordinary sentence.
+# `sid` / `session*` / `pin` are here on RISK ASYMMETRY rather than certainty. A
+# session id is a credential -- it is what session hijacking steals -- and a PIN
+# is one outright. Both can also name something harmless. Over-masking costs a
+# tester one `<redacted>` in a report they can re-run; under-masking puts a live
+# session into a file they email to a colleague. `code` is deliberately NOT here:
+# an OAuth code is a credential but `code` is far more often a country or status
+# code, it is single-use and short-lived, and masking it would shred ordinary
+# rows. That one is a judgement, and it is written down rather than silent.
 _KEY_AUTH = (
-    r"\bpassword\w*|\bemail\w*|\btoken\b|\bauthorization\b|\bapi_?key\b|\bsecret\w*"
+    r"\bpassword\w*|\bemail\w*|\w*token\w*|\bauthorization\b|\bapi_?key\b"
+    r"|\w*secret\w*|\bjwt\b|\bbearer\b|\botp\b|\bpasswd\w*"
+    r"|\bsid\b|\bsession\w*|\bpin\b"
 )
 SENSITIVE_KEY_RE = re.compile(
     "|".join((_KEY_NAMES, _KEY_CONTACT, _KEY_IDENTITY, _KEY_DEMOGRAPHICS, _KEY_AUTH)),
@@ -217,11 +239,41 @@ def scrub_pairs(text: str) -> str:
     return TEXT_PAIR_RE.sub(one, text)
 
 
+# A key/value pair as it survives in a URL QUERY STRING or a form body: ``?token=abc`` /
+# ``&api_key=abc``. The pair net above reads JSON-shaped text and cannot see this shape,
+# which was found the moment a plaintext request line was captured off the wire: an app
+# that puts a token in a URL puts it exactly here. Bounded the same way -- the key is a
+# plain identifier of at most 41 characters and the value stops at the next separator.
+QUERY_PAIR_RE = re.compile(
+    r"(?P<lead>[?&;]|^|\s)(?P<k>[A-Za-z_][A-Za-z0-9_.\-]{0,40})=(?P<v>[^&;\s\"'<>#]{1,4000})"
+)
+
+
+def scrub_query(text: str) -> str:
+    """Mask a sensitive key's value where the pair survives as ``key=value``.
+
+    Like :func:`scrub_pairs`, this needs no arming: the key names itself. The ``=`` test
+    comes first so ordinary prose leaves without paying for the regex.
+    """
+    if "=" not in text:
+        return text
+
+    def one(match: re.Match) -> str:
+        if not SENSITIVE_KEY_RE.search(match.group("k")):
+            return match.group(0)
+        return (
+            match.group("lead") + match.group("k") + "=" + mask_value(match.group("v"))
+        )
+
+    return QUERY_PAIR_RE.sub(one, text)
+
+
 def scrub_text(text: object) -> str:
     """Mask every armed value wherever it appears in free text, every sensitive
-    key/value pair that survives as text, and the labelled prose values. NOT a no-op on
-    an unarmed render: the pair and prose passes always run."""
-    out = scrub_prose(scrub_pairs("" if text is None else str(text)))
+    key/value pair that survives as text (JSON-shaped OR query-shaped), and the
+    labelled prose values. NOT a no-op on an unarmed render: the pair, query and
+    prose passes always run."""
+    out = scrub_prose(scrub_query(scrub_pairs("" if text is None else str(text))))
     if not _SENSITIVE_VALUES:
         return out
     # Longest first, so a value that contains another is masked whole rather than being
