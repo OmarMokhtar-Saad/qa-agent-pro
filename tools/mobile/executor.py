@@ -279,6 +279,50 @@ class Context:
 NON_ACTUATING_OPS: frozenset[str] = frozenset({"assert", "done", "ask_tester"})
 
 
+def inert_ops(trace: object) -> list[str]:
+    """The ops in *trace* that ran, were meant to actuate, and moved nothing.
+
+    In script order and DE-DUPLICATED, so three taps that each did nothing read
+    as ``tap`` once rather than as a list the reader has to count.
+
+    ``wait`` is excluded for the reason ``_settle`` does not mark it: a wait
+    that changes nothing is the normal case, not a finding. Everything else in
+    ``actions.MUTATING_OPS`` is here, because an op that was supposed to move
+    the screen and did not is the same news whichever op it was.
+    """
+    out: list[str] = []
+    for entry in trace if isinstance(trace, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("outcome") or "") != "no_change":
+            continue
+        action = entry.get("action")
+        op = str((action or {}).get("op") or "") if isinstance(action, dict) else ""
+        if not op or op == "wait" or op in NON_ACTUATING_OPS:
+            continue
+        if op not in out:
+            out.append(op)
+    return out
+
+
+#: Said when a script ran to the end and NOTHING it did moved the screen. The
+#: FACT only: what the model should do instead is already stated once, in
+#: ``actions.describe_vocabulary``'s note on `press`, and a second copy of that
+#: advice here would be one meaning with two producers.
+#:
+#: IT LEADS THE REASON, and that placement is load-bearing rather than
+#: stylistic: ``render.verdict_line`` truncates a reason to its own cap, and
+#: this note appended sat behind roughly two hundred characters of boilerplate
+#: and was cut off before any model saw it. Of the claims competing for that
+#: budget, "nothing you did moved the screen" is the one a model can act on.
+#: ``test_the_note_survives_the_verdict_line_cap`` is what holds it there.
+NOTHING_MOVED_NOTE = (
+    "Nothing on screen changed while this script ran (%s moved nothing), so "
+    "whatever it was meant to trigger did not happen -- re-sending the same "
+    "script will do the same thing again. "
+)
+
+
 def _tokens(text: object) -> list[str]:
     return _TOKEN_RE.findall(str(text or "").lower())
 
@@ -635,25 +679,54 @@ async def _dump(ctx: Context) -> dict:
     dpi = await adb.display_density(ctx.serial)
     return perception.prune(
         raw.get("content"),
-        await _activity(ctx),
+        await resolve_activity(ctx),
         display=sized.get("content"),
         density=dpi.get("content"),
     )
 
 
-async def _activity(ctx: Context) -> str:
-    """The focused activity for this context, read once and remembered.
+async def resolve_activity(ctx: object) -> str:
+    """THE activity a screen's identity is hashed with. One producer, no other.
 
     A caller that already knows the activity keeps priority: this only fills the
     gap that made `screen_id` hash two dimensions instead of three. Memoised on
     the context so a replay pays for one probe rather than one per action, and a
     failed probe is remembered as "unknown" rather than retried on every dump.
+
+    PUBLIC, and named without the underscore, because the prune sites OUTSIDE
+    this module must ask it rather than answer the question themselves.
+    `perception._screen_id` hashes ``package|activity|texts[:3]``, so a site
+    that reads the raw ``ctx.activity`` attribute stores a screen under a
+    DIFFERENT id from the one this module stamps on the trace -- and the report
+    joins exactly those two. Measured: run ``mrun-20260909-202601-5d6cf0``
+    stored three screens as ``54746b60347d`` while its trace named
+    ``d86961ab9d42``, with identical content hashes proving one dump behind
+    both, and shipped a report with three PNGs on disk and no picture under any
+    step. ``session.context_for`` builds a fresh context per MCP call with
+    ``activity=""``, so a packet-build site never inherits the replay's probe;
+    the two answers cannot converge by luck.
+
+    *ctx* is typed ``object`` and read through ``getattr``: `explore_runner`
+    takes its context duck-typed, and a producer that only accepts one concrete
+    class is a producer half the callers cannot use.
     """
-    if ctx.activity:
-        return ctx.activity
+    known = str(getattr(ctx, "activity", "") or "")
+    if known:
+        return known
     if getattr(ctx, "_activity_probed", False):
         return ""
-    probed = await adb.current_activity(ctx.serial)
+    serial = str(getattr(ctx, "serial", "") or "")
+    if not serial:
+        # Not a refusal -- an empty activity is a NORMAL answer here and a
+        # weaker screen identity beats a refused dump. But it is the one way
+        # this producer can quietly hand back the two-dimensional id it exists
+        # to prevent, so it says so rather than looking like a probe that found
+        # nothing on a real device.
+        logger.warning(
+            "mobile.executor.resolve_activity: no serial on the context; "
+            "screen ids will be hashed without an activity"
+        )
+    probed = await adb.current_activity(serial)
     found = str(probed.get("content") or "")
     try:
         ctx._activity_probed = True
@@ -2044,6 +2117,16 @@ async def replay(script: object, ctx: Context) -> dict:
                 "verdict comes from the turn that judges the goal."
             )
         )
+        # THE TRACE THIS REASON IS SUMMARISING, actually read. Every branch
+        # above is derived from `ended_verified` and `ctx.asserts_expected`
+        # alone, so all four claimed the script did something -- "it recorded
+        # what the screen did" -- on a script where every action came back
+        # `no_change`. Appended rather than folded into the ladder because it
+        # is orthogonal to all four: a verified turn and an exploratory one are
+        # equally worth telling that nothing moved.
+        inert = inert_ops(trace)
+        if inert:
+            reason = (NOTHING_MOVED_NOTE % ", ".join(inert)) + reason
         return {
             "error": None,
             "content": _result(

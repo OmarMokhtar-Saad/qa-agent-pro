@@ -112,7 +112,7 @@ API TESTS: `qa_api_project`, then `qa_prepare_api_tests`,
 # `qa_mobile_run` PROMPT, which a client pays for only when it is invoked.
 _INSTRUCTIONS_MOBILE = """\
 MOBILE: `qa_mobile_test` gives ONE packet at a time -- answer it with
-`qa_submit_mobile_step`, never re-fetch it; resume in any chat by run id.
+`qa_submit_mobile_step`, never re-fetch it; resume in any chat by run id. `qa_setup_capture` installs the API-capture certificate ahead of a run.
 """
 
 
@@ -296,10 +296,13 @@ that only after the tester has said go, on a later turn.
    reply asks for one in so many words -- read the reply, do not generalise
    from this rule.) Never choose for them.
 3. Once a run starts you get ONE packet: a case (or an exploratory goal), the
-   pruned screen, and the exact action vocabulary you may use. Plan the whole
-   case as a short action script and send it straight back with
-   `qa_submit_mobile_step`. Do not echo the screen, and do not ask for a packet
-   you already hold.
+   pruned screen, and the exact action vocabulary you may use. The budget is
+   TURNS, not actions, so plan the WHOLE case -- or a whole conversational
+   round -- as ONE script and send it straight back with
+   `qa_submit_mobile_step`. A script may carry dozens of actions and the
+   packet states its own ceiling; four scripts that each do one step of a
+   round cost four times what one script costs. Do not echo the screen, and
+   do not ask for a packet you already hold.
 4. If a step comes back needing a credential, ask the TESTER for that ONE field
    in chat and pass the value in `tester_input` with `tester_input_field` set
    to the field name. It is typed into the app and stored nowhere -- not in the
@@ -312,6 +315,13 @@ that only after the tester has said go, on a later turn.
    `qa_mobile_test` with the `run_id` and no session token: that takes the run
    over, and the other chat is told at its next call. `qa_mobile_status` reads
    the whole run back from disk and changes nothing.
+
+Never start, install to or drive a device yourself through a shell. This lane
+owns the emulator: it spawns it detached so it outlives the call, keeps its
+quickboot snapshot so a warm AVD restores instead of cold-booting, and hands
+back a `booting` reply you poll with `qa_mobile_status`. A hand-rolled
+`emulator -avd ...` from a tool shell dies with that shell and boots colder
+and slower than the one this lane starts for you.
 
 Device selection: if the tester already has an emulator running, pass its adb
 serial (e.g. `emulator-5554`) in `serial` on your NEXT `qa_mobile_test` call
@@ -355,8 +365,11 @@ new run for it, and give the script an `assert`: `unverified` means nothing was
 checked, and a script that checks nothing cannot pass however many times it is
 run.
 
-7. When the run finishes, this server writes a self-contained HTML report next
-   to the run's own files and opens it. Relay the PATH it names. A report can be
+7. When the run finishes, this server writes a self-contained report FOLDER
+   next to the run's own files and opens it: `index.html` beside a `media`
+   directory holding the recordings and frames. Relay the PATH it names and
+   say it is a folder: to send it on, zip the WHOLE folder and send that.
+   The html on its own opens with every picture missing. A report can be
    built at any time, mid-run included, with `qa_mobile_status` and
    `report_now=true`.
 

@@ -63,7 +63,7 @@ function Find-QaUvPython {
     if (Test-Path $cand) { $uv = $cand }
   }
   if (-not $uv) { return $null }
-  foreach ($v in @("3.13", "3.12", "3.11", "3.10")) {
+  foreach ($v in @("3.14", "3.13", "3.12", "3.11", "3.10")) {
     $prev = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try { $found = & $uv python find $v 2>&1 } catch { $found = $null }
@@ -78,14 +78,14 @@ function Find-QaUvPython {
 
 $PyExe = $null
 $PyPre = @()
-foreach ($v in @("3.13", "3.12", "3.11", "3.10")) {
+foreach ($v in @("3.14", "3.13", "3.12", "3.11", "3.10")) {
   if (Test-QaPython "py" @("-$v")) { $PyExe = "py"; $PyPre = @("-$v"); break }
 }
 if (-not $PyExe) {
   # python3.12-style names cover uv shims and several per-user layouts;
   # bare python3/python last, since that is where the Store alias sits.
-  foreach ($n in @("python3.13", "python3.12", "python3.11", "python3.10",
-                   "python3", "python")) {
+  foreach ($n in @("python3.14", "python3.13", "python3.12", "python3.11",
+                   "python3.10", "python3", "python")) {
     if (Test-QaPython $n @()) { $PyExe = $n; break }
   }
 }
@@ -127,15 +127,32 @@ if (-not $PyExe) {
 $PyLabel = (@($PyExe) + $PyPre) -join ' '
 Write-Host "Using Python interpreter: $PyLabel"
 
-if ((Test-Path $InstallDir) -and (-not $env:QA_FORCE)) {
-  Write-Host "$InstallDir already exists."
-  Write-Host "Updates are automatic every time your MCP client starts the server."
-  Write-Host 'Set $env:QA_FORCE=1 to reinstall from scratch.'
-  exit 1
+# An existing folder is a reason to UPDATE, not a reason to refuse. Three
+# cases, and only the third ever needed you to delete anything by hand:
+#   complete install -> update it in place
+#   partial/leftover -> repair it by overlaying the release
+#   $env:QA_FORCE=1  -> replace the code, still keeping your data
+$Mode = "install"
+if (Test-Path $InstallDir) {
+  if ($env:QA_FORCE) { $Mode = "reinstall" }
+  elseif ((Test-Path (Join-Path $InstallDir "start.cmd")) -and
+          (Test-Path (Join-Path $InstallDir "VERSION"))) { $Mode = "update" }
+  elseif (Get-ChildItem -Path $InstallDir -Force -ErrorAction SilentlyContinue) {
+    $Mode = "repair"
+    Write-Host "$InstallDir exists but is not a complete install -- repairing it."
+  }
 }
 
 Write-Host "Fetching the latest release of $Repo ..."
 $tag = (Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest").tag_name
+if ($Mode -eq "update") {
+  $have = "v" + ((Get-Content (Join-Path $InstallDir "VERSION") -Raw).Trim())
+  if ($have -eq $tag) {
+    Write-Host "Already on the latest release ($tag). Refreshing dependencies + editor registration ..."
+  } else {
+    Write-Host "Updating $have -> $tag (your .env, suites and corpus are kept) ..."
+  }
+}
 $tmp = Join-Path $env:TEMP ("qa-agent-pro-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $tmp -Force | Out-Null
 try {
@@ -144,18 +161,34 @@ try {
   Expand-Archive -Path $zip -DestinationPath (Join-Path $tmp "x") -Force
   $src = (Get-ChildItem -Path (Join-Path $tmp "x") -Directory | Select-Object -First 1).FullName
   New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+  # Copy-Item -Force still refuses a read-only destination file, and every
+  # start marks the code read-only -- so clear the attribute before the
+  # overlay. Only release files are copied: .env, data/ and corpus/ are not
+  # in the archive and are therefore never overwritten.
+  Get-ChildItem -Path $InstallDir -Recurse -File -Force -ErrorAction SilentlyContinue |
+    ForEach-Object { try { $_.IsReadOnly = $false } catch {} }
   Copy-Item -Path (Join-Path $src "*") -Destination $InstallDir -Recurse -Force
 } finally {
   Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Set-Location $InstallDir
-Write-Host "Creating virtualenv + installing dependencies (a few minutes) ..."
-if ((Invoke-QaNative $PyExe @($PyPre + @("-m", "venv", ".venv"))) -ne 0) {
-  Write-Host "ERROR: could not create the virtualenv."
-  exit 1
-}
 $VenvPy = Join-Path $InstallDir ".venv\Scripts\python.exe"
+# Reuse a healthy venv -- an update should not re-download every wheel --
+# and rebuild it when it is missing, broken, or on a Python now too old.
+$VenvProbe = "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
+$VenvOk = (Test-Path $VenvPy) -and
+         ((Invoke-QaNative $VenvPy @("-c", $VenvProbe) -Quiet) -eq 0)
+if ($VenvOk) {
+  Write-Host "Updating dependencies in the existing virtualenv ..."
+} else {
+  Write-Host "Creating virtualenv + installing dependencies (a few minutes) ..."
+  Remove-Item .venv -Recurse -Force -ErrorAction SilentlyContinue
+  if ((Invoke-QaNative $PyExe @($PyPre + @("-m", "venv", ".venv"))) -ne 0) {
+    Write-Host "ERROR: could not create the virtualenv."
+    exit 1
+  }
+}
 if (-not (Test-Path $VenvPy)) {
   Write-Host "ERROR: virtualenv creation failed ($VenvPy is missing)."
   exit 1
@@ -163,7 +196,7 @@ if (-not (Test-Path $VenvPy)) {
 # pip upgrade is best-effort; the dependency install is not. pip routinely
 # writes notices to stderr, which is the same NativeCommandError trap.
 Invoke-QaNative $VenvPy @("-m", "pip", "install", "--quiet", "--upgrade", "pip") -Quiet | Out-Null
-if ((Invoke-QaNative $VenvPy @("-m", "pip", "install", "--quiet", "-e", ".")) -ne 0) {
+if ((Invoke-QaNative $VenvPy @("-m", "pip", "install", "--quiet", "--upgrade", "-e", ".")) -ne 0) {
   Write-Host "ERROR: dependency install failed (pip output above)."
   exit 1
 }
@@ -172,7 +205,12 @@ if (-not (Test-Path ".env")) { Copy-Item ".env.example" ".env" }
 $LockCode = "from pathlib import Path; from tools.updater import lock_files; lock_files(Path('.'))"
 Invoke-QaNative $VenvPy @("-c", $LockCode) -Quiet | Out-Null
 Write-Host ""
-Write-Host "Installed QA Agent Pro $tag to $InstallDir"
+switch ($Mode) {
+  "update"    { Write-Host "QA Agent Pro is up to date at $tag in $InstallDir" }
+  "repair"    { Write-Host "Repaired QA Agent Pro $tag in $InstallDir" }
+  "reinstall" { Write-Host "Reinstalled QA Agent Pro $tag in $InstallDir" }
+  default     { Write-Host "Installed QA Agent Pro $tag to $InstallDir" }
+}
 Write-Host ""
 Write-Host "Registering with your AI editors ..."
 Invoke-QaNative "powershell" @("-ExecutionPolicy", "Bypass", "-File",
@@ -185,3 +223,4 @@ Write-Host "No API key and no login are needed - your own chat model writes the"
 Write-Host "test cases. Optional settings live in: $InstallDir\.env"
 Write-Host ""
 Write-Host "To re-register editors later, run: $InstallDir\connect.ps1"
+Write-Host "To update later, just re-run this installer (or let the server self-update)."

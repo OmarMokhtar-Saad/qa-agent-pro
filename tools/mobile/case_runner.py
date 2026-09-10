@@ -20,7 +20,8 @@ import logging
 import time
 
 from tools.mobile import actions as actions_mod
-from tools.mobile import adb, executor, perception, run_store
+from tools.mobile import adb, executor, media, perception, run_store
+from tools.mobile_capture import flows as api_flows
 from tools.mobile_evidence import capture, crash_detector
 
 logger = logging.getLogger(__name__)
@@ -376,6 +377,13 @@ async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
         evidence["network"] = network_record(
             await capture.begin_network(ctx.serial, ctx.package, run_id, tc_id, 0)
         )
+        # The API-capture lane's own per-case boundary (Phase 6, T6.2), beside
+        # the pcap lane's above -- a second, independent dimension on the same
+        # seam. Never branched on: an evidence fault here can no more change a
+        # verdict than a failed log slice can.
+        evidence["capture"] = capture_record(
+            api_flows.mark_case_current(run_id, tc_id)
+        )
         launched = await adb.launch(ctx.serial, ctx.package)
         if launched.get("error"):
             return await _abandon(run_id, tc_id, ctx, evidence, launched)
@@ -396,6 +404,7 @@ async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
         polls = 0
         screen = {}
         seen = ""
+        in_front = False
         while True:
             dumped = await adb.uiautomator_dump(ctx.serial)
             if dumped.get("error"):
@@ -405,9 +414,20 @@ async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
             # is cached per serial the same way -- so the accessibility audit
             # measures 48dp against THIS device rather than assuming a density.
             dpi = await adb.display_density(ctx.serial)
+            # THE SETTLE PRUNE, and it passes NO activity on purpose. It answers
+            # ONE question -- "is the app in front yet?" -- inside the loop that
+            # exists BECAUSE the answer is often no: `launch` returns when the
+            # intent is delivered, not when the app is drawn.
+            # `executor.resolve_activity` MEMOISES what it probes, so probing
+            # from in here would freeze whatever held focus mid-launch (the
+            # launcher, an IME, a permission dialog) onto the context and hash
+            # the app's own screen with it -- reinstating the very split this
+            # lane was fixed for, under exactly the condition this loop was
+            # written to survive. The identity is resolved once, after the loop,
+            # and only the screen pruned WITH it is stored.
             pruned = perception.prune(
                 dumped.get("content"),
-                ctx.activity,
+                "",
                 display=sized.get("content"),
                 density=dpi.get("content"),
             )
@@ -418,6 +438,13 @@ async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
             if not seen or seen == ctx.package:
                 # An empty package is a dump that named none -- not evidence of
                 # another app, so it is accepted rather than waited out.
+                #
+                # TWO break paths, and only ONE of them establishes that the app
+                # is in front. The distinction is recorded rather than re-derived
+                # below, because "the loop ended" and "the app is up" are two
+                # facts and reading the first as the second is what freezes a
+                # foreign activity onto the screen -- see the resolve below.
+                in_front = seen == ctx.package
                 break
             # TWO bounds, and the second is not redundant: the first is only
             # as honest as the clock it reads. See MAX_FOREGROUND_POLLS.
@@ -434,6 +461,33 @@ async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
                 )
             polls += 1
             await _sleep(FOREGROUND_POLL_S)
+
+        # THE IDENTITY, resolved once, and ONLY on the break path that actually
+        # established the app is in front. ONE producer, shared with the replay
+        # -- see `executor.resolve_activity`. The dump is re-pruned rather than
+        # re-fetched: same bytes, one more dimension in the hash, no extra
+        # device round trip.
+        #
+        # Not resolving is the SAFE answer, not a degraded one. The other break
+        # path is a dump that named no package at all, where the focused window
+        # may still be whatever the launch was moving away from; `resolve_activity`
+        # memoises, so probing there stamps a foreign activity onto this screen
+        # -- the same freeze this lane was fixed for, one break path over. A
+        # failure to resolve or re-prune likewise leaves the settle screen
+        # standing, which is the weaker two-dimensional identity this lane had
+        # before any of this -- never no screen at all.
+        settled_activity = ""
+        if in_front:
+            settled_activity = await executor.resolve_activity(ctx)
+        if settled_activity:
+            settled = perception.prune(
+                dumped.get("content"),
+                settled_activity,
+                display=sized.get("content"),
+                density=dpi.get("content"),
+            )
+            if not settled.get("error"):
+                screen = settled.get("content") or screen
 
         # The report joins a trace's screen ids to this library. A failure
         # here may never change a verdict, so the result is deliberately
@@ -516,8 +570,24 @@ async def submit_case(
             }
 
         ctx.screen = screen if isinstance(screen, dict) else None
+        # The pixels of this step. Started BEFORE the replay and stopped after
+        # it, so the clip covers exactly what the planner's script did. Never
+        # branches the run: a refused recorder returns a handle carrying the
+        # reason, and the verdict path below cannot see the difference.
+        # `parsed["content"]` is a validated `actions.Script` MODEL, not a list
+        # -- `media.withholds` reads `.actions` off it for that reason.
+        clip = (
+            await media.start_clip(run_id, tc_id, parsed["content"], ctx.serial)
+        ).get("content")
         replayed = await executor.replay(parsed["content"], ctx)
         if replayed.get("error"):
+            # THE LEAK THIS PATH WOULD OTHERWISE BE. This returns BEFORE the
+            # `finish_step` below, so the recorder started two lines up would
+            # outlive the step -- and the next step's device-global
+            # `pkill -INT screenrecord` would then close the WRONG recording.
+            # `abandon` stops it and deletes the file without storing a record:
+            # a step with no result has nowhere to show a picture or a reason.
+            await media.abandon(ctx.serial, clip)
             return replayed
         result = replayed.get("content") or {}
         status = str(result.get("status") or "")
@@ -528,6 +598,18 @@ async def submit_case(
         used = escapes_used(run_id, tc_id)
         if new_screen:
             run_store.write_screen(run_id, new_screen)
+        # Outside the `if`: a step that changed nothing still started a
+        # recorder, and a recorder nobody stops is a device process that
+        # outlives the run. This writes the media records onto the case, and
+        # `_checkpoint` below rebuilds that body whole -- which is why it
+        # carries `media` forward explicitly.
+        await media.finish_step(
+            run_id,
+            tc_id,
+            ctx.serial,
+            clip,
+            str((new_screen or {}).get("screen_id") or ""),
+        )
         # App evidence (plan D5): ONE slice per replay, after the trace is
         # final and before the checkpoint that carries the record forward.
         # The refused-script path above never reaches here: nothing ran, so
@@ -766,6 +848,15 @@ def _checkpoint(
         "started": prior.get("started") or now,
         "updated": now,
         "evidence": _evidence_record(prior.get("evidence")),
+        # CARRY-FORWARD, same reason as `started` and `evidence`: this body
+        # REPLACES the case whole, and `media.remember` wrote its records onto
+        # the case moments ago, on this same submit. Without this line the
+        # clips and frames are written to disk and then erased from their only
+        # index before any consumer sees one -- silently, because the report
+        # simply finds no media and renders the old wireframe.
+        "media": [
+            item for item in list(prior.get("media") or []) if isinstance(item, dict)
+        ],
     }
     written = run_store.write_case(run_id, tc_id, body)
     payload = dict(body)
@@ -838,6 +929,9 @@ async def _abandon(
         await capture.abort_network(
             ctx.serial, run_id, tc_id, (evidence or {}).get("network")
         )
+        # Stops the API-capture lane the same way: an abandoned case must
+        # not go on attributing flows to a case that never finished.
+        api_flows.mark_case_finished(run_id)
     except Exception:  # never-raise: evidence is not a verdict
         logger.exception("mobile.case_runner._abandon failed")
     return result
@@ -871,6 +965,10 @@ def _evidence_record(source: object) -> dict:
         # accessor: a checkpoint written before this feature has no such key,
         # and the report must read a shape rather than a KeyError.
         "network": network_record(body.get("network")),
+        # Carried forward the same way "network" is: a checkpoint written
+        # before this feature has no such key, and the report must read a
+        # shape rather than a KeyError.
+        "capture": capture_record(body.get("capture")),
     }
 
 
@@ -909,6 +1007,29 @@ def network_record(source: object) -> dict:
         "note": str(body.get("note") or ""),
         "path": str(body.get("path") or ""),
         "started_ms": started_ms if isinstance(started_ms, int) else None,
+    }
+
+
+def capture_record(source: object) -> dict:
+    """The case's API-capture flow record, normalised from
+    ``api_flows.mark_case_current`` / ``finish_case``, OR from a record
+    already on disk. EVERY KEY PRESENT; never raises. Beside
+    ``network_record`` -- a second, independent dimension on the same
+    per-case evidence seam: this lane sees inside TLS, the pcap lane does
+    not."""
+    holder = source if isinstance(source, dict) else {}
+    body = holder.get("content") if "content" in holder else holder
+    body = body if isinstance(body, dict) else {}
+    try:
+        flow_count = max(0, int(body.get("flow_count") or 0))
+    except (TypeError, ValueError, OverflowError):
+        flow_count = 0
+    flows = body.get("flows")
+    return {
+        "skipped": body.get("skipped") or holder.get("error") or None,
+        "flow_count": flow_count,
+        "flows": [row for row in (flows or ()) if isinstance(row, dict)],
+        "truncated_by_count": bool(body.get("truncated_by_count")),
     }
 
 
@@ -978,6 +1099,12 @@ async def _slice_evidence(run_id: str, tc_id: str, ctx: executor.Context) -> dic
                 max(0, evidence["slices"] - 1),
                 evidence.get("network"),
             )
+        )
+        # Same checkpoint, same discipline, the API-capture lane's own
+        # dimension: never branched on, an evidence fault here can no more
+        # change a verdict than a failed log slice can.
+        evidence["capture"] = capture_record(
+            api_flows.finish_case(run_id, tc_id, tester_inputs=ctx.tester_inputs)
         )
         # NEVER write a document read before an await. A checkpoint may have
         # landed while the device was being read; the fresh copy carries its

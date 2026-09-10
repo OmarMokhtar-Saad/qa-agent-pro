@@ -76,6 +76,10 @@ def open_report(path: str) -> dict:
         if not settings.qa_mobile_run_enabled:
             return {"error": FLAG_REFUSAL, "content": None}
         target = str(path or "")
+        # The report is a FOLDER now, so a caller may hand either the folder or
+        # its index. One resolution, here, rather than one in every caller.
+        if target and Path(target).is_dir():
+            target = str(Path(target) / "index.html")
         if not target or not Path(target).is_file():
             return _result(False, "", "there is no report file at that path")
         opener = _opener()

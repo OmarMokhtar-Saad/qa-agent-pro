@@ -157,6 +157,10 @@ ALLOWED_HOST_SUFFIXES: tuple[str, ...] = (
     "adoptium.net",
     "github.com",
     "githubusercontent.com",
+    # tools/mobile_capture/mitm_provision.py -- the canonical mitmproxy
+    # distribution domain, independent of the github.com/githubusercontent.com
+    # entries above (added for the unrelated QA IME asset).
+    "mitmproxy.org",
 )
 
 

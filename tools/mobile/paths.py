@@ -27,7 +27,19 @@ logger = logging.getLogger(__name__)
 #: Sub-directories of the cache root. ``sdk``/``jre`` hold provisioned
 #: toolchains, ``ime`` the verified APK, ``runs`` per-run checkpoints,
 #: ``state`` the detached provisioner's progress file, ``locks`` lock files.
-SUBDIRS: tuple[str, ...] = ("sdk", "jre", "ime", "runs", "state", "locks")
+SUBDIRS: tuple[str, ...] = (
+    "sdk",
+    "jre",
+    "ime",
+    "runs",
+    "state",
+    "locks",
+    # The API-capture lane's root: the CA, the trust ledger and the live-proxy
+    # markers. It is listed HERE rather than created by that package so there is
+    # one tree made in one place; tools/mobile_capture/paths.py derives every
+    # path below it and invents no root of its own.
+    "capture",
+)
 
 #: Parts of the default root, relative to the user's home directory.
 DEFAULT_ROOT_PARTS: tuple[str, ...] = (".qa-agents", "mobile")

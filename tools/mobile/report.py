@@ -72,6 +72,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import json
 import logging
 import os
 import re
@@ -82,7 +83,15 @@ from pathlib import Path
 
 from config.settings import settings
 from tools.mobile import actions as actions_mod
-from tools.mobile import explore_runner, paths, run_store, screen_audit, screen_phone
+from tools.mobile import (
+    explore_runner,
+    media,
+    paths,
+    run_store,
+    screen_audit,
+    screen_phone,
+)
+from tools.mobile_capture import flows as api_flows
 from tools.mobile_evidence import crash_detector
 from tools.mobile_evidence import exchanges as ev_exchanges
 from tools.mobile_evidence import profiles as ev_profiles
@@ -90,7 +99,19 @@ from tools.mobile_evidence import render as ev_render
 
 logger = logging.getLogger(__name__)
 
-REPORT_FILE = "report.html"
+#: The report is a self-contained FOLDER, not a file: ``index.html`` beside the
+#: ``media/`` its own markup references RELATIVELY, so the folder can be zipped
+#: and opened anywhere. ``REPORT_FILE`` is gone rather than kept as an alias --
+#: one name for one artifact, and an alias is how two answers start.
+REPORT_DIR = media.REPORT_DIRNAME
+INDEX_FILE = "index.html"
+MEDIA_DIR = media.MEDIA_DIRNAME
+
+
+def report_path(run_id: str) -> Path:
+    """``runs/<run_id>/report/index.html``. Pure; creates nothing."""
+    return paths.run_dir(str(run_id)) / REPORT_DIR / INDEX_FILE
+
 
 #: The design file. Read once, at import: a shell that cannot be read is a
 #: broken install, and it should fail loudly here rather than on the first run.
@@ -1135,6 +1156,203 @@ _WIRE_LEGEND = (
     '<li><i class="sw edit"></i>editable</li><li><i class="sw"></i>other element</li></ul>'
 )
 
+#: A stored media file name, as this page may reference it. Names are produced
+#: by ``media._safe`` (``A-Za-z0-9_.-``) and this is the CONSUMER side of that
+#: one rule: a name that does not match is not referenced at all.
+#:
+#: Deliberately NOT ``report._slug``: that is a FUNCTION, not a compiled
+#: pattern (``_SLUG`` is the pattern), and it rewrites ``.`` to ``-`` -- so
+#: using it here would both raise ``AttributeError`` on every render that has a
+#: media file and, once "fixed" by calling it, point every reference at a file
+#: name that does not exist.
+_MEDIA_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,120}$")
+
+
+def _media_src(rec: object) -> str:
+    """``media/<file>`` for a record with a usable file name, else ``""``."""
+    body = rec if isinstance(rec, dict) else {}
+    name = str(body.get("file") or "")
+    if not name or ".." in name or not _MEDIA_NAME.match(name):
+        return ""
+    return MEDIA_DIR + "/" + name
+
+
+def _media_key(value: object) -> str:
+    """The ONE normalisation of a media-map key, used to BUILD the map and to
+    read it.
+
+    The producer stores ``tc_id`` as a plain string; ``_text`` collapses
+    whitespace and appends an ellipsis past its limit. Keying with ``str(...)``
+    on one side and ``_text(..., 40)`` on the other agrees for every id there is
+    today and diverges the day one is longer or carries a space -- one fact
+    derived twice in two places, which is how a mirrored derivation drifts. The
+    derivation lives here; both sides call it.
+
+    **The id shape this assumes, stated because the key TRUNCATES.** ``_text``
+    caps at 40 characters, so two ids sharing a 40-character prefix collide and
+    the later record wins the slot. That is safe for the ids this lane actually
+    produces and for no others: a ``tc_id`` is a short case identifier
+    (``TC-001``). Both sides truncate identically, so a collision can only ever
+    show the WRONG clip for a case, never a broken reference -- and if an id
+    shape that is long and prefix-shared is ever introduced, this limit is the
+    line to change, in this one place.
+    """
+    return _text(value, 40)
+
+
+def _media_map(cases: object) -> dict:
+    """``{"clips": {tc_id: [rec, ...]}}``, derived ONCE and threaded down.
+
+    **Clips only, and the frames are deliberately absent.** ``media`` writes a
+    per-step FRAME record too, but this page already has one producer for "the
+    device's own picture of this screen": :func:`_shot_html`, reading the
+    per-observation PNGs :func:`_shots` funds, under the ambiguity rule
+    :func:`_resolve_look` owns. A second frame path keyed on ``screen_id``
+    would be a second answer to that one question -- and the wrong one on a
+    conversation, where one ``screen_id`` covers several looks. So frames are
+    read HERE by nobody, and the recording -- which no other producer has -- is
+    what this map carries.
+
+    Deriving it again inside a section would be two answers to one question,
+    and mirrored derivations drift.
+    """
+    clips: dict = {}
+    for case in list(cases or []):
+        if not isinstance(case, dict):
+            continue
+        tc_id = _media_key(case.get("tc_id"))
+        if not tc_id:
+            continue
+        for rec in list(case.get("media") or []):
+            if not isinstance(rec, dict):
+                continue
+            if str(rec.get("kind") or "") == media.CLIP:
+                clips.setdefault(tc_id, []).append(rec)
+    for row in clips.values():
+        row.sort(key=lambda rec: int(rec.get("seq") or 0))
+    return {"clips": clips}
+
+
+def _media_note(state: object) -> str:
+    """The producer's own sentence for a state. NEVER this module's wording:
+    ``media.NOTES`` is the one place a state is put into words, and a state
+    with no entry is named rather than swallowed."""
+    key = str(state or media.NOT_ATTEMPTED)
+    return media.NOTES.get(key) or ("No clip for this step (" + esc(key, 40) + ").")
+
+
+#: What a clip IS, as distinct from how it went.
+#:
+#: A SEPARATE note from :func:`_media_note`, and separate on purpose: "the
+#: recorder refused this step" and "every clip on this page is smaller than the
+#: screen was" are two different facts about the run, and one sentence carrying
+#: both is the half-wired note this repository has already paid for. The same
+#: three-note rule ``_shot_html`` follows for a missing picture and a dropped
+#: one.
+#:
+#: MEASURED, not assumed (2026-09-10, emulator-5554, API 35): the device's
+#: encoder refuses the panel's native 1440x3120 and silently retries at
+#: 720x1280, so ``adb.SCREENRECORD_SIZE`` picks the size instead. The size is
+#: NAMED rather than restated here, so this sentence cannot go stale the day
+#: that constant changes.
+CLIP_SCALE_NOTE = (
+    "This clip was recorded at a reduced size, not at the resolution the device "
+    "drew: the encoder refuses the screen's own size, so the lane chooses one "
+    "(adb.SCREENRECORD_SIZE). It shows WHAT happened, not how sharp the app "
+    "looked; the pictures and the element map on this page carry the detail."
+)
+
+
+def _video_html(tc_id: object, media_map: object) -> str:
+    """Every clip of this case, in order, or the named reason for each gap.
+
+    **The class is ``stepclip``, not ``clip``, and the name was checked before
+    it was chosen.** ``.clip`` is ALREADY taken in ``report_shell.html``: it is
+    the code-block truncation bar (and ``.clip.lazy`` beside it, which the
+    shell's own JS selects by name), and ``tools/mobile_evidence/exchanges.py``
+    emits ``<div class="clip">truncated ...</div>`` onto THIS SAME PAGE. A
+    second ``.clip`` rule added below the first in the cascade would have
+    repainted every one of those notes black and full-width. One name, one
+    meaning, every consumer -- and the consumer here was another module's
+    markup, which is why the check is a grep of the shell and not a memory of
+    it. ``tests/mobile/test_mobile_report_css_binding.py`` asserts every class
+    name this change introduces was UNSTYLED before it landed.
+    """
+    book = media_map if isinstance(media_map, dict) else {}
+    rows = (book.get("clips") or {}).get(_media_key(tc_id)) or []
+    if not rows:
+        return ""
+    out = []
+    for rec in rows:
+        if not isinstance(rec, dict):
+            continue
+        label = "Step " + str(int(rec.get("seq") or 0) + 1)
+        srcpath = _media_src(rec)
+        if srcpath:
+            body = (
+                '<video class="stepclip" controls preload="metadata" playsinline>'
+                '<source src="' + esc(srcpath, 140) + '" type="video/mp4"></video>'
+            )
+        else:
+            # NEVER an empty <video>: a player with no source reads as a broken
+            # report, and the reason is the only thing worth showing here.
+            body = ""
+        # TWO notes, never one. The first says how this step's recording went;
+        # the second says what every recording on this page IS. Collapsing them
+        # would let a clean clip's caption read as if the downscale were a
+        # failure, and a failed clip's caption claim a downscaled file exists.
+        # The scale note is emitted ONLY where a clip actually plays: a step
+        # with no file was not downscaled, it was not recorded.
+        scale = (
+            '<p class="stepclipnote">' + esc(CLIP_SCALE_NOTE, 300) + "</p>"
+            if srcpath
+            else ""
+        )
+        out.append(
+            '<div class="stepcliprow"><h4>'
+            + esc(label, 24)
+            + "</h4>"
+            + body
+            + '<p class="stepclipnote">'
+            + esc(_media_note(rec.get("state")), 300)
+            + "</p>"
+            + scale
+            + "</div>"
+        )
+    return '<div class="stepclips">' + "".join(out) + "</div>"
+
+
+def _seq_frames(rows: object, screens: object) -> dict:
+    """``{trace index: frame html}`` for the merged app-evidence stream.
+
+    The Run sequence has TWO renderers and only one of them is ``_seq_rows``.
+    When a case has app evidence, ``_card_html`` renders
+    ``ev_render.sequence_items(...)`` INSTEAD -- that stream REPLACES the seq
+    rows whole -- so a picture threaded only into ``_seq_rows`` renders on no
+    such run at all, while this page's own prose promises one for every step.
+    Two render sites closed out of three is a promise that is false exactly
+    where nobody looked.
+
+    The indices are the ones ``sequence_items`` already aligns its trace against
+    (``rows[i]``), so this is the SAME alignment rather than a second one.
+
+    Built by :func:`_shot_html`, THE producer of this markup, and only on
+    :func:`_resolve_look`'s ``LOOK_EXACT`` answer -- the same gate
+    :func:`_phone_html` honours, so the merged stream cannot show one arbitrary
+    look of an ambiguous screen as the step's own.
+    """
+    out: dict = {}
+    for index, row in enumerate(list(rows or [])):
+        if not isinstance(row, dict):
+            continue
+        ident, screen, verdict = _resolve_look(row.get("after"), screens)
+        if screen is None or verdict != LOOK_EXACT:
+            continue
+        html = _shot_html(ident)
+        if html:
+            out[index] = html
+    return out
+
 
 # ── the trace ──────────────────────────────────────────────────────────────────
 
@@ -1473,7 +1691,30 @@ def _network_of(safe: dict) -> dict:
     return body if isinstance(body, dict) else {}
 
 
-def _case_facts(case: object, manifest: dict) -> dict:
+def _capture_of(run_id: str, tc_id: str) -> dict | None:
+    """This case's redacted API-capture flows, read from evidence/. The ONE
+    reader. ``None`` when nothing was ever written for this case -- a case a
+    capture never touched, distinct from one it touched and found nothing on
+    (which is a document carrying an empty ``flows`` list).
+
+    Never raises: an evidence fault here can no more change a verdict than a
+    failed log slice can.
+    """
+    if not run_id or not tc_id:
+        return None
+    try:
+        read = run_store.read_evidence_text(run_id, tc_id, api_flows.EVIDENCE_NAME)
+        text = read.get("content") if isinstance(read, dict) else None
+        if not isinstance(text, str) or not text.strip():
+            return None
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        logger.exception("mobile.report._capture_of failed for %s/%s", run_id, tc_id)
+        return None
+
+
+def _case_facts(case: object, manifest: dict, run_id: str = "") -> dict:
     """Everything a card, a table row, a chip and a KPI need, computed ONCE."""
     raw = case if isinstance(case, dict) else {}
     safe = run_store.redact(raw)
@@ -1556,6 +1797,10 @@ def _case_facts(case: object, manifest: dict) -> dict:
         # conditions drift. Absent on a checkpoint written before this feature,
         # which is an empty dict the renderer states rather than a crash.
         "network": _network_of(safe),
+        # This case's own API-capture flows (Phase 7, T7.1), read from
+        # evidence/ -- never from the checkpoint, which only carries this
+        # case's flow COUNT via ladder.record, not the flows themselves.
+        "capture": _capture_of(run_id, tc_id),
         "status": _text(safe.get("status"), 40),
         "reason": _text(safe.get("reason"), 400),
         "escapes": max(0, escapes),
@@ -1685,15 +1930,27 @@ def _ended_block(facts: dict) -> str:
 
 
 def _case_card(
-    case: object, screens: object, manifest: dict | None = None, app: str = ""
+    case: object,
+    screens: object,
+    manifest: dict | None = None,
+    app: str = "",
+    media_map: object = None,
 ) -> str:
     """One case card in the shell's anatomy: expected -> verdict -> screens -> steps -> sequence -> ended at."""
     facts = _case_facts(case, manifest if isinstance(manifest, dict) else {})
-    return _card_html(facts, screens, app)
+    # The map is threaded here too rather than left at its default: this
+    # wrapper builds a WHOLE case card, and the report's own "how to read"
+    # prose promises a photograph in a case card. A default of None here would
+    # make that sentence false for any caller who used this entry point.
+    return _card_html(facts, screens, app, None, media_map)
 
 
 def _card_html(
-    facts: dict, screens: object, app: str, loaded: dict | None = None
+    facts: dict,
+    screens: object,
+    app: str,
+    loaded: dict | None = None,
+    media_map: object = None,
 ) -> str:
     verdict = facts["verdict"]
     _sw, _seg, pill_cls, label = _tone(verdict)
@@ -1822,7 +2079,8 @@ def _card_html(
             "First screen", "the screen the case began on", first_key, screens, app
         ) + _phone_html("Last screen", last_sub, last_key, screens, app)
     phones = (
-        '<div class="phonewide"><div class="phonepair">'
+        _video_html(facts["tc_id"], media_map)
+        + '<div class="phonewide"><div class="phonepair">'
         + frames
         + "</div>"
         + '<p class="hint">Each screen is shown twice: the PNG the lane captured at that '
@@ -1842,6 +2100,9 @@ def _card_html(
     # no app profile at all still has one -- which is the whole point of a
     # capture that needs no app-specific anything.
     network = ev_render.case_network(facts.get("network"))
+    # This case's own API-capture block (Phase 7, T7.1) beside the pcap
+    # lane's network section above -- a second, independent dimension.
+    capture = ev_render.case_capture(facts.get("capture"))
     steps = (
         _sec_block(
             "Steps",
@@ -1861,7 +2122,14 @@ def _card_html(
     # The merged stream: the app's records and the lane's actions on one clock,
     # when the case has app evidence; the lane's own rows otherwise.
     merged = (
-        ev_exchanges.seqlist(ev_render.sequence_items(loaded, facts["tc_id"], rows))
+        ev_exchanges.seqlist(
+            ev_render.sequence_items(
+                loaded,
+                facts["tc_id"],
+                rows,
+                _seq_frames(rows, screens),
+            )
+        )
         if loaded
         else ""
     )
@@ -1909,6 +2177,7 @@ def _card_html(
         + phones
         + turns
         + network
+        + capture
         + steps
         + sequence
         + _ended_block(facts)
@@ -2244,6 +2513,12 @@ def _overview(
         "page says which of two things happened: nothing was stored for that moment, or the "
         "picture exists and this page ran out of image budget for it. A screen this page cannot "
         "pin to one stored moment gets no picture at all, and says so.</p>"
+        "<p>Every replayed step is also <b>recorded</b> on the device, and the clips sit "
+        "at the top of the case's Screen section, one per step, in order. A clip is "
+        "recorded SMALLER than the screen the device drew \u2014 the encoder refuses the "
+        "screen's own size \u2014 so it shows what happened rather than how sharp the app "
+        "looked, and each clip says so beneath it. A step whose clip is missing says why, "
+        "in that step's own place, and never shows an empty player.</p>"
         "<p>Credential values are masked in TEXT: the run store writes <code>***</code> for a marked "
         "value and for a credential-named key, and this page masks again and never prints an "
         "action's typed text. It cannot mask a value written under an unrecognised key with no "
@@ -2532,8 +2807,9 @@ def _cases_section(
     app: str,
     loaded: dict | None = None,
     coverage: dict | None = None,
+    media_map: object = None,
 ) -> str:
-    cards = "".join(_card_html(f, screens, app, loaded) for f in facts)
+    cards = "".join(_card_html(f, screens, app, loaded, media_map) for f in facts)
     # NOT re-counted here. This lede and the four surfaces around it are ONE
     # number with one meaning, produced once by ``verdict_coverage``.
     lede = (
@@ -2568,8 +2844,9 @@ def _footer_html(run_id: str, manifest: dict) -> str:
         + esc(_short_stamp(time.time()), 40)
         + " from <code>manifest.json</code>, <code>cases/*.json</code> and <code>screens/*.json</code> "
         "in the run's own directory by <code>tools/mobile/report.py</code> on the shared shell in "
-        "<code>tools/mobile/report_shell.html</code>. This is one self-contained page: it references "
-        "nothing but its typefaces, and it opens offline in the system face."
+        "<code>tools/mobile/report_shell.html</code>. This is one self-contained FOLDER: this page "
+        "and the <code>media/</code> beside it, referenced relatively, so the folder can be zipped "
+        "and opened offline anywhere."
     )
 
 
@@ -2851,6 +3128,7 @@ def _cases_html(
     loaded: dict | None,
     coverage: dict | None,
     observations: object,
+    media_map: object = None,
 ) -> str:
     """The cases section, plus the store's own disclosure when the run reached
     its observation limit.
@@ -2860,7 +3138,7 @@ def _cases_html(
     says the limit was reached rather than letting a frame read as "not
     captured" for a reason nobody can see.
     """
-    body = _cases_section(facts, screens, app, loaded, coverage)
+    body = _cases_section(facts, screens, app, loaded, coverage, media_map)
     kept = len(observations) if isinstance(observations, dict) else 0
     if kept >= run_store.MAX_RUN_OBSERVATIONS:
         # CONDITIONAL, because this function cannot tell whether anything was
@@ -2941,7 +3219,12 @@ def _document_body(
     partial: bool,
     coverage: dict | None = None,
 ) -> str:
-    facts = [_case_facts(case, manifest) for case in cases]
+    # run_id is this branch's addition (the capture reader needs it to find the
+    # per-case flows); media_map is main's. Both are required: dropping either
+    # silently disables one lane's evidence.
+    facts = [_case_facts(case, manifest, run_id) for case in cases]
+    # The run's pixels, joined ONCE and handed to every section that shows one.
+    media_map = _media_map(cases)
     # TWO libraries, joined once. ``screens`` answers which screens the run
     # visited and stays the accessibility audit's input -- one row per screen,
     # not one per look at it. ``library`` adds every stored OBSERVATION and is
@@ -3048,7 +3331,9 @@ def _document_body(
             "API surface",
             "every endpoint the app reached, on the real wire",
             "Every endpoint the app called from inside a case, against the real backend rather than a fixture.",
-            ev_render.apis_section(loaded) + ev_render.network_section(cases),
+            ev_render.apis_section(loaded)
+            + ev_render.network_section(cases)
+            + ev_render.capture_section(cases, manifest),
         )
         + _sechead(
             "perf",
@@ -3059,7 +3344,7 @@ def _document_body(
         )
         + a11y
         + findings
-        + _cases_html(facts, library, app, loaded, coverage, observations)
+        + _cases_html(facts, library, app, loaded, coverage, observations, media_map)
         + '<div id="'
         + END_ID
         + '" data-cards="'
@@ -3183,7 +3468,11 @@ def _is_partial(manifest: dict, cases: list, tally: dict) -> bool:
 
 
 def render(run_id: str) -> dict:
-    """Write ``runs/<run_id>/report.html`` from that run's files only.
+    """Write ``runs/<run_id>/report/index.html`` and its ``media/`` beside it.
+
+    The artifact is a FOLDER: the page references its recordings and frames
+    relatively, so the whole folder zips and opens anywhere. Built from that
+    run's files only.
 
     ``{"error", "content": {"path", "partial", "cards", "totals", "bytes"}}``.
     Never raises.
@@ -3238,7 +3527,7 @@ def render(run_id: str) -> dict:
             partial=partial,
             coverage=coverage,
         )
-        target = paths.run_dir(str(run_id)) / REPORT_FILE
+        target = report_path(str(run_id))
         written = _write_page(target, page)
         if written.get("error"):
             return written

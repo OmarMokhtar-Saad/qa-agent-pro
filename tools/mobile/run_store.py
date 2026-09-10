@@ -121,6 +121,10 @@ FLAG_NAME = "QA_MOBILE_RUN_ENABLED"
 
 LEASE_FILE = "lease.json"
 MANIFEST_FILE = "manifest.json"
+#: Which chat already holds this run's packet static block. See
+#: :func:`briefed_session`. NOT kept in the lease, which is rewritten wholesale
+#: on every heartbeat -- surviving that is the marker's whole job.
+BRIEFING_FILE = "briefing.json"
 CASES_DIR = "cases"
 SCREENS_DIR = "screens"
 OBSERVATIONS_DIR = "observations"
@@ -985,6 +989,65 @@ def read_lease(run_id: str) -> dict:
         return {"error": None, "content": _read_json(_lease_path(run_id))}
     except Exception as exc:
         logger.exception("mobile.run_store.read_lease failed")
+        return {"error": str(exc), "content": None}
+
+
+def _briefing_path(run_id: str) -> Path:
+    return run_path(run_id) / BRIEFING_FILE
+
+
+def briefed_session(run_id: str) -> dict:
+    """The session that already holds this run's static packet block, or ``""``.
+
+    ``{"error", "content": "<session id>"}``. The elided fields are identical on
+    every packet of a run in every lane, and re-sending them on all thirty turns
+    costs a tester about 53,000 tokens of context for bytes the model already
+    has. They go to a chat ONCE and this is the record.
+
+    Why the SESSION and not the run: a run resumed in a new chat, or taken over
+    from another one, is a model that has never seen the block. Never raises,
+    and an unreadable marker reads as "not briefed" -- the safe direction, per
+    docs/RETIRED_CAPABILITIES.md section 5, constraint 6.
+    """
+    try:
+        if not valid_run_id(run_id):
+            return {"error": "Invalid run id.", "content": ""}
+        body = _read_json(_briefing_path(run_id))
+        if not isinstance(body, dict):
+            return {"error": None, "content": ""}
+        return {"error": None, "content": str(body.get("session_id") or "")}
+    except Exception as exc:
+        logger.exception("mobile.run_store.briefed_session failed")
+        return {"error": str(exc), "content": ""}
+
+
+def mark_briefed(run_id: str, session_id: str) -> dict:
+    """Record that *session_id* has been handed this run's static block."""
+    try:
+        if not valid_run_id(run_id) or not str(session_id or "").strip():
+            return {"error": "Invalid run id or session.", "content": None}
+        _write_json(_briefing_path(run_id), {"session_id": str(session_id)})
+        return {"error": None, "content": {"session_id": str(session_id)}}
+    except Exception as exc:
+        logger.exception("mobile.run_store.mark_briefed failed")
+        return {"error": str(exc), "content": None}
+
+
+def clear_briefing(run_id: str) -> dict:
+    """Forget who was briefed, so the NEXT packet carries the block again.
+
+    Called when a submitted script could not be parsed: that is the observable
+    signal that the model no longer has the block -- a compacted chat, or one
+    that never received it -- and re-arming here is what makes the omission
+    self-healing rather than a trap for the rest of the run.
+    """
+    try:
+        if not valid_run_id(run_id):
+            return {"error": "Invalid run id.", "content": None}
+        _briefing_path(run_id).unlink(missing_ok=True)
+        return {"error": None, "content": {"cleared": True}}
+    except Exception as exc:
+        logger.exception("mobile.run_store.clear_briefing failed")
         return {"error": str(exc), "content": None}
 
 

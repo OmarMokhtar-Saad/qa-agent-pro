@@ -24,6 +24,8 @@ from __future__ import annotations
 import html
 import json
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Iterable
 
 # Headers that carry an invariant worth seeing at a glance. Four, not seven: marking six of
@@ -105,8 +107,18 @@ SENSITIVE_KEY_RE = re.compile(
 MIN_SENSITIVE_LEN = 6
 
 # Populated per render by learn_sensitive / arm, reset by forget_sensitive so one page's
-# values can never leak into the next page's mask decisions.
-_SENSITIVE_VALUES: set[str] = set()
+# values can never leak into the next page's mask decisions. A ContextVar, not a plain
+# module-global set (T5.2): redaction now also runs at WRITE time
+# (tools/mobile_capture/flows.py), concurrently with render, and asyncio gives no LIFO
+# unwind guarantee across overlapping arming windows -- a save/restore context manager
+# over a shared mutable set would let one task's `forget_sensitive` silently un-arm
+# another task's still-in-flight values. Each asyncio task gets its OWN value here,
+# and `arm` always SETS a new frozenset rather than mutating one in place, because a
+# child task inherits the same object reference: an in-place mutation would leak
+# straight back across the boundary this ContextVar exists to draw.
+_SENSITIVE_VALUES: ContextVar[frozenset[str]] = ContextVar(
+    "mobile_evidence_scrub_sensitive_values", default=frozenset()
+)
 
 
 def redact_header(key: object, value: object) -> object:
@@ -151,6 +163,7 @@ def learn_sensitive(data: object) -> int:
     """
     stack = [data]
     seen = 0
+    collected: set[str] = set()
     while stack and seen < 200000:
         node = stack.pop()
         seen += 1
@@ -167,11 +180,15 @@ def learn_sensitive(data: object) -> int:
                             len(text) >= MIN_SENSITIVE_LEN
                             and text.lower() not in FIXTURE_SECRETS
                         ):
-                            _SENSITIVE_VALUES.add(text)
+                            collected.add(text)
             stack.extend(node.values())
         elif isinstance(node, list):
             stack.extend(node)
-    return len(_SENSITIVE_VALUES)
+    if collected:
+        # A NEW frozenset, never a mutation of the one already held -- see the
+        # module docstring above _SENSITIVE_VALUES.
+        _SENSITIVE_VALUES.set(_SENSITIVE_VALUES.get() | collected)
+    return len(_SENSITIVE_VALUES.get())
 
 
 def arm(values: Iterable[object]) -> int:
@@ -181,22 +198,52 @@ def arm(values: Iterable[object]) -> int:
     persisted -- so the moment a logcat slice is taken is the ONLY moment the typed value is
     known and can be masked. A value shorter than MIN_SENSITIVE_LEN is not armed, for the
     reason :func:`mask_value` gives. Returns the size of the armed set.
+
+    Sets a NEW frozenset onto this task's :class:`~contextvars.ContextVar` rather than
+    mutating one in place -- a child task inherits the same object reference, so an
+    in-place ``|=`` would leak straight back across the boundary the ContextVar exists to
+    draw (see the module docstring above ``_SENSITIVE_VALUES``).
     """
-    for value in values or ():
-        text = str(value or "").strip()
-        if len(text) >= MIN_SENSITIVE_LEN:
-            _SENSITIVE_VALUES.add(text)
-    return len(_SENSITIVE_VALUES)
+    additions = {
+        str(value or "").strip()
+        for value in (values or ())
+        if len(str(value or "").strip()) >= MIN_SENSITIVE_LEN
+    }
+    if additions:
+        _SENSITIVE_VALUES.set(_SENSITIVE_VALUES.get() | additions)
+    return len(_SENSITIVE_VALUES.get())
 
 
 def forget_sensitive() -> None:
-    """Drop what the last render or capture learned."""
-    _SENSITIVE_VALUES.clear()
+    """Drop what the last render or capture learned, for THIS task only."""
+    _SENSITIVE_VALUES.set(frozenset())
 
 
 def armed() -> int:
     """How many values the net currently holds (for tests and disclosure)."""
-    return len(_SENSITIVE_VALUES)
+    return len(_SENSITIVE_VALUES.get())
+
+
+@contextmanager
+def armed_scope(values: Iterable[object]):
+    """Arm *values* for the duration of the block, in THIS task only.
+
+    A thin ergonomic wrapper over :func:`arm` / a task-local reset -- used by
+    ``tools/mobile_capture/flows.py`` to redact one case's flows at write time. Restores
+    to whatever THIS task held before the scope opened (not to empty), so a nested or
+    sibling scope in the same task is never clobbered. Safe under non-LIFO unwind ACROSS
+    TASKS by construction: each ``asyncio`` task owns its own value in this ContextVar
+    (a copy taken at task-creation time), so opening or closing a scope in one task can
+    never touch another task's value -- there is no shared mutable object left to
+    corrupt, which is the hazard a save/restore-over-a-plain-set design does not close
+    (see the module docstring above ``_SENSITIVE_VALUES``).
+    """
+    token = _SENSITIVE_VALUES.set(_SENSITIVE_VALUES.get())
+    try:
+        arm(values)
+        yield
+    finally:
+        _SENSITIVE_VALUES.reset(token)
 
 
 # A key/value pair as it survives INSIDE free text, quoted or entity-quoted, with a string or
@@ -274,11 +321,12 @@ def scrub_text(text: object) -> str:
     labelled prose values. NOT a no-op on an unarmed render: the pair, query and
     prose passes always run."""
     out = scrub_prose(scrub_query(scrub_pairs("" if text is None else str(text))))
-    if not _SENSITIVE_VALUES:
+    values = _SENSITIVE_VALUES.get()
+    if not values:
         return out
     # Longest first, so a value that contains another is masked whole rather than being
     # half-rewritten by its own substring.
-    for value in sorted(_SENSITIVE_VALUES, key=len, reverse=True):
+    for value in sorted(values, key=len, reverse=True):
         if value in out:
             out = out.replace(value, mask_value(value))
     return out
@@ -373,7 +421,7 @@ def scrub_json(obj: object, _key: object = None) -> object:
     if isinstance(obj, int) and not isinstance(obj, bool):
         # An id arriving as a NUMBER under a key nobody listed is still an id, but only the
         # value net can see it -- and only when this run presented it as a credential.
-        return mask_value(obj) if str(obj) in _SENSITIVE_VALUES else obj
+        return mask_value(obj) if str(obj) in _SENSITIVE_VALUES.get() else obj
     return obj
 
 
