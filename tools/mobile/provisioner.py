@@ -42,12 +42,25 @@ from tools.mobile import (
 
 logger = logging.getLogger(__name__)
 
+#: The system image this lane provisions. Read once at import time from
+#: `settings.qa_mobile_system_image_tag` (an operator-choice setting -- see
+#: docs/FEATURE_FLAGS.md), with the historical Play tag as the fallback, so an
+#: install that never touches the setting keeps today's behaviour exactly.
+_SYSTEM_IMAGE_TAG_DEFAULT = "google_apis_playstore"
+SYSTEM_IMAGE_TAG = str(settings.qa_mobile_system_image_tag or _SYSTEM_IMAGE_TAG_DEFAULT)
+
 #: The AVD this lane creates and re-attaches to. A fixed name is what makes
-#: re-attach after an MCP server restart possible at all.
-AVD_NAME = "qa-agents-api35"
+#: re-attach after an MCP server restart possible at all -- suffixed with the
+#: image tag whenever it differs from the default, so switching
+#: `qa_mobile_system_image_tag` can never silently reattach an AVD that was
+#: built from the OTHER image.
+AVD_NAME = (
+    "qa-agents-api35"
+    if SYSTEM_IMAGE_TAG == _SYSTEM_IMAGE_TAG_DEFAULT
+    else "qa-agents-api35-" + SYSTEM_IMAGE_TAG.replace("_", "-")
+)
 AVD_DEVICE = "pixel_7"
 ANDROID_API = "android-35"
-SYSTEM_IMAGE_TAG = "google_apis_playstore"
 
 #: Progress / result file inside the cache's ``state/`` dir.
 PROGRESS_FILE = "provision.json"

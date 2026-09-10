@@ -409,6 +409,19 @@ class Settings(BaseSettings):
     # Ceiling (GB) on what provisioning may download. Checked BEFORE the first
     # byte is requested; exceeding it refuses by name with both numbers.
     qa_mobile_download_max_gb: float = 4.0
+    # System image tag for the AVD this lane provisions -- OPERATOR-CHOICE
+    # (flag policy category 4), default UNCHANGED so no existing install's
+    # behaviour changes. The default, `google_apis_playstore`, is a production
+    # Play build: `adb root` is refused on it, so
+    # `tools/mobile_capture/cert.py` can never reach the system certificate
+    # store and captured HTTPS bodies stay encrypted. Setting this to
+    # `google_apis` trades that away in the other direction: no Play Store, so
+    # the `play_store`/`app_tester` install sources in `tools/mobile/render.py`
+    # stop working, but a rootable image lets HTTPS decryption work.
+    # `tools/mobile/provisioner.py` folds a non-default tag into the AVD name
+    # so switching this can never silently reattach an AVD built from the
+    # other image. See docs/FEATURE_FLAGS.md.
+    qa_mobile_system_image_tag: str = "google_apis_playstore"
 
     # --- Mobile Device Testing (Maestro) -- DELETED 2026-08-15. ---
     # Batch 7 (2026-08-13) retired the feature and kept seven QA_MAESTRO_* tuning

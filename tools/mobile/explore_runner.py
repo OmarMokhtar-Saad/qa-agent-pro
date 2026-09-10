@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import time
 
-from tools.mobile import adb, perception, run_store
+from tools.mobile import adb, executor, perception, run_store
 
 logger = logging.getLogger(__name__)
 
@@ -195,7 +195,8 @@ async def next_turn(
         dpi = await adb.display_density(getattr(ctx, "serial", ""))
         pruned = perception.prune(
             dumped.get("content"),
-            str(getattr(ctx, "activity", "") or ""),
+            # ONE producer, shared with the replay: see resolve_activity.
+            await executor.resolve_activity(ctx),
             display=sized.get("content"),
             density=dpi.get("content"),
         )

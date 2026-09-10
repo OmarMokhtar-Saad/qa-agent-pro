@@ -1123,6 +1123,8 @@ def build_server():
             new_run: bool = False,
             virtualization_ack: bool = False,
             locale: str = "",
+            capture: str = "",
+            capture_ack: bool = False,
         ) -> list[ContentBlock]:
             """Run test cases, or explore freely, on an Android emulator.
 
@@ -1189,6 +1191,8 @@ def build_server():
                     new_run=new_run,
                     virtualization_ack=virtualization_ack,
                     locale=locale,
+                    capture=capture,
+                    capture_ack=capture_ack,
                     **_make_elicitors(ctx),
                     progress=_make_progress(ctx),
                 ),
@@ -1271,6 +1275,30 @@ def build_server():
                 mcp_handlers.handle_mobile_status(
                     run_id, session_token, report_now, progress=_make_progress(ctx)
                 ),
+            )
+
+        @mcp.tool()
+        async def qa_setup_capture(
+            ctx: Context,
+            serial: str = "",
+            action: str = "prepare",
+            apply: bool = False,
+            capture_ack: bool = False,
+        ) -> str:
+            """Prepare, check or remove API capture on a device AHEAD of a run.
+
+            `action="prepare"` installs the qa-agents proxy certificate and
+            proves decryption functionally -- the SAME routine the consent
+            step inside `qa_mobile_test` calls, so this tool never re-decides
+            anything a run already decided. `action="status"` reads the
+            device's trust from disk, touching nothing. `action="remove"`
+            clears the live proxy and forgets the device's trust; like every
+            other device-touching step in this lane it needs `apply=true`.
+            """
+            return await _tracked(
+                "qa_setup_capture",
+                ctx,
+                mcp_handlers.handle_setup_capture(serial, action, apply, capture_ack),
             )
 
     # Full edition only — the distribution build exposes test-case tools alone.

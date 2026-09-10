@@ -838,6 +838,7 @@ def plan_suite_run(
     avd: str = "",
     device: object = None,
     locale: object = None,
+    capture: object = None,
 ) -> dict:
     """Order, persist and create a suite run. ``{"error", "content": {...}}``."""
     try:
@@ -879,6 +880,10 @@ def plan_suite_run(
                 # could get two answers.
                 "device": device_record(device),
                 "avd": str(avd or provisioner.AVD_NAME),
+                # WHAT TIER THIS RUN'S API CAPTURE REACHED, recorded once at
+                # planning time for the same reason `locale`/`device` are: a
+                # finished run must still say so after the proxy is torn down.
+                "capture": capture_record(capture),
                 "source": str(source or ""),
                 "case_signature": case_signature(package, kept),
                 # The cases the TESTER supplied, before the filters -- the
@@ -916,6 +921,7 @@ def plan_explore_run(
     avd: str = "",
     device: object = None,
     locale: object = None,
+    capture: object = None,
 ) -> dict:
     """Create an exploratory run whose whole state is one manifest dict."""
     try:
@@ -938,6 +944,7 @@ def plan_explore_run(
                 "serial": str(serial or ""),
                 "device": device_record(device),
                 "locale": locale_record(locale),
+                "capture": capture_record(capture),
                 "avd": str(avd or provisioner.AVD_NAME),
                 "order": [],
                 "total": 0,
@@ -1555,6 +1562,20 @@ def locale_phrase(resolved: object) -> str:
     if requested and not record.get("matched"):
         return ", NOT in " + requested + (" but in " + actual if actual else "")
     return ", in " + actual if actual else ""
+
+
+def capture_record(source: object) -> dict:
+    """Normalise the run-level API-capture tier for the manifest. Never raises.
+
+    THE ONE PRODUCER of the tier vocabulary is ``tools.mobile_capture.ladder``;
+    this is a thin pass-through so the two planners below need no import at
+    module load time and every consumer of the manifest's ``capture`` key
+    reads the SAME shape ``ladder.record`` defines -- never a second
+    normaliser drifting from the first.
+    """
+    from tools.mobile_capture import ladder
+
+    return ladder.record(source)
 
 
 def device_record(facts: object) -> dict:
@@ -2388,5 +2409,14 @@ def screen_of(dump: object, activity: str = "", display: object = None) -> dict:
     `prune` derives the frame from the dump's own windows, which over-estimates
     rather than under-estimates and so cannot lose the screen -- see
     `perception._display_frame`.
+
+    NO PRODUCTION CALLER TODAY, and one thing to know before writing the first
+    one: ``activity`` defaults to ``""``, and a screen pruned without an activity
+    gets a screen_id hashed on two dimensions instead of three -- a DIFFERENT id
+    from the one `executor` stamps on every trace entry. If a screen from here is
+    ever stored in a run, pass ``await executor.resolve_activity(ctx)``, or the
+    report's join silently loses every picture (measured; see
+    ``tests/mobile/test_mobile_screen_id_producer``). This function takes no run
+    id, so that module's class pin cannot see it.
     """
     return perception.prune(dump, activity, display=display)

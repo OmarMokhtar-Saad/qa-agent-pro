@@ -1031,6 +1031,103 @@ async def screencap(serial: str) -> dict:
     return {"error": None, "content": out}
 
 
+#: Bit rate for ``screenrecord``. Not a cap and not a bound: it is a quality
+#: choice, and the SIZE of what it produces is bounded by
+#: ``media.MAX_CLIP_BYTES`` where the file is kept or discarded.
+SCREENRECORD_BITRATE = "2000000"
+
+#: The recording SIZE, passed explicitly because the encoder refuses the
+#: device's own. MEASURED on emulator-5554 (sdk_gphone64_arm64, API 35,
+#: `wm size` 1440x3120) on 2026-09-10: every default-size recording printed
+#: "ERROR: unable to configure video/avc codec at 1440x3120 (err=-22)" and
+#: then "WARNING: failed at 1440x3120, retrying at 720x1280", so the run
+#: shipped an ERROR line in its log and a resolution nobody chose. Passing
+#: this size explicitly produced no warning at all.
+#:
+#: It is a CHOSEN DOWNSCALE, not a cap and not the device's resolution: the
+#: clip shows what happened, not how sharp the app was, and the report says
+#: so beside every clip (``report.CLIP_SCALE_NOTE``). One producer, one
+#: meaning: this constant is the only place the recorded size is decided,
+#: and the note names it rather than restating a number.
+SCREENRECORD_SIZE = "540x1170"
+
+
+async def screenrecord_spawn(serial: str, remote: str, seconds: int) -> dict:
+    """Start ``screenrecord`` on the device and return the live process.
+
+    The ONE function in this module that hands a process back instead of a
+    finished result: a recording outlives the call that starts it by design.
+    ``--time-limit`` is passed explicitly rather than inherited from the
+    device's own ~180s default, so the bound is a number this repository owns
+    and can bound from above.
+    """
+    try:
+        # Reads the kill-switch ITSELF. A recording is an effect that
+        # OUTLIVES this call -- it leaves a process running on a tester's
+        # device and a file on its disk -- which is exactly the class
+        # `install` and `uninstall` guard here rather than at a caller. A
+        # guard on a caller is only as good as the list of callers.
+        if not settings.qa_mobile_run_enabled:
+            return {
+                "error": (
+                    "Refusing to record the screen: the mobile lane needs "
+                    "`QA_MOBILE_RUN_ENABLED=true` in .env."
+                ),
+                "content": None,
+            }
+        if not _valid_device_id(serial):
+            return {
+                "error": "Refusing to use "
+                + repr(str(serial)[:40])
+                + " as a device id.",
+                "content": None,
+            }
+        if not _valid_device_path(remote):
+            return {"error": "Refusing that remote path.", "content": None}
+        cmd = [
+            resolve_adb(),
+            "-s",
+            str(serial),
+            "shell",
+            "screenrecord",
+            "--time-limit",
+            str(int(seconds)),
+            "--bit-rate",
+            SCREENRECORD_BITRATE,
+            "--size",
+            SCREENRECORD_SIZE,
+            str(remote),
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            **platform_info.no_window_kwargs(),
+        )
+        return {"error": None, "content": {"proc": proc}}
+    except FileNotFoundError:
+        return {"error": "adb was not found.", "content": None}
+    except Exception as exc:
+        logger.warning("mobile.adb.screenrecord_spawn failed: %s", exc)
+        return {"error": str(exc)[:200], "content": None}
+
+
+async def pull(serial: str, remote: str, local: str) -> dict:
+    """``adb -s <serial> pull`` one device file to *local*. Never raises.
+
+    ``_device`` takes the SERIAL first and the argv second -- handing it the
+    argv alone makes the list itself the thing ``_valid_device_id`` judges, so
+    every pull would come back "Refusing to use ... as a device id" and every
+    clip would be recorded on the device and then lost. Pinned by
+    ``tests/mobile/test_mobile_media.py::test_pull_sends_the_serial_first``,
+    which drives THIS function against a fake ``_run_argv`` rather than
+    replacing it.
+    """
+    if not _valid_device_path(remote):
+        return {"error": "Refusing that remote path.", "content": None}
+    return await _device(serial, ["pull", str(remote), str(local)], DUMP_TIMEOUT_S)
+
+
 def _coord(value: object) -> int | None:
     try:
         number = int(value)  # type: ignore[arg-type]
@@ -1411,3 +1508,113 @@ async def emu(serial: str, *args: object) -> dict:
             "content": None,
         }
     return {"error": None, "content": lines[:-1]}
+
+
+# ---- proxy primitives (plan mobile-api-capture, Phase 3) -------------------
+#
+# Four small transport calls `tools/mobile_capture/proxy.py` and
+# `tools/mobile_capture/teardown.py` build on. Every argument is
+# re-validated HERE, the same discipline every other function in this module
+# keeps, so a client-controlled string can never smuggle an extra `adb`
+# argument regardless of what called this module.
+
+#: `adb reverse`'s own `<protocol>:<port>` shape. Bounded to five digits so a
+#: caller cannot hand this an arbitrarily long numeral; the callers in this
+#: tree only ever compose this from a port `proxy.py` chose itself, never
+#: from anything device-supplied.
+_REVERSE_SPEC_RE = re.compile(r"^tcp:[0-9]{1,5}$")
+
+#: A `settings` namespace's property name. Same discipline as `getprop`'s.
+_SETTING_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+
+#: A `settings put` value. Narrow on purpose: every caller in this tree sends
+#: either a `host:port` pair or `:0`, never free text, so a bounded charset
+#: with no shell-significant character is both sufficient and safe.
+_SETTING_VALUE_RE = re.compile(r"^[A-Za-z0-9:._+-]{1,120}$")
+
+
+async def reverse(
+    serial: str, remote: str, local: str, timeout: int = DEFAULT_TIMEOUT_S
+) -> dict:
+    """``adb -s <serial> reverse <remote> <local>``.
+
+    Both sides must be ``tcp:<port>`` -- the only spec this lane ever sends,
+    since the port on the device side and the port qa-agents' own proxy
+    listens on are both chosen by :mod:`tools.mobile_capture.proxy`, never
+    taken from anything device-supplied.
+
+    *timeout* is a plain pass-through to :func:`_device`, so a caller with its
+    own bound (``tools/mobile_capture/teardown.py``'s ``CLEAR_TIMEOUT_S``) is
+    not stuck with this module's general-purpose default.
+    """
+    if not _REVERSE_SPEC_RE.match(str(remote or "")):
+        return {
+            "error": "Refusing reverse remote " + repr(str(remote)[:40]),
+            "content": None,
+        }
+    if not _REVERSE_SPEC_RE.match(str(local or "")):
+        return {
+            "error": "Refusing reverse local " + repr(str(local)[:40]),
+            "content": None,
+        }
+    return await _device(serial, ["reverse", str(remote), str(local)], timeout)
+
+
+async def reverse_remove(
+    serial: str, remote: str, timeout: int = DEFAULT_TIMEOUT_S
+) -> dict:
+    """``adb -s <serial> reverse --remove <remote>``. See :func:`reverse` on *timeout*."""
+    if not _REVERSE_SPEC_RE.match(str(remote or "")):
+        return {
+            "error": "Refusing reverse remote " + repr(str(remote)[:40]),
+            "content": None,
+        }
+    return await _device(serial, ["reverse", "--remove", str(remote)], timeout)
+
+
+async def global_setting_get(
+    serial: str, name: str, timeout: int = DEFAULT_TIMEOUT_S
+) -> dict:
+    """``adb -s <serial> shell settings get global <name>``, stripped.
+
+    See :func:`reverse` on *timeout*.
+    """
+    if not _SETTING_NAME_RE.match(str(name or "")):
+        return {
+            "error": "Refusing setting name " + repr(str(name)[:40]),
+            "content": None,
+        }
+    result = await shell(serial, ["settings", "get", "global", str(name)], timeout)
+    if result.get("error"):
+        return result
+    return {
+        "error": None,
+        "content": str((result["content"] or {}).get("out") or "").strip(),
+    }
+
+
+async def global_setting_put(
+    serial: str, name: str, value: str, timeout: int = DEFAULT_TIMEOUT_S
+) -> dict:
+    """``adb -s <serial> shell settings put global <name> <value>``.
+
+    This is the setter the teardown invariant
+    (``tools/mobile_capture/teardown.py``) depends on: it must REFUSE rather
+    than silently drop a value the caller intended, because a refused ``:0``
+    write is exactly the shape of bug that leaves a device proxied. See
+    :func:`reverse` on *timeout*.
+    """
+    if not _SETTING_NAME_RE.match(str(name or "")):
+        return {
+            "error": "Refusing setting name " + repr(str(name)[:40]),
+            "content": None,
+        }
+    text = str(value or "")
+    if not _SETTING_VALUE_RE.match(text):
+        return {
+            "error": "Refusing setting value " + repr(text[:60]),
+            "content": None,
+        }
+    return await shell(
+        serial, ["settings", "put", "global", str(name), text], timeout
+    )

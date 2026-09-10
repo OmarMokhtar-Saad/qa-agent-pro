@@ -141,8 +141,16 @@ _ESCAPE_INSTRUCTION = (
 )
 
 _EXPLORE_INSTRUCTION = (
-    "This is one turn of a bounded exploratory session. Return a short script "
-    "(a handful of actions) that makes progress toward the goal from the screen "
+    "This is one turn of a bounded exploratory session. The budget is TURNS, "
+    "not actions, so put the WHOLE of your next intent in ONE script rather "
+    "than spending a turn per action -- a script may carry up to "
+    + str(actions_mod.MAX_ACTIONS)
+    + " actions under a "
+    + str(actions_mod.SUBMIT_BUDGET_MS // 1000)
+    + "s device budget, and you get the screen back when it ends. A whole "
+    "round belongs in a single script: tap the input, type into it, tap the "
+    "control that submits it BY ITS OWN LABEL, then wait for the reply text. "
+    "Plan it from the screen "
     "above, plus your reading of what you saw. Emit ONLY a JSON object matching "
     "response_schema. Set goal_reached true ONLY when the goal is demonstrably "
     "met on screen; if you need more budget, set request_extension true AND "
@@ -505,7 +513,9 @@ def build_explore_turn(
                     ),
                 },
                 "worker_instructions": (
-                    "Keep each turn small: the budget is turns, not actions. "
+                    "Spend turns, not actions: one script that finishes a whole "
+                    "round costs one turn, and four scripts that each do one "
+                    "step of it cost four. "
                     "Record anything a tester would want to know in `finding`, "
                     "one sentence, even when the turn went fine."
                 ),

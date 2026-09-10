@@ -47,6 +47,7 @@ PIN_NO_ASSET = "no_external_asset"
 PIN_NO_SECRET = "no_secret_marker"
 PIN_SIZE = "page_under_8mb"
 PIN_CRASH = "crashes_disclosed"
+PIN_CAPTURE_TIER = "capture_tier_valid"
 
 PINS = (
     PIN_CASES,
@@ -60,6 +61,7 @@ PINS = (
     PIN_NO_SECRET,
     PIN_SIZE,
     PIN_CRASH,
+    PIN_CAPTURE_TIER,
 )
 
 #: A forged guard note is as dangerous as a real tag, so both are refused.
@@ -69,9 +71,14 @@ FORBIDDEN_MARKERS = ("untrusted_content", "SECURITY NOTE:")
 #: something bypassed ``perception`` entirely.
 RAW_XML = ("<hierarchy", "<node ", 'bounds="[', "NAF=")
 
-#: One self-contained file, bar the shell's typefaces: an image, a frame or
-#: an @import would break silently for a tester offline, which is exactly when
-#: a report is read. These are FETCH constructs, not URL strings, and the
+#: One self-contained FOLDER, bar the shell's typefaces: the report's own
+#: recordings live beside index.html under the media directory and travel
+#: with it, so they are NOT a break -- the image tag already left this
+#: tuple when the lane began storing PNGs, and video and source are judged
+#: the same way, by SOURCE, in :func:`_pin_links`, because a needle over
+#: raw text cannot tell a relative sibling from a remote fetch. A frame, an
+#: object, an embed or an @import still would break silently for a tester
+#: offline, which is exactly when a report is read. These are FETCH constructs, not URL strings, and the
 #: difference was measured rather than assumed: a screen that legitimately
 #: displays "https://example.com" would make a URL-text pin red on a HEALTHY
 #: tree, and a guard that is red on a healthy tree gets deleted. Every needle
@@ -88,6 +95,18 @@ RAW_XML = ("<hierarchy", "<node ", 'bounds="[', "NAF=")
 #: already are. The remaining four are still absences: none of them has a
 #: legitimate form on this page.
 EXTERNAL = ("<iframe", "<object", "<embed", "@import")
+
+#: Tags whose ``src`` the page may carry as a PATH, and the one prefix that
+#: makes such a source portable: a path inside the report's own media folder.
+#: Anything absolute, protocol-relative, or climbing out of the folder does
+#: not travel when the folder is zipped, and fails.
+#:
+#: ``img`` is NOT here, and its absence is the rule rather than an omission:
+#: an image on this page is a ``data:`` payload, judged for IDENTITY against
+#: :data:`SHOT_SRC` below. Two different portability rules for two different
+#: artifacts, each named, rather than one rule that would let a PNG be a path
+#: or a clip be inlined.
+MEDIA_TAGS = ("video", "source")
 
 #: The one ``src`` prefix an image on this page may carry. Anything else is a
 #: FETCH: a path into the run directory dies the moment the report is emailed,
@@ -129,6 +148,9 @@ class _Page(HTMLParser):
         self.scripts = 0
         self.script_text: list = []
         self.links: list = []
+        #: ``(tag, src)`` for every media tag, so the asset pin can judge
+        #: the SOURCE it would actually fetch, not the text around it.
+        self.media: list = []
         #: Every ``img`` ``src``, so the asset pin can check IDENTITY.
         self.images: list = []
         self.handlers: list = []
@@ -145,6 +167,12 @@ class _Page(HTMLParser):
             self._in_script = True
         if tag == "link":
             self.links.append(pairs.get("href", ""))
+        # Only a tag that CARRIES a src fetches anything. The
+        # <video> start tag does not: its fetch is the child
+        # <source>. Recording the parent scored an empty src as
+        # off-folder and failed the pin on every real clip.
+        if tag in MEDIA_TAGS and "src" in pairs:
+            self.media.append((tag, pairs["src"]))
         if tag == "img":
             self.images.append(pairs.get("src", ""))
         if tag == "style":
@@ -269,12 +297,18 @@ def _pin_script(page: "_Page") -> dict:
 
 
 def _pin_links(page: "_Page", text: str) -> dict:
-    """Every ``<link>`` is a font host, every ``<img>`` is inline, nothing fetches.
+    """Links are font hosts, images are inline, clips point INSIDE the folder.
 
-    Three checks, one verdict, because they answer one question: can this file
+    Four checks, one verdict, because they answer one question: can this report
     be read by a tester who is offline, or who was emailed it? A stray ``href``,
-    an image ``src`` that is a PATH rather than a payload, and any of the
-    remaining fetch constructs each break that, and each is reported by name.
+    an image ``src`` that is a PATH rather than a payload, a media ``src`` that
+    is anything but a relative sibling under the report's own media directory,
+    and any of the remaining fetch constructs each break that, and each is
+    reported by name.
+
+    The media half is a SOURCE test, not a text test, and it is judged off the
+    parsed ``src`` so a screen that legitimately DISPLAYS the text of a URL
+    cannot redden a pin on a healthy tree.
     """
     strays = [
         href for href in page.links if not str(href).startswith(report.FONT_HOSTS)
@@ -285,13 +319,21 @@ def _pin_links(page: "_Page", text: str) -> dict:
         str(src)[:60] for src in page.images if not str(src).startswith(SHOT_SRC)
     ]
     found = [needle for needle in EXTERNAL if needle in text]
+    prefix = str(report.MEDIA_DIR) + "/"
+    offfolder = [
+        tag + "@" + (str(src)[:60] or "(empty)")
+        for tag, src in page.media
+        if not str(src).startswith(prefix) or ".." in str(src)
+    ]
     return _pin(
         PIN_NO_ASSET,
-        not strays and not found,
+        not strays and not found and not offfolder,
         "links off the font hosts="
         + ",".join(strays[:4])
         + " fetch constructs="
-        + ",".join(found),
+        + ",".join(found)
+        + " media outside the folder="
+        + ",".join(offfolder[:4]),
     )
 
 
@@ -336,6 +378,26 @@ def _pin_crashes(page_crashes: object, cases: object) -> dict:
     )
 
 
+def _pin_capture_tier(manifest: dict) -> dict:
+    """A manifest carrying a ``capture`` block must state a tier, and that
+    tier must be one of ``tools.mobile_capture.ladder.TIERS`` (T7.4).
+
+    A manifest with NO ``capture`` key at all -- a run planned before this
+    feature -- has nothing to state, so this pin is inert on it rather than a
+    false failure: absence and invalidity are two different findings.
+    """
+    from tools.mobile_capture import ladder
+
+    capture = manifest.get("capture") if isinstance(manifest, dict) else None
+    if not isinstance(capture, dict):
+        return _pin(PIN_CAPTURE_TIER, True, "no capture block on this manifest")
+    tier = capture.get("tier")
+    ok = tier in ladder.TIERS
+    return _pin(
+        PIN_CAPTURE_TIER, ok, "tier=" + repr(tier) if not ok else "tier=" + str(tier)
+    )
+
+
 def check(run_id: str, html_path: str = "") -> dict:
     """Every pin against the page for *run_id*. Never raises.
 
@@ -361,6 +423,8 @@ def check(run_id: str, html_path: str = "") -> dict:
             if isinstance(case, dict)
         ]
         store_ids = [str(case.get("tc_id") or "") for case in cases]
+        manifest = (run_store.read_manifest(run_id) or {}).get("content")
+        manifest = manifest if isinstance(manifest, dict) else {}
         store_tally = report.tally(cases)
         page = _Page()
         page.feed(text)
@@ -381,6 +445,7 @@ def check(run_id: str, html_path: str = "") -> dict:
                 str(size) + " bytes of " + str(report.MAX_PAGE_BYTES),
             ),
             _pin_crashes(page.crashes, cases),
+            _pin_capture_tier(manifest),
         ]
         return {
             "error": None,

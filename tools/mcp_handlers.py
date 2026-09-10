@@ -11858,6 +11858,8 @@ async def handle_mobile_test(
     new_run: bool = False,
     virtualization_ack: bool = False,
     locale: str = "",
+    capture: str = "",
+    capture_ack: bool = False,
     *,
     choose: ChooseCb = None,
     ask_text: AskCb = None,
@@ -12077,6 +12079,16 @@ async def handle_mobile_test(
             )
             if locale_stage:
                 return locale_stage
+            # T6.1: BETWEEN locale and install -- the device is addressable,
+            # the language is settled, and nothing has been installed yet, so
+            # a tester who declines here has spent no minutes. Inside the same
+            # `try` as every other stage, so the `finally` below still gives
+            # the device back.
+            capture_stage, capture_result = await _mobile_capture_stage(
+                serial, apply, capture, capture_ack, owner=pre_run_owner
+            )
+            if capture_stage:
+                return capture_stage
             app_stage, target = await _mobile_app_stage(
                 serial, package, source, app, apply, progress=progress
             )
@@ -12121,6 +12133,7 @@ async def handle_mobile_test(
                 progress=progress,
                 new_run=new_run,
                 locale=locale_taken,
+                capture=capture_result,
             )
             return reply
         finally:
@@ -12405,6 +12418,111 @@ async def _mobile_locale_stage(serial: str, locale: str, apply: bool) -> tuple:
     return "", record
 
 
+def offer_capture(serial: str) -> bool:
+    """True when this device has never been answered about.
+
+    Read by the run reply so a tester learns the feature exists, WITHOUT the
+    run stopping to ask. Silence is not consent and it is not refusal either --
+    it just means nobody has been asked yet, so the offer is worth making once.
+    """
+    try:
+        from tools.mobile_capture import ledger as capture_ledger
+
+        seen = capture_ledger.asked_before(serial)
+        if seen.get("error"):
+            return False
+        return not (seen.get("content") or {}).get("asked")
+    except Exception:  # pragma: no cover - the offer is never the run
+        logger.exception("mobile_capture: could not decide whether to offer capture")
+        return False
+
+
+def _remember_capture_decline(serial: str) -> None:
+    """Record a declined device so the menu is not shown again. Never raises.
+
+    A decline that is not written down is a decline the tester gets asked about
+    again on the next run, which is how a one-time question becomes a nag.
+    """
+    from tools.mobile_capture import ca as capture_ca
+    from tools.mobile_capture import ladder
+    from tools.mobile_capture import ledger as capture_ledger
+
+    try:
+        made = capture_ca.ensure_ca()
+        fingerprint = str(((made.get("content") or {}).get("fingerprint")) or "")
+        if fingerprint:
+            capture_ledger.record(
+                serial, fingerprint, ladder.TIER_NONE, note="declined by the tester"
+            )
+    except Exception:  # pragma: no cover - defensive; the record is not the run
+        logger.exception("mobile_capture: could not record the capture decline")
+
+
+async def _mobile_capture_stage(
+    serial: str, apply: bool, capture: str, capture_ack: bool, *, owner: str
+) -> tuple:
+    """Between locale and install (T6.1): ask consent for API capture, or
+    act on it. ``(markdown_or_none, capture_result_or_none)``.
+
+    Declining, or leaving `capture` unset, never stops the run -- the ONLY
+    markdown this returns is the consent MENU itself, when the tester has
+    said `capture="on"` but not yet confirmed with `capture_ack=true`. Every
+    other outcome, including any refusal reached while calling
+    ``mobile_capture.prepare``, is folded into `capture_result` at
+    `TIER_NONE` with its reason code, and the caller continues the run
+    (brief decision 2).
+    """
+    from tools import mobile_capture as api_capture
+    from tools.mobile import render as mobile_render
+    from tools.mobile_capture import ladder
+
+    from tools.mobile_capture import ledger as capture_ledger
+
+    wanted = str(capture or "").strip().lower()
+    if wanted not in ("on", "off"):
+        # Unset: ask ONCE PER DEVICE. A device we have already answered about
+        # keeps its answer -- asking every run would put a blocking menu in
+        # front of every existing caller forever, and never asking would make
+        # the run-integrated half of this feature undiscoverable.
+        seen = capture_ledger.asked_before(serial)
+        if seen.get("error") or (seen.get("content") or {}).get("asked"):
+            return None, None
+        # Never returns markdown here: an unset `capture` means the caller said
+        # nothing about capture, and a run they did not ask to change must not
+        # stop for a question. The OFFER rides along with the run's own reply
+        # (offer_capture below); only an explicit capture="on" without an ack
+        # pauses for consent.
+        return None, None
+    if wanted == "off":
+        # Remember the decline, so the tester is not asked again on this
+        # device. Recorded under the CURRENT fingerprint, but read back by
+        # asked_before, which ignores the fingerprint on purpose: a new CA
+        # must not reopen a closed conversation.
+        _remember_capture_decline(serial)
+        return None, ladder.record(
+            {
+                "tier": ladder.TIER_NONE,
+                "reason": ladder.REASON_NO_CONSENT,
+                "serial": serial,
+            }
+        )
+    if not capture_ack:
+        return mobile_render.capture_menu_markdown(), None
+    prepared = await api_capture.prepare(serial, owner=owner, apply_=apply)
+    result = (
+        (prepared.get("content") or {})
+        if not prepared.get("error")
+        else ladder.record(
+            {
+                "tier": ladder.TIER_NONE,
+                "reason": ladder.REASON_DEVICE_GONE,
+                "serial": serial,
+            }
+        )
+    )
+    return None, result
+
+
 async def _mobile_app_stage(
     serial: str,
     package: str,
@@ -12566,6 +12684,7 @@ async def _mobile_start(
     progress: ProgressCb = None,
     new_run: bool = False,
     locale: object = None,
+    capture: object = None,
 ) -> tuple:
     """Turn a start-menu choice into a planned run and its first packet.
 
@@ -12618,6 +12737,7 @@ async def _mobile_start(
             avd=await _mobile_avd_of(serial),
             device=device_facts,
             locale=locale,
+            capture=capture,
         )
         if planned.get("error"):
             return "\u26a0\ufe0f " + _safe(planned["error"], 300), False
@@ -12701,6 +12821,7 @@ async def _mobile_start(
         avd=await _mobile_avd_of(serial),
         device=device_facts,
         locale=locale,
+        capture=capture,
     )
     if planned.get("error"):
         return "\u26a0\ufe0f " + _safe(planned["error"], 400), False
@@ -13067,6 +13188,16 @@ async def handle_submit_mobile_step(
                 field=str(tester_input_field or ""),
             ),
         )
+        # A script this server could not parse is the observable signal that the
+        # model no longer has the static block in front of it -- a compacted
+        # chat, or one that never received it. Forgetting the briefing here is
+        # what makes the omission self-healing: the very next packet carries the
+        # whole block again, at the cost of the one turn that already went wrong
+        # rather than of the run. Constraint 5 of the contract.
+        from tools.mobile import case_runner as _case_runner
+
+        if str(case.get("status") or "") == _case_runner.NEEDS_MODEL:
+            run_store.clear_briefing(run_id)
         line = mobile_render.verdict_line(case)
         notice = str(body.get("notice") or "")
         if body.get("packet"):
@@ -13129,6 +13260,7 @@ async def _mobile_packet_text(
     """
     from tools.mobile import adb as mobile_adb
     from tools.mobile import render as mobile_render
+    from tools.mobile import run_store as mobile_run_store
     from tools.mobile import screenshot as mobile_screenshot
 
     body = resolved if isinstance(resolved, dict) else {}
@@ -13188,6 +13320,35 @@ async def _mobile_packet_text(
         # it would outlive this reply.
         shown = dict(shown)
         shown["screen_image"] = note
+        # THE STATIC BLOCK, ONCE PER CHAT PER RUN. `render.STATIC_FIELDS` is
+        # three fields that are byte-identical on every packet of every lane;
+        # `response_schema` is NOT among them and never will be. The contract is
+        # docs/RETIRED_CAPABILITIES.md section 5.
+        #
+        # BOTH ids are required. A packet we cannot attribute to a run AND a
+        # chat is one whose model we cannot know has been briefed, and the safe
+        # answer there is to repeat: a wasted block costs tokens, a missing one
+        # costs the turn.
+        run_id = str(body.get("run_id") or "")
+        token = str(session_token or "")
+        if run_id and token:
+            try:
+                briefed = str(
+                    (mobile_run_store.briefed_session(run_id) or {}).get("content")
+                    or ""
+                )
+                if briefed == token:
+                    shown = mobile_render.without_static(shown)
+                else:
+                    mobile_run_store.mark_briefed(run_id, token)
+            except Exception:
+                # NEVER-RAISE, and the fail-open direction is REPEAT. This
+                # function's promise is that a packet always comes back; the
+                # elision is an optimisation and an optimisation must never be
+                # the reason a tester's model gets an error string where a
+                # screen belongs. `shown` is left whole, so the block goes out
+                # again -- tokens, not a lost turn.
+                logger.exception("mcp mobile static-block memo failed")
         # The observation key is this module's routing value, not packet
         # content: `render.packet_block` promises it adds nothing to what the
         # builder made, and a 25-character hex id in the model's JSON is packet
@@ -13257,6 +13418,122 @@ def _mobile_device_in_use(session, run_id: str, session_token: str = "") -> bool
     except Exception:  # never-raise: a status is not a verdict
         logger.exception("mcp mobile provisioning-section state failed")
         return False
+
+
+async def handle_setup_capture(
+    serial: str = "",
+    action: str = "prepare",
+    apply: bool = False,
+    capture_ack: bool = False,
+) -> str:
+    """``qa_setup_capture``: prepare / check / remove a device's API-capture
+    trust AHEAD of a run. Never raises.
+
+    ``prepare`` calls the SAME ``tools.mobile_capture.prepare`` the run's own
+    consent stage calls (T3.2a/T4.2a) -- this tool never re-decides
+    anything, and a second, unrelated caller on the same serial is refused
+    by name rather than racing the run. ``remove`` needs ``apply=true`` like
+    every other device-touching step in this lane (brief decision 8: no new
+    flag -- it inherits the lane's own kill-switch and per-call gate).
+    """
+    if not _mobile_lane_enabled():
+        from tools.mobile import render as mobile_render
+
+        if apply:
+            return mobile_render.flag_refusal("Setting up API capture")
+        return _mobile_lane_off_message()
+
+    from tools.mobile import render as mobile_render
+    from tools.untrusted import single_line as _safe
+
+    serial = str(serial or "").strip()
+    if not serial:
+        return (
+            "\u26a0\ufe0f `serial` is required -- pass the device's adb serial. "
+            "Nothing was touched."
+        )
+    chosen = str(action or "prepare").strip().lower()
+    if chosen not in ("prepare", "status", "remove"):
+        return (
+            "\u26a0\ufe0f Unknown action "
+            + repr(_safe(chosen, 40))
+            + " -- `action` must be one of `prepare`, `status`, `remove`. "
+            "Nothing was touched."
+        )
+
+    if chosen == "status":
+        from tools.mobile_capture import ca, cert, ledger
+
+        made = ca.ensure_ca()
+        fingerprint = (
+            (made.get("content") or {}).get("fingerprint")
+            if not made.get("error")
+            else ""
+        )
+        known = ledger.tier_for(serial, fingerprint or "")
+        body = (known.get("content") or {}) if not known.get("error") else {}
+        cert_status = cert.status(serial).get("content") or {}
+        cert_line = (
+            "yes, via the "
+            + _safe(str(cert_status.get("route") or ""), 20)
+            + " store"
+            if cert_status.get("installed")
+            else "no"
+        )
+        return (
+            "## Capture status for `"
+            + _safe(serial, 80)
+            + "`\n\n- tier: **"
+            + _safe(str(body.get("tier") or "none"), 40)
+            + "**\n- known under this certificate: "
+            + ("yes" if body.get("known_serial") else "no")
+            + "\n- certificate installed: "
+            + cert_line
+        )
+
+    if chosen == "remove":
+        if not apply:
+            return (
+                "\u26a0\ufe0f Removing the certificate touches the device and "
+                "needs `apply=true`; nothing was removed."
+            )
+        from tools.mobile_capture import cert, teardown
+
+        cleared = await teardown.clear(serial, reason="qa_setup_capture_remove")
+        removed = await cert.remove(serial, apply=True)
+        removed_body = removed.get("content") or {}
+        return (
+            "## Capture removed for `"
+            + _safe(serial, 80)
+            + "`\n\n- proxy cleared: "
+            + ("yes" if cleared.get("cleared") else "no (check status next run)")
+            + "\n- certificate removed from the device: "
+            + ("yes" if removed_body.get("device_removed") else "no")
+            + (
+                " (" + _safe(str(removed_body.get("detail") or ""), 200) + ")"
+                if removed_body.get("detail")
+                else ""
+            )
+            + "\n- ledger row forgotten: yes"
+        )
+
+    # action == "prepare"
+    if not (apply and capture_ack):
+        return mobile_render.capture_menu_markdown()
+    from tools import mobile_capture as api_capture
+
+    prepared = await api_capture.prepare(serial, apply_=apply)
+    body = (prepared.get("content") or {}) if not prepared.get("error") else {}
+    tier = str(body.get("tier") or "none")
+    message = str(body.get("message") or "")
+    return (
+        "## Capture prepared for `"
+        + _safe(serial, 80)
+        + "`\n\n- tier: **"
+        + _safe(tier, 40)
+        + "**\n"
+        + (("- " + _safe(message, 300) + "\n") if message else "")
+    )
 
 
 async def handle_mobile_status(

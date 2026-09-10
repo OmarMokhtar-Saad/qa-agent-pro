@@ -277,6 +277,57 @@ def source_menu_markdown(conflict: object = (), unmatched: object = "") -> str:
     )
 
 
+CAPTURE_SOURCES: tuple[tuple[str, str], ...] = (
+    ("on", "Capture the app's HTTPS traffic for this run"),
+    ("off", "Skip API capture for this run"),
+)
+
+
+def capture_menu_markdown() -> str:
+    """The API-capture consent menu -- the FIRST thing a tester sees about
+    it (brief decisions 1 and 12). Keyed for the same reason every other
+    menu in this module is.
+    """
+    return (
+        "## Capture the app's API calls for this run?\n\n"
+        "qa-agents can install its OWN root certificate on this device to "
+        "decrypt and record the HTTPS calls this run makes -- redacted "
+        "before anything reaches disk. It only ever installs to the SYSTEM "
+        "certificate store, because **the user certificate store is ignored "
+        "by most apps on API 24+ and would not change what this report can "
+        "show**. That needs root, which this lane's own default emulator "
+        "(a Play Store image) and most real phones refuse -- when it is not "
+        "available, capture continues without decryption and the report "
+        "states why.\n\n"
+        "The certificate is **kept installed on the device after this run** "
+        "so a later run does not have to ask again. Remove it any time with "
+        "`qa_setup_capture(action=\"remove\", apply=true)`.\n\n"
+        + _keyed(CAPTURE_SOURCES)
+        + "\nPass `capture` with one of the keys above and `capture_ack=true` "
+        "to confirm, then call again.\n"
+    )
+
+
+def capture_line(resolved: object) -> str:
+    """One status-block line naming the run's capture tier, or its refusal
+    reason by name -- never a generic \"not available\"."""
+    body = resolved if isinstance(resolved, dict) else {}
+    if body.get("offer"):
+        # Never asked about this device. Say so once, in a line the tester is
+        # already reading, rather than halting the run with a menu it did not
+        # ask for. Silence is not consent -- it is just nobody having asked.
+        return (
+            "- capture: not set up on this device — "
+            "call again with `capture=\"on\"` to record the app's API calls"
+        )
+    tier = str(body.get("tier") or "none")
+    message = str(body.get("message") or "")
+    line = "- capture: **" + tier + "**"
+    if message:
+        line += " (" + message + ")"
+    return line
+
+
 def install_menu_markdown(package: str = "", *, probed: bool = True) -> str:
     """The install-source menu, keyed for the same reason the start menu is.
 
@@ -660,6 +711,61 @@ def preflight_block(content: object, rendered: str = "") -> str:
     return head + (str(rendered) or "(no checks were produced)") + tail
 
 
+#: The packet fields that are byte-identical on EVERY packet of a run, in every
+#: lane. Graded against the lane x ordinal matrix that
+#: docs/RETIRED_CAPABILITIES.md section 5 makes binding: case, case-again,
+#: escape, explore, explore-again. Worth about 1,835 tokens a turn.
+#:
+#: THREE FIELDS THAT ARE NOT HERE, and must never be added:
+#:
+#: * ``response_schema`` -- it has TWO forms. The explore lane's carries
+#:   ``goal_reached`` / ``request_extension`` / ``extension_reason`` /
+#:   ``finding`` under ``additionalProperties: false``, so a model handed the
+#:   scripted lane's copy cannot end its own session. That is the defect the
+#:   whole first attempt was reverted for; ``test_mobile_schema_always`` is the
+#:   pin.
+#: * ``instruction`` and ``worker_instructions`` -- three forms each, and they
+#:   are what tell the model how big a script to send. About 250 tokens to keep
+#:   and a behaviour regression to drop.
+STATIC_FIELDS: tuple[str, ...] = (
+    "system_prompt",
+    "vocabulary",
+    "untrusted_data_notice",
+)
+
+#: What stands in their place. It names the RECOVERY, because a model that has
+#: lost the block and is told only "it was sent earlier" has been handed a dead
+#: end -- see ``run_store.clear_briefing``.
+STATIC_OMITTED_NOTE = (
+    "The system prompt, the action vocabulary and the untrusted-data notice "
+    "went out in full with the FIRST packet of this run and have not changed "
+    "since. Read them there rather than asking for them again. If they are no "
+    "longer in front of you, send your best attempt anyway: a script this "
+    "server cannot parse is answered with the whole block again, so this is "
+    "never a dead end. The response schema below is always current -- plan "
+    "against it and not against a remembered one."
+)
+
+
+def without_static(packet: object) -> dict:
+    """*packet* with :data:`STATIC_FIELDS` replaced by one note. Never raises.
+
+    A COPY: the caller's packet is what the run store and the report read, and a
+    field removed in place would go missing from both.
+
+    The note is added only when something was actually removed, so a packet that
+    never carried the block -- a tester request carries none of these fields --
+    is returned unchanged rather than gaining a note about an omission that did
+    not happen.
+    """
+    body = packet if isinstance(packet, dict) else {}
+    if not any(k in body for k in STATIC_FIELDS):
+        return dict(body)
+    out = {k: v for k, v in body.items() if k not in STATIC_FIELDS}
+    out["static_block"] = STATIC_OMITTED_NOTE
+    return out
+
+
 def packet_block(packet: object, *, session_token: str = "") -> str:
     """The packet as a fenced JSON block plus the no-echo instruction.
 
@@ -673,7 +779,13 @@ def packet_block(packet: object, *, session_token: str = "") -> str:
     if session_token:
         payload["session_token"] = str(session_token)
     try:
-        text = json.dumps(payload, indent=2, sort_keys=True, default=str)
+        # COMPACT, not indented. The packet is machine input: `json.loads` on
+        # the other side is indifferent to whitespace, and indent=2 charged
+        # every turn of every run for it. `sort_keys` stays -- a stable field
+        # order is what lets two packets be diffed by eye and by test.
+        text = json.dumps(
+            payload, separators=(",", ":"), sort_keys=True, default=str
+        )
     except Exception:  # pragma: no cover - defensive
         text = "{}"
     return "```json\n" + text + "\n```\n\n" + NO_ECHO
@@ -821,6 +933,9 @@ def status_block(resolved: object, coverage_line: str = "") -> str:
             "- app: `" + _field(body.get("package"), "(none)") + "`",
             "- device: " + _field(body.get("serial"), "(not attached)"),
         ]
+        capture = body.get("capture")
+        if isinstance(capture, dict) and capture:
+            lines.append(capture_line(capture))
         # LEADS the block, on purpose, and that ordering is the whole point: a
         # forward action below the fold is one a model does not act on.
         # Observed -- a model that met a stopped run and got only a status
@@ -973,11 +1088,15 @@ def report_line(
         + (
             "It was opened in your browser. "
             if opened
-            else "Open it in a browser: it is one self-contained file with no "
-            "external assets, so it works offline. "
+            else "Open it in a browser: it is one self-contained folder \u2014 the "
+            "page and its media together \u2014 so it works offline and can be zipped "
+            "as it stands. "
         )
         + "Every screen in it is shown as the picture the lane captured, with a "
-        "drawing composed from the element list beneath it."
+        "drawing composed from the element list beneath it; each step also carries "
+        "the device's own recording of it, recorded smaller than the screen and "
+        "captioned to say so, and a step that types a credential stores no picture "
+        "at all, and says so."
     )
 
 

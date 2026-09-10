@@ -1481,6 +1481,14 @@
   .clip{background:var(--code-bar);color:var(--ink-2);font-family:"IBM Plex Mono",monospace;font-size:.68rem;padding:6px 13px;border-top:1px solid var(--code-line);letter-spacing:.06em}
 
   .empty-note{margin:0;font-family:"IBM Plex Mono",monospace;font-size:.77rem;color:var(--ink-2);font-style:italic;padding:10px 12px;border:1px dashed var(--line);border-radius:6px}
+  .capban{margin:8px 0 12px;font-family:"IBM Plex Mono",monospace;font-size:.72rem;color:var(--ink-2);padding:9px 12px;border:1px solid var(--line-soft);border-radius:6px;background:var(--panel-2)}
+  .captier{margin:0 0 6px;font-size:.88rem;color:var(--ink)}
+  .capreason{margin:0 0 6px;font-size:.85rem;color:var(--ink-2)}
+  .cappin{margin:0 0 10px;font-size:.85rem;color:var(--danger,#b45309);font-weight:600}
+  .capbody{margin:6px 0;font-size:.78rem}
+  .capbody>summary{cursor:pointer;color:var(--accent);font-family:"IBM Plex Mono",monospace;font-size:.7rem}
+  .capbodyinner{margin-top:6px;display:grid;gap:6px}
+  .capbodyinner pre{white-space:pre-wrap;word-break:break-word;background:var(--panel-2);border:1px solid var(--line-soft);border-radius:6px;padding:8px 10px;font-family:"IBM Plex Mono",monospace;font-size:.72rem;max-height:260px;overflow:auto}
   ul.flatapi{margin:0;padding:0;list-style:none;display:grid;gap:5px}
   ul.flatapi li{font-family:"IBM Plex Mono",monospace;font-size:.78rem;color:var(--ink);overflow-wrap:anywhere;padding:5px 9px;background:var(--panel-2);border-radius:5px}
   .hint{font-size:.85rem;color:var(--ink-2);font-style:italic;margin:9px 0 0}
@@ -1656,6 +1664,33 @@
     line-height:1.1;overflow:hidden;padding:1px 2px;color:var(--ph-text);
     font-family:"IBM Plex Sans Arabic","IBM Plex Sans",-apple-system,sans-serif}
   .frame .rect.tap{border-color:var(--ph-accent);background:var(--ph-accent-soft)}
+  /* --- BEGIN media classes (2026-09-08) ---
+     Every name in this block was UNSTYLED in this file before it was written,
+     and that was CHECKED rather than assumed: the name "clip" was already taken
+     here (the code-block truncation bar at the top of this sheet, the lazy
+     variant beside it which this shell's own JS selects by name, and the
+     truncation note tools/mobile_evidence/exchanges.py emits onto this same
+     page), so a second rule for it lower in the cascade would have repainted
+     every one of those notes black and full-width. The video class is
+     "stepclip" for that reason.
+     The shot, shotwrap and shotnote rules this block used to carry are NOT
+     here: 04dec260 already added shot and shotnote rules for the stored PNG,
+     and a second rule for either name lower in the cascade would repaint the
+     picture that already works. Only the recording is new, so only the
+     stepclip family is declared here.
+     tests/mobile/test_mobile_report_css_binding.py strips exactly this block by
+     these markers and asserts each name is unstyled in what remains, so the
+     check cannot rot and these markers are load-bearing text. Names are written
+     WITHOUT their leading dot in this comment on purpose: that guard reads raw
+     text, so prose about a selector would otherwise satisfy it. */
+  .stepclips{display:flex;flex-wrap:wrap;gap:14px;margin:0 0 18px}
+  .stepcliprow{flex:1 1 320px;max-width:420px}
+  .stepcliprow h4{font-family:"IBM Plex Mono",monospace;font-size:.7rem;letter-spacing:.1em;
+                  text-transform:uppercase;margin:0 0 6px}
+  .stepclip{display:block;width:100%;max-width:100%;border-radius:10px;background:#000;
+            border:1px solid var(--ph-divider)}
+  .stepclipnote{color:var(--ph-muted);font-size:.78rem;font-style:italic;margin:6px 0 0}
+  /* --- END media classes --- */
   .frame .rect.edit{border-color:var(--ph-info);background:var(--ph-info-fill)}
   .frame .wirenote{color:var(--ph-muted);font-size:.82rem;font-style:italic;margin:0;max-width:24ch}
   .frame .wirenote.geom{position:absolute;left:0;right:0;bottom:0;z-index:2;max-width:none;

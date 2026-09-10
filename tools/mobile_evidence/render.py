@@ -29,6 +29,7 @@ from collections import Counter
 
 from config.settings import settings
 from tools.mobile import run_store
+from tools.mobile_capture import ladder as capture_ladder
 from tools.mobile_evidence import (
     evidence,
     exchanges,
@@ -1606,9 +1607,18 @@ def _seq_key(rec: dict) -> float | None:
 
 
 def sequence_items(
-    loaded: object, tc_id: object, trace_rows: list | None = None
+    loaded: object,
+    tc_id: object,
+    trace_rows: list | None = None,
+    step_frames: dict | None = None,
 ) -> list:
     """``[(key, rank, kind, inner_html, clock_label, bar)]`` for ``exchanges.seqlist``.
+    *step_frames* is ``{trace index: frame html}``, built by
+    ``report._seq_frames``. THIS stream is the Run sequence a case with app
+    evidence actually gets -- it REPLACES ``report._seq_rows`` entirely -- so a
+    per-step photograph threaded only into that function would render on no such
+    run at all. The markup is this repository's own (``report._shot_html``), so
+    it is appended OUTSIDE ``_guard``, which exists for the app's text.
 
     The app's records and the lane's own actions merge on one absolute clock: the
     records carry the device's epoch ms, an action its host ``at`` corrected by the
@@ -1881,5 +1891,173 @@ def sequence_items(
             if outcome
             else ""
         )
-        items.append((key, exchanges.SEQ_RANK[kind], kind, _guard(inner)))
+        frame = (step_frames or {}).get(i) or ""
+        items.append((key, exchanges.SEQ_RANK[kind], kind, _guard(inner) + str(frame)))
     return items
+
+
+#: Coverage limits every capture-tier report states, at EVERY tier -- never
+#: only on failure. QUIC/HTTP3 over UDP:443 bypasses this lane's TCP proxy
+#: entirely; a client that ignores the system proxy (Flutter/Dart's own
+#: HttpClient, Unity, a client with its own gRPC/Firebase sockets) is
+#: invisible to it; and once our certificate is installed, a PINNED app's own
+#: requests fail -- a failure this capture caused, never a defect in the app.
+CAPTURE_LIMITS_NOTE = (
+    "Coverage limits: traffic that uses QUIC/HTTP3 over UDP:443 bypasses this "
+    "proxy entirely; an app that ignores the system proxy setting (Flutter/Dart's "
+    "own HttpClient, Unity, or a client with its own gRPC/Firebase sockets) is "
+    "invisible to it; and once our certificate is installed, a PINNED app's own "
+    "requests FAIL -- a failure capture caused, never a defect in the app."
+)
+
+#: A human label per tier, keyed on the SAME vocabulary
+#: ``tools.mobile_capture.ladder`` produces -- never a second spelling
+#: drifting from the first.
+CAPTURE_TIER_LABELS = {
+    capture_ladder.TIER_NONE: "not attempted",
+    capture_ladder.TIER_PROXIED: "proxied, not decrypted",
+    capture_ladder.TIER_DECRYPTED: "decrypted",
+    capture_ladder.TIER_TLS_FAILURE: "TLS failed",
+    capture_ladder.TIER_INCONCLUSIVE: "inconclusive",
+}
+
+
+def _capture_banner() -> str:
+    return '<p class="capban">' + ev_esc(CAPTURE_LIMITS_NOTE, 600) + "</p>"
+
+
+def _capture_body_block(flow: dict) -> str:
+    """One flow's request/response bodies, COLLAPSED behind a click (decision
+    11) under a banner naming what they contain. Bodies are already FULL and
+    redacted at WRITE time (Phase 5, ``tools.mobile_capture.flows``); this
+    collapses them for the page, it does not redact them again.
+    """
+    return (
+        '<details class="capbody"><summary>request &amp; response bodies '
+        "(redacted, click to open)</summary>"
+        '<div class="capbodyinner"><p class="mt">request body</p><pre>'
+        + ev_esc(flow.get("request_body"), MAX_REPLY_TEXT)
+        + '</pre><p class="mt">response body</p><pre>'
+        + ev_esc(flow.get("response_body"), MAX_REPLY_TEXT)
+        + "</pre></div></details>"
+    )
+
+
+def _capture_flow_row(flow: object) -> str:
+    body = flow if isinstance(flow, dict) else {}
+    status = body.get("status")
+    return (
+        "<tr><td>"
+        + ev_esc(body.get("method"), 12)
+        + '</td><td dir="auto">'
+        + ev_esc(body.get("url"), 300)
+        + "</td><td>"
+        + (
+            ev_esc(status, 8)
+            if isinstance(status, int) and not isinstance(status, bool)
+            else '<span class="mt">no response</span>'
+        )
+        + "</td><td>"
+        + _capture_body_block(body)
+        + "</td></tr>"
+    )
+
+
+def case_capture(record: object) -> str:
+    """The per-case "APIs we observed" block (T7.1). Always a section, never
+    a blank -- a case a capture never touched still says WHY, the same
+    discipline :func:`case_network` already applies to the pcap lane.
+
+    Wording is always "calls we OBSERVED": a proxy sees what crossed IT,
+    never "the calls the app made".
+    """
+    holder = record if isinstance(record, dict) else {}
+    flows = holder.get("flows")
+    flows = (
+        [f for f in flows if isinstance(f, dict)] if isinstance(flows, list) else None
+    )
+    if flows is None:
+        return _sec_block(
+            "APIs we observed",
+            _empty("no API capture was taken for this case"),
+            note="no capture was taken",
+        )
+    if not flows:
+        return _sec_block(
+            "APIs we observed",
+            _empty(
+                "capture ran and observed no calls we could name while this "
+                "case replayed"
+            ),
+            note="captured, and empty",
+        )
+    rows = "".join(_capture_flow_row(flow) for flow in flows[:MAX_ROWS])
+    body = (
+        _capture_banner()
+        + '<div class="tablewrap"><table class="cov"><thead><tr>'
+        '<th scope="col">Verb</th><th scope="col">URL</th>'
+        '<th scope="col">Status</th><th scope="col">Body</th>'
+        "</tr></thead><tbody>" + rows + "</tbody></table></div>"
+    )
+    return _sec_block(
+        "APIs we observed",
+        body,
+        count=len(flows),
+        note="calls we observed while this case replayed, bodies redacted and "
+        "collapsed",
+    )
+
+
+def capture_section(cases: object, manifest: object) -> str:
+    """The run-level API-capture section (T7.2): the tier this run reached
+    and, when it is not decrypted, the reason BY NAME -- and the
+    coverage-limits banner, present at EVERY tier, never only on failure. A
+    failure THIS capture caused (a pinned app whose requests now fail once
+    our certificate is installed) is attributed to capture here, never left
+    to read as an app defect.
+    """
+    body = manifest if isinstance(manifest, dict) else {}
+    capture = body.get("capture") if isinstance(body.get("capture"), dict) else {}
+    tier = capture.get("tier")
+    tier = tier if tier in capture_ladder.TIERS else capture_ladder.TIER_NONE
+    reason = capture.get("reason")
+    message = capture.get("message")
+    flow_total = 0
+    for case in cases or ():
+        if not isinstance(case, dict):
+            continue
+        record = (case.get("evidence") or {}).get("capture")
+        if isinstance(record, dict):
+            try:
+                flow_total += max(0, int(record.get("flow_count") or 0))
+            except (TypeError, ValueError, OverflowError):
+                pass
+    lines = [
+        '<p class="captier">Capture reached tier: <b>'
+        + ev_esc(CAPTURE_TIER_LABELS.get(tier, tier), 40)
+        + "</b>. Calls we observed across this run: "
+        + str(flow_total)
+        + ".</p>"
+    ]
+    if tier != capture_ladder.TIER_DECRYPTED:
+        lines.append(
+            '<p class="capreason">Not decrypted -- reason: <b>'
+            + ev_esc(reason or "unknown", 40)
+            + "</b>. "
+            + ev_esc(message or "No further detail was recorded.", 300)
+            + "</p>"
+        )
+    if reason == capture_ladder.REASON_PINNED:
+        lines.append(
+            '<p class="cappin">A request failure shown below on this run may '
+            "be capture's own doing, not the app's: the app pins its own "
+            "certificates, so its calls fail once our certificate is "
+            "installed. That is not an app defect.</p>"
+        )
+    lines.append(_capture_banner())
+    return _sec_block(
+        "API capture",
+        "".join(lines),
+        note="calls we observed on this run, and the coverage this capture "
+        "cannot reach",
+    )
