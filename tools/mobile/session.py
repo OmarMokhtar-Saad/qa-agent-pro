@@ -71,6 +71,7 @@ from tools.mobile import (
     explore_runner,
     importers,
     locks,
+    media,
     paths,
     perception,
     platform_info,
@@ -1843,6 +1844,33 @@ def explore_turn_tc_id(turn: object) -> str:
     return "TC-%03d" % max(1, min(number, 999999))
 
 
+def explore_turn_number(state: object) -> int:
+    """THE turn number an exploratory state is on. One coercion, one place.
+
+    The checkpoint needs the NUMBER (it titles the card with it) and the
+    recorder needs the ID; both must agree, so the coercion that turns a junk
+    field into a usable number lives here and nowhere else.
+    """
+    body = state if isinstance(state, dict) else {}
+    try:
+        return max(1, int(body.get("turn") or 1))
+    except (TypeError, ValueError, OverflowError):
+        return 1
+
+
+def explore_turn_case_id(state: object) -> str:
+    """THE case id one exploratory turn writes, derived from its STATE.
+
+    ONE producer, because two callers need the same answer at two moments:
+    ``_checkpoint_explore_turn`` WRITES the turn's case under this id, and the
+    recorder around the replay must file its clip onto that same case -- and it
+    needs the id BEFORE the checkpoint exists. Deriving the number twice is how
+    a clip lands on a case id nothing else uses, which is silent: the report
+    finds no media on the case it renders and draws the old wireframe.
+    """
+    return explore_turn_tc_id(explore_turn_number(state))
+
+
 def _latest_finding(state: object) -> str:
     """The finding recorded for the CURRENT turn, or ``""``.
 
@@ -1965,10 +1993,7 @@ def _checkpoint_explore_turn(
     """
     body = state if isinstance(state, dict) else {}
     result = outcome if isinstance(outcome, dict) else {}
-    try:
-        turn = max(1, int(body.get("turn") or 1))
-    except (TypeError, ValueError, OverflowError):
-        turn = 1
+    turn = explore_turn_number(body)
     tc_id = explore_turn_tc_id(turn)
     goal = " ".join(str(body.get("goal") or "").split())[:200] or "no goal recorded"
     now = time.time()
@@ -2221,11 +2246,29 @@ async def _submit_explore(
     # Run-wide evidence, read from the checkpoints this run already wrote and
     # passed in EXPLICITLY. See ``_explore_prior_verified``.
     ctx.prior_verified = _explore_prior_verified(run_id)
+    # THE RECORDER, on the lane that shipped without one. `case_runner` has
+    # started a clip around ITS replay since v1.87.0; this is the other replay
+    # site and it had none, so every exploratory run -- which is the lane the
+    # testers actually use -- produced a report with no video while the feature
+    # read as shipped. Measured on run mrun-20260910-180207-2ee014: five cases,
+    # zero media records, nothing failed. One question, two sites, one wired.
+    #
+    # The id comes from `explore_turn_case_id`, the same producer the checkpoint
+    # below writes the case under.
+    clip_tc_id = explore_turn_case_id(resolved.get("explore"))
+    clip = (
+        await media.start_clip(run_id, clip_tc_id, parsed["content"], ctx.serial)
+    ).get("content")
     replayed = await executor.replay(parsed["content"], ctx)
     if replayed.get("error"):
         # The turn is over and no checkpoint will be written for it, so the
         # capture this turn started has no later reader. Stop it here or the
         # console records the tester's device until something displaces it.
+        # The RECORDER is the same shape of leak, one artifact over: no
+        # checkpoint means no case to file a record onto, so the clip is
+        # stopped and deleted rather than stored -- `case_runner` calls
+        # `abandon` on its own error path for exactly this reason.
+        await media.abandon(ctx.serial, clip)
         _persist_explore(
             run_id,
             await _explore_abort_network(run_id, resolved.get("explore") or {}, ctx),
@@ -2273,6 +2316,20 @@ async def _submit_explore(
     net = await _explore_finish_network(run_id, before, ctx)
     checkpoint = _checkpoint_explore_turn(
         run_id, before, outcome, finding, verdict=verdict, network=net
+    )
+    # AFTER the checkpoint, and that ordering is the contract, not a style
+    # choice. `media.remember` APPENDS onto the case record; in this lane the
+    # checkpoint above is what CREATES that record, so calling this first would
+    # find no case, log the loss and drop the clip on the floor. The case lane
+    # is the other way round only because `start_case` wrote its record before
+    # the submit began. Nothing rewrites the case after this point, so the
+    # records survive without a carry-forward of their own.
+    await media.finish_step(
+        run_id,
+        clip_tc_id,
+        ctx.serial,
+        clip,
+        str((outcome.get("screen") or {}).get("screen_id") or ""),
     )
     # The replay HAPPENED, so the number this turn was handed is now earned.
     # This is the only writer that ADVANCES ``committed_turn`` to a number the

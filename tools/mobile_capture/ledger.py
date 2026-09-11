@@ -139,9 +139,7 @@ def record(serial: str, fingerprint: str, tier: str, *, note: str = "") -> dict:
                 evicted,
             )
             rows = rows[evicted:]
-        _write_json(
-            paths.ledger_path(), {"version": LEDGER_VERSION, "devices": rows}
-        )
+        _write_json(paths.ledger_path(), {"version": LEDGER_VERSION, "devices": rows})
         return {"error": None, "content": {"stored": rows[-1], "evicted": evicted}}
     except Exception as exc:
         logger.exception("mobile_capture.ledger.record failed")

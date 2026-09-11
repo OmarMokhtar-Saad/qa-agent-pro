@@ -12475,7 +12475,6 @@ async def _mobile_capture_stage(
     from tools import mobile_capture as api_capture
     from tools.mobile import render as mobile_render
     from tools.mobile_capture import ladder
-
     from tools.mobile_capture import ledger as capture_ledger
 
     wanted = str(capture or "").strip().lower()
@@ -12487,6 +12486,20 @@ async def _mobile_capture_stage(
         seen = capture_ledger.asked_before(serial)
         if seen.get("error") or (seen.get("content") or {}).get("asked"):
             return None, None
+        if offer_capture(serial):
+            # The OFFER, as a record rather than a menu: the run continues and
+            # the status line carries one line telling the tester the feature
+            # exists. Returning (None, None) here is what shipped, and it made
+            # the whole lane invisible -- no record, no line, no capture, on
+            # every run.
+            return None, ladder.record(
+                {
+                    "tier": ladder.TIER_NONE,
+                    "reason": ladder.REASON_NOT_OFFERED,
+                    "serial": serial,
+                    "offer": True,
+                }
+            )
         # Never returns markdown here: an unset `capture` means the caller said
         # nothing about capture, and a run they did not ask to change must not
         # stop for a question. The OFFER rides along with the run's own reply
@@ -13474,9 +13487,7 @@ async def handle_setup_capture(
         body = (known.get("content") or {}) if not known.get("error") else {}
         cert_status = cert.status(serial).get("content") or {}
         cert_line = (
-            "yes, via the "
-            + _safe(str(cert_status.get("route") or ""), 20)
-            + " store"
+            "yes, via the " + _safe(str(cert_status.get("route") or ""), 20) + " store"
             if cert_status.get("installed")
             else "no"
         )

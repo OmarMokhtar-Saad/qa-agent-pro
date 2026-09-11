@@ -208,7 +208,9 @@ def scan(text: object, package: object) -> dict:
     try:
         pkg = str(package or "").strip()
         if not pkg:
-            return _empty("no package under test was given, so nothing can be attributed")
+            return _empty(
+                "no package under test was given, so nothing can be attributed"
+            )
         try:
             body = text if isinstance(text, str) else str(text or "")
         except Exception:  # pragma: no cover - a __str__ that raises
@@ -225,9 +227,7 @@ def scan(text: object, package: object) -> dict:
         parsed = []
         for line in lines:
             hit = _LINE_RE.match(line)
-            parsed.append(
-                (hit.group(2), hit.group(3), line) if hit else ("", "", line)
-            )
+            parsed.append((hit.group(2), hit.group(3), line) if hit else ("", "", line))
         seen_marker = ""
         for index, (tag, message, line) in enumerate(parsed):
             if not tag:

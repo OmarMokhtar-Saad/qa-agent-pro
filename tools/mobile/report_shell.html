@@ -1653,8 +1653,12 @@
   /* ── the wireframe: element bounds drawn to scale inside the phone ───────
      Beside the screenshot, and not instead of it: what this lane holds is also
      the pruned element list -- text, ids and rectangles -- so the phone shows those
-     rectangles at their true proportions. A frame is 360x800 CSS px, fixed, so two
-     screens can be compared by eye; the phone around it is widened to hold it. */
+     rectangles at their true proportions. A CAPTURED screen's box is sized
+     inline (per-frame `style="width:...;height:..."`, tools/mobile/report.py)
+     to the device's own aspect, bounded by a 360x800 ceiling so no single
+     frame can dominate the card layout; only an uncaptured/ambiguous frame
+     falls back to the 360x800 default below. The phone around it is widened
+     to hold the largest case this ceiling allows. */
   .phone.wire{max-width:400px}
   .phone.wire .ph-scroll{padding:10px 12px 12px;max-height:none;overflow:visible}
   .frame{position:relative;width:360px;height:800px;margin:0 auto;background:var(--ph-surface);

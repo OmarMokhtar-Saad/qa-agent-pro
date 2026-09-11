@@ -143,18 +143,26 @@ def flow_to_record(flow: object, *, now_ms: int | None = None) -> dict:
     resp_body, resp_trunc = _capped_body(
         getattr(response, "raw_content", None) if response is not None else None
     )
-    req_headers = dict(getattr(request, "headers", None) or {}) if request is not None else {}
+    req_headers = (
+        dict(getattr(request, "headers", None) or {}) if request is not None else {}
+    )
     resp_headers = (
         dict(getattr(response, "headers", None) or {}) if response is not None else {}
     )
     url = ""
     if request is not None:
-        url = str(getattr(request, "pretty_url", "") or getattr(request, "url", "") or "")
+        url = str(
+            getattr(request, "pretty_url", "") or getattr(request, "url", "") or ""
+        )
     return {
         "ts_ms": int(now_ms if now_ms is not None else time.time() * 1000),
-        "method": str(getattr(request, "method", "") or "") if request is not None else "",
+        "method": str(getattr(request, "method", "") or "")
+        if request is not None
+        else "",
         "url": url,
-        "status": getattr(response, "status_code", None) if response is not None else None,
+        "status": getattr(response, "status_code", None)
+        if response is not None
+        else None,
         "request_headers": req_headers,
         "response_headers": resp_headers,
         "request_body": req_body,
@@ -202,4 +210,6 @@ def response(flow: object) -> None:
         record = flow_to_record(flow)
         append_line(target_path(run_id, out_dir), record)
     except Exception as exc:  # pragma: no cover - defensive, another interpreter
-        sys.stderr.write("mobile_capture.addon: response hook failed: " + str(exc) + "\n")
+        sys.stderr.write(
+            "mobile_capture.addon: response hook failed: " + str(exc) + "\n"
+        )

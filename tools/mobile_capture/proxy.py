@@ -274,9 +274,7 @@ async def start(serial: str, *, run_id: str) -> dict:
                         "boot_id": teardown.boot_id(),
                     },
                 )
-                rev = await adb.reverse(
-                    serial, "tcp:" + str(port), "tcp:" + str(port)
-                )
+                rev = await adb.reverse(serial, "tcp:" + str(port), "tcp:" + str(port))
                 if rev.get("error"):
                     return {"error": rev["error"], "content": None}
                 put = await adb.global_setting_put(

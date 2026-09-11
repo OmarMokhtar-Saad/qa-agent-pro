@@ -176,7 +176,8 @@ async def _stage_for_manual_install(serial: str, btype: str) -> dict:
     """
     remote = USER_STORE_STAGE_DIR + "/qa-agents-ca.crt"
     pushed = await adb.raw(
-        ["-s", serial, "push", str(ca.cert_path()), remote], timeout=DEVICE_CALL_TIMEOUT_S
+        ["-s", serial, "push", str(ca.cert_path()), remote],
+        timeout=DEVICE_CALL_TIMEOUT_S,
     )
     body = pushed.get("content") or {}
     if pushed.get("error") or _rc(body) != 0:
@@ -504,7 +505,9 @@ async def remove(serial: str, *, apply: bool = False, owner: str = "") -> dict:
                     )
                     if not device_removed:
                         detail = str(
-                            rm.get("error") or (rm.get("content") or {}).get("err") or ""
+                            rm.get("error")
+                            or (rm.get("content") or {}).get("err")
+                            or ""
                         )[:200]
                 else:
                     detail = "could not reach the device to remove the certificate"

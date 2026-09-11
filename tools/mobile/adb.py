@@ -1615,6 +1615,4 @@ async def global_setting_put(
             "error": "Refusing setting value " + repr(text[:60]),
             "content": None,
         }
-    return await shell(
-        serial, ["settings", "put", "global", str(name), text], timeout
-    )
+    return await shell(serial, ["settings", "put", "global", str(name), text], timeout)

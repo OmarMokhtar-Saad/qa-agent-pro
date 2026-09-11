@@ -1993,8 +1993,7 @@ def case_capture(record: object) -> str:
         )
     rows = "".join(_capture_flow_row(flow) for flow in flows[:MAX_ROWS])
     body = (
-        _capture_banner()
-        + '<div class="tablewrap"><table class="cov"><thead><tr>'
+        _capture_banner() + '<div class="tablewrap"><table class="cov"><thead><tr>'
         '<th scope="col">Verb</th><th scope="col">URL</th>'
         '<th scope="col">Status</th><th scope="col">Body</th>'
         "</tr></thead><tbody>" + rows + "</tbody></table></div>"
