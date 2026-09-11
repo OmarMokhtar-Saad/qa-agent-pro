@@ -757,6 +757,25 @@ def _screen_hash(screen: object) -> str:
     return str(body.get("hash") or "")
 
 
+def _stamp_after(entry: dict, screen: object) -> None:
+    """Stamp BOTH halves of the after-observation, in one call.
+
+    ``after_screen_id`` says WHICH screen the step ended on; ``after_screen_hash``
+    says WHICH LOOK at it. The report joins a step to its stored picture on the
+    PAIR -- `report._obs_key` needs both, and on a chat screen the id alone is
+    ambiguous because one screen id covers every turn of the conversation.
+
+    ONE function because the two fields are one fact recorded at one instant,
+    and recording them separately is not a style difference: measured on the
+    tree that shipped v1.87.0, the id was written at THIRTEEN sites and the hash
+    at ONE, so twelve of thirteen steps rendered "not captured" while their PNG
+    sat on disk. A caller that stamps only one half is the same defect returning,
+    which `tests/mobile/test_mobile_after_stamp.py` now fails by name.
+    """
+    entry["after_screen_id"] = _screen_id(screen)
+    entry["after_screen_hash"] = _screen_hash(screen)
+
+
 def _entry(
     index: int, action: object, before: str, started: float, before_hash: str = ""
 ) -> dict:
@@ -1173,9 +1192,16 @@ async def _settle(
                 STATUS_ERROR, trace, screen, "", entry["detail"], index
             )
         screen = dumped.get("content")
-    entry["after_screen_hash"] = _screen_hash(screen)
+    # BOTH halves, through the one producer. This site used to write the hash
+    # alone and re-derive the id inline for the comparison below -- so it was
+    # simultaneously the only site stamping a look AND a second derivation of
+    # the id. One call answers both.
+    _stamp_after(entry, screen)
     if mark_no_change and _unchanged(
-        before_hash, entry["after_screen_hash"], before_id, _screen_id(screen)
+        before_hash,
+        entry["after_screen_hash"],
+        before_id,
+        entry["after_screen_id"],
     ):
         entry["outcome"] = "no_change"
 
@@ -1189,7 +1215,7 @@ async def _settle(
     if dialog:
         entry["outcome"] = "system_dialog"
         entry["detail"] = system_dialog_detail(dialog)
-        entry["after_screen_id"] = _screen_id(screen)
+        _stamp_after(entry, screen)
         _append(trace, entry)
         return screen, _result(
             STATUS_NEEDS_MODEL, trace, screen, "", entry["detail"], index
@@ -1202,7 +1228,7 @@ async def _settle(
     ):
         entry["outcome"] = "left_app"
         entry["detail"] = left_app_detail(package, ctx.package)
-        entry["after_screen_id"] = _screen_id(screen)
+        _stamp_after(entry, screen)
         _append(trace, entry)
         return screen, _result(
             STATUS_NEEDS_MODEL, trace, screen, "", entry["detail"], index
@@ -1258,8 +1284,22 @@ async def _wait_until_changed(
       spinner replacing a button IS a change -- is re-read before it is handed
       over. ``_wait_until_text`` keeps ``redump=False`` because it already
       matched the thing it was waiting for.
+
+    WHICH IDENTITY, and why it is the hash. ``_screen_id`` is package +
+    activity + the top three texts, and ``perception._screen_id`` says so: it
+    is deliberately coarse because the report dedupes on it. A chat reply is
+    appended at the BOTTOM, so the top three texts never move and the id is
+    byte-identical -- which made this loop blind to the one event it exists to
+    catch. ``_settle`` was moved to the hash for the same reason; this was the
+    consumer left behind.
+
+    ONE-PIXEL SCROLL is the row where this identity and the id disagree, and
+    the trade is deliberate: returning on it costs a re-plan against a screen
+    that barely moved, while not returning cost every chat reply its whole
+    budget. The caller settles with ``redump=True`` regardless, so what the
+    model reads is fetched after this returns, not during it.
     """
-    before = _screen_id(screen)
+    before = _screen_hash(screen)
     deadline = time.monotonic() + (ms / 1000.0)
     margin = MIN_POLL_MARGIN_MS / 1000.0
     current = screen
@@ -1282,7 +1322,7 @@ async def _wait_until_changed(
             # `test_a_dump_error_during_a_polled_wait_is_not_lost`.
             break
         current = dumped.get("content")
-        if _screen_id(current) != before:
+        if _screen_hash(current) != before:
             return current, True
     remaining = deadline - time.monotonic()
     if remaining > 0:
@@ -1724,7 +1764,7 @@ async def replay(script: object, ctx: Context) -> dict:
                     ).strip()
                 entry["outcome"] = "done"
                 entry["detail"] = reason
-                entry["after_screen_id"] = _screen_id(screen)
+                _stamp_after(entry, screen)
                 _append(trace, entry)
                 return {
                     "error": None,
@@ -1743,7 +1783,7 @@ async def replay(script: object, ctx: Context) -> dict:
                 if supplied is None:
                     entry["outcome"] = "needs_tester"
                     entry["detail"] = str(getattr(action, "prompt", ""))[:300]
-                    entry["after_screen_id"] = _screen_id(screen)
+                    _stamp_after(entry, screen)
                     _append(trace, entry)
                     return {
                         "error": None,
@@ -1759,7 +1799,7 @@ async def replay(script: object, ctx: Context) -> dict:
                     }
                 entry["outcome"] = "supplied"
                 entry["detail"] = "the tester supplied " + field
-                entry["after_screen_id"] = _screen_id(screen)
+                _stamp_after(entry, screen)
                 _append(trace, entry)
                 continue
 
@@ -1786,7 +1826,7 @@ async def replay(script: object, ctx: Context) -> dict:
                     resolution = (resolved or {}).get("content") or {}
                     entry["outcome"] = "missing_element"
                     entry["detail"] = missing_element_detail(resolution)
-                    entry["after_screen_id"] = _screen_id(screen)
+                    _stamp_after(entry, screen)
                     _append(trace, entry)
                     return {
                         "error": None,
@@ -1899,7 +1939,7 @@ async def replay(script: object, ctx: Context) -> dict:
                     # the same half-wiring at the other consumer is what round 3
                     # fixed, and this site still had it.
                     entry["detail"] = guard_detail(hit, screen, ctx.package)
-                    entry["after_screen_id"] = _screen_id(screen)
+                    _stamp_after(entry, screen)
                     _append(trace, entry)
                     return {
                         "error": None,
@@ -1919,7 +1959,7 @@ async def replay(script: object, ctx: Context) -> dict:
                 ok, detail = _evaluate_assert(action, screen, trace, baseline_texts)
                 entry["outcome"] = "assert_pass" if ok else "assert_fail"
                 entry["detail"] = detail
-                entry["after_screen_id"] = _screen_id(screen)
+                _stamp_after(entry, screen)
                 _append(trace, entry)
                 if ok:
                     continue
@@ -1958,10 +1998,10 @@ async def replay(script: object, ctx: Context) -> dict:
                         )
                         if stop is not None:
                             return {"error": None, "content": stop}
-                        entry["after_screen_id"] = _screen_id(screen)
+                        _stamp_after(entry, screen)
                         _append(trace, entry)
                         continue
-                    entry["after_screen_id"] = _screen_id(screen)
+                    _stamp_after(entry, screen)
                     _append(trace, entry)
                     return {
                         "error": None,
@@ -2014,7 +2054,7 @@ async def replay(script: object, ctx: Context) -> dict:
                 )
                 if stop is not None:
                     return {"error": None, "content": stop}
-                entry["after_screen_id"] = _screen_id(screen)
+                _stamp_after(entry, screen)
                 _append(trace, entry)
                 continue
 
@@ -2031,7 +2071,7 @@ async def replay(script: object, ctx: Context) -> dict:
                 recoverable = bool(outcome.get("needs_model"))
                 entry["outcome"] = "refused" if recoverable else "device_error"
                 entry["detail"] = str(outcome["error"])[:400]
-                entry["after_screen_id"] = _screen_id(screen)
+                _stamp_after(entry, screen)
                 _append(trace, entry)
                 return {
                     "error": None,
@@ -2062,7 +2102,7 @@ async def replay(script: object, ctx: Context) -> dict:
                 )
                 if stop is not None:
                     return {"error": None, "content": stop}
-            entry["after_screen_id"] = _screen_id(screen)
+            _stamp_after(entry, screen)
             _append(trace, entry)
 
         # A script that never calls done() lands here. It used to hand back an

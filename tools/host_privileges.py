@@ -246,8 +246,7 @@ STEPS: tuple[dict, ...] = (
             + ". On macOS, INSTALLING Homebrew itself needs an administrator "
             "(there is no supported non-admin route), but brew install for a "
             "regular formula afterwards does not -- so if Homebrew is already "
-            "there, this step needs nobody: "
-            + REFERENCES["brew_install"]
+            "there, this step needs nobody: " + REFERENCES["brew_install"]
         ),
     },
     {

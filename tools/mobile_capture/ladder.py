@@ -54,6 +54,12 @@ REASON_PROXY_START_FAILED = "proxy_start_failed"
 REASON_DEVICE_GONE = "device_gone"
 REASON_USER_STORE_ONLY = "user_store_only"
 REASON_INCONCLUSIVE = "inconclusive"
+
+#: Nobody has been asked about this device yet. NOT the same as
+#: REASON_NO_CONSENT: a decline is an answer, and this is the absence of the
+#: question. Collapsing the two would tell a tester they had refused something
+#: they were never offered.
+REASON_NOT_OFFERED = "not_offered"
 REASONS = frozenset(
     {
         REASON_NO_CONSENT,
@@ -66,6 +72,7 @@ REASONS = frozenset(
         REASON_DEVICE_GONE,
         REASON_USER_STORE_ONLY,
         REASON_INCONCLUSIVE,
+        REASON_NOT_OFFERED,
     }
 )
 
@@ -94,18 +101,19 @@ _REASON_SENTENCES = {
         "The proxy could not complete a TLS handshake through the device."
     ),
     REASON_PROXY_START_FAILED: (
-        "The qa-agents proxy did not start, so this run continues without "
-        "capture."
+        "The qa-agents proxy did not start, so this run continues without capture."
     ),
-    REASON_DEVICE_GONE: (
-        "The device disconnected before capture could be confirmed."
-    ),
+    REASON_DEVICE_GONE: ("The device disconnected before capture could be confirmed."),
     REASON_USER_STORE_ONLY: (
         "Only the user certificate store accepted the CA; most apps on this "
         "device ignore it."
     ),
     REASON_INCONCLUSIVE: (
         "Capture could not be confirmed one way or the other on this run."
+    ),
+    REASON_NOT_OFFERED: (
+        "API capture is not set up on this device. Call again with "
+        'capture="on" to record the app\'s API calls.'
     ),
 }
 
@@ -192,6 +200,11 @@ def record(source: object) -> dict:
     return {
         "tier": tier,
         "reason": reason,
+        # Carried by the ONE producer so a consumer can branch on it. The
+        # renderer read this key before anything emitted it, which is how a
+        # released build showed no offer, never prompted a tester, and
+        # captured nothing on every run.
+        "offer": bool(body.get("offer")),
         "message": refusal(reason)["message"] if reason else None,
         "serial": str(body.get("serial") or ""),
         "fingerprint": str(body.get("fingerprint") or ""),

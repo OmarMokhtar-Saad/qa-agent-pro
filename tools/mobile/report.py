@@ -117,11 +117,14 @@ def report_path(run_id: str) -> Path:
 #: broken install, and it should fail loudly here rather than on the first run.
 SHELL_PATH = Path(__file__).with_name("report_shell.html")
 
-#: The phone frame every screen is scaled into. Fixed on purpose: a report whose
-#: frames differ per screen cannot be compared by eye, which is the only thing a
-#: wireframe is for.
-FRAME_W = 360
-FRAME_H = 800
+#: The CEILING the rendered wireframe box may not exceed, in CSS px. REVERSED
+#: from a fixed 360x800 box (docs/DECISIONS.md -> "The frame takes the
+#: device's own aspect"): a fixed frame let a landscape phone draw at a fifth
+#: of the available area inside a tall empty box. `_frame_box` now fits the
+#: device's own aspect INSIDE this ceiling, so a full-screen element always
+#: fills its frame.
+MAX_FRAME_W = 360
+MAX_FRAME_H = 800
 
 #: ``perception.MAX_ELEMENTS`` / ``MAX_ATTR_CHARS``, enforced INDEPENDENTLY here
 #: because a store file is an outside input by the time this module reads it.
@@ -402,7 +405,7 @@ def _device_size(screen: object) -> tuple:
     **The stored root is preferred because ``max()`` is not the viewport.** A
     ``RecyclerView``/``ScrollView`` reports its CONTENT height, so on a scrollable
     screen the lowest element bottom routinely exceeds the display -- and
-    :func:`scale_bounds`, which scales by ``min(FRAME_W/dev_w, FRAME_H/dev_h)``,
+    :func:`scale_bounds`, which scales by ``min(MAX_FRAME_W/dev_w, MAX_FRAME_H/dev_h)``,
     then shrinks EVERY element to fit a device taller than the real one. The
     visible result is every scrollable screen squeezed into the top of its frame.
 
@@ -467,13 +470,56 @@ def _device_size(screen: object) -> tuple:
     return width, height
 
 
+def _frame_scale(dev_w: int, dev_h: int) -> float:
+    """THE scale factor for one device: device pixels -> frame pixels.
+
+    One producer, because two consumers need the SAME float and not merely the
+    same formula. :func:`_frame_box` multiplies it to size the box;
+    :func:`scale_bounds` multiplies it to place every rect inside that box. When
+    `scale_bounds` re-derived its own scale from the already-rounded box, the
+    box's integer aspect differed from the device's by a fraction of a pixel and
+    a full-screen element came out one pixel short of the frame it fills -- the
+    same input, derived twice, drifting. Callers must guarantee both arguments
+    are positive; `_frame_box`'s guard is what establishes that.
+    """
+    return min(MAX_FRAME_W / float(dev_w), MAX_FRAME_H / float(dev_h))
+
+
+def _frame_box(dev_w: int, dev_h: int) -> tuple:
+    """The rendered wireframe box for one device: its own aspect, contained
+    inside the ``MAX_FRAME_W``x``MAX_FRAME_H`` ceiling.
+
+    ONE producer of frame size -- :func:`scale_bounds` and :func:`wireframe`
+    both call this rather than each deriving it, so the clamp and the drawn
+    box can never disagree (the two-derivations trap this project has hit
+    before). Guarantees: both returned values are ``int``, ``>= 1``, and
+    ``<= `` their respective ceiling. A non-positive device (the guard this
+    work owns -- see the mutation clause ratchet) falls back to the full
+    ceiling box rather than dividing by zero or returning a degenerate one.
+    """
+    if dev_w <= 0 or dev_h <= 0:
+        return (MAX_FRAME_W, MAX_FRAME_H)
+    scale = _frame_scale(dev_w, dev_h)
+    # TRUNCATE, exactly as `scale_bounds` does for w/h. The two must round the
+    # same way or a full-device element lands a pixel short of its own frame:
+    # round() here gave a 2208px-tall device a 450px box whose full-screen rect
+    # scaled to 449. Same input, two derivations, one drifting -- the trap this
+    # producer exists to close, reintroduced by the arithmetic rather than by a
+    # second call site. Truncation is also the safe direction: the box can only
+    # be smaller than the exact fit, never larger, so nothing paints outside it.
+    frame_w = min(MAX_FRAME_W, max(1, int(dev_w * scale)))
+    frame_h = min(MAX_FRAME_H, max(1, int(dev_h * scale)))
+    return (frame_w, frame_h)
+
+
 def scale_bounds(box: object, dev_w: int, dev_h: int) -> tuple | None:
-    """Device pixels -> a rect inside the fixed frame, or None.
+    """Device pixels -> a rect inside this device's own frame, or None.
 
     Guarantees, unconditionally, for every tuple it returns: all four values are
-    ``int``, ``x >= 0``, ``y >= 0``, ``x + w <= FRAME_W`` and
-    ``y + h <= FRAME_H``. A malformed dump must not be able to paint outside the
-    frame or raise.
+    ``int``, ``x >= 0``, ``y >= 0``, ``x + w <= frame_w`` and ``y + h <=
+    frame_h``, where ``frame_w, frame_h = _frame_box(dev_w, dev_h)`` and so
+    ``frame_w <= MAX_FRAME_W`` and ``frame_h <= MAX_FRAME_H`` always. A
+    malformed dump must not be able to paint outside the frame or raise.
     """
     try:
         left, top, right, bottom = (int(value) for value in box)
@@ -490,15 +536,19 @@ def scale_bounds(box: object, dev_w: int, dev_h: int) -> tuple | None:
         # dev_w > 0.
         if right <= left or bottom <= top:
             return None
-        scale = min(FRAME_W / float(dev_w), FRAME_H / float(dev_h))
+        frame_w, frame_h = _frame_box(dev_w, dev_h)
+        # The SAME float `_frame_box` sized the box with -- never a scale
+        # re-derived from the rounded box, which drifts by a pixel on the axis
+        # the ceiling did not constrain.
+        scale = _frame_scale(dev_w, dev_h)
         x = int(left * scale)
         y = int(top * scale)
         w = max(1, int((right - left) * scale))
         h = max(1, int((bottom - top) * scale))
-        x = min(x, FRAME_W - 1)
-        y = min(y, FRAME_H - 1)
-        w = min(w, FRAME_W - x)
-        h = min(h, FRAME_H - y)
+        x = min(x, frame_w - 1)
+        y = min(y, frame_h - 1)
+        w = min(w, frame_w - x)
+        h = min(h, frame_h - y)
         return (x, y, w, h)
     except (TypeError, ValueError, OverflowError):
         return None
@@ -567,12 +617,15 @@ def wireframe(screen: object) -> dict:
     # all lie outside the display -- reachable since the visibility frame was
     # widened past it -- scales every one of them to nothing and would otherwise
     # return an empty frame claiming to be a real one.
+    frame_w, frame_h = _frame_box(dev_w, dev_h)
     return {
         "rects": rects,
         "device": [dev_w, dev_h],
         "scaled": bool(rects),
         "clipped": clipped,
         "outside": outside,
+        "frame_w": frame_w,
+        "frame_h": frame_h,
     }
 
 
@@ -1046,7 +1099,11 @@ def _frame_html(screen_id: object, screens: object) -> str:
         for rect in frame["rects"]
     )
     return (
-        '<div class="frame" data-screen="'
+        '<div class="frame" style="width:'
+        + str(int(frame["frame_w"]))
+        + "px;height:"
+        + str(int(frame["frame_h"]))
+        + 'px" data-screen="'
         + esc(ident, 40)
         + '" data-rects="'
         + str(len(frame["rects"]))

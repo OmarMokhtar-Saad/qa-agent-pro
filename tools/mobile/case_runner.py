@@ -381,9 +381,7 @@ async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
         # the pcap lane's above -- a second, independent dimension on the same
         # seam. Never branched on: an evidence fault here can no more change a
         # verdict than a failed log slice can.
-        evidence["capture"] = capture_record(
-            api_flows.mark_case_current(run_id, tc_id)
-        )
+        evidence["capture"] = capture_record(api_flows.mark_case_current(run_id, tc_id))
         launched = await adb.launch(ctx.serial, ctx.package)
         if launched.get("error"):
             return await _abandon(run_id, tc_id, ctx, evidence, launched)

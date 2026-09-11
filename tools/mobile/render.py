@@ -301,7 +301,7 @@ def capture_menu_markdown() -> str:
         "states why.\n\n"
         "The certificate is **kept installed on the device after this run** "
         "so a later run does not have to ask again. Remove it any time with "
-        "`qa_setup_capture(action=\"remove\", apply=true)`.\n\n"
+        '`qa_setup_capture(action="remove", apply=true)`.\n\n'
         + _keyed(CAPTURE_SOURCES)
         + "\nPass `capture` with one of the keys above and `capture_ack=true` "
         "to confirm, then call again.\n"
@@ -318,7 +318,7 @@ def capture_line(resolved: object) -> str:
         # ask for. Silence is not consent -- it is just nobody having asked.
         return (
             "- capture: not set up on this device — "
-            "call again with `capture=\"on\"` to record the app's API calls"
+            'call again with `capture="on"` to record the app\'s API calls'
         )
     tier = str(body.get("tier") or "none")
     message = str(body.get("message") or "")
@@ -783,9 +783,7 @@ def packet_block(packet: object, *, session_token: str = "") -> str:
         # the other side is indifferent to whitespace, and indent=2 charged
         # every turn of every run for it. `sort_keys` stays -- a stable field
         # order is what lets two packets be diffed by eye and by test.
-        text = json.dumps(
-            payload, separators=(",", ":"), sort_keys=True, default=str
-        )
+        text = json.dumps(payload, separators=(",", ":"), sort_keys=True, default=str)
     except Exception:  # pragma: no cover - defensive
         text = "{}"
     return "```json\n" + text + "\n```\n\n" + NO_ECHO

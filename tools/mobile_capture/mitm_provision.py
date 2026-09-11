@@ -99,9 +99,7 @@ MITM_PINS: dict[tuple[str, str], dict[str, str]] = {
             + MITM_VERSION
             + "-macos-arm64.tar.gz"
         ),
-        "sha256": (
-            "0a09ee3b82569e8985aff8186e4792618b8e5d0c766098db093d09a87d4b013a"
-        ),
+        "sha256": ("0a09ee3b82569e8985aff8186e4792618b8e5d0c766098db093d09a87d4b013a"),
     },
     ("darwin", "x86_64"): {
         "url": (
@@ -111,9 +109,7 @@ MITM_PINS: dict[tuple[str, str], dict[str, str]] = {
             + MITM_VERSION
             + "-macos-x86_64.tar.gz"
         ),
-        "sha256": (
-            "7998187f5a0d399ab796af4523d3ad830ebe690726a41bc3e1df47a8e477a641"
-        ),
+        "sha256": ("7998187f5a0d399ab796af4523d3ad830ebe690726a41bc3e1df47a8e477a641"),
     },
     ("linux", "x86_64"): {
         "url": (
@@ -123,9 +119,7 @@ MITM_PINS: dict[tuple[str, str], dict[str, str]] = {
             + MITM_VERSION
             + "-linux-x86_64.tar.gz"
         ),
-        "sha256": (
-            "2e95286b618fa6fd33e5e62a78c2e5112571d85f42ec2bac29b97ee242bdb5c5"
-        ),
+        "sha256": ("2e95286b618fa6fd33e5e62a78c2e5112571d85f42ec2bac29b97ee242bdb5c5"),
     },
     ("linux", "aarch64"): {
         "url": (
@@ -135,9 +129,7 @@ MITM_PINS: dict[tuple[str, str], dict[str, str]] = {
             + MITM_VERSION
             + "-linux-aarch64.tar.gz"
         ),
-        "sha256": (
-            "b358643a6c4f4b39e33d985350f660b724fece95687d7daa899ef0c4e211f681"
-        ),
+        "sha256": ("b358643a6c4f4b39e33d985350f660b724fece95687d7daa899ef0c4e211f681"),
     },
 }
 
@@ -465,8 +457,10 @@ def provision(apply: bool = False) -> dict:
                 },
             }
         pin = _pin_for_platform()
-        if not pin or not pin.get("url") or not downloader.valid_sha256(
-            pin.get("sha256")
+        if (
+            not pin
+            or not pin.get("url")
+            or not downloader.valid_sha256(pin.get("sha256"))
         ):
             key = _platform_key()
             return {
@@ -520,8 +514,7 @@ def provision(apply: bool = False) -> dict:
             binary.chmod(0o755)
         except OSError:
             logger.info(
-                "mobile_capture.mitm_provision: could not set the executable "
-                "bit on %s",
+                "mobile_capture.mitm_provision: could not set the executable bit on %s",
                 binary,
             )
         return {

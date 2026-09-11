@@ -91,24 +91,18 @@ async def prepare(serial: str, *, owner: str = "", apply_: bool = False) -> dict
             if not ca_made.get("error")
             else ""
         )
-        prior = (
-            ledger.tier_for(serial, fingerprint) if fingerprint else {"content": {}}
-        )
+        prior = ledger.tier_for(serial, fingerprint) if fingerprint else {"content": {}}
         prior_tier = (prior.get("content") or {}).get("tier")
 
         installed = await cert.install(serial, apply=apply_, owner=label)
         if installed.get("error"):
             if installed["error"] == proxy.REASON_DEVICE_BUSY:
                 return _none(installed["error"], fingerprint=fingerprint or "")
-            return _none(
-                ladder.REASON_CERT_NOT_TRUSTED, fingerprint=fingerprint or ""
-            )
+            return _none(ladder.REASON_CERT_NOT_TRUSTED, fingerprint=fingerprint or "")
 
         found = mitm_provision.find_mitmdump()
         binary = (
-            (found.get("content") or {}).get("path")
-            if not found.get("error")
-            else ""
+            (found.get("content") or {}).get("path") if not found.get("error") else ""
         )
         if not binary:
             provisioned = mitm_provision.provision(apply=apply_)

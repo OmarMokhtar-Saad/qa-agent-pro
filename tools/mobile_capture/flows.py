@@ -266,7 +266,9 @@ def _process(run_id: str, key: str, path: Path) -> dict:
 
 
 def _typed_values(tester_inputs: object) -> list:
-    return list((tester_inputs or {}).values()) if isinstance(tester_inputs, dict) else []
+    return (
+        list((tester_inputs or {}).values()) if isinstance(tester_inputs, dict) else []
+    )
 
 
 def finish_case(run_id: str, tc_id: str, *, tester_inputs: object = None) -> dict:
