@@ -20,7 +20,8 @@ import logging
 import time
 
 from tools.mobile import actions as actions_mod
-from tools.mobile import adb, executor, media, perception, run_store
+from tools.mobile import adb, executor, media, run_store
+from tools.mobile.providers import composite
 from tools.mobile_capture import flows as api_flows
 from tools.mobile_evidence import capture, crash_detector
 
@@ -423,7 +424,7 @@ async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
             # lane was fixed for, under exactly the condition this loop was
             # written to survive. The identity is resolved once, after the loop,
             # and only the screen pruned WITH it is stored.
-            pruned = perception.prune(
+            pruned = composite.observe(
                 dumped.get("content"),
                 "",
                 display=sized.get("content"),
@@ -478,7 +479,7 @@ async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
         if in_front:
             settled_activity = await executor.resolve_activity(ctx)
         if settled_activity:
-            settled = perception.prune(
+            settled = composite.observe(
                 dumped.get("content"),
                 settled_activity,
                 display=sized.get("content"),

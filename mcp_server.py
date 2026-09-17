@@ -1125,6 +1125,7 @@ def build_server():
             locale: str = "",
             capture: str = "",
             capture_ack: bool = False,
+            charter: str = "",
         ) -> list[ContentBlock]:
             """Run test cases, or explore freely, on an Android emulator.
 
@@ -1139,6 +1140,16 @@ def build_server():
             the turn you were refused, and it dismisses that probe alone. Pass run_id to continue a run in ANY chat --
             that takes the run over and the previous chat is told. It hands you
             ONE packet at a time; answer each with qa_submit_mobile_step.
+
+            Choosing to explore freely with no goal answers with a CHARTER
+            INTAKE packet: the server's own questions about the run's terms
+            (goal, depth, scope, destructive, budget). Put them to the tester
+            in your own words, ask no others, and call again with `charter`
+            set to a JSON object using the field names the packet gives. Never
+            put a password, an OTP or any personal value in it: the charter is
+            written into the run's report on disk, and it has no field for a
+            secret. Anything left out takes a default, and the report names
+            every default it used.
 
             `locale` sets the DEVICE's language for the run -- `ar`, `ar-EG`,
             `en-US`. It is applied before anything is installed, read back off
@@ -1193,6 +1204,7 @@ def build_server():
                     locale=locale,
                     capture=capture,
                     capture_ack=capture_ack,
+                    charter=charter,
                     **_make_elicitors(ctx),
                     progress=_make_progress(ctx),
                 ),
@@ -1275,6 +1287,38 @@ def build_server():
                 mcp_handlers.handle_mobile_status(
                     run_id, session_token, report_now, progress=_make_progress(ctx)
                 ),
+            )
+
+        # Inside the mobile-lane gate, deliberately: a network watch drives the
+        # emulator console and samples the device's socket table, so it lives
+        # or dies with `_mobile_lane_enabled()` exactly like the three tools
+        # beside it. No new flag -- the kill-switch that already governs this
+        # lane is the one that governs this.
+        @mcp.tool()
+        async def qa_network_watch(
+            ctx: Context,
+            action: str = "status",
+            serial: str = "",
+            package: str = "",
+            apply: bool = False,
+        ) -> str:
+            """Watch what a device puts on the wire, passively and root-free.
+
+            The SAME mechanism a mobile run uses (emulator console pcap plus a
+            `/proc/net/tcp` owner sampler), given an entry point that needs no
+            run: `action="start"` (needs `apply=true` -- it touches the
+            device), `"stop"` (never needs it: stopping REVERTS), `"status"`.
+
+            Emulator only -- a physical device is refused by name, because the
+            console does not exist there. Host names come from the TLS
+            ClientHello and from DNS; **paths and query strings are not visible
+            and are never guessed**. The pcap is parsed and DELETED; only the
+            summary comes back.
+            """
+            return await _tracked(
+                "qa_network_watch",
+                ctx,
+                mcp_handlers.handle_network_watch(action, serial, package, apply),
             )
 
         @mcp.tool()
@@ -1701,6 +1745,34 @@ def build_server():
             "qa_host_check",
             ctx,
             mcp_handlers.handle_host_check(refresh=bool(refresh)),
+        )
+
+    # ALL editions, NO flag. It makes no outbound call, needs no per-install
+    # credential, is not an experiment, and there is no install where "do not
+    # tell the client what this machine is" is the right value -- so it falls
+    # into none of the four flag categories and owes no FEATURE_FLAGS entry.
+    # Deliberately NOT named in tools/guidance.py: it is for a GUI client, not
+    # for a chat model, and naming it there would spend instruction budget on a
+    # tool no chat should call.
+    @mcp.tool()
+    async def qa_machine_report(ctx: Context, section: str = "all") -> str:
+        """Machine-readable rows about THIS install, for a non-chat client.
+
+        Returns JSON: `backend` (version + edition in one call), `doctor`
+        (component/status/detail/fix_hint rows from the same producers
+        `qa-doctor` uses), `clients` (which MCP clients are installed and
+        whether the entry they carry points at THIS install) and
+        `provisioning` (the mobile provisioner's steps AND how old that record
+        is).
+
+        READ-ONLY -- unlike `qa-doctor` it repairs nothing, writes no `.env`
+        and edits no client config, so it is safe to poll. Humans should read
+        `qa-doctor` instead; this reply is for a GUI.
+        """
+        return await _tracked(
+            "qa_machine_report",
+            ctx,
+            mcp_handlers.handle_machine_report(section),
         )
 
     @mcp.tool(name=selfcheck_module.SELF_TOOL_NAME)

@@ -18,7 +18,9 @@ from __future__ import annotations
 import logging
 import time
 
-from tools.mobile import adb, executor, perception, run_store
+from tools.mobile import adb, executor, run_store
+from tools.mobile import charter as charter_mod
+from tools.mobile.providers import composite
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +34,11 @@ MAX_WATCH_ITEMS = 10
 
 STOP_GOAL = "goal_reached"
 STOP_TURNS = "turn_budget_exhausted"
-STOP_DEADLINE = "deadline_reached"
+STOP_DEADLINE = "deadline_reached"#: The charter's ``stop_on: first_finding``. A fifth stop, and the only one
+#: step 4 wires: ``coverage_plateau`` is persisted and reported and behaves as
+#: ``budget``, because nothing detects a plateau yet -- nothing grades a
+#: plateau stop, follow-up.
+STOP_FINDING = "first_finding"
 RUNNING = "running"
 
 EXTENSION_REFUSAL = (
@@ -59,6 +65,30 @@ EXTENSION_SPENT = (
     "Report what was found and stop."
 )
 
+#: Shown when an extension would gain NOTHING, because the charter's own
+#: budget is already this run's ceiling. It is a REFUSAL BY NAME, and the
+#: session's one extension is NOT spent.
+#:
+#: Measured on the shipped code before this existed: for ANY charter naming a
+#: steps or minutes budget the extension was a COMPLETE no-op -- new_state had
+#: already clamped the budget to the charter's figure and the extension
+#: re-clamped to that same figure -- while the reply said "Extended once by 15
+#: turns and 10 minutes" and the one extension was consumed. The tester's
+#: model then plans against fifteen turns it does not have, and the run dies
+#: at the next budget check with nothing in the record explaining why.
+#:
+#: The rule this obeys is the lane's, not this function's: EVERY site that
+#: refuses or reduces what the model asked for says so BY NAME in the same
+#: reply, and no clamp leaves a success-shaped message behind it -- the same
+#: reason a flag-OFF ``apply=true`` on the push path refuses by name rather
+#: than silently downgrading to a dry run.
+EXTENSION_NOT_GRANTED = (
+    "This run's budget comes from its charter, which is already the ceiling, "
+    "so an extension would add no turns and no time: nothing was extended and "
+    "the session's one extension was NOT spent. Report what was found and "
+    "stop, or start a run whose charter names a larger budget."
+)
+
 
 def _now(value: float | None) -> float:
     return time.time() if value is None else float(value)
@@ -70,9 +100,23 @@ def new_state(
     *,
     guard: bool = True,
     now: float | None = None,
+    charter: object = None,
 ) -> dict:
-    """A fresh, JSON-serialisable session state. Stored in the run manifest."""
+    """A fresh, JSON-serialisable session state. Stored in the run manifest.
+
+    *charter* is the run's TERMS (``tools/mobile/charter.py``). It lives HERE,
+    inside the state, rather than in a manifest key of its own, because the
+    state IS ``manifest["explore"]`` and is already the dict a turn packet is
+    built from -- so a resume in another chat explores under the same terms
+    with no new reader and no new writer. ``charter=None`` normalises to the
+    default charter and reproduces this function's previous values exactly.
+    """
     started = _now(now)
+    terms = charter_mod.normalize(charter)
+    # DOWNWARD ONLY. The charter can SHORTEN a run and can never lengthen one:
+    # MAX_TURNS and DEADLINE_S remain the lane's ceilings, and a charter asking
+    # for more gets them. See charter.budget_for.
+    steps, seconds = charter_mod.budget_for(terms, MAX_TURNS, DEADLINE_S)
     items = []
     for item in list(watch_for or [])[:MAX_WATCH_ITEMS]:
         text = " ".join(str(item or "").split())[:200]
@@ -87,11 +131,12 @@ def new_state(
         # has; this is a second value with a second name, and its one job is to
         # decide which number the next packet may re-use. See ``next_turn``.
         "committed_turn": 0,
-        "turns_budget": MAX_TURNS,
+        "turns_budget": steps,
         "started": started,
-        "deadline": started + DEADLINE_S,
+        "deadline": started + seconds,
         "extensions_used": 0,
         "guard": bool(guard),
+        "charter": terms,
         "stop": "",
         "findings": [],
     }
@@ -193,7 +238,7 @@ async def next_turn(
         sized = await adb.display_size(getattr(ctx, "serial", ""))
         # Same device fact, same cache, same reason as the case lane's.
         dpi = await adb.display_density(getattr(ctx, "serial", ""))
-        pruned = perception.prune(
+        pruned = composite.observe(
             dumped.get("content"),
             # ONE producer, shared with the replay: see resolve_activity.
             await executor.resolve_activity(ctx),
@@ -314,6 +359,45 @@ def apply_turn_result(state: object, raw: object, *, now: float | None = None) -
                 "content": {"state": body, "status": STOP_GOAL, "notice": notice},
             }
 
+        # ANCHOR NOTE: this text is inserted by REPLACING the statement that
+        # FOLLOWS the ``if bool(reply.get("goal_reached")):`` block -- the
+        # ``requested = ...`` assignment, a SIBLING at function-body
+        # indentation -- and not by anchoring on that if-block's ``return``.
+        # Anchoring on the return placed this text INSIDE the if-body, after an
+        # unconditional return, where it was dead code and ``stop_on:
+        # first_finding`` never fired at all. A following sibling statement is
+        # the anchor that provably lands outside the block: its own indentation
+        # IS the insertion point, so the block cannot be swallowed by the
+        # branch above it. The suite caught the dead placement in one run.
+        # THE CHARTER'S STOP CONDITION, deliberately BELOW the
+        # ``goal_reached`` return and not above it. A turn may report BOTH
+        # a finding and ``goal_reached``; measured on the ordering this
+        # replaces, that run returned ``first_finding`` and ``stop_reason``
+        # then named the stop as ``first_finding`` for a run whose goal was
+        # actually REACHED -- a false statement about the run in the
+        # artifact whose purpose is reconstructing it. Goal-reached is the
+        # stronger and more informative outcome, and the finding is still
+        # recorded in ``body["findings"]`` above either way, so precedence
+        # is expressed STRUCTURALLY by this order rather than by a second
+        # condition that could drift from the return above it. Ordering
+        # mutant M15 swaps the two blocks back;
+        # test_a_turn_that_reports_both_a_finding_and_the_goal_says_goal_reached
+        # is the pin that goes red.
+        #
+        # ``stop`` is the state's own existing stop field and
+        # ``stop_reason`` remains its ONLY reader, so this adds a writer
+        # and not a second derivation.
+        if finding and charter_mod.stop_on(body.get("charter")) == "first_finding":
+            body["stop"] = STOP_FINDING
+            return {
+                "error": None,
+                "content": {
+                    "state": body,
+                    "status": STOP_FINDING,
+                    "notice": notice,
+                },
+            }
+
         requested = reply.get("request_extension")
         if requested:
             reason = " ".join(str(reply.get("extension_reason") or "").split())[:400]
@@ -322,22 +406,86 @@ def apply_turn_result(state: object, raw: object, *, now: float | None = None) -
             elif not reason:
                 notice = EXTENSION_REFUSAL
             else:
-                body["extensions_used"] = int(body.get("extensions_used") or 0) + 1
-                body["turns_budget"] = (
-                    int(body.get("turns_budget") or MAX_TURNS) + EXTENSION_TURNS
+                # THE SECOND WRITER of this run's budget. ``new_state``
+                # clamped these two numbers through ``charter.budget_for``;
+                # this site ADDS to them, so "a charter can never lengthen a
+                # run" is false here unless it re-clamps. ``budget_cap`` is
+                # the one producer of what the tester asked for and returns 0
+                # where they asked for nothing, so a run with no charter
+                # extends exactly as it always has.
+                cap_turns, cap_seconds = charter_mod.budget_cap(
+                    body.get("charter")
                 )
-                body["deadline"] = (
-                    float(body.get("deadline") or _now(now)) + EXTENSION_S
-                )
-                body["extension_reason"] = reason
-                notice = (
-                    "Extended once by "
-                    + str(EXTENSION_TURNS)
-                    + " turns and "
-                    + str(EXTENSION_S // 60)
-                    + " minutes: "
-                    + reason
-                )
+                had_turns = int(body.get("turns_budget") or MAX_TURNS)
+                turns = had_turns + EXTENSION_TURNS
+                if cap_turns:
+                    turns = min(turns, min(cap_turns, MAX_TURNS))
+                had_deadline = float(body.get("deadline") or _now(now))
+                deadline = had_deadline + EXTENSION_S
+                if cap_seconds:
+                    # ``is not None``, never ``or``: ``started`` is 0.0 on
+                    # every test clock and in any run whose epoch is 0, and
+                    # the ``or`` form silently REBASES the deadline onto NOW
+                    # -- lengthening the very run this clamp exists to bound.
+                    # That is mutant M6c, killed by
+                    # test_an_extension_cannot_outrun_the_charters_budget,
+                    # which builds the state at now=0.0 and asserts the
+                    # deadline stays at or below 120.0. Do not "tidy" it back.
+                    _started = body.get("started")
+                    started = float(_started if _started is not None else _now(now))
+                    deadline = min(
+                        deadline, started + min(cap_seconds, DEADLINE_S)
+                    )
+                gained_turns = turns - had_turns
+                gained_seconds = deadline - had_deadline
+                if gained_turns <= 0 and gained_seconds <= 0:
+                    # REFUSE BY NAME. The clamp above left BOTH numbers where
+                    # they were, so granting here would consume the session's
+                    # one extension, change nothing, and REPORT a gain of 15
+                    # turns and 10 minutes -- measured, and for EVERY charter
+                    # naming a steps or minutes budget, because ``new_state``
+                    # already clamped to that same figure. A success-shaped
+                    # reply for work that did not happen is the worse failure:
+                    # the model plans against turns it does not have and the
+                    # run dies at the next budget check with nothing in the
+                    # record explaining why. So nothing is written,
+                    # ``extensions_used`` is NOT incremented,
+                    # ``extension_reason`` is left unwritten, and the refusal
+                    # names the ceiling that bound it. Mutant M6f deletes this
+                    # branch; the upper-bound assertions in
+                    # test_an_extension_cannot_outrun_the_charters_budget
+                    # CANNOT see it, because an inequality is satisfied by the
+                    # collapse -- the pin asserts this notice and
+                    # ``extensions_used`` instead.
+                    notice = EXTENSION_NOT_GRANTED
+                else:
+                    body["extensions_used"] = (
+                        int(body.get("extensions_used") or 0) + 1
+                    )
+                    body["turns_budget"] = turns
+                    body["deadline"] = deadline
+                    body["extension_reason"] = reason
+                    # WHAT WAS ACTUALLY GRANTED, never the full figure. A
+                    # PARTIAL grant (one axis moves, the other does not) names
+                    # only the axis that moved, for the same reason the clamp
+                    # sentence in ``charter.describe_terms`` names only the
+                    # axis that clamped: printing a number the run did not get
+                    # is a false statement about the run the tester just had.
+                    granted = []
+                    if gained_turns > 0:
+                        granted.append(str(int(gained_turns)) + " turns")
+                    if gained_seconds >= 60:
+                        granted.append(
+                            str(int(gained_seconds // 60)) + " minutes"
+                        )
+                    elif gained_seconds > 0:
+                        granted.append("under a minute")
+                    notice = (
+                        "Extended once by "
+                        + " and ".join(granted)
+                        + ": "
+                        + reason
+                    )
 
         status = stop_reason(body, now=now) or RUNNING
         body["stop"] = status if status != RUNNING else ""
