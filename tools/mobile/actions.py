@@ -140,6 +140,7 @@ URL_SCHEMES = ("https", "http", "market")
 MUTATING_OPS = frozenset(
     {
         "tap",
+        "tap_text",
         "type",
         "clear",
         "back",
@@ -165,6 +166,21 @@ MUTATING_OPS = frozenset(
 #: One key on purpose. ``enter`` IS the IME action on a single-line field.
 #: Each addition is one line here plus one behavioural test.
 PRESS_KEYS: dict[str, str] = {"enter": "KEYCODE_ENTER"}
+
+
+#: The longest word or phrase `tap_text` will look for. A LABEL, not a
+#: paragraph: it is matched against an element's visible text, so a query longer
+#: than any label on any screen can only ever miss. It bounds the string a model
+#: can put into a matcher.
+TAP_TEXT_MAX_QUERY_CHARS = 120
+
+#: How many DISTINCT controls may carry the word before `tap_text` refuses.
+#: One, and that is the point rather than a tuning knob: two controls carrying
+#: the same word means the script did not say which it meant, and choosing
+#: between them by dump order is how "Send voice message" was tapped instead of
+#: "Send". The refusal names the count, so the model can re-target with a `tap`
+#: and a narrower selector -- which is always available.
+TAP_TEXT_MAX_CANDIDATES = 1
 
 
 class Target(BaseModel):
@@ -210,6 +226,18 @@ class _Base(BaseModel):
 class TapAction(_Base):
     op: Literal["tap"]
     target: Target
+
+
+class TapTextAction(_Base):
+    """Tap the one control carrying this visible text.
+
+    Deliberately narrower than ``{"op": "tap", "target": {"text": ...}}``, which
+    resolves an ambiguous word to the clickable wrapper and proceeds. This op
+    refuses instead -- see :data:`TAP_TEXT_MAX_CANDIDATES`.
+    """
+
+    op: Literal["tap_text"]
+    text: str = Field(min_length=1, max_length=TAP_TEXT_MAX_QUERY_CHARS)
 
 
 class TypeAction(_Base):
@@ -449,6 +477,7 @@ class DoneAction(_Base):
 Action = Annotated[
     Union[
         TapAction,
+        TapTextAction,
         TypeAction,
         ClearAction,
         BackAction,
@@ -508,6 +537,7 @@ class Script(BaseModel):
 
 OPS = (
     "tap",
+    "tap_text",
     "type",
     "clear",
     "back",
@@ -858,6 +888,31 @@ def candidates_for(target: object, pruned: object) -> dict:
     return out
 
 
+#: What `tap_text` answers when the word is on more than one control. A SENTINEL
+#: with one meaning and one producer: the executor renders it and the trace
+#: carries it, so both branch on this constant rather than on a substring of a
+#: sentence.
+TAP_TEXT_AMBIGUOUS = "tap_text_ambiguous"
+
+
+def tap_text_candidates(text: object, pruned: object) -> tuple:
+    """``(target, [every element carrying this word])``.
+
+    The VOCABULARY half of `tap_text`, and only that half. How many CONTROLS
+    those elements amount to is a question about the screen's containment, and
+    that has one producer already -- `executor.actuated_element`, the function
+    the destructive guard is judged by. Deriving containment a second time here
+    is how two call sites start disagreeing about one screen.
+    """
+    wanted = str(text or "").strip()
+    if not wanted:
+        return None, []
+    target = Target(text=wanted[:TAP_TEXT_MAX_QUERY_CHARS])
+    found = candidates_for(target, pruned) or {}
+    _how, group = found.get("text", ("text", []))
+    return target, [e for e in (group or []) if isinstance(e, dict)]
+
+
 def resolve_target(target: object, pruned: object) -> dict:
     """Find *target* on the pruned screen. A miss is content, not an error.
 
@@ -1061,6 +1116,7 @@ def describe_vocabulary() -> dict:
         ),
         "notes": [
             "tap/type/clear/scroll/press act on a target; back/home/launch take none.",
+            "tap_text(text) is the short form of tap: it taps the ONE control carrying that visible text, and REFUSES when more than one control carries it rather than choosing between them. On a screen with the same word on several rows, use tap with a narrower target instead. It takes no target of its own.",
             "press(key, target) taps the field to focus it and then sends that "
             "key; key is one of "
             + ", ".join(sorted(PRESS_KEYS))

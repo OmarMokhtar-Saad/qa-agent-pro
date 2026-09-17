@@ -951,6 +951,15 @@ def plan_explore_run(
                 "locale": locale_record(locale),
                 "capture": capture_record(capture),
                 "avd": str(avd or provisioner.AVD_NAME),
+                # A SNAPSHOT of the PRODUCER's answer, not of the setting.
+                # provisioner.system_image() is the one function that decides which
+                # image this lane runs: it folds the operator setting, the historical
+                # fallback and the host ABI together. Reading the setting here would be a
+                # SECOND derivation -- it agrees today and drifts the day the fallback
+                # matters, and the manifest would then disagree with the AVD on disk.
+                # It is a snapshot because qa_mobile_system_image_tag is live: a report
+                # re-rendered next month must show the image THIS run used.
+                "system_image": provisioner.system_image(),
                 "order": [],
                 "total": 0,
                 "cases": [],
@@ -1375,6 +1384,63 @@ def release_device_lock(
     }
 
 
+async def finish_device(owner: str, **release_kwargs) -> dict:
+    """Give the tester's keyboard back, THEN give the emulator back.
+
+    **The one chokepoint for ending a run's hold on a device.** Every
+    run-teardown path in ``tools/mcp_handlers`` calls this rather than
+    :func:`release_device_lock` directly, and a test pins that there is no direct
+    call left in that file -- so a fifth teardown path added later cannot skip
+    the restore by reaching for the lock function.
+
+    **Why this exists instead of putting the restore inside
+    :func:`release_device_lock`.** That function is synchronous and takes no
+    serial, deliberately: its own comment says "BY OWNER, NOT BY NAME. The caller
+    does not always know the serial". ``ime.restore_previous`` is async and needs
+    one. Putting the restore inside it would have meant changing the signature of
+    a function with eight callers, or driving an event loop from a sync function
+    that several callers already invoke from inside one. So the lock function is
+    untouched and this wraps it.
+
+    The restore is a no-op for a run that never typed -- which is most of them,
+    and all of the pre-run placeholder releases -- because
+    ``ime_session.restore`` reads a record that only ``ensure_ready`` writes.
+
+    **Not called by the capture lane or the heartbeat.** Those take the device
+    lock for a certificate install, a proxy or a lease sweep; they never touched
+    an input method and have nothing to give back, so they keep calling the
+    synchronous function directly.
+
+    **What this does NOT cover:** a hard crash or a killed process calls nothing
+    at all -- :func:`release_device_lock` says it, and it is true here too. There
+    is no reaper in this lane, so a run killed outright leaves the QA keyboard
+    selected until something else runs. The doctor's per-device "selected" row is
+    what surfaces that afterwards.
+
+    **Keywords are forwarded verbatim, not restated.** ``**release_kwargs`` goes
+    straight to :func:`release_device_lock`, so this wrapper holds no copy of
+    that function's defaults -- a copy would pin today's values and drift the
+    day one of them changed. It also means a caller that passes only ``lease=``
+    still calls a one-keyword function, which is what every existing caller and
+    every existing test double expects.
+    """
+    from tools.mobile import ime_session
+
+    restored = await ime_session.restore(str(owner))
+    released = release_device_lock(str(owner), **release_kwargs)
+    return {
+        "error": None,
+        "content": {
+            "released": bool((released.get("content") or {}).get("released")),
+            "release": released.get("content") or {},
+            # Carried rather than swallowed: a restore that failed is a device
+            # left on the QA keyboard, and the reply a tester reads is the only
+            # place that can say so.
+            "ime": restored.get("content") or {"restored": False, "detail": str(restored.get("error") or "")},
+        },
+    }
+
+
 def relabel_device_lock(from_owner: str, to_owner: str) -> dict:
     """Hand the device from the provisioning phase to the run that now owns it.
 
@@ -1604,10 +1670,19 @@ def device_record(facts: object) -> dict:
 def device_line(resolved: object) -> str:
     """The tester-facing "what hardware was this?" line, or ``""``.
 
-    ``""`` for a run with no serial and for a manifest written before this field
-    existed, so an older run renders EXACTLY as it did -- an empty line is the
-    honest answer when the record does not say, and the alternative ("emulator",
-    assumed) would be a claim about evidence nobody made.
+    ``""`` for a run with no SERIAL, and only for that: an empty line is the
+    honest answer when the record does not say which device, and the alternative
+    ("emulator", assumed) would be a claim about evidence nobody made.
+
+    A run WITH a serial and no recorded ``kind`` -- every manifest written before
+    that field existed -- takes its own branch below and renders
+    "(kind not recorded for this run)". So this function does NOT render an older
+    run exactly as it did before ``device.kind``, and the claim that it does was
+    left standing here after the report started naming the same state: see
+    ``report.DEVICE_KIND_UNKNOWN``, which is a SECOND wording of this one. The
+    ``else "a physical device"`` below therefore cannot be reached by an
+    unrecognised kind, because ``device_record`` writes ``""`` for one and that
+    empty kind is handled above.
     """
     body = resolved if isinstance(resolved, dict) else {}
     serial = str(body.get("serial") or "")

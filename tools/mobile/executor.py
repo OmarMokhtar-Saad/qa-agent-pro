@@ -961,6 +961,22 @@ def missing_element_detail(resolved: object) -> str:
     return MISS_PLAIN
 
 
+#: The trace outcomes that mean THE DEVICE, not the app, ended the action.
+#:
+#: Defined here, beside the four sites that mint them, because this module invents
+#: the vocabulary and ``report.error_classes`` only counts it. A set restated in the
+#: report would be a second producer of the same meaning, and the drift would be
+#: silent: a new outcome minted below would simply stop being counted, and the page
+#: would show a smaller number with nothing to say it was smaller.
+#:
+#: ``tests/mobile/test_mobile_report_derivations.py`` scans THIS FILE for every
+#: literal assigned to ``entry["outcome"]`` and requires the two to agree, so a name
+#: added at a mint site and forgotten here fails by name on its first run.
+DEVICE_ERROR_OUTCOMES: frozenset = frozenset(
+    {"dump_failed", "device_error", "system_dialog", "left_app"}
+)
+
+
 def system_dialog_package(screen: object) -> str:
     """The system-dialog package on this screen, or ``""``.
 
@@ -1629,6 +1645,36 @@ def _touch_point(
     return None
 
 
+def resolve_tap_text(text: object, screen: object) -> dict:
+    """``{"element", "candidates", "ambiguous"}`` for one `tap_text`.
+
+    Counted by the CONTROL a tap would actuate, not by matching nodes. A Button
+    carrying "Send" wrapping a TextView carrying "Send" is two nodes and ONE
+    control -- both taps land on the same clickable ancestor -- and counting
+    nodes refused every ordinary button as ambiguous (probed, before this).
+    :func:`actuated_element` is the one producer of "what does a tap here
+    actuate", and the same one the destructive guard is judged by, so the count
+    and the guard cannot disagree about a screen.
+    """
+    target, group = actions_mod.tap_text_candidates(text, screen)
+    if target is None:
+        return {"element": None, "candidates": 0, "ambiguous": False}
+    controls = {}
+    for element in group:
+        point = _center(element)
+        actuated = actuated_element(screen, point) if point else None
+        chosen = actuated if isinstance(actuated, dict) else element
+        controls[actions_mod._identity(chosen)] = chosen
+    if len(controls) > actions_mod.TAP_TEXT_MAX_CANDIDATES:
+        return {"element": None, "candidates": len(controls), "ambiguous": True}
+    resolved = (actions_mod.resolve_target(target, screen) or {}).get("content") or {}
+    return {
+        "element": resolved.get("element"),
+        "candidates": len(controls),
+        "ambiguous": False,
+    }
+
+
 def actuated_element(screen: object, point: object) -> dict | None:
     """The element Android delivers a touch at *point* to, as far as a flat
     dump can tell. Never raises.
@@ -1861,6 +1907,47 @@ async def replay(script: object, ctx: Context) -> dict:
             # --- target resolution -------------------------------------------
             target = getattr(action, "target", None)
             element = None
+            if op == "tap_text":
+                # Resolved HERE, into the same `element` every other op uses, so
+                # the destructive guard below judges `actuated_element` for this
+                # op exactly as it does for a `tap`. An op that resolved its own
+                # element AFTER the guard would be a bypass, which is the defect
+                # class `NON_ACTUATING_OPS` exists to make explicit.
+                picked = resolve_tap_text(getattr(action, "text", ""), screen)
+                element = picked.get("element")
+                if element is None:
+                    wanted = str(getattr(action, "text", ""))[:80]
+                    entry["outcome"] = (
+                        actions_mod.TAP_TEXT_AMBIGUOUS
+                        if picked.get("ambiguous")
+                        else "missing_element"
+                    )
+                    entry["detail"] = (
+                        "`"
+                        + wanted
+                        + "` is on "
+                        + str(picked.get("candidates"))
+                        + " different controls on this screen, so nothing was "
+                        "tapped. Use `tap` with a narrower target to say which "
+                        "one you mean."
+                        if picked.get("ambiguous")
+                        else "Nothing on this screen carries the text `"
+                        + wanted
+                        + "`."
+                    )
+                    _stamp_after(entry, screen)
+                    _append(trace, entry)
+                    return {
+                        "error": None,
+                        "content": _result(
+                            STATUS_NEEDS_MODEL,
+                            trace,
+                            screen,
+                            "",
+                            entry["detail"],
+                            index,
+                        ),
+                    }
             if target is not None:
                 resolved = actions_mod.resolve_target(target, screen)
                 element = ((resolved or {}).get("content") or {}).get("element")
@@ -2515,7 +2602,10 @@ async def _perform(
                 "needs_model": True,
             }
         return await adb.swipe(serial, *points)
-    if op == "tap":
+    if op in ("tap", "tap_text"):
+        # ONE device path for both. `tap_text` differs only in how its element
+        # was chosen; once chosen a tap is a tap, and a second `adb.tap` call
+        # site would be a second place for the bounds check to drift.
         center = _center(element) if isinstance(element, dict) else None
         if not center:
             return {"error": "That element has no usable bounds.", "content": None}

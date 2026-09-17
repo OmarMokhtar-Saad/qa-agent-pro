@@ -148,6 +148,28 @@ def manifest_status() -> dict:
     }
 
 
+#: How much of an input-method id a REPORT prints. Ids are `package/.Class` and
+#: the package is a reverse domain, so an untruncated one pushes the fact a
+#: tester needs -- installed, selected -- off the end of a narrow table cell.
+#: DISPLAY ONLY: nothing compares, stores or selects a truncated id, and
+#: `same_component` is always handed the full string.
+IME_ID_DISPLAY_CHARS = 60
+
+
+def display_id(value: object) -> str:
+    """An input-method id, shortened for a report cell.
+
+    In this package rather than at each surface: qa-doctor's prose and
+    `machine_report`'s rows both print this id, and two independent truncations
+    of one value is how two surfaces start disagreeing about what the device
+    said.
+    """
+    text = str(value or "").strip()
+    if len(text) <= IME_ID_DISPLAY_CHARS:
+        return text
+    return text[: IME_ID_DISPLAY_CHARS - 1] + "\u2026"
+
+
 def apk_cache_path(version: str) -> Path:
     """Where the verified APK is cached."""
     tag = re.sub(r"[^A-Za-z0-9._-]", "-", str(version or "unversioned"))

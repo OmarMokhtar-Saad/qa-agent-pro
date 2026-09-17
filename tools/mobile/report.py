@@ -69,7 +69,6 @@ it has no entry point of its own.
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import html
 import json
@@ -85,9 +84,11 @@ from config.settings import settings
 from tools.mobile import actions as actions_mod
 from tools.mobile import charter as charter_mod
 from tools.mobile import (
+    executor,
     explore_runner,
     media,
     paths,
+    platform_info,
     run_store,
     screen_audit,
     screen_phone,
@@ -133,25 +134,17 @@ MAX_RECTS = 150
 MAX_TEXT = 200
 MAX_ROWS = 400
 
-#: The selfcheck's page-size pin, shared so the two cannot drift.
+#: The page-size pin, shared with ``report_selfcheck`` so the two cannot drift.
+#:
+#: The index is ONE file inside a self-contained folder: the pictures live in
+#: ``../shots/`` and the recordings in ``report/media/``, so nothing on this page
+#: is an inlined payload any more. What this bounds is the MARKUP -- a run with
+#: thousands of steps grows its case tables without any limit of their own, and a
+#: document a browser cannot open is a report the tester cannot read at all.
+#: That, and not the pictures, is the surviving constraint.
 MAX_PAGE_BYTES = 8 * 1024 * 1024
-#: The total base64 TEXT this page may spend on inlined screen PNGs.
-#:
-#: MEASURED AT THE LAST CONSUMER -- the encoded characters that actually land in
-#: the document -- and NOT at the raw PNG, because base64 costs +33% and a cap
-#: sized on the pre-encoding bytes is wrong by exactly that much at the only
-#: place it matters.
-#:
-#: Half of :data:`MAX_PAGE_BYTES`, so the tables, the wireframes and the shell
-#: always keep the other half. That split is the constraint: a report that blew
-#: the page-size pin because of its pictures is a report the tester cannot open
-#: at all, and the case table is the product while the picture is the addition.
-#: At the ~200KB an encoded 768px screen weighs this funds roughly twenty
-#: OBSERVATIONS -- looks, not screens, because that is what a frame resolves on,
-#: so a long conversation spends far faster than a settings walk does.
-MAX_SHOT_B64_TOTAL = 4 * 1024 * 1024
 
-#: This document's funded frames, ``{"frames": {key: b64}, "dropped": [key]}``.
+#: This document's resolved frames, ``{"frames": {key: filename}}``.
 #:
 #: A ContextVar rather than a parameter for the reason ``mcp_handlers``'
 #: ``_MOBILE_IMAGE_SPECS`` is one: the value is decided ONCE at the top of the
@@ -258,11 +251,6 @@ def _between(text: str, open_tag: str, close_tag: str) -> str:
 SHELL = _read_shell()
 SHELL_STYLE = _between(SHELL, "<style>", "</style>")
 SHELL_SCRIPT = _between(SHELL, "\n<script>", "</script>")
-
-#: The only external references the shell makes: the typefaces the reference
-#: report is set in. Each face carries a system fallback, so the page still
-#: opens offline -- in a different face, with the same layout.
-FONT_HOSTS = ("https://fonts.googleapis.com", "https://fonts.gstatic.com")
 
 
 def _text(value: object, limit: int = MAX_TEXT) -> str:
@@ -925,16 +913,23 @@ def _resolve_look(screen_id: object, screens: object) -> tuple[str, dict | None,
     return ident, screen, LOOK_EXACT
 
 
-#: The prefix every ``img`` on this page carries, and THE definition of it.
+#: The ``src`` prefix every ``img`` on this page carries, and THE definition of it.
+#:
+#: A FOLDER-RELATIVE PATH, not a ``data:`` payload. The index lives in ``report/``
+#: inside the run directory and the PNGs live in ``../shots/``, so the whole folder
+#: travels as one artifact -- which is already the documented contract (the
+#: recordings under ``report/media/`` have always worked this way). A lone
+#: ``index.html``, separated from its folder, shows no screens; the page says so in
+#: its own standfirst rather than rendering broken images silently.
 #:
 #: Declared here, in the emitter, and IMPORTED by the guard
 #: (``report_selfcheck.SHOT_SRC = report.SHOT_SRC``) rather than restated there.
 #: The direction is forced: ``report_selfcheck`` already does
 #: ``from tools.mobile import report``, so the reverse import would be a cycle.
-#: One object, one meaning -- a switch to another media type moves the emitter
-#: and its pin together, where two matching literals would silently desync and
-#: every test reading "its own module's constant" would drift along with them.
-SHOT_SRC = "data:image/png;base64,"
+#: One object, one meaning -- this very change inverted the MEANING of the value
+#: while the name stayed, and every consumer that bound the constant rather than
+#: the literal needed no edit at all. That is the property, demonstrated.
+SHOT_SRC = "../" + run_store.SHOTS_DIR + "/"
 
 #: An observation for which NOTHING was ever stored.
 #:
@@ -950,88 +945,64 @@ SHOT_MISSING_NOTE = (
     "composed from the element list, which is all this page has."
 )
 
-#: ... and one that WAS stored and did not fit this page's image budget.
-SHOT_BUDGET_NOTE = (
-    "A picture of this screen was stored and is NOT shown here: this report "
-    "spent its whole image budget on other screens. Nothing failed, and the "
-    "PNG is still on disk beside the run."
-)
-
 
 def _shots(run_id: object, library: object) -> dict:
-    """``{"frames": {key: base64}, "dropped": [key]}``. Never raises.
+    """``{"frames": {key: filename}}``. Never raises.
 
-    ONE producer for every picture on this page.
+    ONE producer for every picture on this page. It answers exactly one question --
+    "does a non-empty PNG exist on disk for this observation?" -- by reading the
+    file, so the page can never claim a picture that is not there.
 
     *library* is the MERGED book :func:`_merged_library` builds -- screens AND
-    observations -- because that is what a frame resolves against, and a frame
-    the page cannot resolve is a frame no picture belongs under. Reading only
-    the screen library here would fund one frame per screen and leave every
-    turn of a conversation but the last with nothing.
+    observations -- because that is what a frame resolves against, and a frame the
+    page cannot resolve is a frame no picture belongs under.
 
-    THE BUDGET IS SPENT IN SORTED KEY ORDER, not in the order the document
-    happens to render. Choosing by render order would mean deriving the page's
-    screen selection a second time here, while ``_card_html``, ``_seq_rows`` and
-    ``_overview`` already own that answer -- and two derivations of one answer
-    drift. The consequence on a run too wide to fund (an arbitrary subset gets a
-    picture) is DISCLOSED per screen by :data:`SHOT_BUDGET_NOTE`, never hidden.
-
-    ``dropped`` is a separate list and not an absence, because absence already
-    means something else here -- see the two notes above.
+    THERE IS NO BUDGET ANY MORE. Nothing is inlined, so the page costs the same
+    whether it references one picture or two hundred, and a "this report declined
+    to show it" state has no producer left. It was DELETED rather than kept as an
+    always-empty list: a sentence with no producer is a fabricated absence, and an
+    always-empty branch is how a dead state survives a rewrite.
     """
     frames: dict = {}
-    dropped: list = []
     try:
         book = library if isinstance(library, dict) else {}
-        spent = 0
         for ident in sorted(str(key) for key in book):
             data = (run_store.read_shot(str(run_id), ident) or {}).get("content")
             if not isinstance(data, (bytes, bytearray)) or not data:
                 continue
-            encoded = base64.b64encode(bytes(data)).decode("ascii")
-            # Counted on `encoded`, never on `data`: see MAX_SHOT_B64_TOTAL.
-            if spent + len(encoded) > MAX_SHOT_B64_TOTAL:
-                dropped.append(ident)
-                continue
-            spent += len(encoded)
-            frames[ident] = encoded
+            frames[ident] = ident + ".png"
     except Exception:  # never-raise: a picture is not a verdict
         logger.exception("mobile.report._shots failed")
-    return {"frames": frames, "dropped": dropped}
+    return {"frames": frames}
 
 
 def _shot_html(ident: str) -> str:
-    """The stored PNG of *ident* inlined, or the honest note for why it is not.
+    """The stored PNG of *ident*, referenced by path, or the honest note for its absence.
 
-    *ident* is what :func:`_resolve_look` RESOLVED, and this function is called
-    only on its ``LOOK_EXACT`` answer. That is load-bearing: under
-    ``LOOK_AMBIGUOUS`` the key is a bare screen id with two or more stored looks
-    behind it, and a picture drawn there would be one arbitrary look captioned as
-    the step's own -- the fabricated-evidence defect ``_resolve_look`` exists to
-    stop, in a form a tester is even less able to question because it is a
-    photograph.
+    *ident* is what :func:`_resolve_look` RESOLVED, and this function is called only
+    on its ``LOOK_EXACT`` answer. That is load-bearing: under ``LOOK_AMBIGUOUS`` the
+    key is a bare screen id with two or more stored looks behind it, and a picture
+    drawn there would be one arbitrary look captioned as the step's own -- the
+    fabricated-evidence defect ``_resolve_look`` exists to stop, in a form a tester
+    is even less able to question because it is a photograph.
 
-    A ``data:`` URI and never a path: this report is emailed and opened from
-    disk, where a ``src`` pointing into the run directory is already dead. The
-    self-check enforces that every ``img`` on the page is one of these --
-    ``report_selfcheck._pin_links`` checks IDENTITY, exactly as it already does
-    for the shell's one script and three font links.
+    A PATH and never a ``data:`` URI: see :data:`SHOT_SRC`. The self-check enforces
+    that every ``img`` on the page starts with that prefix and climbs exactly one
+    level -- ``report_selfcheck._pin_links`` checks IDENTITY, as it already does for
+    the shell's one script and for every clip source.
 
-    The ``<img>`` is emitted ONLY from a non-empty entry in ``frames``, which
-    only a non-empty file on disk can produce, so a capture that failed can
-    never leave this page claiming a picture exists.
+    The ``<img>`` is emitted ONLY from a non-empty entry in ``frames``, which only a
+    non-empty file on disk can produce, so a capture that failed can never leave
+    this page claiming a picture exists.
     """
     book = _SHOTS.get() or {}
-    encoded = str((book.get("frames") or {}).get(ident) or "")
-    if encoded:
+    filename = str((book.get("frames") or {}).get(ident) or "")
+    if filename:
         return (
             '<figure class="shot"><img alt="The screen as the device drew it" '
-            'src="' + SHOT_SRC + encoded + '"></figure>'
+            'loading="lazy" src="' + SHOT_SRC + filename + '"></figure>'
         )
-    note = (
-        SHOT_BUDGET_NOTE if ident in (book.get("dropped") or []) else SHOT_MISSING_NOTE
-    )
-    return '<p class="wirenote shotnote">' + esc(note, 300) + "</p>"
+    return '<p class="wirenote shotnote">' + esc(SHOT_MISSING_NOTE, 300) + "</p>"
 
 
 def _frame_html(screen_id: object, screens: object) -> str:
@@ -2299,8 +2270,16 @@ def _locale_cell(manifest: dict) -> tuple | None:
 #: That producer refuses to default an unknown kind to ``emulator`` because a
 #: confident wrong answer about whether a run touched real hardware is worse than
 #: a blank -- and this page then printed " · emulator" unconditionally, throwing
-#: that care away and labelling every physical-device run an emulator. One
-#: producer, one meaning, and the unknown case is named rather than guessed.
+#: that care away and labelling every physical-device run an emulator. The
+#: unknown case is now named rather than guessed.
+#:
+#: TWO SURFACES, TWO STRINGS, ONE STATE -- enumerated rather than asserted. This
+#: page says "device kind unrecorded"; ``session.device_line`` says
+#: "(kind not recorded for this run)" for the same empty kind. Nothing branches
+#: on either, so this is an un-unified WORDING and not a half-wired sentinel --
+#: but "one producer, one meaning" would be a false claim while a second wording
+#: exists, so the pointer stands here instead of the claim. Unifying them is a
+#: change to a different surface with its own tester-facing text.
 DEVICE_KINDS = {"emulator": "emulator", "physical": "physical device"}
 DEVICE_KIND_UNKNOWN = "device kind unrecorded"
 
@@ -2912,7 +2891,16 @@ def _cases_section(
         + '</div>\n    <div class="noresults" id="noresults" hidden>\n      No cases match these filters.\n'
         '      <div><button class="chip ghost" type="button" data-clear>Clear filters</button></div>\n    </div>'
     )
-    return _sechead("cases", "Every case", "what ran, and what it came to", lede, body)
+    # The SECTION is opened by the seven-section assembly in `_document_body`; this
+    # builder returns its BODY. It used to return a whole `<section id="cases">`, so
+    # wrapping it produced TWO elements with id="cases" -- an ambiguous nav anchor and
+    # invalid HTML, caught by the existing
+    # test_a_slot_shaped_store_value_is_not_expanded, which counts that id.
+    #
+    # The count lede stays, as a paragraph inside the body: it carries
+    # `coverage_phrase`, which is ONE number with one producer, and dropping it on the
+    # way up would have made the section head the only count on the page.
+    return '\n    <p class="lede">' + lede + "</p>\n" + body
 
 
 def _footer_html(run_id: str, manifest: dict) -> str:
@@ -3295,6 +3283,318 @@ def _document(**kwargs) -> str:
         _SHOTS.reset(token)
 
 
+#: The sentence an OLD manifest gets. A run created before this field existed genuinely
+#: does not know its image, and the page says exactly that. It NEVER falls back to
+#: ``settings`` or to ``provisioner.system_image()``: both would answer with TODAY's
+#: image, which is a fabricated fact about a finished run -- the success-shaped absence
+#: this repository has paid for before.
+SYSTEM_IMAGE_ABSENT = (
+    "not recorded for this run: it was created before the image was snapshotted into "
+    "the manifest, and today's setting is not evidence of what ran then"
+)
+
+#: Every environment fact this page can state, and the named reason for each it cannot.
+#: One row per fact, and a row is NEVER omitted when the value is missing -- an omitted
+#: row reads as "nothing to say", which is the success shape.
+
+
+def _env_section(manifest: dict, loaded: dict | None = None) -> str:
+    """The Environment & provenance section body.
+
+    Reads the manifest and ``platform_info.SUPPORT``; DERIVES nothing that a producer
+    already owns. The system image comes from the manifest SNAPSHOT and from nowhere else.
+    """
+    book = manifest if isinstance(manifest, dict) else {}
+    rows = []
+
+    def row(label, value, sub=""):
+        rows.append(
+            '<div class="envrow"><span class="rfl">'
+            + esc(label, 60)
+            + '</span><span class="rfv">'
+            + value
+            + ("<small>" + esc(sub, 300) + "</small>" if sub else "")
+            + "</span></div>"
+        )
+
+    image = str(book.get("system_image") or "")
+    row(
+        "System image",
+        esc(image, 120)
+        if image
+        else '<span class="cap none">' + esc(SYSTEM_IMAGE_ABSENT, 300) + "</span>",
+        "snapshotted at run creation from provisioner.system_image(); HTTPS body "
+        "decryption is only possible on a rootable image"
+        if image
+        else "",
+    )
+    row("Device", esc(_device_sub(book), 120))
+    # platform_info has NO `host_os`, and `raw_platform()` returns sys.platform
+    # ("darwin"), which is NOT a SUPPORT key -- its own docstring says it is for
+    # REPORTING the host, never for branching. So the host is NAMED from
+    # raw_platform() and the support claim is DERIVED by support_statement(),
+    # which is the module's single producer of that sentence: promoting Windows
+    # without a real run changes this row and the three docs together, or the
+    # existing platform-support pin names each one.
+    host = (
+        platform_info.MACOS
+        if platform_info.is_macos()
+        else (platform_info.WINDOWS if platform_info.is_windows() else "")
+    )
+    row(
+        "Host platform",
+        esc(platform_info.raw_platform() or "(unknown)", 60),
+        platform_info.support_statement(host),
+    )
+    row(
+        "Rendered",
+        esc(_short_stamp(time.time()), 40),
+        "when this page was BUILT, which is not when the run happened",
+    )
+    return '<div class="runstrip">' + "".join(rows) + "</div>"
+
+
+#: The run's last known moment, DERIVED, and labelled as derived everywhere it is shown.
+#:
+#: The manifest carries ``created`` and NO ``ended``: nothing writes one, because a run can
+#: be abandoned and an abandoned run has no honest end. So this page never prints the word
+#: "ended". What it can say is when the newest case was last checkpointed, which is a
+#: different fact with a different name -- and one producer for it, so the masthead, the
+#: overview strip and the timeline cannot disagree about when the run stopped.
+
+
+def _epoch(value: object) -> float | None:
+    """An epoch SECONDS stamp from a store field, or ``None`` when it is not one.
+
+    Deliberately NOT :func:`_ms`, which is a DURATION coercer: it clamps to ``10**9``, and
+    every real epoch second passed ``10**9`` in 2001 -- so reading a timestamp through it
+    pins every stamp on this page to the same instant in 2001, and the caller that then
+    divided by 1000 moved the run to 1970. Two errors that agree, and a fixture whose
+    ``updated`` is a small number (2.0, 300.0) cannot see either one. That is why
+    ``test_a_real_epoch_stamp_is_not_clamped`` grades this with a REAL stamp.
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")) or number <= 0:
+        return None
+    return number
+
+
+def last_checkpoint(cases: object) -> float | None:
+    """The newest ``case["updated"]`` in epoch SECONDS, or ``None`` when none carries one."""
+    stamps = []
+    for case in cases if isinstance(cases, (list, tuple)) else ():
+        value = _epoch(case.get("updated")) if isinstance(case, dict) else None
+        if value is not None:
+            stamps.append(value)
+    return max(stamps) if stamps else None
+
+
+#: The word the page uses for it, so no section invents its own.
+LAST_CHECKPOINT_LABEL = "last checkpoint"
+LAST_CHECKPOINT_SUB = "derived from the newest case checkpoint; this run recorded no end time, because nothing writes one and an abandoned run has no honest end"
+
+
+def elapsed_note(manifest: object, cases: object) -> str:
+    """Elapsed, or the NAME of whichever half is missing. Never a silent blank."""
+    book = manifest if isinstance(manifest, dict) else {}
+    created = _epoch(book.get("created"))
+    end = last_checkpoint(cases)
+    if created is None and end is None:
+        return "no start time recorded, and no case has ever been checkpointed"
+    if created is None:
+        return "no start time recorded, so elapsed cannot be computed"
+    if end is None:
+        return "no case has been checkpointed yet, so elapsed cannot be computed"
+    # Both halves are epoch SECONDS; fmt_ms wants milliseconds.
+    return fmt_ms(max(0, int((end - created) * 1000.0)))
+
+
+def error_classes(facts: object) -> dict:
+    """``{outcome: count}`` over every trace entry of every case. ONE derivation.
+
+    The overview KPI, the Logs breakdown and any case badge all read THIS dict. A section
+    that counted its own rows would be a second derivation of one answer, and mirrored
+    conditions drift -- which is why the pin monkeypatches this function and requires BOTH
+    consuming sections to move.
+
+    Only outcomes in ``executor.DEVICE_ERROR_OUTCOMES`` are counted. An outcome minted
+    there and missing from that set fails the source scan in the pin, not silently here.
+    """
+    counts: dict = {}
+    for fact in facts if isinstance(facts, (list, tuple)) else ():
+        rows = (fact or {}).get("rows") if isinstance(fact, dict) else None
+        for row in rows if isinstance(rows, (list, tuple)) else ():
+            outcome = (
+                str((row or {}).get("outcome") or "") if isinstance(row, dict) else ""
+            )
+            if outcome in executor.DEVICE_ERROR_OUTCOMES:
+                counts[outcome] = counts.get(outcome, 0) + 1
+    return counts
+
+
+def error_phrase(counts: object) -> str:
+    """``"3 (1 dump_failed, 2 left_app)"`` -- or the named zero, never a blank."""
+    book = counts if isinstance(counts, dict) else {}
+    total = sum(book.values())
+    if not total:
+        return "0 - no action on this run ended for a device reason"
+    return (
+        str(total)
+        + " ("
+        + ", ".join(str(n) + " " + name for name, n in sorted(book.items()))
+        + ")"
+    )
+
+
+def _error_kpi(facts: object) -> str:
+    """The overview's device-error figure. Reads ``error_classes`` and counts nothing.
+
+    It DELEGATES to :func:`_kpi` instead of building its own markup, because ``_kpi`` is
+    what puts the figure in a ``.kv`` -- the class the shell sizes, and the class every
+    other KPI on this page carries.
+
+    The round-3 version wrote its own ``<div class="kpi">`` with the figure in
+    ``<div class="n">`` and added ``t-def`` only when the total was non-zero. This shell has
+    no ``.kpi .n`` rule at all: its ``.n`` rules are ``.tricell .n``,
+    ``table.cov.turns td.n`` and ``.kpi.t-ok/.t-gap/.t-def .n``, none of which can match a
+    figure inside a bare ``<div class="kpi">``. So on the COMMON zero-error run the number
+    matched no rule and rendered at body size beside 3.2rem neighbours -- and the pin that
+    was supposed to catch it passed on a bare ``.n`` match against ``.tricell .n``.
+    """
+    counts = error_classes(facts)
+    total = sum(counts.values())
+    return _kpi(
+        esc(str(total), 8),
+        "device errors",
+        esc(error_phrase(counts), 200),
+        tone="c-def" if total else "",
+    )
+
+
+def _gallery_html(library: object) -> str:
+    """Every stored look, grouped by screen. Reads :func:`_shot_html` and nothing else.
+
+    The gallery is a SECOND VIEW of the pictures the case cards already show, not a second
+    producer of them: one ``_shot_html`` call per resolved observation key, so a screen the
+    page cannot pin to one stored look gets the same named absence here as it does there.
+    """
+    book = library if isinstance(library, dict) else {}
+    if not book:
+        return (
+            '<div class="emptystate"><h3>No screen was stored for this run</h3>'
+            "<p>Nothing was captured, so there is nothing to show. This is not a claim that "
+            "the screens were empty.</p></div>"
+        )
+    groups: dict = {}
+    for ident in sorted(str(key) for key in book):
+        groups.setdefault(ident.split("-")[0], []).append(ident)
+    out = []
+    for screen_id, idents in groups.items():
+        cells = "".join(
+            "<div>"
+            + _shot_html(ident)
+            + '<p class="scap">'
+            + esc(ident, 80)
+            + "</p></div>"
+            for ident in idents
+        )
+        out.append(
+            '<div class="screengroup"><p class="elab">screen '
+            + esc(screen_id, 40)
+            + ' · <span class="count">'
+            + str(len(idents))
+            + "</span> look"
+            + ("" if len(idents) == 1 else "s")
+            + '</p><div class="gallery">'
+            + cells
+            + "</div></div>"
+        )
+    return "".join(out)
+
+
+def _logs_section(manifest: object, facts: object, turns: int) -> str:
+    """Findings, the explore-lane stop reason, and the device-error breakdown.
+
+    The breakdown reads :func:`error_classes` -- the SAME call the overview KPI reads. It
+    does not count rows of its own; two derivations of one number drift, and the pin
+    monkeypatches the producer and requires both to move.
+    """
+    book = manifest if isinstance(manifest, dict) else {}
+    body = _findings_section(book, turns) or ""
+    stop = explore_stop(book)
+    if stop:
+        body += '<div class="guard"><p class="gapterm">why this run stopped</p>'
+        body += '<p class="gsub">' + stop + "</p></div>"
+    body += (
+        '<div class="card"><p class="elab">device errors by class</p>'
+        '<p class="logline">'
+        + esc(error_phrase(error_classes(facts)), 300)
+        + "</p></div>"
+    )
+    return body
+
+
+#: The page's OWN limits, named. Each is a fact about what this report cannot show, and
+#: each is here rather than absent because an absent limit reads as no limit.
+#:
+#: The first three are the gaps this change deliberately did NOT close -- see
+#: docs/DECISIONS.md. Naming them on the page is the whole point: a tester who cannot see
+#: a requirement id must be told no case record carries one, not left to conclude the run
+#: had no requirements.
+PAGE_LIMITS = (
+    (
+        "No requirement id per case",
+        "No case record on disk carries one. Suite-lane intake would have to start carrying it; until then this page cannot trace a case to a requirement.",
+    ),
+    (
+        "No per-step offset inside a clip",
+        "media.finish_step writes one clip per submit and records no offset per action, so this page cannot point at the moment a step happened inside a recording.",
+    ),
+    (
+        "No SDK, platform-tools, emulator or backend version",
+        "The manifest stores none and this module reads none. The system image is the one provisioning fact that IS recorded.",
+    ),
+    (
+        "This page cannot show that a case is CORRECT",
+        "Every figure here is about what the emulator DID. Whether the app is right is the tester's question.",
+    ),
+    (
+        "Calls the capture did not see are not here",
+        "A request that never reached the proxy leaves no row, and an empty table is not evidence of an idle app.",
+    ),
+    (
+        "No bodies below the decrypted tier",
+        "Which tier a run reached is stated in the network section; below it, headers and bodies were never readable.",
+    ),
+)
+
+
+def _limits_section() -> str:
+    """The named-gap list. DERIVED for the platform row, hardcoded for nothing."""
+    rows = "".join(
+        '<div class="guard"><p class="gapterm">' + esc(term, 120) + "</p>"
+        '<p class="gsub">' + esc(why, 400) + "</p></div>"
+        for term, why in PAGE_LIMITS
+    )
+    rows += (
+        '<div class="guard"><p class="gapterm">Platform coverage</p><p class="gsub">'
+        + esc(
+            "; ".join(
+                str(key) + ": " + str(value)
+                for key, value in sorted(platform_info.SUPPORT.items())
+            ),
+            600,
+        )
+        + "</p></div>"
+    )
+    return '<div class="gaps">' + rows + "</div>"
+
+
 def _document_body(
     *,
     run_id: str,
@@ -3344,23 +3644,30 @@ def _document_body(
     )
     steps = sum(len(f["rows"]) for f in facts)
     title = "Mobile run " + str(run_id)
-    # Built ONCE and reused: the nav must not offer a section this page does
-    # not emit, and the findings section exists only for the explore lane.
-    findings = _findings_section(manifest, len(facts))
-    # The audit's own section, built ONCE like `findings` above so the nav
-    # cannot offer a section this page does not emit.
+    # The audit's own section, built ONCE so the nav cannot offer a section this
+    # page does not emit. It is embedded under `media` in the body, because it is
+    # about screens -- a NESTED section with a real id, which the nav may point at.
+    #
+    # `findings` is deliberately NOT built here any more. `_logs_section` builds it,
+    # because the findings belong inside Logs. Building it here AND embedding it there
+    # is how this page came to emit id="findings" twice, which makes the nav anchor
+    # ambiguous and is invalid HTML -- see test_no_id_is_emitted_twice_on_the_rendered_page.
     a11y = _a11y_section(screens)
     nav_items = [
         ("overview", "Overview"),
-        ("coverage", "Coverage"),
-        ("apis", "APIs"),
-        ("perf", "Performance"),
+        ("cases", "Cases"),
+        ("media", "Media"),
+        ("network", "Network"),
+        ("logs", "Logs"),
+        ("env", "Environment"),
+        ("limits", "Limits"),
     ]
+    # The nav is still built from this list and only from it, so it can never offer a
+    # section the page did not emit. Accessibility keeps its CONDITIONAL entry: it nests
+    # under media in the body, but a nav entry for a section that was not built is exactly
+    # the promise this list exists to prevent.
     if a11y:
-        nav_items.append(("a11y", "Accessibility"))
-    if findings:
-        nav_items.append(("findings", "Findings"))
-    nav_items.append(("cases", "Cases"))
+        nav_items.insert(3, ("a11y", "Accessibility"))
     nav = "".join(
         '<a href="#' + sid + '" data-nav="' + sid + '">' + label + "</a>"
         for sid, label in nav_items
@@ -3405,34 +3712,65 @@ def _document_body(
             "At a glance",
             "the run in numbers",
             "Every figure here is about what the emulator DID with a case. Whether the app is right is the tester's question, not this one.",
-            _overview(facts, tally, manifest, partial, library, app, loaded, coverage),
+            _overview(facts, tally, manifest, partial, library, app, loaded, coverage)
+            + _error_kpi(facts),
         )
         + _sechead(
-            "coverage",
-            "Coverage by case",
-            "how far each one got",
-            "Every checkpointed case and where it stands. Sort any column; open a row for its card.",
-            _coverage(facts),
+            "cases",
+            # "Every case", not "Cases": this string is the <h2>, and SEVEN pre-existing
+            # assertions in test_mobile_report_selfcheck.py inject their mutation at
+            # "<h2>Every case</h2>". The nav LABEL is the argument below and stays "Cases",
+            # so renaming the heading would have bought nothing and broken all seven.
+            "Every case",
+            "every checkpointed case and how far it got",
+            "Open a case for its card: every tap, every field, every assertion, and the screen before and after.",
+            # NOT _toolbar(...) here: `_cases_html` already opens with it, and a second
+            # copy would ship two filter bars driving one list.
+            _coverage(facts)
+            + _cases_html(
+                facts, library, app, loaded, coverage, observations, media_map
+            ),
         )
         + _sechead(
-            "apis",
-            "API surface",
+            "media",
+            "Media",
+            "every screen this run stored",
+            "One picture per stored LOOK, grouped by screen. A screen with no picture says why, by name, rather than going quiet.",
+            _gallery_html(library) + a11y,
+        )
+        + _sechead(
+            "network",
+            "Network",
             "every endpoint the app reached, on the real wire",
             "Every endpoint the app called from inside a case, against the real backend rather than a fixture.",
+            # The api surface first, with the run-level roll-up UNDER it -- the order
+            # test_the_run_level_roll_up_rides_under_the_api_surface_section is named for.
             ev_render.apis_section(loaded)
             + ev_render.network_section(cases)
-            + ev_render.capture_section(cases, manifest),
+            + ev_render.capture_section(cases, manifest)
+            + _perf(facts, loaded),
         )
         + _sechead(
-            "perf",
-            "Performance",
-            "what the replay could time",
-            "How long things took, from the clock around each replayed action — and, when the app's own log was captured, from the moments the app wrote down itself.",
-            _perf(facts, loaded),
+            "logs",
+            "Logs & server events",
+            "what the run wrote down",
+            "Findings, the reason the run stopped, and every action that ended for a device reason rather than the app's.",
+            _logs_section(manifest, facts, len(facts)),
         )
-        + a11y
-        + findings
-        + _cases_html(facts, library, app, loaded, coverage, observations, media_map)
+        + _sechead(
+            "env",
+            "Environment & provenance",
+            "what this run ran on",
+            "The image, the device and the host, as the run recorded them. A fact the run did not record is named here, never filled in from today's settings.",
+            _env_section(manifest, loaded),
+        )
+        + _sechead(
+            "limits",
+            "What this page cannot show",
+            "the named gaps",
+            "Each line is a fact this report cannot state and the reason it cannot. An absent limit would read as no limit.",
+            _limits_section(),
+        )
         + '<div id="'
         + END_ID
         + '" data-cards="'
@@ -3461,7 +3799,9 @@ def _document_body(
                 "STANDFIRST": (
                     "Every planned case replayed on the emulator from the screen it saw, one action at a "
                     "time, and on the same card what the run did underneath: every tap, every field, every "
-                    "assertion and the screen before and after."
+                    "assertion and the screen before and after. The pictures on this page live in "
+                    "../shots/ beside it: this FOLDER travels as a whole, and a lone index.html shows no "
+                    "screens."
                 ),
                 "META": meta,
                 "FACTS": _facts_strip(

@@ -20,7 +20,7 @@ import logging
 import time
 
 from tools.mobile import actions as actions_mod
-from tools.mobile import adb, executor, media, run_store
+from tools.mobile import adb, executor, ime_session, media, run_store
 from tools.mobile.providers import composite
 from tools.mobile_capture import flows as api_flows
 from tools.mobile_evidence import capture, crash_detector
@@ -527,6 +527,29 @@ async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
         return {"error": str(exc), "content": None}
 
 
+#: Ops that put text on the screen through the QA keyboard.
+#:
+#: `clear` is here with `type`: it is an IME broadcast like the others, and a
+#: CLEAR sent to a keyboard that is not active is the same silence a TYPE would
+#: be. Stated as a set rather than an `op == "type"` test so a fourth text op
+#: added later is caught by the same reader.
+TEXT_OPS = frozenset({"type", "clear"})
+
+
+def script_types(script: object) -> bool:
+    """Does this script put text on screen at any point?
+
+    Asked of the WHOLE script before the replay starts, rather than on the first
+    type op as it happens: making a keyboard ready is an install and three shell
+    round trips, and doing that in the middle of a replay puts a minute of
+    device work between two steps that a tester reads as one action.
+    """
+    for action in list(getattr(script, "actions", None) or []):
+        if str(getattr(action, "op", "") or "") in TEXT_OPS:
+            return True
+    return False
+
+
 async def submit_case(
     run_id: str,
     case: object,
@@ -567,6 +590,31 @@ async def submit_case(
                     packet=None,
                 ),
             }
+
+        # THE KEYBOARD, BEFORE ANYTHING IS TYPED. `ime_session.ensure_ready` is
+        # idempotent, so a run whose every case types pays for this once; a run
+        # that never types never calls it and never displaces the tester's
+        # keyboard. A refusal ends the case by NAME rather than replaying into a
+        # keyboard that is not listening -- which is the silence this whole
+        # change exists to end: ADBKeyBoard's receiver never registers on API
+        # 35, so a tester's own script typed into nothing and reported success.
+        if script_types(parsed["content"]):
+            ready = await ime_session.ensure_ready(ctx.serial, run_id)
+            if ready.get("error"):
+                return {
+                    "error": None,
+                    "content": _checkpoint(
+                        run_id,
+                        tc_id,
+                        view,
+                        verdict="",
+                        status=NEEDS_MODEL,
+                        reason=str(ready["error"]),
+                        trace=[],
+                        escapes=escapes_used(run_id, tc_id),
+                        packet=None,
+                    ),
+                }
 
         ctx.screen = screen if isinstance(screen, dict) else None
         # The pixels of this step. Started BEFORE the replay and stopped after

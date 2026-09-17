@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import time
 
-from tools.mobile import run_store
+from tools.mobile import provisioner, run_store
 from tools.risk_scorer import score_and_sort
 
 logger = logging.getLogger(__name__)
@@ -179,6 +179,10 @@ def plan_run(
                 "total": len(order),
                 "filters": body.get("applied") or [],
                 "planned": time.time(),
+                # The same producer the explore lane reads -- see session.py. Both
+                # callers carry it or the field does not exist, and an absent key reads
+                # as absent on the page rather than as today's setting.
+                "system_image": provisioner.system_image(),
             }
         )
         created = run_store.create_run(run_id, manifest)
