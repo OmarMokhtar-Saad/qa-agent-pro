@@ -3046,6 +3046,144 @@ async def _mobile_non_android(serial: str) -> str:
     return ""
 
 
+#: How long the "is an adb server already up?" connect may take. It is a LOCAL
+#: socket connect to a port that is either listening or not; anything slower is
+#: a wedged machine, and qa-doctor is what a tester runs when nothing works.
+_ADB_SERVER_PROBE_S = 0.5
+
+
+def _adb_server_already_running() -> bool:
+    """Is an adb server LISTENING on this machine right now? Never raises.
+
+    Used only by the lane-OFF disclosure, and the distinction it draws is why it
+    exists at all. `_mobile_lane_disclosure`'s rule is that an off lane starts
+    nothing: `adb devices` there would START an adb server on a machine whose
+    operator switched this lane off. A TCP connect starts nothing -- it either
+    finds a server the tester already has or it does not -- so asking a server
+    already up costs the operator nothing they have not already paid for.
+    """
+    import os
+    import socket
+
+    try:
+        port = int(str(os.environ.get("ANDROID_ADB_SERVER_PORT") or "5037").strip())
+    except Exception:
+        port = 5037
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=_ADB_SERVER_PROBE_S):
+            return True
+    except Exception:
+        return False
+
+
+async def _mobile_ime_rows(serials: list) -> list:
+    """Per-device QA-keyboard lines: installed, selected, and does it answer.
+
+    THE QUESTION THE REST OF THE SECTION DOES NOT ASK. Every other row here is
+    about whether the lane can DRIVE a device; these are about whether it can
+    TYPE on one, which has a different answer -- a device can be attached, free
+    and running the tester's own keyboard, in which case every row above is a
+    tick and no script that types will do anything at all.
+    """
+    out: list = []
+    try:
+        from tools.mobile import ime, ime_session
+    except Exception:
+        logger.debug("qa-doctor keyboard rows skipped: modules absent", exc_info=True)
+        return out
+    for serial in serials:
+        where = str(serial or "?")
+        try:
+            found = await asyncio.wait_for(
+                ime_session.state(where), timeout=_MOBILE_PROBE_S
+            )
+        except Exception as exc:
+            found = {
+                "error": "the keyboard probe did not finish (" + str(exc)[:80] + ")",
+                "content": None,
+            }
+        if found.get("error") or found.get("content") is None:
+            # NOT "the keyboard is missing". A probe that failed says nothing
+            # about the device, and this file has shipped that confusion before.
+            out.append(
+                "- \u26a0\ufe0f Could not check the QA keyboard on "
+                + where
+                + ": "
+                + str(found.get("error") or "the probe failed")[:160]
+            )
+            continue
+        body = found.get("content") or {}
+        if not body.get("installed"):
+            out.append(
+                "- \u2b1c The QA keyboard is not installed on "
+                + where
+                + " yet, so typing is unavailable there until a run installs "
+                "it; the run hands your own keyboard back when it finishes"
+            )
+            continue
+        if not body.get("selected"):
+            out.append(
+                "- \u2b1c The QA keyboard is installed on "
+                + where
+                + " but `"
+                + (ime.display_id(body.get("current")) or "another keyboard")
+                + "` is the active one, so typing is unavailable until a run "
+                "selects it; the run restores yours afterwards"
+            )
+            continue
+        try:
+            answered = await asyncio.wait_for(ime.probe(where), timeout=_MOBILE_PROBE_S)
+        except Exception as exc:
+            answered = {"error": str(exc)[:80], "content": None}
+        if answered.get("error") or not (answered.get("content") or {}).get("ok"):
+            # SELECTED IS NOT WORKING, and that gap is the whole reason this
+            # change exists: ADBKeyBoard is selected on API 35 and its receiver
+            # never registers, so a run types into silence and reports success.
+            # A keyboard that does not answer is reported as broken rather than
+            # assumed good because it is selected.
+            out.append(
+                "- \u26a0\ufe0f The QA keyboard is active on "
+                + where
+                + " but did not answer a test message, so typing may silently "
+                "do nothing: "
+                + str(answered.get("error") or "no reply from the input method")[:160]
+            )
+            continue
+        out.append("- \u2705 The QA keyboard is active on " + where + " and answering")
+    return out
+
+
+async def _mobile_off_attached_note() -> list:
+    """What the lane-OFF disclosure adds when a device is ALREADY visible.
+
+    Empty unless an adb server is already running, so an install with the lane
+    off and no adb server gets exactly the text it gets today and this function
+    makes no subprocess call whatsoever.
+    """
+    if not _adb_server_already_running():
+        return []
+    try:
+        from tools.mobile import adb as mobile_adb
+
+        attached = await asyncio.wait_for(mobile_adb.devices(), timeout=_MOBILE_PROBE_S)
+    except Exception:
+        logger.debug("qa-doctor off-lane device note skipped", exc_info=True)
+        return []
+    if attached.get("error") or attached.get("content") is None:
+        return []
+    serials = [str(s) for s in (attached.get("content") or [])]
+    if not serials:
+        return []
+    return [
+        "- \u2139\ufe0f "
+        + str(len(serials))
+        + " Android device(s) are attached right now ("
+        + ", ".join(serials[:4])
+        + "). Nothing here is driving them while this lane is off, and nothing "
+        "was started to find them.",
+    ]
+
+
 async def _mobile_doctor_section() -> list:
     """The qa-doctor lines for the mobile lane. Never raises, never blocks.
 
@@ -3150,6 +3288,14 @@ async def _mobile_doctor_section() -> list:
             else "- ⬜ QA input method not pinned yet, so typing into the app "
             "is unavailable; taps and assertions work"
         )
+        # AND WHETHER IT WORKS ON THE DEVICES IN FRONT OF US. The pin above is
+        # a fact about this BUILD; it says nothing about whether any attached
+        # device can type a character, which is what a tester whose script typed
+        # nothing is actually asking.
+        if pinned.get("ok"):
+            lines += await _mobile_ime_rows(
+                [str(s) for s in ((attached or {}).get("content") or [])]
+            )
     except Exception:
         logger.debug("qa-doctor mobile sdk/ime section skipped", exc_info=True)
         lines.append("- ⬜ Mobile support modules could not be inspected")
@@ -11931,7 +12077,7 @@ async def handle_mobile_test(
                 # if it is held under the NEW holder's token it must be refused.
                 # Passing nothing used to mean `as_holder=True`, which released
                 # the lock the current holder was driving under.
-                session.release_device_lock(
+                await session.finish_device(
                     run_id,
                     lease=str(
                         (claimed.get("content") or {}).get("session_token") or ""
@@ -12144,7 +12290,12 @@ async def handle_mobile_test(
                 # cannot be released here. `as_holder` is stated because the
                 # placeholder has no lease to present -- this call minted the
                 # label and is unambiguously its owner.
-                session.release_device_lock(pre_run_owner, as_holder=True)
+                # The pre-run placeholder never typed, so the restore
+                # inside this is a reported no-op. It goes through the
+                # same door anyway, so the "no direct release in this
+                # file" pin can be absolute rather than a list of
+                # exceptions somebody has to keep correct.
+                await session.finish_device(pre_run_owner, as_holder=True)
     except Exception as exc:  # never-raise contract
         logger.exception("mcp mobile_test failed")
         _capture_error(exc, "qa_mobile_test")
@@ -13088,7 +13239,7 @@ async def _mobile_next(
         # take a lock from another process even if it wanted to. Under the
         # lease this call is driving with, so a chat that has been displaced
         # since cannot free the new holder's device on its way out.
-        session.release_device_lock(run_id, lease=str(session_token or ""))
+        await session.finish_device(run_id, lease=str(session_token or ""))
         listed = session.summary(run_id)
         # The SECOND consumer of the verdict-coverage value, and the one a
         # tester reads to answer "did this run pass". Without it,
@@ -13203,7 +13354,7 @@ async def handle_submit_mobile_step(
             # waiting for the heartbeat writer's next beat -- under THIS chat's
             # own lease, never as the holder, because this branch has just been
             # told it is not.
-            session.release_device_lock(
+            await session.finish_device(
                 run_id,
                 lease=str((claimed.get("content") or {}).get("session_token") or ""),
             )
@@ -17863,6 +18014,11 @@ async def handle_setup_check(
             lines += [
                 "",
                 *_mobile_lane_disclosure(_mobile_state, _tool_paths.get("adb")),
+                # A tester with a phone plugged in and the flag off used to read
+                # a block that never mentioned their device. This names it --
+                # but only from an adb server that is ALREADY up, so the
+                # disclosure still starts nothing.
+                *await _mobile_off_attached_note(),
             ]
 
         # Item 2b: unfinished host-mode preps (disclosure only, flag-gated;

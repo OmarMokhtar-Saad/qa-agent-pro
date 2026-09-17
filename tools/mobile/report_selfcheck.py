@@ -102,15 +102,21 @@ EXTERNAL = ("<iframe", "<object", "<embed", "@import")
 #: not travel when the folder is zipped, and fails.
 #:
 #: ``img`` is NOT here, and its absence is the rule rather than an omission:
-#: an image on this page is a ``data:`` payload, judged for IDENTITY against
-#: :data:`SHOT_SRC` below. Two different portability rules for two different
-#: artifacts, each named, rather than one rule that would let a PNG be a path
-#: or a clip be inlined.
+#: an image on this page is a path into the run folder's own ``shots/``
+#: directory, one level UP from ``report/``, judged for IDENTITY against
+#: :data:`SHOT_SRC` below. A clip sits INSIDE ``report/media/`` and may not
+#: climb at all; a screen sits beside ``report/`` and must climb exactly once.
+#: Two artifacts, two portability rules, each named -- rather than one rule
+#: loose enough to admit both, which would admit a great deal else.
 MEDIA_TAGS = ("video", "source")
 
-#: The one ``src`` prefix an image on this page may carry. Anything else is a
-#: FETCH: a path into the run directory dies the moment the report is emailed,
-#: which is the ordinary way a tester reads it.
+#: The one ``src`` prefix an image on this page may carry, and the only climb it
+#: may make. Anything else is a FETCH or an escape: an absolute path, an http
+#: URL, or a second ``..`` that leaves the run directory entirely.
+#:
+#: This used to be a ``data:`` prefix and the rule used to be the opposite one.
+#: The value moved and this guard did not need editing for the IDENTITY half,
+#: because it binds the emitter's object rather than restating a literal.
 #:
 #: NOT a second literal. It is the EMITTER's constant, bound here, because a
 #: guard that restates the value it guards stops guarding on the day the value
@@ -297,7 +303,7 @@ def _pin_script(page: "_Page") -> dict:
 
 
 def _pin_links(page: "_Page", text: str) -> dict:
-    """Links are font hosts, images are inline, clips point INSIDE the folder.
+    """The page fetches NOTHING, images are inline, clips point INSIDE the folder.
 
     Four checks, one verdict, because they answer one question: can this report
     be read by a tester who is offline, or who was emailed it? A stray ``href``,
@@ -310,13 +316,19 @@ def _pin_links(page: "_Page", text: str) -> dict:
     parsed ``src`` so a screen that legitimately DISPLAYS the text of a URL
     cannot redden a pin on a healthy tree.
     """
-    strays = [
-        href for href in page.links if not str(href).startswith(report.FONT_HOSTS)
-    ]
-    # IDENTITY, not absence: see the note on EXTERNAL. An image whose src is a
-    # file path or an http URL is exactly the offline break this pin exists for.
+    # EVERY link is a stray now. The shell used to carry three typeface links and this
+    # filter existed to allow exactly those; they were deleted because a report is read
+    # offline from a folder, so there is no longer a legitimate href on this page.
+    strays = [str(href)[:60] for href in page.links]
+    # IDENTITY, not absence: see the note on EXTERNAL. TWO conditions, because
+    # "starts with ../" alone would admit "../../../etc" and every other escape
+    # out of the run folder -- a rule that passes on anything shaped vaguely
+    # right is the shape this repository keeps paying for. The prefix is the
+    # emitter's own constant, and the climb must be EXACTLY one.
     strays += [
-        str(src)[:60] for src in page.images if not str(src).startswith(SHOT_SRC)
+        str(src)[:60]
+        for src in page.images
+        if not str(src).startswith(SHOT_SRC) or str(src).count("..") != 1
     ]
     found = [needle for needle in EXTERNAL if needle in text]
     prefix = str(report.MEDIA_DIR) + "/"

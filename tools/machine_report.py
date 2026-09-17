@@ -53,6 +53,10 @@ PRODUCERS = {
     # end up on a second adb server, where a device is visible in one place
     # and absent in the other.
     "adb": ("tools.mobile.sdk_locator", "locate_sdk"),
+    # WHETHER THIS INSTALL CAN TYPE AT ALL. Without this row every component
+    # could be green on a build with no keyboard pinned, where no script can
+    # enter a character -- a machine that looks ready and is not.
+    "mobile_ime": ("tools.mobile.ime", "manifest_status"),
 }
 
 #: How many rows ONE SECTION of a reply may carry (so `section="all"` carries at
@@ -253,6 +257,29 @@ def doctor_rows() -> list:
         rows.append(
             Row(
                 "adb",
+                "off",
+                "The mobile modules are not present in this edition.",
+            )
+        )
+    try:
+        from tools.mobile import ime
+
+        pinned = (ime.manifest_status() or {}).get("content") or {}
+        ok = bool(pinned.get("ok"))
+        rows.append(
+            Row(
+                "mobile_ime",
+                "ok" if ok else "warn",
+                str(pinned.get("detail") or ("pinned" if ok else "not pinned")),
+                "" if ok else str(pinned.get("fix") or ""),
+            )
+        )
+    except Exception:
+        # `off`, not `undetermined`: on a build with no mobile modules the
+        # keyboard is not an open question, it is absent by construction.
+        rows.append(
+            Row(
+                "mobile_ime",
                 "off",
                 "The mobile modules are not present in this edition.",
             )

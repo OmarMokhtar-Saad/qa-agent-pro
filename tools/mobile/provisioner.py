@@ -289,7 +289,11 @@ def plan() -> dict:
                     "sdk": sdk,
                     "java": java,
                     "avd": AVD_NAME,
-                    "system_image": "",
+                    # The RESOLVED coordinate, same as the provisioning branch below and
+                    # same as the run manifest. This was "" on the nothing-to-do path,
+                    # which made one key name carry two shapes -- and the manifest field
+                    # added by this change would have been a third.
+                    "system_image": system_image(),
                     "steps": steps,
                 },
             }

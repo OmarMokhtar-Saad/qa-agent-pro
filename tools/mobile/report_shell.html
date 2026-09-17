@@ -1,19 +1,22 @@
 <title>{{DOC_TITLE}}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Sans+Arabic:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Serif:wght@600;700&display=swap">
 
 <!--
   Sara reports — the shared page shell.
 
-  This file owns the DESIGN: every token, every rule, every line of behaviour. The generators
-  (tools/audit_report.py, tools/device_cases_html.py, both through tools/report_shell.py) own
-  the DATA and fill the double-brace slots below with markup. Keep it that way: a colour never
-  belongs in a generator, and a number never belongs in here.
+  This file owns the DESIGN: every token, every rule, every line of behaviour. The one
+  generator is tools/mobile/report.py; it owns the DATA and fills the double-brace slots below
+  with markup. Keep it that way: a colour never belongs in a generator, and a number never
+  belongs in here.
 
-  Both reports render the SAME structure — appbar, masthead, sections, case cards, toolbar —
-  so a reader who has learned one page can read the other without relearning anything, and a
-  fix to the explorer lands on both at once.
+  THE BLAST RADIUS OF A PALETTE EDIT IS THE MOBILE RUN REPORT ALONE. This comment used to name
+  tools/audit_report.py, tools/device_cases_html.py and tools/report_shell.py as co-owners and
+  to say "Both reports render the SAME structure"; measured, none of those three files exists in
+  this tree and `grep -rln report_shell --include=*.py` returns exactly one production module.
+  A reader who believed the old text would over-scope every change made here.
+
+  THIS FILE FETCHES NOTHING. The IBM Plex links that used to sit above were deleted: the report
+  must open offline from a run folder, and a CDN font load contradicts that. Type is the system
+  stack, in the --sans and --mono tokens below.
 
   Slots: DOC_TITLE BRAND BRAND_SUB NAV EYEBROW TITLE STANDFIRST META SECTIONS FOOTER_META
 -->
@@ -22,47 +25,63 @@
   :root{
     color-scheme:light dark;
 
-    /* Neutrals carry a slight cool-green bias toward the accent, so the greys read as chosen
-       rather than inherited. Surfaces run GROUND (tinted) -> PANEL (white) -> PANEL-2/3 (tinted
-       again) so each nested thing reads as its own material. */
-    --ground:#f2f6f6;
+    /* Surfaces are NEUTRAL GREY: no tint, no saturation, anywhere. Colour appears only on the
+       status dots, the status badges and the accent. Values approved in
+       docs/mockups/mobile-report-mockup.md; every token NAME is unchanged, and --row-alt is the
+       single addition, so table zebra striping keeps its colour out of the generator. */
+    --ground:#f5f5f7;
     --panel:#ffffff;
-    --panel-2:#f0f5f4;
-    --panel-3:#e4ecea;
-    --line:#ccdad8;
-    --line-soft:#dfe9e7;
+    --panel-2:#fafafa;
+    --panel-3:#f0f0f2;
+    --row-alt:rgba(0,0,0,.025);
+    --line:rgba(0,0,0,.10);
+    --line-soft:rgba(0,0,0,.06);
 
-    --ink:#0d1b1a;
-    --ink-2:#415553;
-    /* Small labels (.62–.7rem) need 4.5:1, not 3:1. This clears it on all three light surfaces:
-       panel 5.57, ground 5.17, panel-2 4.83. */
-    --ink-3:#586c6a;
+    /* Type is fetched from NOWHERE: the CDN links are gone and this page is read offline,
+       from a folder. The faces are still NAMED first, deliberately. Dropping the links did
+       not rewrite the ~95 rules in this file that spell "IBM Plex Mono" literally, so a
+       token leading with a different face would draw the new sections in one monospace and
+       everything else in another. One page, one face: --mono leads with what the literals
+       name and falls through to the system stack, and test_one_mono_face_governs_the_whole_page
+       goes red if the two ever disagree. A named-but-unfetched face is not a tombstone --
+       unlike FONT_HOSTS, it permits nothing; it is a preference that falls through. */
+    --sans:"IBM Plex Sans",system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+    --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 
-    --accent:#0a6560;
-    --accent-2:#0d857e;
-    --accent-soft:#d6ebe9;
+    --ink:#1c1c1e;
+    --ink-2:#48484a;
+    /* Small labels (.62–.7rem) need 4.5:1, not 3:1. MEASURED on the new surfaces: panel 5.30,
+       ground 4.87, panel-2 5.08, panel-3 4.66. tests/mobile/test_mobile_report_palette.py
+       recomputes these from the tokens, so a surface that drifts fails by the PAIR's name. */
+    --ink-3:#6b6b70;
+
+    /* --accent and --ground are COUPLED: accent-on-ground measures 4.67, which clears AA with
+       little room, so a lighter page grey pushes it under. Neither moves alone. */
+    --accent:#0a60ff;
+    --accent-2:#0a60ff;
+    --accent-soft:#f0f0f2;
     --on-accent:#ffffff;
     --on-seg:#ffffff;
 
     /* Status colours are reserved for state and never reused as series colour. Each ships with
        a text label wherever it appears — a colour alone is not a signal. */
-    --pass:#186b4c;
-    --pass-soft:#d5eade;
-    --gap:#8a5806;
-    --gap-soft:#f6e6c8;
-    --defect:#9c2b2b;
-    --defect-soft:#f6d9d9;
-    --void:#525872;
-    --void-soft:#e2e4ec;
+    --pass:#0f6b3f;
+    --pass-soft:#e6f4ec;
+    --gap:#7a5200;
+    --gap-soft:#fbf0d8;
+    --defect:#a11b1b;
+    --defect-soft:#fceaea;
+    --void:#4a4a55;
+    --void-soft:#eeeef1;
 
-    --cell-key:#f0f5f4;
+    --cell-key:#fafafa;
     --cell-val:#ffffff;
 
     /* Code is a different material: cooler and a step darker than the pane it sits in. */
-    --code-bg:#e9f0f5;
-    --code-bar:#dce7ee;
-    --code-line:#c3d5e0;
-    --code-ink:#1b2f3d;
+    --code-bg:#f7f7f8;
+    --code-bar:#f0f0f2;
+    --code-line:rgba(0,0,0,.10);
+    --code-ink:#2b2b2e;
     --code-key:#0a5f5a;
     --code-str:#8c4a0f;
     --code-num:#17459b;
@@ -72,112 +91,116 @@
     --shadow:0 1px 2px rgba(13,27,26,.04),0 2px 8px rgba(13,27,26,.04);
     --shadow-lift:0 6px 24px rgba(13,27,26,.10);
     --focus:#0d857e;
-    --bar-alpha:rgba(242,246,246,.86);
-    --bar-solid:#f6f9f9;
+    --bar-alpha:rgba(245,245,247,.86);
+    --bar-solid:#f6f6f6;
 
     /* Heights of the two things that stick. Anything that scrolls itself into view has
        to clear them, so they are tokens rather than numbers repeated down the file. */
     --bar-h:54px;
     --toolbar-h:56px;
 
-    /* Series hues for stacked duration figures. Analogous to the accent so they read as
-       one family, and never one of the status colours above. */
-    --ser-1:#0a6560;
-    --ser-2:#4f9e98;
-    --ser-3:#a9cdc9;
-    --ser-4:#7d84a3;
+    /* Series hues for stacked duration figures: the accent plus greys. With a neutral system a
+       second hue family would read as status colour, and status colour is never a series. */
+    --ser-1:#0a60ff;
+    --ser-2:#6b6b70;
+    --ser-3:#b8b8bd;
+    --ser-4:#4a4a55;
   }
 
   @media (prefers-color-scheme: dark){
     :root:not([data-theme="light"]){
-      --ground:#0d1215;
-      --panel:#151d21;
-      --panel-2:#1b252a;
-      --panel-3:#232f35;
-      --line:#2c3a41;
-      --line-soft:#212c32;
-      --ink:#e7eef2;
-      --ink-2:#a4b4bc;
-      --ink-3:#8b9ca4;
-      --accent:#42d6c2;
-      --accent-2:#6ee5d5;
-      --accent-soft:#0f322e;
-      --on-accent:#08201e;
-      --on-seg:#0d1215;
-      --pass:#4ecf94;
-      --pass-soft:#0d2f21;
-      --gap:#e0ac4c;
-      --gap-soft:#33270f;
-      --defect:#f0837c;
-      --defect-soft:#3b1d1d;
-      --void:#a8adc9;
-      --void-soft:#20232f;
-      --cell-key:#151d21;
-      --cell-val:#1b252a;
-      --code-bg:#0a1013;
-      --code-bar:#141d22;
-      --code-line:#26333a;
-      --code-ink:#c8d6dc;
-      --code-key:#5fdcc6;
-      --code-str:#f2b184;
+      --ground:#1e1e1e;
+      --panel:#2a2a2d;
+      --panel-2:#262628;
+      /* MEASURED: --ink-3 on this surface is 4.55. It started at #35353a, where it was 4.35 and
+         FAILED AA -- it was darkened to clear the bar, not found clearing it. */
+      --panel-3:#323236;
+      --row-alt:rgba(255,255,255,.03);
+      --line:rgba(255,255,255,.08);
+      --line-soft:rgba(255,255,255,.05);
+      --ink:#f2f2f2;
+      --ink-2:#c8c8cc;
+      --ink-3:#9a9a9e;
+      --accent:#6aa5ff;
+      --accent-2:#6aa5ff;
+      --accent-soft:#323236;
+      --on-accent:#10131a;
+      --on-seg:#1e1e1e;
+      --pass:#6ddb9e;
+      --pass-soft:#17301f;
+      --gap:#e8b555;
+      --gap-soft:#33280f;
+      --defect:#ff9a9a;
+      --defect-soft:#331a1a;
+      --void:#b0b0bd;
+      --void-soft:#2a2a33;
+      --cell-key:#262628;
+      --cell-val:#2a2a2d;
+      --code-bg:#232326;
+      --code-bar:#2a2a2d;
+      --code-line:rgba(255,255,255,.08);
+      --code-ink:#d4d4d8;
+      --code-key:#9ad1ff;
+      --code-str:#e8b555;
       --code-num:#8fc2ff;
       --code-lit:#cfa4ff;
-      --req:#7fb4e8;
-      --shadow:0 1px 2px rgba(0,0,0,.35),0 2px 12px rgba(0,0,0,.25);
+      --req:#8fb6e8;
+      --shadow:0 1px 2px rgba(0,0,0,.45);
       --shadow-lift:0 8px 28px rgba(0,0,0,.5);
-      --focus:#42d6c2;
-      --bar-alpha:rgba(13,18,21,.86);
-      --bar-solid:#0e1417;
-      --ser-1:#3fb3aa;
-      --ser-2:#2a7f79;
-      --ser-3:#1d4f4b;
-      --ser-4:#7d84a3;
+      --focus:#6aa5ff;
+      --bar-alpha:rgba(30,30,30,.86);
+      --bar-solid:#262628;
+      --ser-1:#6aa5ff;
+      --ser-2:#9a9a9e;
+      --ser-3:#56565b;
+      --ser-4:#b0b0bd;
     }
   }
 
   :root[data-theme="dark"]{
-    --ground:#0d1215;
-    --panel:#151d21;
-    --panel-2:#1b252a;
-    --panel-3:#232f35;
-    --line:#2c3a41;
-    --line-soft:#212c32;
-    --ink:#e7eef2;
-    --ink-2:#a4b4bc;
-    --ink-3:#8b9ca4;
-    --accent:#42d6c2;
-    --accent-2:#6ee5d5;
-    --accent-soft:#0f322e;
-    --on-accent:#08201e;
-    --on-seg:#0d1215;
-    --pass:#4ecf94;
-    --pass-soft:#0d2f21;
-    --gap:#e0ac4c;
-    --gap-soft:#33270f;
-    --defect:#f0837c;
-    --defect-soft:#3b1d1d;
-    --void:#a8adc9;
-    --void-soft:#20232f;
-    --cell-key:#151d21;
-    --cell-val:#1b252a;
-    --code-bg:#0a1013;
-    --code-bar:#141d22;
-    --code-line:#26333a;
-    --code-ink:#c8d6dc;
-    --code-key:#5fdcc6;
-    --code-str:#f2b184;
+    --ground:#1e1e1e;
+    --panel:#2a2a2d;
+    --panel-2:#262628;
+    --panel-3:#323236;
+    --row-alt:rgba(255,255,255,.03);
+    --line:rgba(255,255,255,.08);
+    --line-soft:rgba(255,255,255,.05);
+    --ink:#f2f2f2;
+    --ink-2:#c8c8cc;
+    --ink-3:#9a9a9e;
+    --accent:#6aa5ff;
+    --accent-2:#6aa5ff;
+    --accent-soft:#323236;
+    --on-accent:#10131a;
+    --on-seg:#1e1e1e;
+    --pass:#6ddb9e;
+    --pass-soft:#17301f;
+    --gap:#e8b555;
+    --gap-soft:#33280f;
+    --defect:#ff9a9a;
+    --defect-soft:#331a1a;
+    --void:#b0b0bd;
+    --void-soft:#2a2a33;
+    --cell-key:#262628;
+    --cell-val:#2a2a2d;
+    --code-bg:#232326;
+    --code-bar:#2a2a2d;
+    --code-line:rgba(255,255,255,.08);
+    --code-ink:#d4d4d8;
+    --code-key:#9ad1ff;
+    --code-str:#e8b555;
     --code-num:#8fc2ff;
     --code-lit:#cfa4ff;
-    --req:#7fb4e8;
-    --shadow:0 1px 2px rgba(0,0,0,.35),0 2px 12px rgba(0,0,0,.25);
+    --req:#8fb6e8;
+    --shadow:0 1px 2px rgba(0,0,0,.45);
     --shadow-lift:0 8px 28px rgba(0,0,0,.5);
-    --focus:#42d6c2;
-    --bar-alpha:rgba(13,18,21,.86);
-    --bar-solid:#0e1417;
-    --ser-1:#3fb3aa;
-    --ser-2:#2a7f79;
-    --ser-3:#1d4f4b;
-    --ser-4:#7d84a3;
+    --focus:#6aa5ff;
+    --bar-alpha:rgba(30,30,30,.86);
+    --bar-solid:#262628;
+    --ser-1:#6aa5ff;
+    --ser-2:#9a9a9e;
+    --ser-3:#56565b;
+    --ser-4:#b0b0bd;
   }
 
   /* ── base ─────────────────────────────────────────────────────────────── */
@@ -186,7 +209,7 @@
   html.nosmooth{scroll-behavior:auto}
   body{
     margin:0;background:var(--ground);color:var(--ink);
-    font-family:"IBM Plex Sans",system-ui,-apple-system,sans-serif;
+    font-family:var(--sans);
     font-size:16px;line-height:1.6;-webkit-font-smoothing:antialiased;
   }
   .wrap{max-width:1180px;margin:0 auto;padding:36px 28px 96px}
@@ -441,7 +464,7 @@
   table.cov tbody tr:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}
   .uc{font-weight:600;min-width:200px}
   .uc small{display:block;font-weight:400;font-size:.72rem;color:var(--ink-3);font-family:"IBM Plex Mono",monospace;margin-top:1px;letter-spacing:.04em;text-transform:uppercase}
-  .cap{font-family:"IBM Plex Mono",monospace;font-size:.84rem;color:var(--ink)}
+  .cap{font-family:var(--mono);font-size:.84rem;color:var(--ink)}
   .cap.none{color:var(--ink-3);font-style:italic}
   .score{font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums;white-space:nowrap;
     display:flex;align-items:center;gap:10px;min-width:118px}
@@ -693,55 +716,52 @@
 
 
   /* ── on-screen preview (phone) ────────────────────────────────────────── */
-  /* The phone wears the APP's palette (the app's own light/dark colour tables),
-     not the report's — it is a picture of another product. It flips with the report theme so
-     the reader sees the light app on the light page and the dark app on the dark page. */
-  /* Copied from the reference report's phone palette -- do not edit these values here.
-     The phone wears the APP's palette, not the report's: it is a picture of
-     another product. It flips with the report theme so the reader sees the light
-     app on the light page and the dark app on the dark page. */
-  :root{
-    --ph-bg-top:#eaf6f1; --ph-bg-bot:#ffffff; --ph-surface:#ffffff; --ph-border:#d2d6db;
-    --ph-divider:#e5e7eb; --ph-text:#1f2a37; --ph-text-2:#4b5563; --ph-muted:#6c737f;
-    --ph-on-brand:#ffffff; --ph-accent:#1b8354; --ph-accent-soft:rgba(27,131,84,0.102);
-    --ph-user-top:#1b8354; --ph-user-bot:#166b45; --ph-on-user:#ffffff; --ph-sara:#f6f7f9;
-    --ph-chip-fill:#e7f2ec; --ph-chip-text:#14603d; --ph-chip-border:#bfddcd; --ph-ok:#067647;
-    --ph-ok-fill:#e3f5eb; --ph-warn:#9a5b08; --ph-warn-fill:#fdf0e3; --ph-bad:#b42318;
-    --ph-bad-fill:#fde8e6; --ph-info:#0a6ca8; --ph-info-fill:#e4f0f8; --ph-frame:#0d1215;
-  }
-  @media (prefers-color-scheme: dark){
-    :root:not([data-theme="light"]){
-      --ph-bg-top:#0a1714; --ph-bg-bot:#0e1a22; --ph-surface:rgba(255,255,255,0.078);
-      --ph-border:rgba(95,227,171,0.180); --ph-divider:rgba(255,255,255,0.122); --ph-text:#dff7ee;
-      --ph-text-2:#9fc4b6; --ph-muted:#7e9a90; --ph-on-brand:#04140e; --ph-accent:#2be5a0;
-      --ph-accent-soft:rgba(43,229,160,0.220); --ph-user-top:#2be5a0; --ph-user-bot:#00a259;
-      --ph-on-user:#04140e; --ph-sara:#141a19; --ph-chip-fill:rgba(43,229,160,0.122);
-      --ph-chip-text:#7af0c0; --ph-chip-border:rgba(43,229,160,0.200); --ph-ok:#4ade80;
-      --ph-ok-fill:rgba(74,222,128,0.149); --ph-warn:#fbbf24;
-      --ph-warn-fill:rgba(251,191,36,0.149); --ph-bad:#f87171;
-      --ph-bad-fill:rgba(248,113,113,0.149); --ph-info:#60a5fa;
-      --ph-info-fill:rgba(96,165,250,0.149); --ph-frame:#2c3a41;
-    }
-  }
-  :root[data-theme="dark"]{
-    --ph-bg-top:#0a1714; --ph-bg-bot:#0e1a22; --ph-surface:rgba(255,255,255,0.078);
-    --ph-border:rgba(95,227,171,0.180); --ph-divider:rgba(255,255,255,0.122); --ph-text:#dff7ee;
-    --ph-text-2:#9fc4b6; --ph-muted:#7e9a90; --ph-on-brand:#04140e; --ph-accent:#2be5a0;
-    --ph-accent-soft:rgba(43,229,160,0.220); --ph-user-top:#2be5a0; --ph-user-bot:#00a259;
-    --ph-on-user:#04140e; --ph-sara:#141a19; --ph-chip-fill:rgba(43,229,160,0.122);
-    --ph-chip-text:#7af0c0; --ph-chip-border:rgba(43,229,160,0.200); --ph-ok:#4ade80;
-    --ph-ok-fill:rgba(74,222,128,0.149); --ph-warn:#fbbf24;
-    --ph-warn-fill:rgba(251,191,36,0.149); --ph-bad:#f87171;
-    --ph-bad-fill:rgba(248,113,113,0.149); --ph-info:#60a5fa;
-    --ph-info-fill:rgba(96,165,250,0.149); --ph-frame:#2c3a41;
-  }
+  /* ── on-screen preview (phone) ────────────────────────────────── */
+  /* THE PHONE IS A MOCK THIS REPORT DRAWS, not a photograph of the app. Nothing in it is
+     measured from the device -- the bubbles are composed from the element list -- so a colour
+     hardcoded here is this report INVENTING a brand for a product it never sampled. Every
+     --ph-* token is therefore report chrome, and is defined as a reference to the report's own
+     token of the same role: accent to --accent, ok/warn/bad to --pass/--gap/--defect, the
+     surfaces to --panel/--panel-2/--panel-3, the rules to --line/--line-soft.
 
-  /* The verdict and the screen it judges, side by side. The verdict grows with the number
-     of contract checks, so it takes the flexible column; the phone is a fixed picture. */
-  .cbody-top{display:grid;grid-template-columns:minmax(0,1fr) 392px;gap:26px;align-items:start;margin-bottom:22px}
-  .cbody-top .grade{margin-bottom:0}
-  /* Below the breakpoint the phone would be stranded under a full-width verdict, so it
-     centres rather than clinging to the left edge of a column it no longer shares. */
+     ONE block, not three. The three tinted blocks this replaces (a light :root and two dark
+     overrides) each restated all 27 values, so an edit to one left the other two on the old
+     look -- and the palette pin could not see any of them. Because these are var() references
+     to tokens that themselves flip with the theme, the phone follows the page in both modes
+     with no dark block of its own, and there is nothing left to drift.
+
+     If a token here ever needs to be the PREVIEWED APP's own colour it must be sourced from
+     the run and written inline by report.py; a hardcoded value in this file is chrome by
+     definition. None of the 27 is sourced from the run today, so none is exempt. */
+  :root{
+    --ph-bg-top:var(--panel-2);
+    --ph-bg-bot:var(--panel);
+    --ph-surface:var(--panel);
+    --ph-border:var(--line);
+    --ph-divider:var(--line-soft);
+    --ph-text:var(--ink);
+    --ph-text-2:var(--ink-2);
+    --ph-muted:var(--ink-3);
+    --ph-on-brand:var(--on-accent);
+    --ph-accent:var(--accent);
+    --ph-accent-soft:var(--accent-soft);
+    --ph-user-top:var(--accent);
+    --ph-user-bot:var(--accent-2);
+    --ph-on-user:var(--on-accent);
+    --ph-sara:var(--panel-3);
+    --ph-chip-fill:var(--accent-soft);
+    --ph-chip-text:var(--accent);
+    --ph-chip-border:var(--line);
+    --ph-ok:var(--pass);
+    --ph-ok-fill:var(--pass-soft);
+    --ph-warn:var(--gap);
+    --ph-warn-fill:var(--gap-soft);
+    --ph-bad:var(--defect);
+    --ph-bad-fill:var(--defect-soft);
+    --ph-info:var(--req);
+    --ph-info-fill:var(--panel-3);
+    --ph-frame:var(--ink);
+  }
   @media (max-width:960px){
     .cbody-top{grid-template-columns:minmax(0,1fr);gap:20px}
     .cbody-top .phone-col{max-width:392px;margin:0 auto}
@@ -1637,6 +1657,88 @@
   .totop.show{opacity:1;pointer-events:auto;transform:none}
   .totop:hover{color:var(--accent);border-color:var(--accent)}
   .totop svg{width:16px;height:16px}
+
+
+  /* ── redesign: the seven sections ──────────────────────────────── */
+  /* Every class report.py emits in the new sections has its rule HERE, in the same commit
+     that emits it -- test_mobile_report_css_binding.py's UNSTYLED ratchet is shrink-only
+     and would go red otherwise. Every name below was measured FREE against this file and
+     against render.py / exchanges.py, which emit onto this same page. The five names the
+     mockup wanted but that were already TAKEN with another meaning were renamed instead of
+     overloaded: b-pass/b-fail -> seg-pass/seg-fail (.m.base.b-pass is the packet-diff base
+     marker), empty -> emptystate (.sec.empty and .ph-bubble.empty are scoped states),
+     erow -> envrow (.erow is the evidence gauge row), id -> tcid (too generic to grep).
+     A name under three characters is renamed on sight, because free-ness cannot be
+     established for it by grep. */
+  .mast{display:grid;gap:10px;padding:26px 0 18px}
+  .stand{color:var(--ink-2);max-width:72ch;margin:0}
+  .bar{display:flex;align-items:center;gap:10px;min-width:0}
+  .btn{appearance:none;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:8px;padding:5px 11px;font:600 .78rem var(--sans);cursor:pointer}
+  .btn:hover{border-color:var(--accent);color:var(--accent)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;box-shadow:var(--shadow)}
+  .count{font-variant-numeric:tabular-nums;color:var(--ink-3)}
+  table.dtable{width:100%;border-collapse:collapse;font-size:.85rem}
+  table.dtable th{text-align:left;background:var(--panel-2);color:var(--ink-3);font:600 .7rem var(--mono);letter-spacing:.08em;text-transform:uppercase;padding:8px 10px;border-bottom:1px solid var(--line)}
+  table.dtable td{padding:8px 10px;border-bottom:1px solid var(--line-soft);vertical-align:top}
+  table.dtable tbody tr:nth-child(even){background:var(--row-alt)}
+  table.dtable td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+  table.dtable td.mono{font-family:var(--mono);font-size:.8rem;word-break:break-all}
+  .emptystate{border:1px dashed var(--line);border-radius:12px;background:var(--panel-2);padding:20px;color:var(--ink-2)}
+  .emptystate h3{font-size:.96rem;margin:0 0 6px}
+  .envrow{display:grid;gap:3px;padding:10px 14px;border-right:1px solid var(--line-soft);min-width:0}
+  .envrow:last-child{border-right:none}
+  .verdictline{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin:0 0 8px}
+  .bigpill{display:inline-flex;align-items:center;gap:7px;padding:5px 13px;border-radius:999px;border:1px solid transparent;font:700 .8rem var(--sans)}
+  .p-neutral{background:var(--panel-3);color:var(--ink-2)}
+  .kpi.t-ok .n{color:var(--pass)}
+  .kpi.t-gap .n{color:var(--gap)}
+  .kpi.t-def .n{color:var(--defect)}
+  .segbar .seg-pass{background:var(--pass)}
+  .segbar .seg-fail{background:var(--defect)}
+  .segbar .seg-blocked{background:var(--gap)}
+  .segbar .seg-unverified{background:var(--void)}
+  .casehead{display:flex;align-items:center;gap:10px;padding:11px 14px;cursor:pointer;min-width:0}
+  .casebody{padding:0 14px 14px;border-top:1px solid var(--line-soft)}
+  .ctitle{font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tcid{font:600 .78rem var(--mono);color:var(--ink-2);white-space:nowrap}
+  .tagp{display:inline-flex;gap:5px;flex-wrap:wrap}
+  .steps{margin-top:10px}
+  .idx{color:var(--ink-3);font-variant-numeric:tabular-nums;width:2.5em;text-align:right}
+  .opname{font:600 .78rem var(--mono);color:var(--accent)}
+  .tgt{font-family:var(--mono);font-size:.78rem;color:var(--ink-2);word-break:break-word}
+  .obsid{font-family:var(--mono);font-size:.7rem;color:var(--ink-3)}
+  .dur{color:var(--ink-3);font-variant-numeric:tabular-nums;white-space:nowrap}
+  .msval{font-variant-numeric:tabular-nums;white-space:nowrap}
+  .skip{color:var(--ink-3);font-style:italic}
+  details.subfold{border:1px solid var(--line-soft);border-radius:10px;margin-top:10px;background:var(--panel-2)}
+  details.subfold>summary{padding:9px 12px;cursor:pointer;font-weight:600;font-size:.84rem}
+  .gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:14px}
+  .screengroup{margin-bottom:22px}
+  .scap{font:600 .72rem var(--mono);color:var(--ink-3);margin:6px 0 0;word-break:break-all}
+  .thumbs{display:flex;gap:9px;flex-wrap:wrap}
+  .nolink{color:var(--ink-3);font-style:italic;font-size:.82rem}
+  .clipgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:14px}
+  .clipcard{border:1px solid var(--line);border-radius:11px;background:var(--panel);overflow:hidden}
+  .clipmeta{padding:9px 11px;display:grid;gap:3px;font-size:.78rem;color:var(--ink-2)}
+  .clipnote{padding:9px 11px;color:var(--ink-2);font-size:.82rem}
+  .clipabsent{border-style:dashed;background:var(--panel-2)}
+  .lightbox{position:fixed;inset:0;background:rgba(0,0,0,.72);display:none;align-items:center;justify-content:center;z-index:40}
+  .lightbox[open],.lightbox.on{display:flex}
+  .lightboxcap{position:absolute;left:0;right:0;bottom:0;padding:12px 16px;color:#fff;font-size:.82rem;background:rgba(0,0,0,.55)}
+  .lightboxclose{position:absolute;top:14px;right:16px;color:#fff;background:transparent;border:1px solid rgba(255,255,255,.5);border-radius:8px;padding:4px 10px;cursor:pointer}
+  .logbox{background:var(--code-bg);border:1px solid var(--code-line);border-radius:10px;padding:11px 13px;max-height:340px;overflow:auto}
+  .logline{font:400 .78rem/1.5 var(--mono);color:var(--code-ink);white-space:pre-wrap;word-break:break-word}
+  .loglevel{font-weight:600;margin-right:7px}
+  .lcat{color:var(--ink-3);margin-right:7px}
+  .gaps{display:grid;gap:11px}
+  .guard{border-left:4px solid var(--void);background:var(--void-soft);border-radius:0 10px 10px 0;padding:11px 14px}
+  .gsub{color:var(--ink-2);font-size:.84rem;margin:4px 0 0}
+  .gapterm{font:600 .82rem var(--mono);color:var(--ink)}
+  .icon{width:15px;height:15px;flex:none}
+  .sronly{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+  .tlrow{display:grid;grid-template-columns:minmax(0,13em) 1fr auto;gap:10px;align-items:center;padding:5px 0}
+  .tltrack{position:relative;height:9px;border-radius:999px;background:var(--panel-3);overflow:hidden}
+  .tlab{font-size:.78rem;color:var(--ink-3);white-space:nowrap}
 
   @media (prefers-reduced-motion:reduce){
     *{animation:none!important;transition:none!important}
