@@ -83,6 +83,7 @@ from pathlib import Path
 
 from config.settings import settings
 from tools.mobile import actions as actions_mod
+from tools.mobile import charter as charter_mod
 from tools.mobile import (
     explore_runner,
     media,
@@ -2292,6 +2293,29 @@ def _locale_cell(manifest: dict) -> tuple | None:
     )
 
 
+#: The two kinds ``session.device_record`` writes, and the third state it leaves
+#: EMPTY on purpose.
+#:
+#: That producer refuses to default an unknown kind to ``emulator`` because a
+#: confident wrong answer about whether a run touched real hardware is worse than
+#: a blank -- and this page then printed " · emulator" unconditionally, throwing
+#: that care away and labelling every physical-device run an emulator. One
+#: producer, one meaning, and the unknown case is named rather than guessed.
+DEVICE_KINDS = {"emulator": "emulator", "physical": "physical device"}
+DEVICE_KIND_UNKNOWN = "device kind unrecorded"
+
+
+def _device_sub(manifest: dict) -> str:
+    """The device cell's sub-line: the avd, and what the manifest SAYS it ran on."""
+    device = manifest.get("device")
+    kind = str((device if isinstance(device, dict) else {}).get("kind") or "")
+    return (
+        esc(manifest.get("avd") or "(unknown avd)", 40)
+        + " · "
+        + DEVICE_KINDS.get(kind, DEVICE_KIND_UNKNOWN)
+    )
+
+
 def _facts_strip(
     run_id: str,
     manifest: dict,
@@ -2306,7 +2330,7 @@ def _facts_strip(
         (
             "device",
             esc(manifest.get("serial") or "(not attached)", 40),
-            esc(manifest.get("avd") or "(unknown avd)", 40) + " · emulator",
+            _device_sub(manifest),
             "",
         ),
         ("app", esc(_app_label(manifest), 80), "the package under test", ""),
@@ -2978,6 +3002,12 @@ def _findings_section(manifest: dict, turns: int) -> str:
             continue
     silent = max(0, replayed - len(spoke))
     stop = _text(explore_stop(body), 40)
+    # The run's TERMS, including every default the tester did not set: a
+    # silent default is a run whose terms nobody can reconstruct afterwards.
+    # `charter.describe_terms` is the ONE producer of this sentence, and it
+    # returns "" for a run with no charter -- every run recorded before step 4
+    # -- so those pages render exactly as they did.
+    terms = charter_mod.describe_terms(explore.get("charter"))
     lede = (
         "Goal: "
         + (esc(explore.get("goal"), 400) or "(not recorded)")
@@ -3005,6 +3035,7 @@ def _findings_section(manifest: dict, turns: int) -> str:
             if stop
             else "This session has NOT ended, so this list is incomplete."
         )
+        + ((" " + esc(terms, 800)) if terms else "")
     )
     rows = "".join(
         '<tr><td class="num">'

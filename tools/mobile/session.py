@@ -73,13 +73,13 @@ from tools.mobile import (
     locks,
     media,
     paths,
-    perception,
     platform_info,
     preflight,
     provisioner,
     run_store,
     scheduler,
 )
+from tools.mobile.providers import composite
 from tools.mobile_evidence import capture
 
 logger = logging.getLogger(__name__)
@@ -918,6 +918,7 @@ def plan_explore_run(
     *,
     package: str,
     serial: str,
+    charter: object = None,
     watch_for: object = (),
     avd: str = "",
     device: object = None,
@@ -936,7 +937,10 @@ def plan_explore_run(
                 "content": None,
             }
         run_id = mint_run_id()
-        state = explore_runner.new_state(text, watch_for)
+        # The run's TERMS go into the state, which IS manifest["explore"], so a
+        # resume from another chat explores under the same charter.
+        # charter=None reproduces this call's previous behaviour exactly.
+        state = explore_runner.new_state(text, watch_for, charter=charter)
         created = run_store.create_run(
             run_id,
             {
@@ -2476,4 +2480,4 @@ def screen_of(dump: object, activity: str = "", display: object = None) -> dict:
     ``tests/mobile/test_mobile_screen_id_producer``). This function takes no run
     id, so that module's class pin cannot see it.
     """
-    return perception.prune(dump, activity, display=display)
+    return composite.observe(dump, activity, display=display)

@@ -385,6 +385,16 @@ def screen_asks(executor_mod) -> dict:
             "which is judged by its own label. Ask the tester only if you "
             "cannot tell which control that is."
         ),
+        executor_mod.SCREEN_CONTROL_NOT_READ: (
+            "The replay stopped before acting: the element under that touch was "
+            "not read in full -- the app does not expose its text to the "
+            "accessibility layer this lane reads, so what the action would "
+            "trigger cannot be judged. Nothing was touched. Repeating it stops "
+            "here again, and no re-wording of the script recovers a string the "
+            "app never exposed -- ask the tester to turn accessibility on for "
+            "the app under test, or to use an instrumented build. Until then, "
+            "plan a tap on a control the packet does name."
+        ),
     }
 
 
@@ -524,4 +534,133 @@ def build_explore_turn(
         return packet
     except Exception:  # pragma: no cover - defensive
         logger.warning("build_explore_turn failed", exc_info=True)
+        return {}
+
+#: The FIRST packet of an explore run. A packet KIND on the existing return
+#: path, deliberately NOT a tool: the test for whether something earns a tool
+#: is whether the model could call it out of order and still be right, and
+#: intake is only ever first.
+CHARTER_INTAKE_KIND = "charter_intake"
+
+
+def build_charter_intake(
+    *, run_id: str = "", package: str = "", charter: object = None
+) -> dict:
+    """Ask the tester for the run's TERMS -- the server's questions, once.
+
+    The SERVER owns the question set and the typed schema
+    (``tools/mobile/charter.py``); the model owns only the wording it puts the
+    questions in. A model that improvises the questions gives every run a
+    different charter shape, so nothing is resumable and two runs of "the
+    same" exploration are not comparable.
+
+    At most ``charter.MAX_QUESTIONS`` questions reach this packet, because
+    ``charter.questions_for`` slices to that cap -- the number is not enforced
+    here as well, so the two cannot drift.
+
+    *charter* must be the RAW charter the tester sent -- the schema-stripped
+    body ``charter.parse`` returns under ``raw`` -- and never the normalised
+    terms. Normalisation fills every field, so a normalised empty charter
+    yields ONE question instead of five. See ``charter.questions_for``.
+
+    THE CHARTER HAS NO FIELD FOR A SECRET, and that is deliberate rather
+    than an omission to correct: the schema carried a ``credentials`` list for
+    one revision, nothing consumed it, and its only observable effect was
+    writing secret-adjacent free text into a report that lands on disk.
+    ``never_do`` says so in the packet. A credential VALUE exists only in the
+    tester's own chat turn and on the device's stdin -- see this module's
+    header and ``tools/mobile/ime.py``.
+    """
+    try:
+        from tools.mobile import charter as charter_mod
+
+        # THE RAW CHARTER, NOT A NORMALISED ONE. ``normalize`` fills every
+        # field, so ``questions_for(normalize({}))`` returns ONE question
+        # (``goal``) where ``questions_for({})`` returns FIVE -- measured. This
+        # line held the normalised form, so a tester with no charter was asked
+        # ONE question and depth, scope, destructive and budget were silently
+        # defaulted. Same defect as judging the normalised charter in
+        # ``defaults_used`` (M2d), at a SECOND CONSUMER: the function was
+        # graded, the WIRING was not. Graded at this seam by M1c /
+        # ``test_an_empty_intake_asks_all_five_questions_through_the_builder``.
+        asks = charter_mod.questions_for(charter)
+        packet = _packet_base(run_id)
+        packet.update(
+            {
+                "kind": CHARTER_INTAKE_KIND,
+                "package": str(package or "")[:200],
+                "questions": [
+                    {
+                        "field": str(question["field"]),
+                        "ask": str(question["ask"]),
+                        "options": list(question["options"]),
+                        "default": charter_mod.defaults()[question["field"]],
+                    }
+                    for question in asks
+                ],
+                "defaults": charter_mod.defaults(),
+                "unasked_fields_take_their_default": [
+                    field
+                    for field in charter_mod.defaults()
+                    if field not in charter_mod.ASKABLE
+                ],
+                "instruction": (
+                    "Put these questions to the TESTER in your own words, in "
+                    "one message, and ask no others -- the server owns the "
+                    "question set so that two runs of the same exploration "
+                    "are comparable. Then call `qa_mobile_test` again with "
+                    "`charter` set to a JSON object using these exact field "
+                    "names. Anything the tester does not answer takes the "
+                    "default shown, and the report NAMES every default that "
+                    "was used, so leaving a field out is a recorded choice "
+                    "rather than a silent one."
+                ),
+                "never_do": (
+                    "Never put a password, an OTP or any personal VALUE "
+                    "in this charter, in any field: the charter is written "
+                    "into the run's report on disk, and it has no field for "
+                    "a secret. When the app asks for one during the run, the "
+                    "packet asks the tester for that field by name and the "
+                    "value is typed straight to the device -- it never "
+                    "passes through you, a packet, the report or the run "
+                    "store."
+                ),
+                "response_schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["goal"],
+                    "properties": {
+                        "goal": {"type": "string"},
+                        "depth": {"enum": list(charter_mod.DEPTHS)},
+                        "scope": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "include": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                                "exclude": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            },
+                        },
+                        "destructive": {"enum": list(charter_mod.DESTRUCTIVE)},
+                        "budget": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "steps": {"type": "integer"},
+                                "minutes": {"type": "integer"},
+                            },
+                        },
+                        "stop_on": {"enum": list(charter_mod.STOP_ON)},
+                    },
+                },
+            }
+        )
+        return packet
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("build_charter_intake failed", exc_info=True)
         return {}

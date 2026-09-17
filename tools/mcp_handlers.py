@@ -11860,6 +11860,7 @@ async def handle_mobile_test(
     locale: str = "",
     capture: str = "",
     capture_ack: bool = False,
+    charter: str = "",
     *,
     choose: ChooseCb = None,
     ask_text: AskCb = None,
@@ -12127,6 +12128,7 @@ async def handle_mobile_test(
                 suite_id=suite_id,
                 goal=goal,
                 cases=cases,
+                charter=charter,
                 package=target,
                 serial=serial,
                 pre_run_owner=pre_run_owner,
@@ -12691,6 +12693,7 @@ async def _mobile_start(
     suite_id: str,
     goal: str,
     cases: str,
+    charter: str = "",
     package: str,
     serial: str,
     pre_run_owner: str,
@@ -12743,8 +12746,50 @@ async def _mobile_start(
 
     device_facts = (await mobile_adb.device_facts(serial) or {}).get("content") or {}
     if picked == "explore":
+        # THE CHARTER (step 4). `charter.parse` is the only reader of the
+        # host-submitted string: size-capped, json.loads only, every field
+        # coerced to the server's typed schema.
+        from tools.mobile import charter as mobile_charter
+
+        parsed = mobile_charter.parse(charter, goal=goal)
+        if parsed.get("error"):
+            return "\u26a0\ufe0f " + _safe(parsed["error"], 300), False
+        terms = parsed.get("content") or {}
+        if not str(terms.get("goal") or ""):
+            # Neither a charter nor a goal: ASK, once, with the SERVER's own
+            # questions, as a packet KIND on this same return path -- never a
+            # tool, because intake is only ever the first packet of a run.
+            # This replaces the bare "give the exploratory goal in a sentence"
+            # refusal. A start that already carries a goal is untouched: it
+            # runs under the default charter, whose defaults the report NAMES.
+            # THE RAW BODY, never `terms`: normalisation fills every field, so
+            # handing the builder the normalised charter makes four of the five
+            # questions read as ANSWERED and the intake asks ONE -- measured.
+            from agents import mobile_run as mobile_run_agent
+
+            return (
+                mobile_render.packet_block(
+                    mobile_run_agent.build_charter_intake(
+                        package=package, charter=parsed.get("raw") or {}
+                    )
+                ),
+                False,
+            )
+        # THE RAW (schema-stripped) BODY, never the normalised `terms`.
+        # `new_state` normalises what it is given, and `normalize` STRIPS
+        # DEFAULTS_KEY/REJECTED_KEY (the anti-spoof strip) and then re-derives
+        # the verdict against a body whose every field is already filled -- so
+        # handing it `terms` records "no defaults used" for EVERY run started
+        # through this handler, including the goal-only start whose whole
+        # justification is that the report names every default it used.
+        # Measured on the merge tree: `terms` -> [], the raw body ->
+        # ['depth','scope','destructive','budget','stop_on']. `parse` already
+        # injected the caller's `goal` into this body, so nothing is lost by
+        # passing it. Normalise ONCE, at the one writer. Graded at the HANDLER
+        # by M14 / test_a_goal_only_start_through_the_handler_names_its_defaults.
         planned = session.plan_explore_run(
-            goal,
+            terms.get("goal") or goal,
+            charter=parsed.get("raw") or {},
             package=package,
             serial=serial,
             avd=await _mobile_avd_of(serial),
@@ -17015,6 +17060,46 @@ def _overall_verdict(
     # working, so a machine with no Android tooling and a dead Jira read
     # exactly like a healthy one.
     return head + " \u00b7 Not available on this machine: " + "; ".join(limited)
+
+
+async def handle_network_watch(
+    action: str = "status", serial: str = "", package: str = "", apply: bool = False
+) -> str:
+    """Passive, root-free network watch for a GUI client. Never raises.
+
+    Thin by construction: `tools/mobile_evidence/network_watch.py` only gives its own package's
+    EXISTING console capture a run-free entry point. Nothing about how traffic
+    is observed, parsed or redacted is decided here or in the desktop app.
+    """
+    await _audit("mcp_network_watch")
+    try:
+        from tools.mobile_evidence import network_watch
+
+        payload = await network_watch.handle(action, serial, package, bool(apply))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("handle_network_watch failed")
+        payload = {"error": str(exc), "content": None}
+    return "```json\n" + json.dumps(payload, indent=2, default=str) + "\n```"
+
+
+async def handle_machine_report(section: str = "all") -> str:
+    """The machine-readable twin of the prose surfaces, for a non-chat client.
+
+    READ-ONLY, unlike `qa-doctor`: it repairs no `.env` and writes no MCP
+    config, so a desktop app may poll it without a tester wondering what a
+    refresh changed. Never raises -- an unreadable producer becomes an
+    `undetermined` row, because a client that loses the whole report over one
+    unreadable file learns less than one that loses a line.
+    """
+    await _audit("mcp_machine_report")
+    try:
+        from tools import machine_report
+
+        payload = await asyncio.to_thread(machine_report.collect, section)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("handle_machine_report failed")
+        payload = {"error": str(exc)}
+    return "```json\n" + json.dumps(payload, indent=2, default=str) + "\n```"
 
 
 async def handle_selfcheck(*, server: Any) -> str:

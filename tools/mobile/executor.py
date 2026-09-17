@@ -41,6 +41,8 @@ import time
 
 from tools.mobile import actions as actions_mod
 from tools.mobile import adb, ime, perception
+from tools.mobile.providers import base as providers_base
+from tools.mobile.providers import composite
 
 logger = logging.getLogger(__name__)
 
@@ -475,6 +477,36 @@ SCREEN_NOT_FULLY_SEEN = "screen not fully seen"
 #: them, and this refusal is then the only thing the tester is told.
 SCREEN_NOT_THE_APP = "screen belongs to another app"
 
+#: The guard term for an action landing on a control this packet did not read
+#: in full -- a Flutter view with no semantics tree, or a region whose
+#: identifying strings never reached the dump. A SEPARATE sentinel from the
+#: truncation one because the CAUSE is different and so is the fix: the packet
+#: carried this screen whole, and no re-plan of the script can recover a string
+#: the app never exposed. Reusing the truncation wording would tell the tester
+#: to do the wrong thing.
+#:
+#: THE BYPASS THIS CLOSES ONCE A PROVIDER EMITS REGIONS: a blind region gives
+#: `actuated_element` one huge node, no lexicon term matches it, and an unknown
+#: control is actuated with nothing stopping it -- while `truncated` stays
+#: False, because nothing was truncated. INERT TODAY, deliberately:
+#: `providers.composite.regions_of` returns no region in this step, so no live
+#: element is ever stamped degraded or blind and this branch is reached only by
+#: a test that supplies a region. It arms itself when steps 5 and 6 land the
+#: Compose and Flutter readers -- nothing else has to change then.
+SCREEN_CONTROL_NOT_READ = "control not read in full"
+
+
+#: The sentence that rides in ``detail``, where there is room for the remedy.
+#: Names the CAUSE-SPECIFIC fix: the app's own accessibility surface, not a
+#: different tap and not a `launch`.
+GUARD_DETAIL_CONTROL_NOT_READ = (
+    "Stopped before acting: the control under that touch was not read in full "
+    "-- the app does not expose its text to the accessibility layer this lane "
+    "reads, so what the action would trigger cannot be judged. Nothing was "
+    "touched. Turn accessibility on for the app under test, or use an "
+    "instrumented build, and then tap the control again."
+)
+
 
 def not_the_app_detail(package: object, expected: object) -> str:
     return (
@@ -534,6 +566,9 @@ def screen_stop_details() -> dict:
         SCREEN_NOT_FULLY_SEEN: lambda screen, expected: GUARD_DETAIL_NOT_FULLY_SEEN,
         SCREEN_NOT_THE_APP: lambda screen, expected: not_the_app_detail(
             (screen or {}).get("package"), expected
+        ),
+        SCREEN_CONTROL_NOT_READ: lambda screen, expected: (
+            GUARD_DETAIL_CONTROL_NOT_READ
         ),
     }
 
@@ -595,7 +630,9 @@ def guard_detail(hit: str, screen: object, expected: object) -> str:
     return GUARD_DETAIL + " Matched: " + str(hit)
 
 
-def screen_hit(screen: object, expected_package: str = "") -> str:
+def screen_hit(
+    screen: object, expected_package: str = "", judged: object = None
+) -> str:
     """The lexicon term some element on *screen* carries in its OWN strings, a
     ``SCREEN_*`` sentinel, or ``""``.
 
@@ -615,6 +652,24 @@ def screen_hit(screen: object, expected_package: str = "") -> str:
     text belongs to other elements, which are judged on their own turn. Never
     raises.
     """
+    # THE FIDELITY QUESTION, and ONLY it. `judged` PRESENT selects this branch
+    # and returns; ABSENT leaves everything below byte-for-byte what it was.
+    # It is a parameter rather than a second function on purpose: the ratchet
+    # (test_screen_hit_is_the_only_screen_level_producer) reads the producers
+    # out of this module and a new one would be ungraded.
+    if judged is not None:
+        # DELEGATED, never re-derived. `providers_base.is_untrusted` is THE
+        # one answer to "may the guard judge what it read here", and it
+        # carries its own non-dict check, so spelling the lookup again here
+        # would be the same answer derived twice from the same input --
+        # mirrored conditions drift, and the two would agree only by
+        # coincidence. ABSENT or UNKNOWN is NOT untrusted -- only `degraded`
+        # and `blind` are; a guard stop is terminal for a scripted case, so
+        # refusing on absence would stop every checkpoint written before the
+        # seam existed. That rule lives in `providers_base`, once.
+        if providers_base.is_untrusted(judged):
+            return SCREEN_CONTROL_NOT_READ
+        return ""
     if not isinstance(screen, dict):
         return ""
     if screen.get("truncated"):
@@ -677,7 +732,7 @@ async def _dump(ctx: Context) -> dict:
     # Cached per serial like the size above, so the accessibility floor is this
     # device's 48dp rather than an assumed one, at no extra round trip.
     dpi = await adb.display_density(ctx.serial)
-    return perception.prune(
+    return composite.observe(
         raw.get("content"),
         await resolve_activity(ctx),
         display=sized.get("content"),
@@ -1893,6 +1948,7 @@ async def replay(script: object, ctx: Context) -> dict:
             # scripted case, so the pan stays unjudged and the decision is
             # pinned in both directions by tests/mobile.
             if ctx.guard_destructive and op not in NON_ACTUATING_OPS:
+                actuated = None
                 labels = [
                     actions_mod.action_text(action),
                     element_label(element, screen),
@@ -1920,6 +1976,10 @@ async def replay(script: object, ctx: Context) -> dict:
                     # a stop is terminal for a scripted case.
                     if actuated is not None and actuated is not element:
                         labels.append(element_label(actuated))
+                # The node the action ACTUATES where the touch resolved one,
+                # else the node it NAMES. The same derivation the actuated-node
+                # guard already uses -- not a second one.
+                judged_node = actuated if actuated is not None else element
                 label = " ".join(labels).strip()
                 hit = destructive_hit(label)
                 if not hit and op == "press":
@@ -1932,6 +1992,11 @@ async def replay(script: object, ctx: Context) -> dict:
                     # "Confirm payment"}` was refused while `press enter
                     # {"rid": amount}` on the same form sent KEYCODE_ENTER.
                     hit = screen_hit(screen, ctx.package)
+                if not hit and judged_node is not None:
+                    # LAST, and only with a node in hand: a path that has a term
+                    # today keeps it, and `judged=None` can never reach the
+                    # fidelity branch, so nothing else about this guard moves.
+                    hit = screen_hit(screen, "", judged=judged_node)
                 if hit:
                     entry["outcome"] = "guard_stop"
                     # ONE call, not a chain. The chain that was here handled two
