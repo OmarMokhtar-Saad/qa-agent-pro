@@ -13160,7 +13160,75 @@ async def _mobile_hand_off(
             False,
         )
     _mobile_start_heartbeat(run_id, token)
-    return await _mobile_next(run_id, token, progress=progress), True
+    # THE KEYBOARD, BEFORE THE FIRST DUMP EXISTS. This is the last point at
+    # which the run holds the device and no screen has been handed to the model
+    # yet -- `_mobile_next` below produces that screen. Doing it here rather
+    # than at the first `type` op closes a window rather than a bug: selecting
+    # an input method can CHANGE THE SCREEN (the old keyboard goes, ours may
+    # come up), so an ensure that runs mid-run replays a plan against a screen
+    # that is no longer the one it was planned on.
+    #
+    # Not fatal. Typing may be impossible while tapping and asserting are fine,
+    # and refusing a whole run for that would be worse than the defect -- so the
+    # outcome is REPORTED and the per-case hook still refuses the individual
+    # case that types.
+    keyboard_note = await _mobile_keyboard_stage(run_id)
+    rendered = await _mobile_next(run_id, token, progress=progress)
+    if keyboard_note:
+        rendered = keyboard_note + "\n\n" + rendered
+    return rendered, True
+
+
+async def _mobile_keyboard_stage(run_id: str) -> str:
+    """Sweep a crashed run's keyboard, make ours ready, and say what happened.
+
+    Returns markdown for the run's FIRST reply, or ``""`` when there is nothing
+    a tester needs to know -- which is the ordinary case: a keyboard that was
+    already ours, or a sweep that found nothing, is silence.
+
+    Never raises and never stops a run. Both halves are best-effort by design;
+    what they must not be is silent about a change they made to the tester's
+    device.
+    """
+    from tools.mobile import ime_session, session
+
+    lines: list = []
+    serial = ""
+    try:
+        serial = str(session.serial_of(run_id) or "")
+    except Exception:
+        logger.debug("mobile keyboard stage: no serial for the run", exc_info=True)
+    if not serial:
+        return ""
+    try:
+        # THE CRASHED RUN'S KEYBOARD FIRST. Doing it after our own ensure would
+        # find a device already on the QA keyboard and record THAT as the thing
+        # to go back to -- the tester would keep it forever, which is the defect
+        # being fixed, reproduced by the fix.
+        swept = (await ime_session.restore_stale(serial, skip_run_id=run_id) or {}).get(
+            "content"
+        ) or {}
+        # A SWEEP THAT TRIED AND FAILED IS REPORTED TOO. It used to be silent,
+        # which left the one person who could fix it in Settings unaware there
+        # was anything to fix. A sweep that found nothing to do stays silent --
+        # that is the ordinary case and a note on every run start is noise.
+        if swept.get("restored"):
+            lines.append("\u2139\ufe0f " + str(swept.get("detail") or "")[:300])
+        elif swept.get("previous"):
+            lines.append("\u26a0\ufe0f " + str(swept.get("detail") or "")[:300])
+    except Exception:
+        logger.debug("mobile keyboard stage: stale sweep skipped", exc_info=True)
+    try:
+        ready = await ime_session.ensure_ready(serial, run_id)
+        if ready.get("error"):
+            lines.append(
+                "\u26a0\ufe0f Typing is not available on this device: "
+                + str(ready["error"])[:300]
+                + " Taps, swipes and screen checks are unaffected."
+            )
+    except Exception:
+        logger.debug("mobile keyboard stage: ensure skipped", exc_info=True)
+    return "\n\n".join(lines)
 
 
 def _mobile_start_heartbeat(run_id: str, token: str) -> None:

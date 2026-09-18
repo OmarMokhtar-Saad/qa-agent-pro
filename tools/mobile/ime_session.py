@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 
 from tools.mobile import ime, run_store
@@ -85,6 +86,225 @@ def clear_record(run_id: str) -> None:
         logger.exception("mobile.ime_session.clear_record failed")
 
 
+#: How many recent runs the stale-keyboard scan reads.
+#:
+#: This runs on the critical path of TAKING a device, and each run costs one
+#: small JSON read. The constraint is that a tester waits for it before their
+#: first screen: a crashed run is the newest thing on disk after the crash, so
+#: the answer is always near the top of a newest-first listing, and reading
+#: further buys nothing a tester would wait for.
+IME_STALE_SCAN_RUNS = 40
+
+
+def pid_is_provably_dead(pid: object) -> bool:
+    """True only when *pid* is a real pid this process can show is GONE.
+
+    Every uncertain answer is False, and the asymmetry is the point. This
+    decides whether to change a device belonging to somebody else's run, so "I
+    could not tell" must read as "leave it alone". A pid of 0, a pid this user
+    may not signal, an OS that will not say, a value that is not a number at
+    all: all are "not proven dead", none is "dead".
+
+    NOT ``mobile_capture.teardown._pid_alive``. That answers "should I try to
+    stop this process" and resolves its unknowns to False, which is right for a
+    caller about to send a signal and exactly wrong here -- it would report an
+    un-signallable live run as gone. Same subject, opposite safe default, so it
+    is its own function rather than a caller of that one.
+    """
+    import os
+
+    try:
+        number = int(pid)
+    except Exception:
+        return False
+    if number <= 0:
+        return False
+    try:
+        os.kill(number, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        # A process we may not signal is still a process.
+        return False
+    except Exception:
+        return False
+    return False
+
+
+def stale_records(serial: str, *, skip_run_id: str = "") -> list:
+    """Records from OTHER runs that still claim to have changed *serial*.
+
+    A record exists only between `ensure_ready` and `restore`, so one left on
+    disk means a run ended without running its restore -- a killed editor, a
+    crashed process. `restore_stale` decides what to do about it; this only
+    finds them, so the decision has one place and the search has another.
+    """
+    out: list = []
+    try:
+        wanted = str(serial or "")
+        if not wanted:
+            return out
+        listed = run_store.list_runs(IME_STALE_SCAN_RUNS, gc=False) or {}
+        for row in listed.get("content") or []:
+            run_id = str((row or {}).get("run_id") or "")
+            if not run_id or run_id == str(skip_run_id or ""):
+                continue
+            record = read_record(run_id)
+            if not record or str(record.get("serial") or "") != wanted:
+                continue
+            out.append({"run_id": run_id, **record})
+    except Exception:
+        logger.exception("mobile.ime_session.stale_records failed")
+    return out
+
+
+async def restore_stale(serial: str, *, skip_run_id: str = "") -> dict:
+    """Give back a keyboard a crashed run left selected on *serial*.
+
+    ``{"restored": bool, "detail": str, "previous": str, "runs": [...]}``.
+
+    **A held device is left alone, and that is the whole safety argument.**
+    A record whose device is currently held belongs to a LIVE run, and
+    restoring the tester's keyboard underneath a run that is mid-replay would
+    be a worse defect than the one this fixes -- the run would type into a
+    keyboard that stopped listening halfway through. `locks.device_holders` is
+    asked by name, and anything other than a clear "free" is treated as held:
+    a probe that failed is not evidence the device is idle.
+
+    Reported, never silent. A tester whose keyboard changes back must be told
+    which run left it and what it was set to, or the tool looks like it is
+    acting on its own.
+    """
+    try:
+        from tools.mobile import locks as mobile_locks
+
+        found = stale_records(serial, skip_run_id=skip_run_id)
+        if not found:
+            return {
+                "error": None,
+                "content": {
+                    "restored": False,
+                    "detail": "no earlier run left a keyboard selected on this device",
+                    "previous": "",
+                    "runs": [],
+                },
+            }
+        # THREE CONDITIONS, ALL REQUIRED, ALL FAILING CLOSED. This changes a
+        # device belonging to somebody else's run, so the bar is not "looks
+        # idle" but "is provably not in use".
+        #
+        # (a) THE PROBE ANSWERED. No row, or a row carrying an error, is not
+        #     evidence of an idle device.
+        # (b) THE DEVICE IS FREE OR OURS. Asking only "is it held" was the
+        #     defect a review caught: both call sites run while THIS run holds
+        #     the lock -- `_mobile_hand_off` takes it and then sweeps,
+        #     `finish_device` sweeps before releasing -- so the hold the guard
+        #     tripped over was its own and the sweep could never fire.
+        #     Measured before the fix: held=True, owner=our own run id.
+        # (c) EVERY WRITER IS PROVABLY GONE. A lock can be free while its
+        #     writer lives, so this is the condition that actually protects a
+        #     live run; (b) is the weaker check, not the only one.
+        rows = mobile_locks.device_holders([str(serial)]) or []
+        row = rows[0] if rows else {}
+        mine = str(skip_run_id or "")
+        held_by_another = bool(row.get("held")) and str(row.get("owner") or "") != mine
+        undead = [
+            r["run_id"] for r in found if not pid_is_provably_dead(r.get("pid"))
+        ]
+        if not rows or row.get("error") or held_by_another or undead:
+            # ONE refusal for all three, deliberately: they are the same answer
+            # to the tester -- something may still be using this device, so
+            # nothing was touched -- and three differently-worded refusals for
+            # one outcome is how a reader starts believing they mean different
+            # things. `undead` includes every record written before the pid
+            # field existed, which is correct and self-healing: no pid is not
+            # evidence of a dead run, and the next run writes one.
+            return {
+                "error": None,
+                "content": {
+                    "restored": False,
+                    "detail": (
+                        "a previous run's keyboard record exists but its holder "
+                        "could not be confirmed dead, so the device was left "
+                        "alone"
+                    ),
+                    "previous": "",
+                    "runs": undead or [r["run_id"] for r in found],
+                },
+            }
+        # OLDEST first: the earliest record holds the keyboard the tester
+        # actually chose. A later crashed run may have recorded OUR keyboard as
+        # its previous, and restoring that would hand back the thing being
+        # undone.
+        found.sort(key=lambda r: float(r.get("selected_at") or 0.0))
+        previous = ""
+        for record in found:
+            candidate = str(record.get("previous") or "")
+            if candidate and not record.get("was_ours"):
+                previous = candidate
+                break
+        if not previous:
+            # NOTHING TO GO BACK TO, so these records are spent: every candidate
+            # names our own keyboard. Cleared, because keeping them would make
+            # every later sweep re-report a crash nobody can act on -- and
+            # unlike the failure below, there is no information here to lose.
+            for record in found:
+                clear_record(str(record.get("run_id") or ""))
+            return {
+                "error": None,
+                "content": {
+                    "restored": False,
+                    "detail": (
+                        "an earlier run left a record naming no keyboard to go "
+                        "back to, so nothing was changed"
+                    ),
+                    "previous": "",
+                    "runs": [r["run_id"] for r in found],
+                },
+            }
+        # RESTORE FIRST, CLEAR ONLY ON SUCCESS. The first version cleared here,
+        # before the restore, and a review caught what that costs: a device that
+        # dropped off adb for the second the `ime set` takes left no record, so
+        # no later run could retry -- the fix deleted, on its own failure path,
+        # the one thing it was built to read.
+        result = await ime.restore_previous(str(serial), previous)
+        if result.get("error"):
+            return {
+                "error": None,
+                "content": {
+                    "restored": False,
+                    # KEPT, so the next run can try again, and SAID, because the
+                    # tester is the only one who can fix it in Settings if no
+                    # next run comes.
+                    "detail": (
+                        "could not give back the keyboard an earlier run left "
+                        "selected (" + str(result["error"])[:160] + "). It will "
+                        "be tried again next time."
+                    ),
+                    "previous": previous,
+                    "runs": [r["run_id"] for r in found],
+                },
+            }
+        for record in found:
+            clear_record(str(record.get("run_id") or ""))
+        return {
+            "error": None,
+            "content": {
+                "restored": True,
+                "detail": (
+                    "restored the keyboard a crashed run left selected ("
+                    + ime.display_id(previous)
+                    + ")"
+                ),
+                "previous": previous,
+                "runs": [r["run_id"] for r in found],
+            },
+        }
+    except Exception as exc:
+        logger.exception("mobile.ime_session.restore_stale failed")
+        return {"error": str(exc), "content": None}
+
+
 async def state(serial: str) -> dict:
     """``{"installed", "selected", "current"}`` for one device. Never raises."""
     try:
@@ -146,7 +366,13 @@ async def _ensure_ready(serial: str, run_id: str) -> dict:
     """The sequence itself. See :func:`ensure_ready` for the bound.
 
     Idempotent: a device already installed-and-selected is reported as ready
-    and nothing is written or changed. Otherwise the tester's current keyboard
+    and nothing is written, installed, enabled or selected. It is NOT free --
+    it costs the two adb reads `state()` makes, one for the package list and one
+    for the active input method. Worth stating precisely because the per-case
+    fallback calls this on every case that types, and "no-op" would be a wider
+    claim than the two reads it actually makes.
+
+    Otherwise the tester's current keyboard
     is remembered FIRST -- before anything is installed, enabled or selected --
     because a remember that runs after the change records our own keyboard as
     the thing to restore, which is how a tester's phone keeps a keyboard they
@@ -180,6 +406,11 @@ async def _ensure_ready(serial: str, run_id: str) -> dict:
                     "previous": str(kept.get("previous") or ""),
                     "was_ours": bool(kept.get("was_ours")),
                     "selected_at": time.time(),
+                    # WHO to prove gone before anyone undoes this. Without it a
+                    # later sweep can only ask whether the device lock is free,
+                    # and a lock can be free while its writer is alive between
+                    # two calls. A record carrying no pid is never swept.
+                    "pid": os.getpid(),
                 },
             )
             if written.get("error"):

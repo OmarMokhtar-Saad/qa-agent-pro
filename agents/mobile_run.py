@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 
 from tools.mobile import actions as actions_mod
+from tools.mobile import charter as charter_mod
 from tools.mobile import perception, run_store, screen_audit
 from tools.untrusted import _GUARD, wrap_untrusted
 
@@ -501,7 +502,40 @@ def build_explore_turn(
                 "turns_left": int(left.get("turns") or 0),
                 "seconds_left": int(left.get("seconds") or 0),
                 "extensions_left": max(0, 1 - int(body.get("extensions_used") or 0)),
-                "guard_destructive": bool(body.get("guard", True)),
+                "guard_destructive": bool(body.get("guard", True)),                # THE CHARTER'S THREE STEERING FIELDS. They ride the state
+                # this packet is already built from (``state["charter"]``), so
+                # no signature moves. ``depth`` decides what the packet ASKS
+                # THE MODEL TO ATTEMPT -- one server-owned sentence, not a
+                # tactics catalogue -- and the scope lines are WRAPPED, like
+                # ``goal`` above, because they are tester-authored text
+                # reaching a model.
+                "depth": charter_mod.normalize(body.get("charter"))["depth"],
+                "attempt": charter_mod.depth_directive(body.get("charter")),
+                "scope": wrap_untrusted(
+                    "scope",
+                    charter_mod.scope_sentence(body.get("charter")),
+                    limit=1200,
+                ),
+                # READ, never re-derived. ``explore_runner.next_turn`` is the
+                # ONE writer of this verdict, computed once from the screen it
+                # has just pruned; deriving it again here would be two
+                # conditions over one question, and mirrored conditions drift.
+                #
+                # TWO KEYS ONLY: ``state`` and ``note`` are SERVER-authored
+                # constants. ``matched`` is the tester's own charter line --
+                # the same provenance as ``scope`` above, which is wrapped --
+                # so it does NOT ride the packet as a bare string. The choice
+                # is to KEEP IT ON THE STATE rather than wrap it here: it is
+                # already recorded in ``off_charter`` where the tester and a
+                # resume read it, the model does not need to be told WHICH of
+                # the lines it was already shown matched in order to leave the
+                # screen, and one wrapped value is cheaper than two. One class
+                # of string, one route: tester text reaching a model is
+                # wrapped, or it does not go.
+                "scope_verdict": {
+                    "state": str((body.get("scope_verdict") or {}).get("state") or ""),
+                    "note": str((body.get("scope_verdict") or {}).get("note") or ""),
+                },
                 "screen_block": _screen_block(screen),
                 "instruction": _EXPLORE_INSTRUCTION,
                 # The turn fields come from `actions.TURN_FIELD_SCHEMA`, the

@@ -39,6 +39,22 @@ STOP_DEADLINE = "deadline_reached"#: The charter's ``stop_on: first_finding``. A
 #: ``budget``, because nothing detects a plateau yet -- nothing grades a
 #: plateau stop, follow-up.
 STOP_FINDING = "first_finding"
+#: The charter's ``destructive`` REFUSE, recorded as a stop. A refused run is
+#: OVER: ``session._submit_explore`` writes this the moment the executor
+#: reports a refusal, so ``stop_reason`` -- which returns any non-empty
+#: ``state["stop"]`` -- and every page under it say the run stopped, rather
+#: than leaving a terminal refusal looking like a turn the tester can answer.
+STOP_GUARD_REFUSED = "guard_refused"
+
+#: What the tester is TOLD when that happens, in the SAME reply. The lane's
+#: rule: a site that refuses says so BY NAME and leaves no success-shaped
+#: message behind it.
+GUARD_REFUSED_NOTICE = (
+    "This run's charter says `destructive: none`, so the guard's stop ENDED "
+    "the attempt rather than pausing for you. Nothing was tapped and the run "
+    "is over. Start a run with `destructive: reversible` if a stop should "
+    "pause for a confirmation instead."
+)
 RUNNING = "running"
 
 EXTENSION_REFUSAL = (
@@ -252,6 +268,30 @@ async def next_turn(
         # Same contract as case_runner's: a screen the report can draw,
         # stored best-effort, never able to stop a turn.
         run_store.write_screen(run_id, screen)
+        # THE SCOPE VERDICT, COMPUTED ONCE. The packet builder READS
+        # ``state["scope_verdict"]`` and never re-derives it: one writer, one
+        # reader, so what the model is told and what the run records cannot
+        # disagree. Three-valued and POSITIVE -- see charter.scope_verdict.
+        verdict = charter_mod.scope_verdict(body.get("charter"), screen)
+        body["scope_verdict"] = verdict
+        if verdict.get("state") == charter_mod.SCOPE_OUT:
+            # RECORDED, never silently explored. The run is NOT stopped here:
+            # nothing grades a scope-driven stop because nothing implements
+            # one -- follow-up. The list is bounded, because it lands in a
+            # manifest that a report reads.
+            # ONE producer of the record, which owns BOTH the identity rule
+            # (one entry per screen_id + matched line, not one per turn the
+            # model lingered) and the cap. The same screen is seen on every
+            # turn until the model leaves it, so an unconditional append
+            # recorded one fact many times -- measured.
+            body["off_charter"] = charter_mod.record_off_charter(
+                body.get("off_charter"),
+                {
+                    "turn": int(body.get("turn") or 0) + 1,
+                    "screen_id": str(screen.get("screen_id") or "")[:80],
+                    "matched": str(verdict.get("matched") or "")[:200],
+                },
+            )
 
         # A turn number is consumed by a replay HAVING HAPPENED, not by a packet
         # having gone out. This increment was unconditional and
