@@ -79,6 +79,10 @@ from tools.mobile import (
     run_store,
     scheduler,
 )
+
+# ITS OWN LINE, after the parenthesised block: ruff's isort (I001) wants an
+# ALIASED import separated, exactly as ``explore_runner`` already writes it.
+from tools.mobile import charter as charter_mod
 from tools.mobile.providers import composite
 from tools.mobile_evidence import capture
 
@@ -1427,6 +1431,23 @@ async def finish_device(owner: str, **release_kwargs) -> dict:
     from tools.mobile import ime_session
 
     restored = await ime_session.restore(str(owner))
+    # AND ANY KEYBOARD AN EARLIER RUN CRASHED OUT OF. Done here as well as at
+    # run start because the two reach different machines: run start covers the
+    # tester who runs the lane again, this covers the run that is ending on a
+    # device whose previous holder died. Both go through the same function, so
+    # neither can drift from the held-device check that makes it safe.
+    swept = {}
+    try:
+        # `serial_of` is THE producer of a run's device for the locking path --
+        # its own docstring says so -- rather than a second derivation off the
+        # restore envelope, which does not carry one.
+        serial = serial_of(str(owner))
+        if serial:
+            swept = (
+                await ime_session.restore_stale(serial, skip_run_id=str(owner)) or {}
+            ).get("content") or {}
+    except Exception:
+        logger.debug("mobile.session.finish_device: stale sweep skipped", exc_info=True)
     released = release_device_lock(str(owner), **release_kwargs)
     return {
         "error": None,
@@ -1437,6 +1458,12 @@ async def finish_device(owner: str, **release_kwargs) -> dict:
             # left on the QA keyboard, and the reply a tester reads is the only
             # place that can say so.
             "ime": restored.get("content") or {"restored": False, "detail": str(restored.get("error") or "")},
+            # A SECOND VALUE WITH A SECOND NAME, not a caveat on the first.
+            # "the keyboard this run displaced" and "a keyboard an earlier,
+            # crashed run displaced" are different facts with different owners,
+            # and a reader that had to tell them apart from one field would be
+            # guessing.
+            "ime_stale": swept,
         },
     }
 
@@ -2324,7 +2351,18 @@ async def _submit_explore(
         }
     # Run-wide evidence, read from the checkpoints this run already wrote and
     # passed in EXPLICITLY. See ``_explore_prior_verified``.
-    ctx.prior_verified = _explore_prior_verified(run_id)
+    ctx.prior_verified = _explore_prior_verified(run_id)    # WHAT HAPPENS AFTER A GUARD HIT, from this run's own charter. The guard
+    # itself is unchanged and no value here lets an action through it:
+    # ``charter.guard_policy`` maps ``destructive: none`` to REFUSE, and the
+    # executor then ENDS the attempt by name instead of pausing for the
+    # tester. An explicit input, set beside ``prior_verified`` for the same
+    # reason -- the executor knows nothing about runs or charters.
+    ctx.guard_refuses = (
+        charter_mod.guard_policy(
+            ((resolved.get("explore") or {}).get("charter") or {}).get("destructive")
+        )
+        == charter_mod.REFUSE
+    )
     # THE RECORDER, on the lane that shipped without one. `case_runner` has
     # started a clip around ITS replay since v1.87.0; this is the other replay
     # site and it had none, so every exploratory run -- which is the lane the
@@ -2437,22 +2475,30 @@ async def _submit_explore(
     # This turn's capture is finished and its record now lives on the case
     # record. Leaving it on the state would have the NEXT turn's begin treat it
     # as a capture still running and abort a file that is already gone.
-    committed_state.pop("network", None)
+    committed_state.pop("network", None)    # THE REFUSE, RECORDED AS A STOP. The executor marks a charter-driven
+    # refusal explicitly (``guard_refused``), and a refused run is OVER -- so
+    # the state says so and every reader under ``stop_reason`` sees it.
+    # Without this the reply would carry the refusal text and still report a
+    # running run: a success-shaped message behind a refusal, which is exactly
+    # what this lane's rule forbids.
+    refused = bool(outcome.get("guard_refused"))
+    if refused:
+        committed_state["stop"] = explore_runner.STOP_GUARD_REFUSED
     _persist_explore(
         run_id,
         committed_state,
         planned=_explore_planned_case(checkpoint["tc_id"], before, finding),
     )
-    if str(turn.get("status") or "") != explore_runner.RUNNING:
+    # ONE derivation of "has this run stopped", read by BOTH consumers below.
+    # The two used to be two copies of the same condition, and a refusal must
+    # move both or the chat reply invites a next turn the run will not give.
+    stopped = refused or str(turn.get("status") or "") != explore_runner.RUNNING
+    if stopped:
         await _finish_evidence(run_id, resolved)
     return {
         "error": None,
         "content": {
-            "state": (
-                STATE_REPORT
-                if str(turn.get("status") or "") != explore_runner.RUNNING
-                else STATE_RUNNING
-            ),
+            "state": STATE_REPORT if stopped else STATE_RUNNING,
             "case": {
                 "tc_id": checkpoint["tc_id"],
                 "title": checkpoint["title"],
@@ -2463,7 +2509,11 @@ async def _submit_explore(
             },
             "packet": None,
             "next": {},
-            "notice": str(turn.get("notice") or ""),
+            "notice": (
+                explore_runner.GUARD_REFUSED_NOTICE
+                if refused
+                else str(turn.get("notice") or "")
+            ),
             "field": "",
             "resolved": resolved,
         },

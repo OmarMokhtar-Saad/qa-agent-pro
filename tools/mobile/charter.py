@@ -38,12 +38,15 @@ property is graded only once its mutant has been RUN.
   is said here: there is no value of ``destructive`` that lets an action
   through the guard. ``allowed`` means the tester has pre-authorised what the
   guard stops on, so the pause is a one-line confirm; it is not a bypass.
-  **The REFUSE half is NOT WIRED.** Nothing in the executor consults this
-  function, so a guard hit PAUSES the run whatever the charter says.
-  :func:`describe_terms` therefore reports the pause -- what actually happens
-  -- and discloses the refuse as recorded-but-unwired, in the same voice it
-  uses for ``coverage_plateau``. Nothing grades a charter-driven refuse,
-  because nothing implements one: follow-up.
+  **The REFUSE half IS WIRED, since step 5.** ``session._submit_explore``
+  reads :func:`guard_policy` for the run's own charter and sets
+  ``executor.Context.guard_refuses``; at the one guard-hit site a refusing
+  run gets the refusal detail and a TERMINAL status instead of the tester
+  pause, and the stop is recorded on the explore state. What is STILL
+  unwired keeps its own disclosure -- ``coverage_plateau``, which nothing
+  detects. This is the module's FRONT PAGE, and it is retired in the same
+  commit that wired the thing it described: a disclosure that outlives its
+  gap is the same defect as one that precedes the fix.
 
 **There is no ``credentials`` field, deliberately, and it is not an oversight
 a later reader should quietly correct.** The schema carried one for exactly one
@@ -103,6 +106,118 @@ MAX_CHARTER_BYTES = 8000
 #: own ceilings clamp a charter downward long before this binds); its job is
 #: to bound the RENDERED WIDTH, not to express a policy about run length.
 MAX_BUDGET_UNITS = 100000
+#: The most OFF-CHARTER screen visits one run records. The bound is the
+#: RECORD in the MANIFEST: the list is written on every turn, persisted, and
+#: re-read on every resume, so it needs a fence whatever reads it. **Nothing
+#: renders it yet.** The writer is ``explore_runner.next_turn``; the readers
+#: today are a resume and one pin -- no report page and no packet shows it to
+#: a tester, and nothing grades a rendering because nothing implements one --
+#: follow-up. The lane's own MAX_TURNS bounds the visits long before this
+#: binds.
+MAX_OFF_CHARTER_RECORDS = 50
+
+#: The most characters of the screen strings the scope predicate reads.
+#: ``perception.MAX_ELEMENTS`` bounds the element count, but each element
+#: carries several strings, so the joined haystack is bounded HERE rather than
+#: left to the product of two other caps. It bounds WORK per turn, not policy.
+MAX_SCOPE_MATCH_CHARS = 4000
+
+#: WHICH strings a scope line may match -- an ALLOWLIST, by name, and the
+#: whole of the haystack. The rule in one line: **the scope predicate reads
+#: only what the TESTER CAN SEE ON THE SCREEN.**
+#:
+#: This was key-AGNOSTIC for one revision, and only EXECUTION showed how
+#: wrong that was. Taking every string a screen record carries swept in
+#: ``screen_id``, ``hash``, ``package``, ``dialog_package`` and ``activity``,
+#: and per element ``rid``, ``cls`` and ``package``. MEASURED on the applied
+#: tree: excluding "Settings" put a CHECKOUT screen out of scope because the
+#: activity was ``com.example.app/.SettingsActivity``; excluding "cab"
+#: matched the screen_id ``cab99f10dead``; "fee" matched the hash
+#: ``feed00112233abcd``; "ad" matched ``deadbeefcafe0001``. The activity case
+#: is the bad one, because the activity is usually the SAME across an app's
+#: screens: every screen then reads out_of_scope, the packet tells the model
+#: to send ``back`` every turn, and the run spends its whole budget going
+#: backwards while reporting normally.
+#:
+#: The agnostic form was sold as a safety property -- "a provider that
+#: renames a field cannot silently empty the haystack". It did buy that, and
+#: the honest statement of the trade is that it bought it BY MATCHING
+#: IDENTIFIERS THE TESTER NEVER WROTE. ``out_of_scope`` is meant to be a
+#: POSITIVE identification, and a two-character line hitting a hex digest
+#: identifies nothing. The allowlist takes the opposite risk KNOWINGLY: a
+#: renamed field CAN empty the haystack, and the failure is then ``in_scope``
+#: or ``not_confirmed`` -- the direction that explores a screen it might have
+#: avoided, rather than the direction that abandons the whole app. A provider
+#: that adds a tester-visible screen title adds its key HERE.
+#:
+#: ``activity`` is EXCLUDED deliberately: a tester writes flow names, not
+#: Android class names, and it is precisely the field that turns one bad
+#: match into an app-wide one. ``screen_id``, ``hash``, ``package`` and
+#: ``dialog_package`` are NEVER admissible by any future edit -- they are
+#: identifiers by construction.
+#:
+#: Empty TODAY: ``perception`` emits no screen-level string a tester reads.
+#: It is named rather than inlined so the providers step has one obvious
+#: place to extend, and so the exclusions above have something to be an
+#: exclusion FROM.
+SCOPE_SCREEN_FIELDS = ()
+
+#: The per-element strings the same rule admits: the visible label and the
+#: accessibility description. NOT ``rid`` and NOT ``cls`` -- the same defect
+#: class with the same app-wide blast radius: excluding "view" would match
+#: ``TextView`` on every element of every screen, and ``id/settings_row`` is
+#: a developer's name, not the tester's. NOT ``package``, ever.
+SCOPE_ELEMENT_FIELDS = ("text", "desc")
+
+#: What each ``depth`` asks the tester's model to ATTEMPT, one sentence each.
+#: ONE producer of the directive (:func:`depth_directive`), and deliberately
+#: NOT a tactics catalogue: it enumerates no per-element tactic and records no
+#: tactic coverage, because a catalogue is a later step with its own design
+#: questions. What it does is the thing the field was typed for -- the packet
+#: asks for different WORK under different depths.
+DEPTH_DIRECTIVES = {
+    "happy": (
+        "Attempt only the intended, successful path through this screen. Do "
+        "not try to make anything fail this run."
+    ),
+    "negative": (
+        "Attempt the ways this screen can be made to fail or refuse -- empty, "
+        "over-long and wrong-shaped input, and actions taken out of order. Do "
+        "not spend turns re-walking the intended path."
+    ),
+    "both": (
+        "Walk the intended path through this screen first, then, on the SAME "
+        "screen, probe one way it can be made to fail or refuse."
+    ),
+}
+
+#: The three scope verdicts. THREE, not two, and the third IS the design:
+#: "no include line matched" is NOT "out of bounds". A screen whose wording
+#: differs from the tester's would otherwise stop a run on its second turn, so
+#: the undeterminable answer is DISCLOSED to the model and never acted on.
+SCOPE_IN = "in_scope"
+SCOPE_OUT = "out_of_scope"
+SCOPE_UNCONFIRMED = "not_confirmed"
+
+#: Said to the model when a screen matches a line the charter put OUT of
+#: scope. A NAMED record plus a next move, not a stop: nothing in this server
+#: ends a run on it -- nothing grades a scope-driven stop, because nothing
+#: implements one, follow-up.
+OFF_CHARTER_NOTE = (
+    "This screen matches a flow the charter put OUT of scope. Do not explore "
+    "it: send `back`, say in `finding` that the run reached an out-of-scope "
+    "screen and name it, then carry on inside the scope."
+)
+
+#: Said when the charter names INCLUDE lines and none matched. The honest form
+#: of "I cannot tell": the model is told what was asked for and asked to
+#: judge, rather than being told a screen is out of bounds on the strength of
+#: a substring that did not match.
+UNCONFIRMED_NOTE = (
+    "Nothing on this screen matched the flows the charter named, so the "
+    "server cannot confirm it is in scope. Judge it yourself against the "
+    "scope lines above, and say in `finding` if you believe it is outside."
+)
 
 #: Where :func:`normalize` records WHICH fields the tester left unanswered.
 #: It is metadata about the answering, not a term of the run, so it is not a
@@ -126,8 +241,10 @@ DEPTHS = ("happy", "negative", "both")
 DESTRUCTIVE = ("none", "reversible", "allowed")
 STOP_ON = ("first_finding", "budget", "coverage_plateau")
 
-#: What a guard hit WOULD do under this charter. Two values, and only two --
-#: and see :func:`guard_policy`: only ``PAUSE`` is implemented anywhere.
+#: What a guard hit DOES under this charter. Two values, and only two, and
+#: BOTH are implemented: ``PAUSE`` stops for the tester and ``REFUSE`` ends
+#: the attempt by name -- see :func:`guard_policy` for which value maps where
+#: and for the one site that reads it.
 PAUSE = "pause"
 REFUSE = "refuse"
 
@@ -162,7 +279,10 @@ QUESTIONS = (
         "field": "destructive",
         "ask": (
             "May the run take actions that change data -- none, reversible "
-            "ones only, or all of them once the tester has said yes?"
+            "ones only, or all of them once the tester has said yes? With "
+            "`none`, which is also what an unanswered charter gets, a stopped "
+            "action ENDS the run rather than pausing for you; ask for "
+            "`reversible` if you would rather be asked and carry on."
         ),
         "options": DESTRUCTIVE,
     },
@@ -200,8 +320,12 @@ def _int(value: object, fallback: int = 0) -> int:
     ``int(float(1e300))`` is a 301-digit integer -- only ``>= 1e309`` reaches
     the ``OverflowError`` path -- so a charter well inside
     :data:`MAX_CHARTER_BYTES` could put two such numbers into the budget
-    clause of :func:`describe_terms` and push the "NOT yet steering"
-    disclosure past the report's 800-character clip. A disclosure a caller can
+    clause of :func:`describe_terms` and push the CHARTER clause that follows
+    it past the report's 800-character clip. The clip PROPERTY survives; the
+    sentence it used to name does not -- "NOT yet steering" was retired in
+    the same commit that wired depth, scope and destructive -- so this names
+    the clause by POSITION instead, exactly the way op 8 re-points the clip
+    pin. A disclosure a caller can
     push off the page is a disclosure that was not made, so the bound is on
     the VALUE, at the one producer of it. Graded by mutant M12.
     """
@@ -563,16 +687,18 @@ def guard_policy(destructive: object) -> str:
     ``reversible`` and ``allowed`` ask to PAUSE, which is what the lane does
     today.
 
-    **The refuse is NOT IMPLEMENTED.** Nothing in ``tools/mobile/executor.py``
-    calls this function, no packet carries its answer, and a guard hit PAUSES
-    the run whatever this returns. Its ONE live consumer is
-    :func:`describe_terms`, which reports the PAUSE that actually happens and
-    discloses the refuse as recorded-but-unwired. Nothing grades a
-    charter-driven refuse, because nothing implements one -- follow-up.
+    **The refuse IS implemented, since step 5.** ``session._submit_explore``
+    reads this function for the run's own charter and sets
+    ``executor.Context.guard_refuses``; at the one guard-hit site a refusing
+    run gets ``executor.GUARD_DETAIL_REFUSED`` and a TERMINAL status instead
+    of the tester pause, and ``session`` records the stop -- so neither the
+    reply nor the report can imply the run continued.
 
     What this function does NOT do, stated because a reader will assume it
-    does: it does not widen the destructive lexicon, it is not called by the
-    executor, and no value it returns lets an action through the guard.
+    does: it does not widen the destructive lexicon, it does not decide
+    WHETHER an action is stopped -- the guard alone does that, unchanged --
+    and no value it returns lets an action through. It decides only what
+    happens AFTER a hit.
     """
     return REFUSE if _choice(destructive, DESTRUCTIVE, "none") == "none" else PAUSE
 
@@ -613,6 +739,145 @@ def budget_for(charter: object, max_steps: int, max_seconds: int) -> tuple:
     )
     return out_steps, out_seconds
 
+def depth_directive(charter: object) -> str:
+    """What this run's ``depth`` asks the model to ATTEMPT. ONE producer.
+
+    The turn packet carries this sentence and nothing else in this server
+    derives it. NOT a tactics catalogue -- see :data:`DEPTH_DIRECTIVES`.
+    """
+    body = charter if isinstance(charter, dict) else {}
+    return DEPTH_DIRECTIVES[_choice(body.get("depth"), DEPTHS, "both")]
+
+
+def scope_lines(charter: object) -> dict:
+    """``{"include": [...], "exclude": [...]}``, coerced. ONE producer.
+
+    Read by the packet builder and by :func:`scope_verdict`, so the lines the
+    model is TOLD about and the lines the server JUDGES against are the same
+    list. Two derivations would drift, and the drift is invisible from either
+    end: the model would be told one scope while the report recorded another.
+    """
+    body = charter if isinstance(charter, dict) else {}
+    scope = body.get("scope")
+    scope = scope if isinstance(scope, dict) else {}
+    return {
+        "include": _items(scope.get("include")),
+        "exclude": _items(scope.get("exclude")),
+    }
+
+
+def scope_sentence(charter: object) -> str:
+    """The scope as one plain phrase, for the PACKET.
+
+    Shares :func:`_scope_phrase` with the report sentence, so the tester and
+    the tester's model read the same scope in the same words.
+    """
+    body = charter if isinstance(charter, dict) else {}
+    return _scope_phrase(body.get("scope"))
+
+
+def _named(body: object, fields: tuple) -> list:
+    """The ALLOWLISTED string fields of one record. ONE helper, both levels.
+
+    Screen and element are read through the same function so the two lists
+    cannot acquire different rules: :data:`SCOPE_SCREEN_FIELDS` and
+    :data:`SCOPE_ELEMENT_FIELDS` are the whole difference between them.
+    """
+    record = body if isinstance(body, dict) else {}
+    out = []
+    for key in fields:
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            out.append(value)
+    return out
+
+
+def _screen_terms(screen: object) -> str:
+    """WHAT THE TESTER CAN SEE on this screen, lower-cased and bounded.
+
+    An ALLOWLIST, not every string the record carries -- see
+    :data:`SCOPE_SCREEN_FIELDS` for the measured failure that decided it and
+    for the honest statement of what the key-agnostic form bought and cost.
+    In one line: ``screen_id``, ``hash``, ``package``, ``dialog_package``,
+    ``activity``, ``rid`` and ``cls`` are IDENTIFIERS the tester never wrote,
+    and a scope line matching one of those identifies nothing.
+
+    The residual risk is stated rather than hidden: a provider that renames
+    ``text``/``desc`` empties the haystack, and the verdict then fails
+    ``in_scope``/``not_confirmed`` -- the direction that explores a screen it
+    might have avoided, never the direction that abandons the whole app.
+    """
+    body = screen if isinstance(screen, dict) else {}
+    parts = _named(body, SCOPE_SCREEN_FIELDS)
+    for element in list(body.get("elements") or []):
+        parts.extend(_named(element, SCOPE_ELEMENT_FIELDS))
+    return " ".join(parts).lower()[:MAX_SCOPE_MATCH_CHARS]
+
+
+def _needle(line: object) -> str:
+    return " ".join(str(line or "").split()).lower()[:MAX_SCOPE_ITEM_CHARS]
+
+
+def scope_verdict(charter: object, screen: object) -> dict:
+    """Is THIS screen inside the charter's scope? ONE producer, THREE answers.
+
+    ``{"state", "matched", "note"}``, where ``state`` is :data:`SCOPE_IN`,
+    :data:`SCOPE_OUT` or :data:`SCOPE_UNCONFIRMED`.
+
+    **Every answer identifies POSITIVELY.** ``out_of_scope`` means an EXCLUDE
+    line was FOUND in what the tester can SEE on the screen (the allowlisted
+    fields of :func:`_screen_terms`, never an identifier) -- never "no
+    include matched", which is a different fact and has its own name. That third answer is what keeps the
+    rule honest: a tester writes "Checkout" and the screen says "Basket", and
+    a two-valued predicate would either explore a flow it was told to avoid or
+    declare the whole app out of bounds. The undeterminable row is the one
+    that decides the design, so it gets its own value and its own sentence.
+
+    This server does NOT stop a run on ``out_of_scope``: the visit is RECORDED
+    (``explore_runner.next_turn`` appends it to ``state["off_charter"]``) and
+    the model is told to leave. Nothing grades a scope-driven stop, because
+    nothing implements one -- follow-up.
+    """
+    lines = scope_lines(charter)
+    haystack = _screen_terms(screen)
+    for line in lines["exclude"]:
+        needle = _needle(line)
+        if needle and needle in haystack:
+            return {"state": SCOPE_OUT, "matched": needle, "note": OFF_CHARTER_NOTE}
+    if not lines["include"]:
+        return {"state": SCOPE_IN, "matched": "", "note": ""}
+    for line in lines["include"]:
+        needle = _needle(line)
+        if needle and needle in haystack:
+            return {"state": SCOPE_IN, "matched": needle, "note": ""}
+    return {"state": SCOPE_UNCONFIRMED, "matched": "", "note": UNCONFIRMED_NOTE}
+
+
+def record_off_charter(visits: object, entry: object) -> list:
+    """Append ONE off-charter visit -- DEDUPLICATED and BOUNDED. ONE producer.
+
+    **The identity rule: one record per ``(screen_id, matched)`` pair.** What
+    the tester needs to know is that the run TOUCHED an excluded flow and
+    which line matched it; how many consecutive turns the model lingered there
+    is a property of the model's next move, not of the charter, and recording
+    it fills the manifest with copies of one fact. Measured: without this the
+    same screen was recorded on turn 1 and again on turn 2.
+
+    This is also the ONE reader of :data:`MAX_OFF_CHARTER_RECORDS` -- the cap
+    is applied HERE rather than at the call site, so the bound and the
+    identity rule cannot be applied in one place and forgotten in another.
+    """
+    out = [dict(item) for item in list(visits or []) if isinstance(item, dict)]
+    body = entry if isinstance(entry, dict) else {}
+    key = (str(body.get("screen_id") or ""), str(body.get("matched") or ""))
+    seen = {
+        (str(item.get("screen_id") or ""), str(item.get("matched") or ""))
+        for item in out
+    }
+    if key not in seen:
+        out.append(dict(body))
+    return out[-MAX_OFF_CHARTER_RECORDS:]
+
 
 def _scope_phrase(scope: object) -> str:
     body = scope if isinstance(scope, dict) else {}
@@ -637,14 +902,13 @@ def describe_terms(charter: object) -> str:
     **Order is load-bearing.** The report clips this string, and the scope can
     fill it on its own (``MAX_SCOPE_ITEMS`` x ``MAX_SCOPE_ITEM_CHARS``), so
     every clause that DISCLOSES something -- which defaults were assumed, which
-    stop condition is not detected, that the refuse is not wired, that depth,
-    scope and destructive steer nothing -- comes AHEAD of the clippable content
+    stop condition is not detected -- comes AHEAD of the clippable content
     it concerns. A disclosure that a long scope can push past the clip is a
     disclosure that is not made.
 
     Ordering alone does not deliver that, and the difference matters: the
-    not-yet-steering disclosure sits AFTER the budget clause, so it survives
-    the clip only because every clause ahead of it is BOUNDED. The scope is
+    charter clause sits AFTER the budget clause, so it survives the clip only
+    because every clause ahead of it is BOUNDED. The scope is
     bounded by ``MAX_SCOPE_ITEMS``/``MAX_SCOPE_ITEM_CHARS`` and the budget
     figures by :data:`MAX_BUDGET_UNITS` in :func:`_int` -- without which a
     caller sending ``1e300`` writes a 301-digit number into that clause and
@@ -652,12 +916,13 @@ def describe_terms(charter: object) -> str:
     anywhere ahead of a disclosure defeats the whole ordering, so a new clause
     owes a bound.
 
-    **Voice is load-bearing too.** ``depth``, ``scope`` and ``destructive``
-    are recorded and reported and steer NOTHING in step 4, so they are
-    rendered in the recorded-but-not-yet-wired voice ``coverage_plateau`` and
-    the unwired refuse already get -- and the sentence states plainly that a
-    resume therefore does not yet explore under the same terms, which is the
-    promise the charter was typed and persisted for.
+    **Voice is load-bearing too, and it follows the WIRING.** ``depth``,
+    ``scope`` and ``destructive`` now steer the run, so they are rendered in
+    the present indicative and the sentence says a resume explores under the
+    same terms. What is STILL unwired -- ``coverage_plateau`` -- keeps the
+    recorded-but-not-yet-detected voice. A disclosure and the pins that grade
+    it are ONE artifact: changing this text without moving those pins is how a
+    stale claim survives its own fix.
 
     The defaults clause is not decoration. A default nobody is told about is a
     run whose terms cannot be reconstructed afterwards, which is the same
@@ -710,8 +975,9 @@ def describe_terms(charter: object) -> str:
         )
     if guard_policy(terms["destructive"]) == REFUSE:
         said += (
-            "This charter asks for a guard hit to END the attempt, which is "
-            "recorded but not yet wired into the guard. "
+            "This charter asks for a guard hit to END the attempt, and it "
+            "does: a stopped action ends this run by name rather than pausing "
+            "for the tester. "
         )
     budget = terms["budget"]
     spend = (
@@ -759,32 +1025,28 @@ def describe_terms(charter: object) -> str:
         # fixture diversity and not mutation count is what grades it.
         spend += ", clamped to the lane's ceiling of " + " and ".join(clamped)
     said += "Budget " + spend + "; stopping on " + terms["stop_on"] + ". "
-    # DISCLOSURE VOICE, not the present indicative. ``depth``, ``scope`` and
-    # ``destructive`` reach NO consumer: ``build_explore_turn`` carries the
-    # goal, the watch list, the turn counters, the destructive guard flag and
-    # the screen block and nothing else, and ``explore_runner`` reads only
-    # ``stop_on`` and the budget. "Charter: scope inside Checkout" in the
-    # present indicative is a claim about a run that nothing constrained to
-    # Checkout, and the artifact that reconstructs a run cannot contain a
-    # false one. It also means the RESUME PROMISE -- the stated reason for
-    # typing and persisting the charter at all -- is not yet met, so the
-    # sentence says that in the artifact the TESTER reads and not only in the
-    # plan. Wiring these three into the turn packet is a real feature with its
-    # own design questions and is OUT OF SCOPE for step 4. The disclosure
-    # precedes the values because the report clips this string and the scope
-    # can fill it on its own.
+    # THE DISCLOSURE THESE THREE FIELDS USED TO CARRY IS GONE, because the gap
+    # it described is gone: the turn packet carries the depth directive and
+    # the scope lines, and the destructive policy decides what happens after a
+    # guard hit. A disclosure that outlives the gap it described is the same
+    # defect as one that preceded the fix, so it was retired in the SAME
+    # commit that wired them. What is still genuinely unwired keeps its own
+    # sentence -- see the ``coverage_plateau`` clause above, untouched.
     said += (
-        "Charter: depth, destructive and scope were RECORDED and are reported "
-        "here, and they are NOT yet steering the run -- no packet carries them "
-        "to the tester's model, so nothing constrained this run to them, and a "
-        "resume reads them back but does not yet explore under them. "
-        "Recorded: depth "
+        "Charter: depth "
         + terms["depth"]
-        + "; destructive "
+        + " -- the turn packet asks for that work by name; destructive "
         + terms["destructive"]
-        + " (a guard stop pauses the run for the tester)"
+        + (
+            " (a guard stop ENDS the run)"
+            if guard_policy(terms["destructive"]) == REFUSE
+            else " (a guard stop pauses the run for the tester)"
+        )
         + "; scope "
         + _scope_phrase(terms["scope"])
-        + "."
+        + " -- the packet carries those lines, and a screen matching an "
+        "excluded flow is RECORDED as an off-charter visit, though nothing "
+        "stops the run on one. A resume reads these back and explores under "
+        "them."
     )
     return said

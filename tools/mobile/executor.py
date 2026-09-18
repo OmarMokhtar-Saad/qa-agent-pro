@@ -121,6 +121,21 @@ GUARD_DETAIL = (
     "Stopped before a control that looks irreversible. Nothing was tapped. "
     "Confirm with the tester, then resubmit the script with the same action."
 )
+#: The SAME stop, for a run whose charter says ``destructive: none``. A
+#: SEPARATE sentence because both halves of :data:`GUARD_DETAIL` are wrong
+#: here: there is no tester to confirm with and no resubmit that can succeed,
+#: because the charter asked for a stop to END the attempt.
+#:
+#: This constant is the REFUSAL BY NAME the lane's rule requires. It changes
+#: nothing about WHAT the guard stops: the term was produced by the lexicon
+#: and by the actuated-node judging exactly as before, and this decides only
+#: what happens AFTER a hit. It registers no sentinel and widens no lexicon.
+GUARD_DETAIL_REFUSED = (
+    "REFUSED: this run's charter says `destructive: none`, so a control that "
+    "looks irreversible ENDS the attempt rather than pausing for the tester. "
+    "Nothing was tapped and the run is over. A run started with "
+    "`destructive: reversible` pauses for a confirmation instead."
+)
 
 #: The same stop for a screen the packet does not carry in full. A SEPARATE
 #: sentence because both halves of :data:`GUARD_DETAIL` are false here: no
@@ -264,7 +279,22 @@ class Context:
     # A fact about what a trace is EXPECTED to carry, not a lane name: this
     # module still knows nothing about runs, and the default leaves the
     # scripted rule untouched and unweakened.
-    asserts_expected: bool = True
+    asserts_expected: bool = True    # What happens AFTER the destructive guard stops something. False PAUSES
+    # for the tester (``needs_tester``), which is today's behaviour and the
+    # default, so the SCRIPTED lane is unchanged byte-for-byte. True ENDS the
+    # attempt, which is what a charter saying ``destructive: none`` asks for;
+    # the explore lane's own submit seam sets it from the charter's guard
+    # policy. NOTE the wording: ``tests/mobile/test_mobile_charter.py``
+    # forbids the dotted form in this file, and that pin is PROSE-SENSITIVE
+    # -- it reads the source text, so a comment naming the attribute trips
+    # it exactly as an import would. The property it protects (this module
+    # depends on no charter module) is genuinely satisfied: nothing here
+    # imports one or reads an attribute off one.
+    #
+    # It decides NOTHING about what is stopped. The lexicon, the actuated-node
+    # judging and the screen-level questions are untouched, and no value here
+    # lets an action through the guard.
+    guard_refuses: bool = False
 
 
 #: The ONLY ops the destructive guard skips, because none can actuate anything:
@@ -2086,13 +2116,45 @@ async def replay(script: object, ctx: Context) -> dict:
                     hit = screen_hit(screen, "", judged=judged_node)
                 if hit:
                     entry["outcome"] = "guard_stop"
+                    # WHAT the guard stopped is decided above and is not
+                    # touched here. This branch decides only what happens
+                    # AFTER the hit, which is the one thing a charter's
+                    # ``destructive`` field is allowed to decide.
+                    refuses = bool(getattr(ctx, "guard_refuses", False))
                     # ONE call, not a chain. The chain that was here handled two
                     # sentinels and gave every future one the control wording --
                     # the same half-wiring at the other consumer is what round 3
                     # fixed, and this site still had it.
-                    entry["detail"] = guard_detail(hit, screen, ctx.package)
+                    entry["detail"] = (
+                        GUARD_DETAIL_REFUSED
+                        if refuses
+                        else guard_detail(hit, screen, ctx.package)
+                    )
                     _stamp_after(entry, screen)
                     _append(trace, entry)
+                    if refuses:
+                        # EXPLICIT KEYWORDS, never a dict splat. The sentinel
+                        # ratchet forbids ``**kwargs`` into this sink because
+                        # ``guard_term``'s provenance must be traceable by
+                        # reading the call, and it is right: a splat hides
+                        # which keys reach the payload. ``guard_refused`` is
+                        # an EXPLICIT marker rather than a comparison against
+                        # the detail PROSE -- a reader that matches on wording
+                        # breaks the moment the wording is improved, and the
+                        # wording is the part the tester actually reads.
+                        return {
+                            "error": None,
+                            "content": _result(
+                                STATUS_ERROR,
+                                trace,
+                                screen,
+                                "",
+                                entry["detail"],
+                                index,
+                                guard_term=hit,
+                                guard_refused=True,
+                            ),
+                        }
                     return {
                         "error": None,
                         "content": _result(
