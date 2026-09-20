@@ -289,6 +289,74 @@ def locate_java() -> dict:
         return {"error": str(exc), "content": None}
 
 
+#: Bytes of one AVD ``config.ini`` read to find its system image. A real one is
+#: a few KB; the cap keeps a corrupt or hostile file from being read whole on
+#: every machine-report poll. Bounded from above in
+#: ``tests/mobile/test_mobile_bounds_upper.py``.
+AVD_CONFIG_MAX_BYTES = 65536
+
+
+def _avd_name_is_safe(name: str) -> bool:
+    """An AVD name is a single path component: no separator, no leading dot."""
+    return (
+        bool(name)
+        and not name.startswith(".")
+        and all(c.isalnum() or c in "._-" for c in name)
+    )
+
+
+def avd_system_image(avd: object) -> dict:
+    """The system image an AVD boots, in the SDK's own package form.
+
+    ``{"error", "content": "system-images;android-35;google_apis;x86_64" or ""}``.
+    Read from ``image.sysdir.1`` in the AVD's ``config.ini`` -- the exact tag
+    Android Studio chose, with no device call, so it is pinned without a
+    device. The AVD homes are searched in the emulator's own order:
+    ``ANDROID_AVD_HOME``, ``ANDROID_USER_HOME/avd``,
+    ``ANDROID_EMULATOR_HOME/avd``, ``~/.android/avd``. ``""`` when the name is
+    not a plain AVD name, or the config or its key cannot be found. Never
+    raises.
+    """
+    try:
+        name = str(avd or "").strip()
+        if not _avd_name_is_safe(name):
+            return {"error": None, "content": ""}
+        homes = []
+        raw = (os.environ.get("ANDROID_AVD_HOME") or "").strip()
+        if raw:
+            homes.append(Path(raw).expanduser())
+        for var in ("ANDROID_USER_HOME", "ANDROID_EMULATOR_HOME"):
+            raw = (os.environ.get(var) or "").strip()
+            if raw:
+                homes.append(Path(raw).expanduser() / "avd")
+        homes.append(Path.home() / ".android" / "avd")
+        for home in homes:
+            config = home / (name + ".avd") / "config.ini"
+            try:
+                if not config.is_file():
+                    continue
+                with config.open("r", encoding="utf-8", errors="replace") as handle:
+                    text = handle.read(AVD_CONFIG_MAX_BYTES)
+            except OSError:
+                continue
+            for line in text.splitlines():
+                key, _, value = line.partition("=")
+                if key.strip() != "image.sysdir.1":
+                    continue
+                parts = [p for p in value.strip().replace("\\", "/").split("/") if p]
+                if (
+                    len(parts) == 4
+                    and parts[0] == "system-images"
+                    and all(_avd_name_is_safe(part) for part in parts)
+                ):
+                    return {"error": None, "content": ";".join(parts)}
+                return {"error": None, "content": ""}
+        return {"error": None, "content": ""}
+    except Exception as exc:
+        logger.exception("mobile.sdk_locator.avd_system_image failed")
+        return {"error": str(exc), "content": None}
+
+
 def studio_present() -> bool:
     """True when Android Studio appears to be installed on this host.
 

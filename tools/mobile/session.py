@@ -40,13 +40,11 @@ read-decide-write with a compare-after-swap that NARROWS that race and does not
 close it, which is stated here and in the tester-facing text rather than
 improved upon in prose.
 
-**This module does not read the kill-switch.** There are exactly two readers in
-``tools/mobile`` -- ``provisioner.run(apply=True)`` and
-``provisioner.start_detached``, i.e. the two places that spend bytes -- plus
-``preflight.flag_state`` for reporting, and the MCP boundary's own
-``mcp_handlers._mobile_lane_enabled()``. A third reader here would be a fourth
-copy of one rule, and the copy is the defect: the guard belongs at the process
-that acts and at the boundary that is called, and this module is neither.
+**This module does not read the kill-switch.** Its readers in ``tools/mobile``
+are ``downloader.download`` -- the place that spends bytes -- plus
+``preflight.flag_state`` for reporting. The device effects this module starts
+run without it; tests/mobile/test_mobile_killswitch_surface.py derives that
+scope and fails on any new reader.
 """
 
 from __future__ import annotations
@@ -60,7 +58,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from config.settings import settings
 from tools.device_manager import _valid_device_id, valid_package_name
 from tools.mobile import (
     adb,
@@ -75,9 +72,9 @@ from tools.mobile import (
     paths,
     platform_info,
     preflight,
-    provisioner,
     run_store,
     scheduler,
+    sdk_locator,
 )
 
 # ITS OWN LINE, after the parenthesised block: ruff's isort (I001) wants an
@@ -90,6 +87,11 @@ logger = logging.getLogger(__name__)
 
 STATE_NEEDS_FLAG = "needs_flag"
 STATE_PROVISIONING = "provisioning"
+#: ``ensure_run_device`` only: the run's device is gone and the AVD it came from
+#: no longer exists, so there is nothing to re-boot. Never written to a manifest;
+#: its one consumer, ``mcp_handlers._mobile_resume_device_stage``, answers it
+#: with the no-AVD setup guide.
+STATE_NO_AVD = "no_avd"
 STATE_BOOTING = "booting"
 STATE_NEEDS_APP = "needs_app"
 STATE_PREFLIGHT = "preflight"
@@ -300,7 +302,7 @@ async def ensure_device(
     hand to the tester must not offer a knob that cannot change this wait.
     """
     try:
-        name = str(avd or provisioner.AVD_NAME)
+        name = str(avd or "").strip()
         budget = max(1, int(budget_s or DEVICE_WAIT_BUDGET_S))
         if serial:
             # A tester-chosen (or already-adopted) device: never probe for
@@ -324,6 +326,19 @@ async def ensure_device(
             return {
                 "error": None,
                 "content": {"state": "ready", "serial": serial, "detail": ""},
+            }
+        if not name:
+            # No house AVD to fall back on: auto-provisioning is retired
+            # (docs/RETIRED_CAPABILITIES.md -> 6) and the handler resolves the
+            # tester's own AVD before it gets here. Refuse rather than spawn
+            # `emulator -avd ""`.
+            return {
+                "error": (
+                    "No emulator (AVD) is named, and this server creates none. "
+                    "Call `qa_mobile_test` again with `avd` set to one of the "
+                    "AVDs in Android Studio's Device Manager."
+                ),
+                "content": None,
             }
         running = await emulator.find_running(name)
         if running.get("error"):
@@ -399,7 +414,8 @@ async def ensure_run_device(run_id: str, *, budget: Budget | None = None) -> dic
     """Make sure the emulator THIS RUN was driving is up, re-booting if it died.
 
     ``{"error", "content": {"state", "serial", "detail", "rebooted"}}`` with
-    ``state`` either ``ready`` or :data:`STATE_BOOTING`.
+    ``state`` ``ready``, :data:`STATE_BOOTING`, or :data:`STATE_NO_AVD` (plus
+    ``avd``) when the AVD this run came from no longer exists.
 
     A resume can arrive days later, in a new chat, on a machine that has been
     rebooted since -- at which point the manifest names a serial that no longer
@@ -422,7 +438,7 @@ async def ensure_run_device(run_id: str, *, budget: Budget | None = None) -> dic
                 "content": None,
             }
         serial = str(manifest.get("serial") or "")
-        avd = str(manifest.get("avd") or provisioner.AVD_NAME)
+        avd = str(manifest.get("avd") or "")
         alive = (await device_alive(serial)).get("content") or {}
         if alive.get("alive"):
             return {
@@ -430,6 +446,23 @@ async def ensure_run_device(run_id: str, *, budget: Budget | None = None) -> dic
                 "content": {
                     "state": "ready",
                     "serial": serial,
+                    "detail": "",
+                    "rebooted": False,
+                },
+            }
+        # The device is gone and must be booted again -- but only from an AVD
+        # that still exists. Spawning a missing one "succeeds" (the launcher is
+        # detached) and then times out as a boot, which tells the tester to wait
+        # for something that will never come up. A failed listing (no SDK)
+        # falls through to the spawn, whose own error says what is missing.
+        listed = await emulator.list_avds()
+        if not listed.get("error") and avd not in (listed.get("content") or []):
+            return {
+                "error": None,
+                "content": {
+                    "state": STATE_NO_AVD,
+                    "serial": "",
+                    "avd": avd,
                     "detail": "",
                     "rebooted": False,
                 },
@@ -566,15 +599,6 @@ def start_install(serial: str, apk_path: str, package: str) -> dict:
     the parent process did not cover ``python -m``.
     """
     try:
-        if not settings.qa_mobile_run_enabled:
-            return {
-                "error": (
-                    "Refusing to install: the mobile lane needs "
-                    "`QA_MOBILE_RUN_ENABLED=true` in `.env`. Nothing was "
-                    "installed and no process was started."
-                ),
-                "content": None,
-            }
         if not valid_package_name(package):
             return {
                 "error": (
@@ -884,7 +908,7 @@ def plan_suite_run(
                 # unplugged, and because two readers asking the device again
                 # could get two answers.
                 "device": device_record(device),
-                "avd": str(avd or provisioner.AVD_NAME),
+                "avd": str(avd or ""),
                 # WHAT TIER THIS RUN'S API CAPTURE REACHED, recorded once at
                 # planning time for the same reason `locale`/`device` are: a
                 # finished run must still say so after the proxy is torn down.
@@ -954,16 +978,18 @@ def plan_explore_run(
                 "device": device_record(device),
                 "locale": locale_record(locale),
                 "capture": capture_record(capture),
-                "avd": str(avd or provisioner.AVD_NAME),
-                # A SNAPSHOT of the PRODUCER's answer, not of the setting.
-                # provisioner.system_image() is the one function that decides which
-                # image this lane runs: it folds the operator setting, the historical
-                # fallback and the host ABI together. Reading the setting here would be a
-                # SECOND derivation -- it agrees today and drifts the day the fallback
-                # matters, and the manifest would then disagree with the AVD on disk.
-                # It is a snapshot because qa_mobile_system_image_tag is live: a report
-                # re-rendered next month must show the image THIS run used.
-                "system_image": provisioner.system_image(),
+                "avd": str(avd or ""),
+                # A SNAPSHOT of the PRODUCER's answer, not of a setting.
+                # sdk_locator.avd_system_image() is the one function that says which
+                # image this lane runs: it reads image.sysdir.1 out of the AVD's own
+                # config.ini, so it reports what the device on disk actually boots.
+                # Reading qa_mobile_system_image_tag here would be a SECOND derivation
+                # -- and since the tester brings their own AVD, no setting decides it.
+                # "" when the AVD cannot be resolved, which the report renders as "not
+                # recorded" rather than inventing today's answer for a finished run.
+                "system_image": str(
+                    (sdk_locator.avd_system_image(avd) or {}).get("content") or ""
+                ),
                 "order": [],
                 "total": 0,
                 "cases": [],
@@ -1159,7 +1185,7 @@ def resolve(run_id: str, session_token: str = "") -> dict:
                 "package": str(manifest.get("package") or ""),
                 "serial": str(manifest.get("serial") or ""),
                 "device": device_record(manifest.get("device")),
-                "avd": str(manifest.get("avd") or provisioner.AVD_NAME),
+                "avd": str(manifest.get("avd") or ""),
                 "source": str(manifest.get("source") or ""),
                 "total": int(manifest.get("total") or 0),
                 "done": int(point.get("done") or 0),
@@ -2566,26 +2592,6 @@ def audit_detail(
     except Exception:  # pragma: no cover - defensive
         logger.warning("mobile.session.audit_detail failed", exc_info=True)
         return {}
-
-
-def provision_progress() -> dict:
-    return provisioner.read_progress()
-
-
-def start_provisioning(virtualization_ack: bool = False) -> dict:
-    """Kick the DETACHED provisioner. Nothing downloads inside this process.
-
-    ``virtualization_ack`` is CARRIED, not judged: this layer holds no state and
-    makes no decision, and the one place the acknowledgement means anything is
-    the preflight inside ``provisioner.run``. A default here that silently
-    dropped it would report a consent that was never applied, which is worse
-    than never accepting one.
-    """
-    return provisioner.start_detached(virtualization_ack=virtualization_ack)
-
-
-def provision_plan() -> dict:
-    return provisioner.plan()
 
 
 def screen_of(dump: object, activity: str = "", display: object = None) -> dict:

@@ -96,7 +96,7 @@ async def prepare(serial: str, *, owner: str = "", apply_: bool = False) -> dict
 
         installed = await cert.install(serial, apply=apply_, owner=label)
         if installed.get("error"):
-            if installed["error"] == proxy.REASON_DEVICE_BUSY:
+            if installed["error"] in (proxy.REASON_DEVICE_BUSY, ladder.REASON_FLAG_OFF):
                 return _none(installed["error"], fingerprint=fingerprint or "")
             return _none(ladder.REASON_CERT_NOT_TRUSTED, fingerprint=fingerprint or "")
 

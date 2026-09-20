@@ -6,7 +6,7 @@ package and nothing in it is importable from an installed build.
 
 Phase 0 of the mobile programme puts exactly one module here -- ``ime_manifest``,
 the pinned identity of the QA input method APK. Phase 1 added the platform layer
-(paths, platform_info, sdk_locator, downloader, provisioner, adb, emulator, ime,
+(paths, platform_info, sdk_locator, downloader, adb, emulator, ime,
 preflight, run_store, locks) and Phase 2 the execution engine (perception,
 actions, executor, case_runner, explore_runner, importers, scheduler), whose
 prompt builders live in ``agents/mobile_run.py``. Phase 3 added the MCP surface

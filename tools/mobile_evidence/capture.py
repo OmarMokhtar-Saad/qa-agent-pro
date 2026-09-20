@@ -130,13 +130,8 @@ def forget_run(run_id: str) -> None:
 
 
 def _refusal() -> str | None:
-    """The flag that says no, or None. The kill-switch is checked first."""
-    if not settings.qa_mobile_run_enabled:
-        return (
-            "Refusing to capture app evidence: the mobile lane needs `"
-            + FLAG_NAME
-            + "=true` in `.env`. No adb call was made and nothing was written."
-        )
+    """The setting that says no, or None. The lane kill-switch is NOT read
+    here: it gates provisioning and the certificate install only."""
     if not bool(getattr(settings, "qa_mobile_app_evidence", True)):
         return (
             "Refusing to capture app evidence: `"

@@ -27,7 +27,6 @@ from tools.mobile import (
     ime,
     paths,
     platform_info,
-    provisioner,
 )
 
 logger = logging.getLogger(__name__)
@@ -141,9 +140,8 @@ _FLAG_FIX = (
 #: the reason is a considered trade rather than a softening: ``paths.ownership``
 #: answers ``ok=False`` when the owner cannot be DETERMINED at all, so a blocking
 #: check would newly refuse runs on POSIX installs that proceed today. The gate
-#: that must block already blocks -- ``provisioner.run`` and
-#: ``provisioner.start_detached`` both refuse on ``ok=False`` before anything is
-#: written into the cache. What was missing was telling the TESTER, which is what
+#: that blocked was the SDK provisioner, retired 2026-09-18, so no SDK is written
+#: into the cache any more and nothing needs to block. What was missing was telling the TESTER, which is what
 #: this check does. ``test_the_ownership_check_cannot_block_a_run`` pins it.
 #: ``host_privileges`` is advisory for the SAME reason as ``cache_ownership``,
 #: and the reason is a considered trade rather than a softening:
@@ -152,9 +150,8 @@ _FLAG_FIX = (
 #: today -- on exactly the locked-down machines this check exists to help. And
 #: elevation is not a precondition of a RUN in the first place: once
 #: virtualization is on, a non-administrator account taps, swipes, asserts and
-#: gets a report. The gate that must block already blocks -- ``provisioner.run``
-#: and ``provisioner.start_detached`` refuse on their own preconditions before
-#: anything is written. What was missing was telling the TESTER, which is what
+#: gets a report. No SDK download is left to gate (auto-provisioning was
+#: retired 2026-09-18). What was missing was telling the TESTER, which is what
 #: this check does. ``test_the_privilege_check_cannot_block_a_run`` pins it the
 #: way ``test_the_ownership_check_cannot_block_a_run`` pins the one above.
 ADVISORY_CHECKS: frozenset = frozenset(
@@ -197,6 +194,22 @@ def _exit_code(body: object, default: int = 1) -> int:
         return int(value)
     except (TypeError, ValueError, OverflowError):
         return int(default)
+
+
+#: The IME check that BLOCKS when the caller says the script types
+#: (``check(needs_typing=True)``). Only ``ime_pinned``: without a pinned APK
+#: nothing can install the keyboard. ``ime_installed``/``ime_selected`` stay
+#: advisory because ``executor.replay`` installs and selects on demand, so
+#: before the first replay they are legitimately false; ``ime_oracle`` is
+#: checked by that replay's own probe.
+TYPING_BLOCKING_CHECKS: frozenset = frozenset({"ime_pinned"})
+
+
+def _mark_typing_blocking(checks: list) -> None:
+    """Make the typing-blocking records blocking, in place."""
+    for record in checks:
+        if isinstance(record, dict) and record.get("name") in TYPING_BLOCKING_CHECKS:
+            record["blocking"] = True
 
 
 def _record(name: str, ok: bool, detail: str, fix: str = "") -> dict:
@@ -246,7 +259,9 @@ def _unanswered(name: str, result: object, fix: str = "") -> dict | None:
     )
 
 
-async def check(target_package: str = "", serial: str = "") -> dict:
+async def check(
+    target_package: str = "", serial: str = "", needs_typing: bool = False
+) -> dict:
     """Run EVERY check and return all of them.
 
     ``{"error", "content": {"ok", "serial", "checks": [...], "failing": [...]}}``.
@@ -281,8 +296,7 @@ async def check(target_package: str = "", serial: str = "") -> dict:
                         "adb_responds",
                         False,
                         str(listed["error"]),
-                        "Install Android Studio, or run the mobile provisioner, "
-                        "then try again.",
+                        "Install Android Studio, then try again.",
                     )
                 )
             else:
@@ -332,11 +346,6 @@ async def check(target_package: str = "", serial: str = "") -> dict:
 
         # 4. emulator booted -----------------------------------------------
         try:
-            if not resolved_serial:
-                running = (await emulator.find_running(provisioner.AVD_NAME)).get(
-                    "content"
-                ) or {}
-                resolved_serial = str(running.get("serial") or "")
             if not resolved_serial and serials:
                 # NEVER serials[0]. adb's order is not stable, and this lane
                 # installs, types, taps and force-stops -- so picking the
@@ -840,6 +849,8 @@ async def check(target_package: str = "", serial: str = "") -> dict:
         # failure, because the renderer still shows an advisory one with its fix
         # -- a tester should read that typing is unavailable, and then be allowed
         # to run anyway.
+        if needs_typing:
+            _mark_typing_blocking(checks)
         blocking = [
             record["name"]
             for record in checks

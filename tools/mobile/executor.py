@@ -1808,7 +1808,154 @@ def budget_stop_reason(ran: int, total: int) -> str:
     )
 
 
+#: Ops that go through the QA keyboard, so a script carrying one needs it up.
+KEYBOARD_OPS: frozenset = frozenset({"type", "clear"})
+
+#: What a run that brought the keyboard up and put it back tells the tester.
+KEYBOARD_NOTE = "QA keyboard installed and selected; previous keyboard restored."
+
+
+def needs_keyboard(script: object) -> bool:
+    """True when *script* carries a ``type`` or ``clear`` step."""
+    return any(
+        str(getattr(item, "op", "") or "") in KEYBOARD_OPS
+        for item in list(getattr(script, "actions", None) or [])
+    )
+
+
+async def keyboard_up(serial: str) -> dict:
+    """Remember the current keyboard; install, enable, select ours; QUERY once.
+
+    The install is skipped when ``ime.installed`` says it is there, and the
+    select when the current keyboard already IS ours. The one ``ime.probe`` at
+    the end is the run's receiver check: every type/clear after it passes
+    ``receiver_known=True`` and sends no QUERY of its own. ``content`` is
+    ``{"previous": <id or "">}``; ``error`` names the step that failed, and a
+    failure AFTER the select still carries ``previous`` so it is restored.
+    Never raises.
+    """
+    try:
+        remembered = await ime.remember_previous(serial)
+        if remembered.get("error"):
+            return {
+                "error": "QA keyboard not set up: reading the current keyboard "
+                "failed: " + str(remembered["error"]),
+                "content": None,
+            }
+        previous = str((remembered.get("content") or {}).get("previous") or "")
+        present = await ime.installed(serial)
+        if present.get("error"):
+            return {
+                "error": "QA keyboard not set up: checking whether it is "
+                "installed failed: " + str(present["error"]),
+                "content": None,
+            }
+        if not (present.get("content") or {}).get("installed"):
+            put = await ime.install(serial)
+            if put.get("error"):
+                return {
+                    "error": "QA keyboard not set up: installing it failed: "
+                    + str(put["error"]),
+                    "content": None,
+                }
+        enabled = await ime.enable(serial)
+        if enabled.get("error"):
+            return {
+                "error": "QA keyboard not set up: enabling it failed: "
+                + str(enabled["error"]),
+                "content": None,
+            }
+        ours = str(((ime.manifest() or {}).get("content") or {}).get("ime_id") or "")
+        current = await ime.current_ime(serial)
+        if current.get("error") or not ime.same_component(current.get("content"), ours):
+            chosen = await ime.select(serial)
+            if chosen.get("error"):
+                return {
+                    "error": "QA keyboard not set up: selecting it failed: "
+                    + str(chosen["error"]),
+                    "content": {"previous": previous},
+                }
+        probed = await ime.probe(serial)
+        if probed.get("error") or not (probed.get("content") or {}).get("ok"):
+            return {
+                "error": "QA keyboard not set up: it does not answer its status "
+                "query: " + str(probed.get("error") or "no result= in the reply"),
+                "content": {"previous": previous},
+            }
+        return {"error": None, "content": {"previous": previous}}
+    except Exception as exc:
+        logger.exception("mobile.executor.keyboard_up failed")
+        return {"error": "QA keyboard not set up: " + str(exc), "content": None}
+
+
+async def keyboard_down(serial: str, previous: str) -> dict:
+    """Put the remembered keyboard back. ``content.note`` is what to tell."""
+    try:
+        restored = await ime.restore_previous(serial, previous)
+        if restored.get("error"):
+            return {
+                "error": "QA keyboard installed and selected; previous keyboard "
+                "NOT restored: " + str(restored["error"]),
+                "content": None,
+            }
+        return {"error": None, "content": {"note": KEYBOARD_NOTE}}
+    except Exception as exc:
+        logger.exception("mobile.executor.keyboard_down failed")
+        return {
+            "error": "QA keyboard installed and selected; previous keyboard "
+            "NOT restored: " + str(exc),
+            "content": None,
+        }
+
+
 async def replay(script: object, ctx: Context) -> dict:
+    """Execute *script* with the QA keyboard up for its typing.
+
+    A script with a ``type``/``clear`` step runs :func:`keyboard_up` before its
+    first step and :func:`keyboard_down` in a ``finally`` -- success, failure,
+    an exception and a cancelled task (an abort) all restore. A keyboard that
+    cannot come up stops the run by name before any step, restoring first if
+    the select had already happened. Otherwise the contract is
+    :func:`_replay_steps`'s.
+    """
+    if not needs_keyboard(script):
+        return await _replay_steps(script, ctx)
+    serial = str(getattr(ctx, "serial", "") or "")
+    up = await keyboard_up(serial)
+    previous = (up.get("content") or {}).get("previous")
+    if up.get("error"):
+        detail = str(up["error"])[:400]
+        if previous is not None:
+            await keyboard_down(serial, str(previous))
+        screen = getattr(ctx, "screen", None)
+        content = _result(
+            STATUS_ERROR,
+            [],
+            screen if isinstance(screen, dict) else None,
+            "",
+            detail,
+            -1,
+        )
+        content["keyboard"] = detail
+        return {"error": None, "content": content}
+    down: dict = {"error": None, "content": None}
+    try:
+        replied = await _replay_steps(script, ctx)
+    finally:
+        if previous is not None:
+            down = await keyboard_down(serial, str(previous))
+    if down.get("error"):
+        note = str(down["error"])
+    else:
+        note = str((down.get("content") or {}).get("note") or "")
+    content = replied.get("content") if isinstance(replied, dict) else None
+    if note and isinstance(content, dict):
+        content["keyboard"] = note
+        content["reason"] = (str(content.get("reason") or "") + " " + note).strip()
+    return replied
+
+
+async def _replay_steps(script: object, ctx: Context) -> dict:
     """Execute *script* against ``ctx``. Never raises.
 
     ``{"error": None, "content": {"status", "trace", "screen", "verdict",
@@ -2695,7 +2842,9 @@ async def _perform(
         if focused.get("error"):
             return focused
         if op == "clear":
-            return await ime.clear(serial)
+            # `replay` ran keyboard_up (its one QUERY) for every script
+            # carrying type/clear, so the receiver is known to answer.
+            return await ime.clear(serial, receiver_known=True)
         # A PASSWORD INPUT TAKES ONLY A TESTER-SUPPLIED VALUE. Refused by name
         # rather than typed and masked afterwards, and decided on the ELEMENT
         # rather than on the action's chosen names: a field named in an alphabet
@@ -2736,9 +2885,14 @@ async def _perform(
                     ),
                     "content": None,
                 }
-            return await ime.type_text(serial, str(value), secret=True)
+            return await ime.type_text(
+                serial, str(value), secret=True, receiver_known=True
+            )
         return await ime.type_text(
-            serial, str(getattr(action, "text", "") or ""), secret=False
+            serial,
+            str(getattr(action, "text", "") or ""),
+            secret=False,
+            receiver_known=True,
         )
     return {"error": "Unsupported action " + repr(op), "content": None}
 
