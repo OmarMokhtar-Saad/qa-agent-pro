@@ -417,8 +417,21 @@ async def _broadcast(serial: str, action: str, b64: str = "") -> dict:
     return await adb.shell(serial, [], stdin_data=str(built["content"]).encode("utf-8"))
 
 
-def _parse_reply(text: str) -> dict:
-    """``{result, field, ime_visible, text}`` from a broadcast reply."""
+def _parse_reply(text: str, reveal_text: bool = True) -> dict:
+    """``{result, field, ime_visible, text}`` from a broadcast reply.
+
+    **``reveal_text=False`` is the SECRET path, and it is structural.** Under
+    it the ``t:`` payload is decoded, MEASURED, and the plaintext is bound to
+    nothing that outlives this function: the returned dict carries ``text_len``
+    and has **no ``text`` key at all**. Absent, not empty -- a consumer
+    reaching for it raises ``KeyError`` rather than silently reading ``""`` and
+    concluding the field was blank.
+
+    The existing secret guarantee (module docstring, ``adb.py``) is OUTBOUND: a
+    secret never reaches argv on the way TO the device. This mode is the
+    INBOUND half, opened the moment ``type_text`` began querying a secret
+    field to see whether its text landed.
+    """
     result_match = _RESULT_RE.search(text or "")
     result = int(result_match.group(1)) if result_match else -1
     data_match = _DATA_RE.search(text or "")
@@ -439,16 +452,24 @@ def _parse_reply(text: str) -> dict:
             field = part[2:]
         elif part.startswith("k:"):
             visible = part[2:].strip() == "1"
-    return {
+    reply = {
         "result": result,
         "field": field,
         "ime_visible": visible,
-        "text": field_text,
     }
+    if reveal_text:
+        reply["text"] = field_text
+    else:
+        reply["text_len"] = len(field_text)
+    return reply
 
 
-async def query(serial: str) -> dict:
-    """Ask the oracle what it can see. ``result=0`` means NO input connection."""
+async def query(serial: str, reveal_text: bool = True) -> dict:
+    """Ask the oracle what it can see. ``result=0`` means NO input connection.
+
+    ``reveal_text=False`` returns ``text_len`` instead of ``text``; see
+    ``_parse_reply``.
+    """
     resolved = manifest()
     if resolved.get("error"):
         return resolved
@@ -458,7 +479,7 @@ async def query(serial: str) -> dict:
         return sent
     payload = sent["content"] or {}
     raw_text = str(payload.get("out") or "") + str(payload.get("err") or "")
-    return {"error": None, "content": _parse_reply(raw_text)}
+    return {"error": None, "content": _parse_reply(raw_text, reveal_text=reveal_text)}
 
 
 async def probe(serial: str) -> dict:
@@ -503,6 +524,132 @@ def _reply_code(sent: dict) -> int:
         return -1
     raw = str(payload.get("out") or "") + str(payload.get("err") or "")
     return int(_parse_reply(raw)["result"])
+
+
+#: The three values of the ``landed`` verdict. THREE, not a bool, and the
+#: reason is the middle one: a masked or formatted field (a phone or card
+#: formatter, a password mask) legitimately holds something other than what
+#: was sent, and calling that ``LANDED_NO`` would fail real runs on working
+#: apps. ``LANDED_UNKNOWN`` is the honest answer there -- and the executor
+#: treats it as a non-success too, so the ambiguity reaches the tester instead
+#: of being resolved silently in our favour.
+LANDED_YES = "yes"
+LANDED_NO = "no"
+LANDED_UNKNOWN = "unknown"
+
+
+async def _field_snapshot(serial: str, actions: dict, secret: bool):
+    """What the focused field holds, or ``None`` when the keyboard cannot say.
+
+    ``None`` for every unanswerable case -- broadcast error, no ``result=``,
+    ``result=0`` (no input connection) -- so one sentinel means "no reading",
+    and the verdict never has to distinguish a failure from an empty field.
+
+    For a secret this returns an INT (the length) and never the text; see
+    ``_parse_reply``'s ``reveal_text``.
+    """
+    sent = await _broadcast(serial, str(actions["query"]))
+    if sent.get("error"):
+        return None
+    payload = sent.get("content") or {}
+    raw = str(payload.get("out") or "") + str(payload.get("err") or "")
+    reply = _parse_reply(raw, reveal_text=not secret)
+    if int(reply.get("result", -1)) != 1:
+        return None
+    return reply["text_len"] if secret else reply["text"]
+
+
+#: What a field's own formatter adds or drops: a phone mask's dashes and
+#: parentheses, a currency field's spaces, a trailing space a trim ate, an
+#: underscore. Stripped from BOTH sides before comparing, so ``123-456`` and
+#: ``123456`` are the same text.
+_SEPARATORS = re.compile(r"[\W_]+")
+
+
+def _could_be_transform(after: str, value: str) -> bool:
+    """Could *after* be what this field MADE of *value*?
+
+    Asked only about an UNCHANGED field that does not contain the value, where
+    before/after comparison has run out: it cannot separate "nothing was
+    committed" from "a transformed commit landed on what was already there".
+    This decides which of the two to assume.
+
+    The arms are not symmetric, so neither are the errors. A false ``True``
+    turns a ``no`` into an ``unknown`` and costs ONE model round trip to look
+    at the screen. A false ``False`` turns a transformed commit into a ``no``,
+    and the executor ENDS THE CASE -- a passing run dies. So this leans
+    towards ``True``, and each clause is a shape a real field produces:
+
+    * an EMPTY field is the one thing no commit can leave behind, so it is the
+      only certain ``False`` -- and it is asked FIRST, because
+      ``value.startswith("")`` is True for every value, which would otherwise
+      read an untouched empty field as a truncation;
+    * ``value.startswith(after)`` is a ``maxLength`` cap, which keeps a prefix;
+    * separators and case stripped from both sides catches a mask, a trim and
+      a field that upper- or lower-cases what it accepts.
+    """
+    if not after:
+        return False
+    if value.startswith(after):
+        return True
+    stripped = _SEPARATORS.sub("", after).casefold()
+    return stripped == _SEPARATORS.sub("", value).casefold()
+
+
+def _landed_verdict(before, after, value: str, secret: bool) -> str:
+    """Did *value* land in the field? ``yes`` / ``no`` / ``unknown``.
+
+    An empty *value* is ``unknown``: there is nothing to look for, and calling
+    a no-op ``yes`` would let a step that typed nothing report success -- the
+    exact defect this verdict exists to end.
+
+    The SECRET arm compares LENGTHS ONLY; the plaintext is never held, diffed
+    or returned. Its accepted weakness is named in docs/MOBILE_TESTING.md: a
+    field holding unrelated pre-existing content of a matching length (autofill
+    is the realistic case) can read as ``yes``. The non-secret arm does not
+    have that weakness because it compares content.
+
+    **A COMMIT CAN REPLACE, NOT ONLY APPEND.** `QaImeService` calls
+    `commitText`, which overwrites the current SELECTION, and
+    `executor._perform` taps the field to focus it immediately before typing --
+    the gesture that triggers `selectAllOnFocus`. So "the field did not change"
+    does NOT imply "nothing happened": re-typing a value the field already
+    held is a correct type with an unchanged field. Containment is therefore
+    asked FIRST, and that collision resolves to ``unknown``, never ``no``.
+    **AN UNCHANGED FIELD WITHOUT THE VALUE IS STILL NOT PROOF.** A field that
+    TRANSFORMS what it accepts -- a phone mask, a ``maxLength`` cap, a trim, a
+    case fold -- can take *value* and land on text the field already held, and
+    then it holds neither its old contents unchanged by accident nor the value
+    itself. Before/after comparison cannot separate that from "nothing was
+    committed", so `_could_be_transform` decides which to assume and ``no``
+    narrows to an unchanged field whose contents no transform of *value* could
+    be. This matters because the arms are not symmetric: ``unknown`` asks the
+    model to look, while ``no`` ends the case, so a false ``no`` kills a
+    working run.
+
+    The SECRET arm cannot ask that question at all -- only LENGTHS are knowable
+    there -- so ``no`` narrows further still, to a field that is EMPTY after
+    the commit. A field capped at two characters lands ``s3`` of ``s3cret``
+    without moving its length, and nothing here can tell that from a dead one.
+    """
+    if before is None or after is None or not value:
+        return LANDED_UNKNOWN
+    if secret:
+        if int(after) - int(before) == len(value):
+            return LANDED_YES
+        if int(after) != int(before):
+            return LANDED_UNKNOWN
+        # Unchanged length, and only the length is knowable here. A
+        # replace-on-focus of a field that already held something this long,
+        # and a capped field that kept a truncation of what was sent, are both
+        # indistinguishable from nothing happening. An EMPTY field is the one
+        # shape no commit can leave behind, so it is all that is left of ``no``.
+        return LANDED_NO if int(after) == 0 else LANDED_UNKNOWN
+    if value in str(after):
+        return LANDED_YES if after != before else LANDED_UNKNOWN
+    if after != before:
+        return LANDED_UNKNOWN
+    return LANDED_UNKNOWN if _could_be_transform(str(after), value) else LANDED_NO
 
 
 async def _focused_field(serial: str, actions: dict) -> str:
@@ -569,20 +716,34 @@ async def type_text(
             refused = await _focused_field(serial, actions)
             if refused:
                 return {"error": refused, "content": None}
+        # BEFORE the commit, because the verdict is a DIFFERENCE. A snapshot
+        # taken only afterwards cannot tell a field that accepted the text
+        # from one that already held it.
+        before = await _field_snapshot(serial, actions, secret)
         sent = await _broadcast(serial, str(actions["input"]), payload)
         if sent.get("error"):
             return sent
         refused = await _undelivered(serial, actions, sent)
         if refused:
             return {"error": refused, "content": None}
+        after = await _field_snapshot(serial, actions, secret)
+        landed = _landed_verdict(before, after, value, secret)
         logger.info(
-            "mobile.ime: typed %d character(s)%s",
+            "mobile.ime: typed %d character(s)%s, landed=%s",
             len(value),
             " (secret)" if secret else "",
+            landed,
         )
         return {
             "error": None,
-            "content": {"typed": len(value), "secret": bool(secret)},
+            # ``typed`` is what the HOST SENT. ``landed`` is what the DEVICE
+            # ACCEPTED. Two questions, two names -- reporting only the first is
+            # how a run passed having typed nothing.
+            "content": {
+                "typed": len(value),
+                "secret": bool(secret),
+                "landed": landed,
+            },
         }
     except Exception as exc:
         logger.exception("mobile.ime.type_text failed")

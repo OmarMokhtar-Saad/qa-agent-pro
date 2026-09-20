@@ -89,7 +89,7 @@ _REASON_SENTENCES = {
     ),
     REASON_FLAG_OFF: (
         "API capture installs a root certificate on the device, which needs "
-        "`QA_MOBILE_RUN_ENABLED=true` in `.env`; nothing was installed."
+        "`QA_MOBILE_HTTPS_CAPTURE_ENABLED=true` in `.env`; nothing was installed."
     ),
     REASON_NO_APPLY: (
         "API capture needs apply=true to install or start anything; nothing "

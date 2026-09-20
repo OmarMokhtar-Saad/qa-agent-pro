@@ -90,19 +90,25 @@ def regions_of(screen: object) -> list:
     whole suite stays green, because the fixture matrix grades the COMPARISON
     and nothing grades the SPACE. That is this repo's frame-box-and-rects bug
     and its reverted viewport rule, both again.
-    NOTHING GRADES THIS CONTRACT TODAY. It is ADVISORY: ``regions_of``
-    returns ``[]``, so no test can observe the space it would have used, and
-    ``test_a_region_built_from_a_real_dump_node_contains_that_node`` in
-    ``tests/mobile/test_mobile_providers_seam.py`` does NOT grade it -- it
-    builds its region from a node's own bounds and then asserts
-    ``_inside(x, x)``, which is reflexively true in ANY coordinate space,
-    including the wrong one. The space pin is OWED by steps 5/6: the FIRST
-    provider that returns a non-empty ``regions_of`` must land, in the same
-    change, a pin that grades the space -- derived from a real dump node, with
-    the region rectangle produced by the provider rather than copied from the
-    element -- and a mutant that re-origins or rescales that rectangle and is
-    measured to go RED. Until that lands, this docstring is the only thing
-    standing between a future implementer and a silently inert guard.
+    THIS CONTRACT IS GRADED, and it grades YOUR implementation without you
+    adding a test. ``tests/mobile/space_contract.assert_region_space`` is the
+    one producer of the rule -- a region's rectangle must EQUAL some element's
+    raw absolute ``bounds`` -- and
+    ``tests/mobile/test_composite_space_contract.py`` calls it on the REAL
+    ``regions_of`` output for three real captures. Empty passes trivially; the
+    day this returns something, the contract runs on it.
+
+    Strictness is free here because of the SIGNATURE: you are handed the
+    pruned screen and nothing else, so every node you can see is already an
+    element of ``screen["elements"]``. A rectangle that is not one of theirs
+    was transformed, which is the defect.
+
+    The matrix behind the rule is one fixture per MECHANISM -- re-origined,
+    display-panel-substituted, density-rescaled -- plus two legitimate regions
+    that must be ACCEPTED, one inset and one that coincides with the panel.
+    That last pair is why the rule is membership in the element set and not a
+    blacklist of ``root_bounds``/``frame_bounds``: the same rectangle is wrong
+    on an inset-dialog screen and right on a full-screen one.
 
     EMPTY today, and that is the native-only step in one line: with no region,
     ``partition`` takes clause C1 for every element and the lane behaves exactly

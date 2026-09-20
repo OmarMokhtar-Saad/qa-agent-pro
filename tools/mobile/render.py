@@ -72,8 +72,6 @@ _COUNT_WORDS = {
     8: "eight",
 }
 
-FLAG_NAME = "QA_MOBILE_RUN_ENABLED"
-
 #: The one place the packet tells the model not to hand the screen back. It is a
 #: real cost: a 150-element screen echoed into the next turn doubles the tokens
 #: the tester pays for and adds nothing the server does not already hold.
@@ -391,27 +389,8 @@ def install_source_for_label(label: str) -> str:
     return ""
 
 
-def flag_refusal(step: str) -> str:
-    """The refusal when the lane's kill-switch is off and ``apply=true`` was sent.
-
-    Same three beats as ``handle_push_suite``'s: what did NOT happen, the exact
-    flag plus the restart, and the reversible alternative. It refuses BY NAME
-    rather than quietly doing a dry run, because a success-shaped reply for a
-    step that never ran is the worse failure.
-    """
-    return (
-        "⚠️ **Nothing happened on the device.** "
-        + str(step or "That step")
-        + " needs `"
-        + FLAG_NAME
-        + "=true` in `.env` and an MCP server restart (quit and reopen the "
-        "editor). Re-run without `apply` for a preview of exactly what it "
-        "would do."
-    )
-
-
 def apply_refusal(step: str, detail: str = "") -> str:
-    """The preview a tester gets when the flag is ON and ``apply`` is not."""
+    """The preview a tester gets when ``apply`` is not sent."""
     return (
         "\U0001f50e **Preview — nothing was changed.** "
         + str(step or "That step")

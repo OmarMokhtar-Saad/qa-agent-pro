@@ -1092,7 +1092,7 @@ def build_server():
     # The mobile emulator lane. ONE call, and nothing else may join it here:
     # `_mobile_lane_enabled()` is `_mobile_modules_present()` alone, which
     # checks tools/mobile is really on disk -- a build made without the pinned
-    # IME ships none of it. QA_MOBILE_RUN_ENABLED is not a term: it gates only
+    # IME ships none of it. QA_MOBILE_HTTPS_CAPTURE_ENABLED is not a term: it gates only
     # the capture download and the capture-certificate install, at those effects.
     # tests/mobile/test_mobile_registration.py parses this file and fails if
     # this `if` becomes anything other than a call to that predicate.

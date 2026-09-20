@@ -12,8 +12,8 @@ Three calls, in the order a case runs them (plan D5):
   ``evidence/events.ndjson``. A release build refuses ``run-as``; the result then
   says ``events_source: "logcat-only"`` with the reason, and nothing raises.
 
-**Both flags are read HERE, before any adb call** (plan D3): the lane's kill-switch
-``QA_MOBILE_RUN_ENABLED`` and the operator-choice ``QA_MOBILE_APP_EVIDENCE``. A
+**Its one flag is read HERE, before any adb call** (plan D3): the operator-choice
+``QA_MOBILE_APP_EVIDENCE``. The HTTPS-capture kill-switch is not read here. A
 guard on a caller is only as good as the list of callers, and this module is
 importable from anywhere. A package with no profile makes NO adb call at all and
 every function reports ``skipped`` with the reason -- the report then says "no app
@@ -49,7 +49,6 @@ from tools.mobile_evidence import crash_detector, netattr, pcap, profiles, scrub
 
 logger = logging.getLogger(__name__)
 
-FLAG_NAME = "QA_MOBILE_RUN_ENABLED"
 EVIDENCE_FLAG_NAME = "QA_MOBILE_APP_EVIDENCE"
 
 #: One slice: the reference's per-turn slices were tens of KB; a 4 MiB cap is

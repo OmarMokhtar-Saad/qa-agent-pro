@@ -54,7 +54,7 @@ AXES: tuple = (
     # register the same tools. It is KEPT because the committed baselines under
     # operations/capabilities/ key every edition by it: dropping the axis is a
     # baseline migration with release-gate effect, not a prose edit.
-    ("mobile", ("qa_mobile_run_enabled",)),
+    ("mobile", ("qa_mobile_https_capture_enabled",)),
     ("push", ("qa_testrail_push_enabled", "qa_xray_push_enabled")),
 )
 
@@ -183,7 +183,7 @@ def build_snapshot(
     eight editions, well inside the Constitution's 60s build budget.
 
     A MATRIX rather than a single snapshot, because a single one would not have
-    caught the defect this exists for. ``qa_mobile_run_enabled`` gated
+    caught the defect this exists for. The mobile kill-switch gated
     registration then and defaulted OFF, so v1.77.0's dist and the
     release before it both registered zero mobile tools *as configured* -- an
     empty diff, a green gate, and a dead lane. The question worth asking is

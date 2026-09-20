@@ -18,7 +18,7 @@ first time either changed.
 
 **The rules the lane already has are the rules here.**
 
-* ``QA_MOBILE_RUN_ENABLED`` is untouched and still governs registration, and
+* Registration follows ``mcp_handlers._mobile_lane_enabled()`` (no flag), and
   ``capture._refusal()`` is called for every action, so a flag-off install
   refuses BY NAME without an adb call.
 * ``apply=true`` is required to START, because starting touches the device.

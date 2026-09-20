@@ -40,9 +40,9 @@ read-decide-write with a compare-after-swap that NARROWS that race and does not
 close it, which is stated here and in the tester-facing text rather than
 improved upon in prose.
 
-**This module does not read the kill-switch.** Its readers in ``tools/mobile``
-are ``downloader.download`` -- the place that spends bytes -- plus
-``preflight.flag_state`` for reporting. The device effects this module starts
+**This module does not read the kill-switch.** Its one reader in ``tools/mobile``
+is ``downloader.download`` -- the place that spends bytes; the other is
+``mobile_capture/cert.install``. The device effects this module starts
 run without it; tests/mobile/test_mobile_killswitch_surface.py derives that
 scope and fails on any new reader.
 """
@@ -1483,7 +1483,8 @@ async def finish_device(owner: str, **release_kwargs) -> dict:
             # Carried rather than swallowed: a restore that failed is a device
             # left on the QA keyboard, and the reply a tester reads is the only
             # place that can say so.
-            "ime": restored.get("content") or {"restored": False, "detail": str(restored.get("error") or "")},
+            "ime": restored.get("content")
+            or {"restored": False, "detail": str(restored.get("error") or "")},
             # A SECOND VALUE WITH A SECOND NAME, not a caveat on the first.
             # "the keyboard this run displaced" and "a keyboard an earlier,
             # crashed run displaced" are different facts with different owners,
@@ -2377,7 +2378,9 @@ async def _submit_explore(
         }
     # Run-wide evidence, read from the checkpoints this run already wrote and
     # passed in EXPLICITLY. See ``_explore_prior_verified``.
-    ctx.prior_verified = _explore_prior_verified(run_id)    # WHAT HAPPENS AFTER A GUARD HIT, from this run's own charter. The guard
+    ctx.prior_verified = _explore_prior_verified(
+        run_id
+    )  # WHAT HAPPENS AFTER A GUARD HIT, from this run's own charter. The guard
     # itself is unchanged and no value here lets an action through it:
     # ``charter.guard_policy`` maps ``destructive: none`` to REFUSE, and the
     # executor then ENDS the attempt by name instead of pausing for the
@@ -2501,7 +2504,9 @@ async def _submit_explore(
     # This turn's capture is finished and its record now lives on the case
     # record. Leaving it on the state would have the NEXT turn's begin treat it
     # as a capture still running and abort a file that is already gone.
-    committed_state.pop("network", None)    # THE REFUSE, RECORDED AS A STOP. The executor marks a charter-driven
+    committed_state.pop(
+        "network", None
+    )  # THE REFUSE, RECORDED AS A STOP. The executor marks a charter-driven
     # refusal explicitly (``guard_refused``), and a refused run is OVER -- so
     # the state says so and every reader under ``stop_reason`` sees it.
     # Without this the reply would carry the refusal text and still report a

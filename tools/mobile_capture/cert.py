@@ -244,7 +244,7 @@ async def install(serial: str, *, apply: bool = False, owner: str = "") -> dict:
         try:
             if not apply:
                 return {"error": REASON_NO_APPLY, "content": None}
-            if not settings.qa_mobile_run_enabled:
+            if not settings.qa_mobile_https_capture_enabled:
                 return {"error": REASON_FLAG_OFF, "content": None}
 
             made = ca.ensure_ca()

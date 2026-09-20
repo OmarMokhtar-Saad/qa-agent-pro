@@ -31,9 +31,6 @@ from tools.mobile import platform_info
 
 logger = logging.getLogger(__name__)
 
-FLAG_NAME = "QA_MOBILE_RUN_ENABLED"
-
-
 NO_OPENER = "no file opener on this machine"
 
 WINDOWS = "startfile"
