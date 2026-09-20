@@ -219,13 +219,13 @@ STEPS: tuple[dict, ...] = (
         ),
     },
     {
-        "step": "provision the Android SDK (cmdline-tools)",
+        "step": "install the Android SDK (cmdline-tools)",
         "needs_admin": False,
         "needs_network": True,
         "admin_free_route": (
-            "Unpack the cmdline-tools zip under your own home directory; this "
-            "server provisions into ~/.qa-agents/mobile/ and writes nothing "
-            "outside $HOME: " + REFERENCES["cmdline_tools_zip"]
+            "Unpack the cmdline-tools zip under your own home directory and "
+            "point ANDROID_HOME at it; this server downloads no SDK itself: "
+            + REFERENCES["cmdline_tools_zip"]
         ),
     },
     {

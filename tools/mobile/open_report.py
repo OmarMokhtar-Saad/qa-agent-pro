@@ -27,18 +27,12 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from config.settings import settings
 from tools.mobile import platform_info
 
 logger = logging.getLogger(__name__)
 
 FLAG_NAME = "QA_MOBILE_RUN_ENABLED"
 
-FLAG_REFUSAL = (
-    "The report was not opened. The mobile lane needs `"
-    + FLAG_NAME
-    + "=true` in `.env` and an MCP server restart."
-)
 
 NO_OPENER = "no file opener on this machine"
 
@@ -73,8 +67,6 @@ def _result(opened: bool, how: str = "", detail: str = "") -> dict:
 def open_report(path: str) -> dict:
     """``{"error", "content": {"opened", "how", "detail"}}``. Never raises."""
     try:
-        if not settings.qa_mobile_run_enabled:
-            return {"error": FLAG_REFUSAL, "content": None}
         target = str(path or "")
         # The report is a FOLDER now, so a caller may hand either the folder or
         # its index. One resolution, here, rather than one in every caller.

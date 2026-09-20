@@ -27,7 +27,6 @@ from __future__ import annotations
 import logging
 import threading
 
-from config.settings import settings
 from tools.mobile import run_store
 
 logger = logging.getLogger(__name__)
@@ -40,11 +39,6 @@ INTERVAL_S = max(1.0, float(run_store.LEASE_STALE_S) / 4.0)
 
 FLAG_NAME = "QA_MOBILE_RUN_ENABLED"
 
-FLAG_REFUSAL = (
-    "No lease heartbeat was started: the mobile lane needs `"
-    + FLAG_NAME
-    + "=true` in `.env`. Nothing is running in the background."
-)
 
 NO_TOKEN = (
     "A lease heartbeat needs the session token that holds the run; without it "
@@ -225,8 +219,6 @@ def start(
     a sleep the assertion has to outlast.
     """
     try:
-        if not settings.qa_mobile_run_enabled:
-            return {"error": FLAG_REFUSAL, "content": None}
         if not run_store.valid_run_id(run_id):
             return {
                 "error": "Refusing " + repr(str(run_id)[:40]) + " as a run id.",

@@ -23,11 +23,11 @@ an emulator exactly as on a real phone. This module reads that property and
 refuses by name (:data:`REASON_PRODUCTION_BUILD`) BEFORE ever calling
 ``adb root``, rather than trying it and improvising off the refusal text.
 
-**This lane's own provisioned emulator is such a device.**
-``tools/mobile/provisioner.py`` pins ``SYSTEM_IMAGE_TAG =
-"google_apis_playstore"``, a Play (production) system image, and
+**A Play Store emulator is such a device.** The lane boots the AVD the
+tester created in Android Studio; a ``google_apis_playstore`` image is a
+Play (production) system image, and
 ``tools/mobile/emulator.py`` never passes ``-writable-system`` on its start
-command. Neither is changed here: the image tag is what lets a tester
+command. Neither is changed here: a Play image is what lets a tester
 install and open an app from the Play Store inside a run at all, and
 ``-writable-system`` changes how every emulator this lane owns boots. Both
 are owner decisions with their own blast radius (see the plan ledger). The
@@ -63,6 +63,7 @@ import re
 import time
 from pathlib import Path
 
+from config.settings import settings
 from tools.mobile import adb, session
 from tools.mobile_capture import ca, ledger, paths, proxy
 
@@ -96,6 +97,9 @@ ROUTE_DATA = "data"
 #: specific reason available to a direct caller (`qa_setup_capture`) or a
 #: test.
 REASON_NO_APPLY = "no_apply"
+#: The lane kill-switch is unset. Installing a root CA into a device's trust
+#: store is one of the two effects the flag still gates (with provisioning).
+REASON_FLAG_OFF = "flag_off"
 REASON_NO_CA = "no_ca"
 REASON_DEVICE_UNREACHABLE = "device_unreachable"
 REASON_PRODUCTION_BUILD = "production_build"
@@ -240,6 +244,8 @@ async def install(serial: str, *, apply: bool = False, owner: str = "") -> dict:
         try:
             if not apply:
                 return {"error": REASON_NO_APPLY, "content": None}
+            if not settings.qa_mobile_run_enabled:
+                return {"error": REASON_FLAG_OFF, "content": None}
 
             made = ca.ensure_ca()
             if made.get("error"):
@@ -289,10 +295,10 @@ async def install(serial: str, *, apply: bool = False, owner: str = "") -> dict:
                         "detail": (
                             "adb root was refused: "
                             + str(root_body.get("err") or "").strip()[:200]
-                            + ". If this is the qa-agents emulator, its system "
-                            "image is chosen by `qa_mobile_system_image_tag`; "
-                            "`google_apis_playstore` cannot root, so switch it "
-                            "to `google_apis` to enable decryption."
+                            + ". A Google Play (`google_apis_playstore`) "
+                            "image cannot root: create an AVD with a "
+                            "`google_apis` image in Android Studio's Device "
+                            "Manager to enable decryption."
                         )
                     },
                 }

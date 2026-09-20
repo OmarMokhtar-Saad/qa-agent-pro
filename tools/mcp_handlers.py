@@ -2799,14 +2799,13 @@ def _mobile_modules_present() -> bool:
 def _mobile_lane_enabled() -> bool:
     """The ONE condition that decides whether the mobile lane exists.
 
-    Both conjuncts are load-bearing and neither may be re-expressed anywhere
-    else -- ``mcp_server`` calls THIS, and a test asserts the registration site
-    holds nothing but a call to it. The failure mode being designed out is a
-    gate copied with one of its two terms, which this project has shipped before.
+    It is ``_mobile_modules_present()`` ALONE, and it may not be re-expressed
+    anywhere else -- ``mcp_server`` calls THIS, and a test asserts the
+    registration site holds nothing but a call to it. A build made without
+    the pinned IME ships no ``tools/mobile`` (``scripts/build_dist.py``), so
+    module absence IS the edition gate. ``qa_mobile_run_enabled`` is not a term: it gates only
+    the capture download and the capture-certificate install, at those effects.
 
-    * ``qa_mobile_run_enabled`` is the contract's category-1 kill-switch:
-      default OFF forever, because a run installs an app, drives an emulator and
-      writes to a shared cache.
     * ``_mobile_modules_present()`` is the CORRECTNESS term: a build whose
       checkout had no ``tools/mobile/ime_manifest.py`` ships no ``tools/mobile``
       at all (``scripts/build_dist.py`` excludes it), and a registered tool
@@ -2827,18 +2826,10 @@ def _mobile_lane_enabled() -> bool:
     ``_mobile_modules_present()`` carries the argument alone -- which is what
     ``.claude/plans/mobile-programme.md`` specified in the first place.
 
-    Read fresh on every call, never cached: the flag is read from ``settings``,
-    which a test may flip, and a cached answer would make the off-path
-    unobservable.
+    Read fresh on every call, never cached: a test may patch the module probe,
+    and a cached answer would make the absent path unobservable.
     """
-    return bool(settings.qa_mobile_run_enabled) and _mobile_modules_present()
-
-
-_MOBILE_LANE_OFF = (
-    "ℹ️ The mobile emulator lane is off on this install. Add "
-    "`QA_MOBILE_RUN_ENABLED=true` to `.env` and restart the MCP server (quit "
-    "and reopen the editor) to turn it on. Nothing else here is affected."
-)
+    return _mobile_modules_present()
 
 
 _MOBILE_LANE_ABSENT = (
@@ -2850,21 +2841,12 @@ _MOBILE_LANE_ABSENT = (
 
 
 def _mobile_lane_state() -> str:
-    """``"on"``, ``"flag_off"`` or ``"absent"``. Never raises.
+    """``"on"`` or ``"absent"``. Never raises.
 
-    ONE PRODUCER, and it invents no condition: it CALLS the two predicates
-    ``_mobile_lane_enabled()`` is made of rather than re-expressing either, so
-    it cannot drift from the gate that decides registration. A second copy of a
-    two-conjunct gate is the failure this file has shipped before.
-
-    What it ADDS is the distinction the gate deliberately does not draw. A
-    single boolean is the RIGHT answer for registration -- both Falses register
-    nothing -- and the WRONG answer for a tester, because the two Falses have
-    different owners: ``flag_off`` is the operator's, fixable in one line of
-    ``.env``; ``absent`` is the build's, and nothing on the machine can change
-    it. Telling the second tester to edit ``.env`` sends them to change a file
-    that will alter no behaviour, which is why ``absent`` is tested FIRST: with
-    no modules on disk the flag decides nothing at all.
+    ONE PRODUCER, and it invents no condition: it CALLS the gate that decides
+    registration rather than re-expressing it, so the two cannot drift. There
+    is no settings-owned off state: the lane is on wherever its modules are on
+    disk, and ``absent`` is the build's, which nothing on the machine changes.
 
     Consumers, all of them: ``_mobile_lane_off_message`` (the three tool-call
     refusals), ``_mobile_gate_row`` (qa-doctor's Feature-gates row) and
@@ -2873,20 +2855,15 @@ def _mobile_lane_state() -> str:
     both only ever ask "may I name these tools", and the boolean gate is the
     right answer to that question.
     """
-    if not _mobile_modules_present():
-        return "absent"
-    return "on" if _mobile_lane_enabled() else "flag_off"
+    return "on" if _mobile_lane_enabled() else "absent"
 
 
 def _mobile_lane_off_message() -> str:
     """The refusal a mobile tool returns when the lane will not run.
 
-    ``_MOBILE_LANE_OFF`` keeps its name and its exact text -- ``tools/mobile/
-    render.py`` refers to it in prose twice, and both statements stay true --
-    but it is now the answer to ONE of the two off states rather than to both.
-    A build with no ``tools/mobile`` gets ``_MOBILE_LANE_ABSENT`` instead,
-    because a refusal that names a setting the tester can set, on an install
-    where setting it changes nothing, sends them to edit a file for no reason.
+    The only off state is ``absent``: a build with no ``tools/mobile`` gets
+    ``_MOBILE_LANE_ABSENT``, which names no setting, because no setting can
+    turn the lane on or off.
 
     Total on purpose. The ``"on"`` branch is unreachable from all three call
     sites (each is guarded by ``if not _mobile_lane_enabled():``) but a
@@ -2896,8 +2873,6 @@ def _mobile_lane_off_message() -> str:
     state = _mobile_lane_state()
     if state == "absent":
         return _MOBILE_LANE_ABSENT
-    if state == "flag_off":
-        return _MOBILE_LANE_OFF
     return (
         "\u2139\ufe0f The mobile emulator lane is available on this install. "
         "Nothing was refused -- call the mobile tool again."
@@ -2932,14 +2907,7 @@ def _mobile_gate_row(state: str) -> tuple[str, bool]:
             "installed here, so nothing on this machine can switch it on",
             False,
         )
-    return (
-        "Mobile emulator lane \u2014 OFF on this install. It runs your test "
-        "cases on an attached Android device or an emulator, taps and types "
-        "and checks the screen for you, and writes an HTML report. To turn it "
-        "on, add `QA_MOBILE_RUN_ENABLED=true` to this install's `.env` and "
-        "restart the MCP server (quit and reopen your editor)",
-        False,
-    )
+    return _mobile_gate_row("absent")
 
 
 def _mobile_lane_disclosure(state: str, adb_path: str | None) -> list[str]:
@@ -2966,23 +2934,7 @@ def _mobile_lane_disclosure(state: str, adb_path: str | None) -> list[str]:
             "turn on. Test-case generation, exports and device listing are "
             "unaffected.",
         ]
-    out = [
-        "### Mobile emulator lane (off)",
-        "- \u2b1c This install can run your test cases on an attached Android "
-        "device or an emulator: it taps, types and checks the screen for you, "
-        "and writes an HTML report of the screens it saw. It is off until "
-        "someone turns it on, and it starts nothing by itself.",
-        "- To turn it on: add `QA_MOBILE_RUN_ENABLED=true` to this install's "
-        "`.env`, then quit and reopen your editor so the server reloads it.",
-    ]
-    if adb_path:
-        out.append(
-            "- \u2705 `adb` is already installed here ("
-            + str(adb_path)
-            + "), so this machine has what the lane needs. If you are driving "
-            "an Android device by hand, this is the switch you are looking for."
-        )
-    return out
+    return _mobile_lane_disclosure("absent", adb_path)
 
 
 #: How long qa-doctor's ONE device probe may take. Small, because this report is
@@ -3041,7 +2993,7 @@ async def _mobile_non_android(serial: str) -> str:
             "its screenshots and `qa_list_devices` keeps listing it. To use "
             "this lane, pass an Android emulator serial (like `emulator-5554`) "
             "in `serial`, or call `qa_mobile_test` with no `serial` and let it "
-            "adopt or provision one."
+            "adopt one or boot one of your AVDs."
         )
     return ""
 
@@ -3198,7 +3150,9 @@ async def _mobile_doctor_section() -> list:
         return []
     lines = ["### Mobile emulator lane"]
     try:
+        from tools.mobile import emulator as doctor_emulator
         from tools.mobile import ime, sdk_locator
+        from tools.mobile import render as doctor_render
 
         located = (sdk_locator.locate_sdk() or {}).get("content") or {}
         root = str(located.get("sdk_root") or "")
@@ -3209,9 +3163,38 @@ async def _mobile_doctor_section() -> list:
             + str(located.get("source") or "?")
             + ")"
             if root
-            else "- ⬜ No Android SDK found yet — the first mobile run "
-            "provisions one into `~/.qa-agents/mobile/` (about 2.2 GB)"
+            else "- ⬜ Android SDK not found → `qa_mobile_test` answers with a "
+            "setup guide (install Android Studio: "
+            + doctor_render.ANDROID_STUDIO_URL
+            + "). This server downloads no SDK."
         )
+        if root:
+            # The SAME producer the run's device stage asks. `list_avds` runs its
+            # subprocess on a worker thread, so this wait really is the bound.
+            try:
+                avds = await asyncio.wait_for(
+                    doctor_emulator.list_avds(), timeout=_MOBILE_PROBE_S
+                )
+            except Exception:  # a slow probe is not a missing AVD
+                avds = {"error": "the AVD probe did not finish", "content": None}
+            names = list(avds.get("content") or [])
+            if avds.get("error"):
+                lines.append(
+                    "- ⬜ Emulators (AVDs) not checked: " + str(avds["error"])[:160]
+                )
+            elif names:
+                lines.append(
+                    "- ✅ "
+                    + str(len(names))
+                    + " emulator(s) configured: "
+                    + ", ".join("`" + str(n)[:40] + "`" for n in names[:5])
+                )
+            else:
+                lines.append(
+                    "- ⬜ No AVD → create one in Android Studio's Device Manager ("
+                    + doctor_render.AVD_GUIDE_URL
+                    + "); `qa_mobile_test` answers with the same setup guide"
+                )
         # THE DEVICE LOCKS, ONE PER DEVICE, ASKED BY NAME. The design's honest
         # bound (plan §5.6) is that a holder whose heartbeat writer never
         # started is NOT force-released -- breaking a live holder's lock is the
@@ -3303,7 +3286,7 @@ async def _mobile_doctor_section() -> list:
         # `provisioner` went with the AVD_NAME filter below: this probe no
         # longer asks about ONE hardcoded AVD, so its only two uses in this
         # scope are gone and leaving the import would fail ruff (F401).
-        from tools.mobile import emulator
+        from tools.mobile import emulator, sdk_locator
 
         # EVERY booted emulator, not just ours. `find_running(AVD_NAME)` filters
         # to the hardcoded AVD, which is the D1 defect -- and it survived here
@@ -3326,8 +3309,19 @@ async def _mobile_doctor_section() -> list:
         else:
             for item in booted:
                 serial = str((item or {}).get("serial") or "")
-                avd = str((item or {}).get("avd") or "") or "unknown AVD"
-                lines.append("- ✅ Emulator `" + avd + "` is running as " + serial)
+                named = str((item or {}).get("avd") or "")
+                avd = named or "unknown AVD"
+                # The producer the machine report's image row reads, so the
+                # doctor and the desktop's decrypt opt-in cannot disagree.
+                found = sdk_locator.avd_system_image(named) or {}
+                image = str(found.get("content") or "")
+                lines.append(
+                    "- ✅ Emulator `"
+                    + avd
+                    + "` is running as "
+                    + serial
+                    + (" (" + image + ")" if image else "")
+                )
             if len(booted) > 1:
                 lines.append(
                     "  Pass `serial` to `qa_mobile_test` to say which one to use."
@@ -12002,7 +11996,6 @@ async def handle_mobile_test(
     serial: str = "",
     avd: str = "",
     new_run: bool = False,
-    virtualization_ack: bool = False,
     locale: str = "",
     capture: str = "",
     capture_ack: bool = False,
@@ -12040,10 +12033,6 @@ async def handle_mobile_test(
     from tools.untrusted import single_line as _safe
 
     if not _mobile_lane_enabled():
-        from tools.mobile import render as mobile_render
-
-        if apply:
-            return mobile_render.flag_refusal("Running the emulator lane")
         return _mobile_lane_off_message()
 
     from tools.mobile import render as mobile_render
@@ -12200,7 +12189,6 @@ async def handle_mobile_test(
                 apply,
                 serial=serial,
                 avd=avd,
-                virtualization_ack=virtualization_ack,
                 locale=locale,
                 choose=choose,
                 progress=progress,
@@ -12354,7 +12342,6 @@ async def _mobile_pick_source(
 async def _mobile_device_stage(
     apply: bool,
     *,
-    virtualization_ack: bool = False,
     serial: str = "",
     avd: str = "",
     locale: str = "",
@@ -12362,19 +12349,20 @@ async def _mobile_device_stage(
     progress: ProgressCb = None,
 ) -> tuple:
     """Device selection, then -- only if nothing is already booted --
-    provisioning and boot. Returns ``(markdown_to_send_back, serial)``.
+    the tester's own AVD, or the setup guide. Returns
+    ``(markdown_to_send_back, serial)``.
 
     A tuple rather than a string because the caller needs the serial and asking
     for it twice would mean two device probes per call -- and, worse, two
     answers that could disagree.
 
-    Device selection runs BEFORE provisioning is even considered: an explicit
-    ``serial`` or an already-booted emulator means there is nothing to
-    provision. Only when NOTHING is connected does this fall through to the
-    provisioning/spawn path, and spawning still needs ``apply=true``.
+    Device selection runs FIRST: an explicit ``serial`` or an already-booted
+    emulator means there is nothing to boot. Only when NOTHING is connected
+    does this look for the tester's AVDs, and spawning still needs
+    ``apply=true``.
 
-    Neither the spawn nor a boot-wait is allowed to block this call:
-    provisioning runs as a detached OS process and the emulator is started and
+    Neither the spawn nor a boot-wait is allowed to block this call: the
+    emulator is started and
     then polled with an explicit bounded budget, so the reply is always a
     pointer to ``qa_mobile_status`` rather than a tool call the client kills
     at its own timeout.
@@ -12456,44 +12444,45 @@ async def _mobile_device_stage(
             return mobile_render.device_pending_block(state), picked_serial
         return "", picked_serial
 
-    # Nothing booted at all: fall through to provisioning/spawn, unchanged
-    # except the spawn branch below now explicitly needs apply=true.
-    plan = session.provision_plan()
-    steps = (plan.get("content") or {}).get("steps") or []
-    pending = [s for s in steps if str(s.get("state") or "") == "pending"]
-    if pending:
-        if not apply:
-            return (
-                mobile_render.apply_refusal(
-                    "Provisioning the Android SDK and an emulator image",
-                    str(len(pending)) + " step(s), up to about 2.2 GB of downloads",
-                ),
-                "",
-            )
-        await _emit(progress, "⚙️ Starting the provisioner…")
-        # The tester's acknowledgement of an AMBIGUOUS virtualization probe,
-        # carried to the only place it means anything. It rides BELOW both real
-        # guards and weakens neither: the lane's kill-switch is checked by
-        # `_mobile_lane_enabled()` at the top of this handler and again inside
-        # `provisioner.run`, and the `apply` refusal is a few lines above. It
-        # dismisses one probe that says of itself it may be wrong.
-        started = session.start_provisioning(virtualization_ack=virtualization_ack)
-        if started.get("error"):
-            return "⚠️ " + str(started["error"])[:300], ""
+    # Nothing booted at all. This server downloads no SDK and creates no AVD
+    # (docs/RETIRED_CAPABILITIES.md -> 6), so a machine without them gets the
+    # setup guide, and only an AVD the TESTER created can be booted. The one
+    # question the guide turns on -- is there an emulator binary -- is asked of
+    # the same `locate_sdk` every other SDK consumer asks.
+    from tools.mobile import sdk_locator
+
+    located = (sdk_locator.locate_sdk() or {}).get("content") or {}
+    if not str((located.get("tools") or {}).get("emulator") or ""):
+        guide = mobile_render.setup_guide(mobile_render.SETUP_NO_SDK)
+        return mobile_render.setup_guide_block(guide), ""
+    listed = await emulator.list_avds()
+    if listed.get("error"):
+        return "⚠️ " + str(listed["error"])[:300], ""
+    avds = [str(name) for name in (listed.get("content") or []) if str(name)]
+    if not avds:
+        guide = mobile_render.setup_guide(mobile_render.SETUP_NO_AVD)
+        return mobile_render.setup_guide_block(guide), ""
+    wanted = str(avd or "").strip()
+    if wanted and wanted not in avds:
         return (
-            "## Provisioning started\n\n"
-            + mobile_render.provisioning_line(
-                (session.provision_progress() or {}).get("content")
-            )
-            + "\n\nIt runs OUTSIDE this server, so nothing here is waiting on "
-            "it. Call `qa_mobile_status` for progress; it can take several "
-            "minutes on a first run.",
+            "## That emulator (AVD) does not exist on this machine\n\n"
+            "Call `qa_mobile_test` again with `avd` set to one of: "
+            + ", ".join("`" + name + "`" for name in avds),
             "",
         )
+    if not wanted and len(avds) > 1:
+        menu = "\n".join(str(i + 1) + ". `" + name + "`" for i, name in enumerate(avds))
+        return (
+            "## Several emulators (AVDs) are configured\n\n"
+            + menu
+            + "\n\nCall `qa_mobile_test` again with `avd` set to the one you want.",
+            "",
+        )
+    wanted = wanted or avds[0]
     if not apply:
         return (
             mobile_render.apply_refusal(
-                "Starting the " + str(avd or "default") + " emulator",
+                "Starting the " + wanted + " emulator",
                 "one detached process",
             ),
             "",
@@ -12501,7 +12490,7 @@ async def _mobile_device_stage(
     # THE ONLY BRANCH THAT SPAWNS, so the only one that can set the language
     # from the first frame. Every branch above ADOPTED a device somebody else
     # booted; `_mobile_locale_stage` handles those by reading back.
-    ready = await session.ensure_device(avd=str(avd or ""), locale=str(locale or ""))
+    ready = await session.ensure_device(avd=wanted, locale=str(locale or ""))
     if ready.get("error"):
         return "⚠️ " + str(ready["error"])[:300], ""
     state = ready.get("content") or {}
@@ -13260,6 +13249,21 @@ async def _mobile_resume_device_stage(run_id: str, *, budget: object = None) -> 
     if ready.get("error"):
         return "\u26a0\ufe0f " + str(ready["error"])[:300]
     state = ready.get("content") or {}
+    if str(state.get("state") or "") == session.STATE_NO_AVD:
+        # The name comes off our own manifest, but it is echoed into markdown,
+        # so only AVD-name characters survive.
+        gone = "".join(
+            c for c in str(state.get("avd") or "") if c.isalnum() or c in "._-"
+        )[:60]
+        return (
+            "The emulator this run used"
+            + (" (`" + gone + "`)" if gone else "")
+            + " is not on this machine any more, so this run cannot be re-booted "
+            "on it. Set up an emulator as below, then start a new run.\n\n"
+            + mobile_render.setup_guide_block(
+                mobile_render.setup_guide(mobile_render.SETUP_NO_AVD)
+            )
+        )
     if str(state.get("state") or "") != "ready":
         return mobile_render.device_pending_block(state)
     if not state.get("rebooted"):
@@ -13664,39 +13668,6 @@ async def handle_submit_mobile_step_content(*args, **kwargs) -> tuple:
         _MOBILE_IMAGE_SPECS.reset(token)
 
 
-def _mobile_device_in_use(session, run_id: str, session_token: str = "") -> bool:
-    """Does the run this status is about already HAVE a device, right now?
-
-    The one question `render.provisioning_section` needs: it decides whether a
-    provisioning REFUSAL recorded on this machine is about this reader's
-    situation at all. Two clauses, both load-bearing:
-
-    * a recorded serial -- a run that never got one was never provisioned FOR,
-      so a refusal is exactly its explanation and must be shown;
-    * a LIVE state -- a finished or abandoned run's old serial says nothing
-      about whether a refusal the tester hit a minute ago was needed, and that
-      refusal is the thing they are looking for.
-
-    No run id (the run listing) is not a run and cannot answer either clause:
-    False, so the section renders as it always did. `session` is passed in
-    rather than imported so this module keeps its lazy-import discipline.
-    """
-    if not str(run_id or "").strip():
-        return False
-    try:
-        resolved = session.resolve(run_id, session_token)
-        if resolved.get("error"):
-            return False
-        body = resolved.get("content") or {}
-        return bool(body.get("serial")) and str(body.get("state") or "") in (
-            session.STATE_RUNNING,
-            session.STATE_GATE,
-        )
-    except Exception:  # never-raise: a status is not a verdict
-        logger.exception("mcp mobile provisioning-section state failed")
-        return False
-
-
 async def handle_setup_capture(
     serial: str = "",
     action: str = "prepare",
@@ -13711,13 +13682,10 @@ async def handle_setup_capture(
     anything, and a second, unrelated caller on the same serial is refused
     by name rather than racing the run. ``remove`` needs ``apply=true`` like
     every other device-touching step in this lane (brief decision 8: no new
-    flag -- it inherits the lane's own kill-switch and per-call gate).
+    flag -- the certificate install reads the lane's kill-switch itself, in
+    ``cert.install``, and ``apply`` is the per-call gate).
     """
     if not _mobile_lane_enabled():
-        from tools.mobile import render as mobile_render
-
-        if apply:
-            return mobile_render.flag_refusal("Setting up API capture")
         return _mobile_lane_off_message()
 
     from tools.mobile import render as mobile_render
@@ -13821,8 +13789,8 @@ async def handle_mobile_status(
     """Where everything stands, read from disk only. Never drives the device.
 
     Deliberately the one tool in this lane that never touches the emulator: it
-    is what a tester calls after a provisioning kick, an install or a boot, all
-    three of which outlive a tool call by design.
+    is what a tester calls after an install or a boot, both of which outlive a
+    tool call by design.
 
     ``report_now=True`` is the one thing here that WRITES: it renders the run's
     standalone HTML report -- mid-run is fine and is labelled partial -- into
@@ -13841,11 +13809,6 @@ async def handle_mobile_status(
 
     try:
         lines: list = []
-        progress_body = (session.provision_progress() or {}).get("content")
-        lines += mobile_render.provisioning_section(
-            progress_body,
-            device_in_use=_mobile_device_in_use(session, run_id, session_token),
-        )
         if not run_id:
             runs = (session.list_runs(10) or {}).get("content") or []
             if not runs:
@@ -17510,12 +17473,6 @@ async def handle_setup_check(
         # report forever is the nag-with-no-exit this function was corrected
         # for on 2026-09-01. The DISCLOSURE itself is unconditional -- it is in
         # the Feature-gates row and in the section below on every install.
-        if _mobile_state == "flag_off" and _tool_paths.get("adb"):
-            limited.append(
-                "running test cases on the Android device this machine can "
-                "already see (the emulator lane is off \u2014 see Feature "
-                "gates below)"
-            )
         # A reload that did not take effect is not passive information: the
         # server may be serving stale code, so it belongs in the action items.
         # Recommended, not blocking -- the server still answers.

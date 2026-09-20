@@ -81,7 +81,6 @@ import shutil
 import time
 from pathlib import Path
 
-from config.settings import settings
 from tools.mobile import paths
 
 logger = logging.getLogger(__name__)
@@ -695,15 +694,6 @@ def gc_stale_runs(*, now: float | None = None, keep_s: float = STALE_RUN_S) -> d
       *keep_s* old is kept.
     """
     try:
-        if not settings.qa_mobile_run_enabled:
-            return {
-                "error": (
-                    "Refusing to delete old runs: the mobile lane needs `"
-                    + FLAG_NAME
-                    + "=true` in `.env`. Nothing was removed."
-                ),
-                "content": None,
-            }
         moment = _now(now)
         root = paths.sub("runs")
         removed: list[str] = []

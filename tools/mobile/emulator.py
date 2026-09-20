@@ -29,8 +29,6 @@ from tools.mobile import (
     adb,
     paths,
     platform_info,
-    provisioner,
-    render,
     sdk_locator,
 )
 
@@ -89,16 +87,22 @@ def ensure_adb_first_on_path(adb_path: str = "") -> dict:
         return {"error": str(exc), "content": None}
 
 
-async def list_avds() -> dict:
-    """AVD names ``emulator -list-avds`` reports."""
+def _list_avds_sync() -> dict:
+    """AVD names ``emulator -list-avds`` reports. Blocking; see :func:`list_avds`.
+
+    Newer emulators print ``INFO | ...`` diagnostics on the same stdout, and an
+    AVD name never contains a space or ``|``, so a line with either is not a
+    name. No emulator binary is an ERROR, never ``[]``: "no SDK" and "no AVD"
+    get two different setup guides.
+    """
     try:
         located = (sdk_locator.locate_sdk() or {}).get("content") or {}
         binary = str((located.get("tools") or {}).get("emulator") or "")
         if not binary:
             return {
                 "error": (
-                    "The Android emulator binary was not found. Run the mobile "
-                    "provisioner (or install Android Studio) first."
+                    "The Android emulator binary was not found. Install Android "
+                    "Studio, then create an emulator in its Device Manager."
                 ),
                 "content": None,
             }
@@ -109,11 +113,25 @@ async def list_avds() -> dict:
                 + (err.strip() or "rc=" + str(rc))[:300],
                 "content": None,
             }
-        names = [line.strip() for line in out.splitlines() if line.strip()]
+        names = [
+            line.strip()
+            for line in out.splitlines()
+            if line.strip() and " " not in line.strip() and "|" not in line
+        ]
         return {"error": None, "content": names}
     except Exception as exc:
         logger.exception("mobile.emulator.list_avds failed")
         return {"error": str(exc), "content": None}
+
+
+async def list_avds() -> dict:
+    """AVD names, asked on a worker thread.
+
+    The subprocess would otherwise hold the event loop for up to its own 60 s
+    timeout, and a caller's ``asyncio.wait_for`` (qa-doctor's) could not bound
+    it.
+    """
+    return await asyncio.to_thread(_list_avds_sync)
 
 
 async def avd_name_of(serial: str) -> dict:
@@ -129,7 +147,7 @@ async def avd_name_of(serial: str) -> dict:
     return {"error": None, "content": lines[0] if lines else ""}
 
 
-async def find_running(avd: str = provisioner.AVD_NAME) -> dict:
+async def find_running(avd: str) -> dict:
     """``{"serial": ...}`` for an already-running *avd*, serial ``""`` if none."""
     try:
         listed = await adb.devices()
@@ -155,8 +173,8 @@ async def list_running() -> dict:
 
     Unlike :func:`find_running`, this does NOT filter by AVD -- it is how the
     device-selection stage sees a FOREIGN emulator (one not named
-    ``provisioner.AVD_NAME``) that a tester already has running, so a run can
-    adopt it instead of always spawning the hardcoded default.
+    by the caller) that a tester already has running, so a run can adopt it
+    instead of spawning one.
 
     ``{"error", "content": [{"serial": ..., "avd": ...}, ...]}``.
     """
@@ -213,27 +231,6 @@ async def wait_boot(serial: str, timeout: int = 0, *, tunable: bool = True) -> d
             if not prop.get("error") and str(prop.get("content") or "").strip() == "1":
                 return {"error": None, "content": {"serial": serial, "booted": True}}
             await asyncio.sleep(POLL_INTERVAL_S)
-        # ONE PRODUCER: `render` decides both whether this machine has a CURRENT
-        # record of an overridden negative virtualization verdict and what to
-        # say about it. This function composes no sentence of its own -- and it
-        # is empty on every machine that did not override one, because a message
-        # that always blamed virtualization is the same defect pointing the
-        # other way.
-        # WHICH DEVICE FAILED. `avd_name_of` asks the emulator CONSOLE, which
-        # answers long before `sys.boot_completed`. STATED EXACTLY: it yields ""
-        # when `raw` sets an error (adb missing, timeout, exception), and
-        # otherwise the first non-OK line of STDOUT -- a NON-ZERO rc is NOT an
-        # error there, so a physical handset (whose console reply goes to
-        # stderr) normally yields "" but is not guaranteed to. Either way the
-        # downstream match is POSITIVE: "" and any junk both fail to equal the
-        # provisioned AVD name, so the note stays silent. One extra call, only
-        # on a path where a boot has already timed out.
-        named = await avd_name_of(serial)
-        note = render.virtualization_override_note(
-            (provisioner.read_progress() or {}).get("content"),
-            time.time(),
-            str((named or {}).get("content") or ""),
-        )
         # The remedy, and the ONE thing that decides it: whose budget was this?
         # Both branches name Android Studio, because warming the snapshot
         # shortens the BOOT and so helps either way; only the first offers the
@@ -260,7 +257,6 @@ async def wait_boot(serial: str, timeout: int = 0, *, tunable: bool = True) -> d
                 + repr(last[:60])
                 + "). "
                 + remedy
-                + note
             ),
             "content": None,
         }
@@ -269,7 +265,7 @@ async def wait_boot(serial: str, timeout: int = 0, *, tunable: bool = True) -> d
         return {"error": str(exc), "content": None}
 
 
-async def start(avd: str = provisioner.AVD_NAME, *, locale: str = "") -> dict:
+async def start(avd: str, *, locale: str = "") -> dict:
     """Spawn *avd* detached and return AT ONCE. ``{"error", "content": {"pid"}}``.
 
     ``locale`` is keyword-only and defaults empty, so every existing caller --
@@ -289,15 +285,6 @@ async def start(avd: str = provisioner.AVD_NAME, *, locale: str = "") -> dict:
     to close that class.
     """
     try:
-        if not settings.qa_mobile_run_enabled:
-            return {
-                "error": (
-                    "Refusing to start an emulator: the mobile lane needs "
-                    "`QA_MOBILE_RUN_ENABLED=true` in `.env`. Nothing was "
-                    "launched."
-                ),
-                "content": None,
-            }
         located = (sdk_locator.locate_sdk() or {}).get("content") or {}
         binary = str((located.get("tools") or {}).get("emulator") or "")
         if not binary:
@@ -305,7 +292,7 @@ async def start(avd: str = provisioner.AVD_NAME, *, locale: str = "") -> dict:
                 "error": (
                     "The Android emulator binary was not found, so "
                     + str(avd)
-                    + " cannot be started. Run the mobile provisioner first."
+                    + " cannot be started. Install Android Studio first."
                 ),
                 "content": None,
             }
@@ -341,7 +328,7 @@ async def start(avd: str = provisioner.AVD_NAME, *, locale: str = "") -> dict:
         return {"error": str(exc), "content": None}
 
 
-async def boot(avd: str = provisioner.AVD_NAME, timeout: int = 0) -> dict:
+async def boot(avd: str, timeout: int = 0) -> dict:
     """Ensure *avd* is running and booted, re-attaching when it already is.
 
     ``{"error", "content": {"serial", "avd", "reattached", "pid"}}``.
@@ -369,15 +356,6 @@ async def boot(avd: str = provisioner.AVD_NAME, timeout: int = 0) -> dict:
     red.
     """
     try:
-        if not settings.qa_mobile_run_enabled:
-            return {
-                "error": (
-                    "Refusing to boot an emulator: the mobile lane needs "
-                    "`QA_MOBILE_RUN_ENABLED=true` in `.env`. Nothing was "
-                    "launched, and no already-running emulator was attached to."
-                ),
-                "content": None,
-            }
         ensure_adb_first_on_path()
         # A FAILED probe is not "no emulator": `or {}` collapsed the two, and
         # this function's next move is to spawn one. That is D1 exactly -- a

@@ -23,7 +23,6 @@ import re
 import time
 from pathlib import Path
 
-from config.settings import settings
 from tools.device_manager import (
     _valid_device_id,
     parse_adb_devices,
@@ -138,10 +137,7 @@ async def raw(
         }
     except FileNotFoundError:
         return {
-            "error": (
-                "adb was not found. Install Android Studio (or let the mobile "
-                "lane provision the platform-tools) and try again."
-            ),
+            "error": ("adb was not found. Install Android Studio and try again."),
             "content": None,
         }
     except asyncio.TimeoutError:
@@ -367,14 +363,6 @@ async def set_locale(serial: str, tag: str) -> dict:
     ``emulator.start`` states: a guard on a caller is only as good as the list
     of callers.
     """
-    if not settings.qa_mobile_run_enabled:
-        return {
-            "error": (
-                "Refusing to change the device language: the mobile lane needs "
-                "`QA_MOBILE_RUN_ENABLED=true` in `.env`. Nothing was changed."
-            ),
-            "content": None,
-        }
     wanted = str(tag or "").strip()
     if not LOCALE_TAG.match(wanted):
         return {
@@ -475,15 +463,6 @@ async def install(serial: str, apk_path: str) -> dict:
     of callers -- which is how the same switch came to be missing from
     ``provisioner.run`` and then ``session.start_install``.
     """
-    if not settings.qa_mobile_run_enabled:
-        return {
-            "error": (
-                "Refusing to install: the mobile lane needs "
-                "`QA_MOBILE_RUN_ENABLED=true` in `.env`. Nothing was "
-                "installed and no process was started."
-            ),
-            "content": None,
-        }
     try:
         path = Path(str(apk_path)).expanduser()
         if not path.is_file():
@@ -515,14 +494,6 @@ async def uninstall(serial: str, package: str) -> dict:
     BEFORE the package-name validation: a tester whose lane is off should be
     told that, not handed a name error they cannot act on.
     """
-    if not settings.qa_mobile_run_enabled:
-        return {
-            "error": (
-                "Refusing to uninstall: the mobile lane needs "
-                "`QA_MOBILE_RUN_ENABLED=true` in `.env`. Nothing was removed."
-            ),
-            "content": None,
-        }
     if not valid_package_name(package):
         return {
             "error": "Refusing to uninstall " + repr(str(package)[:60]),
@@ -1067,14 +1038,6 @@ async def screenrecord_spawn(serial: str, remote: str, seconds: int) -> dict:
         # device and a file on its disk -- which is exactly the class
         # `install` and `uninstall` guard here rather than at a caller. A
         # guard on a caller is only as good as the list of callers.
-        if not settings.qa_mobile_run_enabled:
-            return {
-                "error": (
-                    "Refusing to record the screen: the mobile lane needs "
-                    "`QA_MOBILE_RUN_ENABLED=true` in .env."
-                ),
-                "content": None,
-            }
         if not _valid_device_id(serial):
             return {
                 "error": "Refusing to use "

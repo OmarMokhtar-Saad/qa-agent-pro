@@ -406,22 +406,6 @@ class Settings(BaseSettings):
     # first boot of a Play-Store system image genuinely takes minutes, and
     # `adb wait-for-device` returns long before the launcher exists.
     qa_mobile_boot_timeout_s: int = 240
-    # Ceiling (GB) on what provisioning may download. Checked BEFORE the first
-    # byte is requested; exceeding it refuses by name with both numbers.
-    qa_mobile_download_max_gb: float = 4.0
-    # System image tag for the AVD this lane provisions -- OPERATOR-CHOICE
-    # (flag policy category 4), default UNCHANGED so no existing install's
-    # behaviour changes. The default, `google_apis_playstore`, is a production
-    # Play build: `adb root` is refused on it, so
-    # `tools/mobile_capture/cert.py` can never reach the system certificate
-    # store and captured HTTPS bodies stay encrypted. Setting this to
-    # `google_apis` trades that away in the other direction: no Play Store, so
-    # the `play_store`/`app_tester` install sources in `tools/mobile/render.py`
-    # stop working, but a rootable image lets HTTPS decryption work.
-    # `tools/mobile/provisioner.py` folds a non-default tag into the AVD name
-    # so switching this can never silently reattach an AVD built from the
-    # other image. See docs/FEATURE_FLAGS.md.
-    qa_mobile_system_image_tag: str = "google_apis_playstore"
 
     # --- Mobile Device Testing (Maestro) -- DELETED 2026-08-15. ---
     # Batch 7 (2026-08-13) retired the feature and kept seven QA_MAESTRO_* tuning
@@ -1393,55 +1377,6 @@ class Settings(BaseSettings):
                 "Invalid %s=%r (not a finite number) — using default %s",
                 info.field_name.upper(),
                 v,
-                default,
-            )
-            return default
-        return parsed
-
-    @field_validator("qa_mobile_download_max_gb", mode="before")
-    @classmethod
-    def _coerce_mobile_gb(cls, v: object, info) -> float:
-        """Lenient, never-raising float coercer for the download ceiling.
-
-        It gets its own validator rather than joining _coerce_checklist_float
-        (which CLAMPS to [0, 1] -- wrong for a gigabyte count) or
-        _coerce_reconcile_threshold (whose name is historical and whose group
-        is a set of ratios). The value is floored at 0.5 GB: a ceiling below
-        the smallest component would refuse every provision by name, which
-        reads as a bug rather than as a policy.
-        """
-        default = cls.model_fields[info.field_name].default
-        try:
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
-                parsed = float(v)
-            else:
-                parsed = float(str(v).strip())
-        except (TypeError, ValueError, OverflowError):
-            logger.warning(
-                "Invalid %s=%r — using default %s",
-                info.field_name.upper(),
-                v,
-                default,
-            )
-            return default
-        if not math.isfinite(parsed):
-            # A string never overflows float(), it returns inf or nan -- and
-            # nan fails EVERY comparison, so a range check alone lets it
-            # through. QA_RAG_SIMILARITY_THRESHOLD=nan made every
-            # `score >= threshold` False and turned RAG grounding off in
-            # silence, because the coercer had succeeded.
-            logger.warning(
-                "Invalid %s=%r (not a finite number) — using default %s",
-                info.field_name.upper(),
-                v,
-                default,
-            )
-            return default
-        if parsed < 0.5:
-            logger.warning(
-                "%s=%r is below the 0.5 GB floor — using %s",
-                info.field_name.upper(),
-                parsed,
                 default,
             )
             return default

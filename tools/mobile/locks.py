@@ -2,8 +2,7 @@
 
 Deliberately NOT a threading or asyncio lock. The thing being serialised is a
 physical emulator shared by every chat on the machine, and the contenders are
-separate OS processes (the MCP server, a second editor, the detached
-provisioner). A lock that only existed inside one interpreter would not see
+separate OS processes (the MCP server, a second editor). A lock that only existed inside one interpreter would not see
 them.
 
 THE INVARIANT, and the reason this module was rewritten on 2026-09-04:
@@ -81,20 +80,11 @@ class LockUnsupported(RuntimeError):
 #: steps (install, preflight, the run itself) begin. Two runs on two devices
 #: then overlap everywhere except the seconds of selection; two runs on ONE
 #: device still serialise, on the device lock, exactly as they did before.
-#:
-#: Provisioning and boot keep their own separate :data:`PROVISION_LOCK`, held by
-#: the detached worker -- the genuinely machine-wide act was already isolated
-#: from the per-run hold, which is what makes per-device keying safe.
 EMULATOR_LOCK = "emulator"
 
 #: Every device lock name starts here, so one ``startswith`` tells a device lock
-#: from :data:`EMULATOR_LOCK` or :data:`PROVISION_LOCK` without parsing.
+#: from :data:`EMULATOR_LOCK` without parsing.
 DEVICE_LOCK_PREFIX = "device-"
-
-#: The lock the DETACHED provisioner holds for its own lifetime. The worker
-#: holds it, never the chat that started the worker -- so the kernel releases it
-#: when that worker exits or crashes and there is nothing to reap.
-PROVISION_LOCK = "provision"
 
 
 def new_provisioning_owner() -> str:

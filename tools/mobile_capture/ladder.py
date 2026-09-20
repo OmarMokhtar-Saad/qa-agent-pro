@@ -54,6 +54,9 @@ REASON_PROXY_START_FAILED = "proxy_start_failed"
 REASON_DEVICE_GONE = "device_gone"
 REASON_USER_STORE_ONLY = "user_store_only"
 REASON_INCONCLUSIVE = "inconclusive"
+#: The lane kill-switch is unset, so the root CA was not installed. Same
+#: string as ``cert.REASON_FLAG_OFF``, which ``prepare`` passes through.
+REASON_FLAG_OFF = "flag_off"
 
 #: Nobody has been asked about this device yet. NOT the same as
 #: REASON_NO_CONSENT: a decline is an answer, and this is the absence of the
@@ -73,6 +76,7 @@ REASONS = frozenset(
         REASON_USER_STORE_ONLY,
         REASON_INCONCLUSIVE,
         REASON_NOT_OFFERED,
+        REASON_FLAG_OFF,
     }
 )
 
@@ -82,6 +86,10 @@ REASONS = frozenset(
 _REASON_SENTENCES = {
     REASON_NO_CONSENT: (
         "The tester declined API capture, so this run continues without it."
+    ),
+    REASON_FLAG_OFF: (
+        "API capture installs a root certificate on the device, which needs "
+        "`QA_MOBILE_RUN_ENABLED=true` in `.env`; nothing was installed."
     ),
     REASON_NO_APPLY: (
         "API capture needs apply=true to install or start anything; nothing "

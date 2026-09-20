@@ -47,8 +47,8 @@ from __future__ import annotations
 # The arithmetic is the justification rather than headroom-by-feel. The mobile
 # block is two lines of text and ``server_instructions`` joins its parts with a
 # blank line, so the worst case is core + full + api + mobile. Measured before
-# the host-check line: 42 there, 39 for a default install (full + api, the
-# mobile kill-switch being OFF by default forever), 32 test-cases-only.
+# the host-check line: 42 there, 39 for full + api without the mobile block
+# (then the default, when a flag gated the lane), 32 test-cases-only.
 #
 # The host-check line is ONE line and it lives in CORE, not in a gated block,
 # because ``qa_host_check`` is registered in every edition -- so it costs +1 on
@@ -285,7 +285,7 @@ app, downloads an SDK or launches anything needs `apply=true`, and you send
 that only after the tester has said go, on a later turn.
 
 1. Call `qa_mobile_test` with no arguments. It answers with whatever the
-   machine needs next -- a provisioning preview, an install menu, a preflight
+   machine needs next -- a setup guide, an install menu, a preflight
    list with a fix per failed check, or the start menu.
 2. A markdown menu means your client could not show a dialog. Put it to the
    TESTER, and re-call with the identifier THEIR option prints -- a backticked
@@ -329,7 +329,7 @@ rather than letting the server guess or start a second one. Several booted
 devices come back as a menu of serials -- put it to the tester and resend with
 the `serial` they choose, not with its position in the list.
 
-A reply naming "booting" or "provisioning" is not something to retry by
+A reply naming "booting" is not something to retry by
 calling `qa_mobile_test` again: call `qa_mobile_status` instead and keep
 polling it until it reports ready, then continue with the `run_id`.
 

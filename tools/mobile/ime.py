@@ -16,13 +16,13 @@ package that has nothing to do with qa-agents. Restore therefore reads and
 replays whatever was there -- it never assumes ours was the pre-existing one,
 and an absent previous value is reported rather than papered over.
 
-**3. An unpinned asset refuses BY NAME.** ``tools/mobile/ime_manifest.py`` is
-Phase 0 Part B and does not exist until a release is cut, so :func:`manifest`
-reports exactly that, with the fix, and every function that needs the APK
-refuses the same way. Nothing here carries a placeholder hash: a hash nobody
-published is not a weaker verification, it is the absence of one. When Part B
-lands this module starts working with NO change here -- the import is by name,
-resolved at call time.
+**3. An unpinned asset refuses BY NAME.** ``tools/mobile/ime_manifest.py`` pins
+the published qa-ime release asset URL and its SHA-256. :func:`manifest`
+imports it by name at call time; if it is missing or incomplete (a stripped
+build, a deleted file) :func:`manifest` says so, with the fix, and every
+function that needs the APK refuses the same way. Nothing here carries a
+placeholder hash: a hash nobody published is not a weaker verification, it is
+the absence of one.
 """
 
 from __future__ import annotations
@@ -33,28 +33,27 @@ import logging
 import re
 from pathlib import Path
 
-from config.settings import settings
 from tools.mobile import adb, downloader, paths
 
 logger = logging.getLogger(__name__)
 
-#: The module Phase 0 Part B adds. Imported by NAME, at call time.
+#: The module that pins the published qa-ime APK. Imported by NAME, at call time.
 MANIFEST_MODULE = "tools.mobile.ime_manifest"
 
 #: Reason code callers (and preflight) branch on.
 NOT_PINNED = "ime_not_pinned"
 
 NOT_PINNED_DETAIL = (
-    "The QA input method is not pinned yet: `"
+    "The QA input method is not pinned yet on this install: `"
     + MANIFEST_MODULE.replace(".", "/")
-    + ".py` carries no published release asset URL and SHA-256, so the APK "
-    "cannot be fetched or verified. Nothing was downloaded."
+    + ".py` is missing or carries no release asset URL and SHA-256, so the "
+    "APK cannot be fetched or verified. Nothing was downloaded."
 )
 
 NOT_PINNED_FIX = (
-    "Cut the qa-ime release (mobile programme Phase 0 Part B) and commit "
-    "`tools/mobile/ime_manifest.py` with the release asset URL and the "
-    "SHA-256 the build published. No change is needed in tools/mobile/ime.py: "
+    "Restore `tools/mobile/ime_manifest.py` from the release this install "
+    "came from (it pins the qa-ime release asset URL and its SHA-256), or "
+    "reinstall. No change is needed in tools/mobile/ime.py: "
     "it resolves that module by name at call time, so this check starts "
     "passing the moment the module lands."
 )
@@ -184,15 +183,6 @@ def ensure_apk() -> dict:
     download or launch. A guard only on the provisioner covers the path one
     reviewer walked, not the class.
     """
-    if not settings.qa_mobile_run_enabled:
-        return {
-            "error": (
-                "Refusing to fetch the QA IME: the mobile lane needs "
-                "`QA_MOBILE_RUN_ENABLED=true` in `.env`. Nothing was "
-                "downloaded."
-            ),
-            "content": None,
-        }
     resolved = manifest()
     if resolved.get("error"):
         return resolved
@@ -230,14 +220,6 @@ async def install(serial: str) -> dict:
     Guarded in its own right rather than relying on ensure_apk's check: a
     warm cache would otherwise install without the flag ever being read.
     """
-    if not settings.qa_mobile_run_enabled:
-        return {
-            "error": (
-                "Refusing to install the QA IME: the mobile lane needs "
-                "`QA_MOBILE_RUN_ENABLED=true` in `.env`. Nothing was installed."
-            ),
-            "content": None,
-        }
     fetched = ensure_apk()
     if fetched.get("error"):
         return fetched
@@ -501,7 +483,58 @@ async def probe(serial: str) -> dict:
     }
 
 
-async def type_text(serial: str, text: str, secret: bool = False) -> dict:
+#: A broadcast reply with no ``result=`` line: nothing received it.
+NO_RECEIVER = (
+    "The QA keyboard did not answer (no result= in the broadcast reply), so "
+    "nothing was typed or cleared: it is not installed, enabled or selected."
+)
+
+#: QaImeService.onQuery sets result 0 when there is no input connection.
+NO_FOCUSED_FIELD = (
+    "The QA keyboard answered that no field has input focus (result=0), so "
+    "nothing was typed or cleared. Target the field by its visible label."
+)
+
+
+def _reply_code(sent: dict) -> int:
+    """The ``result=`` code of a broadcast envelope; -1 when there is none."""
+    payload = sent.get("content") or {}
+    if not isinstance(payload, dict):
+        return -1
+    raw = str(payload.get("out") or "") + str(payload.get("err") or "")
+    return int(_parse_reply(raw)["result"])
+
+
+async def _focused_field(serial: str, actions: dict) -> str:
+    """Empty when the keyboard answers with a focused field, else why not."""
+    sent = await _broadcast(serial, str(actions["query"]))
+    if sent.get("error"):
+        return str(sent["error"])
+    code = _reply_code(sent)
+    if code < 0:
+        return NO_RECEIVER
+    if code == 0:
+        return NO_FOCUSED_FIELD
+    return ""
+
+
+async def _undelivered(serial: str, actions: dict, sent: dict) -> str:
+    """Why an INPUT/CLEAR reply did not land, or empty when it did.
+
+    Only a reply with NO ``result=`` is a failure; its VALUE is not read,
+    because QaImeService.onInput/onClear set no result code and ``am
+    broadcast`` reports its default on every delivery (whether the text
+    LANDED is the open item in docs/DECISIONS.md). On that path ONE query
+    tells a dead receiver from a field that lost focus.
+    """
+    if _reply_code(sent) >= 0:
+        return ""
+    return (await _focused_field(serial, actions)) or NO_RECEIVER
+
+
+async def type_text(
+    serial: str, text: str, secret: bool = False, receiver_known: bool = False
+) -> dict:
     """Commit *text* into the focused field through the IME.
 
     ``secret=True`` changes NOTHING about the transport -- the payload always
@@ -527,10 +560,21 @@ async def type_text(serial: str, text: str, secret: bool = False) -> dict:
         if resolved.get("error"):
             return resolved
         actions = (resolved["content"] or {})["actions"]
+        # `receiver_known`: the caller (executor.replay, via keyboard_up) has
+        # already had the receiver answer once this run, so no per-type QUERY.
+        # Encoded BEFORE any broadcast, so an encoding failure is reported as
+        # itself rather than hidden behind a device round trip.
         payload = base64.b64encode(value.encode("utf-8")).decode("ascii")
+        if not receiver_known:
+            refused = await _focused_field(serial, actions)
+            if refused:
+                return {"error": refused, "content": None}
         sent = await _broadcast(serial, str(actions["input"]), payload)
         if sent.get("error"):
             return sent
+        refused = await _undelivered(serial, actions, sent)
+        if refused:
+            return {"error": refused, "content": None}
         logger.info(
             "mobile.ime: typed %d character(s)%s",
             len(value),
@@ -545,13 +589,20 @@ async def type_text(serial: str, text: str, secret: bool = False) -> dict:
         return {"error": str(exc), "content": None}
 
 
-async def clear(serial: str) -> dict:
+async def clear(serial: str, receiver_known: bool = False) -> dict:
     """Clear the focused field through the IME."""
     resolved = manifest()
     if resolved.get("error"):
         return resolved
     actions = (resolved["content"] or {})["actions"]
+    if not receiver_known:
+        refused = await _focused_field(serial, actions)
+        if refused:
+            return {"error": refused, "content": None}
     sent = await _broadcast(serial, str(actions["clear"]))
     if sent.get("error"):
         return sent
+    refused = await _undelivered(serial, actions, sent)
+    if refused:
+        return {"error": refused, "content": None}
     return {"error": None, "content": {"cleared": True}}

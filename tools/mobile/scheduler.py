@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import time
 
-from tools.mobile import provisioner, run_store
+from tools.mobile import run_store, sdk_locator
 from tools.risk_scorer import score_and_sort
 
 logger = logging.getLogger(__name__)
@@ -181,8 +181,14 @@ def plan_run(
                 "planned": time.time(),
                 # The same producer the explore lane reads -- see session.py. Both
                 # callers carry it or the field does not exist, and an absent key reads
-                # as absent on the page rather than as today's setting.
-                "system_image": provisioner.system_image(),
+                # as absent on the page rather than as today's setting. The AVD comes
+                # from manifest_extra, which the suite lane fills before this update.
+                "system_image": str(
+                    (sdk_locator.avd_system_image(manifest.get("avd")) or {}).get(
+                        "content"
+                    )
+                    or ""
+                ),
             }
         )
         created = run_store.create_run(run_id, manifest)

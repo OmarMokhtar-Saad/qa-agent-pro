@@ -28,7 +28,6 @@ Two rules this module exists to keep:
 from __future__ import annotations
 
 import json
-import time
 
 from tools.mobile_evidence import crash_detector
 from tools.untrusted import wrap_untrusted
@@ -423,269 +422,80 @@ def apply_refusal(step: str, detail: str = "") -> str:
     )
 
 
-#: SECONDS any provisioning record may be old and still be printed as the state
-#: of this machine -- a failure, a phase, or a decline. The record is
-#: machine-wide and carries no run identity, so past this age it describes an
-#: attempt the reader never made, WHATEVER field it carries. Biased LONG on
-#: purpose: the lane-off case is already answered upstream
-#: (``mcp_handlers._MOBILE_LANE_OFF``), so the only thing too small a value can
-#: cost is hiding a genuinely recent record a tester could act on, while the
-#: defect at the other end needed days (the field record was five days old).
-#: Read by :func:`_record_is_current`; bounded from above in
-#: ``tests/mobile/test_mobile_bounds_upper.py``.
-_RECORD_MAX_AGE_S = 21600
+#: The official Android Studio download page. ONE constant: the setup guide,
+#: the qa-doctor row and docs/MOBILE_TESTING.md name the same URL.
+ANDROID_STUDIO_URL = "https://developer.android.com/studio"
+
+#: The official "create and manage virtual devices" page.
+AVD_GUIDE_URL = "https://developer.android.com/studio/run/managing-avds"
+
+#: Why a setup guide was returned. ``no_sdk``: no emulator binary was located,
+#: so Android Studio comes first. ``no_avd``: the SDK is there but no virtual
+#: device exists yet.
+SETUP_NO_SDK = "no_sdk"
+SETUP_NO_AVD = "no_avd"
 
 
-def _record_is_current(body: dict, now: float) -> bool:
-    """Is this RECORD recent enough to describe the machine NOW?
+def setup_guide(reason: str) -> dict:
+    """What the tester must do by hand before this lane can boot anything.
 
-    It judges the record, not one of its fields, and that is the whole rule:
-    the file is machine-wide with no run identity, so its age governs every
-    claim it makes. A five-day-old ``phase: system-image -- 33%`` and a
-    five-day-old ``starting -- another provisioner is already running`` are the
-    same false assertion as a five-day-old ``error``, and both printed as the
-    first line of ``qa_mobile_status`` while the age rule was scoped to the
-    error field alone.
+    This server downloads no Android SDK and creates no emulator
+    (docs/RETIRED_CAPABILITIES.md -> 6), so a machine without them gets these
+    steps instead. Any ``reason`` other than ``no_avd`` reads as ``no_sdk``: an
+    unknown reason must still lead with the install step.
 
-    ``provisioner._publish`` is the ONE producer that writes this file, and it
-    stamps ``written_at`` unconditionally, so every record this consumer can
-    receive is stamped. (``downloader.write_progress`` is shared, but its own
-    in-flight record and ``session``'s install record go to different files
-    with different readers.)
-
-    A record with NO stamp is not current. That is the load-bearing half: every
-    record already on disk in the field was written before the stamp existed,
-    so treating "no timestamp" as fresh would leave the defect exactly where it
-    was on every install that has one. A stamp in the FUTURE is not evidence of
-    freshness either -- a changed or broken clock is not a recent attempt -- and
-    neither is a non-numeric one (``bool`` is excluded explicitly: it is an
-    ``int`` subclass, and ``True`` would otherwise read as the epoch).
-
-    THE NUMBERS THAT ARE NOT AGES, each measured rather than assumed:
-
-    * an oversized ``int`` (a corrupted or hostile record) raised
-      ``OverflowError`` out of ``float()`` and blanked the ENTIRE status reply,
-      so it is caught here and reads as stale;
-    * ``nan`` compares False against everything, so it already reads as stale;
-    * ``inf``/``-inf`` give an infinite age of one sign or the other, both
-      outside the window, so they read as stale too.
-
-    Every one of them lands on "not current", which is the safe direction: the
-    section is withheld rather than asserted.
+    ``{"setup_required": True, "reason", "steps": [str, ...],
+    "links": {"android_studio", "create_avd"}}``.
     """
-    stamp = body.get("written_at")
-    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
-        return False
-    try:
-        age = float(now) - float(stamp)
-    except (OverflowError, ValueError):
-        return False
-    return 0 <= age <= _RECORD_MAX_AGE_S
-
-
-#: The record field that says THIS MACHINE proceeded past a NEGATIVE
-#: virtualization verdict on an acknowledgement. The name lives HERE, on the
-#: consumer side, and ``provisioner`` imports it, because two hand-written
-#: spellings of one key drift -- the same failure ``provisioner.VIRT_ACK_ARG``
-#: exists to prevent for the acknowledgement's own two transports.
-VIRT_OVERRIDE_FIELD = "virtualization_overridden"
-
-#: WHICH AVD that override was spent on. Written on the same branch and the
-#: same line of code as the flag above, so no record can carry the claim
-#: without the identity that scopes it -- exactly as it already cannot carry it
-#: without the ``written_at`` that expires it. The name lives HERE, on the
-#: consumer side, for the same anti-drift reason as its sibling.
-VIRT_OVERRIDE_AVD_FIELD = "virtualization_overridden_avd"
-
-#: THE ONE SENTENCE anywhere in this tree that connects a boot failure to an
-#: overridden virtualization verdict. It says "check this first", not "this is
-#: the cause": the probe that was overridden can itself be wrong (a locked-down
-#: Windows box cannot see the feature without an elevated shell), and no Windows
-#: machine has run this lane. It quotes no probe detail, so it needs no cap --
-#: the refusal the tester answered already carried that detail, capped.
-_VIRT_OVERRIDE_NOTE = (
-    " Before this was provisioned, the virtualization probe on this machine said"
-    " NO and that refusal was overridden with virtualization_ack=true -- so a"
-    " hypervisor that really is off is the first thing to check (enable VT-x /"
-    " AMD-V in firmware, or Hyper-V/WHPX on Windows), ahead of a longer timeout."
-)
-
-
-def virtualization_override_note(progress: object, now: float, avd: object) -> str:
-    """The sentence a boot failure adds, or ``""`` -- composed ONCE, here.
-
-    THREE independent conditions, and the silent direction is the default. A
-    boot timeout on a healthy hypervisor has other causes, so a message that
-    always named virtualization would be the same defect pointing the other way.
-
-    ``avd`` is the AVD name resolved from the device that actually failed, and
-    it has NO DEFAULT on purpose: a default is how a bound clause gets silenced
-    at a call site nobody re-reads.
-
-    * the record must CARRY the override. ``provisioner._publish`` is its one
-      writer, and it rewrites the whole file, so a later clean provisioning
-      erases the claim rather than leaving it behind.
-    * the record must be CURRENT, judged by :func:`_record_is_current` -- the
-      same judge, the same window, no second rule. A machine fixed in firmware
-      since must not be told for ever that its hypervisor is the suspect; that
-      is exactly the defect a days-old provisioning record already caused once.
-
-    * the device must BE the emulator the record is about -- a POSITIVE match
-      between ``VIRT_OVERRIDE_AVD_FIELD`` and the name resolved from the serial
-      that failed, both non-empty. ``wait_boot`` is not emulator-only:
-      ``session.ensure_device`` calls it for a tester-supplied serial and the
-      only upstream filter rejects iOS, so an attached Galaxy S21 reached this
-      sentence and was told to enable VT-x in its firmware. Matching
-      ``emulator-*`` on the serial would not do: that is the ABSENCE of
-      evidence for a phone, and it still speaks about a DIFFERENT emulator
-      running a foreign AVD. An overridden probe says nothing whatsoever about
-      a device this machine did not provision.
-
-    A stale record, an absent record, an unnamed device and a device we cannot
-    identify all therefore read as UNKNOWN and say nothing -- one direction for
-    every unknown, which is the rule the freshness clause already follows.
-
-    WHAT IT CANNOT DISTINGUISH: a second emulator started from the SAME AVD (it
-    is the same AVD on the same machine, so the sentence is still about the
-    right hypervisor), and a tester-created AVD that happens to share the name.
-    It also withholds a TRUE positive when the emulator console will not answer
-    -- a missing hint costs a slower diagnosis, a wrong hint sent a tester into
-    their firmware over a USB phone.
-    """
-    body = progress if isinstance(progress, dict) else {}
-    if not body.get(VIRT_OVERRIDE_FIELD):
-        return ""
-    if not _record_is_current(body, now):
-        return ""
-    provisioned = str(body.get(VIRT_OVERRIDE_AVD_FIELD) or "").strip()
-    failed = str(avd or "").strip()
-    # ONE non-empty check, not two. A record written before this field existed
-    # carries "", a device whose console said nothing resolves to "", and
-    # `"" == ""` would turn two unknowns into a match -- so the emptiness test
-    # is load-bearing. But `not failed` was ALSO here, and either clause alone
-    # rejects the both-empty case, so no mutant dropping one could ever die and
-    # NEITHER was graded (CLAUDE.md: where two clauses would both do the job,
-    # neither is graded). Measured: dropping either survived the whole matrix.
-    # `not failed` is the one deleted because it is strictly implied -- when
-    # `provisioned` is non-empty and equal to `failed`, `failed` is non-empty
-    # too. What remains is graded: drop `not provisioned` and R4 fires; drop
-    # the comparison and R2 fires.
-    if not provisioned or provisioned != failed:
-        return ""
-    return _VIRT_OVERRIDE_NOTE
-
-
-def provisioning_line(progress: object) -> str:
-    """One line for the detached provisioner's state. Never a stack trace."""
-    body = progress if isinstance(progress, dict) else {}
-    if not body:
-        return "Provisioning has not started yet."
-    if body.get("error"):
-        return "Provisioning stopped: " + str(body["error"])[:300]
-    return (
-        "Provisioning "
-        + str(body.get("phase") or "running")
-        + " — "
-        + str(int(body.get("pct") or 0))
-        + "% — "
-        + str(body.get("message") or "")[:200]
-    )
-
-
-def provisioning_section(progress: object, *, device_in_use: bool = False) -> list:
-    """The provisioning section's markdown lines, or ``[]`` for no section.
-
-    THE ONE PLACE that decides whether there is a section at all.
-
-    `provisioner.read_progress` publishes a single machine-wide file with no
-    timestamp and no run identity, so its content answers "what did the last
-    provisioning attempt ON THIS MACHINE do", NOT "what is happening to this
-    run". Rendering it whenever the file exists is how a run already replaying
-    against an attached emulator printed "### Provisioning / - Provisioning
-    stopped: kill-switch off" (mrun-20260905-051728) -- nothing was being
-    provisioned, and to a tester it reads like the run failed.
-
-    Two meanings, both handled HERE rather than re-derived at each caller:
-
-    * ATTEMPTED AND REFUSED (or failed) -- an ``error``. Real, necessary, and
-      NOT deleted: it still renders whenever the reader could act on it. It is
-      withheld from exactly one reader -- a run that already HAS a device and is
-      still live -- for whom provisioning was never needed, so the refusal is
-      about something else entirely. It stays reachable for them:
-      `qa_mobile_status` with no run id shows it.
-    * ATTEMPTED AND RUNNING/SUCCEEDED -- a ``phase``. Rendered device or no
-      device, for as long as it is CURRENT. A 2.2 GB download in flight is a
-      fact about the machine that a tester needs whatever else is going on, and
-      suppressing it would be the same defect pointing the other way -- which is
-      exactly why the age, not the field, is the discriminator: a download that
-      is really in flight cannot outlive its own step, while a five-day-old
-      ``phase`` means the process died.
-
-      THE GUARANTEE IS A COUPLING BETWEEN TWO CONSTANTS, not a write rate.
-      This said "rewrites this record every few seconds", which is false --
-      measured, it is about two writes per step -- and a reader who believed it
-      could lower the cap to seconds and start suppressing live downloads. What
-      actually holds is ``provisioner.STEP_TIMEOUT_S`` (1800) <
-      ``_RECORD_MAX_AGE_S`` (21600): no single provisioning step may run longer
-      than the step timeout, so a step still in flight has written within that
-      window and is inside this cap with room to spare. Lowering this constant
-      below the step timeout would suppress a genuinely running download.
-
-    The third state -- never attempted at all -- is the empty body, and it has
-    always rendered nothing.
-
-    THE AGE OF THE RECORD. "Withheld from a live run that has a device" was not
-    enough, and the reader it missed is the commonest one there is: a tester's
-    FIRST ``qa_mobile_status`` call, which passes no run id and so can answer
-    neither clause of ``_mobile_device_in_use``. Those callers were shown a
-    five-day-old ``kill-switch off`` on a machine where the lane was enabled and
-    seven runs had already started, and two of them abandoned the task on it.
-
-    So the record is aged out by ``_record_is_current``, ONCE, before any field
-    is read -- not per field. Scoping that rule to the ``error`` branch left
-    every other record rendering forever, and a stale ``phase`` or a stale
-    ``starting -- another provisioner is already running`` is the same failure
-    wearing a different key. There is one age JUDGE here -- ``_record_is_current``
-    -- and every consumer of this record calls it; none re-derives freshness.
-
-    Nothing actionable is lost. ``handle_mobile_status`` answers the
-    genuinely-off lane upstream with ``_MOBILE_LANE_OFF`` before this function
-    is ever reached, so a stale kill-switch line here is ALWAYS false about the
-    current state; a record the tester actually just produced is fresh and still
-    renders; and a stale non-kill-switch failure -- a disk-full from this
-    morning -- is REGENERABLE: the next provisioning attempt republishes it
-    inside the cap, and that attempt is the very thing the tester is about to
-    make. A dated "7 hours ago" line was considered and rejected: the measured
-    failure is that a model repeats such a line as the current state.
-
-    THE RECONCILING CLAUSE is part of the section rather than of one caller,
-    for the reason the rest of this docstring gives: one place decides what this
-    section says. ``qa_list_devices`` showing a live emulator while this reports
-    a stopped provisioner are answers to two different questions -- any attached
-    device versus the SDK/AVD this server provisions -- and both Arabic probes
-    flagged the pair as a contradiction, unprompted.
-    """
-    body = progress if isinstance(progress, dict) else {}
-    if not body:
-        return []
-    # ONE age check, on the WHOLE record, before any field is read.
-    if not _record_is_current(body, time.time()):
-        return []
-    # A SECOND, INDEPENDENT question, and neither guard subsumes the other:
-    # this one asks whether provisioning was ever needed by THIS reader, and it
-    # applies only to a failure -- a phase is a fact about the machine either
-    # way.
-    if body.get("error") and device_in_use:
-        return []
-    return [
-        "### Provisioning",
-        "- " + provisioning_line(body),
-        "- This is about the Android SDK and emulator THIS SERVER provisions "
-        "into `~/.qa-agents/mobile/`. It says nothing about devices already "
-        "attached to this machine -- `qa_list_devices` answers that one, and "
-        "the two can differ without either being wrong.",
-        "",
+    missing_avd_only = reason == SETUP_NO_AVD
+    steps = []
+    if not missing_avd_only:
+        steps.append(
+            "Install Android Studio from "
+            + ANDROID_STUDIO_URL
+            + " and open it once, so it installs the Android SDK and the emulator."
+        )
+    steps += [
+        "In Android Studio open Device Manager and create a virtual device "
+        "(AVD). Pick a system image marked Google Play, so apps can be "
+        "installed from the Play Store. Pick a Google APIs image instead only "
+        "if you want HTTPS traffic decrypted: a Play image cannot be rooted. "
+        "Guide: " + AVD_GUIDE_URL,
+        "Run `qa-doctor` and check that the mobile emulator lane now finds the "
+        "SDK and your AVD.",
+        "Call `qa_mobile_test` again.",
     ]
+    return {
+        "setup_required": True,
+        "reason": SETUP_NO_AVD if missing_avd_only else SETUP_NO_SDK,
+        "steps": steps,
+        "links": {"android_studio": ANDROID_STUDIO_URL, "create_avd": AVD_GUIDE_URL},
+    }
+
+
+def setup_guide_block(guide: object) -> str:
+    """The setup guide as a reply: readable steps, then the dict itself.
+
+    The steps are for the tester; the fenced JSON copy is for the chat model, so
+    it sees ``setup_required: true`` without parsing prose. Nothing is
+    downloaded or started on this path, and the reply says so.
+    """
+    body = guide if isinstance(guide, dict) else setup_guide(SETUP_NO_SDK)
+    title = (
+        "## No Android emulator (AVD) on this machine yet"
+        if body.get("reason") == SETUP_NO_AVD
+        else "## Android Studio is needed first"
+    )
+    listed = body.get("steps") or []
+    steps = "\n".join(str(i + 1) + ". " + str(step) for i, step in enumerate(listed))
+    return (
+        title + "\n\nThis server does not download an Android SDK or create an "
+        "emulator. Nothing was downloaded or started. Do this once:\n\n"
+        + steps
+        + "\n\n```json\n"
+        + json.dumps(body, indent=2)
+        + "\n```"
+    )
 
 
 def preflight_block(content: object, rendered: str = "") -> str:

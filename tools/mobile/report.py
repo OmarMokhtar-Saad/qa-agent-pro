@@ -80,7 +80,6 @@ from collections import Counter
 from contextvars import ContextVar
 from pathlib import Path
 
-from config.settings import settings
 from tools.mobile import actions as actions_mod
 from tools.mobile import charter as charter_mod
 from tools.mobile import (
@@ -225,11 +224,6 @@ OP_KIND = {
 
 FLAG_NAME = "QA_MOBILE_RUN_ENABLED"
 
-FLAG_REFUSAL = (
-    "Nothing was written. Building a mobile run report needs `"
-    + FLAG_NAME
-    + "=true` in `.env` and an MCP server restart (quit and reopen the editor)."
-)
 
 NOT_CAPTURED = "this screen was not captured"
 
@@ -3285,9 +3279,9 @@ def _document(**kwargs) -> str:
 
 #: The sentence an OLD manifest gets. A run created before this field existed genuinely
 #: does not know its image, and the page says exactly that. It NEVER falls back to
-#: ``settings`` or to ``provisioner.system_image()``: both would answer with TODAY's
-#: image, which is a fabricated fact about a finished run -- the success-shaped absence
-#: this repository has paid for before.
+#: ``settings`` or to a live ``sdk_locator.avd_system_image()`` read: both answer with
+#: TODAY's image, which is a fabricated fact about a finished run -- the
+#: success-shaped absence this repository has paid for before.
 SYSTEM_IMAGE_ABSENT = (
     "not recorded for this run: it was created before the image was snapshotted into "
     "the manifest, and today's setting is not evidence of what ran then"
@@ -3323,7 +3317,7 @@ def _env_section(manifest: dict, loaded: dict | None = None) -> str:
         esc(image, 120)
         if image
         else '<span class="cap none">' + esc(SYSTEM_IMAGE_ABSENT, 300) + "</span>",
-        "snapshotted at run creation from provisioner.system_image(); HTTPS body "
+        "snapshotted at run creation from sdk_locator.avd_system_image(); HTTPS body "
         "decryption is only possible on a rootable image"
         if image
         else "",
@@ -3906,8 +3900,6 @@ def render(run_id: str) -> dict:
     Never raises.
     """
     try:
-        if not settings.qa_mobile_run_enabled:
-            return {"error": FLAG_REFUSAL, "content": None}
         if not run_store.valid_run_id(run_id):
             return {
                 "error": "Refusing " + repr(str(run_id)[:40]) + " as a run id.",

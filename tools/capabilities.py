@@ -42,14 +42,18 @@ SCHEMA = 1
 
 #: The settings fields that gate tool REGISTRATION, and nothing else. Verified
 #: 2026-09-04 by reading every ``if`` inside ``mcp_server.build_server``: the
-#: gates are ``_mobile_lane_enabled()`` (``qa_mobile_run_enabled`` AND
-#: ``_mobile_modules_present()``), ``not _test_cases_only()``
+#: gates are ``_mobile_lane_enabled()`` (``_mobile_modules_present()``
+#: alone), ``not _test_cases_only()``
 #: (``qa_dist_mode`` OR NOT ``_FULL_EDITION``), the TestRail/Xray push pair,
 #: and ``qa_api_test_enabled``. ``qa_dist_mode`` is deliberately NOT an axis:
 #: it is a fact about the tree, recorded under ``edition``, not an operator
 #: choice worth enumerating.
 AXES: tuple = (
     ("api", ("qa_api_test_enabled",)),
+    # Registration no longer reads this field, so both halves of this axis
+    # register the same tools. It is KEPT because the committed baselines under
+    # operations/capabilities/ key every edition by it: dropping the axis is a
+    # baseline migration with release-gate effect, not a prose edit.
     ("mobile", ("qa_mobile_run_enabled",)),
     ("push", ("qa_testrail_push_enabled", "qa_xray_push_enabled")),
 )
@@ -179,8 +183,8 @@ def build_snapshot(
     eight editions, well inside the Constitution's 60s build budget.
 
     A MATRIX rather than a single snapshot, because a single one would not have
-    caught the defect this exists for. ``qa_mobile_run_enabled`` is a
-    category-1 kill-switch and defaults OFF forever, so v1.77.0's dist and the
+    caught the defect this exists for. ``qa_mobile_run_enabled`` gated
+    registration then and defaulted OFF, so v1.77.0's dist and the
     release before it both registered zero mobile tools *as configured* -- an
     empty diff, a green gate, and a dead lane. The question worth asking is
     conditional: *if an operator turns this on, do the tools appear?*

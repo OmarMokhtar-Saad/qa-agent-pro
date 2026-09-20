@@ -261,6 +261,31 @@ def _open(url: str, start: int):
     return opener.open(request, timeout=SOCKET_TIMEOUT_S)
 
 
+def _is_pinned_ime(url: object, sha256: object) -> bool:
+    """True only for the pinned QA keyboard: its exact asset URL AND its SHA.
+
+    The ONE fetch that runs with the kill-switch unset -- the keyboard is on
+    by default, with no flag. Both values must EQUAL what ``ime.manifest()``
+    pins; never a prefix, a host or a pattern, so every other URL still needs
+    the flag. The fetch itself verifies the bytes against that same SHA.
+    Never raises.
+    """
+    try:
+        from tools.mobile import ime
+
+        pinned = ime.manifest()
+        if pinned.get("error"):
+            return False
+        info = pinned.get("content") or {}
+        want_url = str(info.get("url") or "")
+        want_sha = str(info.get("sha256") or "").lower()
+        if not (want_url and want_sha):
+            return False
+        return str(url) == want_url and str(sha256).lower() == want_sha
+    except Exception:
+        return False
+
+
 def download(
     url: str,
     dest: str | Path,
@@ -274,14 +299,14 @@ def download(
     Returns ``{"error", "content": {"path", "bytes", "cached", "verified"}}``.
     A *dest* that already exists and already hashes correctly is returned
     immediately with ``cached=True`` and no request is made -- which is also
-    what makes a second provisioner run issue no downloads.
+    what makes a second run issue no downloads.
 
     THE KILL-SWITCH LIVES HERE, at the innermost public function that fetches:
     a guard on a caller is only as good as the list of callers, and that list
     grew by one in the very commit meant to close that class.
     """
     try:
-        if not settings.qa_mobile_run_enabled:
+        if not settings.qa_mobile_run_enabled and not _is_pinned_ime(url, sha256):
             return {
                 "error": (
                     "Refusing to download: the mobile lane needs "

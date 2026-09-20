@@ -683,9 +683,9 @@ def build_server():
     )  # The mobile lane's gate is a single named predicate rather than an
     # expression, and it is read here for the same reason as the two above: the
     # guidance names three tools and must not be able to name them on an
-    # edition that does not register them. Its own definition carries BOTH
-    # terms (the kill-switch and not-test-cases-only), so nothing at the
-    # registration site below may add a second one -- a test asserts that site
+    # edition that does not register them. Its own definition is the
+    # whole gate (the modules on disk), so nothing at the
+    # registration site below may add a second term -- a test asserts that site
     # holds nothing but a call to this.
     edition_mobile = mcp_handlers._mobile_lane_enabled()
 
@@ -1090,11 +1090,10 @@ def build_server():
         )
 
     # The mobile emulator lane. ONE call, and nothing else may join it here:
-    # `_mobile_lane_enabled()` already carries both terms (the
-    # QA_MOBILE_RUN_ENABLED kill-switch AND `_mobile_modules_present()`, which
-    # checks tools/mobile is really on disk -- a build made before the qa-ime
-    # release was pinned ships none of it), and a gate copied with one of its
-    # two conjuncts has shipped in this project before.
+    # `_mobile_lane_enabled()` is `_mobile_modules_present()` alone, which
+    # checks tools/mobile is really on disk -- a build made without the pinned
+    # IME ships none of it. QA_MOBILE_RUN_ENABLED is not a term: it gates only
+    # the capture download and the capture-certificate install, at those effects.
     # tests/mobile/test_mobile_registration.py parses this file and fails if
     # this `if` becomes anything other than a call to that predicate.
     #
@@ -1121,7 +1120,6 @@ def build_server():
             serial: str = "",
             avd: str = "",
             new_run: bool = False,
-            virtualization_ack: bool = False,
             locale: str = "",
             capture: str = "",
             capture_ack: bool = False,
@@ -1130,14 +1128,13 @@ def build_server():
             """Run test cases, or explore freely, on an Android emulator.
 
             Call with NO arguments to start: it answers with whatever the machine
-            needs next (provisioning, an install source, a preflight list, or the
-            start menu) and asks the tester itself. Every step that installs,
+            needs next (a setup guide, an install source, a preflight list, or
+            the start menu) and asks the tester itself. Every step that installs,
             downloads or launches needs apply=true, and nothing is installed or
-            downloaded without it. If provisioning refuses because this machine
-            reports no usable hardware virtualization, that probe can be wrong
-            on a locked-down machine: put the concern to the tester, and only
-            after they say go, call again with virtualization_ack=true. Never on
-            the turn you were refused, and it dismisses that probe alone. Pass run_id to continue a run in ANY chat --
+            downloaded without it. With no Android SDK or no emulator (AVD) on
+            this machine it answers with a setup guide (`setup_required: true`):
+            relay its steps to the tester -- this server downloads no SDK and
+            creates no emulator. Pass run_id to continue a run in ANY chat --
             that takes the run over and the previous chat is told. It hands you
             ONE packet at a time; answer each with qa_submit_mobile_step.
 
@@ -1162,7 +1159,7 @@ def build_server():
             and the refusal says so and how to set it by hand.
 
             If the tester already has an emulator running, pass its adb serial
-            (e.g. `emulator-5554`) in `serial` -- that skips provisioning
+            (e.g. `emulator-5554`) in `serial` -- that skips the AVD lookup
             entirely and never spawns a second one underneath it. `avd` names
             which AVD to boot when none is running and more than one is
             configured; leave both empty to let the server look and, if it
@@ -1200,7 +1197,6 @@ def build_server():
                     serial=serial,
                     avd=avd,
                     new_run=new_run,
-                    virtualization_ack=virtualization_ack,
                     locale=locale,
                     capture=capture,
                     capture_ack=capture_ack,
@@ -1274,9 +1270,9 @@ def build_server():
         ) -> str:
             """Where a mobile run stands, read from disk. Touches no device.
 
-            Provisioning progress, the emulator, the lease holder and the cases
-            done/failed/remaining. Call this after anything that outlives a tool
-            call -- provisioning, a large install, a cold boot. With no run_id it
+            The emulator, the lease holder and the cases done/failed/remaining.
+            Call this after anything that outlives a tool call -- a large
+            install, a cold boot. With no run_id it
             lists the runs on this machine. Pass report_now=true to also write
             that run's standalone HTML report and get its path back; a mid-run
             report is fine and says it is partial.
@@ -1292,8 +1288,8 @@ def build_server():
         # Inside the mobile-lane gate, deliberately: a network watch drives the
         # emulator console and samples the device's socket table, so it lives
         # or dies with `_mobile_lane_enabled()` exactly like the three tools
-        # beside it. No new flag -- the kill-switch that already governs this
-        # lane is the one that governs this.
+        # beside it. No flag: like the rest of the lane it runs wherever the
+        # modules are on disk.
         @mcp.tool()
         async def qa_network_watch(
             ctx: Context,
@@ -1762,8 +1758,8 @@ def build_server():
         (component/status/detail/fix_hint rows from the same producers
         `qa-doctor` uses), `clients` (which MCP clients are installed and
         whether the entry they carry points at THIS install) and
-        `provisioning` (the mobile provisioner's steps AND how old that record
-        is).
+        `provisioning` (one fixed `off` row: this server provisions no SDK
+        or emulator).
 
         READ-ONLY -- unlike `qa-doctor` it repairs nothing, writes no `.env`
         and edits no client config, so it is safe to poll. Humans should read

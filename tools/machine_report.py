@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import logging
 import shutil
-import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -48,7 +47,7 @@ PRODUCERS = {
     "host_privileges": ("tools.host_privileges", "probe"),
     "mobile_sdk": ("tools.mobile.sdk_locator", "locate_sdk"),
     # Same producer as `mobile_sdk`, different QUESTION: the SDK root is what
-    # the provisioner manages, the adb binary is what a mirror and the mobile
+    # the emulator lives in, the adb binary is what a mirror and the mobile
     # lane must BOTH drive. A desktop client that guesses `adb` off PATH can
     # end up on a second adb server, where a device is visible in one place
     # and absent in the other.
@@ -57,25 +56,38 @@ PRODUCERS = {
     # could be green on a build with no keyboard pinned, where no script can
     # enter a character -- a machine that looks ready and is not.
     "mobile_ime": ("tools.mobile.ime", "manifest_status"),
+    # The REST of the SDK's tools, one row each, same producer, different
+    # question again. Without these a client has to read "Missing: emulator,
+    # sdkmanager" out of the `mobile_sdk` row's prose to learn which tools are
+    # absent -- which is the parse this module was written to make unnecessary.
+    "sdk_tool:emulator": ("tools.mobile.sdk_locator", "locate_sdk"),
+    "sdk_tool:sdkmanager": ("tools.mobile.sdk_locator", "locate_sdk"),
+    "sdk_tool:avdmanager": ("tools.mobile.sdk_locator", "locate_sdk"),
+    # The booted emulator's image, in `system-images;...` form: the tag the
+    # desktop's HTTPS-decrypt opt-in reads (only `google_apis` can be rooted).
+    "mobile_system_image": ("tools.mobile.sdk_locator", "avd_system_image"),
 }
+
+#: The SDK tools that get an ``sdk_tool:<name>`` row. ``adb`` is deliberately
+#: NOT here: it has its own row and its own question. Declared ONCE and used by
+#: BOTH branches of the SDK block below, so the present-edition and
+#: absent-edition replies can never carry different component sets -- a
+#: consumer that saw a row in one case and nothing in the other could not tell
+#: "this edition has no mobile modules" from "this backend is too old to
+#: report it". A test pins this set, plus ``adb``, against
+#: ``sdk_locator.TOOL_NAMES``, so a new tool there fails by name until it has a
+#: row and a PRODUCERS entry.
+SDK_TOOL_ROWS = ("emulator", "sdkmanager", "avdmanager")
 
 #: How many rows ONE SECTION of a reply may carry (so `section="all"` carries at
 #: most that many per section it contains). Bounds the payload a polling GUI parses
 #: and renders, not the work: every builder below enumerates a bounded set
-#: already (a fixed component list, the MCP clients on this machine, the
-#: provisioner's own step list), so this is the backstop against a future
+#: already (a fixed component list, the MCP clients on this machine), so
+#: this is the backstop against a future
 #: section that enumerates something device-sized -- a run's cases, a corpus --
 #: and turns a polled reply into a multi-megabyte one. Applied in ONE place,
 #: ``_rows``, so no builder can forget it and no two can disagree about it.
 MAX_ROWS = 200
-
-#: How old the machine-wide provisioning record may be before its rows are
-#: reported as describing a PAST run. That record lives at a single path,
-#: carries no run identity, and its only defence against being read as "what is
-#: happening now" is its age -- a days-old error line has already been read as
-#: live state. A polling client is the worst possible reader for that, so the
-#: READER is made honest here rather than a reaper being added.
-PROGRESS_STALE_S = 900
 
 _SECTIONS = ("doctor", "clients", "provisioning", "backend")
 
@@ -94,6 +106,12 @@ class Row:
     #: two derivations of "where is Cursor's config" is how a backup lands
     #: beside one file and the merge lands in another.
     config_path: str = ""
+    #: For a row about a BINARY, the absolute path that binary was found at.
+    #: Carried as a field rather than left inside ``detail`` because the desktop
+    #: app has to know WHERE a tool is, and a GUI reading a path out of an
+    #: English sentence is the silent consumer of an unpromised format that this
+    #: module exists to prevent. Empty for every row that is not about a binary.
+    tool_path: str = ""
 
     def as_dict(self) -> dict:
         out = asdict(self)
@@ -230,8 +248,9 @@ def doctor_rows() -> list:
                 + (" Missing: " + ", ".join(missing) if missing else ""),
                 ""
                 if root and not missing
-                else "The mobile provisioner installs these; the desktop "
+                else "Android Studio's SDK Manager installs these; the desktop "
                 "wizard never writes into the SDK itself.",
+                tool_path=root,
             )
         )
         adb_path = str((located.get("tools") or {}).get("adb") or "")
@@ -242,10 +261,27 @@ def doctor_rows() -> list:
                 "adb at " + adb_path if adb_path else "No adb in the located SDK.",
                 ""
                 if adb_path
-                else "Run the mobile provisioner's platform-tools step; this "
-                "server installs it, a desktop client never should.",
+                else "Install Platform-Tools from Android Studio's SDK Manager; "
+                "neither this server nor a desktop client installs it.",
+                tool_path=adb_path,
             )
         )
+        for tool in SDK_TOOL_ROWS:
+            tool_path = str((located.get("tools") or {}).get(tool) or "")
+            rows.append(
+                Row(
+                    "sdk_tool:" + tool,
+                    "ok" if tool_path else "fail",
+                    tool + " at " + tool_path
+                    if tool_path
+                    else "No " + tool + " in the located SDK.",
+                    ""
+                    if tool_path
+                    else "Install it from Android Studio's SDK Manager; neither "
+                    "this server nor a desktop client writes into the SDK.",
+                    tool_path=tool_path,
+                )
+            )
     except Exception:
         rows.append(
             Row(
@@ -261,6 +297,18 @@ def doctor_rows() -> list:
                 "The mobile modules are not present in this edition.",
             )
         )
+        # The SAME component set as the branch above. A consumer that saw these
+        # rows on one machine and nothing on another could not tell an edition
+        # without the mobile modules from a backend too old to report them, and
+        # would round the second one to "not installed".
+        for tool in SDK_TOOL_ROWS:
+            rows.append(
+                Row(
+                    "sdk_tool:" + tool,
+                    "off",
+                    "The mobile modules are not present in this edition.",
+                )
+            )
     try:
         from tools.mobile import ime
 
@@ -284,7 +332,88 @@ def doctor_rows() -> list:
                 "The mobile modules are not present in this edition.",
             )
         )
+    rows.extend(_system_image_items())
     return _rows(rows)
+
+
+#: Seconds the machine report waits for the booted-emulator listing behind the
+#: system-image row. The report runs on a worker thread a polling client waits
+#: on, so a wedged adb costs a bounded, stated delay rather than a hang.
+#: Bounded from above in ``tests/test_bounds_upper.py``.
+SYSTEM_IMAGE_PROBE_TIMEOUT_S = 10
+
+
+def _system_image_items() -> list:
+    """``Row``s naming each booted emulator's system image. Never raises.
+
+    The booted AVD's name comes from ``emulator.list_running`` -- the producer
+    qa-doctor asks -- and its image from ``sdk_locator.avd_system_image``, on
+    disk. With nothing booted the row says so and carries NO tag, and no detail
+    here ever carries an AVD name: the desktop also accepts the bare word
+    ``google_apis`` anywhere in a detail, and a tester may name an AVD that.
+    ``asyncio.run`` is safe because ``collect`` runs on a worker thread.
+    """
+    component = "mobile_system_image"
+    try:
+        import asyncio
+
+        from tools.mobile import emulator, sdk_locator
+    except Exception:
+        return [
+            Row(component, "off", "The mobile modules are not present in this edition.")
+        ]
+    try:
+        listed = asyncio.run(
+            asyncio.wait_for(
+                emulator.list_running(), timeout=SYSTEM_IMAGE_PROBE_TIMEOUT_S
+            )
+        )
+    except Exception:
+        return [
+            Row(
+                component,
+                "undetermined",
+                "The emulator probe did not finish, so the image is unknown.",
+            )
+        ]
+    if listed.get("error"):
+        return [
+            Row(
+                component,
+                "undetermined",
+                "The emulator probe failed, so the image is unknown.",
+            )
+        ]
+    booted = [item for item in (listed.get("content") or []) if isinstance(item, dict)]
+    if not booted:
+        return [
+            Row(
+                component,
+                "off",
+                "No emulator is booted, so its system image is unknown.",
+            )
+        ]
+    items = []
+    for item in booted:
+        serial = str(item.get("serial") or "")[:40]
+        found = sdk_locator.avd_system_image(item.get("avd")) or {}
+        image = str(found.get("content") or "")
+        if image:
+            items.append(Row(component, "ok", serial + " runs " + image))
+        else:
+            items.append(
+                Row(
+                    component,
+                    "undetermined",
+                    serial + " is booted, but its system image could not be read.",
+                )
+            )
+    return items
+
+
+def system_image_rows() -> list:
+    """The system-image rows alone, serialised -- what the pins read."""
+    return _rows(_system_image_items())
 
 
 def client_rows(home=None) -> list:
@@ -435,88 +564,26 @@ def client_rows(home=None) -> list:
     return _rows(rows)
 
 
-def provisioning_rows(now: float | None = None) -> list:
-    """Where mobile provisioning stands -- and HOW OLD that claim is.
+def provisioning_rows() -> list:
+    """One fixed row: this server provisions no Android SDK or emulator.
 
-    The kill-switch and ``apply=true`` rules are untouched: this reads a file
-    and starts nothing.
+    The ``provisioning`` SECTION is kept because a polling client (the
+    ``desktop/`` app) may ask for it by name, and an unknown-section error would
+    read as a broken server. It reads nothing and starts nothing
+    (docs/RETIRED_CAPABILITIES.md -> 6).
     """
-    stamp = time.time() if now is None else float(now)
-    rows = []
-    try:
-        from tools.mobile import provisioner
-    except Exception:
-        return _rows(
-            [
-                Row(
-                    "provisioning",
-                    "off",
-                    "The mobile modules are not present in this edition.",
-                )
-            ]
-        )
-    try:
-        record = provisioner.read_progress()
-    except Exception as exc:
-        return _rows([Row("provisioning", "undetermined", str(exc))])
-    content = record.get("content") if isinstance(record, dict) else None
-    if not isinstance(content, dict) or not content:
-        return _rows(
-            [
-                Row(
-                    "provisioning",
-                    "off",
-                    "No provisioning has been started on this machine.",
-                )
-            ]
-        )
-    written_at = content.get("written_at")
-    age = None
-    if isinstance(written_at, (int, float)):
-        age = max(0.0, stamp - float(written_at))
-    stale = age is None or age > PROGRESS_STALE_S
-    if content.get("error"):
-        rows.append(
+    return _rows(
+        [
             Row(
                 "provisioning",
-                "warn" if stale else "fail",
-                str(content.get("error")),
-                "This record is older than the freshness window; re-check "
-                "before believing it."
-                if stale
-                else "",
+                "off",
+                "Auto-provisioning is retired: this server no longer downloads "
+                "an Android SDK or creates an emulator. When none is found, "
+                "`qa_mobile_test` answers with a setup guide (install Android "
+                "Studio, create an AVD in its Device Manager).",
             )
-        )
-    for step in content.get("steps") or []:
-        if not isinstance(step, dict):
-            continue
-        rows.append(
-            Row(
-                "provision_step:" + str(step.get("name") or "step"),
-                "warn" if stale else str(step.get("status") or "undetermined"),
-                str(step.get("detail") or ""),
-            )
-        )
-    if not rows:
-        rows.append(
-            Row(
-                "provisioning",
-                "warn" if stale else "ok",
-                "A provisioning record exists.",
-            )
-        )
-    rows.append(
-        Row(
-            "provisioning_record_age",
-            "warn" if stale else "ok",
-            "unknown age" if age is None else ("%.0f seconds old" % age),
-            "Older than the freshness window: this describes a PAST run, not "
-            "necessarily what is happening now."
-            if stale
-            else "",
-        )
+        ]
     )
-    return _rows(rows)
 
 
 def collect(section: str = "all") -> dict:
