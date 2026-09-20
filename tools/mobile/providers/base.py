@@ -36,9 +36,7 @@ ORIGIN_WEBVIEW = "webview"
 
 #: Closed on purpose: an origin nobody enumerated is a region nobody wrote a
 #: reader for, and the seam must refuse to stamp it rather than invent one.
-ORIGINS = frozenset(
-    {ORIGIN_NATIVE, ORIGIN_COMPOSE, ORIGIN_FLUTTER, ORIGIN_WEBVIEW}
-)
+ORIGINS = frozenset({ORIGIN_NATIVE, ORIGIN_COMPOSE, ORIGIN_FLUTTER, ORIGIN_WEBVIEW})
 
 #: ``full``    -- every identifying string the toolkit has was read.
 #: ``merged``  -- the toolkit merged a subtree into one node (Compose semantics).

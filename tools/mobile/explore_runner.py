@@ -34,7 +34,7 @@ MAX_WATCH_ITEMS = 10
 
 STOP_GOAL = "goal_reached"
 STOP_TURNS = "turn_budget_exhausted"
-STOP_DEADLINE = "deadline_reached"#: The charter's ``stop_on: first_finding``. A fifth stop, and the only one
+STOP_DEADLINE = "deadline_reached"  #: The charter's ``stop_on: first_finding``. A fifth stop, and the only one
 #: step 4 wires: ``coverage_plateau`` is persisted and reported and behaves as
 #: ``budget``, because nothing detects a plateau yet -- nothing grades a
 #: plateau stop, follow-up.
@@ -453,9 +453,7 @@ def apply_turn_result(state: object, raw: object, *, now: float | None = None) -
                 # the one producer of what the tester asked for and returns 0
                 # where they asked for nothing, so a run with no charter
                 # extends exactly as it always has.
-                cap_turns, cap_seconds = charter_mod.budget_cap(
-                    body.get("charter")
-                )
+                cap_turns, cap_seconds = charter_mod.budget_cap(body.get("charter"))
                 had_turns = int(body.get("turns_budget") or MAX_TURNS)
                 turns = had_turns + EXTENSION_TURNS
                 if cap_turns:
@@ -473,9 +471,7 @@ def apply_turn_result(state: object, raw: object, *, now: float | None = None) -
                     # deadline stays at or below 120.0. Do not "tidy" it back.
                     _started = body.get("started")
                     started = float(_started if _started is not None else _now(now))
-                    deadline = min(
-                        deadline, started + min(cap_seconds, DEADLINE_S)
-                    )
+                    deadline = min(deadline, started + min(cap_seconds, DEADLINE_S))
                 gained_turns = turns - had_turns
                 gained_seconds = deadline - had_deadline
                 if gained_turns <= 0 and gained_seconds <= 0:
@@ -499,9 +495,7 @@ def apply_turn_result(state: object, raw: object, *, now: float | None = None) -
                     # ``extensions_used`` instead.
                     notice = EXTENSION_NOT_GRANTED
                 else:
-                    body["extensions_used"] = (
-                        int(body.get("extensions_used") or 0) + 1
-                    )
+                    body["extensions_used"] = int(body.get("extensions_used") or 0) + 1
                     body["turns_budget"] = turns
                     body["deadline"] = deadline
                     body["extension_reason"] = reason
@@ -515,17 +509,10 @@ def apply_turn_result(state: object, raw: object, *, now: float | None = None) -
                     if gained_turns > 0:
                         granted.append(str(int(gained_turns)) + " turns")
                     if gained_seconds >= 60:
-                        granted.append(
-                            str(int(gained_seconds // 60)) + " minutes"
-                        )
+                        granted.append(str(int(gained_seconds // 60)) + " minutes")
                     elif gained_seconds > 0:
                         granted.append("under a minute")
-                    notice = (
-                        "Extended once by "
-                        + " and ".join(granted)
-                        + ": "
-                        + reason
-                    )
+                    notice = "Extended once by " + " and ".join(granted) + ": " + reason
 
         status = stop_reason(body, now=now) or RUNNING
         body["stop"] = status if status != RUNNING else ""

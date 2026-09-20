@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import logging
 
-from config.settings import settings
 from tools import host_privileges
 from tools.device_manager import valid_package_name
 from tools.mobile import (
@@ -118,11 +117,6 @@ DNS_NO_ROUTE_FIX = (
 DNS_SLOW_NOTE = (
     "a resolver this slow cannot be told apart from a broken one by waiting "
     "longer, and an app under test stalls on it the same way"
-)
-
-_FLAG_FIX = (
-    "Add `QA_MOBILE_RUN_ENABLED=true` to `.env` and restart the MCP server "
-    "(quit and reopen the editor)."
 )
 
 
@@ -871,20 +865,6 @@ async def check(
     except Exception as exc:
         logger.exception("mobile.preflight.check failed")
         return {"error": str(exc), "content": None}
-
-
-def flag_state() -> dict:
-    """``{enabled, fix}`` for the lane's kill-switch.
-
-    Separate from :func:`check` on purpose: the flag gates tool REGISTRATION in
-    Phase 3, so by the time a check runs it is already true. This exists so
-    ``qa-doctor`` and the Phase-3 handler can say the same thing in one place.
-    """
-    enabled = bool(settings.qa_mobile_run_enabled)
-    return {
-        "error": None,
-        "content": {"enabled": enabled, "fix": "" if enabled else _FLAG_FIX},
-    }
 
 
 def render(content: dict) -> str:

@@ -37,9 +37,6 @@ logger = logging.getLogger(__name__)
 #: into a writer that beats slower than the lease goes stale.
 INTERVAL_S = max(1.0, float(run_store.LEASE_STALE_S) / 4.0)
 
-FLAG_NAME = "QA_MOBILE_RUN_ENABLED"
-
-
 NO_TOKEN = (
     "A lease heartbeat needs the session token that holds the run; without it "
     "this would refresh somebody else's lease."

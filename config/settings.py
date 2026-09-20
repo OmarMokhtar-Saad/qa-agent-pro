@@ -374,17 +374,19 @@ class Settings(BaseSettings):
     qa_device_command_timeout: int = 20
     # Timeout (seconds) for a single screenshot capture (larger -- image transfer).
     qa_device_screenshot_timeout: int = 60
-    # --- Mobile emulator testing (mobile programme, Phase 1) --------------
+    # --- Mobile lane: HTTPS capture ----------------------------------------
     # KILL-SWITCH (flag policy category 1), default OFF forever. ON lets the
-    # mobile lane download an Android SDK / JRE / system image onto this
-    # machine, install packages onto a device and drive that device -- every
-    # one of those effects lands outside this process. It gates tool
-    # REGISTRATION in mcp_server (Phase 3); every install, download or launch
-    # additionally requires apply=true on the call, and a flag-OFF apply=true
-    # REFUSES BY NAME rather than silently dry-running, exactly as
-    # mcp_handlers.handle_push_suite does. See docs/FEATURE_FLAGS.md and
-    # tools/flag_registry.py, which carry the same rationale verbatim.
-    qa_mobile_run_enabled: bool = False
+    # mobile lane download the HTTPS-capture proxy onto this machine and
+    # install its CA certificate into a device's trust store -- effects that
+    # land outside this process. It gates neither tool registration nor the
+    # lane's device effects. Every download or install additionally requires
+    # apply=true on the call, and a flag-OFF apply=true REFUSES BY NAME rather
+    # than silently dry-running, exactly as mcp_handlers.handle_push_suite
+    # does. NO ALIAS: extra="ignore" drops a stale key under the lane's former
+    # name, so it enables nothing (tests/test_settings.py; the rename is in
+    # docs/DECISIONS.md). See docs/FEATURE_FLAGS.md and tools/flag_registry.py,
+    # which carry the same rationale verbatim.
+    qa_mobile_https_capture_enabled: bool = False
     # App-log evidence for the mobile lane -- OPERATOR-CHOICE (flag policy
     # category 4), default ON. ON: while a case runs, the lane keeps the app's own
     # logcat slice and pulls its event log (`run-as`, debuggable builds only), both
@@ -1244,7 +1246,7 @@ class Settings(BaseSettings):
         "qa_host_ambiguity_require_result",
         "qa_host_image_require_relevant",
         "qa_host_dedup_apply",
-        "qa_mobile_run_enabled",
+        "qa_mobile_https_capture_enabled",
         "qa_mobile_app_evidence",
         mode="before",
     )

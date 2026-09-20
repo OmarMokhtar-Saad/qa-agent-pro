@@ -115,9 +115,6 @@ LEASE_STALE_S = 120
 #: directories forever.
 STALE_RUN_S = 7 * 24 * 3600
 
-#: Named here because the GC refusal has to print it.
-FLAG_NAME = "QA_MOBILE_RUN_ENABLED"
-
 LEASE_FILE = "lease.json"
 MANIFEST_FILE = "manifest.json"
 #: Which chat already holds this run's packet static block. See

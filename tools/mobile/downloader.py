@@ -306,12 +306,14 @@ def download(
     grew by one in the very commit meant to close that class.
     """
     try:
-        if not settings.qa_mobile_run_enabled and not _is_pinned_ime(url, sha256):
+        if not settings.qa_mobile_https_capture_enabled and not _is_pinned_ime(
+            url, sha256
+        ):
             return {
                 "error": (
-                    "Refusing to download: the mobile lane needs "
-                    "`QA_MOBILE_RUN_ENABLED=true` in `.env`. Nothing was "
-                    "fetched."
+                    "Refusing to download: HTTPS capture needs "
+                    "`QA_MOBILE_HTTPS_CAPTURE_ENABLED=true` in `.env` and an "
+                    "MCP server restart. Nothing was fetched."
                 ),
                 "content": None,
             }

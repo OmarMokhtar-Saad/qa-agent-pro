@@ -739,6 +739,7 @@ def budget_for(charter: object, max_steps: int, max_seconds: int) -> tuple:
     )
     return out_steps, out_seconds
 
+
 def depth_directive(charter: object) -> str:
     """What this run's ``depth`` asks the model to ATTEMPT. ONE producer.
 

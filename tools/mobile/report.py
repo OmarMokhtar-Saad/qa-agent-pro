@@ -222,9 +222,6 @@ OP_KIND = {
     "needs": "note",
 }
 
-FLAG_NAME = "QA_MOBILE_RUN_ENABLED"
-
-
 NOT_CAPTURED = "this screen was not captured"
 
 _SAFE_TOKEN = re.compile(r"[^a-z0-9_]+")

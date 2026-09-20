@@ -502,7 +502,9 @@ def build_explore_turn(
                 "turns_left": int(left.get("turns") or 0),
                 "seconds_left": int(left.get("seconds") or 0),
                 "extensions_left": max(0, 1 - int(body.get("extensions_used") or 0)),
-                "guard_destructive": bool(body.get("guard", True)),                # THE CHARTER'S THREE STEERING FIELDS. They ride the state
+                "guard_destructive": bool(
+                    body.get("guard", True)
+                ),  # THE CHARTER'S THREE STEERING FIELDS. They ride the state
                 # this packet is already built from (``state["charter"]``), so
                 # no signature moves. ``depth`` decides what the packet ASKS
                 # THE MODEL TO ATTEMPT -- one server-owned sentence, not a
@@ -569,6 +571,7 @@ def build_explore_turn(
     except Exception:  # pragma: no cover - defensive
         logger.warning("build_explore_turn failed", exc_info=True)
         return {}
+
 
 #: The FIRST packet of an explore run. A packet KIND on the existing return
 #: path, deliberately NOT a tool: the test for whether something earns a tool

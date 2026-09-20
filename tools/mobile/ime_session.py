@@ -8,10 +8,13 @@ API 35 and got silence. Measured on a second Mac, 2026-09-17. This module is the
 first caller of both, and the sequence lives in one place so the order -- remember
 BEFORE anything changes -- cannot be got wrong by a second caller written later.
 
-**It takes no new setting.** `ime.ensure_apk` and `ime.install` already refuse
-without `QA_MOBILE_RUN_ENABLED`, and `apply=true` still gates the run. Per
-CLAUDE.md's flag policy, an improvement ships ON with no flag of its own; the
-kill-switch and `apply` remain the only two gates.
+**It takes no new setting.** No flag gates the QA keyboard at all:
+`downloader.download` exempts the PINNED IME asset from
+`QA_MOBILE_HTTPS_CAPTURE_ENABLED`, which gates only the HTTPS-capture proxy
+download and the capture CA-certificate install, and installing on the device
+is a device effect, which this lane never flag-gates. `apply=true` still gates
+the run. Per CLAUDE.md's flag policy, an improvement ships ON with no flag of
+its own; `apply` is the gate here.
 
 House rules obeyed: no `print`, and every public function returns
 ``{"error", "content"}`` rather than raising.
@@ -208,9 +211,7 @@ async def restore_stale(serial: str, *, skip_run_id: str = "") -> dict:
         row = rows[0] if rows else {}
         mine = str(skip_run_id or "")
         held_by_another = bool(row.get("held")) and str(row.get("owner") or "") != mine
-        undead = [
-            r["run_id"] for r in found if not pid_is_provably_dead(r.get("pid"))
-        ]
+        undead = [r["run_id"] for r in found if not pid_is_provably_dead(r.get("pid"))]
         if not rows or row.get("error") or held_by_another or undead:
             # ONE refusal for all three, deliberately: they are the same answer
             # to the tester -- something may still be using this device, so

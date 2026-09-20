@@ -279,7 +279,9 @@ class Context:
     # A fact about what a trace is EXPECTED to carry, not a lane name: this
     # module still knows nothing about runs, and the default leaves the
     # scripted rule untouched and unweakened.
-    asserts_expected: bool = True    # What happens AFTER the destructive guard stops something. False PAUSES
+    asserts_expected: bool = (
+        True  # What happens AFTER the destructive guard stops something. False PAUSES
+    )
     # for the tester (``needs_tester``), which is today's behaviour and the
     # default, so the SCRIPTED lane is unchanged byte-for-byte. True ENDS the
     # attempt, which is what a charter saying ``destructive: none`` asks for;
@@ -597,9 +599,7 @@ def screen_stop_details() -> dict:
         SCREEN_NOT_THE_APP: lambda screen, expected: not_the_app_detail(
             (screen or {}).get("package"), expected
         ),
-        SCREEN_CONTROL_NOT_READ: lambda screen, expected: (
-            GUARD_DETAIL_CONTROL_NOT_READ
-        ),
+        SCREEN_CONTROL_NOT_READ: lambda screen, expected: GUARD_DETAIL_CONTROL_NOT_READ,
     }
 
 
@@ -2108,9 +2108,7 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                         "tapped. Use `tap` with a narrower target to say which "
                         "one you mean."
                         if picked.get("ambiguous")
-                        else "Nothing on this screen carries the text `"
-                        + wanted
-                        + "`."
+                        else "Nothing on this screen carries the text `" + wanted + "`."
                     )
                     _stamp_after(entry, screen)
                     _append(trace, entry)
@@ -2875,7 +2873,14 @@ async def _perform(
         if secret:
             field = str(getattr(action, "field", "") or "")
             value = (ctx.tester_inputs or {}).get(field)
-            if value is None:
+            # `not value`, not `value is None`: an EMPTY held value types
+            # nothing, and the `landed` verdict cannot speak for a step that
+            # made no claim, so it would pass silently -- the defect that
+            # verdict exists to end. `actions.parse_script` already refuses an
+            # empty `text` on the non-secret path ("type needs text"); this is
+            # the same boundary for the path whose value never appears in the
+            # script.
+            if not value:
                 return {
                     "error": (
                         "No tester-supplied value is held for the field "
@@ -2885,16 +2890,98 @@ async def _perform(
                     ),
                     "content": None,
                 }
-            return await ime.type_text(
-                serial, str(value), secret=True, receiver_known=True
+            return _judge_landed(
+                await ime.type_text(
+                    serial, str(value), secret=True, receiver_known=True
+                ),
+                field or "the focused field",
             )
-        return await ime.type_text(
-            serial,
-            str(getattr(action, "text", "") or ""),
-            secret=False,
-            receiver_known=True,
+        return _judge_landed(
+            await ime.type_text(
+                serial,
+                str(getattr(action, "text", "") or ""),
+                secret=False,
+                receiver_known=True,
+            ),
+            str(getattr(action, "field", "") or "") or "the focused field",
         )
     return {"error": "Unsupported action " + repr(op), "content": None}
+
+
+def _judge_landed(result: object, field: str) -> dict:
+    """A typed step whose text did not land is NOT a success.
+
+    ``ime.type_text`` reports two different things and only one of them used
+    to be read: ``typed`` is what the HOST SENT, ``landed`` is what the DEVICE
+    ACCEPTED. Returning the dict unchanged meant a field that took nothing --
+    no input connection, a read-only view, a WebView that ignored the commit --
+    produced a success-shaped step, and the run PASSED having typed nothing.
+
+    Two non-success shapes, because the two verdicts need different answers:
+
+    * ``no`` -- the field is byte-identical to before the commit. That is a
+      device_error like any other failed ``_perform``: it ends the case.
+    * ``unknown`` -- the keyboard could not say (no input connection, no ``t:``
+      part, or a formatter transformed the text). This takes the
+      ``needs_model`` arm the password refusal already uses, because it names a
+      RECOVERY -- look at the screenshot and confirm -- rather than asserting a
+      failure nobody measured. It is still not a success: an unconfirmed type
+      never passes silently.
+    """
+    if not isinstance(result, dict):
+        # Unreachable: `ime.type_text` returns a dict on every path including
+        # its `except`. A FIXED string rather than `str(result)`, because this
+        # is the only line here that could interpolate an unconstrained object
+        # into a message a tester reads -- and the day the contract changes is
+        # the day that object might be a field's contents.
+        return {"error": "The keyboard returned an unusable reply.", "content": None}
+    if result.get("error"):
+        return result
+    content = result.get("content") or {}
+    landed = content.get("landed")
+    if landed == ime.LANDED_YES:
+        return result
+    # No `if not typed: return result` guard. It would be unreachable on the
+    # script path (`parse_script` refuses `type` with no text) and WRONG on
+    # the secret path, where an empty held value would then pass silently;
+    # that case is refused above, at the boundary, by name.
+    typed = content.get("typed", 0)
+    if landed == ime.LANDED_NO:
+        return {
+            "error": (
+                "Typed "
+                + str(typed)
+                + " character(s) into "
+                + repr(field[:60])
+                + " but the field did not change, so the step did not happen."
+            ),
+            "content": None,
+        }
+    # TWO recoveries, because the two modes can be asked for different things.
+    # Telling the model to check that "the field shows the value" is the right
+    # instruction for ordinary text and exactly the wrong one for a
+    # credential: the field is masked, so it cannot be done, and asking for it
+    # points a model at a plaintext password on a screen capture -- undoing at
+    # the prose layer what the length-only comparison protects in the code.
+    if content.get("secret"):
+        recovery = (
+            " and the keyboard could not confirm it landed. Look at the "
+            "screenshot: the field is masked, so check that it is non-empty "
+            "and roughly the right length. Never read the value back."
+        )
+    else:
+        recovery = (
+            " and the keyboard could not confirm the text landed. Look at the "
+            "screenshot: if the field shows the value (a formatter may have "
+            "reshaped it) continue, otherwise the step did not happen."
+        )
+    return {
+        "error": (
+            "Typed " + str(typed) + " character(s) into " + repr(field[:60]) + recovery
+        ),
+        "content": None,
+        "needs_model": True,
+    }
 
 
 async def _sleep(seconds: float) -> None:

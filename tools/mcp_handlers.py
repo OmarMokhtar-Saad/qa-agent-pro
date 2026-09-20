@@ -2781,7 +2781,7 @@ def _mobile_modules_present() -> bool:
     whose checkout has no ``tools/mobile/ime_manifest.py`` (the qa-ime release
     is not cut yet, so the lane could never complete a preflight anyway). This
     is the registration-time half of that same refusal: without it, an
-    operator who set ``QA_MOBILE_RUN_ENABLED=true`` on such a build would still
+    operator who switched the lane on for such a build would still
     see the three tools registered, and the first call would fail on the
     function-local ``tools.mobile`` import inside ``handle_mobile_test`` -- an
     ugly generic error instead of the tool simply not existing. Uses
@@ -2803,7 +2803,7 @@ def _mobile_lane_enabled() -> bool:
     anywhere else -- ``mcp_server`` calls THIS, and a test asserts the
     registration site holds nothing but a call to it. A build made without
     the pinned IME ships no ``tools/mobile`` (``scripts/build_dist.py``), so
-    module absence IS the edition gate. ``qa_mobile_run_enabled`` is not a term: it gates only
+    module absence IS the edition gate. ``qa_mobile_https_capture_enabled`` is not a term: it gates only
     the capture download and the capture-certificate install, at those effects.
 
     * ``_mobile_modules_present()`` is the CORRECTNESS term: a build whose
@@ -2819,7 +2819,7 @@ def _mobile_lane_enabled() -> bool:
     ``_FULL_EDITION`` is False on a dist because the bug-report and
     exploratory-coach agents are not shipped -- a fact about two unrelated
     agents. Measured on the published v1.77.0 install with
-    ``QA_MOBILE_RUN_ENABLED=true``: 12 tools registered, none of them mobile,
+    the lane's then-flag switched on: 12 tools registered, none of them mobile,
     while the README promised three. Neutralising this one term in that same
     install produced all three. The whole point of shipping the lane and
     pinning the IME was to reach a tester, so the term is gone and

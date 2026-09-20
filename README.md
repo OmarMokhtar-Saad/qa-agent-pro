@@ -242,7 +242,7 @@ your editor.
 | `QA_EXPORT_DIR` | Folder auto-exported Excel files are saved to (`data/exports`; persists across sessions and updates) |
 | `QA_INSTALL_DIR` | Install location, read by the installer (default `~/qa-agent-pro`) |
 | `QA_UPDATE_INTERVAL_MINUTES` | How often a running server checks for a new release (default 15) |
-| `QA_MOBILE_RUN_ENABLED` | Opt in to the Android emulator run lane — off by default |
+| `QA_MOBILE_HTTPS_CAPTURE_ENABLED` | Let the Android emulator lane capture the app's HTTPS traffic (downloads a proxy, installs a device certificate) — off by default |
 | `QA_UPDATE_REQUIRE_SIGNATURE` | Refuse unsigned releases instead of warning |
 | `DO_NOT_TRACK` | Set to `1` to disable telemetry |
 
@@ -321,15 +321,15 @@ macOS-only tooling as missing on Windows.
 
 ### Optional: running test cases on an Android emulator
 
-**Off by default, and it stays off until you turn it on.** The emulator
+**HTTPS capture is off by default; the lane itself is not.** The emulator
 lane runs your suite on a real Android app: it plans each case from the
 screen, replays it, asks you when a screen needs a credential, and ends
 with a self-contained report folder that opens in your browser.
 
-To turn it on, add this to `.env` and restart your editor:
+To capture the app's HTTPS traffic too (a proxy download and a device certificate), add this to `.env` and restart your editor:
 
 ```
-QA_MOBILE_RUN_ENABLED=true
+QA_MOBILE_HTTPS_CAPTURE_ENABLED=true
 ```
 
 Then say `run mobile test`. Three tools appear -- `qa_mobile_test`,
@@ -470,15 +470,15 @@ winget install --id Google.PlatformTools -e --scope user
 <details>
 <summary>Running test cases on an Android emulator (opt-in)</summary>
 
-**Off by default, and it stays off until you turn it on.** The emulator lane
+**HTTPS capture is off by default; the lane itself is not.** The emulator lane
 runs your suite against a real Android app: it plans each case from the screen,
 replays it, asks you when a screen needs a credential, and ends with a
 self-contained HTML report that opens in your browser.
 
-To turn it on, add this to `.env` and restart your editor:
+To capture the app's HTTPS traffic too (a proxy download and a device certificate), add this to `.env` and restart your editor:
 
 ```
-QA_MOBILE_RUN_ENABLED=true
+QA_MOBILE_HTTPS_CAPTURE_ENABLED=true
 ```
 
 Then say `run mobile test`. Three tools appear — `qa_mobile_test`,
