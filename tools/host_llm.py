@@ -300,9 +300,9 @@ UNMIGRATED_PATHS: tuple[tuple[str, str], ...] = (
     #   TWO cross-phase gates had to be widened in the same op, because both
     #   are AND-ed with "the prep produced checklist items" -- which is False
     #   at prepare time once the decomposition is boomeranged:
-    #     * tools/mcp_handlers._nli_suppress (Phase 3b). Un-widened, the two
-    #       ask_json calls in tools/rtm.py fire server-side on a host submit and
-    #       `rtm.nli_verdicts`'s terminal status becomes FALSE in the tree.
+    #     * tools/mcp_handlers._nli_suppress (Phase 3b, since DELETED along
+    #       with the two NLI ask_json calls in tools/rtm.py it guarded -- both
+    #       gone since P2-G1).
     #     * agents/host_mode._coverage_instruction -- HISTORICAL, this widen no
     #       longer exists. Un-widened it would have made the whole
     #       QA_HOST_COVERAGE_REVIEW_ENABLED clause vanish from the payload,
@@ -312,7 +312,8 @@ UNMIGRATED_PATHS: tuple[tuple[str, str], ...] = (
     #       reduction, batch 2b) that helper AND that flag were DELETED as an
     #       unvalidated, never-shipped experiment, so there is no host analog
     #       to keep alive: the 3b disclosure now states plainly that there is
-    #       none, and _nli_suppress above is the only surviving widen.
+    #       none, and _nli_suppress above is gone with the matcher it
+    #       guarded, so nothing widens on this path anymore.
     #
     #   The legacy call is NOT deleted (graph.py, evals/test_eval_goldens.py and
     #   evals/test_terse_schemas_goldens.py all still reach

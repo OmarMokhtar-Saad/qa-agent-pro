@@ -39,11 +39,8 @@ HEAL_RULES: dict[str, tuple[tuple[str, ...], str, str]] = {
         "true",
         "names the screenshots a ticket references instead of silently ignoring them",
     ),
-    "JIRA_FETCH_SIBLING_STORIES": (
-        ("false", "0", "no", "off"),
-        "true",
-        "sibling user stories carry requirements this ticket inherits",
-    ),
+    # No JIRA_FETCH_SIBLING_STORIES / JIRA_FETCH_PARENT rule: both are opt-in
+    # (default false), so "false" is the current default, not a superseded one.
 }
 
 _MAX_ENV_BYTES = 1_000_000
@@ -58,6 +55,54 @@ def _split(line: str) -> tuple[str, str]:
     return key.strip(), value.strip()
 
 
+def _scan(raw: str) -> tuple[list[str], list[tuple[str, str, str, str]]]:
+    """(rewritten lines, [(key, old, new, reason), ...]) for ``raw``. Pure."""
+    lines = raw.splitlines()
+    changed: list[tuple[str, str, str, str]] = []
+    for idx, line in enumerate(lines):
+        key, value = _split(line)
+        if not key or key not in HEAL_RULES:
+            continue
+        superseded, new_value, reason = HEAL_RULES[key]
+        if value.lower() not in superseded or value == new_value:
+            continue
+        # Preserve the original indentation/spacing style of the line.
+        lines[idx] = line.replace(f"={value}", f"={new_value}", 1)
+        changed.append((key, value, new_value, reason))
+    return lines, changed
+
+
+def _read_env(install_dir: Path, result: dict) -> tuple[Path, str | None]:
+    """(path, text) of ``install_dir/.env``; text None when absent or too large."""
+    env = Path(install_dir) / ".env"
+    if not env.is_file():
+        return env, None
+    raw = env.read_text(encoding="utf-8")
+    if len(raw.encode("utf-8", "ignore")) > _MAX_ENV_BYTES:
+        result["error"] = "the .env is unexpectedly large -- not touching it"
+        return env, None
+    return env, raw
+
+
+def find_superseded(install_dir: Path) -> dict:
+    """What heal_env WOULD rewrite, without writing anything.
+
+    Returns ``{"changed": [(key, old, new, reason), ...], "error": None}``, so a
+    read-only qa-doctor can name outdated settings instead of skipping the
+    check. Never raises.
+    """
+    result: dict = {"changed": [], "error": None}
+    try:
+        _env, raw = _read_env(install_dir, result)
+        if raw is not None:
+            result["changed"] = _scan(raw)[1]
+        return result
+    except Exception as exc:
+        logger.exception("env superseded-value check failed")
+        result["error"] = str(exc)
+        return result
+
+
 def heal_env(install_dir: Path) -> dict:
     """Rewrite superseded default values in ``install_dir/.env``.
 
@@ -67,27 +112,11 @@ def heal_env(install_dir: Path) -> dict:
     """
     result: dict = {"changed": [], "backup": "", "error": None}
     try:
-        env = Path(install_dir) / ".env"
-        if not env.is_file():
-            return result
-        raw = env.read_text(encoding="utf-8")
-        if len(raw.encode("utf-8", "ignore")) > _MAX_ENV_BYTES:
-            result["error"] = "the .env is unexpectedly large -- not touching it"
+        env, raw = _read_env(install_dir, result)
+        if raw is None:
             return result
 
-        lines = raw.splitlines()
-        changed: list[tuple[str, str, str, str]] = []
-        for idx, line in enumerate(lines):
-            key, value = _split(line)
-            if not key or key not in HEAL_RULES:
-                continue
-            superseded, new_value, reason = HEAL_RULES[key]
-            if value.lower() not in superseded or value == new_value:
-                continue
-            # Preserve the original indentation/spacing style of the line.
-            lines[idx] = line.replace(f"={value}", f"={new_value}", 1)
-            changed.append((key, value, new_value, reason))
-
+        lines, changed = _scan(raw)
         if not changed:
             return result
 

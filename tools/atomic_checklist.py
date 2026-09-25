@@ -1,24 +1,20 @@
-"""Atomic Requirements Checklist (Batch 2) — granularity audit + matcher input.
+"""Atomic Requirements Checklist (Batch 2) — granularity audit and prompt clustering.
 
-Pass 1 of the three-pass "auditable coverage" pipeline USED to live here as
+Pass 1 of the checklist pipeline USED to live here as
 ``decompose_to_checklist``: one server-side llm.ask_json call decomposing the
 ticket into an UNBOUNDED, EARS-shaped, source-tagged flat checklist. It was
 DELETED on 2026-08-16 (dead-code deletion P2-F2) -- see the tombstone below
 the response models. The decomposition now runs on the TESTER'S OWN model as
 agents/host_mode.CHECKLIST_JOB (stage step_zero) and arrives back on the
 submission, where tools/mcp_handlers.py validates its shape and sets
-``prepared.checklist_items``. Everything in this module that CONSUMES a
-checklist is live and unchanged:
+``prepared.checklist_items``. What this module still does is CONSUME that
+checklist:
 
   Pass 2 (agents/test_scenario_agent.py) the 8-category fan-out with the
                         checklist in context — CLUSTERED, so the prompt never
                         becomes a flat 40-line constraint wall (constraint decay:
                         LLM quality drops ~30pp as structural requirements
                         accumulate, arXiv 2605.06445).
-  Pass 3 (tools/rtm.py) a DETERMINISTIC external matcher (embeddings ->
-                        optional entailment -> optional adjudication) computing
-                        bidirectional coverage. The GENERATING model never marks
-                        its own homework.
 
 ``checklist_enabled()`` is LIVE and load-bearing -- a True constant since
 2026-08-14, when QA_ATOMIC_CHECKLIST_ENABLED was DELETED and the behaviour
@@ -27,11 +23,10 @@ CHECKLIST_JOB ships to the host. tests/conftest.py pins it False suite-wide.
 
 TRUNCATION IS NEVER SILENT. ``format_checklist_prompt_block`` returns BOTH the
 prompt block and the exact list of item ids that fitted inside
-``QA_CHECKLIST_MAX_PROMPT_CHARS``. tools/rtm.match_checklist scores only the
-PRESENTED ids; anything that did not reach the generator lands in a separate
-"NOT PRESENTED TO GENERATOR" bucket that is EXCLUDED from the coverage
-percentage. A tool whose only product is an honest coverage figure must never
-report its own prompt truncation as a requirement gap.
+``QA_CHECKLIST_MAX_PROMPT_CHARS``, so a caller can always tell which items
+never reached the generator -- silently dropping the tail of an over-long
+checklist must never be reported downstream as if every item had been
+presented.
 
 House rules honoured:
   * Never raises at the public boundary — every helper degrades to an empty /
@@ -57,18 +52,12 @@ RENDERED as authority — but it cannot detect a wrong-but-plausible tag.
 ``PROVENANCE_LIMITATION`` states that in every rendered report, unconditionally.
 The real containment here is structural: ``wrap_untrusted`` + ``_GUARD`` on every
 input block, and not reading the comment thread at all.
-
-HONESTY BOUNDARY: the checklist, and every tally derived from it, measure
-TEXTUAL alignment between requirements and test cases. They are NOT a
-verification-strength guarantee — see ``HONESTY_BOUNDARY``.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 import re
-from collections import Counter
 
 from pydantic import BaseModel, Field
 
@@ -87,18 +76,6 @@ EARS_PATTERNS = (
     "optional",
     "unwanted",
     "complex",
-)
-
-# Verbatim caveat appended to EVERY rendered coverage tally. RESTestBench (2026)
-# shows generated tests adapt to faulty implementations rather than to
-# requirements, so a coverage percentage is textual alignment only.
-HONESTY_BOUNDARY = (
-    "_Textual coverage only. This tally measures semantic alignment between the "
-    "requirement checklist and the generated test cases — it is NOT a quality or "
-    "verification-strength guarantee. Generated tests can adapt to a faulty spec "
-    "or example instead of to the requirement, and mutation-detection strength is "
-    "UNKNOWN. Treat every LOW-confidence match, NOT COVERED gap and "
-    "REVIEW_REQUIRED orphan as work, not noise._"
 )
 
 _WORD_RE = re.compile(r"[\W_]+")
@@ -330,7 +307,7 @@ class ChecklistItem(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# Lexical helpers (pure stdlib — the never-raise fallback for tools/embeddings)
+# Lexical helpers (pure stdlib, deterministic text-similarity scoring)
 # --------------------------------------------------------------------------- #
 
 
@@ -340,57 +317,6 @@ def _tokens(text: str) -> list[str]:
 
 def _norm(text: str) -> str:
     return " ".join(_tokens(text))
-
-
-def lexical_cosine_matrix(a_texts: list[str], b_texts: list[str]) -> list[list[float]]:
-    """TF-IDF cosine similarity of every a_text against every b_text.
-
-    Pure stdlib, no model, no network — the deterministic fallback used whenever
-    ``tools.embeddings`` is disabled or fails. Scores live on a DIFFERENT scale
-    than embedding cosine, so callers must apply the lexical thresholds
-    (tools/rtm._LEXICAL_HIGH), never the embedding one.
-
-    SYNCHRONOUS AND O(len(a) x len(b)) IN PURE PYTHON: callers on the asyncio
-    event loop MUST invoke it through ``asyncio.to_thread`` (tools/rtm does), or
-    a 200 x 80 matrix stalls the MCP stdio loop.
-
-    Returns a len(a) x len(b) matrix of zeros on any failure. Never raises."""
-    try:
-        a_toks = [_tokens(t) for t in a_texts]
-        b_toks = [_tokens(t) for t in b_texts]
-        corpus = a_toks + b_toks
-        n = len(corpus) or 1
-        df: Counter = Counter()
-        for toks in corpus:
-            for t in set(toks):
-                df[t] += 1
-
-        def _idf(t: str) -> float:
-            return math.log((n + 1) / (df.get(t, 0) + 1)) + 1.0
-
-        def _vec(toks: list[str]) -> dict:
-            if not toks:
-                return {}
-            tf = Counter(toks)
-            total = len(toks)
-            return {t: (c / total) * _idf(t) for t, c in tf.items()}
-
-        a_vecs = [_vec(t) for t in a_toks]
-        b_vecs = [_vec(t) for t in b_toks]
-        a_norms = [math.sqrt(sum(v * v for v in vec.values())) or 1.0 for vec in a_vecs]
-        b_norms = [math.sqrt(sum(v * v for v in vec.values())) or 1.0 for vec in b_vecs]
-        matrix: list[list[float]] = []
-        for i, av in enumerate(a_vecs):
-            row: list[float] = []
-            for j, bv in enumerate(b_vecs):
-                small, large = (av, bv) if len(av) <= len(bv) else (bv, av)
-                dot = sum(w * large.get(t, 0.0) for t, w in small.items())
-                row.append(dot / (a_norms[i] * b_norms[j]))
-            matrix.append(row)
-        return matrix
-    except Exception:
-        logger.exception("lexical_cosine_matrix failed — returning zeros")
-        return [[0.0] * len(b_texts) for _ in a_texts]
 
 
 def _jaccard(a: set[str], b: set[str]) -> float:
@@ -647,12 +573,10 @@ def format_checklist_prompt_block(
     WHY THE SECOND RETURN VALUE EXISTS. The block is capped at
     ``QA_CHECKLIST_MAX_PROMPT_CHARS``. If the cap were applied by handing the
     whole body to ``wrap_untrusted(limit=...)``, the tail of the checklist would
-    be silently cut, never reach the generator, and then be scored as an
-    uncovered requirement — the tool would report its own prompt truncation as a
-    coverage gap in the very number it exists to make trustworthy. Instead the
-    budget is spent ITEM BY ITEM, the ids that fitted are returned, and
-    tools/rtm.match_checklist scores only those; the rest are reported in a
-    separate "NOT PRESENTED TO GENERATOR" bucket EXCLUDED from the percentage.
+    be silently cut and never reach the generator, with no way to tell which
+    items were dropped. Instead the budget is spent ITEM BY ITEM, and the ids
+    that actually fitted are returned alongside the block, so a caller can
+    always distinguish a presented requirement from a truncated one.
 
     Returns ``("", [])`` for an empty checklist so a flag-OFF run's prompt is
     byte-identical to today's. Never raises."""
@@ -711,16 +635,16 @@ def format_checklist_prompt_block(
         if missing > 0:
             logger.warning(
                 "Atomic checklist prompt block truncated: %d of %d item(s) did not "
-                "fit in QA_CHECKLIST_MAX_PROMPT_CHARS=%d. They are EXCLUDED from "
-                "the coverage percentage and reported as NOT PRESENTED.",
+                "fit in QA_CHECKLIST_MAX_PROMPT_CHARS=%d and are reported as "
+                "NOT PRESENTED.",
                 missing,
                 len(items),
                 cap,
             )
             note = (
                 f"\n\n[{missing} further checklist item(s) did not fit in this "
-                "prompt and are NOT shown above. They are tracked separately and "
-                "are excluded from the coverage score — do not try to guess them.]"
+                "prompt and are NOT shown above. They are tracked separately as "
+                "NOT PRESENTED — do not try to guess them.]"
             )
         return (
             "## Atomic Requirements Checklist (every item must end up covered)\n"
@@ -834,190 +758,23 @@ def checklist_from_dicts(rows: list[dict]) -> list[ChecklistItem]:
     return out
 
 
-def checklist_rows(items: list[ChecklistItem], coverage: dict | None = None) -> list:
+def checklist_rows(items: list[ChecklistItem]) -> list:
     """Rows (header first) for the 'Requirements Checklist' XLSX sheet.
 
-    ``coverage`` is the dict produced by ``tools.rtm.coverage_to_dict`` (or
-    ``None`` when the matcher did not run). Items the prompt could not present
-    get the explicit ``NOT PRESENTED TO GENERATOR`` status so a spreadsheet
-    reader can never confuse a truncated prompt with an untested requirement.
-    Pure — cell sanitisation happens in tools/xlsx_generator. Returns [] when
-    there is nothing to write. Never raises."""
+    A PLAIN LIST of the parsed EARS requirements. Deterministic
+    requirement_id traceability (``tools.rtm.rtm_rows``) is the 'Requirements
+    Traceability' sheet instead. Pure — cell sanitisation happens in
+    tools/xlsx_generator. Returns [] when there is nothing to write. Never
+    raises."""
     try:
         if not items:
             return []
-        cov = coverage or {}
-        not_presented = set(cov.get("not_presented_item_ids") or [])
-        # Same reasoning as coverage_rows: a bare "NOT COVERED" on this sheet is
-        # a worklist instruction, and in lexical fallback it is unreliable
-        # enough to send a tester after a requirement that is already covered.
-        degraded = bool(cov.get("degraded"))
-        by_item: dict[str, list] = {}
-        for link in cov.get("links") or []:
-            by_item.setdefault(str(link.get("item_id", "")), []).append(link)
-        rows: list = [
-            [
-                "Req ID",
-                "Requirement (EARS)",
-                "Pattern",
-                "Source",
-                "Status",
-                "Linked TCs",
-                "Confidence",
-                "Match score",
-            ]
-        ]
+        rows: list = [["Req ID", "Requirement (EARS)", "Pattern", "Source"]]
         for it in items:
-            links = by_item.get(it.item_id) or []
-            if not cov:
-                # REACHABLE: match_checklist never raises, it returns ran=False,
-                # and coverage_to_dict maps that to {}. Labelling those items
-                # "NOT COVERED" would report a matcher outage as a requirements
-                # failure, so they are explicitly NOT MEASURED.
-                status, tcs, conf, score = (
-                    "NOT MEASURED (matcher did not run)",
-                    "",
-                    "",
-                    "",
-                )
-            elif it.item_id in not_presented:
-                status = "NOT PRESENTED TO GENERATOR (excluded from coverage %)"
-                tcs = ""
-                conf = ""
-                score = ""
-            elif links:
-                status = "COVERED"
-                tcs = ", ".join(str(x.get("tc_id", "")) for x in links)
-                conf = ", ".join(str(x.get("confidence", "")) for x in links)
-                score = ", ".join(f"{float(x.get('score', 0.0)):.2f}" for x in links)
-            else:
-                status = "NOT COVERED" + (
-                    " (UNRELIABLE — lexical fallback; set QA_EMBEDDINGS_BACKEND)"
-                    if degraded
-                    else ""
-                )
-                tcs = ""
-                conf = ""
-                score = ""
-            rows.append(
-                [
-                    it.item_id,
-                    it.text,
-                    it.ears_pattern,
-                    it.source,
-                    status,
-                    tcs,
-                    conf,
-                    score,
-                ]
-            )
+            rows.append([it.item_id, it.text, it.ears_pattern, it.source])
         return rows
     except Exception:
         logger.exception("checklist_rows failed — omitting the sheet")
-        return []
-
-
-def coverage_rows(
-    coverage: dict | None, audit: dict | None = None, items: list | None = None
-) -> list:
-    """Rows (header first) for the 'Coverage Audit' XLSX sheet. Never raises.
-
-    Two invariants this sheet MUST preserve:
-      * a lexical-fallback run reports NO percentage (the TF-IDF scale does not
-        support one) — the cells say SUPPRESSED and name the fix;
-      * prompt truncation is a first-class row, never folded into the gap list."""
-    try:
-        if not coverage and not audit and not items:
-            return []
-        cov = coverage or {}
-        degraded = bool(cov.get("degraded"))
-        suppressed = "SUPPRESSED — lexical fallback (set QA_EMBEDDINGS_BACKEND)"
-        rows: list = [["Metric", "Value"]]
-        if cov:
-            presented = cov.get("presented_items", cov.get("total_items", 0))
-            not_presented = cov.get("not_presented_item_ids") or []
-            rows += [
-                ["Requirements total", cov.get("total_items", 0)],
-                ["Requirements presented to the generator", presented],
-                [
-                    "Requirements NOT PRESENTED (prompt cap; excluded from %)",
-                    len(not_presented),
-                ],
-                ["Requirements traced", len(cov.get("covered_item_ids") or [])],
-                [
-                    "Coverage % (of presented)",
-                    suppressed
-                    if degraded
-                    else f"{float(cov.get('coverage_pct', 0.0)):.1f}%",
-                ],
-                [
-                    "Gaps (NOT COVERED)" + (" — UNRELIABLE" if degraded else ""),
-                    len(cov.get("gap_item_ids") or []),
-                ],
-                [
-                    "Gap rate",
-                    suppressed
-                    if degraded
-                    else f"{float(cov.get('gap_rate', 0.0)):.1f}%",
-                ],
-                ["Test cases total", cov.get("total_cases", 0)],
-                [
-                    "Orphans (REVIEW_REQUIRED)" + (" — UNRELIABLE" if degraded else ""),
-                    len(cov.get("orphan_tc_ids") or []),
-                ],
-                [
-                    "Orphan rate",
-                    suppressed
-                    if degraded
-                    else f"{float(cov.get('orphan_rate', 0.0)):.1f}%",
-                ],
-                ["Matcher tier", cov.get("tier_used", "")],
-            ]
-            counts = cov.get("confidence_counts") or {}
-            for bucket in ("HIGH", "MEDIUM", "LOW"):
-                rows.append([f"Matches — {bucket}", counts.get(bucket, 0)])
-            for note in cov.get("notes") or []:
-                rows.append(["Matcher note", note])
-            for nid in not_presented:
-                # A MANDATED line (rule-pack `RP-*`) that did not fit means a
-                # standing rule was not enforced this run. Lumping it in with a
-                # ticket requirement that did not fit hid exactly that.
-                label = (
-                    "MANDATED RULE NOT PRESENTED (rule not enforced this run)"
-                    if str(nid).startswith("RP-")
-                    else "NOT PRESENTED TO GENERATOR"
-                )
-                rows.append([label, nid])
-            # In lexical fallback these two lists are the WORKLIST a tester
-            # acts on, and they are wrong often enough to matter: measured 1
-            # false gap + 1 false orphan on a 5-item set where every case
-            # matched exactly one requirement. Suppressing the rates while
-            # printing these as bare fact sent the tester to write a test that
-            # already existed. The rows stay -- they are just labelled.
-            gap_label = "NOT COVERED" + (
-                " (UNRELIABLE — lexical fallback; may already be covered)"
-                if degraded
-                else ""
-            )
-            orphan_label = "REVIEW_REQUIRED (orphan test)" + (
-                " (UNRELIABLE — lexical fallback; may in fact be traced)"
-                if degraded
-                else ""
-            )
-            for gid in cov.get("gap_item_ids") or []:
-                rows.append([gap_label, gid])
-            for tid in cov.get("orphan_tc_ids") or []:
-                rows.append([orphan_label, tid])
-        if audit:
-            rows.append(["Decomposition granularity score", audit.get("score", "")])
-            for w in audit.get("warnings") or []:
-                rows.append(["Decomposition warning", w])
-        for caveat in provenance_caveats(items or []):
-            rows.append(["Provenance caveat", caveat.replace("**", "")])
-        rows.append(["Honesty boundary", HONESTY_BOUNDARY.strip("_")])
-        return rows
-    except Exception:
-        logger.exception("coverage_rows failed — omitting the sheet")
         return []
 
 
@@ -1037,8 +794,7 @@ def granularity_warning_section(audit: dict | None) -> str:
             "The atomic checklist scored "
             f"{audit.get('score', 0)} on the granularity check "
             f"({audit.get('item_count', 0)} items) — below the configured "
-            "threshold. The coverage tally below is still computed, but read it "
-            "with these caveats:",
+            "threshold. Read the checklist above with these caveats:",
         ]
         lines += [f"- {w}" for w in warnings]
         return "\n".join(lines)

@@ -1817,7 +1817,7 @@ def build_server():
     @mcp.tool(name="qa-doctor")
     async def qa_doctor(ctx: Context, fix: bool = False) -> str:
         """Check whether THIS machine is ready: overall verdict, environment,
-        integrations (Jira/Atlassian, embeddings), CLI tooling (adb/xcrun),
+        integrations (Jira/Atlassian), CLI tooling (adb/xcrun),
         enabled features and action items. It reports NO model backend --
         there is none: every generative step runs in YOUR chat model.
         Read-only by default (2026-09-25): pass fix=true to let it repair what
@@ -2105,16 +2105,6 @@ def main() -> None:
     # `except` around it is exactly why this had to be deleted deliberately
     # rather than left to fail silently.
     threading.Thread(target=_drift_watch, daemon=True).start()
-    # Warm the (optional) local embeddings model off the serving path too --
-    # see tools/embeddings.warm_local_model_background. Guarded the same way
-    # as the disclosure above: an absent optional dependency must never block
-    # or crash startup.
-    try:
-        from tools.embeddings import warm_local_model_background
-
-        warm_local_model_background()
-    except Exception:  # pragma: no cover - a warm-up must never block boot
-        logger.debug("embeddings warm-up unavailable", exc_info=True)
     logger.info("Starting the qa-agents MCP server over stdio…")
     server.run(show_banner=False)
 
