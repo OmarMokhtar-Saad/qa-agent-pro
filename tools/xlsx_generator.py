@@ -249,9 +249,11 @@ def cleanup_temp_files(max_age_seconds: int = 3600) -> int:
 
 
 def _write_checklist_sheets(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
-    """Append the 'Requirements Checklist' and 'Coverage Audit' sheets when the
-    suite carries ``_checklist_artifacts`` (unconditional since 2026-08-14 --
+    """Append the 'Requirements Checklist' sheet when the suite carries
+    ``_checklist_artifacts`` (unconditional since 2026-08-14 --
     QA_ATOMIC_CHECKLIST_ENABLED was deleted and the checklist hardcoded ON).
+
+    A plain list of the parsed requirements.
 
     No-op when absent, so the workbook is byte-identical for a suite that
     carried no checklist.
@@ -265,12 +267,9 @@ def _write_checklist_sheets(workbook: xlsxwriter.Workbook, suite: TestSuite) -> 
         from tools.atomic_checklist import (
             checklist_from_dicts,
             checklist_rows,
-            coverage_rows,
         )
 
         items = checklist_from_dicts(artifacts.get("items") or [])
-        coverage = artifacts.get("coverage") or {}
-        audit = artifacts.get("audit") or {}
         header_fmt = workbook.add_format(
             {
                 "bold": True,
@@ -284,10 +283,7 @@ def _write_checklist_sheets(workbook: xlsxwriter.Workbook, suite: TestSuite) -> 
         cell_fmt = workbook.add_format(
             {"border": 1, "valign": "top", "text_wrap": True}
         )
-        for name, rows in (
-            ("Requirements Checklist", checklist_rows(items, coverage)),
-            ("Coverage Audit", coverage_rows(coverage, audit, items)),
-        ):
+        for name, rows in (("Requirements Checklist", checklist_rows(items)),):
             if not rows:
                 continue
             try:
@@ -335,19 +331,7 @@ def _write_rtm_sheet(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
         rows = (artifacts or {}).get("rows") or []
         if not rows:
             return
-        # C1/C2 (SHYJ-5138): reconcile this sheet's DECLARED-LINK percentage with
-        # the 'Coverage Audit' sheet's SIMILARITY-MATCHED figure, and name a
-        # degraded matcher HERE -- next to the number a tester actually reads.
-        # The live run printed an unqualified "4 of 4 ... (100%)" here while that
-        # sheet suppressed every percentage it had. Done at render time because
-        # this is the only place holding both artifacts, and it leaves rtm_rows'
-        # output byte-identical. See tools.rtm.reconcile_coverage_rows.
-        from tools.rtm import reconcile_coverage_rows
-
-        rows = reconcile_coverage_rows(
-            rows,
-            (getattr(suite, "_checklist_artifacts", None) or {}).get("coverage"),
-        )
+        # rtm_rows' output is rendered as-is.
         header_fmt = workbook.add_format(
             {
                 "bold": True,

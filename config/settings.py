@@ -704,19 +704,6 @@ class Settings(BaseSettings):
     # 0 = unlimited (default).
     qa_rag_max_entries: int = 0
 
-    # --- Semantic embeddings (opt-in; default disabled) --------------------
-    # Optional embedding backend powering semantic dedup + vector RAG ranking.
-    #   ""       : disabled (default) — zero cost, no optional import.
-    #   "local"  : sentence-transformers (extra: pip install -e ".[embeddings]").
-    #   "voyage" : Voyage AI over httpx (needs VOYAGE_API_KEY; no new hard dep).
-    # tools/embeddings.py degrades gracefully (never-raise) when the backend or
-    # its dependency/key is missing.
-    qa_embeddings_backend: str = ""
-    # Model id override. Empty uses the backend default (local ->
-    # all-MiniLM-L6-v2, voyage -> voyage-3).
-    qa_embeddings_model: str = ""
-    # Voyage API key (voyage backend). .env only; falls back to $VOYAGE_API_KEY.
-    voyage_api_key: str = ""
     # QA_SEMANTIC_DEDUP_THRESHOLD stood here until 2026-08-30 (audit G3). It was
     # the cosine cut-off for intra-suite semantic dedup -- a path hardcoded OFF
     # on 2026-08-13, so the field's only reader sat behind
@@ -729,13 +716,11 @@ class Settings(BaseSettings):
     # (flag-surface reduction, batch 7 (needs-config)):
     # QA_SEMANTIC_DEDUP_ENABLED was DELETED and hardcoded OFF, so
     # agents.test_scenario_agent.semantic_dedup_enabled() returns the False
-    # constant and the generation pipeline never merges cases on embedding
-    # similarity. QA_EMBEDDINGS_BACKEND survives and still powers vector RAG
-    # ranking -- which is exactly the separation this gate existed to protect,
-    # now enforced in code rather than by a second .env line. OFF is also the
-    # SAFE direction: this was the one gate in the batch whose ON state DROPS
-    # generated cases. The threshold that stood above it was deleted on
-    # 2026-08-30; the revival path keeps its 0.9 as a module constant.
+    # constant and the generation pipeline never merges cases on similarity.
+    # OFF is also the SAFE direction: this was the one gate in the batch whose
+    # ON state DROPS generated cases. The threshold that stood above it was
+    # deleted on 2026-08-30; the revival path keeps its 0.9 as a module
+    # constant.
 
     # --- Atomic Requirements Checklist (Batch 2) --------------------------
     # QA_ATOMIC_CHECKLIST_ENABLED was DELETED on 2026-08-14 (flag-surface
@@ -751,24 +736,14 @@ class Settings(BaseSettings):
     #           CHECKLIST_JOB / step 0d, so it costs this server NO LLM call.
     #   Pass 2  the 8-category fan-out with that checklist injected as its OWN
     #           untrusted, CLUSTERED block (constraint-decay mitigation).
-    #   Pass 3  tools/rtm.match_checklist -> a DETERMINISTIC EXTERNAL matcher
-    #           that recomputes coverage instead of trusting the generating
-    #           model's self-assigned requirement_id. Falls back to the
-    #           lexical tier when no embeddings backend is configured, so a
-    #           bare install degrades rather than fails.
+    #   Pass 3  tools/rtm.rtm_trace -> deterministic requirement_id
+    #           traceability: a generated case counts as tracing a
+    #           requirement only by naming its requirement_id (no
+    #           similarity scoring, no matcher). A requirement_id with no
+    #           tracing case is reported as an orphaned requirement.
     # The named seam is tools/atomic_checklist.checklist_enabled(), a True
     # constant, and tests/conftest.py pins it False suite-wide -- unpinned,
     # every generation test would decompose and make a real ask_json call.
-    #
-    # QA_CHECKLIST_NLI_ENABLED (tier b: ONE batched entailment judgement over
-    # the ambiguous similarity band) and QA_CHECKLIST_ADJUDICATE_ENABLED
-    # (tier c: a final adjudication over ONLY the pairs tier b left "unsure")
-    # were DELETED the same day and hardcoded OFF -- their own code defaults
-    # and the value .env.example shipped. The ambiguous band is reported as
-    # uncovered, which is what every install already did. Both are retained
-    # behind tools/rtm._nli_tier_enabled() / _adjudicate_tier_enabled(), and
-    # tools/rtm's degradation note still fires under a revived seam so a
-    # revival cannot silently ship an undisclosed degraded measurement.
     # See docs/FEATURE_FLAGS.md.
     # QA_CHECKLIST_REMEDIATION_ENABLED was DELETED on 2026-08-14
     # (flag-surface reduction, batch 8b) and the behaviour hardcoded OFF --
@@ -782,26 +757,6 @@ class Settings(BaseSettings):
     # branch is retained and
     # agents.test_scenario_agent.checklist_remediation_enabled() is the named
     # seam -- a revival is one line there. See docs/FEATURE_FLAGS.md.
-    # Embedding-cosine bands. score >= high -> HIGH-confidence match;
-    # low <= score < high -> the ambiguous band, REPORTED AS UNCOVERED since
-    # 2026-08-14 (tiers (b)/(c) are False seams, so nothing is handed to them);
-    # score < low -> no match. Thresholds are dataset-dependent (TraceLLM tunes
-    # 0.01..1.0 per domain against labelled ground truth); these are
-    # conservative project-level defaults, NOT tuned optima. The lexical TF-IDF
-    # fallback uses its own fixed constants in tools/rtm.py because its scores
-    # live on a different scale.
-    qa_checklist_match_high: float = 0.75
-    # 2026-08-31 (F6): scores in [medium, high) were reported as UNCOVERED
-    # because the two LLM re-judging tiers that owned that band were deleted
-    # on 2026-08-16 and nothing replaced them. Measured on suite
-    # ff45816692044c4a: 10 of 17 items were called gaps and at least 6 were
-    # near-verbatim matches -- "send the objection request and comment to
-    # Seha" against "Objection request and comment are sent to Seha on
-    # successful submission" -- while every match that DID land scored
-    # 0.75..0.80, i.e. the true matches lived right under the cut-off. The
-    # band is now reported as MEDIUM-confidence links that COUNT as covered,
-    # and every renderer prints the confidence so a weak link stays visible.
-    qa_checklist_match_medium: float = 0.62
     # Phase-0 granularity gate. Below this the decomposition is reported as
     # probably inflated / under-split -- ADVISORY only, it never blocks
     # generation (house rule: log and degrade).
@@ -1011,13 +966,14 @@ class Settings(BaseSettings):
     # whether the reported groups are ACTED on is still the opt-in sub-flag
     # below. See docs/FEATURE_FLAGS.md -> "Changelog 2026-08-12".
     # Sub-flag: actually REMOVE the non-keeper members of each reported group.
-    # Default OFF, and deliberately ASYMMETRIC with the embedding-based semantic
-    # dedup path (which does remove -- itself hardcoded OFF on 2026-08-13,
-    # flag-surface reduction batch 7): that path drops on a NUMERIC cosine >=
-    # qa_semantic_dedup_threshold over a fixed payload, with a protected-id list
-    # and the NB-016 sole-tracer rescue. A host model's free-form judgement has no
-    # threshold and no calibrated precision, and -- unlike an embedding computed
-    # server-side -- it arrives as UNTRUSTED input. The realistic threat is NOT an
+    # Default OFF, and deliberately ASYMMETRIC with the semantic dedup path
+    # (which does remove -- itself hardcoded OFF on 2026-08-13, flag-surface
+    # reduction batch 7, retained-for-revival): that path would drop on a
+    # NUMERIC cosine >= the 0.9 module constant over a fixed payload, with a
+    # protected-id list and the NB-016 sole-tracer rescue. A host model's
+    # free-form judgement has no threshold and no calibrated precision, and --
+    # unlike a deterministic score computed server-side -- it arrives as
+    # UNTRUSTED input. The realistic threat is NOT an
     # untrustworthy host model: it is injected content inside the _GUARD-wrapped
     # Jira/comment text that host mode deliberately places in the host's own
     # context. So this path is DESTRUCTIVE + attacker-influenced and is bounded by
@@ -1244,15 +1200,13 @@ class Settings(BaseSettings):
 
     @field_validator(
         "qa_rag_similarity_threshold",
-        "qa_checklist_match_high",
-        "qa_checklist_match_medium",
         "qa_checklist_min_granularity",
         mode="before",
     )
     @classmethod
     def _coerce_checklist_float(cls, v: object, info) -> float:
-        """Lenient, never-raising float coercer for the Batch-2 checklist bands
-        and the RAG similarity threshold.
+        """Lenient, never-raising float coercer for the checklist granularity
+        gate and the RAG similarity threshold.
 
         QA_RAG_SIMILARITY_THRESHOLD joined this group rather than
         keeping its own validator, which had no range check at all.

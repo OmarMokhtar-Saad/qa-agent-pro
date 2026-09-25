@@ -1543,8 +1543,8 @@ def summary_budget(sections: list[ReplySection], header_len: int) -> int:
     *sections* must be EVERY section of the reply except the one the summary
     sits in -- including the ones appended after it, which the round-2 review
     caught this missing: `cap_note` is added at the assemble call and was never
-    counted, so the reply over-ran the cap by its length on the max-gap-round
-    path. Pass the whole list; the only thing left out is the suite block.
+    counted, so the reply over-ran the cap by its length. Pass the whole list;
+    the only thing left out is the suite block.
 
     Clamped into [_SUMMARY_FLOOR, _SUMMARY_CAP], so this can only ever be
     STRICTER than the cap that shipped, never looser: a reply with few notes
@@ -5089,12 +5089,10 @@ def _host_mode_server_llm_notice(
             "per-category route, in the finalize review sidecar). This server "
             "assigns every `CL-NNN` id and labels the result MODEL-DERIVED. "
             "**You will have authored both the requirement set and the test "
-            "cases, so you control the denominator of the coverage tally** -- "
-            "this server's DETERMINISTIC coverage matcher and its pure-Python "
-            "granularity audit still run over your list and are the only "
-            "independent checks left. Omit the field and the suite finalizes "
-            "with NO requirement coverage tally: nothing is decomposed to fill "
-            "the gap."
+            "cases.** This server's pure-Python granularity audit still runs "
+            "over your list and is the only independent check left. Omit the "
+            "field and the suite finalizes with no requirement checklist at "
+            "all: nothing is decomposed to fill the gap."
         )
     # ...and the ONE accepted capability narrowing that rides with it, claimed
     # only when a rule pack actually mandated a line that is now falling back to
@@ -5107,7 +5105,7 @@ def _host_mode_server_llm_notice(
             "they run in **prompt + advisory** mode: the mandated lines still "
             "reach your generation prompt and the advisory rule-pack report is "
             "still rendered, but they are NOT interleaved into the checklist, "
-            "so no coverage tally scores them. Cover them anyway -- nothing "
+            "so nothing checks them against the suite. Cover them anyway -- nothing "
             "downstream will tell you if you did not."
         )
     return "\n".join(lines)
@@ -6167,34 +6165,6 @@ async def handle_prepare_test_cases(
         # all (source_acs is non-empty and nothing was synthesized either way).
         _ac_job = bool(_host_ac and not prepared.source_acs and not prepared.acs)
 
-        # Phase 3b: the checklist entailment/adjudication tiers. NOT a job --
-        # no payload key, no instruction clause, no return field -- just a
-        # decision taken HERE, at prepare time, and STAMPED.
-        #
-        # 2026-08-14 (batch 8b-ii): QA_CHECKLIST_NLI_ENABLED and
-        # QA_CHECKLIST_ADJUDICATE_ENABLED were DELETED and hardcoded OFF, and
-        # tools/rtm's two tier seams are False constants, so there is no tier
-        # left to suppress and this is constantly False. False is the
-        # SEMANTICALLY correct value, not merely the convenient one: nothing
-        # is being suppressed when the tier no longer exists, and a True stamp
-        # would announce a suppression that could not have happened.
-        #
-        # The stamp itself SURVIVES (see the meta writes below and the
-        # meta.get read at submit). Dropping it would make submit read None
-        # -- the same value, but silently by ABSENCE rather than by decision.
-        # It also keeps host_suppress_llm_tiers=False exercising the
-        # belt-and-braces path whenever a test revives a tier seam.
-        #
-        # !! REVIVAL HAZARD, read before flipping a tier seam back on. This
-        # literal REPLACED the CORRECTION 5 widening, and it is safe ONLY
-        # because tools/rtm's two seams are False constants. The stamp is read
-        # back at submit as host_suppress_llm_tiers and becomes
-        # allow_llm_tiers=not <stamp>, so with it constant False a revived tier
-        # would fire its ask_json SERVER-SIDE on a host submit -- exactly the
-        # failure CORRECTION 5 widened this to prevent. Reviving
-        # _nli_tier_enabled or _adjudicate_tier_enabled therefore REQUIRES
-        # re-widening this expression, not just flipping the seam.
-        _nli_suppress = False
 
         # Residue R4: the ONE capability narrowing this fold accepts, and the
         # TESTER -- not only the ledger and docs/FEATURE_FLAGS.md -- has to be
@@ -6204,7 +6174,7 @@ async def handle_prepare_test_cases(
         # non-empty; with the decomposition boomeranged it is empty at that
         # line, so the packs fall back to PROMPT + ADVISORY mode -- the mandated
         # lines still reach the generator and the advisory report still renders,
-        # but no coverage tally scores them. Disclosed ONLY when a pack actually
+        # but nothing checks them against the suite. Disclosed ONLY when a pack actually
         # mandated a line AND the fallback really happened: announcing a
         # narrowing that could not have occurred is the same over-claim class
         # the _boomeranged set exists to prevent. Never raises -- a disclosure
@@ -6338,13 +6308,6 @@ async def handle_prepare_test_cases(
                 # is byte-identical to today's.
                 "host_image_preflight": bool(_img_preflight),
                 "host_image_require_relevant": bool(_img_require),
-                # Phase 3b: whether THIS prep suppresses the server-side
-                # checklist entailment/adjudication tiers at finalize. Same
-                # mid-flow-flip rule; submit reads this stamp, never the live
-                # flags. Gated on this prep HAVING a checklist -- which since
-                # residue R4 means either one the SERVER decomposed or one the
-                # host will return via CHECKLIST_JOB.
-                "host_nli_suppressed": bool(_nli_suppress),
                 # Residue R4: whether THIS prep handed the requirement
                 # decomposition to the host, so submit knows whether to expect
                 # a `checklist_items` field. Same mid-flow-flip rule as above:
@@ -6483,7 +6446,6 @@ async def handle_prepare_test_cases(
                 "captured_image_read": _captured,
                 "carried_forward_capture_count": len(_carried_ids),
                 "image_carry_ack": bool(image_carry_ack),
-                "host_nli_suppressed": bool(_nli_suppress),
                 "host_checklist_job": bool(_checklist_job),
             },
         )
@@ -7195,68 +7157,6 @@ def assemble_prepare_payload(
 # before it reaches a spreadsheet cell).
 # --------------------------------------------------------------------------- #
 
-# Hard bound on host-mode gap/remediation rounds so a host cannot ping-pong
-# forever. Each qa_submit_suite call performs EXACTLY ONE round (there is NO
-# server-side while loop -- driving the fan-out from the tester's chat is the
-# whole point of host mode). The round counter lives in the prep envelope's
-# meta.round and is bumped via prep_store.update_prep, which preserves created_at
-# so a looping host cannot extend the prep TTL by resubmitting.
-_MAX_GAP_ROUNDS = 3
-
-
-class _CoverageView:
-    """Attribute adapter over the coverage DICT stored at
-    ``suite._checklist_artifacts['coverage']`` (produced by rtm.coverage_to_dict),
-    so host_mode.build_gap_response and rtm.checklist_tally_line -- which read
-    ATTRIBUTES off a ChecklistCoverage -- work against the persisted dict without
-    any agent edit. A non-empty coverage dict only exists when the deterministic
-    matcher actually ran, so ``ran`` is True; any attribute a reader expects but
-    the dict omits falls back to a safe empty default."""
-
-    _DEFAULTS = {
-        "ran": True,
-        "total_items": 0,
-        "presented_items": 0,
-        "total_cases": 0,
-        "links": [],
-        "covered_item_ids": [],
-        "gap_item_ids": [],
-        "not_presented_item_ids": [],
-        "orphan_tc_ids": [],
-        "confidence_counts": {},
-        "coverage_pct": 0.0,
-        "gap_rate": 0.0,
-        "orphan_rate": 0.0,
-        "tier_used": "",
-        "degraded": False,
-        "notes": [],
-    }
-
-    def __init__(self, d: dict) -> None:
-        self._d = dict(d or {})
-
-    def __getattr__(self, name: str):
-        d = object.__getattribute__(self, "_d")
-        if name in d:
-            return d[name]
-        defaults = _CoverageView._DEFAULTS
-        if name in defaults:
-            return defaults[name]
-        raise AttributeError(name)
-
-
-def _coverage_view(suite) -> "_CoverageView | None":
-    """A _CoverageView over the suite's stored coverage dict, or None when no
-    matcher coverage was attached (no checklist configured, or the matcher did
-    not run). None means "no deterministic gaps to boomerang" -> finalize."""
-    artifacts = getattr(suite, "_checklist_artifacts", None)
-    if not isinstance(artifacts, dict):
-        return None
-    cov = artifacts.get("coverage")
-    if not cov or not isinstance(cov, dict):
-        return None
-    return _CoverageView(cov)
-
 
 def _rtm_trace_detail(suite) -> dict:
     """The Step 0 traceability counts, flattened for an audit detail dict.
@@ -7394,9 +7294,8 @@ def _no_coverage_signal_note(view: object) -> str:
     left an 8-case suite able to pass with zero quality signal AND zero
     disclosure. This does not run the critic; it says that none ran.
 
-    SILENT whenever the deterministic matcher DID produce a coverage view
-    (`view is not None` -- _coverage_view only builds one when the matcher
-    actually produced coverage).
+    SILENT only when a caller passes a non-None ``view``. handle_submit_suite
+    builds no coverage view, so on the submit path it always fires.
 
     ALWAYS-ON IS THE INTENT, not an oversight (review W2). A disclosure that
     fired only on small suites would be worse than none: its ABSENCE would
@@ -7404,10 +7303,9 @@ def _no_coverage_signal_note(view: object) -> str:
     batch exists to stop.
 
     2026-08-14 (batch 8b-ii): QA_ATOMIC_CHECKLIST_ENABLED was DELETED and the
-    checklist hardcoded ON, which INVERTS how often this fires. It used to be
-    the standing truth about every suite a default install produced; now a
-    coverage view is normally present and this note marks the exception --
-    a submission that returned no checklist_items, so nothing was matched.
+    checklist hardcoded ON, which INVERTS how often this fires. No requirement
+    matching runs on this server, so it is the standing truth about every
+    suite.
     Never raises."""
     try:
         if view is not None:
@@ -7415,13 +7313,10 @@ def _no_coverage_signal_note(view: object) -> str:
         return (
             "> \u2139\ufe0f  **No automated coverage critique ran on this "
             "suite.** The server-side critic is a model call this chat-only path "
-            "does not make, and no deterministic requirement checklist was "
-            "matched either -- so the generation-volume floor is the ONLY "
+            "does not make, and no requirement matching runs on this server "
+            "either -- so the generation-volume floor is the ONLY "
             "quantitative gate this suite passed. Read the cases against the "
-            "requirements yourself before signing them off. (The requirement "
-            "checklist itself is unconditional -- this suite carries no "
-            "coverage tally because no `checklist_items` came back with it, "
-            "and nothing is decomposed to fill that gap.)\n\n"
+            "requirements yourself before signing them off.\n\n"
         )
     except Exception:  # pragma: no cover - a disclosure must never raise
         logger.debug("_no_coverage_signal_note failed", exc_info=True)
@@ -8479,13 +8374,11 @@ def _image_relevance_gate(
         off = host_mode.off_topic_images(result)
         if counts.get("ran") and not counts.get("no"):
             return "", ""
-        # Review H1: a gap-remediation resubmit is asked to fix CASES, not to
-        # resend `image_descriptions` -- host_mode.build_gap_response never
-        # mentions the field, so an ABSENT field on a later round means "the
-        # server did not ask for it", NOT "the check was forfeited". Refusing
-        # there would reject a suite THIS gate had already passed in round 0.
-        # The round that DID answer stamps `image_relevance_seen` (see the
-        # gap-round block in handle_submit_suite) -- the same carry-forward
+        # Review H1: a resubmit is not asked to resend `image_descriptions`,
+        # so an ABSENT field on a later submit means "the server did not ask
+        # for it", NOT "the check was forfeited". Refusing there would reject
+        # a suite THIS gate had already passed. The submit that DID answer
+        # stamps `image_relevance_seen` -- the same carry-forward
         # discipline as serialize_adopted_state and the carried checklist
         # beside it. Only ABSENCE is forgiven: a verdict that IS resent is
         # judged normally, so a fresh `no` on a later round still refuses.
@@ -9829,9 +9722,8 @@ async def handle_submit_suite(
     progress: ProgressCb = None,
 ) -> str:
     """BACK half of host-mode generation: validate the host-generated suite,
-    finalize it deterministically, and return EITHER a gap report to fix and
-    resubmit (SAME prep_id) OR the finished suite + export path. Performs EXACTLY
-    ONE gap round per call. Never raises."""
+    finalize it deterministically, and return EITHER a refusal to fix and
+    resubmit (SAME prep_id) OR the finished suite + export path. Never raises."""
     dispatch_guard.require_dispatched("qa_submit_suite")
     # UNTRUSTED at every one of these entry points: the id is whatever the
     # host sent, and it is echoed back in refusals and next-step
@@ -9906,10 +9798,6 @@ async def handle_submit_suite(
             )
         except Exception:
             logger.debug("prep version check failed", exc_info=True)
-        try:
-            round_no = int(meta.get("round", 0) or 0)
-        except (TypeError, ValueError, OverflowError):
-            round_no = 0
 
         # CONFLICT RULE (item 4): a non-empty suite_json is AUTHORITATIVE and any
         # accumulated per-category rows are ignored (the reply says how many were
@@ -10100,11 +9988,9 @@ async def handle_submit_suite(
                 # parse_host_suite with no checklist at all, raw_checklist_items
                 # stayed None, extract_host_checklist returned ran=False, and
                 # the reply told the tester the submission "carried no usable
-                # checklist_items field" -- while the host HAD sent one. Worse,
-                # _nli_suppress is already stamped True on such a prep, so the
-                # server-side tools/rtm.py tiers are off too: the staged route
-                # would have finished with NO requirement coverage measurement
-                # of any kind, silently. Keyed off the prep's META STAMP, with
+                # checklist_items field" -- while the host HAD sent one, and
+                # the staged route finished with no requirements checklist at
+                # all, silently. Keyed off the prep's META STAMP, with
                 # the same present-but-empty discipline as every field above.
                 # Deliberately NO id remap: CL-NNN ids are assigned server-side
                 # in extract_host_checklist and are never tc_ids, so 3a's
@@ -10309,9 +10195,8 @@ async def handle_submit_suite(
             # TWO-BEAT ack (the image gate's pattern): mark the prep as refused
             # so that a LATER volume_floor_ack is honoured, while an ack sent on
             # the FIRST submit -- which the tester cannot have seen these
-            # numbers for -- is refused and told so. Non-fatal, the same
-            # discipline as the gap round's update_prep: an unpersisted mark
-            # only means the next ack is refused again.
+            # numbers for -- is refused and told so. Non-fatal: an unpersisted
+            # mark only means the next ack is refused again.
             try:
                 _mark = await prep_store.update_prep(
                     prep_id,
@@ -10584,12 +10469,7 @@ async def handle_submit_suite(
         # submission -- no extra round trip and no server-side LLM call -- and
         # is UNTRUSTED, so host_mode.extract_host_checklist shape-validates it,
         # strips URLs, caps it and ASSIGNS every CL-NNN id before anything reads
-        # it. Adopted onto `prepared` so _finalize_generation's deterministic
-        # Pass-3 matcher and the XLSX sheets read it unchanged.
-        #
-        # ORDERING IS LOAD-BEARING and is pinned by a test: this block must run
-        # BEFORE the _nli_suppressed re-check further down (which asks whether a
-        # checklist exists at all).
+        # it. Adopted onto `prepared` so the XLSX sheets read it unchanged.
         #
         # presented_ids is EVERY returned id: the host had the whole list in its
         # own context, so the QA_CHECKLIST_MAX_PROMPT_CHARS "NOT PRESENTED TO
@@ -10611,14 +10491,10 @@ async def handle_submit_suite(
             )
             _cl_audit: dict = {}
             # CARRIED FORWARD (residue R4, review iteration 3): what this prep
-            # already holds. On round 0 this is empty by construction -- the
-            # server made no decomposition call. On a gap-remediation ROUND 2+
-            # it is the checklist the host sent on round 0, which the remediation
-            # branch below now persists back into the envelope: the host is not
-            # told to resend the field on a resubmit and reasonably does not, so
-            # without this the entire remediation loop -- whose only purpose is
-            # closing requirement-coverage gaps -- would finalize with NO
-            # coverage tally at all.
+            # already holds from an earlier submit of the SAME prep_id. The host
+            # is not told to resend `checklist_items` on a resubmit and
+            # reasonably does not, so without this a resubmit would finalize
+            # with no requirement checklist at all.
             _cl_carried = len(list(getattr(prepared, "checklist_items", None) or []))
             if _cl_result.ran:
                 _cl_audit = audit_granularity(_cl_result.items)
@@ -10637,7 +10513,7 @@ async def handle_submit_suite(
                 _cl_result, _cl_audit, carried=(0 if _cl_result.ran else _cl_carried)
             )
             # A carried-forward list is NOT a gap: the requirements are still in
-            # force and the coverage tally still ran over them.
+            # force and the traceability report still reads them.
             checklist_gap = not _cl_result.ran and not _cl_carried
         # The image job's return field. This server described NOTHING itself on
         # this prep -- no ask_vision at all -- so the host's own multimodal model
@@ -10751,39 +10627,6 @@ async def handle_submit_suite(
                     },
                 )
                 img_note += _imd
-        # Phase 3b: the checklist entailment (b) / adjudication (c) tiers.
-        # Nothing comes BACK from the host for these -- they are not folded,
-        # they are DISABLED on this path (ledger id `rtm.nli_verdicts`), because
-        # their only value is a SECOND opinion from a model that did not write
-        # the cases, and their verdicts enter the deterministic coverage
-        # measurement rather than a labelled review section. So the whole wiring
-        # is one boolean threaded into finalize plus this disclosure. Keyed off
-        # the prep's meta stamp for the same mid-flow-flip reason as the two
-        # folds above. Prepare already refuses to stamp a prep with no
-        # checklist, so the checklist_items re-check below is belt-and-braces
-        # for an OLD envelope written before that gate existed (and for the same
-        # honesty reason: with no checklist the tiers could never have fired, so
-        # claiming a suppression would be its own over-claim).
-        _nli_suppressed = bool(meta.get("host_nli_suppressed"))
-        nli_note = ""
-        if _nli_suppressed and list(getattr(prepared, "checklist_items", None) or []):
-            nli_note = (
-                "> \u2139\ufe0f  The OPTIONAL checklist **entailment / "
-                "adjudication** tiers did **not** run: they are retired and no "
-                "submit of any kind can reach them. Requirement coverage "
-                "below is the DETERMINISTIC matcher's own measurement, so the "
-                "ambiguous similarity band is reported as uncovered instead of "
-                "being re-judged -- you may see MORE gaps than with those tiers "
-                "on. They were deliberately not handed to your chat model: you "
-                "wrote these cases, so your verdict on them is not an "
-                "independent second opinion, and unlike the reviews above it "
-                "would enter the measurement itself. "
-                "There is no host analog: the host-reviewed coverage review "
-                "that once filled that role was deleted on 2026-08-12. (The "
-                "same disclosure is written into the checklist coverage notes, "
-                "so it survives into the export.)"
-                "\n\n"
-            )
         # Piece 1: the host's OPTIONAL cross-category duplicate review. It rode in
         # on THIS submission -- no extra round trip and no server-side LLM call --
         # and its SHAPE was validated against the submitted tc_ids inside
@@ -10964,10 +10807,6 @@ async def handle_submit_suite(
             # it. There is no argument left to pass and no call left to avoid. The
             # qa_feature_analysis TOOL is untouched and still produces a report;
             # it is chat-only.
-            # Phase 3b: True stops _finalize_generation's ONE remaining
-            # match_checklist call from firing tiers (b)/(c). False (an
-            # unstamped prep) is byte-identical to today.
-            host_suppress_llm_tiers=_nli_suppressed,
         )
         suite = captured.get("suite")
         if suite is None or not getattr(suite, "test_cases", None):
@@ -11004,8 +10843,8 @@ async def handle_submit_suite(
         # FINAL merged+renumbered suite rather than `all_cases`, because the
         # duplicate-title signal only means anything after the merge and the
         # tc_ids it prints must be the ids the tester reads in the export.
-        # Placed HERE -- after _finalize_generation, BEFORE the gap round, the
-        # persist, the export and the finalized stamp -- so a refusal costs one
+        # Placed HERE -- after _finalize_generation, BEFORE the persist, the
+        # export and the finalized stamp -- so a refusal costs one
         # round trip and destroys nothing: the prep and every staged category row
         # survive, no remediation round is consumed and nothing is written.
         # Two-beat, exactly like volume_floor_ack / step_assertion_ack: an ack on
@@ -11097,134 +10936,9 @@ async def handle_submit_suite(
                 agreements=dup_agreements,
             )
 
-        # GAP ROUND (items 3 + 7): gaps come ONLY from the deterministic matcher.
-        # A degraded coverage view (no QA_EMBEDDINGS_BACKEND) NEVER enters the loop
-        # -- build_gap_response's own UNRELIABLE caveat stands and the suite is
-        # finalized. The loop is bounded by _MAX_GAP_ROUNDS and runs at most ONE
-        # round per call. It is additionally gated on the remediation flag; see the
-        # plan's "server-side remediation interaction" note.
-        view = _coverage_view(suite)
-        cap_note = ""
-        # The seam is imported at CALL time, not module level: mcp_handlers
-        # uses `from agents.test_scenario_agent import ...` at line 49, and a
-        # module-level from-import would bind the constant once and silently
-        # ignore a revival (or a test's patch) of the single seam. This is
-        # batch 8a's Decision-5 hazard, avoided rather than re-fixed.
-        from agents.test_scenario_agent import checklist_remediation_enabled
-
-        if (
-            checklist_remediation_enabled()
-            and view is not None
-            and not view.degraded
-            and view.gap_item_ids
-        ):
-            if round_no < _MAX_GAP_ROUNDS:
-                new_env = dict(envelope)
-                new_meta = dict(meta)
-                new_meta["round"] = round_no + 1
-                # Batch 4 (review H1): carry the IMAGE-VERDICT OUTCOME
-                # into the next round. build_gap_response asks the host
-                # to fix CASES and resubmit; it never mentions
-                # `image_descriptions`, so the host reasonably does not
-                # resend it -- and without this stamp the zero-verdict
-                # arm of _image_relevance_gate would refuse a round-2
-                # resubmit for a field the server itself did not ask
-                # for, rejecting a suite it had already passed. Exactly
-                # the silent-loss class serialize_adopted_state below
-                # and the carried checklist above exist to prevent. Only
-                # a round that actually PRODUCED usable verdicts stamps
-                # it, so a forfeited round-0 check is never laundered
-                # into a pass by the remediation loop.
-                if _img_counts.get("ran"):
-                    new_meta["image_relevance_seen"] = True
-                new_env["meta"] = new_meta
-                # Residue R4 (review iteration 3): re-serialize the ADOPTED prep
-                # state, not just the bumped round. `envelope["prepared"]` is the
-                # PREPARE-time serialization, and every boomerang adopted at
-                # submit time (the R4 checklist; the Phase-3a AC list) lives only
-                # in this request's memory -- so writing the envelope back
-                # unchanged silently reverts them for round 2. Under CHECKLIST_JOB
-                # the prepare-time checklist is EMPTY by construction, so the
-                # un-carried version made the gap-remediation loop finalize with
-                # no requirement coverage tally at all: the precise outcome the
-                # loop exists to prevent. Merged (never replaced) over the stored
-                # dict, and {} on any failure, so this can only ever add fidelity.
-                _adopted = host_mode.serialize_adopted_state(prepared)
-                _base_prepared = new_env.get("prepared")
-                if _adopted and isinstance(_base_prepared, dict):
-                    new_env["prepared"] = {**_base_prepared, **_adopted}
-                _upd = await prep_store.update_prep(prep_id, new_env)  # KEEP the prep
-                if _upd.get("error"):
-                    # Never fatal (the round still runs), but it must not be
-                    # invisible: an unpersisted round means the carried checklist
-                    # and the round counter both revert.
-                    logger.warning(
-                        "gap round %d: prep %s not updated (%s)",
-                        round_no + 1,
-                        prep_id,
-                        _upd.get("error"),
-                    )
-                gap_md = host_mode.build_gap_response(
-                    view, suite.test_cases, prep_id, staged=staged_rows
-                )
-                await _audit(
-                    "mcp_submit_suite_gap",
-                    entity_id=prep_id,
-                    detail={
-                        "round": round_no + 1,
-                        "gaps": len(view.gap_item_ids),
-                    },
-                )
-                # F03 (2026-08-16): the gap reply is the SECOND concatenation
-                # of these same variables, so it gets the same budget -- an
-                # unbounded intermediate reply is the same bug in a different
-                # place. gap_md is protected: it is the instruction the host
-                # has to act on, and a gap round with no instruction is a dead
-                # end. Same ordering contract as the final return below.
-                return assemble_finalize_reply(
-                    [
-                        ReplySection("ambiguity screening", amb_note, protected=True),
-                        ReplySection("server version", version_note, protected=True),
-                        ReplySection("dropped cases", dropped_note, protected=True),
-                        ReplySection(
-                            "unused staged rows", conflict_note, protected=True
-                        ),
-                        ReplySection(
-                            "category provenance", cat_source, _REPLY_P_PROVENANCE
-                        ),
-                        ReplySection("volume floor", volume_note, protected=True),
-                        ReplySection("step assertions", assertion_note, protected=True),
-                        ReplySection("acceptance criteria", ac_note, protected=True),
-                        ReplySection("grounding", grounding_note, protected=True),
-                        # Split on checklist_gap exactly as the finalize site
-                        # does. Round-2 review, MAJOR 2: one slot here made the
-                        # MISSING-checklist warning droppable in the gap reply
-                        # while it is protected in the final one -- the same
-                        # note, two contradictory rulings, and the weaker one on
-                        # the branch that repeats every round.
-                        ReplySection(
-                            "checklist gap",
-                            checklist_note if checklist_gap else "",
-                            protected=True,
-                        ),
-                        ReplySection(
-                            "checklist coverage",
-                            "" if checklist_gap else checklist_note,
-                            _REPLY_P_REPORT,
-                        ),
-                        ReplySection("screenshots", img_note, protected=True),
-                        ReplySection(
-                            "duplicate review", dup_status_note, protected=True
-                        ),
-                        ReplySection("duplicates", dup_note, protected=True),
-                        ReplySection("gap instructions", gap_md, protected=True),
-                    ]
-                )
-            cap_note = (
-                "\n\n> ⚠️  Requirement coverage still shows "
-                f"{len(view.gap_item_ids)} gap(s), but the remediation round limit "
-                f"({_MAX_GAP_ROUNDS}) was reached -- finalizing the suite as-is."
-            )
+        # No coverage view is built, so _no_coverage_signal_note below
+        # always fires.
+        view = None
 
         # FINALIZE branch: replicate the server persistence tail
         # (handle_generate_test_cases ~lines 1470-1533), then delete the prep.
@@ -11300,8 +11014,8 @@ async def handle_submit_suite(
                         "The requirement decomposition runs in the tester's chat "
                         "model, not on this server, and this run returned no "
                         "usable `checklist_items`. There is therefore NO "
-                        "requirement coverage tally for this suite, and no "
-                        "Requirements Checklist or Coverage Audit sheet. "
+                        "requirements checklist for this suite, and no "
+                        "Requirements Checklist sheet. "
                         "Nothing was invented to fill the gap -- treat the "
                         "suite's coverage as unmeasured, not as complete.",
                     )
@@ -11532,8 +11246,10 @@ async def handle_submit_suite(
         # once HERE so they cover BOTH finalize routes -- the merged suite_json
         # (Path B) and the accumulated per-category rows (Path A) converge on
         # this one tail, exactly as _volume_floor_note does. Deliberately NOT
-        # added to the gap-round early return above: that reply is a request for
-        # more work, and the suite is not final there. The orphan note is "" for
+        # added to the fix-and-resubmit early returns above (the quality gate,
+        # the step_assertion refusal, the PrepSerdeError reply): each of those
+        # is a request for more work, and the suite is not final there. The
+        # orphan note is "" for
         # a suite carrying no traceability data, so those runs stay
         # byte-identical; the coverage note is expected to be always-on on a
         # default install, which is the point (see its docstring).
@@ -11549,8 +11265,11 @@ async def handle_submit_suite(
         # redundant clusters. Same measure, same constants, second call site.
         #
         # THREE things about the placement are deliberate:
-        #   * AFTER the gap-round early return above, so a "fix and resubmit"
-        #     reply is untouched and this cannot repeat once per round.
+        #   * AFTER the quality-gate early return above. That return is ONE OF
+        #     SEVERAL fix-and-resubmit refusals in this function -- the
+        #     step_assertion refusal and the PrepSerdeError reply are the same
+        #     kind -- and every one of them is left untouched, so this cannot
+        #     repeat on every resubmit.
         #   * AFTER _finalize_generation, which renumbers every tc_id, so the
         #     ids printed are the FINAL ones the workbook carries.
         #   * Gated on `_review_claimed_none`. With no review reported,
@@ -11667,10 +11386,6 @@ async def handle_submit_suite(
                 _REPLY_P_REPORT,
             ),
             ReplySection("screenshots", img_note, protected=True),
-            # Its own text says "the same disclosure is written into the
-            # checklist coverage notes, so it survives into the export" --
-            # which is what makes it, alone, safe to drop first.
-            ReplySection("checklist NLI tier", nli_note, _REPLY_P_EXPORTED),
             ReplySection("duplicate review", dup_status_note, protected=True),
             ReplySection("duplicates", dup_note, protected=True),
             # D4: PROTECTED, because it states that the duplicate-review
@@ -11706,11 +11421,6 @@ async def handle_submit_suite(
             ReplySection("traceability orphans", rtm_note, protected=True),
             ReplySection("coverage signal", cov_signal_note, protected=True),
         ]
-        # cap_note is appended AFTER the suite block, so it has to be part
-        # of the budget's overhead even though it is not part of the
-        # preamble. Round-2 review, MAJOR 1: omitting it put the reply over
-        # the cap by its own length on the max-gap-round path.
-        _tail = [ReplySection("coverage round limit", cap_note, protected=True)]
         # Two shaping passes, both pure and both cheap: the first measures
         # the header the summary sits under, so the budget is exact rather
         # than a reserved guess.
@@ -11723,7 +11433,7 @@ async def handle_submit_suite(
             suite_id,
             status,
             auto_export=auto_export,
-            summary_cap=summary_budget(_sections + _tail, len(_head)),
+            summary_cap=summary_budget(_sections, len(_head)),
         )
         return (
             # FIX 2 (2026-08-09): {amb_note} LEADS. host_mode's
@@ -11741,14 +11451,14 @@ async def handle_submit_suite(
             # same measured failure: a host model summarising this reply keeps
             # the .xlsx path -- the thing that looks like the deliverable -- and
             # drops what follows it. An under-generated suite and a suite with
-            # no requirement coverage tally at all are both claims about whether
+            # no requirements checklist at all are both claims about whether
             # the deliverable is what it appears to be, so they must not sit
             # behind it. Both are "" on a healthy run, so those replies keep
             # today's exact ordering. A checklist note that is NOT a gap
             # (present, or carried forward from an earlier round) stays in the
             # tail with the other informational sections.
             assemble_finalize_reply(
-                _sections + [ReplySection("suite", result_md, protected=True)] + _tail
+                _sections + [ReplySection("suite", result_md, protected=True)]
             )
         )
     except Exception as exc:
@@ -17064,42 +16774,6 @@ async def _atlassian_autofix(fix: bool = False) -> tuple[list[str], list[str]]:
         return [], []
 
 
-def _embeddings_backend_advisory() -> str:
-    """The qa-doctor line for an UNSET QA_EMBEDDINGS_BACKEND.
-
-    C2 (2026-08-21, SHYJ-5138): the setting defaults to "" and nothing told the
-    operator. On the live run every requirement-coverage percentage in the
-    workbook was SUPPRESSED and 9 of 15 checklist rows read "NOT COVERED
-    (UNRELIABLE -- lexical fallback)", while qa-doctor reported all gates on -- a
-    gate reporting less than it claims.
-
-    Returns "" when a backend IS configured, so it is used as a guard: this
-    function names a loss only where the loss is real, which is the disclosure
-    discipline the rest of handle_setup_check follows. RECOMMENDED, never a
-    blocker: generation, dedup and export are unaffected, so it must not flip the
-    verdict to "Not ready". No threshold is tuned -- a lexical score's on-topic
-    band overlaps its unrelated band, so no threshold separates them. Never
-    raises."""
-    try:
-        from tools import embeddings as _embeddings
-
-        if _embeddings.backend_enabled():
-            return ""
-    except Exception:  # pragma: no cover - an advisory must never break qa-doctor
-        logger.debug("embeddings backend check failed", exc_info=True)
-        return ""
-    return (
-        "Set `QA_EMBEDDINGS_BACKEND` (`local` or `voyage`) if you rely on the "
-        "coverage numbers. It is UNSET, so requirement matching runs on the "
-        "LEXICAL fallback: the workbook's Coverage Audit sheet SUPPRESSES every "
-        "coverage percentage, marks its gap and orphan counts UNRELIABLE, and "
-        'checklist rows it cannot match read "NOT COVERED (UNRELIABLE)" whether '
-        "or not a case actually covers them. Test generation, deduplication and "
-        "export are unaffected. `local` needs "
-        '`pip install -e ".[embeddings]"`; `voyage` needs a `VOYAGE_API_KEY`.'
-    )
-
-
 def _update_rate_limit_advisory(status: str) -> str:
     """The qa-doctor line for an update check GitHub refused on quota.
 
@@ -17625,11 +17299,6 @@ async def handle_setup_check(
                 recommended.append(_split)
         except Exception:
             logger.debug("split-server check failed", exc_info=True)
-        # C2 (2026-08-21): an UNSET embeddings backend silently degrades every
-        # coverage number the workbook prints. Recommended, not blocking.
-        _embeddings_note = _embeddings_backend_advisory()
-        if _embeddings_note:
-            recommended.append(_embeddings_note)
         # D4 follow-up (2026-08-25): the tester-facing half of the
         # "rate-limited" status. "" on every other status, so a healthy
         # run is byte-identical.
@@ -17781,16 +17450,25 @@ async def handle_setup_check(
         # as a recommendation and the rest of the check proceeds.
         heal_lines: list[str] = []
         try:
-            from tools.env_heal import heal_env
+            from tools.env_heal import find_superseded, heal_env
 
             if fix:
                 _heal = await asyncio.to_thread(heal_env, Path(_INSTALL_DIR))
             else:
-                _heal = {}
-                recommended.append(
-                    ".env not checked -- call qa-doctor with fix=true to "
-                    "repair superseded settings if any exist."
-                )
+                # Read-only default: look, never write, and stay silent when
+                # nothing is outdated.
+                _heal = await asyncio.to_thread(find_superseded, Path(_INSTALL_DIR))
+                if _heal.get("changed"):
+                    _stale = ", ".join(
+                        f"`{_key}` (`{_old}` → `{_new}`)"
+                        for _key, _old, _new, _why in _heal["changed"]
+                    )
+                    recommended.append(
+                        f"Outdated .env setting(s): {_stale}. Call qa-doctor with "
+                        "fix=true to update them (the old .env is backed up to "
+                        ".env.bak-*)."
+                    )
+                    _heal = {"error": _heal.get("error")}
             if _heal.get("changed"):
                 heal_lines.append("### Configuration repaired")
                 heal_lines.append("")

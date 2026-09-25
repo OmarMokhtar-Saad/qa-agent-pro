@@ -150,11 +150,11 @@ def format_test_data_lines(items: list["TestDataItem"]) -> list[str]:
 #
 # They live HERE, beside TestCase, rather than in tools/rtm.py where
 # normalize_ac_id was born, because the five exporters need them on every row of
-# every export and tools/rtm.py is a comparatively heavy sibling -- it pulls in
-# tools.atomic_checklist and tools.embeddings, which a plain CSV / feature file /
-# Playwright skeleton has no reason to load. tools.rtm RE-EXPORTS
-# normalize_ac_id, so every existing `from tools.rtm import normalize_ac_id`
-# keeps resolving and no caller changed. Both are pure and never raise.
+# every export and tools.rtm carries deterministic requirement_id traceability
+# a plain CSV / feature file / Playwright skeleton has no reason to load. The
+# split stays because tools.rtm RE-EXPORTS normalize_ac_id, so every existing
+# `from tools.rtm import normalize_ac_id` keeps resolving and no caller
+# changed. Both are pure and never raise.
 # --------------------------------------------------------------------------- #
 
 _CANONICAL_AC_RE = re.compile(r"^AC-\d{3,}$")

@@ -21,7 +21,6 @@ from tools.atomic_checklist import (
     granularity_warning_section,
 )
 from tools.csv_exporter import generate_test_case_csv
-from tools.embeddings import backend_enabled, cosine_similarity, embed_texts
 from tools.jira_mcp import _extract_ac_from_description
 from tools.models import TestCase, TestSuite
 from tools.quality_checks import (
@@ -51,13 +50,9 @@ from tools.risk_scorer import (
 from tools.rtm import (
     AcceptanceCriterion,
     build_rtm_summary,
-    coverage_to_dict,
     format_ac_prompt_block,
-    match_checklist,
-    normalize_ac_id,
     orphan_case_ids,
     parse_acceptance_criteria,
-    render_checklist_section,
     rtm_oneline,
     rtm_rows,
     rtm_trace,
@@ -66,10 +61,8 @@ from tools.rtm import (
 from tools.rule_packs import (
     apply_rule_packs,
     build_rule_packs,
-    coverage_matches,
     format_rule_pack_prompt_block,
     inject_manual_validation_case,
-    protected_stable_ids,
     rule_pack_notes,
     rule_pack_section,
 )
@@ -225,23 +218,20 @@ def checklist_remediation_enabled() -> bool:
 
     2026-08-16 (dead-code deletion P2-E1): the bounded critic/regeneration loop
     this seam used to switch -- ``_remediate_gaps`` and the critic pair -- was
-    DELETED, so inside THIS module the seam now governs nothing. It is retained
-    because tools/mcp_handlers reaches it through a call-time import to gate the
-    HOST-side gap round, which is live; that is its only remaining reader, and
-    reviving the server-side loop is a fresh implementation rather than a flip.
+    DELETED, so inside THIS module the seam now governs nothing. Its own
+    HOST-side reader (tools/mcp_handlers' GAP ROUND block) was deleted too, so
+    this function has no remaining reader; retained for revival rather than
+    deleted outright.
     """
     return False
 
 
 def semantic_dedup_enabled() -> bool:
-    """Always False -- intra-suite semantic dedup is RETIRED.
+    """Always False -- there is no intra-suite semantic dedup.
 
-    QA_SEMANTIC_DEDUP_ENABLED was DELETED on 2026-08-13 and hardcoded to its
-    own code default: it never shipped in the distribution's .env template, and
-    OFF is the safe direction for the one path in that batch that DROPS
-    generated cases. QA_EMBEDDINGS_BACKEND is untouched and still powers vector
-    RAG ranking -- exactly the separation this gate existed to protect.
-    _semantic_dedupe_cases is retained for revival. NOT settings-derived.
+    QA_SEMANTIC_DEDUP_ENABLED was DELETED and hardcoded OFF; nothing in the
+    pipeline merges cases on similarity. NOT
+    settings-derived.
     """
     return False
 
@@ -789,143 +779,6 @@ def _dedupe_cases(all_cases: list[TestCase]) -> list[TestCase]:
     return deduped
 
 
-# Priority rank used as the tie-breaker when picking a cluster's highest-risk
-# representative during semantic dedup (lower rank = higher priority).
-_SEMANTIC_PRIORITY_RANK = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
-
-
-def _semantic_payload(tc: TestCase) -> str:
-    """Compact text embedded for semantic dedup: title + first-step action only."""
-    first = tc.steps[0].action if tc.steps else ""
-    # 600 chars comfortably covers a title + one action while bounding the
-    # per-case embedding payload (and Voyage token cost) on pathologically long
-    # steps.
-    return (tc.title.strip() + " || " + first.strip())[:600]
-
-
-def _risk_key(tc: TestCase) -> tuple:
-    """Sort key that ranks a case by risk (higher wins), tie-broken by priority."""
-    return (
-        getattr(tc, "risk_score", 0) or 0,
-        -_SEMANTIC_PRIORITY_RANK.get(tc.priority.value, 99),
-    )
-
-
-#: The cosine cut-off the deleted QA_SEMANTIC_DEDUP_THRESHOLD carried (audit G3,
-#: 2026-08-30). Its only reader was this function, which runs only behind
-#: semantic_dedup_enabled() -- the False constant since 2026-08-13 -- so the
-#: setting could never be observed. Same 0.9, one line to change on revival.
-_SEMANTIC_DEDUP_THRESHOLD = 0.9
-
-
-async def _semantic_dedupe_cases(
-    cases: list[TestCase], protected_stable_ids: set[str] | None = None
-) -> tuple[list[TestCase], str]:
-    """Opt-in semantic dedup (QA_EMBEDDINGS_BACKEND). Founder-based greedy
-    clustering: each case joins the first existing cluster whose FOUNDER (first
-    member) is >= _SEMANTIC_DEDUP_THRESHOLD cosine-similar, else it starts a
-    new cluster. Within each cluster the highest-risk case is kept as the
-    representative and the rest are merged into it.
-
-    NB-016 (mirrors _dedupe_cases): a cluster member is NEVER dropped when it is
-    the sole case tracing a requirement_id not already covered by a kept case —
-    otherwise that AC would flip to ORPHAN in the RTM / AC-anchoring reports,
-    which are computed after this pass.
-
-    Returns (kept_cases, note) where note is a markdown 'Semantic dedup' block
-    (empty when nothing merged). NEVER drops a case when embeddings are
-    unavailable — returns the input unchanged with an empty note. Never raises.
-    """
-    if len(cases) < 2:
-        return cases, ""
-    try:
-        payloads = [_semantic_payload(tc) for tc in cases]
-        emb = await embed_texts(payloads)
-        if emb.get("error") or not emb.get("content"):
-            logger.info(
-                "Semantic dedup skipped (embeddings unavailable): %s",
-                emb.get("error"),
-            )
-            return cases, ""
-        vectors = emb["content"]
-        if len(vectors) != len(cases):
-            return cases, ""
-        threshold = _SEMANTIC_DEDUP_THRESHOLD
-        clusters: list[list[int]] = []
-        for i in range(len(cases)):
-            placed = False
-            for cl in clusters:
-                if cosine_similarity(vectors[i], vectors[cl[0]]) >= threshold:
-                    cl.append(i)
-                    placed = True
-                    break
-            if not placed:
-                clusters.append([i])
-
-        def _req(idx: int):
-            return (cases[idx].requirement_id or "").strip() or None
-
-        # Every cluster representative is definitely kept — seed the covered set
-        # from them so NB-016 only rescues genuinely-orphaned tracers.
-        reps = {max(cl, key=lambda j: _risk_key(cases[j])) for cl in clusters}
-        covered_reqs: set[str] = set()
-        for idx in reps:
-            r = _req(idx)
-            if r:
-                covered_reqs.add(normalize_ac_id(r))
-
-        merges: list[tuple[int, int]] = []
-        drop: set[int] = set()
-        for cl in clusters:
-            if len(cl) < 2:
-                continue
-            keep_idx = max(cl, key=lambda j: _risk_key(cases[j]))
-            for j in cl:
-                if j == keep_idx:
-                    continue
-                if (
-                    protected_stable_ids
-                    and (cases[j].stable_id or "") in protected_stable_ids
-                ):
-                    # Batch 3: a case carrying a MANDATED EN/AR message
-                    # pair is never merged. Ordering substitution before
-                    # this pass is necessary but NOT sufficient -- two
-                    # bilingual cases still differ only by which
-                    # documented message they quote, and a real sentence
-                    # embedding can score that pair above the 0.9
-                    # threshold. Merging either one deletes a mandated
-                    # checklist line, which then reports as an uncovered
-                    # requirement: the batch would flag a gap it created
-                    # itself. Empty set unless the bilingual pack is on
-                    # AND substituted something, so the default path is
-                    # unchanged.
-                    continue
-                req = _req(j)
-                if req and normalize_ac_id(req) not in covered_reqs:
-                    # Sole tracer for this AC — keep it (NB-016) rather than
-                    # orphaning the requirement downstream.
-                    covered_reqs.add(normalize_ac_id(req))
-                    continue
-                merges.append((j, keep_idx))
-                drop.add(j)
-        if not merges:
-            return cases, ""
-        kept = [tc for i, tc in enumerate(cases) if i not in drop]
-        lines = [
-            "\n\n> ♻️  **Semantic dedup:** merged near-duplicate cases (embeddings)."
-        ]
-        for d, keep_idx in merges:
-            lines.append(
-                f'> - `{cases[d].tc_id}` "{cases[d].title}" → merged into '
-                f'"{cases[keep_idx].title}"'
-            )
-        logger.info("Semantic dedup merged %d near-duplicate cases", len(merges))
-        return kept, "\n".join(lines)
-    except Exception:
-        logger.exception("Semantic dedup failed — keeping all cases")
-        return cases, ""
-
-
 def _category_response_model() -> type[TestSuite]:
     """The response model every category call uses.
 
@@ -1236,7 +1089,6 @@ class PreparedGeneration:
     checklist_items: list[ChecklistItem]
     checklist_presented_ids: object
     checklist_audit: dict
-    checklist_coverage: object | None
     rule_packs: object
     ui_content: dict | None
     parent_context: str
@@ -1634,7 +1486,7 @@ async def _prepare_generation(
     )
     # THE ENFORCEMENT SEAM IS GONE (dead-code deletion 3a, 2026-08-16).
     # It interleaved the rule packs' mandated lines into the atomic
-    # checklist so the coverage tally would score them, under
+    # checklist so they would be checked as requirements, under
     # `if _rule_pack_items and checklist_items:`. BOTH operands are
     # structurally empty: the three packs are hardcoded OFF
     # (tools/rule_packs' *_rules_enabled seams, 2026-08-14) so the
@@ -1649,10 +1501,6 @@ async def _prepare_generation(
     # made unreachable. A revived pack still reaches the generator through
     # format_rule_pack_prompt_block below, which is untouched -- prompt +
     # advisory mode, exactly what the deleted `elif` used to log.
-    # Pre-initialised so the post-renumber rule-pack report can read it
-    # unconditionally; Batch 2's matcher overwrites it when it runs.
-    checklist_coverage = None
-
     # The atomic checklist used to ride here as its own untrusted block,
     # capped at QA_CHECKLIST_MAX_PROMPT_CHARS, with
     # format_checklist_prompt_block returning the ids it ACTUALLY
@@ -1749,7 +1597,6 @@ async def _prepare_generation(
         checklist_items=checklist_items,
         checklist_presented_ids=checklist_presented_ids,
         checklist_audit=checklist_audit,
-        checklist_coverage=checklist_coverage,
         rule_packs=rule_packs,
         ui_content=ui_content,
         parent_context=parent_context,
@@ -1972,7 +1819,6 @@ async def _finalize_generation(
     # caller ever passed it -- _prepare_generation keeps its own copy, which
     # really is read (it selects the complexity_text override).
     ui_content: dict | None = None,
-    host_suppress_llm_tiers: bool = False,
 ) -> tuple[str, str, str, str, str]:
     """Finalize a generated suite: dedupe -> risk -> semantic dedup -> rule
     packs -> renumber -> RTM -> checklist coverage -> sections -> exports ->
@@ -1992,9 +1838,7 @@ async def _finalize_generation(
     acs = prepared.acs
     source_acs = prepared.source_acs
     checklist_items = prepared.checklist_items
-    checklist_presented_ids = prepared.checklist_presented_ids
     checklist_audit = prepared.checklist_audit
-    checklist_coverage = prepared.checklist_coverage
     rule_packs = prepared.rule_packs
     parent_context = prepared.parent_context
     image_notice = prepared.image_notice
@@ -2036,7 +1880,7 @@ async def _finalize_generation(
     # ops-5 (issue 7): finalize used to log NOTHING across its whole run. That is
     # how a 108s server-side LLM call (the advisory gap critique on the host path)
     # stayed invisible for a full session -- the only way to find it was reading
-    # branch conditions. Log the case-count funnel and the coverage tier so the
+    # branch conditions. Log the case-count funnel so the
     # next regression is visible in the log instead of requiring a code read.
     logger.info(
         "finalize: received %d case(s) -> %d after exact dedup",
@@ -2087,52 +1931,29 @@ async def _finalize_generation(
     # The deterministic heuristic is the only thing that scores a case.
     scored, risk_section = score_and_sort(all_cases)
 
-    # Semantic dedup (QA_SEMANTIC_DEDUP_ENABLED, opt-in, default OFF, AND an
-    # embeddings backend). The dedicated flag is required IN ADDITION to
-    # backend_enabled() so enabling embeddings purely for RAG ranking does not
-    # silently start DROPPING near-duplicate cases here. Runs AFTER risk scoring
-    # so the highest-risk case survives each cluster, and BEFORE the final TC
-    # renumber. Never drops a case when embeddings are unavailable, and preserves
-    # the sole tracer for any requirement_id (NB-016).
     # Batch 3: deterministic placeholder substitution + the residual-token
     # sweep. The generator emits opaque {{EN:DM01}} / {{AR:DM01}} tokens and
     # the real strings are carried through IN CODE from the parsed ticket --
     # verbatim reproduction by an LLM hallucinates, and this way the
     # untrusted literals never enter a prompt at all.
     #
-    # PLACED BEFORE SEMANTIC DEDUP DELIBERATELY. An un-substituted bilingual
-    # suite is N near-identical templated cases differing only by an opaque
-    # key, so embedding cosine between them is close to 1.0 and
-    # _semantic_dedupe_cases would merge away mandated per-key coverage
-    # before substitution could tell them apart (proved in
-    # tests/test_rule_packs_integration.py, both directions).
-    #
     # The substituted strings are UNTRUSTED ticket text and
     # _rewrite_vague_fields below feeds step text to ask_json -- which is
     # why that call now carries _GUARD and wraps its items.
     scored, rule_pack_ctx = apply_rule_packs(scored, rule_packs)
-    # Ordering alone is not enough: two substituted bilingual cases still
-    # differ only by which documented message they quote, and a real
-    # sentence-embedding model could score that pair above
-    # QA_SEMANTIC_DEDUP_THRESHOLD if the retired dedup path were revived.
-    # Empty set when the pack is off.
-    protected_ids = protected_stable_ids(rule_pack_ctx)
 
+    # No semantic dedup runs (semantic_dedup_enabled() is hardcoded False), so
+    # semantic_dedup_note is a fixed empty string in the two summary f-strings
+    # below.
     semantic_dedup_note = ""
-    if semantic_dedup_enabled() and backend_enabled():
-        scored, semantic_dedup_note = await _semantic_dedupe_cases(
-            scored, protected_stable_ids=protected_ids
-        )
 
     # Jira sub-task scope check (advisory, FLAG-ONLY). When a parent story was
     # injected as BACKGROUND, flag — never drop — cases whose wording tracks the
     # parent rather than the sub-task under test.
     #
     # Placed HERE on purpose: after the LAST content mutation and before the tc_id
-    # renumber below. Everything upstream still changes the case set —
-    # _remediate_gaps can ADD cases (they would otherwise never be scope-checked
-    # at all), _semantic_dedupe_cases can drop them, and _rewrite_vague_fields
-    # rewrites step text. Checking here means every case that reaches the export
+    # renumber below. Everything upstream can still change the cases —
+    # _rewrite_vague_fields rewrites step text. Checking here means every case that reaches the export
     # is checked exactly once, against its final content. The returned stable_ids
     # then still match what scope_warning_section renders from, because the
     # renumber uses model_copy(update={"tc_id": ...}), which does NOT re-run the
@@ -2226,44 +2047,19 @@ async def _finalize_generation(
     # sections below (anchoring_warning_section / scope_warning_section).
     rtm_section += traceability_warning_section(acs, renumbered)
 
-    # Batch 2 Pass 3: EXTERNAL, deterministic, bidirectional coverage. Runs on
-    # the FINAL renumbered suite so every tc_id in the report matches the
-    # exported file exactly. Empty (and zero extra calls) when there is no
-    # checklist, so the flag-off summary is byte-identical to before.
+    # Coverage is reported by deterministic requirement_id traceability
+    # only (rtm_trace, below): a generated case counts as tracing a
+    # requirement only by naming its requirement_id, and every requirement_id
+    # with no tracing case is reported as an orphaned requirement -- no
+    # similarity scoring, no confidence band, no coverage percentage. The
+    # checklist GRANULARITY audit is unrelated to matching and still runs.
     checklist_section = ""
-    if checklist_items and renumbered:
-        await _emit_status(
-            on_status,
-            "🧮 Cross-checking coverage against the requirements checklist…",
-        )
-        checklist_coverage = await match_checklist(
-            checklist_items,
-            renumbered,
-            presented_item_ids=checklist_presented_ids or None,
-            # Phase 3b (host boomerang, ledger id `rtm.nli_verdicts`): this is
-            # the ONE remaining site where the OPTIONAL entailment (b) /
-            # adjudication (c) tiers can still fire -- the remediation loop
-            # already passes allow_llm_tiers=False, and it is suppressed on the
-            # host path anyway (remediate=False). A host-mode submit passes
-            # host_suppress_llm_tiers=True, so those two ask_json calls are not
-            # made at all. They are NOT boomeranged: their entire value is that
-            # a model OTHER than the generator re-judges the shortlist, and in
-            # host mode the generator is the host. match_checklist records the
-            # suppression in ChecklistCoverage.notes so the EXPORTED artifact
-            # says so too. The DEFAULT is False, which used to mean server
-            # mode, graph.py and evals/ stayed byte-identical; all three are
-            # gone (P2-A/P2-B/P2-E), so the host route is the only route and
-            # the default now only documents the seam's original intent.
-            allow_llm_tiers=not host_suppress_llm_tiers,
-        )
-        checklist_section = granularity_warning_section(
-            checklist_audit
-        ) + render_checklist_section(checklist_coverage, checklist_items)
+    if checklist_items:
+        checklist_section = granularity_warning_section(checklist_audit)
         try:
             suite._checklist_artifacts = {
                 "items": checklist_to_dicts(checklist_items),
                 "audit": checklist_audit,
-                "coverage": coverage_to_dict(checklist_coverage),
             }
         except Exception:
             logger.debug("attaching checklist artifacts failed", exc_info=True)
@@ -2274,12 +2070,6 @@ async def _finalize_generation(
     # label is a fixed code constant plus the sanitised ticket reference --
     # never an LLM-written citation, so it can never become "per RFC 9110"
     # for an RFC nobody cited.
-    #
-    # coverage_matches() adapts Batch 2's ChecklistCoverage.links
-    # (MatchLink(item_id, tc_id, ...)) into {item_id: [tc_id]} for the
-    # checklist-driven bundling signal, and returns {} in prompt+advisory
-    # mode (checklist_coverage is still None), where only the textual signal
-    # runs.
     rule_pack_notes_map = rule_pack_notes(renumbered, rule_packs)
     if rule_pack_notes_map:
         try:
@@ -2291,7 +2081,6 @@ async def _finalize_generation(
         rule_packs,
         renumbered,
         rule_pack_ctx,
-        matches=coverage_matches(checklist_coverage),
     )
 
     # Cheap heuristic quality gate: flag any vague steps / placeholder test data
@@ -2347,12 +2136,9 @@ async def _finalize_generation(
     # tools/test_plan_report.py and the private attribute are all gone.
 
     # ops-5 (issue 7): the closing funnel line. Deliberately ONE line carrying
-    # everything a reader needs to spot a silent change: the count, whether the
-    # deterministic coverage tier degraded to lexical (which suppresses the
-    # percentage), and whether the quality gate flagged anything.
+    # everything a reader needs to spot a silent change: the count and whether
+    # the quality gate flagged anything.
     try:
-        _cov = getattr(suite, "_checklist_artifacts", None) or {}
-        _cov_tier = str((_cov.get("coverage") or {}).get("tier_used") or "none")
         logger.info(
             # SHYJ-5138 (2026-08-21). Two more facts on the SAME line, no new
             # call. D1: 15 of 64 cases shipped a blank Test Data column and the
@@ -2364,10 +2150,9 @@ async def _finalize_generation(
             # exists to fix, and the one this count actually detects) needed a
             # hand read of the file. Both are counts over `renumbered`, i.e.
             # the cases actually shipped.
-            "finalize: %d case(s) final | coverage tier=%s | quality flags=%s"
+            "finalize: %d case(s) final | quality flags=%s"
             " | empty test_data=%d/%d | module labels=%d",
             len(getattr(suite, "test_cases", None) or []),
-            _cov_tier,
             "yes" if quality_section else "no",
             sum(1 for _tc in renumbered if not getattr(_tc, "test_data", None)),
             len(renumbered),

@@ -141,7 +141,6 @@ LIVE_ENV: frozenset = frozenset(
         "QA_EXPORT_DIR",
         "QA_DIST_MODE",
         "QA_UPDATE_REPO",
-        "QA_EMBEDDINGS_BACKEND",
         "QA_POSTHOG_KEY",
         "QA_FORCE",
         "QA_DRIFT_RESTART_ENABLED",
@@ -154,7 +153,6 @@ LIVE_ENV: frozenset = frozenset(
         "QA_LOG_RETENTION_DAYS",
         "QA_LOG_RETENTION_MAX_FILES",
         "API_AUTH_TOKEN",
-        "VOYAGE_API_KEY",
         "GITHUB_TOKEN",
     }
 )

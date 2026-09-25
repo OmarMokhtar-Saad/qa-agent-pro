@@ -13,8 +13,7 @@ This file grows across the ops-3 sequence:
 
 * **ops-3b (this batch):** ``serialize_prepared`` / ``deserialize_prepared`` -- the
   lossless, schema-versioned round trip and its error contract. Nothing else.
-* **ops-3c:** ``build_prepare_payload`` / ``parse_host_suite`` /
-  ``build_gap_response``.
+* **ops-3c:** ``build_prepare_payload`` / ``parse_host_suite``.
 * **ops-3d:** the ``qa_prepare_test_cases`` / ``qa_submit_suite`` /
   ``qa_submit_category`` handlers and mode routing.
 
@@ -49,12 +48,7 @@ from tools.atomic_checklist import ChecklistItem
 from tools.bilingual import LanguagePair
 from tools.id_collisions import find_identifier_collisions
 from tools.models import TestCase, TestSuite
-from tools.quality_checks import (
-    find_placeholder_data,
-    find_vague_expected,
-    find_vague_steps,
-)
-from tools.rtm import AcceptanceCriterion, checklist_tally_line, normalize_ac_id
+from tools.rtm import AcceptanceCriterion, normalize_ac_id
 from tools.rule_packs import RulePackLine, RulePackResult
 from tools.standing_rules import Triggers
 from tools.untrusted import _GUARD, wrap_untrusted
@@ -86,7 +80,6 @@ _KNOWN_FIELDS = frozenset(
         "checklist_items",
         "checklist_presented_ids",
         "checklist_audit",
-        "checklist_coverage",
         "rule_packs",
         "ui_content",
         "parent_context",
@@ -231,10 +224,7 @@ def serialize_prepared(prepared) -> dict:
     """PreparedGeneration -> a JSON-serializable dict (``json.dumps``-safe).
 
     Raises PrepSerializeError if ANY field cannot be represented losslessly --
-    never silently drops fidelity. In particular it refuses to serialize a
-    non-None ``checklist_coverage`` (Pass-3 coverage needs generated cases and is
-    computed in finalize, so it must be None at prepare time; a non-None value
-    here means the caller mis-sequenced the pipeline).
+    never silently drops fidelity.
     """
     # Fail loudly if the dataclass grew a field this serializer does not handle,
     # rather than shipping a prep record that silently loses it.
@@ -244,12 +234,6 @@ def serialize_prepared(prepared) -> dict:
         raise PrepSerializeError(
             "PreparedGeneration has field(s) the serializer does not handle: "
             f"{sorted(unknown)} -- update agents.host_mode._KNOWN_FIELDS"
-        )
-
-    if prepared.checklist_coverage is not None:
-        raise PrepSerializeError(
-            "checklist_coverage must be None at prepare time (Pass-3 coverage is "
-            "computed in _finalize_generation from generated cases)"
         )
 
     try:
@@ -270,7 +254,6 @@ def serialize_prepared(prepared) -> dict:
         payload["checklist_presented_ids"] = list(
             prepared.checklist_presented_ids or []
         )
-        payload["checklist_coverage"] = None  # guarded None above
         payload["rule_packs"] = _serialize_rule_packs(prepared.rule_packs)
         # tuples are JSON-lossy (json turns them into lists); store as lists and
         # re-tuple on load, or downstream tuple-unpacking breaks.
@@ -298,8 +281,9 @@ def serialize_adopted_state(prepared) -> dict:
     Before R4 that was harmless for the checklist, because the server decomposed
     it at prepare time and it was in the envelope from the start. With
     CHECKLIST_JOB the prepare-time list is EMPTY by construction, so an
-    un-carried remediation round would finalize a coverage-gap loop with no
-    coverage tally at all -- the exact failure that loop exists to prevent.
+    un-carried remediation round would finalize with the checklist items lost --
+    an empty Requirements Checklist sheet on a suite that WAS decomposed, the
+    exact failure that loop exists to prevent.
 
     Returns ONLY the fields a submit can adopt, so merging it over the stored
     ``prepared`` dict cannot disturb anything else:
@@ -310,10 +294,8 @@ def serialize_adopted_state(prepared) -> dict:
         lost the host's derived criteria on every remediation round since Phase
         3a; carried here rather than left as a known silent bug next door.
 
-    Deliberately NOT a full ``serialize_prepared`` re-run: by submit time
-    ``checklist_coverage`` may be populated, which that function refuses (and
-    correctly so). Never raises -- returns {} on any failure, which degrades to
-    exactly the pre-R4 behaviour.
+    Deliberately NOT a full ``serialize_prepared`` re-run. Never raises --
+    returns {} on any failure, which degrades to exactly the pre-R4 behaviour.
     """
     try:
         out: dict = {}
@@ -374,7 +356,6 @@ def deserialize_prepared(payload: dict):
             checklist_items=checklist_items,
             checklist_presented_ids=list(payload.get("checklist_presented_ids") or []),
             checklist_audit=dict(payload.get("checklist_audit") or {}),
-            checklist_coverage=None,
             rule_packs=rule_packs,
             ui_content=payload.get("ui_content"),
             parent_context=str(payload["parent_context"]),
@@ -412,10 +393,8 @@ _MAX_DROPPED_REASONS = 20
 # --------------------------------------------------------------------------- #
 # Piece 1: host-reviewed duplicate review (QA_HOST_DEDUP_REVIEW_ENABLED)
 #
-# QA_SEMANTIC_DEDUP_ENABLED needs QA_EMBEDDINGS_BACKEND and the only keyless
-# embeddings backend is "local" (sentence-transformers, ~2 GB of torch), so on a
-# keyless host-mode deployment both are OFF and only byte-identical duplicates are
-# collapsed. The meaning engine used instead is the tester's OWN chat model, which
+# The server itself collapses only byte-identical duplicates. The
+# meaning engine used instead is the tester's OWN chat model, which
 # is ALREADY in the loop and already holds the merged 8-category set: prepare asks
 # it to review that set and return an optional top-level ``duplicate_groups``, and
 # submit acts on it deterministically here in Python. No extra round trip (the
@@ -469,7 +448,7 @@ _DUP_LOW_TEXT_DEFAULT = 0.50
 
 # Priority rank used to pick a group's keeper. risk_score is deliberately NOT used:
 # risk is scored later, inside _finalize_generation, so every case still scores 0
-# at this point (unlike _semantic_dedupe_cases, which runs after scoring).
+# at this point.
 _DUP_PRIORITY_RANK = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
 
 # Non-alphanumeric runs collapse to one space before the lexical comparison.
@@ -1286,13 +1265,12 @@ _HOST_GENERATION_INSTRUCTIONS = (
     "exported cleanly, path never shown). Never report the suite as delivered "
     "without showing the path. "
     "THE SAME RULE COVERS THE QUALITY CAVEATS IN THAT REPLY. If it carries "
-    "a traceability warning, an UNRELIABLE (lexical fallback) coverage "
-    "caveat, a contradicted duplicate review, or a dropped-case or volume "
-    "warning, quote those lines too and put them ABOVE your own summary "
-    "table -- do not paraphrase them into it, and do not call the run "
-    "complete without them. Measured on 2026-08-21: the server reported 0 "
-    "of 4 acceptance criteria traced, 96 orphaned cases and an UNRELIABLE "
-    'matcher tier; the tester was shown "Status: Complete" and a tidy '
+    "a traceability warning, a contradicted duplicate review, or a "
+    "dropped-case or volume warning, quote those lines too and put them "
+    "ABOVE your own summary table -- do not paraphrase them into it, and "
+    "do not call the run complete without them. Measured on 2026-08-21: "
+    "the server reported 0 of 4 acceptance criteria traced and 96 "
+    'orphaned cases; the tester was shown "Status: Complete" and a tidy '
     "per-category table. A caveat the tester never sees did not happen. "
     "Do not offer alternate export formats unless "
     "the tester asks.\n"
@@ -1308,25 +1286,11 @@ _HOST_GENERATION_INSTRUCTIONS = (
     "Return each job's `return_field` on the submission.\n"
 )
 
-# HONESTY RULE (load-bearing): a degraded (lexical, no-embeddings) coverage object
-# publishes NO percentage and must NOT drive a remediation round. Mirrors
-# tools.rtm.checklist_tally_line's UNRELIABLE wording. No resubmit call-to-action
-# and no prep_id -- the suite stands as generated.
-_DEGRADED_GAP_NOTICE = (
-    "**Requirements coverage: UNRELIABLE (lexical fallback -- no embeddings "
-    "backend).** The coverage percentage is SUPPRESSED: TF-IDF matching "
-    "UNDERSTATES real coverage and is not a coverage figure, so the gaps cannot "
-    "be trusted and no remediation round can be driven from them. The suite you "
-    "submitted stands as-is. To obtain a scored coverage audit, configure "
-    "QA_EMBEDDINGS_BACKEND (local or voyage)."
-)
-
-
 @dataclasses.dataclass
 class ParsedSubmission:
     """Result of parse_host_suite. Carries the validated suite AND the salvage
     delta so ops-3d can ALWAYS tell the tester "N case(s) were dropped as
-    malformed" -- independent of checklist/embeddings config. Silence about
+    malformed" -- independent of checklist config. Silence about
     dropped cases was the thing being fixed: without this, a host submitting 40
     cases of which 39 are malformed would yield a silent 1-case suite presented
     as finished."""
@@ -2161,12 +2125,10 @@ def build_host_ac_section(result, cases=None) -> str:
 # exactly as AC_JOB already proves works -- not an extra round trip.
 #
 # THE HONEST COST, disclosed everywhere it matters: the host now authors BOTH the
-# requirement set and the cases, so it controls the denominator of the coverage
-# percentage. Two independent SERVER-side counterweights survive and are what make
-# this fold defensible rather than an over-claim: the deterministic Pass-3 matcher
-# (tools/rtm.match_checklist -- embeddings/lexical, no LLM) and
+# requirement set and the cases. One SERVER-side counterweight survives and is
+# what makes this fold defensible rather than an over-claim:
 # tools/atomic_checklist.audit_granularity (pure Python, and precisely the
-# narrow/inflated-decomposition detector). Both still run on the server, over the
+# narrow/inflated-decomposition detector). It still runs on the server, over the
 # host's checklist.
 #
 # Ids are ALWAYS assigned here, never trusted from the host -- CL-NNN ids are
@@ -2210,7 +2172,7 @@ _CHECKLIST_JOB_INSTRUCTIONS = (
     "collapses whitespace, caps the item count and each item's length, folds "
     "unknown EARS tags and unrecognised source tags, and labels the result "
     "MODEL-DERIVED. It is OPTIONAL: if you omit it the suite still finalizes, "
-    "with NO requirement coverage tally -- the server will not decompose the "
+    "with NO requirements checklist -- the server will not decompose the "
     "ticket to fill the gap. `qa_submit_category` cannot carry the field; on that "
     "route send it in the finalize sidecar (a `suite_json` object with no "
     "`test_cases`), beside any `duplicate_groups`.\n"
@@ -2279,7 +2241,7 @@ class HostChecklistResult:
     ``ran`` is False when the field was absent or UNUSABLE. In that case ``items``
     is EMPTY and the server does NOT fall back to decomposing the ticket itself --
     the whole point of the flag is that it makes no such call. The suite finalizes
-    with no requirement coverage tally and the reply says so. This is Phase 5d's
+    with no requirements checklist and the reply says so. This is Phase 5d's
     rule written down again: an empty or unexpected host answer counts as EMPTY,
     never as matched.
     """
@@ -2429,7 +2391,7 @@ def extract_host_checklist(raw, *, requested: bool = True) -> HostChecklistResul
             _note(
                 "`checklist_items` contained no usable requirement, so it is "
                 "treated as an UNUSABLE field. Nothing was decomposed to replace "
-                "it: this run has no requirement coverage tally."
+                "it: this run has no requirements checklist."
             )
             return res
         res.items = out
@@ -2482,12 +2444,9 @@ def build_host_checklist_section(
             "> \u2139\ufe0f  **Requirements checklist: MODEL-DERIVED.** "
             f"{len(result.items)} atomic requirement(s) were decomposed by YOUR "
             "chat model, not by this server, and the ids (CL-001 ...) were "
-            "assigned here. **You authored both the requirement set and the test "
-            "cases, so you controlled the denominator of the coverage tally "
-            "below.** Two checks are still this server's own and were run over "
-            "your list: the DETERMINISTIC coverage matcher (embeddings/lexical, "
-            "no model) and the pure-Python granularity audit, which is exactly "
-            "the detector for a narrow or inflated decomposition."
+            "assigned here. This server's own check over your list is the "
+            "pure-Python granularity audit, which is exactly the detector for "
+            "a narrow or inflated decomposition."
         ]
         if isinstance(audit, dict) and audit:
             score = audit.get("score", "")
@@ -3463,7 +3422,7 @@ def _validate_suite(data: dict) -> ParsedSubmission:
     all-or-nothing would block the round trip forever, whereas keeping the valid
     ones lets each resubmission make progress. The dropped delta is returned (not
     swallowed) so ops-3d can ALWAYS tell the tester how many cases were discarded,
-    regardless of checklist/embeddings config. Raises PrepParseError only when
+    regardless of checklist config. Raises PrepParseError only when
     NOTHING valid remains.
     """
     # Piece 1: duplicate_groups is a SUBMISSION-level field, not a TestSuite field
@@ -3634,8 +3593,8 @@ def _dup_text(tc) -> str:
     step action, lower-cased with every non-alphanumeric run collapsed to one space.
 
     Deliberately mirrors ``agents.test_scenario_agent._semantic_payload``'s choice of
-    fields, so the reported number describes the same content the embeddings path
-    would judge. Never raises.
+    fields, so the reported number describes the same content that helper
+    compares. Never raises.
     """
     try:
         title = getattr(tc, "title", "") or ""
@@ -3648,7 +3607,7 @@ def _dup_text(tc) -> str:
 
 def _dup_text_ratio(a, b) -> float:
     """Server-measured textual agreement in [0, 1] between two cases (stdlib
-    ``difflib`` only -- no embeddings, no optional dependency, no network, no LLM, no
+    ``difflib`` only -- no optional dependency, no network, no LLM, no
     async, no I/O). Never raises.
 
     ADVISORY ONLY. It is REPORTED, never used to veto or to authorise a removal --
@@ -3683,8 +3642,8 @@ def _dup_text_ratio(a, b) -> float:
 # direction word, so `SAR 1,500 accepted` vs `SAR 1,050 rejected` scored 0.906
 # -- ABOVE the one pair worth surfacing at 0.827. No threshold fixes that: any
 # cut keeping the real pair keeps seven false positives with it. Suppressing
-# the tier outright (the tools/rtm._LEXICAL_COMPACT_CAVEAT precedent) would
-# also stop surfacing the real pair, so it was rejected too.
+# the tier outright would also stop surfacing the real pair, so it was
+# rejected too.
 #
 # Jaccard over TITLE tokens instead: each discriminating word counts once
 # rather than in proportion to its length, and dropping the action removes the
@@ -3920,7 +3879,7 @@ def build_dup_shortlist_counted(merged_cases: list) -> tuple[list, int]:
 
     The original contract, unchanged:
 
-    Pure, synchronous, stdlib only -- no LLM, no embeddings, no I/O.
+    Pure, synchronous, stdlib only -- no LLM, no I/O.
     Deterministic and bounded: at most _DUP_SHORTLIST_MAX_CASES cases are
     compared, a size prefilter skips cheap non-matches, and at most
     _DUP_SHORTLIST_MAX_PAIRS pairs are returned, highest agreement first.
@@ -4171,7 +4130,7 @@ def build_dup_contradiction_pairs(pairs: list) -> str:
             "### \U0001f50d Candidate duplicate pairs (server lexical "
             "prescreen -- ADVISORY)",
             "",
-            "Titles only -- no LLM, no embeddings, nothing removed. Check each "
+            "Titles only -- no LLM, nothing removed. Check each "
             "against the workbook and drop any that differ in boundary value, "
             "role, error message, language or platform; most near-identical "
             "titles turn out to be deliberate variants.",
@@ -4461,9 +4420,8 @@ def dup_agreements(cases: list, groups: list) -> list:
     any floor low enough to admit it admits everything. Aggregating over a whole
     review does not rescue it either: on a templated 64-case suite the medians were
     0.97 genuine vs 0.57 hostile, but on hand-written text 0.29 vs 0.28 -- the scale
-    is entirely corpus-dependent, which is why ``tools/rtm.py`` documents its
-    embedding bands as "conservative project-level defaults, NOT tuned optima" and
-    why that matcher FLAGS instead of dropping.
+    is entirely corpus-dependent, which is exactly why this signal FLAGS instead
+    of dropping.
 
     Shipping an uncalibrated number as a security bound on a DESTRUCTIVE path would
     be worse than shipping none: it would look like a guarantee. So the number is
@@ -4584,12 +4542,12 @@ def apply_duplicate_groups(cases: list, groups: list) -> tuple[list, list, list]
     tc_ids. Returns ``(kept_cases, removed, notes)`` where removed is a list of
     ``(removed_tc_id, keeper_tc_id)`` pairs and notes discloses each rescue.
 
-    NB-016 mirror (see ``agents.test_scenario_agent._dedupe_cases`` and
-    ``_semantic_dedupe_cases``): a member is NEVER removed while it is the only case
+    NB-016 mirror (see ``agents.test_scenario_agent._dedupe_cases``): a
+    member is NEVER removed while it is the only case
     tracing its ``requirement_id`` -- dropping it would flip that AC to a false
     ORPHAN in the RTM / AC-anchoring reports, which are built afterwards. Ids are
-    compared through ``rtm.normalize_ac_id``, matching ``_semantic_dedupe_cases``
-    (``_dedupe_cases`` compares raw strings; the normalised form is the stricter of
+    compared through ``rtm.normalize_ac_id`` (``_dedupe_cases`` compares raw
+    strings; the normalised form is the stricter of
     the two).
 
     This rescue is NOT a security bound and is not claimed as one: ``requirement_id``
@@ -5008,118 +4966,6 @@ def parse_host_suite(text_or_obj, *, enforce_size_cap: bool = True) -> ParsedSub
             "no JSON object with a 'test_cases' key found in the submitted text"
         )
     return _validate_suite(best)
-
-
-def _flagged_issues(cases) -> dict:
-    """tc_id -> short issue strings for every vague/placeholder case, mirroring
-    agents.test_scenario_agent._flagged_case_issues but built from the PUBLIC
-    tools.quality_checks detectors so host_mode stays decoupled. Never raises."""
-    issues: dict[str, list[str]] = {}
-    try:
-        for tc_id, step_no, action in find_vague_steps(cases):
-            issues.setdefault(tc_id, []).append(
-                f'step {step_no} action is vague: "{action[:120]}"'
-            )
-        for tc_id, step_no, expected in find_vague_expected(cases):
-            issues.setdefault(tc_id, []).append(
-                f'step {step_no} expected_result is vague: "{expected[:120]}"'
-            )
-        for tc_id, step_no, test_data in find_placeholder_data(cases):
-            issues.setdefault(tc_id, []).append(
-                f'step {step_no} test_data is a placeholder: "{test_data}"'
-            )
-    except Exception:
-        logger.exception("_flagged_issues failed -- returning partial result")
-    return issues
-
-
-def build_gap_response(
-    coverage, cases, prep_id: str, *, categories_to_regenerate=None, staged: int = 0
-) -> str:
-    """The structured reply that drives the chat-side remediation loop.
-
-    Lists the uncovered checklist items (CL-N), the categories to regenerate, the
-    specific vague/placeholder cases to fix (real tools.quality_checks output),
-    and an explicit instruction to resubmit via ``qa_submit_suite`` with the SAME
-    prep_id. Pure and synchronous.
-
-    HONESTY RULE (load-bearing): gaps come from the deterministic
-    ``rtm.match_checklist`` matcher, never an LLM critic. A DEGRADED coverage
-    object (no QA_EMBEDDINGS_BACKEND -> lexical fallback) publishes NO percentage
-    and must NOT drive a remediation round: this returns the UNRELIABLE notice
-    with the percentage suppressed and NO resubmit call-to-action, mirroring
-    tools.rtm.checklist_tally_line's degraded wording.
-
-    ``staged`` is how many per-category rows the server already holds (0 on the
-    merged route, where they were not used). It changes the NEXT-STEP wording
-    only: "resubmit the COMPLETE suite" is the right instruction when the server
-    holds nothing, and pure waste when it holds eight categories -- the host
-    regenerates every category to fix two, at the cost of a second full pass and
-    of silently changing cases the tester already reviewed (MEASURED; see
-    tools.mcp_handlers._staged_resubmit_hint).
-    """
-    # Sanitise ONCE, here: this function renders the host-supplied id into three
-    # separate instructions below, and fixing them one at a time is how the
-    # second and third were missed.
-    prep_id = safe_prep_id(prep_id)
-    if coverage is not None and getattr(coverage, "degraded", False):
-        return _DEGRADED_GAP_NOTICE
-
-    lines: list[str] = ["## Coverage & quality gaps -- regenerate and resubmit", ""]
-
-    tally = checklist_tally_line(coverage) if coverage is not None else ""
-    if tally:
-        lines += [f"**Requirements coverage:** {tally}", ""]
-
-    gap_ids = list(getattr(coverage, "gap_item_ids", None) or []) if coverage else []
-    if gap_ids:
-        lines += ["### Uncovered requirements -- add cases that verify these:", ""]
-        lines += [f"- NOT COVERED: {gid}" for gid in gap_ids]
-        lines.append("")
-
-    if categories_to_regenerate:
-        lines += [
-            "### Regenerate additional cases for these categories:",
-            "",
-            ", ".join(categories_to_regenerate),
-            "",
-        ]
-
-    issues = _flagged_issues(cases)
-    if issues:
-        lines += ["### Fix these cases (vague steps / placeholder data):", ""]
-        for tc_id in sorted(issues):
-            for msg in issues[tc_id]:
-                lines.append(f"- {tc_id}: {msg}")
-        lines.append("")
-
-    if staged:
-        next_step = (
-            "Correct ONLY what is listed above. **Do not resend the categories "
-            f"you already sent** -- {staged} categor"
-            + ("y is" if staged == 1 else "ies are")
-            + f" already staged on prep `{prep_id}`. Re-send just the affected "
-            "categories with `qa_submit_category` (a repeat call REPLACES that "
-            "category's staged row, so send that category's full set), then "
-            f"call `qa_submit_suite` with prep_id `{prep_id}` and the review "
-            "SIDECAR (or an EMPTY `suite_json` if you have no review to carry) "
-            "-- the finalize rebuilds the suite from the staged "
-            "rows. Regenerating every category instead costs a second full pass "
-            "AND silently changes cases the tester already reviewed. If "
-            "correcting a category legitimately REMOVES cases (dropping a "
-            "flagged duplicate, say), that re-send shrinks the staged row and "
-            "is refused by the shrink guard -- send it with "
-            "`replace_smaller=true`, which the refusal also names."
-        )
-    else:
-        next_step = (
-            "Correct the suite (regenerate the categories/requirements above and "
-            "fix the flagged cases), then resubmit the COMPLETE suite by calling "
-            f"the `qa_submit_suite` tool with prep_id `{prep_id}` and your "
-            "corrected JSON."
-        )
-    lines += ["### Next step", "", next_step]
-    return "\n".join(lines)
 
 
 def category_checklist_note(parsed) -> str:

@@ -12,8 +12,7 @@ one advisory line instead of one pipeline stage:
     cases,c = apply_rule_packs(cases, packs)               # BEFORE semantic dedup
     keep    = protected_stable_ids(c)                      # -> dedup do-not-merge
     notes   = rule_pack_notes(final_cases, packs)          # after the renumber
-    section = rule_pack_section(packs, final_cases, c,
-                               matches=coverage_matches(coverage))
+    section = rule_pack_section(packs, final_cases, c)
 
 COMPOSITION WITH BATCH 2 IS A HARD DEPENDENCY, NOT A BRIDGE.
 ``rule_pack_checklist_items`` constructs REAL ``tools.atomic_checklist.ChecklistItem``
@@ -22,9 +21,8 @@ exactly four fields: ``item_id`` / ``text`` / ``ears_pattern`` / ``source`` --
 tools/atomic_checklist.py:233-242). There is no ``register_mandatory_lines`` in
 Batch 2 and none is invented here: the agent APPENDS the returned items to its
 ``checklist_items`` list, so Batch 2's own
-``format_checklist_prompt_block`` presents them, its ``match_checklist`` scores
-them and its coverage tally / XLSX sheets render them, with no Batch-2 code
-change at all.
+``format_checklist_prompt_block`` presents them and the 'Requirements
+Checklist' XLSX sheet renders them, with no Batch-2 code change at all.
 
 Because ``ChecklistItem`` forbids extra fields, the rule-pack metadata that has
 no home on it (``origin`` / ``subsystem``) stays on ``RulePackResult.lines`` and
@@ -38,8 +36,8 @@ create a synthetic checklist out of rule-pack lines alone (that would silently
 switch the pipeline into checklist mode and skip ``qa_ac_anchoring_enforce``).
 The packs then run in PROMPT + ADVISORY mode: the rules still reach the
 generator, substitution and the advisory sections still run, but there is no
-external coverage tally enforcing them. ``coverage_matches`` returns {} and the
-checklist-driven bundling signal is simply absent. This is stated plainly in
+external check enforcing them -- only the textual
+``detect_bundled_cases`` signal. This is stated plainly in
 plan-b3-rule-packs.md -- no over-claiming.
 
 Every function is never-raise. With all three flags OFF, ``build_rule_packs``
@@ -303,8 +301,7 @@ def rule_pack_checklist_items(result: RulePackResult) -> list:
     does not exist) is what makes the enforcement REAL: the agent appends the
     returned items to ``checklist_items`` before
     ``format_checklist_prompt_block`` runs, so they are presented to the
-    generator, scored by ``tools.rtm.match_checklist``, counted in the coverage
-    tally and written to the 'Requirements Checklist' XLSX sheet.
+    generator and written to the 'Requirements Checklist' XLSX sheet.
 
     Returns [] when nothing was mandated or when ``tools.atomic_checklist`` is
     unavailable (Batch 2 not installed -- a configuration error the plan calls
@@ -346,37 +343,11 @@ def rule_pack_checklist_items(result: RulePackResult) -> list:
         return []
 
 
-def coverage_matches(coverage: object) -> dict[str, list[str]]:
-    """Adapter: Batch-2 ``ChecklistCoverage`` -> ``{item_id: [tc_id, ...]}``.
-
-    Batch 2's matcher returns a ``ChecklistCoverage`` dataclass whose ``links``
-    are ``MatchLink(item_id, tc_id, score, confidence, tier)`` -- NOT a plain
-    dict (tools/rtm.py, added by ops-b2-atomic-checklist.json). Duck-typed on
-    purpose so this module never imports the matcher and cannot create a cycle.
-
-    Returns {} for ``None``, for a coverage object that did not run, or on any
-    failure -- which is exactly the prompt+advisory-mode behaviour. Never raises.
-    """
-    try:
-        if coverage is None or not getattr(coverage, "ran", False):
-            return {}
-        out: dict[str, list[str]] = {}
-        for link in getattr(coverage, "links", None) or []:
-            item_id = str(getattr(link, "item_id", "") or "")
-            tc_id = str(getattr(link, "tc_id", "") or "")
-            if item_id and tc_id:
-                out.setdefault(item_id, []).append(tc_id)
-        return out
-    except Exception:
-        logger.exception("coverage_matches failed - returning no matches")
-        return {}
-
-
 def line_subsystem_map(result: RulePackResult) -> dict[str, str]:
-    """``{line_id: subsystem}`` for the checklist-driven bundling signal.
+    """``{line_id: subsystem}``, since ``ChecklistItem`` forbids extra fields.
 
-    Exists because ``ChecklistItem`` forbids extra fields, so ``subsystem`` has
-    no home on the checklist item itself and must be joined back by id.
+    ``subsystem`` has no home on the checklist item itself and must be joined
+    back by id.
     """
     try:
         return {line.line_id: line.subsystem for line in result.lines}
@@ -435,12 +406,7 @@ def apply_rule_packs(
     documented strings (the model is never asked to echo them), then run the
     residual-token sweep.
 
-    CALL ORDER MATTERS TWICE:
-      * BEFORE ``_semantic_dedupe_cases``. Un-substituted bilingual cases are
-        near-identical templated text differing only by an opaque key, so
-        embedding cosine between them is very high and dedup would merge away
-        mandated per-key coverage. Substituting first makes each case carry its
-        own distinct message text.
+    CALL ORDER MATTERS:
       * The substituted strings are UNTRUSTED ticket text, and
         ``_rewrite_vague_fields`` (which runs after dedup) feeds step text to
         ``ask_json``. That call site therefore carries ``_GUARD`` and wraps its
@@ -481,24 +447,14 @@ def apply_rule_packs(
 
 
 def protected_stable_ids(ctx: dict | None) -> set[str]:
-    """``stable_id``s that ``_semantic_dedupe_cases`` must never merge away.
+    """``stable_id``s of the bilingual cases that carry a documented pair.
 
-    Ordering substitution BEFORE semantic dedup is necessary but NOT sufficient.
-    Two bilingual cases still differ only by which documented message they quote
-    ("the banner shows Login failed" vs. "the banner shows Account locked"), and a
-    real sentence-embedding model can score that pair above
-    ``QA_SEMANTIC_DEDUP_THRESHOLD`` (default 0.9). Merging either one destroys a
-    MANDATED per-key checklist line, which then reports as an uncovered
-    requirement -- the batch would be flagging a gap it created itself.
-
-    So the agent threads this set into ``_semantic_dedupe_cases`` as a
-    do-not-merge list. ``stable_id`` is derived from (title, steps) and the only
-    mutation between substitution and the dedup call is the residual sweep's
-    ``model_copy``, which does NOT re-run that validator -- so these ids still
-    match at the call site.
+    Two bilingual cases differ only by which documented message they quote,
+    so any near-duplicate merge must treat this set as a do-not-merge list:
+    merging either case destroys a MANDATED per-key case.
 
     Returns an empty set when the bilingual pack is off or nothing was
-    substituted, which is the byte-identical-to-today path. Never raises.
+    substituted, which is the default path. Never raises.
     """
     try:
         report = (ctx or {}).get("bilingual") or {}
@@ -564,14 +520,11 @@ def rule_pack_section(
     result: RulePackResult,
     cases: list[TestCase],
     ctx: dict | None = None,
-    matches: dict[str, list[str]] | None = None,
 ) -> str:
     """Combined advisory markdown for every enabled pack. "" when inert.
 
-    ``matches`` is the Batch-2 backward-matcher output already adapted by
-    ``coverage_matches``; when non-empty it powers the second, checklist-driven
-    bundling signal. Empty in prompt+advisory mode, where only the textual
-    ``detect_bundled_cases`` signal runs. Never raises.
+    Only the textual ``detect_bundled_cases`` signal runs; there is no
+    external check behind it. Never raises.
     """
     try:
         if not result.active or not cases:

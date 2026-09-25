@@ -319,9 +319,9 @@ def checklist_lines(pairs: list[LanguagePair]) -> list[str]:
     """One mandatory checklist line per documented pair (decomposition rule).
 
     The line carries the PLACEHOLDER TOKENS, never the literal strings, so the
-    same text is safe on the checklist that is rendered into the prompt, into the
-    XLSX 'Requirements Checklist' sheet and into the coverage tally. Written in
-    EARS event_driven shape to match the rest of the Batch-2 checklist.
+    same text is safe on the checklist that is rendered into the prompt and into
+    the XLSX 'Requirements Checklist' sheet. Written in EARS event_driven shape
+    to match the rest of the Batch-2 checklist.
     """
     out: list[str] = []
     try:
@@ -477,10 +477,9 @@ def new_report(documented_pairs: int = 0) -> dict:
         "cases_touched": [],
         "baked_keys": [],
         "residual_tokens": [],
-        # stable_ids of the cases that actually carry a documented pair. Handed to
-        # _semantic_dedupe_cases as protected_stable_ids: a mandated per-key case
-        # must never be merged away as a near-duplicate, no matter how similar two
-        # locale-switch cases look to an embedding model.
+        # stable_ids of the cases that actually carry a documented pair (see
+        # rule_packs.protected_stable_ids): a mandated per-key case must never be
+        # merged away as a near-duplicate.
         "protected_stable_ids": [],
         "placeholders_seen": False,
     }
@@ -561,12 +560,13 @@ def substitute_placeholders(
         report["split_keys"] = sorted(k for k, ids in holder.items() if len(ids) > 1)
         report["unresolved"] = sorted(unresolved)
         # PROTECTION LIST, not a nice-to-have. Two bilingual cases differ only by
-        # which documented message they quote; real sentence embeddings can score
-        # that pair above QA_SEMANTIC_DEDUP_THRESHOLD (default 0.9) even AFTER
-        # substitution, so ordering substitution before dedup is necessary but not
-        # sufficient. stable_id is derived from (title, steps) and the only later
-        # mutation before dedup is the sweep's model_copy, which does NOT re-run
-        # that validator -- so these ids still match at the dedup call site.
+        # which documented message they quote; a similarity scorer could still
+        # score that pair above the 0.9 dedup threshold even AFTER substitution,
+        # were the disabled dedup seam revived, so ordering substitution before
+        # dedup is necessary but not sufficient. stable_id is derived from
+        # (title, steps) and the only later mutation before dedup is the sweep's
+        # model_copy, which does NOT re-run that validator -- so these ids still
+        # match at the dedup call site.
         report["protected_stable_ids"] = sorted(
             {
                 sid

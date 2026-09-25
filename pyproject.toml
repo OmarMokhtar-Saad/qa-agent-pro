@@ -1,6 +1,6 @@
 [project]
 name = "qa-agent-pro"
-version = "1.96.0"
+version = "1.96.1"
 requires-python = ">=3.10"
 dependencies = [
     "pyyaml>=6.0",  # contracts + OpenAPI specs are YAML (api_test agent)
@@ -63,13 +63,6 @@ spec = [
     "pypdf>=4.0",
     "python-docx>=1.1",
 ]
-embeddings = [
-    # Optional local embedding backend (QA_EMBEDDINGS_BACKEND=local). Imported
-    # lazily by tools/embeddings.py; absent by default so the disabled path and
-    # the dist build stay dependency-identical.
-    "sentence-transformers>=2.2",
-]
-
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
