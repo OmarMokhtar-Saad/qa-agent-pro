@@ -225,21 +225,26 @@ class Settings(BaseSettings):
     # submission that carries verdicts anyway is still handled safely. What is
     # gone is only the INSTRUCTION that asks for them; the seam is
     # agents.host_mode.grounding_review_enabled(). See docs/FEATURE_FLAGS.md.
-    # Parent-story context (JIRA_FETCH_PARENT). Default **ON** — a deliberate
-    # exception to the constitution's defaults-OFF rule. The two flags this
-    # comment used to name alongside it are both gone: QA_AUTO_EXPORT_XLSX was
-    # hardcoded ON in batch 4 (2026-08-12) and QA_AMBIGUITY_GATE_SEVERITY was
-    # deleted by P2-J2 with the gate it switched.
+    # Parent-story context (JIRA_FETCH_PARENT). Default **OFF** since
+    # 2026-09-25 (Air onboarding test) -- this REVERSES the "deliberate
+    # exception to the defaults-OFF rule" this comment used to record: a
+    # tester who never asked for parent-story context got it fetched and
+    # injected anyway, with no way to know why extra Jira calls were
+    # happening. Category: operator-choice (unchanged) -- opt in per install
+    # with JIRA_FETCH_PARENT=true. The two flags this comment used to name
+    # alongside it are both gone: QA_AUTO_EXPORT_XLSX was hardcoded ON in
+    # batch 4 (2026-08-12) and QA_AMBIGUITY_GATE_SEVERITY was deleted by
+    # P2-J2 with the gate it switched.
     # A Jira SUB-TASK ("Add Apple Pay button") carries almost no requirements
     # — they live on the parent story — so fetching only the sub-task makes
     # the generator either fabricate a suite or trip the ambiguity gate, which
-    # is exactly the failure this flag exists to prevent. parent/subtasks/
-    # issuelinks are already in the DEFAULT REST field set (free to extract);
-    # only the parent BODY costs one extra authenticated GET, and a ticket
-    # with no parent makes no extra call at all. The result is injected as
-    # clearly-labelled BACKGROUND, never as the thing under test.
-    # Set JIRA_FETCH_PARENT=false to disable (complete kill-switch).
-    jira_fetch_parent: bool = True
+    # is exactly the failure this flag exists to prevent when turned ON.
+    # parent/subtasks/issuelinks are already in the DEFAULT REST field set
+    # (free to extract); only the parent BODY costs one extra authenticated
+    # GET, and a ticket with no parent makes no extra call at all. The result
+    # is injected as clearly-labelled BACKGROUND, never as the thing under
+    # test. Set JIRA_FETCH_PARENT=true to opt in.
+    jira_fetch_parent: bool = False
     # Character cap on the composed parent/related-issue BACKGROUND block so a
     # huge epic description can never crowd out the sub-task under test. 0
     # means "emit no background block" (same convention as jira_max_comments),
@@ -263,12 +268,15 @@ class Settings(BaseSettings):
     # parent, WITH their bodies. _extract_subtasks / _extract_issuelinks only
     # ever see {key, summary, status} from arrays that ride along with the issue
     # fetch, so the requirements WRITTEN IN a sibling story were invisible: a
-    # sub-task inherits them and a tester reading the board sees them. ON by
-    # default for the same reason as jira_fetch_parent (a default-OFF switch
-    # leaves the generator guessing), and a deliberate exception to the
-    # defaults-OFF rule, documented in docs/FEATURE_FLAGS.md. Costs ONE extra
-    # host-side searchJiraIssuesUsingJql call, and only when a parent exists.
-    jira_fetch_sibling_stories: bool = True
+    # sub-task inherits them and a tester reading the board sees them.
+    # Default OFF since 2026-09-25 (Air onboarding test) -- this REVERSES the
+    # "deliberate exception to the defaults-OFF rule" this comment used to
+    # record (matching jira_fetch_parent above): unrequested sibling fetches
+    # cost a tester extra, unexplained Jira calls. Category: operator-choice
+    # (unchanged), documented in docs/FEATURE_FLAGS.md. Costs ONE extra
+    # host-side searchJiraIssuesUsingJql call when turned ON, and only when a
+    # parent exists. Set JIRA_FETCH_SIBLING_STORIES=true to opt in.
+    jira_fetch_sibling_stories: bool = False
     # How many sibling stories may contribute a BODY. Deliberately its own knob
     # rather than reusing the 10-issue _MAX_RELATED_ISSUES list cap: listing ten
     # keys costs a line each, but ten BODIES split the character budget ten ways.
@@ -696,21 +704,6 @@ class Settings(BaseSettings):
     # 0 = unlimited (default).
     qa_rag_max_entries: int = 0
 
-    # Relevance FLOOR for the injected "## Similar Past Test Cases" block.
-    # 0.0 = OFF (default = today's behaviour: _enrich_with_rag injects ALL top-k
-    # hits with no floor -- only the Duplicate-Risk block was ever thresholded,
-    # by qa_rag_similarity_threshold). On the 2026-07-30 run that put 5 snippets
-    # from unrelated past tickets into the prompt whose TOP score was 0.0875
-    # (886-entry corpus, bm25): wasted host-context tokens and real topic-bleed
-    # risk into the tester's own model. The scale is MODE-DEPENDENT (jaccard /
-    # cosine / bm25 normalise differently), so a value belongs with a pinned
-    # QA_RAG_SIMILARITY_MODE. Suppression is always logged with counts -- silence
-    # here would be indistinguishable from an empty corpus or a broken query. The
-    # Duplicate-Risk block keeps its own threshold and is UNAFFECTED.
-    # Coerced by _coerce_checklist_float, which CLAMPS to [0, 1]: an operator
-    # writing 15 (meaning "15%") would otherwise suppress the block permanently.
-    qa_rag_similar_min_score: float = 0.0
-
     # --- Semantic embeddings (opt-in; default disabled) --------------------
     # Optional embedding backend powering semantic dedup + vector RAG ranking.
     #   ""       : disabled (default) — zero cost, no optional import.
@@ -1084,21 +1077,8 @@ class Settings(BaseSettings):
     # soaked ON and are now unconditional. The floor is still always the prep's
     # OWN stamped value, the guard is still keyed on source_url only, both still
     # fail OPEN, and `volume_floor_ack=true` is still honoured only after a
-    # refusal. The two WINDOW settings below stay as tuning knobs.
+    # refusal. The WINDOW setting below stays as a tuning knob.
     qa_host_duplicate_prep_window_s: int = 1800
-    # 2026-08-10 (I3): the FINISHED-SUITE half of the same guard gets its own,
-    # much wider window. The two are different failure modes and 1800s was only
-    # ever right for one of them: a second PREP 43 seconds later is wasted
-    # in-flight work, while a second finalized SUITE hours later is a duplicate
-    # deliverable the tester pays for twice. Live 2026-08-10: the 13:06 prepare
-    # was the THIRD full generation of one ticket that day -- SEVEN stored
-    # suites and a delivered .xlsx -- and said nothing, because the newest match
-    # was ~4.9x the prep window old. A generous default is safe here because
-    # this exit is INFORMATIONAL, not a refusal: it names the existing suite and
-    # `proceed_anyway=true` still regenerates, so the worst case is one extra
-    # confirmation round trip per ticket per day. Coerced by the same lenient,
-    # never-raising validator as every other int in this file.
-    qa_host_duplicate_suite_window_s: int = 86400
 
     # --- Server-LLM kill switch: DELETED 2026-08-15 ------------------
     # QA_SERVER_LLM_ENABLED and QA_SERVER_LLM_ALLOW were the host-boomerang
@@ -1267,15 +1247,12 @@ class Settings(BaseSettings):
         "qa_checklist_match_high",
         "qa_checklist_match_medium",
         "qa_checklist_min_granularity",
-        "qa_rag_similar_min_score",
         mode="before",
     )
     @classmethod
     def _coerce_checklist_float(cls, v: object, info) -> float:
         """Lenient, never-raising float coercer for the Batch-2 checklist bands
-        and the RAG relevance floor (QA_RAG_SIMILAR_MIN_SCORE, added
-        2026-07-30 -- it belongs here rather than with the reconciler
-        thresholds precisely BECAUSE this group clamps).
+        and the RAG similarity threshold.
 
         QA_RAG_SIMILARITY_THRESHOLD joined this group rather than
         keeping its own validator, which had no range check at all.
@@ -1417,7 +1394,6 @@ class Settings(BaseSettings):
         "qa_host_dedup_max_groups",
         "qa_host_dedup_max_group_size",
         "qa_host_duplicate_prep_window_s",
-        "qa_host_duplicate_suite_window_s",
         "qa_mobile_boot_timeout_s",
         mode="before",
     )

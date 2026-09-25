@@ -33,7 +33,6 @@ from tools.quality_checks import (
     resolve_chained_refs_to_stable,
     restore_chained_refs_from_stable,
 )
-from tools.rag_store import query_corpus
 from tools.requirement_units import (
     assignable_unit_ids,
     coverage_warning_section,
@@ -234,18 +233,6 @@ def checklist_remediation_enabled() -> bool:
     return False
 
 
-def rag_enabled() -> bool:
-    """Always True -- RAG corpus grounding is ON, unconditionally.
-
-    QA_RAG_ENABLED was DELETED on 2026-08-13 (flag-surface reduction, batch 7
-    (needs-config)) and hardcoded to the value the DISTRIBUTION ships (`true`),
-    not this field's code default. A named seam so the no-corpus path stays
-    executable by its tests -- and so the mocked suite never reads a developer
-    machine's real corpus/ directory. NOT settings-derived.
-    """
-    return True
-
-
 def semantic_dedup_enabled() -> bool:
     """Always False -- intra-suite semantic dedup is RETIRED.
 
@@ -257,87 +244,6 @@ def semantic_dedup_enabled() -> bool:
     _semantic_dedupe_cases is retained for revival. NOT settings-derived.
     """
     return False
-
-
-async def _enrich_with_rag(feature_text: str, parts: list[str]) -> None:
-    """Optionally query the RAG corpus for similar past test cases.
-
-    Appends a '## Similar Past Test Cases' block and/or a '## Duplicate Risk'
-    block to parts when relevant results are found.
-    Checks rag_enabled() first — returns immediately when that seam is off.
-    Never raises.
-    """
-    if not rag_enabled():
-        return
-
-    result = await query_corpus(
-        feature_text,
-        entry_type="test_case",
-        top_k=settings.qa_rag_top_k,
-    )
-    if result.get("error"):
-        logger.warning(
-            "RAG corpus query failed: %s — proceeding without past context",
-            result["error"],
-        )
-        return
-
-    hits = result.get("content") or []
-    if not hits:
-        return
-
-    similar_lines: list[str] = []
-    duplicate_lines: list[str] = []
-    threshold = settings.qa_rag_similarity_threshold
-    # Relevance FLOOR for the similar-cases block ONLY
-    # (QA_RAG_SIMILAR_MIN_SCORE; 0.0 = off = today's behaviour). The
-    # Duplicate-Risk block below keeps its own `threshold` and is
-    # deliberately UNTOUCHED, so a hit can still be flagged as a duplicate
-    # risk even when an aggressive floor keeps it out of the prompt block.
-    try:
-        floor = float(settings.qa_rag_similar_min_score or 0.0)
-    except Exception:  # pragma: no cover - defensive
-        floor = 0.0
-    suppressed = 0
-
-    for hit in hits:
-        score = hit.get("score", 0.0)
-        snippet = (hit.get("content") or "")[:300].replace("\n", " ")
-        meta = hit.get("metadata") or {}
-        feature_label = meta.get("feature", "")
-        label = f"{feature_label}: {snippet}" if feature_label else snippet
-        if floor > 0.0 and score < floor:
-            suppressed += 1
-        else:
-            similar_lines.append(f"- (score={score:.2f}) {label}")
-        if score >= threshold:
-            duplicate_lines.append(f"- score={score:.2f}: {label}")
-
-    if similar_lines:
-        parts.append("## Similar Past Test Cases\n" + "\n".join(similar_lines))
-    if duplicate_lines:
-        parts.append(
-            "## Duplicate Risk\n"
-            "The following existing test cases overlap significantly with this feature. "
-            "Avoid duplicating them — extend or reference them instead:\n"
-            + "\n".join(duplicate_lines)
-        )
-    if suppressed:
-        # NEVER silent: with the block gone, an operator cannot tell a floor that
-        # suppressed 5 irrelevant hits from an empty corpus or a broken query.
-        logger.info(
-            "RAG: %d of %d hit(s) scored below the relevance floor %.3f and were "
-            "omitted from the similar-cases block (%d kept)",
-            suppressed,
-            len(hits),
-            floor,
-            len(similar_lines),
-        )
-    logger.info(
-        "RAG: injected %d similar past test cases (%d flagged as duplicate risk)",
-        len(similar_lines),
-        len(duplicate_lines),
-    )
 
 
 # ---- Category prompt: split into a STABLE part and a per-category part -----
@@ -1542,7 +1448,6 @@ async def _prepare_generation(
     # T-05 (I-028): the independent enrichment calls — compliance web search, RAG
     # query, and (when no explicit ACs) AC synthesis — depend only on feature_text,
     # so fan them out concurrently instead of awaiting them one after another.
-    rag_parts: list[str] = []
     _need_acs = not acs and bool(feature_text and feature_text.strip())
     # Batch 2 Pass 1: the atomic requirements checklist. Joins the EXISTING
     # concurrent enrichment gather so its single ask_json costs no extra wall
@@ -1586,12 +1491,6 @@ async def _prepare_generation(
     # passed decompose_checklist=False.
     checklist_items: list[ChecklistItem] = []
 
-    await _emit_status(
-        on_status,
-        "🔎 Gathering context — corpus, checklist…",
-    )
-    await _enrich_with_rag(feature_text, rag_parts)
-
     # The Phase-0 granularity audit does NOT run here. It used to guard the
     # decomposed checklist, but checklist_items is empty for the whole of
     # prepare (see above), so audit_granularity was only ever called on []
@@ -1618,9 +1517,6 @@ async def _prepare_generation(
     target_description = feature_text or ""
     has_jira_images = False
     has_attached_images = False
-
-    for rag_part in rag_parts:
-        parts.append(wrap_untrusted("rag_similar_past_cases", rag_part))
 
     if url_content and not url_content.get("error"):
         jira_context_text = _strip_html(

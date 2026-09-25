@@ -34,6 +34,7 @@ from urllib.parse import unquote, urlparse
 os.chdir(Path(__file__).resolve().parent)
 
 from config.settings import settings  # noqa: E402, I001
+from tools import dispatch_guard  # noqa: E402
 from tools import guidance  # noqa: E402
 from tools import mcp_handlers  # noqa: E402
 from tools import telemetry  # noqa: E402
@@ -166,6 +167,47 @@ DRIFT_RESTART_EXIT_CODE = 86
 _DRIFT_EXIT_JITTER_S = 3.0
 _INFLIGHT: dict = {"n": 0, "last_finish": 0.0}
 _INFLIGHT_LOCK = threading.Lock()
+
+# P1-5 (Air onboarding fix): a duplicate call landing within this window --
+# a host retry, a double-click in a chat UI -- returns the cached result
+# instead of re-running the tool. Deliberately NOT inside `_tracked()`: that
+# function's docstring says it is structurally denied an `args` parameter so
+# a payload can never leak through the one seam every tool shares, so this
+# cache has to live at each call site instead.
+_RECENT_CALL_TTL_S = 5.0
+# qa_generate_test_cases gets a longer window: in the Air run the duplicate
+# arrived ~6s after a 17s call had FINISHED, which 5s would miss. This is a
+# duplicate-call guard, NOT the removed 24h finished-suite stop: 30s, same
+# args only, and only a reply that created a prep is replayed.
+_GENERATE_DUP_WINDOW_S = 30.0
+_RECENT_CALLS: dict = {}
+_RECENT_CALLS_LOCK = threading.Lock()
+
+
+def _recent_call_cached(key, ttl_s: float = _RECENT_CALL_TTL_S):
+    """Return the cached result for key if still within ttl_s, else None.
+    Never raises."""
+    with _RECENT_CALLS_LOCK:
+        entry = _RECENT_CALLS.get(key)
+        if not entry:
+            return None
+        result, at = entry
+        if time.monotonic() - at > ttl_s:
+            _RECENT_CALLS.pop(key, None)
+            return None
+        return result
+
+
+def _recent_call_store(key, result) -> None:
+    """Store result under key with the current time, for _recent_call_cached
+    to serve back within the TTL. Drops every entry older than the longest
+    window first, so the cache cannot grow for the life of the process."""
+    now = time.monotonic()
+    horizon = max(_RECENT_CALL_TTL_S, _GENERATE_DUP_WINDOW_S)
+    with _RECENT_CALLS_LOCK:
+        for stale in [k for k, (_, at) in _RECENT_CALLS.items() if now - at > horizon]:
+            del _RECENT_CALLS[stale]
+        _RECENT_CALLS[key] = (result, now)
 
 
 def _drift_restart_enabled() -> bool:
@@ -340,6 +382,7 @@ async def _tracked(name, ctx, coro):
     error_type = None
     telemetry.start_tool_trace(name)
     _inflight_enter()
+    _dispatch_token = dispatch_guard.enter_dispatched()
     try:
         return await coro
     except Exception as exc:
@@ -355,6 +398,21 @@ async def _tracked(name, ctx, coro):
             "ok" if ok else "error %s" % (error_type or "Exception"),
             duration_ms,
         )
+        try:
+            from tools import audit_log
+
+            await audit_log.record_event(
+                event_type="tool_called",
+                actor=_CLIENT.get("name", "") or None,
+                detail={
+                    "tool": name,
+                    "duration_ms": duration_ms,
+                    "ok": ok,
+                    "error_type": error_type,
+                },
+            )
+        except Exception:
+            logger.debug("audit_log record_event failed", exc_info=True)
         telemetry.tool_called(
             name,
             duration_ms=duration_ms,
@@ -367,6 +425,7 @@ async def _tracked(name, ctx, coro):
         # LAST in the finally: releasing the slot earlier would let a drift
         # restart fire while telemetry and FastMCP's result serialization still
         # had work to do, and os._exit does not flush buffered stdout.
+        dispatch_guard.exit_dispatched(_dispatch_token)
         _inflight_exit()
 
 
@@ -668,7 +727,7 @@ def build_server():
     does.
     """
     from fastmcp import Context, FastMCP
-    from mcp.types import ContentBlock
+    from mcp.types import ContentBlock, ToolAnnotations
 
     # The two edition gates, read here so the GUIDANCE text is built from the
     # same expressions the registration gates below use. (Those gates still
@@ -689,13 +748,36 @@ def build_server():
     # holds nothing but a call to this.
     edition_mobile = mcp_handlers._mobile_lane_enabled()
 
+    # P1-4 (Air onboarding fix): a drift restart silently swaps the process
+    # under a tester mid-session; the reload marker was previously read only
+    # by qa-doctor's next call. Peeking at it here too -- in the
+    # `instructions=` block every client reads at `initialize`, before any
+    # tool call -- reaches the tester's actual next action. PEEK, never
+    # consume: the marker is one-shot and qa-doctor's reload-outcome report
+    # must still find it. Read-only report,
+    # never a `_tracked()` side effect: never raises, never blocks startup.
+    reload_notice = ""
+    try:
+        from tools.mcp_handlers import _peek_reload_marker
+
+        marker = _peek_reload_marker() or {}
+        if marker.get("reason"):
+            reload_notice = (
+                "\n\nNOTE: this server restarted mid-session ("
+                f"{marker.get('reason')}) to pick up a change. If a reply "
+                "looks stale, say so and I will retry."
+            )
+    except Exception:
+        reload_notice = ""
+
     mcp = FastMCP(
         SERVER_NAME,
         instructions=guidance.server_instructions(
             test_cases_only=edition_test_cases_only,
             api_tests=edition_api_tests,
             mobile=edition_mobile,
-        ),
+        )
+        + reload_notice,
     )
 
     @mcp.tool()
@@ -768,7 +850,25 @@ def build_server():
         pass `image_carry_ack=true` if the user really wants the cases written
         without them.
         """
-        return await _tracked(
+        _cache_key = (
+            "qa_generate_test_cases",
+            feature_or_url,
+            proceed_anyway,
+            jira_content_json,
+            source_plan,
+            attached_image_count,
+            tuple(capture_ids or ()),
+            image_gate_ack,
+            image_carry_ack,
+        )
+        _cached = _recent_call_cached(_cache_key, _GENERATE_DUP_WINDOW_S)
+        if _cached is not None:
+            return (
+                "Already done: an identical `qa_generate_test_cases` call "
+                "finished moments ago, so nothing was re-run. Its reply "
+                "follows; continue from its prep_id.\n\n" + _cached
+            )
+        _result = await _tracked(
             "qa_generate_test_cases",
             ctx,
             mcp_handlers.handle_generate_test_cases(
@@ -784,6 +884,11 @@ def build_server():
                 image_carry_ack=image_carry_ack,
             ),
         )
+        # Only a reply that created a prep: replaying a clarify or a gate
+        # block would hide a changed tester answer (e.g. the P0-3 dialog).
+        if "**prep_id:** `" in _result:
+            _recent_call_store(_cache_key, _result)
+        return _result
 
     @mcp.tool()
     async def qa_prepare_test_cases(
@@ -852,10 +957,13 @@ def build_server():
         -- many screens are fine, and the ids stay valid across the Jira fetch
         directive and any failed attempt, so re-send them unchanged. Once the
         ticket is fetched a SECOND short reply may NAME the screens the ticket
-        actually has and ask again; supply them, or pass `image_gate_ack=true` to
-        generate from the ticket text anyway. If the user already said the
-        screens do not matter, send `source_plan='jira'` AND
-        `image_gate_ack=true` together and neither ask appears.
+        actually has and ask again; supply them, or ASK THE TESTER FIRST
+        whether skipping is acceptable and, only if they agree, pass
+        `image_gate_ack=true`: the server then shows the tester a
+        confirmation dialog and only their own skip pick generates from the
+        ticket text. If the user already said the screens do not matter,
+        send `source_plan='jira'` AND `image_gate_ack=true` together; the
+        confirmation dialog still appears.
 
         RE-PREPARING THE SAME SOURCE: if a recent preparation for this source was
         grounded on screens and your new call carries none, this server either
@@ -970,7 +1078,7 @@ def build_server():
             ),
         )
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def qa_prep_status(ctx: Context, prep_id: str = "") -> str:
         """Show which categories are staged for a host-mode prep_id and whether
         the per-category (Path A) finalize is allowed yet.
@@ -987,7 +1095,7 @@ def build_server():
             mcp_handlers.handle_prep_status(prep_id),
         )
 
-    @mcp.tool()
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def qa_get_category_job(
         ctx: Context, prep_id: str = "", category_name: str = ""
     ) -> str:
@@ -999,12 +1107,24 @@ def build_server():
         Pass category_name="all" (or "*") to get EVERY job in ONE call with
         the shared prompt blocks hoisted once -- always preferred; never fetch
         packets one call per category.
+
+        Generation itself is invisible to this server (no model call happens
+        here) and can run 6.5-24 minutes per category from the caller's own
+        chat model. Tell the tester a short status line -- "Generating
+        <category>..." -- before you start writing each category, so a long
+        gap is never silent.
         """
-        return await _tracked(
+        _cache_key = ("qa_get_category_job", prep_id, category_name)
+        _cached = _recent_call_cached(_cache_key)
+        if _cached is not None:
+            return _cached
+        _result = await _tracked(
             "qa_get_category_job",
             ctx,
             mcp_handlers.handle_get_category_job(prep_id, category_name),
         )
+        _recent_call_store(_cache_key, _result)
+        return _result
 
     @mcp.tool()
     async def qa_submit_category(
@@ -1695,14 +1815,16 @@ def build_server():
             )
 
     @mcp.tool(name="qa-doctor")
-    async def qa_doctor(ctx: Context) -> str:
+    async def qa_doctor(ctx: Context, fix: bool = False) -> str:
         """Check whether THIS machine is ready: overall verdict, environment,
         integrations (Jira/Atlassian, embeddings), CLI tooling (adb/xcrun),
         enabled features and action items. It reports NO model backend --
-        there is none: every generative step runs in YOUR chat model. Fast, but NOT read-only -- it repairs what it can: it
-        rewrites `.env` (keeping a timestamped `.env.bak-*`) and writes the
-        hosted `atlassian` entry into this client's MCP config. Run this first
-        on a new machine."""
+        there is none: every generative step runs in YOUR chat model.
+        Read-only by default (2026-09-25): pass fix=true to let it repair what
+        it can -- rewrite `.env` (keeping a timestamped `.env.bak-*`) and write
+        the hosted `atlassian` entry into this client's MCP config. Run this
+        first on a new machine; call again with fix=true once you see a repair
+        it can make."""
         progress = _make_progress(ctx)
         # Resolved BEFORE entering _tracked: this is a round trip back to the
         # client, not part of the report's own work, and _tracked owns the
@@ -1711,7 +1833,9 @@ def build_server():
         return await _tracked(
             "qa-doctor",
             ctx,
-            mcp_handlers.handle_setup_check(progress=progress, workspace_roots=roots),
+            mcp_handlers.handle_setup_check(
+                progress=progress, workspace_roots=roots, fix=fix
+            ),
         )
 
     # ALL editions, NO flag: flag policy says a new feature ships ON, and this
