@@ -81,7 +81,6 @@ from tools.jira_mcp import (
     not_connected_message,
     verify_directive,
     verify_outcome,
-    verify_tool_name,
 )
 from tools.playwright_exporter import generate_playwright_script
 from tools.rag_store import (
@@ -17158,7 +17157,7 @@ def _jira_status_text(state: str, view: dict | None) -> str:
         return (
             f"{head}\u26a0\ufe0f checked {age} ago and not re-checked since. "
             f"{tail} An OAuth session can expire or be revoked in that time, so "
-            "I'll re-check it."
+            "I'll re-check it the next time you ask me for a Jira ticket."
         )
     if state == "access_unconfirmed":
         return (
@@ -17170,7 +17169,8 @@ def _jira_status_text(state: str, view: dict | None) -> str:
         return (
             f"{head}\u26a0\ufe0f checked {age} ago, but only that you were "
             f"signed in \u2014 not that the account can reach your Jira site. "
-            f"{tail} I'll re-check it."
+            f"{tail} I'll re-check it the next time you ask "
+            "me for a Jira ticket."
         )
     if state == "wrong_site":
         return (
@@ -17186,10 +17186,9 @@ def _jira_status_text(state: str, view: dict | None) -> str:
             "and I'll show the exact connection steps for your client."
         )
     return (
-        f"{head}\u26a0\ufe0f not checked yet. {tail} I can't see that connection "
-        "from here, so I haven't confirmed it's signed in \u2014 it's probably "
-        "fine; if a ticket URL fails I'll show the exact connection steps for "
-        "your client."
+        f"{head}\u26a0\ufe0f not checked yet. {tail} I check it the first time "
+        "you ask me for a Jira ticket, not before \u2014 it's probably fine; if "
+        "you're not signed in then, I'll walk you through authorizing it."
     )
 
 
@@ -17664,17 +17663,12 @@ async def handle_setup_check(
         _atlassian_lines, _atlassian_advisories = await _atlassian_autofix()
         recommended.extend(_atlassian_advisories)
         # verify_offered: the on-disk hint returns "" rather than shrugging
-        # beside an answer this report has already given. A "Fix now" item
-        # settles it in the unverified state; the Integrations row states it in
-        # the other three. The CONNECT wording (no entry on disk) is unaffected
-        # and still appears.
+        # beside an answer this report has already given -- the Integrations
+        # row states the Jira state in every verdict, including "checked when
+        # you first ask for a ticket". The CONNECT wording (no entry on disk)
+        # is unaffected and still appears.
         _hint = connect_hint_line(
             workspace_roots=workspace_roots,
-            # True in EVERY verdict state: unverified carries a Fix-now item,
-            # and verified / stale / failed each state the answer on the
-            # Integrations row. There is no state in which this report both
-            # says nothing and leaves an entry on disk unexplained, so the
-            # hedge would always contradict something already printed.
             verify_offered=True,
         )
         if _hint:
@@ -17826,58 +17820,24 @@ async def handle_setup_check(
         except Exception:
             logger.debug("flag-registry expiry check skipped", exc_info=True)
 
-        # 2026-09-01 (item A): FOUR states, not one. Re-raising "Fix now:
-        # verify" a minute after a successful probe trains agents to ignore the
-        # item, and an item that can never be satisfied is not an action item --
-        # it is what pinned the headline off "Ready" on every install.
+        # 2026-09-25: qa-doctor NEVER asks the agent to probe Atlassian. The
+        # probe call is what opens the OAuth sign-in, and a readiness check must
+        # not push the tester through an authorization they did not ask for.
+        # The connection is checked on demand instead: the first time the
+        # tester asks for Jira data, build_fetch_directive's getJiraIssue call
+        # either works or falls through to connect_steps(). Known-broken states
+        # still warn, because they say something the tester can act on.
         #
-        # This block is deliberately ABOVE the headline: the stale and failed
-        # states append to `recommended`, which _overall_verdict counts. Built
-        # at the action-item site instead, the headline would ignore an item
-        # printed below it -- the defect 0b5b0f77 fixed.
-        _verify_ask = (
-            f"call `{verify_tool_name()}` (read-only, no parameters), then "
-            "`qa_configure_jira` with `atlassian_verify_json` set to that "
-            'call\'s raw JSON -- or to `{"error": "<what happened>"}` if the '
-            "tool is missing or fails. See *Verify the Jira (Atlassian) "
-            "connection* above."
+        # This block is deliberately ABOVE the headline: the failed states
+        # append to `recommended`, which _overall_verdict counts.
+        _on_demand = (
+            "I'll re-check it the next time you ask me for a Jira ticket, and "
+            "walk you through signing in then if it is still not connected."
         )
-        _verify_items: list[tuple[str, str]] = []
-        if _verdict_state == "verified":
-            pass  # Answered, and recently. The Integrations row states it.
-        elif _verdict_state == "stale":
-            # RECOMMENDED, not Fix now: something did work, so this is a nudge,
-            # not a fault.
-            recommended.append(
-                "Agent: the Atlassian (Jira) connection verified at "
-                f"{(_verdict_view or {}).get('at')} and has not been re-checked "
-                "since -- an OAuth grant can be revoked or rotated in that "
-                "time. Re-verify now, without asking the tester: " + _verify_ask
-            )
-        elif _verdict_state == "probe_outdated":
-            recommended.append(
-                "Agent: the Atlassian (Jira) connection verified at "
-                f"{(_verdict_view or {}).get('at')}, but only that someone was "
-                "signed in -- not that the account can reach this tester's Jira "
-                "site, which is the check that catches a sign-in on a personal "
-                "Atlassian account. Re-verify now, without asking the tester: "
-                + _verify_ask
-            )
-        # access_unconfirmed raises NO action item, deliberately. A client
-        # whose toolset lacks the access probe can never satisfy one, so it
-        # would repeat on every report forever -- the nag loop with no exit
-        # that 3e66fabf removed. The Integrations row states it instead, and
-        # the headline stays green: nothing is known to be wrong.
-        elif _verdict_state == "access_unconfirmed":
-            pass  # Deliberately no item. See above -- and note that OMITTING
-            # this branch does not produce silence, it falls through to the
-            # unverified "Fix now" below, which is the loudest thing in the
-            # report and wrong about a working connection.
-        elif _verdict_state == "wrong_site":
+        if _verdict_state == "wrong_site":
             # Same branch, so ONE derivation with two consumers: the action
             # item says what to do, `limited` makes the headline say what has
-            # stopped working. `stale` and `probe_outdated` get no `limited`
-            # entry -- nothing is KNOWN to be broken in those states.
+            # stopped working.
             limited.append(
                 "importing Jira tickets (the connected Atlassian account "
                 "cannot reach this tester's site)"
@@ -17888,12 +17848,11 @@ async def handle_setup_check(
                 f"({(_verdict_view or {}).get('at')}), so ticket URLs will fail "
                 "until the right account is connected in your editor. Test "
                 "generation from a typed feature description is unaffected. "
-                "Agent: re-check after they reconnect: " + _verify_ask
+                + _on_demand
             )
         elif _verdict_state == "failed":
-            # Known-broken and actionable to the TESTER, so a warning rather
-            # than an unsettled question. Not a blocker: generation from a typed
-            # feature description is entirely unaffected.
+            # Known-broken and actionable to the TESTER. Not a blocker:
+            # generation from a typed feature description is unaffected.
             limited.append(
                 "importing Jira tickets (the Atlassian connection failed its "
                 "last check)"
@@ -17902,28 +17861,13 @@ async def handle_setup_check(
                 "The Atlassian (Jira) connection failed its last check "
                 f"({(_verdict_view or {}).get('at')}), so ticket URLs will not "
                 "work until it is reconnected in your editor. Test generation "
-                "from a typed feature description is unaffected. Agent: "
-                "re-check it now, without asking the tester: " + _verify_ask
+                "from a typed feature description is unaffected. " + _on_demand
             )
-        else:
-            _verify_items = [
-                (
-                    "Fix now",
-                    "Agent: the Atlassian (Jira) connection above is a GUESS "
-                    "from on-disk config -- an entry can be present and "
-                    "unauthorized, or absent and working through a hosted "
-                    "connector. Verify it now, before you summarise this "
-                    "report and without asking the tester: " + _verify_ask,
-                )
-            ]
-        # Only the "unverified" state is an unsettled question. A stale or
-        # failed verdict is something KNOWN, and its item is in `recommended`,
-        # where it reads as "Ready, with warnings" rather than "unverified".
-        # This is the line that makes "✅ Ready" reachable again.
+        # Jira is never an unsettled question here: it is checked on demand.
         verdict = _overall_verdict(
             len(blockers),
             len(recommended),
-            1 if _verdict_state == "unverified" else 0,
+            0,
             # KEYWORD, and pinned at this call site by its own test: the
             # parameter has a default, so nothing about the function alone can
             # catch this argument being dropped.
@@ -18051,29 +17995,9 @@ async def handle_setup_check(
         _unfinished = await _unfinished_preps_note()
         if _unfinished:
             lines += ["", "### Unfinished host-mode preps", _unfinished.rstrip()]
-        # 2026-08-03: everything Jira-shaped above is this server's BEST GUESS
-        # -- an `atlassian` entry found on disk at most, and nothing at all for
-        # Claude Desktop's hosted Connector. So every report also carries a
-        # directive asking the AGENT to make ONE read-only atlassianUserInfo
-        # call and hand the result back through qa_configure_jira, which turns
-        # the guess into a verified yes/no. Unconditional on purpose: a missing
-        # local config entry is not evidence of absence, and a present one is
-        # not evidence of authorization. Additive -- the optional hint stays.
         lines += ["", *_ac_field_section()]
-        lines += [
-            "",
-            "### Verify the Jira (Atlassian) connection",
-            verify_directive(),
-        ]
-        # 2026-08-31: the verify directive above is unconditional, but it lived
-        # in a section while the only Jira-shaped ACTION item was the on-disk
-        # hint tagged "Optional" -- so agents reported the guess and never made
-        # the probe call. An unverified OAuth session is now an open "Fix now"
-        # item, listed FIRST, naming both calls. It is advice to the AGENT, not
-        # to the tester, and costs one read-only call.
         items = (
-            _verify_items
-            + [("Fix now", item) for item in blockers]
+            [("Fix now", item) for item in blockers]
             + [("Recommended", item) for item in recommended]
             + [("Optional", item) for item in optional]
         )
