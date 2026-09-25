@@ -2268,8 +2268,9 @@ def verify_tool_name() -> str:
 def verify_directive() -> str:
     """Directive asking the calling agent to PROVE the Atlassian connection.
 
-    Appended to EVERY qa-doctor report and to qa_configure_jira's
-    no-argument reply, so the flow is reachable from either entry point.
+    Appended to qa_configure_jira's no-argument reply only -- NOT to
+    qa-doctor (2026-09-25): the probe call opens the OAuth sign-in, which must
+    happen only when the tester asks for Jira data or runs qa_configure_jira.
     Additive by design: the on-disk best guess (connect_hint_line) still stands
     beside it, because this only becomes a real status once the agent calls
     back. Never raises.
