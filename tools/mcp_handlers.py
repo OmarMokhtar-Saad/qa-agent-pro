@@ -55,6 +55,7 @@ from agents.test_scenario_agent import (
 from config.settings import settings
 from tools import (
     case_quality_gate,
+    dispatch_guard,
     handover_cost,
     host_privileges,
     prep_store,
@@ -240,6 +241,24 @@ def _consume_reload_marker() -> dict:
         # A marker that cannot be removed would repeat its verdict; the TTL
         # below bounds how long that can go on.
         logger.debug("could not remove the reload marker", exc_info=True)
+    return _parse_reload_marker(raw)
+
+
+def _peek_reload_marker() -> dict:
+    """Read the reload breadcrumb WITHOUT deleting it. build_server() uses this
+    for its startup notice so qa-doctor's _consume_reload_marker() still finds
+    the marker and reports the reload outcome. Never raises."""
+    try:
+        raw = _reload_marker_path().read_text(encoding="utf-8")
+    except Exception:
+        return {}
+    return _parse_reload_marker(raw)
+
+
+def _parse_reload_marker(raw: str) -> dict:
+    """The marker dict, or {} when it is corrupt or outside
+    _RELOAD_MARKER_TTL_S (a future timestamp is a clock change, not a
+    reload). Never raises."""
     try:
         data = json.loads(raw)
         if not isinstance(data, dict):
@@ -2403,6 +2422,37 @@ _IMAGE_GATE_LINE = (
     "alone unless you give me the images another way."
 )
 
+# P0-3: `image_gate_ack=true` is the AGENT's say-so that the tester agreed to
+# skip the screens. Beat 2 asks the tester directly; only this skip label,
+# CHOSEN by them, clears it. There is no agent-side override.
+_IMAGE_GATE_SKIP_LABEL = "Skip the screens -- generate from the ticket text only"
+_IMAGE_GATE_ATTACH_LABEL = "I will attach or capture the screens first"
+
+
+async def _confirm_image_gate_skip(choose: ChooseCb, beat2: str) -> str:
+    """Ask the TESTER whether beat 2 may be skipped. Returns "" only on a CHOSEN
+    skip; otherwise ``beat2`` plus a line saying why the ack did not clear it.
+    Never raises (_elicit_choice degrades to UNAVAILABLE)."""
+    res = await _elicit_choice(
+        choose,
+        "This ticket has screens I was not given. Generate from the ticket "
+        "text only?",
+        [_IMAGE_GATE_SKIP_LABEL, _IMAGE_GATE_ATTACH_LABEL],
+    )
+    if res.status == CHOSEN and res.value == _IMAGE_GATE_SKIP_LABEL:
+        return ""
+    if res.status == CHOSEN:
+        why = "The tester chose to attach the screens first."
+    elif res.status == DECLINED:
+        why = "The tester dismissed the confirmation dialog."
+    else:
+        why = (
+            "The tester could not be asked (this client shows no dialog, or no "
+            "answer arrived), and `image_gate_ack=true` alone cannot skip the "
+            "screens. Attach them instead."
+        )
+    return f"{beat2}\n\n{why}"
+
 _IMAGE_PLAN_ALIASES = {
     "text": "jira",
     "text_only": "jira",
@@ -4156,13 +4206,18 @@ def _image_gate_second_beat(
                 "Ask the user, then call the SAME tool again with the SAME "
                 "`feature_or_url` AND the SAME `jira_content_json` (do NOT "
                 "fetch the ticket again) plus ONE of:\n\n"
-                "1. **Attach the missing screens** -- attach them, then pass "
-                "`attached_image_count=<the TOTAL now attached, not just the "
-                "new ones>`. They stay in YOUR context: no image bytes are "
-                "sent to this server, and the generation payload will ask you "
-                "to describe them.\n"
-                "2. **Generate from the screens I already have** -- pass "
-                "`image_gate_ack=true`. The cases will reflect only those "
+                "1. **Attach the missing screens** -- attach them (Claude "
+                "Code: drag the file into this chat or use `/attach`; "
+                "Cursor: click the paperclip icon and pick the file), then "
+                "pass `attached_image_count=<the TOTAL now attached, not "
+                "just the new ones>`. They stay in YOUR context: no image "
+                "bytes are sent to this server, and the generation payload "
+                "will ask you to describe them.\n"
+                "2. **Generate from the screens I already have** -- ASK THE "
+                "TESTER FIRST; only if they agree, pass `image_gate_ack=true`. "
+                "I then show the tester a confirmation dialog and only THEIR "
+                "'skip the screens' pick clears this gate. The cases will "
+                "reflect only those "
                 f"{_have}, and the reply will say so.\n\n"
                 "Nothing has been prepared yet, so this costs no re-fetch and "
                 "no second generation."
@@ -4185,15 +4240,20 @@ def _image_gate_second_beat(
             "Ask the user which they want, then call the SAME tool again with "
             "the SAME `feature_or_url` AND the SAME `jira_content_json` (do NOT "
             "fetch the ticket again) plus ONE of:\n\n"
-            "1. **Attach the screens to this chat** -- attach them, then pass "
+            "1. **Attach the screens to this chat** -- attach them (Claude "
+            "Code: drag the file into this chat or use `/attach`; Cursor: "
+            "click the paperclip icon and pick the file), then pass "
             "`attached_image_count=<how many you attached>`. They stay in YOUR "
             "context: no image bytes are sent to this server, and the generation "
             "payload will ask you to describe them.\n"
             "2. **Capture them from a connected device** -- call "
             "`qa_capture_screens` first, then pass its `capture_ids`.\n"
-            "3. **Generate from the ticket TEXT anyway** -- pass "
-            "`image_gate_ack=true`. The cases will not reflect anything that "
-            "exists only in those screens, and the reply will say so.\n\n"
+            "3. **Generate from the ticket TEXT anyway** -- ASK THE TESTER "
+            "FIRST; only if they agree, pass `image_gate_ack=true`. I then "
+            "show the tester a confirmation dialog and only THEIR 'skip the "
+            "screens' pick clears this gate. The cases will not reflect "
+            "anything that exists only in those screens, and the reply will "
+            "say so.\n\n"
             "Nothing has been prepared yet, so this costs no re-fetch and no "
             "second generation."
         )
@@ -4714,6 +4774,7 @@ async def handle_generate_test_cases(
     progress: ProgressCb = None,
     jira_content_json: str = "",
 ) -> str:
+    dispatch_guard.require_dispatched("qa_generate_test_cases")
     text = (feature_or_url or "").strip()
     if not text:
         # No source given — run the guided picker (dialogs where the client
@@ -5412,42 +5473,6 @@ def _pending_image_gate_hint(
         return ""
 
 
-async def _find_recent_duplicate_suite(source_text: str) -> dict | None:
-    """Best-effort lookup for a recently-finalized suite generated from the
-    SAME source_url. Never raises and never blocks prepare on a store error --
-    this is a UX guard against a silent full re-run, not a correctness gate.
-
-    Keyed on exact source_url match only (a Jira/issue/web/Swagger URL, as
-    stored by handle_submit_suite). Free-text feature descriptions have no
-    stable identity to dedupe against and are never flagged.
-
-    2026-08-10 (I3): windowed by QA_HOST_DUPLICATE_SUITE_WINDOW_S (24h), NOT by
-    the 1800s PREP window it used to share -- a second prep minutes later and a
-    second finished suite hours later are different failure modes. The scan is
-    20 rows rather than 5 for the same reason, and it is not cosmetic: with a
-    day-wide window the matching suite is routinely not among the 5 newest
-    (seven suites were stored on the day this was found), so a 5-row scan would
-    have left the whole widening as dead code.
-    """
-    if not source_text:
-        return None
-    try:
-        recent = await list_recent_suites(limit=20)
-    except Exception:
-        return None
-    if recent.get("error"):
-        return None
-    window_s = max(0, int(getattr(settings, "qa_host_duplicate_suite_window_s", 86400)))
-    now = time.time()
-    for item in recent.get("content") or []:
-        if item.get("source_url") != source_text:
-            continue
-        created_at = item.get("created_at") or 0
-        if now - created_at <= window_s:
-            return item
-    return None
-
-
 def _jira_page_without_issue_note(text: str) -> str:
     """Refusal when *text* is a URL on a Jira HOST that names no ISSUE, else "".
 
@@ -5498,6 +5523,7 @@ async def handle_prepare_test_cases(
     like the server path, runs _prepare_generation, serializes the result into
     the prep store, and returns the grounded payload the tester's own chat model
     runs the fan-out against. Never raises."""
+    dispatch_guard.require_dispatched("qa_prepare_test_cases")
     text = (feature_or_url or "").strip()
     if not text:
         return PreparePayloadResult(
@@ -5604,8 +5630,8 @@ async def handle_prepare_test_cases(
     # guard's advertised purpose -- "warns instead of silently starting a
     # second full generation for the same source". Losing the previous
     # prep's screens IS the silent harm it exists to prevent, so it rides
-    # this same default-ON flag and needs no new one. Unlike the two
-    # clarifies below it runs REGARDLESS of `proceed_anyway`, which the host
+    # this same default-ON flag and needs no new one. Unlike the
+    # clarify below it runs REGARDLESS of `proceed_anyway`, which the host
     # model in the live run sent: a generic dismissal must not answer a
     # specific loss, so this takes its own `image_carry_ack=true` (the
     # volume_floor_ack pattern). The decision itself is in
@@ -5671,50 +5697,22 @@ async def handle_prepare_test_cases(
                 )
             )
         )
-    # The two clarifies here stay dismissible by `proceed_anyway=true`; only
-    # the IMAGE-loss refusal above is not, because it has its own ack.
-    dup = None if proceed_anyway else await _find_recent_duplicate_suite(text)
-    if dup is not None:
-        # I3 (2026-08-10): hours-aware, because the window is a day wide now
-        # and "151 minute(s) ago" was about to become the normal reading.
-        _dup_ago = _ago_label(time.time() - (dup.get("created_at") or 0))
-        return PreparePayloadResult(
-            clarify=(
-                "⚠️ A suite was already generated from this exact "
-                f"source **{_dup_ago} ago** "
-                f"({dup.get('case_count', '?')} cases, suite "
-                f"`{dup.get('suite_id', '?')}`). Re-running now will create a "
-                "SEPARATE duplicate suite, not continue or replace that one.\n\n"
-                "To hand the tester THAT suite instead, call `qa_export_suite` "
-                f"with `suite_id='{dup.get('suite_id', '')}'` -- the file is "
-                "written again from the stored cases, so no regeneration is "
-                "needed. Otherwise ask the tester whether they actually want a "
-                "fresh regeneration before proceeding; if they confirm yes, "
-                "call `qa_prepare_test_cases` again with `proceed_anyway=true`."
-                + _pending_image_gate_hint(
-                    text,
-                    source_plan,
-                    jira_content_json,
-                    attached_images,
-                    attached_image_count,
-                    capture_ids,
-                )
-            )
-        )
+    # The open-prep clarify above stays dismissible by `proceed_anyway=true`;
+    # the IMAGE-loss refusal is not, because it has its own ack.
     # F22: SHAPE before SCREENS. A board / dashboard / site-root URL on a Jira
     # host names no ticket, so there are no ticket screens to ask about -- and
     # _jira_page_without_issue_note fetches nothing, so this costs one string
-    # test. Placed after the two duplicate guards (cheaper still, and they can
-    # end the call themselves) and deliberately BEFORE the deferred revive
+    # test. Placed after the open-prep guard (cheaper still, and it can
+    # end the call itself) and deliberately BEFORE the deferred revive
     # below: a round that refuses must not first move a screen off the
     # carry-forward shelf, which is the same rule the revive's own comment
-    # states for the two clarifies above it.
+    # states for the clarify above it.
     _shape_refusal = _jira_page_without_issue_note(text)
     if _shape_refusal:
         return PreparePayloadResult(clarify=_shape_refusal)
     # Deferred REVIVE (review M3). NOTHING above this point may move a
-    # screen off the carry-forward shelf: both clarifies above are
-    # dismissible RETRIES, and consuming the shelf on a round that returned a
+    # screen off the carry-forward shelf: the clarify above is a
+    # dismissible RETRY, and consuming the shelf on a round that returned a
     # clarify destroyed the very disclosure the retry needed. Everything
     # above only PROBES; the mutation happens here, once the call is certain
     # to proceed to the gate and the fetch.
@@ -5970,53 +5968,59 @@ async def handle_prepare_test_cases(
         # saved, the duplicate-prep guard cannot fire on the follow-up call.
         # The captures are still in the tray (peeked, not popped), so re-sending
         # the same capture_ids works.
-        if not image_gate_ack:
-            _img_n, _img_names, _img_kind = _ticket_image_evidence(grounded.url_content)
-            # N4 (2026-08-10): bound, not inlined -- the audit row could not tell
-            # "no screens at all" from "3 of 4 arrived" without the ratio.
-            # 2026-08-31 (C2): NOT a sum. `attached_images` already contains the
-            # device captures (merged above) and, on hosts that forward them, the
-            # SAME chat screens `_attested` counts -- so summing double-counted
-            # one channel and let 2-of-3 read as 3-of-3, re-opening the exact
-            # subset-generation hole the completeness rule was added to close.
-            # Chat bytes vs chat attestation: take the larger, they are one
-            # channel. Device captures are a genuinely separate channel and add.
-            # RESIDUAL, accepted: a host that folds its device captures INTO
-            # attached_image_count over-counts by the overlap. Unfixable here --
-            # the count is an unverifiable host claim either way (see the
-            # attested_without_bytes audit stamp below) -- and it is a much
-            # narrower hole than the one it replaces, which needed no
-            # misreporting at all to fire.
-            _chat_side = max(0, len(attached_images or []) - _captured)
-            _have_images = max(_chat_side, _attested) + _captured
-            _beat2 = _image_gate_second_beat(
-                count=_img_n,
-                names=_img_names,
-                kind=_img_kind,
-                plan=_plan,
-                have_images=_have_images,
+        # P0-3: runs whatever `image_gate_ack` says; the ack now only opens
+        # the tester confirmation dialog below.
+        _img_n, _img_names, _img_kind = _ticket_image_evidence(grounded.url_content)
+        # N4 (2026-08-10): bound, not inlined -- the audit row could not tell
+        # "no screens at all" from "3 of 4 arrived" without the ratio.
+        # 2026-08-31 (C2): NOT a sum. `attached_images` already contains the
+        # device captures (merged above) and, on hosts that forward them, the
+        # SAME chat screens `_attested` counts -- so summing double-counted
+        # one channel and let 2-of-3 read as 3-of-3, re-opening the exact
+        # subset-generation hole the completeness rule was added to close.
+        # Chat bytes vs chat attestation: take the larger, they are one
+        # channel. Device captures are a genuinely separate channel and add.
+        # RESIDUAL, accepted: a host that folds its device captures INTO
+        # attached_image_count over-counts by the overlap. Unfixable here --
+        # the count is an unverifiable host claim either way (see the
+        # attested_without_bytes audit stamp below) -- and it is a much
+        # narrower hole than the one it replaces, which needed no
+        # misreporting at all to fire.
+        _chat_side = max(0, len(attached_images or []) - _captured)
+        _have_images = max(_chat_side, _attested) + _captured
+        _beat2 = _image_gate_second_beat(
+            count=_img_n,
+            names=_img_names,
+            kind=_img_kind,
+            plan=_plan,
+            have_images=_have_images,
+        )
+        if _beat2 and image_gate_ack:
+            # P0-3: the ack is the AGENT's claim that the tester agreed; only
+            # the tester's own pick in this dialog clears beat 2. No dialog,
+            # a dismissal or the attach option keep it shut.
+            _beat2 = await _confirm_image_gate_skip(choose, _beat2)
+        if _beat2:
+            # K2 (2026-08-10): INSIDE the gated branch on purpose. At the
+            # _ticket_image_evidence call above, _beat2 is not decided yet, so
+            # shelving there would stamp labels even when beat 2 stays SILENT
+            # (images already supplied) and a later unrelated capture would pop
+            # them. This branch is the only path that actually sends the tester
+            # off to capture.
+            _shelve_ticket_image_labels(_img_names, text)
+            # N3b's fetch-failure disclosure went with the fetch (batch D1)
+            # and its dead renderer (2026-09-02); a revived fetch adds its
+            # own note here.
+            await _audit(
+                "mcp_image_gate_beat2",
+                detail={
+                    "kind": _img_kind,
+                    "count": _img_n,
+                    "plan": _plan,
+                    "have_images": _have_images,
+                },
             )
-            if _beat2:
-                # K2 (2026-08-10): INSIDE the gated branch on purpose. At the
-                # _ticket_image_evidence call above, _beat2 is not decided yet, so
-                # shelving there would stamp labels even when beat 2 stays SILENT
-                # (images already supplied) and a later unrelated capture would pop
-                # them. This branch is the only path that actually sends the tester
-                # off to capture.
-                _shelve_ticket_image_labels(_img_names, text)
-                # N3b's fetch-failure disclosure went with the fetch (batch D1)
-                # and its dead renderer (2026-09-02); a revived fetch adds its
-                # own note here.
-                await _audit(
-                    "mcp_image_gate_beat2",
-                    detail={
-                        "kind": _img_kind,
-                        "count": _img_n,
-                        "plan": _plan,
-                        "have_images": _have_images,
-                    },
-                )
-                return PreparePayloadResult(clarify=_beat2)
+            return PreparePayloadResult(clarify=_beat2)
         # I2 (2026-08-10): ticket snapshot RECENCY. The host caches the Jira
         # payload on disk and re-sends hours-old copies, and `fields.updated` is
         # the only recency signal obtainable WITHOUT a second fetch -- the
@@ -9120,6 +9124,7 @@ async def handle_submit_category(
     prep_store.save_submission. That row is INSERT OR REPLACE, so re-submitting the
     same category REPLACES the earlier one (newest wins) -- the reply says so.
     Never raises."""
+    dispatch_guard.require_dispatched("qa_submit_category")
     # UNTRUSTED at every one of these entry points: the id is whatever the
     # host sent, and it is echoed back in refusals and next-step
     # instructions, so an unsanitised one can close its code span and write
@@ -9827,6 +9832,7 @@ async def handle_submit_suite(
     finalize it deterministically, and return EITHER a gap report to fix and
     resubmit (SAME prep_id) OR the finished suite + export path. Performs EXACTLY
     ONE gap round per call. Never raises."""
+    dispatch_guard.require_dispatched("qa_submit_suite")
     # UNTRUSTED at every one of these entry points: the id is whatever the
     # host sent, and it is echoed back in refusals and next-step
     # instructions, so an unsanitised one can close its code span and write
@@ -16968,7 +16974,7 @@ def _ac_field_section() -> list[str]:
         return []
 
 
-async def _atlassian_autofix() -> tuple[list[str], list[str]]:
+async def _atlassian_autofix(fix: bool = False) -> tuple[list[str], list[str]]:
     """Write the hosted `atlassian` MCP entry when missing. (report_lines, advisories).
 
     WHY THIS LIVES IN THE SETUP CHECK AT ALL. v1.42.0 taught connect.sh/.ps1 to
@@ -17008,8 +17014,16 @@ async def _atlassian_autofix() -> tuple[list[str], list[str]]:
     try:
         # QA_REGISTER_ATLASSIAN_MCP was DELETED on 2026-08-13 (flag-surface
         # reduction, batch 6) and hardcoded ON -- the value both the code
-        # default and the shipped dist .env already carried, so no install
-        # changes behaviour. The autofix therefore always runs.
+        # default and the shipped dist .env already carried, so writing itself
+        # is unconditional once invoked. P2-10 (2026-09-25) added a
+        # caller-side gate instead: qa-doctor only passes fix=True when the
+        # tester asked for repairs, so a plain qa-doctor call never reaches
+        # register_atlassian at all.
+        if not fix:
+            return [], [
+                "Jira MCP entry not checked -- call qa-doctor with fix=true "
+                "to write it if missing."
+            ]
         from tools.client_registry import ADDED, ERROR, register_atlassian
 
         # to_thread because it takes a file lock, exactly as heal_env is called.
@@ -17330,17 +17344,20 @@ async def handle_selfcheck(*, server: Any) -> str:
 
 
 async def handle_setup_check(
-    *, progress: ProgressCb = None, workspace_roots: list[Path] | None = None
+    *,
+    progress: ProgressCb = None,
+    workspace_roots: list[Path] | None = None,
+    fix: bool = False,
 ) -> str:
     """Machine-readiness report for tester onboarding: environment, LLM
     backend auth, integrations, CLI tooling, and feature gates — summarised
     into an overall verdict plus concrete action items. Never raises.
 
-    **Not read-only**, since 2026-08-04: it repairs superseded defaults in the
-    install's own `.env` (`QA_ENV_SELFHEAL_ENABLED`) and writes a missing
-    `atlassian` MCP entry to the editor's config (`QA_REGISTER_ATLASSIAN_MCP`).
-    Both are disclosed in the report rather than done silently, both are gated by a
-    flag, and neither touches the unattended startup pass.
+    **Read-only by default** (2026-09-25, P2-10): pass ``fix=True`` to repair
+    superseded defaults in the install's own `.env` and write a missing
+    `atlassian` MCP entry to the editor's config. With ``fix=False`` neither
+    write runs; both are reported as "not checked, call with fix=true"
+    instead. Neither touches the unattended startup pass.
 
     ``workspace_roots`` is the tester's OPEN workspace folder(s) as reported by
     the MCP ``roots`` capability. It is resolved in ``mcp_server.qa-doctor``
@@ -17660,7 +17677,7 @@ async def handle_setup_check(
             _verdict_state = "access_unconfirmed"
         else:
             _verdict_state = "verified"
-        _atlassian_lines, _atlassian_advisories = await _atlassian_autofix()
+        _atlassian_lines, _atlassian_advisories = await _atlassian_autofix(fix=fix)
         recommended.extend(_atlassian_advisories)
         # verify_offered: the on-disk hint returns "" rather than shrugging
         # beside an answer this report has already given -- the Integrations
@@ -17766,7 +17783,14 @@ async def handle_setup_check(
         try:
             from tools.env_heal import heal_env
 
-            _heal = await asyncio.to_thread(heal_env, Path(_INSTALL_DIR))
+            if fix:
+                _heal = await asyncio.to_thread(heal_env, Path(_INSTALL_DIR))
+            else:
+                _heal = {}
+                recommended.append(
+                    ".env not checked -- call qa-doctor with fix=true to "
+                    "repair superseded settings if any exist."
+                )
             if _heal.get("changed"):
                 heal_lines.append("### Configuration repaired")
                 heal_lines.append("")

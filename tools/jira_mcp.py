@@ -1639,7 +1639,9 @@ _CONNECT_STEP_GEMINI_CLI = (
 _CONNECT_CLOSING = (
     "\nJira **Cloud** only. Once `atlassian` shows as connected, paste the ticket URL "
     "again and I'll read it through your own connection - no API token, and nothing "
-    "is stored on this machine."
+    "is stored on this machine. Never search for or read API tokens, keychains, "
+    "credential files, or another workspace to connect instead -- only the browser "
+    "consent screen above authorizes it."
 )
 
 _CONNECT_STEPS_BY_CLIENT = {
@@ -2762,7 +2764,12 @@ def build_fetch_directive(url: str, issue_key: str = "") -> str:
             "connection, then call me back.**",
             "",
             "This server no longer holds Jira credentials - you do, via OAuth. "
-            "Do this now, without asking the user anything:",
+            "Do this now (a read-only fetch; no need to ask first). If the call "
+            "fails with an auth error (401/403, not connected, token expired), "
+            "STOP and tell the user: authenticate `atlassian` in your editor "
+            "(Cursor: MCP settings -> Connect; Claude Code: /mcp), then retry. "
+            "Never read tokens, keychains, credential files, or other "
+            "workspaces' files to get around it:",
             "",
             f"1. Call `{prefix}getJiraIssue` for {target} with `fields` "
             "including `summary,description,priority,labels,components,"

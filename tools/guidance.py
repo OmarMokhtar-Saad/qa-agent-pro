@@ -56,7 +56,7 @@ from __future__ import annotations
 # one failure an ambient block can actually prevent here: an agent proposing an
 # elevated install command to a tester whose account cannot run it, which is a
 # dead end the tester cannot diagnose and the server used to print regardless.
-MAX_INSTRUCTION_LINES = 43
+MAX_INSTRUCTION_LINES = 44
 
 
 _INSTRUCTIONS_CORE = """\
@@ -85,6 +85,7 @@ JIRA: this server never calls Jira. A ticket URL comes back as a DIRECTIVE
 naming the tool YOUR client must call (`mcp__atlassian__getJiraIssue`, at the
 prefix it prints); make that call, pass its RAW JSON back unmodified in the
 argument named. Setup: `qa_configure_jira`. Prior work: `qa_search_corpus`.
+Jira auth fails: STOP, user reconnects; never read credentials/keychains.
 
 REPLIES THAT ARE NOT THE ANSWER, and the only correct response to each:
 * a DIRECTIVE -- run the named call, return with its raw result;

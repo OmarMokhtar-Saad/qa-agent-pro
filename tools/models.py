@@ -276,6 +276,29 @@ class TestCase(BaseModel):
         "for a case that manipulates no data.",
     )
 
+    @field_validator("tc_id", mode="before")
+    @classmethod
+    def _normalize_tc_id(cls, v):
+        """Rewrite common tc_id variants (`tc-1`, `TC_001`, `TC- 001`, `TC1`)
+        to the canonical `TC-NNN` form before the `pattern=` constraint above
+        ever sees them. Anything that still does not look like a test case id
+        is left untouched so the Field pattern's own error names the
+        offending value -- this validator never widens what counts as valid,
+        only normalizes what already does.
+
+        Air onboarding fix P1-6: the specific malformed id from that run was
+        not in synced evidence, so this targets the documented common-variant
+        class rather than one literal string.
+        """
+        if not isinstance(v, str):
+            return v
+        raw = v.strip()
+        match = re.match(r"(?i)^tc[\s_-]*(\d{1,6})$", raw)
+        if not match:
+            return v
+        digits = match.group(1)
+        return f"TC-{digits.zfill(3)}"
+
     @field_validator("title", mode="after")
     @classmethod
     def strip_and_check_title(cls, v: str) -> str:
