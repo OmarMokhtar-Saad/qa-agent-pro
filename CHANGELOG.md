@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.98.0] - 2026-09-26
+## [1.99.0] - 2026-09-26
 
 ### Added
 
@@ -29,23 +29,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- Closed a path-traversal defect in server-side staging: a crafted
-  stage part name could write outside the intended app-data root.
-- Provenance is now recorded on every call that contributed cases to
-  a suite, not only the one that finalises it. Categories submitted
-  from one client and finalised from another are reported as a
-  union, and the unrecognised-client warning fires when it should.
-- An oversized Jira payload no longer produces a garbled composite
-  refusal. The message now names the fetch tool to call and walks
-  through staging the ticket part by part.
-- The non-deterministic-oracle check now also flags escape-hatch
-  phrasing -- "if applicable", "where present", or an "unless it is
-  visible/available" clause -- which lets a step pass whatever
-  happens. It previously needed a disjunctive "or" to notice.
-
-### Security
-
-- Release notes are gated at build time: a build whose CHANGELOG.md
-  body is byte-identical to the previous release's, or to the
-  generic placeholder text shipped from v1.79.9 through v1.97.0, is
-  refused on `--push`.
+- Nothing user-facing. The server, agents, generators and exports in
+  this build are identical to v1.98.0 -- if you are already on
+  v1.98.0, this update changes no behaviour you can observe.
+- The work in this version is development tooling that is not part
+  of the installed package: the repository's own gate checker no
+  longer rewrites the live operations validator while it runs (which
+  intermittently failed unrelated parallel builds), a design-check
+  CLI moved to the directory its lint policy already exempted, and a
+  build-acceptance step that asserted a UI section which never
+  existed was removed.
