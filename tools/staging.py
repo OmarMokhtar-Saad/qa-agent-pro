@@ -62,8 +62,21 @@ def staging_dir(name: str) -> Path:
 
     Never under ``tempfile.gettempdir()`` -- that is the one thing this
     helper exists to avoid; see the module docstring.
+
+    ``name`` is sanitised to its final path component before use: D1
+    (2026-09-26, v1.98 scope D) closed a path-traversal defect where an
+    unsanitised multi-segment ``name`` (or an absolute path) could create a
+    directory outside ``staging_root()``. ``Path(name).name`` already
+    collapses those cases, but a single-segment ``".."`` is pathlib's one
+    exception -- it returns ``".."`` verbatim (unlike ``"."``, which parses
+    to ``""``) -- so ``""``, ``"."`` and ``".."`` are folded to a literal
+    ``"default"`` subdirectory, preserving this module's never-raises
+    posture (degrade to a safe default, do not raise).
     """
-    directory = staging_root() / str(name)
+    safe_name = Path(str(name)).name
+    if safe_name in ("", ".", ".."):
+        safe_name = "default"
+    directory = staging_root() / safe_name
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
         # mkdir's mode is masked by umask and a no-op if the dir pre-existed,

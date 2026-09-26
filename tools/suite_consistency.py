@@ -182,6 +182,35 @@ _DISJUNCTION_PATTERNS: list[re.Pattern] = [
     ),
 ]
 
+# Escape-hatch phrasing (2026-09-26, v1.98 scope C2): a second, INDEPENDENT
+# check inside _is_nondeterministic, run alongside (not merged into) the two
+# lists above. Both markers here are closed GRAMMATICAL/idiom classes, not
+# domain vocabulary tied to one observed suite:
+#   - "if applicable" / "where applicable" / "if present" / "where present" is
+#     a fixed English hedge idiom: whatever follows may not apply at all, so
+#     the case accepts its own absence as much as its presence.
+#   - "unless <adjective>" reuses, byte for byte, the build-state adjective set
+#     _CONDITIONAL_ACTION_RE below already uses for the analogous problem on
+#     ACTIONS (a tester cannot establish these before running the step). This
+#     is the same list, applied here to the ORACLE side instead.
+# A companion "verb-or-state" rule (a bounded-window aux...or...aux, e.g. "is
+# ... or ... is") was designed alongside this one and REJECTED: it is the same
+# windowed-disjunction shape that took four review rounds to withdraw below
+# (see _WITHDRAWN_CROSS_KIND in tests/test_suite_consistency.py) -- e.g.
+# "Response is HTTP 403 and the error banner or toast is shown" plausibly
+# matches an aux-before-"or"-aux-after window and MUST stay unreported.
+# Reviving that shape needs the clause splitter this module's own comments
+# already call for (see the withdrawn cross-kind rule above), not another
+# window over a different word list.
+_ESCAPE_HATCH_PATTERNS: list[re.Pattern] = [
+    re.compile(r"\b(?:if|where)\s+(?:applicable|present)\b", re.IGNORECASE),
+    re.compile(
+        r"\bunless\b[^.]{0,120}?\b(?:visible|available|exposed|present|shown|"
+        r"enabled|applicable|offered|supported|exists)\b",
+        re.IGNORECASE,
+    ),
+]
+
 # An expected result may legitimately list two RENDERINGS of one outcome
 # ("hidden or disabled", "403 or 404"). Those are not disjunctive oracles, so a
 # match containing only such an alternation is not reported.
@@ -239,6 +268,11 @@ def _is_nondeterministic(expected: str | None) -> bool:
         if any(p.search(expected) for p in _NONDETERMINISTIC_PATTERNS) and any(
             p.search(stripped) for p in _NONDETERMINISTIC_PATTERNS
         ):
+            return True
+        # Escape-hatch phrasing (2026-09-26, v1.98 scope C2): independent of
+        # the disjunction machinery below -- neither idiom needs an "or" at
+        # all ("field updated, if applicable" has none).
+        if any(p.search(expected) for p in _ESCAPE_HATCH_PATTERNS):
             return True
         # The 2026-08-16 rules, and ONLY those, additionally discount a
         # disjunction that sits inside a negative scope: in "no X or Y" both
