@@ -51,6 +51,12 @@ logger = logging.getLogger("qa_agents.client_registry")
 
 SERVER_NAME = "qa-agent-pro"
 
+# This module's own directory is tools/, so its grandparent is the server's
+# install root -- computed locally rather than imported from
+# tools.mcp_handlers, per this module's stdlib-only/imports-no-project-module
+# house rule above.
+_SERVER_ROOT = Path(__file__).resolve().parent.parent
+
 # The HOSTED Atlassian MCP server (Jira Cloud, OAuth 2.1). Jira is read through
 # the tester's OWN connection, so this entry has to exist in THEIR client config
 # -- and writing it is the difference between "paste a ticket URL" and "hand-edit
@@ -431,6 +437,62 @@ def split_server_warning(
     except Exception:
         logger.debug("split_server_warning failed", exc_info=True)
         return ""
+
+
+def workspace_contains_server_warning(
+    workspace_roots: list | None = None,
+    server_root: Path | None = None,
+) -> str:
+    """One advisory line when the tester's OPEN WORKSPACE contains this
+    server's own source tree.
+
+    A workspace that contains ``tools/mcp_handlers.py`` lets an agent import
+    that module directly, or spawn its own stdio copy of this server inside
+    its own environment, bypassing the registered tool surface and its
+    dispatch guard entirely -- exactly how the 2026-09-25 Cursor audit
+    session reached qa_prepare's internals without ever calling the real
+    tool. Returns "" when there is nothing to say. Never raises.
+    """
+    try:
+        root = Path(server_root) if server_root is not None else _SERVER_ROOT
+        try:
+            root = root.resolve()
+        except Exception:
+            pass
+        marker = root / "tools" / "mcp_handlers.py"
+        if not marker.is_file():
+            return ""
+        for raw in workspace_roots or []:
+            try:
+                candidate = Path(raw).resolve()
+            except Exception:
+                continue
+            same = candidate == root
+            root_inside_candidate = root != candidate and root_is_relative(root, candidate)
+            candidate_inside_root = candidate != root and root_is_relative(candidate, root)
+            if same or root_inside_candidate or candidate_inside_root:
+                return (
+                    "**Your open workspace contains this MCP server's own source "
+                    f"tree** (`{root}`). An agent running in this workspace can "
+                    "import `tools/mcp_handlers.py` directly or start its own copy "
+                    "of this server, bypassing the registered tool surface and its "
+                    "dispatch guard entirely. Point your editor at a dedicated "
+                    "workspace instead, e.g. `~/qa-onboarding-ws`, and keep this "
+                    "install's checkout closed while you run QA sessions."
+                )
+        return ""
+    except Exception:
+        logger.debug("workspace_contains_server_warning failed", exc_info=True)
+        return ""
+
+
+def root_is_relative(inner: Path, outer: Path) -> bool:
+    """True when ``inner`` is ``outer`` or nested under it. Never raises."""
+    try:
+        inner.relative_to(outer)
+        return True
+    except ValueError:
+        return False
 
 
 def register_all(

@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -51,6 +52,18 @@ import llm
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+# AGENTS.md Hard Rule 2 ("jira_fetcher.py and jira_mcp.py must never raise to
+# callers -- always return {"error": ..., "content": None}"): the public
+# entry points OTHER modules call. normalize_issue_payload and
+# jira_mcp_required_result are fetch-shaped (return the error dict on
+# failure); verify_jira_access is a network-free stand-in that always returns
+# {"ok": True, ...} and cannot fail. Reviewed on export; see
+# tests/test_jira_public_api_never_raises.py, the parametrized backstop that
+# asserts each fetch-shaped callable survives an injected internal exception.
+PUBLIC_CALLABLES = frozenset(
+    {"normalize_issue_payload", "jira_mcp_required_result", "verify_jira_access"}
+)
 
 # --------------------------------------------------------------------------- #
 # Constants                                                                    #
@@ -907,8 +920,10 @@ def _image_ref_labels(text: object) -> list:
 #
 # WHY IT MATTERS DOWNSTREAM: an inline image is far likelier to be the mockup the
 # requirements live in than a stray upload at the bottom of the ticket, so
-# tools/jira_attachments._ordered gives the ones marked `inline` the
-# JIRA_MAX_IMAGES budget first.
+# _ordered() -- in THIS module -- gives the ones marked `inline` the
+# JIRA_MAX_IMAGES budget first. That ranking runs at the normalize_issue_payload
+# call site, AFTER this join: the only order in which `inline` is known before
+# the budget is spent.
 #
 # Ids here are Media-API identifiers and are NOT attachment ids -- the two id
 # spaces are different, which is why the join back to `fields.attachment[]` is
@@ -923,6 +938,18 @@ _MAX_MEDIA_ALT_CHARS = 120
 # syntax-gates the id before it may enter a URL path).
 _MAX_ATTACHMENT_ID_CHARS = 128
 _MAX_ATTACHMENT_URL_CHARS = 512
+#: How many `fields.attachment` entries the image walk LOOKS AT, which is a
+#: DIFFERENT axis from `jira_max_images` (how many it ultimately ships). They
+#: were the same number until the inline-ordering fix, and conflating them is
+#: exactly the defect: truncating on the delivery cap happened BEFORE
+#: `_match_media_to_attachments` marked which images were inline, so a ticket
+#: whose mockup was pasted into a comment lost it to whatever stray upload sat
+#: at the top of the list. Ordering needs the WHOLE candidate set, so the
+#: delivery cap moved to the call site and this bound took over the job the
+#: break was really doing -- keeping a walk over untrusted host-submitted JSON
+#: finite. The harmful direction is UPWARD: every entry admitted here is a dict
+#: of length-capped strings held in memory before anything filters it.
+_MAX_IMAGE_ATTACHMENTS_SCANNED = 50
 
 
 def _extract_adf_media(node: object, depth: int = 0) -> list[dict]:
@@ -1039,24 +1066,49 @@ def _match_media_to_attachments(media: object, attachments: object) -> None:
         logger.exception("_match_media_to_attachments failed - leaving both lists")
 
 
+def _ordered(attachments: list) -> list:
+    """INLINE images first, ticket order otherwise.
+
+    ``JIRA_MAX_IMAGES`` truncates, and an image pasted INTO the description or a
+    comment is far likelier to be the mockup the requirements live in than a
+    stray upload at the bottom of the ticket -- so the inline ones, which
+    ``_match_media_to_attachments`` marks from the ADF media nodes, win the
+    budget. ``sorted`` is stable, so everything else keeps ticket order.
+
+    Recovered from the deleted ``tools/jira_attachments.py`` (``git show
+    cdc6fcc:tools/jira_attachments.py``), which is the only place this ranking
+    ever lived; reviving the ranking does NOT revive that module or its
+    credentialed fetch. Never raises.
+    """
+    try:
+        return sorted(attachments, key=lambda a: 0 if a.get("inline") else 1)
+    except Exception:
+        logger.debug("_ordered failed - keeping ticket order", exc_info=True)
+        return list(attachments)
+
+
 def _extract_image_attachments(fields: dict) -> list[dict]:
     """Image attachment METADATA from an issue payload.
 
-    ``{filename, mime, size, id, content}``. THIS MODULE STILL MAKES NO OUTBOUND
-    HTTP REQUEST -- that hard rule is unchanged and unchangeable here. The ``id``
-    and ``content`` fields are METADATA the Atlassian MCP server already
-    returned; carrying them lets a SEPARATE, opt-in module
-    (``tools/jira_attachments.py``, QA_JIRA_ATTACHMENT_FETCH_ENABLED, default
-    OFF) download the bytes with the install's own credential. With that flag off
-    nothing reads them and the behaviour is exactly what it was: metadata only,
-    ``images_unavailable`` set by the caller, and the tester asked to attach the
-    screenshots to the chat.
+    ``{filename, mime, size, id, content}``, for EVERY image candidate in the
+    payload up to ``_MAX_IMAGE_ATTACHMENTS_SCANNED``. Deliberately NOT capped at
+    ``jira_max_images``: that is the DELIVERY cap, and the caller applies it
+    after ``_match_media_to_attachments`` has marked which images are inline and
+    ``_ordered`` has ranked them. Capping here truncated candidates before they
+    could be ranked, which is the defect the ranking exists to prevent.
+    ``jira_fetch_images`` off, or a cap of zero, still yields nothing.
 
-    Both new fields are echoed from UNTRUSTED host-submitted JSON, so they are
-    length-capped here and the CONSUMER -- not this function -- syntax-gates the
-    id before it may enter a URL path (``jira_attachments._ATTACHMENT_ID_RE``); a
-    payload-supplied ``content`` URL is used only when its host matches the
-    configured JIRA_BASE_URL. Never raises.
+    THIS MODULE MAKES NO OUTBOUND HTTP REQUEST -- that hard rule is unchanged and
+    unchangeable here. The credentialed attachment fetch that once consumed
+    ``id``/``content`` is RETIRED (``docs/RETIRED_CAPABILITIES.md`` section 1):
+    no module in this process downloads the bytes, so both fields are inert
+    metadata echoed back from what the Atlassian MCP server already returned.
+    They survive because the HOST -- the tester's own client, with the tester's
+    own credential -- is what fetches images now.
+
+    Both fields come from UNTRUSTED host-submitted JSON, so they are
+    length-capped here, and any future CONSUMER -- not this function -- must
+    syntax-gate the id before it may enter a URL path. Never raises.
     """
     if not settings.jira_fetch_images or settings.jira_max_images <= 0:
         return []
@@ -1076,16 +1128,21 @@ def _extract_image_attachments(fields: dict) -> list[dict]:
                     "filename": str(att.get("filename") or "attachment"),
                     "mime": mime,
                     "size": att.get("size") or 0,
-                    # Metadata only -- see the docstring. Both are inert unless
-                    # QA_JIRA_ATTACHMENT_FETCH_ENABLED is on, and both are
-                    # length-capped because they are untrusted stored strings.
+                    # Metadata only -- see the docstring. Nothing in this
+                    # process reads them: the credentialed fetch that used to is
+                    # retired. Length-capped because they are untrusted stored
+                    # strings.
                     "id": str(att.get("id") or "")[:_MAX_ATTACHMENT_ID_CHARS],
                     "content": str(att.get("content") or "")[
                         :_MAX_ATTACHMENT_URL_CHARS
                     ],
                 }
             )
-            if len(out) >= settings.jira_max_images:
+            # NOT `jira_max_images` -- see _MAX_IMAGE_ATTACHMENTS_SCANNED.
+            # The delivery cap is applied at the call site, AFTER the inline
+            # join and the ordering it feeds; applying it here silently
+            # discarded the candidates ordering exists to promote.
+            if len(out) >= _MAX_IMAGE_ATTACHMENTS_SCANNED:
                 break
         return out
     except Exception:
@@ -2748,6 +2805,7 @@ def build_fetch_directive(url: str, issue_key: str = "") -> str:
     """
     try:
         prefix = _tool_prefix()
+        token = secrets.token_urlsafe(16)
         key = _valid_issue_key(issue_key) or issue_key_from_url(url)
         target = f"`{key}`" if key else f"the issue at {url}"
         want_comments = bool(settings.jira_fetch_comments)
@@ -2776,7 +2834,11 @@ def build_fetch_directive(url: str, issue_key: str = "") -> str:
             "issuetype,status,updated,parent,subtasks,issuelinks,attachment"
             + (",comment" if want_comments else "")
             + (f",{ac_field}" if ac_field else "")
-            + "`.",
+            + "`. Immediately call `qa_stage_jira(stage_token='"
+            + token
+            + "', part='issue', json=<STRINGIFIED result of THIS fetch "
+            "only>)` before doing anything else - do not wait to collect "
+            "the parent or siblings.",
         ]
         step = 2
         if want_parent:
@@ -2789,7 +2851,10 @@ def build_fetch_directive(url: str, issue_key: str = "") -> str:
                 "by*), fetch THAT issue the same way and pass it as "
                 "`parent_issue` -- on a backend/task ticket the requirement "
                 "usually lives there, and its one-line link title is not "
-                "enough. Send at most one."
+                "enough. Send at most one. Immediately call "
+                f"`qa_stage_jira(stage_token='{token}', part='parent', "
+                "json=<STRINGIFIED result of THIS fetch only>)` before doing "
+                "anything else."
             )
             step += 1
         if want_parent and settings.jira_fetch_sibling_stories:
@@ -2797,9 +2862,7 @@ def build_fetch_directive(url: str, issue_key: str = "") -> str:
                 f"{step}. If there WAS a parent, also call "
                 f"`{prefix}searchJiraIssuesUsingJql` with `jql` = "
                 '"parent = <THAT PARENT KEY> ORDER BY key", `fields` = '
-                "[`summary`, `description`, `issuetype`, `status`"
-                + (f", `{ac_field}`" if ac_field else "")
-                + "], `responseContentFormat` = "
+                "[`summary`, `status`], `responseContentFormat` = "
                 f'"markdown", `searchResultMode` = "all" '
                 f"and `maxResults` = "
                 f"{settings.jira_max_sibling_stories}. Pass the "
@@ -2807,32 +2870,30 @@ def build_fetch_directive(url: str, issue_key: str = "") -> str:
                 f"say how many stories I did NOT read). The "
                 "sibling user stories under that parent carry requirements this "
                 "ticket inherits, and their one-line titles alone are not "
-                "enough. Skip this step when there is no parent."
+                "enough. Skip this step when there is no parent. Immediately "
+                f"call `qa_stage_jira(stage_token='{token}', part='siblings', "
+                "json=<STRINGIFIED result of THIS fetch only>)` when you do "
+                "run it."
             )
             step += 1
         lines += [
             f"{step}. Call `qa_prepare_test_cases` again with the SAME "
-            "`feature_or_url`, plus `jira_content_json` set to the STRINGIFIED "
-            "JSON of the raw tool output - ONE STRING argument (`json.dumps(...)` "
-            "of the object below, NOT the object itself: that parameter is typed "
-            "as a string and an object is rejected before I ever see the ticket). "
-            "Do NOT summarise, reword, translate or truncate it, and do NOT strip "
-            "fields - `fields.updated` in particular is how I tell whether the "
-            "payload you sent is a fresh read or a cached copy, and I say so in "
-            "the reply. The object you "
-            "stringify must be shaped exactly like this:",
+            "`feature_or_url` plus `stage_token='"
+            + token
+            + "'` - do NOT pass `jira_content_json`; the parts you staged "
+            "with `qa_stage_jira` above are assembled server-side. If a "
+            "staging call was rejected, fix that part and re-stage it "
+            "before calling `qa_prepare_test_cases`.",
             "",
-            "```json",
-            "{",
-            '  "issue": { "key": "...", "fields": { ... } },',
-            '  "parent_issue": { "key": "...", "fields": { ... } },',
-            '  "sibling_issues": [ { "key": "...", "fields": { ... } } ]',
-            "}",
-            "```",
+            "Stage each fetch VERBATIM. Do NOT summarise, reword, translate "
+            "or truncate it, and do NOT strip fields - `fields.updated` in "
+            "particular is how I tell whether the payload you sent is a fresh "
+            "read or a cached copy, and I say so in the reply.",
             "",
-            "`parent_issue` is optional - omit it when there is no parent. "
-            "`sibling_issues` is optional too: pass the `issues` array from the "
-            "JQL result (or the whole result object) when you ran that step.",
+            "RULES: qa_* MCP tools are the only path - never import handlers "
+            "or spawn your own MCP client; never read tokens/keychains; "
+            "generate NEW cases, never resubmit an old export; never edit or "
+            "strip the staged ticket content.",
             "",
             "**If you have no `atlassian` MCP server connected** (the tools above "
             "do not exist in your tool list), do NOT guess the ticket contents and "
@@ -2852,16 +2913,32 @@ def jira_mcp_required_result(url: str) -> dict:
 
     Keeps ``tools/jira_fetcher.fetch_url_content``'s Hard-Rule contract
     (``{"error": ..., "content": None}``) while carrying the machine-readable
-    ``needs_jira_mcp`` marker and the tester/agent-facing directive. Never raises.
+    ``needs_jira_mcp`` marker and the tester/agent-facing directive. Never raises:
+    ``issue_key_from_url`` and ``build_fetch_directive`` already guard themselves,
+    but this function wraps them too rather than depending transitively on that --
+    a future edit to either callee must not be able to make this one leak.
     """
-    key = issue_key_from_url(url)
-    return {
-        "error": build_fetch_directive(url, key),
-        "content": None,
-        "needs_jira_mcp": True,
-        "issue_key": key,
-        "source_url": url,
-    }
+    try:
+        key = issue_key_from_url(url)
+        return {
+            "error": build_fetch_directive(url, key),
+            "content": None,
+            "needs_jira_mcp": True,
+            "issue_key": key,
+            "source_url": url,
+        }
+    except Exception:
+        logger.exception("jira_mcp_required_result failed")
+        return {
+            "error": (
+                "\u26a0\ufe0f I couldn't build the Jira fetch directive for that "
+                "URL. Paste the ticket text and I'll generate test cases from it."
+            ),
+            "content": None,
+            "needs_jira_mcp": True,
+            "issue_key": "",
+            "source_url": url,
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -2917,6 +2994,32 @@ def _name_of(value: object) -> str:
     except Exception:  # pragma: no cover - defensive
         logger.debug("_name_of failed", exc_info=True)
     return ""
+
+
+def _screen_reference_advisory(
+    description_text: str, attachments: list, media_refs: list
+) -> str:
+    """Advisory (never a gate skip, never a refusal): the ticket's OWN
+    description/media reference screens but zero attachments or embedded
+    media arrived to back that up -- the 2026-09-25 tamper case deleted only
+    `fields.attachment` and the "### UI Screen" section, so this cross-checks
+    THREE independently-tamperable signals (the description's own
+    "UI#nn"/heading labels via `_image_ref_labels`, ADF media nodes actually
+    embedded via `_extract_adf_media`/`_match_media_to_attachments`, and the
+    attachment list) rather than trusting any one of them alone. Silent when
+    nothing references screens or when at least one attachment/media node
+    backs the reference up. Never raises."""
+    try:
+        labels = _image_ref_labels(description_text or "")
+        media_count = len([m for m in (media_refs or []) if m])
+        attachment_count = len([a for a in (attachments or []) if a])
+        referenced = max(len(labels), media_count)
+        if referenced <= 0 or attachment_count > 0 or media_count > 0:
+            return ""
+        return f"ticket references {referenced} screen(s); {attachment_count} attachments staged"
+    except Exception:
+        logger.debug("_screen_reference_advisory failed", exc_info=True)
+        return ""
 
 
 def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
@@ -3190,13 +3293,21 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
         _ac_field_id, _ac_value, _ac_reason = resolve_ac_field(fields)
         acceptance_criteria = _ac_value or _extract_ac_from_description(description)
 
+        # ORDER MATTERS, and it is the whole point of this block. Extract every
+        # candidate (bounded by _MAX_IMAGE_ATTACHMENTS_SCANNED), join the ADF
+        # media nodes on so `inline` exists, rank inline-first, and only THEN
+        # apply the delivery cap. Truncating before the join -- which is what
+        # this did until the ordering fix -- dropped the mockup pasted into a
+        # comment in favour of whatever stray upload sat at the top.
         attachments = _extract_image_attachments(fields)
         # Inline (pasted-into-the-body) images, from the description AND the
-        # comment thread, joined onto the attachment records by filename. The
-        # `inline` marker decides which images win the download budget when
-        # QA_JIRA_ATTACHMENT_FETCH_ENABLED is on (jira_attachments._ordered).
+        # comment thread, joined onto the attachment records by filename.
         media_refs = extract_media_refs(fields)
         _match_media_to_attachments(media_refs, attachments)
+        # `jira_max_images = 0` is a legitimate "allow none" cap and still
+        # yields nothing, because the slice runs after the ranking, not instead
+        # of it.
+        attachments = _ordered(attachments)[: max(0, settings.jira_max_images)]
         result = {
             "title": title,
             "description": description,
@@ -3225,6 +3336,15 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
             # description and the comment bodies. Downstream consumers that do
             # not know about it are unaffected.
             "media_refs": media_refs,
+            # v1.97.0 cursor-hardening (item 7): cross-checks THREE
+            # independently-tamperable signals (description labels, embedded
+            # media, attachments) so deleting only `fields.attachment` no
+            # longer erases the evidence trail. "" when nothing references
+            # screens or when at least one attachment/media node backs the
+            # reference up.
+            "image_reference_advisory": _screen_reference_advisory(
+                description, attachments, media_refs
+            ),
             # "The ticket has no images" and "nobody requested the attachment
             # field" are different facts, and only the first is safe to stay
             # quiet about. A live 2026-08-03 run had three PNG attachments and an

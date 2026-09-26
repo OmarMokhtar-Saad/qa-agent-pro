@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS suites (
     source_url   TEXT,
     created_at   REAL NOT NULL,
     created_by   TEXT,
-    prep_id      TEXT
+    prep_id      TEXT,
+    provenance_json TEXT
 );
 CREATE TABLE IF NOT EXISTS cases (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,6 +101,17 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
         )
     except sqlite3.Error:
         logger.debug("suite_store: suites.prep_id migration skipped", exc_info=True)
+    # v1.97.0 cursor-hardening (item 3b): suites.provenance_json, in its own
+    # try/except so a failure here cannot block the prep_id migration above
+    # (or vice versa) -- same idempotent, pre-existing-DB pattern.
+    try:
+        have2 = {r[1] for r in conn.execute("PRAGMA table_info(suites)").fetchall()}
+        if "provenance_json" not in have2:
+            conn.execute("ALTER TABLE suites ADD COLUMN provenance_json TEXT")
+    except sqlite3.Error:
+        logger.debug(
+            "suite_store: suites.provenance_json migration skipped", exc_info=True
+        )
 
 
 def _drop_retired_tables(conn: sqlite3.Connection) -> None:
@@ -179,6 +191,7 @@ def _save_suite_sync(
     source_url: str | None,
     created_by: str | None,
     prep_id: str | None = None,
+    provenance_json: str | None = None,
 ) -> str:
     now = time.time()
     conn = _connect()
@@ -199,13 +212,15 @@ def _save_suite_sync(
             # that carries NO prep_id behaves byte-identically to before this fix.
             conn.execute(
                 "INSERT OR REPLACE INTO suites "
-                "(id, feature_text, source_url, created_at, created_by, prep_id) "
-                "VALUES (?, ?, ?, ?, ?, ?) "
+                "(id, feature_text, source_url, created_at, created_by, prep_id, "
+                "provenance_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(prep_id) WHERE prep_id IS NOT NULL DO UPDATE SET "
                 "feature_text = excluded.feature_text, "
                 "source_url = excluded.source_url, "
                 "created_at = excluded.created_at, "
-                "created_by = excluded.created_by",
+                "created_by = excluded.created_by, "
+                "provenance_json = excluded.provenance_json",
                 (
                     suite.suite_id,
                     feature_text or "",
@@ -213,6 +228,7 @@ def _save_suite_sync(
                     now,
                     created_by,
                     prep_id or None,
+                    provenance_json,
                 ),
             )
             target_id = suite.suite_id
@@ -397,6 +413,7 @@ async def save_suite(
     source_url: str | None = None,
     created_by: str | None = None,
     prep_id: str | None = None,
+    provenance: dict | None = None,
 ) -> dict:
     """Persist a suite and its cases. Returns {"content": {"suite_id": ...}}.
 
@@ -406,10 +423,26 @@ async def save_suite(
     guarantee is a partial UNIQUE index plus a single upsert statement, so it
     holds even when the two finalizes run CONCURRENTLY. Omitted (the default)
     the behaviour is byte-identical to before.
+
+    *provenance* (v1.97.0 cursor-hardening item 3b) is stored as JSON;
+    serialization failures store None rather than raising.
     """
     try:
+        try:
+            _provenance_json = (
+                json.dumps(provenance) if provenance is not None else None
+            )
+        except Exception:
+            logger.debug("save_suite: provenance serialization failed", exc_info=True)
+            _provenance_json = None
         suite_id = await asyncio.to_thread(
-            _save_suite_sync, suite, feature_text, source_url, created_by, prep_id
+            _save_suite_sync,
+            suite,
+            feature_text,
+            source_url,
+            created_by,
+            prep_id,
+            _provenance_json,
         )
         logger.info(
             "suite_store: saved suite %s (%d cases)", suite_id, len(suite.test_cases)
@@ -482,6 +515,43 @@ async def list_recent_suites(limit: int = 5) -> dict:
         return {"error": None, "content": rows}
     except Exception as exc:
         logger.exception("suite_store.list_recent_suites failed")
+        return {"error": str(exc), "content": None}
+
+
+def _find_recent_suite_by_source_sync(
+    source_url: str, window_s: float | None
+) -> dict | None:
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT id, created_at FROM suites WHERE source_url = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (source_url,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    if window_s is not None and window_s > 0 and (time.time() - row[1]) > window_s:
+        return None
+    return {"suite_id": row[0], "created_at": row[1]}
+
+
+async def find_recent_suite_by_source(
+    source_url: str, window_s: float | None = None
+) -> dict:
+    """Most recent suite saved for `source_url`, or None. `window_s=None` or
+    `<=0` means no age limit (item 3a's identity check); a positive value
+    bounds it (item 8's 24h warning). Never raises."""
+    try:
+        if not source_url:
+            return {"error": None, "content": None}
+        row = await asyncio.to_thread(
+            _find_recent_suite_by_source_sync, source_url, window_s
+        )
+        return {"error": None, "content": row}
+    except Exception as exc:
+        logger.exception("suite_store.find_recent_suite_by_source failed")
         return {"error": str(exc), "content": None}
 
 

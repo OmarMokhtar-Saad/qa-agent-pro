@@ -66,6 +66,11 @@ def _note_client(ctx) -> None:
         # this name so one editor's verdict can never gate another's on a shared
         # install. Never raises (see tools.mcp_handlers.note_elicit_client).
         mcp_handlers.note_elicit_client(name)
+        # v1.97.0 cursor-hardening (item 6a): forward clientInfo a second
+        # time so tools.mcp_handlers._dispatch_provenance can stamp it onto
+        # every saved suite -- both already-set values at this point
+        # (_CLIENT["name"]/["version"] just above).
+        mcp_handlers.note_provenance_client(name, _CLIENT.get("version", ""))
         # Tag this process's log lines with the editor that owns it: on an
         # install shared by three clients, the pid alone does not say WHICH.
         from tools.log_setup import set_client
@@ -786,6 +791,7 @@ def build_server():
         feature_or_url: str = "",
         proceed_anyway: bool = False,
         jira_content_json: str = "",
+        stage_token: str = "",
         source_plan: str = "",
         attached_image_count: int = 0,
         capture_ids: list[str] | None = None,
@@ -797,10 +803,14 @@ def build_server():
         spec URL.
 
         For a Jira URL the first reply is a DIRECTIVE: fetch the issue with
-        your own mcp__atlassian__getJiraIssue and call again with
-        `jira_content_json` set to its raw result as a JSON STRING
-        (`json.dumps(result)` -- that parameter is typed `str`, and an object
-        is rejected by schema validation before this server sees the ticket).
+        your own mcp__atlassian__getJiraIssue, call `qa_stage_jira` with the
+        raw result right after each fetch, then call again with the SAME
+        `stage_token` -- the preferred path, since no fetch result has to
+        survive inside one argument. A client that cannot stage incrementally
+        may still pass `jira_content_json` set to the raw result as a JSON
+        STRING (`json.dumps(result)` -- that parameter is typed `str`, and an
+        object is rejected by schema validation before this server sees the
+        ticket).
 
         When the user asks for test cases WITHOUT saying where the feature
         comes from, call this immediately with feature_or_url omitted — I will
@@ -877,6 +887,7 @@ def build_server():
                 **_make_elicitors(ctx),
                 progress=_make_progress(ctx),
                 jira_content_json=jira_content_json,
+                stage_token=stage_token,
                 source_plan=source_plan,
                 attached_image_count=attached_image_count,
                 capture_ids=list(capture_ids or []),
@@ -891,11 +902,35 @@ def build_server():
         return _result
 
     @mcp.tool()
+    async def qa_stage_jira(
+        ctx: Context, stage_token: str, part: str, json: str
+    ) -> str:
+        """Stage ONE raw Jira fetch result right after you fetch it, so a ticket's
+        issue/parent/siblings never have to survive inside one giant argument.
+
+        Call this immediately after each `getJiraIssue`/JQL call the
+        `qa_prepare_test_cases`/`qa_generate_test_cases` directive told you to make
+        -- `part='issue'` after the ticket fetch, `part='parent'` after the parent
+        fetch (if any), `part='siblings'` after the sibling JQL (if any). `json`
+        is that ONE result, stringified (`json.dumps(result)`), under ~20KB --
+        request only the fields the directive named if a part is rejected for
+        size. Once every part the directive asked for is staged, call
+        `qa_prepare_test_cases` again with the SAME `feature_or_url` and the SAME
+        `stage_token` -- do not pass `jira_content_json`.
+        """
+        return await _tracked(
+            "qa_stage_jira",
+            ctx,
+            mcp_handlers.handle_stage_jira(stage_token, part, json),
+        )
+
+    @mcp.tool()
     async def qa_prepare_test_cases(
         ctx: Context,
         feature_or_url: str = "",
         proceed_anyway: bool = False,
         jira_content_json: str = "",
+        stage_token: str = "",
         source_plan: str = "",
         attached_image_count: int = 0,
         capture_ids: list[str] | None = None,
@@ -913,10 +948,13 @@ def build_server():
         JIRA URLS ARE A TWO-STEP BOOMERANG. This server holds no Jira
         credentials. For a Jira URL the FIRST reply is a DIRECTIVE telling you to
         call your OWN `mcp__atlassian__getJiraIssue` (and once more for the
-        parent issue, when there is one), then call this tool AGAIN with the same
-        feature_or_url plus `jira_content_json` set to the raw result as a
-        JSON STRING -- stringified JSON, i.e. `json.dumps(result)`, because
-        that parameter is typed `str`; do not pass the object itself. Do
+        parent issue, when there is one), calling `qa_stage_jira` with each raw
+        result right after that fetch, then call this tool AGAIN with the same
+        feature_or_url plus the SAME `stage_token` -- the preferred path, since
+        no fetch result has to survive inside one argument. A client that cannot
+        stage incrementally may still pass `jira_content_json` set to the raw
+        result as a JSON STRING -- stringified JSON, i.e. `json.dumps(result)`,
+        because that parameter is typed `str`; do not pass the object itself. Do
         not summarise, translate or invent ticket content, and do not generate
         from the URL alone. If you have no `atlassian` MCP server connected, show
         the user the connection steps the directive includes.
@@ -957,13 +995,13 @@ def build_server():
         -- many screens are fine, and the ids stay valid across the Jira fetch
         directive and any failed attempt, so re-send them unchanged. Once the
         ticket is fetched a SECOND short reply may NAME the screens the ticket
-        actually has and ask again; supply them, or ASK THE TESTER FIRST
-        whether skipping is acceptable and, only if they agree, pass
-        `image_gate_ack=true`: the server then shows the tester a
-        confirmation dialog and only their own skip pick generates from the
-        ticket text. If the user already said the screens do not matter,
-        send `source_plan='jira'` AND `image_gate_ack=true` together; the
-        confirmation dialog still appears.
+        actually has and ask again for `jira_attach`/`jira_device`/`jira_both`/
+        `device`; supply them, or ASK THE TESTER FIRST whether skipping is
+        acceptable and, only if they agree, pass `image_gate_ack=true`: the
+        server then shows the tester a confirmation dialog and only their own
+        skip pick generates from the ticket text. `source_plan='jira'` (ticket
+        text only) never gets that second ask -- picking it IS the tester's
+        own answer to where the screens come from.
 
         RE-PREPARING THE SAME SOURCE: if a recent preparation for this source was
         grounded on screens and your new call carries none, this server either
@@ -978,6 +1016,11 @@ def build_server():
         content -- inspect them directly. For an under-specified or no-UI ticket
         the reply may instead be clarifying questions (no payload); relay them, or
         pass proceed_anyway=true to prepare anyway.
+
+        RULES: qa_* MCP tools are the only path -- never import handlers or
+        spawn your own MCP client; never read tokens/keychains; generate NEW
+        cases, never resubmit an old export; never edit or strip the staged
+        ticket content.
         """
         result = await _tracked(
             "qa_prepare_test_cases",
@@ -988,6 +1031,7 @@ def build_server():
                 **_make_elicitors(ctx),
                 progress=_make_progress(ctx),
                 jira_content_json=jira_content_json,
+                stage_token=stage_token,
                 source_plan=source_plan,
                 attached_image_count=attached_image_count,
                 capture_ids=list(capture_ids or []),
@@ -1062,6 +1106,11 @@ def build_server():
         as the three acks above: ignored on the first submit, honoured only after
         that refusal, and only ever on the USER's word. Nothing is exported or
         saved on a refusal, so nothing is lost by fixing the cases instead.
+
+        RULES: qa_* MCP tools are the only path -- never import handlers or
+        spawn your own MCP client; never read tokens/keychains; generate NEW
+        cases, never resubmit an old export; never edit or strip the staged
+        ticket content.
         """
         return await _tracked(
             "qa_submit_suite",
@@ -1153,6 +1202,11 @@ def build_server():
         a small review SIDECAR, which is how the duplicate review rides this
         route (it works on EITHER route; what it needs is the field, not a
         particular route). Check progress with qa_prep_status.
+
+        RULES: qa_* MCP tools are the only path -- never import handlers or
+        spawn your own MCP client; never read tokens/keychains; generate NEW
+        cases, never resubmit an old export; never edit or strip the staged
+        ticket content.
         """
         return await _tracked(
             "qa_submit_category",
