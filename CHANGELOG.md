@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.99.0] - 2026-09-26
+## [1.99.1] - 2026-09-26
 
 ### Added
 
@@ -29,13 +29,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- Nothing user-facing. The server, agents, generators and exports in
-  this build are identical to v1.98.0 -- if you are already on
-  v1.98.0, this update changes no behaviour you can observe.
-- The work in this version is development tooling that is not part
-  of the installed package: the repository's own gate checker no
-  longer rewrites the live operations validator while it runs (which
-  intermittently failed unrelated parallel builds), a design-check
-  CLI moved to the directory its lint policy already exempted, and a
-  build-acceptance step that asserted a UI section which never
-  existed was removed.
+- The chat model is now told to drive an Android emulator or device
+  only through `qa_mobile_test`: ad-hoc steps go in `goal="..."` with
+  `apply=true`, and it should never run raw adb, uiautomator or ADB
+  Keyboard commands. A raw command skipped the destructive-action
+  guard, the keyboard restore, the run folder and the screenshots.
+  The rule appears in the `qa_mobile_test` and `qa_mobile_status`
+  descriptions, the server instructions and the qa-doctor mobile
+  section.
+- `qa_mobile_test` now says plainly that it cannot reset app data,
+  so the model tells you so instead of running `pm clear` around it.
