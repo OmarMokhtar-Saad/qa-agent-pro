@@ -78,6 +78,14 @@ from tools.net_guard import embedded_v4_non_public
 
 logger = logging.getLogger(__name__)
 
+# AGENTS.md Hard Rule 2 ("jira_fetcher.py ... must never raise to callers --
+# always return {"error": ..., "content": None}"): the public entry points
+# OTHER modules call, each of which wraps its whole body in try/except and
+# returns the error-shaped dict on failure. Reviewed on export; see
+# tests/test_jira_public_api_never_raises.py, the parametrized backstop that
+# asserts each of these survives an injected internal exception.
+PUBLIC_CALLABLES = frozenset({"fetch_url_content"})
+
 _RETRY_MAX = 2
 _RETRY_DELAYS = (1.0, 2.0)  # seconds between attempts
 

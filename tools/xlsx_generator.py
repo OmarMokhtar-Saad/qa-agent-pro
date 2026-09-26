@@ -51,7 +51,11 @@ _COL_CATEGORY = 11
 # F06 (2026-08-19): APPENDED for the same reason _COL_CATEGORY was, never
 # inserted -- every hardcoded column letter is derived from these indices.
 _COL_REQUIREMENT = 12
-_TOTAL_COLS = 13
+# v1.97.0 cursor-hardening (item 12): APPENDED, never inserted -- same
+# reasoning as _COL_CATEGORY/_COL_REQUIREMENT above. Sortable/filterable risk
+# score, replacing the "Risk <score>" text that used to be glued into Notes.
+_COL_RISK_SCORE = 13
+_TOTAL_COLS = 14
 
 
 def _col_letter(index: int) -> str:
@@ -89,12 +93,13 @@ _HEADERS = [
     "Notes",
     "Coverage Category",
     "Requirement ID",
+    "Risk Score",
 ]
 
 # Index-parallel to _HEADERS (test_column_constants_stay_in_lockstep) and also
 # the row-height autofit input. Column L went 22 -> 24: "Coverage Category" is 17
 # chars and the widest value, "Negative / Error Flows", is 22.
-_COL_WIDTHS = [10, 18, 30, 12, 14, 28, 45, 28, 45, 12, 20, 24, 16]
+_COL_WIDTHS = [10, 18, 30, 12, 14, 28, 45, 28, 45, 12, 20, 24, 16, 11]
 
 
 def _prepare(text: str) -> str:
@@ -145,40 +150,34 @@ def _row_height_for(cells: list[tuple[str, float]]) -> float:
 def _notes_cell(tc: object, rule_pack_note: str) -> str:
     """Text for the Notes column of one case.
 
-    tools/risk_scorer.py scores EVERY suite and the sheet's row order IS the risk
-    order (TC-001 = highest risk), but risk_label / risk_score were never
-    exported -- while Notes was empty in 65/65 rows of the 2026-07-30 run,
-    because it only ever carried a Batch-3 rule-pack note and the rule packs are
-    off in that deployment. Unconditional since 2026-08-12 (QA_XLSX_RISK_NOTES
-    was deleted).
-
-    A rule-pack note ALWAYS wins, so no information is ever displaced, and any
-    problem degrades to the rule-pack note -- i.e. exactly the pre-feature
+    v1.97.0 cursor-hardening (item 12): the risk score used to be glued into
+    this cell as "Risk <score>" text (2026-08-04 - 2026-09-26), making it
+    unsortable and unfilterable and duplicating nothing else on the row. The
+    score now has its own column (_risk_score_cell / _COL_RISK_SCORE below);
+    this cell carries ONLY the rule-pack note, exactly the pre-2026-08-04
     output. Pure and never raises.
-
-    2026-08-04: the cell used to read "Risk: <label> (<score>)", and the LABEL
-    duplicated the Priority column -- contradicting it in 10/97 rows of that
-    day's run (Priority=High vs "Risk: CRITICAL (34)"), because the label mixes
-    in type weight and Priority does not. Only the SCORE is written now: it is
-    the sheet's row-order key and appears in no other column.
     """
-    note = rule_pack_note or ""
-    if note:
-        return note
+    return rule_pack_note or ""
+
+
+def _risk_score_cell(tc: object) -> int | None:
+    """The Risk Score cell for one case: the integer score, or None when the
+    suite was never scored.
+
+    Mirrors _notes_cell's old gate exactly: an UNSCORED suite has
+    risk_label == "" and risk_score == 0, and must produce an EMPTY cell
+    (write_blank), not a misleading "0" that reads as "scored and safe".
+    Pure and never raises.
+    """
     try:
-        # The gate stays on risk_label: an UNSCORED suite has risk_label == ""
-        # and risk_score == 0, and must keep producing an empty Notes cell rather
-        # than a meaningless "Risk 0".
         label = str(getattr(tc, "risk_label", "") or "").strip()
         if not label:
-            return note
+            return None
         score = getattr(tc, "risk_score", None)
-        # No score means nothing is left to show once the label is dropped, so
-        # degrade to the rule-pack note (empty in practice) rather than invent one.
-        return f"Risk {score}" if score is not None else note
+        return int(score) if score is not None else None
     except Exception:  # pragma: no cover - defensive
-        logger.debug("risk note rendering failed -- Notes left as-is", exc_info=True)
-        return note
+        logger.debug("risk score cell rendering failed -- left blank", exc_info=True)
+        return None
 
 
 _UNTRACED_LABEL = "(untraced)"
@@ -697,6 +696,13 @@ def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
         # the reply's "N/N traced" claim, in the file the tester keeps.
         requirement_text = _requirement_cell(tc)
         _write_text(_COL_REQUIREMENT, requirement_text)
+        # v1.97.0 cursor-hardening (item 12): sortable/filterable risk score,
+        # its own column rather than text glued into Notes (see _notes_cell).
+        _risk_score = _risk_score_cell(tc)
+        if _risk_score is None:
+            ws.write_blank(row_idx, _COL_RISK_SCORE, None, fmt)
+        else:
+            ws.write_number(row_idx, _COL_RISK_SCORE, _risk_score, fmt)
 
         # Row height: fit the tallest cell in the row (wrapped text included),
         # not just the step count -- long titles/preconditions/data/expected

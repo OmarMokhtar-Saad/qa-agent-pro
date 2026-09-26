@@ -15,13 +15,15 @@ from tools.models import (
     format_test_data_lines,
 )
 from tools.secure_temp import SUBDIR_NAME, make_secure_temp_path
+from tools.xlsx_generator import _risk_score_cell
 
 logger = logging.getLogger(__name__)
 
-# Risk Score / Risk Label / Risk Rationale / Stable ID are intentionally NOT
-# exported here — see the matching comment in xlsx_generator.py. Requirement ID
-# left that list on 2026-08-19 (F06) and is the 13th column, in lockstep with the
-# xlsx as always.
+# Risk Label / Risk Rationale / Stable ID are intentionally NOT exported here —
+# see the matching comment in xlsx_generator.py. Requirement ID left that list on
+# 2026-08-19 (F06); Risk Score left it in v1.97.0 (item 12) and is the 14th
+# column, in lockstep with the xlsx as always — the cell itself comes from
+# xlsx_generator._risk_score_cell so the two cannot drift.
 # Kept in lockstep with xlsx_generator._HEADERS -- an invariant asserted by
 # tests/test_csv_exporter.test_csv_headers_match_xlsx_headers. "Test Type" /
 # "Coverage Category" renamed 2026-08-04 with the xlsx; nothing external reads
@@ -40,6 +42,7 @@ _HEADERS = [
     "Notes",
     "Coverage Category",
     "Requirement ID",
+    "Risk Score",
 ]
 
 
@@ -94,6 +97,9 @@ def generate_test_case_csv(suite: TestSuite, output_path: str | None = None) -> 
                     sanitize_cell(
                         display_requirement_id(tc.requirement_id) or "(untraced)"
                     ),
+                    # An unscored suite writes an EMPTY cell, not "0" -- the
+                    # xlsx writes write_blank for the same reason.
+                    _risk_score_cell(tc) if _risk_score_cell(tc) is not None else "",
                 ]
             )
 

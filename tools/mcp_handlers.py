@@ -90,6 +90,7 @@ from tools.rag_store import (
     replace_source_entries,
 )
 from tools.suite_store import (
+    find_recent_suite_by_source,
     list_recent_suites,
     load_suite,
     save_checklist,
@@ -955,6 +956,69 @@ def note_elicit_client(name) -> None:
         _elicit_client_current["name"] = str(name or "").strip().lower()
     except Exception:
         logger.debug("elicit client note failed", exc_info=True)
+
+
+# --------------------------------------------------------------------------- #
+# v1.97.0 cursor-hardening (item 3b/6a/6b): provenance state, kept SEPARATE
+# from _elicit_client_current so elicitation gating and provenance can evolve
+# independently.
+# --------------------------------------------------------------------------- #
+_provenance_client = {"name": "", "version": ""}
+
+# The documented hosts, kept in step with jira_mcp._detect_client_key's
+# four clients (cursor / gemini-cli / claude-desktop / claude-code);
+# "claude" covers the last two. Matched as a case-insensitive substring
+# so a versioned or vendor-prefixed clientInfo.name still matches.
+_KNOWN_EDITOR_SUBSTRINGS = ("cursor", "claude", "gemini")
+
+
+def note_provenance_client(name, version: str = "") -> None:
+    """Record which client (name + version) this process is serving, for
+    stamping onto every saved suite. Mirrors note_elicit_client's shape.
+    Never raises."""
+    try:
+        _provenance_client["name"] = str(name or "").strip()
+        _provenance_client["version"] = str(version or "").strip()
+    except Exception:
+        logger.debug("provenance client note failed", exc_info=True)
+
+
+def _known_editor_host(name: str) -> bool:
+    """True when name matches one of the documented hosts. Empty or
+    unrecognized -- e.g. a side-channel process's own spawned
+    mcp.ClientSession -- is False. Never raises."""
+    try:
+        low = str(name or "").strip().lower()
+        if not low:
+            return False
+        return any(sub in low for sub in _KNOWN_EDITOR_SUBSTRINGS)
+    except Exception:
+        return False
+
+
+def _dispatch_provenance() -> dict:
+    """{"dispatch", "client_name", "client_version", "known_editor"} for the
+    suite about to be saved. Reaching this at all already proves
+    dispatch_guard.require_dispatched passed for THIS call -- a guard-less
+    attempt raises before any handler body runs -- so every suite saved
+    through this path carries "dispatch": "mcp_tracked". Never raises."""
+    try:
+        name = _provenance_client.get("name", "")
+        version = _provenance_client.get("version", "")
+        return {
+            "dispatch": "mcp_tracked",
+            "client_name": name,
+            "client_version": version,
+            "known_editor": _known_editor_host(name),
+        }
+    except Exception:
+        logger.debug("_dispatch_provenance failed", exc_info=True)
+        return {
+            "dispatch": "mcp_tracked",
+            "client_name": "",
+            "client_version": "",
+            "known_editor": False,
+        }
 
 
 def _elicit_client_key(name=None) -> str:
@@ -4122,6 +4186,20 @@ def _carry_forward_or_refuse(
         return ([], [], "", "", "")
 
 
+def _text_only_image_skip_stamp(plan: str, img_n: int, img_names: list) -> tuple:
+    """(count, names[:8]) to stamp into envelope["meta"] when a text-only
+    source_plan='jira' pick skipped beat 2 while the ticket referenced
+    screens (v1.97.0 cursor-hardening item 2) -- (0, []) otherwise, so the
+    skip is disclosed rather than silently dropped. Never raises."""
+    try:
+        n = _clamped_count(img_n, lo=0, hi=99) if plan == "jira" else 0
+        names = [str(x) for x in (img_names or [])][:8] if n > 0 else []
+        return n, names
+    except Exception:
+        logger.debug("_text_only_image_skip_stamp failed", exc_info=True)
+        return 0, []
+
+
 def _image_gate_second_beat(
     *, count: int, names: list, kind: str, plan: str, have_images: int
 ) -> str:
@@ -4133,16 +4211,22 @@ def _image_gate_second_beat(
     which spent a whole extra round trip to say "I could not tell" on a ticket
     that may well have no images -- it is purely informational, so it is left to
     the pre-existing post-hoc notice on the finished payload instead. Silent
-    also whenever images actually arrived --
-    a plan that already covered the screens is never asked twice. It DOES fire
-    for a text-only plan, deliberately: the ticket has now told us something
-    beat 1 could not know, that there really ARE screens and what they are
-    called. That is at most ONE extra ask, it names the screens, and both the
-    beat-1 menu and the tool docstrings tell the host to send
-    `image_gate_ack=true` alongside `source_plan='jira'` to skip it. Never
+    also whenever images actually arrived, or the ticket's own plan is the
+    text-only `source_plan='jira'` pick -- a plan that already covered the
+    screens is never asked twice, and beat 1's `source_plan='jira'` IS the
+    tester's own answer to where the screens come from, so beat 2 must not
+    ask a second time (v1.97.0 cursor-hardening item 2 -- this used to fire
+    here too, forcing a double ask). Never
     raises."""
     try:
         if kind not in ("attachments", "embedded"):
+            return ""
+        # v1.97.0 cursor-hardening (item 2): source_plan='jira' (text-only) IS
+        # the tester's own answer to "where do the screens come from" -- beat 1
+        # already asked and got that answer, so beat 2 must not ask again. The
+        # skipped-attachment count is still disclosed elsewhere (never silent),
+        # just not via a second dialog.
+        if plan == "jira":
             return ""
         # 2026-08-31 (C12): menu option 5 reads "Device screens only -- IGNORE
         # the ticket text". Demanding the ticket's attachments from a tester who
@@ -4664,6 +4748,125 @@ def _corpus_source_key(source_url: object, feature_text: object = "") -> str:
         return ""
 
 
+# --------------------------------------------------------------------------- #
+# v1.97.0 cursor-hardening (item 3a/8): duplicate-content and recent-suite
+# advisories. Both are WARN-only -- neither ever blocks generation or submit.
+# --------------------------------------------------------------------------- #
+_DUP_CORPUS_QUERY_CHARS_CAP = 4000
+_DUP_CORPUS_TOP_K = 10
+_RECENT_SUITE_WARN_WINDOW_S = 86400
+
+
+def _case_content_hash(tc: object) -> str:
+    """SHA-256 hex digest of the EXACT text _persist_suite_to_corpus writes to
+    the corpus for this case, so the two always agree on byte-identical
+    content. Never raises (returns "" on any failure)."""
+    try:
+        steps_text = "\n".join(
+            f"{s.step_number}. {s.action} -> {s.expected_result}" for s in tc.steps
+        )
+        content = f"{tc.title}\n{steps_text}"
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+    except Exception:
+        logger.debug("_case_content_hash failed", exc_info=True)
+        return ""
+
+
+async def _duplicate_case_note(cases: list, source_url: str = "") -> tuple:
+    """(note, counts) -- a WARN-only, hash-based duplicate check run at
+    qa_submit_suite (against the prior suite for the same source, computed
+    BEFORE that suite is overwritten) and best-effort at qa_submit_category.
+    Checks the most recent suite for this source for exact overlap, then runs
+    ONE bounded query_corpus call (capped to keep a large suite's submit
+    cheap) and intersects returned entries' content hashes. Returns ("",
+    counts-with-zeros) when nothing matches. Never raises."""
+    counts = {"suite_id": "", "suite_n": 0, "corpus_n": 0, "m": 0}
+    try:
+        hashes = {_case_content_hash(tc) for tc in (cases or [])}
+        hashes.discard("")
+        m = len(cases or [])
+        counts["m"] = m
+        if not hashes:
+            return "", counts
+        suite_n = 0
+        prior_suite_id = ""
+        if source_url:
+            recent = await find_recent_suite_by_source(source_url, window_s=None)
+            prior = (recent.get("content") or {}) if not recent.get("error") else {}
+            prior_suite_id = str(prior.get("suite_id") or "")
+            if prior_suite_id:
+                loaded = await load_suite(prior_suite_id)
+                prior_suite = loaded.get("content")
+                if prior_suite is not None:
+                    prior_hashes = {
+                        _case_content_hash(tc)
+                        for tc in (getattr(prior_suite, "test_cases", None) or [])
+                    }
+                    suite_n = len(hashes & prior_hashes)
+        counts["suite_id"] = prior_suite_id
+        counts["suite_n"] = suite_n
+        corpus_n = 0
+        try:
+            titles = " ".join(
+                str(getattr(tc, "title", "") or "") for tc in (cases or [])
+            )
+            titles = titles[:_DUP_CORPUS_QUERY_CHARS_CAP]
+            if titles.strip():
+                result = await query_corpus(
+                    titles, entry_type="test_case", top_k=_DUP_CORPUS_TOP_K
+                )
+                hits = (result.get("content") or []) if not result.get("error") else []
+                corpus_hashes = {
+                    hashlib.sha256(
+                        str(h.get("content") or "").encode("utf-8")
+                    ).hexdigest()
+                    for h in hits
+                }
+                corpus_n = len(hashes & corpus_hashes)
+        except Exception:
+            logger.debug("_duplicate_case_note corpus check failed", exc_info=True)
+        counts["corpus_n"] = corpus_n
+        if suite_n and prior_suite_id:
+            return (
+                f"{suite_n}/{m} cases identical to suite `{prior_suite_id}`",
+                counts,
+            )
+        if corpus_n:
+            return f"{corpus_n}/{m} cases match existing corpus entries", counts
+        return "", counts
+    except Exception:
+        logger.debug("_duplicate_case_note failed", exc_info=True)
+        return "", counts
+
+
+async def _recent_suite_warning_note(source_url: str, window_s: float) -> str:
+    """\"> ...\" WARN when a suite already exists for source_url within
+    window_s (item 8) -- restores what _find_recent_duplicate_suite gave up
+    in 1.96.0. Never blocks generation. Never raises."""
+    try:
+        if not source_url:
+            return ""
+        recent = await find_recent_suite_by_source(source_url, window_s=window_s)
+        if recent.get("error"):
+            return ""
+        row = recent.get("content")
+        if not row:
+            return ""
+        suite_id = str(row.get("suite_id") or "")
+        created_at = row.get("created_at")
+        if not suite_id or not created_at:
+            return ""
+        age_s = max(0.0, time.time() - float(created_at))
+        age = _ago_label(age_s)
+        return (
+            f"> \u2139\ufe0f Suite `{suite_id}` for this ticket was generated "
+            f"{age} ago. Generation continues."
+        )
+    except Exception:
+        logger.debug("_recent_suite_warning_note failed", exc_info=True)
+        return ""
+
+
 async def _persist_suite_to_corpus(
     suite: object, feature_text: str = "", source_url: str = ""
 ) -> None:
@@ -4773,6 +4976,7 @@ async def handle_generate_test_cases(
     ask_text: AskCb = None,
     progress: ProgressCb = None,
     jira_content_json: str = "",
+    stage_token: str = "",
 ) -> str:
     dispatch_guard.require_dispatched("qa_generate_test_cases")
     text = (feature_or_url or "").strip()
@@ -4822,6 +5026,7 @@ async def handle_generate_test_cases(
             ask_text=ask_text,
             progress=progress,
             jira_content_json=jira_content_json,
+            stage_token=stage_token,
             source_plan=source_plan,
             attached_image_count=attached_image_count,
             capture_ids=list(capture_ids or []),
@@ -5516,6 +5721,7 @@ async def handle_prepare_test_cases(
     ask_text: AskCb = None,
     progress: ProgressCb = None,
     jira_content_json: str = "",
+    stage_token: str = "",
 ) -> PreparePayloadResult:
     """FRONT half of host-mode generation. Grounds + gates the inputs exactly
     like the server path, runs _prepare_generation, serializes the result into
@@ -5530,6 +5736,15 @@ async def handle_prepare_test_cases(
                 "Jira/issue URL, a web page URL, or a Swagger/OpenAPI spec URL."
             )
         )
+    # v1.97.0 cursor-hardening (item 1): assemble jira_content_json from the
+    # per-fetch stage tray when the caller sent stage_token instead. An
+    # explicitly-supplied jira_content_json still wins (legacy callers keep
+    # working unchanged).
+    jira_content_json, _stage_err = _resolve_jira_content_json(
+        jira_content_json, stage_token
+    )
+    if _stage_err:
+        return PreparePayloadResult(clarify=_stage_err)
     # 2026-09-02 audit F8. A BARE issue key is not a feature description. It used
     # to be handled as one, and generated a full suite whose every case was about
     # the literal string "SHYJ-7154" -- grounded in nothing, traceable to
@@ -5993,6 +6208,14 @@ async def handle_prepare_test_cases(
             plan=_plan,
             have_images=_have_images,
         )
+        # v1.97.0 cursor-hardening (item 2): text-only source_plan='jira'
+        # clears beat 2 in ONE ask now (see _image_gate_second_beat above),
+        # but the skip must still be disclosed, never silent -- stamped into
+        # envelope["meta"] below and rendered at submit time by
+        # _text_only_image_skip_note.
+        _text_only_image_skip_count, _text_only_image_skip_names = (
+            _text_only_image_skip_stamp(_plan, _img_n, _img_names)
+        )
         if _beat2 and image_gate_ack:
             # P0-3: the ack is the AGENT's claim that the tester agreed; only
             # the tester's own pick in this dialog clears beat 2. No dialog,
@@ -6030,6 +6253,14 @@ async def handle_prepare_test_cases(
             (grounded.url_content or {}).get("updated")
         )
         _stale_note = await _stale_snapshot_note(text, _snapshot_updated)
+        # v1.97.0 cursor-hardening (item 8): a suite already exists for this
+        # exact source and is still within the warn window -- WARN only,
+        # never blocks generation. Restores what _find_recent_duplicate_suite
+        # gave up in 1.96.0 (only the 30s _RECENT_CALLS replay cache survived
+        # that cut).
+        _recent_suite_note = await _recent_suite_warning_note(
+            text, _RECENT_SUITE_WARN_WINDOW_S
+        )
         # F9: and the fidelity half of the same question. _stale_snapshot_note
         # asks "is this the CURRENT revision of the ticket?"; this asks "is this
         # the WHOLE of it?" -- the failure the fetch directive's "do NOT
@@ -6237,6 +6468,13 @@ async def handle_prepare_test_cases(
                 # whether to expect an `image_descriptions` field, and a mid-flow
                 # .env flip must not change that for an in-flight prep.
                 "host_image_job": bool(_img_job),
+                # v1.97.0 cursor-hardening (item 2): non-zero only when beat 2
+                # was skipped because the tester picked source_plan='jira'
+                # (ticket text only) while the ticket itself referenced
+                # screens -- read by _text_only_image_skip_note so the skip is
+                # disclosed, never silent.
+                "text_only_image_skip_count": _text_only_image_skip_count,
+                "text_only_image_skip_names": _text_only_image_skip_names,
                 # Host-ATTESTED chat attachments (no image bytes ever reached
                 # this server). Stamped for the same mid-flow-flip reason: the
                 # submit reply compares it against the returned
@@ -6579,6 +6817,15 @@ async def handle_prepare_test_cases(
             _notice = (_notice + "\n\n" + _snap_note) if _notice else _snap_note
         if _stale_note:
             _notice = (_notice + "\n\n" + _stale_note) if _notice else _stale_note
+        # v1.97.0 cursor-hardening (item 8): self-contained sibling -- does not
+        # assume what wraps the anchor line above, only matches its
+        # indentation.
+        if _recent_suite_note:
+            _notice = (
+                (_notice + "\n\n" + _recent_suite_note)
+                if _notice
+                else _recent_suite_note
+            )
         # F9: ahead of nothing in particular, but in the SAME notice block as
         # the staleness warning -- they answer the two halves of "is the ticket
         # this suite will be built from the right one, and all of it?".
@@ -6937,6 +7184,27 @@ def _select_prepare_images(result: PreparePayloadResult) -> tuple[list[dict], st
             "payload above."
         )
     return kept, disclosure
+
+
+def _text_only_image_skip_note(meta: dict) -> str:
+    """"> ..." disclosure when the tester's own text-only source_plan='jira'
+    pick skipped beat 2 while the ticket itself referenced screens (v1.97.0
+    cursor-hardening item 2). "" when the prep's meta carries no skip stamp
+    (every prep before this change, and every prep where the pick did not
+    skip anything). Never raises."""
+    try:
+        _n = _clamped_count((meta or {}).get("text_only_image_skip_count"), lo=0, hi=99)
+        if _n <= 0:
+            return ""
+        _names = [str(x) for x in ((meta or {}).get("text_only_image_skip_names") or [])][:8]
+        _named = (" Names: " + ", ".join(f"`{n}`" for n in _names) + ".") if _names else ""
+        return (
+            f"\n> \u2139\ufe0f {_n} screen(s) referenced by this ticket were not "
+            f"read -- the tester chose ticket text only.{_named}"
+        )
+    except Exception:
+        logger.debug("_text_only_image_skip_note failed", exc_info=True)
+        return ""
 
 
 def _attested_image_gap_note(attested, result, *, captured=0) -> str:
@@ -8189,7 +8457,7 @@ def _volume_floor_note(
                 + ignored_ack
                 + f"\n\nNothing was discarded and prep `{prep_id}` is intact -- "
                 "the prepared context and every staged category are still "
-                "there, and no remediation round was used.\n\n"
+                "there.\n\n"
                 "**Pick one:**\n" + picks + "\n"
                 "Do **not** write the suite to a file yourself. A hand-authored "
                 "CSV or XLSX skips de-duplication, the coverage critic, "
@@ -8436,8 +8704,7 @@ def _image_relevance_gate(
             + facts
             + ignored_ack
             + f"\n\nNothing was discarded and prep `{prep_id}` is intact -- the "
-            "prepared context and every staged category are still there, and no "
-            "remediation round was used.\n\n"
+            "prepared context and every staged category are still there.\n\n"
             "**Pick one:**\n"
             "1. If the screen really is the wrong one, capture or attach the "
             "correct screen and run `qa_prepare_test_cases` again WITH "
@@ -9172,6 +9439,23 @@ async def handle_submit_category(
             overridden=bool(_shrinking and replace_smaller),
         )
         note += _dropped_note(parsed)
+        # v1.97.0 cursor-hardening (item 3a): best-effort duplicate check at
+        # category-submit time too -- no suite object exists yet here, so the
+        # note folds straight into the reply string; the Generation Notes
+        # sheet only ever sees the finalize-time (handle_submit_suite) signal.
+        # VERIFIED 2026-09-26: prepare writes both keys into the envelope
+        # meta ("source_text" / "source_url"); read defensively anyway so a
+        # pre-1.97 envelope degrades to "" instead of raising.
+        try:
+            _cat_source = str(_meta.get("source_url") or _meta.get("source_text") or "")
+            _cat_dup_note, _ = await _duplicate_case_note(
+                getattr(getattr(parsed, "suite", None), "test_cases", None) or [],
+                _cat_source,
+            )
+            if _cat_dup_note:
+                note += f"\n\n> \u2139\ufe0f {_cat_dup_note}"
+        except Exception:
+            logger.debug("category duplicate check failed", exc_info=True)
         # F4: tracked SEPARATELY from `note`, which also carries the
         # dropped-cases disclosure -- keying the route wording off `note` would
         # promise a review that never ran whenever cases were dropped.
@@ -10176,7 +10460,7 @@ async def handle_submit_suite(
         # self-reported `category`, and before the ambiguity gate, the
         # finalize, the export and the persist -- so a refusal costs one round
         # trip and destroys nothing (the prep is kept, no staged row is
-        # dropped, no remediation round is consumed), exactly like the
+        # dropped), exactly like the
         # ambiguity refusal below. version_note is prefixed for the same reason
         # that one prefixes amb_note: a prep staged on one install and
         # submitted to another is a plausible cause of a host ignoring the
@@ -10321,8 +10605,8 @@ async def handle_submit_suite(
                     "observable outcome -- the exact on-screen message, the "
                     "field/button state, or the resulting screen -- and resubmit "
                     f"under the SAME prep_id `{prep_id}`. **Nothing was "
-                    "discarded**: the prep and every staged category row survive "
-                    "and no remediation round was consumed. To finalize as-is "
+                    "discarded**: the prep and every staged category row "
+                    "survive. To finalize as-is "
                     "anyway, ask the tester first and then resend with "
                     f"`step_assertion_ack=true`{_ack_shape}.{_first_beat}"
                 )
@@ -10524,6 +10808,10 @@ async def handle_submit_suite(
         # field. Keyed off the prep's meta stamp, so a mid-flow .env flip cannot
         # change an in-flight prep and a normal submit is byte-identical.
         img_note = ""
+        # v1.97.0 cursor-hardening (item 2): disclosed here, unconditionally,
+        # because a skipped text-only plan never triggers a host image job at
+        # all (see host_image_job below) -- this must not be nested under it.
+        img_note += _text_only_image_skip_note(meta)
         # Batch 4 LAYER 3: hoisted OUT of the block below so the submit audit
         # row can read them. They stay None / {} on a prep that shipped no image
         # job, which is what keeps that row byte-identical to today's.
@@ -10537,7 +10825,7 @@ async def handle_submit_suite(
                 # warned about.
                 relevance=bool(meta.get("host_image_relevance")),
             )
-            img_note = host_mode.build_host_image_section(_img_result)
+            img_note += host_mode.build_host_image_section(_img_result)
             # The attested-count channel has no server-side evidence at all, so
             # an empty return field is reported instead of assumed benign.
             # BOTH intake channels now. The captured count is a 2026-08-09
@@ -10555,7 +10843,7 @@ async def handle_submit_suite(
             # sidecar/merge branches above, so it sees BOTH finalize routes, and
             # before _finalize_generation, the export and the persist, so a
             # refusal costs one round trip and destroys nothing (the prep is
-            # kept, no staged row is dropped, no remediation round is consumed),
+            # kept, no staged row is dropped),
             # exactly like the ambiguity and volume refusals. img_note is
             # prefixed so the tester sees the off-topic finding itself, not just
             # the refusal, and version_note for the same reason the two gates
@@ -10846,7 +11134,7 @@ async def handle_submit_suite(
         # Placed HERE -- after _finalize_generation, BEFORE the persist, the
         # export and the finalized stamp -- so a refusal costs one
         # round trip and destroys nothing: the prep and every staged category row
-        # survive, no remediation round is consumed and nothing is written.
+        # survive and nothing is written.
         # Two-beat, exactly like volume_floor_ack / step_assertion_ack: an ack on
         # the FIRST submit is IGNORED and told so, because the tester cannot have
         # seen these findings yet. A CLEAN suite yields no section and no
@@ -10897,8 +11185,8 @@ async def handle_submit_suite(
                     "instead of repeating the action, and give duplicated titles "
                     "distinct behaviour -- then resubmit under the SAME prep_id "
                     f"`{prep_id}`. **Nothing was discarded**: the prep and every "
-                    "staged category row survive, no remediation round was used, "
-                    "and nothing was exported or saved. To finalize as-is anyway, "
+                    "staged category row survive, and nothing was exported or "
+                    "saved. To finalize as-is anyway, "
                     "ask the tester first and then resend with "
                     f"`quality_gate_ack=true`.{_q_first_beat}"
                 )
@@ -10949,6 +11237,27 @@ async def handle_submit_suite(
         _t0 = time.monotonic()
         await _emit(progress, "\U0001f4be Saving the suite…")
         _t_emit = time.monotonic()
+        # v1.97.0 cursor-hardening (item 3a/3b/6a/6b): computed BEFORE the
+        # save below overwrites the prior suite for this source -- the whole
+        # reason this must run here and not after.
+        _dup_note, _dup_counts = await _duplicate_case_note(
+            list(getattr(suite, "test_cases", None) or []), source_url
+        )
+        _provenance = _dispatch_provenance()
+        suite._duplicate_case_note = _dup_note
+        suite._duplicate_case_counts = _dup_counts
+        suite._provenance = _provenance
+        _session_provenance_note = (
+            ""
+            if _provenance.get("known_editor")
+            else (
+                "> \u26a0\ufe0f This suite was saved by an MCP client this "
+                "server does not recognise (`"
+                + str(_provenance.get("client_name") or "unknown")
+                + "`). If you did not expect that, a process may be calling "
+                "this server's tools outside your editor's own MCP session."
+            )
+        )
         saved = await save_suite(
             suite,
             feature_text=source_text,
@@ -10956,6 +11265,7 @@ async def handle_submit_suite(
             # F1c: a retried finalize for this SAME prep must converge on the
             # suite this prep already produced, not fork a second one.
             prep_id=prep_id,
+            provenance=_provenance,
         )
         logger.info(
             "submit tail: progress emit %.1fs | save_suite %.1fs",
@@ -11062,6 +11372,17 @@ async def handle_submit_suite(
                             "than a bug.",
                         )
                     )
+            # v1.97.0 cursor-hardening (item 9): extract_ambiguity_result
+            # already records a rejected `testable_surface` (or other
+            # unreadable ambiguity_result field) in result.notes, and
+            # build_ambiguity_result_section already renders those notes into
+            # the CHAT REPLY -- but the chat reply is transient and the
+            # workbook is what the tester keeps. Mirrors the F4/F8 rationale
+            # below: the same signal, once more, in the artifact that
+            # survives.
+            _amb_gen_note = host_mode.ambiguity_notes_gen_note(amb_result)
+            if _amb_gen_note is not None:
+                _gen_notes.append(_amb_gen_note)
             # F4 (2026-08-29): the .xlsx is what the tester keeps; a step that
             # cannot fail has to be visible there and not only in a chat reply.
             # Both notes are advisory here -- the REFUSAL above is the gate, and
@@ -11365,6 +11686,14 @@ async def handle_submit_suite(
             # keeps the path and drops what follows it, and "your suite was
             # not stored" must not be what gets dropped.
             ReplySection("suite persistence", persist_note, protected=True),
+            # v1.97.0 cursor-hardening (item 6b): _dispatch_provenance()
+            # ["known_editor"] is False for an empty or unrecognized
+            # clientInfo.name -- e.g. the audited side-channel client's own
+            # spawned mcp.ClientSession. "" when known_editor is True, so a
+            # healthy run's reply is byte-identical.
+            ReplySection(
+                "session provenance", _session_provenance_note, protected=True
+            ),
             ReplySection("Excel export", export_note, protected=True),
             ReplySection("server version", version_note, protected=True),
             ReplySection("dropped cases", dropped_note, protected=True),
@@ -11388,6 +11717,11 @@ async def handle_submit_suite(
             ReplySection("screenshots", img_note, protected=True),
             ReplySection("duplicate review", dup_status_note, protected=True),
             ReplySection("duplicates", dup_note, protected=True),
+            # v1.97.0 cursor-hardening (item 3a): a WARN-only, hash-based
+            # check against the prior suite for this same source (and,
+            # best-effort, the RAG corpus) -- distinct from the intra-suite
+            # `dup_note` above, which compares cases WITHIN this one submit.
+            ReplySection("duplicate cases", _dup_note, protected=True),
             # D4: PROTECTED, because it states that the duplicate-review
             # assurance immediately above it is CONTRADICTED -- a claim
             # about whether the deliverable is what it appears to be, which
@@ -14617,6 +14951,124 @@ _CAPTURE_TRAY: dict = {}
 _CAPTURE_TRAY_TTL_S = 1800
 _CAPTURE_TRAY_MAX = 24
 
+# --------------------------------------------------------------------------- #
+# v1.97.0 cursor-hardening (item 1): per-fetch Jira staging tray. Mirrors the
+# _CAPTURE_TRAY shape exactly -- a token minted before the consuming call
+# exists (by tools.jira_mcp.build_fetch_directive), redeemed once
+# qa_prepare_test_cases/qa_generate_test_cases arrives with the same token,
+# swept on every touch. Keeps a single raw Jira fetch result from ever having
+# to survive inside one host-authored jira_content_json blob.
+# --------------------------------------------------------------------------- #
+_JIRA_STAGE_TRAY: dict = {}
+_JIRA_STAGE_TRAY_TTL_S = 1800
+_JIRA_STAGE_TRAY_MAX = 24
+_JIRA_STAGE_PART_MAX_BYTES = 20 * 1024
+_JIRA_STAGE_PARTS = ("issue", "parent", "siblings")
+
+
+def _sweep_jira_stage_tray() -> None:
+    """Evict stage-tray entries older than TTL or beyond MAX count (oldest
+    first). Mirrors _sweep_capture_tray. Never raises."""
+    try:
+        now = time.time()
+        for token, entry in list(_JIRA_STAGE_TRAY.items()):
+            if now - float(entry.get("_ts") or 0) > _JIRA_STAGE_TRAY_TTL_S:
+                _JIRA_STAGE_TRAY.pop(token, None)
+        overflow = len(_JIRA_STAGE_TRAY) - _JIRA_STAGE_TRAY_MAX
+        if overflow > 0:
+            oldest = sorted(
+                _JIRA_STAGE_TRAY.items(), key=lambda kv: kv[1].get("_ts") or 0
+            )
+            for token, _ in oldest[:overflow]:
+                _JIRA_STAGE_TRAY.pop(token, None)
+    except Exception:
+        logger.debug("_sweep_jira_stage_tray failed", exc_info=True)
+
+
+async def handle_stage_jira(stage_token: str, part: str, json_text: str) -> str:
+    """Stage ONE raw Jira fetch result (issue/parent/siblings) under
+    stage_token, redeemed later by _assemble_staged_jira_payload. Treats
+    json_text as UNTRUSTED, exactly like jira_content_json -- stored as-is,
+    parsed only once, at assembly time. Never raises."""
+    try:
+        _sweep_jira_stage_tray()
+        token = str(stage_token or "").strip()
+        if not token:
+            return "No `stage_token` given -- call the fetch directive first."
+        if part not in _JIRA_STAGE_PARTS:
+            return (
+                f"Unknown `part={part!r}` -- expected one of "
+                f"{', '.join(_JIRA_STAGE_PARTS)}."
+            )
+        text = str(json_text or "")
+        if len(text.encode("utf-8", "ignore")) > _JIRA_STAGE_PART_MAX_BYTES:
+            return (
+                "That staged part is too large to accept (over "
+                f"{_JIRA_STAGE_PART_MAX_BYTES // 1024} KB). Re-fetch requesting "
+                "only the fields the directive named."
+            )
+        entry = _JIRA_STAGE_TRAY.setdefault(token, {})
+        entry[part] = text
+        entry["_ts"] = time.time()
+        _sweep_jira_stage_tray()
+        return (
+            f"Staged `{part}` part for this fetch. Stage the remaining parts, "
+            "then call `qa_prepare_test_cases` with the same `stage_token`."
+        )
+    except Exception:
+        logger.debug("handle_stage_jira failed", exc_info=True)
+        return "Could not stage that part -- re-fetch and try again."
+
+
+def _assemble_staged_jira_payload(stage_token: str) -> tuple:
+    """(assembled_json_string, error) from the parts staged under
+    stage_token. Requires at least `issue`; a malformed single part does not
+    sink the others. Never raises."""
+    try:
+        token = str(stage_token or "").strip()
+        entry = _JIRA_STAGE_TRAY.get(token) if token else None
+        if not entry or not entry.get("issue"):
+            return "", (
+                "No `issue` part staged for this `stage_token` yet -- call "
+                "`qa_stage_jira(stage_token=..., part='issue', json=...)` "
+                "with the ticket fetch first."
+            )
+        payload: dict = {}
+        try:
+            payload["issue"] = json.loads(entry["issue"])
+        except Exception:
+            return "", "The staged `issue` part is not valid JSON -- re-stage it."
+        if entry.get("parent"):
+            try:
+                payload["parent_issue"] = json.loads(entry["parent"])
+            except Exception:
+                logger.debug("staged parent part failed to parse", exc_info=True)
+        if entry.get("siblings"):
+            try:
+                payload["sibling_issues"] = json.loads(entry["siblings"])
+            except Exception:
+                logger.debug("staged siblings part failed to parse", exc_info=True)
+        return json.dumps(payload), ""
+    except Exception:
+        logger.debug("_assemble_staged_jira_payload failed", exc_info=True)
+        return "", "Could not assemble the staged Jira payload -- re-stage and retry."
+
+
+def _resolve_jira_content_json(jira_content_json: str, stage_token: str) -> tuple:
+    """(resolved_jira_content_json, error) -- assembles from the stage tray
+    only when the caller sent stage_token AND no explicit jira_content_json
+    (an explicit argument always wins, so a legacy caller's jira_content_json
+    is never silently overridden). Never raises."""
+    try:
+        explicit = str(jira_content_json or "").strip()
+        if explicit or not stage_token:
+            return jira_content_json, ""
+        return _assemble_staged_jira_payload(stage_token)
+    except Exception:
+        logger.debug("_resolve_jira_content_json failed", exc_info=True)
+        return jira_content_json, ""
+
+
 # WHY an id the tester was handed no longer resolves -- keyed by id, written by
 # EVERY evictor (tray count, tray bytes, shelf count, shelf bytes, a revive that
 # did not fit) and read at the LAST consumer, _peek_captures, which puts the
@@ -17299,6 +17751,21 @@ async def handle_setup_check(
                 recommended.append(_split)
         except Exception:
             logger.debug("split-server check failed", exc_info=True)
+        # Cursor-hardening v1.97.0 (item 5): warn when the tester's open
+        # workspace CONTAINS this server's own source tree -- that is what
+        # lets an agent import tools/mcp_handlers.py directly or spawn its
+        # own copy of this server, bypassing the registered tool surface and
+        # its dispatch guard entirely (2026-09-25 Cursor audit).
+        try:
+            from tools.client_registry import workspace_contains_server_warning
+
+            _ws_warning = workspace_contains_server_warning(
+                workspace_roots=workspace_roots
+            )
+            if _ws_warning:
+                recommended.append(_ws_warning)
+        except Exception:
+            logger.debug("workspace-contains-server check failed", exc_info=True)
         # D4 follow-up (2026-08-25): the tester-facing half of the
         # "rate-limited" status. "" on every other status, so a healthy
         # run is byte-identical.
