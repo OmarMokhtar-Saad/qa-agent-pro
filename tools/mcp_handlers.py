@@ -77,6 +77,7 @@ from tools.jira_mcp import (
     bare_issue_key,
     connect_hint_line,
     connect_steps,
+    fetch_tool_name,
     issue_url_for_key,
     looks_like_jira_url,
     not_connected_message,
@@ -89,6 +90,7 @@ from tools.rag_store import (
     query_corpus,
     replace_source_entries,
 )
+from tools.suite_quality_signals import compute_suite_quality_advisories
 from tools.suite_store import (
     find_recent_suite_by_source,
     list_recent_suites,
@@ -1019,6 +1021,103 @@ def _dispatch_provenance() -> dict:
             "client_version": "",
             "known_editor": False,
         }
+
+
+def _union_provenance(rows: "list | None") -> dict:
+    """Union of every ``qa_submit_category`` row's OWN client_name (Step 2
+    stamps it into ``row["payload"]["client_name"]``) with the finalizing
+    call's own client. A2/N2, the headline fix: before this,
+    ``qa_submit_suite`` stamped ``known_editor`` from ONLY the finalizing
+    process, so eight categories submitted by an unrecognised side-channel
+    client and finalized by a known editor saved ``known_editor: True`` and
+    dropped every contributor on the floor. ``known_editor`` is True here
+    only when EVERY contributor (each row's client, plus this call's own) is
+    a known editor host. Never raises -- any failure degrades to the single
+    finalizing client, the pre-fix behaviour."""
+    try:
+        _base = _dispatch_provenance()
+        _clients: list = []
+        _seen: set = set()
+        for _row in rows or []:
+            _payload = (_row or {}).get("payload") or {}
+            _name = str(_payload.get("client_name") or "").strip()
+            if _name and _name not in _seen:
+                _seen.add(_name)
+                _clients.append(_name)
+        _final_name = str(_base.get("client_name") or "").strip()
+        if _final_name and _final_name not in _seen:
+            _seen.add(_final_name)
+            _clients.append(_final_name)
+        _known = (
+            all(_known_editor_host(c) for c in _clients)
+            if _clients
+            else bool(_base.get("known_editor"))
+        )
+        return {
+            "dispatch": _base.get("dispatch", "mcp_tracked"),
+            "client_name": _final_name,
+            "client_version": _base.get("client_version", ""),
+            "known_editor": bool(_known),
+            "contributing_clients": _clients,
+        }
+    except Exception:
+        logger.debug("_union_provenance failed", exc_info=True)
+        return _dispatch_provenance()
+
+
+def _unrecognized_client_note(provenance: dict, *, context: str) -> str:
+    """The A3/A4 warn-only banner: "" whenever every contributor is a known
+    editor host, else a loud "> warning" line naming every unrecognised
+    client. Ships ON, no flag (A3 owner decision) -- this NEVER gates a
+    return; the caller's submit always succeeds regardless of what this
+    returns. Reused for both the per-call ``qa_submit_category`` reply and
+    the finalize ``qa_submit_suite`` reply/session-provenance section, so
+    the two never drift. Never raises."""
+    try:
+        provenance = provenance or {}
+        if provenance.get("known_editor"):
+            return ""
+        _clients = list(provenance.get("contributing_clients") or [])
+        if not _clients:
+            _solo = str(provenance.get("client_name") or "unknown")
+            _clients = [_solo]
+        _label = ", ".join(f"`{c}`" for c in _clients if c) or "`unknown`"
+        _scope = "This category submission" if context == "category" else "This suite"
+        return (
+            "> \u26a0\ufe0f **" + _scope + " was recorded from an MCP client "
+            "this server does not recognise** (" + _label + "). If you did "
+            "not expect that, a process may be calling this server's tools "
+            "outside your editor's own MCP session. Submission was NOT "
+            "blocked -- this is a disclosure, not a refusal.\n\n"
+        )
+    except Exception:
+        logger.debug("_unrecognized_client_note failed", exc_info=True)
+        return ""
+
+
+def _provenance_gen_note_detail(provenance: dict) -> str:
+    """The Generation Notes workbook row text for session provenance -- ""
+    when every contributor is a known editor host (the sheet gets no row),
+    else the same fact the chat warning discloses, phrased for a cell the
+    tester reads later rather than mid-chat. Never raises."""
+    try:
+        provenance = provenance or {}
+        if provenance.get("known_editor"):
+            return ""
+        _clients = list(provenance.get("contributing_clients") or [])
+        if not _clients:
+            _solo = str(provenance.get("client_name") or "unknown")
+            _clients = [_solo]
+        _label = ", ".join(_clients) or "unknown"
+        return (
+            "This suite was recorded from an MCP client this server does "
+            f"not recognise ({_label}). If this was not expected, a process "
+            "may be calling this server's tools outside the editor's own MCP "
+            "session."
+        )
+    except Exception:
+        logger.debug("_provenance_gen_note_detail failed", exc_info=True)
+        return ""
 
 
 def _elicit_client_key(name=None) -> str:
@@ -6441,6 +6540,14 @@ async def handle_prepare_test_cases(
             "meta": {
                 "source_text": text,
                 "source_url": text if grounded.url_content else "",
+                # A6 (2026-09-26, v1.98 scope A): _screen_reference_advisory
+                # already computes this in tools/jira_mcp.py -- one hit
+                # repo-wide before this plan, the assignment, nothing read
+                # it. Stamped here so it survives to finalize (Step 5's
+                # Generation Notes row) and to the prepare reply below.
+                "image_reference_advisory": str(
+                    (grounded.url_content or {}).get("image_reference_advisory") or ""
+                ),
                 "round": 0,
                 # ops-6 (bug 1): the launcher applies updates "at the next idle
                 # minute", and a host-mode flow is idle exactly between prepare
@@ -6804,6 +6911,18 @@ async def handle_prepare_test_cases(
         _src_note = _grounding_source_note(text, _url_content, grounded.openapi_text)
         if _src_note:
             _notice = (_notice + "\n\n" + _src_note) if _notice else _src_note
+        # A6 (2026-09-26, v1.98 scope A): evidence about the submitted
+        # payload, not a gate decision, so it renders regardless of which
+        # image-gate branch fired above -- matching the wiring note left by
+        # the prior cursor-hardening-1-staging plan when this field was
+        # first computed and never read.
+        _screen_ref_note = str(_url_content.get("image_reference_advisory") or "")
+        if _screen_ref_note:
+            _notice = (
+                (_notice + "\n\n> \u2139\ufe0f " + _screen_ref_note)
+                if _notice
+                else "> \u2139\ufe0f " + _screen_ref_note
+            )
         # I2b (2026-08-10): WHICH snapshot these cases were generated from, so a
         # reused cached payload is visible instead of silent. APPEND, never
         # assign -- see PreparePayloadResult.
@@ -9394,10 +9513,20 @@ async def handle_submit_category(
             return _shrinking_resubmit_reply(
                 prep_id, category_name, _prior, len(cases_json)
             )
+        # A2/A4 (2026-09-26, v1.98 scope A): record THIS call's own client so
+        # a later finalize from a different process can union every
+        # contributor instead of stamping only the finalizing client (the
+        # laundering path A2/N2 fixes at finalize time -- see
+        # _union_provenance).
+        _call_provenance = _dispatch_provenance()
         saved = await prep_store.save_submission(
             prep_id,
             category_name,
-            {"test_cases": cases_json, "dropped_count": parsed.dropped_count},
+            {
+                "test_cases": cases_json,
+                "dropped_count": parsed.dropped_count,
+                "client_name": _call_provenance.get("client_name", ""),
+            },
         )
         if saved.get("error"):
             return f"⚠️ Could not record **{_cat}**: {saved['error']}"
@@ -9630,8 +9759,12 @@ async def handle_submit_category(
         _staged_all = _all_staged_banner(
             (loaded.get("content") or {}).get("meta"), rows.get("content") or []
         )
+        # A4: warn on EVERY category submit from an unrecognised client, not
+        # only at finalize -- "" (no-op) whenever this call's own client is a
+        # known editor host. Never gates: the row above is already saved.
+        _client_warn = _unrecognized_client_note(_call_provenance, context="category")
         return (
-            f"{_staged_all}{note}## ✅ Recorded {len(cases_json)} case(s) for "
+            f"{_client_warn}{_staged_all}{note}## ✅ Recorded {len(cases_json)} case(s) for "
             f"**{_cat}**\n\n"
             f"Re-submitting **{_cat}** REPLACES its previous rows "
             "(newest wins).\n\n"
@@ -10358,7 +10491,8 @@ async def handle_submit_suite(
                     enforce_size_cap=False,
                 )
                 rows_res = await prep_store.load_submissions(prep_id)
-                n_rows = len(rows_res.get("content") or [])
+                rows = rows_res.get("content") or []
+                n_rows = len(rows)
                 if n_rows:
                     conflict_note = (
                         f"> ℹ️  A full suite was submitted, so {n_rows} "
@@ -11244,6 +11378,11 @@ async def handle_submit_suite(
             list(getattr(suite, "test_cases", None) or []), source_url
         )
         _provenance = _dispatch_provenance()
+        # A2/N2 (2026-09-26, v1.98 scope A): supersede the single-finalizing-
+        # client stamp above with the UNION of every qa_submit_category
+        # contributor's own client plus this call's -- the laundering fix.
+        # `rows` is bound in all three finalize branches (Step 3).
+        _provenance = _union_provenance(rows)
         suite._duplicate_case_note = _dup_note
         suite._duplicate_case_counts = _dup_counts
         suite._provenance = _provenance
@@ -11257,6 +11396,15 @@ async def handle_submit_suite(
                 + "`). If you did not expect that, a process may be calling "
                 "this server's tools outside your editor's own MCP session."
             )
+        )
+        # A4 (2026-09-26, v1.98 scope A): supersede the legacy single-client
+        # computation above with the SAME shared helper qa_submit_category
+        # uses (Step 2), built from the UNIONED _provenance above rather than
+        # only the finalizing client. The old block above still runs --
+        # harmless dead work, not worth a byte-for-byte rewrite of its
+        # escaped literal -- and is immediately overwritten here.
+        _session_provenance_note = _unrecognized_client_note(
+            _provenance, context="suite"
         )
         saved = await save_suite(
             suite,
@@ -11312,6 +11460,36 @@ async def handle_submit_suite(
         # a failure here must never cost the tester the export.
         try:
             _gen_notes: list = []
+            # A1 (2026-09-26, v1.98 scope A): five signals that already exist
+            # server-side but never reached the Generation Notes sheet. Each
+            # is independent and best-effort -- a failure in one must never
+            # drop the others or block export, matching every append below.
+            try:
+                _skip_gen_note = _text_only_image_skip_note(meta)
+                if _skip_gen_note:
+                    _gen_notes.append(("Skipped attachments", _skip_gen_note))
+            except Exception:
+                logger.debug("skipped-attachments gen note failed", exc_info=True)
+            if _dup_note:
+                _gen_notes.append(("Duplicate cases", _dup_note))
+            try:
+                _recent_gen_note = await _recent_suite_warning_note(
+                    source_text, _RECENT_SUITE_WARN_WINDOW_S
+                )
+                if _recent_gen_note:
+                    _gen_notes.append(
+                        ("Recent suite for this source", _recent_gen_note)
+                    )
+            except Exception:
+                logger.debug("recent-suite gen note failed", exc_info=True)
+            _provenance_gen_detail = _provenance_gen_note_detail(_provenance)
+            if _provenance_gen_detail:
+                _gen_notes.append(("Session provenance", _provenance_gen_detail))
+            _screen_ref_gen_note = str(meta.get("image_reference_advisory") or "")
+            if _screen_ref_gen_note:
+                _gen_notes.append(
+                    ("Screen references without attachments", _screen_ref_gen_note)
+                )
             _vol_detail = _volume_shortfall_detail(
                 meta, list(getattr(suite, "test_cases", None) or [])
             )
@@ -11394,6 +11572,25 @@ async def handle_submit_suite(
             if _data_detail_text:
                 _gen_notes.append(
                     ("Test data that restates the field name", _data_detail_text)
+                )
+            # C1 (2026-09-26, v1.98 scope C): tools.suite_quality_signals is
+            # mature (17 unit tests) and warn-only, but had zero non-test
+            # callers -- computed advisories never reached a tester. Call it
+            # here, the same place every other advisory-only signal above
+            # already lands in _gen_notes. compute_suite_quality_advisories
+            # never raises on its own, but it is wrapped anyway so a future
+            # change to it can never cost the tester the export. The
+            # dedup-contradiction argument is intentionally left at its
+            # default (a no-op): its evidence is computed after workbook
+            # export and reordering that is OUT OF SCOPE for this change.
+            try:
+                for _qs_title, _qs_detail in compute_suite_quality_advisories(
+                    all_cases, staged_text=source_text
+                ):
+                    _gen_notes.append((_qs_title, _qs_detail))
+            except Exception:  # pragma: no cover - advisory never blocks export
+                logger.debug(
+                    "compute_suite_quality_advisories failed", exc_info=True
                 )
             # F8 (2026-08-30): the finalize reply truncates at _SUMMARY_CAP and
             # told the tester to "re-submit a smaller suite" to read the
@@ -11665,6 +11862,18 @@ async def handle_submit_suite(
         # finalized under different flags.
         _sections = [
             ReplySection("ambiguity screening", amb_note, protected=True),
+            # A4 (2026-09-26, v1.98 scope A): moved up to SECOND -- an
+            # unrecognised-client warning buried 7th is a warning nobody
+            # reads. It does NOT take the first slot: L3
+            # (test_the_submit_reply_puts_the_ambiguity_note_first) pins the
+            # ambiguity note there, because a host model summarising the reply
+            # keeps the deliverable path and drops whatever follows it. Second
+            # is the highest slot available without breaking that invariant.
+            # See this section's old position below for the comment explaining
+            # what computes _session_provenance_note.
+            ReplySection(
+                "session provenance", _session_provenance_note, protected=True
+            ),
             ReplySection("volume floor", volume_note, protected=True),
             # PROTECTED for the same reason volume_note is: this line is the
             # only place the finalize reply says the tester waved 65
@@ -11686,14 +11895,11 @@ async def handle_submit_suite(
             # keeps the path and drops what follows it, and "your suite was
             # not stored" must not be what gets dropped.
             ReplySection("suite persistence", persist_note, protected=True),
-            # v1.97.0 cursor-hardening (item 6b): _dispatch_provenance()
-            # ["known_editor"] is False for an empty or unrecognized
-            # clientInfo.name -- e.g. the audited side-channel client's own
-            # spawned mcp.ClientSession. "" when known_editor is True, so a
-            # healthy run's reply is byte-identical.
-            ReplySection(
-                "session provenance", _session_provenance_note, protected=True
-            ),
+            # v1.97.0 cursor-hardening (item 6b) / A4 (2026-09-26, v1.98
+            # scope A): this section MOVED to the front of `_sections` --
+            # see above -- so the warning is not buried 7th. Comment kept
+            # here as the historical note for _session_provenance_note's
+            # computation earlier in this function.
             ReplySection("Excel export", export_note, protected=True),
             ReplySection("server version", version_note, protected=True),
             ReplySection("dropped cases", dropped_note, protected=True),
@@ -15020,6 +15226,44 @@ async def handle_stage_jira(stage_token: str, part: str, json_text: str) -> str:
         return "Could not stage that part -- re-fetch and try again."
 
 
+#: A stage token is minted by ``jira_mcp.build_fetch_directive`` as
+#: ``secrets.token_urlsafe(16)``, so it is always URL-safe base64. Anything
+#: else reaching a reply is host-supplied free text. Checked without ``re``:
+#: this module has no module-level regex import and does not need one for a
+#: character-class test.
+_STAGE_TOKEN_EXTRA_CHARS = "-_"
+
+
+def _is_stage_token_shaped(text: str) -> bool:
+    """True when ``text`` could be a minted stage token: URL-safe base64, and
+    long enough that no short free-text fragment passes by accident."""
+    return 16 <= len(text) <= 64 and all(
+        (ch.isascii() and ch.isalnum()) or ch in _STAGE_TOKEN_EXTRA_CHARS
+        for ch in text
+    )
+
+
+def _safe_stage_token(value: object) -> str:
+    """``value`` if it is shaped like a stage token, else a sanitised stand-in.
+
+    Same discipline as ``host_mode.safe_prep_id`` and ``jira_mcp._sanitize_echo``:
+    a token we do not recognise is still ECHOED -- a host that sent a typo needs
+    to see what it sent -- but stripped of backticks and newlines and capped, so
+    it can only ever read as a wrong token, never close its code span and write
+    markdown into text the model then follows. Never raises.
+    """
+    try:
+        text = str(value or "").strip()
+        if _is_stage_token_shaped(text):
+            return text
+        flattened = "".join(
+            " " if ch in "`\n\r\t" else ch for ch in text[:64] if ch.isprintable()
+        )
+        return " ".join(flattened.split())
+    except Exception:  # pragma: no cover - defensive
+        return ""
+
+
 def _assemble_staged_jira_payload(stage_token: str) -> tuple:
     """(assembled_json_string, error) from the parts staged under
     stage_token. Requires at least `issue`; a malformed single part does not
@@ -15028,10 +15272,33 @@ def _assemble_staged_jira_payload(stage_token: str) -> tuple:
         token = str(stage_token or "").strip()
         entry = _JIRA_STAGE_TRAY.get(token) if token else None
         if not entry or not entry.get("issue"):
+            # B1/B2 (2026-09-26, v1.98 scope B): the live SHYJ-5645 failure was
+            # an agent that read this exact refusal, concluded -- wrongly, two
+            # turns after using the SAME bridge for part='parent'/'siblings' --
+            # that its Atlassian MCP tool was "not in shell", and rebuilt its
+            # own MCP client instead of making one more call it already had.
+            # Lead with an explicit denial of that belief, name the real tool,
+            # and give the literal next call with THIS token filled in.
+            _also = [k for k in ("parent", "siblings") if entry and entry.get(k)]
+            _used_note = (
+                " -- the SAME bridge you already used for this ticket's "
+                + " and ".join(_also)
+                if _also
+                else ""
+            )
             return "", (
-                "No `issue` part staged for this `stage_token` yet -- call "
-                "`qa_stage_jira(stage_token=..., part='issue', json=...)` "
-                "with the ticket fetch first."
+                "\u26a0\ufe0f **No `issue` part staged yet -- this is not a "
+                "missing tool.** You already have `"
+                + fetch_tool_name()
+                + "`"
+                + _used_note
+                + ". Call it once more for the ticket itself, then stage "
+                "that exact result with this literal call: "
+                f"`qa_stage_jira(stage_token='{_safe_stage_token(token)}', part='issue', "
+                "json=<json.dumps(that result)>)`. Once `issue` is staged, "
+                "call `qa_prepare_test_cases` again with the SAME "
+                "`feature_or_url` and this SAME `stage_token` -- do not pass "
+                "`jira_content_json`."
             )
         payload: dict = {}
         try:

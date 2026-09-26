@@ -1,6 +1,6 @@
 [project]
 name = "qa-agent-pro"
-version = "1.97.0"
+version = "1.98.0"
 requires-python = ">=3.10"
 dependencies = [
     "pyyaml>=6.0",  # contracts + OpenAPI specs are YAML (api_test agent)
@@ -89,6 +89,7 @@ filterwarnings = ["ignore::pytest.PytestCollectionWarning"]
 # outside that directory.
 markers = [
     "live: drives a running MCP server through a real chat model; costs model calls. Needs QA_LIVE_SWEEP=1.",
+    "dispatch_guard_bare: opts a test OUT of conftest.py's autouse dispatch-guard entry, so tools.dispatch_guard.require_dispatched reflects reality for it (needed by tests driving a real mcp_server._tracked() dispatch or stdio handshake).",
 ]
 
 [tool.ruff]

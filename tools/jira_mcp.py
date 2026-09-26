@@ -2002,6 +2002,12 @@ _VERIFY_TOOL = "atlassianUserInfo"
 # read-only and parameterless.
 _ACCESS_TOOL = "getAccessibleAtlassianResources"
 
+# The per-ticket FETCH tool every Jira boomerang directive names (2026-09-26,
+# v1.98 scope B / B1-B2-B4): a shared constant + accessor so a refusal that
+# needs to NAME the tool never hand-types a prefix-less default that can
+# drift from what build_fetch_directive already sends.
+_FETCH_TOOL = "getJiraIssue"
+
 # At most this many site NAMES are ever echoed back, each sanitized.
 _MAX_ECHO_SITES = 5
 
@@ -2070,6 +2076,16 @@ def access_tool_name() -> str:
     is exactly ``mcp__atlassian__getAccessibleAtlassianResources``.
     """
     return f"{_tool_prefix()}{_ACCESS_TOOL}"
+
+
+def fetch_tool_name() -> str:
+    """Fully-qualified name of the per-ticket FETCH tool the AGENT must call.
+
+    Same client-configurable prefix as :func:`verify_tool_name`, so the default
+    is exactly ``mcp__atlassian__getJiraIssue`` -- used by refusals that must
+    NAME the tool the agent already has, not merely assert one exists.
+    """
+    return f"{_tool_prefix()}{_FETCH_TOOL}"
 
 
 def probe_provenance() -> str:
@@ -3039,6 +3055,32 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
     try:
         payload, load_error = _load_payload(raw)
         if load_error:
+            if "too large" in load_error:
+                # B4 (2026-09-26, v1.98 scope B): the generic wrap below built
+                # a garbled composite ("I couldn't read the payload (That
+                # Jira payload is too large...)") whose own instruction then
+                # told the agent to RESEND the same oversized payload
+                # unmodified -- guaranteed to fail identically again. Name
+                # the size (already inside load_error) and the real escape
+                # hatch: staged parts, not a retry of the thing just refused.
+                return {
+                    "error": (
+                        f"⚠️ {load_error} Sending it again unmodified will "
+                        "fail the same way -- switch to staged parts instead. "
+                        "Call `qa_prepare_test_cases` again with the SAME "
+                        "`feature_or_url` and NO `jira_content_json` to get a "
+                        f"fresh `stage_token`, then call `{fetch_tool_name()}` "
+                        "for each part you still need and stage that ONE "
+                        "result with `qa_stage_jira(stage_token=..., "
+                        "part='issue'|'parent'|'siblings', json=<that "
+                        "result>)` -- request only the fields the directive "
+                        "named if a part is rejected for size too -- then "
+                        "call `qa_prepare_test_cases` again with that SAME "
+                        "`stage_token`."
+                    ),
+                    "content": None,
+                    "needs_jira_mcp": False,
+                }
             return {
                 "error": (
                     "⚠️ I couldn't read the Jira payload you sent back "
