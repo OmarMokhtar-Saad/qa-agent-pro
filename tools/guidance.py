@@ -56,7 +56,15 @@ from __future__ import annotations
 # one failure an ambient block can actually prevent here: an agent proposing an
 # elevated install command to a tester whose account cannot run it, which is a
 # dead end the tester cannot diagnose and the server used to print regardless.
-MAX_INSTRUCTION_LINES = 44
+#
+# The Jira-auth line ("Jira auth fails: STOP ...") is ONE more line in CORE, so
+# +1 on every row again: worst case 44.
+#
+# The no-raw-adb line is ONE line in the mobile block: a Cursor agent read the
+# qa_mobile_test description, called no tool and drove the emulator with raw
+# adb, bypassing the destructive guard, keyboard restore and evidence. It costs
+# +1 only where the lane is registered: worst case 45.
+MAX_INSTRUCTION_LINES = 45
 
 
 _INSTRUCTIONS_CORE = """\
@@ -106,13 +114,15 @@ _INSTRUCTIONS_API = """\
 API TESTS: `qa_api_project`, then `qa_prepare_api_tests`,
 `qa_submit_api_tests`, `qa_write_api_test`.
 """
-# Two lines, and they buy their place: the two failure modes an ambient block
+# Three lines. The first is the no-raw-adb rule (see MAX_INSTRUCTION_LINES);
+# the other two buy their place too: the two failure modes an ambient block
 # can actually prevent here are re-fetching a packet the model already holds
 # (it costs the tester's own tokens) and starting over in a new chat instead of
 # resuming. Everything else -- credentials, the guard, the budgets -- is in the
 # `qa_mobile_run` PROMPT, which a client pays for only when it is invoked.
 _INSTRUCTIONS_MOBILE = """\
-MOBILE: `qa_mobile_test` gives ONE packet at a time -- answer it with
+MOBILE: For anything on an Android emulator or device use the qa_mobile_test tool (goal=... for ad-hoc steps). Never run adb/uiautomator/ADB Keyboard directly; the tool owns the safety guard, keyboard handling and evidence.
+`qa_mobile_test` gives ONE packet at a time -- answer it with
 `qa_submit_mobile_step`, never re-fetch it; resume in any chat by run id. `qa_setup_capture` installs the API-capture certificate ahead of a run.
 """
 

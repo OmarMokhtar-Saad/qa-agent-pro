@@ -1299,7 +1299,17 @@ def build_server():
             capture_ack: bool = False,
             charter: str = "",
         ) -> list[ContentBlock]:
-            """Run test cases, or explore freely, on an Android emulator.
+            """Drive an Android device: ad-hoc steps (goal=...), cases, exploration.
+
+            ANY action on an Android emulator or device -- install, launch, switch
+            environment, log in, tap, type, explore -- goes through this tool. For
+            ad-hoc steps pass goal="..." with apply=true (no suite, no cases needed)
+            and it drives the device step by step. Do NOT use raw adb or shell
+            commands for device actions (adb shell input/am/pm, uiautomator dumps,
+            ADB Keyboard broadcasts): this tool owns the destructive guard, keyboard
+            install/restore, the run folder, evidence and per-step screenshots, and a
+            raw command skips every one of them. It has no clear-app-data step, so
+            never `pm clear` around it: tell the tester the tool cannot reset app data.
 
             Call with NO arguments to start: it answers with whatever the machine
             needs next (a setup guide, an install source, a preflight list, or
@@ -1443,6 +1453,9 @@ def build_server():
             report_now: bool = False,
         ) -> str:
             """Where a mobile run stands, read from disk. Touches no device.
+
+            Device actions go through `qa_mobile_test` (goal=... for ad-hoc steps),
+            never raw adb.
 
             The emulator, the lease holder and the cases done/failed/remaining.
             Call this after anything that outlives a tool call -- a large

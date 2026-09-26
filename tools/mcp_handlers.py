@@ -3360,7 +3360,12 @@ async def _mobile_doctor_section() -> list:
     """
     if not _mobile_lane_enabled():
         return []
-    lines = ["### Mobile emulator lane"]
+    lines = [
+        "### Mobile emulator lane",
+        "- Device actions go through `qa_mobile_test` (goal=... for ad-hoc"
+        " steps), not raw adb: it owns the safety guard, keyboard handling and"
+        " evidence.",
+    ]
     try:
         from tools.mobile import emulator as doctor_emulator
         from tools.mobile import ime, sdk_locator
