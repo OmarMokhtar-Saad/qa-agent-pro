@@ -1374,6 +1374,11 @@ def build_server():
             almost nothing there, so on those apps the picture is the only
             description of the screen you get. Coordinates still come from the
             element list. If a capture did not succeed the packet says so.
+
+            Never report a screen state, field value or login outcome that was
+            not read from a qa_* observation. If the server cannot type or act,
+            stop and report the blocker by name. Do not fall back to raw adb
+            input, and do not claim a result.
             """
             from mcp.types import TextContent
 
@@ -1423,6 +1428,7 @@ def build_server():
             tester_input: str = "",
             tester_input_field: str = "",
             session_token: str = "",
+            confirm_destructive: bool = False,
         ) -> list[ContentBlock]:
             """Submit the action script YOU planned for a mobile packet.
 
@@ -1441,6 +1447,20 @@ def build_server():
             content: look at it before you plan the next script. If a capture
             did not succeed the packet says so rather than leaving you to
             wonder.
+
+            When the destructive guard stops a control and the TESTER confirms
+            it, resubmit with confirm_destructive=true: it unlocks only the
+            control THIS case's last stop named, not any control -- resubmit
+            the SAME op against the SAME element the stop pointed at. A
+            different op, a different element, or a submission before any
+            stop was recorded, refuses by name and does NOT spend the
+            confirm, so the next, correctly-aimed resubmission can still use
+            it. A run whose charter says `destructive: none` still refuses.
+
+            Never report a screen state, field value or login outcome that was
+            not read from a qa_* observation. If the server cannot type or act,
+            stop and report the blocker by name. Do not fall back to raw adb
+            input, and do not claim a result.
             """
             from mcp.types import TextContent
 
@@ -1454,6 +1474,7 @@ def build_server():
                     tester_input,
                     tester_input_field,
                     session_token,
+                    confirm_destructive=confirm_destructive,
                     progress=_make_progress(ctx),
                 ),
             )

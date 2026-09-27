@@ -121,7 +121,7 @@ API TESTS: `qa_api_project`, then `qa_prepare_api_tests`,
 # resuming. Everything else -- credentials, the guard, the budgets -- is in the
 # `qa_mobile_run` PROMPT, which a client pays for only when it is invoked.
 _INSTRUCTIONS_MOBILE = """\
-MOBILE: For anything on an Android emulator or device use the qa_mobile_test tool (goal=... for ad-hoc steps). Never run adb/uiautomator/ADB Keyboard directly; the tool owns the safety guard, keyboard handling and evidence.
+MOBILE: For anything on an Android emulator or device use the qa_mobile_test tool (goal=... for ad-hoc steps). Never run adb/uiautomator/ADB Keyboard directly; the tool owns the safety guard, keyboard handling and evidence. Never report a screen state, field value or login outcome that was not read from a qa_* observation. If the server cannot type or act, stop and report the blocker by name. Do not fall back to raw adb input, and do not claim a result.
 `qa_mobile_test` gives ONE packet at a time -- answer it with
 `qa_submit_mobile_step`, never re-fetch it; resume in any chat by run id. `qa_setup_capture` installs the API-capture certificate ahead of a run.
 """

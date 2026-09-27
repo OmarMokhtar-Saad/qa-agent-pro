@@ -1202,6 +1202,15 @@ _IME_REFUSAL_RE = re.compile(
 )
 
 
+#: The shape ``ime set`` accepts from this lane: ``package/Class``.
+IME_ID_SHAPE = re.compile(r"^[A-Za-z0-9._]{1,120}/[A-Za-z0-9._$]{1,120}$")
+
+
+def is_ime_id(text: str) -> bool:
+    """Whether *text* has the shape :func:`pm_select` will send."""
+    return bool(IME_ID_SHAPE.match(str(text or "")))
+
+
 async def pm_select(serial: str, ime_id: str) -> dict:
     """Select an input method by id (``adb shell ime set <id>``).
 
@@ -1215,7 +1224,7 @@ async def pm_select(serial: str, ime_id: str) -> dict:
     pattern `adb.install` already uses.
     """
     text = str(ime_id or "")
-    if not re.match(r"^[A-Za-z0-9._]{1,120}/[A-Za-z0-9._$]{1,120}$", text):
+    if not is_ime_id(text):
         return {
             "error": "Refusing to select input method " + repr(text[:60]) + ".",
             "content": None,

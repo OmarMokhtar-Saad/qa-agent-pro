@@ -121,6 +121,44 @@ GUARD_DETAIL = (
     "Stopped before a control that looks irreversible. Nothing was tapped. "
     "Confirm with the tester, then resubmit the script with the same action."
 )
+#: What an UNCONFIRMED control stop adds, naming the field and the one op it
+#: unlocks. Appended at the stop rather than folded into :data:`GUARD_DETAIL`,
+#: whose wording the sentinel ratchet pins.
+CONFIRM_HINT = (
+    " After the tester confirms, resubmit with `confirm_destructive: true`: it "
+    "unlocks this one `%s` on %s for that single submission and nothing else."
+)
+#: Bound on the guard-stop fingerprint's node text: untrusted device text,
+#: written at a checkpoint and read back at a later submission, so it is
+#: byte-compared across two separate device dumps.
+MAX_GUARD_NODE_CHARS = 120
+#: What a confirm that does not match the run's last recorded stop adds.
+#: Same ``%(op, repr(hit[:60]))`` shape as :data:`CONFIRM_HINT`; the wording
+#: names a DIFFERENT control so a test can grep for it.
+CONFIRM_MISMATCH_HINT = (
+    " That confirm was not spent: it named a different control than the one "
+    "this run's last stop pointed at. Resubmit `confirm_destructive: true` "
+    "against `%s` on %s -- the control the tester actually confirmed."
+)
+#: The rule the air session broke: it reported a login and two filled fields
+#: that no observation showed. Carried by every blocked-type reply, and
+#: restated in ``tools/guidance.py`` and both mobile tool docstrings.
+NO_FABRICATION_NOTE = (
+    "Never report a screen state, field value or login outcome that was not "
+    "read from a qa_* observation. If the server cannot type or act, stop and "
+    "report the blocker by name. Do not fall back to raw adb input, and do not "
+    "claim a result."
+)
+#: Characters of the active keyboard's package :data:`QA_IME_NOT_ACTIVE`
+#: names; sized so the whole reply fits the 400-char device-error detail.
+QA_IME_SEEN_CAP = 40
+#: A ``type``/``clear`` while a different keyboard is active: every broadcast
+#: after this goes nowhere, so nothing is attempted.
+QA_IME_NOT_ACTIVE = (
+    "The QA keyboard is not the active input method (active: %s), so "
+    "nothing was typed. Restart the run with `qa_mobile_test`. "
+    + NO_FABRICATION_NOTE
+)
 #: The SAME stop, for a run whose charter says ``destructive: none``. A
 #: SEPARATE sentence because both halves of :data:`GUARD_DETAIL` are wrong
 #: here: there is no tester to confirm with and no resubmit that can succeed,
@@ -297,6 +335,24 @@ class Context:
     # judging and the screen-level questions are untouched, and no value here
     # lets an action through the guard.
     guard_refuses: bool = False
+    # ONE control stop the tester confirmed, for THIS submission only. Spent
+    # by the first control the guard stops (see ``_consume_confirm``), so a
+    # second destructive op in the same script stops again. It never clears
+    # a screen-level stop, and ``guard_refuses`` outranks it.
+    confirm_destructive: bool = False
+    # Whether the explore turn right before this one failed to type or moved
+    # nothing. An explicit input like ``prior_verified``: set by the explore
+    # lane's submit seam, False on the scripted lane.
+    prior_turn_blocked: bool = False
+    # The fingerprint of the control THIS run's LAST turn stopped on --
+    # ``{"term": ..., "op": ..., "node": ...}`` -- or ``{}`` if that turn
+    # recorded no stop. ``None`` (the default) means UNTRACKED: every direct
+    # ``Context(...)`` unit test that never sets this keeps today's lenient
+    # behaviour, where any control stop's own confirm releases it. Only
+    # ``session.submit`` sets a dict, and only there does ``_consume_confirm``
+    # compare against it -- a confirm naming a different op, or arriving
+    # before any stop was recorded, then refuses by name and stays unspent.
+    prior_guard_stop: dict | None = None
 
 
 #: The ONLY ops the destructive guard skips, because none can actuate anything:
@@ -360,6 +416,9 @@ NOTHING_MOVED_NOTE = (
     "whatever it was meant to trigger did not happen -- re-sending the same "
     "script will do the same thing again. "
 )
+#: The fixed opening of :data:`NOTHING_MOVED_NOTE`, which is what a stored
+#: turn reason is matched on (the rest is formatted per turn).
+NOTHING_MOVED_PREFIX = NOTHING_MOVED_NOTE.split(" (", 1)[0]
 
 
 def _tokens(text: object) -> list[str]:
@@ -608,6 +667,16 @@ def screen_stop_details() -> dict:
     }
 
 
+def _control_detail(hit: str) -> str:
+    """The CONTROL stop's detail: :data:`GUARD_DETAIL` naming the term.
+
+    One producer, because the confirm and its hint must recognise exactly
+    what :func:`guard_detail` returns; comparing against the bare constant
+    never matched, since the term is always appended.
+    """
+    return GUARD_DETAIL + " Matched: " + str(hit)
+
+
 def guard_detail(hit: str, screen: object, expected: object) -> str:
     """The ``detail`` for ANY guard stop -- the ONE place that decides.
 
@@ -662,7 +731,7 @@ def guard_detail(hit: str, screen: object, expected: object) -> str:
     except Exception:  # pragma: no cover - defensive; the guard must not crash
         logger.error("mobile.executor.guard_detail failed", exc_info=True)
         return GUARD_DETAIL_SCREEN_GENERIC
-    return GUARD_DETAIL + " Matched: " + str(hit)
+    return _control_detail(hit)
 
 
 def screen_hit(
@@ -1228,6 +1297,111 @@ def _verified(trace: list[dict], ctx: Context) -> bool:
       no script could have fixed.
     """
     return _has_verification(trace) or bool(ctx.prior_verified)
+
+
+#: Assert kinds that name something the screen now SHOWS as a thing: an
+#: element, or text that was not there before this turn's action.
+NEW_ELEMENT_KINDS = ("element", "new_text")
+
+
+def _asserts_new_element(trace: list[dict]) -> bool:
+    """True when THIS trace passed an assert naming a specific new thing.
+
+    What a pass needs after a blocked turn. ``text_present`` does not count:
+    the air session's pass stood on a greeting that was already on screen
+    while the OTP it typed had moved nothing.
+    """
+    for item in trace:
+        action = item.get("action") if isinstance(item, dict) else None
+        if (
+            str(item.get("outcome") or "") == "assert_pass"
+            and isinstance(action, dict)
+            and str(action.get("kind") or "") in NEW_ELEMENT_KINDS
+        ):
+            return True
+    return False
+
+
+def _consume_confirm(
+    ctx: Context, hit: str, screen: object, op: str, entry: dict, label: str = ""
+) -> bool:
+    """Spend the one-shot ``confirm_destructive`` on THIS control stop, or not.
+
+    Only a CONTROL stop (the :data:`GUARD_DETAIL` wording) can be confirmed; a
+    screen-level stop names a different move, and ``guard_refuses`` outranks
+    any confirm. Bound to the op the guard stopped on the PRIOR turn, not any
+    control: ``ctx.prior_guard_stop`` carries that stop's fingerprint
+    (``None`` means untracked, the lenient default every direct
+    ``Context(...)`` unit test still gets; ``{}`` means tracked and no stop
+    was recorded). A tracked confirm that does not match refuses by name and
+    leaves the confirm UNSPENT, so a later, correctly-aimed resubmission can
+    still use it. The trace entry records what was confirmed, so the run
+    folder's checkpoint of this turn names the op and the term.
+    """
+    if not ctx.confirm_destructive or bool(getattr(ctx, "guard_refuses", False)):
+        return False
+    if guard_detail(hit, screen, ctx.package) != _control_detail(hit):
+        return False
+    stopped = getattr(ctx, "prior_guard_stop", None)
+    if stopped is not None:
+        current = {
+            "term": str(hit)[:80],
+            "op": str(op)[:40],
+            "node": str(label)[:MAX_GUARD_NODE_CHARS],
+        }
+        if not stopped or stopped != current:
+            entry["guard_confirm_mismatch"] = True
+            return False
+    ctx.confirm_destructive = False
+    entry["guard_confirmed"] = {"op": op, "term": str(hit)[:80]}
+    return True
+
+
+def _with_confirm_hint(
+    detail: str, op: str, hit: str, mismatched: bool = False
+) -> str:
+    """:data:`CONFIRM_HINT` on a control stop; any other stop is unchanged."""
+    if detail != _control_detail(hit):
+        return detail
+    hint = CONFIRM_MISMATCH_HINT if mismatched else CONFIRM_HINT
+    return detail + hint % (op, repr(str(hit)[:60]))
+
+
+def _confirmed(entry: dict, detail: str) -> str:
+    """Prefix the detail of an op that ran on a confirmed destructive stop."""
+    confirmed = entry.get("guard_confirmed")
+    if not isinstance(confirmed, dict):
+        return detail
+    return (
+        "CONFIRMED destructive op ("
+        + str(confirmed.get("op") or "")
+        + " on "
+        + repr(str(confirmed.get("term") or ""))
+        + "): "
+        + detail
+    ).strip()
+
+
+async def _qa_ime_blocker(serial: str) -> dict | None:
+    """A named blocker when the QA keyboard is not the active one, else None.
+
+    ``keyboard_up`` selected it before the script started, but a tap can bring
+    up another keyboard and every broadcast after that goes nowhere. A read
+    error or a DIFFERENT keyboard stops the step; a blank read proves nothing
+    and is left to the read-back verdict.
+    """
+    ours = str(((ime.manifest() or {}).get("content") or {}).get("ime_id") or "")
+    current = await ime.current_ime(serial)
+    if current.get("error"):
+        seen = "an unreadable setting: " + str(current["error"])[:120]
+    else:
+        seen = str(current.get("content") or "")
+        if not seen or ime.same_component(seen, ours):
+            return None
+    # The package only, capped: the device-error detail is cut at 400
+    # chars, and the note at the end is the part that must survive.
+    package = seen.split("/", 1)[0][:QA_IME_SEEN_CAP]
+    return {"error": QA_IME_NOT_ACTIVE % package, "content": None}
 
 
 def _unchanged(
@@ -2045,6 +2219,19 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                         "Add an `assert` for what the case is supposed to "
                         "show. " + reason
                     ).strip()
+                elif (
+                    verdict == "pass"
+                    and ctx.prior_turn_blocked
+                    and not _asserts_new_element(trace)
+                ):
+                    verdict = STATUS_UNVERIFIED
+                    reason = (
+                        "verdict=pass was not accepted: the previous turn failed "
+                        "to type or changed nothing on screen, and this turn "
+                        "asserts no new element. Add an `assert` of kind "
+                        "`element` or `new_text` for what the step produced. "
+                        + reason
+                    ).strip()
                 entry["outcome"] = "done"
                 entry["detail"] = reason
                 _stamp_after(entry, screen)
@@ -2264,13 +2451,19 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                     # today keeps it, and `judged=None` can never reach the
                     # fidelity branch, so nothing else about this guard moves.
                     hit = screen_hit(screen, "", judged=judged_node)
-                if hit:
+                # A flag, not `hit = ""`: the sentinel ratchet requires
+                # `hit` be bound ONLY by destructive_hit/screen_hit.
+                confirmed = bool(hit) and _consume_confirm(
+                    ctx, hit, screen, op, entry, label
+                )
+                if hit and not confirmed:
                     entry["outcome"] = "guard_stop"
                     # WHAT the guard stopped is decided above and is not
                     # touched here. This branch decides only what happens
                     # AFTER the hit, which is the one thing a charter's
                     # ``destructive`` field is allowed to decide.
                     refuses = bool(getattr(ctx, "guard_refuses", False))
+                    mismatched = bool(entry.get("guard_confirm_mismatch"))
                     # ONE call, not a chain. The chain that was here handled two
                     # sentinels and gave every future one the control wording --
                     # the same half-wiring at the other consumer is what round 3
@@ -2278,7 +2471,12 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                     entry["detail"] = (
                         GUARD_DETAIL_REFUSED
                         if refuses
-                        else guard_detail(hit, screen, ctx.package)
+                        else _with_confirm_hint(
+                            guard_detail(hit, screen, ctx.package),
+                            op,
+                            hit,
+                            mismatched,
+                        )
                     )
                     _stamp_after(entry, screen)
                     _append(trace, entry)
@@ -2315,6 +2513,8 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                             entry["detail"],
                             index,
                             guard_term=hit,
+                            guard_op=op,
+                            guard_node=str(label)[:MAX_GUARD_NODE_CHARS],
                         ),
                     }
 
@@ -2434,7 +2634,7 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                             entry["action"][key] = actions_mod.SECRET_MASK
                 recoverable = bool(outcome.get("needs_model"))
                 entry["outcome"] = "refused" if recoverable else "device_error"
-                entry["detail"] = str(outcome["error"])[:400]
+                entry["detail"] = _confirmed(entry, str(outcome["error"]))[:400]
                 _stamp_after(entry, screen)
                 _append(trace, entry)
                 return {
@@ -2449,7 +2649,9 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                     ),
                 }
             entry["outcome"] = "ok"
-            entry["detail"] = str((outcome.get("content") or {}).get("detail") or "")
+            entry["detail"] = _confirmed(
+                entry, str((outcome.get("content") or {}).get("detail") or "")
+            )
             if scroll_missed:
                 entry["detail"] = (SCROLL_TARGET_MISSED + " " + entry["detail"]).strip()
 
@@ -2847,6 +3049,9 @@ async def _perform(
             return focused
         return await adb.keyevent(serial, code)
     if op in ("type", "clear"):
+        blocked = await _qa_ime_blocker(serial)
+        if blocked is not None:
+            return blocked
         center = _center(element) if isinstance(element, dict) else None
         if not center:
             return {"error": "That field has no usable bounds.", "content": None}
@@ -2967,7 +3172,8 @@ def _judge_landed(result: object, field: str) -> dict:
                 + str(typed)
                 + " character(s) into "
                 + repr(field[:60])
-                + " but the field did not change, so the step did not happen."
+                + " but the field did not take it, so the step did not happen. "
+                + NO_FABRICATION_NOTE
             ),
             "content": None,
         }

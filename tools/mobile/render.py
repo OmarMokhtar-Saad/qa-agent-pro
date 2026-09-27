@@ -887,6 +887,38 @@ def report_line(
     )
 
 
+def _typed_field_tally(rows: list[dict]) -> str:
+    """"N typed fields verified, M failed", naming each failed field.
+
+    Read from each case's own trace: a ``type`` whose outcome is ``ok`` landed
+    (``executor._judge_landed`` made every other verdict a failure), and one
+    that came back ``device_error`` or ``refused`` did not. Empty when the run
+    typed nothing, so a run that never touched a field is not told about one.
+    """
+    verified = 0
+    failed: list[str] = []
+    for row in rows:
+        for item in list(row.get("trace") or []):
+            if not isinstance(item, dict):
+                continue
+            action = item.get("action") if isinstance(item.get("action"), dict) else {}
+            if str(action.get("op") or "") != "type":
+                continue
+            outcome = str(item.get("outcome") or "")
+            if outcome == "ok":
+                verified += 1
+            elif outcome in ("device_error", "refused"):
+                failed.append(str(action.get("field") or "") or "(unnamed field)")
+    if not verified and not failed:
+        return ""
+    line = str(verified) + " typed fields verified, " + str(len(failed)) + " failed"
+    if failed:
+        line += ": " + ", ".join(repr(name[:60]) for name in failed[:12])
+        if len(failed) > 12:
+            line += " and others"
+    return line + "\n\n"
+
+
 def summary_block(
     cases: object,
     *,
@@ -925,6 +957,7 @@ def summary_block(
         ((coverage_line + "\n\n") if coverage_line else "")
         + (counts or "no cases recorded yet")
         + "\n\n"
+        + _typed_field_tally(rows)
     )
     lines = "\n".join(verdict_line(row) for row in rows)
     tail = "\n\n" + report_line(
