@@ -88,6 +88,7 @@ from tools.mobile import (
     media,
     paths,
     platform_info,
+    report_images,
     run_store,
     screen_audit,
     screen_phone,
@@ -229,8 +230,46 @@ _SLOT = re.compile(r"\{\{([A-Z_]+)\}\}")
 _SLUG = re.compile(r"[^A-Za-z0-9_-]+")
 
 
+def _compact_css(css: str) -> str:
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    lines = (line.strip() for line in css.splitlines())
+    return "\n" + "\n".join(line for line in lines if line) + "\n"
+
+
+def _compact_js(js: str) -> str:
+    # Block comments go too, as in the CSS. The shell's script holds no string
+    # or regex with "/*" in it; test_the_page_script_keeps_no_comment binds that.
+    js = re.sub(r"/\*.*?\*/", "", js, flags=re.S)
+    lines = (line.strip() for line in js.splitlines())
+    return "\n" + "\n".join(
+        line for line in lines if line and not line.startswith("//")
+    ) + "\n"
+
+
 def _read_shell() -> str:
-    return SHELL_PATH.read_text(encoding="utf-8")
+    """The shell as shipped: the file minus its commentary and indentation.
+
+    The file is written to be read, and every page used to carry that reading
+    -- about 30 KB of design notes per report. Comments are dropped here, ONCE,
+    so :data:`SHELL`, :data:`SHELL_STYLE` and :data:`SHELL_SCRIPT` all come
+    from the same compacted text and the self-check's identity pins still
+    compare like with like. Only whole-line ``//`` comments leave the script
+    (a ``//`` inside a line may be a string), and newlines stay so automatic
+    semicolon insertion reads the code exactly as written. The one HTML
+    comment kept is the source stamp, which carries a slot.
+    """
+    text = SHELL_PATH.read_text(encoding="utf-8")
+    text = re.sub(
+        r"<!--(?!\s*Rendered from: \{\{SOURCE_STAMP\}\}).*?-->\n?", "", text, flags=re.S
+    )
+    head, rest = text.split("<style>", 1)
+    css, rest = rest.split("</style>", 1)
+    body, rest = rest.split("\n<script>", 1)
+    js, tail = rest.split("</script>", 1)
+    return (
+        head + "<style>" + _compact_css(css) + "</style>" + body
+        + "\n<script>" + _compact_js(js) + "</script>" + tail
+    )
 
 
 def _between(text: str, open_tag: str, close_tag: str) -> str:
@@ -242,6 +281,92 @@ def _between(text: str, open_tag: str, close_tag: str) -> str:
 SHELL = _read_shell()
 SHELL_STYLE = _between(SHELL, "<style>", "</style>")
 SHELL_SCRIPT = _between(SHELL, "\n<script>", "</script>")
+
+_CSS_CLASS = re.compile(r"\.(-?[A-Za-z_][\w-]*)")
+_CSS_NOT = re.compile(r":not\([^()]*\)")
+_CLASS_ATTR = re.compile(r'class="([^"]*)"')
+#: Every class the script can PUT on the page: an element's ``className``, a
+#: ``classList.add``/``toggle``, and a ``class="..."`` in markup it writes. A class it
+#: only queries (``$$('li.seq')``, ``contains('is-' + k)``) needs a rule only when the
+#: markup carries it, and then ``live`` has it -- counting every word the script held
+#: kept ~3 KB of sequence and exchange rules on pages that draw neither.
+_SCRIPT_CLASSES = frozenset(
+    token
+    for value in re.findall(
+        r"className\s*=\s*'([^']*)'"
+        r"|classList\.(?:add|toggle)\('([^']*)'"
+        r'|class="([^"]*)"',
+        SHELL_SCRIPT,
+    )
+    for part in value
+    for token in part.split()
+)
+
+
+def _block_end(css: str, start: int) -> int:
+    """Index just past the ``}`` closing the block whose ``{`` is at ``start``."""
+    depth = 0
+    for i in range(start, len(css)):
+        if css[i] == "{":
+            depth += 1
+        elif css[i] == "}":
+            depth -= 1
+            if not depth:
+                return i + 1
+    return len(css)
+
+
+def _css_rules(css: str, at: str = "") -> list:
+    """``css`` as ``(at_rule, rule)`` pairs in source order; ``@media`` opened."""
+    out: list = []
+    i = 0
+    while True:
+        j = css.find("{", i)
+        if j < 0:
+            return out
+        prelude = css[i:j].strip()
+        end = _block_end(css, j)
+        if prelude.startswith("@media"):
+            out += _css_rules(css[j + 1 : end - 1], prelude)
+        else:
+            out.append((at, prelude + css[j:end].strip()))
+        i = end
+
+
+def _page_style(markup: str) -> str:
+    """The shell's rules, in the shell's order, that can match ``markup``.
+
+    The stylesheet styles every kind of run -- the scripted cards, their
+    filters and wireframes -- and a page carried all of it: about 36 KB of an
+    exploratory page styled nothing on it. A rule stays when one of its
+    selectors names only classes the markup carries or the script creates; a selector
+    with no class, and every other at-rule, always stays. Nothing is added or
+    rewritten, so the page's style is still the shell's text.
+    """
+    live = {tok for value in _CLASS_ATTR.findall(markup) for tok in value.split()}
+
+    def usable(rule: str) -> bool:
+        if rule.startswith("@"):
+            return True
+        selector = _CSS_NOT.sub("", rule.split("{", 1)[0])
+        return any(
+            all(
+                name in live or name in _SCRIPT_CLASSES
+                for name in _CSS_CLASS.findall(branch)
+            )
+            for branch in selector.split(",")
+        )
+
+    out: list = []
+    group, rules = None, []
+    for at, rule in _css_rules(SHELL_STYLE) + [(None, "")]:
+        if at != group:
+            if rules:
+                out.append((group + "{" + "\n".join(rules) + "}") if group else "\n".join(rules))
+            group, rules = at, []
+        if at is not None and usable(rule):
+            rules.append(rule)
+    return "\n" + "\n".join(out) + "\n"
 
 
 def _text(value: object, limit: int = MAX_TEXT) -> str:
@@ -293,7 +418,95 @@ def esc(value: object, limit: int = MAX_TEXT) -> str:
     reader -- or a model asked to summarise the report later. So markers are
     neutralised before escaping.
     """
-    return html.escape(_neutralize_markers(_text(value, limit)), quote=True)
+    return html.escape(_neutralize_markers(_text(_mask_prose(value), limit)), quote=True)
+
+
+#: A credential NAMED in prose, and the value written after it: "password Qwerty123",
+#: "OTP 4821", "national ID" and its ten digits. A goal, a case title and a turn's action are
+#: written by a person, and people put the login in the sentence. The value must carry
+#: a digit -- "the password field" and "Tapped the password" name no value. A
+#: digitless value is caught by `_PROSE_CREDENTIAL_SET` below when the sentence marks
+#: it as a value; a bare one ("password Hunter") only by the run-scoped list, when the
+#: run typed it into a field marked secret or named as a credential.
+#:
+#: Deliberately NOT a key=value sweep: ``tenantToken=UNMARKED-CANARY-42`` still
+#: renders, as `test_the_secret_refusal_cannot_catch_an_unmarked_value` pins. The terms
+#: are whole words, so ``tenantToken`` is not ``token`` (which is not a term here).
+_CREDENTIAL_TERMS = (
+    r"\b(national[ -]?id(?: number)?|id number|iqama|password|passwd|passcode|pin(?: code)?|otp)\b"
+)
+_PROSE_CREDENTIAL = re.compile(
+    _CREDENTIAL_TERMS
+    + r"(\s*(?:is|was|=|:)?\s*)"
+    r"([^\s,;\"'<>]*\d[^\s,;\"'<>]*?)(?=[.)]?(?:[\s,;\"'<>]|$))",
+    re.IGNORECASE,
+)
+#: The same terms with the value MARKED as one, so it needs no digit: after ``:`` or
+#: ``=`` ("password: Hunter"), or quoted ("password is 'Hunter Horse'"). Group 3 keeps
+#: the quotes, so the mask replaces them too.
+_PROSE_CREDENTIAL_SET = re.compile(
+    _CREDENTIAL_TERMS
+    + r"(\s*[:=]\s*|\s+(?:(?:is|was)\s+)?(?=[\"']))"
+    r"(\"[^\"<>\n]+\"|'[^'<>\n]+'|[^\s,;\"'<>]+?)(?=[.)]?(?:[\s,;\"'<>]|$))",
+    re.IGNORECASE,
+)
+#: A remembered value shorter than this is masked only where the phrase above finds
+#: it: "4821" blanked everywhere would eat timestamps, counts and file names.
+_SECRET_MIN = 6
+#: This page's remembered credential values, longest first, bound by :func:`_document`.
+_SECRETS: ContextVar = ContextVar("_SECRETS", default=())
+
+
+def _mask_prose(value: object) -> object:
+    """*value* with every credential value this page knows of replaced by the mask.
+
+    Runs before `_text` caps the length, so a cap can never cut a secret in half
+    and leave the half the mask would have matched. Non-strings pass through.
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    # Case-blind: the card's search index lower-cases its text before it gets here,
+    # and "Hunter-Horse" typed is "hunter-horse" there.
+    for secret in _SECRETS.get():
+        if secret.casefold() in value.casefold():
+            value = re.sub(
+                r"(?<!\w)" + re.escape(secret) + r"(?!\w)",
+                actions_mod.SECRET_MASK,
+                value,
+                flags=re.IGNORECASE,
+            )
+    for phrase in (_PROSE_CREDENTIAL_SET, _PROSE_CREDENTIAL):
+        value = phrase.sub(
+            lambda m: m.group(1) + m.group(2) + actions_mod.SECRET_MASK, value
+        )
+    return value
+
+
+def _run_secrets(*records: object) -> tuple:
+    """Every credential value the run's own records name or type, longest first.
+
+    Two sources: a value written after a credential term in any string (the goal
+    names the national ID the tester then types into an unmarked field), and the
+    text of a ``type`` action the run marked secret or aimed at a credential field.
+    Only values of `_SECRET_MIN` characters or more are kept.
+    """
+    found: set = set()
+    stack = list(records)
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            if str(item.get("op") or "") == "type" and (
+                item.get("secret") or actions_mod.is_credential_action(item)
+            ):
+                found.add(_text(item.get("text"), 200))
+            stack.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
+        elif isinstance(item, str):
+            for phrase in (_PROSE_CREDENTIAL, _PROSE_CREDENTIAL_SET):
+                found.update(m.group(3).strip("\"'") for m in phrase.finditer(item))
+    kept = {value for value in found if len(value) >= _SECRET_MIN}
+    return tuple(sorted(kept, key=lambda value: (-len(value), value)))
 
 
 def _token(value: object) -> str:
@@ -341,6 +554,131 @@ def tally(cases: object) -> dict:
         key = _verdict_of(case)
         out[key] = out.get(key, 0) + 1
     return out
+
+
+#: The four words a reader sees, in page order. Everything a case can say about
+#: itself folds into one of them; the raw word stays on the pill's tooltip.
+RESULTS = ("pass", "fail", "blocked", "unfinished")
+RESULT_LABEL = {
+    "pass": "Pass",
+    "fail": "Fail",
+    "blocked": "Blocked",
+    "unfinished": "Unfinished",
+}
+RESULT_TONE = {"pass": "ok", "fail": "def", "blocked": "gap", "unfinished": "void"}
+RESULT_PILL = {word: "p-" + tone for word, tone in RESULT_TONE.items()}
+#: The literal `session._explore_case` writes as an exploratory turn's one step.
+EXPLORE_GOAL_PREFIX = "Explore towards the goal: "
+EXPLORATORY = "Exploratory"
+
+
+def _unify_verdict(raw: object) -> str:
+    """``pass``/``fail``/``blocked`` pass through; every other word is ``unfinished``.
+
+    ``unverified`` is a verdict the run could not stand behind, so it reads as
+    blocked, not as a pass. In-flight states (``needs_model``, ``planning``,
+    ``needs_tester``, ``done`` without a verdict) and ``unknown`` never finished.
+    """
+    word = _token(raw)
+    if word in ("pass", "fail", "blocked"):
+        return word
+    if word == "unverified":
+        return "blocked"
+    return "unfinished"
+
+
+def _case_type(case: object, manifest: dict) -> str:
+    body = case if isinstance(case, dict) else {}
+    planned = _planned_case(manifest, _text(body.get("tc_id"), 40))
+    return _text(planned.get("type") or body.get("type"), 40)
+
+
+def _run_kind(cases: object, manifest: dict | None = None) -> str:
+    """``exploratory``, ``scripted`` or ``mixed``; an empty run is ``scripted``."""
+    manifest = manifest if isinstance(manifest, dict) else {}
+    kinds = {
+        _case_type(case, manifest) == EXPLORATORY for case in list(cases or [])
+    }
+    if kinds == {True}:
+        return "exploratory"
+    if True in kinds:
+        return "mixed"
+    return "scripted"
+
+
+def _run_goals(manifest: dict) -> list:
+    explore = manifest.get("explore") if isinstance(manifest, dict) else None
+    explore = explore if isinstance(explore, dict) else {}
+    charter = explore.get("charter")
+    charter = charter if isinstance(charter, dict) else {}
+    goal = _text(charter.get("goal") or explore.get("goal"), 2000)
+    return [goal] if goal else []
+
+
+def _goal_of(case: object, manifest: dict) -> str:
+    """The goal text an exploratory turn was driving at, read from its one step."""
+    body = case if isinstance(case, dict) else {}
+    planned = _planned_case(manifest, _text(body.get("tc_id"), 40))
+    for step in planned.get("steps") or []:
+        action = _text(step.get("action") if isinstance(step, dict) else "", 2000)
+        if action.startswith(EXPLORE_GOAL_PREFIX):
+            return action[len(EXPLORE_GOAL_PREFIX):].strip()
+    return ""
+
+
+def _derive_goals(cases: object, manifest: dict) -> list:
+    """Exploratory turns grouped by goal, in first-seen order.
+
+    ``[{"goal": text, "cases": [case, ...]}]``. The run's charter goal is
+    listed first even before a turn names it; a turn whose own step names a
+    different goal opens a group of its own; a turn naming no goal at all is
+    its own group labelled by its title, never dropped. Scripted cases are not
+    goals and are skipped.
+    """
+    manifest = manifest if isinstance(manifest, dict) else {}
+    groups: list = []
+    by_goal: dict = {}
+    for goal in _run_goals(manifest):
+        by_goal[goal] = {"goal": goal, "cases": []}
+        groups.append(by_goal[goal])
+    for case in list(cases or []):
+        if _case_type(case, manifest) != EXPLORATORY:
+            continue
+        goal = _goal_of(case, manifest)
+        if not goal:
+            body = case if isinstance(case, dict) else {}
+            groups.append(
+                {"goal": _text(body.get("title") or body.get("tc_id"), 250),
+                 "cases": [case]}
+            )
+            continue
+        # A charter goal is stored whole while a turn's copy may be the
+        # truncated title-length form: match on the shared prefix.
+        match = next(
+            (g for text, g in by_goal.items()
+             if text == goal or text.startswith(goal) or goal.startswith(text)),
+            None,
+        )
+        if match is None:
+            match = by_goal[goal] = {"goal": goal, "cases": []}
+            groups.append(match)
+        match["cases"].append(case)
+    return [g for g in groups if g["cases"]]
+
+
+def _goal_result(cases: list) -> str:
+    """A goal's one result: the newest turn that reached a verdict decides it.
+
+    Exploratory turns before the committing one carry no verdict of their own
+    (they are steps towards the goal), so they cannot fail it; a goal whose
+    turns never reached one is ``unfinished``.
+    """
+    for case in reversed(list(cases or [])):
+        body = case if isinstance(case, dict) else {}
+        verdict = _token(body.get("verdict"))
+        if verdict in DONE_VERDICTS:
+            return _unify_verdict(verdict)
+    return "unfinished"
 
 
 def _bounds_of(element: object) -> tuple | None:
@@ -804,14 +1142,26 @@ def _sec_block(
     )
 
 
-def _sechead(sid: str, title: str, label: str, lede: str, body: str) -> str:
-    """``lede`` is markup built through :func:`esc`; the ids are constants."""
+def _sechead(
+    sid: str, title: str, label: str, lede: str, body: str, level: int = 2
+) -> str:
+    """``lede`` is markup built through :func:`esc`; the ids are constants.
+
+    ``level`` 3 is for a section only ever drawn inside a Diagnostics part, which
+    ``<h2>Diagnostics</h2>`` already heads: an h2 there reads, in a screen reader's
+    outline, as a sibling of Diagnostics rather than a part of it.
+    """
+    tag = "h3" if level == 3 else "h2"
     return (
         '\n  <section id="'
         + sid
-        + '">\n    <div class="sechead"><h2>'
+        + '">\n    <div class="sechead"><'
+        + tag
+        + ">"
         + esc(title, 80)
-        + '</h2><span class="label">'
+        + "</"
+        + tag
+        + '><span class="label">'
         + esc(label, 80)
         + "</span></div>\n"
         + (('    <p class="lede">' + lede + "</p>\n") if lede else "")
@@ -1473,6 +1823,10 @@ def _trace_rows(trace: object) -> list:
                 "index": _text(safe.get("index"), 8),
                 "op": _text(action.get("op"), 24) or "?",
                 "action": _action_line(safe.get("action")),
+                "plain": _plain_action(action),
+                "act": action,
+                "target_id": _text((action.get("target") or {}).get("id")
+                                   if isinstance(action.get("target"), dict) else "", 40),
                 "outcome": _text(safe.get("outcome"), 40) or "-",
                 "ms": _ms(safe.get("ms")),
                 "detail": _text(safe.get("detail"), MAX_TEXT),
@@ -1533,45 +1887,6 @@ def _outcome_pill(outcome: str) -> str:
     else:
         cls = "p-void"
     return _pill(cls, outcome)
-
-
-def _steps_table(rows: list) -> str:
-    body = "".join(
-        '<tr><td class="n">'
-        + esc(row["index"], 8)
-        + '</td><td class="said" dir="auto"><q>'
-        + esc(row["action"], 160)
-        + "</q></td>"
-        + '<td class="outc">'
-        + _outcome_pill(row["outcome"])
-        + '</td><td class="num">'
-        + esc(fmt_ms(row["ms"]), 16)
-        + '</td><td class="said" dir="auto">'
-        + (
-            esc(row["detail"])
-            if row["detail"]
-            else '<span class="mt">no detail recorded</span>'
-        )
-        + '</td><td><span class="cap'
-        + ("" if (row["before"] or row["after"]) else " none")
-        + '">'
-        + (esc(row["before"], 40) or "—")
-        + " → "
-        + (esc(row["after"], 40) or "—")
-        + "</span></td></tr>"
-        for row in rows
-    )
-    return (
-        '<div class="tablewrap"><table class="cov turns"><thead><tr>'
-        '<th scope="col">#</th><th scope="col">Action</th><th scope="col">Outcome</th>'
-        '<th scope="col" class="num">Took</th><th scope="col">Detail</th>'
-        '<th scope="col">Screen before → after</th>'
-        "</tr></thead><tbody>" + body + "</tbody></table></div>"
-        '<p class="hint">Took: the replay clock for that one action, as the server measured it. '
-        "A type action shows what it sent, so a chat case can be read as the exchange it "
-        "was — unless the value was marked secret or the field is named as a credential, "
-        "in which case it is masked here and at every earlier step that wrote it down.</p>"
-    )
 
 
 def _changed(row: dict) -> bool:
@@ -1823,6 +2138,7 @@ def _case_facts(case: object, manifest: dict, run_id: str = "") -> dict:
         "capture": _capture_of(run_id, tc_id),
         "status": _text(safe.get("status"), 40),
         "reason": _text(safe.get("reason"), 400),
+        "finding": _text(safe.get("finding"), 200),
         "escapes": max(0, escapes),
         "free_stops": free_stops,
         # Planning turns by the tester's own chat model: the first plan, every
@@ -2051,96 +2367,44 @@ def _card_html(
         if facts["expected"]
         else "the suite states no expected result for this case"
     )
-    # ONE phone when the case began and ended on the same screen: two identical
-    # frames side by side read as a diff with nothing in it.
-    first_key = facts["first_obs"] or facts["first"]
-    # `last_look`, NOT `last_obs`: the observation this case's own steps recorded
-    # at the screen it ended on, which is the right look when the final action
-    # was not captured again. `_resolve_look` still refuses anything ambiguous,
-    # so the fallback to the bare id cannot draw somebody else's turn.
-    last_key = facts["last_look"] or facts["last"]
-    # THE CAPTION IS CAPPED AT 80 CHARS BY `esc(sub, 80)` in `_phone_html`, and
-    # the cap TRUNCATES rather than refuses. A first draft of this sentence ran
-    # to 100 characters and lost "was not captured again" mid-word, leaving a
-    # dangling clause that still reads as an assertion. The truncation is not
-    # what hid the disclosure -- the same-screen branch below did that, by
-    # rendering no disclosure at all -- but a caption cut mid-word is its own
-    # small dishonesty, so both captions are kept under the cap and
-    # `test_the_substitution_caption_is_never_truncated` binds that at the
-    # rendered page rather than here. Re-measure anything added below.
-    last_sub = (
-        "the last look this case recorded at that screen"
-        if facts.get("last_substituted")
-        else "the screen the case ended on"
+    # THE SAME STEP LIST AS A JOURNEY TURN. Each step shows the screen before
+    # and after it, resolved through `_look_pic`, so the ambiguous-look and
+    # not-captured notes stand in place of a picture exactly as they do there.
+    # The phone pair, the element maps and the lane-only sequence repeated those
+    # same screens two and three times per card.
+    #
+    # THE END STATE KEEPS ITS SUBSTITUTION. When the last action's own after
+    # look was not captured again, `_case_facts` names the last look this case
+    # recorded at that screen, and the last step's After shows it -- with the
+    # caption saying so, because the right picture under a caption claiming it
+    # is the end state would be the same defect in better clothes.
+    last = (
+        (facts["last_look"], "the last look this case recorded at that screen")
+        if facts.get("last_substituted") and facts.get("last_look")
+        else ()
     )
-    if first_key and first_key == last_key:
-        # THE SUBSTITUTION MUST BE DISCLOSED HERE TOO. One phone is drawn when
-        # the case began and ended on the same screen -- and that is exactly the
-        # shape a substituted look produces, because the fallback resolves to the
-        # screen the case started on. Saying only "the case began and ended on
-        # this screen" would assert the picture IS the end state while
-        # `last_substituted` says it is an earlier look, which is the defect this
-        # change exists to remove, surviving in the one branch that drops the
-        # caption.
-        frames = _phone_html(
-            "On screen",
-            (
-                # 69 chars, inside the 80-char caption cap. See `last_sub`.
-                "began and ended here; " + last_sub
-                if facts.get("last_substituted")
-                else "the case began and ended on this screen"
-            ),
-            first_key,
-            screens,
-            app,
+    first_key = facts["first_obs"] or facts["first"]
+    if rows:
+        steps = (
+            '<ol class="steplist">'
+            + "".join(
+                _step_html(
+                    facts["slug"], i, row, screens, app, last if i == len(rows) - 1 else ()
+                )
+                for i, row in enumerate(rows)
+            )
+            + "</ol>"
         )
     else:
-        frames = _phone_html(
-            "First screen", "the screen the case began on", first_key, screens, app
-        ) + _phone_html("Last screen", last_sub, last_key, screens, app)
-    phones = (
-        _video_html(facts["tc_id"], media_map)
-        + '<div class="phonewide"><div class="phonepair">'
-        + frames
-        + "</div>"
-        + '<p class="hint">Each screen is shown twice: the PNG the lane captured at that '
-        "moment, and beneath it a drawing composed from the screen's element list — the text, "
-        "labels and rectangles the server already held. The picture is what the app looked "
-        "like; the drawing is what the accessibility tree said was there, which is what every "
-        "action was planned against, so the two disagreeing is itself a finding. The element "
-        "map under each phone holds the exact rectangles. Where a note stands in place of a "
-        "picture it says which of two things happened: nothing was stored for that moment, or "
-        "this page ran out of image budget. A phone that says the screen was not captured is a "
-        "step whose screen the run did not store — not a step that did not happen.</p></div>"
-    )
-    # What the app heard and answered inside this case's window (plan P3).
-    turns = ev_render.turns_table(loaded, facts["tc_id"]) if loaded else ""
-    # The wire, beside what the app own log said. NOT gated on `loaded`: the
-    # capture is written onto the checkpoint by the case runner, so a run with
-    # no app profile at all still has one -- which is the whole point of a
-    # capture that needs no app-specific anything.
-    network = ev_render.case_network(facts.get("network"))
-    # This case's own API-capture block (Phase 7, T7.1) beside the pcap
-    # lane's network section above -- a second, independent dimension.
-    capture = ev_render.case_capture(facts.get("capture"))
-    steps = (
-        _sec_block(
-            "Steps",
-            _steps_table(rows),
-            count=len(rows),
-            note="every action replayed, in order",
-            open_=True,
+        steps = '<p class="empty-note big">No step has been replayed for this case yet.</p>' + (
+            ('<div class="steppics">' + _look_pic(first_key, screens, "On screen", app) + "</div>")
+            if first_key
+            else ""
         )
-        if rows
-        else _sec_block(
-            "Steps",
-            '<p class="empty-note big">No step has been replayed for this case yet.</p>',
-            note="nothing replayed yet",
-            open_=True,
-        )
-    )
-    # The merged stream: the app's records and the lane's actions on one clock,
-    # when the case has app evidence; the lane's own rows otherwise.
+    # What the app heard and answered inside this case's window (plan P3), the
+    # wire, and this case's own API capture -- folded, as in a Journey turn.
+    # The network and capture blocks are NOT gated on `loaded`: the case runner
+    # writes both onto the checkpoint, so a run with no app profile has them.
     merged = (
         ev_exchanges.seqlist(
             ev_render.sequence_items(
@@ -2153,17 +2417,20 @@ def _card_html(
         if loaded
         else ""
     )
-    sequence = _sec_block(
-        "Run sequence",
-        merged
-        or _seq_rows(rows, screens, app)
-        or '<p class="empty-note big">No step has been replayed for this case yet.</p>',
-        count=len(rows) if rows else None,
-        note="everything in the order it ran"
+    tech = (
+        (ev_render.turns_table(loaded, facts["tc_id"]) if _app_logged(loaded) else "")
+        + ev_render.case_network(facts.get("network"))
+        + ev_render.case_capture(facts.get("capture"))
         + (
-            " — the app's records and the lane's actions on one clock" if merged else ""
-        ),
-        open_=True,
+            _sec_block(
+                "Run sequence",
+                merged,
+                count=len(rows) if rows else None,
+                note="the app's records and the lane's actions on one clock",
+            )
+            if merged
+            else ""
+        )
     )
     return (
         '\n<details class="case rail-'
@@ -2194,13 +2461,12 @@ def _card_html(
         + expected
         + "</p>"
         + _vstrip(facts)
-        + phones
-        + turns
-        + network
-        + capture
+        + _video_html(facts["tc_id"], media_map)
         + steps
-        + sequence
         + _ended_block(facts)
+        + '<details class="tech"><summary>Technical detail</summary>'
+        + tech
+        + "</details>"
         + "</div>\n</details>"
     )
 
@@ -2376,10 +2642,10 @@ def _segbar(counts: dict) -> str:
             continue
         sw, seg, _pill_cls, label = _tone(name)
         pct = n / total * 100
+        # A number without its word is a colour-coded riddle: a segment too
+        # narrow for both says nothing, and the legend below names every count.
         if pct >= (len(label) + 3) * 1.6:
             text = "<b>" + str(n) + "</b>" + esc(label.lower(), 40)
-        elif pct >= 5:
-            text = "<b>" + str(n) + "</b>"
         else:
             text = ""
         segs.append(
@@ -2408,265 +2674,12 @@ def _segbar(counts: dict) -> str:
         )
     return (
         '<figure class="seg"><figcaption><b>Outcomes</b><span>what each case came to</span></figcaption>'
-        '<div class="segbar">'
+        # The legend is the readable copy; the bar is its picture.
+        '<div class="segbar" aria-hidden="true">'
         + "".join(segs)
         + '</div><ul class="seglegend">'
         + "".join(legend)
         + "</ul></figure>"
-    )
-
-
-def _summary_html(tally: dict, total: int, coverage: dict | None = None) -> str:
-    """The machine-readable totals the selfcheck compares, wrapping the outcome tiles."""
-    ordered = [(name, int(tally.get(name) or 0)) for name in TILES]
-    ordered += [
-        (name, int(count)) for name, count in sorted(tally.items()) if name not in TILES
-    ]
-    attrs = "".join(
-        " data-" + name.replace("_", "-") + '="' + str(int(count)) + '"'
-        for name, count in ordered
-    )
-    hero = _kpi(
-        str(int(total)),
-        "cases checkpointed",
-        (
-            str(int(tally.get("pass") or 0))
-            + " passed · "
-            + str(int(tally.get("fail") or 0))
-            + " failed · "
-            + str(int(tally.get("blocked") or 0))
-            + " blocked · "
-            + esc(coverage_phrase(coverage), 200)
-            + ' · <a href="#cases">all cases →</a>'
-        ),
-        hero=True,
-    )
-    return (
-        '<div id="'
-        + SUMMARY_ID
-        + '" data-total="'
-        + str(int(total))
-        + '"'
-        + attrs
-        + '><div class="outcome">'
-        + hero
-        + _segbar(tally)
-        + "</div></div>"
-    )
-
-
-def _overview(
-    facts: list,
-    tally: dict,
-    manifest: dict,
-    partial: bool,
-    screens: object = None,
-    app: str = "",
-    loaded: dict | None = None,
-    coverage: dict | None = None,
-) -> str:
-    steps = sum(len(f["rows"]) for f in facts)
-    walls = [f["wall"] for f in facts if f["wall"] is not None]
-    step_ms = [row["ms"] for f in facts for row in f["rows"] if row["ms"] is not None]
-    escapes = sum(f["escapes"] for f in facts)
-    plans = sum(f["plans"] for f in facts)
-    # NOT `screens`: that name is the screen LIBRARY parameter, and a count
-    # bound to it made every opening frame below render as not captured.
-    captured = sum(f["screens"] for f in facts)
-    planned = 0
-    try:
-        planned = int(manifest.get("total") or 0)
-    except (TypeError, ValueError, OverflowError):
-        planned = 0
-    run_tiles = [
-        _kpi(
-            str(steps),
-            "actions replayed",
-            "across "
-            + str(len(facts))
-            + " case card"
-            + ("" if len(facts) == 1 else "s"),
-        ),
-        _kpi(
-            esc(fmt_ms(sum(walls)), 16) if walls else '<span class="kv-gap">n/a</span>',
-            "replay time",
-            "the sum of every measured action"
-            if walls
-            else "no action carried a measured duration",
-        ),
-        _kpi(
-            esc(fmt_ms(max(step_ms)), 16)
-            if step_ms
-            else '<span class="kv-gap">n/a</span>',
-            "slowest action",
-            'the worst single action in the run · <a href="#perf">timings →</a>'
-            if step_ms
-            else "nothing was timed",
-        ),
-        _kpi(
-            str(plans),
-            "LLM turns",
-            "planning turns by the tester\u2019s own chat model \u2014 one plan per case plus "
-            "every escape-hatch re-plan, and every stop the server did not charge "
-            "as an escape. Tokens and cost are not shown: no model call "
-            "passes through this server, so it has nothing to meter",
-        ),
-        _kpi(
-            str(escapes),
-            "escape-hatch turns",
-            "times the model was asked for a plan mid-case"
-            if escapes
-            else "every case ran its script through",
-            tone="c-gap" if escapes else "",
-        ),
-        _kpi(
-            str(captured),
-            "screens captured",
-            "distinct pruned screens referenced by the steps",
-        ),
-        _kpi(
-            str(planned),
-            "cases planned",
-            (
-                (
-                    "in progress — "
-                    + str(max(0, planned - len(facts)))
-                    + " not yet checkpointed · "
-                )
-                if partial
-                else ""
-            )
-            + esc(coverage_phrase(coverage), 200),
-            tone=(
-                "c-gap"
-                if (partial or not (coverage or {}).get("complete"))
-                else "c-pass"
-            ),
-        ),
-    ]
-    note = (
-        '<details class="note fold"><summary><h3>What this report can and cannot tell you</h3>'
-        '<span class="mt">how to read every figure above</span></summary><div class="notebody">'
-        "<p>A case is <b>passed</b> when the model that planned it said so after the last action it "
-        "asked for; <b>failed</b> and <b>blocked</b> likewise. The server replays actions and reports "
-        "outcomes; it never judges a screen itself. A case in flight shows its status, never a verdict.</p>"
-        "<p><b>LLM turns</b> counts the planning turns the tester\u2019s own chat model took: one "
-        "plan per case, every escape-hatch re-plan, and every stop the server did not charge "
-        "as an escape -- so it can exceed the <b>escapes</b> figure beside it, and the "
-        "difference is the stops this run was given for free. "
-        "There is no token or cost figure because "
-        "no model call passes through this server \u2014 the model runs in the tester\u2019s chat, "
-        "and this page can only count the plans it was handed.</p>"
-        "<p>Every screen is shown as the <b>PNG</b> the lane captured at that moment, with a drawing "
-        "<b>composed</b> from the element list — text, labels and bounds — beneath it. The picture "
-        "is how the screen looked; the drawing is where the controls were and what they said, and "
-        "it is the description every action was planned against. Where a picture is missing the "
-        "page says which of two things happened: nothing was stored for that moment, or the "
-        "picture exists and this page ran out of image budget for it. A screen this page cannot "
-        "pin to one stored moment gets no picture at all, and says so.</p>"
-        "<p>Every replayed step is also <b>recorded</b> on the device, and the clips sit "
-        "at the top of the case's Screen section, one per step, in order. A clip is "
-        "recorded SMALLER than the screen the device drew \u2014 the encoder refuses the "
-        "screen's own size \u2014 so it shows what happened rather than how sharp the app "
-        "looked, and each clip says so beneath it. A step whose clip is missing says why, "
-        "in that step's own place, and never shows an empty player.</p>"
-        "<p>Credential values are masked in TEXT: the run store writes <code>***</code> for a marked "
-        "value and for a credential-named key, and this page masks again and never prints an "
-        "action's typed text. It cannot mask a value written under an unrecognised key with no "
-        "marker. <b>It cannot mask the pictures at all</b> — a screenshot is pixels, so anything "
-        "visible on the screen at that moment is in this file. Treat the report as you would treat "
-        "the device. Both limits are stated rather than papered over.</p></div></details>"
-        "<p>Credential values are masked: the run store writes <code>***</code> for a marked value "
-        "and for a credential-named key, and this page masks again and never prints an action's "
-        "typed text. It cannot mask a value written under an unrecognised key with no marker; that "
-        "limit is the run store's, and it is stated rather than papered over.</p></div></details>"
-    )
-    # The reference's "screen every case opened on": the first screen the run
-    # saw, drawn once, with how many distinct opening screens there were.
-    opening = ""
-    # TWO QUESTIONS, TWO NAMES. The frame needs the observation (which look);
-    # the sentence beneath it is about SCREENS (how many different screens the
-    # cases opened on). Counting observations there told a tester "4 distinct
-    # opening screens" for a four-turn chat that never left ONE screen, while
-    # the case cards on the same page said "1 screens".
-    first_ids = [f["first_obs"] or f["first"] for f in facts if f["first"]]
-    first_screens = [f["first"] for f in facts if f["first"]]
-    if first_ids:
-        distinct = len(set(first_screens))
-        opening = _sec_block(
-            "The screen every case opened on"
-            if distinct == 1
-            else "The screen the first case opened on",
-            '<div class="phonewide">'
-            + _phone_html(
-                "Opening screen", "as the run first saw it", first_ids[0], screens, app
-            )
-            + "</div>",
-            count=distinct,
-            note=(
-                "one opening screen, shared by every case"
-                if distinct == 1
-                else str(distinct) + " distinct opening screens across the cases"
-            ),
-        )
-    return (
-        _summary_html(tally, len(facts), coverage)
-        + '<div class="kpis run">'
-        + "".join(run_tiles)
-        + ("".join(ev_render.overview_tiles(loaded)) if loaded else "")
-        + "</div>"
-        + opening
-        + (
-            (ev_render.session_block(loaded) + ev_render.trust_block(loaded))
-            if loaded
-            else ""
-        )
-        + note
-    )
-
-
-def _coverage(facts: list) -> str:
-    if not facts:
-        return '<p class="empty-note big">No case has been checkpointed yet.</p>'
-    rows = ""
-    for f in facts:
-        _sw, _seg, pill_cls, label = _tone(f["verdict"])
-        rows += (
-            '<tr class="jumpable" data-jump-case="'
-            + esc(f["slug"], 40)
-            + '" tabindex="0" data-stc="'
-            + esc(f["tc_id"], 40)
-            + '" data-stitle="'
-            + esc(f["title"], 120)
-            + '" data-smodule="'
-            + esc(f["module"], 60)
-            + '" data-sverdict="'
-            + esc(f["verdict"], 24)
-            + '" data-ssteps="'
-            + str(len(f["rows"]))
-            + '" data-swall="'
-            + (str(f["wall"]) if f["wall"] is not None else "-1")
-            + '"><td class="uc">'
-            + esc(f["tc_id"], 40)
-            + "<small>"
-            + esc(f["module"], 60)
-            + '</small></td><td dir="auto">'
-            + (esc(f["title"], 120) or "(untitled case)")
-            + "</td><td>"
-            + _pill(pill_cls, label)
-            + '</td><td class="num">'
-            + str(len(f["rows"]))
-            + '</td><td class="num">'
-            + esc(fmt_ms(f["wall"]), 16)
-            + '</td><td><span class="goto">open →</span></td></tr>'
-        )
-    return (
-        '<div class="tablewrap"><table class="cov" id="covtable"><thead><tr>'
-        '<th data-sort="tc" scope="col">Case</th><th data-sort="title" scope="col">Title</th>'
-        '<th data-sort="verdict" scope="col">Verdict</th><th data-sort="steps" scope="col" class="num">Actions</th>'
-        '<th data-sort="wall" scope="col" class="num">Replay time</th>'
-        '<th scope="col"><span class="visually-hidden">Open case</span></th>'
-        "</tr></thead><tbody>" + rows + "</tbody></table></div>"
     )
 
 
@@ -3033,7 +3046,7 @@ def _findings_section(manifest: dict, turns: int) -> str:
         else '<p class="empty-note big">No turn recorded a finding.</p>'
     )
     return _sechead(
-        "findings", "What exploring found", "one line per turn", lede, table
+        "findings", "What exploring found", "one line per turn", lede, table, level=3
     )
 
 
@@ -3185,6 +3198,7 @@ def _a11y_section(screens: object) -> str:
         "what the screens themselves say",
         lede,
         table,
+        level=3,
     )
 
 
@@ -3268,9 +3282,13 @@ def _document(**kwargs) -> str:
             _merged_library(kwargs.get("screens"), kwargs.get("observations")),
         )
     )
+    images = _IMAGES.set(_image_book(kwargs.get("run_id") or ""))
+    secrets = _SECRETS.set(_run_secrets(kwargs.get("manifest"), kwargs.get("cases")))
     try:
         return _document_body(**kwargs)
     finally:
+        _SECRETS.reset(secrets)
+        _IMAGES.reset(images)
         _SHOTS.reset(token)
 
 
@@ -3442,72 +3460,6 @@ def error_phrase(counts: object) -> str:
     )
 
 
-def _error_kpi(facts: object) -> str:
-    """The overview's device-error figure. Reads ``error_classes`` and counts nothing.
-
-    It DELEGATES to :func:`_kpi` instead of building its own markup, because ``_kpi`` is
-    what puts the figure in a ``.kv`` -- the class the shell sizes, and the class every
-    other KPI on this page carries.
-
-    The round-3 version wrote its own ``<div class="kpi">`` with the figure in
-    ``<div class="n">`` and added ``t-def`` only when the total was non-zero. This shell has
-    no ``.kpi .n`` rule at all: its ``.n`` rules are ``.tricell .n``,
-    ``table.cov.turns td.n`` and ``.kpi.t-ok/.t-gap/.t-def .n``, none of which can match a
-    figure inside a bare ``<div class="kpi">``. So on the COMMON zero-error run the number
-    matched no rule and rendered at body size beside 3.2rem neighbours -- and the pin that
-    was supposed to catch it passed on a bare ``.n`` match against ``.tricell .n``.
-    """
-    counts = error_classes(facts)
-    total = sum(counts.values())
-    return _kpi(
-        esc(str(total), 8),
-        "device errors",
-        esc(error_phrase(counts), 200),
-        tone="c-def" if total else "",
-    )
-
-
-def _gallery_html(library: object) -> str:
-    """Every stored look, grouped by screen. Reads :func:`_shot_html` and nothing else.
-
-    The gallery is a SECOND VIEW of the pictures the case cards already show, not a second
-    producer of them: one ``_shot_html`` call per resolved observation key, so a screen the
-    page cannot pin to one stored look gets the same named absence here as it does there.
-    """
-    book = library if isinstance(library, dict) else {}
-    if not book:
-        return (
-            '<div class="emptystate"><h3>No screen was stored for this run</h3>'
-            "<p>Nothing was captured, so there is nothing to show. This is not a claim that "
-            "the screens were empty.</p></div>"
-        )
-    groups: dict = {}
-    for ident in sorted(str(key) for key in book):
-        groups.setdefault(ident.split("-")[0], []).append(ident)
-    out = []
-    for screen_id, idents in groups.items():
-        cells = "".join(
-            "<div>"
-            + _shot_html(ident)
-            + '<p class="scap">'
-            + esc(ident, 80)
-            + "</p></div>"
-            for ident in idents
-        )
-        out.append(
-            '<div class="screengroup"><p class="elab">screen '
-            + esc(screen_id, 40)
-            + ' · <span class="count">'
-            + str(len(idents))
-            + "</span> look"
-            + ("" if len(idents) == 1 else "s")
-            + '</p><div class="gallery">'
-            + cells
-            + "</div></div>"
-        )
-    return "".join(out)
-
-
 def _logs_section(manifest: object, facts: object, turns: int) -> str:
     """Findings, the explore-lane stop reason, and the device-error breakdown.
 
@@ -3565,25 +3517,804 @@ PAGE_LIMITS = (
 )
 
 
-def _limits_section() -> str:
-    """The named-gap list. DERIVED for the platform row, hardcoded for nothing."""
-    rows = "".join(
-        '<div class="guard"><p class="gapterm">' + esc(term, 120) + "</p>"
-        '<p class="gsub">' + esc(why, 400) + "</p></div>"
-        for term, why in PAGE_LIMITS
+# ── the run page: header, issues, journey, scripted cases, diagnostics ─────────
+
+
+#: Section ids, top to bottom. The nav lists only the ones this run fills.
+ISSUES_ID = "issues"
+JOURNEY_ID = "journey"
+CASES_ID = "cases"
+DIAG_ID = "diagnostics"
+ABOUT_ID = "about"
+
+#: This build's picture book: where the report's media and the run's shots
+#: live, the derivatives made so far, how many images were emitted (the first
+#: loads eagerly) and every image note Diagnostics must print. Set by
+#: :func:`_document` and reset in its ``finally``, like :data:`_SHOTS`.
+_IMAGES: ContextVar = ContextVar("_IMAGES", default=None)
+
+#: ``sizes`` for a step picture and for a filmstrip thumbnail.
+STEP_SIZES = "(max-width: 600px) 44vw, 240px"
+THUMB_SIZES = "(max-width: 600px) 30vw, 160px"
+
+#: A trace outcome in plain words. Anything unlisted reads as its own name.
+OUTCOME_WORDS = {
+    "ok": "done",
+    "done": "finished",
+    "assert_pass": "check passed",
+    "assert_fail": "check failed",
+    "left_app": "left the app",
+    "supplied": "tester answered",
+    "-": "not run",
+}
+
+#: The ops whose target is an element on the screen before the step.
+TARGET_OPS = ("tap", "long_press", "type", "clear")
+
+
+def _image_book(run_id: object) -> dict:
+    target = report_path(str(run_id))
+    return {
+        "media_dir": target.parent / MEDIA_DIR,
+        "shots_dir": target.parent.parent / run_store.SHOTS_DIR,
+        "variants": {},
+        "notes": [],
+        "seen": 0,
+    }
+
+
+def _image_note(text: object) -> None:
+    book = _IMAGES.get()
+    if book is not None and text and str(text) not in book["notes"]:
+        book["notes"].append(str(text))
+
+
+def _variants(path: Path) -> dict:
+    """``report_images.ensure_variants`` once per file per build."""
+    book = _IMAGES.get()
+    if book is None:
+        return {}
+    key = str(path)
+    if key not in book["variants"]:
+        got = report_images.ensure_variants(path, book["media_dir"])
+        _image_note(got.get("error"))
+        book["variants"][key] = got
+    return book["variants"][key]
+
+
+def _img_html(rel_dir: str, name: str, path: Path, alt: str, sizes: str) -> str:
+    """One ``<img>`` with its WebP ``srcset``; ``data-full`` is the original.
+
+    Every value is escaped by :func:`esc`, inside ``srcset_markup`` or here.
+    The first image of the page loads eagerly; every other one is lazy.
+    """
+    book = _IMAGES.get()
+    got = _variants(path)
+    # Derivatives always live in the report's media folder; the original
+    # stays where it is (a screenshot sits in ../shots beside the report).
+    marks = report_images.srcset_markup(
+        esc,
+        MEDIA_DIR,
+        got.get("hash"),
+        got.get("widths"),
+        name,
+        got.get("width"),
+        original_dir=rel_dir,
     )
-    rows += (
-        '<div class="guard"><p class="gapterm">Platform coverage</p><p class="gsub">'
-        + esc(
-            "; ".join(
-                str(key) + ": " + str(value)
-                for key, value in sorted(platform_info.SUPPORT.items())
-            ),
-            600,
+    _image_note(marks.get("error"))
+    first = book is not None and not book["seen"]
+    if book is not None:
+        book["seen"] += 1
+    width, height = got.get("width"), got.get("height")
+    return (
+        '<img src="'
+        + marks["src"]
+        + '"'
+        + (
+            (' srcset="' + marks["srcset"] + '" sizes="' + esc(sizes, 80) + '"')
+            if "," in marks["srcset"]
+            else ""
         )
-        + "</p></div>"
+        + (
+            (' width="' + str(int(width)) + '" height="' + str(int(height)) + '"')
+            if width and height
+            else ""
+        )
+        + (' fetchpriority="high"' if first else ' loading="lazy"')
+        + ' decoding="async" alt="'
+        + esc(alt, 160)
+        + '" data-full="'
+        + esc(rel_dir.rstrip("/") + "/" + name, 200)
+        + '">'
     )
-    return '<div class="gaps">' + rows + "</div>"
+
+
+def _q(text: object) -> tuple:
+    """A quoted run of app text inside a plain-words line."""
+    return ("q", _text(text, 80))
+
+
+def _rid_tail(rid: object) -> str:
+    return str(rid or "").rsplit("/", 1)[-1].replace("_", " ")
+
+
+def _plain_action(action: object) -> list:
+    """A trace action as plain words: text parts and :func:`_q` quotes.
+
+    Typed text goes through :func:`_typed_literal`, so a credential is the
+    mask here exactly as it is in the step table.
+    """
+    body = action if isinstance(action, dict) else {}
+    op = str(body.get("op") or "")
+    target = body.get("target")
+    target = target if isinstance(target, dict) else {}
+    name = _text(
+        target.get("text")
+        or target.get("label")
+        or target.get("desc")
+        or _rid_tail(target.get("rid")),
+        60,
+    )
+    role = _text(target.get("role"), 24)
+    thing = [_q(name)] if name else ["the " + role if role else "an unlabelled element"]
+    if op == "tap":
+        return ["Tapped "] + thing
+    if op == "long_press":
+        return ["Long-pressed "] + thing
+    if op == "clear":
+        return ["Cleared "] + thing
+    if op == "type":
+        typed = _typed_literal(body)
+        return ["Typed ", _q(typed)] + ([" into "] + thing if name or role else [])
+    if op in ("scroll", "swipe"):
+        return ["Scrolled " + (_text(body.get("dir"), 12) or "the screen")]
+    if op in ("back", "home"):
+        return ["Pressed " + op.capitalize()]
+    if op == "wait":
+        until = _text(body.get("until_text"), 80)
+        if until:
+            return ["Waited for ", _q(until), " to appear"]
+        return ["Waited " + fmt_ms(_ms(body.get("ms")) or 0)]
+    if op == "assert":
+        text = _text(body.get("text") or body.get("contains"), 80)
+        return ["Checked that ", _q(text), " is on screen"] if text else ["Checked the screen"]
+    if op == "done":
+        reason = _text(body.get("reason"), 200)
+        return ["Finished the turn" + (": " if reason else "")] + ([_q(reason)] if reason else [])
+    if op == "ask_tester":
+        field = _text(body.get("field"), 24)
+        return ["Asked the tester for " + (field or "input")]
+    if op == "launch":
+        return ["Opened the app"]
+    return [_action_line(body)]
+
+
+def _parts_html(parts: object) -> str:
+    out = []
+    for part in list(parts or []):
+        if isinstance(part, tuple):
+            out.append('<q dir="auto">' + esc(part[1], 200) + "</q>")
+        else:
+            text = str(part)
+            out.append(
+                (" " if text[:1] == " " else "")
+                + esc(text, 200)
+                + (" " if text[-1:] == " " else "")
+            )
+    return "".join(out)
+
+
+def _element_of(target_id: object, screen: object) -> dict:
+    tid = str(target_id or "")
+    body = screen if isinstance(screen, dict) else {}
+    for element in list(body.get("elements") or []) if tid else []:
+        if isinstance(element, dict) and str(element.get("id") or "") == tid:
+            return element
+    return {}
+
+
+def _step_words(row: dict, library: object) -> list:
+    """The row's plain words, naming its target from the before screen when
+    the trace itself recorded only the element's id."""
+    action = row.get("act") if isinstance(row.get("act"), dict) else {}
+    target = action.get("target") if isinstance(action.get("target"), dict) else {}
+    if not target or any(target.get(k) for k in ("text", "label", "desc", "rid")):
+        return row.get("plain") or []
+    _ident, screen, _verdict = _resolve_look(
+        row.get("before_obs") or row.get("before"), library
+    )
+    element = _element_of(target.get("id"), screen)
+    if not element:
+        return row.get("plain") or []
+    named = {k: element.get(k) for k in ("text", "label", "desc", "rid", "role")}
+    return _plain_action(dict(action, target=dict(target, **named)))
+
+
+def _tap_overlay(target_id: object, screen: object) -> str:
+    """The acted-on element's box and a tap dot, in CSS percentages, or ``""``."""
+    tid = str(target_id or "")
+    body = screen if isinstance(screen, dict) else {}
+    if not tid:
+        return ""
+    for element in list(body.get("elements") or []):
+        if isinstance(element, dict) and str(element.get("id") or "") == tid:
+            dev_w, dev_h = _device_size(body)
+            box = report_images.overlay_style(_bounds_of(element), dev_w, dev_h)
+            if not box:
+                return ""
+            return (
+                '<span class="tapbox" aria-hidden="true" style="left:{left}%;top:{top}%;'
+                'width:{width}%;height:{height}%"></span><span class="tapdot" '
+                'aria-hidden="true" style="left:{dot_x}%;top:{dot_y}%"></span>'
+            ).format(**{k: float(v) for k, v in box.items()})
+    return ""
+
+
+def _look_pic(
+    key: object,
+    library: object,
+    caption: str,
+    app: str,
+    target_id: str = "",
+    note: str = "",
+) -> str:
+    """One moment of a step: the device's picture, the drawing, or why neither.
+
+    The note stands IN PLACE of a picture, never beside one. The drawing is
+    composed only when no picture was stored for an exact look.
+
+    Every figure is stamped with what `_resolve_look` returned: ``data-look``
+    the verdict and ``data-screen`` the key it resolved. The page-level sweep in
+    ``test_mobile_screen_observations`` reads those, so a caller that resolved
+    the library itself would be graded on the day it was written.
+    """
+    ident, screen, verdict = _resolve_look(key, library)
+    head = (
+        '<figure class="pic" data-look="'
+        + esc(verdict, 16)
+        + '"'
+        + ((' data-screen="' + esc(ident, 40) + '"') if ident else "")
+        + ">"
+    )
+    label = esc(caption, 40) + (
+        ('<span class="picsub">' + esc(note, 80) + "</span>") if note else ""
+    )
+    if screen is not None and verdict == LOOK_EXACT:
+        filename = str(((_SHOTS.get() or {}).get("frames") or {}).get(ident) or "")
+        book = _IMAGES.get()
+        if filename and book is not None:
+            return (
+                head
+                + '<div class="picbox">'
+                + _img_html(
+                    "../" + run_store.SHOTS_DIR,
+                    filename,
+                    book["shots_dir"] / filename,
+                    caption + ": the screen as the device drew it",
+                    STEP_SIZES,
+                )
+                + _tap_overlay(target_id, screen)
+                + "</div><figcaption>"
+                + label
+                + "</figcaption></figure>"
+            )
+        return (
+            head
+            + '<div class="picdraw">'
+            + screen_phone.compose(screen, esc=esc, app=app)
+            + "</div><figcaption>"
+            + label
+            + " · drawn from the element list, no picture stored"
+            + "</figcaption></figure>"
+        )
+    gap = AMBIGUOUS_LOOK if verdict == LOOK_AMBIGUOUS else NOT_CAPTURED
+    return (
+        head
+        + '<p class="picnote">'
+        + esc(gap, 300)
+        + "</p><figcaption>"
+        + label
+        + "</figcaption></figure>"
+    )
+
+
+def _same_gap(one: tuple, two: tuple) -> bool:
+    """Both looks resolved to no picture, with the same verdict."""
+    return one[2] == two[2] and one[2] != LOOK_EXACT
+
+
+def _step_html(
+    tc_slug: str,
+    index: int,
+    row: dict,
+    library: object,
+    app: str,
+    after_look: tuple = (),
+) -> str:
+    """One step: its words, its outcome, what the server said about it, and
+    the screen before and after.
+
+    *after_look* is ``(key, note)`` when the caller knows a better After than
+    the row's own key: the case card's substituted end state, disclosed in
+    *note*.
+    """
+    outcome = str(row.get("outcome") or "-")
+    word = OUTCOME_WORDS.get(outcome.lower(), outcome.replace("_", " "))
+    before = row.get("before_obs") or row.get("before")
+    after = row.get("after_obs") or row.get("after")
+    target = row.get("target_id") if row.get("op") in TARGET_OPS else ""
+    if after_look:
+        pics = (_look_pic(before, library, "Before", app, target) if before else "") + (
+            _look_pic(after_look[0], library, "After", app, note=after_look[1])
+        )
+    elif before and (
+        before == after
+        or (after and _same_gap(_resolve_look(before, library), _resolve_look(after, library)))
+    ):
+        # Neither end has a picture and both miss it for the same reason: one
+        # note for the pair, not the same sentence twice side by side.
+        pics = _look_pic(before, library, "Before and after", app, target)
+    else:
+        pics = (_look_pic(before, library, "Before", app, target) if before else "") + (
+            _look_pic(after, library, "After", app) if after else ""
+        )
+    detail = str(row.get("detail") or "")
+    return (
+        '<li class="step" id="step-'
+        + tc_slug
+        + "-"
+        + str(int(index))
+        + '"><div class="stephead"><span class="stepn">'
+        + str(int(index) + 1)
+        + '</span><p class="stepact" dir="auto">'
+        + _parts_html(_step_words(row, library))
+        + "</p>"
+        + _outcome_pill(word)
+        + "</div>"
+        + (('<p class="stepnote" dir="auto">' + esc(detail, 300) + "</p>") if detail else "")
+        + (('<div class="steppics">' + pics + "</div>") if pics else "")
+        + "</li>"
+    )
+
+
+def _clip_html(rec: object) -> str:
+    """A turn's recording with its poster, or the producer's reason for none."""
+    body = rec if isinstance(rec, dict) else {}
+    srcpath = _media_src(body)
+    if not srcpath:
+        return '<p class="clipgap">' + esc(_media_note(body.get("state")), 300) + "</p>"
+    poster = ""
+    book = _IMAGES.get()
+    if book is not None:
+        got = report_images.ensure_poster(book["media_dir"] / str(body.get("file")), book["media_dir"])
+        _image_note(got.get("error"))
+        if got.get("path"):
+            poster = ' poster="' + esc(MEDIA_DIR + "/" + str(got["path"]), 200) + '"'
+    return (
+        '<figure class="turnclip"><video controls preload="metadata" playsinline'
+        + poster
+        + '><source src="'
+        + esc(srcpath, 140)
+        + '" type="video/mp4"></video><figcaption>Recording of this turn</figcaption></figure>'
+    )
+
+
+def _turn_frame(tc_id: object, cases_by_id: dict) -> dict:
+    """The turn's full-size frame record from the media lane, or ``{}``."""
+    case = cases_by_id.get(_media_key(tc_id)) or {}
+    for rec in list(case.get("media") or []):
+        if (
+            isinstance(rec, dict)
+            and str(rec.get("kind") or "") == media.FRAME
+            and _media_src(rec)
+        ):
+            return rec
+    return {}
+
+
+def _thumb_html(n: int, f: dict, frame: dict, library: object) -> str:
+    book = _IMAGES.get()
+    img = ""
+    if frame and book is not None:
+        name = str(frame.get("file"))
+        img = _img_html(MEDIA_DIR, name, book["media_dir"] / name, "Turn " + str(n), THUMB_SIZES)
+    elif book is not None:
+        ident, screen, verdict = _resolve_look(f["last_look"] or f["last"], library)
+        filename = str(((_SHOTS.get() or {}).get("frames") or {}).get(ident) or "")
+        if screen is not None and verdict == LOOK_EXACT and filename:
+            img = _img_html(
+                "../" + run_store.SHOTS_DIR,
+                filename,
+                book["shots_dir"] / filename,
+                "Turn " + str(n),
+                THUMB_SIZES,
+            )
+    return (
+        '<li><a class="thumb" href="#turn-'
+        + f["slug"]
+        + '">'
+        + (img or '<span class="thumbgap">no picture</span>')
+        + "<span>Turn "
+        + str(int(n))
+        + "</span></a></li>"
+    )
+
+
+def _finding_of(f: dict, manifest: dict, n: int) -> str:
+    if f.get("finding"):
+        return f["finding"]
+    explore = manifest.get("explore") if isinstance(manifest.get("explore"), dict) else {}
+    for item in list(explore.get("findings") or []):
+        if isinstance(item, dict) and str(item.get("turn")) == str(n):
+            return _text(item.get("note"), 200)
+    return f["title"] or f["tc_id"]
+
+
+def _result_pill(word: str) -> str:
+    return _pill(
+        RESULT_PILL.get(word, "p-void"),
+        RESULT_LABEL.get(word, word),
+    )
+
+
+def _count(n: int, one: str, many: str = "") -> str:
+    return str(int(n)) + " " + (one if int(n) == 1 else (many or one + "s"))
+
+
+def _turn_html(
+    n: int,
+    f: dict,
+    manifest: dict,
+    library: object,
+    app: str,
+    media_map: object,
+    loaded: dict | None,
+) -> str:
+    verdict = f["verdict"]
+    word = _unify_verdict(verdict)
+    pill = _result_pill(word) if verdict in DONE_VERDICTS else ""
+    rows = f["rows"]
+    steps = "".join(_step_html(f["slug"], i, row, library, app) for i, row in enumerate(rows))
+    clips = "".join(
+        _clip_html(rec)
+        for rec in ((media_map or {}).get("clips") or {}).get(_media_key(f["tc_id"])) or []
+    )
+    meta = [_count(len(rows), "step")]
+    if f["wall"] is not None:
+        meta.append(fmt_ms(f["wall"]))
+    tech = [
+        ("Case", f["tc_id"]),
+        ("Status", f["status"] or "(none)"),
+        ("Why it ended", f["reason"]),
+    ]
+    tech_rows = "".join(
+        "<dt>" + esc(k, 40) + '</dt><dd dir="auto">' + esc(v, 400) + "</dd>"
+        for k, v in tech
+        if v
+    )
+    extra = (
+        _crash_block(f.get("crash"))
+        + (ev_render.turns_table(loaded, f["tc_id"]) if _app_logged(loaded) else "")
+        + ev_render.case_network(f.get("network"))
+        + ev_render.case_capture(f.get("capture"))
+    )
+    return (
+        '<article class="turn" id="turn-'
+        + f["slug"]
+        + '" data-tc="'
+        + esc(f["tc_id"], 40)
+        + '" data-verdict="'
+        + esc(verdict, 24)
+        + '" data-crash="'
+        + esc(str((f.get("crash") or {}).get("kind") or ""), 40)
+        + '"><header class="turnhead"><span class="turnn">Turn '
+        + str(int(n))
+        + '</span><h4 dir="auto">'
+        + esc(_finding_of(f, manifest, n), 200)
+        + "</h4>"
+        + pill
+        + '<span class="turnmeta">'
+        + esc(" · ".join(meta), 60)
+        + "</span></header>"
+        + clips
+        + (('<ol class="steplist">' + steps + "</ol>") if steps else '<p class="picnote">No step was replayed in this turn.</p>')
+        + '<details class="tech"><summary>Technical detail</summary><dl class="techlist">'
+        + tech_rows
+        + "</dl>"
+        + extra
+        + "</details></article>"
+    )
+
+
+def _journey_html(
+    groups: list,
+    facts_by_id: dict,
+    cases_by_id: dict,
+    manifest: dict,
+    library: object,
+    app: str,
+    media_map: object,
+    loaded: dict | None,
+) -> str:
+    order = {tc: i + 1 for i, tc in enumerate(facts_by_id)}
+    out = []
+    for gi, group in enumerate(groups, 1):
+        facts = [facts_by_id[_text(c.get("tc_id"), 40)] for c in group["cases"] if _text(c.get("tc_id"), 40) in facts_by_id]
+        if not facts:
+            continue
+        steps = sum(len(f["rows"]) for f in facts)
+        walls = [f["wall"] for f in facts if f["wall"] is not None]
+        meta = [_count(len(facts), "turn"), _count(steps, "step")]
+        if walls:
+            meta.append(fmt_ms(sum(walls)))
+        film = "".join(
+            _thumb_html(order[f["tc_id"]], f, _turn_frame(f["tc_id"], cases_by_id), library)
+            for f in facts
+        )
+        turns = "".join(
+            _turn_html(order[f["tc_id"]], f, manifest, library, app, media_map, loaded)
+            for f in facts
+        )
+        out.append(
+            '<section class="goal" aria-labelledby="goal-'
+            + str(gi)
+            + '"><div class="goalhead"><h3 id="goal-'
+            + str(gi)
+            + '" dir="auto">'
+            + esc(group["goal"], 400)
+            + "</h3>"
+            + _result_pill(_goal_result(group["cases"]))
+            + '<span class="goalmeta">'
+            + esc(" · ".join(meta), 80)
+            + '</span></div><ol class="film">'
+            + film
+            + "</ol>"
+            + turns
+            + "</section>"
+        )
+    return "".join(out)
+
+
+def _issues_html(facts: list, kinds: dict) -> str:
+    """Every case that failed, was blocked or crashed, or ``""``."""
+    items = []
+    for f in facts:
+        word = _unify_verdict(f["verdict"])
+        crash = (f.get("crash") or {}).get("kind")
+        if word not in ("fail", "blocked") and not crash:
+            continue
+        anchor = ("turn-" if kinds.get(f["tc_id"]) == "turn" else "case-") + f["slug"]
+        items.append(
+            '<li class="issue">'
+            + _result_pill(word if word in ("fail", "blocked") else "fail")
+            + '<a href="#'
+            + anchor
+            + '">'
+            + esc(f["tc_id"], 40)
+            + '</a><span dir="auto">'
+            + esc(f.get("finding") or f["reason"] or f["title"], 300)
+            + (("; the app crashed (" + esc(crash, 40) + ")") if crash else "")
+            + "</span></li>"
+        )
+    return ('<ul class="issues">' + "".join(items) + "</ul>") if items else ""
+
+
+def _results_html(groups: list, scripted: list, tally_: dict, total: int) -> str:
+    """The header's result lines, inside the totals the selfcheck compares."""
+    ordered = [(name, int(tally_.get(name) or 0)) for name in TILES]
+    ordered += [(name, int(c)) for name, c in sorted(tally_.items()) if name not in TILES]
+    attrs = "".join(
+        " data-" + name.replace("_", "-") + '="' + str(int(count)) + '"'
+        for name, count in ordered
+    )
+    lines = []
+    for group in groups:
+        lines.append(
+            '<li class="result">'
+            + _result_pill(_goal_result(group["cases"]))
+            + '<span dir="auto">'
+            + esc(group["goal"], 400)
+            + "</span></li>"
+        )
+    if scripted:
+        words: dict = {}
+        for f in scripted:
+            word = _unify_verdict(f["verdict"])
+            words[word] = words.get(word, 0) + 1
+        lines.append(
+            '<li class="result"><span class="rcount">'
+            + esc(_count(len(scripted), "scripted case"), 40)
+            + "</span><span>"
+            + esc(" · ".join(str(words[w]) + " " + w for w in RESULTS if words.get(w)), 120)
+            + "</span></li>"
+        )
+    if not lines:
+        lines.append('<li class="result"><span>No case has been checkpointed yet.</span></li>')
+    return (
+        '<div id="'
+        + SUMMARY_ID
+        + '" data-total="'
+        + str(int(total))
+        + '"'
+        + attrs
+        + '><ul class="results">'
+        + "".join(lines)
+        + "</ul>"
+        + (_segbar(tally_) if scripted else "")
+        + "</div>"
+    )
+
+
+def _build_label(manifest: dict) -> str:
+    for key in ("app_version", "version_name", "build"):
+        value = _text(manifest.get(key), 40)
+        if value:
+            return value
+    return ""
+
+
+def _duration(manifest: dict, cases: list) -> str:
+    start = _epoch(manifest.get("created"))
+    end = last_checkpoint(cases)
+    if start is None or end is None or end < start:
+        return ""
+    return fmt_ms(int((end - start) * 1000))
+
+
+def _meta_html(
+    manifest: dict, cases: list, partial: bool, coverage: dict | None = None
+) -> str:
+    device = manifest.get("device") if isinstance(manifest.get("device"), dict) else {}
+    model = _text(device.get("model"), 40)
+    api = _text(device.get("api"), 8)
+    kind = DEVICE_KINDS.get(str(device.get("kind") or ""), "")
+    what = " · ".join(
+        bit
+        for bit in (
+            model or _text(manifest.get("avd"), 40),
+            ("Android API " + api) if api else "",
+            kind,
+        )
+        if bit
+    ) or _text(manifest.get("serial"), 40) or "device not recorded"
+    items = [("Device", what), ("Date", _short_stamp(manifest.get("created")))]
+    took = _duration(manifest, cases)
+    if took:
+        items.append(("Duration", took))
+    state = "finished"
+    if partial:
+        try:
+            planned = int(manifest.get("total") or 0)
+        except (TypeError, ValueError, OverflowError):
+            planned = 0
+        waiting = max(0, planned - len(cases))
+        state = "in progress" + (
+            (" — " + str(waiting) + " not yet checkpointed") if waiting else ""
+        )
+    items.append(("State", state))
+    # The one coverage sentence (run_store owns it): "finished" alone would read
+    # as "every case judged" on a run that judged two of three.
+    if coverage:
+        items.append(("Verdicts", coverage_phrase(coverage)))
+    return "".join(
+        "<span><b>" + esc(k, 20) + "</b> " + esc(v, 200) + "</span>" for k, v in items if v
+    )
+
+
+#: The screen-capture fields Diagnostics tabulates, in this order.
+CAPTURE_FIELDS = (
+    "dropped_inside_panel",
+    "dropped_outside_panel",
+    "dropped_unclassified",
+    "considered",
+    "panel_axes",
+    "dialog_package",
+)
+
+
+def _capture_value(value: object) -> str:
+    if isinstance(value, (list, tuple)):
+        return " × ".join(_text(v, 12) for v in value)
+    return _text(value, 60)
+
+
+def _capture_table(screens: object) -> str:
+    """One row per stored screen; a column no screen fills is left out."""
+    book = screens if isinstance(screens, dict) else {}
+    rows = [
+        (str(sid), {k: _capture_value(s.get(k)) for k in CAPTURE_FIELDS})
+        for sid, s in sorted(book.items())
+        if isinstance(s, dict)
+    ]
+    cols = [k for k in CAPTURE_FIELDS if any(r[k] not in ("", "0") for _sid, r in rows)]
+    if not rows or not cols:
+        return ""
+    head = "<th>screen</th>" + "".join("<th>" + esc(k.replace("_", " "), 40) + "</th>" for k in cols)
+    body = "".join(
+        "<tr><td>" + esc(sid, 40) + "</td>" + "".join("<td>" + esc(r[k], 60) + "</td>" for k in cols) + "</tr>"
+        for sid, r in rows
+    )
+    return '<div class="tablewrap"><table class="cov"><thead><tr>' + head + "</tr></thead><tbody>" + body + "</tbody></table></div>"
+
+
+def _diag_part(sid: str, title: str, note: str, body: str) -> str:
+    """One collapsed Diagnostics part, or ``""`` when it has nothing to say."""
+    if not body:
+        return ""
+    return (
+        '<details class="diag" id="' + sid + '"><summary>'
+        + esc(title, 60)
+        + (('<span class="diagnote">' + esc(note, 120) + "</span>") if note else "")
+        + '</summary><div class="diagbody">'
+        + body
+        + "</div></details>"
+    )
+
+
+def _app_logged(loaded: object) -> bool:
+    """Whether the run holds an app log.
+
+    When it does not, the Diagnostics "App evidence" part says why, once. Every
+    case and turn repeating the same run-wide reason said nothing new.
+    """
+    content = loaded.get("content") if isinstance(loaded, dict) else None
+    return isinstance(content, dict) and content.get("source") not in (None, "none")
+
+
+def _has_network(facts: list, loaded: dict | None) -> bool:
+    for f in facts:
+        try:
+            if int((f.get("network") or {}).get("packets") or 0) > 0:
+                return True
+        except (TypeError, ValueError, OverflowError):
+            pass
+        if (f.get("capture") or {}).get("flows"):
+            return True
+    # The loader answers {"error", "content"}; a content whose source is
+    # "none" read nothing (no capture, the flag off, no profile).
+    content = loaded.get("content") if isinstance(loaded, dict) else None
+    return isinstance(content, dict) and content.get("source") not in (None, "", "none")
+
+
+def _about_html() -> str:
+    """How to read the page, said once."""
+    rows = [
+        (
+            "Results",
+            "Every goal, turn and case reads as one of four words. Pass, fail and "
+            "blocked are what the model that drove the run concluded after its last "
+            "action; unfinished means it has not concluded yet. The report replays and "
+            "records; it never judges a screen itself.",
+        ),
+        (
+            "Pictures",
+            "Each step shows the device's own screenshot before and after it. The "
+            "outlined box and dot mark the element the step acted on. Where no "
+            "picture was stored the step says so in its place. Pictures live in the "
+            "run folder beside this page (../shots and media/), so keep the folder "
+            "together when you share it.",
+        ),
+        ("Recordings", CLIP_SCALE_NOTE),
+        (
+            "LLM turns",
+            "The planning turns the tester\u2019s own chat model took: one "
+            "plan per case, every escape-hatch re-plan, and every stop the server did "
+            "not charge as an escape. Tokens and cost are not shown: no model call "
+            "passes through this server, so it has nothing to meter. The figure can "
+            "exceed the escape-hatch count beside it; the difference is the stops this "
+            "run was given for free.",
+        ),
+        (
+            "Private data",
+            "Typed passwords and other marked values are written as *** in text. "
+            "Screenshots and recordings cannot be masked: anything visible on the "
+            "screen is in this folder, so treat it like the device itself.",
+        ),
+    ]
+    rows += [(term, why) for term, why in PAGE_LIMITS]
+    return '<dl class="about">' + "".join(
+        "<dt>" + esc(term, 120) + "</dt><dd>" + esc(why, 600) + "</dd>" for term, why in rows
+    ) + "</dl>"
 
 
 def _document_body(
@@ -3633,134 +4364,109 @@ def _document_body(
     loaded = ev_render.load_run_evidence(
         run_id, manifest, cases, ev_profiles.profile_for(manifest.get("package"))
     )
-    steps = sum(len(f["rows"]) for f in facts)
-    title = "Mobile run " + str(run_id)
-    # The audit's own section, built ONCE so the nav cannot offer a section this
-    # page does not emit. It is embedded under `media` in the body, because it is
-    # about screens -- a NESTED section with a real id, which the nav may point at.
+    # A run is goals, turns and steps. An exploratory case is a TURN, drawn in
+    # the journey of the goal it drove at; every other case is a scripted case,
+    # drawn in the case list. One map says which, so no case is drawn twice.
     #
-    # `findings` is deliberately NOT built here any more. `_logs_section` builds it,
-    # because the findings belong inside Logs. Building it here AND embedding it there
-    # is how this page came to emit id="findings" twice, which makes the nav anchor
-    # ambiguous and is invalid HTML -- see test_no_id_is_emitted_twice_on_the_rendered_page.
-    a11y = _a11y_section(screens)
-    nav_items = [
-        ("overview", "Overview"),
-        ("cases", "Cases"),
-        ("media", "Media"),
-        ("network", "Network"),
-        ("logs", "Logs"),
-        ("env", "Environment"),
-        ("limits", "Limits"),
-    ]
-    # The nav is still built from this list and only from it, so it can never offer a
-    # section the page did not emit. Accessibility keeps its CONDITIONAL entry: it nests
-    # under media in the body, but a nav entry for a section that was not built is exactly
-    # the promise this list exists to prevent.
-    if a11y:
-        nav_items.insert(3, ("a11y", "Accessibility"))
-    nav = "".join(
-        '<a href="#' + sid + '" data-nav="' + sid + '">' + label + "</a>"
-        for sid, label in nav_items
-    )
-    meta = "".join(
-        "<span><b>" + k + "</b> " + v + "</span>"
-        for k, v in (
-            (
-                "Suite",
-                str(len(facts))
-                + " case"
-                + ("" if len(facts) == 1 else "s")
-                + " checkpointed · "
-                + esc(manifest.get("total") or 0, 12)
-                + " planned",
-            ),
-            (
-                "This run",
-                str(steps)
-                + " action"
-                + ("" if steps == 1 else "s")
-                + " replayed · rendered "
-                + esc(_short_stamp(time.time()), 40),
-            ),
-            (
-                "Driven against",
-                esc(app, 80)
-                + " on "
-                + esc(manifest.get("serial") or "(not attached)", 40),
-            ),
-            (
-                "State",
-                ("in progress" if partial else "finished")
-                + " — "
-                + esc(coverage_phrase(coverage), 200),
-            ),
+    # `findings` is built by `_logs_section` and only there: building it twice
+    # is how this page once emitted id="findings" twice -- see
+    # test_no_id_is_emitted_twice_on_the_rendered_page.
+    kinds = {
+        _text(c.get("tc_id"), 40): (
+            "turn" if _case_type(c, manifest) == EXPLORATORY else "case"
         )
+        for c in cases
+        if isinstance(c, dict)
+    }
+    facts_by_id = {f["tc_id"]: f for f in facts}
+    cases_by_id = {_media_key(c.get("tc_id")): c for c in cases if isinstance(c, dict)}
+    turns = {
+        tc: facts_by_id[tc]
+        for tc, kind in kinds.items()
+        if kind == "turn" and tc in facts_by_id
+    }
+    scripted = [f for f in facts if kinds.get(f["tc_id"]) != "turn"]
+    groups = _derive_goals(cases, manifest)
+    issues = _issues_html(facts, kinds)
+    journey = _journey_html(
+        groups, turns, cases_by_id, manifest, library, app, media_map, loaded
+    )
+    cases_body = (
+        _cases_html(scripted, library, app, loaded, coverage, observations, media_map)
+        if scripted
+        else ""
+    )
+    a11y = _a11y_section(screens)
+    network = (
+        ev_render.apis_section(loaded)
+        + ev_render.network_section(cases)
+        + ev_render.capture_section(cases, manifest)
+        + _perf(facts, loaded)
+        if _has_network(facts, loaded)
+        else ""
+    )
+    # The app's own capture, summarised: its tiles, the session it came from,
+    # and the trust checks -- including why nothing was read (the flag is off,
+    # the load hit its byte cap). The old overview carried these.
+    tiles = "".join(ev_render.overview_tiles(loaded)) if loaded else ""
+    evidence = (
+        (('<div class="kpis run">' + tiles + "</div>") if tiles else "")
+        + (ev_render.session_block(loaded) + ev_render.trust_block(loaded))
+        if loaded
+        else ""
+    )
+    # Built after the journey and the case list: every image note those
+    # pictures raised is in the book by now.
+    notes = "".join(
+        "<li>" + esc(note, 300) + "</li>"
+        for note in list((_IMAGES.get() or {}).get("notes") or [])
+    )
+    diagnostics = (
+        _diag_part(
+            "screen-capture",
+            "Screen capture",
+            "what the element reader kept and dropped",
+            _capture_table(library),
+        )
+        + _diag_part(
+            "images",
+            "Image processing",
+            "",
+            ('<ul class="plain">' + notes + "</ul>") if notes else "",
+        )
+        + _diag_part(
+            "evidence", "App evidence", "what the app's own capture holds", evidence
+        )
+        + _diag_part("network", "Network", "the app's own calls", network)
+        + _diag_part(
+            "logs", "Logs and findings", "", _logs_section(manifest, facts, len(facts))
+        )
+        + _diag_part("diag-a11y", "Accessibility", "", a11y)
+        + _diag_part(
+            "env",
+            "Environment",
+            "what this run ran on",
+            _facts_strip(run_id, manifest, lease, partial, loaded, coverage)
+            + _env_section(manifest, loaded),
+        )
+    )
+    parts = [
+        (ISSUES_ID, "Issues", "what failed or was blocked", issues),
+        (JOURNEY_ID, "Journey", "what the explorer did, turn by turn", journey),
+        (CASES_ID, "Scripted cases", "every planned case and how it ended", cases_body),
+        (DIAG_ID, "Diagnostics", "technical detail, collapsed", diagnostics),
+        (ABOUT_ID, "About this report", "how to read it", _about_html()),
+    ]
+    # The nav is built from what was emitted and only from it, so it can never
+    # offer a section this page does not have.
+    present = [part for part in parts if part[3]]
+    nav = "".join(
+        '<a href="#' + sid + '" data-nav="' + sid + '">' + esc(title, 40) + "</a>"
+        for sid, title, _label, _body in present
     )
     sections = (
-        _sechead(
-            "overview",
-            "At a glance",
-            "the run in numbers",
-            "Every figure here is about what the emulator DID with a case. Whether the app is right is the tester's question, not this one.",
-            _overview(facts, tally, manifest, partial, library, app, loaded, coverage)
-            + _error_kpi(facts),
-        )
-        + _sechead(
-            "cases",
-            # "Every case", not "Cases": this string is the <h2>, and SEVEN pre-existing
-            # assertions in test_mobile_report_selfcheck.py inject their mutation at
-            # "<h2>Every case</h2>". The nav LABEL is the argument below and stays "Cases",
-            # so renaming the heading would have bought nothing and broken all seven.
-            "Every case",
-            "every checkpointed case and how far it got",
-            "Open a case for its card: every tap, every field, every assertion, and the screen before and after.",
-            # NOT _toolbar(...) here: `_cases_html` already opens with it, and a second
-            # copy would ship two filter bars driving one list.
-            _coverage(facts)
-            + _cases_html(
-                facts, library, app, loaded, coverage, observations, media_map
-            ),
-        )
-        + _sechead(
-            "media",
-            "Media",
-            "every screen this run stored",
-            "One picture per stored LOOK, grouped by screen. A screen with no picture says why, by name, rather than going quiet.",
-            _gallery_html(library) + a11y,
-        )
-        + _sechead(
-            "network",
-            "Network",
-            "every endpoint the app reached, on the real wire",
-            "Every endpoint the app called from inside a case, against the real backend rather than a fixture.",
-            # The api surface first, with the run-level roll-up UNDER it -- the order
-            # test_the_run_level_roll_up_rides_under_the_api_surface_section is named for.
-            ev_render.apis_section(loaded)
-            + ev_render.network_section(cases)
-            + ev_render.capture_section(cases, manifest)
-            + _perf(facts, loaded),
-        )
-        + _sechead(
-            "logs",
-            "Logs & server events",
-            "what the run wrote down",
-            "Findings, the reason the run stopped, and every action that ended for a device reason rather than the app's.",
-            _logs_section(manifest, facts, len(facts)),
-        )
-        + _sechead(
-            "env",
-            "Environment & provenance",
-            "what this run ran on",
-            "The image, the device and the host, as the run recorded them. A fact the run did not record is named here, never filled in from today's settings.",
-            _env_section(manifest, loaded),
-        )
-        + _sechead(
-            "limits",
-            "What this page cannot show",
-            "the named gaps",
-            "Each line is a fact this report cannot state and the reason it cannot. An absent limit would read as no limit.",
-            _limits_section(),
+        "".join(
+            _sechead(sid, title, label, "", body) for sid, title, label, body in present
         )
         + '<div id="'
         + END_ID
@@ -3768,6 +4474,7 @@ def _document_body(
         + str(len(cases))
         + '"></div>'
     )
+    build = _build_label(manifest)
     digest = hashlib.sha1(
         (
             str(run_id)
@@ -3781,23 +4488,17 @@ def _document_body(
         body = _fill(
             SHELL,
             {
-                "DOC_TITLE": esc(title, 120),
-                "BRAND": "Mobile Run",
+                "DOC_TITLE": esc(app + " · mobile run " + str(run_id), 160),
+                "BRAND": "Mobile run",
                 "BRAND_SUB": "QA Agents",
                 "NAV": nav,
-                "EYEBROW": "QA Agents · mobile lane · one run on the emulator",
-                "TITLE": esc(app, 80) + " on device, one run end to end",
-                "STANDFIRST": (
-                    "Every planned case replayed on the emulator from the screen it saw, one action at a "
-                    "time, and on the same card what the run did underneath: every tap, every field, every "
-                    "assertion and the screen before and after. The pictures on this page live in "
-                    "../shots/ beside it: this FOLDER travels as a whole, and a lone index.html shows no "
-                    "screens."
-                ),
-                "META": meta,
-                "FACTS": _facts_strip(
-                    run_id, manifest, lease, partial, loaded, coverage
-                ),
+                "EYEBROW": "Mobile run " + esc(run_id, 80),
+                "TITLE": '<span dir="auto">'
+                + esc(app, 80)
+                + "</span>"
+                + ((' <span class="build">' + esc(build, 40) + "</span>") if build else ""),
+                "META": _meta_html(manifest, cases, partial, coverage),
+                "RESULTS": _results_html(groups, scripted, tally, len(facts)),
                 "SECTIONS": sections,
                 "FOOTER_META": _footer_html(run_id, manifest),
                 "SOURCE_STAMP": esc(str(run_id) + ":" + digest, 80),
@@ -3809,6 +4510,10 @@ def _document_body(
         # The learned-value net stays armed only while the page is being built --
         # and not a moment longer when the build raises.
         ev_render.release()
+    whole = "<style>" + SHELL_STYLE + "</style>"
+    if whole in body:
+        markup = body.replace(whole, "", 1)
+        body = body.replace(whole, "<style>" + _page_style(markup) + "</style>", 1)
     return (
         '<!DOCTYPE html>\n<html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1"></head><body>\n'

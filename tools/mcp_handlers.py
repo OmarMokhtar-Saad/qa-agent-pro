@@ -12259,6 +12259,7 @@ async def handle_mobile_test(
     locale: str = "",
     capture: str = "",
     capture_ack: bool = False,
+    reset_app: bool = False,
     charter: str = "",
     *,
     choose: ChooseCb = None,
@@ -12489,6 +12490,22 @@ async def handle_mobile_test(
             )
             if app_stage:
                 return app_stage
+            if target:
+                # D3: bring the confirmed app to the foreground before the
+                # preflight/first packet, so the first screen shown is the
+                # app the tester asked to test rather than whatever the
+                # emulator already had up -- matters most for
+                # `installed_package`, whose app never goes through an
+                # install step that would have launched it. Best-effort: a
+                # launch failure here is not fatal, preflight still runs.
+                from tools.mobile import adb as mobile_adb
+
+                await mobile_adb.launch(serial, target)
+            reset_stage, reset_result = await _mobile_reset_app_stage(
+                serial, target, reset_app, apply
+            )
+            if reset_stage:
+                return reset_stage
             checked = await session.preflight_for({"package": target, "serial": serial})
             if checked.get("error"):
                 return "⚠️ " + _safe(checked["error"], 300)
@@ -12530,6 +12547,7 @@ async def handle_mobile_test(
                 new_run=new_run,
                 locale=locale_taken,
                 capture=capture_result,
+                reset_app=reset_result,
             )
             return reply
         finally:
@@ -12585,11 +12603,24 @@ async def _mobile_pick_source(
 
     given = str(source or "").strip()
     if given:
-        return mobile_render.source_for_label(given)
+        matched = mobile_render.source_for_label(given)
+        if matched:
+            return matched
+        # `given` may be answering a DIFFERENT question that already consumed
+        # it earlier in this same call -- e.g. `source="installed_package"`
+        # is a valid INSTALL-menu key, `_mobile_app_stage` already used it,
+        # and it matches no RUN-menu key here. Falling straight to "ask"
+        # ignored `goal`/`cases`/`suite_id` even when one of them already
+        # named the run lane -- the D3 field defect. Fall through to the
+        # implied-sources check instead of treating this as a bad answer.
     implied = mobile_render.implied_sources(suite_id=suite_id, goal=goal, cases=cases)
     if len(implied) == 1:
         return implied[0]
     if implied:
+        return ""
+    if given:
+        # No implied source either, and `given` matched no run-menu key: ask,
+        # same as the original behaviour for a genuinely unmatched answer.
         return ""
     picked = await _elicit_choice(
         choose, "What should the emulator run?", mobile_render.source_labels()
@@ -12818,6 +12849,54 @@ async def _mobile_locale_stage(serial: str, locale: str, apply: bool) -> tuple:
             None,
         )
     return "", record
+
+
+async def _mobile_reset_app_stage(
+    serial: str, package: str, reset_app: bool, apply: bool
+) -> tuple:
+    """Wipe THIS run's own app before its first packet.
+
+    ``(markdown_or_empty, record_or_none)`` -- the same shape
+    `_mobile_locale_stage`/`_mobile_capture_stage` return, and gated on
+    `apply` alone for the same reason: this runs after `_mobile_app_stage`
+    confirms `package` but still before `session.preflight_for`, so no
+    device screen exists yet for the destructive guard to judge. There is no
+    "actuated node" here any more than there is for locale or capture, so
+    `apply=true` plus the confirmed, run-scoped `package` IS the guard
+    equivalent at this point in the flow -- exactly as it already is for
+    those two stages. `qa_submit_mobile_step`'s `clear_app_data` op is the
+    SAME primitive (`adb.clear_app_data` then `adb.launch`), guarded by the
+    ordinary destructive-guard check instead, because a script action runs
+    against a device that already has a screen to judge it against.
+
+    A clear failure returns a refusal here and nothing else: the caller must
+    return this stage's markdown straight back and never reach
+    `preflight_for`, so a run is never planned against an app this call
+    could not actually reset.
+    """
+    if not reset_app:
+        return "", None
+    from tools.mobile import render as mobile_render
+
+    if not apply:
+        return (
+            mobile_render.apply_refusal(
+                "Resetting the app's data",
+                "pm clear on this run's own app, then relaunching it",
+            ),
+            None,
+        )
+    from tools.mobile import adb as mobile_adb
+
+    cleared = await mobile_adb.clear_app_data(serial, package)
+    if cleared.get("error"):
+        return (
+            "\u26a0\ufe0f Could not reset the app's data: "
+            + wrap_untrusted("device_pm_clear", str(cleared["error"]), limit=400),
+            None,
+        )
+    await mobile_adb.launch(serial, package)
+    return "", {"requested": True, "package": str(package or ""), "cleared": True}
 
 
 def offer_capture(serial: str) -> bool:
@@ -13101,6 +13180,7 @@ async def _mobile_start(
     new_run: bool = False,
     locale: object = None,
     capture: object = None,
+    reset_app: object = None,
 ) -> tuple:
     """Turn a start-menu choice into a planned run and its first packet.
 
@@ -13196,6 +13276,7 @@ async def _mobile_start(
             device=device_facts,
             locale=locale,
             capture=capture,
+            reset_app=reset_app,
         )
         if planned.get("error"):
             return "\u26a0\ufe0f " + _safe(planned["error"], 300), False
@@ -13280,6 +13361,7 @@ async def _mobile_start(
         device=device_facts,
         locale=locale,
         capture=capture,
+        reset_app=reset_app,
     )
     if planned.get("error"):
         return "\u26a0\ufe0f " + _safe(planned["error"], 400), False

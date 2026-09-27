@@ -310,6 +310,11 @@ class Context:
 #: behaviourally by the parametrised guard test in tests/mobile, which drives
 #: every op in the vocabulary against a destructive control and fails on an op
 #: it has never seen.
+#: `clear_app_data` is deliberately NOT in this set: a whole-app wipe needs
+#: the guard exactly like a tap or a type does, even though it names no
+#: on-screen node. See `actions.action_text`'s `clear_app_data` branch, which
+#: hands the guard a fixed destructive-lexicon phrase instead of an element
+#: label -- there is no node to derive one from.
 NON_ACTUATING_OPS: frozenset[str] = frozenset({"assert", "done", "ask_tester"})
 
 
@@ -2787,6 +2792,15 @@ async def _perform(
     if op == "launch":
         if not ctx.package:
             return {"error": "No app package is set for this run.", "content": None}
+        return await adb.launch(serial, ctx.package)
+    if op == "clear_app_data":
+        # Only ever THIS run's own package -- `ctx.package`, never a value
+        # read off the script, so a plan cannot name a different app to wipe.
+        if not ctx.package:
+            return {"error": "No app package is set for this run.", "content": None}
+        cleared = await adb.clear_app_data(serial, ctx.package)
+        if cleared.get("error"):
+            return cleared
         return await adb.launch(serial, ctx.package)
     if op == "open_url":
         return await adb.open_url(serial, str(getattr(action, "url", "")))

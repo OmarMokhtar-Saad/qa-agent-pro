@@ -224,7 +224,6 @@
     border:1px solid var(--line-soft);padding:1px 5px;border-radius:3px;
   }
   .clip.lazy{opacity:.75;font-style:italic}
-  .visually-hidden{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
   /* The page opens with a sticky bar, a four-item nav and a theme switch, and inside
      the explorer a toolbar as well. Without this a keyboard reader tabs through all of
      it before reaching a word of the report. */
@@ -268,9 +267,24 @@
   }
   .themeswitch button:hover{color:var(--accent);background:var(--panel-2)}
   .themeswitch button[aria-pressed="true"]{background:var(--accent);color:var(--on-accent);font-weight:600}
+  /* A phone keeps the section nav: a second row of the bar that scrolls sideways
+     rather than wrapping, so the bar is always the height --bar-h says it is. */
   @media (max-width:760px){
-    .appbar-in{padding:0 16px;gap:12px}
-    .sectnav{display:none}
+    :root{--bar-h:92px}
+    .appbar-in{
+      padding:0 16px;
+      display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-rows:52px 40px;
+      gap:0 12px;align-items:center;
+    }
+    .appbar .spacer{display:none}
+    .brand{min-width:0;overflow:hidden;text-overflow:ellipsis}
+    .sectnav{
+      grid-column:1/-1;grid-row:2;align-self:stretch;align-items:center;
+      margin:0 -16px;padding:0 12px 4px;overflow-x:auto;overscroll-behavior-x:contain;
+      scrollbar-width:none;
+    }
+    .sectnav::-webkit-scrollbar{display:none}
+    .sectnav a{flex:0 0 auto;white-space:nowrap}
     .brand span{display:none}
     .wrap{padding:24px 16px 80px}
   }
@@ -286,7 +300,6 @@
     font-size:clamp(2rem,4.6vw,2.9rem);line-height:1.08;margin:0 0 14px;
     text-wrap:balance;letter-spacing:-.015em;
   }
-  .standfirst{font-size:1.1rem;color:var(--ink-2);max-width:64ch;margin:0}
   .meta{
     display:flex;flex-wrap:wrap;gap:8px 22px;margin-top:22px;
     font-family:"IBM Plex Mono",monospace;font-size:.75rem;color:var(--ink-3);
@@ -304,6 +317,10 @@
     font-family:"IBM Plex Serif",Georgia,serif;font-size:1.5rem;font-weight:600;
     margin:0;letter-spacing:-.01em;
   }
+  /* A section drawn inside a Diagnostics part: one level down, and no top gap -- the
+     part's own summary is the break. */
+  .diagbody>section{margin-top:0}
+  .sechead h3{font-size:1.15rem;font-weight:600;margin:0}
   .lede{color:var(--ink-2);margin:0 0 22px;max-width:70ch}
   p{max-width:70ch}
 
@@ -350,11 +367,6 @@
   .kd a,.kd button{all:unset;cursor:pointer;color:var(--accent);border-bottom:1px dotted var(--accent);font:inherit}
   .kd a:hover,.kd button:hover{border-bottom-style:solid}
   .kd a:focus-visible,.kd button:focus-visible{outline:2px solid var(--focus)}
-  .kv.c-pass{color:var(--pass)}
-  .kv.c-def{color:var(--defect)}
-  .kv.c-gap{color:var(--gap)}
-  .kv.c-void{color:var(--void)}
-  .kv.c-acc{color:var(--accent)}
   .kpis.run{margin-top:12px}
   .kpis.run .kpi{padding:12px 14px 11px}
   .kpis.run .kv{font-size:1.3rem}
@@ -387,8 +399,6 @@
   .rtrack>i{display:block;height:100%;border-radius:3px}
   .rval{font-family:"IBM Plex Mono",monospace;font-size:.78rem;color:var(--ink);
     font-variant-numeric:tabular-nums}
-
-  .bars{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px;margin-top:12px}
   figure.seg{
     margin:0;background:var(--panel);border:1px solid var(--line);border-radius:10px;
     padding:16px 18px 14px;box-shadow:var(--shadow);min-width:0;
@@ -425,7 +435,6 @@
   .sw.gap{background:var(--gap)}
   .sw.def{background:var(--defect)}
   .sw.void{background:var(--void)}
-  .sw.mix{background:var(--accent)}
 
   /* ── callouts ─────────────────────────────────────────────────────────── */
   .note{
@@ -469,13 +478,6 @@
   .score{font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums;white-space:nowrap;
     display:flex;align-items:center;gap:10px;min-width:118px}
   .score b{font-weight:600;min-width:52px}
-  .meter{flex:1;height:6px;border-radius:3px;background:var(--panel-3);overflow:hidden;min-width:48px}
-  .meter i{display:block;height:100%;background:var(--pass);border-radius:3px}
-  .tri{display:flex;gap:2px;height:8px;border-radius:3px;overflow:hidden;width:96px;background:var(--panel-3);flex:none}
-  .tri i{display:block;height:100%}
-  .tricell{display:flex;align-items:center;gap:10px;font-family:"IBM Plex Mono",monospace;font-size:.74rem;
-    color:var(--ink-2);white-space:nowrap;font-variant-numeric:tabular-nums}
-  .tricell .n{color:var(--ink-3);font-style:italic}
   .goto{font-family:"IBM Plex Mono",monospace;font-size:.72rem;color:var(--accent);white-space:nowrap;opacity:.7}
   tr:hover .goto{opacity:1}
 
@@ -489,19 +491,12 @@
   .p-def{background:var(--defect-soft);color:var(--defect)}
   .p-mix{background:var(--accent-soft);color:var(--accent)}
   .p-void{background:var(--void-soft);color:var(--void)}
-  .pill.outline{background:transparent;border:1px solid currentColor}
 
 
 
   /* -- the governance panel ----------------------------------------------- */
   /* A meter's colour is the ANSWER, not decoration: at the cap it is the defect colour,
      because a run that reached its budget did not finish -- it was stopped. */
-  .meter.m-near i{background:var(--gap)}
-  .meter.m-full i{background:var(--defect)}
-  .erow.gauge{display:flex;align-items:center;gap:10px}
-  .gnum{font-family:"IBM Plex Mono",monospace;font-size:.78rem;font-variant-numeric:tabular-nums;
-    color:var(--ink-2);white-space:nowrap;flex:none}
-  .gnum i{color:var(--ink-3);font-style:normal}
   /* A short labelled note that rides a sequence row -- a guard's reason, a degraded-mode
      branch. Wide, because the text IS the finding and truncating it loses the point. */
   .chipnote{display:inline-flex;align-items:baseline;gap:7px;flex-basis:100%;
@@ -521,15 +516,6 @@
   .hist figcaption b{font-size:.94rem}
   .hist figcaption span{font-size:.76rem;color:var(--ink-3)}
   .hist svg{display:block;width:100%;height:132px}
-  .hb rect{fill:var(--accent);transition:fill .12s ease}
-  .hb rect.hit{fill:transparent;cursor:pointer}
-  .hb-fast rect{fill:var(--pass)}
-  .hb-ok rect{fill:var(--gap)}
-  .hb-slow rect{fill:var(--defect)}
-  .hb:hover rect,.hb:focus-visible rect{fill:var(--accent)}
-  .hb:focus-visible{outline:2px solid var(--focus)}
-  .hax{stroke:var(--line);stroke-width:1}
-  .ht{fill:var(--ink-3);font-family:"IBM Plex Mono",monospace;font-size:10px}
   .sw-lat-fast{background:var(--pass)}
   .sw-lat-ok{background:var(--gap)}
   .sw-lat-slow{background:var(--defect)}
@@ -542,12 +528,6 @@
   .kpi:has(.kv-gap){background:transparent;border-style:dashed;box-shadow:none}
   /* Waterfall bars: width is proportional to a MEASURED duration. A row with no measured
      duration gets no bar at all -- a zero-width bar would be a measurement of zero. */
-  .wf{width:46%;min-width:120px}
-  .wfbar{display:block;height:8px;border-radius:4px;background:var(--accent)}
-  .wf-llm{background:var(--accent)}
-  .wf-api{background:var(--gap)}
-  .wf-tool{background:var(--pass)}
-  .wf-wall{background:var(--void)}
   .seqbar{display:block;width:88px;height:6px;border-radius:3px;background:var(--accent-soft);
     align-self:start;margin-top:8px;flex:none}
   .seqbar i{display:block;height:6px;border-radius:3px;background:var(--accent)}
@@ -630,7 +610,10 @@
   .noresults div{margin-top:10px}
 
   /* ── case card ────────────────────────────────────────────────────────── */
-  .cases{display:grid;gap:9px}
+  /* minmax(0,1fr), not auto: an auto track is as wide as a card's widest
+     content, and the coverage table's min-width made every card 1017px wide
+     on a phone. Its .tablewrap scrolls instead. */
+  .cases{display:grid;grid-template-columns:minmax(0,1fr);gap:9px}
   details.case{
     background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow);
     transition:border-color .14s ease,box-shadow .14s ease;border-left-width:4px;border-left-style:solid;
@@ -680,17 +663,11 @@
     border-radius:99px;background:var(--panel-2);border:1px solid var(--line-soft)}
   .m b{color:var(--ink);font-weight:700;font-variant-numeric:tabular-nums;font-size:.78rem}
   .m i{color:var(--ink-2);font-style:normal;font-size:.66rem;letter-spacing:.06em;text-transform:uppercase}
-  .m.tin b{color:var(--code-num)}
-  .m.tout b{color:var(--accent)}
-  .m.ttot{background:var(--panel-3)}
   .m.warn{background:var(--gap-soft);border-color:var(--gap)}
   .m.warn b,.m.warn i{color:var(--gap)}
   .m.cost{background:var(--accent-soft);border-color:var(--accent)}
   .m.cost b{color:var(--accent)}
   .m.base b{font-weight:600}
-  .m.base.b-pass b{color:var(--pass)}
-  .m.base.b-fail b{color:var(--defect)}
-  .m.base.b-und b{color:var(--void)}
   .m.none{font-style:italic;color:var(--ink-3);font-size:.7rem;padding:2px 9px}
   .msep{width:1px;height:13px;background:var(--line);flex:none}
   details.case[open] > summary .m{background:var(--panel)}
@@ -701,18 +678,12 @@
 
   /* Contract checks: the grader's evidence, one line per check. */
   .grade{margin:0 0 18px;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--panel)}
-  .grade.g-fail{border-color:var(--defect)}
-  .grade.g-pass{border-color:var(--pass)}
   .gh{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:9px 13px;background:var(--panel-2);border-bottom:1px solid var(--line-soft)}
   .gh .label{margin-right:auto}
-  .gwhy{padding:9px 13px;margin:0;font-size:.9rem;color:var(--ink);border-bottom:1px solid var(--line-soft);max-width:none}
-  .gwhy b{font-family:"IBM Plex Mono",monospace;font-size:.68rem;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-3);margin-right:6px}
   ul.checks{list-style:none;margin:0;padding:4px 0}
   ul.checks li{display:grid;grid-template-columns:auto auto minmax(0,1fr);gap:10px;align-items:baseline;padding:6px 13px;font-size:.86rem}
   ul.checks .ck{font-family:"IBM Plex Mono",monospace;font-size:.78rem;font-weight:600;color:var(--ink)}
   ul.checks .cd{color:var(--ink-2);overflow-wrap:anywhere;font-family:"IBM Plex Mono",monospace;font-size:.76rem}
-  ul.checks .ckhow{grid-column:2/-1;font-size:.72rem;color:var(--ink-3);font-style:italic}
-  .ckdoc{margin:0;font-size:.8rem;color:var(--ink-2);max-width:74ch}
 
 
   /* ── on-screen preview (phone) ────────────────────────────────────────── */
@@ -762,10 +733,6 @@
     --ph-info-fill:var(--panel-3);
     --ph-frame:var(--ink);
   }
-  @media (max-width:960px){
-    .cbody-top{grid-template-columns:minmax(0,1fr);gap:20px}
-    .cbody-top .phone-col{max-width:392px;margin:0 auto}
-  }
   /* The reconstruction and the real screen, side by side so they can be compared
      rather than described. Wraps on a narrow viewport. */
   .phonepair{display:flex;gap:18px;flex-wrap:wrap;align-items:flex-start}
@@ -776,18 +743,12 @@
      strip of one phone per turn: the device shows a case as a single scroll, and reading a
      conversation sideways across four frames of repeated chrome was the wrong picture. */
   .phonewide{margin:0 0 22px}
-  .phonewide .phone-col{max-width:392px;margin:0 auto}
+  .phonewide .phone-col{max-width:min(392px,100%);min-width:0;margin:0 auto}
   /* A completed step, as the app draws it: a chip, not a sentence. */
   .ph-chip{display:inline-block;padding:5px 11px;border-radius:999px;background:var(--ph-surface);
     border:1px solid var(--ph-border);color:var(--ph-muted);font-size:.78rem;margin:0 2px 4px 0}
   /* Where the opening screen ends and the conversation begins. */
-  .ph-rule{display:flex;align-items:center;gap:10px;margin:4px 2px;justify-content:center;
-    color:var(--ph-muted);font-size:.72rem;text-align:center}
-  .ph-rule::before,.ph-rule::after{content:"";flex:1;height:1px;background:var(--ph-divider)}
   /* The memory offer's two buttons are a row of actions, not two things Sara said. */
-  .ph-acts{display:flex;gap:18px;justify-content:flex-start;padding:9px 14px 11px;border-top:1px solid var(--ph-divider)}
-  .ph-acts b{font-weight:700;font-size:.9rem;color:var(--ph-accent)}
-  .ph-acts b:last-child{color:var(--ph-muted);font-weight:600}
   .phone-col h4{font-family:"IBM Plex Mono",monospace;font-size:.7rem;letter-spacing:.1em;text-transform:uppercase;
     color:var(--ink-3);margin:0 0 9px;font-weight:600;display:flex;align-items:center;gap:8px}
   .phone{
@@ -810,19 +771,8 @@
     justify-content:center;background:var(--ph-accent);color:var(--ph-on-brand);
     font-size:.72rem;font-weight:700;font-style:normal;
   }
-  .ph-lang{
-    display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;
-    border:1px solid var(--ph-border);background:var(--ph-surface);color:var(--ph-text-2);
-    font-size:.74rem;font-weight:600;white-space:nowrap;
-  }
-  .ph-lang i{font-style:normal;font-size:.6rem;color:var(--ph-muted)}
   .ph-brand{display:inline-flex;align-items:center;gap:7px;font-weight:700;color:var(--ph-accent)}
   /* Sara's mark. It was a bare 9px dot when the bar was a caption rather than an app-bar. */
-  .ph-dot{
-    width:22px;height:22px;border-radius:50%;flex:none;display:flex;align-items:center;
-    justify-content:center;background:var(--ph-accent-soft);color:var(--ph-accent);
-    font-size:.7rem;font-weight:700;font-style:normal;
-  }
   .ph-ico{color:var(--ph-text-2);font-size:1rem;line-height:1;flex:none;font-style:normal}
   .ph-ico.kebab{margin-inline-start:auto}
   .ph-scroll{
@@ -865,7 +815,6 @@
   .ph-row:first-child,.ph-opt:first-child{border-top:none}
   .ph-rowmain{flex:1;min-width:0}
   .ph-t{font-weight:600;font-size:.92rem;overflow-wrap:anywhere}
-  .ph-sub{color:var(--ph-muted);font-size:.8rem;margin-top:1px;overflow-wrap:anywhere}
   .ph-chip{
     flex:none;font-size:.72rem;font-weight:650;padding:3px 9px;border-radius:999px;
     background:var(--ph-surface);border:1px solid var(--ph-border);color:var(--ph-muted);white-space:nowrap;
@@ -873,130 +822,14 @@
   .ph-chip.ok{background:var(--ph-ok-fill);color:var(--ph-ok);border-color:transparent}
   .ph-chip.warn{background:var(--ph-warn-fill);color:var(--ph-warn);border-color:transparent}
   .ph-chip.bad{background:var(--ph-bad-fill);color:var(--ph-bad);border-color:transparent}
-  .ph-more{padding:11px 14px;border-top:1px solid var(--ph-divider);color:var(--ph-accent);font-weight:650;font-size:.88rem;display:flex;justify-content:space-between}
-  .ph-more i,.ph-opt i{font-style:normal;color:var(--ph-muted);font-size:1.1rem;line-height:1}
+  .ph-opt i{font-style:normal;color:var(--ph-muted);font-size:1.1rem;line-height:1}
   .ph-empty{padding:12px 14px;color:var(--ph-muted);font-size:.85rem;font-style:italic}
-  .ph-div{height:1px;background:var(--ph-divider)}
-  .ph-foot{padding:8px 14px 11px;color:var(--ph-muted);font-size:.78rem}
-
-  .ph-tiles{display:flex;gap:8px}
-  .ph-tiles.scroll{overflow-x:auto;padding-bottom:4px}
-  .ph-tile{flex:1 1 0;min-width:0;background:var(--ph-surface);border:1px solid var(--ph-border);border-radius:14px;padding:10px 12px}
-  .ph-tiles.scroll .ph-tile{flex:0 0 132px}
-  .ph-tl{color:var(--ph-muted);font-size:.74rem;font-weight:600}
-  .ph-tv{font-weight:700;font-size:1.15rem;line-height:1.25;margin-top:2px;overflow-wrap:anywhere;color:var(--ph-text)}
-  .ph-tv.ok{color:var(--ph-ok)}.ph-tv.warn{color:var(--ph-warn)}.ph-tv.bad{color:var(--ph-bad)}
-  .ph-unit{font-size:.72rem;font-weight:500;color:var(--ph-muted);margin-inline-start:4px}
-  .ph-trend{font-size:.85rem;margin-inline-start:4px}
-
-  .ph-tablewrap{overflow-x:auto}
-  .ph-table{width:100%;border-collapse:collapse;font-size:.84rem}
-  .ph-table th{color:var(--ph-muted);font-weight:600;font-size:.74rem;text-align:start;padding:9px 10px;border-bottom:1px solid var(--ph-divider);white-space:nowrap}
-  .ph-table td{padding:8px 10px;border-bottom:1px solid var(--ph-divider);vertical-align:top;overflow-wrap:anywhere}
-  .ph-table tbody tr:nth-child(even) td{background:var(--ph-accent-soft)}
-  .ph-table tbody tr:last-child td{border-bottom:none}
-
-  .ph-callout{border-radius:14px;padding:10px 12px;border-inline-start:4px solid var(--ph-info);background:var(--ph-info-fill);color:var(--ph-text)}
-  .ph-callout.tip{border-color:var(--ph-accent);background:var(--ph-accent-soft)}
-  .ph-callout.warning{border-color:var(--ph-warn);background:var(--ph-warn-fill)}
-  .ph-callout.success{border-color:var(--ph-ok);background:var(--ph-ok-fill)}
-  .ph-ct{font-weight:700;font-size:.88rem;margin-bottom:2px}
-  .ph-cx{font-size:.88rem;overflow-wrap:anywhere}
-
-  .ph-actions{display:flex;flex-wrap:wrap;gap:8px}
-  .ph-actions.confirm{padding:10px 14px 12px}
-  .ph-actions.confirm .ph-btn{flex:1;text-align:center}
-  .ph-btn{
-    display:inline-block;padding:10px 16px;border-radius:12px;background:var(--ph-surface);
-    border:1px solid var(--ph-border);color:var(--ph-accent);font-weight:650;font-size:.88rem;min-width:44px;min-height:40px;
-  }
-  .ph-btn.primary{background:var(--ph-accent);color:var(--ph-on-brand);border-color:transparent}
-  .ph-btn.chip{border-radius:999px;background:var(--ph-chip-fill);color:var(--ph-chip-text);border-color:var(--ph-chip-border);padding:7px 13px;min-height:0}
-  .ph-btn:empty::after{content:"\00a0";}
-
-  .ph-kv{display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:8px 14px;border-top:1px solid var(--ph-divider);font-size:.88rem}
-  .ph-kv:first-child,.ph-title + .ph-kv{border-top:none}
-  .ph-kv span{color:var(--ph-muted)}
-  .ph-kv b{font-weight:650;text-align:end;overflow-wrap:anywhere}
 
   .ph-opt{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 14px;border-top:1px solid var(--ph-divider);font-weight:600;font-size:.9rem}
   .ph-opt span{display:grid;gap:1px;min-width:0}
   .ph-opt small{font-weight:400;color:var(--ph-muted);font-size:.78rem}
-  .ph-receipts{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
-  .ph-receipt{
-    display:inline-flex;align-items:baseline;gap:5px;padding:4px 10px;border-radius:999px;font-size:.78rem;font-weight:600;
-    background:var(--ph-chip-fill);color:var(--ph-chip-text);border:1px solid var(--ph-chip-border);
-  }
-  .ph-receipt small{font-weight:400;opacity:.8;font-size:.7rem}
-
-  .ph-steps{display:grid;gap:0;padding:6px 14px 10px}
-  .ph-step{display:flex;align-items:center;gap:10px;padding:6px 0;font-size:.88rem;position:relative}
-  .ph-step i{width:12px;height:12px;border-radius:50%;border:2px solid var(--ph-border);flex:none;background:var(--ph-surface)}
-  .ph-step.done i{background:var(--ph-ok);border-color:var(--ph-ok)}
-  .ph-step.current i{border-color:var(--ph-accent);box-shadow:0 0 0 3px var(--ph-accent-soft)}
-  .ph-step.current span{font-weight:700}
-  .ph-step.todo span{color:var(--ph-muted)}
-
-  .ph-timeline{display:grid;padding:8px 14px 10px}
-  .ph-tlrow{display:grid;grid-template-columns:auto 12px minmax(0,1fr);gap:10px;align-items:start;padding:5px 0}
-  .ph-tltime{font-size:.74rem;color:var(--ph-muted);font-variant-numeric:tabular-nums;padding-top:2px}
-  .ph-tlrow i{width:10px;height:10px;border-radius:50%;background:var(--ph-muted);margin-top:5px}
-  .ph-tlrow i.ok{background:var(--ph-ok)}.ph-tlrow i.warn{background:var(--ph-warn)}.ph-tlrow i.bad{background:var(--ph-bad)}
-
-  .ph-bars{display:flex;align-items:flex-end;gap:8px;height:140px;padding:10px 14px 12px}
-  .ph-bar{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%;gap:4px;min-width:0}
-  .ph-bar b{font-size:.72rem;font-weight:650}
-  .ph-bar i{display:block;width:100%;max-width:38px;border-radius:6px 6px 3px 3px;background:linear-gradient(180deg,var(--ph-accent),var(--ph-user-bot))}
-  .ph-bar i.warn{background:linear-gradient(180deg,var(--ph-warn),#7a4706)}
-  .ph-bar i.bad{background:linear-gradient(180deg,var(--ph-bad),#7f1a12)}
-  .ph-bar span{font-size:.72rem;color:var(--ph-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
-
-  .ph-sparkhead{display:flex;align-items:baseline;gap:8px;padding:10px 14px 0}
-  .ph-sparkhead .ph-title{padding:0;flex:1}
-  .ph-sparkhead b{font-size:1.05rem}
-  .ph-sparkhead small{color:var(--ph-muted);font-weight:500;font-size:.72rem}
-  .ph-spark{display:block;width:100%;height:64px;padding:6px 14px 10px}
-  .ph-sparkfill{fill:var(--ph-accent);fill-opacity:.15}
-  .ph-sparkline{fill:none;stroke:var(--ph-accent);stroke-width:2;stroke-linejoin:round;stroke-linecap:round;vector-effect:non-scaling-stroke}
-  .ph-sparkdot{fill:var(--ph-accent);stroke:var(--ph-surface);stroke-width:2}
-
-  .ph-img{border-radius:14px;background:linear-gradient(135deg,var(--ph-accent-soft),var(--ph-user-bot));display:grid;place-items:center;color:var(--ph-on-brand);font-weight:600}
-  .ph-unknown{padding:10px 14px;border:1px dashed var(--ph-border);border-radius:14px;color:var(--ph-muted);font-size:.84rem}
-  .ph-note{
-    font-family:"IBM Plex Mono",monospace;font-size:.7rem;line-height:1.5;color:var(--gap);
-    background:var(--gap-soft);border:1px solid var(--gap);border-radius:8px;padding:6px 9px;margin-top:-2px;
-    direction:ltr;text-align:left;
-  }
-  .ph-note code{background:transparent;border:none;padding:0}
 
   /* render_html: the sa-* design system the WebView shell injects, scoped to the fragment. */
-  .ph-html{background:var(--ph-surface);border:1px solid var(--ph-border);border-radius:16px;padding:12px 14px;font-size:.92rem;overflow:hidden}
-  .ph-html h1,.ph-html h2,.ph-html h3,.ph-html h4{color:var(--ph-text);margin:0 0 10px;line-height:1.3}
-  .ph-html h1{font-size:1.3rem}.ph-html h2{font-size:1.1rem}.ph-html h3{font-size:1rem}.ph-html h4{font-size:.95rem}
-  .ph-html p{margin:0 0 10px;max-width:none}
-  .ph-html ul,.ph-html ol{margin:0 0 12px;padding-inline-start:20px}
-  .ph-html table{width:100%;border-collapse:collapse;margin:0 0 12px}
-  .ph-html th{color:var(--ph-muted);font-weight:600;text-align:start;font-size:.78rem}
-  .ph-html th,.ph-html td{padding:9px 10px;border-bottom:1px solid var(--ph-divider)}
-  .ph-html a{color:var(--ph-accent)}
-  .ph-html a[href^="sa://"]{display:inline-block;padding:11px 18px;margin:4px 6px 2px 0;border-radius:14px;background:var(--ph-accent);color:var(--ph-on-user);text-decoration:none;font-weight:700}
-  .ph-html .sa-title{font-size:1.2rem;font-weight:800;margin:0 0 2px}
-  .ph-html .sa-sub,.ph-html .sa-muted{color:var(--ph-muted);font-size:.82rem;margin:0 0 10px}
-  .ph-html .sa-card{background:var(--ph-surface);border:1px solid var(--ph-border);border-radius:16px;padding:12px 14px;margin:0 0 10px}
-  .ph-html .sa-row{display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:7px 0}
-  .ph-html .sa-row+.sa-row{border-top:1px solid var(--ph-divider)}
-  .ph-html .sa-row b{font-weight:650;text-align:end}
-  .ph-html .sa-badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:.76rem;font-weight:650;background:var(--ph-surface);border:1px solid var(--ph-border)}
-  .ph-html .sa-ok{background:var(--ph-accent-soft);color:var(--ph-accent);border-color:transparent}
-  .ph-html .sa-warn{background:var(--ph-warn-fill);color:var(--ph-warn);border-color:transparent}
-  .ph-html .sa-bad{background:var(--ph-bad-fill);color:var(--ph-bad);border-color:transparent}
-  .ph-html .sa-options{display:flex;flex-direction:column;gap:8px;margin:0 0 10px}
-  .ph-html .sa-options a[href^="sa://"]{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:0;padding:13px 14px;background:var(--ph-surface);color:var(--ph-text);border:1px solid var(--ph-border);border-radius:12px;font-weight:600;text-align:start}
-  .ph-html .sa-selected{outline:2px solid var(--ph-accent);outline-offset:-2px;background:var(--ph-accent-soft)}
-  .ph-html .sa-actions{display:flex;gap:8px;flex-wrap:wrap;margin:2px 0 4px}
-  .ph-html .sa-actions a[href^="sa://"]{flex:1;margin:0;text-align:center}
-  .ph-html a.sa-secondary{background:var(--ph-surface);color:var(--ph-accent);border:1px solid var(--ph-border)}
-  .ph-html .sa-grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:0 0 10px}
   /* ── the rest of the app's sa-* system, mirrored from the SDK ──────────────
      HtmlShell.kt:56-115 builds the stylesheet the app injects into its own WebView. The
      rules below were the ones missing here, and each is the SDK's rule with the palette
@@ -1007,16 +840,7 @@
      The chevron is the visible one. HtmlShell.kt:101-103 puts a muted chevron at the end of
      every option row and FLIPS it for RTL — without it an option row reads as a paragraph,
      which is exactly the "wall of text vs a list" difference the SDK comment at :93-95 is
-     about. */
-  .ph-html li{margin-bottom:6px}                                    /* HtmlShell.kt:67 */
-  .ph-html hr{border:none;border-top:1px solid var(--ph-divider);margin:12px 0}  /* :68 */
-  .ph-html th{text-transform:uppercase;letter-spacing:.04em}        /* HtmlShell.kt:70-71 */
-  .ph-html tbody tr:last-child td{border-bottom:none}               /* HtmlShell.kt:73 */
-  .ph-html h1,.ph-html h2,.ph-html h3,.ph-html h4{letter-spacing:-.01em}  /* :64 */
-  .ph-html .sa-title{letter-spacing:-.01em}                         /* HtmlShell.kt:81 */
-  .ph-html .sa-options a[href^="sa://"]::after{content:'\203A';color:var(--ph-muted);font-weight:400;font-size:18px;line-height:1}  /* HtmlShell.kt:101-102 */
-  .ph-html .sa-options a[href^="sa://"]:dir(rtl)::after{content:'\2039'}  /* HtmlShell.kt:103 */
-  .ph-html *{box-sizing:border-box;max-width:100%}                  /* HtmlShell.kt:112 */
+     about. */                                    /* HtmlShell.kt:67 */  /* :68 */        /* HtmlShell.kt:70-71 */               /* HtmlShell.kt:73 */  /* :64 */                         /* HtmlShell.kt:81 */  /* HtmlShell.kt:101-102 */  /* HtmlShell.kt:103 */                  /* HtmlShell.kt:112 */
 
   /* ── run meta ─────────────────────────────────────────────────────────── */
   .cmeta{display:grid;grid-template-columns:repeat(auto-fit,minmax(0,1fr));gap:20px;padding-top:18px;border-top:1px solid var(--line-soft)}
@@ -1029,29 +853,6 @@
   .estate{display:grid;gap:11px}
   .erow{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap}
   .elab{font-family:"IBM Plex Mono",monospace;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);font-weight:600}
-  .eflow{font-family:"IBM Plex Mono",monospace;font-size:.82rem;color:var(--ink);font-weight:600;overflow-wrap:anywhere}
-  .eft{font-size:.78rem;color:var(--ink-2);overflow-wrap:anywhere}
-  .enone{font-size:.78rem;color:var(--ink-3);font-style:italic}
-  .erail{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
-  .scp{display:inline-flex;align-items:baseline;gap:7px;border:1px solid var(--line);border-radius:4px;padding:3px 9px;background:var(--panel-3);
-    font-family:"IBM Plex Mono",monospace;font-size:.76rem;max-width:100%;overflow-wrap:anywhere}
-  .scp .sk{color:var(--ink-3)}
-  .scp .sv{color:var(--ink);font-weight:600}
-  .scp .sn{font-size:.66rem;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3)}
-  .scp.done{background:var(--pass-soft);border-color:transparent}
-  .scp.done .sk{color:var(--pass)}
-  .scp.now{background:var(--accent-soft);border-color:var(--accent)}
-  .scp.now .sk,.scp.now .sv,.scp.now .sn{color:var(--accent)}
-  .scp.held{background:transparent;border-style:dashed}
-  .epills{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-  .tlstate{display:flex;gap:7px;flex-wrap:wrap;align-items:center;min-width:0}
-
-  .stmark{font-family:"IBM Plex Mono",monospace;font-size:.66rem;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);font-weight:700}
-  .tl.is-start .tlbar{background:var(--line)}
-  .tl.is-end .tlbar{background:var(--accent)}
-  .tl.is-end .stmark{color:var(--accent)}
-  .edet{font-family:"IBM Plex Mono",monospace;font-size:.72rem;color:var(--ink-3);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .cflags{display:flex;gap:7px;flex-wrap:wrap;margin-top:16px}
 
   /* The run sequence: a clock gutter, one row per thing that happened. */
   .seqlist{list-style:none;margin:0;padding:0;display:grid;gap:2px}
@@ -1091,7 +892,7 @@
   .seqfold>summary .seqtx,.seqfold>summary .path,.seqfold>summary .mt{
     white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:0 1 auto}
   .seqfold>summary .badge,.seqfold>summary .exdur,.seqfold>summary .pill,
-  .seqfold>summary .seqx,.seqfold>summary .toks,.seqfold>summary .tldur{flex:none}
+  .seqfold>summary .seqx{flex:none}
   /* The fold: indented to the text column, on the panel tint -- everything the row
      could not say in one line. */
   .seqdetail{margin:4px 0 10px 86px;padding:10px 12px;border-left:2px solid var(--line);
@@ -1101,8 +902,6 @@
     border:1px solid var(--code-line);border-radius:5px;font-size:.74rem;line-height:1.5;
     white-space:pre-wrap;overflow-wrap:anywhere;max-height:340px;overflow:auto}
   .seqfull{margin:0;font-size:.92rem;color:var(--ink);overflow-wrap:anywhere}
-  .dlab{font-family:"IBM Plex Mono",monospace;font-size:.62rem;letter-spacing:.12em;
-    text-transform:uppercase;color:var(--ink-3);font-weight:700}
   .seqdetail .capdesc{display:block;-webkit-line-clamp:unset;line-clamp:unset}
   .seqdetail .inseed{display:block}
   .seqt{font-family:"IBM Plex Mono",monospace;font-size:.72rem;color:var(--ink-3);font-variant-numeric:tabular-nums;padding-top:3px}
@@ -1113,8 +912,7 @@
      it shrinks to whatever is left, wraps its own contents at that width, and centres
      itself vertically against a 20px pill. `.apis` -- the capability panel -- was off
      the list, which is exactly how it drew. */
-  .seqmain>.code,.seqmain>.tlstate,.seqmain>.tltext,.seqmain>.ex,
-  .seqmain>.qrlist,.seqmain>.apis{flex-basis:100%;min-width:0}
+  .seqmain>.code,.seqmain>.ex,.seqmain>.apis{flex-basis:100%;min-width:0}
   /* FIXED WIDTH, so the text after it starts at the same x on every row. This one rule
      is most of the difference between a list and a log. */
   .seqk{font-family:"IBM Plex Mono",monospace;font-size:.6rem;letter-spacing:.1em;
@@ -1197,166 +995,41 @@
      the ones the model actually reached marked, then one disclosure for the rest.
      Chips rather than a comma list: the question a reader brings here is "which of
      these did this case touch", which prose hides and a marked chip answers. */
-  .cappanel{display:grid;gap:10px}
-  .capmeter{display:flex;align-items:center;gap:10px}
-  .capmeter .meter{flex:1 1 auto}
-  .caprow2{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
-  .caplab{flex:0 0 116px;font-family:"IBM Plex Mono",monospace;font-size:.64rem;
-    letter-spacing:.12em;text-transform:uppercase;font-weight:700;color:var(--ink-3);
-    line-height:1.5}
   /* The tool a capability is an argument TO, subordinate to the argument name. */
-  .caplab i{display:block;font-style:normal;font-weight:400;letter-spacing:.06em;
-    text-transform:none;opacity:.75}
-  .capchips{display:flex;flex-wrap:wrap;gap:5px;flex:1 1 220px;min-width:0}
-  .capchip{font-family:"IBM Plex Mono",monospace;font-size:.75rem;color:var(--ink-2);
-    background:var(--panel-2);border:1px solid var(--line-soft);border-radius:5px;
-    padding:2px 8px;display:inline-flex;align-items:center;gap:6px}
-  .capchip.cap{border-style:dashed}
-  .capchip.hot{color:var(--accent);border-color:var(--accent);background:var(--accent-soft);
-    font-weight:600}
-  .capchip i{font-style:normal;font-size:.6rem;letter-spacing:.1em;text-transform:uppercase;
-    opacity:.8}
-  .caprow2.col{align-items:flex-start}
   /* WHAT A TOOL CALL DID, inside the row for that call. Below both panes, because it
      is neither the request nor the response -- it is the work between them. */
   .inside{border-top:1px solid var(--line);padding:11px 14px;display:grid;gap:6px}
-  .inhead{font-family:"IBM Plex Mono",monospace;font-size:.62rem;letter-spacing:.12em;
-    text-transform:uppercase;font-weight:700;color:var(--ink-3)}
-  .inrow{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;min-width:0}
-  .inlab{flex:0 0 76px;font-family:"IBM Plex Mono",monospace;font-size:.62rem;
-    letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3)}
-  .inurl{font-family:"IBM Plex Mono",monospace;font-size:.78rem;color:var(--ink-2);
-    overflow-wrap:anywhere;min-width:0}
-  .inrow .capdesc{flex-basis:100%;-webkit-line-clamp:2}
   /* The values the model handed the flow up front, beside the capability they
      seeded -- a step answered before it was asked is a card the user never saw. */
   .inseed{font-family:"IBM Plex Sans Arabic","IBM Plex Sans",system-ui,sans-serif;
     font-size:.78rem;color:var(--accent);background:var(--accent-soft);
     border-radius:5px;padding:1px 8px}
-  .caprow2.col .exlist{flex:1 1 220px;min-width:0}
   /* A stated absence, in the same slot a chip would have taken. Not a chip: nothing
      was called, and a bordered token saying so reads at a glance like a name. */
-  .capnone{font-size:.82rem;color:var(--ink-3);flex:0 1 auto}
   /* The reason, folded. `why` is one word because the row above it already said what
      is missing and how much of it -- this only has to be findable, not explanatory. */
-  .capwhy{flex:0 0 auto}
-  .capwhy>summary{list-style:none;cursor:pointer;font-family:"IBM Plex Mono",monospace;
-    font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);
-    border-bottom:1px dotted var(--ink-3)}
-  .capwhy>summary::-webkit-details-marker{display:none}
-  .capwhy>summary:hover{color:var(--ink-2)}
-  .capwhytx{flex-basis:100%;margin:6px 0 0;font-size:.82rem;line-height:1.6;
-    color:var(--ink-3);max-width:68ch}
-  .caprow2>.capwhytx{flex-basis:100%}
-
-  .tblock{border-bottom:1px solid var(--line-soft)}
-  .tblock:last-of-type{border-bottom:none}
-  .tblock>summary{list-style:none;cursor:pointer;position:relative;padding-right:64px}
-  .tblock>summary::-webkit-details-marker{display:none}
-  .tnum{position:absolute;top:4px;right:0;font-family:"IBM Plex Mono",monospace;font-size:.66rem;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3)}
-  .tblock[open]>summary .tnum{color:var(--accent)}
   .tbody{padding:4px 0 16px 76px;display:grid;gap:12px}
   .tbody .exlist{display:grid;gap:8px}
-  .tbody .tlist{margin:0}
-
-  .sarabody{display:grid;gap:7px;min-width:0}
-  .qrlist{list-style:none;margin:10px 0 0;padding:9px 0 0;display:grid;gap:1px;border-top:1px solid var(--line)}
-  .qrlist li{display:grid;grid-template-columns:auto minmax(0,1fr);gap:12px;align-items:baseline;padding:6px 0}
-  .qrid{font-family:"IBM Plex Mono",monospace;font-size:.72rem;color:var(--ink-3);min-width:52px}
-  .qrtx{font-size:.9rem;color:var(--ink);overflow-wrap:anywhere;line-height:1.5}
-  .tdh{font-family:"IBM Plex Mono",monospace;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);margin:0;font-weight:600;display:flex;align-items:center;gap:8px}
 
   /* ── run stats / context / log ────────────────────────────────────────── */
   .stats{display:flex;flex-wrap:wrap;gap:1px;background:var(--line);border:1px solid var(--line);border-radius:7px;overflow:hidden;margin-bottom:18px}
   .stat{flex:1 1 96px;background:var(--panel-2);padding:9px 12px;min-width:0}
   .stat .sv{font-family:"IBM Plex Mono",monospace;font-size:.95rem;font-weight:700;color:var(--ink);font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
-  .stat .sl{font-family:"IBM Plex Mono",monospace;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);margin-top:3px}
-  .stat.muted .sv{color:var(--ink-3);font-weight:500;font-size:.78rem}
-
-  .ctxlist{display:grid;gap:6px}
-  .ctxlist > details.sec{border:1px solid var(--line-soft);border-radius:7px;background:var(--panel-2);padding:9px 12px}
-  .ctxlist > details.sec[open]{background:var(--panel);border-color:var(--line)}
   .tools{display:flex;flex-wrap:wrap;gap:6px}
   .tool{font-family:"IBM Plex Mono",monospace;font-size:.77rem;padding:5px 11px;border-radius:99px;background:var(--panel-3);color:var(--ink-2);border:1px solid var(--line)}
   .tool.w{background:var(--defect-soft);color:var(--defect);border-color:var(--defect);font-weight:700}
-  .ctxlist pre{max-height:340px}
-
-  .lgsecs{display:grid;gap:6px}
-  details.lgsec{border:1px solid var(--line-soft);border-radius:7px;background:var(--panel-2);padding:9px 12px}
-  details.lgsec[open]{background:var(--panel);border-color:var(--line)}
-  details.lgsec > summary{margin:0}
-  details.lgsec[open] > summary{margin-bottom:8px}
-  details.lgsec.lg-session > summary{color:var(--ink-3)}
-  details.lgsec.lg-noreply{border-color:var(--gap);background:var(--gap-soft)}
-  .noreply{color:var(--gap);font-weight:700;font-style:normal}
-  .lgk.bind{color:var(--accent)}
-  li.lg.bind{background:var(--panel-2)}
-  ul.lglist{list-style:none;margin:0;padding:0;display:grid;gap:1px;background:var(--code-line);border:1px solid var(--code-line);border-radius:6px;overflow:hidden;max-height:420px;overflow-y:auto}
-  li.lg{display:grid;grid-template-columns:74px minmax(0,1fr);gap:10px;align-items:baseline;background:var(--code-bg);padding:5px 10px}
-  .lgk{font-family:"IBM Plex Mono",monospace;font-size:.68rem;letter-spacing:.09em;text-transform:uppercase;font-weight:700;text-align:right;color:var(--ink-3)}
-  .lgk.req{color:var(--code-num)}
-  .lgk.res{color:var(--code-key)}
-  .lgk.cost{color:var(--gap)}
-  .lgk.auth{color:var(--code-lit)}
-  .lgk.sdk{color:var(--ink-3)}
-  .lgt{font-family:"IBM Plex Mono",monospace;font-size:.76rem;line-height:1.6;color:var(--code-ink);white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
-  li.lg.cont .lgt{color:var(--ink-3);padding-left:10px}
-  li.lg.cost .lgt{color:var(--gap);font-weight:600}
-  li.lg.req,li.lg.res{background:var(--code-bar)}
-  pre.tlflat{margin:0;padding:9px 11px;background:var(--code-bg);color:var(--code-ink);border:1px solid var(--code-line);border-radius:5px;
-    font-family:"IBM Plex Mono",monospace;font-size:.77rem;white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow-y:auto}
 
   /* ── tool timeline ────────────────────────────────────────────────────── */
-  ul.tlist{list-style:none;margin:0;padding:0;display:grid;gap:7px}
-  li.tl{display:grid;grid-template-columns:3px minmax(0,1fr);gap:11px;background:var(--panel-2);border:1px solid var(--line-soft);border-radius:7px;padding:10px 12px 10px 0;overflow:hidden}
-  .tlbar{background:var(--ink-3);border-radius:0 2px 2px 0}
-  li.k-pass .tlbar{background:var(--pass)}
-  li.k-fail .tlbar{background:var(--defect)}
-  li.await .tlbar{background:var(--gap)}
-  li.k-unknown .tlbar{background:var(--ink-3)}
-  .tlmain{min-width:0;display:grid;gap:8px}
-  .tlhead{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
   .tlname{font-family:"IBM Plex Mono",monospace;font-size:.88rem;font-weight:700;color:var(--ink)}
   .kind{font-family:"IBM Plex Mono",monospace;font-size:.68rem;letter-spacing:.08em;text-transform:uppercase;font-weight:700;padding:2px 8px;border-radius:99px}
   .kind.k-pass{background:var(--panel);color:var(--pass);border:1px solid var(--pass)}
   .kind.k-fail{background:var(--panel);color:var(--defect);border:1px solid var(--defect)}
   .exdur{font-family:"IBM Plex Mono",monospace;font-size:.72rem;color:var(--ink-2);font-variant-numeric:tabular-nums;flex:none;margin-left:auto;padding-right:4px}
   .exhost{color:var(--ink-3);opacity:.85}
-  .tldur{margin-left:auto;font-family:"IBM Plex Mono",monospace;font-size:.74rem;color:var(--ink-2);font-variant-numeric:tabular-nums}
-  .tlsec{display:grid;gap:5px;min-width:0}
-  .tllab{font-family:"IBM Plex Mono",monospace;font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);font-weight:600}
-  ul.tlapi{list-style:none;margin:0;padding:0;display:grid;gap:3px}
-  ul.tlapi li{font-family:"IBM Plex Mono",monospace;font-size:.77rem;color:var(--ink);overflow-wrap:anywhere;padding-left:13px;position:relative;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-  ul.tlapi li::before{content:"→";position:absolute;left:0;color:var(--accent)}
-  details.tltext > summary{cursor:pointer;font-family:"IBM Plex Mono",monospace;font-size:.68rem;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-3);font-weight:600;display:flex;align-items:center;gap:7px}
-  details.tltext > summary:hover{color:var(--accent)}
-  details.tltext pre{margin:6px 0 0;padding:9px 11px;background:var(--code-bg);color:var(--code-ink);border:1px solid var(--code-line);border-radius:5px;
-    font-family:"IBM Plex Mono",monospace;font-size:.77rem;white-space:pre-wrap;overflow-wrap:anywhere;max-height:220px;overflow-y:auto}
-
-  .llmrow .exhead{cursor:default}
-  .llmrow.noans .exhead{opacity:.85}
   .v-llm{color:var(--accent);border-color:var(--accent);background:var(--accent-soft)}
   .v-none{color:var(--gap);border-color:var(--gap);background:var(--gap-soft)}
-  .toks{margin-left:auto;display:inline-flex;align-items:baseline;gap:4px;flex:none;font-family:"IBM Plex Mono",monospace;font-size:.74rem;color:var(--ink);font-variant-numeric:tabular-nums}
-  .toks i{font-style:normal;font-size:.68rem;color:var(--ink-3);letter-spacing:.06em;text-transform:uppercase;margin-right:6px}
-  ul.tlist2{list-style:none;margin:0;padding:0;display:grid;gap:4px}
-  li.trow{display:flex;align-items:center;gap:9px;padding:7px 11px;border-radius:6px;border:1px solid var(--line-soft);background:var(--panel-2)}
-  li.trow.tidle{opacity:.72}
-  li.trow.tused{border-left:3px solid var(--accent)}
-  .tname{font-family:"IBM Plex Mono",monospace;font-size:.79rem;font-weight:600;color:var(--ink);flex:1;min-width:0;overflow-wrap:anywhere}
-  .twrite{font-family:"IBM Plex Mono",monospace;font-size:.66rem;letter-spacing:.08em;text-transform:uppercase;font-weight:700;color:var(--defect);background:var(--defect-soft);border:1px solid var(--defect);padding:1px 7px;border-radius:99px;flex:none}
   .tn{font-family:"IBM Plex Mono",monospace;font-size:.68rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);flex:none}
-  .tkind{font-family:"IBM Plex Mono",monospace;font-size:.68rem;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-3);flex:none}
-  .tcap{font-family:"IBM Plex Mono",monospace;font-size:.74rem;font-weight:600;color:var(--accent);background:var(--accent-soft);border:1px solid var(--accent);padding:2px 9px;border-radius:99px;flex:none}
-  .cpath{flex:1;min-width:0;overflow-wrap:anywhere}
-  .crep{font-family:"IBM Plex Mono",monospace;font-size:.68rem;letter-spacing:.06em;text-transform:uppercase;font-weight:700;color:var(--gap);background:var(--gap-soft);border:1px solid var(--gap);padding:1px 7px;border-radius:99px;flex:none}
-  .cdur{font-family:"IBM Plex Mono",monospace;font-size:.72rem;color:var(--ink-2);font-variant-numeric:tabular-nums;flex:none}
-
-  ul.caplist{list-style:none;margin:0;padding:0;display:grid;gap:4px}
-  li.caprow{display:flex;align-items:baseline;gap:9px;padding:7px 11px;border-radius:6px;border:1px solid var(--line-soft);background:var(--panel-2);flex-wrap:wrap}
-  li.caprow.capused{border-left:3px solid var(--accent);background:var(--accent-soft)}
   .capid{font-family:"IBM Plex Mono",monospace;font-size:.78rem;font-weight:700;color:var(--ink);flex:none}
-  li.caprow.capused .capid{color:var(--accent)}
   /* THE CAPABILITY TEXT IS ARABIC on this track -- it is lifted from the prompt the
      model was given. It inherited the exchange summary's monospace face, which carries
      no Arabic, so every line fell back to a face that does not shape or join: the
@@ -1374,17 +1047,7 @@
     display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden}
   /* Open, the body carries the text -- so the preview would be its first line, twice.
      That duplicate is what made the fold look pointless. */
-  details.caprow[open] > summary .capdesc{display:none}
-  li.caprow.capused .capdesc{color:var(--ink)}
-  details.caprow > summary{flex-wrap:wrap;padding:8px 11px}
-  details.caprow{background:var(--panel-2)}
-  details.caprow.capused{border-left:3px solid var(--accent)}
-  details.caprow.capused .capid{color:var(--accent)}
-  .capfull{margin:0;font-size:.88rem;line-height:1.7;color:var(--ink);max-width:none;font-family:"IBM Plex Sans Arabic","IBM Plex Sans",system-ui,sans-serif}
-  .askd{color:var(--ink-3);font-size:.74rem}
   .v-prompt{color:var(--code-lit);border-color:var(--code-lit);background:var(--panel)}
-  details.ex.noans{border-color:var(--gap)}
-  details.ex.noans > summary{background:var(--gap-soft)}
 
   /* ── exchanges ────────────────────────────────────────────────────────── */
   .apis{margin-top:20px}
@@ -1437,7 +1100,6 @@
   .badge.sm{font-size:.68rem;padding:2px 7px}
   .mt{font-family:"IBM Plex Mono",monospace;font-size:.68rem;color:var(--ink-2);letter-spacing:.06em;text-transform:uppercase;font-weight:600;font-style:normal;padding:2px 8px;border-radius:99px;background:var(--panel-2);border:1px solid var(--line-soft);line-height:1.4}
   .exbody{padding:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(0,1fr));gap:18px}
-  .exbody.solo{grid-template-columns:minmax(0,1fr)}
   .pane{min-width:0;display:grid;gap:12px;align-content:start;padding:12px;border:1px solid var(--line-soft);border-radius:7px;background:var(--panel-2)}
   .phead{font-family:"IBM Plex Mono",monospace;font-size:.73rem;letter-spacing:.11em;text-transform:uppercase;color:var(--ink);font-weight:700;padding-bottom:8px;border-bottom:1px solid var(--line);display:flex;gap:9px;align-items:center}
   .dot{width:7px;height:7px;border-radius:50%;flex:none}
@@ -1509,8 +1171,6 @@
   .capbody>summary{cursor:pointer;color:var(--accent);font-family:"IBM Plex Mono",monospace;font-size:.7rem}
   .capbodyinner{margin-top:6px;display:grid;gap:6px}
   .capbodyinner pre{white-space:pre-wrap;word-break:break-word;background:var(--panel-2);border:1px solid var(--line-soft);border-radius:6px;padding:8px 10px;font-family:"IBM Plex Mono",monospace;font-size:.72rem;max-height:260px;overflow:auto}
-  ul.flatapi{margin:0;padding:0;list-style:none;display:grid;gap:5px}
-  ul.flatapi li{font-family:"IBM Plex Mono",monospace;font-size:.78rem;color:var(--ink);overflow-wrap:anywhere;padding:5px 9px;background:var(--panel-2);border-radius:5px}
   .hint{font-size:.85rem;color:var(--ink-2);font-style:italic;margin:9px 0 0}
   /* The network capture own two words. `netcap` is the disclosure line under a
      host table -- what the capture could NOT see -- and `netown` is the socket
@@ -1523,8 +1183,6 @@
   /* ── series tokens ────────────────────────────────────────────────────── */
   /* Four hues for the stacked figures, NEVER a status colour: a segment that happened to be
      the defect red would read as a failure, and these are durations, not verdicts. */
-  .sw.ser-1{background:var(--ser-1)}.sw.ser-2{background:var(--ser-2)}
-  .sw.ser-3{background:var(--ser-3)}.sw.ser-4{background:var(--ser-4)}
 
   /* ── run facts strip ──────────────────────────────────────────────────── */
   /* The six things a reader asks before any number -- which device, which build, which
@@ -1555,21 +1213,14 @@
   /* What the fence let through, as numbers with names; the sentence that used to carry all
      nine of them in one breath is folded beneath, in full, for the reader who needs it. */
   .scope{margin-top:12px;border:1px solid var(--line);border-radius:10px;background:var(--panel);box-shadow:var(--shadow);padding:12px 16px 10px}
-  .scope-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px 18px}
-  .scope .sk{display:block;font-family:"IBM Plex Mono",monospace;font-size:.62rem;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);font-weight:600}
   .scope .sv{font-size:.98rem;font-weight:600;color:var(--ink);font-variant-numeric:tabular-nums;line-height:1.3}
   .scope .sv small{font-weight:400;color:var(--ink-3);font-size:.74rem;margin-left:4px}
   .scope details{margin-top:8px}
   .scope details>summary{cursor:pointer;list-style:none;display:inline-block;font-family:"IBM Plex Mono",monospace;font-size:.72rem;color:var(--accent);border-bottom:1px dotted var(--accent)}
   .scope details>summary::-webkit-details-marker{display:none}
   .scope details>summary:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
-  .scope details ul.flatapi{margin-top:8px}
-  .scope details ul.flatapi li{font-family:"IBM Plex Sans",system-ui,sans-serif;font-size:.84rem;line-height:1.55}
 
   /* A card the user saw is one click from the case it was on. */
-  table.cov td.caselinks a{font-family:"IBM Plex Mono",monospace;font-size:.8rem;font-weight:600;text-decoration:none;
-    border:1px solid var(--line);border-radius:5px;padding:2px 8px;margin-right:4px;background:var(--panel-2)}
-  table.cov td.caselinks a:hover{border-color:var(--accent);background:var(--accent-soft)}
 
   /* ── the reading guide, folded ────────────────────────────────────────── */
   /* Doctrine, not data: it is the same text on every run, so it opens on request instead of
@@ -1580,7 +1231,6 @@
   details.note.fold>summary h3{margin:0}
   details.note.fold>summary .mt{font-size:.8rem;color:var(--ink-3)}
   details.note.fold>summary:hover h3{color:var(--accent)}
-  details.note.fold>.notebody{padding:0 20px 18px}
 
   /* ── stacked figure ───────────────────────────────────────────────────── */
   /* One bar per row, split into the phases that made up its total. Same row shape as
@@ -1590,10 +1240,6 @@
   .budget li>button{all:unset;display:contents;cursor:pointer}
   .budget li:hover{background:var(--panel-2)}
   .budget li:focus-within{outline:2px solid var(--focus);outline-offset:-2px}
-  .btrack{grid-column:1/-1;display:flex;gap:2px;height:14px;border-radius:3px;overflow:hidden;background:var(--panel-2)}
-  .btrack i{display:block;height:100%;min-width:0}
-  .btrack .ser-1{background:var(--ser-1)}.btrack .ser-2{background:var(--ser-2)}
-  .btrack .ser-3{background:var(--ser-3)}.btrack .ser-4{background:var(--ser-4)}
 
   /* The scan line's token pair: in and out on one pill, because they are one measurement. */
   .m.tok b+i{margin-right:6px}
@@ -1631,7 +1277,6 @@
   table.cov.turns td.said q{quotes:"\00ab" "\00bb";font-family:"IBM Plex Sans Arabic","IBM Plex Sans",system-ui,sans-serif;unicode-bidi:isolate}
   table.cov.turns td.said small{display:block;color:var(--ink-3);font-size:.72rem;font-style:italic;margin-top:2px}
   table.cov.turns td.num{white-space:nowrap}
-  table.cov.turns .btrack{height:10px;min-width:150px}
   table.cov.turns td.outc{white-space:nowrap}
 
   /* ── lanes: filter a run sequence by what kind of thing happened ──────────── */
@@ -1670,75 +1315,26 @@
      erow -> envrow (.erow is the evidence gauge row), id -> tcid (too generic to grep).
      A name under three characters is renamed on sight, because free-ness cannot be
      established for it by grep. */
-  .mast{display:grid;gap:10px;padding:26px 0 18px}
   .stand{color:var(--ink-2);max-width:72ch;margin:0}
   .bar{display:flex;align-items:center;gap:10px;min-width:0}
   .btn{appearance:none;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:8px;padding:5px 11px;font:600 .78rem var(--sans);cursor:pointer}
   .btn:hover{border-color:var(--accent);color:var(--accent)}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;box-shadow:var(--shadow)}
   .count{font-variant-numeric:tabular-nums;color:var(--ink-3)}
-  table.dtable{width:100%;border-collapse:collapse;font-size:.85rem}
-  table.dtable th{text-align:left;background:var(--panel-2);color:var(--ink-3);font:600 .7rem var(--mono);letter-spacing:.08em;text-transform:uppercase;padding:8px 10px;border-bottom:1px solid var(--line)}
-  table.dtable td{padding:8px 10px;border-bottom:1px solid var(--line-soft);vertical-align:top}
-  table.dtable tbody tr:nth-child(even){background:var(--row-alt)}
-  table.dtable td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
-  table.dtable td.mono{font-family:var(--mono);font-size:.8rem;word-break:break-all}
-  .emptystate{border:1px dashed var(--line);border-radius:12px;background:var(--panel-2);padding:20px;color:var(--ink-2)}
-  .emptystate h3{font-size:.96rem;margin:0 0 6px}
   .envrow{display:grid;gap:3px;padding:10px 14px;border-right:1px solid var(--line-soft);min-width:0}
   .envrow:last-child{border-right:none}
-  .verdictline{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin:0 0 8px}
-  .bigpill{display:inline-flex;align-items:center;gap:7px;padding:5px 13px;border-radius:999px;border:1px solid transparent;font:700 .8rem var(--sans)}
   .p-neutral{background:var(--panel-3);color:var(--ink-2)}
-  .kpi.t-ok .n{color:var(--pass)}
-  .kpi.t-gap .n{color:var(--gap)}
-  .kpi.t-def .n{color:var(--defect)}
-  .segbar .seg-pass{background:var(--pass)}
-  .segbar .seg-fail{background:var(--defect)}
-  .segbar .seg-blocked{background:var(--gap)}
-  .segbar .seg-unverified{background:var(--void)}
-  .casehead{display:flex;align-items:center;gap:10px;padding:11px 14px;cursor:pointer;min-width:0}
-  .casebody{padding:0 14px 14px;border-top:1px solid var(--line-soft)}
-  .ctitle{font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .tcid{font:600 .78rem var(--mono);color:var(--ink-2);white-space:nowrap}
-  .tagp{display:inline-flex;gap:5px;flex-wrap:wrap}
   .steps{margin-top:10px}
-  .idx{color:var(--ink-3);font-variant-numeric:tabular-nums;width:2.5em;text-align:right}
-  .opname{font:600 .78rem var(--mono);color:var(--accent)}
-  .tgt{font-family:var(--mono);font-size:.78rem;color:var(--ink-2);word-break:break-word}
-  .obsid{font-family:var(--mono);font-size:.7rem;color:var(--ink-3)}
-  .dur{color:var(--ink-3);font-variant-numeric:tabular-nums;white-space:nowrap}
-  .msval{font-variant-numeric:tabular-nums;white-space:nowrap}
   .skip{color:var(--ink-3);font-style:italic}
-  details.subfold{border:1px solid var(--line-soft);border-radius:10px;margin-top:10px;background:var(--panel-2)}
-  details.subfold>summary{padding:9px 12px;cursor:pointer;font-weight:600;font-size:.84rem}
-  .gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:14px}
-  .screengroup{margin-bottom:22px}
-  .scap{font:600 .72rem var(--mono);color:var(--ink-3);margin:6px 0 0;word-break:break-all}
-  .thumbs{display:flex;gap:9px;flex-wrap:wrap}
-  .nolink{color:var(--ink-3);font-style:italic;font-size:.82rem}
-  .clipgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:14px}
-  .clipcard{border:1px solid var(--line);border-radius:11px;background:var(--panel);overflow:hidden}
-  .clipmeta{padding:9px 11px;display:grid;gap:3px;font-size:.78rem;color:var(--ink-2)}
-  .clipnote{padding:9px 11px;color:var(--ink-2);font-size:.82rem}
-  .clipabsent{border-style:dashed;background:var(--panel-2)}
   .lightbox{position:fixed;inset:0;background:rgba(0,0,0,.72);display:none;align-items:center;justify-content:center;z-index:40}
   .lightbox[open],.lightbox.on{display:flex}
-  .lightboxcap{position:absolute;left:0;right:0;bottom:0;padding:12px 16px;color:#fff;font-size:.82rem;background:rgba(0,0,0,.55)}
-  .lightboxclose{position:absolute;top:14px;right:16px;color:#fff;background:transparent;border:1px solid rgba(255,255,255,.5);border-radius:8px;padding:4px 10px;cursor:pointer}
-  .logbox{background:var(--code-bg);border:1px solid var(--code-line);border-radius:10px;padding:11px 13px;max-height:340px;overflow:auto}
   .logline{font:400 .78rem/1.5 var(--mono);color:var(--code-ink);white-space:pre-wrap;word-break:break-word}
-  .loglevel{font-weight:600;margin-right:7px}
-  .lcat{color:var(--ink-3);margin-right:7px}
   .gaps{display:grid;gap:11px}
   .guard{border-left:4px solid var(--void);background:var(--void-soft);border-radius:0 10px 10px 0;padding:11px 14px}
   .gsub{color:var(--ink-2);font-size:.84rem;margin:4px 0 0}
   .gapterm{font:600 .82rem var(--mono);color:var(--ink)}
   .icon{width:15px;height:15px;flex:none}
-  .sronly{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
-  .tlrow{display:grid;grid-template-columns:minmax(0,13em) 1fr auto;gap:10px;align-items:center;padding:5px 0}
-  .tltrack{position:relative;height:9px;border-radius:999px;background:var(--panel-3);overflow:hidden}
-  .tlab{font-size:.78rem;color:var(--ink-3);white-space:nowrap}
 
   @media (prefers-reduced-motion:reduce){
     *{animation:none!important;transition:none!important}
@@ -1822,6 +1418,82 @@
   .wirenote.shotnote{color:var(--ph-muted);font-size:.78rem;font-style:italic;
     margin:0 0 8px;max-width:none;text-align:center}
   .ph-top .ph-brand b{font-family:"IBM Plex Mono",monospace;font-weight:600;font-size:.78rem}
+  /* ── the run page: results, journey, steps, diagnostics, about ─────────── */
+  /* One sans face for every word a reader reads; mono is left to code. */
+  h1,h2,h3,h4,.brand b{font-family:var(--sans)}
+  .label,.eyebrow,.meta,.brand span,.pill,.sectnav a,.themeswitch button{font-family:var(--sans);text-transform:none;letter-spacing:0}
+  .label{font-size:.8rem;font-weight:500}
+  .eyebrow{font-size:.85rem}
+  .meta{font-size:.85rem}
+  h1{overflow-wrap:anywhere}
+  h1 .build{font-size:.5em;font-weight:500;color:var(--ink-2);white-space:nowrap}
+  main,section,.goal,.turn,.step{min-width:0}
+  img,video{max-width:100%;height:auto}
+  .results{list-style:none;margin:20px 0 0;padding:0;display:grid;gap:8px}
+  .result{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;overflow-wrap:anywhere}
+  .rcount{font-weight:600}
+  .issues{list-style:none;margin:0;padding:0;display:grid;gap:8px}
+  .issue{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;padding:10px 12px;border:1px solid var(--line);border-left:4px solid var(--defect);border-radius:8px;background:var(--panel);overflow-wrap:anywhere}
+  .goal{margin-top:18px}
+  .goalhead{display:flex;gap:10px 14px;align-items:baseline;flex-wrap:wrap;margin-bottom:12px}
+  .goalhead h3{margin:0;font-size:1.1rem;font-weight:600;max-width:70ch;overflow-wrap:anywhere}
+  .goalmeta,.turnmeta{color:var(--ink-2);font-size:.85rem}
+  .film{list-style:none;margin:0 0 20px;padding:0 0 6px;display:flex;gap:10px;overflow-x:auto}
+  .film li{flex:0 0 auto}
+  .thumb{display:grid;gap:4px;width:110px;color:var(--ink-2);font-size:.8rem;text-decoration:none}
+  .thumb img{width:110px;height:auto;border:1px solid var(--line);border-radius:6px;cursor:zoom-in}
+  .thumbgap{display:grid;place-items:center;aspect-ratio:9/19;border:1px dashed var(--line);border-radius:6px;font-size:.75rem}
+  .turn{border:1px solid var(--line);border-radius:12px;background:var(--panel);padding:16px;margin:0 0 16px;scroll-margin-top:calc(var(--bar-h) + 16px)}
+  .turnhead{display:flex;gap:6px 12px;align-items:baseline;flex-wrap:wrap;margin-bottom:10px}
+  .turnn{color:var(--ink-2);font-size:.85rem;font-weight:600}
+  .turnhead h4{margin:0;flex:1 1 20ch;font-size:1rem;font-weight:600;overflow-wrap:anywhere}
+  .steplist{list-style:none;margin:0;padding:0;display:grid;gap:14px}
+  .step{border-top:1px solid var(--line-soft);padding-top:12px}
+  .stephead{display:flex;gap:8px 10px;align-items:baseline;flex-wrap:wrap}
+  .stepn{display:inline-grid;place-items:center;min-width:1.6em;height:1.6em;border-radius:50%;background:var(--panel-2);font-size:.8rem;font-weight:600}
+  .stepact{margin:0;flex:1 1 24ch;overflow-wrap:anywhere}
+  .stepact q{font-weight:600}
+  .pic figcaption .picsub{display:block;font-style:italic}
+  .stepnote{margin:4px 0 0;font-size:.85rem;color:var(--ink-2);overflow-wrap:anywhere}
+  .steppics{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,240px));gap:12px;margin-top:10px}
+  .pic{margin:0;min-width:0}
+  .pic figcaption{font-size:.8rem;color:var(--ink-2);margin-top:4px}
+  .picbox{position:relative;line-height:0}
+  .picbox img{width:100%;border:1px solid var(--line);border-radius:8px;cursor:zoom-in}
+  .tapbox{position:absolute;border:2px solid var(--accent);border-radius:4px;box-shadow:0 0 0 2px var(--panel);pointer-events:none}
+  .tapdot{position:absolute;width:14px;height:14px;margin:-7px 0 0 -7px;border-radius:50%;background:var(--accent);border:2px solid var(--panel);pointer-events:none}
+  .picdraw{max-width:240px;overflow:hidden}
+  .picnote,.clipgap{margin:0;padding:10px 12px;border:1px dashed var(--line);border-radius:8px;color:var(--ink-2);font-size:.85rem}
+  .turnclip{margin:0 0 12px;max-width:200px}
+  .turnclip video{width:100%;border-radius:8px;background:#000}
+  .turnclip figcaption{font-size:.8rem;color:var(--ink-2)}
+  details.tech,details.diag{margin-top:12px;border:1px solid var(--line-soft);border-radius:8px;background:var(--panel)}
+  details.tech>summary,details.diag>summary{cursor:pointer;padding:8px 12px;font-size:.9rem;font-weight:500}
+  details.diag>summary .diagnote{margin-left:10px;color:var(--ink-2);font-weight:400;font-size:.85rem}
+  details.tech[open]>summary,details.diag[open]>summary{border-bottom:1px solid var(--line-soft)}
+  .techlist{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;margin:10px 12px;font-size:.88rem}
+  .techlist dt{color:var(--ink-2)}
+  .techlist dd{margin:0;overflow-wrap:anywhere}
+  details.tech>*:not(summary),.diagbody{overflow-x:auto;max-width:100%}
+  .diagbody{padding:12px}
+  .plain{margin:0;padding-left:1.2em}
+  .about{display:grid;grid-template-columns:minmax(8em,max-content) 1fr;gap:10px 18px;max-width:80ch}
+  .about dt{font-weight:600}
+  .about dd{margin:0;color:var(--ink-2)}
+  dialog.lightbox{border:0;padding:0;background:transparent;max-width:96vw;max-height:96vh}
+  dialog.lightbox::backdrop{background:rgba(0,0,0,.82)}
+  dialog.lightbox img{display:block;max-width:96vw;max-height:90vh;width:auto;height:auto;border-radius:8px}
+  .lbclose{position:fixed;top:12px;right:12px;font:inherit;font-size:1rem;padding:6px 12px;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--ink);cursor:pointer}
+  @media (max-width:600px){
+    .turn{padding:12px}
+    .steppics{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .techlist,.about{grid-template-columns:1fr}
+    /* The step detail's 86px indent lines it up under the step text on a wide
+       card; on a phone it leaves the wireframe too little room, and the card
+       clipped the drawing's edge. The 360px frame scrolls inside its phone. */
+    .seqdetail{margin-left:0;grid-template-columns:minmax(0,1fr)}
+    .phone.wire .ph-scroll{overflow-x:auto}
+  }
 </style>
 
 <a class="skiplink" href="#top">Skip to the report</a>
@@ -1846,9 +1518,8 @@
   <div class="masthead">
     <p class="eyebrow">{{EYEBROW}}</p>
     <h1>{{TITLE}}</h1>
-    <p class="standfirst">{{STANDFIRST}}</p>
     <div class="meta">{{META}}</div>
-    {{FACTS}}
+    {{RESULTS}}
   </div>
 
 {{SECTIONS}}
@@ -1856,6 +1527,11 @@
   <footer>{{FOOTER_META}}</footer>
 
 </main>
+
+<dialog class="lightbox" id="lightbox" aria-label="Picture at full size">
+  <button class="lbclose" type="button">Close</button>
+  <figure class="lbfig"></figure>
+</dialog>
 
 <button class="totop" id="totop" type="button" aria-label="Back to top">
   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5"/></svg>
@@ -2357,7 +2033,15 @@
     var io = new IntersectionObserver(function (entries) {
       entries.forEach(function (en) {
         if (!en.isIntersecting) return;
-        navs.forEach(function (a) { a.classList.toggle('on', a.dataset.nav === en.target.id); });
+        navs.forEach(function (a) {
+          var on = a.dataset.nav === en.target.id;
+          a.classList.toggle('on', on);
+          // On a phone the nav is a strip that scrolls sideways: keep the lit link in it.
+          var strip = a.parentNode;
+          if (!on || strip.scrollWidth <= strip.clientWidth) return;
+          var r = a.getBoundingClientRect(), s = strip.getBoundingClientRect();
+          if (r.left < s.left || r.right > s.right) strip.scrollLeft += r.left - s.left - 12;
+        });
       });
     }, { rootMargin: '-30% 0px -60% 0px' });
     navs.forEach(function (a) { var s = document.getElementById(a.dataset.nav || ''); if (s) io.observe(s); });
@@ -2374,5 +2058,54 @@
 
   render();
   openHash();
+  // ── pictures open full size; a link to a closed part opens it ───────────
+  // The dialog's <img> is made here, never in the markup: an empty src in
+  // the page would be a fetch the self-check has to judge. Its src is the
+  // picture's own data-full, which the self-check has already pinned.
+  var box = document.getElementById('lightbox');
+  var lastPic = null;
+  function openPic(img) {
+    if (!box || !box.showModal) return;
+    var fig = box.querySelector('.lbfig');
+    var big = document.createElement('img');
+    big.src = img.getAttribute('data-full') || img.currentSrc || img.src;
+    big.alt = img.alt;
+    fig.textContent = '';
+    fig.appendChild(big);
+    lastPic = img;
+    box.showModal();
+  }
+  if (box) {
+    box.addEventListener('click', function (e) {
+      if (e.target === box || e.target.classList.contains('lbclose')) box.close();
+    });
+    box.addEventListener('close', function () {
+      box.querySelector('.lbfig').textContent = '';
+      if (lastPic) lastPic.focus();
+    });
+  }
+  document.querySelectorAll('img[data-full]').forEach(function (img) {
+    var thumb = img.closest('a');
+    if (thumb) return;
+    img.tabIndex = 0;
+    img.setAttribute('role', 'button');
+    img.addEventListener('click', function () { openPic(img); });
+    img.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openPic(img); }
+    });
+  });
+  // A case card has openHash above; this is every other collapsed part.
+  function openTarget() {
+    if (/^#case-/.test(location.hash)) return;
+    var id = decodeURIComponent(location.hash.slice(1));
+    var el = id && document.getElementById(id);
+    var opened = false;
+    for (var n = el; n; n = n.parentElement) {
+      if (n.tagName === 'DETAILS' && !n.open) { n.open = true; opened = true; }
+    }
+    if (opened) el.scrollIntoView();
+  }
+  window.addEventListener('hashchange', openTarget);
+  if (location.hash) openTarget();
 })();
 </script>

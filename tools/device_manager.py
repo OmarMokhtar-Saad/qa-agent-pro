@@ -528,6 +528,12 @@ _MAX_PACKAGE_LEN = 205
 # whose third-party list comes back empty.
 _ANDROID_SYSTEM_PREFIXES = ("com.android.", "com.google.android.", "android.")
 
+#: Public alias of :data:`_ANDROID_SYSTEM_PREFIXES`, for callers outside this
+#: module (e.g. ``tools.mobile.adb.clear_app_data`` refusing to wipe a system
+#: namespace) that should not import the underscore-private name -- same
+#: reason :func:`valid_package_name` wraps :func:`_valid_package_name`.
+SYSTEM_PACKAGE_PREFIXES = _ANDROID_SYSTEM_PREFIXES
+
 # CFBundleIdentifier occurrences in `xcrun simctl listapps` plist-ish output.
 _CFBUNDLE_ID_RE = re.compile(r'CFBundleIdentifier\s*=\s*"([^"]+)"')
 

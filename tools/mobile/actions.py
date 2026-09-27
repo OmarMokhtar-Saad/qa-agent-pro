@@ -147,6 +147,7 @@ MUTATING_OPS = frozenset(
         "home",
         "scroll",
         "launch",
+        "clear_app_data",
         "open_url",
         "wait",
         "press",
@@ -344,6 +345,19 @@ class LaunchAction(_Base):
     op: Literal["launch"]
 
 
+class ClearAppDataAction(_Base):
+    """Wipe the run's OWN app's data (``pm clear``) and relaunch it.
+
+    No ``target`` and no package field: this is a whole-app op, not a tap on
+    an element, and the executor resolves the package from ``ctx.package``
+    only -- a script cannot name a DIFFERENT app to wipe. Guarded like every
+    other destructive action even though it names no on-screen node; see
+    ``action_text``'s special case and ``executor.NON_ACTUATING_OPS``.
+    """
+
+    op: Literal["clear_app_data"]
+
+
 class OpenUrlAction(_Base):
     op: Literal["open_url"]
     url: str = Field(max_length=2000)
@@ -486,6 +500,7 @@ Action = Annotated[
         ScrollAction,
         WaitAction,
         LaunchAction,
+        ClearAppDataAction,
         OpenUrlAction,
         AssertAction,
         AskTesterAction,
@@ -539,6 +554,7 @@ OPS = (
     "tap",
     "tap_text",
     "type",
+    "clear_app_data",
     "clear",
     "back",
     "home",
@@ -740,7 +756,17 @@ def is_credential_action(action: object) -> bool:
 
 
 def action_text(action: object) -> str:
-    """The on-screen label an action is aiming at, for the destructive guard."""
+    """The on-screen label an action is aiming at, for the destructive guard.
+
+    ``clear_app_data`` names no on-screen node at all -- it wipes the whole
+    app -- so it cannot be judged by an element label the way a tap or a type
+    is. It is represented to the SAME lexicon match instead: a fixed phrase
+    carrying the destructive-lexicon term ``erase``, so `executor.py`'s guard
+    stops it exactly as it stops any other irreversible control, through the
+    ordinary ``destructive_hit(label)`` path and no second guard.
+    """
+    if str(getattr(action, "op", "") or "") == "clear_app_data":
+        return "erase app data"
     target = getattr(action, "target", None)
     parts = []
     if target is not None:
@@ -1116,6 +1142,9 @@ def describe_vocabulary() -> dict:
         ),
         "notes": [
             "tap/type/clear/scroll/press act on a target; back/home/launch take none.",
+            "clear_app_data takes no target and no package -- it wipes THIS "
+            "run's own app's data (pm clear) and relaunches it, judged by the "
+            "destructive guard like every other irreversible action.",
             "tap_text(text) is the short form of tap: it taps the ONE control carrying that visible text, and REFUSES when more than one control carries it rather than choosing between them. On a screen with the same word on several rows, use tap with a narrower target instead. It takes no target of its own.",
             "press(key, target) taps the field to focus it and then sends that "
             "key; key is one of "
