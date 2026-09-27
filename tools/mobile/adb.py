@@ -643,6 +643,43 @@ async def force_stop(serial: str, package: str) -> dict:
     return await shell(serial, ["am", "force-stop", str(package)])
 
 
+async def clear_app_data(serial: str, package: str) -> dict:
+    """``pm clear`` *package* -- wipes its data and re-stops it.
+
+    Whitelisted name only. Every caller of this function passes the RUN's own
+    ``ctx.package``, never a value read off a script action, so this refusal
+    is a second, independent check rather than the only one: a well-formed
+    but SYSTEM package name (``com.android.*``, ``com.google.android.*``,
+    ``android.*``) is refused too, because looking like a valid package is not
+    the same question as being an app this lane may wipe.
+    """
+    from tools import device_manager
+
+    name = str(package or "")
+    if not valid_package_name(name) or name.startswith(
+        device_manager.SYSTEM_PACKAGE_PREFIXES
+    ):
+        return {
+            "error": "Refusing to clear data for " + repr(name[:60]),
+            "content": None,
+        }
+    result = await shell(serial, ["pm", "clear", name])
+    if result.get("error"):
+        return result
+    # `shell` never inspects rc, and `pm clear` can exit 0 while printing
+    # "Failed". Only its literal "Success" means the data is gone.
+    body = result.get("content") or {}
+    rc = int(body.get("rc") or 0)
+    out = str(body.get("out") or "")
+    if rc != 0 or "Success" not in out:
+        combined = out + str(body.get("err") or "")
+        return {
+            "error": "adb pm clear failed: " + combined.strip()[:400],
+            "content": None,
+        }
+    return result
+
+
 # The digit guards are load-bearing: without them `\d{1,7}` happily matches a
 # SEVEN-digit slice of an eight-digit number, so a device reporting a size
 # too large to be representable would be read as a plausible one instead of
@@ -1157,12 +1194,25 @@ async def open_url(serial: str, url: str) -> dict:
     )
 
 
+#: Android's ``ime`` command can answer a refusal on stdout at rc 0 ("Unknown
+#: input method <id>"), so an rc check alone is not enough -- mirrors
+#: `adb.install`'s established rc-plus-text pattern.
+_IME_REFUSAL_RE = re.compile(
+    r"unknown input method|cannot be (?:enabled|set)|error", re.IGNORECASE
+)
+
+
 async def pm_select(serial: str, ime_id: str) -> dict:
     """Select an input method by id (``adb shell ime set <id>``).
 
     The name comes from the phase spec's module list. It is the ONE "make this
     component the active one" call the lane needs, and it is here rather than
     in ``ime.py`` so that every argv this lane builds is built in one file.
+
+    Checks the device's actual answer: `adb shell ime set` can exit 0 while
+    printing a refusal, so a non-zero ``rc`` OR a refusal phrase in the
+    combined stdout/stderr is treated as a failure -- the same rc-plus-text
+    pattern `adb.install` already uses.
     """
     text = str(ime_id or "")
     if not re.match(r"^[A-Za-z0-9._]{1,120}/[A-Za-z0-9._$]{1,120}$", text):
@@ -1170,7 +1220,18 @@ async def pm_select(serial: str, ime_id: str) -> dict:
             "error": "Refusing to select input method " + repr(text[:60]) + ".",
             "content": None,
         }
-    return await shell(serial, ["ime", "set", text])
+    result = await shell(serial, ["ime", "set", text])
+    if result.get("error"):
+        return result
+    body = result.get("content") or {}
+    rc = int(body.get("rc") or 0)
+    combined = str(body.get("out") or "") + str(body.get("err") or "")
+    if rc != 0 or _IME_REFUSAL_RE.search(combined):
+        return {
+            "error": "adb ime set failed: " + combined.strip()[:400],
+            "content": None,
+        }
+    return result
 
 
 # ── app-log evidence transport (plan mobile-app-evidence, P2) ───────────────

@@ -69,6 +69,14 @@ MAX_TEXT_CHARS = 4000
 _RESULT_RE = re.compile(r"result=(-?\d+)")
 _DATA_RE = re.compile(r'data="(.*)"', re.DOTALL)
 
+#: Android's ``ime`` command can answer a refusal on stdout at rc 0 ("Unknown
+#: input method <id>"), so an rc check alone is not enough for `enable`
+#: either -- same phrases as adb.pm_select's own copy, declared separately so
+#: neither module imports the other's private regex.
+_IME_REFUSAL_RE = re.compile(
+    r"unknown input method|cannot be (?:enabled|set)|error", re.IGNORECASE
+)
+
 
 def manifest() -> dict:
     """The pinned IME identity, or a refusal naming the missing pin.
@@ -319,12 +327,29 @@ async def remember_previous(serial: str) -> dict:
 
 
 async def enable(serial: str) -> dict:
-    """``ime enable`` for the pinned id (an IME must be enabled before it is set)."""
+    """``ime enable`` for the pinned id (an IME must be enabled before it is set).
+
+    Checks the device's actual answer the same way :func:`current_ime` already
+    does in this file: a non-zero ``rc`` OR a refusal phrase in the combined
+    stdout/stderr is a failure, since ``ime enable`` can exit 0 while printing
+    a refusal.
+    """
     resolved = manifest()
     if resolved.get("error"):
         return resolved
     ime_id = str((resolved["content"] or {})["ime_id"])
-    return await adb.shell(serial, ["ime", "enable", ime_id])
+    result = await adb.shell(serial, ["ime", "enable", ime_id])
+    if result.get("error"):
+        return result
+    body = result.get("content") or {}
+    rc = int(body.get("rc") or 0)
+    combined = str(body.get("out") or "") + str(body.get("err") or "")
+    if rc != 0 or _IME_REFUSAL_RE.search(combined):
+        return {
+            "error": "adb ime enable failed: " + combined.strip()[:400],
+            "content": None,
+        }
+    return {"error": None, "content": {}}
 
 
 async def select(serial: str) -> dict:

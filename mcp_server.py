@@ -1297,6 +1297,7 @@ def build_server():
             locale: str = "",
             capture: str = "",
             capture_ack: bool = False,
+            reset_app: bool = False,
             charter: str = "",
         ) -> list[ContentBlock]:
             """Drive an Android device: ad-hoc steps (goal=...), cases, exploration.
@@ -1308,8 +1309,10 @@ def build_server():
             commands for device actions (adb shell input/am/pm, uiautomator dumps,
             ADB Keyboard broadcasts): this tool owns the destructive guard, keyboard
             install/restore, the run folder, evidence and per-step screenshots, and a
-            raw command skips every one of them. It has no clear-app-data step, so
-            never `pm clear` around it: tell the tester the tool cannot reset app data.
+            raw command skips every one of them. To reset the app under test, pass
+            `reset_app=true` (clears its data and relaunches it) or send a
+            `clear_app_data` op to `qa_submit_mobile_step`; either needs `apply=true`
+            and never touches a different app.
 
             Call with NO arguments to start: it answers with whatever the machine
             needs next (a setup guide, an install source, a preflight list, or
@@ -1321,6 +1324,16 @@ def build_server():
             creates no emulator. Pass run_id to continue a run in ANY chat --
             that takes the run over and the previous chat is told. It hands you
             ONE packet at a time; answer each with qa_submit_mobile_step.
+
+            The install menu's key goes in `source` and its value in `app`
+            (a path, a URL or a package name); for `source=installed_package`
+            specifically, `package` is also accepted for that value and is
+            preferred when both are given. The run menu (current_suite,
+            stored_suite, own_cases, explore, rerun_failures, resume) is a
+            SEPARATE question answered by that same `source` argument in a
+            later call -- send the run menu's key once the app is confirmed
+            installed, or give `goal`/`cases`/`suite_id` instead and skip the
+            question entirely.
 
             Choosing to explore freely with no goal answers with a CHARTER
             INTAKE packet: the server's own questions about the run's terms
@@ -1384,6 +1397,7 @@ def build_server():
                     locale=locale,
                     capture=capture,
                     capture_ack=capture_ack,
+                    reset_app=reset_app,
                     charter=charter,
                     **_make_elicitors(ctx),
                     progress=_make_progress(ctx),
@@ -1418,6 +1432,10 @@ def build_server():
             pass it as tester_input with tester_input_field set to the field
             name: it is typed into the app and stored nowhere -- not in the
             report, the checkpoint or the audit log.
+
+            Send {"op": "clear_app_data"} as a script action to wipe this run's
+            OWN app's data and relaunch it -- gated by the same destructive
+            guard as every other irreversible action, and never a different app.
 
             The NEXT packet arrives with a PNG of the screen attached as image
             content: look at it before you plan the next script. If a capture

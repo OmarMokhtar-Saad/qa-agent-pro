@@ -868,6 +868,7 @@ def plan_suite_run(
     device: object = None,
     locale: object = None,
     capture: object = None,
+    reset_app: object = None,
 ) -> dict:
     """Order, persist and create a suite run. ``{"error", "content": {...}}``."""
     try:
@@ -913,6 +914,7 @@ def plan_suite_run(
                 # planning time for the same reason `locale`/`device` are: a
                 # finished run must still say so after the proxy is torn down.
                 "capture": capture_record(capture),
+                "reset_app": reset_app_record(reset_app),
                 "source": str(source or ""),
                 "case_signature": case_signature(package, kept),
                 # The cases the TESTER supplied, before the filters -- the
@@ -952,6 +954,7 @@ def plan_explore_run(
     device: object = None,
     locale: object = None,
     capture: object = None,
+    reset_app: object = None,
 ) -> dict:
     """Create an exploratory run whose whole state is one manifest dict."""
     try:
@@ -978,6 +981,7 @@ def plan_explore_run(
                 "device": device_record(device),
                 "locale": locale_record(locale),
                 "capture": capture_record(capture),
+                "reset_app": reset_app_record(reset_app),
                 "avd": str(avd or ""),
                 # A SNAPSHOT of the PRODUCER's answer, not of a setting.
                 # sdk_locator.avd_system_image() is the one function that says which
@@ -1701,6 +1705,22 @@ def capture_record(source: object) -> dict:
     from tools.mobile_capture import ladder
 
     return ladder.record(source)
+
+
+def reset_app_record(body: object) -> dict:
+    """Normalise the pre-run app-reset outcome for the manifest. Never raises.
+
+    The counterpart of :func:`locale_record`/:func:`capture_record`: one
+    shape written by both planners below and read by every consumer, so a
+    finished run still states whether its own app's data was wiped before it
+    started, after the device that ran ``pm clear`` is gone.
+    """
+    given = body if isinstance(body, dict) else {}
+    return {
+        "requested": bool(given.get("requested")),
+        "package": str(given.get("package") or ""),
+        "cleared": bool(given.get("cleared")),
+    }
 
 
 def device_record(facts: object) -> dict:

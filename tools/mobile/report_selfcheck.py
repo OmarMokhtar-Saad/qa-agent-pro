@@ -157,7 +157,9 @@ class _Page(HTMLParser):
         #: ``(tag, src)`` for every media tag, so the asset pin can judge
         #: the SOURCE it would actually fetch, not the text around it.
         self.media: list = []
-        #: Every ``img`` ``src``, so the asset pin can check IDENTITY.
+        #: Every URL an ``img`` can fetch -- its ``src``, each ``srcset``
+        #: candidate and the lightbox's ``data-full`` -- so the asset pin can
+        #: check IDENTITY on all of them, not on the one the browser starts with.
         self.images: list = []
         self.handlers: list = []
         self._in_style = False
@@ -181,6 +183,14 @@ class _Page(HTMLParser):
             self.media.append((tag, pairs["src"]))
         if tag == "img":
             self.images.append(pairs.get("src", ""))
+            for candidate in pairs.get("srcset", "").split(","):
+                if candidate.strip():
+                    self.images.append(candidate.split()[0])
+            if "data-full" in pairs:
+                self.images.append(pairs["data-full"])
+        # A poster is fetched as soon as the page paints: judged as media.
+        if tag == "video" and "poster" in pairs:
+            self.media.append(("poster", pairs["poster"]))
         if tag == "style":
             self._in_style = True
         for name in pairs:
@@ -302,7 +312,7 @@ def _pin_script(page: "_Page") -> dict:
     )
 
 
-def _pin_links(page: "_Page", text: str) -> dict:
+def _pin_links(page: "_Page", text: str, folder: Path | None = None) -> dict:
     """The page fetches NOTHING, images are inline, clips point INSIDE the folder.
 
     Four checks, one verdict, because they answer one question: can this report
@@ -325,13 +335,30 @@ def _pin_links(page: "_Page", text: str) -> dict:
     # out of the run folder -- a rule that passes on anything shaped vaguely
     # right is the shape this repository keeps paying for. The prefix is the
     # emitter's own constant, and the climb must be EXACTLY one.
+    #
+    # The one other home an image has is the report's own media folder -- a
+    # frame or a resized copy of one -- held to the media rule below: inside
+    # it, with no climb at all. And THERE: frames used to travel inline, so a
+    # path under media/ that nothing wrote is the regression to catch, and a
+    # well-formed src that points at nothing passes every shape test.
+    prefix = str(report.MEDIA_DIR) + "/"
+
+    def _stored(src: str) -> bool:
+        return folder is None or (folder / src).is_file()
+
     strays += [
         str(src)[:60]
         for src in page.images
-        if not str(src).startswith(SHOT_SRC) or str(src).count("..") != 1
+        if not (
+            (str(src).startswith(SHOT_SRC) and str(src).count("..") == 1)
+            or (
+                str(src).startswith(prefix)
+                and ".." not in str(src)
+                and _stored(str(src))
+            )
+        )
     ]
     found = [needle for needle in EXTERNAL if needle in text]
-    prefix = str(report.MEDIA_DIR) + "/"
     offfolder = [
         tag + "@" + (str(src)[:60] or "(empty)")
         for tag, src in page.media
@@ -449,7 +476,7 @@ def check(run_id: str, html_path: str = "") -> dict:
             _pin_absent(PIN_NO_MARKERS, text, FORBIDDEN_MARKERS),
             _pin_absent(PIN_NO_XML, text, RAW_XML),
             _pin_script(page),
-            _pin_links(page, text),
+            _pin_links(page, text, report.report_path(run_id).parent),
             _pin_absent(PIN_NO_SECRET, text, SECRET_TOKENS),
             _pin(
                 PIN_SIZE,

@@ -28,6 +28,7 @@ import os
 import time
 
 from tools.mobile import ime, run_store
+from tools.untrusted import wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,35 @@ IME_READY_TIMEOUT_S = 120.0
 #: constraint is that this runs after EVERY type op, so it is paid per op rather
 #: than per run and must not become the thing that makes typing feel slow.
 IME_VERIFY_TIMEOUT_S = 15.0
+
+#: Attempts of enable+select before ``_ensure_ready`` gives up. Bounded because
+#: an ``ime`` command that refuses once (a stale receiver, a device still
+#: settling) is not evidence it will refuse forever, and Android's own answer
+#: is known to arrive asynchronously -- see the shorthand/expanded id note on
+#: `ime.same_component`.
+IME_SELECT_MAX_ATTEMPTS = 3
+
+#: Delay between one failed enable+select attempt and the next.
+IME_SELECT_RETRY_DELAY_S = 1.0
+
+#: Reads of `state()` after a successful enable+select before treating the
+#: keyboard as stuck. A single read cannot distinguish "refused" from "not yet
+#: settled" -- this module's own docstring already says the device layer
+#: answers asynchronously.
+IME_POLL_MAX_ATTEMPTS = 5
+
+#: Delay between one poll read and the next.
+IME_POLL_INTERVAL_S = 1.0
+
+#: Worst case: IME_SELECT_MAX_ATTEMPTS * (IME_SELECT_RETRY_DELAY_S +
+#: IME_POLL_MAX_ATTEMPTS * IME_POLL_INTERVAL_S) = 3 * (1 + 5) = 18s, well
+#: inside the unchanged IME_READY_TIMEOUT_S outer bound.
+
+
+async def _sleep(seconds: float) -> None:
+    """``asyncio.sleep`` under its own name, so a test can monkeypatch retry
+    and poll delays to zero without touching the shared ``asyncio`` module."""
+    await asyncio.sleep(seconds)
 
 
 def _record_path(run_id: str):
@@ -431,34 +461,67 @@ async def _ensure_ready(serial: str, run_id: str) -> dict:
             installed = await ime.install(serial)
             if installed.get("error"):
                 return installed
-        enabled = await ime.enable(serial)
-        if enabled.get("error"):
-            return enabled
-        chosen = await ime.select(serial)
-        if chosen.get("error"):
-            return chosen
+        settled: dict = {}
+        last_failure_text = ""
+        reached_poll = False
+        for attempt in range(1, IME_SELECT_MAX_ATTEMPTS + 1):
+            enabled = await ime.enable(serial)
+            if enabled.get("error"):
+                last_failure_text = str(enabled.get("error") or "")
+                if attempt < IME_SELECT_MAX_ATTEMPTS:
+                    await _sleep(IME_SELECT_RETRY_DELAY_S)
+                continue
+            chosen = await ime.select(serial)
+            if chosen.get("error"):
+                last_failure_text = str(chosen.get("error") or "")
+                if attempt < IME_SELECT_MAX_ATTEMPTS:
+                    await _sleep(IME_SELECT_RETRY_DELAY_S)
+                continue
 
-        after = await state(serial)
-        if after.get("error"):
-            return after
-        settled = after.get("content") or {}
-        if not settled.get("selected"):
-            return {
-                "error": (
-                    "The QA input method was installed and enabled but did not "
-                    "become the active keyboard; typing would go to "
-                    + (str(settled.get("current") or "no keyboard")[:120])
-                    + ". Nothing was typed."
-                ),
-                "content": None,
-            }
+            last_failure_text = ""
+            reached_poll = True
+            for poll in range(IME_POLL_MAX_ATTEMPTS):
+                after = await state(serial)
+                if after.get("error"):
+                    return after
+                settled = after.get("content") or {}
+                if settled.get("selected"):
+                    return {
+                        "error": None,
+                        "content": {
+                            "ready": True,
+                            "changed": True,
+                            "detail": "selected the QA input method",
+                        },
+                    }
+                if poll < IME_POLL_MAX_ATTEMPTS - 1:
+                    await _sleep(IME_POLL_INTERVAL_S)
+            if attempt < IME_SELECT_MAX_ATTEMPTS:
+                await _sleep(IME_SELECT_RETRY_DELAY_S)
+
+        if not reached_poll:
+            after = await state(serial)
+            if after.get("error"):
+                return after
+            settled = after.get("content") or {}
+
+        detail = wrap_untrusted(
+            "device_ime_state",
+            str(settled.get("current") or "no keyboard")[:120]
+            + (
+                "; last attempt failed: " + last_failure_text[:200]
+                if last_failure_text
+                else ""
+            ),
+        )
         return {
-            "error": None,
-            "content": {
-                "ready": True,
-                "changed": True,
-                "detail": "selected the QA input method",
-            },
+            "error": (
+                "The QA input method was installed and enabled but did not "
+                "become the active keyboard; typing would go to "
+                + detail
+                + ". Nothing was typed."
+            ),
+            "content": None,
         }
     except Exception as exc:
         logger.exception("mobile.ime_session.ensure_ready failed")
