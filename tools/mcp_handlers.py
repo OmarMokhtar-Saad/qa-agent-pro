@@ -13732,6 +13732,7 @@ async def handle_submit_mobile_step(
     tester_input_field: str = "",
     session_token: str = "",
     *,
+    confirm_destructive: bool = False,
     progress: ProgressCb = None,
 ) -> str:
     """Replay the actions YOU planned, then hand back the verdict and next packet.
@@ -13795,6 +13796,7 @@ async def handle_submit_mobile_step(
             session_token=token,
             tester_input=tester_input,
             tester_input_field=tester_input_field,
+            confirm_destructive=confirm_destructive,
         )
         if result.get("error"):
             return "⚠️ " + _safe(result["error"], 400)

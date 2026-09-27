@@ -2079,6 +2079,77 @@ def _explore_prior_verified(run_id: str) -> bool:
     return False
 
 
+def _explore_prior_turn_blocked(run_id: str) -> bool:
+    """True when the LATEST checkpointed turn failed to type or moved nothing.
+
+    ONE turn, not run-wide like :func:`_explore_prior_verified`: a failure
+    several turns back must not block every later pass once the app moved on.
+    "Latest" is by the turn number in ``tc_id``, not list position. Counted: a
+    reason carrying :data:`executor.NOTHING_MOVED_PREFIX`, or a ``type``/
+    ``clear`` whose outcome was ``device_error`` or ``refused``.
+
+    Never raises: an unreadable case store is "not blocked".
+    """
+    try:
+        listed = run_store.list_cases(run_id) or {}
+        latest: dict | None = None
+        latest_turn = -1
+        for body in listed.get("content") or []:
+            if not isinstance(body, dict):
+                continue
+            digits = "".join(ch for ch in str(body.get("tc_id") or "") if ch.isdigit())
+            turn = int(digits) if digits else -1
+            if turn >= latest_turn:
+                latest, latest_turn = body, turn
+        if latest is None:
+            return False
+        if executor.NOTHING_MOVED_PREFIX in str(latest.get("reason") or ""):
+            return True
+        for item in list(latest.get("trace") or []):
+            if not isinstance(item, dict):
+                continue
+            action = item.get("action") if isinstance(item.get("action"), dict) else {}
+            if str(action.get("op") or "") in ("type", "clear") and str(
+                item.get("outcome") or ""
+            ) in ("device_error", "refused"):
+                return True
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("mobile.session: could not read this run's previous turn")
+    return False
+
+
+def _prior_guard_stop(run_id: str, tc_id: str) -> dict:
+    """THIS case's own last recorded guard-stop fingerprint, or ``{}``.
+
+    Scoped to the ONE case being submitted -- an exact match on ``tc_id`` --
+    not a run-wide "latest by tc_id digit" scan: that scan's "latest" case
+    can be a DIFFERENT tc_id than the one this confirm names, which would let
+    a stop recorded against one case authorise a confirm submitted for
+    another. The scripted lane passes its own ``tc_id``; the explore lane
+    passes ``explore_turn_case_id(resolved.get("explore"))`` computed BEFORE
+    this submission's replay -- the SAME id ``_checkpoint_explore_turn``
+    wrote the CURRENT turn's own stop under, because the turn number does
+    not advance across a resubmission of the same turn (see the ``before``
+    comment in ``_submit_explore``).
+
+    FAILS CLOSED: any read that raises, or a matching case that recorded no
+    stop, is untracked -- ``{}`` -- rather than treated as leniently as
+    :func:`_explore_prior_turn_blocked` treats its own question. That
+    sibling fails OPEN because its wrong "no" only costs one extra retry;
+    this one's wrong "no" would let a mismatched confirm through, which is
+    the defect this function exists to close.
+    """
+    try:
+        listed = run_store.list_cases(run_id) or {}
+        for body in listed.get("content") or []:
+            if isinstance(body, dict) and str(body.get("tc_id") or "") == str(tc_id):
+                stop = body.get("guard_stop")
+                return dict(stop) if isinstance(stop, dict) else {}
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("mobile.session: could not read this case's last guard stop")
+    return {}
+
+
 def _explore_planned_case(tc_id: str, state: object, finding: str = "") -> dict:
     """The turn as a MINIMAL valid ``TestCase`` dump, for ``manifest["cases"]``.
 
@@ -2165,6 +2236,19 @@ def _checkpoint_explore_turn(
         "reason": str(result.get("reason") or "")[:1200],
         "trace": list(result.get("trace") or []),
         "escapes": 0,
+        # Same fingerprint shape `case_runner._checkpoint` writes, from the
+        # SAME per-submit `result` this turn's own replay returned -- so an
+        # explore-lane confirm binds to the op THIS run's last turn stopped
+        # on, exactly like the scripted lane's `_consume_confirm`. Not
+        # carried forward from a prior turn's checkpoint, for the same
+        # reason `case_runner._checkpoint` does not carry it forward either.
+        "guard_stop": {
+            "term": str(result.get("guard_term") or "")[:80],
+            "op": str(result.get("guard_op") or "")[:40],
+            "node": str(result.get("guard_node") or "")[
+                : executor.MAX_GUARD_NODE_CHARS
+            ],
+        },
         "finding": " ".join(str(finding or "").split())[:600],
         "started": min(began, now),
         "updated": now,
@@ -2312,6 +2396,7 @@ async def submit(
     session_token: str = "",
     tester_input: str = "",
     tester_input_field: str = "",
+    confirm_destructive: bool = False,
 ) -> dict:
     """Replay one answered packet and return the verdict plus the NEXT packet.
 
@@ -2328,8 +2413,11 @@ async def submit(
         field = str(tester_input_field or "").strip()[:80]
         if field and str(tester_input or ""):
             ctx.tester_inputs = {field: str(tester_input)}
+        ctx.confirm_destructive = bool(confirm_destructive)
         if str(body.get("lane")) == LANE_EXPLORE:
             return await _submit_explore(run_id, raw_script, ctx, body)
+        # Scoped to THIS tc_id, not a run-wide scan -- see `_prior_guard_stop`.
+        ctx.prior_guard_stop = _prior_guard_stop(run_id, tc_id)
         loaded = load_case(run_id, tc_id)
         if loaded.get("error"):
             return loaded
@@ -2398,6 +2486,7 @@ async def _submit_explore(
         }
     # Run-wide evidence, read from the checkpoints this run already wrote and
     # passed in EXPLICITLY. See ``_explore_prior_verified``.
+    ctx.prior_turn_blocked = _explore_prior_turn_blocked(run_id)
     ctx.prior_verified = _explore_prior_verified(
         run_id
     )  # WHAT HAPPENS AFTER A GUARD HIT, from this run's own charter. The guard
@@ -2411,6 +2500,13 @@ async def _submit_explore(
             ((resolved.get("explore") or {}).get("charter") or {}).get("destructive")
         )
         == charter_mod.REFUSE
+    )
+    # THIS turn's own id, computed BEFORE the replay below -- the same id
+    # `_checkpoint_explore_turn` will write THIS turn's stop under, and the
+    # same one a resubmission of this SAME turn recomputes (the turn number
+    # only advances once a NEW packet goes out). See `_prior_guard_stop`.
+    ctx.prior_guard_stop = _prior_guard_stop(
+        run_id, explore_turn_case_id(resolved.get("explore"))
     )
     # THE RECORDER, on the lane that shipped without one. `case_runner` has
     # started a clip around ITS replay since v1.87.0; this is the other replay

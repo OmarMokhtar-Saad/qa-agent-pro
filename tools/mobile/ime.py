@@ -299,6 +299,73 @@ async def current_ime(serial: str) -> dict:
     return {"error": None, "content": text}
 
 
+#: One id per line from ``ime list -a -s``; ``ime list -a`` prints one block
+#: per input method, headed ``pkg/.Class:`` and carrying ``mId=pkg/.Class``.
+_IME_ID_RE = re.compile(
+    r"^\s*(?:mId=)?([A-Za-z0-9_.]+/[A-Za-z0-9_.$]+):?(?=\s|$)", re.MULTILINE
+)
+
+#: The QA keyboard is installed but the device does not list it under the
+#: pinned component, so ``ime enable``/``ime set`` would only be refused.
+IME_NOT_LISTED = (
+    "The QA keyboard (%s) is not among the input methods this device lists "
+    "(%s), so it cannot be enabled or selected and nothing can be typed. Start "
+    "the run again with apply=true so the server reinstalls the pinned QA "
+    "keyboard; if it is still not listed, report this message as a defect."
+)
+
+
+async def _list_ime_ids(serial: str) -> list[str]:
+    """Every input method id the device lists, spelled as the device spells it.
+
+    ``ime list -a -s`` first, ``ime list -a`` when that fails or lists nothing.
+    Empty when neither answered: the caller decides what an unread list means.
+    """
+    for argv in (["ime", "list", "-a", "-s"], ["ime", "list", "-a"]):
+        result = await adb.shell(serial, argv)
+        if result.get("error"):
+            continue
+        body = result.get("content") or {}
+        if int(body.get("rc") or 0) != 0:
+            continue
+        ids: list[str] = []
+        for found in _IME_ID_RE.findall(str(body.get("out") or "")):
+            if found not in ids:
+                ids.append(found)
+        if ids:
+            return ids
+    return []
+
+
+async def resolve_installed_id(serial: str) -> dict:
+    """The QA keyboard's id AS THE DEVICE LISTS IT, for ``enable``/``select``.
+
+    The manifest pins ``pkg/pkg.Class`` and a device stores and lists
+    ``pkg/.Class``; the air session's API 35 device refused the pinned
+    spelling on ``ime enable`` and nothing was ever typed. So the id sent is
+    the LISTED one that :func:`same_component` matches, never the pin itself.
+
+    A list that names other keyboards but not ours is a refusal by name
+    (:data:`IME_NOT_LISTED`). A list that could not be read at all proves
+    nothing, so the pinned id is sent and the device's own answer decides.
+    """
+    resolved = manifest()
+    if resolved.get("error"):
+        return resolved
+    pinned = str((resolved["content"] or {})["ime_id"])
+    listed = await _list_ime_ids(serial)
+    if not listed:
+        logger.warning("mobile.ime: the device listed no input methods; sending the pin")
+        return {"error": None, "content": pinned}
+    for candidate in listed:
+        if same_component(candidate, pinned):
+            return {"error": None, "content": candidate}
+    return {
+        "error": IME_NOT_LISTED % (pinned, ", ".join(listed[:8])[:400]),
+        "content": None,
+    }
+
+
 async def remember_previous(serial: str) -> dict:
     """Read the input method to restore later, BEFORE selecting ours.
 
@@ -334,10 +401,10 @@ async def enable(serial: str) -> dict:
     stdout/stderr is a failure, since ``ime enable`` can exit 0 while printing
     a refusal.
     """
-    resolved = manifest()
+    resolved = await resolve_installed_id(serial)
     if resolved.get("error"):
         return resolved
-    ime_id = str((resolved["content"] or {})["ime_id"])
+    ime_id = str(resolved["content"])
     result = await adb.shell(serial, ["ime", "enable", ime_id])
     if result.get("error"):
         return result
@@ -353,11 +420,11 @@ async def enable(serial: str) -> dict:
 
 
 async def select(serial: str) -> dict:
-    """Make the pinned IME the active one."""
-    resolved = manifest()
+    """Make the pinned IME the active one, by the id the device lists."""
+    resolved = await resolve_installed_id(serial)
     if resolved.get("error"):
         return resolved
-    return await adb.pm_select(serial, str((resolved["content"] or {})["ime_id"]))
+    return await adb.pm_select(serial, str(resolved["content"]))
 
 
 async def restore_previous(serial: str, previous: str) -> dict:
@@ -393,7 +460,13 @@ async def restore_previous(serial: str, previous: str) -> dict:
                 "detail": "The QA input method was already the default before this run.",
             },
         }
-    result = await adb.pm_select(serial, target)
+    # Best effort: the listed spelling of the same component when the device
+    # lists one, else the value exactly as it was read.
+    # A malformed id is refused by pm_select without a device call;
+    # listing first would spend one on a value that cannot be sent.
+    listed = await _list_ime_ids(serial) if adb.is_ime_id(target) else []
+    send = next((c for c in listed if same_component(c, target)), target)
+    result = await adb.pm_select(serial, send)
     if result.get("error"):
         return result
     return {
@@ -662,6 +735,11 @@ def _landed_verdict(before, after, value: str, secret: bool) -> str:
     if secret:
         if int(after) - int(before) == len(value):
             return LANDED_YES
+        # EMPTY after the commit is the one shape no commit leaves behind,
+        # whatever the field held before -- asked before the changed/unchanged
+        # split, which read a field emptied by a failed commit as ``unknown``.
+        if int(after) == 0:
+            return LANDED_NO
         if int(after) != int(before):
             return LANDED_UNKNOWN
         # Unchanged length, and only the length is knowable here. A
@@ -670,6 +748,8 @@ def _landed_verdict(before, after, value: str, secret: bool) -> str:
         # indistinguishable from nothing happening. An EMPTY field is the one
         # shape no commit can leave behind, so it is all that is left of ``no``.
         return LANDED_NO if int(after) == 0 else LANDED_UNKNOWN
+    if not str(after):
+        return LANDED_NO
     if value in str(after):
         return LANDED_YES if after != before else LANDED_UNKNOWN
     if after != before:

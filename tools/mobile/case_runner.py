@@ -717,6 +717,13 @@ async def submit_case(
                     trace=trace,
                     escapes=used,
                     packet=packet,
+                    guard_stop={
+                        "term": str(result.get("guard_term") or "")[:80],
+                        "op": str(result.get("guard_op") or "")[:40],
+                        "node": str(result.get("guard_node") or "")[
+                            : executor.MAX_GUARD_NODE_CHARS
+                        ],
+                    },
                 ),
             }
 
@@ -858,6 +865,7 @@ def _checkpoint(
     escapes: int,
     packet: object,
     uncharged: object = None,
+    guard_stop: object = None,
 ) -> dict:
     """Write the case checkpoint and return the caller's payload.
 
@@ -892,6 +900,11 @@ def _checkpoint(
         "uncharged_stops": (
             dict(uncharged) if isinstance(uncharged, dict) else _prior_uncharged(prior)
         ),
+        # NOT carried forward from `prior`, unlike `uncharged_stops` above: a
+        # guard stop this call did not just produce is not THIS turn's stop,
+        # and carrying an old one forward would let a later turn's confirm
+        # match a control nobody stopped on THIS submission.
+        "guard_stop": dict(guard_stop) if isinstance(guard_stop, dict) else {},
         "started": prior.get("started") or now,
         "updated": now,
         "evidence": _evidence_record(prior.get("evidence")),
