@@ -66,6 +66,19 @@ def _shot_timeout() -> int:
     return settings.qa_device_screenshot_timeout
 
 
+def _adb_binary() -> str:
+    """The adb every spawn here uses: the SDK's own, as the mobile lane resolves it.
+
+    A bare ``"adb"`` depends on this process's PATH, which an IDE-spawned
+    server often lacks, so qa_list_devices reported "No devices detected"
+    for a device qa_mobile_test was driving. Deferred import: tools.mobile.adb
+    imports this module at module scope.
+    """
+    from tools.mobile import adb as mobile_adb
+
+    return mobile_adb.resolve_adb()
+
+
 async def _run(cmd: list[str], timeout: int) -> tuple[int, bytes, bytes]:
     """Run *cmd* (argument list, NO shell) and return (returncode, stdout, stderr).
 
@@ -339,7 +352,7 @@ async def _list_android_all() -> tuple[list[dict], list[dict], int]:
     passed to a subprocess.
     """
     try:
-        rc, out, err = await _run(["adb", "devices", "-l"], _cmd_timeout())
+        rc, out, err = await _run([_adb_binary(), "devices", "-l"], _cmd_timeout())
     except FileNotFoundError:
         logger.info("device_manager: adb not installed -- skipping Android devices")
         return ([], [], 0)
@@ -585,7 +598,7 @@ async def _list_android_apps(device_id: str) -> list[dict]:
     adb, a timeout, or a non-zero return code all degrade to an empty list."""
     try:
         rc, out, _err = await _run(
-            ["adb", "-s", device_id, "shell", "pm", "list", "packages", "-3"],
+            [_adb_binary(), "-s", device_id, "shell", "pm", "list", "packages", "-3"],
             _cmd_timeout(),
         )
     except FileNotFoundError:
@@ -602,7 +615,7 @@ async def _list_android_apps(device_id: str) -> list[dict]:
     # Fallback: full package list minus obvious system namespaces.
     try:
         rc, out, _err = await _run(
-            ["adb", "-s", device_id, "shell", "pm", "list", "packages"],
+            [_adb_binary(), "-s", device_id, "shell", "pm", "list", "packages"],
             _cmd_timeout(),
         )
     except (FileNotFoundError, asyncio.TimeoutError):
@@ -693,7 +706,7 @@ def _png_result(data: bytes) -> dict:
 
 async def _screenshot_android(device_id: str) -> dict:
     rc, out, err = await _run(
-        ["adb", "-s", device_id, "exec-out", "screencap", "-p"], _shot_timeout()
+        [_adb_binary(), "-s", device_id, "exec-out", "screencap", "-p"], _shot_timeout()
     )
     if rc != 0:
         return {

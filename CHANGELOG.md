@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.100.3] - 2026-09-28
+## [1.100.4] - 2026-09-28
 
 ### Added
 
@@ -29,18 +29,19 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- Mobile runs: a charter value the run does not know (for example
-  depth: xyz) now refuses the run by name, listing the accepted
-  values, instead of quietly using the default. happy_path is
-  accepted as another name for happy.
-- Mobile runs: a finished run's reply opens with a short verdict block
-  (verdict, whether the requested reset landed, typed-field count) to
-  relay as written, and the submit reply and report state how many
-  fields were typed.
-- Mobile runs: fewer round trips when the device is busy or a step
-  runs out of time; actions not yet run when time runs out are kept
-  for the next reply on both explore and scripted runs, with typed
-  secret text never stored.
-- Mobile runs: confirming a destructive action after resuming a
-  paused explore run now works, and a cancelled device command no
-  longer leaves an adb process running.
+- Device listing and screenshots use the same adb as mobile runs, so
+  qa_list_devices finds a device even when adb is not on the editor's
+  PATH.
+- Mobile runs: a status reply for a run that is still going no longer
+  says to stop, and a run whose time extension is used up says so.
+- Mobile runs: a script with a single action gets a hint to batch
+  several actions per reply, saving round trips.
+- Mobile runs: a goal that asks to reset the app, sent without a
+  destructive setting, is told which setting allows it.
+- Mobile runs: a package id that is not installed now suggests the
+  closest installed package ids.
+- Mobile runs: a script may wait for on-screen text for up to 40
+  seconds in total (was 25), so two ordinary waits are accepted.
+- Mobile runs: the app resolved for a goal is remembered for up to a
+  week, so rerunning the same goal skips finding the app again; the
+  device is still checked before anything runs.

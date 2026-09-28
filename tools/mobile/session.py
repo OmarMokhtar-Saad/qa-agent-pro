@@ -60,6 +60,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from tools.device_manager import _valid_device_id, valid_package_name
+from tools.mobile import actions as actions_mod
 from tools.mobile import (
     adb,
     case_runner,
@@ -775,6 +776,22 @@ async def install_state(serial: str, package: str) -> dict:
             and str(record.get("serial") or "") == str(serial)
             and _install_is_recent(record, time.time())
         )
+        # FUZZY MATCH, FROM THE SAME PROBE. `installed_packages` already listed
+        # every package id on the device to answer `installed` above -- this
+        # reuses that ONE round trip rather than spending a second adb call to
+        # answer "did the caller guess the wrong id". A tester (or the model
+        # on their behalf) names an app, not a bundle id, and a wrong guess
+        # used to dead-end in "not installed" with no way forward short of a
+        # manual `adb shell pm list packages`. The cap of 5 is a LOCAL bound
+        # (not a module constant): a hint in an error message, not a listing,
+        # so it does not need the CEILINGS governance a shared cap would.
+        suggestions: list[str] = []
+        if probed and not installed and names:
+            import difflib
+
+            suggestions = difflib.get_close_matches(
+                str(package), names, n=5, cutoff=0.4
+            )
         return {
             "error": None,
             "content": {
@@ -783,6 +800,7 @@ async def install_state(serial: str, package: str) -> dict:
                 "pending": pending,
                 "apk": str(record.get("apk") or ""),
                 "started": _started_seconds(record),
+                "suggestions": suggestions,
             },
         }
     except Exception as exc:  # pragma: no cover - defensive
@@ -2616,6 +2634,41 @@ def _merge_tester_inputs(
     return merged
 
 
+SINGLE_ACTION_NOTICE = (
+    "This script carried one action. A script may carry up to "
+    "{max_actions} -- a tap, the type it triggers and the assert that "
+    "checks it usually fit in one script together, and each extra round trip "
+    "through this tool is one the tester's own client timer is also paying "
+    "for. Batch the next few actions you already know you want when they do "
+    "not depend on an unpredictable reply."
+)
+
+
+def _single_action_notice(raw_script: object) -> str:
+    """"" unless *raw_script* parses to exactly one action.
+
+    Never raises and never refuses: read AFTER `case_runner.submit_case`
+    already validated and replayed the same script, so a parse failure here
+    can only mean the script changed between the two reads, which never
+    happens on this call's own object. Audit item 3 -- the schema already
+    allowed up to `actions.MAX_ACTIONS`; nothing said so where a planner
+    would see it before scripting one action per submit. VERIFIED (not
+    UNVERIFIED): `actions_mod.parse_script`'s own docstring says it
+    "[a]ccepts the packet shape ({\"actions\": [...]}), a bare list, or a
+    JSON string of either" -- `tools/mobile/actions.py:636-642` -- so this
+    call on the raw string `submit()` already received is exactly one of
+    the three documented shapes, not a new assumption.
+    """
+    try:
+        parsed = actions_mod.parse_script(raw_script)
+        script = parsed.get("content")
+        if script is not None and len(script.actions) == 1:
+            return SINGLE_ACTION_NOTICE.format(max_actions=actions_mod.MAX_ACTIONS)
+    except Exception:
+        logger.debug("mobile.session._single_action_notice failed", exc_info=True)
+    return ""
+
+
 async def submit(
     run_id: str,
     tc_id: str,
@@ -2689,6 +2742,7 @@ async def submit(
                 "next": follow,
                 "field": field,
                 "resolved": body,
+                "notice": _single_action_notice(raw_script),
             },
         }
     except Exception as exc:  # pragma: no cover - defensive
