@@ -36,6 +36,14 @@ logger = logging.getLogger(__name__)
 #: as a failed check, not as a client timeout on the MCP boundary.
 DEFAULT_TIMEOUT_S = 30
 
+#: Above this, a single adb call's duration line becomes a WARNing instead of
+#: a DEBUG one. The audit that motivated this module found a call buried
+#: inside a 60s timeout with no signal until the whole thing finally failed
+#: (qa_list_devices measured at 5515 ms); this is the line that would have
+#: named it. The harmful direction is UPWARD, so this ceiling binds and no
+#: floor test is owed.
+SLOW_CALL_CEILING_S = 5.0
+
 #: ``uiautomator dump`` writes a file and we then read it back; both halves are
 #: slow on a cold emulator.
 DUMP_TIMEOUT_S = 60
@@ -75,14 +83,24 @@ _SWIPE_MAX = 20000
 
 
 def resolve_adb() -> str:
-    """Absolute path of the adb to use, or the bare name as a last resort."""
-    located = (sdk_locator.locate_sdk() or {}).get("content") or {}
-    found = str((located.get("tools") or {}).get("adb") or "")
-    if found:
-        return found
-    from tools.mobile import platform_info
+    """One resolver for the lane, the device list and qa-doctor.
 
-    return platform_info.exe("adb")
+    Delegates at call time to :func:`tools.mobile.sdk_locator.resolve_adb`
+    rather than aliasing it, so patching either name reaches every caller.
+    """
+    return sdk_locator.resolve_adb()
+
+
+def _cmd_for_log(cmd: list[str], stdin_data: bytes | None = None) -> str:
+    """The command line to log in full -- no argv element is ever a secret
+    (see the module docstring); the ONE channel that carries typed text or
+    credentials is ``stdin_data``, so it is logged as a byte count, never its
+    content.
+    """
+    rendered = " ".join(cmd)
+    if stdin_data is not None:
+        rendered += f" <stdin:{len(stdin_data)}B>"
+    return rendered
 
 
 async def _run_argv(
@@ -103,6 +121,7 @@ async def _run_argv(
         stderr=asyncio.subprocess.PIPE,
         **platform_info.no_window_kwargs(),
     )
+    started = time.monotonic()
     try:
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(input=stdin_data), timeout=timeout
@@ -113,7 +132,11 @@ async def _run_argv(
             await asyncio.wait_for(proc.communicate(), timeout=1)
         except Exception:
             pass
-        logger.warning("mobile.adb: command timed out: %s", cmd[:2])
+        logger.warning(
+            "mobile.adb: command timed out after %ss: %s",
+            timeout,
+            _cmd_for_log(cmd, stdin_data),
+        )
         raise
     except asyncio.CancelledError:
         # An outer `wait_for`/task cancellation must still kill the child --
@@ -126,6 +149,18 @@ async def _run_argv(
         except Exception:
             pass
         raise
+    duration = time.monotonic() - started
+    if duration > SLOW_CALL_CEILING_S:
+        logger.warning(
+            "mobile.adb: call took %.2fs (over %ss): %s",
+            duration,
+            SLOW_CALL_CEILING_S,
+            _cmd_for_log(cmd, stdin_data),
+        )
+    else:
+        logger.debug(
+            "mobile.adb: call took %.2fs: %s", duration, _cmd_for_log(cmd, stdin_data)
+        )
     return int(proc.returncode or 0), stdout or b"", stderr or b""
 
 
@@ -433,7 +468,7 @@ async def device_facts(serial: str) -> dict:
     return {"error": None, "content": facts}
 
 
-async def current_activity(serial: str) -> dict:
+async def current_activity(serial: str, timeout: int = 20) -> dict:
     """The focused activity as ``package/Activity``, or "" when unknowable.
 
     The uiautomator dump does NOT carry the activity, so `perception` took it as
@@ -452,7 +487,7 @@ async def current_activity(serial: str) -> dict:
     window can leave no resolvable component, and a screen identity that is
     weaker than it could be is far better than a refused dump.
     """
-    result = await shell(serial, ["dumpsys", "window"], timeout=20)
+    result = await shell(serial, ["dumpsys", "window"], timeout=timeout)
     if result.get("error"):
         return {"error": None, "content": ""}
     text = str((result["content"] or {}).get("out") or "")
@@ -531,7 +566,7 @@ async def installed_packages(serial: str) -> dict:
     a fact this module already holds exactly -- one question with two answers,
     which is how mirrored conditions drift.
     """
-    result = await shell(serial, ["pm", "list", "packages"], timeout=60)
+    result = await shell(serial, ["pm", "list", "packages"], timeout=PM_LIST_TIMEOUT_S)
     if result.get("error"):
         return result
     body = result.get("content") or {}
@@ -598,6 +633,54 @@ async def resolve_launcher(serial: str, package: str) -> str:
     return last
 
 
+#: Timeout for the ``am start`` / ``monkey`` that starts an app. Without
+#: ``-W`` the command returns once the intent is delivered -- well under a
+#: second on a healthy device -- so this bounds a wedged adbd, not a slow app.
+#: It was 60 with ``-W``, which on the Air's overloaded s25_ultra AVD was the
+#: 60 s stall in the run start (fix round 2, item 2). Bounded from above in
+#: ``tests/mobile/test_mobile_bounds_upper.py``.
+LAUNCH_START_TIMEOUT_S = 10
+
+#: How long ``launch`` then polls the focused window for the app. NON-GATING:
+#: running out is not an error, because callers that need the app up
+#: (``case_runner.start_case``) already poll with their own bound, and the rest
+#: settle on the next dump. Bounded from above in
+#: ``tests/mobile/test_mobile_bounds_upper.py``.
+LAUNCH_FOREGROUND_TIMEOUT_S = 8.0
+
+#: Gap between two focus reads in that poll. Matches
+#: ``case_runner.FOREGROUND_POLL_S``.
+LAUNCH_FOREGROUND_POLL_S = 0.5
+
+#: Timeout for ``pm list packages``: ~0.2 s on the Air's device, so 60 was a
+#: minute of silence on a wedged device rather than a bound. Bounded from above
+#: in ``tests/mobile/test_mobile_bounds_upper.py``.
+PM_LIST_TIMEOUT_S = 30
+
+
+async def _wait_foreground(serial: str, package: str) -> None:
+    """Poll the focused window until *package* holds it, for a bounded time.
+
+    What ``-W`` was used for, without its failure mode: ``-W`` waits for the
+    app to report a completed DRAW, which an overloaded host can take the whole
+    timeout to deliver. This asks the cheap question (``dumpsys window``) and
+    stops the moment the answer is yes. Each read's own timeout is cut to the
+    time left, so the poll cannot outlive its bound by a hung read. Never
+    raises and never fails the launch.
+    """
+    deadline = time.monotonic() + LAUNCH_FOREGROUND_TIMEOUT_S
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        focus = await current_activity(serial, timeout=int(remaining) + 1)
+        if str(focus.get("content") or "").split("/", 1)[0] == package:
+            return
+        await asyncio.sleep(
+            min(LAUNCH_FOREGROUND_POLL_S, max(0.0, deadline - time.monotonic()))
+        )
+
+
 async def launch(serial: str, package: str) -> dict:
     """Start *package*'s launcher activity.
 
@@ -619,7 +702,7 @@ async def launch(serial: str, package: str) -> dict:
     component = await resolve_launcher(serial, package)
     if component:
         started = await shell(
-            serial, ["am", "start", "-W", "-n", component], timeout=60
+            serial, ["am", "start", "-n", component], timeout=LAUNCH_START_TIMEOUT_S
         )
         body = started.get("content") or {}
         text = str(body.get("out") or "") + str(body.get("err") or "")
@@ -633,8 +716,9 @@ async def launch(serial: str, package: str) -> dict:
                 ),
                 "content": None,
             }
+        await _wait_foreground(serial, str(package))
         return started
-    return await shell(
+    monkeyed = await shell(
         serial,
         [
             "monkey",
@@ -644,8 +728,11 @@ async def launch(serial: str, package: str) -> dict:
             "android.intent.category.LAUNCHER",
             "1",
         ],
-        timeout=60,
+        timeout=LAUNCH_START_TIMEOUT_S,
     )
+    if not monkeyed.get("error"):
+        await _wait_foreground(serial, str(package))
+    return monkeyed
 
 
 async def force_stop(serial: str, package: str) -> dict:

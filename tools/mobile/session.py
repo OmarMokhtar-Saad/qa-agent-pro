@@ -1973,7 +1973,11 @@ async def next_packet(
                 # answering with a pointer. The reserved tail is spent on ONE
                 # best-effort capture instead of returning bare -- see
                 # _final_packet.
-                return _busy(body, "", packet=None if budget.expired() else await _final_packet(ctx, budget))
+                # Always attempt the capture: _final_packet self-guards with
+                # asyncio.wait_for(..., timeout=max(0.0, remaining())), so an
+                # already-expired budget degrades to None on its own instead
+                # of skipping the attempt outright.
+                return _busy(body, "", packet=await _final_packet(ctx, budget))
             turn = await explore_runner.next_turn(run_id, state, ctx)
             if turn.get("error"):
                 return turn
@@ -2050,10 +2054,12 @@ async def next_packet(
             # already given up on the call, so nothing is started at all. The
             # reserved tail is spent on ONE best-effort capture instead -- see
             # _final_packet.
+            # Always attempt the capture -- see the matching comment in the
+            # explore-lane busy branch above.
             return _busy(
                 body,
                 str(body.get("next_tc_id") or ""),
-                packet=None if budget.expired() else await _final_packet(ctx, budget),
+                packet=await _final_packet(ctx, budget),
             )
         started = await case_runner.start_case(run_id, loaded["content"], ctx)
         if started.get("error"):
@@ -2679,6 +2685,7 @@ async def submit(
     tester_input_field: str = "",
     tester_inputs: dict | None = None,
     confirm_destructive: bool = False,
+    budget: object = None,
 ) -> dict:
     """Replay one answered packet and return the verdict plus the NEXT packet.
 
@@ -2696,6 +2703,17 @@ async def submit(
             return resolved
         body = resolved["content"] or {}
         ctx = context_for(body)
+        if budget is not None:
+            # Caps THIS submit's replay so PACKET_RESERVE_S is still there for
+            # next_packet afterward -- without this, a slow action can spend
+            # the whole call budget on the replay and next_packet's busy
+            # reply is left with nothing to build a packet from. Never above
+            # SUBMIT_BUDGET_S: that constant is unchanged and still the
+            # ceiling.
+            ctx.budget_s = max(
+                1.0,
+                min(executor.SUBMIT_BUDGET_S, budget.remaining() - PACKET_RESERVE_S),
+            )
         field = str(tester_input_field or "").strip()[:80]
         try:
             merged_inputs = _merge_tester_inputs(

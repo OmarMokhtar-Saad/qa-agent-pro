@@ -1573,7 +1573,9 @@ async def _elicit_device_with_rescan(
     rounds = 0
     while rounds < _MAX_ELICIT_ROUNDS:
         rounds += 1
-        result = await list_devices()
+        # A rescan must bypass the discovery TTL cache: the tester just plugged
+        # a phone in or booted an emulator.
+        result = await list_devices(refresh=rounds > 1)
         devices = result.get("content") or []
         labels, by_label = _device_options(devices)
         picked = await _elicit_choice(choose, "Which device?", [*labels, rescan_label])
@@ -3412,6 +3414,20 @@ async def _mobile_doctor_section() -> list:
                     + doctor_render.AVD_GUIDE_URL
                     + "); `qa_mobile_test` answers with the same setup guide"
                 )
+            # Fix round 2, item 7: a heavy AVD is read from its config.ini and
+            # the host load from the OS, so this needs no booted device.
+            from tools.mobile import avd_guard
+
+            for name in names[:5]:
+                shown = sdk_locator.avd_display(name).get("content") or {}
+                heavy = avd_guard.assess(
+                    shown.get("width", 0), shown.get("height", 0), shown.get("density")
+                )
+                if heavy:
+                    lines.append("- ⚠️ `" + str(name)[:40] + "`: " + heavy)
+            loaded = avd_guard.assess(load_per_core=avd_guard.host_load())
+            if loaded:
+                lines.append("- ⚠️ " + loaded)
         # THE DEVICE LOCKS, ONE PER DEVICE, ASKED BY NAME. The design's honest
         # bound (plan §5.6) is that a holder whose heartbeat writer never
         # started is NOT force-released -- breaking a live holder's lock is the
@@ -12432,6 +12448,41 @@ async def handle_mobile_test(
         # `adb devices` answer, so serialising two calls that read the same
         # state produces the same outcome twice. See
         # `.claude/plans/plan-emulator-lock-2026-09-04.md` §5.2.
+        # THE SOURCE IS PICKED BEFORE ANY DEVICE WORK (fix round 2, item 3).
+        # The menu is a question about the arguments, not the device, and it
+        # used to be asked LAST -- after the device was selected and locked,
+        # the locale read, the app resolved and launched and the preflight run
+        # -- so a bare "what should the emulator run?" cost 50 s on the Air,
+        # and up to the boot wait on a cold emulator. `_mobile_pick_source`
+        # touches no device (it elicits through `choose` at most), so moving it
+        # here changes the order of questions only: source, then device.
+        picked = await _mobile_pick_source(
+            source,
+            suite_id=suite_id,
+            goal=goal,
+            cases=cases,
+            choose=choose,
+        )
+        # An INSTALL-menu key in `source` (`play_store`, `installed_package`,
+        # ...) answers the app question, not this one: that call still runs
+        # the device and app stages first and is asked this menu after them,
+        # exactly as before the move.
+        install_only = bool(
+            mobile_render.install_source_for_label(str(source or "").strip())
+        )
+        if not picked and not install_only:
+            # Two start arguments implying different lanes ask the NARROW
+            # question; nothing given asks the menu. One entry point, so a
+            # conflict cannot be rendered by an untested path.
+            # `source` reaches here ONLY when it matched no option key --
+            # `_mobile_pick_source` returns the key for everything it
+            # recognises -- so passing it cannot mislabel a good answer.
+            return mobile_render.source_menu_markdown(
+                conflict=mobile_render.implied_sources(
+                    suite_id=suite_id, goal=goal, cases=cases
+                ),
+                unmatched=source,
+            )
         pre_run_owner = session.new_provisioning_owner()
         # SELECTION FIRST, THEN THE DEVICE. Choosing is a question about the
         # machine -- it reads `adb devices` and may spawn the shared emulator --
@@ -12514,20 +12565,9 @@ async def handle_mobile_test(
             pf = checked.get("content") or {}
             if not pf.get("ok"):
                 return mobile_render.preflight_block(pf, mobile_preflight.render(pf))
-            picked = await _mobile_pick_source(
-                source,
-                suite_id=suite_id,
-                goal=goal,
-                cases=cases,
-                choose=choose,
-            )
             if not picked:
-                # Two start arguments implying different lanes ask the NARROW
-                # question; nothing given asks the menu. One entry point, so a
-                # conflict cannot be rendered by an untested path.
-                # `source` reaches here ONLY when it matched no option key --
-                # `_mobile_pick_source` returns the key for everything it
-                # recognises -- so passing it cannot mislabel a good answer.
+                # Only an install-only call gets here (see the source pick
+                # above): its run menu was deferred past the app stage.
                 return mobile_render.source_menu_markdown(
                     conflict=mobile_render.implied_sources(
                         suite_id=suite_id, goal=goal, cases=cases
@@ -12549,7 +12589,7 @@ async def handle_mobile_test(
                 capture=capture_result,
                 reset_app=reset_result,
             )
-            return reply
+            return await _mobile_heavy_avd_note(serial) + reply
         finally:
             if not handed_off:
                 # Only ever THIS call's own label, so a sibling call's hold
@@ -12566,6 +12606,29 @@ async def handle_mobile_test(
         logger.exception("mcp mobile_test failed")
         _capture_error(exc, "qa_mobile_test")
         return "⚠️ The mobile run could not continue: " + _safe(str(exc), 200)
+
+
+async def _mobile_heavy_avd_note(serial: str) -> str:
+    """The heavy-AVD warning to put above a run-start reply, or ``""``.
+
+    Fix round 2, item 7: the Air drove a 1440x3120 / 600 dpi AVD on a host at
+    load ~3 per core and nothing said so. ``display_size`` and
+    ``display_density`` are cached per serial. Advice only -- never raises,
+    never turns a started run into an error.
+    """
+    if not serial:
+        return ""
+    try:
+        from tools.mobile import adb as mobile_adb
+        from tools.mobile import avd_guard
+
+        size = (await mobile_adb.display_size(serial) or {}).get("content") or [0, 0]
+        density = (await mobile_adb.display_density(serial) or {}).get("content")
+        note = avd_guard.assess(size[0], size[1], density, avd_guard.host_load())
+        return ("⚠️ " + note + "\n\n") if note else ""
+    except Exception:
+        logger.exception("mobile heavy-AVD check failed")
+        return ""
 
 
 async def _mobile_pick_source(
@@ -13128,17 +13191,38 @@ async def _mobile_app_stage(
                 "Nothing was installed or started.",
                 target,
             )
+        from tools import device_manager as _device_manager
+        from tools.mobile import run_store as _run_store
+
         hint = (
             (" Closest installed match: `" + "`, `".join(suggestions) + "`.")
             if suggestions
             else ""
         )
+        try:
+            installed = await _device_manager.list_installed_apps(
+                {"id": serial, "platform": "android"}
+            )
+            names = [
+                str(app.get("id") or "")
+                for app in (installed.get("content") or [])
+                if isinstance(app, dict) and app.get("id")
+            ]
+            if names:
+                hint += "\n\nInstalled third-party packages: " + ", ".join(
+                    names[:20]
+                )
+            last = _run_store.last_used_package(serial)
+            if last:
+                hint += "\n\nLast used on this device: `" + last + "`"
+        except Exception:
+            pass
         return (
             "⚠️ `"
             + (target or "(none given)")
             + "` is not installed on the emulator, so there is nothing to run."
             + hint
-            + " Pick another install source, or install it and try again.",
+            + "\n\nPick another install source, or install it and try again.",
             target,
         )
     url = value
@@ -13533,7 +13617,7 @@ async def _mobile_hand_off(
     # outcome is REPORTED and the per-case hook still refuses the individual
     # case that types.
     keyboard_note = await _mobile_keyboard_stage(run_id)
-    rendered = await _mobile_next(run_id, token, progress=progress)
+    rendered = await _mobile_next(run_id, token, progress=progress, first_packet=True)
     if keyboard_note:
         rendered = keyboard_note + "\n\n" + rendered
     return rendered, True
@@ -13660,6 +13744,7 @@ async def _mobile_next(
     progress: ProgressCb = None,
     past_gate: bool = False,
     budget: object = None,
+    first_packet: bool = False,
 ) -> str:
     """Render the next packet, the gate, or the summary. One place, three states."""
     from tools.mobile import render as mobile_render
@@ -13748,8 +13833,17 @@ async def _mobile_next(
                 "failed": resolved.get("failed"),
             }
         )
+    resolved_body = body.get("resolved") if isinstance(body.get("resolved"), dict) else {}
+    reset_note = ""
+    if first_packet and (resolved_body.get("reset_app") or {}).get("cleared"):
+        reset_note = (
+            "**App data was already cleared at run start** -- do not add a "
+            "`clear_app_data` action; the app is already in its post-reset "
+            "state.\n\n"
+        )
     header = (
-        "## Mobile run `"
+        reset_note
+        + "## Mobile run `"
         + run_id
         + "`"
         + (" — " + str(body.get("tc_id")) if body.get("tc_id") else "")
@@ -13792,12 +13886,14 @@ async def handle_submit_mobile_step(
         return _mobile_lane_off_message()
 
     from tools.mobile import render as mobile_render
-    from tools.mobile import run_store, session
+    from tools.mobile import run_store, session, step_timing
 
     try:
         # Created here, so the time the replay itself spends counts against the
         # budget the NEXT packet is produced under.
         budget = session.new_budget()
+        # Fix round 2, item 4: arm the per-phase breakdown for this call.
+        step_timing.begin()
         claimed = session.claim(run_id, session_token)
         if claimed.get("error"):
             return "⚠️ " + _safe(claimed["error"], 300)
@@ -13835,15 +13931,19 @@ async def handle_submit_mobile_step(
                     parsed_inputs = loaded
             except Exception:
                 parsed_inputs = {}
-        result = await session.submit(
-            run_id,
-            tc_id,
-            script,
-            session_token=token,
-            tester_input=tester_input,
-            tester_input_field=tester_input_field,
-            tester_inputs=parsed_inputs,
-            confirm_destructive=confirm_destructive,
+        result = await step_timing.timed(
+            "replay",
+            session.submit(
+                run_id,
+                tc_id,
+                script,
+                session_token=token,
+                tester_input=tester_input,
+                tester_input_field=tester_input_field,
+                tester_inputs=parsed_inputs,
+                confirm_destructive=confirm_destructive,
+                budget=budget,
+            ),
         )
         if result.get("error"):
             return "⚠️ " + _safe(result["error"], 400)
@@ -13874,14 +13974,21 @@ async def handle_submit_mobile_step(
         line = mobile_render.verdict_line(case)
         notice = str(body.get("notice") or "")
         if body.get("packet"):
-            return (
+            reply = (
                 line
                 + (("\n\n" + notice) if notice else "")
                 + "\n\n"
                 + await _mobile_packet_text(body["packet"], token, body.get("resolved"))
             )
-        tail = await _mobile_next(run_id, token, progress=progress, budget=budget)
-        return line + (("\n\n" + notice) if notice else "") + "\n\n" + tail
+        else:
+            tail = await _mobile_next(run_id, token, progress=progress, budget=budget)
+            reply = line + (("\n\n" + notice) if notice else "") + "\n\n" + tail
+        # LAST, so the next packet's screenshot is inside the total. The same
+        # line goes to the log, where the audit row's one duration_ms cannot
+        # say which phase spent it.
+        timing = step_timing.line()
+        logger.info("mobile step %s %s: %s", run_id, tc_id, timing)
+        return reply + "\n\n" + timing
     except Exception as exc:  # never-raise contract
         logger.exception("mcp submit_mobile_step failed")
         _capture_error(exc, "qa_submit_mobile_step")
@@ -13952,7 +14059,9 @@ async def _mobile_packet_text(
     else:
         note = mobile_screenshot.CAPTURE_FAILED_NOTE
         try:
-            shot = await mobile_adb.screencap(serial)
+            from tools.mobile import step_timing
+
+            shot = await step_timing.timed("screenshot", mobile_adb.screencap(serial))
             spec = mobile_screenshot.to_spec(
                 (shot or {}).get("content"),
                 run_id=body.get("run_id"),
@@ -15253,7 +15362,8 @@ async def handle_search_corpus(
 async def handle_list_devices(*, progress: ProgressCb = None) -> str:
     try:
         await _emit(progress, "📱 Discovering connected devices…")
-        result = await list_devices()
+        # The tester asked for a scan: never answer it from the TTL cache.
+        result = await list_devices(refresh=True)
         if result.get("error"):
             return f"⚠️ Device discovery failed: {result['error']}"
         devices = await _android_device_details(result.get("content") or [])
@@ -17386,7 +17496,19 @@ def _optional_tool_paths() -> dict[str, str | None]:
     rows render.
     """
     names = ["adb"] + (["xcrun"] if sys.platform == "darwin" else [])
-    return {name: shutil.which(name) for name in names}
+    paths = {name: shutil.which(name) for name in names}
+    if not paths["adb"]:
+        # The lane drives the SDK's adb when PATH has none; saying "adb is not
+        # installed" while the lane runs on it is the D1 contradiction. A
+        # filesystem lookup only: it starts no adb server. A build without the
+        # mobile modules keeps the PATH answer.
+        try:
+            from tools.mobile import sdk_locator
+        except ImportError:
+            return paths
+        found = sdk_locator.resolve_adb()
+        paths["adb"] = found if os.path.isabs(found) and os.path.exists(found) else None
+    return paths
 
 
 def _tooling_gaps(paths: dict[str, str | None]) -> list[str]:

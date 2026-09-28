@@ -1470,6 +1470,8 @@ def build_server():
             Send {"op": "clear_app_data"} as a script action to wipe this run's
             OWN app's data and relaunch it -- gated by the same destructive
             guard as every other irreversible action, and never a different app.
+            If the first packet already says app data was cleared at run start
+            (reset_app=true), do not send clear_app_data again for that reason.
 
             One script may carry SEVERAL actions -- up to actions.MAX_ACTIONS,
             replayed in order until one needs the screen re-read or the case
