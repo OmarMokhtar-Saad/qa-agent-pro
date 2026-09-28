@@ -874,6 +874,30 @@ def list_runs(limit: int = 50, *, gc: bool = True) -> dict:
         return {"error": str(exc), "content": None}
 
 
+def last_used_package(serial: str) -> str:
+    """The most recently touched run's package on *serial*, or "".
+
+    Scans :func:`list_runs` (already newest-first) for the first manifest
+    whose serial matches and whose package is non-empty. Read-only, no gc --
+    a caller building an error message must never trigger a collection pass.
+    """
+    serial = str(serial or "")
+    if not serial:
+        return ""
+    listed = list_runs(limit=100, gc=False)
+    if listed.get("error"):
+        return ""
+    for row in listed.get("content") or []:
+        manifest = row.get("manifest") if isinstance(row, dict) else {}
+        manifest = manifest if isinstance(manifest, dict) else {}
+        if str(manifest.get("serial") or "") != serial:
+            continue
+        package = str(manifest.get("package") or "")
+        if package:
+            return package
+    return ""
+
+
 #: A verdict that means the case is FINISHED -- it will not be handed out
 #: again. Defined here, at the layer that decides what "done" means, and
 #: imported by `report.DONE_VERDICTS`; `case_runner` accepts exactly these

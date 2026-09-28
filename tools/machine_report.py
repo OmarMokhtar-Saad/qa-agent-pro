@@ -235,6 +235,7 @@ def doctor_rows() -> list:
     except Exception as exc:
         rows.append(Row("host_privileges", "undetermined", str(exc)))
     try:
+        from tools.mobile import adb as mobile_adb
         from tools.mobile import sdk_locator
 
         located = (sdk_locator.locate_sdk() or {}).get("content") or {}
@@ -254,16 +255,22 @@ def doctor_rows() -> list:
             )
         )
         adb_path = str((located.get("tools") or {}).get("adb") or "")
+        # The one shared resolver the mobile lane itself calls (tools.mobile.
+        # adb.resolve_adb / device_manager._adb_binary), so the doctor can
+        # never diverge from what a run actually drives -- audit item 6.
+        resolved_adb = mobile_adb.resolve_adb()
         rows.append(
             Row(
                 "adb",
                 "ok" if adb_path else "fail",
-                "adb at " + adb_path if adb_path else "No adb in the located SDK.",
+                "adb at " + resolved_adb
+                if adb_path
+                else "No adb in the located SDK.",
                 ""
                 if adb_path
                 else "Install Platform-Tools from Android Studio's SDK Manager; "
                 "neither this server nor a desktop client installs it.",
-                tool_path=adb_path,
+                tool_path=resolved_adb,
             )
         )
         for tool in SDK_TOOL_ROWS:

@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import re
+import time
 
 from config.settings import settings
 from tools.secure_temp import make_secure_temp_path
@@ -72,11 +73,21 @@ def _adb_binary() -> str:
     A bare ``"adb"`` depends on this process's PATH, which an IDE-spawned
     server often lacks, so qa_list_devices reported "No devices detected"
     for a device qa_mobile_test was driving. Deferred import: tools.mobile.adb
-    imports this module at module scope.
+    imports this module at module scope. A build without the mobile modules
+    degrades to the bare ``"adb"`` on PATH instead of raising.
     """
-    from tools.mobile import adb as mobile_adb
-
+    try:
+        from tools.mobile import adb as mobile_adb
+    except ImportError:
+        return "adb"
     return mobile_adb.resolve_adb()
+
+
+#: Above this, a single subprocess call here is worth a WARNing rather than a
+#: DEBUG line -- mirrors ``tools.mobile.adb.SLOW_CALL_CEILING_S``, kept as its
+#: own constant because this module's calls are unauthenticated listing/probe
+#: commands, not the mobile lane's per-action calls (audit item 1).
+SLOW_CALL_CEILING_S = 5.0
 
 
 async def _run(cmd: list[str], timeout: int) -> tuple[int, bytes, bytes]:
@@ -91,6 +102,7 @@ async def _run(cmd: list[str], timeout: int) -> tuple[int, bytes, bytes]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    started = time.monotonic()
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -102,8 +114,20 @@ async def _run(cmd: list[str], timeout: int) -> tuple[int, bytes, bytes]:
             # rather than passed so a device that cannot be reaped leaves a
             # trace -- the warning below only says the command timed out.
             logger.debug("device_manager: drain after kill failed", exc_info=True)
-        logger.warning("device_manager: command timed out: %s", cmd[0])
+        logger.warning(
+            "device_manager: command timed out after %ss: %s", timeout, " ".join(cmd)
+        )
         raise
+    duration = time.monotonic() - started
+    if duration > SLOW_CALL_CEILING_S:
+        logger.warning(
+            "device_manager: call took %.2fs (over %ss): %s",
+            duration,
+            SLOW_CALL_CEILING_S,
+            " ".join(cmd),
+        )
+    else:
+        logger.debug("device_manager: call took %.2fs: %s", duration, " ".join(cmd))
     return proc.returncode or 0, stdout or b"", stderr or b""
 
 
@@ -390,8 +414,45 @@ async def _list_android() -> list[dict]:
     return usable
 
 
+#: TTL for the whole-device-listing result (audit item 5: discovery forked
+#: xcrun on every call). Long enough to collapse the menu-then-run burst
+#: within one MCP exchange, short enough that a device plugged in mid-run is
+#: still found soon.
+DISCOVERY_CACHE_TTL_S = 10.0
+
+#: ``(cached_at, result)`` from the last successful ``list_devices`` probe, or
+#: ``None`` before the first call. Process-local; ``tests/conftest.py`` resets
+#: it between tests.
+_discovery_cache: tuple[float, dict] | None = None
+
+#: Whether full Xcode (not just the Command Line Tools) is installed, detected
+#: once per process and cached -- mirrors ``host_privileges.probe``'s shape.
+#: ``None`` before the first probe.
+_XCODE_CACHE: bool | None = None
+
+
+async def _xcode_present(refresh: bool = False) -> bool:
+    """True when ``xcrun -f simctl`` resolves, i.e. full Xcode is installed.
+
+    The Command Line Tools alone answer "unable to find utility simctl", which
+    is the noisy failure audit item 5 reported forking on every discovery
+    call. Cached per process; ``refresh=True`` re-probes.
+    """
+    global _XCODE_CACHE
+    if _XCODE_CACHE is not None and not refresh:
+        return _XCODE_CACHE
+    try:
+        rc, _out, _err = await _run(["xcrun", "-f", "simctl"], _cmd_timeout())
+        _XCODE_CACHE = rc == 0
+    except (FileNotFoundError, asyncio.TimeoutError):
+        _XCODE_CACHE = False
+    return _XCODE_CACHE
+
+
 async def _list_ios_simulators() -> list[dict]:
     """Booted iOS simulators via ``xcrun simctl list devices booted -j``."""
+    if not await _xcode_present():
+        return []
     try:
         rc, out, err = await _run(
             ["xcrun", "simctl", "list", "devices", "booted", "-j"], _cmd_timeout()
@@ -439,6 +500,8 @@ async def _list_ios_physical() -> list[dict]:
     Best-effort -- returns an empty list if devicectl is unavailable or the
     format is unrecognised.
     """
+    if not await _xcode_present():
+        return []
     try:
         rc, out, err = await _run(
             ["xcrun", "devicectl", "list", "devices"], _cmd_timeout()
@@ -473,7 +536,7 @@ async def _list_ios_physical() -> list[dict]:
     return devices
 
 
-async def list_devices() -> dict:
+async def list_devices(refresh: bool = False) -> dict:
     """Return every attached Android/iOS device, emulator, and simulator.
 
     Shape: ``{"content": [{id, name, platform, kind, state}, ...], "unusable":
@@ -490,7 +553,17 @@ async def list_devices() -> dict:
     special-case its absence.
     Never raises. A per-platform tool being missing is NOT an error -- that
     platform is simply skipped. Only a truly unexpected failure sets ``error``.
+
+    Cached for ``DISCOVERY_CACHE_TTL_S`` seconds (audit item 5): discovery
+    forked ``xcrun simctl``/``devicectl`` on every call, which is slow and,
+    without full Xcode, fails outright. ``refresh=True`` bypasses the cache.
     """
+    global _discovery_cache
+    now = time.monotonic()
+    if not refresh and _discovery_cache is not None:
+        cached_at, cached_result = _discovery_cache
+        if (now - cached_at) < DISCOVERY_CACHE_TTL_S:
+            return dict(cached_result)
     try:
         android, simulators, physical = await asyncio.gather(
             _list_android_all(),
@@ -504,7 +577,7 @@ async def list_devices() -> dict:
             len(devices),
             len(unusable_android),
         )
-        return {
+        result = {
             "content": devices,
             "unusable": unusable_android,
             # Lines of `adb devices` output the parser did not read. Always
@@ -513,6 +586,8 @@ async def list_devices() -> dict:
             "adb_dropped_lines": dropped_lines,
             "error": None,
         }
+        _discovery_cache = (now, dict(result))
+        return result
     except Exception as exc:
         logger.exception("device_manager: unexpected error listing devices")
         return {

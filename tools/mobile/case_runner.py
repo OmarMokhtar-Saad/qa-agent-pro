@@ -20,7 +20,7 @@ import logging
 import time
 
 from tools.mobile import actions as actions_mod
-from tools.mobile import adb, executor, ime_session, media, run_store
+from tools.mobile import adb, executor, ime_session, media, run_store, step_timing
 from tools.mobile.providers import composite
 from tools.mobile_capture import flows as api_flows
 from tools.mobile_evidence import capture, crash_detector
@@ -680,18 +680,21 @@ async def submit_case(
         # outlives the run. This writes the media records onto the case, and
         # `_checkpoint` below rebuilds that body whole -- which is why it
         # carries `media` forward explicitly.
-        await media.finish_step(
-            run_id,
-            tc_id,
-            ctx.serial,
-            clip,
-            str((new_screen or {}).get("screen_id") or ""),
+        await step_timing.timed(
+            "evidence",
+            media.finish_step(
+                run_id,
+                tc_id,
+                ctx.serial,
+                clip,
+                str((new_screen or {}).get("screen_id") or ""),
+            ),
         )
         # App evidence (plan D5): ONE slice per replay, after the trace is
         # final and before the checkpoint that carries the record forward.
         # The refused-script path above never reaches here: nothing ran, so
         # there is nothing to slice.
-        crash = await _slice_evidence(run_id, tc_id, ctx)
+        crash = await step_timing.timed("evidence", _slice_evidence(run_id, tc_id, ctx))
 
         from agents import mobile_run
 

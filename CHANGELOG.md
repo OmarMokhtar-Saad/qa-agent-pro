@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.100.4] - 2026-09-28
+## [1.100.5] - 2026-09-28
 
 ### Added
 
@@ -29,19 +29,18 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- Device listing and screenshots use the same adb as mobile runs, so
-  qa_list_devices finds a device even when adb is not on the editor's
-  PATH.
-- Mobile runs: a status reply for a run that is still going no longer
-  says to stop, and a run whose time extension is used up says so.
-- Mobile runs: a script with a single action gets a hint to batch
-  several actions per reply, saving round trips.
-- Mobile runs: a goal that asks to reset the app, sent without a
-  destructive setting, is told which setting allows it.
-- Mobile runs: a package id that is not installed now suggests the
-  closest installed package ids.
-- Mobile runs: a script may wait for on-screen text for up to 40
-  seconds in total (was 25), so two ordinary waits are accepted.
-- Mobile runs: the app resolved for a goal is remembered for up to a
-  week, so rerunning the same goal skips finding the app again; the
-  device is still checked before anything runs.
+- Mobile runs: starting a run with no source shows the run menu at
+  once, before touching the device.
+- Mobile runs: launching the app no longer waits for Android's full
+  launch report; a short foreground check replaces it.
+- Mobile runs: each step reply ends with a timing line showing where
+  the time went (screen reads, evidence, replay).
+- Mobile runs: an emulator image too heavy for this machine gets a
+  note saying so before the run starts.
+- Mobile runs: logging in takes about 4 calls instead of ~20; a
+  package that is not installed lists the installed apps and the one
+  used last on that device.
+- Device listing is cached for 10 seconds for internal lookups;
+  qa_list_devices and Rescan always read the devices fresh.
+- qa-doctor finds adb the same way mobile runs do.
+- Slow adb calls are logged with their duration.

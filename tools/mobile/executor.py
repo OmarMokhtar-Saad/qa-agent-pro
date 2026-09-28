@@ -40,7 +40,7 @@ import re
 import time
 
 from tools.mobile import actions as actions_mod
-from tools.mobile import adb, ime, perception
+from tools.mobile import adb, ime, perception, step_timing
 from tools.mobile.providers import base as providers_base
 from tools.mobile.providers import composite
 
@@ -826,7 +826,7 @@ def is_destructive(text: object) -> bool:
 
 async def _dump(ctx: Context) -> dict:
     """Re-dump and re-prune. Returns the ``{"error","content"}`` shape."""
-    raw = await adb.uiautomator_dump(ctx.serial)
+    raw = await step_timing.timed("ui_dump", adb.uiautomator_dump(ctx.serial))
     if raw.get("error"):
         return raw
     # The display is a DEVICE fact, so it is read from the device rather than
@@ -1391,7 +1391,7 @@ async def _qa_ime_blocker(serial: str) -> dict | None:
     and is left to the read-back verdict.
     """
     ours = str(((ime.manifest() or {}).get("content") or {}).get("ime_id") or "")
-    current = await ime.current_ime(serial)
+    current = await step_timing.timed("ime_check", ime.current_ime(serial))
     if current.get("error"):
         seen = "an unreadable setting: " + str(current["error"])[:120]
     else:
@@ -2067,7 +2067,7 @@ async def keyboard_up(serial: str) -> dict:
                 "content": None,
             }
         ours = str(((ime.manifest() or {}).get("content") or {}).get("ime_id") or "")
-        current = await ime.current_ime(serial)
+        current = await step_timing.timed("ime_check", ime.current_ime(serial))
         if current.get("error") or not ime.same_component(current.get("content"), ours):
             chosen = await ime.select(serial)
             if chosen.get("error"):
@@ -2565,8 +2565,14 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                 until_text = str(getattr(action, "until_text", "") or "").strip()
                 ms = int(getattr(action, "ms", 0) or 0)
                 if until_text:
+                    # A bare wait (no explicit ms) gets its split share of
+                    # MAX_TOTAL_WAIT_MS -- see actions.bare_wait_ms_each --
+                    # instead of the flat UNTIL_TEXT_DEFAULT_MS, so two or
+                    # more bare waits in one script share the 25s total
+                    # instead of the validator refusing the script outright.
+                    effective_ms = ms or actions_mod.bare_wait_ms_each(items)
                     found, screen, _timed_out = await _wait_until_text(
-                        ctx, screen, until_text, ms
+                        ctx, screen, until_text, effective_ms
                     )
                     entry["outcome"] = "ok" if found else "wait_timeout"
                     entry["detail"] = (
@@ -3234,4 +3240,4 @@ async def _sleep(seconds: float) -> None:
     """Named so a test can patch it; a real sleep would be the slowest thing here."""
     import asyncio
 
-    await asyncio.sleep(seconds)
+    await step_timing.timed("wait", asyncio.sleep(seconds))

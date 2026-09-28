@@ -219,6 +219,22 @@ def locate_sdk() -> dict:
         return {"error": str(exc), "content": None}
 
 
+def resolve_adb() -> str:
+    """Absolute path of the adb to use, or the bare name as a last resort.
+
+    Lives here, not in ``tools.mobile.adb``, because ``tools.mobile.adb``
+    imports ``tools.device_manager``: ``device_manager`` and qa-doctor read
+    this one function without closing that import loop, so the device list,
+    the doctor and the lane all find the same adb. ``tools.mobile.adb``
+    re-exports it under the same name.
+    """
+    located = (locate_sdk() or {}).get("content") or {}
+    found = str((located.get("tools") or {}).get("adb") or "")
+    if found:
+        return found
+    return platform_info.exe("adb")
+
+
 def _candidate_java_paths() -> list[tuple[str, Path]]:
     leaf = platform_info.exe("java")
     out: list[tuple[str, Path]] = []
@@ -305,6 +321,73 @@ def _avd_name_is_safe(name: str) -> bool:
     )
 
 
+def _avd_config_texts(name: str) -> list[str]:
+    """The head of every ``config.ini`` AVD *name* has, in the emulator's order.
+
+    The homes: ``ANDROID_AVD_HOME``, ``ANDROID_USER_HOME/avd``,
+    ``ANDROID_EMULATOR_HOME/avd``, ``~/.android/avd``. Each read is capped at
+    ``AVD_CONFIG_MAX_BYTES``; an unreadable file is skipped. *name* must
+    already have passed ``_avd_name_is_safe``.
+    """
+    homes = []
+    raw = (os.environ.get("ANDROID_AVD_HOME") or "").strip()
+    if raw:
+        homes.append(Path(raw).expanduser())
+    for var in ("ANDROID_USER_HOME", "ANDROID_EMULATOR_HOME"):
+        raw = (os.environ.get(var) or "").strip()
+        if raw:
+            homes.append(Path(raw).expanduser() / "avd")
+    homes.append(Path.home() / ".android" / "avd")
+    texts = []
+    for home in homes:
+        config = home / (name + ".avd") / "config.ini"
+        try:
+            if not config.is_file():
+                continue
+            with config.open("r", encoding="utf-8", errors="replace") as handle:
+                texts.append(handle.read(AVD_CONFIG_MAX_BYTES))
+        except OSError:
+            continue
+    return texts
+
+
+#: ``config.ini`` keys of an AVD's panel, and the name each is reported under.
+_AVD_DISPLAY_KEYS = {
+    "hw.lcd.width": "width",
+    "hw.lcd.height": "height",
+    "hw.lcd.density": "density",
+}
+
+
+def avd_display(avd: object) -> dict:
+    """An AVD's configured panel, read from its ``config.ini`` with no device.
+
+    ``{"error", "content": {"width", "height", "density"}}`` -- whichever of
+    ``hw.lcd.width``/``hw.lcd.height``/``hw.lcd.density`` the first config
+    carrying any of them states; ``{}`` when the name is not a plain AVD name
+    or nothing is found. Feeds the heavy-AVD warning in qa-doctor (fix round
+    2, item 7). Never raises.
+    """
+    try:
+        name = str(avd or "").strip()
+        if not _avd_name_is_safe(name):
+            return {"error": None, "content": {}}
+        for text in _avd_config_texts(name):
+            found = {}
+            for line in text.splitlines():
+                key, _, value = line.partition("=")
+                field = _AVD_DISPLAY_KEYS.get(key.strip())
+                value = value.strip()
+                if field and value.isdigit() and len(value) <= 6:
+                    found[field] = int(value)
+            if found:
+                return {"error": None, "content": found}
+        return {"error": None, "content": {}}
+    except Exception as exc:
+        logger.exception("mobile.sdk_locator.avd_display failed")
+        return {"error": str(exc), "content": None}
+
+
 def avd_system_image(avd: object) -> dict:
     """The system image an AVD boots, in the SDK's own package form.
 
@@ -321,24 +404,7 @@ def avd_system_image(avd: object) -> dict:
         name = str(avd or "").strip()
         if not _avd_name_is_safe(name):
             return {"error": None, "content": ""}
-        homes = []
-        raw = (os.environ.get("ANDROID_AVD_HOME") or "").strip()
-        if raw:
-            homes.append(Path(raw).expanduser())
-        for var in ("ANDROID_USER_HOME", "ANDROID_EMULATOR_HOME"):
-            raw = (os.environ.get(var) or "").strip()
-            if raw:
-                homes.append(Path(raw).expanduser() / "avd")
-        homes.append(Path.home() / ".android" / "avd")
-        for home in homes:
-            config = home / (name + ".avd") / "config.ini"
-            try:
-                if not config.is_file():
-                    continue
-                with config.open("r", encoding="utf-8", errors="replace") as handle:
-                    text = handle.read(AVD_CONFIG_MAX_BYTES)
-            except OSError:
-                continue
+        for text in _avd_config_texts(name):
             for line in text.splitlines():
                 key, _, value = line.partition("=")
                 if key.strip() != "image.sysdir.1":
