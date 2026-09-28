@@ -13040,7 +13040,7 @@ async def _mobile_app_stage(
     """
     from tools.mobile import adb as mobile_adb
     from tools.mobile import render as mobile_render
-    from tools.mobile import session
+    from tools.mobile import run_store, session
 
     chosen = str(source or "").strip()
     value = str(app or "").strip()
@@ -13050,7 +13050,14 @@ async def _mobile_app_stage(
     install_source = mobile_render.install_source_for_label(chosen)
     target = str(package or "").strip()
     if not target and install_source == "installed_package":
-        target = value
+        # A REMEMBERED RESOLUTION, tried before the raw hint. A rerun of the
+        # same goal used to re-send the same free-text app name and re-walk
+        # the fuzzy-match path every time; a cache hit here is still VERIFIED
+        # by the same `session.install_state` probe every other path below
+        # takes -- this only skips guessing the bundle id again, never the
+        # "is it actually installed" check.
+        cached_target = run_store.read_resolved_app(value) if value else {}
+        target = str(cached_target.get("package") or "") or value
 
     # WHETHER THE DEVICE ANSWERED, read from the one witness that knows.
     # `session.install_state` publishes `probed` on its CONTENT; this used to
@@ -13060,11 +13067,15 @@ async def _mobile_app_stage(
     # absent off a probe that never ran. `install_state` runs only for a
     # non-empty target, so a first call leaves this False and the menu ASKS.
     probed = False
+    suggestions: list[str] = []
     if target:
         state = await session.install_state(serial, target)
         body = state.get("content") or {}
         probed = bool(body.get("probed"))
+        suggestions = [str(s) for s in (body.get("suggestions") or [])][:5]
         if body.get("installed"):
+            if value:
+                run_store.write_resolved_app(value, target, serial, {})
             return "", target
         if body.get("pending"):
             return (
@@ -13117,11 +13128,17 @@ async def _mobile_app_stage(
                 "Nothing was installed or started.",
                 target,
             )
+        hint = (
+            (" Closest installed match: `" + "`, `".join(suggestions) + "`.")
+            if suggestions
+            else ""
+        )
         return (
             "⚠️ `"
             + (target or "(none given)")
-            + "` is not installed on the emulator, so there is nothing to run. "
-            "Pick another install source, or install it and try again.",
+            + "` is not installed on the emulator, so there is nothing to run."
+            + hint
+            + " Pick another install source, or install it and try again.",
             target,
         )
     url = value
@@ -13235,6 +13252,15 @@ async def _mobile_start(
         if parsed.get("error"):
             return "\u26a0\ufe0f " + _safe(parsed["error"], 300), False
         terms = parsed.get("content") or {}
+        raw_charter = parsed.get("raw") or {}
+        # Audit item 4: the destructive hint reaches the LIVE reply. (Item 5,
+        # an out-of-enum value, never gets this far: `charter.parse` above
+        # refuses it by name, listing the valid choices.) Read off
+        # `raw_charter`, never `terms`: same M11 reason `normalize`'s own
+        # docstring gives.
+        disclosures = mobile_charter.destructive_hint(
+            raw_charter, terms.get("goal") or goal
+        )
         if not str(terms.get("goal") or ""):
             # Neither a charter nor a goal: ASK, once, with the SERVER's own
             # questions, as a packet KIND on this same return path -- never a
@@ -13280,15 +13306,14 @@ async def _mobile_start(
         )
         if planned.get("error"):
             return "\u26a0\ufe0f " + _safe(planned["error"], 300), False
-        # `charter.parse` above already refuses (by name) any charter field it
-        # would otherwise have coerced silently -- a run only reaches this
-        # point with nothing rejected, so there is no longer a notice to
-        # prepend here.
-        return await _mobile_hand_off(
+        handed_text, handed_started = await _mobile_hand_off(
             str((planned.get("content") or {}).get("run_id") or ""),
             pre_run_owner=pre_run_owner,
             progress=progress,
         )
+        return (
+            (disclosures + "\n\n" + handed_text) if disclosures else handed_text
+        ), handed_started
 
     collected: list = []
     filters: dict = {}

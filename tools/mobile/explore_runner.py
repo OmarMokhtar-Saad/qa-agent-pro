@@ -105,6 +105,26 @@ EXTENSION_NOT_GRANTED = (
     "stop, or start a run whose charter names a larger budget."
 )
 
+#: The same two refusals, worded for a turn that is NOT actually the run's
+#: last one -- `apply_turn_result` picks between this pair and the "stop"
+#: pair above by checking `stop_reason` BEFORE choosing the notice. Audit
+#: item 2: a run at turn 4 of 30 whose second extension was refused got
+#: EXTENSION_SPENT ("...Report what was found and stop.") glued directly
+#: ahead of the next packet's own instructions to keep going -- one reply
+#: telling the model both to stop and to continue. The text must match the
+#: status it ships beside, not just the refusal it names.
+EXTENSION_SPENT_CONTINUE = (
+    "This session has already used its one extension, so the budget stands "
+    "at what it already has. Keep going within that budget and report what "
+    "was found when it ends."
+)
+EXTENSION_NOT_GRANTED_CONTINUE = (
+    "This run's budget comes from its charter, which is already the ceiling, "
+    "so an extension would add no turns and no time: nothing was extended and "
+    "the session's one extension was NOT spent. Keep going within the "
+    "charter's budget, or start a run whose charter names a larger budget."
+)
+
 
 def _now(value: float | None) -> float:
     return time.time() if value is None else float(value)
@@ -441,8 +461,13 @@ def apply_turn_result(state: object, raw: object, *, now: float | None = None) -
         requested = reply.get("request_extension")
         if requested:
             reason = " ".join(str(reply.get("extension_reason") or "").split())[:400]
+            # Computed BEFORE the notice text is chosen, and pure: nothing in
+            # this block touches turn/turns_budget/deadline ahead of a GRANT,
+            # so this is the exact value `status` gets at the return below.
+            # See EXTENSION_SPENT_CONTINUE's comment -- the text must match it.
+            ending = bool(stop_reason(body, now=now))
             if int(body.get("extensions_used") or 0) >= MAX_EXTENSIONS:
-                notice = EXTENSION_SPENT
+                notice = EXTENSION_SPENT if ending else EXTENSION_SPENT_CONTINUE
             elif not reason:
                 notice = EXTENSION_REFUSAL
             else:
@@ -493,7 +518,11 @@ def apply_turn_result(state: object, raw: object, *, now: float | None = None) -
                     # CANNOT see it, because an inequality is satisfied by the
                     # collapse -- the pin asserts this notice and
                     # ``extensions_used`` instead.
-                    notice = EXTENSION_NOT_GRANTED
+                    notice = (
+                        EXTENSION_NOT_GRANTED
+                        if ending
+                        else EXTENSION_NOT_GRANTED_CONTINUE
+                    )
                 else:
                     body["extensions_used"] = int(body.get("extensions_used") or 0) + 1
                     body["turns_budget"] = turns

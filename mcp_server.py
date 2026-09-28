@@ -1312,7 +1312,15 @@ def build_server():
             raw command skips every one of them. To reset the app under test, pass
             `reset_app=true` (clears its data and relaunches it) or send a
             `clear_app_data` op to `qa_submit_mobile_step`; either needs `apply=true`
-            and never touches a different app.
+            and never touches a different app. A goal charter (explore lane)
+            defaults to `destructive: "none"`, which REFUSES every irreversible
+            op it meets -- a goal that reads like a reset gets a named hint to
+            resend with `destructive: "reversible"` rather than failing on its
+            first step with no explanation. An out-of-enum charter field (e.g.
+            `depth: "functional"`) is never silently accepted either: the reply
+            names the field, what was sent, what was used instead, and a fenced
+            JSON block carrying the field's real `enum` values, sourced from
+            this server's own charter vocabulary rather than restated by hand.
 
             Call with NO arguments to start: it answers with whatever the machine
             needs next (a setup guide, an install source, a preflight list, or
@@ -1462,6 +1470,16 @@ def build_server():
             Send {"op": "clear_app_data"} as a script action to wipe this run's
             OWN app's data and relaunch it -- gated by the same destructive
             guard as every other irreversible action, and never a different app.
+
+            One script may carry SEVERAL actions -- up to actions.MAX_ACTIONS,
+            replayed in order until one needs the screen re-read or the case
+            ends -- so batch what you already know you want done rather than
+            one action per call: {"actions": [{"op": "tap", "text": "Email"},
+            {"op": "type", "text": "user@example.com"}, {"op": "tap",
+            "text": "Continue"}, {"op": "assert", "kind": "new_text",
+            "text": "Password"}]} is ONE submit, not four. A script that
+            carries exactly one action still runs, but the reply says so: use
+            more of the budget you already have per call.
 
             The NEXT packet arrives with a PNG of the screen attached as image
             content: look at it before you plan the next script. If a capture

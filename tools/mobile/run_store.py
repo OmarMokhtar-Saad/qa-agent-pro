@@ -108,6 +108,19 @@ SECRET_VALUE_KEYS: tuple[str, ...] = (
 
 #: A lease whose heartbeat is older than this is up for grabs.
 LEASE_STALE_S = 120
+#: How long a cached (package, serial) resolution for one task/app is trusted
+#: before a rerun re-discovers it from the device. Long enough that a
+#: same-session retry of a failed run skips the fuzzy-match and device-probe
+#: round trips a repeated goal used to pay for on every rerun; short enough
+#: that a device wipe or app reinstall days later is not trusted blindly --
+#: the reader still probes the device before ACTING on a hit, this only skips
+#: the DISCOVERY round trips, never the safety checks.
+RESOLVED_APP_TTL_S = 7 * 24 * 3600
+#: Entries in the cross-run resolved-app cache. Bounded so a long-lived
+#: machine cannot grow this file without limit; oldest `cached_at` entries
+#: are evicted first.
+MAX_RESOLVED_APPS = 50
+RESOLVED_APPS_FILE = "resolved_apps.json"
 
 #: A run whose newest activity is older than this is collected when the run list
 #: is read. Seven days: long enough that a tester who was away for a week still
@@ -305,6 +318,75 @@ def read_manifest(run_id: str) -> dict:
     except Exception as exc:
         logger.exception("mobile.run_store.read_manifest failed")
         return {"error": str(exc), "content": None}
+
+
+def _resolved_app_key(task_key: str) -> str:
+    """Normalise a task/app hint to a stable cache key. No secrets stored."""
+    return str(task_key or "").strip().lower()[:200]
+
+
+def read_resolved_app(task_key: str) -> dict:
+    """Cached ``{package, serial, charter}`` for *task_key*, or ``{}`` on a
+    miss or an expired entry. Never raises -- a miss is the normal first-run
+    case, not an error.
+    """
+    try:
+        key = _resolved_app_key(task_key)
+        if not key:
+            return {}
+        store = _read_json(paths.state_file(RESOLVED_APPS_FILE)) or {}
+        if not isinstance(store, dict):
+            return {}
+        entry = store.get(key) or {}
+        if not entry:
+            return {}
+        if (time.time() - float(entry.get("cached_at") or 0)) > RESOLVED_APP_TTL_S:
+            return {}
+        return {
+            "package": str(entry.get("package") or ""),
+            "serial": str(entry.get("serial") or ""),
+            "charter": (
+                entry.get("charter") if isinstance(entry.get("charter"), dict) else {}
+            ),
+        }
+    except Exception:
+        logger.exception("mobile.run_store.read_resolved_app failed")
+        return {}
+
+
+def write_resolved_app(
+    task_key: str, package: str, serial: str, charter: dict
+) -> None:
+    """Remember *package*/*serial*/*charter* for *task_key*. Never raises.
+
+    Bounded to MAX_RESOLVED_APPS entries (oldest `cached_at` evicted first)
+    and carries no secrets -- a package id, a device serial and the charter's
+    own (already-disclosed) destructive policy, nothing from the run's own
+    steps or the app's data.
+    """
+    try:
+        key = _resolved_app_key(task_key)
+        if not key:
+            return
+        path = paths.state_file(RESOLVED_APPS_FILE)
+        store = _read_json(path) or {}
+        if not isinstance(store, dict):
+            store = {}
+        store[key] = {
+            "package": str(package or ""),
+            "serial": str(serial or ""),
+            "charter": charter if isinstance(charter, dict) else {},
+            "cached_at": time.time(),
+        }
+        if len(store) > MAX_RESOLVED_APPS:
+            oldest = sorted(
+                store.items(), key=lambda kv: kv[1].get("cached_at") or 0
+            )
+            for stale_key, _ in oldest[: len(store) - MAX_RESOLVED_APPS]:
+                store.pop(stale_key, None)
+        _write_json(path, store)
+    except Exception:
+        logger.exception("mobile.run_store.write_resolved_app failed")
 
 
 def write_case(run_id: str, tc_id: str, payload: dict) -> dict:

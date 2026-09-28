@@ -67,7 +67,7 @@ SUBMIT_BUDGET_MS = 40000
 #: types and two asserts took a submit past the client's kill. Refusing costs
 #: the tester nothing: a refused script is not an escape, so the model resends a
 #: shorter one against the same screen.
-MAX_TOTAL_WAIT_MS = 25000
+MAX_TOTAL_WAIT_MS = 40000
 
 #: What a ``wait`` carrying only ``until_text`` counts as, for the total above:
 #: the bound the executor actually applies to it. Mirrored rather than imported

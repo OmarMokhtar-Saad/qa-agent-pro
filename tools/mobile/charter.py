@@ -316,6 +316,48 @@ def defaults() -> dict:
         "stop_on": "budget",
     }
 
+#: Reset-shaped goals get a NAMED hint toward `destructive: "reversible"`
+#: rather than a silent default flip. Flipping the shipped default risks a
+#: false positive on a free-text goal that only mentions a reset in passing,
+#: and this module's own rule is that a REDUCTION says so by name in the
+#: reply -- an unset field pointed at a destructive-shaped goal is the same
+#: kind of gap in the other direction, so it gets the same treatment: named,
+#: not silently assumed either way. Audit item 4.
+RESET_HINT_WORDS = (
+    "reset",
+    "clear data",
+    "clear app data",
+    "fresh install",
+    "reinstall",
+    "wipe",
+)
+
+
+def destructive_hint(raw: object, goal: object) -> str:
+    """"" unless *raw* left `destructive` unset AND *goal* names a reset.
+
+    Never changes the charter: `defaults()` above still ships
+    `destructive: "none"`, which REFUSES every destructive op. This is a
+    disclosure only, so a tester sees -- before the run starts, not after
+    its first refused step -- that a goal asking to reset/clear/reinstall
+    will refuse its own first action unless the next call also sends
+    `destructive: "reversible"`. Read off *raw*, the charter AS SENT, for
+    the same M11 reason `describe_terms` reads off `charter` and never
+    `terms`.
+    """
+    body = raw if isinstance(raw, dict) else {}
+    if str(body.get("destructive") or "").strip():
+        return ""
+    text = str(goal or "").lower()
+    if not any(word in text for word in RESET_HINT_WORDS):
+        return ""
+    return (
+        "This goal reads like it wants a reset, but no `destructive` was "
+        "sent, so the charter defaults to `destructive: \"none\"` and every "
+        "irreversible action REFUSES. Start again with "
+        "`destructive: \"reversible\"` if the reset should actually run."
+    )
+
 
 def _one_line(value: object, limit: int) -> str:
     return " ".join(str(value or "").split())[:limit]
