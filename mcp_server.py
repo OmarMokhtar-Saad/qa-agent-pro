@@ -1379,6 +1379,11 @@ def build_server():
             not read from a qa_* observation. If the server cannot type or act,
             stop and report the blocker by name. Do not fall back to raw adb
             input, and do not claim a result.
+
+            A finished run's reply STARTS with a short verdict block (verdict,
+            each requested step, the typed-field tally). Relay that block to
+            the tester word for word -- never upgrade, soften or summarise it
+            into a plainer claim than it makes.
             """
             from mcp.types import TextContent
 
@@ -1429,6 +1434,7 @@ def build_server():
             tester_input_field: str = "",
             session_token: str = "",
             confirm_destructive: bool = False,
+            tester_inputs: str = "",
         ) -> list[ContentBlock]:
             """Submit the action script YOU planned for a mobile packet.
 
@@ -1438,6 +1444,20 @@ def build_server():
             pass it as tester_input with tester_input_field set to the field
             name: it is typed into the app and stored nowhere -- not in the
             report, the checkpoint or the audit log.
+
+            When a packet asks for TWO OR MORE fields in the same turn (a
+            password plus a one-time code, say), pass them all at once as
+            tester_inputs, a JSON object string mapping field name to value,
+            e.g. '{"login_password": "...", "login_otp": "..."}' -- still
+            masked, still typed into the app and stored nowhere. Example: type
+            the ID, type the password ({"op": "type", "target": ..., "field":
+            "login_password", "secret": true}), tap send, wait until_text for
+            the one-time-code screen, type the code the same way ({"op":
+            "type", "target": ..., "field": "login_otp", "secret": true}),
+            assert, then done -- with both login_password and login_otp
+            supplied via tester_inputs on that SAME submit. The final assert
+            and done belong in the same script as the step before them, and
+            wait until_text is preferred over a fixed-ms wait.
 
             Send {"op": "clear_app_data"} as a script action to wipe this run's
             OWN app's data and relaunch it -- gated by the same destructive
@@ -1461,6 +1481,11 @@ def build_server():
             not read from a qa_* observation. If the server cannot type or act,
             stop and report the blocker by name. Do not fall back to raw adb
             input, and do not claim a result.
+
+            A finished run's reply STARTS with a short verdict block (verdict,
+            each requested step, the typed-field tally). Relay that block to
+            the tester word for word -- never upgrade, soften or summarise it
+            into a plainer claim than it makes.
             """
             from mcp.types import TextContent
 
@@ -1475,6 +1500,7 @@ def build_server():
                     tester_input_field,
                     session_token,
                     confirm_destructive=confirm_destructive,
+                    tester_inputs=tester_inputs,
                     progress=_make_progress(ctx),
                 ),
             )

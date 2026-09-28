@@ -1980,11 +1980,33 @@ def budget_stop_reason(ran: int, total: int) -> str:
         + str(int(ran))
         + " action(s); the remaining "
         + str(max(0, int(total) - int(ran)))
-        + " actions were not run; continue from the screen shown. One submit "
-        "replays for at most "
+        + " action(s) are queued and will run FIRST on your next submit -- "
+        "you do not need to resend them. One submit replays for at most "
         + str(int(SUBMIT_BUDGET_S))
-        + "s, so send a shorter script."
+        + "s."
     )
+
+
+def _serialize_queued(pending: object) -> list[dict]:
+    """Unreached actions from a budget-stopped replay, as plain dicts ready to
+    run again on a later submit -- the SERVER-SIDE queue this defect exists to
+    carry, instead of asking the model to retype a shorter script.
+
+    A queued ``type`` action never carries a secret literal past this call:
+    the FIELD NAME survives (so the tester supplies it again on the submit
+    that finally runs it, exactly like a fresh secret field); the VALUE does
+    not.
+    """
+    out: list[dict] = []
+    for action in list(pending or []):
+        try:
+            payload = action.model_dump(mode="json")
+        except Exception:  # pragma: no cover - defensive
+            continue
+        if payload.get("secret"):
+            payload["text"] = ""
+        out.append(payload)
+    return out
 
 
 #: Ops that go through the QA keyboard, so a script carrying one needs it up.
@@ -2191,6 +2213,10 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                         # charging one of three escapes for obeying our own
                         # bound is how a correct case becomes `blocked`.
                         budget_stop=True,
+                        # SERVER-SIDE queue (defect F2): the unreached actions
+                        # ride along on THIS reply so the next submit can run
+                        # them first instead of the model retyping them.
+                        queued_actions=_serialize_queued(items[index:]),
                     ),
                 }
             started = time.monotonic()

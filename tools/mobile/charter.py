@@ -241,6 +241,14 @@ DEPTHS = ("happy", "negative", "both")
 DESTRUCTIVE = ("none", "reversible", "allowed")
 STOP_ON = ("first_finding", "budget", "coverage_plateau")
 
+#: Answers accepted as a synonym for the field's real enum value, resolved in
+#: :func:`_choice` before the allowed-set check runs -- so every call site
+#: (`normalize`'s depth/destructive/stop_on clamps and the standalone
+#: `stop_on` reader) gets the resolution for free, and in `_rejected`'s own
+#: comparison, so an alias is never misreported as a value the server had to
+#: replace.
+ALIASES = {"happy_path": "happy"}
+
 #: What a guard hit DOES under this charter. Two values, and only two, and
 #: BOTH are implemented: ``PAUSE`` stops for the tester and ``REFUSE`` ends
 #: the attempt by name -- see :func:`guard_policy` for which value maps where
@@ -338,6 +346,7 @@ def _int(value: object, fallback: int = 0) -> int:
 
 def _choice(value: object, allowed: tuple, fallback: str) -> str:
     text = _one_line(value, 40).lower()
+    text = ALIASES.get(text, text)
     return text if text in allowed else fallback
 
 
@@ -429,7 +438,9 @@ def _rejected(body: object) -> list:
         if _unset(src, field):
             continue
         used = _choice(src.get(field), allowed, blank[field])
-        if used != _sent(src.get(field)).lower():
+        sent_norm = _sent(src.get(field)).lower()
+        sent_norm = ALIASES.get(sent_norm, sent_norm)
+        if used != sent_norm:
             out.append(
                 {
                     "field": field,
@@ -454,6 +465,27 @@ def _rejected(body: object) -> list:
                 }
             )
     return out
+
+
+def _refusal_message(rejected: list) -> str:
+    """The refusal for one or more fields :func:`_rejected` flagged.
+
+    Plain ``str()`` on the sent value, NEVER ``repr()``: this message is what
+    the tester reads back verbatim, and ``repr()`` would wrap the value in
+    quotes and break the exact substring an existing test asserts on --
+    ``"depth was sent as xyz"``, not ``"depth was sent as 'xyz'"``.
+    """
+    sentences: list = []
+    for item in rejected:
+        sentences.append(
+            str(item.get("field"))
+            + " was sent as "
+            + str(item.get("sent"))
+            + ", which is not one of: "
+            + ", ".join(str(choice) for choice in item.get("choices") or [])
+            + "."
+        )
+    return " ".join(sentences)
 
 
 def rejected_fields(charter: object) -> list:
@@ -606,6 +638,9 @@ def parse(text: object, goal: str = "") -> dict:
                 "content": None,
             }
     supplied = _schema_only(body)
+    rejected = _rejected(supplied)
+    if rejected:
+        return {"error": _refusal_message(rejected), "content": None}
     terms = normalize(supplied)
     if not terms["goal"]:
         supplied["goal"] = goal
@@ -894,6 +929,37 @@ def _scope_phrase(scope: object) -> str:
     return "; ".join(said)
 
 
+def _rejected_clause(charter: object) -> str:
+    """The disclosure sentence for every out-of-enum answer this run replaced,
+    or ``""``. Extracted from :func:`describe_terms` so a caller that only
+    needs THIS clause -- before the run has any cases, let alone a finished
+    report -- can get it without paying for the rest of the sentence. See
+    :func:`rejection_notice`.
+    """
+    said = ""
+    for spoiled in rejected_fields(charter):
+        said += (
+            str(spoiled.get("field"))
+            + " was sent as "
+            + str(spoiled.get("sent"))
+            + ", which is not one of "
+            + ", ".join(str(choice) for choice in (spoiled.get("choices") or []))
+            + ", so the server used "
+            + str(spoiled.get("used"))
+            + ". "
+        )
+    return said
+
+
+def rejection_notice(charter: object) -> str:
+    """The SAME disclosure :func:`describe_terms` buries in the finished
+    report, surfaced at the START -- an unknown enum value used to be named
+    only once the run was already over, never in `qa_mobile_test`'s own
+    immediate reply. ``""`` when nothing was rejected.
+    """
+    return _rejected_clause(charter)
+
+
 def describe_terms(charter: object) -> str:
     """The run's TERMS as one plain sentence, defaults NAMED. ONE producer.
 
@@ -948,18 +1014,10 @@ def describe_terms(charter: object) -> str:
     # off ``charter``, the argument as given, for the M11 reason: re-normalising
     # strips the recorded verdict. The clause is BOUNDED -- at most five
     # entries, each value trimmed to 40 characters -- because one unbounded
-    # clause ahead of a disclosure defeats the whole ordering.
-    for spoiled in rejected_fields(charter):
-        said += (
-            str(spoiled.get("field"))
-            + " was sent as "
-            + str(spoiled.get("sent"))
-            + ", which is not one of "
-            + ", ".join(str(choice) for choice in (spoiled.get("choices") or []))
-            + ", so the server used "
-            + str(spoiled.get("used"))
-            + ". "
-        )
+    # clause ahead of a disclosure defeats the whole ordering. See
+    # :func:`_rejected_clause`, the same loop extracted so `rejection_notice`
+    # can surface it before this run has a finished report.
+    said += _rejected_clause(charter)
     assumed = defaults_used(charter)
     if assumed:
         said += (

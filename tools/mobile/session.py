@@ -49,6 +49,7 @@ scope and fails on any new reader.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -133,11 +134,24 @@ STATES: tuple[str, ...] = (
 #: here would be asserting below its own noise floor.
 CALL_BUDGET_S = 45
 
+#: The most tester-supplied fields one submit may carry via ``tester_inputs``
+#: (see :func:`_merge_tester_inputs`). A real login/registration turn asks for
+#: a handful of fields -- a password, a one-time code -- never dozens; the cap
+#: exists so an oversized multi-field payload cannot grow the audit's
+#: ``tester_fields`` list, or the executor's per-field lookups, without bound.
+MOBILE_MAX_TESTER_INPUTS = 8
+
 #: The longest this module will ever wait on the device inside one tool call.
 #: Well under a client's ~50s tool timeout, and passed EXPLICITLY to
 #: ``wait_boot`` -- whose own default is 240s, so an omitted keyword is the
 #: defect this constant exists to prevent.
 DEVICE_WAIT_BUDGET_S = 20
+
+#: The tail of :data:`CALL_BUDGET_S` reserved, once, for one best-effort
+#: screen capture when a busy reply is about to go out with nothing in it.
+#: ``next_packet`` spends it on :func:`_final_packet` instead of starting the
+#: slow relaunch/foreground-poll path this reserve exists to avoid overrunning.
+PACKET_RESERVE_S = 8
 
 INSTALL_FILE = "install.json"
 
@@ -170,17 +184,80 @@ def new_budget(seconds: float = CALL_BUDGET_S) -> Budget:
     return Budget(deadline=time.monotonic() + max(1.0, span))
 
 
-def _busy(resolved: object, tc_id: str) -> dict:
-    """The bounded-call reply: a pointer, not a packet, and nothing half-done."""
+def _busy(resolved: object, tc_id: str, *, packet: object = None) -> dict:
+    """The bounded-call reply: usually a pointer, and never half-done.
+
+    *packet* is the reserved-tail capture from :func:`_final_packet` -- a
+    best-effort screen, or ``None`` when the device did not answer inside
+    :data:`PACKET_RESERVE_S`. Passing it through here, rather than building it
+    at the call site, keeps every caller's shape the same.
+    """
     return {
         "error": None,
         "content": {
             "state": STATE_BUSY,
-            "packet": None,
+            "packet": packet,
             "tc_id": str(tc_id or ""),
             "resolved": resolved if isinstance(resolved, dict) else {},
         },
     }
+
+
+def _in_reserve(budget: object) -> bool:
+    """Expired, or inside the reserved tail. ``expired()`` is asked first so a
+    budget without ``remaining()`` (a duck-typed test budget) still works."""
+    if budget.expired():
+        return True
+    remaining = getattr(budget, "remaining", None)
+    return callable(remaining) and remaining() <= PACKET_RESERVE_S
+
+
+async def _final_packet(ctx: object, budget: object) -> dict | None:
+    """One best-effort screen capture spent from the reserved tail of a busy
+    reply. Never raises -- a device that will not answer in time degrades the
+    busy reply to plain text, exactly as before this change.
+
+    Reuses the SAME primitive ``case_runner.start_case`` uses to prune a fresh
+    dump into a screen (``adb.uiautomator_dump``/``display_size``/
+    ``display_density`` feeding :func:`composite.observe`), with no relaunch,
+    no foreground poll and no activity resolve -- those are the slow parts
+    this fix exists to avoid starting this close to the client's own timeout.
+
+    The whole capture runs under ``asyncio.wait_for`` with what is left of
+    *budget* as its timeout, so a device that stalls on any of the three adb
+    calls is cut off at the budget deadline and the call never overruns
+    :data:`CALL_BUDGET_S`.
+    """
+    serial = str(getattr(ctx, "serial", "") or "")
+    remaining = getattr(budget, "remaining", None)
+    if not serial or not callable(remaining):
+        return None
+
+    async def capture() -> dict | None:
+        dumped = await adb.uiautomator_dump(serial)
+        if dumped.get("error"):
+            return None
+        sized = await adb.display_size(serial)
+        dpi = await adb.display_density(serial)
+        pruned = composite.observe(
+            dumped.get("content"),
+            "",
+            display=sized.get("content"),
+            density=dpi.get("content"),
+        )
+        if pruned.get("error"):
+            return None
+        return pruned.get("content") or None
+
+    try:
+        return await asyncio.wait_for(capture(), timeout=max(0.0, remaining()))
+    except asyncio.TimeoutError:
+        logger.info("mobile.session: _final_packet capture hit the call budget")
+        return None
+    except Exception:  # pragma: no cover - defensive, see docstring
+        logger.warning("mobile.session: _final_packet capture failed", exc_info=True)
+        return None
+
 
 
 def mint_session() -> str:
@@ -1722,6 +1799,59 @@ def reset_app_record(body: object) -> dict:
         "cleared": bool(given.get("cleared")),
     }
 
+def reset_step_status(resolved: object, cases: object) -> dict:
+    """What "reset" means for the relay block: requested from EITHER the
+    launch-time ``reset_app=true`` flag (the manifest's ``reset_app`` record,
+    see :func:`reset_app_record`) OR a ``clear_app_data`` op the model
+    submitted mid-run, and done only when a clear actually landed. A
+    requested reset that never confirmed is exactly the gap the relay block
+    exists to surface. A run once read as a pass after a reset that never ran.
+    """
+    body = resolved if isinstance(resolved, dict) else {}
+    manifest_reset = body.get("reset_app")
+    manifest_reset = manifest_reset if isinstance(manifest_reset, dict) else {}
+    requested = bool(manifest_reset.get("requested"))
+    done = bool(manifest_reset.get("cleared"))
+    for row in list(cases or []):
+        if not isinstance(row, dict):
+            continue
+        for item in list(row.get("trace") or []):
+            if not isinstance(item, dict):
+                continue
+            action = item.get("action") if isinstance(item.get("action"), dict) else {}
+            if str(action.get("op") or "") != "clear_app_data":
+                continue
+            requested = True
+            if str(item.get("outcome") or "") == "ok":
+                done = True
+    return {"requested": requested, "done": done}
+
+
+def run_verdict(resolved: object, cases: object) -> str:
+    """pass / fail / unverified -- the ONE word a tester reads to answer "did
+    this run pass". An abandoned run and a requested-but-unconfirmed reset
+    BOTH force ``unverified``: a run this lane cannot vouch for must never
+    read as a pass, which is the defect a chat once told a tester "Login
+    succeeded" against.
+    """
+    from tools.mobile import case_runner
+
+    body = resolved if isinstance(resolved, dict) else {}
+    rows = [row for row in list(cases or []) if isinstance(row, dict)]
+    reset = reset_step_status(body, rows)
+    if str(body.get("state") or "") == STATE_ABANDONED:
+        return case_runner.VERDICT_UNVERIFIED
+    if reset.get("requested") and not reset.get("done"):
+        return case_runner.VERDICT_UNVERIFIED
+    if not rows:
+        return case_runner.VERDICT_UNVERIFIED
+    verdicts = {str(row.get("verdict") or "") for row in rows}
+    if case_runner.VERDICT_FAIL in verdicts:
+        return case_runner.VERDICT_FAIL
+    if verdicts <= {case_runner.VERDICT_PASS}:
+        return case_runner.VERDICT_PASS
+    return case_runner.VERDICT_UNVERIFIED
+
 
 def device_record(facts: object) -> dict:
     """Normalise ``adb.device_facts`` content for the manifest. Never raises.
@@ -1819,11 +1949,13 @@ async def next_packet(
         ctx = context_for(body)
         if str(body.get("lane")) == LANE_EXPLORE:
             state = body.get("explore") or {}
-            if budget is not None and budget.expired():
+            if budget is not None and _in_reserve(budget):
                 # Checked BEFORE the turn, never during: a turn dumps the screen
                 # and writes state, and abandoning one half-done is worse than
-                # answering with a pointer.
-                return _busy(body, "")
+                # answering with a pointer. The reserved tail is spent on ONE
+                # best-effort capture instead of returning bare -- see
+                # _final_packet.
+                return _busy(body, "", packet=None if budget.expired() else await _final_packet(ctx, budget))
             turn = await explore_runner.next_turn(run_id, state, ctx)
             if turn.get("error"):
                 return turn
@@ -1894,11 +2026,17 @@ async def next_packet(
         loaded = load_case(run_id, str(body.get("next_tc_id") or ""))
         if loaded.get("error"):
             return loaded
-        if budget is not None and budget.expired():
+        if budget is not None and _in_reserve(budget):
             # start_case force-stops the app, relaunches it and dumps the screen.
             # With the budget gone that work would land after the client has
-            # already given up on the call, so nothing is started at all.
-            return _busy(body, str(body.get("next_tc_id") or ""))
+            # already given up on the call, so nothing is started at all. The
+            # reserved tail is spent on ONE best-effort capture instead -- see
+            # _final_packet.
+            return _busy(
+                body,
+                str(body.get("next_tc_id") or ""),
+                packet=None if budget.expired() else await _final_packet(ctx, budget),
+            )
         started = await case_runner.start_case(run_id, loaded["content"], ctx)
         if started.get("error"):
             return started
@@ -2118,6 +2256,48 @@ def _explore_prior_turn_blocked(run_id: str) -> bool:
     return False
 
 
+def _prior_guard_stop_explore(run_id: str, tc_id: str) -> dict:
+    """The explore lane's own guard-stop lookup: an EXACT match on ``tc_id``
+    first (the common case, a resubmission of the SAME turn), and only when
+    that misses, the highest-turn checkpointed case's own ``guard_stop`` --
+    verbatim, so a confirm still spends against exactly what that turn
+    recorded (``{}`` if that turn recorded none, which keeps the one-shot
+    confirm inert rather than manufacturing a stop for it to consume).
+
+    This exists because the explore lane's turn counter
+    (``explore_runner.next_packet``) bumps ``state["turn"]`` on EVERY call,
+    not only across a resubmission of the same turn -- so a confirm
+    submitted after the scheduler already advanced past this turn names a
+    ``tc_id`` no case was ever checkpointed under, and the exact-match lookup
+    alone returns ``{}`` and the guard fires again on a turn that already
+    confirmed. The scripted lane never reaches this: it always has an exact
+    ``tc_id`` match once a case exists, so :func:`_prior_guard_stop` alone
+    still serves it directly. FAILS CLOSED the same way its sibling does:
+    any read that raises, or no checkpointed case at all, is untracked --
+    ``{}``.
+    """
+    exact = _prior_guard_stop(run_id, tc_id)
+    if exact:
+        return exact
+    try:
+        listed = run_store.list_cases(run_id) or {}
+        rows = [b for b in (listed.get("content") or []) if isinstance(b, dict)]
+        if not rows:
+            return {}
+        # (length, text): TC-\d{3,6} sorts numerically, so TC-1000 > TC-999.
+        latest = max(
+            rows,
+            key=lambda b: (len(str(b.get("tc_id") or "")), str(b.get("tc_id") or "")),
+        )
+        stop = latest.get("guard_stop")
+        return dict(stop) if isinstance(stop, dict) else {}
+    except Exception:  # pragma: no cover - defensive
+        logger.warning(
+            "mobile.session: could not read the latest explore turn's guard stop"
+        )
+        return {}
+
+
 def _prior_guard_stop(run_id: str, tc_id: str) -> dict:
     """THIS case's own last recorded guard-stop fingerprint, or ``{}``.
 
@@ -2125,12 +2305,12 @@ def _prior_guard_stop(run_id: str, tc_id: str) -> dict:
     not a run-wide "latest by tc_id digit" scan: that scan's "latest" case
     can be a DIFFERENT tc_id than the one this confirm names, which would let
     a stop recorded against one case authorise a confirm submitted for
-    another. The scripted lane passes its own ``tc_id``; the explore lane
-    passes ``explore_turn_case_id(resolved.get("explore"))`` computed BEFORE
-    this submission's replay -- the SAME id ``_checkpoint_explore_turn``
-    wrote the CURRENT turn's own stop under, because the turn number does
-    not advance across a resubmission of the same turn (see the ``before``
-    comment in ``_submit_explore``).
+    another. The scripted lane passes its own ``tc_id`` and stops here. The
+    explore lane no longer calls this function directly -- its turn counter
+    advances on EVERY packet, not only across a resubmission, so an exact
+    match alone misses a confirm submitted after the scheduler moved on; see
+    :func:`_prior_guard_stop_explore`, which tries this exact match FIRST
+    and only then falls back.
 
     FAILS CLOSED: any read that raises, or a matching case that recorded no
     stop, is untracked -- ``{}`` -- rather than treated as leniently as
@@ -2388,6 +2568,54 @@ def _persist_explore(run_id: str, state: object, planned: object = None) -> None
         logger.warning("mobile.session: could not persist explore state")
 
 
+def _combine_queued_actions(queued: object, new_actions: object) -> dict:
+    """Actions left queued by a budget stop, folded with a fresh submit.
+
+    Delegates to :func:`tools.mobile.actions.combine_queued_actions` -- FU1
+    moved the combine rule there so ``case_runner`` (which cannot import
+    ``session``) can use the same rule for the SCRIPTED lane. Behaviour-
+    identical; see that function's docstring for the queue-first,
+    cap-refuses-by-name design.
+    """
+    from tools.mobile import actions as actions_mod
+
+    return actions_mod.combine_queued_actions(queued, new_actions)
+
+
+def _merge_tester_inputs(
+    tester_input: str, tester_input_field: str, tester_inputs: dict | None
+) -> dict:
+    """The legacy single ``(field, value)`` pair plus a multi-field dict, merged
+    into ONE dict :func:`submit` puts on ``Context.tester_inputs``.
+
+    ``tester_inputs`` wins on a colliding field name -- it is the newer, more
+    specific form, and a caller sending both is choosing to override the
+    legacy pair rather than fighting it silently. Each field name is
+    truncated to 80 chars, matching the legacy single-field cap. More than
+    :data:`MOBILE_MAX_TESTER_INPUTS` fields raises ``ValueError`` naming the
+    cap -- :func:`submit` returns it as the error, and runs nothing -- rather
+    than dropping fields silently, so an oversized payload cannot grow the audit's ``tester_fields`` list, or the
+    executor's per-field lookups, without bound.
+    """
+    merged: dict = {}
+    legacy_field = str(tester_input_field or "").strip()[:80]
+    if legacy_field and str(tester_input or ""):
+        merged[legacy_field] = str(tester_input)
+    if isinstance(tester_inputs, dict):
+        for raw_name, value in tester_inputs.items():
+            name = str(raw_name or "").strip()[:80]
+            if name and str(value or ""):
+                merged[name] = str(value)
+    if len(merged) > MOBILE_MAX_TESTER_INPUTS:
+        raise ValueError(
+            "this submit names %d tester fields; one submit takes at most %d "
+            "(MOBILE_MAX_TESTER_INPUTS). Nothing was run: answer only the "
+            "fields this screen asks for and send the rest on a later submit."
+            % (len(merged), MOBILE_MAX_TESTER_INPUTS)
+        )
+    return merged
+
+
 async def submit(
     run_id: str,
     tc_id: str,
@@ -2396,13 +2624,18 @@ async def submit(
     session_token: str = "",
     tester_input: str = "",
     tester_input_field: str = "",
+    tester_inputs: dict | None = None,
     confirm_destructive: bool = False,
 ) -> dict:
     """Replay one answered packet and return the verdict plus the NEXT packet.
 
-    The tester's value is put on ``Context.tester_inputs`` and nowhere else: it
-    is not returned, not checkpointed, not logged and not part of any dict this
-    function hands back. The FIELD NAME travels; the value does not.
+    The tester's value(s) are put on ``Context.tester_inputs`` and nowhere
+    else: not returned, not checkpointed, not logged and not part of any dict
+    this function hands back. ``tester_input``/``tester_input_field`` is the
+    legacy single-field pair; ``tester_inputs`` is a dict for a submit that
+    answers TWO OR MORE fields at once (a password plus a one-time code, say)
+    -- see :func:`_merge_tester_inputs`. The FIELD NAMES travel; the values do
+    not.
     """
     try:
         resolved = resolve(run_id, session_token)
@@ -2411,8 +2644,14 @@ async def submit(
         body = resolved["content"] or {}
         ctx = context_for(body)
         field = str(tester_input_field or "").strip()[:80]
-        if field and str(tester_input or ""):
-            ctx.tester_inputs = {field: str(tester_input)}
+        try:
+            merged_inputs = _merge_tester_inputs(
+                tester_input, tester_input_field, tester_inputs
+            )
+        except ValueError as exc:
+            return {"error": str(exc), "content": None}
+        if merged_inputs:
+            ctx.tester_inputs = merged_inputs
         ctx.confirm_destructive = bool(confirm_destructive)
         if str(body.get("lane")) == LANE_EXPLORE:
             return await _submit_explore(run_id, raw_script, ctx, body)
@@ -2471,6 +2710,30 @@ async def _submit_explore(
     # finding. Two failures, one cause, and no test saw either because every
     # test passed a dict into this helper.
     payload = actions_mod.decode_reply(raw)
+    # SERVER-SIDE queue (defect F2): actions a prior budget stop left unreached
+    # ride the persisted explore state and run FIRST, ahead of whatever the
+    # model just submitted -- see _combine_queued_actions.
+    queued_in = list((resolved.get("explore") or {}).get("queued_actions") or [])
+    if queued_in:
+        combined = _combine_queued_actions(
+            queued_in, list(payload.get("actions") or [])
+        )
+        if not combined.get("ok"):
+            return {
+                "error": None,
+                "content": {
+                    "state": STATE_RUNNING,
+                    "case": {
+                        "status": case_runner.NEEDS_MODEL,
+                        "reason": str(combined.get("reason") or ""),
+                    },
+                    "packet": None,
+                    "next": {},
+                    "field": "",
+                    "resolved": resolved,
+                },
+            }
+        payload["actions"] = combined["actions"]
     parsed = actions_mod.parse_script(payload.get("actions"))
     if parsed.get("error"):
         return {
@@ -2501,11 +2764,12 @@ async def _submit_explore(
         )
         == charter_mod.REFUSE
     )
-    # THIS turn's own id, computed BEFORE the replay below -- the same id
-    # `_checkpoint_explore_turn` will write THIS turn's stop under, and the
-    # same one a resubmission of this SAME turn recomputes (the turn number
-    # only advances once a NEW packet goes out). See `_prior_guard_stop`.
-    ctx.prior_guard_stop = _prior_guard_stop(
+    # THIS turn's own id, computed BEFORE the replay below. The exact-match
+    # lookup alone no longer suffices here: `explore_runner.next_packet`
+    # bumps `state["turn"]` on EVERY call, so a confirm submitted after the
+    # scheduler already advanced past this turn names a `tc_id` no case was
+    # ever checkpointed under. See `_prior_guard_stop_explore`.
+    ctx.prior_guard_stop = _prior_guard_stop_explore(
         run_id, explore_turn_case_id(resolved.get("explore"))
     )
     # THE RECORDER, on the lane that shipped without one. `case_runner` has
@@ -2541,6 +2805,12 @@ async def _submit_explore(
     if folded.get("error"):
         return folded
     turn = folded.get("content") or {}
+    # Carried on `turn["state"]`, not `turn` itself: `committed_state` below is
+    # built from `turn.get("state")`, and that is the ONLY part of `turn`
+    # `_persist_explore` writes back into `resolved["explore"]` -- a queue
+    # attached anywhere else on `turn` would never reach the next submit.
+    if isinstance(turn.get("state"), dict):
+        turn["state"]["queued_actions"] = outcome.get("queued_actions") or []
     # The turn just replayed, checkpointed as a case. ``resolved["explore"]``
     # carries the turn NUMBER this submit answered (``next_turn`` incremented
     # and persisted it before the packet went out), so the id is the turn's own
@@ -2679,6 +2949,7 @@ def audit_detail(
     verdict: str = "",
     status: str = "",
     field: str = "",
+    fields: list[str] | None = None,
     step: str = "",
     apply: object = None,
 ) -> dict:
@@ -2709,6 +2980,15 @@ def audit_detail(
                 "field": str(field)[:80],
                 "value": run_store.SECRET_MASK,
             }
+        if fields:
+            names = [
+                str(name)[:80] for name in fields if str(name or "").strip()
+            ][:MOBILE_MAX_TESTER_INPUTS]
+            if names:
+                detail["tester_fields"] = [
+                    {"secret": True, "field": name, "value": run_store.SECRET_MASK}
+                    for name in names
+                ]
         return run_store.redact(detail)
     except Exception:  # pragma: no cover - defensive
         logger.warning("mobile.session.audit_detail failed", exc_info=True)

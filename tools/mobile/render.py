@@ -633,6 +633,7 @@ def verdict_line(case: object) -> str:
     verdict = _field(body.get("verdict") or body.get("status"))
     reason = _field(body.get("reason"))[:160]
     note = crash_note(case)
+    tally = _typed_field_tally([body])
     return (
         marks.get(verdict, "•")
         + " `"
@@ -644,6 +645,7 @@ def verdict_line(case: object) -> str:
         + "**"
         + ((" — " + reason) if reason else "")
         + (("\n\n" + note) if note else "")
+        + (("\n\n" + tally.strip()) if tally else "")
     )
 
 
@@ -812,15 +814,22 @@ def status_block(resolved: object, coverage_line: str = "") -> str:
         return "## Mobile run\n\n- state: **unknown**"
 
 
-def busy_block(run_id: str, tc_id: str = "") -> str:
+def busy_block(run_id: str, tc_id: str = "", *, packet: object = None) -> str:
     """The bounded-call reply: this call stopped ITSELF, and nothing was lost.
 
     A client kills a tool call at around 50 seconds, and a killed call looks
     exactly like a broken server -- so the lane answers before the client's
     timer does. The wording has one job beyond politeness: to say that no work
     was half-done, because a tester who thinks a case ran will not re-run it.
+
+    *packet* is the reserved-tail capture ``session._final_packet`` took
+    before this call gave up -- best-effort, and ``None`` when the device did
+    not answer in time. When present it is embedded so the model can plan its
+    next call from THIS reply instead of spending a whole extra round trip
+    just to see the screen it already asked about.
     """
     run = str(run_id)[:64]
+    packet_text = packet_block(packet) if isinstance(packet, dict) and packet else ""
     return (
         "## Still working on run `"
         + run
@@ -828,7 +837,9 @@ def busy_block(run_id: str, tc_id: str = "") -> str:
         "would not time it out. There is no step in this reply and nothing was "
         "half-done"
         + (" \u2014 `" + str(tc_id)[:16] + "` has not started yet" if tc_id else "")
-        + ".\n\n- `qa_mobile_status` shows where the run stands.\n"
+        + ".\n\n"
+        + packet_text
+        + "- `qa_mobile_status` shows where the run stands.\n"
         '- Call `qa_mobile_test` again with `run_id="'
         + run
         + '"` to carry on from the same place.'
@@ -917,6 +928,46 @@ def _typed_field_tally(rows: list[dict]) -> str:
         if len(failed) > 12:
             line += " and others"
     return line + "\n\n"
+
+def typed_field_tally(rows: list[dict]) -> str:
+    """Public wrapper around :func:`_typed_field_tally`. :func:`verdict_line`
+    (the per-turn submit reply) and ``report.py``'s ``_meta_html`` (the
+    finished-run report) both call this ONE name, so the field count and the
+    failed-field names can never drift between the chat reply and the
+    report page.
+    """
+    return _typed_field_tally(rows)
+
+
+def relay_block(*, verdict: str = "", reset: object = None, typed_field_line: str = "") -> str:
+    """The block a finished-run reply MUST start with. The calling model is
+    told, in the block itself, to relay it word for word -- never upgrade it
+    into a plainer claim ("Login succeeded") than the run itself can back.
+
+    Three facts only: the verdict, whether the reset the tester asked for
+    (at launch, or mid-run via ``clear_app_data``) actually landed, and the
+    typed-field tally when the run typed anything. Empty inputs still render
+    -- a run with no verdict computed yet reads ``unverified``, never blank.
+    """
+    reset = reset if isinstance(reset, dict) else {}
+    requested = bool(reset.get("requested"))
+    done = bool(reset.get("done"))
+    if requested:
+        reset_line = "reset: " + (
+            "done" if done else "not done - guard stop not confirmed"
+        )
+    else:
+        reset_line = "reset: not requested"
+    lines = [
+        "RELAY THIS BLOCK WORD FOR WORD to the tester. Never upgrade, soften "
+        "or omit it.",
+        "verdict: " + (str(verdict).strip() or "unverified"),
+        reset_line,
+    ]
+    tally = str(typed_field_line or "").strip()
+    if tally:
+        lines.append(tally)
+    return "\n".join(lines) + "\n\n"
 
 
 def summary_block(

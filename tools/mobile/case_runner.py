@@ -571,6 +571,34 @@ async def submit_case(
         if not run_store.valid_tc_id(tc_id):
             return {"error": "Invalid case id.", "content": None}
 
+        prior_checkpoint = (run_store.read_case(run_id, tc_id) or {}).get("content")
+        prior_checkpoint = (
+            prior_checkpoint if isinstance(prior_checkpoint, dict) else {}
+        )
+        queued_in = list(prior_checkpoint.get("queued_actions") or [])
+        if queued_in:
+            decoded = actions_mod.decode_reply(raw_script)
+            combined = actions_mod.combine_queued_actions(
+                queued_in, list(decoded.get("actions") or [])
+            )
+            if not combined.get("ok"):
+                return {
+                    "error": None,
+                    "content": _checkpoint(
+                        run_id,
+                        tc_id,
+                        view,
+                        verdict="",
+                        status=NEEDS_MODEL,
+                        reason=str(combined.get("reason") or ""),
+                        trace=[],
+                        escapes=escapes_used(run_id, tc_id),
+                        packet=None,
+                        queued_actions=queued_in,
+                    ),
+                }
+            raw_script = {"actions": combined["actions"]}
+
         parsed = actions_mod.parse_script(raw_script)
         if parsed.get("error"):
             # A refused script is NOT an escape: nothing was replayed, so the
@@ -588,6 +616,7 @@ async def submit_case(
                     trace=[],
                     escapes=escapes_used(run_id, tc_id),
                     packet=None,
+                    queued_actions=queued_in,
                 ),
             }
 
@@ -613,6 +642,7 @@ async def submit_case(
                         trace=[],
                         escapes=escapes_used(run_id, tc_id),
                         packet=None,
+                        queued_actions=queued_in,
                     ),
                 }
 
@@ -846,6 +876,15 @@ async def submit_case(
                 escapes=used,
                 packet=packet,
                 uncharged=uncharged,
+                # A fresh budget stop's real remainder, and ONLY that -- a
+                # selector-stale or ordinary escape stop clears the queue by
+                # passing None, same as every other checkpoint that omits
+                # this keyword.
+                queued_actions=(
+                    result.get("queued_actions")
+                    if reason_key == REASON_BUDGET
+                    else None
+                ),
             ),
         }
     except Exception as exc:  # pragma: no cover - defensive
@@ -866,6 +905,7 @@ def _checkpoint(
     packet: object,
     uncharged: object = None,
     guard_stop: object = None,
+    queued_actions: object = None,
 ) -> dict:
     """Write the case checkpoint and return the caller's payload.
 
@@ -905,6 +945,13 @@ def _checkpoint(
         # and carrying an old one forward would let a later turn's confirm
         # match a control nobody stopped on THIS submission.
         "guard_stop": dict(guard_stop) if isinstance(guard_stop, dict) else {},
+        # CLEARED BY DEFAULT (`queued_actions=None`), unlike `uncharged_stops`
+        # above: a queue not explicitly carried forward is queue the model has
+        # either consumed or that no longer applies -- see call sites for the
+        # three cases that pass it explicitly.
+        "queued_actions": (
+            list(queued_actions) if isinstance(queued_actions, list) else []
+        ),
         "started": prior.get("started") or now,
         "updated": now,
         "evidence": _evidence_record(prior.get("evidence")),

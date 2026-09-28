@@ -326,6 +326,9 @@ that only after the tester has said go, on a later turn.
    `qa_mobile_test` with the `run_id` and no session token: that takes the run
    over, and the other chat is told at its next call. `qa_mobile_status` reads
    the whole run back from disk and changes nothing.
+7. A finished run's reply starts with a short verdict block (verdict, each
+   requested step, the typed-field tally). Relay it to the tester word for
+   word -- never upgrade, soften or summarise it into a plainer claim.
 
 Never start, install to or drive a device yourself through a shell. This lane
 owns the emulator: it spawns it detached so it outlives the call, keeps its

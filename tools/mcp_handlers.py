@@ -13280,6 +13280,10 @@ async def _mobile_start(
         )
         if planned.get("error"):
             return "\u26a0\ufe0f " + _safe(planned["error"], 300), False
+        # `charter.parse` above already refuses (by name) any charter field it
+        # would otherwise have coerced silently -- a run only reaches this
+        # point with nothing rejected, so there is no longer a notice to
+        # prepend here.
         return await _mobile_hand_off(
             str((planned.get("content") or {}).get("run_id") or ""),
             pre_run_owner=pre_run_owner,
@@ -13646,7 +13650,9 @@ async def _mobile_next(
     body = result.get("content") or {}
     state = str(body.get("state") or "")
     if state == session.STATE_BUSY:
-        return mobile_render.busy_block(run_id, str(body.get("tc_id") or ""))
+        return mobile_render.busy_block(
+            run_id, str(body.get("tc_id") or ""), packet=body.get("packet")
+        )
     if state == session.STATE_REPORT:
         # The run is over: give the emulator back. THE HOLDER releasing its
         # own lock -- there is no reaper in this lane, and nothing here could
@@ -13686,8 +13692,14 @@ async def _mobile_next(
             report_failed = (
                 "the report renderer failed; the verdicts below are unaffected"
             )
-        return mobile_render.summary_block(
-            listed.get("content") or [],
+        rows_for_relay = listed.get("content") or []
+        relay = mobile_render.relay_block(
+            verdict=session.run_verdict(resolved, rows_for_relay),
+            reset=session.reset_step_status(resolved, rows_for_relay),
+            typed_field_line=mobile_render.typed_field_tally(rows_for_relay),
+        )
+        return relay + mobile_render.summary_block(
+            rows_for_relay,
             coverage_line=coverage,
             run_id=run_id,
             # ``partial`` stays a hardcoded LIFECYCLE fact here, and it is true
@@ -13733,6 +13745,7 @@ async def handle_submit_mobile_step(
     session_token: str = "",
     *,
     confirm_destructive: bool = False,
+    tester_inputs: str = "",
     progress: ProgressCb = None,
 ) -> str:
     """Replay the actions YOU planned, then hand back the verdict and next packet.
@@ -13789,6 +13802,14 @@ async def handle_submit_mobile_step(
         ) or {}
         if not taken.get("acquired"):
             return mobile_render.device_busy_block(taken)
+        parsed_inputs: dict = {}
+        if tester_inputs:
+            try:
+                loaded = json.loads(tester_inputs)
+                if isinstance(loaded, dict):
+                    parsed_inputs = loaded
+            except Exception:
+                parsed_inputs = {}
         result = await session.submit(
             run_id,
             tc_id,
@@ -13796,6 +13817,7 @@ async def handle_submit_mobile_step(
             session_token=token,
             tester_input=tester_input,
             tester_input_field=tester_input_field,
+            tester_inputs=parsed_inputs,
             confirm_destructive=confirm_destructive,
         )
         if result.get("error"):
@@ -13811,6 +13833,7 @@ async def handle_submit_mobile_step(
                 verdict=str(case.get("verdict") or ""),
                 status=str(case.get("status") or ""),
                 field=str(tester_input_field or ""),
+                fields=list(parsed_inputs.keys()) or None,
             ),
         )
         # A script this server could not parse is the observable signal that the
@@ -14198,8 +14221,16 @@ async def handle_mobile_status(
                 report_failed = str(produced["error"])
             else:
                 report_path = str((produced.get("content") or {}).get("path") or "")
+        relay = ""
+        if body.get("finished") or abandoned:
+            relay = mobile_render.relay_block(
+                verdict=session.run_verdict(body, recorded),
+                reset=session.reset_step_status(body, recorded),
+                typed_field_line=mobile_render.typed_field_tally(recorded),
+            )
         return (
-            "\n".join(lines)
+            relay
+            + "\n".join(lines)
             + mobile_render.status_block(body, coverage)
             # WHICH HARDWARE. A pass on an emulator is weaker evidence than a
             # pass on the phone, so the run says which it ran on -- from the

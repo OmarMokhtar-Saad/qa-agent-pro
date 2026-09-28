@@ -266,8 +266,10 @@ class TypeAction(_Base):
             # that matters -- that a secret was written into a plan at all.
             if self.text:
                 raise ValueError(
-                    "a secret value must never appear in a script; use field "
-                    "and let the tester supply it"
+                    'a secret value must never appear in a script; send '
+                    '{"op": "type", "target": ..., "field": "<name>", '
+                    '"secret": true} and supply the value as tester_input/'
+                    "tester_inputs on the same submit"
                 )
             if not self.field.strip():
                 raise ValueError(
@@ -631,6 +633,43 @@ def decode_reply(raw: object) -> dict:
     except Exception:  # pragma: no cover - defensive
         logger.exception("mobile.actions.decode_reply failed")
         return {"actions": raw}
+
+
+def combine_queued_actions(queued: object, new_actions: object) -> dict:
+    """Actions left queued by a budget stop, folded with a fresh submit.
+
+    Queued actions run FIRST -- they are unreached work from a script the
+    model already committed to, not a second draft -- and the combined total
+    is held to the SAME ceiling a single script is: ``MAX_ACTIONS``. Over
+    that cap this refuses BY NAME rather than silently truncating either
+    side, because the model chose what to resend without knowing the exact
+    queue depth, and dropping part of either list would replay a script the
+    model believes is intact.
+
+    Shared by both mobile lanes: ``session._combine_queued_actions``
+    (EXPLORE) delegates here, and ``case_runner.submit_case`` (SCRIPTED)
+    calls it directly, because ``case_runner`` cannot import ``session``
+    (``session`` already imports ``case_runner``).
+    """
+    queued_list = list(queued or [])
+    new_list = list(new_actions or [])
+    combined = queued_list + new_list
+    if len(combined) > MAX_ACTIONS:
+        return {
+            "ok": False,
+            "reason": (
+                str(len(queued_list))
+                + " action(s) are already queued from a prior budget stop and "
+                + str(len(new_list))
+                + " more were just submitted -- "
+                + str(len(combined))
+                + " total, over the "
+                + str(MAX_ACTIONS)
+                + "-action limit. Resend fewer new actions, or none: the "
+                "queued ones will still run."
+            ),
+        }
+    return {"ok": True, "actions": combined}
 
 
 def parse_script(raw: object) -> dict:
