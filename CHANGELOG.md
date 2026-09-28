@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.100.1] - 2026-09-28
+## [1.100.2] - 2026-09-28
 
 ### Added
 
@@ -27,20 +27,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Anonymous, opt-out usage analytics (telemetry). See the README
   'Telemetry & privacy' section; disable with DO_NOT_TRACK=1.
 
-### Fixed
+### Changed
 
-- A confirmation after the destructive-action guard stops now releases
-  only the exact control that was stopped, and only once. Confirming one
-  control can no longer let a different control, or a second tap,
-  through; a confirmation that does not match refuses by name.
-- The QA keyboard is selected by the exact ID the device lists, and
-  `qa_mobile_test` refuses a keyboard ID it cannot find instead of
-  guessing.
-- Typing waits until the QA keyboard is active, and when it cannot
-  type, the reply names the blocker and stops instead of continuing.
-- A typed field is read back after typing: a field that comes back
-  empty is reported as not typed, and a turn that was blocked can no
-  longer be reported as a pass.
-- The agent is told never to report a screen state, field value or
-  login result it did not read from the app, and never to fall back to
-  raw adb when the server cannot act.
+- No change to the server since 1.100.1: the tools, prompts and
+  behaviour are the same. This version is the backend bundled with the
+  desktop app build that redesigns the Setup tab (tool logos, info
+  tips, progress card, search with a no-matches state), adds a device
+  strip to the Network tab, and adds the Mirror tab.
