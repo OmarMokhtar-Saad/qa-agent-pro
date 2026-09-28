@@ -115,6 +115,17 @@ async def _run_argv(
             pass
         logger.warning("mobile.adb: command timed out: %s", cmd[:2])
         raise
+    except asyncio.CancelledError:
+        # An outer `wait_for`/task cancellation must still kill the child --
+        # otherwise a cancelled adb call leaves the process running. The
+        # reap below is bounded the same way the timeout path is; it must
+        # not block indefinitely on a child that ignores the kill.
+        proc.kill()
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=1)
+        except Exception:
+            pass
+        raise
     return int(proc.returncode or 0), stdout or b"", stderr or b""
 
 

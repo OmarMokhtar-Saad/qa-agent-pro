@@ -93,6 +93,7 @@ from tools.mobile import (
     screen_audit,
     screen_phone,
 )
+from tools.mobile import render as mobile_render
 from tools.mobile_capture import flows as api_flows
 from tools.mobile_evidence import crash_detector
 from tools.mobile_evidence import exchanges as ev_exchanges
@@ -4196,6 +4197,11 @@ def _meta_html(
     # as "every case judged" on a run that judged two of three.
     if coverage:
         items.append(("Verdicts", coverage_phrase(coverage)))
+    # ONE producer with `verdict_line`'s own tally (`mobile_render.typed_field_tally`)
+    # -- the report and the chat reply must never disagree on a field count.
+    tally = mobile_render.typed_field_tally(cases).strip()
+    if tally:
+        items.append(("Typed fields", tally))
     return "".join(
         "<span><b>" + esc(k, 20) + "</b> " + esc(v, 200) + "</span>" for k, v in items if v
     )

@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.100.2] - 2026-09-28
+## [1.100.3] - 2026-09-28
 
 ### Added
 
@@ -27,10 +27,20 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Anonymous, opt-out usage analytics (telemetry). See the README
   'Telemetry & privacy' section; disable with DO_NOT_TRACK=1.
 
-### Changed
+### Fixed
 
-- No change to the server since 1.100.1: the tools, prompts and
-  behaviour are the same. This version is the backend bundled with the
-  desktop app build that redesigns the Setup tab (tool logos, info
-  tips, progress card, search with a no-matches state), adds a device
-  strip to the Network tab, and adds the Mirror tab.
+- Mobile runs: a charter value the run does not know (for example
+  depth: xyz) now refuses the run by name, listing the accepted
+  values, instead of quietly using the default. happy_path is
+  accepted as another name for happy.
+- Mobile runs: a finished run's reply opens with a short verdict block
+  (verdict, whether the requested reset landed, typed-field count) to
+  relay as written, and the submit reply and report state how many
+  fields were typed.
+- Mobile runs: fewer round trips when the device is busy or a step
+  runs out of time; actions not yet run when time runs out are kept
+  for the next reply on both explore and scripted runs, with typed
+  secret text never stored.
+- Mobile runs: confirming a destructive action after resuming a
+  paused explore run now works, and a cancelled device command no
+  longer leaves an adb process running.
