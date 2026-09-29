@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.100.5] - 2026-09-28
+## [1.100.6] - 2026-09-29
 
 ### Added
 
@@ -27,20 +27,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Anonymous, opt-out usage analytics (telemetry). See the README
   'Telemetry & privacy' section; disable with DO_NOT_TRACK=1.
 
-### Fixed
+### Changed
 
-- Mobile runs: starting a run with no source shows the run menu at
-  once, before touching the device.
-- Mobile runs: launching the app no longer waits for Android's full
-  launch report; a short foreground check replaces it.
-- Mobile runs: each step reply ends with a timing line showing where
-  the time went (screen reads, evidence, replay).
-- Mobile runs: an emulator image too heavy for this machine gets a
-  note saying so before the run starts.
-- Mobile runs: logging in takes about 4 calls instead of ~20; a
-  package that is not installed lists the installed apps and the one
-  used last on that device.
-- Device listing is cached for 10 seconds for internal lookups;
-  qa_list_devices and Rescan always read the devices fresh.
-- qa-doctor finds adb the same way mobile runs do.
-- Slow adb calls are logged with their duration.
+- No behaviour change from 1.100.5. This release adds regression
+  tests that guard four of its mobile fixes: qa-doctor's adb row,
+  the app-launch deadline, and two cases of the shorter login flow.
