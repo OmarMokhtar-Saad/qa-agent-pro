@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -14220,6 +14221,153 @@ async def _mobile_packet_text(
     return mobile_render.packet_block(shown, session_token=session_token)
 
 
+def _mobile_note_target(run_id: str = "", package: str = "") -> tuple:
+    """``(package, run_id, refusal)`` for a saved-app-note call.
+
+    A run id wins (its manifest names the app); otherwise a validated
+    ``package``. Never raises.
+    """
+    rid = str(run_id or "").strip()
+    if rid:
+        try:
+            from tools.mobile import session as _note_session
+
+            found = _note_session.resolve(rid)
+            pkg = str(((found or {}).get("content") or {}).get("package") or "")
+            if pkg:
+                return pkg, rid, ""
+        except Exception:
+            logger.exception("mobile note: could not resolve run %r", rid[:40])
+    pkg = str(package or "").strip()
+    if pkg:
+        from tools import device_manager as _note_dm
+
+        if _note_dm.valid_package_name(pkg):
+            return pkg, rid, ""
+        return "", rid, "`package` is not an Android package name"
+    return (
+        "",
+        rid,
+        "pass `package` (or a `run_id`) so the note is filed under the right app",
+    )
+
+
+def _mobile_call_secrets(tester_input: object = "", tester_inputs_json: object = "") -> list:
+    """The values the tester supplied on THIS call, so a note that repeats one
+    is refused. Never raises."""
+    values: list = []
+    if str(tester_input or "").strip():
+        values.append(str(tester_input))
+    try:
+        raw = str(tester_inputs_json or "").strip()
+        parsed = json.loads(raw) if raw else {}
+        if isinstance(parsed, dict):
+            values += [str(v) for v in parsed.values() if str(v).strip()]
+    except ValueError:
+        pass
+    return values
+
+
+def _call_arg(fn: Callable, args: tuple, kwargs: dict, name: str) -> str:
+    """*name*'s value in a call to *fn*, however it was passed (bound by the
+    real signature, so a reordered handler cannot misread it); ``""`` when it
+    is absent or the call does not bind. Never raises."""
+    if name in kwargs:
+        return str(kwargs.get(name) or "")
+    try:
+        bound = inspect.signature(fn).bind_partial(*args, **kwargs)
+    except (TypeError, ValueError):
+        return ""
+    return str(bound.arguments.get(name) or "")
+
+
+def mobile_note_intake(
+    note: object = "",
+    run_id: str = "",
+    package: str = "",
+    secrets: object = (),
+) -> str:
+    """Save the ``note`` parameter and return a line to prefix the reply with
+    (``""`` when there is no note, or the lane is off). Never raises."""
+    if not str(note or "").strip() or not _mobile_lane_enabled():
+        return ""
+    try:
+        from tools.mobile import app_knowledge
+        from tools.untrusted import single_line
+
+        try:
+            spec = json.loads(note) if isinstance(note, str) else note
+        except ValueError:
+            spec = None
+        if not isinstance(spec, dict):
+            return (
+                "Note not saved: pass `note` as a JSON object like "
+                '{"kind": "wait", "text": "...", "when": {"rid": "send"}, '
+                '"then": {"until_rid": "reply"}}.\n\n'
+            )
+        pkg, rid, refusal = _mobile_note_target(run_id, package)
+        if refusal:
+            return "Note not saved: " + refusal + ".\n\n"
+        saved = app_knowledge.add_note(
+            pkg,
+            spec.get("text", ""),
+            spec.get("kind", ""),
+            spec.get("when"),
+            spec.get("then"),
+            source_run=rid,
+            secrets=secrets,
+        )
+        if saved.get("error"):
+            return "Note not saved: " + single_line(saved["error"], 300) + "\n\n"
+        made = saved["content"]
+        line = "Saved app note #%s for `%s` (%s). " % (made["id"], pkg, made["kind"])
+        line += "It applies to this app's later steps on this machine; "
+        line += "`qa_mobile_notes` lists or retires it.\n" + app_knowledge.echo(made)
+        if made.get("superseded"):
+            line += "\nSuperseded: " + ", ".join("#%s" % n for n in made["superseded"])
+        return line + "\n\n"
+    except Exception:
+        logger.exception("mobile note intake failed")
+        return "Note not saved: internal error.\n\n"
+
+
+async def handle_mobile_notes(
+    action: str = "list",
+    package: str = "",
+    run_id: str = "",
+    note_id: int = 0,
+    reason: str = "",
+) -> str:
+    """``qa_mobile_notes``: list or retire the notes saved about one app.
+    Never raises."""
+    if not _mobile_lane_enabled():
+        return _mobile_lane_off_message()
+    try:
+        from tools.mobile import app_knowledge
+        from tools.untrusted import single_line
+
+        verb = str(action or "list").strip().lower()
+        if verb not in ("list", "retire"):
+            return "\u26a0\ufe0f `action` must be `list` or `retire`."
+        pkg, rid, refusal = _mobile_note_target(run_id, package)
+        if refusal:
+            return "\u26a0\ufe0f " + refusal + "."
+        if verb == "list":
+            listed = app_knowledge.list_notes(pkg)
+            if listed.get("error"):
+                return "\u26a0\ufe0f " + single_line(listed["error"], 300)
+            return app_knowledge.render(pkg, listed["content"])
+        if not note_id:
+            return "\u26a0\ufe0f `retire` needs `note_id`."
+        done = app_knowledge.retire_note(pkg, note_id, reason=str(reason or ""), run_id=rid)
+        if done.get("error"):
+            return "\u26a0\ufe0f " + single_line(done["error"], 300)
+        return "Retired app note #%s for `%s`. It stays in history." % (note_id, pkg)
+    except Exception:
+        logger.exception("mobile notes failed")
+        return "\u26a0\ufe0f The notes store could not be read."
+
+
 async def handle_mobile_test_content(*args, **kwargs) -> tuple:
     """``handle_mobile_test``'s text PLUS the image specs of the screens it took.
 
@@ -14233,7 +14381,13 @@ async def handle_mobile_test_content(*args, **kwargs) -> tuple:
     """
     token = _MOBILE_IMAGE_SPECS.set([])
     try:
-        text = await handle_mobile_test(*args, **kwargs)
+        note = kwargs.pop("note", "")
+        note_line = mobile_note_intake(
+            note,
+            run_id=_call_arg(handle_mobile_test, args, kwargs, "run_id"),
+            package=_call_arg(handle_mobile_test, args, kwargs, "package"),
+        )
+        text = note_line + await handle_mobile_test(*args, **kwargs)
         return text, list(_MOBILE_IMAGE_SPECS.get() or [])
     finally:
         _MOBILE_IMAGE_SPECS.reset(token)
@@ -14243,7 +14397,16 @@ async def handle_submit_mobile_step_content(*args, **kwargs) -> tuple:
     """``handle_submit_mobile_step``'s text plus its screens. See above."""
     token = _MOBILE_IMAGE_SPECS.set([])
     try:
-        text = await handle_submit_mobile_step(*args, **kwargs)
+        note = kwargs.pop("note", "")
+        note_line = mobile_note_intake(
+            note,
+            run_id=_call_arg(handle_submit_mobile_step, args, kwargs, "run_id"),
+            secrets=_mobile_call_secrets(
+                _call_arg(handle_submit_mobile_step, args, kwargs, "tester_input"),
+                _call_arg(handle_submit_mobile_step, args, kwargs, "tester_inputs"),
+            ),
+        )
+        text = note_line + await handle_submit_mobile_step(*args, **kwargs)
         return text, list(_MOBILE_IMAGE_SPECS.get() or [])
     finally:
         _MOBILE_IMAGE_SPECS.reset(token)

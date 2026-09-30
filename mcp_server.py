@@ -1318,6 +1318,7 @@ def build_server():
             capture_ack: bool = False,
             reset_app: bool = False,
             charter: str = "",
+            note: str = "",
         ) -> list[ContentBlock]:
             """Drive an Android device: ad-hoc steps (goal=...), cases, exploration.
 
@@ -1340,6 +1341,16 @@ def build_server():
             names the field, what was sent, what was used instead, and a fenced
             JSON block carrying the field's real `enum` values, sourced from
             this server's own charter vocabulary rather than restated by hand.
+
+            To save something you learned about THIS app for its later runs on this
+            machine, pass note as a JSON object string, e.g. '{"kind": "wait",
+            "text": "the reply takes a few seconds", "when": {"rid": "send"},
+            "then": {"until_rid": "reply"}}'. kind `wait` waits (bounded) for what
+            `then` names before the op on `when.rid`; kind `avoid` refuses that op.
+            Never put a password, a code or a personal number in a note: it is
+            stored as plain text. The server refuses obvious secrets (digit runs,
+            a credential word next to a value, values typed in this run) but
+            cannot catch every one. `qa_mobile_notes` lists and retires them.
 
             Call with NO arguments to start: it answers with whatever the machine
             needs next (a setup guide, an install source, a preflight list, or
@@ -1436,6 +1447,7 @@ def build_server():
                     capture_ack=capture_ack,
                     reset_app=reset_app,
                     charter=charter,
+                    note=note,
                     **_make_elicitors(ctx),
                     progress=_make_progress(ctx),
                 ),
@@ -1462,6 +1474,7 @@ def build_server():
             session_token: str = "",
             confirm_destructive: bool = False,
             tester_inputs: str = "",
+            note: str = "",
         ) -> list[ContentBlock]:
             """Submit the action script YOU planned for a mobile packet.
 
@@ -1507,6 +1520,11 @@ def build_server():
             did not succeed the packet says so rather than leaving you to
             wonder.
 
+            To save something you learned about this app for its later runs, pass
+            note as a JSON object string (same shape as on `qa_mobile_test`).
+            Never put a password, a code or a personal number in a note: the
+            server refuses obvious secrets but cannot catch every one.
+
             When the destructive guard stops a control and the TESTER confirms
             it, resubmit with confirm_destructive=true: it unlocks only the
             control THIS case's last stop named, not any control -- resubmit
@@ -1540,6 +1558,7 @@ def build_server():
                     session_token,
                     confirm_destructive=confirm_destructive,
                     tester_inputs=tester_inputs,
+                    note=note,
                     progress=_make_progress(ctx),
                 ),
             )
@@ -1606,6 +1625,32 @@ def build_server():
                 "qa_network_watch",
                 ctx,
                 mcp_handlers.handle_network_watch(action, serial, package, apply),
+            )
+
+        @mcp.tool()
+        async def qa_mobile_notes(
+            ctx: Context,
+            action: str = "list",
+            package: str = "",
+            run_id: str = "",
+            note_id: int = 0,
+            reason: str = "",
+        ) -> str:
+            """List or retire the notes saved about ONE Android app.
+
+            `action="list"` shows the app's active notes and how often each was
+            confirmed or contradicted; `action="retire"` retires `note_id` (it is
+            kept in history, never deleted; `reason` is optional and must not
+            contain a secret). Name the app with `package` or a `run_id`. Notes
+            are saved through the `note` parameter of `qa_mobile_test` and
+            `qa_submit_mobile_step`.
+            """
+            return await _tracked(
+                "qa_mobile_notes",
+                ctx,
+                mcp_handlers.handle_mobile_notes(
+                    action, package, run_id, note_id, reason
+                ),
             )
 
         @mcp.tool()
