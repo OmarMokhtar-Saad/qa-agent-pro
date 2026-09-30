@@ -84,6 +84,12 @@ _ASSIGNED_RE = re.compile(
     + r"|\b(?i:%s)(?:\s+(?i:is|was)\s+|\s*:\s*)" % _STATED_WORDS
     + r"(?![a-z]+(?:-[a-z]+)*(?:[\s,;.!?)]|$))[^\s,;]{3,}"
 )
+#: Four or more digits split by spaces, dots or dashes right after a secret
+#: word: "pin 1-2-3-4", "otp: 48 21". Only after the word, so "version
+#: 1.2.3.4" and "wait 2-3 s" stay prose.
+_STATED_DIGITS_RE = re.compile(
+    r"\b(?i:%s)(?:\s+(?i:is|was))?\s*[:=]?\s*\d(?:[ .-]?\d){3,}" % _STATED_WORDS
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -162,16 +168,27 @@ def _tighten(path: Path, mode: int) -> None:
         logger.info("app knowledge: could not tighten permissions on %s", path)
 
 
+def _tighten_store(path: Path) -> None:
+    """Owner-only modes on *path*'s directory, the database and its ``-wal`` /
+    ``-shm`` files, so a store made before the mode rule is fixed by any open,
+    not only the next write. Creates nothing."""
+    _tighten(path.parent, 0o700)
+    for name in (path.name, path.name + "-wal", path.name + "-shm"):
+        member = path.with_name(name)
+        if member.exists():
+            _tighten(member, 0o600)
+
+
 def _connect(path: Path, *, write: bool) -> sqlite3.Connection:
     """WRITE creates the directory (0700), the file (0600) and the schema. READ
     never creates anything (the caller checks the file exists first) and is
-    ``query_only``. ``mode=ro`` is not used: it can fail on a WAL file. SQLite
-    gives the ``-wal`` and ``-shm`` files the database file's mode."""
+    ``query_only``. Both tighten an existing store (``_tighten_store``).
+    ``mode=ro`` is not used: it can fail on a WAL file. SQLite gives new
+    ``-wal`` and ``-shm`` files the database file's mode."""
     if write:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        _tighten(path.parent, 0o700)
         os.close(os.open(str(path), os.O_CREAT | os.O_WRONLY, 0o600))
-        _tighten(path, 0o600)
+    _tighten_store(path)
     conn = sqlite3.connect(str(path), timeout=DB_TIMEOUT_S)
     try:
         conn.row_factory = sqlite3.Row
@@ -325,7 +342,7 @@ def _is_value_token(token: str) -> bool:
 
 
 def _credential_near_value(segment: str) -> bool:
-    if _ASSIGNED_RE.search(segment):
+    if _ASSIGNED_RE.search(segment) or _STATED_DIGITS_RE.search(segment):
         return True
     segment = _SPACED_DIGITS_RE.sub(lambda m: re.sub(r"\D", "", m.group()), segment)
     tokens = [t.strip(".,;()[]{}\"'") for t in _SPLIT_RE.split(segment)]

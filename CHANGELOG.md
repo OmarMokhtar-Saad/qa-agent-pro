@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.103.0] - 2026-09-30
+## [1.103.1] - 2026-09-30
 
 ### Added
 
@@ -27,18 +27,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Anonymous, opt-out usage analytics (telemetry). See the README
   'Telemetry & privacy' section; disable with DO_NOT_TRACK=1.
 
-### Changed
-
-- App notes refuse more secrets by name: API keys, tokens, card
-  numbers, contact details, assigned credentials (`pin=...`) and
-  spaced-out PINs. Verdicts such as "Pass: Yes" still save.
-- The notes store is readable only by your user account, and package
-  names that differ only in case get separate stores.
-
 ### Fixed
 
-- A note sent with a mobile step is saved only after the step runs and
-  keeps its run, and it is checked against the values the step typed.
-- Loading or saving notes no longer blocks the server, and cancelling
-  a run while notes load no longer leaves them half-applied.
-- Retiring a note while another run reads it no longer races.
+- An app notes store made before 1.103.0 is now made readable only by
+  your user account the first time it is opened, not only when a new
+  note is saved.
+- A PIN or code split by dots or dashes right after a secret word
+  ("pin 1-2-3-4", "otp: 48 21") is now refused in a note.
