@@ -14,14 +14,17 @@ op, never allow one the destructive guard stops.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import re
 import sqlite3
 import time
 from contextlib import closing
 from pathlib import Path
 
+from tools import api_redact
 from tools.mobile import actions, held_inputs, paths
 from tools.untrusted import wrap_untrusted
 
@@ -59,13 +62,28 @@ _DIGITS_RE = re.compile(r"\d{6,}")
 #: either direction ("otp 4821", "enter 4821 as the PIN", "pin=1234"). A bare
 #: credential word is fine ("login is required", "the code is sent by SMS"):
 #: the term list names topics, not secrets, so matching it alone over-refuses.
-#: Value-shaped = 4+ digits, or 5+ chars mixing letters and digits. KNOWN
-#: LIMIT: an all-letters secret ("password: hunter") is not caught here; the
-#: held-value check and the long-digit-run check are the other nets.
+#: Value-shaped = 4+ digits, or 5+ chars mixing letters and digits. Single
+#: digits spaced out ("pin 1 2 3 4") are joined before the check.
 _NEAR_WORDS = 3
 _SPLIT_RE = re.compile(r"[\s:=]+")
 _ALPHA_RE = re.compile(r"[a-z]+")
 _DIGITS4_RE = re.compile(r"\d{4}")
+_SPACED_DIGITS_RE = re.compile(r"(?<![\d.-])\d(?:[ .-]\d(?![\d.-])){3,}")
+#: A secret word ASSIGNED a value: ``password=ab12`` (any 3+ chars after
+#: ``=``), or ``password is Hunter`` / ``pin: Tr0ub`` (after ``is``/``was``/
+#: ``:``, a token that is not a plain lowercase word). Narrower than
+#: CREDENTIAL_TERMS: "login is required" and "the code is sent" stay prose.
+#: ``pass`` counts only in the ``=`` form: "Pass: Yes" is a test verdict.
+#: KNOWN LIMIT: an all-lowercase word after ``is`` or ``:`` ("password:
+#: hunter") reads as prose, and so does an all-lowercase hyphenated
+#: passphrase ("passphrase is correct-horse-battery"); the held-value check
+#: is the net for both.
+_STATED_WORDS = r"password|passwd|passcode|passphrase|pin|otp|secret|token|apikey|cvv"
+_ASSIGNED_RE = re.compile(
+    r"\b(?i:pass|%s)\s*=\s*[^\s,;]{3,}" % _STATED_WORDS
+    + r"|\b(?i:%s)(?:\s+(?i:is|was)\s+|\s*:\s*)" % _STATED_WORDS
+    + r"(?![a-z]+(?:-[a-z]+)*(?:[\s,;.!?)]|$))[^\s,;]{3,}"
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -119,29 +137,60 @@ def db_path(package: object) -> Path | None:
     name = str(package or "").strip()
     if len(name) > _FIELD_CHARS or not _PACKAGE_RE.match(name):
         return None
-    return paths.sub("apps") / name / "knowledge.db"
+    return paths.sub("apps") / _dir_name(name) / "knowledge.db"
+
+
+def _dir_name(name: str) -> str:
+    """The store directory for package *name*. Android package names are
+    case-sensitive but macOS and Windows file systems are not, so
+    ``com.Foo.app`` and ``com.foo.app`` would share one store there. A name
+    with an upper-case letter gets a lower-case directory plus a digest of the
+    exact name; an all-lower-case name (the usual case) is used as is.
+    A mixed-case store made before this rule is left where it was: no longer
+    read, never deleted."""
+    if name == name.lower():
+        return name
+    return "%s~%s" % (name.lower(), hashlib.sha256(name.encode()).hexdigest()[:12])
+
+
+def _tighten(path: Path, mode: int) -> None:
+    """Owner-only *mode* where the OS allows it. Notes are plain text about the
+    tester's app; nobody else on the machine needs to read them."""
+    try:
+        path.chmod(mode)
+    except OSError:
+        logger.info("app knowledge: could not tighten permissions on %s", path)
 
 
 def _connect(path: Path, *, write: bool) -> sqlite3.Connection:
-    """WRITE creates the directory, the file and the schema. READ never creates
-    anything (the caller checks the file exists first) and is ``query_only``.
-    ``mode=ro`` is not used: it can fail on a WAL file."""
+    """WRITE creates the directory (0700), the file (0600) and the schema. READ
+    never creates anything (the caller checks the file exists first) and is
+    ``query_only``. ``mode=ro`` is not used: it can fail on a WAL file. SQLite
+    gives the ``-wal`` and ``-shm`` files the database file's mode."""
     if write:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _tighten(path.parent, 0o700)
+        os.close(os.open(str(path), os.O_CREAT | os.O_WRONLY, 0o600))
+        _tighten(path, 0o600)
     conn = sqlite3.connect(str(path), timeout=DB_TIMEOUT_S)
-    conn.row_factory = sqlite3.Row
-    if write:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.executescript(_SCHEMA)
-        conn.execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
-            (_SCHEMA_VERSION,),
-        )
-        # The INSERT opened an implicit transaction; close it, or the caller's
-        # BEGIN IMMEDIATE raises "cannot start a transaction within a transaction".
-        conn.commit()
-    else:
-        conn.execute("PRAGMA query_only=ON")
+    try:
+        conn.row_factory = sqlite3.Row
+        if write:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.executescript(_SCHEMA)
+            conn.execute(
+                "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
+                (_SCHEMA_VERSION,),
+            )
+            # The INSERT opened an implicit transaction; close it, or the caller's
+            # BEGIN IMMEDIATE raises "cannot start a transaction within a transaction".
+            conn.commit()
+        else:
+            conn.execute("PRAGMA query_only=ON")
+    except BaseException:
+        # The caller's closing() never sees a connection this raised out of.
+        conn.close()
+        raise
     return conn
 
 
@@ -276,6 +325,9 @@ def _is_value_token(token: str) -> bool:
 
 
 def _credential_near_value(segment: str) -> bool:
+    if _ASSIGNED_RE.search(segment):
+        return True
+    segment = _SPACED_DIGITS_RE.sub(lambda m: re.sub(r"\D", "", m.group()), segment)
     tokens = [t.strip(".,;()[]{}\"'") for t in _SPLIT_RE.split(segment)]
     tokens = [t for t in tokens if t]
     terms = [
@@ -303,6 +355,10 @@ def _secret_reason(blob: str, secrets: object, source_run: object) -> str:
             return "it contains a value the tester typed into this run"
     if _DIGITS_RE.search(blob):
         return "it contains a run of 6 or more digits"
+    # The API lane's value-shape scan: API keys, JWTs, `Bearer` tokens, grouped
+    # card numbers, e-mail addresses, +phone numbers.
+    if api_redact.scan_finds_secret(blob):
+        return "it contains a key, token, card number or contact detail"
     if any(_credential_near_value(seg) for seg in blob.split("\n")):
         return "it states a credential value"
     return ""
@@ -486,6 +542,9 @@ def retire_note(
         if _secret_reason(why, (), run_id):
             why = ""
         with closing(_connect(path, write=True)) as conn, conn:
+            # Lock before the status read, as add_note does: two racing
+            # retires must not both see the note active.
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT status FROM notes WHERE id = ?", (number,)
             ).fetchone()

@@ -13952,6 +13952,7 @@ async def handle_submit_mobile_step(
         ) or {}
         if not taken.get("acquired"):
             return mobile_render.device_busy_block(taken)
+        _mark_mobile_step_held()
         parsed_inputs: dict = {}
         if tester_inputs:
             try:
@@ -14066,6 +14067,20 @@ async def handle_submit_mobile_step(
 #: only the outermost frame uses. ONE producer writes here and exactly two
 #: readers drain it.
 _MOBILE_IMAGE_SPECS: ContextVar = ContextVar("_MOBILE_IMAGE_SPECS", default=None)
+
+#: Armed by ``handle_submit_mobile_step_content`` and marked by
+#: ``handle_submit_mobile_step`` once the call HOLDS the run (claim, then the
+#: device lock). The wrapper saves the call's ``note`` only when it was marked,
+#: so a refused call (another chat's lease, a takeover, a busy device, a bad
+#: run id) leaves no note behind. A ContextVar for the reason given above.
+_MOBILE_STEP_HELD: ContextVar = ContextVar("_MOBILE_STEP_HELD", default=None)
+
+
+def _mark_mobile_step_held() -> None:
+    """Record that this submit call holds its run. A no-op outside the wrapper."""
+    held = _MOBILE_STEP_HELD.get()
+    if isinstance(held, dict):
+        held["held"] = True
 
 
 async def _mobile_packet_text(
@@ -14268,6 +14283,13 @@ def _mobile_call_secrets(tester_input: object = "", tester_inputs_json: object =
     return values
 
 
+def _mobile_held_values(run_id: object) -> list:
+    """The values held for *run_id* right now. Never raises."""
+    from tools.mobile import held_inputs
+
+    return [str(v) for v in held_inputs.recall(str(run_id or "")).values()]
+
+
 def _call_arg(fn: Callable, args: tuple, kwargs: dict, name: str) -> str:
     """*name*'s value in a call to *fn*, however it was passed (bound by the
     real signature, so a reordered handler cannot misread it); ``""`` when it
@@ -14353,13 +14375,16 @@ async def handle_mobile_notes(
         if refusal:
             return "\u26a0\ufe0f " + refusal + "."
         if verb == "list":
-            listed = app_knowledge.list_notes(pkg)
+            # SQLite with a busy timeout: off the event loop, like the note intake.
+            listed = await asyncio.to_thread(app_knowledge.list_notes, pkg)
             if listed.get("error"):
                 return "\u26a0\ufe0f " + single_line(listed["error"], 300)
             return app_knowledge.render(pkg, listed["content"])
         if not note_id:
             return "\u26a0\ufe0f `retire` needs `note_id`."
-        done = app_knowledge.retire_note(pkg, note_id, reason=str(reason or ""), run_id=rid)
+        done = await asyncio.to_thread(
+            app_knowledge.retire_note, pkg, note_id, reason=str(reason or ""), run_id=rid
+        )
         if done.get("error"):
             return "\u26a0\ufe0f " + single_line(done["error"], 300)
         return "Retired app note #%s for `%s`. It stays in history." % (note_id, pkg)
@@ -14382,7 +14407,11 @@ async def handle_mobile_test_content(*args, **kwargs) -> tuple:
     token = _MOBILE_IMAGE_SPECS.set([])
     try:
         note = kwargs.pop("note", "")
-        note_line = mobile_note_intake(
+        # The store is SQLite with a busy timeout: off the event loop. Values
+        # the tester typed into an existing run are refused through run_id
+        # (held inputs); this tool takes no tester value of its own.
+        note_line = await asyncio.to_thread(
+            mobile_note_intake,
             note,
             run_id=_call_arg(handle_mobile_test, args, kwargs, "run_id"),
             package=_call_arg(handle_mobile_test, args, kwargs, "package"),
@@ -14394,21 +14423,37 @@ async def handle_mobile_test_content(*args, **kwargs) -> tuple:
 
 
 async def handle_submit_mobile_step_content(*args, **kwargs) -> tuple:
-    """``handle_submit_mobile_step``'s text plus its screens. See above."""
+    """``handle_submit_mobile_step``'s text plus its screens. See above.
+
+    The ``note`` is saved AFTER the step and only when the step held its run
+    (``_MOBILE_STEP_HELD``): a refused or raising call leaves no note."""
     token = _MOBILE_IMAGE_SPECS.set([])
+    held = {"held": False}
+    held_token = _MOBILE_STEP_HELD.set(held)
     try:
         note = kwargs.pop("note", "")
-        note_line = mobile_note_intake(
-            note,
-            run_id=_call_arg(handle_submit_mobile_step, args, kwargs, "run_id"),
-            secrets=_mobile_call_secrets(
-                _call_arg(handle_submit_mobile_step, args, kwargs, "tester_input"),
-                _call_arg(handle_submit_mobile_step, args, kwargs, "tester_inputs"),
-            ),
-        )
-        text = note_line + await handle_submit_mobile_step(*args, **kwargs)
-        return text, list(_MOBILE_IMAGE_SPECS.get() or [])
+        run_id = _call_arg(handle_submit_mobile_step, args, kwargs, "run_id")
+        # Copied BEFORE the step: a step that reaches the report forgets the
+        # run's held values, and the note must still be checked against them.
+        earlier = _mobile_held_values(run_id) if str(note or "").strip() else []
+        body = await handle_submit_mobile_step(*args, **kwargs)
+        note_line = ""
+        if held["held"]:
+            note_line = await asyncio.to_thread(
+                mobile_note_intake,
+                note,
+                run_id=run_id,
+                secrets=earlier
+                + _mobile_call_secrets(
+                    _call_arg(handle_submit_mobile_step, args, kwargs, "tester_input"),
+                    _call_arg(handle_submit_mobile_step, args, kwargs, "tester_inputs"),
+                ),
+            )
+        elif str(note or "").strip() and _mobile_lane_enabled():
+            note_line = "Note not saved: this call did not run a step.\n\n"
+        return note_line + body, list(_MOBILE_IMAGE_SPECS.get() or [])
     finally:
+        _MOBILE_STEP_HELD.reset(held_token)
         _MOBILE_IMAGE_SPECS.reset(token)
 
 
