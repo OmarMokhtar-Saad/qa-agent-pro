@@ -385,6 +385,11 @@ async def _tracked(name, ctx, coro):
     start = time.monotonic()
     ok = True
     error_type = None
+    # A per-call sink for facts a returned handler must not report as `ok`
+    # -- an adb screencap or dump that timed out (fix round 3, item 3).
+    from tools import tool_status
+
+    _status_token = tool_status.begin()
     telemetry.start_tool_trace(name)
     _inflight_enter()
     _dispatch_token = dispatch_guard.enter_dispatched()
@@ -397,10 +402,21 @@ async def _tracked(name, ctx, coro):
         raise
     finally:
         duration_ms = int((time.monotonic() - start) * 1000)
+        # A handler that RETURNED after a device timeout is not `ok`: the Air
+        # run logged "tool qa_mobile_test: ok in 47589 ms" over a screencap
+        # that had timed out after 30 s (fix round 3, item 3). A raised
+        # exception keeps its own error type.
+        timed_out = tool_status.finish(_status_token)
+        degraded = ok and bool(timed_out)
+        if degraded:
+            ok = False
+            error_type = ("timed_out:" + ",".join(sorted(set(timed_out))))[:120]
         logger.info(
             "tool %s: %s in %d ms",
             name,
-            "ok" if ok else "error %s" % (error_type or "Exception"),
+            "ok"
+            if ok
+            else (error_type if degraded else "error %s" % (error_type or "Exception")),
             duration_ms,
         )
         try:
@@ -414,6 +430,9 @@ async def _tracked(name, ctx, coro):
                     "duration_ms": duration_ms,
                     "ok": ok,
                     "error_type": error_type,
+                    "status": (
+                        "timed_out" if degraded else ("ok" if ok else "error")
+                    ),
                 },
             )
         except Exception:
@@ -1879,6 +1898,18 @@ def build_server():
             ctx,
             mcp_handlers.handle_list_devices(progress=_make_progress(ctx)),
         )
+
+    @mcp.tool()
+    async def qa_mirror_hold(ctx: Context, serial: str, action: str = "status") -> str:
+        """Desktop Mirror screen only: hold, release or read ONE device's lock
+        (action=acquire|release|status) so no test run drives a phone that is
+        being mirrored. Sends no device command. Returns JSON with owner and
+        mirror_hold."""
+
+        async def _hold() -> str:
+            return mcp_handlers.handle_mirror_hold(serial, action)
+
+        return await _tracked("qa_mirror_hold", ctx, _hold())
 
     # Registered UNCONDITIONALLY (not inside the full-edition block below):
     # tools/device_manager IS shipped in the test-cases-only edition, capturing

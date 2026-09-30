@@ -16,6 +16,7 @@ TRANSITION instead.
 from __future__ import annotations
 
 import logging
+import re
 import time
 
 from tools.mobile import adb, executor, run_store
@@ -31,6 +32,39 @@ EXTENSION_TURNS = 15
 EXTENSION_S = 10 * 60
 MAX_GOAL_CHARS = 600
 MAX_WATCH_ITEMS = 10
+#: Fix round 3, item 1: the step of a multi-app goal the model is on now. It
+#: rides every packet in place of the full goal, so it is short by design.
+MAX_SUB_GOAL_CHARS = 200
+#: A hand-over package longer than this is refused, never trimmed.
+MAX_PACKAGE_CHARS = 200
+#: Surfaces a hand-over may NEVER name: the system UI, settings, the dialer,
+#: the browsers, the store and Play services. Handing the guard to one of them
+#: would let the model drive the device's own chrome as "the app under test".
+#: Matched as a PREFIX, so a sibling package of the same surface
+#: (``com.android.settings.intelligence``,
+#: ``com.google.android.gms.policy_sidecar_aps``) is refused with it. The
+#: cost, stated: a run whose app under test IS one of these cannot be handed
+#: over to it -- it must be the run's own package instead.
+HANDOVER_REFUSED_PREFIXES = (
+    "com.android.settings",
+    "com.google.android.settings",
+    "com.android.systemui",
+    "com.android.dialer",
+    "com.google.android.dialer",
+    "com.android.chrome",
+    "com.chrome.",
+    "org.chromium.",
+    "com.android.browser",
+    "org.mozilla.",
+    "com.sec.android.app.sbrowser",
+    "com.android.vending",
+    "com.google.android.gms",
+    "com.google.android.gsf",
+)
+#: ... and any package whose name CONTAINS one of these words, whoever ships
+#: it: every launcher, package installer and permission dialog.
+HANDOVER_REFUSED_WORDS = ("launcher", "packageinstaller", "permissioncontroller")
+_PACKAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$")
 
 STOP_GOAL = "goal_reached"
 STOP_TURNS = "turn_budget_exhausted"
@@ -268,7 +302,7 @@ async def next_turn(
                 },
             }
 
-        dumped = await adb.uiautomator_dump(getattr(ctx, "serial", ""))
+        dumped = await executor.dump_raw(getattr(ctx, "serial", ""))
         if dumped.get("error"):
             return dumped
         sized = await adb.display_size(getattr(ctx, "serial", ""))
@@ -294,6 +328,11 @@ async def next_turn(
         # disagree. Three-valued and POSITIVE -- see charter.scope_verdict.
         verdict = charter_mod.scope_verdict(body.get("charter"), screen)
         body["scope_verdict"] = verdict
+        # THE FOREGROUND PACKAGE THE SERVER SAW, for the one reader that needs
+        # it: `handover` accepts a model's `app` only when it is THIS value,
+        # so the guard cannot be handed to an app that is not actually in
+        # front (fix round 3, item 1).
+        body["screen_package"] = str(screen.get("package") or "")[:MAX_PACKAGE_CHARS]
         if verdict.get("state") == charter_mod.SCOPE_OUT:
             # RECORDED, never silently explored. The run is NOT stopped here:
             # nothing grades a scope-driven stop because nothing implements
@@ -389,6 +428,49 @@ async def next_turn(
         return {"error": str(exc), "content": None}
 
 
+def handover(state: object, reply: object) -> str:
+    """The package a turn reply hands the run over to, or ``""``. Never raises.
+
+    Fix round 3, item 1. A multi-app goal -- open App Tester, update the app under test,
+    open it, log in -- moves into a second app, and the guard kept comparing
+    against the first: five turns on the right screen were refused as
+    SCREEN_NOT_THE_APP. The reply's ``app`` is accepted only when ALL hold:
+
+    * it is a well-formed package name no longer than
+      :data:`MAX_PACKAGE_CHARS`;
+    * it is not a system surface: not ``android``, not under
+      :data:`HANDOVER_REFUSED_PREFIXES`, and containing none of
+      :data:`HANDOVER_REFUSED_WORDS`;
+    * it EQUALS ``state["screen_package"]`` -- the package ``next_turn`` saw
+      in front when it built this turn's packet. The model can name the app
+      the flow has visibly moved into, and nothing else.
+
+    ``""`` for anything else, including the app already handed over, so the
+    caller writes only on a real change.
+    """
+    try:
+        body = state if isinstance(state, dict) else {}
+        said = reply if isinstance(reply, dict) else {}
+        wanted = str(said.get("app") or "").strip()
+        if not wanted or len(wanted) > MAX_PACKAGE_CHARS:
+            return ""
+        if not _PACKAGE_RE.match(wanted):
+            return ""
+        lowered = wanted.lower()
+        if wanted == "android" or lowered.startswith(HANDOVER_REFUSED_PREFIXES):
+            return ""
+        if any(word in lowered for word in HANDOVER_REFUSED_WORDS):
+            return ""
+        if wanted != str(body.get("screen_package") or ""):
+            return ""
+        if wanted == str(body.get("app") or ""):
+            return ""
+        return wanted
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("mobile.explore_runner.handover failed", exc_info=True)
+        return ""
+
+
 def apply_turn_result(state: object, raw: object, *, now: float | None = None) -> dict:
     """Fold a turn reply into the state: goal, a finding, or an extension.
 
@@ -411,6 +493,13 @@ def apply_turn_result(state: object, raw: object, *, now: float | None = None) -
             # verdict overwrites this below, on purpose: that one is about the
             # budget, which matters more than a nudge.
             notice = NO_FINDING_NOTICE
+
+        # THE STEP IT IS ON NOW (fix round 3, item 1). The full goal goes to a
+        # chat once per run; this short line rides every packet after it. A
+        # reply that omits it keeps the last one.
+        sub_goal = " ".join(str(reply.get("sub_goal") or "").split())
+        if sub_goal:
+            body["sub_goal"] = sub_goal[:MAX_SUB_GOAL_CHARS]
 
         if bool(reply.get("goal_reached")):
             body["stop"] = STOP_GOAL

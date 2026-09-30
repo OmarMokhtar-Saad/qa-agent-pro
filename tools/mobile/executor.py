@@ -34,13 +34,14 @@ moved the defect rather than removed the class.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 import re
 import time
 
 from tools.mobile import actions as actions_mod
-from tools.mobile import adb, ime, perception, step_timing
+from tools.mobile import adb, dump_latency, ime, perception, step_timing
 from tools.mobile.providers import base as providers_base
 from tools.mobile.providers import composite
 
@@ -288,6 +289,11 @@ class Context:
 
     serial: str
     package: str = ""
+    # The run's OWN package, which a multi-app hand-over never moves (fix
+    # round 3, item 1). `package` above is the app under test NOW and is what
+    # every guard compares against; `home_package` is the only app
+    # `clear_app_data` may wipe. Empty means "same as `package`".
+    home_package: str = ""
     activity: str = ""
     guard_destructive: bool = True
     screen: dict | None = None
@@ -824,9 +830,64 @@ def is_destructive(text: object) -> bool:
     return bool(destructive_hit(text))
 
 
-async def _dump(ctx: Context) -> dict:
-    """Re-dump and re-prune. Returns the ``{"error","content"}`` shape."""
-    raw = await step_timing.timed("ui_dump", adb.uiautomator_dump(ctx.serial))
+async def dump_raw(serial: str) -> dict:
+    """ONE raw ``uiautomator dump`` for a caller outside :func:`_dump`.
+
+    Session open, the case lane's foreground loop and the explore turn read
+    the raw dump themselves. Calling ``adb.uiautomator_dump`` directly would
+    start a second dump beside one :func:`_dump` left running after a cut, on
+    the same ``adb.DUMP_REMOTE_PATH`` (fix round 3, item 4). This takes the
+    same guard: join the dump in flight, start this one through
+    ``dump_latency.start`` (so its real time feeds the p90) and await it
+    shielded, so a caller's own ``wait_for`` cancels the wait, never the dump.
+    """
+    await dump_latency.join(serial)
+    task = dump_latency.start(serial, adb.uiautomator_dump(serial))
+    return await asyncio.shield(task)
+
+
+#: What a dump cut at a wait's deadline reports. An error result, because the
+#: polled wait already treats any failed poll as "stop polling"; the dump
+#: itself was NOT cancelled and finishes on the device (see `_dump`).
+DUMP_CUT_DETAIL = (
+    "The screen dump did not finish before the wait's deadline; it was left "
+    "to finish on the device."
+)
+
+
+async def _dump(ctx: Context, deadline: float | None = None) -> dict:
+    """Re-dump and re-prune. Returns the ``{"error","content"}`` shape.
+
+    SINGLE-FLIGHT PER SERIAL (fix round 3, item 4). Every dump writes the same
+    ``adb.DUMP_REMOTE_PATH``, so this first joins any dump still running on
+    the device and only then starts its own, through ``dump_latency.start``,
+    which also records the dump's real time for the adaptive margin.
+
+    With a *deadline* (an instant on this module's ``time.monotonic``) the
+    wait is cut there -- and ONLY the wait: ``asyncio.shield`` leaves the adb
+    dump running to its end, where it records its time and the next ``_dump``
+    joins it. A cut returns :data:`DUMP_CUT_DETAIL` as an error.
+    """
+    serial = ctx.serial
+    if deadline is None:
+        await dump_latency.join(serial)
+    elif not await dump_latency.join(serial, deadline - time.monotonic()):
+        step_timing.mark("dump_cut")
+        return {"error": DUMP_CUT_DETAIL, "content": None}
+    task = dump_latency.start(serial, adb.uiautomator_dump(serial))
+    try:
+        if deadline is None:
+            raw = await step_timing.timed("ui_dump", asyncio.shield(task))
+        else:
+            raw = await step_timing.timed(
+                "ui_dump",
+                asyncio.wait_for(
+                    asyncio.shield(task), max(0.0, deadline - time.monotonic())
+                ),
+            )
+    except asyncio.TimeoutError:
+        step_timing.mark("dump_cut")
+        return {"error": DUMP_CUT_DETAIL, "content": None}
     if raw.get("error"):
         return raw
     # The display is a DEVICE fact, so it is read from the device rather than
@@ -1540,12 +1601,30 @@ async def _wait_until_text(
         current = dumped.get("content")
 
 
+async def _focus_probe(serial: str, budget: float) -> str:
+    """The focused ``package/Activity``, or ``""`` when not known in *budget* s.
+
+    One short ``dumpsys window`` line, far cheaper than a dump. Bounded by the
+    budget the polled wait has left, and never raises: an unknown focus is
+    never a change.
+    """
+    if budget <= 0:
+        return ""
+    try:
+        probed = await asyncio.wait_for(
+            adb.current_activity(serial, timeout=int(budget) + 1), budget
+        )
+    except Exception:
+        return ""
+    return str((probed or {}).get("content") or "")
+
+
 async def _wait_until_changed(
     ctx: Context, screen: object, ms: int
-) -> tuple[object, bool]:
+) -> tuple[object, bool, bool]:
     """Poll until the screen is no longer the one we started on. Never overruns.
 
-    Returns ``(latest_screen, changed)``. A bare ``wait`` exists because the
+    Returns ``(latest_screen, changed, reusable)``. A bare ``wait`` exists because the
     planner expects the screen to become something else; sleeping through the
     whole ``ms`` after it already has is the cheapest thing this lane was
     getting wrong -- observed on run mrun-20260908-061316-a41b2a, where fixed
@@ -1576,16 +1655,59 @@ async def _wait_until_changed(
     ONE-PIXEL SCROLL is the row where this identity and the id disagree, and
     the trade is deliberate: returning on it costs a re-plan against a screen
     that barely moved, while not returning cost every chat reply its whole
-    budget. The caller settles with ``redump=True`` regardless, so what the
-    model reads is fetched after this returns, not during it.
+    budget. An EARLY return still settles with ``redump=True``, so what the
+    model reads after a change is fetched after this returns, not during it.
+
+    ``reusable`` (fix round 3, item 4) is True in ONE case only: the screen
+    never changed and the last poll's dump -- started as late as the margin
+    allows -- ENDED within :data:`WAIT_POLL_S` of the deadline, so that dump
+    stands for the post-wait screen and the caller's settle skips its own
+    (``redump=not reusable``). Whatever is left after that dump is slept: the
+    wait never ends before its ms (plan-mobile-lane-latency-2026-09-08). When
+    more than one poll interval is left, the dump is too old to reuse and
+    ``reusable`` is False. Every early
+    return is ``reusable=False``: a spinner replacing a button is a change,
+    and the screen after it must be re-read before the model sees it.
+
+    THE MARGIN is ``dump_latency.margin_ms``: the larger of
+    :data:`MIN_POLL_MARGIN_MS` and this device's p90 dump time, so a slow AVD
+    widens it instead of overrunning. Each poll dump is also cut at the
+    deadline (``_dump(ctx, deadline=...)``), so even a dump slower than its
+    p90 cannot carry the wait past the ms it was given.
+
+    FOCUS FIRST. Each iteration asks ``adb.current_activity`` -- bounded by
+    the time left -- before paying for a dump. A focused window different
+    from the one PROBED when the wait started (never ``ctx.activity``, which
+    is memoised per replay) is a change, returned at once and never
+    reusable. An empty answer on either side is unknown, never a change.
     """
     before = _screen_hash(screen)
     deadline = time.monotonic() + (ms / 1000.0)
-    margin = MIN_POLL_MARGIN_MS / 1000.0
+    margin = dump_latency.margin_ms(ctx.serial, MIN_POLL_MARGIN_MS) / 1000.0
+    # The baseline is PROBED here, never read from `ctx.activity`: that is
+    # memoised once per replay (`resolve_activity`) and is stale after the
+    # first navigation, when every later probe would differ from it and end
+    # every wait at its first poll. An empty or failed probe is UNKNOWN: this
+    # wait skips the focus check and the dump path alone decides.
+    before_focus = await _focus_probe(
+        ctx.serial, deadline - margin - time.monotonic()
+    )
     current = screen
     while time.monotonic() + margin <= deadline:
-        await _sleep(WAIT_POLL_S)
-        dumped = await _dump(ctx)
+        if before_focus:
+            focus = await _focus_probe(
+                ctx.serial, deadline - margin - time.monotonic()
+            )
+            if focus and focus != before_focus:
+                return current, True, False
+        now = time.monotonic()
+        # The LAST dump starts as late as the margin allows, so it ends at or
+        # just before the deadline; what is left after it is slept below.
+        last = now + 2 * (WAIT_POLL_S + margin) > deadline
+        pause = (deadline - margin - now) if last else WAIT_POLL_S
+        if pause > 0:
+            await _sleep(pause)
+        dumped = await _dump(ctx, deadline=deadline)
         if dumped.get("error"):
             # WHY THIS `break` DOES NOT REPORT, where `_wait_until_text`'s
             # same failure returns `timed_out`: the two have different next
@@ -1603,11 +1725,19 @@ async def _wait_until_changed(
             break
         current = dumped.get("content")
         if _screen_hash(current) != before:
-            return current, True
+            return current, True, False
+        if last:
+            # The wait NEVER ends early. What is left after the last dump is
+            # slept; if that is more than one poll interval the dump is too
+            # old to stand for the post-wait screen, and the caller redumps.
+            left = deadline - time.monotonic()
+            if left > 0:
+                await _sleep(left)
+            return current, False, left <= WAIT_POLL_S
     remaining = deadline - time.monotonic()
     if remaining > 0:
         await _sleep(remaining)
-    return current, False
+    return current, False, False
 
 
 def _center(element: dict) -> tuple[int, int] | None:
@@ -2611,9 +2741,12 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                         ),
                     }
                 changed = False
+                reusable = False
                 if ms:
                     if ms >= POLL_MIN_WAIT_MS:
-                        screen, changed = await _wait_until_changed(ctx, screen, ms)
+                        screen, changed, reusable = await _wait_until_changed(
+                            ctx, screen, ms
+                        )
                     else:
                         await _sleep(ms / 1000.0)
                 entry["outcome"] = "ok"
@@ -2627,24 +2760,25 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                     if changed
                     else ("waited " + str(ms) + "ms")
                 )
-                # `redump=True`, and the `redump=False` above is NOT reusable
-                # here. There the poll has just dumped, so its `screen` is
-                # post-wait; on this path the only screen in hand is the
-                # PRE-sleep one. Skipping the dump would stamp
-                # `after_screen_hash` from before the wait and hand the next
-                # action's target resolution and destructive guard a screen
-                # older than the wait itself -- the defect this function's
+                # `redump=not reusable`. Only a polled wait whose LAST dump was
+                # timed to end at the deadline hands back a post-wait screen
+                # (`_wait_until_changed` says when). Every other path -- a flat
+                # sleep, an early return on a change, a cut dump -- holds a
+                # screen from before the wait ended, and skipping the dump there
+                # would stamp `after_screen_hash` from before the wait and hand
+                # the next action's target resolution and destructive guard a
+                # screen older than the wait itself -- the defect `_settle`'s
                 # docstring records, where every assert after a wait was
-                # evaluated against the pre-wait screen. The dump costs wall
-                # clock; the way to spend less of it is `wait until_text`,
-                # which returns early AND folds its dump into its last poll.
+                # evaluated against the pre-wait screen.
+                if reusable:
+                    step_timing.mark("dump_reused")
                 screen, stop = await _settle(
                     ctx,
                     entry,
                     screen,
                     trace,
                     index,
-                    redump=True,
+                    redump=not reusable,
                     mark_no_change=False,
                     op=op,
                 )
@@ -2687,6 +2821,15 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
             if scroll_missed:
                 entry["detail"] = (SCROLL_TARGET_MISSED + " " + entry["detail"]).strip()
 
+            # A `launch` whose `am start` only brought this app's own task to
+            # the front of a screen that was ALREADY this app changed nothing a
+            # dump would see. The one redump it skips is the costliest call on a
+            # heavy AVD. ONLY the dump is skipped: `_settle` still runs on the
+            # screen in hand, so `no_change` and the system-dialog and
+            # left-app checks are kept.
+            front = op == "launch" and _brought_to_front(outcome, screen, ctx)
+            if front:
+                step_timing.mark("dump_skipped")
             if op in actions_mod.MUTATING_OPS:
                 screen, stop = await _settle(
                     ctx,
@@ -2694,7 +2837,7 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                     screen,
                     trace,
                     index,
-                    redump=True,
+                    redump=not front,
                     mark_no_change=True,
                     op=op,
                 )
@@ -3010,6 +3153,31 @@ def _evaluate_assert(
     )
 
 
+#: What ``am start`` prints when the activity was not started because its
+#: task already existed and was only moved to the front.
+BROUGHT_TO_FRONT = "brought to the front"
+
+
+def _brought_to_front(outcome: object, screen: object, ctx: object) -> bool:
+    """True when a `launch` only moved THIS app's task to the front of a screen
+    that was already this app, so the screen in hand is still current.
+
+    The package check is what makes the skip safe: `am start` says the same
+    words when the app was in the BACKGROUND, and then the screen in hand is
+    the launcher and must be re-read.
+    """
+    body = outcome.get("content") if isinstance(outcome, dict) else None
+    if not isinstance(body, dict):
+        return False
+    said = str(body.get("out") or "") + str(body.get("err") or "")
+    package = str(getattr(ctx, "package", "") or "")
+    return (
+        bool(package)
+        and BROUGHT_TO_FRONT in said
+        and _screen_package(screen) == package
+    )
+
+
 async def _perform(
     op: str,
     action: object,
@@ -3028,14 +3196,18 @@ async def _perform(
             return {"error": "No app package is set for this run.", "content": None}
         return await adb.launch(serial, ctx.package)
     if op == "clear_app_data":
-        # Only ever THIS run's own package -- `ctx.package`, never a value
-        # read off the script, so a plan cannot name a different app to wipe.
-        if not ctx.package:
+        # Only ever THIS run's own package -- `ctx.home_package` (falling back
+        # to `ctx.package` for a Context built without one), never a value
+        # read off the script, and never the app a multi-app goal handed over
+        # to: a hand-over moves what the guard compares against, not what may
+        # be wiped.
+        home = getattr(ctx, "home_package", "") or ctx.package
+        if not home:
             return {"error": "No app package is set for this run.", "content": None}
-        cleared = await adb.clear_app_data(serial, ctx.package)
+        cleared = await adb.clear_app_data(serial, home)
         if cleared.get("error"):
             return cleared
-        return await adb.launch(serial, ctx.package)
+        return await adb.launch(serial, home)
     if op == "open_url":
         return await adb.open_url(serial, str(getattr(action, "url", "")))
     if op == "wait":

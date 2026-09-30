@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import io
 import logging
+import struct
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +161,40 @@ CAPTURE_FAILED_NOTE = (
     "from the element list alone, and if it is empty say so rather than "
     "guessing -- do not wait for a picture, none is coming for this turn."
 )
+
+#: ... and when the capture TIMED OUT (fix round 3, item 3). Its own note
+#: because a timeout says something the generic failure does not: the device
+#: or its host is too slow right now, and the call is reported as
+#: ``timed_out`` rather than ``ok``. It does not say how many tries were made:
+#: the retry runs only when the turn's budget has room for it.
+CAPTURE_TIMED_OUT_NOTE = (
+    "NO image of this screen is attached: the capture TIMED OUT, so the "
+    "device or its host is too slow right now. Plan from the element list "
+    "alone -- do not wait for a picture, none is coming for this turn."
+)
+
+#: The shortest wait worth a screencap retry, in seconds. Below it a second
+#: try is unlikely to answer where a 30 s one did not.
+MIN_RETRY_TIMEOUT_S = 8
+#: Seconds of the turn's budget kept back from the retry for the rest of the
+#: packet (render, send).
+RETRY_MARGIN_S = 2
+
+
+def retry_timeout_s(remaining: float | None, full_s: float) -> float | None:
+    """The wait for the ONE screencap retry, or ``None`` when there is none.
+
+    ``remaining`` is the turn budget's time left (``None``: no budget, no
+    retry). ``RETRY_MARGIN_S`` is kept back for the rest of the packet, and a
+    wait shorter than ``MIN_RETRY_TIMEOUT_S`` is not worth trying; the wait
+    never exceeds ``full_s``, the first try's own timeout.
+    """
+    if remaining is None:
+        return None
+    left = float(remaining) - RETRY_MARGIN_S
+    if left < MIN_RETRY_TIMEOUT_S:
+        return None
+    return min(float(full_s), left)
 
 #: ... and when none was attempted, because this reply cannot carry one.
 #:
@@ -326,3 +361,82 @@ def to_spec(data: object, *, run_id: object = "", tc_id: object = "") -> dict | 
     except Exception:  # never-raise: a picture is not a verdict
         logger.exception("mobile.screenshot.to_spec failed")
         return None
+
+
+#: ``screencap``'s pixel format id for RGBA_8888, the only one decoded here.
+_RGBA_8888 = 1
+
+
+def png_from_raw(raw: object) -> bytes | None:
+    """A RAW ``screencap`` frame as a PNG scaled to :data:`MAX_LONG_EDGE_PX`.
+
+    The frame is ``width, height, format`` as little-endian uint32 -- plus a
+    fourth word (the colour space) on newer Android -- then RGBA_8888 pixels.
+    The header length is DERIVED from the byte count (12 or 16) rather than
+    assumed per Android version. Scaled BEFORE it is encoded, which is the
+    point: the device's PNG encode of the full frame is what item 7 removes.
+
+    Never raises. ``None`` means "take the PNG path" -- any format, size or
+    Pillow problem, and anything over :data:`MAX_DECODE_PIXELS`.
+    """
+    try:
+        if not isinstance(raw, (bytes, bytearray)) or len(raw) < 12:
+            return None
+        width, height, fmt = struct.unpack_from("<III", raw, 0)
+        pixels = width * height
+        if width <= 0 or height <= 0 or pixels > MAX_DECODE_PIXELS:
+            return None
+        if fmt != _RGBA_8888:
+            return None
+        header = len(raw) - pixels * 4
+        if header not in (12, 16):
+            return None
+        from PIL import Image
+
+        image = Image.frombuffer(
+            "RGBA", (width, height), bytes(raw[header:]), "raw", "RGBA", 0, 1
+        ).convert("RGB")
+        longest = max(width, height)
+        if longest > MAX_LONG_EDGE_PX:
+            scale = MAX_LONG_EDGE_PX / float(longest)
+            size = (
+                max(1, int(round(width * scale))),
+                max(1, int(round(height * scale))),
+            )
+            image = image.resize(size, Image.LANCZOS)
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG", optimize=True)
+        return buffer.getvalue()
+    except Exception:  # never-raise: a picture is not a verdict
+        logger.debug("mobile.screenshot.png_from_raw failed", exc_info=True)
+        return None
+
+
+async def capture(serial: str, *, timeout_s: float | None = None) -> dict:
+    """The screen as PNG bytes, ``{"error", "content"}`` -- raw on a heavy panel.
+
+    On a panel whose long edge is over ``avd_guard.HEAVY_AVD_MAX_LONG_EDGE_PX``
+    the frame is pulled RAW and scaled here (:func:`png_from_raw`). A raw
+    timeout is returned as it is, ``timed_out`` included -- the PNG path would
+    only time out again, and the packet's retry and audit status read that
+    field -- and every other failure falls back to ``adb.screencap`` unchanged,
+    including whatever that reports. ``timeout_s`` goes to whichever capture
+    runs, clamped there. Never raises.
+    """
+    from tools.mobile import adb, avd_guard
+
+    try:
+        sized = await adb.display_size(serial)
+        edge = max((sized or {}).get("content") or [0, 0])
+        if int(edge) > avd_guard.HEAVY_AVD_MAX_LONG_EDGE_PX:
+            raw = await adb.screencap_raw(serial, timeout_s=timeout_s)
+            if (raw or {}).get("timed_out"):
+                return raw
+            png = png_from_raw((raw or {}).get("content"))
+            if png:
+                return {"error": None, "content": png}
+    except Exception:
+        logger.debug("mobile.screenshot.capture raw path failed", exc_info=True)
+    if timeout_s is None:
+        return await adb.screencap(serial)
+    return await adb.screencap(serial, timeout_s=timeout_s)

@@ -635,6 +635,13 @@ TURN_FIELD_SCHEMA: dict = {
     "goal_reached": {"type": "boolean"},
     "request_extension": {"type": "boolean"},
     "extension_reason": {"type": "string", "maxLength": 400},
+    # Fix round 3, item 1. `app`: the package a multi-app goal has moved into,
+    # declared once while that app is in front; the server accepts it only
+    # when it matches the package it saw (explore_runner.handover). `sub_goal`:
+    # the one step the model is on, which rides every packet in place of the
+    # full goal. 200 = explore_runner.MAX_PACKAGE_CHARS / MAX_SUB_GOAL_CHARS.
+    "app": {"type": "string", "maxLength": 200},
+    "sub_goal": {"type": "string", "maxLength": 200},
 }
 
 #: Just the names, for callers that only need to know what rides beside the

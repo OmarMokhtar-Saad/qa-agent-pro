@@ -405,7 +405,7 @@ async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
         seen = ""
         in_front = False
         while True:
-            dumped = await adb.uiautomator_dump(ctx.serial)
+            dumped = await executor.dump_raw(ctx.serial)
             if dumped.get("error"):
                 return await _abandon(run_id, tc_id, ctx, evidence, dumped)
             sized = await adb.display_size(ctx.serial)

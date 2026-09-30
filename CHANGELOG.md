@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.100.6] - 2026-09-29
+## [1.101.0] - 2026-09-30
 
 ### Added
 
@@ -29,6 +29,19 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- No behaviour change from 1.100.5. This release adds regression
-  tests that guard four of its mobile fixes: qa-doctor's adb row,
-  the app-launch deadline, and two cases of the shorter login flow.
+- Mobile testing no longer loops on the login screen when a flow
+  hands over from one app to another: the goal and the expected app
+  follow the current step, and tester credentials are kept for the
+  whole run instead of being asked for again.
+- The wait for the screen to change now adapts to how slow each
+  device is to read, and never runs past its own deadline.
+- A screenshot or screen-read timeout is now reported as a timeout
+  in the result and the audit log, instead of as success.
+- Steps are faster: the screen is not re-read after actions that
+  cannot change it, and each step reports its time per phase.
+- qa_list_devices says an emulator is booting instead of 'No devices
+  detected'.
+- A slow host or emulator gets one warning per run, with a
+  suggestion for a lighter emulator.
+- The option picker falls back to the text menu clearly when it
+  times out.

@@ -63,6 +63,22 @@ async def timed(name: str, awaitable: Awaitable[Any]) -> Any:
     return result
 
 
+def mark(name: str) -> None:
+    """Count one EVENT under *name* -- a dump reused, skipped or cut.
+
+    Not a phase: nothing was awaited, so there is no time to add. It shares
+    :data:`MAX_TIMED_PHASES` with the phases because both end up in the one
+    line :func:`line` renders. Unarmed, it records nothing.
+    """
+    state = _PHASES.get()
+    if state is None:
+        return
+    marks = state.setdefault("marks", {})
+    if name not in marks and len(marks) >= MAX_TIMED_PHASES:
+        return
+    marks[name] = marks.get(name, 0) + 1
+
+
 def summary() -> dict:
     """``{"total_ms": int, "phases": {name: {"ms": int, "n": int}}}`` or ``{}``."""
     state = _PHASES.get()
@@ -86,6 +102,8 @@ def line() -> str:
         f"{name} {info['ms']:,} ms" + (f" ×{info['n']}" if info["n"] > 1 else "")
         for name, info in data["phases"].items()
     ]
+    marks = (_PHASES.get() or {}).get("marks") or {}
+    parts += [f"{name} ×{count}" for name, count in marks.items()]
     return f"⏱ step {data['total_ms']:,} ms" + (
         " — " + " · ".join(parts) if parts else ""
     )
