@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.103.1] - 2026-09-30
+## [1.103.2] - 2026-09-30
 
 ### Added
 
@@ -29,8 +29,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- An app notes store made before 1.103.0 is now made readable only by
-  your user account the first time it is opened, not only when a new
-  note is saved.
-- A PIN or code split by dots or dashes right after a secret word
-  ("pin 1-2-3-4", "otp: 48 21") is now refused in a note.
+- A version number, host address or measurement after a secret word
+  ("token 1.2.3.4 is invalid", "secret 10.0.2.2", "pin 100 200 px")
+  no longer blocks saving an app note.
+- A PIN split by commas, slashes or spaced dashes ("pin: 1,2,3,4",
+  "pin 1/2/3/4", "pin 1 - 2 - 3 - 4") is now refused in a note.
+- The old notes store of an app whose package name has capital letters
+  is now made readable only by your user account as well.
