@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.101.0] - 2026-09-30
+## [1.102.0] - 2026-09-30
 
 ### Added
 
@@ -29,19 +29,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Mobile testing no longer loops on the login screen when a flow
-  hands over from one app to another: the goal and the expected app
-  follow the current step, and tester credentials are kept for the
-  whole run instead of being asked for again.
-- The wait for the screen to change now adapts to how slow each
-  device is to read, and never runs past its own deadline.
-- A screenshot or screen-read timeout is now reported as a timeout
-  in the result and the audit log, instead of as success.
-- Steps are faster: the screen is not re-read after actions that
-  cannot change it, and each step reports its time per phase.
-- qa_list_devices says an emulator is booting instead of 'No devices
-  detected'.
-- A slow host or emulator gets one warning per run, with a
-  suggestion for a lighter emulator.
-- The option picker falls back to the text menu clearly when it
-  times out.
+- Mobile testing can now remember things about one app. Save a note
+  with the `note` parameter of qa_mobile_test or qa_submit_mobile_step:
+  a `wait` note waits for a named text or element before acting on a
+  matching element; an `avoid` note refuses an action and hands the
+  decision back to the chat.
+- New qa_mobile_notes tool lists an app's saved notes and retires one.
+  Notes stay on this machine, one file per app, and are never uploaded.
+- A note that contains a value typed into the run, a long number or a
+  credential is refused by name. A note can only add a wait or a
+  refusal: the destructive-action guard still runs after it.

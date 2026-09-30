@@ -335,11 +335,21 @@ class WaitAction(_Base):
     op: Literal["wait"]
     ms: int = Field(default=0, ge=0, le=MAX_WAIT_MS)
     until_text: str = Field(default="", max_length=200)
+    # Wait for an ELEMENT by its resource id (present, or gone with
+    # ``until_gone``), optionally one whose text/desc contains ``until_rid_text``.
+    until_rid: str = Field(default="", max_length=200)
+    until_gone: bool = False
+    until_rid_text: str = Field(default="", max_length=200)
 
     @model_validator(mode="after")
     def something_to_wait_for(self) -> "WaitAction":
-        if not self.ms and not self.until_text.strip():
-            raise ValueError("wait needs ms or until_text")
+        has_rid = bool(self.until_rid.strip())
+        if (self.until_gone or self.until_rid_text.strip()) and not has_rid:
+            raise ValueError("until_gone and until_rid_text need until_rid")
+        if has_rid and self.until_text.strip():
+            raise ValueError("wait takes until_text OR until_rid, not both")
+        if not self.ms and not self.until_text.strip() and not has_rid:
+            raise ValueError("wait needs ms, until_text or until_rid")
         return self
 
 
@@ -523,7 +533,10 @@ def _bare_until_text_count(actions: object) -> int:
         if str(getattr(action, "op", "") or "") != "wait":
             continue
         ms = int(getattr(action, "ms", 0) or 0)
-        if not ms and str(getattr(action, "until_text", "") or "").strip():
+        if not ms and (
+            str(getattr(action, "until_text", "") or "").strip()
+            or str(getattr(action, "until_rid", "") or "").strip()
+        ):
             count += 1
     return count
 
@@ -1253,7 +1266,8 @@ def describe_vocabulary() -> dict:
             "you mean instead; that is judged by its own label.",
             "type carries secret=true ONLY for a value the tester supplied; never "
             "invent a credential and never put one in a plan.",
-            "wait takes until_text (PREFERRED) or ms (<= "
+            "wait takes until_text (PREFERRED), until_rid (an element by its "
+            "resource id: present, or gone with until_gone=true) or ms (<= "
             + str(MAX_WAIT_MS)
             + "). until_text names what you are waiting FOR and returns the moment "
             "it appears; a flat ms always sleeps the whole amount whether or not "

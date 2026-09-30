@@ -41,7 +41,7 @@ import re
 import time
 
 from tools.mobile import actions as actions_mod
-from tools.mobile import adb, dump_latency, ime, perception, step_timing
+from tools.mobile import adb, app_knowledge, dump_latency, ime, perception, step_timing
 from tools.mobile.providers import base as providers_base
 from tools.mobile.providers import composite
 
@@ -359,6 +359,11 @@ class Context:
     # compare against it -- a confirm naming a different op, or arriving
     # before any stop was recorded, then refuses by name and stays unspent.
     prior_guard_stop: dict | None = None
+    # This app's saved notes for THIS replay: ``{package, guards, counts,
+    # events, spent_ms}``. ``None`` until ``replay`` loads it (once per replay);
+    # a direct ``Context(...)`` test may preset it. Never written by a guard
+    # except through ``_apply_knowledge``.
+    knowledge: dict | None = None
 
 
 #: The ONLY ops the destructive guard skips, because none can actuate anything:
@@ -1233,6 +1238,28 @@ def _screen_has(screen: object, needle: str) -> bool:
     return False
 
 
+def _screen_has_element(screen: object, rid: str, text: str = "") -> bool:
+    """True when an element on *screen* has resource id *rid* (equal, or *rid*
+    is the id without its package prefix), and, when *text* is given, a label
+    (text or desc) containing it. ``resend`` never matches ``send``."""
+    want = " ".join(str(rid or "").split()).lower()
+    needle = " ".join(str(text or "").split()).lower()
+    if not want or not isinstance(screen, dict):
+        return False
+    for element in screen.get("elements") or []:
+        if not isinstance(element, dict):
+            continue
+        have = " ".join(str(element.get("rid") or "").split()).lower()
+        if have != want and not have.endswith("/" + want):
+            continue
+        if not needle:
+            return True
+        for field in ("text", "desc"):
+            if needle in " ".join(str(element.get(field) or "").split()).lower():
+                return True
+    return False
+
+
 def _texts(screen: object) -> set:
     """Every visible string on *screen*, whitespace-normalised.
 
@@ -1578,13 +1605,19 @@ async def _settle(
 
 
 async def _wait_until_text(
-    ctx: Context, screen: object, text: str, ms: int
+    ctx: Context, screen: object, text: str, ms: int, *, bounded: bool = False
 ) -> tuple[bool, object, bool]:
     """Poll the screen until *text* appears or the budget runs out.
 
     Returns ``(found, latest_screen, timed_out)``. ``ms`` is the caller's cap;
     ``0`` falls back to :data:`DEFAULT_WAIT_UNTIL_TEXT_S` so a script that
     forgot to set it does not poll forever.
+
+    ``bounded`` (a saved-note guard) makes ``ms`` a HARD limit: each poll's
+    sleep stops at the deadline and each dump is cut there
+    (``_dump(ctx, deadline=...)``, as :func:`_wait_until_changed` does), so a
+    slow dump cannot carry the guard past the budget it was given. A script's
+    own ``until_text`` keeps the unbounded dump.
     """
     budget = (ms / 1000.0) if ms else DEFAULT_WAIT_UNTIL_TEXT_S
     deadline = time.monotonic() + budget
@@ -1594,11 +1627,234 @@ async def _wait_until_text(
             return True, current, False
         if time.monotonic() >= deadline:
             return False, current, True
-        await _sleep(WAIT_POLL_S)
-        dumped = await _dump(ctx)
+        await _sleep(
+            min(WAIT_POLL_S, max(0.0, deadline - time.monotonic()))
+            if bounded
+            else WAIT_POLL_S
+        )
+        dumped = await _dump(ctx, deadline=deadline if bounded else None)
         if dumped.get("error"):
             return False, current, True
         current = dumped.get("content")
+
+
+async def _wait_until_element(
+    ctx: Context,
+    screen: object,
+    rid: str,
+    text: str,
+    gone: bool,
+    ms: int,
+    *,
+    bounded: bool = False,
+) -> tuple[bool, object, bool]:
+    """Poll until an element with resource id *rid* is on the screen (or, with
+    *gone*, is not). Same contract as :func:`_wait_until_text`, ``bounded``
+    included: ``(satisfied, latest_screen, timed_out)``; ``ms == 0`` falls back
+    to the default budget.
+    """
+    budget = (ms / 1000.0) if ms else DEFAULT_WAIT_UNTIL_TEXT_S
+    deadline = time.monotonic() + budget
+    current = screen
+    while True:
+        if _screen_has_element(current, rid, text) != gone:
+            return True, current, False
+        if time.monotonic() >= deadline:
+            return False, current, True
+        await _sleep(
+            min(WAIT_POLL_S, max(0.0, deadline - time.monotonic()))
+            if bounded
+            else WAIT_POLL_S
+        )
+        dumped = await _dump(ctx, deadline=deadline if bounded else None)
+        if dumped.get("error"):
+            return False, current, True
+        current = dumped.get("content")
+
+
+def _load_knowledge(ctx: Context) -> None:
+    """Load this app's saved-note guards ONCE per replay. Read-only: an app
+    with no store creates nothing. Never raises; any failure is "no notes"."""
+    if getattr(ctx, "knowledge", None) is not None:
+        return
+    package = str(getattr(ctx, "package", "") or "")
+    guards: list = []
+    try:
+        if package:
+            loaded = app_knowledge.load_guards(package)
+            if not loaded.get("error"):
+                guards = list(loaded.get("content") or [])
+    except Exception:
+        logger.exception("mobile app knowledge: load failed; continuing without notes")
+    ctx.knowledge = {
+        "package": package,
+        "guards": guards,
+        "counts": {},
+        "events": [],
+        "spent_ms": 0,
+    }
+
+
+def _flush_knowledge(ctx: Context) -> None:
+    """Write the tallies buffered by ``_apply_knowledge``, in ``replay``'s
+    ``finally`` so success, error, exception and abort all flush. Never raises.
+
+    It then DROPS the loaded notes (``ctx.knowledge = None``), so the next
+    ``replay`` on the same Context reloads them: a note added or retired
+    between two replays is seen by the second one."""
+    know = getattr(ctx, "knowledge", None)
+    ctx.knowledge = None
+    if not isinstance(know, dict):
+        return
+    try:
+        if know.get("counts") or know.get("events"):
+            app_knowledge.flush_counters(
+                str(know.get("package") or ""),
+                know.get("counts") or {},
+                know.get("events") or [],
+                run_id=str(getattr(ctx, "run_id", "") or ""),
+            )
+    except Exception:
+        logger.exception("mobile app knowledge: flush failed")
+    finally:
+        know["counts"] = {}
+        know["events"] = []
+        know["spent_ms"] = 0
+
+
+def _action_rids(action: object, screen: object) -> list:
+    """Every resource id this action could hit: the target's own ``rid``, plus
+    the rid of each element on *screen* that its ``id`` names or whose text or
+    content-desc contains its ``text`` / ``label`` (``tap_text``'s ``text``
+    too). So an avoid note on a rid also stops a tap aimed by its words."""
+    target = getattr(action, "target", None)
+
+    def pick(name: str) -> str:
+        raw = target.get(name) if isinstance(target, dict) else getattr(target, name, "")
+        return " ".join(str(raw or "").split()).lower()
+
+    rids = [pick("rid")] if pick("rid") else []
+    words = [w for w in (pick("text"), pick("label")) if w]
+    own = " ".join(str(getattr(action, "text", "") or "").split()).lower()
+    if target is None and own:
+        words.append(own)
+    want_id = pick("id")
+    elements = screen.get("elements") if isinstance(screen, dict) else None
+    for element in elements or []:
+        if not isinstance(element, dict) or not element.get("rid"):
+            continue
+        labels = [
+            " ".join(str(element.get(f) or "").split()).lower() for f in ("text", "desc")
+        ]
+        by_id = bool(want_id) and str(element.get("id") or "").lower() == want_id
+        if by_id or any(w in label for w in words for label in labels if label):
+            rids.append(str(element["rid"]))
+    return rids
+
+
+async def _apply_knowledge(
+    ctx: Context,
+    action: object,
+    op: str,
+    entry: dict,
+    screen: object,
+    items: list,
+    deadline: float,
+) -> tuple[object, str | None]:
+    """Apply this app's saved notes to ONE action, BEFORE it resolves a target.
+
+    ``(screen, refusal)``. An ``avoid`` note that matches refuses the op (the
+    reply names the note and echoes it as untrusted text). A ``wait`` note polls
+    for what it names within a budget that can never hang the replay: the
+    smallest of the note's ms, ``MAX_WAIT_MS``, what the script's waits leave of
+    ``MAX_TOTAL_WAIT_MS`` after the guard waits already spent, and the time left
+    to the replay deadline. A timeout PROCEEDS and is buffered as
+    ``contradicted``. This decides nothing about the destructive guard, which
+    still runs after and outranks it. Never raises.
+    """
+    try:
+        know = getattr(ctx, "knowledge", None)
+        if op == "wait" or not isinstance(know, dict) or not know.get("guards"):
+            return screen, None
+        matched = app_knowledge.candidates(
+            know["guards"], op, _action_rids(action, screen)
+        )
+        if not matched:
+            return screen, None
+        probe = ""
+        if any((g.get("when") or {}).get("activity") for g in matched):
+            began = time.monotonic()
+            probe = await _focus_probe(
+                ctx.serial, min(2.0, max(0.0, deadline - began))
+            )
+            know["spent_ms"] = int(know.get("spent_ms") or 0) + int(
+                max(0.0, time.monotonic() - began) * 1000
+            )
+        live = [g for g in matched if app_knowledge.activity_ok(g, probe)]
+        fired: list[dict] = []
+        for guard in live:
+            if guard.get("kind") != "avoid":
+                continue
+            know["events"].append(
+                {"note_id": guard.get("id"), "event": "avoided", "detail": op}
+            )
+            fired.append(
+                {"note_id": guard.get("id"), "kind": "avoid", "outcome": "avoided", "ms": 0}
+            )
+            entry["knowledge"] = fired
+            return screen, (
+                "A saved note for this app says not to do this here (note #%s). "
+                "Do something else, or ask the tester. %s"
+                % (guard.get("id"), app_knowledge.echo(guard))
+            )
+        for guard in live:
+            if guard.get("kind") != "wait":
+                continue
+            then = guard.get("then") or {}
+            budget = min(
+                int(then.get("ms") or app_knowledge.DEFAULT_GUARD_WAIT_MS),
+                actions_mod.MAX_WAIT_MS,
+                actions_mod.MAX_TOTAL_WAIT_MS
+                - actions_mod.total_wait_ms(items)
+                - int(know.get("spent_ms") or 0),
+                int((deadline - time.monotonic()) * 1000),
+            )
+            if budget <= 0:
+                continue
+            began = time.monotonic()
+            if then.get("until_rid"):
+                satisfied, screen, _late = await _wait_until_element(
+                    ctx,
+                    screen,
+                    str(then["until_rid"]),
+                    str(then.get("until_rid_text") or ""),
+                    bool(then.get("until_gone")),
+                    budget,
+                    bounded=True,
+                )
+            else:
+                satisfied, screen, _late = await _wait_until_text(
+                    ctx, screen, str(then.get("until_text") or ""), budget, bounded=True
+                )
+            spent = int(max(0.0, time.monotonic() - began) * 1000)
+            know["spent_ms"] = int(know.get("spent_ms") or 0) + spent
+            outcome = "confirmed" if satisfied else "contradicted"
+            tally = know["counts"].setdefault(
+                guard.get("id"), {"confirmed": 0, "contradicted": 0}
+            )
+            tally[outcome] += 1
+            know["events"].append(
+                {"note_id": guard.get("id"), "event": outcome, "detail": op}
+            )
+            fired.append(
+                {"note_id": guard.get("id"), "kind": "wait", "outcome": outcome, "ms": spent}
+            )
+        if fired:
+            entry["knowledge"] = fired
+        return screen, None
+    except Exception:
+        logger.exception("mobile app knowledge: guard failed; continuing without notes")
+        return screen, None
 
 
 async def _focus_probe(serial: str, budget: float) -> str:
@@ -2240,6 +2496,21 @@ async def keyboard_down(serial: str, previous: str) -> dict:
 
 
 async def replay(script: object, ctx: Context) -> dict:
+    """Execute *script*; the contract is :func:`_replay_keyboard`'s.
+
+    Loads this app's saved notes ONCE (read-only) and flushes their buffered
+    counters in a ``finally``, so success, error, exception and abort all
+    flush. Both steps degrade to "no notes" and never raise, and both run in a
+    worker thread so a busy SQLite file (up to its timeout) never blocks the loop.
+    """
+    await asyncio.to_thread(_load_knowledge, ctx)
+    try:
+        return await _replay_keyboard(script, ctx)
+    finally:
+        await asyncio.to_thread(_flush_knowledge, ctx)
+
+
+async def _replay_keyboard(script: object, ctx: Context) -> dict:
     """Execute *script* with the QA keyboard up for its typing.
 
     A script with a ``type``/``clear`` step runs :func:`keyboard_up` before its
@@ -2428,6 +2699,24 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                 _stamp_after(entry, screen)
                 _append(trace, entry)
                 continue
+
+            # Saved app notes, BEFORE the target resolves. A wait note polls
+            # (bounded); an avoid note refuses. The destructive guard below
+            # still runs and still outranks both.
+            screen, note_stop = await _apply_knowledge(
+                ctx, action, op, entry, screen, items, deadline
+            )
+            if note_stop is not None:
+                entry["outcome"] = "knowledge_avoid"
+                entry["detail"] = note_stop
+                _stamp_after(entry, screen)
+                _append(trace, entry)
+                return {
+                    "error": None,
+                    "content": _result(
+                        STATUS_NEEDS_MODEL, trace, screen, "", note_stop, index
+                    ),
+                }
 
             # --- target resolution -------------------------------------------
             target = getattr(action, "target", None)
@@ -2693,23 +2982,39 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
             # --- wait / until_text ---------------------------------------------
             if op == "wait":
                 until_text = str(getattr(action, "until_text", "") or "").strip()
+                until_rid = str(getattr(action, "until_rid", "") or "").strip()
                 ms = int(getattr(action, "ms", 0) or 0)
-                if until_text:
+                if until_text or until_rid:
                     # A bare wait (no explicit ms) gets its split share of
                     # MAX_TOTAL_WAIT_MS -- see actions.bare_wait_ms_each --
                     # instead of the flat UNTIL_TEXT_DEFAULT_MS, so two or
                     # more bare waits in one script share the 25s total
                     # instead of the validator refusing the script outright.
                     effective_ms = ms or actions_mod.bare_wait_ms_each(items)
-                    found, screen, _timed_out = await _wait_until_text(
-                        ctx, screen, until_text, effective_ms
-                    )
+                    if until_rid:
+                        gone = bool(getattr(action, "until_gone", False))
+                        found, screen, _timed_out = await _wait_until_element(
+                            ctx,
+                            screen,
+                            until_rid,
+                            str(getattr(action, "until_rid_text", "") or ""),
+                            gone,
+                            effective_ms,
+                        )
+                        label = (
+                            "element "
+                            + repr(until_rid[:120])
+                            + (" gone" if gone else " present")
+                        )
+                    else:
+                        found, screen, _timed_out = await _wait_until_text(
+                            ctx, screen, until_text, effective_ms
+                        )
+                        label = repr(until_text[:120])
                     entry["outcome"] = "ok" if found else "wait_timeout"
                     entry["detail"] = (
-                        "found " + repr(until_text[:120])
-                        if found
-                        else "timed out waiting for " + repr(until_text[:120])
-                    )
+                        "found " if found else "timed out waiting for "
+                    ) + label
                     if found:
                         # No re-dump: the poll already left a fresh screen.
                         screen, stop = await _settle(
