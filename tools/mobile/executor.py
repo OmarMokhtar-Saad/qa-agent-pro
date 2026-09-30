@@ -1677,7 +1677,13 @@ def _load_knowledge(ctx: Context) -> None:
     with no store creates nothing. Never raises; any failure is "no notes"."""
     if getattr(ctx, "knowledge", None) is not None:
         return
-    package = str(getattr(ctx, "package", "") or "")
+    ctx.knowledge = _read_knowledge(str(getattr(ctx, "package", "") or ""))
+
+
+def _read_knowledge(package: str) -> dict:
+    """*package*'s guards plus empty tallies. Touches no Context, so a worker
+    thread still running after its awaiting task was cancelled cannot set
+    ``ctx.knowledge`` behind ``_flush_knowledge``'s back. Never raises."""
     guards: list = []
     try:
         if package:
@@ -1686,7 +1692,7 @@ def _load_knowledge(ctx: Context) -> None:
                 guards = list(loaded.get("content") or [])
     except Exception:
         logger.exception("mobile app knowledge: load failed; continuing without notes")
-    ctx.knowledge = {
+    return {
         "package": package,
         "guards": guards,
         "counts": {},
@@ -2503,8 +2509,13 @@ async def replay(script: object, ctx: Context) -> dict:
     flush. Both steps degrade to "no notes" and never raise, and both run in a
     worker thread so a busy SQLite file (up to its timeout) never blocks the loop.
     """
-    await asyncio.to_thread(_load_knowledge, ctx)
     try:
+        # Inside the try: a cancel during the load still reaches the flush,
+        # which drops ctx.knowledge. The worker only READS; the assignment
+        # happens here, on the loop, so a cancelled load never assigns.
+        if getattr(ctx, "knowledge", None) is None:
+            package = str(getattr(ctx, "package", "") or "")
+            ctx.knowledge = await asyncio.to_thread(_read_knowledge, package)
         return await _replay_keyboard(script, ctx)
     finally:
         await asyncio.to_thread(_flush_knowledge, ctx)

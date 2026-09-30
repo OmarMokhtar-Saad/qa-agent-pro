@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.102.0] - 2026-09-30
+## [1.103.0] - 2026-09-30
 
 ### Added
 
@@ -29,13 +29,16 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Mobile testing can now remember things about one app. Save a note
-  with the `note` parameter of qa_mobile_test or qa_submit_mobile_step:
-  a `wait` note waits for a named text or element before acting on a
-  matching element; an `avoid` note refuses an action and hands the
-  decision back to the chat.
-- New qa_mobile_notes tool lists an app's saved notes and retires one.
-  Notes stay on this machine, one file per app, and are never uploaded.
-- A note that contains a value typed into the run, a long number or a
-  credential is refused by name. A note can only add a wait or a
-  refusal: the destructive-action guard still runs after it.
+- App notes refuse more secrets by name: API keys, tokens, card
+  numbers, contact details, assigned credentials (`pin=...`) and
+  spaced-out PINs. Verdicts such as "Pass: Yes" still save.
+- The notes store is readable only by your user account, and package
+  names that differ only in case get separate stores.
+
+### Fixed
+
+- A note sent with a mobile step is saved only after the step runs and
+  keeps its run, and it is checked against the values the step typed.
+- Loading or saving notes no longer blocks the server, and cancelling
+  a run while notes load no longer leaves them half-applied.
+- Retiring a note while another run reads it no longer races.
