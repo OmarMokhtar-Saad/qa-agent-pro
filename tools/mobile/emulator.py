@@ -201,6 +201,63 @@ async def list_running() -> dict:
         return {"error": str(exc), "content": None}
 
 
+#: Fix round 3, item 5. AVDs THIS process spawned, name -> monotonic start
+#: time. On the Air run ``qa_list_devices`` said "No devices detected" while the
+#: emulator ``qa_mobile_test`` had just started was still booting: early in a
+#: boot adb does not list the device at all, so the only evidence is that we
+#: started it. :func:`start` is the one spawn site, so it is the one writer.
+#:
+#: Process memory, bounded by :data:`MAX_BOOT_RECORDS` and aged out after
+#: :data:`BOOT_RECORD_TTL_S`. No PID liveness check: ``os.kill(pid, 0)``
+#: TERMINATES the process on Windows. A crashed emulator therefore reads as
+#: "started N s ago and not visible to adb yet" until its record ages out --
+#: which is exactly what the tester is told.
+MAX_BOOT_RECORDS = 8
+BOOT_RECORD_TTL_S = 600
+_STARTED: dict[str, float] = {}
+
+
+def note_started(avd: str, *, now: float | None = None) -> None:
+    """Record that *avd* was spawned just now. Never raises."""
+    import time
+
+    try:
+        name = str(avd or "").strip()[:120]
+        if not name:
+            return
+        _STARTED[name] = time.monotonic() if now is None else float(now)
+        while len(_STARTED) > MAX_BOOT_RECORDS:
+            _STARTED.pop(min(_STARTED, key=_STARTED.__getitem__), None)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("mobile.emulator.note_started failed", exc_info=True)
+
+
+def recently_started(*, now: float | None = None) -> list[dict]:
+    """``[{"avd", "age_s"}]`` for spawns younger than the TTL, oldest first.
+
+    Read ONLY when the device list is empty: a caller that has the device in
+    hand does not need to be told it is booting. Never raises.
+    """
+    import time
+
+    try:
+        stamp = time.monotonic() if now is None else float(now)
+        for name in [n for n, t in _STARTED.items() if stamp - t > BOOT_RECORD_TTL_S]:
+            _STARTED.pop(name, None)
+        return [
+            {"avd": name, "age_s": max(0, int(stamp - started))}
+            for name, started in sorted(_STARTED.items(), key=lambda kv: kv[1])
+        ]
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("mobile.emulator.recently_started failed", exc_info=True)
+        return []
+
+
+def clear_started() -> None:
+    """Forget every record. For tests."""
+    _STARTED.clear()
+
+
 async def wait_boot(serial: str, timeout: int = 0, *, tunable: bool = True) -> dict:
     """Poll until ``sys.boot_completed`` is ``1``.
 
@@ -322,7 +379,11 @@ async def start(avd: str, *, locale: str = "") -> dict:
             "stderr": subprocess.DEVNULL,
         }
         kwargs.update(platform_info.detach_kwargs())
-        return {"error": None, "content": {"pid": _spawn(command, **kwargs)}}
+        pid = _spawn(command, **kwargs)
+        # Recorded AFTER the spawn returned, so a failed spawn is never listed
+        # as booting (fix round 3, item 5).
+        note_started(str(avd))
+        return {"error": None, "content": {"pid": pid}}
     except Exception as exc:
         logger.exception("mobile.emulator.start failed")
         return {"error": str(exc), "content": None}

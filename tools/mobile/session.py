@@ -10,6 +10,11 @@ a defect somewhere else before it was written down:
    this module has no mutable module-level object -- pinned by a property test,
    because "we did not happen to cache anything this time" is not the same
    claim.
+   The ONE sanctioned in-process hold is :mod:`tools.mobile.held_inputs`
+   (fix round 3, item 1): a tester's secret may never reach the run folder,
+   so it is held in THAT module's memory -- bounded, on a sliding TTL -- and a
+   restart costs the tester one more question, never a run. It lives outside
+   this module so the property test keeps holding here.
 
 2. **Nothing here waits on the device longer than a tool call may last.** A
    client kills a tool call at roughly 50 seconds, and both
@@ -235,7 +240,7 @@ async def _final_packet(ctx: object, budget: object) -> dict | None:
         return None
 
     async def capture() -> dict | None:
-        dumped = await adb.uiautomator_dump(serial)
+        dumped = await executor.dump_raw(serial)
         if dumped.get("error"):
             return None
         sized = await adb.display_size(serial)
@@ -1194,10 +1199,22 @@ def load_run_cases(run_id: str) -> dict:
 def context_for(resolved: object) -> executor.Context:
     """Build the per-call device context. Holds no tester value by default."""
     body = resolved if isinstance(resolved, dict) else {}
+    # THE APP UNDER TEST, which a multi-app goal may have handed over (fix
+    # round 3, item 1): `explore["app"]` is written only by
+    # `_submit_explore`, after `explore_runner.handover` checked it against
+    # the package the server itself saw in front. The run's own package stays
+    # `home_package`, the only one `clear_app_data` may wipe. The launch
+    # activity belongs to the home app, so after a hand-over it is left empty
+    # and resolved from the device instead.
+    explore = body.get("explore")
+    explore = explore if isinstance(explore, dict) else {}
+    home = str(body.get("package") or "")
+    handed = str(explore.get("app") or "")
     return executor.Context(
         serial=str(body.get("serial") or ""),
-        package=str(body.get("package") or ""),
-        activity=str(body.get("activity") or ""),
+        package=handed or home,
+        home_package=home,
+        activity="" if handed else str(body.get("activity") or ""),
         # The lane decides whether a script that asserted nothing is an
         # omission worth naming. Set HERE, at the one production construction
         # site, which both explore entry points (``next_packet`` and
@@ -2721,11 +2738,28 @@ async def submit(
             )
         except ValueError as exc:
             return {"error": str(exc), "content": None}
-        if merged_inputs:
-            ctx.tester_inputs = merged_inputs
+        # HELD FOR THE RUN (fix round 3, item 1). On the Air run the tester
+        # gave the login fields once and was asked again on five of eight
+        # turns, because a value lived on the Context for ONE call. It is now
+        # held in process memory by `held_inputs` -- never on disk, and never
+        # in this module, which keeps no state in memory -- and every later
+        # submit of the same run carries it, so `ask_tester` finds it already
+        # supplied. A value given on THIS call wins over a held one. The hold
+        # is dropped when the SUBMIT ITSELF reaches the report (both lanes,
+        # below); any other way a run ends relies on the sliding TTL.
+        from tools.mobile import held_inputs
+
+        held_inputs.remember(run_id, merged_inputs)
+        carried = held_inputs.recall(run_id)
+        if carried or merged_inputs:
+            ctx.tester_inputs = dict(carried, **dict(merged_inputs or {}))
         ctx.confirm_destructive = bool(confirm_destructive)
         if str(body.get("lane")) == LANE_EXPLORE:
-            return await _submit_explore(run_id, raw_script, ctx, body)
+            explored = await _submit_explore(run_id, raw_script, ctx, body)
+            content = explored.get("content") if isinstance(explored, dict) else None
+            if isinstance(content, dict) and content.get("state") == STATE_REPORT:
+                held_inputs.forget(run_id)
+            return explored
         # Scoped to THIS tc_id, not a run-wide scan -- see `_prior_guard_stop`.
         ctx.prior_guard_stop = _prior_guard_stop(run_id, tc_id)
         loaded = load_case(run_id, tc_id)
@@ -2751,6 +2785,7 @@ async def submit(
         )
         if state == STATE_REPORT:
             await _finish_evidence(run_id, body)
+            held_inputs.forget(run_id)
         return {
             "error": None,
             "content": {
@@ -2819,6 +2854,22 @@ async def _submit_explore(
                 "resolved": resolved,
             },
         }
+    # HAND-OVER TO THE TARGET APP (fix round 3, item 1). A multi-app goal
+    # (App Tester -> the app under test) moves into a second app, and every guard that
+    # asks "is this the app under test" reads `ctx.package` -- which stayed
+    # the run's FIRST app for the whole Air run, so five turns on the right
+    # screen were refused as SCREEN_NOT_THE_APP. `explore_runner.handover`
+    # accepts the model's `app` only when it is the package the SERVER saw in
+    # front when it built this turn's packet, and never a system surface.
+    # Applied BEFORE the replay and carried on the explore state that
+    # `apply_turn_result` persists, so `context_for` reads it on every later
+    # call. `clear_app_data` keeps `ctx.home_package`.
+    handed = explore_runner.handover(resolved.get("explore") or {}, payload)
+    if handed:
+        resolved = dict(resolved)
+        resolved["explore"] = dict(resolved.get("explore") or {}, app=handed)
+        ctx.package = handed
+        ctx.activity = ""
     # Run-wide evidence, read from the checkpoints this run already wrote and
     # passed in EXPLICITLY. See ``_explore_prior_verified``.
     ctx.prior_turn_blocked = _explore_prior_turn_blocked(run_id)

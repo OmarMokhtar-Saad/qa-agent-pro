@@ -497,6 +497,15 @@ def build_explore_turn(
                 "kind": "explore",
                 "observation_id": _observation_key(screen),
                 "goal": wrap_untrusted("goal", str(body.get("goal") or ""), limit=1200),
+                # Fix round 3, item 1. The full goal above goes to a chat ONCE
+                # per run (mcp_handlers elides it with `render.without_goal`);
+                # `sub_goal` is the model's own current step and rides every
+                # packet, wrapped because it is model-authored text coming
+                # back. `app` is the server-checked hand-over package.
+                "sub_goal": wrap_untrusted(
+                    "sub_goal", str(body.get("sub_goal") or ""), limit=400
+                ),
+                "app": str(body.get("app") or "")[:200],
                 "watch_for": list(body.get("watch_for") or []),
                 "turn": int(body.get("turn") or 0),
                 "turns_left": int(left.get("turns") or 0),
@@ -563,7 +572,10 @@ def build_explore_turn(
                     "round costs one turn, and four scripts that each do one "
                     "step of it cost four. "
                     "Record anything a tester would want to know in `finding`, "
-                    "one sentence, even when the turn went fine."
+                    "one sentence, even when the turn went fine. "
+                    "Set `sub_goal` to the one step you are on now. When the "
+                    "goal moves on to ANOTHER app and that app is on screen, "
+                    "set `app` to its package name once."
                 ),
             }
         )

@@ -1429,8 +1429,13 @@ async def _elicit_choice(choose: ChooseCb, message: str, options: list) -> Choic
         # subclass on every version this project supports (>=3.10), so the ordering
         # is load-bearing. WARNING, not DEBUG: the installed log runs at INFO and a
         # silent timeout is undiagnosable from the log file.
+        # Says WHAT HAPPENS NEXT (fix round 3, item 6): the caller falls back
+        # to its text menu, and this log is where that is diagnosed from.
         logger.warning(
-            "mcp elicit_choice timed out after %.0fs for %r", wait_s, message
+            "mcp elicit_choice timed out after %.0fs for %r; "
+            "falling back to the text menu",
+            wait_s,
+            message,
         )
         # ONLY here. A proven-dead transport must not cost the rest of this call
         # another full dialog bound. The bare `except Exception` below, the
@@ -2228,7 +2233,11 @@ async def _android_device_details(devices: list) -> list:
 
 
 def shape_devices(
-    devices: list, unusable: list | None = None, adb_dropped_lines: int = 0
+    devices: list,
+    unusable: list | None = None,
+    adb_dropped_lines: int = 0,
+    *,
+    booting: list | None = None,
 ) -> str:
     """The device list a tester reads. *unusable* is rendered SEPARATELY.
 
@@ -2271,6 +2280,16 @@ def shape_devices(
         # The notice belongs on THIS branch most of all: 200+ unparseable lines
         # yield zero rows, and "No devices detected" while a phone is plugged
         # in is the very defect this section exists to prevent.
+        # BOOTING, not absent (fix round 3, item 5): `booting` is
+        # `emulator.recently_started()`, passed only when both lists are
+        # empty. The heading is `render.starting_heading`, the sentence
+        # `qa_mobile_test` already says for the same state.
+        if booting:
+            from tools.mobile import render as mobile_render
+
+            block = mobile_render.booting_devices_block(booting)
+            if block:
+                return block + notice
         return (
             "No devices detected. Connect an Android device/emulator or boot an "
             "iOS simulator, then retry `qa_list_devices`."
@@ -12689,7 +12708,16 @@ async def _mobile_pick_source(
         choose, "What should the emulator run?", mobile_render.source_labels()
     )
     if picked.status == CHOSEN:
+        # Which path answered is logged (fix round 3, item 6); the label is a
+        # server-authored menu entry, not tester text.
+        logger.info("mcp emulator source picked via dialog: %r", picked.value)
         return mobile_render.source_for_label(picked.value or "")
+    logger.info(
+        "mcp emulator source: %s",
+        "dialog timed out, text menu shown"
+        if getattr(picked, "timed_out", False)
+        else "no dialog answer, text menu shown",
+    )
     return ""
 
 
@@ -13851,7 +13879,7 @@ async def _mobile_next(
         "with `qa_submit_mobile_step`.\n\n"
     )
     return header + await _mobile_packet_text(
-        body.get("packet"), session_token, body.get("resolved")
+        body.get("packet"), session_token, body.get("resolved"), budget=bounded
     )
 
 
@@ -13978,7 +14006,9 @@ async def handle_submit_mobile_step(
                 line
                 + (("\n\n" + notice) if notice else "")
                 + "\n\n"
-                + await _mobile_packet_text(body["packet"], token, body.get("resolved"))
+                + await _mobile_packet_text(
+                    body["packet"], token, body.get("resolved"), budget=budget
+                )
             )
         else:
             tail = await _mobile_next(run_id, token, progress=progress, budget=budget)
@@ -13988,7 +14018,24 @@ async def handle_submit_mobile_step(
         # say which phase spent it.
         timing = step_timing.line()
         logger.info("mobile step %s %s: %s", run_id, tc_id, timing)
-        return reply + "\n\n" + timing
+        # This device's dump latency and -- once per run -- the warning that
+        # the host or the AVD is the bottleneck (fix round 3, item 2). The
+        # serial is the run body's own, the one `_mobile_packet_text` reads.
+        from tools.mobile import dump_latency
+
+        _res = body.get("resolved") if isinstance(body.get("resolved"), dict) else {}
+        _serial = str(_res.get("serial") or "")
+        slow: list = []
+        if _serial:
+            slow = [
+                part
+                for part in (
+                    dump_latency.describe(_serial),
+                    dump_latency.host_warning_once(run_id, _serial),
+                )
+                if part
+            ]
+        return reply + "\n\n" + timing + "".join("\n" + part for part in slow)
     except Exception as exc:  # never-raise contract
         logger.exception("mcp submit_mobile_step failed")
         _capture_error(exc, "qa_submit_mobile_step")
@@ -14021,7 +14068,11 @@ _MOBILE_IMAGE_SPECS: ContextVar = ContextVar("_MOBILE_IMAGE_SPECS", default=None
 
 
 async def _mobile_packet_text(
-    packet: object, session_token: str, resolved: object
+    packet: object,
+    session_token: str,
+    resolved: object,
+    *,
+    budget: object = None,
 ) -> str:
     """The rendered packet, PLUS this turn's screen captured and recorded.
 
@@ -14061,7 +14112,31 @@ async def _mobile_packet_text(
         try:
             from tools.mobile import step_timing
 
-            shot = await step_timing.timed("screenshot", mobile_adb.screencap(serial))
+            shot = await step_timing.timed(
+                "screenshot", mobile_screenshot.capture(serial)
+            )
+            if (shot or {}).get("timed_out"):
+                # At most ONE retry, and only when the turn's budget has room
+                # for it (fix round 3, item 3): a first timeout already spent
+                # up to 30 s, and a second full wait would overrun the call.
+                # The first timeout is already marked on the call by
+                # `adb.screencap` or `adb.screencap_raw`, so `_tracked` reports it
+                # as `timed_out` whatever the retry does.
+                wait = mobile_screenshot.retry_timeout_s(
+                    None if budget is None else budget.remaining(),
+                    mobile_adb.DEFAULT_TIMEOUT_S,
+                )
+                if wait is not None:
+                    shot = await step_timing.timed(
+                        "screenshot",
+                        mobile_adb.screencap(
+                            serial,
+                            timeout_s=wait,
+                        ),
+                    )
+                if (shot or {}).get("timed_out"):
+                    # Said as a TIMEOUT, not as the generic failure.
+                    note = mobile_screenshot.CAPTURE_TIMED_OUT_NOTE
             spec = mobile_screenshot.to_spec(
                 (shot or {}).get("content"),
                 run_id=body.get("run_id"),
@@ -14120,7 +14195,12 @@ async def _mobile_packet_text(
                     or ""
                 )
                 if briefed == token:
-                    shown = mobile_render.without_static(shown)
+                    # The goal rides the same memo (fix round 3, item 1): a
+                    # chat that has been briefed has also seen the goal, and a
+                    # re-armed briefing brings both back together.
+                    shown = mobile_render.without_goal(
+                        mobile_render.without_static(shown)
+                    )
                 else:
                     mobile_run_store.mark_briefed(run_id, token)
             except Exception:
@@ -15372,11 +15452,120 @@ async def handle_list_devices(*, progress: ProgressCb = None) -> str:
             "mcp_list_devices",
             detail={"count": len(devices), "unusable": len(unusable)},
         )
-        return shape_devices(devices, unusable, result.get("adb_dropped_lines") or 0)
+        # Early in a boot adb does not list the emulator at all, so the only
+        # evidence is that this server started it (fix round 3, item 5).
+        booting: list = []
+        if not devices and not unusable:
+            try:
+                from tools.mobile import emulator as mobile_emulator
+
+                booting = mobile_emulator.recently_started()
+            except Exception:
+                logger.debug("booting probe failed", exc_info=True)
+        return shape_devices(
+            devices,
+            unusable,
+            result.get("adb_dropped_lines") or 0,
+            booting=booting,
+        )
     except Exception as exc:
         logger.exception("handle_list_devices failed")
         _capture_error(exc, "qa_list_devices")
         return f"⚠️ Device discovery failed: {exc}"
+
+
+# --------------------------------------------------------------------------- #
+# Mirror hold (qa_mirror_hold)
+#
+# The desktop Mirror screen holds ONE device's lock for as long as it mirrors,
+# so a test run cannot start driving a phone somebody is watching. The owner is
+# `mirror-<token>`, one token per server process: only a hold made by the
+# Mirror screen counts as the app's own, and a run's `mrun-...` hold on the same
+# lock stays foreign to it (control and scrcpy stay blocked while a test holds
+# the phone). The lock is a file lock held by this process, so it drops when the
+# process exits -- the server exits when its stdin closes.
+#
+# No device command is sent and nothing here raises: every path returns JSON.
+
+_MIRROR_OWNER_PREFIX = "mirror-"
+_MIRROR_HOLD_OWNER = _MIRROR_OWNER_PREFIX + uuid.uuid4().hex[:12]
+_MIRROR_HOLD_ACTIONS = ("acquire", "release", "status")
+
+
+def _mirror_hold_json(payload: dict) -> str:
+    return json.dumps(payload, sort_keys=True)
+
+
+def handle_mirror_hold(serial: str = "", action: str = "status") -> str:
+    """``qa_mirror_hold``: acquire, release or read ONE device's lock.
+
+    Always a JSON object with ``ok``, ``action``, ``serial``, ``owner``,
+    ``mine`` and ``mirror_hold``. ``mirror_hold`` is true only when the lock is
+    held by THIS process (``mine``) AND its owner starts with ``mirror-``; it is
+    computed here so the Kotlin side never reads ``mine`` on its own.
+    """
+    what = str(action or "").strip().lower()
+    text = str(serial or "").strip()
+    base = {
+        "ok": False,
+        "action": what,
+        "serial": text,
+        "owner": "",
+        "mine": False,
+        "mirror_hold": False,
+        "reason": "",
+    }
+    try:
+        from tools.mobile import locks as mobile_locks
+
+        if what not in _MIRROR_HOLD_ACTIONS:
+            base["reason"] = "action must be one of: " + ", ".join(_MIRROR_HOLD_ACTIONS)
+            return _mirror_hold_json(base)
+        name = mobile_locks.device_lock_name(text)
+        if not name:
+            base["reason"] = "that is not a device serial"
+            return _mirror_hold_json(base)
+        if what == "acquire":
+            res = mobile_locks.acquire(name, owner=_MIRROR_HOLD_OWNER)
+            body = res.get("content")
+            if res.get("error") or body is None:
+                base["reason"] = str(res.get("error") or "the lock could not be taken")
+                return _mirror_hold_json(base)
+            if not body.get("acquired"):
+                base["reason"] = str(body.get("reason") or "held")
+                base["owner"] = str(body.get("holder") or "")
+                return _mirror_hold_json(base)
+        elif what == "release":
+            res = mobile_locks.release(name, owner=_MIRROR_HOLD_OWNER, as_holder=True)
+            body = res.get("content")
+            if res.get("error") or body is None:
+                base["reason"] = str(res.get("error") or "the lock could not be released")
+                return _mirror_hold_json(base)
+            base["reason"] = str(body.get("reason") or "")
+            if not body.get("released") and str(base["reason"]).startswith("held by "):
+                base["owner"] = str(base["reason"])[len("held by ") :]
+                return _mirror_hold_json(base)
+        probed = mobile_locks.holder(name)
+        info = probed.get("content")
+        if probed.get("error") or info is None:
+            base["reason"] = str(probed.get("error") or "the lock could not be read")
+            return _mirror_hold_json(base)
+        held = bool(info.get("held"))
+        owner = str(info.get("owner") or "") if held else ""
+        mine = held and bool(info.get("mine"))
+        base.update(
+            ok=True,
+            owner=owner,
+            mine=mine,
+            mirror_hold=mine and owner.startswith(_MIRROR_OWNER_PREFIX),
+            reason=base["reason"] or ("held" if held else "free"),
+        )
+        return _mirror_hold_json(base)
+    except Exception as exc:
+        logger.exception("handle_mirror_hold failed")
+        base["ok"] = False
+        base["reason"] = str(exc)[:200]
+        return _mirror_hold_json(base)
 
 
 # --------------------------------------------------------------------------- #

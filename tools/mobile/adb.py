@@ -1011,6 +1011,12 @@ async def uiautomator_dump(serial: str) -> dict:
     """
     read = await shell(serial, [_DUMP_COMMAND], timeout=DUMP_TIMEOUT_S)
     if read.get("error"):
+        if read.get("timed_out"):
+            # Same rule as `screencap` (fix round 3, item 3): a dump that
+            # timed out is a distinct status on the call, not an `ok`.
+            from tools import tool_status
+
+            tool_status.mark_timed_out("uiautomator_dump")
         return read
     xml = str((read["content"] or {}).get("out") or "")
     if not xml.lstrip().startswith("<"):
@@ -1056,7 +1062,7 @@ async def uiautomator_dump(serial: str) -> dict:
     return {"error": None, "content": xml}
 
 
-async def screencap(serial: str) -> dict:
+async def screencap(serial: str, *, timeout_s: float | None = None) -> dict:
     """The current screen as PNG BYTES: ``{"error", "content": bytes|None}``.
 
     Never raises, exactly like every other function in this module, and a
@@ -1089,18 +1095,33 @@ async def screencap(serial: str) -> dict:
             "content": None,
         }
     try:
+        # A caller with less time left passes a shorter wait (fix round 3,
+        # item 3): never above the default, never below one second.
+        wait_s = (
+            DEFAULT_TIMEOUT_S
+            if timeout_s is None
+            else max(1.0, min(float(DEFAULT_TIMEOUT_S), float(timeout_s)))
+        )
         cmd = [resolve_adb(), "-s", str(serial), "exec-out", "screencap", "-p"]
-        rc, out, err = await _run_argv(cmd, DEFAULT_TIMEOUT_S)
+        rc, out, err = await _run_argv(cmd, wait_s)
     except FileNotFoundError:
         return {
             "error": "adb was not found, so no screen could be captured.",
             "content": None,
         }
     except asyncio.TimeoutError:
+        # A TIMEOUT, said as one (fix round 3, item 3). The Air run's final
+        # screencap timed out after 30 s and the call was logged `ok`: this
+        # branch returned the same shape as a refusal. `timed_out` is the
+        # same additive field `raw` sets, and the mark reaches `_tracked`.
+        from tools import tool_status
+
+        tool_status.mark_timed_out("screencap")
         return {
             "error": (
-                "screencap did not answer within " + str(DEFAULT_TIMEOUT_S) + "s."
+                "screencap did not answer within " + str(int(wait_s)) + "s."
             ),
+            "timed_out": True,
             "content": None,
         }
     except Exception as exc:
@@ -1131,6 +1152,79 @@ async def screencap(serial: str) -> dict:
                 "screencap returned no PNG for this screen. A secure window (a "
                 "password field or a payment sheet) blocks a capture."
                 + ((" The device said: " + said) if said else "")
+            ),
+            "content": None,
+        }
+    return {"error": None, "content": out}
+
+
+#: RAW frame bytes one ``screencap`` without ``-p`` may return. A raw frame
+#: is 4 bytes per pixel, uncompressed, so it is far larger than the PNG
+#: :data:`MAX_SCREENSHOT_BYTES` bounds: a 1440x3120 panel is 17.9 MB. Read only
+#: on a heavy panel (``screenshot.capture``). Bounded from above in
+#: ``tests/mobile/test_mobile_bounds_upper.py``.
+MAX_RAW_SCREENSHOT_BYTES = 64 * 1024 * 1024
+
+
+async def screencap_raw(serial: str, *, timeout_s: float | None = None) -> dict:
+    """The screen as a RAW ``screencap`` frame: ``{"error", "content": bytes|None}``.
+
+    :func:`screencap`'s contract and reasons (``_run_argv`` directly,
+    ``exec-out``, never raises) without ``-p``: the device skips its own PNG
+    encode of a full-size frame, which on a heavy panel is the slow part, and
+    ``screenshot.png_from_raw`` scales BEFORE it encodes. Fix round 3, item 7.
+
+    ``timeout_s`` is clamped exactly as :func:`screencap` clamps it (never above
+    :data:`DEFAULT_TIMEOUT_S`, never below one second), and a timeout returns
+    the same ``timed_out`` shape as :func:`raw`, so the packet's shorter retry
+    and its audit status (fix round 3, item 3) hold on the raw path too.
+    """
+    if not _valid_device_id(serial):
+        return {
+            "error": "Refusing to use " + repr(str(serial)[:40]) + " as a device id.",
+            "content": None,
+        }
+    wait_s = (
+        DEFAULT_TIMEOUT_S
+        if timeout_s is None
+        else max(1.0, min(float(DEFAULT_TIMEOUT_S), float(timeout_s)))
+    )
+    try:
+        cmd = [resolve_adb(), "-s", str(serial), "exec-out", "screencap"]
+        rc, out, err = await _run_argv(cmd, wait_s)
+    except FileNotFoundError:
+        return {
+            "error": "adb was not found, so no screen could be captured.",
+            "content": None,
+        }
+    except asyncio.TimeoutError:
+        # Marked like the PNG path: a heavy panel takes this path first, and an
+        # unmarked timeout here was logged `ok` by `_tracked` (fix round 3, item 3).
+        from tools import tool_status
+
+        tool_status.mark_timed_out("screencap_raw")
+        return {
+            "error": "raw screencap did not answer within " + str(wait_s) + "s.",
+            "timed_out": True,
+            "content": None,
+        }
+    except Exception as exc:
+        logger.exception("mobile.adb.screencap_raw failed")
+        return {"error": str(exc), "content": None}
+    if rc != 0:
+        said = " ".join(err.decode(errors="replace").split())[:200]
+        return {
+            "error": (
+                "raw screencap exited " + str(rc) + ((": " + said) if said else ".")
+            ),
+            "content": None,
+        }
+    if len(out) > MAX_RAW_SCREENSHOT_BYTES:
+        return {
+            "error": (
+                "This screen's raw frame exceeds the "
+                + str(MAX_RAW_SCREENSHOT_BYTES)
+                + " byte cap and was discarded."
             ),
             "content": None,
         }

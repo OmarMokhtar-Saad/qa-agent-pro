@@ -555,6 +555,41 @@ def without_static(packet: object) -> dict:
     return out
 
 
+#: Fix round 3, item 1. The Air run resent the ORIGINAL goal ("Open Firebase
+#: App Tester...") on every packet, and the model kept re-planning from its
+#: first step. The goal goes to a chat ONCE per run, on the same memo as the
+#: static block, and ``sub_goal`` rides every packet instead.
+#:
+#: Its OWN list and its own note, never a :data:`STATIC_FIELDS` entry: a case
+#: packet carries no goal, so the lane x ordinal matrix in
+#: ``test_mobile_static_block_once`` would reject it there.
+GOAL_FIELDS: tuple[str, ...] = ("goal",)
+
+GOAL_OMITTED_NOTE = (
+    "The run's full goal went out with the FIRST packet of this run in this "
+    "chat and has not changed. `sub_goal` is the step you are on now: plan "
+    "the next step from it and the screen. If the goal is no longer in front "
+    "of you, send your best attempt anyway -- a script this server cannot "
+    "parse is answered with the goal and the whole block again."
+)
+
+
+def without_goal(packet: object) -> dict:
+    """*packet* with :data:`GOAL_FIELDS` replaced by one note. Never raises.
+
+    A COPY, for the reason :func:`without_static` gives. Only an EXPLORE
+    packet is touched; any other kind comes back unchanged.
+    """
+    body = packet if isinstance(packet, dict) else {}
+    if str(body.get("kind") or "") != "explore":
+        return dict(body)
+    if not any(k in body for k in GOAL_FIELDS):
+        return dict(body)
+    out = {k: v for k, v in body.items() if k not in GOAL_FIELDS}
+    out["goal_note"] = GOAL_OMITTED_NOTE
+    return out
+
+
 def packet_block(packet: object, *, session_token: str = "") -> str:
     """The packet as a fenced JSON block plus the no-echo instruction.
 
@@ -1081,11 +1116,59 @@ def takeover_block(message: str) -> str:
     )
 
 
+def starting_heading(avd: str = "") -> str:
+    """"The emulator [<avd>] is still starting" -- ONE sentence, two tools.
+
+    Fix round 3, item 5: ``qa_mobile_test`` said this while ``qa_list_devices``
+    said "No devices detected" in the same turn. Both take the words from
+    here now. With no *avd* the text is byte-identical to what
+    :func:`device_pending_block` always said.
+    """
+    name = " ".join(str(avd or "").split())[:80]
+    if name:
+        return "The emulator " + name + " is still starting"
+    return "The emulator is still starting"
+
+
+def booting_devices_block(records: object) -> str:
+    """``qa_list_devices``'s answer when nothing is listed but an emulator this
+    server started is still booting, or ``""``. *records* is
+    ``emulator.recently_started()``'s list. Never raises."""
+    rows = [
+        r for r in (records if isinstance(records, list) else []) if isinstance(r, dict)
+    ]
+    rows = [r for r in rows if str(r.get("avd") or "").strip()]
+    if not rows:
+        return ""
+    lines = ["## " + starting_heading(str(rows[-1].get("avd") or "")), ""]
+    for row in rows:
+        try:
+            age = max(0, int(row.get("age_s") or 0))
+        except (TypeError, ValueError, OverflowError):
+            age = 0
+        lines.append(
+            "- `"
+            + " ".join(str(row.get("avd") or "").split())[:80]
+            + "` was started "
+            + str(age)
+            + " s ago and is not visible to adb yet."
+        )
+    lines.append("")
+    lines.append(
+        "A cold emulator takes a minute or two. Call `qa_list_devices` again in "
+        "a few seconds; if it is still missing after several minutes, check the "
+        "emulator window for an error."
+    )
+    return "\n".join(lines)
+
+
 def device_pending_block(state: object) -> str:
     """The emulator is starting; hand back a pointer, never a blocked call."""
     body = state if isinstance(state, dict) else {}
     return (
-        "## The emulator is still starting\n\n"
+        "## "
+        + starting_heading(str(body.get("avd") or ""))
+        + "\n\n"
         + str(body.get("detail") or "")[:300]
         + "\n\nNothing is waiting on it in this call — a tool call that "
         "blocks on a boot dies at the client's timeout and tells the tester "
