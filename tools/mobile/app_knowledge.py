@@ -84,12 +84,36 @@ _ASSIGNED_RE = re.compile(
     + r"|\b(?i:%s)(?:\s+(?i:is|was)\s+|\s*:\s*)" % _STATED_WORDS
     + r"(?![a-z]+(?:-[a-z]+)*(?:[\s,;.!?)]|$))[^\s,;]{3,}"
 )
-#: Four or more digits split by spaces, dots or dashes right after a secret
-#: word: "pin 1-2-3-4", "otp: 48 21". Only after the word, so "version
-#: 1.2.3.4" and "wait 2-3 s" stay prose.
+#: Four or more digits split by spaces, dashes, commas or slashes (spaces
+#: around the separator allowed) right after a secret word: "pin 1 - 2 - 3 - 4",
+#: "otp: 48 21", "pin: 1,2,3,4". Dots count only after a word that names a
+#: numeric secret (``_NUMERIC_WORDS``), so "pin 1.2.3.4" is refused while
+#: "token 2.0.1.3 build" and "secret 10.0.2.2" read as a version or a host.
+#: A layout unit (px, dp, sp, pt) after a run whose every group has 3 or more
+#: digits ("pin 100 200 px", a drag pin) reads as a measurement; a time unit or
+#: "x" does not, since "otp 123 456 s" is a code (``_states_digits``). A run
+#: of 1- or 2-digit groups or a mix ("pin 12 34 px", "pin 123 4 px") is still
+#: a PIN. Only after the word, so "version 1.2.3.4" and "wait 2-3 s" stay
+#: prose. The prefix has one way to spend each space, so a long run of spaces
+#: costs linear time.
+_NUMERIC_WORDS = r"pin|otp|passcode|cvv"
+_DIGIT_SEP = r"(?:\s*[-,/]\s*|\s+)"
+_WORD_PREFIX = r"(?:\s+(?i:is|was)\b)?(?:\s*[:=])?\s*"
 _STATED_DIGITS_RE = re.compile(
-    r"\b(?i:%s)(?:\s+(?i:is|was))?\s*[:=]?\s*\d(?:[ .-]?\d){3,}" % _STATED_WORDS
+    r"\b(?:(?i:%s)%s\d(?:%s?\d){3,}|(?i:%s)%s\d(?:(?:%s|\.)?\d){3,})(?!\d)"
+    % (_STATED_WORDS, _WORD_PREFIX, _DIGIT_SEP, _NUMERIC_WORDS, _WORD_PREFIX, _DIGIT_SEP)
 )
+_UNIT_AFTER_RE = re.compile(r"\s*(?i:px|dp|sp|pt)\b")
+_MEASURE_GROUP_DIGITS = 3
+
+
+def _states_digits(segment: str) -> bool:
+    """A ``_STATED_DIGITS_RE`` run that is not a measurement."""
+    for match in _STATED_DIGITS_RE.finditer(segment):
+        narrowest = min(len(g) for g in re.findall(r"\d+", match.group()))
+        if narrowest < _MEASURE_GROUP_DIGITS or not _UNIT_AFTER_RE.match(segment, match.end()):
+            return True
+    return False
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -159,6 +183,18 @@ def _dir_name(name: str) -> str:
     return "%s~%s" % (name.lower(), hashlib.sha256(name.encode()).hexdigest()[:12])
 
 
+def _store_path(package: object) -> Path | None:
+    """``db_path``, plus owner-only modes on a mixed-case store made before the
+    ``_dir_name`` rule, which still sits under the exact package name. That
+    store is never read again, but its notes stay on disk. Creates nothing."""
+    path = db_path(package)
+    if path is not None:
+        legacy = path.parent.with_name(str(package).strip()) / path.name
+        if legacy.parent != path.parent and legacy.parent.is_dir():
+            _tighten_store(legacy)
+    return path
+
+
 def _tighten(path: Path, mode: int) -> None:
     """Owner-only *mode* where the OS allows it. Notes are plain text about the
     tester's app; nobody else on the machine needs to read them."""
@@ -171,7 +207,10 @@ def _tighten(path: Path, mode: int) -> None:
 def _tighten_store(path: Path) -> None:
     """Owner-only modes on *path*'s directory, the database and its ``-wal`` /
     ``-shm`` files, so a store made before the mode rule is fixed by any open,
-    not only the next write. Creates nothing."""
+    not only the next write. Creates nothing and never raises: a path with no
+    file name (``/``) is left alone."""
+    if not path.name:
+        return
     _tighten(path.parent, 0o700)
     for name in (path.name, path.name + "-wal", path.name + "-shm"):
         member = path.with_name(name)
@@ -342,7 +381,7 @@ def _is_value_token(token: str) -> bool:
 
 
 def _credential_near_value(segment: str) -> bool:
-    if _ASSIGNED_RE.search(segment) or _STATED_DIGITS_RE.search(segment):
+    if _ASSIGNED_RE.search(segment) or _states_digits(segment):
         return True
     segment = _SPACED_DIGITS_RE.sub(lambda m: re.sub(r"\D", "", m.group()), segment)
     tokens = [t.strip(".,;()[]{}\"'") for t in _SPLIT_RE.split(segment)]
@@ -434,7 +473,7 @@ def add_note(
     SUPERSEDES the old one: the old row is marked, never deleted.
     """
     try:
-        path = db_path(package)
+        path = _store_path(package)
         if path is None:
             return _err("that is not an Android package name")
         clean = _validate(text, kind, when, then)
@@ -508,7 +547,7 @@ def add_note(
 def _read_notes(package: object, where: str) -> tuple:
     """``(notes, error)``. A missing store is ``([], None)`` and is NOT created.
     *where* is a constant SQL fragment, never caller text."""
-    path = db_path(package)
+    path = _store_path(package)
     if path is None:
         return [], "that is not an Android package name"
     if not path.exists():
@@ -546,7 +585,7 @@ def retire_note(
 ) -> dict:
     """Retire one active note. The row stays: retire is a status, not a delete."""
     try:
-        path = db_path(package)
+        path = _store_path(package)
         if path is None:
             return _err("that is not an Android package name")
         try:
@@ -585,7 +624,7 @@ def flush_counters(
     """Write a replay's buffered tallies. Counts only notes that are STILL
     active; events stop at ``MAX_EVENT_ROWS``. A missing store is a no-op."""
     try:
-        path = db_path(package)
+        path = _store_path(package)
         if path is None or not path.exists():
             return _ok({"counted": 0, "events": 0})
         counted = logged = 0
