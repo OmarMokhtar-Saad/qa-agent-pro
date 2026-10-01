@@ -90,16 +90,18 @@ _ASSIGNED_RE = re.compile(
 #: commas and slashes split a run too, so "pin: 1,2,3,4", "pin 1/2/3/4" and
 #: "password 1.2.3.4" are refused while "token 2.0.1.3 build", "secret
 #: 10.0.2.2" and "token 1, 2, 3, 4 appear" read as a version, a host or a list.
-#: Only after the word, so "version 1.2.3.4" and "wait 2-3 s" stay prose. Up
-#: to two of is/was/at/to/on may sit between ("pin at 123 456", "pin is at
-#: 1234"). The prefix has one way to spend each space, so a long run of spaces costs
+#: Only after the word, so "version 1.2.3.4" and "wait 2-3 s" stay prose. Any
+#: number of is/was/at/to/on may sit between ("pin at 123 456", "pin is at to
+#: 1234"), and so may a line break ("pin\nis 1234": the run is matched over
+#: the whole note, not per line). The prefix has one way to spend each space,
+#: and each connector needs a word, so a long run of spaces or connectors costs
 #: linear time. After "pin" only, ``_states_digits`` lets a measurement or a
 #: date through. The loosening is deliberate: "token 1,2,3,4" and "secret
 #: 1/2/3/4" read as prose, since a token or secret is rarely a digit run.
 _CODE_WORDS = r"pin|otp|passcode|cvv|password|passwd|passphrase"
 _SPACE_SEP = r"(?:\s*-\s*|\s+)"
 _CODE_SEP = r"(?:\s*[-,/.]\s*|\s+)"
-_WORD_PREFIX = r"(?:\s+(?i:is|was|at|to|on)\b){0,2}(?:\s*[:=])?\s*"
+_WORD_PREFIX = r"(?:\s+(?i:is|was|at|to|on)\b)*(?:\s*[:=])?\s*"
 _STATED_DIGITS_RE = re.compile(
     r"\b(?:((?i:%s))%s(\d(?:%s?\d){3,})|((?i:%s))%s(\d(?:%s?\d){3,}))(?!\d)"
     % (_CODE_WORDS, _WORD_PREFIX, _CODE_SEP, _STATED_WORDS, _WORD_PREFIX, _SPACE_SEP)
@@ -459,7 +461,9 @@ def _secret_reason(blob: str, secrets: object, source_run: object) -> str:
     # card numbers, e-mail addresses, +phone numbers.
     if api_redact.scan_finds_secret(blob):
         return "it contains a key, token, card number or contact detail"
-    if any(_credential_near_value(seg) for seg in blob.split("\n")):
+    if _states_digits(blob) or any(
+        _credential_near_value(seg) for seg in blob.split("\n")
+    ):
         return "it states a credential value"
     return ""
 
