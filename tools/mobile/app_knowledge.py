@@ -132,10 +132,14 @@ _DATE_RE = re.compile(r"([0-9]{1,2})/([0-9]{1,2})")
 
 
 def _states_digits(segment: str) -> bool:
-    """A ``_STATED_DIGITS_RE`` run that is not a pin measurement or date."""
+    """A ``_STATED_DIGITS_RE`` run that is not a pin measurement or date.
+
+    A run on a later line than "pin" is its value, as in a label above a field:
+    "pin\\n1234 px" is a PIN.
+    """
     for match in _STATED_DIGITS_RE.finditer(segment):
         word, run = (g for g in match.groups() if g)
-        if word.lower() != _PROSE_WORD:
+        if word.lower() != _PROSE_WORD or "\n" in match.group()[: -len(run)]:
             return True
         if not (_is_measurement(segment, match.end(), run) or _is_date(run)):
             return True
