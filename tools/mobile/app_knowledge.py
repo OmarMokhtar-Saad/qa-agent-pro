@@ -90,15 +90,16 @@ _ASSIGNED_RE = re.compile(
 #: commas and slashes split a run too, so "pin: 1,2,3,4", "pin 1/2/3/4" and
 #: "password 1.2.3.4" are refused while "token 2.0.1.3 build", "secret
 #: 10.0.2.2" and "token 1, 2, 3, 4 appear" read as a version, a host or a list.
-#: Only after the word, so "version 1.2.3.4" and "wait 2-3 s" stay prose. The
-#: prefix has one way to spend each space, so a long run of spaces costs
+#: Only after the word, so "version 1.2.3.4" and "wait 2-3 s" stay prose. Up
+#: to two of is/was/at/to/on may sit between ("pin at 123 456", "pin is at
+#: 1234"). The prefix has one way to spend each space, so a long run of spaces costs
 #: linear time. After "pin" only, ``_states_digits`` lets a measurement or a
 #: date through. The loosening is deliberate: "token 1,2,3,4" and "secret
 #: 1/2/3/4" read as prose, since a token or secret is rarely a digit run.
 _CODE_WORDS = r"pin|otp|passcode|cvv|password|passwd|passphrase"
 _SPACE_SEP = r"(?:\s*-\s*|\s+)"
 _CODE_SEP = r"(?:\s*[-,/.]\s*|\s+)"
-_WORD_PREFIX = r"(?:\s+(?i:is|was)\b)?(?:\s*[:=])?\s*"
+_WORD_PREFIX = r"(?:\s+(?i:is|was|at|to|on)\b){0,2}(?:\s*[:=])?\s*"
 _STATED_DIGITS_RE = re.compile(
     r"\b(?:((?i:%s))%s(\d(?:%s?\d){3,})|((?i:%s))%s(\d(?:%s?\d){3,}))(?!\d)"
     % (_CODE_WORDS, _WORD_PREFIX, _CODE_SEP, _STATED_WORDS, _WORD_PREFIX, _SPACE_SEP)
@@ -110,7 +111,9 @@ _STATED_DIGITS_RE = re.compile(
 #: count, since "pin 123 456 s" is a code) + no more digits, even behind
 #: punctuation or "is" ("pin 100 200 px 4321", "pin 100 200 px: 4321" are
 #: PINs). A run of 1- or 2-digit groups or a mix ("pin 12 34 px", "pin 123 4
-#: px") is still a PIN.
+#: px") is still a PIN, and so is a run of 6 or more digits in all ("pin 123
+#: 456 px", "pin 100 200 px"): split or not, that is a 6-digit code, the same
+#: as ``_DIGITS_RE``. Drag coordinates read as prose without the word "pin".
 _PROSE_WORD = "pin"
 _UNIT_AFTER_RE = re.compile(r"\s*(?i:px|dp|sp|pt)\b")
 _MORE_DIGITS_RE = re.compile(
@@ -118,6 +121,7 @@ _MORE_DIGITS_RE = re.compile(
 )
 _THOUSANDS_RE = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
 _MEASURE_GROUP_DIGITS = 3
+_MEASURE_MAX_DIGITS = 6
 #: A date is two 1- or 2-digit groups split by one slash, month/day or
 #: day/month: "pin 12/31 on the map". No year: a 4-digit year is refused as a
 #: value anyway (``_is_value_token``). ASCII digits only: ``int`` would read
@@ -143,6 +147,8 @@ def _is_measurement(segment: str, end: int, run: str) -> bool:
     if not run.isascii():
         return False
     groups = re.findall(r"\d+", _THOUSANDS_RE.sub("", run))
+    if sum(len(g) for g in groups) >= _MEASURE_MAX_DIGITS:
+        return False
     return min(len(g) for g in groups) >= _MEASURE_GROUP_DIGITS
 
 
