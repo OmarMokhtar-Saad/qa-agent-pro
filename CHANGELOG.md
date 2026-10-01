@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.103.4] - 2026-10-01
+## [1.103.5] - 2026-10-01
 
 ### Added
 
@@ -29,9 +29,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- A 6-digit code split into groups after "pin" is now refused in an
-  app note even when a unit follows ("pin 123 456 px"), as the unsplit
-  "pin 123456 px" already was. Coordinates after the word "pin" are
-  refused too; say "drag the marker to 100 200 px" instead.
-- A code after "pin at", "pin to", "pin on" or "pin is at"
-  ("pin at 123 456") is now refused, the same as after "pin is".
+- A code after any number of connector words ("pin is at to 1234")
+  is now refused in an app note, not only after one or two of them.
+- A code on the line after its label ("pin" then "1234" on the next
+  line, or "otp:" then "4821") is now refused, the same as on one line.
