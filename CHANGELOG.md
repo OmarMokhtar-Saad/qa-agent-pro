@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.103.3] - 2026-10-01
+## [1.103.4] - 2026-10-01
 
 ### Added
 
@@ -29,12 +29,9 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- A code split by dots, commas or slashes after a password word
-  ("password 1.2.3.4") is now refused in an app note, as it already
-  was after pin, otp, passcode and cvv.
-- Only "pin" can be read as a screen measurement or a date, so
-  "otp 123 456 pt" and "cvv 12/25" are refused, and digits after the
-  unit ("pin 100 200 px 4321") are refused too.
-- A date or a thousands number after "pin" ("pin 12/31 on the map",
-  "pin 1,000 px") and a list after "token" ("token 1, 2, 3, 4
-  appear") no longer block saving an app note.
+- A 6-digit code split into groups after "pin" is now refused in an
+  app note even when a unit follows ("pin 123 456 px"), as the unsplit
+  "pin 123456 px" already was. Coordinates after the word "pin" are
+  refused too; say "drag the marker to 100 200 px" instead.
+- A code after "pin at", "pin to", "pin on" or "pin is at"
+  ("pin at 123 456") is now refused, the same as after "pin is".
