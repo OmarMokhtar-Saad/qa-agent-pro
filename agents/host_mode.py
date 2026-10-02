@@ -1327,6 +1327,7 @@ _HOST_GENERATION_INSTRUCTIONS = (
     "Return each job's `return_field` on the submission.\n"
 )
 
+
 @dataclasses.dataclass
 class ParsedSubmission:
     """Result of parse_host_suite. Carries the validated suite AND the salvage

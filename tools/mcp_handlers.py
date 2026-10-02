@@ -101,6 +101,7 @@ from tools.suite_store import (
 )
 from tools.swagger_fetcher import fetch_openapi_spec, looks_like_openapi_url
 from tools.testrail_exporter import generate_testrail_csv
+from tools.tool_briefs import FLOW_BRIEF, MOBILE_BRIEF
 from tools.ui_extractor import extract_ui_elements
 from tools.untrusted import wrap_untrusted
 from tools.xlsx_generator import generate_test_case_xlsx
@@ -2239,6 +2240,8 @@ def shape_devices(
     adb_dropped_lines: int = 0,
     *,
     booting: list | None = None,
+    empty_hint: str = "",
+    adb_problem: str = "",
 ) -> str:
     """The device list a tester reads. *unusable* is rendered SEPARATELY.
 
@@ -2277,6 +2280,10 @@ def shape_devices(
         if dropped
         else ""
     )
+    if adb_problem:
+        # OUR sentence about adb (B4): a timed-out `adb start-server` or
+        # `adb devices -l` is otherwise indistinguishable from "no devices".
+        notice += "\n\n> \u26a0\ufe0f " + " ".join(str(adb_problem).split())[:400]
     if not devices and not attached:
         # The notice belongs on THIS branch most of all: 200+ unparseable lines
         # yield zero rows, and "No devices detected" while a phone is plugged
@@ -2294,6 +2301,7 @@ def shape_devices(
         return (
             "No devices detected. Connect an Android device/emulator or boot an "
             "iOS simulator, then retry `qa_list_devices`."
+            + ("\n\n" + str(empty_hint) if empty_hint else "")
         ) + notice
     lines: list[str] = []
     if not devices:
@@ -2620,8 +2628,7 @@ async def _confirm_image_gate_skip(choose: ChooseCb, beat2: str) -> str:
     Never raises (_elicit_choice degrades to UNAVAILABLE)."""
     res = await _elicit_choice(
         choose,
-        "This ticket has screens I was not given. Generate from the ticket "
-        "text only?",
+        "This ticket has screens I was not given. Generate from the ticket text only?",
         [_IMAGE_GATE_SKIP_LABEL, _IMAGE_GATE_ATTACH_LABEL],
     )
     if res.status == CHOSEN and res.value == _IMAGE_GATE_SKIP_LABEL:
@@ -2637,6 +2644,7 @@ async def _confirm_image_gate_skip(choose: ChooseCb, beat2: str) -> str:
             "screens. Attach them instead."
         )
     return f"{beat2}\n\n{why}"
+
 
 _IMAGE_PLAN_ALIASES = {
     "text": "jira",
@@ -6536,7 +6544,6 @@ async def handle_prepare_test_cases(
         # all (source_acs is non-empty and nothing was synthesized either way).
         _ac_job = bool(_host_ac and not prepared.source_acs and not prepared.acs)
 
-
         # Residue R4: the ONE capability narrowing this fold accepts, and the
         # TESTER -- not only the ledger and docs/FEATURE_FLAGS.md -- has to be
         # told about it. agents/test_scenario_agent.py interleaves the Batch-3
@@ -7179,6 +7186,8 @@ def render_prepare_payload(result: PreparePayloadResult) -> str:
         f"**prep_id:** `{result.prep_id}` (pass this to `qa_submit_suite`).",
         *_next_call_block(result.payload, str(result.prep_id or "")),
         "",
+        FLOW_BRIEF.strip(),
+        "",
         "Generate the suite from the payload below, then call `qa_submit_suite` "
         "with this prep_id and your merged JSON:",
         "",
@@ -7347,7 +7356,7 @@ def _select_prepare_images(result: PreparePayloadResult) -> tuple[list[dict], st
 
 
 def _text_only_image_skip_note(meta: dict) -> str:
-    """"> ..." disclosure when the tester's own text-only source_plan='jira'
+    """ "> ..." disclosure when the tester's own text-only source_plan='jira'
     pick skipped beat 2 while the ticket itself referenced screens (v1.97.0
     cursor-hardening item 2). "" when the prep's meta carries no skip stamp
     (every prep before this change, and every prep where the pick did not
@@ -7356,8 +7365,12 @@ def _text_only_image_skip_note(meta: dict) -> str:
         _n = _clamped_count((meta or {}).get("text_only_image_skip_count"), lo=0, hi=99)
         if _n <= 0:
             return ""
-        _names = [str(x) for x in ((meta or {}).get("text_only_image_skip_names") or [])][:8]
-        _named = (" Names: " + ", ".join(f"`{n}`" for n in _names) + ".") if _names else ""
+        _names = [
+            str(x) for x in ((meta or {}).get("text_only_image_skip_names") or [])
+        ][:8]
+        _named = (
+            (" Names: " + ", ".join(f"`{n}`" for n in _names) + ".") if _names else ""
+        )
         return (
             f"\n> \u2139\ufe0f {_n} screen(s) referenced by this ticket were not "
             f"read -- the tester chose ticket text only.{_named}"
@@ -7493,6 +7506,8 @@ def _split_prepare_text_blocks(payload: dict, prep_id: str, notice: str) -> list
         "",
         f"**prep_id:** `{prep_id}` (pass this to `qa_submit_suite`).",
         *_next_call_block(payload, str(prep_id or "")),
+        "",
+        FLOW_BRIEF.strip(),
         "",
         "This grounded payload exceeded the single-block size budget, so it is "
         "split across the labeled blocks below WITHOUT truncation. Reassemble ONE "
@@ -11630,9 +11645,7 @@ async def handle_submit_suite(
                 ):
                     _gen_notes.append((_qs_title, _qs_detail))
             except Exception:  # pragma: no cover - advisory never blocks export
-                logger.debug(
-                    "compute_suite_quality_advisories failed", exc_info=True
-                )
+                logger.debug("compute_suite_quality_advisories failed", exc_info=True)
             # F8 (2026-08-30): the finalize reply truncates at _SUMMARY_CAP and
             # told the tester to "re-submit a smaller suite" to read the
             # advisories it cut -- i.e. to regenerate the work in order to read a
@@ -12827,7 +12840,7 @@ async def _mobile_device_stage(
             return mobile_render.device_pending_block(state), picked_serial
         return "", picked_serial
 
-    # Nothing booted at all. This server downloads no SDK and creates no AVD
+    # Nothing booted at all. This server downloads no SDK and makes no AVD unasked
     # (docs/RETIRED_CAPABILITIES.md -> 6), so a machine without them gets the
     # setup guide, and only an AVD the TESTER created can be booted. The one
     # question the guide turns on -- is there an emulator binary -- is asked of
@@ -13238,9 +13251,7 @@ async def _mobile_app_stage(
                 if isinstance(app, dict) and app.get("id")
             ]
             if names:
-                hint += "\n\nInstalled third-party packages: " + ", ".join(
-                    names[:20]
-                )
+                hint += "\n\nInstalled third-party packages: " + ", ".join(names[:20])
             last = _run_store.last_used_package(serial)
             if last:
                 hint += "\n\nLast used on this device: `" + last + "`"
@@ -13269,7 +13280,12 @@ async def _mobile_app_stage(
     return (
         "## Opened on the emulator\n\nFinish the install in the emulator's own "
         "UI, then call `qa_mobile_test` again with the app's `package` name and "
-        "`source=installed_package`. Nothing was downloaded by this server.",
+        "`source=installed_package`. Nothing was downloaded by this server."
+        + (
+            "\n\n" + mobile_render.app_tester_hint(mobile_render.APP_TESTER_PACKAGES[0])
+            if install_source == "app_tester"
+            else ""
+        ),
         target,
     )
 
@@ -13354,7 +13370,15 @@ async def _mobile_start(
     # run still says what it ran on after the device is gone.
     from tools.mobile import adb as mobile_adb
 
-    device_facts = (await mobile_adb.device_facts(serial) or {}).get("content") or {}
+    #
+    # The AVD name is asked FOR THE SAME DEVICE AT THE SAME TIME (S13): both
+    # are read-only probes, and asking one after the other doubled the round
+    # trips before the first screen. `_mobile_avd_of` never raises, so a
+    # `device_facts` failure propagates exactly as it did alone.
+    facts_result, avd = await asyncio.gather(
+        mobile_adb.device_facts(serial), _mobile_avd_of(serial)
+    )
+    device_facts = (facts_result or {}).get("content") or {}
     if picked == "explore":
         # THE CHARTER (step 4). `charter.parse` is the only reader of the
         # host-submitted string: size-capped, json.loads only, every field
@@ -13386,12 +13410,17 @@ async def _mobile_start(
             # questions read as ANSWERED and the intake asks ONE -- measured.
             from agents import mobile_run as mobile_run_agent
 
+            # The intake is the FIRST mobile packet and has no run to memoise
+            # a briefing on, so it always carries the mobile brief (same
+            # heading `_mobile_packet_text` uses).
             return (
                 mobile_render.packet_block(
                     mobile_run_agent.build_charter_intake(
                         package=package, charter=parsed.get("raw") or {}
                     )
-                ),
+                )
+                + "\n\n### Tool brief (sent once per chat)\n"
+                + MOBILE_BRIEF.strip(),
                 False,
             )
         # THE RAW (schema-stripped) BODY, never the normalised `terms`.
@@ -13411,7 +13440,7 @@ async def _mobile_start(
             charter=parsed.get("raw") or {},
             package=package,
             serial=serial,
-            avd=await _mobile_avd_of(serial),
+            avd=avd,
             device=device_facts,
             locale=locale,
             capture=capture,
@@ -13499,7 +13528,7 @@ async def _mobile_start(
         serial=serial,
         source=picked,
         filters=filters,
-        avd=await _mobile_avd_of(serial),
+        avd=avd,
         device=device_facts,
         locale=locale,
         capture=capture,
@@ -13645,10 +13674,21 @@ async def _mobile_hand_off(
     # and refusing a whole run for that would be worse than the defect -- so the
     # outcome is REPORTED and the per-case hook still refuses the individual
     # case that types.
-    keyboard_note = await _mobile_keyboard_stage(run_id)
+    #
+    # ANIMATIONS OFF, BEFORE THE FIRST DUMP for the same reason: the first
+    # screen handed to the model is the first one that must be settled. The two
+    # stages run TOGETHER (S13): they touch different settings, and neither
+    # raises, so neither can cancel the other.
+    keyboard_note, animations_note = await asyncio.gather(
+        _mobile_keyboard_stage(run_id), _mobile_animations_stage(run_id)
+    )
+    # After the gather, not inside it: a parity dump taken mid IME switch would
+    # fail for the wrong reason.
+    a11y_note = await _mobile_a11y_stage(run_id)
     rendered = await _mobile_next(run_id, token, progress=progress, first_packet=True)
-    if keyboard_note:
-        rendered = keyboard_note + "\n\n" + rendered
+    for note in (a11y_note, animations_note, keyboard_note):
+        if note:
+            rendered = note + "\n\n" + rendered
     return rendered, True
 
 
@@ -13694,13 +13734,95 @@ async def _mobile_keyboard_stage(run_id: str) -> str:
     try:
         ready = await ime_session.ensure_ready(serial, run_id)
         if ready.get("error"):
+            # R1d: the run CONTINUES. Typing falls back to `adb shell input text`
+            # and this says so, why, and the exact fix (the run is not blocked).
+            from tools.mobile import ime as mobile_ime
+
             lines.append(
-                "\u26a0\ufe0f Typing is not available on this device: "
-                + str(ready["error"])[:300]
-                + " Taps, swipes and screen checks are unaffected."
+                "\u26a0\ufe0f "
+                + mobile_ime.fallback_notice(str(ready["error"])[:300], serial)
             )
     except Exception:
         logger.debug("mobile keyboard stage: ensure skipped", exc_info=True)
+    return "\n\n".join(lines)
+
+
+async def _mobile_a11y_stage(run_id: str) -> str:
+    """Give back a crashed run's accessibility settings, enable the fast dump, say what happened.
+
+    ``""`` on success AND on a legacy APK (nothing to say). A failure is one line: the
+    run carries on with uiautomator. Never raises.
+    """
+    from tools.mobile import a11y, session
+
+    lines: list = []
+    serial = ""
+    try:
+        serial = str(session.serial_of(run_id) or "")
+    except Exception:
+        logger.debug("mobile a11y stage: no serial for the run", exc_info=True)
+    if not serial:
+        return ""
+    try:
+        swept = (await a11y.restore_stale(serial, skip_run_id=run_id) or {}).get(
+            "content"
+        ) or {}
+        if swept.get("detail"):
+            mark = "\u2139\ufe0f " if swept.get("restored") else "\u26a0\ufe0f "
+            lines.append(mark + str(swept["detail"])[:300])
+    except Exception:
+        logger.debug("mobile a11y stage: stale sweep skipped", exc_info=True)
+    try:
+        on = await a11y.enable(serial, run_id)
+        if on.get("error"):
+            lines.append(
+                "\u26a0\ufe0f Fast screen reading is off for this run ("
+                + str(on["error"])[:200]
+                + "); using uiautomator, which is slower."
+            )
+    except Exception:
+        logger.debug("mobile a11y stage: enable skipped", exc_info=True)
+    return "\n\n".join(lines)
+
+
+async def _mobile_animations_stage(run_id: str) -> str:
+    """Restore a crashed run's animation scales, turn ours off, say what happened.
+
+    ``""`` in the ordinary case. Never raises and never stops a run: animations
+    left on make steps slower, not wrong, so a failure is reported and the run
+    carries on.
+    """
+    from tools.mobile import animations, session
+
+    lines: list = []
+    serial = ""
+    try:
+        serial = str(session.serial_of(run_id) or "")
+    except Exception:
+        logger.debug("mobile animations stage: no serial for the run", exc_info=True)
+    if not serial:
+        return ""
+    try:
+        # THE CRASHED RUN'S VALUES FIRST, or our own disable would read 0 and
+        # the tester's real scales would never come back.
+        swept = (await animations.restore_stale(serial, skip_run_id=run_id) or {}).get(
+            "content"
+        ) or {}
+        if swept.get("detail"):
+            mark = "ℹ️ " if swept.get("restored") else "⚠️ "
+            lines.append(mark + str(swept["detail"])[:300])
+    except Exception:
+        logger.debug("mobile animations stage: stale sweep skipped", exc_info=True)
+    try:
+        off = await animations.disable(serial, run_id)
+        if off.get("error"):
+            lines.append(
+                "⚠️ Could not turn off system animations for this run ("
+                + str(off["error"])[:300]
+                + "). Steps may be slower to settle; the run continues."
+            )
+    except Exception:
+        logger.debug("mobile animations stage: disable skipped", exc_info=True)
     return "\n\n".join(lines)
 
 
@@ -13862,7 +13984,9 @@ async def _mobile_next(
                 "failed": resolved.get("failed"),
             }
         )
-    resolved_body = body.get("resolved") if isinstance(body.get("resolved"), dict) else {}
+    resolved_body = (
+        body.get("resolved") if isinstance(body.get("resolved"), dict) else {}
+    )
     reset_note = ""
     if first_packet and (resolved_body.get("reset_app") or {}).get("cleared"):
         reset_note = (
@@ -13973,12 +14097,14 @@ async def handle_submit_mobile_step(
                 tester_inputs=parsed_inputs,
                 confirm_destructive=confirm_destructive,
                 budget=budget,
+                **_mobile_route_kwargs(),
             ),
         )
         if result.get("error"):
             return "⚠️ " + _safe(result["error"], 400)
         body = result.get("content") or {}
         case = body.get("case") or {}
+        _note_mobile_step_case(case)
         await _audit(
             "mcp_mobile_step",
             entity_id=run_id,
@@ -14001,6 +14127,19 @@ async def handle_submit_mobile_step(
 
         if str(case.get("status") or "") == _case_runner.NEEDS_MODEL:
             run_store.clear_briefing(run_id)
+            run_store.clear_screen(run_id)
+            # A `visual` assert stopped this replay (S1): the model asked to
+            # judge THIS screen, so the next packet carries its picture. The
+            # LAST entry only -- the trace is merged across submits.
+            _trace = case.get("trace") if isinstance(case.get("trace"), list) else []
+            _want = _MOBILE_SHOT_WANT.get()
+            if (
+                _trace
+                and isinstance(_trace[-1], dict)
+                and _trace[-1].get("outcome") == "visual_check"
+                and isinstance(_want, dict)
+            ):
+                _want["visual"] = True
         line = mobile_render.verdict_line(case)
         notice = str(body.get("notice") or "")
         if body.get("packet"):
@@ -14076,11 +14215,43 @@ _MOBILE_IMAGE_SPECS: ContextVar = ContextVar("_MOBILE_IMAGE_SPECS", default=None
 _MOBILE_STEP_HELD: ContextVar = ContextVar("_MOBILE_STEP_HELD", default=None)
 
 
+def _note_mobile_step_case(case: object) -> None:
+    """Hand the step's case to the wrapper that called it (a saved flow reads its trace).
+    A no-op outside the wrapper."""
+    held = _MOBILE_STEP_HELD.get()
+    if isinstance(held, dict) and isinstance(case, dict):
+        held["case"] = case
+
+
 def _mark_mobile_step_held() -> None:
     """Record that this submit call holds its run. A no-op outside the wrapper."""
     held = _MOBILE_STEP_HELD.get()
     if isinstance(held, dict):
         held["held"] = True
+
+
+def _mobile_route_kwargs() -> dict:
+    """``{'route_expect': [...]}`` when the wrapper is replaying a saved route, else ``{}``.
+    Conditional on purpose: a call that is not a route replay passes session.submit nothing new."""
+    held = _MOBILE_STEP_HELD.get()
+    expect = held.get("route_expect") if isinstance(held, dict) else None
+    return {"route_expect": list(expect)} if expect else {}
+
+
+#: What THIS call wants from the screenshot (S1, dump-first): ``{"asked": bool}``
+#: from the tool's ``screenshot`` argument, plus ``"visual": True`` once the
+#: submit path sees a ``visual`` assert stop. A dict, and mutated in place,
+#: because the submit path and the packet renderer run in the same context.
+#: ``None`` (every ``str``-returning caller) reads as "not asked".
+_MOBILE_SHOT_WANT: ContextVar = ContextVar("_MOBILE_SHOT_WANT", default=None)
+
+#: What replaces ``screen_block`` when the S8 memo says this chat already holds
+#: the byte-identical list. The fingerprint lets a reader match the two.
+_MOBILE_SAME_SCREEN_NOTE = (
+    "SAME SCREEN as the last packet this chat was sent (fingerprint {fp}): the "
+    "element list you already have is still exact, so it is not repeated. "
+    "Plan from it."
+)
 
 
 async def _mobile_packet_text(
@@ -14114,6 +14285,18 @@ async def _mobile_packet_text(
     sink = _MOBILE_IMAGE_SPECS.get()
     serial = str(body.get("serial") or "")
     spec = None
+    # DUMP FIRST (S1). The picture is still taken and stored every step -- the
+    # report shows it -- but it goes to the model only when the element list is
+    # not enough, or the model asked. A packet without the routing key (not
+    # made by a `mobile_run` builder) reads as unusable: the safe direction.
+    unusable = (
+        str(packet.get("screen_unusable", "unknown") or "")
+        if isinstance(packet, dict)
+        else "unknown"
+    )
+    want = _MOBILE_SHOT_WANT.get()
+    want = want if isinstance(want, dict) else {}
+    attach = bool(unusable or want.get("asked") or want.get("visual"))
     if sink is None:
         # No image channel on this path. NOT an attempt that failed -- so no
         # device call is made and the note says exactly that.
@@ -14161,9 +14344,12 @@ async def _mobile_packet_text(
         except Exception:  # never-raise: a picture is not a verdict
             logger.exception("mcp mobile screen capture failed")
             spec = None
-        if spec is not None:
+        if spec is not None and not attach:
+            note = mobile_screenshot.NOT_ATTACHED_NOTE
+        elif spec is not None:
             note = mobile_screenshot.ATTACHED_NOTE
             sink.append(spec)
+        if spec is not None:
             # ... and keep it, so the HTML report can show the screen rather
             # than only a drawing of it. The SAME bytes the model was handed:
             # one screenshot of one look, at one size, two consumers.
@@ -14187,6 +14373,7 @@ async def _mobile_packet_text(
                 )
             except Exception:  # never-raise: a picture is not a verdict
                 logger.exception("mcp mobile screen store failed")
+    brief_needed = True
     shown = packet
     if isinstance(shown, dict):
         # A COPY: the packet is the caller's own dict, and a note written into
@@ -14217,6 +14404,10 @@ async def _mobile_packet_text(
                     shown = mobile_render.without_goal(
                         mobile_render.without_static(shown)
                     )
+                    # The once-per-chat tool brief rides the same memo. Every
+                    # other path (either id missing, memo failure) keeps
+                    # `brief_needed`, so the fail-open direction is REPEAT.
+                    brief_needed = False
                 else:
                     mobile_run_store.mark_briefed(run_id, token)
             except Exception:
@@ -14227,13 +14418,57 @@ async def _mobile_packet_text(
                 # screen belongs. `shown` is left whole, so the block goes out
                 # again -- tokens, not a lost turn.
                 logger.exception("mcp mobile static-block memo failed")
+            # S8: the SAME screen, to the SAME chat, at a NEW position, goes as
+            # one line. Byte-identical text is the test, so the elision is
+            # lossless; a re-issued packet (same position) always goes whole,
+            # as does an unusable screen or one whose picture is attached.
+            try:
+                block = str(shown.get("screen_block") or "")
+                fingerprint = hashlib.sha256(block.encode("utf-8")).hexdigest()[:12]
+                position = hashlib.sha256(
+                    json.dumps(
+                        [
+                            shown.get(key)
+                            for key in (
+                                "kind",
+                                "tc_id",
+                                "turn",
+                                "escapes_used",
+                                "trace",
+                                "stopped_because",
+                            )
+                        ],
+                        default=str,
+                    ).encode("utf-8")
+                ).hexdigest()[:12]
+                last = (mobile_run_store.last_screen(run_id) or {}).get("content") or {}
+                if (
+                    block
+                    and not unusable
+                    and note != mobile_screenshot.ATTACHED_NOTE
+                    and last.get("session") == token
+                    and last.get("fingerprint") == fingerprint
+                    and last.get("position") != position
+                ):
+                    shown["screen_block"] = _MOBILE_SAME_SCREEN_NOTE.format(
+                        fp=fingerprint
+                    )
+                if block:
+                    mobile_run_store.mark_screen(run_id, token, fingerprint, position)
+            except Exception:
+                # Fail-open is REPEAT, like the briefing memo above.
+                logger.exception("mcp mobile screen memo failed")
         # The observation key is this module's routing value, not packet
         # content: `render.packet_block` promises it adds nothing to what the
         # builder made, and a 25-character hex id in the model's JSON is packet
         # budget spent on a string the model has no use for. Popped from the
         # COPY only -- the caller's packet still carries it for the writer above.
         shown.pop("observation_id", None)
-    return mobile_render.packet_block(shown, session_token=session_token)
+        shown.pop("screen_unusable", None)
+    text = mobile_render.packet_block(shown, session_token=session_token)
+    if brief_needed:
+        text += "\n\n### Tool brief (sent once per chat)\n" + MOBILE_BRIEF.strip()
+    return text
 
 
 def _mobile_note_target(run_id: str = "", package: str = "") -> tuple:
@@ -14263,11 +14498,13 @@ def _mobile_note_target(run_id: str = "", package: str = "") -> tuple:
     return (
         "",
         rid,
-        "pass `package` (or a `run_id`) so the note is filed under the right app",
+        "pass `package` (or a `run_id`) so it is filed under the right app",
     )
 
 
-def _mobile_call_secrets(tester_input: object = "", tester_inputs_json: object = "") -> list:
+def _mobile_call_secrets(
+    tester_input: object = "", tester_inputs_json: object = ""
+) -> list:
     """The values the tester supplied on THIS call, so a note that repeats one
     is refused. Never raises."""
     values: list = []
@@ -14383,7 +14620,11 @@ async def handle_mobile_notes(
         if not note_id:
             return "\u26a0\ufe0f `retire` needs `note_id`."
         done = await asyncio.to_thread(
-            app_knowledge.retire_note, pkg, note_id, reason=str(reason or ""), run_id=rid
+            app_knowledge.retire_note,
+            pkg,
+            note_id,
+            reason=str(reason or ""),
+            run_id=rid,
         )
         if done.get("error"):
             return "\u26a0\ufe0f " + single_line(done["error"], 300)
@@ -14391,6 +14632,60 @@ async def handle_mobile_notes(
     except Exception:
         logger.exception("mobile notes failed")
         return "\u26a0\ufe0f The notes store could not be read."
+
+
+def _mobile_arg(args: tuple, kwargs: dict, name: str):
+    """*name*'s RAW value in a ``handle_mobile_test`` call, however it was passed.
+
+    Unlike ``_call_arg`` (which returns ``str``) the type survives, so
+    ``apply=False`` stays ``False`` instead of becoming the truthy ``"False"``.
+    Found by the handler's own signature, not by position. ``None`` when absent.
+    """
+    if name in kwargs:
+        return kwargs[name]
+    import inspect
+
+    names = list(inspect.signature(handle_mobile_test).parameters)
+    index = names.index(name)
+    return args[index] if index < len(args) else None
+
+
+async def _mobile_avd_reply(
+    action: str, args: tuple, kwargs: dict, system_image: str, confirm: object
+) -> str:
+    """``qa_mobile_test(emulator=...)``: list, boot, create or delete an AVD. Never raises.
+
+    The lane gate comes first. The logic lives in ``tools/mobile/avd_manage``
+    (function-local import, like every ``tools.mobile`` module here). ``apply``
+    and ``avd`` are read from the ORIGINAL call; ``confirm`` reaches the module
+    only as the literal ``True``.
+    """
+    if not _mobile_lane_enabled():
+        return _mobile_lane_off_message()
+    try:
+        from tools.mobile import avd_manage
+
+        apply = _mobile_arg(args, kwargs, "apply") is True
+        avd = str(_mobile_arg(args, kwargs, "avd") or "").strip()
+        await _audit(
+            "mcp_mobile_avd",
+            detail={
+                "action": action[:12],
+                "avd": avd[:64],
+                "apply": apply,
+                "confirmed": confirm is True,
+            },
+        )
+        return await avd_manage.manage(
+            action,
+            avd=avd,
+            system_image=system_image,
+            apply=apply,
+            confirm_destructive=confirm is True,
+        )
+    except Exception:
+        logger.exception("mobile avd action failed")
+        return "\u26a0\ufe0f The emulator action failed; nothing further was run."
 
 
 async def handle_mobile_test_content(*args, **kwargs) -> tuple:
@@ -14403,7 +14698,17 @@ async def handle_mobile_test_content(*args, **kwargs) -> tuple:
     caller and is this function's text, projected.
 
     Opening the sink is what ARMS the capture: see ``_MOBILE_IMAGE_SPECS``.
+
+    ``emulator`` (list/boot/create/delete an AVD) is answered BEFORE the sink
+    opens: it is not a run step, takes no screenshot and shares no state with one.
     """
+    avd_action = str(kwargs.pop("emulator", "") or "").strip()
+    system_image = str(kwargs.pop("system_image", "") or "")
+    confirm = kwargs.pop("confirm_destructive", False)
+    if avd_action:
+        reply = await _mobile_avd_reply(avd_action, args, kwargs, system_image, confirm)
+        return reply, []
+    want = _MOBILE_SHOT_WANT.set({"asked": bool(kwargs.pop("screenshot", False))})
     token = _MOBILE_IMAGE_SPECS.set([])
     try:
         note = kwargs.pop("note", "")
@@ -14420,15 +14725,393 @@ async def handle_mobile_test_content(*args, **kwargs) -> tuple:
         return text, list(_MOBILE_IMAGE_SPECS.get() or [])
     finally:
         _MOBILE_IMAGE_SPECS.reset(token)
+        _MOBILE_SHOT_WANT.reset(want)
+
+
+_FLOW_WARN = chr(0x26A0) + chr(0xFE0F) + " "
+
+
+def _mobile_flow_names(args: tuple, kwargs: dict) -> set:
+    """Secret FIELD NAMES the tester supplied on this call or holds for the run. Names only."""
+    from tools.mobile import held_inputs
+
+    names: set = set()
+    field = _call_arg(
+        handle_submit_mobile_step, args, kwargs, "tester_input_field"
+    ).strip()
+    if field:
+        names.add(field)
+    try:
+        loaded = json.loads(
+            _call_arg(handle_submit_mobile_step, args, kwargs, "tester_inputs") or "{}"
+        )
+        if isinstance(loaded, dict):
+            names.update(str(key) for key in loaded)
+    except Exception:
+        pass
+    try:
+        run_id = _call_arg(handle_submit_mobile_step, args, kwargs, "run_id")
+        names.update(str(key) for key in held_inputs.recall(run_id))
+    except Exception:
+        pass
+    return names
+
+
+def _with_script(args: tuple, kwargs: dict, script: str) -> tuple:
+    """``(args, kwargs)`` with the script slot (third positional, or the keyword) replaced."""
+    if len(args) > 2:
+        return args[:2] + (script,) + args[3:], kwargs
+    return args, {**kwargs, "script": script}
+
+
+def _mobile_flow_prepare(
+    args: tuple, kwargs: dict, name: str, raw_params: object, save_name: str
+) -> dict:
+    """Turn a flow call into the script to replay, or ``{'refusal': text}`` when nothing may
+    run. Every refusal comes BEFORE the device is touched. Never raises."""
+    from tools.mobile import app_flows
+    from tools.untrusted import single_line
+
+    def stop(why: str) -> dict:
+        return {"refusal": _FLOW_WARN + single_line(why, 400) + " Nothing was touched."}
+
+    try:
+        script = _call_arg(handle_submit_mobile_step, args, kwargs, "script")
+        if name and save_name:
+            return stop(
+                "Pass `flow` (replay a saved flow) OR `save_flow` (save this script as one), not both."
+            )
+        if name and script.strip():
+            return stop("`flow` replays a saved flow; leave `script` empty.")
+        if save_name and not script.strip():
+            return stop("`save_flow` saves this call's `script`; pass one.")
+        pkg, _rid, refusal = _mobile_note_target(
+            _call_arg(handle_submit_mobile_step, args, kwargs, "run_id"), ""
+        )
+        if refusal:
+            return stop("Flow not run: " + refusal + ".")
+        params: object = {}
+        if str(raw_params or "").strip():
+            try:
+                params = json.loads(str(raw_params))
+            except ValueError:
+                return stop("`flow_params` is not valid JSON.")
+        got = (
+            app_flows.get_flow(pkg, name)
+            if name
+            else app_flows.template_from_script(script)
+        )
+        if name or app_flows.valid_name(save_name):
+            pass
+        else:
+            return stop("`save_flow` is not a valid flow name.")
+        if got.get("error"):
+            return stop("Flow not run: " + str(got["error"]) + ".")
+        template = got["content"]
+        if save_name:
+            problem = app_flows.check_save(pkg, save_name, template)
+            if problem:
+                return stop("Flow not run: " + problem + ".")
+        built = app_flows.expand(template, params, _mobile_flow_names(args, kwargs))
+        if built.get("error"):
+            return stop("Flow not run: " + str(built["error"]) + ".")
+        return {
+            "script": built["content"],
+            "name": name or save_name,
+            "package": pkg,
+            "save": bool(save_name),
+            "steps": len(template["steps"]),
+            "template": template,
+        }
+    except Exception:
+        logger.exception("mobile flow: prepare failed")
+        return stop("Flow not run: the flow store is unavailable.")
+
+
+def _mobile_flow_finish(plan: dict, held: dict) -> str:
+    """The line a flow call prepends to the step reply. Saves a new flow ONLY after a clean
+    replay. Never raises."""
+    from tools.mobile import app_flows
+    from tools.untrusted import single_line
+
+    try:
+        count = int(plan.get("steps") or 0)
+        case = held.get("case") if isinstance(held.get("case"), dict) else {}
+        clean = bool(held.get("held")) and app_flows.clean_replay(case, count)
+        if plan.get("save"):
+            if not held.get("held"):
+                return "Flow not saved: this call did not run a step.\n\n"
+            if not clean:
+                return (
+                    "Flow `%s` not saved: the replay did not finish cleanly.\n\n"
+                    % plan["name"]
+                )
+            saved = app_flows.save_flow(plan["package"], plan["name"], plan["template"])
+            if saved.get("error"):
+                return "Flow not saved: " + single_line(saved["error"], 300) + "\n\n"
+            return "Saved flow `%s` for `%s` (%d steps).\n\n" % (
+                plan["name"],
+                plan["package"],
+                count,
+            )
+        if not held.get("held") or clean:
+            return ""
+        return app_flows.stop_line(plan["name"], case, count) + "\n\n"
+    except Exception:
+        logger.exception("mobile flow: finish failed")
+        return ""
+
+
+def _mobile_route_prepare(
+    args: tuple, kwargs: dict, name: str, raw_params: object, save_name: str
+) -> dict:
+    """Turn a route call into the script to replay, or ``{'refusal': text}`` when nothing may
+    run. Every refusal comes BEFORE the device is touched. Never raises. A replay carries the
+    saved screens as ``expect``; a save carries none (it records them from the trace)."""
+    from tools.mobile import app_flows, app_routes
+    from tools.untrusted import single_line
+
+    def stop(why: str) -> dict:
+        return {"refusal": _FLOW_WARN + single_line(why, 400) + " Nothing was touched."}
+
+    try:
+        script = _call_arg(handle_submit_mobile_step, args, kwargs, "script")
+        if name and save_name:
+            return stop(
+                "Pass `route` (replay a saved route) OR `save_route` (save this script as one), not both."
+            )
+        if name and script.strip():
+            return stop("`route` replays a saved route; leave `script` empty.")
+        if save_name and not script.strip():
+            return stop("`save_route` saves this call's `script`; pass one.")
+        if save_name and not app_flows.valid_name(save_name):
+            return stop("`save_route` is not a valid route name.")
+        pkg, _rid, refusal = _mobile_note_target(
+            _call_arg(handle_submit_mobile_step, args, kwargs, "run_id"), ""
+        )
+        if refusal:
+            return stop("Route not run: " + refusal + ".")
+        params: object = {}
+        if str(raw_params or "").strip():
+            try:
+                params = json.loads(str(raw_params))
+            except ValueError:
+                return stop("`flow_params` is not valid JSON.")
+        got = (
+            app_routes.get_route(pkg, name)
+            if name
+            else app_flows.template_from_script(script)
+        )
+        if got.get("error"):
+            return stop("Route not run: " + str(got["error"]) + ".")
+        template = got["content"]
+        if save_name:
+            problem = app_routes.check_save(pkg, save_name, template)
+            if problem:
+                return stop("Route not run: " + problem + ".")
+        built = app_flows.expand(template, params, _mobile_flow_names(args, kwargs))
+        if built.get("error"):
+            return stop("Route not run: " + str(built["error"]) + ".")
+        return {
+            "script": built["content"],
+            "name": name or save_name,
+            "package": pkg,
+            "save": bool(save_name),
+            "steps": len(template["steps"]),
+            "template": template,
+            "expect": [] if save_name else list(template["screens"]),
+            "end": "" if save_name else str(template["end"]),
+        }
+    except Exception:
+        logger.exception("mobile route: prepare failed")
+        return stop("Route not run: the route store is unavailable.")
+
+
+def _mobile_route_finish(plan: dict, held: dict) -> str:
+    """The line a route call prepends to the step reply. Saves a new route ONLY after a clean
+    replay whose every step recorded the screens it started and ended on. Never raises."""
+    from tools.mobile import app_routes
+    from tools.untrusted import single_line
+
+    try:
+        count = int(plan.get("steps") or 0)
+        case = held.get("case") if isinstance(held.get("case"), dict) else {}
+        name = plan["name"]
+        if plan.get("save"):
+            if not held.get("held"):
+                return "Route not saved: this call did not run a step.\n\n"
+            recorded = app_routes.record_from_case(case, count)
+            if recorded.get("error"):
+                return "Route `%s` not saved: %s.\n\n" % (
+                    name,
+                    single_line(recorded["error"], 300),
+                )
+            seen = recorded["content"]
+            saved = app_routes.save_route(
+                plan["package"], name, plan["template"], seen["screens"], seen["end"]
+            )
+            if saved.get("error"):
+                return "Route not saved: " + single_line(saved["error"], 300) + "\n\n"
+            return "Saved route `%s` for `%s` (%d steps).\n\n" % (
+                name,
+                plan["package"],
+                count,
+            )
+        if not held.get("held"):
+            return ""
+        if app_routes.replay_matched(case, count, plan.get("expect"), plan.get("end")):
+            return (
+                "Route `%s` replayed: every screen matched the saved route (%d steps).\n\n"
+                % (name, count)
+            )
+        return app_routes.stop_line(name, case) + "\n\n"
+    except Exception:
+        logger.exception("mobile route: finish failed")
+        return ""
+
+
+async def _mobile_routes_manage(verb: str, pkg: str, name: str) -> str:
+    """``qa_mobile_flows`` with ``kind='route'``: list, show or delete one app's routes."""
+    from tools.mobile import app_routes
+    from tools.untrusted import single_line
+
+    if verb == "list":
+        listed = await asyncio.to_thread(app_routes.list_routes, pkg)
+        rows = listed.get("content") or []
+        if not rows:
+            return "No saved routes for `%s`." % pkg
+        lines = ["Saved routes for `%s`:" % pkg]
+        for row in rows:
+            lines.append(
+                "- `%s`: %d steps; params: %s; secret fields: %s"
+                % (
+                    row["name"],
+                    row["steps"],
+                    ", ".join(row["params"]) or "none",
+                    ", ".join(row["fields"]) or "none",
+                )
+            )
+        return "\n".join(lines)
+    if verb == "show":
+        got = await asyncio.to_thread(app_routes.get_route, pkg, name)
+        if got.get("error"):
+            return _FLOW_WARN + single_line(got["error"], 300) + "."
+        route = got["content"]
+        lines = ["Route `%s` for `%s`:" % (name, pkg)]
+        for index, step in enumerate(route["steps"], 1):
+            lines.append(
+                "%d. %s (starts on screen %s)"
+                % (
+                    index,
+                    single_line(json.dumps(step, sort_keys=True), 300),
+                    route["screens"][index - 1],
+                )
+            )
+        lines.append("Ends on screen %s." % route["end"])
+        return "\n".join(lines)
+    gone = await asyncio.to_thread(app_routes.delete_route, pkg, name)
+    if gone.get("error"):
+        return _FLOW_WARN + single_line(gone["error"], 300) + "."
+    return "Deleted route `%s` for `%s`." % (name, pkg)
+
+
+async def handle_mobile_flows(
+    action: str = "list",
+    package: str = "",
+    run_id: str = "",
+    name: str = "",
+    kind: str = "flow",
+) -> str:
+    """``qa_mobile_flows``: list, show or delete the flows (``kind='route'``: the routes) saved
+    for one app. Never raises."""
+    if not _mobile_lane_enabled():
+        return _mobile_lane_off_message()
+    try:
+        from tools.mobile import app_flows
+        from tools.untrusted import single_line
+
+        verb = str(action or "list").strip().lower()
+        if verb not in ("list", "show", "delete"):
+            return _FLOW_WARN + "`action` must be `list`, `show` or `delete`."
+        pkg, _rid, refusal = _mobile_note_target(run_id, package)
+        if refusal:
+            return _FLOW_WARN + single_line(refusal, 300) + "."
+        kind_name = str(kind or "flow").strip().lower()
+        if kind_name not in ("flow", "route"):
+            return _FLOW_WARN + "`kind` must be `flow` or `route`."
+        if kind_name == "route":
+            return await _mobile_routes_manage(verb, pkg, name)
+        if verb == "list":
+            listed = await asyncio.to_thread(app_flows.list_flows, pkg)
+            rows = listed.get("content") or []
+            if not rows:
+                return "No saved flows for `%s`." % pkg
+            lines = ["Saved flows for `%s`:" % pkg]
+            for row in rows:
+                lines.append(
+                    "- `%s`: %d steps; params: %s; secret fields: %s"
+                    % (
+                        row["name"],
+                        row["steps"],
+                        ", ".join(row["params"]) or "none",
+                        ", ".join(row["fields"]) or "none",
+                    )
+                )
+            return "\n".join(lines)
+        if verb == "show":
+            got = await asyncio.to_thread(app_flows.get_flow, pkg, name)
+            if got.get("error"):
+                return _FLOW_WARN + single_line(got["error"], 300) + "."
+            lines = ["Flow `%s` for `%s`:" % (name, pkg)]
+            for index, step in enumerate(got["content"]["steps"], 1):
+                lines.append(
+                    "%d. %s"
+                    % (index, single_line(json.dumps(step, sort_keys=True), 300))
+                )
+            return "\n".join(lines)
+        gone = await asyncio.to_thread(app_flows.delete_flow, pkg, name)
+        if gone.get("error"):
+            return _FLOW_WARN + single_line(gone["error"], 300) + "."
+        return "Deleted flow `%s` for `%s`." % (name, pkg)
+    except Exception:
+        logger.exception("mobile flows failed")
+        return _FLOW_WARN + "the flow store is unavailable."
 
 
 async def handle_submit_mobile_step_content(*args, **kwargs) -> tuple:
     """``handle_submit_mobile_step``'s text plus its screens. See above.
 
     The ``note`` is saved AFTER the step and only when the step held its run
-    (``_MOBILE_STEP_HELD``): a refused or raising call leaves no note."""
+    (``_MOBILE_STEP_HELD``): a refused or raising call leaves no note.
+
+    ``flow`` / ``flow_params`` / ``save_flow`` are popped and resolved into the script BEFORE
+    the step, so a refused flow call never reaches the device."""
+    flow_name = str(kwargs.pop("flow", "") or "").strip()
+    flow_params = kwargs.pop("flow_params", "")
+    save_flow = str(kwargs.pop("save_flow", "") or "").strip()
+    route_name = str(kwargs.pop("route", "") or "").strip()
+    save_route = str(kwargs.pop("save_route", "") or "").strip()
+    if (route_name or save_route) and (flow_name or save_flow):
+        return _FLOW_WARN + "Pass a flow OR a route, not both. Nothing was touched.", []
+    flow_plan: dict = {}
+    if flow_name or save_flow:
+        flow_plan = await asyncio.to_thread(
+            _mobile_flow_prepare, args, kwargs, flow_name, flow_params, save_flow
+        )
+        if flow_plan.get("refusal"):
+            return flow_plan["refusal"], []
+        args, kwargs = _with_script(args, kwargs, flow_plan["script"])
+    route_plan: dict = {}
+    if route_name or save_route:
+        route_plan = await asyncio.to_thread(
+            _mobile_route_prepare, args, kwargs, route_name, flow_params, save_route
+        )
+        if route_plan.get("refusal"):
+            return route_plan["refusal"], []
+        args, kwargs = _with_script(args, kwargs, route_plan["script"])
+    want = _MOBILE_SHOT_WANT.set({"asked": bool(kwargs.pop("screenshot", False))})
     token = _MOBILE_IMAGE_SPECS.set([])
-    held = {"held": False}
+    held = {"held": False, "route_expect": list(route_plan.get("expect") or [])}
     held_token = _MOBILE_STEP_HELD.set(held)
     try:
         note = kwargs.pop("note", "")
@@ -14451,10 +15134,19 @@ async def handle_submit_mobile_step_content(*args, **kwargs) -> tuple:
             )
         elif str(note or "").strip() and _mobile_lane_enabled():
             note_line = "Note not saved: this call did not run a step.\n\n"
-        return note_line + body, list(_MOBILE_IMAGE_SPECS.get() or [])
+        flow_line = ""
+        if flow_plan:
+            flow_line = await asyncio.to_thread(_mobile_flow_finish, flow_plan, held)
+        route_line = ""
+        if route_plan:
+            route_line = await asyncio.to_thread(_mobile_route_finish, route_plan, held)
+        return route_line + flow_line + note_line + body, list(
+            _MOBILE_IMAGE_SPECS.get() or []
+        )
     finally:
         _MOBILE_STEP_HELD.reset(held_token)
         _MOBILE_IMAGE_SPECS.reset(token)
+        _MOBILE_SHOT_WANT.reset(want)
 
 
 async def handle_setup_capture(
@@ -15670,11 +16362,25 @@ async def handle_list_devices(*, progress: ProgressCb = None) -> str:
                 booting = mobile_emulator.recently_started()
             except Exception:
                 logger.debug("booting probe failed", exc_info=True)
+        # B3: an empty list is explained (AVDs on file + a bounded acceleration
+        # check), never by the minute-long WHPX feature query.
+        empty_hint = ""
+        if not devices and not unusable and not booting:
+            try:
+                from tools.mobile import emulator as mobile_emulator
+
+                empty_hint = mobile_emulator.render_no_devices_hint(
+                    await mobile_emulator.diagnose_no_devices()
+                )
+            except Exception:
+                logger.debug("no-devices diagnosis failed", exc_info=True)
         return shape_devices(
             devices,
             unusable,
             result.get("adb_dropped_lines") or 0,
             booting=booting,
+            empty_hint=empty_hint,
+            adb_problem=str(result.get("adb_problem") or ""),
         )
     except Exception as exc:
         logger.exception("handle_list_devices failed")
@@ -15747,7 +16453,9 @@ def handle_mirror_hold(serial: str = "", action: str = "status") -> str:
             res = mobile_locks.release(name, owner=_MIRROR_HOLD_OWNER, as_holder=True)
             body = res.get("content")
             if res.get("error") or body is None:
-                base["reason"] = str(res.get("error") or "the lock could not be released")
+                base["reason"] = str(
+                    res.get("error") or "the lock could not be released"
+                )
                 return _mirror_hold_json(base)
             base["reason"] = str(body.get("reason") or "")
             if not body.get("released") and str(base["reason"]).startswith("held by "):
@@ -15890,8 +16598,7 @@ def _is_stage_token_shaped(text: str) -> bool:
     """True when ``text`` could be a minted stage token: URL-safe base64, and
     long enough that no short free-text fragment passes by accident."""
     return 16 <= len(text) <= 64 and all(
-        (ch.isascii() and ch.isalnum()) or ch in _STAGE_TOKEN_EXTRA_CHARS
-        for ch in text
+        (ch.isascii() and ch.isalnum()) or ch in _STAGE_TOKEN_EXTRA_CHARS for ch in text
     )
 
 
@@ -16631,11 +17338,61 @@ def _capture_retry_hint(capture_ids: list | None) -> str:
         return ""
 
 
+async def _capture_peek(device_id: str) -> str:
+    """``qa_capture_screens(peek=true)``: the current Android screen as text.
+
+    Read-only and light: one accessibility dump through ``tools.mobile.peek``. No
+    screenshot, no tray entry, no capture id, no actuation, no picker, so no
+    ``apply``. With no id it uses the only Android device and otherwise shows the
+    device menu (never a guess); an iOS device is refused by name. Never raises.
+    """
+    try:
+        if not _mobile_lane_enabled():
+            return (
+                "\u2139\ufe0f Screen peek is not part of this build. Call "
+                "`qa_capture_screens` without `peek` for a screenshot."
+            )
+        wanted = (device_id or "").strip()
+        if wanted:
+            device, why_not = await _resolve_device_with_reason(wanted)
+            if device is None:
+                return (
+                    f"\u26a0\ufe0f Device `{wanted}` not found. Run `qa_list_devices` "
+                    "and retry with an id from that list." + why_not
+                )
+        else:
+            listed = await list_devices()
+            android = [
+                d
+                for d in (listed.get("content") or [])
+                if isinstance(d, dict) and d.get("platform") == "android"
+            ]
+            if len(android) != 1:
+                return await _device_menu_markdown("qa_capture_screens")
+            device = android[0]
+        if device.get("platform") != "android":
+            return (
+                "\u2139\ufe0f Screen peek reads the Android accessibility tree, so it "
+                "cannot read an iOS device. Call `qa_capture_screens` without "
+                "`peek` for a screenshot."
+            )
+        from tools.mobile import peek as mobile_peek
+
+        return await mobile_peek.peek(str(device.get("id") or ""))
+    except Exception:
+        logger.debug("_capture_peek failed", exc_info=True)
+        return (
+            "\u26a0\ufe0f Could not peek at the screen. Call `qa_capture_screens` "
+            "without `peek` for a screenshot."
+        )
+
+
 async def handle_capture_screens(
     device_id: str = "",
     count: int = 1,
     rescan: bool = False,
     names: str = "",
+    peek: bool = False,
     *,
     choose: ChooseCb = None,
     ask_text: AskCb = None,
@@ -16670,6 +17427,10 @@ async def handle_capture_screens(
                 "`attached_image_count` to `qa_prepare_test_cases`.",
                 [],
             )
+        if peek:
+            # G2: a text-only look. Before ANY device selection or capture so a
+            # peek can never take, stash or attach a screenshot.
+            return await _capture_peek(device_id), []
         device = None
         device_id = (device_id or "").strip()
         if device_id and not rescan:
@@ -18067,6 +18828,32 @@ def _ac_field_section() -> list[str]:
         return []
 
 
+def _jira_in_use(
+    workspace_roots: list | None = None, verdict_view: object = None
+) -> bool:
+    """True when Jira is ALREADY part of this install. Read-only, never raises.
+
+    qa-doctor checks and mentions Atlassian/Jira only then. Any one is enough: a
+    stored Atlassian verdict (so a known-broken connection is never hidden), a
+    non-empty ``settings.jira_base_url`` or ``settings.jira_ac_field``, or an
+    ``atlassian`` entry on disk for a file-configured client. A failed lookup
+    answers False, which only ever removes Jira lines.
+    """
+    try:
+        if verdict_view:
+            return True
+        if str(settings.jira_base_url or "").strip():
+            return True
+        if str(settings.jira_ac_field or "").strip():
+            return True
+        from tools.jira_mcp import atlassian_entry_configured
+
+        return atlassian_entry_configured(workspace_roots)
+    except Exception:
+        logger.debug("jira-in-use check failed", exc_info=True)
+        return False
+
+
 async def _atlassian_autofix(fix: bool = False) -> tuple[list[str], list[str]]:
     """Write the hosted `atlassian` MCP entry when missing. (report_lines, advisories).
 
@@ -18744,16 +19531,25 @@ async def handle_setup_check(
             _verdict_state = "access_unconfirmed"
         else:
             _verdict_state = "verified"
-        _atlassian_lines, _atlassian_advisories = await _atlassian_autofix(fix=fix)
+        # G5: Jira is checked, mentioned and (with fix=true) written ONLY when it
+        # is already in use. A tester with no Jira sees no Jira line, and fix=true
+        # writes nothing for them; settings or an entry or a verdict keep today's
+        # behaviour, fix path included.
+        _jira_used = _jira_in_use(workspace_roots, _verdict_view)
+        if _jira_used:
+            _atlassian_lines, _atlassian_advisories = await _atlassian_autofix(fix=fix)
+        else:
+            _atlassian_lines, _atlassian_advisories = [], []
         recommended.extend(_atlassian_advisories)
         # verify_offered: the on-disk hint returns "" rather than shrugging
         # beside an answer this report has already given -- the Integrations
         # row states the Jira state in every verdict, including "checked when
         # you first ask for a ticket". The CONNECT wording (no entry on disk)
         # is unaffected and still appears.
-        _hint = connect_hint_line(
-            workspace_roots=workspace_roots,
-            verify_offered=True,
+        _hint = (
+            connect_hint_line(workspace_roots=workspace_roots, verify_offered=True)
+            if _jira_used
+            else ""
         )
         if _hint:
             optional.append(_hint)
@@ -18989,9 +19785,7 @@ async def handle_setup_check(
             + ("" if py_ok else " — 3.10 or newer required"),
             *([export_line] if export_line else []),
             "",
-            "### Integrations",
-            "- " + _jira_status_line,
-            "",
+            *(["### Integrations", "- " + _jira_status_line, ""] if _jira_used else []),
             *_tooling_lines(_tool_paths),
             "",
             "### Feature gates",

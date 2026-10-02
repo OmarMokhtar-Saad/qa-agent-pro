@@ -30,12 +30,21 @@ from tools.mobile import (
     paths,
     platform_info,
     sdk_locator,
+    watch,
 )
+from tools.untrusted import wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
-#: How often the boot poll asks the device.
-POLL_INTERVAL_S = 2.0
+#: How often the boot poll asks the device. Half a second (S16): a boot that
+#: finished, or an emulator that died, is seen within one short poll.
+POLL_INTERVAL_S = 0.5
+
+#: How often ``boot()`` asks adb whether the new emulator has a serial yet.
+#: Slower than :data:`POLL_INTERVAL_S` on purpose: a cold emulator takes tens
+#: of seconds to appear, each ask is an ``adb devices`` round trip, and a
+#: process that died is caught by ``exit_report`` on the same tick.
+BOOT_SERIAL_POLL_S = 2.0
 
 #: A booted device answers this with ``1``.
 BOOT_PROP = "sys.boot_completed"
@@ -49,9 +58,38 @@ def boot_timeout_s() -> int:
         return 240
 
 
+#: pid -> Popen for the last few emulators this process spawned, so the boot poll
+#: can ask "did it already die?" (Batch 1b, B5). Bounded by MAX_BOOT_RECORDS.
+_PROCS: dict[int, subprocess.Popen] = {}
+
+
 def _spawn(cmd: list[str], **kwargs) -> int:
-    """The detached-spawn seam. Returns the child pid."""
-    proc = subprocess.Popen(cmd, **kwargs)  # noqa: S603 - argv list, no shell
+    """The detached-spawn seam. Returns the child pid.
+
+    ``log_path`` is popped (it is not a Popen argument): when given, the child's
+    stdout AND stderr go to that file, TRUNCATED on every spawn so the log cannot
+    grow across starts. The emulator prints its own reason for refusing to start
+    there, which used to go to DEVNULL (B5). The parent closes its handle at
+    once; the child keeps its duplicate.
+    """
+    log_path = str(kwargs.pop("log_path", "") or "")
+    handle = None
+    if log_path:
+        try:
+            handle = open(log_path, "wb")  # noqa: SIM115 - closed in the finally below
+        except OSError:
+            logger.debug("mobile.emulator: cannot open %s", log_path, exc_info=True)
+        else:
+            kwargs["stdout"] = handle
+            kwargs["stderr"] = subprocess.STDOUT
+    try:
+        proc = subprocess.Popen(cmd, **kwargs)  # noqa: S603 - argv list, no shell
+    finally:
+        if handle is not None:
+            handle.close()
+    _PROCS[int(proc.pid)] = proc
+    while len(_PROCS) > MAX_BOOT_RECORDS:
+        _PROCS.pop(next(iter(_PROCS)), None)
     return int(proc.pid)
 
 
@@ -235,8 +273,10 @@ def note_started(avd: str, *, now: float | None = None) -> None:
 def recently_started(*, now: float | None = None) -> list[dict]:
     """``[{"avd", "age_s"}]`` for spawns younger than the TTL, oldest first.
 
-    Read ONLY when the device list is empty: a caller that has the device in
-    hand does not need to be told it is booting. Never raises.
+    Two kinds of reader: one that found the device list empty and wants to say
+    an emulator is still booting, and ``avd_manage``'s delete guard, which
+    reads it unconditionally so an AVD that was just started is not removed.
+    Never raises.
     """
     import time
 
@@ -256,9 +296,252 @@ def recently_started(*, now: float | None = None) -> list[dict]:
 def clear_started() -> None:
     """Forget every record. For tests."""
     _STARTED.clear()
+    _RUNS.clear()
+    _PROCS.clear()
 
 
-async def wait_boot(serial: str, timeout: int = 0, *, tunable: bool = True) -> dict:
+#: avd -> {"pid", "log"} for the emulators this process spawned (B5). Bounded by
+#: MAX_BOOT_RECORDS, oldest dropped first.
+_RUNS: dict[str, dict] = {}
+
+#: Characters of the emulator's own output quoted back to the tester.
+LOG_TAIL_CHARS = 600
+
+#: Seconds `emulator -accel-check` may run (B3). The Windows feature query in
+#: platform_info takes up to 60 s and is deliberately NOT used to explain an
+#: empty device list.
+ACCEL_CHECK_TIMEOUT_S = 10
+
+
+def _emulator_log_path(avd: str) -> str:
+    """``state/emulator-<avd>.log``, or ``""`` when the tree is unavailable.
+
+    There is no run folder yet when an emulator is spawned, so the log lives in
+    the shared ``state/`` dir; the file is truncated on every spawn (see
+    :func:`_spawn`).
+    """
+    safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in str(avd))[:60]
+    try:
+        return str(paths.state_file("emulator-" + safe + ".log"))
+    except Exception:
+        logger.debug("mobile.emulator: no log path", exc_info=True)
+        return ""
+
+
+def _note_run(avd: str, pid: int, log: str) -> None:
+    """Remember which pid/log belongs to *avd*. Never raises."""
+    name = str(avd or "").strip()[:120]
+    if not name:
+        return
+    _RUNS.pop(name, None)
+    _RUNS[name] = {"pid": int(pid or 0), "log": str(log or "")}
+    while len(_RUNS) > MAX_BOOT_RECORDS:
+        _RUNS.pop(next(iter(_RUNS)), None)
+
+
+def _log_tail(path: str) -> str:
+    """The informative end of an emulator log: error-ish lines first. Never raises."""
+    if not path:
+        return ""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - LOG_TAIL_CHARS * 4))
+            raw = fh.read()
+    except OSError:
+        return ""
+    text = "".join(
+        c for c in raw.decode("utf-8", errors="replace") if c.isprintable() or c == "\n"
+    )
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    errs = [
+        ln
+        for ln in lines
+        if any(k in ln.upper() for k in ("ERROR", "PANIC", "FATAL", "FAILED"))
+    ]
+    return " | ".join((errs or lines)[-6:])[-LOG_TAIL_CHARS:]
+
+
+def accel_fix(output: str = "") -> str:
+    """The per-platform fix for a failed hardware-acceleration check.
+
+    Uses the fix TEXT only. ``platform_info.virtualization()`` and the privilege
+    probe are not called: they can take a minute, and this runs while a tester
+    waits for an empty device list to be explained.
+    """
+    if platform_info.is_windows():
+        return platform_info._WHPX_FIX
+    if platform_info.is_macos():
+        return platform_info._HVF_FIX
+    return (
+        "On Linux the emulator needs KVM. Check `ls -l /dev/kvm`, install your "
+        "distribution's qemu-kvm / cpu-checker package, make sure virtualization is "
+        "enabled in the BIOS/UEFI, and add your user to the `kvm` group "
+        "(`sudo usermod -aG kvm $USER`, then log out and back in)."
+    )
+
+
+def _accel_check_sync() -> dict:
+    """Bounded ``emulator -accel-check``. ``content.ok`` is None when undetermined."""
+    try:
+        located = (sdk_locator.locate_sdk() or {}).get("content") or {}
+        binary = str((located.get("tools") or {}).get("emulator") or "")
+        if not binary:
+            return {
+                "error": "The Android emulator binary was not found.",
+                "content": None,
+            }
+        rc, out, err = platform_info._run_sync(
+            [binary, "-accel-check"], timeout=ACCEL_CHECK_TIMEOUT_S
+        )
+        text = " ".join((out + "\n" + err).split())[:400]
+        if rc == 124:
+            return {
+                "error": None,
+                "content": {"ok": None, "timed_out": True, "output": text, "fix": ""},
+            }
+        if rc in (126, 127):
+            return {
+                "error": text or "emulator -accel-check could not run",
+                "content": None,
+            }
+        ok = rc == 0
+        return {
+            "error": None,
+            "content": {
+                "ok": ok,
+                "timed_out": False,
+                "output": text,
+                "fix": "" if ok else accel_fix(text),
+            },
+        }
+    except Exception as exc:
+        logger.exception("mobile.emulator.accel_check failed")
+        return {"error": str(exc), "content": None}
+
+
+async def accel_check() -> dict:
+    """``emulator -accel-check`` on a worker thread, bounded by ACCEL_CHECK_TIMEOUT_S."""
+    return await asyncio.to_thread(_accel_check_sync)
+
+
+async def diagnose_no_devices() -> dict:
+    """Why ``qa_list_devices`` is empty: the AVDs on file and the acceleration verdict.
+
+    ``{"avds": [...], "avd_error": str, "accel": {...} | None}``. Both probes run
+    together under one bound of ``ACCEL_CHECK_TIMEOUT_S + 2`` s. Never raises and
+    never calls ``platform_info.virtualization`` (B3).
+    """
+    diag: dict = {"avds": [], "avd_error": "", "accel": None}
+    try:
+        avds, accel = await asyncio.wait_for(
+            asyncio.gather(list_avds(), accel_check()),
+            timeout=ACCEL_CHECK_TIMEOUT_S + 2,
+        )
+    except Exception:
+        logger.debug("mobile.emulator.diagnose_no_devices failed", exc_info=True)
+        diag["avd_error"] = "The emulator diagnosis did not finish in time."
+        return diag
+    if avds.get("error"):
+        diag["avd_error"] = str(avds["error"])[:300]
+    else:
+        diag["avds"] = [str(n) for n in (avds.get("content") or [])][:20]
+    if not accel.get("error"):
+        diag["accel"] = accel.get("content")
+    return diag
+
+
+def render_no_devices_hint(diag: dict) -> str:
+    """Tester-facing paragraph for an empty device list. Empty string if nothing to say."""
+    parts: list[str] = []
+    avds = list((diag or {}).get("avds") or [])
+    if avds:
+        parts.append(
+            "Emulators (AVDs) you can start: "
+            + ", ".join(avds)
+            + ". Call `qa_mobile_test` with `avd` set to one of them."
+        )
+    elif (diag or {}).get("avd_error"):
+        parts.append(str(diag["avd_error"]))
+    else:
+        parts.append(
+            "No emulator (AVD) is defined. Create one in Android Studio's Device "
+            "Manager, or attach a phone with USB debugging on."
+        )
+    accel = (diag or {}).get("accel") or {}
+    if accel.get("timed_out"):
+        parts.append(
+            f"`emulator -accel-check` did not answer within {ACCEL_CHECK_TIMEOUT_S} s, so "
+            "hardware acceleration is undetermined. " + accel_fix("")
+        )
+    elif accel.get("ok") is False:
+        parts.append(
+            "Hardware acceleration is NOT available ("
+            + str(accel.get("output") or "no detail")[:300]
+            + "). Fix: "
+            + str(accel.get("fix") or accel_fix(""))
+        )
+    return " ".join(parts)
+
+
+def _exit_fix(tail: str) -> str:
+    """A fix chosen from the emulator's own words; the generic one is last."""
+    low = tail.lower()
+    if any(k in low for k in ("whpx", "haxm", "hvf", "kvm", "hypervisor", "accel")):
+        return accel_fix(tail)
+    if any(k in low for k in ("already running", "same avd", "multiple emulators")):
+        return "Another emulator is already using this AVD. Close its window (or run `adb -s <serial> emu kill`), then retry."
+    if any(
+        k in low
+        for k in ("unknown avd", "no such avd", "could not find avd", "cannot find avd")
+    ):
+        return "The emulator does not know this AVD name. Run `emulator -list-avds` and pass one of those names."
+    if "no space" in low or "disk" in low:
+        return "The disk is full or read-only. Free space under the Android AVD folder, then retry."
+    return "Start this AVD once from Android Studio's Device Manager to see the same error in its window, then fix what it names."
+
+
+def exit_report(
+    avd: str, *, when: str = "before it appeared in `adb devices`"
+) -> dict | None:
+    """None while *avd*'s emulator is running or unknown; else what it said when it died.
+
+    ``{"avd", "code", "log", "error"}``. One-shot: reporting CONSUMES the record, so
+    the next start is not answered with the last failure. A zero exit with nothing
+    error-like in the log is not reported (on Windows the launcher may hand off to
+    a child and exit 0).
+    """
+    name = str(avd or "").strip()[:120]
+    run = _RUNS.get(name)
+    if not run:
+        return None
+    proc = _PROCS.get(int(run.get("pid") or 0))
+    if proc is None:
+        return None
+    code = proc.poll()
+    if code is None:
+        return None
+    tail = _log_tail(str(run.get("log") or ""))
+    if code == 0 and not tail:
+        return None
+    _RUNS.pop(name, None)
+    _STARTED.pop(name, None)
+    return {
+        "avd": name,
+        "code": int(code),
+        "log": str(run.get("log") or ""),
+        "error": (
+            f"{name}'s emulator exited with code {code} {when}. "
+            f"Its own output: {wrap_untrusted('emulator log', tail, limit=600) or 'nothing was captured'}. "
+            f"Fix: {_exit_fix(tail)} Full log: {run.get('log') or 'not captured'}"
+        ),
+    }
+
+
+async def wait_boot(
+    serial: str, timeout: int = 0, *, tunable: bool = True, avd: str = ""
+) -> dict:
     """Poll until ``sys.boot_completed`` is ``1``.
 
     ``adb wait-for-device`` returns as soon as adbd answers, which is minutes
@@ -273,12 +556,22 @@ async def wait_boot(serial: str, timeout: int = 0, *, tunable: bool = True) -> d
     pointer rather than waiting (:func:`session.ensure_device`, 20s). There the
     setting cannot move this wait, and a remedy naming it sends the tester to
     turn a knob that is not connected to anything they can see.
+
+    WATCHED (S16): with *avd* named, an emulator process that exits mid-boot
+    ends the wait at once in its own words (:func:`exit_report`) instead of
+    after the whole budget, and every poll may send the host a progress line.
     """
     try:
         budget = int(timeout or boot_timeout_s())
         deadline = time.monotonic() + budget
         last = ""
+        ticker = watch.Ticker("emulator booting")
         while time.monotonic() < deadline:
+            if avd:
+                gone = exit_report(avd, when="before it finished booting")
+                if gone:
+                    return {"error": gone["error"], "content": None}
+            await ticker.tick()
             prop = await adb.getprop(serial, BOOT_PROP)
             last = (
                 str(prop.get("content") or "")
@@ -379,10 +672,14 @@ async def start(avd: str, *, locale: str = "") -> dict:
             "stderr": subprocess.DEVNULL,
         }
         kwargs.update(platform_info.detach_kwargs())
+        log_path = _emulator_log_path(str(avd))
+        if log_path:
+            kwargs["log_path"] = log_path
         pid = _spawn(command, **kwargs)
         # Recorded AFTER the spawn returned, so a failed spawn is never listed
         # as booting (fix round 3, item 5).
         note_started(str(avd))
+        _note_run(str(avd), pid, log_path)
         return {"error": None, "content": {"pid": pid}}
     except Exception as exc:
         logger.exception("mobile.emulator.start failed")
@@ -447,10 +744,18 @@ async def boot(avd: str, timeout: int = 0) -> dict:
 
         deadline = time.monotonic() + budget
         serial = ""
+        ticker = watch.Ticker("emulator starting")
         while time.monotonic() < deadline and not serial:
-            await asyncio.sleep(POLL_INTERVAL_S)
+            await asyncio.sleep(BOOT_SERIAL_POLL_S)
+            await ticker.tick()
             found = (await find_running(avd)).get("content") or {}
             serial = str(found.get("serial") or "")
+            if not serial:
+                # B5: a process that already died will never appear in adb.
+                # Say so now, in the emulator's own words, not after the budget.
+                gone = exit_report(avd)
+                if gone:
+                    return {"error": gone["error"], "content": None}
         if not serial:
             return {
                 "error": (
@@ -464,7 +769,9 @@ async def boot(avd: str, timeout: int = 0) -> dict:
                 ),
                 "content": None,
             }
-        waited = await wait_boot(serial, max(1, int(deadline - time.monotonic())))
+        waited = await wait_boot(
+            serial, max(1, int(deadline - time.monotonic())), avd=avd
+        )
         if waited.get("error"):
             return waited
         return {

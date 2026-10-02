@@ -468,8 +468,12 @@ def workspace_contains_server_warning(
             except Exception:
                 continue
             same = candidate == root
-            root_inside_candidate = root != candidate and root_is_relative(root, candidate)
-            candidate_inside_root = candidate != root and root_is_relative(candidate, root)
+            root_inside_candidate = root != candidate and root_is_relative(
+                root, candidate
+            )
+            candidate_inside_root = candidate != root and root_is_relative(
+                candidate, root
+            )
             if same or root_inside_candidate or candidate_inside_root:
                 return (
                     "**Your open workspace contains this MCP server's own source "

@@ -157,9 +157,14 @@ MAX_FREE_STOPS = 2
 #: has its own evidence behind it.
 REASON_BUDGET = "budget"
 REASON_SELECTOR = "selector"
+#: A ``visual`` assert stop: the plan did what it said and asked for the
+#: picture, so it is not an escape. Capped so a model cannot use it to loop.
+REASON_VISUAL = "visual"
+MAX_VISUAL_STOPS = 3
 UNCHARGED_CAPS = {
     REASON_BUDGET: MAX_BUDGET_STOPS,
     REASON_SELECTOR: MAX_FREE_STOPS,
+    REASON_VISUAL: MAX_VISUAL_STOPS,
 }
 
 
@@ -533,7 +538,7 @@ async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
 #: CLEAR sent to a keyboard that is not active is the same silence a TYPE would
 #: be. Stated as a set rather than an `op == "type"` test so a fourth text op
 #: added later is caught by the same reader.
-TEXT_OPS = frozenset({"type", "clear"})
+TEXT_OPS = frozenset({"type", "fill", "clear"})
 
 
 def script_types(script: object) -> bool:
@@ -599,7 +604,14 @@ async def submit_case(
                 }
             raw_script = {"actions": combined["actions"]}
 
-        parsed = actions_mod.parse_script(raw_script)
+        # A folded queue was already held to both caps by the combine, so only
+        # a bare submission is held to the model cap here.
+        parsed = actions_mod.parse_script(
+            raw_script,
+            max_actions=(
+                actions_mod.MAX_ACTIONS if queued_in else actions_mod.MAX_MODEL_ACTIONS
+            ),
+        )
         if parsed.get("error"):
             # A refused script is NOT an escape: nothing was replayed, so the
             # planner gets the same screen back and one of its escapes is not
@@ -630,21 +642,10 @@ async def submit_case(
         if script_types(parsed["content"]):
             ready = await ime_session.ensure_ready(ctx.serial, run_id)
             if ready.get("error"):
-                return {
-                    "error": None,
-                    "content": _checkpoint(
-                        run_id,
-                        tc_id,
-                        view,
-                        verdict="",
-                        status=NEEDS_MODEL,
-                        reason=str(ready["error"]),
-                        trace=[],
-                        escapes=escapes_used(run_id, tc_id),
-                        packet=None,
-                        queued_actions=queued_in,
-                    ),
-                }
+                # R1d: NO early return. The case runs with typing over stdin; the
+                # replay attaches the fallback notice (why, and the exact fix) to
+                # the result. The failure is memoised per run by ensure_ready.
+                ctx.typing_fallback = str(ready["error"])[:400]
 
         ctx.screen = screen if isinstance(screen, dict) else None
         # The pixels of this step. Started BEFORE the replay and stopped after
@@ -656,7 +657,13 @@ async def submit_case(
         clip = (
             await media.start_clip(run_id, tc_id, parsed["content"], ctx.serial)
         ).get("content")
+        fallback_before = str(getattr(ctx, "typing_fallback", "") or "")
         replayed = await executor.replay(parsed["content"], ctx)
+        fallback_after = str(getattr(ctx, "typing_fallback", "") or "")
+        if fallback_after and not fallback_before:
+            # R1d: the keyboard was ready but would not come up inside the replay.
+            # Memoise it so the next typing case does not retry the install.
+            ime_session.write_fallback(run_id, fallback_after)
         if replayed.get("error"):
             # THE LEAK THIS PATH WOULD OTHERWISE BE. This returns BEFORE the
             # `finish_step` below, so the recorder started two lines up would
@@ -801,6 +808,8 @@ async def submit_case(
             reason_key = REASON_BUDGET
         elif bool(result.get("selector_stale")) and not result.get("actuated"):
             reason_key = REASON_SELECTOR
+        elif result.get("visual_check"):
+            reason_key = REASON_VISUAL
         if reason_key and uncharged[reason_key] < UNCHARGED_CAPS[reason_key]:
             uncharged[reason_key] += 1
             # ONE number per reason. This used to read MAX_BUDGET_STOPS while
@@ -996,6 +1005,7 @@ def _prior_uncharged(prior: object) -> dict:
     for reason, legacy in (
         (REASON_BUDGET, "budget_stops"),
         (REASON_SELECTOR, "free_stops"),
+        (REASON_VISUAL, ""),
     ):
         value = _uncharged_count(merged.get(reason))
         if value is None:

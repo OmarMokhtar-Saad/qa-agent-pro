@@ -196,6 +196,21 @@ def retry_timeout_s(remaining: float | None, full_s: float) -> float | None:
         return None
     return min(float(full_s), left)
 
+
+#: ... and when one was taken but NOT sent (S1, dump-first). The element list
+#: was judged enough for this screen, so the picture was kept for the report
+#: only. The two ways to get it are named, because a model that cannot see a
+#: route to the picture guesses instead.
+NOT_ATTACHED_NOTE = (
+    "No image of this screen is attached: the element list above was judged "
+    "enough to act on, so the screenshot was kept for the report only. If the "
+    "list is not enough -- or the case needs a VISUAL judgement (layout, "
+    "colour, an image, a chart) -- either pass screenshot=true on your next "
+    "qa_submit_mobile_step (or qa_mobile_test with this run_id), or end your "
+    'script with {"op": "assert", "kind": "visual", '
+    '"note": "<what to judge>"} and the next reply carries the picture.'
+)
+
 #: ... and when none was attempted, because this reply cannot carry one.
 #:
 #: A DIFFERENT name from the note above on purpose: "it failed" and "it was

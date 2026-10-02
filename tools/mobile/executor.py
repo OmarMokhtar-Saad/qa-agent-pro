@@ -41,9 +41,19 @@ import re
 import time
 
 from tools.mobile import actions as actions_mod
-from tools.mobile import adb, app_knowledge, dump_latency, ime, perception, step_timing
+from tools.mobile import (
+    adb,
+    app_knowledge,
+    dump_latency,
+    fill_label,
+    ime,
+    perception,
+    step_timing,
+    watch,
+)
 from tools.mobile.providers import base as providers_base
 from tools.mobile.providers import composite
+from tools.untrusted import wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -157,8 +167,7 @@ QA_IME_SEEN_CAP = 40
 #: after this goes nowhere, so nothing is attempted.
 QA_IME_NOT_ACTIVE = (
     "The QA keyboard is not the active input method (active: %s), so "
-    "nothing was typed. Restart the run with `qa_mobile_test`. "
-    + NO_FABRICATION_NOTE
+    "nothing was typed. Restart the run with `qa_mobile_test`. " + NO_FABRICATION_NOTE
 )
 #: The SAME stop, for a run whose charter says ``destructive: none``. A
 #: SEPARATE sentence because both halves of :data:`GUARD_DETAIL` are wrong
@@ -246,30 +255,24 @@ STATUS_UNVERIFIED = "unverified"
 #: and asserts the ordering this reasoning rests on.
 WAIT_POLL_S = 0.25
 
-#: The shortest bare ``wait ms`` worth POLLING rather than sleeping through.
-#:
-#: Polling is not free: one iteration costs :data:`WAIT_POLL_S` plus a full
-#: dump. Below this a poll cannot return earlier than the sleep it replaced, so
-#: ``_wait_until_changed`` is not entered at all and the sleep runs exactly as
-#: it shipped. Graded by
-#: ``test_a_short_wait_is_not_polled_because_polling_it_is_slower``, which is
-#: the only fixture where THIS clause alone decides the outcome.
-POLL_MIN_WAIT_MS = 4000
+#: The longest :func:`_auto_settle` keeps reading after a screen-changing
+#: action whose first post-action read showed NO change (owner decision, batch
+#: 3). A slow app paints its next screen after the dump that followed the tap,
+#: and that read used to be handed back as ``no_change`` -- so the model tapped
+#: again. Bounded, because a tap that really did nothing must still say so.
+AUTO_SETTLE_MAX_S = 2.0
 
-#: How much budget must remain before a polling ``wait`` starts one more
-#: iteration.
-#:
-#: A SEPARATE constant from the threshold above, and deliberately so: they gate
-#: different things, and while one value did both jobs neither clause could be
-#: graded -- every fixture that exercised one also satisfied the other, which is
-#: the shape this project calls a mutant that reports a kill it did not earn.
-#:
-#: The relation that decides it: this must EXCEED one dump, or the last
-#: iteration's dump lands after the deadline and the wait overruns the ms the
-#: script declared -- which would quietly make ``actions.MAX_TOTAL_WAIT_MS`` an
-#: underestimate of what one script can spend. Graded by
-#: ``test_a_polled_wait_never_starts_a_poll_it_cannot_finish``.
-MIN_POLL_MARGIN_MS = 2500
+#: Screen-changing ops that do NOT auto-settle: a field edit changes one
+#: element in place, and polling for a "change" after it would spend the whole
+#: bound on every keystroke the IME already confirmed.
+NO_AUTO_SETTLE_OPS = frozenset({"type", "fill", "clear"})
+
+#: The longest a legacy ``wait ms`` runs, now that it runs as
+#: ``wait_until_changed`` (S17): the condition waits' own ceiling. There is no
+#: floor below which a wait is slept instead of polled, and no top-up sleep
+#: after an unchanged screen -- every wait ends on its condition or its bound.
+#: Nothing overruns the bound: each poll's dump is cut at the deadline.
+LEGACY_WAIT_MAX_MS = actions_mod.WAIT_UNTIL_MAX_S * 1000
 
 #: The bound for ``wait`` with ``until_text`` and no explicit ``ms`` -- keeps a
 #: script that forgot to set ms from polling forever.
@@ -364,6 +367,17 @@ class Context:
     # a direct ``Context(...)`` test may preset it. Never written by a guard
     # except through ``_apply_knowledge``.
     knowledge: dict | None = None
+    # Non-empty when the QA keyboard could not be set up and typing goes through
+    # `adb shell input text` instead (R1d). Holds the reason. Set by the replay
+    # itself or by the case runner; empty (the default) is the normal path.
+    typing_fallback: str = ""
+    # Set by a wait that ended EARLY because something new took the screen
+    # (a dialog, a call, an error text, a device that stopped answering): the
+    # "interrupted: <what>" sentence. Read and cleared by the `wait` branch.
+    wait_interruption: str = ""
+    # S10 saved route (PROVISIONAL): the screen_id each step must START on, in script order.
+    # Empty = not a route replay. Set by session.submit; read ONLY by _route_expected.
+    route_expect: tuple = ()
 
 
 #: The ONLY ops the destructive guard skips, because none can actuate anything:
@@ -404,7 +418,7 @@ def inert_ops(trace: object) -> list[str]:
             continue
         action = entry.get("action")
         op = str((action or {}).get("op") or "") if isinstance(action, dict) else ""
-        if not op or op == "wait" or op in NON_ACTUATING_OPS:
+        if not op or op in actions_mod.WAIT_OPS or op in NON_ACTUATING_OPS:
             continue
         if op not in out:
             out.append(op)
@@ -835,11 +849,12 @@ def is_destructive(text: object) -> bool:
     return bool(destructive_hit(text))
 
 
-async def dump_raw(serial: str) -> dict:
+async def dump_raw(serial: str, *, use_provider: bool = True) -> dict:
     """ONE raw ``uiautomator dump`` for a caller outside :func:`_dump`.
 
     Session open, the case lane's foreground loop and the explore turn read
-    the raw dump themselves. Calling ``adb.uiautomator_dump`` directly would
+    the raw dump themselves; the a11y parity check passes ``use_provider=False``
+    because it needs uiautomator's own answer, not the fast dump it is judging. Calling ``adb.uiautomator_dump`` directly would
     start a second dump beside one :func:`_dump` left running after a cut, on
     the same ``adb.DUMP_REMOTE_PATH`` (fix round 3, item 4). This takes the
     same guard: join the dump in flight, start this one through
@@ -847,7 +862,9 @@ async def dump_raw(serial: str) -> dict:
     shielded, so a caller's own ``wait_for`` cancels the wait, never the dump.
     """
     await dump_latency.join(serial)
-    task = dump_latency.start(serial, adb.uiautomator_dump(serial))
+    task = dump_latency.start(
+        serial, adb.uiautomator_dump(serial, use_provider=use_provider)
+    )
     return await asyncio.shield(task)
 
 
@@ -1313,7 +1330,10 @@ def _typed_by_script(trace: list[dict]) -> set:
     out: set = set()
     for item in trace or []:
         action = item.get("action")
-        if not isinstance(action, dict) or str(action.get("op") or "") != "type":
+        if not isinstance(action, dict) or str(action.get("op") or "") not in (
+            "type",
+            "fill",
+        ):
             continue
         value = " ".join(str(action.get("text") or "").split())
         if value:
@@ -1445,9 +1465,7 @@ def _consume_confirm(
     return True
 
 
-def _with_confirm_hint(
-    detail: str, op: str, hit: str, mismatched: bool = False
-) -> str:
+def _with_confirm_hint(detail: str, op: str, hit: str, mismatched: bool = False) -> str:
     """:data:`CONFIRM_HINT` on a control stop; any other stop is unchanged."""
     if detail != _control_detail(hit):
         return detail
@@ -1468,6 +1486,11 @@ def _confirmed(entry: dict, detail: str) -> str:
         + "): "
         + detail
     ).strip()
+
+
+def _typer(fallback: str):
+    """The typing function for this replay: the fallback one when the keyboard is down."""
+    return ime.type_via_input if fallback else ime.type_text
 
 
 async def _qa_ime_blocker(serial: str) -> dict | None:
@@ -1520,6 +1543,51 @@ def _unchanged(
     return str(after_id) == str(before_id)
 
 
+async def _auto_settle(ctx: Context, screen: object, before_hash: str) -> object:
+    """Keep reading after an action whose first read showed no change.
+
+    Owner decision (batch 3): poll every :data:`WAIT_POLL_S`. Once the content
+    hash differs from *before_hash*, the screen is moving, and the read handed
+    back is the first of two IDENTICAL reads in a row with the same focused
+    activity -- a transition is not handed over mid-animation. A screen that
+    never changes ends at :data:`AUTO_SETTLE_MAX_S` and the caller reports
+    ``no_change`` exactly as before.
+
+    Never raises and never fails the step: a dump error or a cut dump returns
+    the latest good read, which is at worst the read the caller already had.
+    Each dump is cut at the deadline, so the bound is the wall clock.
+    """
+    deadline = time.monotonic() + AUTO_SETTLE_MAX_S
+    current = screen
+    moving = False
+    last: tuple | None = None
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return current
+        await _sleep(min(WAIT_POLL_S, left))
+        if time.monotonic() >= deadline:
+            return current
+        dumped = await _dump(ctx, deadline=deadline)
+        if dumped.get("error"):
+            return current
+        current = dumped.get("content")
+        read_hash = _screen_hash(current)
+        if not read_hash:
+            return current
+        if not moving:
+            if read_hash == before_hash:
+                continue
+            moving = True
+        key = (
+            read_hash,
+            await _focus_probe(ctx.serial, deadline - time.monotonic()),
+        )
+        if key == last:
+            return current
+        last = key
+
+
 async def _settle(
     ctx: Context,
     entry: dict,
@@ -1565,12 +1633,25 @@ async def _settle(
     # simultaneously the only site stamping a look AND a second derivation of
     # the id. One call answers both.
     _stamp_after(entry, screen)
-    if mark_no_change and _unchanged(
+    unchanged = mark_no_change and _unchanged(
         before_hash,
         entry["after_screen_hash"],
         before_id,
         entry["after_screen_id"],
-    ):
+    )
+    # AUTO-SETTLE only on a read this call took itself: a skipped redump
+    # (`launch` brought to front) already decided nothing moved, and a wait's
+    # own poll (`mark_no_change=False`) is its own settle.
+    if unchanged and redump and before_hash and str(op or "") not in NO_AUTO_SETTLE_OPS:
+        screen = await _auto_settle(ctx, screen, before_hash)
+        _stamp_after(entry, screen)
+        unchanged = _unchanged(
+            before_hash,
+            entry["after_screen_hash"],
+            before_id,
+            entry["after_screen_id"],
+        )
+    if unchanged:
         entry["outcome"] = "no_change"
 
     # The app is not where the script thinks it is. Recorded on the ACTION that
@@ -1605,37 +1686,169 @@ async def _settle(
 
 
 async def _wait_until_text(
-    ctx: Context, screen: object, text: str, ms: int, *, bounded: bool = False
+    ctx: Context, screen: object, text: str, ms: int, *, gone: bool = False
 ) -> tuple[bool, object, bool]:
-    """Poll the screen until *text* appears or the budget runs out.
+    """Poll the screen until *text* appears (or, with *gone*, is no longer on
+    it) or the budget runs out.
 
     Returns ``(found, latest_screen, timed_out)``. ``ms`` is the caller's cap;
     ``0`` falls back to :data:`DEFAULT_WAIT_UNTIL_TEXT_S` so a script that
     forgot to set it does not poll forever.
 
-    ``bounded`` (a saved-note guard) makes ``ms`` a HARD limit: each poll's
-    sleep stops at the deadline and each dump is cut there
-    (``_dump(ctx, deadline=...)``, as :func:`_wait_until_changed` does), so a
-    slow dump cannot carry the guard past the budget it was given. A script's
-    own ``until_text`` keeps the unbounded dump.
+    WATCHED (B6/S16): a poll that finds something NEW in front of the app -- a
+    system dialog, a call, another app, an error text -- or a device that
+    stopped answering ends the wait at once with ``(False, screen, False)``
+    and the sentence in ``ctx.wait_interruption``. It used to keep polling a
+    covered screen until the whole budget was gone.
+    """
+    if gone:
+        return await _wait_for(
+            ctx,
+            screen,
+            ms,
+            lambda _previous, current: not _screen_has(current, text),
+            "waiting for " + repr(str(text)[:40]) + " to go",
+        )
+    return await _wait_for(
+        ctx,
+        screen,
+        ms,
+        lambda _previous, current: _screen_has(current, text),
+        "waiting for " + repr(str(text)[:40]),
+    )
+
+
+async def _wait_until_idle(
+    ctx: Context, screen: object, ms: int
+) -> tuple[bool, object, bool]:
+    """Poll until two reads in a row are the same screen (S17).
+
+    The screen in hand is NOT the first of the two: it may be a read taken
+    mid-animation, so idle is only ever claimed from two polls. Same return
+    and interruptions as :func:`_wait_until_text`.
+    """
+    return await _wait_for(
+        ctx,
+        screen,
+        ms,
+        lambda previous, current: (
+            previous is not None and _screen_hash(previous) == _screen_hash(current)
+        ),
+        "waiting for the screen to settle",
+    )
+
+
+async def _wait_for(
+    ctx: Context,
+    screen: object,
+    ms: int,
+    met,
+    label: str,
+) -> tuple[bool, object, bool]:
+    """THE watched condition poll behind the text, gone and idle waits.
+
+    ``met(previous, current)`` is the condition; ``previous`` is ``None``
+    until a poll has replaced the screen the wait started on.
     """
     budget = (ms / 1000.0) if ms else DEFAULT_WAIT_UNTIL_TEXT_S
     deadline = time.monotonic() + budget
+    previous: object = None
     current = screen
+    ticker = watch.Ticker(label)
     while True:
-        if _screen_has(current, text):
+        if met(previous, current):
             return True, current, False
+        interruption = _interruption_of(ctx, current, screen)
+        if interruption:
+            ctx.wait_interruption = interruption
+            return False, current, False
         if time.monotonic() >= deadline:
             return False, current, True
-        await _sleep(
-            min(WAIT_POLL_S, max(0.0, deadline - time.monotonic()))
-            if bounded
-            else WAIT_POLL_S
-        )
-        dumped = await _dump(ctx, deadline=deadline if bounded else None)
-        if dumped.get("error"):
+        await _sleep(min(WAIT_POLL_S, max(0.0, deadline - time.monotonic())))
+        if time.monotonic() >= deadline:
             return False, current, True
-        current = dumped.get("content")
+        # Cut at the deadline like every other poll's dump, so a slow dump
+        # cannot carry the wait past its bound. A cut is the bound running
+        # out, never a device interruption.
+        dumped = await _dump(ctx, deadline=deadline)
+        if dumped.get("error") == DUMP_CUT_DETAIL:
+            return False, current, True
+        if dumped.get("error"):
+            ctx.wait_interruption = watch.classify_error(dumped["error"])
+            return False, current, not ctx.wait_interruption
+        previous, current = current, dumped.get("content")
+        await ticker.tick()
+
+
+def _wait_spec(action: object, items: object) -> tuple[str, str, int]:
+    """``(kind, text, ms)`` for any wait op: the one mapping from the legacy
+    ``wait`` onto the condition waits (S17, owner decision).
+
+    ``wait until_text`` is ``wait_until_text``, with its split bare share of
+    the total when it set no ms; ``wait ms`` is ``wait_until_changed`` bounded
+    by that ms and clipped to :data:`LEGACY_WAIT_MAX_MS` -- still parsed, never
+    refused, and never a fixed sleep.
+    """
+    op = str(getattr(action, "op", "") or "")
+    if op == "wait":
+        until_text = str(getattr(action, "until_text", "") or "").strip()
+        ms = int(getattr(action, "ms", 0) or 0)
+        until_rid = str(getattr(action, "until_rid", "") or "").strip()
+        if until_rid:
+            return "element", until_rid, ms or actions_mod.bare_wait_ms_each(items)
+        if until_text:
+            return "text", until_text, ms or actions_mod.bare_wait_ms_each(items)
+        return "changed", "", min(ms, LEGACY_WAIT_MAX_MS)
+    ms = int(float(getattr(action, "max_s", 0) or 0) * 1000)
+    kind = op[len("wait_until_") :]
+    return kind, str(getattr(action, "text", "") or "").strip(), ms
+
+
+def _wait_words(kind: str, text: str) -> tuple[str, str, str]:
+    """``(met, timed_out, doing)`` -- the trace sentences for one wait kind."""
+    quoted = repr(text[:120])
+    if kind == "gone":
+        return (
+            quoted + " is gone",
+            "timed out waiting for " + quoted + " to go",
+            "waiting for " + quoted + " to go",
+        )
+    if kind == "idle":
+        return (
+            "the screen settled",
+            "timed out waiting for the screen to settle",
+            "waiting for the screen to settle",
+        )
+    return (
+        "found " + quoted,
+        "timed out waiting for " + quoted,
+        "waiting for " + quoted,
+    )
+
+
+def _secs(ms: int) -> str:
+    """``8000`` -> ``"8s"``, ``2500`` -> ``"2.5s"``."""
+    return ("%g" % (ms / 1000.0)) + "s"
+
+
+def _interruption_of(ctx: Context, screen: object, baseline: object) -> str:
+    """``"interrupted: <what>"`` for what is NEW on *screen* since *baseline*.
+
+    ``""`` when nothing new took the screen. Only NEW facts count: a dialog
+    that was already up when the wait began is the screen the model chose to
+    wait on, not an interruption of it.
+    """
+    package = _screen_package(screen)
+    before_package = _screen_package(baseline)
+    named = watch.classify_package(package, before_package)
+    if named:
+        return named
+    dialog = system_dialog_package(screen)
+    if dialog and dialog != system_dialog_package(baseline):
+        return watch.PREFIX + system_dialog_detail(dialog)
+    if package and ctx.package and package != ctx.package and before_package != package:
+        return watch.PREFIX + left_app_detail(package, ctx.package)
+    return watch.classify_texts(_texts(screen) - _texts(baseline))
 
 
 async def _wait_until_element(
@@ -1645,31 +1858,19 @@ async def _wait_until_element(
     text: str,
     gone: bool,
     ms: int,
-    *,
-    bounded: bool = False,
 ) -> tuple[bool, object, bool]:
     """Poll until an element with resource id *rid* is on the screen (or, with
-    *gone*, is not). Same contract as :func:`_wait_until_text`, ``bounded``
-    included: ``(satisfied, latest_screen, timed_out)``; ``ms == 0`` falls back
-    to the default budget.
+    *gone*, is not). ``(satisfied, latest_screen, timed_out)``; ``ms == 0``
+    falls back to the default budget. Watched and hard-bounded by
+    :func:`_wait_for`, the same as the text, gone and idle waits.
     """
-    budget = (ms / 1000.0) if ms else DEFAULT_WAIT_UNTIL_TEXT_S
-    deadline = time.monotonic() + budget
-    current = screen
-    while True:
-        if _screen_has_element(current, rid, text) != gone:
-            return True, current, False
-        if time.monotonic() >= deadline:
-            return False, current, True
-        await _sleep(
-            min(WAIT_POLL_S, max(0.0, deadline - time.monotonic()))
-            if bounded
-            else WAIT_POLL_S
-        )
-        dumped = await _dump(ctx, deadline=deadline if bounded else None)
-        if dumped.get("error"):
-            return False, current, True
-        current = dumped.get("content")
+    return await _wait_for(
+        ctx,
+        screen,
+        ms,
+        lambda _previous, current: _screen_has_element(current, rid, text) != gone,
+        "waiting for element " + repr(str(rid)[:40]) + (" to go" if gone else ""),
+    )
 
 
 def _load_knowledge(ctx: Context) -> None:
@@ -1736,7 +1937,9 @@ def _action_rids(action: object, screen: object) -> list:
     target = getattr(action, "target", None)
 
     def pick(name: str) -> str:
-        raw = target.get(name) if isinstance(target, dict) else getattr(target, name, "")
+        raw = (
+            target.get(name) if isinstance(target, dict) else getattr(target, name, "")
+        )
         return " ".join(str(raw or "").split()).lower()
 
     rids = [pick("rid")] if pick("rid") else []
@@ -1750,7 +1953,8 @@ def _action_rids(action: object, screen: object) -> list:
         if not isinstance(element, dict) or not element.get("rid"):
             continue
         labels = [
-            " ".join(str(element.get(f) or "").split()).lower() for f in ("text", "desc")
+            " ".join(str(element.get(f) or "").split()).lower()
+            for f in ("text", "desc")
         ]
         by_id = bool(want_id) and str(element.get("id") or "").lower() == want_id
         if by_id or any(w in label for w in words for label in labels if label):
@@ -1775,7 +1979,8 @@ async def _apply_knowledge(
     smallest of the note's ms, ``MAX_WAIT_MS``, what the script's waits leave of
     ``MAX_TOTAL_WAIT_MS`` after the guard waits already spent, and the time left
     to the replay deadline. A timeout PROCEEDS and is buffered as
-    ``contradicted``. This decides nothing about the destructive guard, which
+    ``contradicted``; an interruption proceeds too, logged as ``interrupted``
+    and tallied neither way. This decides nothing about the destructive guard, which
     still runs after and outranks it. Never raises.
     """
     try:
@@ -1790,9 +1995,7 @@ async def _apply_knowledge(
         probe = ""
         if any((g.get("when") or {}).get("activity") for g in matched):
             began = time.monotonic()
-            probe = await _focus_probe(
-                ctx.serial, min(2.0, max(0.0, deadline - began))
-            )
+            probe = await _focus_probe(ctx.serial, min(2.0, max(0.0, deadline - began)))
             know["spent_ms"] = int(know.get("spent_ms") or 0) + int(
                 max(0.0, time.monotonic() - began) * 1000
             )
@@ -1805,7 +2008,12 @@ async def _apply_knowledge(
                 {"note_id": guard.get("id"), "event": "avoided", "detail": op}
             )
             fired.append(
-                {"note_id": guard.get("id"), "kind": "avoid", "outcome": "avoided", "ms": 0}
+                {
+                    "note_id": guard.get("id"),
+                    "kind": "avoid",
+                    "outcome": "avoided",
+                    "ms": 0,
+                }
             )
             entry["knowledge"] = fired
             return screen, (
@@ -1828,6 +2036,7 @@ async def _apply_knowledge(
             if budget <= 0:
                 continue
             began = time.monotonic()
+            ctx.wait_interruption = ""
             if then.get("until_rid"):
                 satisfied, screen, _late = await _wait_until_element(
                     ctx,
@@ -1836,24 +2045,37 @@ async def _apply_knowledge(
                     str(then.get("until_rid_text") or ""),
                     bool(then.get("until_gone")),
                     budget,
-                    bounded=True,
                 )
             else:
                 satisfied, screen, _late = await _wait_until_text(
-                    ctx, screen, str(then.get("until_text") or ""), budget, bounded=True
+                    ctx, screen, str(then.get("until_text") or ""), budget
                 )
             spent = int(max(0.0, time.monotonic() - began) * 1000)
             know["spent_ms"] = int(know.get("spent_ms") or 0) + spent
-            outcome = "confirmed" if satisfied else "contradicted"
-            tally = know["counts"].setdefault(
-                guard.get("id"), {"confirmed": 0, "contradicted": 0}
-            )
-            tally[outcome] += 1
+            interrupted, ctx.wait_interruption = ctx.wait_interruption, ""
+            # An interruption says nothing about the note, so it is logged
+            # but tallied neither way.
+            if satisfied:
+                outcome = "confirmed"
+            elif interrupted:
+                outcome = "interrupted"
+            else:
+                outcome = "contradicted"
+            if outcome != "interrupted":
+                tally = know["counts"].setdefault(
+                    guard.get("id"), {"confirmed": 0, "contradicted": 0}
+                )
+                tally[outcome] += 1
             know["events"].append(
                 {"note_id": guard.get("id"), "event": outcome, "detail": op}
             )
             fired.append(
-                {"note_id": guard.get("id"), "kind": "wait", "outcome": outcome, "ms": spent}
+                {
+                    "note_id": guard.get("id"),
+                    "kind": "wait",
+                    "outcome": outcome,
+                    "ms": spent,
+                }
             )
         if fired:
             entry["knowledge"] = fired
@@ -1884,58 +2106,39 @@ async def _focus_probe(serial: str, budget: float) -> str:
 async def _wait_until_changed(
     ctx: Context, screen: object, ms: int
 ) -> tuple[object, bool, bool]:
-    """Poll until the screen is no longer the one we started on. Never overruns.
+    """Poll until the screen is no longer the one we started on, or *ms* runs out.
 
-    Returns ``(latest_screen, changed, reusable)``. A bare ``wait`` exists because the
+    Returns ``(latest_screen, changed, reusable)``. A wait exists because the
     planner expects the screen to become something else; sleeping through the
     whole ``ms`` after it already has is the cheapest thing this lane was
     getting wrong -- observed on run mrun-20260908-061316-a41b2a, where fixed
     sleeps sat between every action.
 
-    Three things it deliberately does NOT do:
+    NO FIXED SLEEP (S17, owner decision). There is no floor below which the
+    wait is slept instead of polled, and nothing is slept after the last poll:
+    an unchanged screen ends the wait at its bound, a changed one at the poll
+    that sees it. Each poll's dump is cut at the deadline
+    (``_dump(ctx, deadline=...)``), so even a dump slower than its p90 cannot
+    carry the wait past the ms it was given.
 
-    * It is not entered below :data:`POLL_MIN_WAIT_MS`, where one poll costs
-      more than the sleep it would replace.
-    * It starts no iteration it cannot finish, so a polled wait never spends
-      longer than the ``ms`` the script declared. That is
-      :data:`MIN_POLL_MARGIN_MS`, and it is a separate clause from the
-      threshold on purpose -- see that constant.
-    * It does not decide the screen the model SEES. The caller still settles
-      with ``redump=True``, so an early return on an intermediate screen -- a
-      spinner replacing a button IS a change -- is re-read before it is handed
-      over. ``_wait_until_text`` keeps ``redump=False`` because it already
-      matched the thing it was waiting for.
+    It does not decide the screen the model SEES on a change. The caller still
+    settles with ``redump=True`` after an early return, so an intermediate
+    screen -- a spinner replacing a button IS a change -- is re-read before it
+    is handed over.
 
     WHICH IDENTITY, and why it is the hash. ``_screen_id`` is package +
     activity + the top three texts, and ``perception._screen_id`` says so: it
     is deliberately coarse because the report dedupes on it. A chat reply is
     appended at the BOTTOM, so the top three texts never move and the id is
     byte-identical -- which made this loop blind to the one event it exists to
-    catch. ``_settle`` was moved to the hash for the same reason; this was the
-    consumer left behind.
+    catch. ``_settle`` was moved to the hash for the same reason.
 
-    ONE-PIXEL SCROLL is the row where this identity and the id disagree, and
-    the trade is deliberate: returning on it costs a re-plan against a screen
-    that barely moved, while not returning cost every chat reply its whole
-    budget. An EARLY return still settles with ``redump=True``, so what the
-    model reads after a change is fetched after this returns, not during it.
-
-    ``reusable`` (fix round 3, item 4) is True in ONE case only: the screen
-    never changed and the last poll's dump -- started as late as the margin
-    allows -- ENDED within :data:`WAIT_POLL_S` of the deadline, so that dump
-    stands for the post-wait screen and the caller's settle skips its own
-    (``redump=not reusable``). Whatever is left after that dump is slept: the
-    wait never ends before its ms (plan-mobile-lane-latency-2026-09-08). When
-    more than one poll interval is left, the dump is too old to reuse and
-    ``reusable`` is False. Every early
-    return is ``reusable=False``: a spinner replacing a button is a change,
-    and the screen after it must be re-read before the model sees it.
-
-    THE MARGIN is ``dump_latency.margin_ms``: the larger of
-    :data:`MIN_POLL_MARGIN_MS` and this device's p90 dump time, so a slow AVD
-    widens it instead of overrunning. Each poll dump is also cut at the
-    deadline (``_dump(ctx, deadline=...)``), so even a dump slower than its
-    p90 cannot carry the wait past the ms it was given.
+    ``reusable`` is True in ONE case only: the screen never changed and the
+    wait ended on a poll whose dump SUCCEEDED, so that dump is the post-wait
+    screen and the caller's settle skips its own (``redump=not reusable``).
+    Every early return is ``reusable=False``. That screen can be up to one
+    :data:`WAIT_POLL_S` old: a poll whose sleep reached the deadline dumps
+    nothing, so the last successful read stands for the post-wait screen.
 
     FOCUS FIRST. Each iteration asks ``adb.current_activity`` -- bounded by
     the time left -- before paying for a dump. A focused window different
@@ -1945,61 +2148,42 @@ async def _wait_until_changed(
     """
     before = _screen_hash(screen)
     deadline = time.monotonic() + (ms / 1000.0)
-    margin = dump_latency.margin_ms(ctx.serial, MIN_POLL_MARGIN_MS) / 1000.0
     # The baseline is PROBED here, never read from `ctx.activity`: that is
     # memoised once per replay (`resolve_activity`) and is stale after the
     # first navigation, when every later probe would differ from it and end
     # every wait at its first poll. An empty or failed probe is UNKNOWN: this
     # wait skips the focus check and the dump path alone decides.
-    before_focus = await _focus_probe(
-        ctx.serial, deadline - margin - time.monotonic()
-    )
+    before_focus = await _focus_probe(ctx.serial, deadline - time.monotonic())
     current = screen
-    while time.monotonic() + margin <= deadline:
+    fresh = False
+    ticker = watch.Ticker("waiting for the screen to change")
+    while time.monotonic() < deadline:
+        await ticker.tick()
         if before_focus:
-            focus = await _focus_probe(
-                ctx.serial, deadline - margin - time.monotonic()
-            )
+            focus = await _focus_probe(ctx.serial, deadline - time.monotonic())
             if focus and focus != before_focus:
                 return current, True, False
-        now = time.monotonic()
-        # The LAST dump starts as late as the margin allows, so it ends at or
-        # just before the deadline; what is left after it is slept below.
-        last = now + 2 * (WAIT_POLL_S + margin) > deadline
-        pause = (deadline - margin - now) if last else WAIT_POLL_S
-        if pause > 0:
-            await _sleep(pause)
+        await _sleep(min(WAIT_POLL_S, max(0.0, deadline - time.monotonic())))
+        if time.monotonic() >= deadline:
+            # A dump started at the deadline has no budget and is cut before
+            # it reads anything; the last read, at most one WAIT_POLL_S old,
+            # stands for the post-wait screen instead.
+            break
         dumped = await _dump(ctx, deadline=deadline)
         if dumped.get("error"):
-            # WHY THIS `break` DOES NOT REPORT, where `_wait_until_text`'s
-            # same failure returns `timed_out`: the two have different next
-            # steps. That one returns to a branch which, on a timeout, hands
-            # the model the screen and stops -- so if it stayed silent the
-            # error would be the end of the story. This one returns to a
-            # branch that immediately calls `_settle(redump=True)`, whose OWN
-            # `_dump` runs against the same device: a device still failing is
-            # reported there as `dump_failed` / STATUS_ERROR, overwriting this
-            # action's outcome and detail, and a device that has recovered by
-            # then did not deserve a failed step. Escalating here as well
-            # would be the same answer derived twice, which is how mirrored
-            # conditions drift. Graded by
+            # WHY THIS DOES NOT REPORT, where `_wait_until_text`'s same
+            # failure does: this returns to a branch that immediately calls
+            # `_settle(redump=True)`, whose OWN `_dump` runs against the same
+            # device -- a device still failing is reported there as
+            # `dump_failed`, and one that has recovered did not deserve a
+            # failed step. Graded by
             # `test_a_dump_error_during_a_polled_wait_is_not_lost`.
-            break
+            return current, False, False
         current = dumped.get("content")
+        fresh = True
         if _screen_hash(current) != before:
             return current, True, False
-        if last:
-            # The wait NEVER ends early. What is left after the last dump is
-            # slept; if that is more than one poll interval the dump is too
-            # old to stand for the post-wait screen, and the caller redumps.
-            left = deadline - time.monotonic()
-            if left > 0:
-                await _sleep(left)
-            return current, False, left <= WAIT_POLL_S
-    remaining = deadline - time.monotonic()
-    if remaining > 0:
-        await _sleep(remaining)
-    return current, False, False
+    return current, False, fresh
 
 
 def _center(element: dict) -> tuple[int, int] | None:
@@ -2246,6 +2430,16 @@ def _touch_point(
     return None
 
 
+def _screen_elements(screen: object) -> list:
+    """The element list of a pruned screen, with or without its ``content``
+    envelope -- the same two shapes ``actions.candidates_for`` accepts."""
+    body = screen if isinstance(screen, dict) else {}
+    if isinstance(body.get("content"), dict):
+        body = body["content"]
+    found = body.get("elements")
+    return found if isinstance(found, list) else []
+
+
 def resolve_tap_text(text: object, screen: object) -> dict:
     """``{"element", "candidates", "ambiguous"}`` for one `tap_text`.
 
@@ -2365,17 +2559,43 @@ SCROLL_TARGET_MISSED = (
 )
 
 
-def budget_stop_reason(ran: int, total: int) -> str:
-    """What the model is told when the wall clock ended a replay early."""
+def budget_stop_reason(ran: int, total: int, queued: int | None = None) -> str:
+    """What the model is told when the wall clock ended a replay early.
+
+    ``queued`` is how many of the remaining actions the queue really holds.
+    ``_serialize_queued`` ends the queue at a literal typed at a credential
+    field, so telling the model "do not resend" for the dropped tail would
+    skip those steps silently: they are named and asked for again instead.
+    """
+    remaining = max(0, int(total) - int(ran))
+    limit = " One submit replays for at most " + str(int(SUBMIT_BUDGET_S)) + "s."
+    kept = remaining if queued is None else max(0, min(int(queued), remaining))
+    if kept == remaining:
+        return (
+            "budget reached after "
+            + str(int(ran))
+            + " action(s); the remaining "
+            + str(remaining)
+            + " action(s) are queued and will run FIRST on your next submit -- "
+            "you do not need to resend them." + limit
+        )
+    first_dropped = int(ran) + kept + 1
     return (
         "budget reached after "
         + str(int(ran))
-        + " action(s); the remaining "
-        + str(max(0, int(total) - int(ran)))
-        + " action(s) are queued and will run FIRST on your next submit -- "
-        "you do not need to resend them. One submit replays for at most "
-        + str(int(SUBMIT_BUDGET_S))
-        + "s."
+        + " action(s); of the remaining "
+        + str(remaining)
+        + ", "
+        + str(kept)
+        + " are queued and will run FIRST on your next submit -- do not resend "
+        "those. Actions "
+        + str(first_dropped)
+        + " to "
+        + str(int(total))
+        + " of this script were NOT queued, because action "
+        + str(first_dropped)
+        + " types a value at a credential field and that value is never stored: "
+        "send them again, with the value, in your next submit." + limit
     )
 
 
@@ -2388,6 +2608,12 @@ def _serialize_queued(pending: object) -> list[dict]:
     the FIELD NAME survives (so the tester supplies it again on the submit
     that finally runs it, exactly like a fresh secret field); the VALUE does
     not.
+
+    A NON-secret action that types a literal at a credential-named field ends
+    the queue: it and everything after it are dropped, and the model issues
+    them again on the next submit. Blanking the literal instead would queue a
+    step that cannot replay (``type`` needs text), and keeping it would write
+    a credential in clear to the run folder and the reply.
     """
     out: list[dict] = []
     for action in list(pending or []):
@@ -2397,12 +2623,14 @@ def _serialize_queued(pending: object) -> list[dict]:
             continue
         if payload.get("secret"):
             payload["text"] = ""
+        elif payload.get("text") and actions_mod.is_credential_action(action):
+            break
         out.append(payload)
     return out
 
 
 #: Ops that go through the QA keyboard, so a script carrying one needs it up.
-KEYBOARD_OPS: frozenset = frozenset({"type", "clear"})
+KEYBOARD_OPS: frozenset = frozenset({"type", "fill", "clear"})
 
 #: What a run that brought the keyboard up and put it back tells the tester.
 KEYBOARD_NOTE = "QA keyboard installed and selected; previous keyboard restored."
@@ -2443,7 +2671,8 @@ async def keyboard_up(serial: str) -> dict:
                 "installed failed: " + str(present["error"]),
                 "content": None,
             }
-        if not (present.get("content") or {}).get("installed"):
+        missing = not (present.get("content") or {}).get("installed")
+        if missing or await ime.is_foreign_build(serial):
             put = await ime.install(serial)
             if put.get("error"):
                 return {
@@ -2468,6 +2697,14 @@ async def keyboard_up(serial: str) -> dict:
                     + str(chosen["error"]),
                     "content": {"previous": previous},
                 }
+        # G4: arm before the receiver check. A refused or unexpected ARM stops the
+        # keyboard here, which `replay` turns into the usual typing fallback and notice.
+        armed = await ime.arm(serial)
+        if armed.get("error"):
+            return {
+                "error": "QA keyboard not set up: " + str(armed["error"]),
+                "content": {"previous": previous},
+            }
         probed = await ime.probe(serial)
         if probed.get("error") or not (probed.get("content") or {}).get("ok"):
             return {
@@ -2534,30 +2771,29 @@ async def _replay_keyboard(script: object, ctx: Context) -> dict:
     if not needs_keyboard(script):
         return await _replay_steps(script, ctx)
     serial = str(getattr(ctx, "serial", "") or "")
-    up = await keyboard_up(serial)
+    carried = str(getattr(ctx, "typing_fallback", "") or "")
+    up = {"error": carried, "content": None} if carried else await keyboard_up(serial)
     previous = (up.get("content") or {}).get("previous")
+    fallback_note = ""
     if up.get("error"):
+        # R1d: a keyboard that cannot come up no longer STOPS the run. The tester's
+        # keyboard is given back first (if the select had happened), the steps run
+        # with typing over stdin, and the result says so, why, and the exact fix.
         detail = str(up["error"])[:400]
         if previous is not None:
             await keyboard_down(serial, str(previous))
-        screen = getattr(ctx, "screen", None)
-        content = _result(
-            STATUS_ERROR,
-            [],
-            screen if isinstance(screen, dict) else None,
-            "",
-            detail,
-            -1,
-        )
-        content["keyboard"] = detail
-        return {"error": None, "content": content}
+        previous = None
+        ctx.typing_fallback = detail
+        fallback_note = ime.fallback_notice(detail, serial)
     down: dict = {"error": None, "content": None}
     try:
         replied = await _replay_steps(script, ctx)
     finally:
         if previous is not None:
             down = await keyboard_down(serial, str(previous))
-    if down.get("error"):
+    if fallback_note:
+        note = fallback_note
+    elif down.get("error"):
         note = str(down["error"])
     else:
         note = str((down.get("content") or {}).get("note") or "")
@@ -2610,6 +2846,13 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
             # short budget would turn every case into `blocked` without ever
             # touching the device.
             if index and time.monotonic() >= deadline:
+                # SERVER-SIDE queue (defect F2): the unreached actions ride
+                # along on THIS reply so the next submit can run them first
+                # instead of the model retyping them.
+                # A route replay queues NOTHING: the remainder has not been
+                # checked against its saved screens and must not run blind.
+                is_route = bool(getattr(ctx, "route_expect", None))
+                queued = [] if is_route else _serialize_queued(items[index:])
                 return {
                     "error": None,
                     "content": _result(
@@ -2617,7 +2860,9 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                         trace,
                         screen,
                         "",
-                        budget_stop_reason(index, len(items)),
+                        budget_stop_reason(
+                            index, len(items), None if is_route else len(queued)
+                        ),
                         index,
                         # NOT an escape. The budget can stop a script the
                         # validator called legal -- the per-wait re-dump costs
@@ -2625,10 +2870,7 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                         # charging one of three escapes for obeying our own
                         # bound is how a correct case becomes `blocked`.
                         budget_stop=True,
-                        # SERVER-SIDE queue (defect F2): the unreached actions
-                        # ride along on THIS reply so the next submit can run
-                        # them first instead of the model retyping them.
-                        queued_actions=_serialize_queued(items[index:]),
+                        queued_actions=queued,
                     ),
                 }
             started = time.monotonic()
@@ -2636,6 +2878,29 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                 index, action, _screen_id(screen), started, _screen_hash(screen)
             )
             op = str(getattr(action, "op", "") or "")
+            # S10 saved route (PROVISIONAL): the live screen must be the one this step was
+            # saved from. Checked BEFORE the guard and before anything is actuated.
+            expected_id = _route_expected(ctx, index, len(items))
+            if expected_id and expected_id != _screen_id(screen):
+                entry["outcome"] = "route_mismatch"
+                entry["detail"] = ROUTE_MISMATCH_DETAIL
+                _stamp_after(entry, screen)
+                _append(trace, entry)
+                return {
+                    "error": None,
+                    "content": _result(
+                        STATUS_NEEDS_MODEL,
+                        trace,
+                        screen,
+                        "",
+                        ROUTE_MISMATCH_DETAIL,
+                        index,
+                        # Uncharged by case_runner while nothing has actuated (the free
+                        # stop for a stale selector); a hop AFTER an actuated one is charged.
+                        selector_stale=True,
+                        actuated=_actuated(trace),
+                    ),
+                }
             # Per ACTION, not per replay: a scroll whose target missed must not
             # colour the note of a later scroll that resolved.
             scroll_missed = False
@@ -2667,8 +2932,7 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                         "verdict=pass was not accepted: the previous turn failed "
                         "to type or changed nothing on screen, and this turn "
                         "asserts no new element. Add an `assert` of kind "
-                        "`element` or `new_text` for what the step produced. "
-                        + reason
+                        "`element` or `new_text` for what the step produced. " + reason
                     ).strip()
                 entry["outcome"] = "done"
                 entry["detail"] = reason
@@ -2757,6 +3021,33 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                         "one you mean."
                         if picked.get("ambiguous")
                         else "Nothing on this screen carries the text `" + wanted + "`."
+                    )
+                    _stamp_after(entry, screen)
+                    _append(trace, entry)
+                    return {
+                        "error": None,
+                        "content": _result(
+                            STATUS_NEEDS_MODEL,
+                            trace,
+                            screen,
+                            "",
+                            entry["detail"],
+                            index,
+                        ),
+                    }
+            if op == "fill":
+                # Resolved HERE, for the reason `tap_text` is: the destructive
+                # guard below must judge the field a fill will touch. The
+                # refusal names the label and, when ambiguous, bounded
+                # candidates -- never a field's contents.
+                picked = fill_label.resolve_fill(
+                    getattr(action, "label", ""), _screen_elements(screen)
+                )
+                element = picked.get("element")
+                if element is None:
+                    entry["outcome"] = "missing_element"
+                    entry["detail"] = fill_label.refusal_detail(
+                        getattr(action, "label", ""), picked
                     )
                     _stamp_after(entry, screen)
                     _append(trace, entry)
@@ -2976,6 +3267,28 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
 
             # --- asserts ------------------------------------------------------
             if op == "assert":
+                if str(getattr(action, "kind", "")) == "visual":
+                    # Nothing here can judge a picture. Stop, and let the next
+                    # reply carry the screenshot of THIS screen to the model;
+                    # `Script` already refused a visual that is not last.
+                    entry["outcome"] = "visual_check"
+                    entry["detail"] = (
+                        "Visual check: " + str(getattr(action, "note", ""))
+                    )[:MAX_VISUAL_DETAIL_CHARS]
+                    _stamp_after(entry, screen)
+                    _append(trace, entry)
+                    return {
+                        "error": None,
+                        "content": _result(
+                            STATUS_NEEDS_MODEL,
+                            trace,
+                            screen,
+                            "",
+                            entry["detail"],
+                            index,
+                            visual_check=True,
+                        ),
+                    }
                 ok, detail = _evaluate_assert(action, screen, trace, baseline_texts)
                 entry["outcome"] = "assert_pass" if ok else "assert_fail"
                 entry["detail"] = detail
@@ -2990,42 +3303,50 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                     ),
                 }
 
-            # --- wait / until_text ---------------------------------------------
-            if op == "wait":
-                until_text = str(getattr(action, "until_text", "") or "").strip()
-                until_rid = str(getattr(action, "until_rid", "") or "").strip()
-                ms = int(getattr(action, "ms", 0) or 0)
-                if until_text or until_rid:
-                    # A bare wait (no explicit ms) gets its split share of
-                    # MAX_TOTAL_WAIT_MS -- see actions.bare_wait_ms_each --
-                    # instead of the flat UNTIL_TEXT_DEFAULT_MS, so two or
-                    # more bare waits in one script share the 25s total
-                    # instead of the validator refusing the script outright.
-                    effective_ms = ms or actions_mod.bare_wait_ms_each(items)
-                    if until_rid:
+            # --- waits --------------------------------------------------------
+            # Every wait is a condition with a bound (S17): the legacy `wait`
+            # maps onto the same four through `_wait_spec`.
+            if op in actions_mod.WAIT_OPS:
+                kind, wait_text, wait_ms = _wait_spec(action, items)
+                if kind != "changed":
+                    ctx.wait_interruption = ""
+                    if kind == "element":
                         gone = bool(getattr(action, "until_gone", False))
                         found, screen, _timed_out = await _wait_until_element(
                             ctx,
                             screen,
-                            until_rid,
+                            wait_text,
                             str(getattr(action, "until_rid_text", "") or ""),
                             gone,
-                            effective_ms,
+                            wait_ms,
                         )
-                        label = (
-                            "element "
-                            + repr(until_rid[:120])
-                            + (" gone" if gone else " present")
+                    elif kind == "idle":
+                        found, screen, _timed_out = await _wait_until_idle(
+                            ctx, screen, wait_ms
                         )
                     else:
                         found, screen, _timed_out = await _wait_until_text(
-                            ctx, screen, until_text, effective_ms
+                            ctx, screen, wait_text, wait_ms, gone=kind == "gone"
                         )
-                        label = repr(until_text[:120])
-                    entry["outcome"] = "ok" if found else "wait_timeout"
-                    entry["detail"] = (
-                        "found " if found else "timed out waiting for "
-                    ) + label
+                    interruption, ctx.wait_interruption = ctx.wait_interruption, ""
+                    if kind == "element":
+                        label = (
+                            "element "
+                            + repr(wait_text[:120])
+                            + (" gone" if gone else " present")
+                        )
+                        met, missed = "found " + label, "timed out waiting for " + label
+                    else:
+                        met, missed, label = _wait_words(kind, wait_text)
+                    if found:
+                        entry["outcome"] = "ok"
+                        entry["detail"] = met
+                    elif interruption:
+                        entry["outcome"] = "interrupted"
+                        entry["detail"] = interruption + " (while " + label + ")"
+                    else:
+                        entry["outcome"] = "wait_timeout"
+                        entry["detail"] = missed
                     if found:
                         # No re-dump: the poll already left a fresh screen.
                         screen, stop = await _settle(
@@ -3056,36 +3377,75 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                             index,
                         ),
                     }
-                changed = False
-                reusable = False
-                if ms:
-                    if ms >= POLL_MIN_WAIT_MS:
-                        screen, changed, reusable = await _wait_until_changed(
-                            ctx, screen, ms
-                        )
-                    else:
-                        await _sleep(ms / 1000.0)
+                before_wait = screen
+                screen, changed, reusable = await _wait_until_changed(
+                    ctx, screen, wait_ms
+                )
                 entry["outcome"] = "ok"
                 # The detail says what the wait DID, not what it was allowed to
                 # do. Reporting "waited 8000ms" for a wait that came back in a
                 # quarter of a second is the true-shaped sentence this lane has
                 # been burned by before, and the trace is read back in the
                 # report and in the next packet.
-                entry["detail"] = (
-                    ("waited for the screen to change, inside the " + str(ms) + "ms")
-                    if changed
-                    else ("waited " + str(ms) + "ms")
-                )
-                # `redump=not reusable`. Only a polled wait whose LAST dump was
-                # timed to end at the deadline hands back a post-wait screen
-                # (`_wait_until_changed` says when). Every other path -- a flat
-                # sleep, an early return on a change, a cut dump -- holds a
-                # screen from before the wait ended, and skipping the dump there
-                # would stamp `after_screen_hash` from before the wait and hand
-                # the next action's target resolution and destructive guard a
+                if op == "wait":
+                    entry["detail"] = (
+                        (
+                            "waited for the screen to change, inside the "
+                            + str(wait_ms)
+                            + "ms"
+                        )
+                        if changed
+                        else ("waited " + str(wait_ms) + "ms")
+                    )
+                else:
+                    entry["detail"] = (
+                        "the screen changed"
+                        if changed
+                        else "the screen did not change in " + _secs(wait_ms)
+                    )
+                # `redump=not reusable`. Only a wait whose LAST poll dumped
+                # the unchanged screen hands back a post-wait screen
+                # (`_wait_until_changed` says when). Every other path -- an
+                # early return on a change, a cut dump -- holds a screen from
+                # before the wait ended, and skipping the dump there would
+                # stamp `after_screen_hash` from before the wait and hand the
+                # next action's target resolution and destructive guard a
                 # screen older than the wait itself -- the defect `_settle`'s
                 # docstring records, where every assert after a wait was
                 # evaluated against the pre-wait screen.
+                # WATCHED (B6): a change that is a dialog, a call, another app or
+                # an error text is NAMED and the replay stops for the model,
+                # instead of an "ok" that hands the next action a screen the
+                # script never expected.
+                # A FOCUS change returns the pre-wait screen un-read (the
+                # probe saw a new window, no dump was taken), so on that path
+                # the screen is read once here: comparing the baseline with
+                # itself could never name the call or app that took focus.
+                # That read IS the post-wait screen, so the settle reuses it
+                # rather than dumping a second time.
+                # A dump that fails here is left to `_settle`, which reports
+                # it as `dump_failed` unless the device names a disconnect.
+                interruption = ""
+                if changed and screen is before_wait:
+                    reread = await _dump(ctx)
+                    if reread.get("error"):
+                        interruption = watch.classify_error(reread["error"])
+                    else:
+                        screen = reread.get("content")
+                        reusable = True
+                if changed and not interruption:
+                    interruption = _interruption_of(ctx, screen, before_wait)
+                if interruption:
+                    entry["outcome"] = "interrupted"
+                    entry["detail"] = interruption
+                    _stamp_after(entry, screen)
+                    _append(trace, entry)
+                    return {
+                        "error": None,
+                        "content": _result(
+                            STATUS_NEEDS_MODEL, trace, screen, "", interruption, index
+                        ),
+                    }
                 if reusable:
                     step_timing.mark("dump_reused")
                 screen, stop = await _settle(
@@ -3101,6 +3461,24 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                 if stop is not None:
                     return {"error": None, "content": stop}
                 _stamp_after(entry, screen)
+                if op != "wait" and not changed:
+                    # The model said the screen would change and it did not:
+                    # hand it the screen rather than run the rest of a script
+                    # written for a screen that never came. The legacy `wait`
+                    # carries on, as it always has.
+                    entry["outcome"] = "wait_timeout"
+                    _append(trace, entry)
+                    return {
+                        "error": None,
+                        "content": _result(
+                            STATUS_NEEDS_MODEL,
+                            trace,
+                            screen,
+                            "",
+                            entry["detail"],
+                            index,
+                        ),
+                    }
                 _append(trace, entry)
                 continue
 
@@ -3255,7 +3633,9 @@ def _append(trace: list[dict], entry: dict) -> None:
 #: actuates nothing, and counting it as progress charged an escape for a stop
 #: that had moved nothing. Derived from that frozenset rather than restated, so
 #: an op added there is covered here by construction.
-ACTUATING_OPS: frozenset[str] = frozenset(actions_mod.MUTATING_OPS) - {"wait"}
+ACTUATING_OPS: frozenset[str] = (
+    frozenset(actions_mod.MUTATING_OPS) - actions_mod.WAIT_OPS
+)
 
 #: Why a target did not resolve, in the words the model reads on its next turn.
 #: Constants so a test asserts this module's own text instead of a copy of it,
@@ -3309,6 +3689,32 @@ MISS_CONFLICT = (
 )
 
 
+ROUTE_MISMATCH_DETAIL = (
+    "This screen is not the one this saved route was recorded from, so nothing was tapped "
+    "for this step. Carry on from the packet."
+)
+
+
+def _route_expect_sentinel() -> str:
+    return "<route-length-mismatch>"
+
+
+def _route_expected(ctx: object, index: int, total: int) -> str:
+    """The screen_id step *index* of *total* must start on, or ``""`` when it is unchecked.
+
+    Aligned FROM THE END: a budget-stop queue is prepended to a script by case_runner, and the
+    saved route is always the tail. A route longer than the script can never match, so it
+    returns a sentinel no screen_id equals.
+    """
+    expect = getattr(ctx, "route_expect", None) or ()
+    offset = total - len(expect)
+    if offset < 0:
+        return _route_expect_sentinel()
+    if index < offset:
+        return ""
+    return str(expect[index - offset] or "")
+
+
 def _actuated(trace: object) -> bool:
     """Whether anything in THIS submit has already touched the device.
 
@@ -3341,6 +3747,11 @@ def _actuated(trace: object) -> bool:
         if str(action.get("op") or "") in ACTUATING_OPS:
             return True
     return False
+
+
+# The note is capped at 300 by `AssertAction`; this bounds the prefixed
+# detail so a later cap change cannot grow the trace unseen.
+MAX_VISUAL_DETAIL_CHARS = 320
 
 
 def _result(
@@ -3526,11 +3937,10 @@ async def _perform(
         return await adb.launch(serial, home)
     if op == "open_url":
         return await adb.open_url(serial, str(getattr(action, "url", "")))
-    if op == "wait":
-        ms = int(getattr(action, "ms", 0) or 0)
-        if ms:
-            await _sleep(ms / 1000.0)
-        return {"error": None, "content": {"detail": "waited " + str(ms) + "ms"}}
+    if op in actions_mod.WAIT_OPS:
+        # Every wait is handled, and polled, by `replay` before any device op;
+        # a wait reaching here would otherwise fall through to the unknown op.
+        return {"error": "A wait is not a device op.", "content": None}
     if op == "scroll":
         direction = str(getattr(action, "dir", "") or "")
         if direction not in _SWIPE:
@@ -3568,8 +3978,20 @@ async def _perform(
         if focused.get("error"):
             return focused
         return await adb.keyevent(serial, code)
-    if op in ("type", "clear"):
-        blocked = await _qa_ime_blocker(serial)
+    if op in ("type", "fill", "clear"):
+        fallback = str(getattr(ctx, "typing_fallback", "") or "")
+        if fallback and op == "clear":
+            return {
+                "error": (
+                    "Clearing a field needs the QA keyboard, which is not set up on this "
+                    "device. Clear it by hand, or install the keyboard as the note "
+                    "about the QA keyboard says. Reason:\n"
+                    + wrap_untrusted("adb", fallback, limit=200)
+                ),
+                "content": None,
+                "needs_model": True,
+            }
+        blocked = None if fallback else await _qa_ime_blocker(serial)
         if blocked is not None:
             return blocked
         center = _center(element) if isinstance(element, dict) else None
@@ -3630,13 +4052,13 @@ async def _perform(
                     "content": None,
                 }
             return _judge_landed(
-                await ime.type_text(
+                await _typer(fallback)(
                     serial, str(value), secret=True, receiver_known=True
                 ),
                 field or "the focused field",
             )
         return _judge_landed(
-            await ime.type_text(
+            await _typer(fallback)(
                 serial,
                 str(getattr(action, "text", "") or ""),
                 secret=False,

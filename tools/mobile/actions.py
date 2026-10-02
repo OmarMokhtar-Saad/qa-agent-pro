@@ -46,9 +46,18 @@ from typing import Annotated, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from tools.mobile.fill_label import FILL_MAX_LABEL_CHARS
+
 logger = logging.getLogger(__name__)
 
 MAX_ACTIONS = 40
+
+#: What ONE model submission may carry (owner decision, batch 3). The replay
+#: stops at the first surprise and hands the screen back, so every action
+#: planned past it was planned blind and is thrown away. ``MAX_ACTIONS`` stays
+#: the ceiling of a :class:`Script` itself -- the total a budget-stop queue
+#: folds into, and any script that was already accepted once.
+MAX_MODEL_ACTIONS = 10
 MAX_WAIT_MS = 10000
 
 #: The wall clock ONE submit may spend replaying, in ms. A client kills a tool
@@ -74,6 +83,23 @@ MAX_TOTAL_WAIT_MS = 40000
 #: -- ``actions`` must not import ``executor`` -- and pinned equal to
 #: ``executor.DEFAULT_WAIT_UNTIL_TEXT_S`` by a test, so the two cannot drift.
 UNTIL_TEXT_DEFAULT_MS = 20000
+
+#: The condition waits (S17, owner decision: no fixed waits anywhere). Each one
+#: returns the moment its condition holds, or when something NEW takes the
+#: screen, and ``max_s`` is only the bound on a condition that never comes.
+WAIT_UNTIL_OPS = (
+    "wait_until_changed",
+    "wait_until_text",
+    "wait_until_gone",
+    "wait_until_idle",
+)
+#: The longest one condition wait may run, in seconds. Also the cap a legacy
+#: ``wait ms`` is clipped to, since it now runs as ``wait_until_changed``.
+WAIT_UNTIL_MAX_S = 20
+WAIT_UNTIL_DEFAULT_S = 10
+#: Every op that waits and actuates nothing. ``executor.ACTUATING_OPS`` is
+#: ``MUTATING_OPS`` minus this set.
+WAIT_OPS = frozenset({"wait", *WAIT_UNTIL_OPS})
 MAX_TEXT_CHARS = 4000
 MAX_ERROR_CHARS = 600
 SECRET_MASK = "***"
@@ -125,6 +151,7 @@ ASSERT_KINDS = (
     "element",
     "new_text",
     "screen_changed",
+    "visual",
 )
 VERDICTS = ("pass", "fail", "blocked")
 URL_SCHEMES = ("https", "http", "market")
@@ -142,6 +169,7 @@ MUTATING_OPS = frozenset(
         "tap",
         "tap_text",
         "type",
+        "fill",
         "clear",
         "back",
         "home",
@@ -150,6 +178,7 @@ MUTATING_OPS = frozenset(
         "clear_app_data",
         "open_url",
         "wait",
+        *WAIT_UNTIL_OPS,
         "press",
     }
 )
@@ -266,7 +295,7 @@ class TypeAction(_Base):
             # that matters -- that a secret was written into a plan at all.
             if self.text:
                 raise ValueError(
-                    'a secret value must never appear in a script; send '
+                    "a secret value must never appear in a script; send "
                     '{"op": "type", "target": ..., "field": "<name>", '
                     '"secret": true} and supply the value as tester_input/'
                     "tester_inputs on the same submit"
@@ -278,6 +307,43 @@ class TypeAction(_Base):
                 )
         elif not self.text.strip():
             raise ValueError("type needs text")
+        return self
+
+
+class FillAction(_Base):
+    """Type into the field a visible LABEL names -- no selector needed.
+
+    ``label`` is matched against the screen's input fields (see
+    ``tools.mobile.fill_label``); more than one field is a refusal, never a
+    guess. The value rules are ``type``'s: a SECRET is never carried here, so
+    ``secret=true`` requires ``field`` and forbids ``text``.
+    """
+
+    op: Literal["fill"]
+    label: str = Field(min_length=1, max_length=FILL_MAX_LABEL_CHARS)
+    text: str = Field(default="", max_length=MAX_TEXT_CHARS)
+    secret: bool = False
+    field: str = Field(default="", max_length=80)
+
+    @model_validator(mode="after")
+    def value_rules_match_type(self) -> "FillAction":
+        if not self.label.strip():
+            raise ValueError("fill needs a non-blank label")
+        if self.secret:
+            if self.text:
+                raise ValueError(
+                    "a secret value must never appear in a script; send "
+                    '{"op": "fill", "label": ..., "field": "<name>", '
+                    '"secret": true} and supply the value as tester_input/'
+                    "tester_inputs on the same submit"
+                )
+            if not self.field.strip():
+                raise ValueError(
+                    "a secret fill action needs field (the name the tester was "
+                    "asked for) and must leave text empty"
+                )
+        elif not self.text.strip():
+            raise ValueError("fill needs text")
         return self
 
 
@@ -353,6 +419,26 @@ class WaitAction(_Base):
         return self
 
 
+class WaitUntilAction(_Base):
+    """A condition wait. ``text`` is what ``wait_until_text`` waits to see and
+    what ``wait_until_gone`` waits to lose; the other two take none."""
+
+    op: Literal[
+        "wait_until_changed", "wait_until_text", "wait_until_gone", "wait_until_idle"
+    ]
+    max_s: float = Field(default=WAIT_UNTIL_DEFAULT_S, gt=0, le=WAIT_UNTIL_MAX_S)
+    text: str = Field(default="", max_length=200)
+
+    @model_validator(mode="after")
+    def text_where_it_is_the_condition(self) -> "WaitUntilAction":
+        needs_text = self.op in ("wait_until_text", "wait_until_gone")
+        if needs_text and not self.text.strip():
+            raise ValueError(self.op + " needs the text it waits for")
+        if not needs_text and self.text.strip():
+            raise ValueError(self.op + " takes no text")
+        return self
+
+
 class LaunchAction(_Base):
     op: Literal["launch"]
 
@@ -414,11 +500,14 @@ class AssertAction(_Base):
 
     op: Literal["assert"]
     kind: Literal[
-        "text_present", "text_absent", "element", "new_text", "screen_changed"
+        "text_present", "text_absent", "element", "new_text", "screen_changed", "visual"
     ]
     text: str = Field(default="", max_length=200)
     contains: str = Field(default="", max_length=200)
     target: Optional[Target] = None
+    # What to judge from the picture, for ``visual`` only. The server cannot
+    # judge it: the replay stops here and the next reply carries the screenshot.
+    note: str = Field(default="", max_length=300)
 
     @model_validator(mode="after")
     def kind_has_its_operand(self) -> "AssertAction":
@@ -451,6 +540,10 @@ class AssertAction(_Base):
                 )
         if self.kind == "element" and self.target is None:
             raise ValueError("assert element needs a target")
+        if self.kind == "visual" and len(self.note.strip()) < 3:
+            raise ValueError(
+                "assert visual needs a `note` saying what to judge from the screenshot"
+            )
         return self
 
 
@@ -505,12 +598,14 @@ Action = Annotated[
         TapAction,
         TapTextAction,
         TypeAction,
+        FillAction,
         ClearAction,
         BackAction,
         HomeAction,
         PressAction,
         ScrollAction,
         WaitAction,
+        WaitUntilAction,
         LaunchAction,
         ClearAppDataAction,
         OpenUrlAction,
@@ -544,12 +639,15 @@ def _bare_until_text_count(actions: object) -> int:
 def _explicit_wait_ms(actions: object) -> int:
     """Device time every ``wait`` with an explicit ``ms`` may spend, in ms.
     Excludes bare ``until_text`` waits -- see :func:`_bare_until_text_count`.
+    A condition wait counts its ``max_s``: the most it may spend.
     """
     total = 0
     for action in list(actions or []):
-        if str(getattr(action, "op", "") or "") != "wait":
-            continue
-        total += int(getattr(action, "ms", 0) or 0)
+        op = str(getattr(action, "op", "") or "")
+        if op in WAIT_UNTIL_OPS:
+            total += int(float(getattr(action, "max_s", 0) or 0) * 1000)
+        elif op == "wait":
+            total += int(getattr(action, "ms", 0) or 0)
     return total
 
 
@@ -611,11 +709,28 @@ class Script(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def visual_is_last(self) -> "Script":
+        # The screen a `visual` assert is judged on is the one attached to the
+        # NEXT reply, so the replay stops there; an action after it would never
+        # run, and a model reading its script back would believe it had.
+        for action in self.actions[:-1]:
+            if (
+                getattr(action, "op", "") == "assert"
+                and getattr(action, "kind", "") == "visual"
+            ):
+                raise ValueError(
+                    "assert visual must be the LAST action of a script: the "
+                    "replay stops there and hands you the screenshot to judge"
+                )
+        return self
+
 
 OPS = (
     "tap",
     "tap_text",
     "type",
+    "fill",
     "clear_app_data",
     "clear",
     "back",
@@ -623,6 +738,7 @@ OPS = (
     "press",
     "scroll",
     "wait",
+    *WAIT_UNTIL_OPS,
     "launch",
     "open_url",
     "assert",
@@ -721,6 +837,10 @@ def combine_queued_actions(queued: object, new_actions: object) -> dict:
     queued_list = list(queued or [])
     new_list = list(new_actions or [])
     combined = queued_list + new_list
+    # The NEW part is a model submission and is held to MAX_MODEL_ACTIONS; the
+    # queued part was accepted earlier and may be longer.
+    if len(new_list) > MAX_MODEL_ACTIONS:
+        return {"ok": False, "reason": too_many_actions(len(new_list))}
     if len(combined) > MAX_ACTIONS:
         return {
             "ok": False,
@@ -739,12 +859,30 @@ def combine_queued_actions(queued: object, new_actions: object) -> dict:
     return {"ok": True, "actions": combined}
 
 
-def parse_script(raw: object) -> dict:
+def too_many_actions(count: int, limit: int = MAX_MODEL_ACTIONS) -> str:
+    """The refusal for a submission carrying more than *limit* actions."""
+    return (
+        "This script was refused and nothing was replayed. It has "
+        + str(count)
+        + " actions; one submission may carry at most "
+        + str(limit)
+        + ". Send the first steps, read the screen that comes back, then send "
+        "the next ones."
+    )
+
+
+def parse_script(raw: object, *, max_actions: int = MAX_MODEL_ACTIONS) -> dict:
     """A model's reply -> a validated :class:`Script`. Never raises.
 
     Accepts the packet shape (``{"actions": [...]}``), a bare list, or a JSON
     string of either -- a chat model reliably produces all three and refusing
     two of them would boomerang a correct plan.
+
+    *max_actions* defaults to :data:`MAX_MODEL_ACTIONS` because a caller that
+    passes nothing is parsing a fresh model submission. A caller parsing
+    actions that were already accepted -- a budget-stop queue folded with a new
+    submit, which :func:`combine_queued_actions` has already held to both caps
+    -- passes :data:`MAX_ACTIONS`.
     """
     try:
         payload = raw
@@ -766,6 +904,12 @@ def parse_script(raw: object) -> dict:
         if not isinstance(payload, dict):
             return {
                 "error": "The script must be a JSON object with an `actions` list.",
+                "content": None,
+            }
+        listed = payload.get("actions")
+        if isinstance(listed, list) and len(listed) > max_actions:
+            return {
+                "error": too_many_actions(len(listed), max_actions),
                 "content": None,
             }
         script = Script.model_validate(payload)
@@ -790,7 +934,7 @@ def parse_script(raw: object) -> dict:
 #: The ops whose action can hold a value a tester typed. Everything else is
 #: read-only as far as a credential is concerned, so the mask has no business
 #: touching it.
-VALUE_BEARING_OPS: frozenset = frozenset({"type", "ask_tester"})
+VALUE_BEARING_OPS: frozenset = frozenset({"type", "fill", "ask_tester"})
 
 
 def is_credential_action(action: object) -> bool:
@@ -825,6 +969,7 @@ def is_credential_action(action: object) -> bool:
     target = target if isinstance(target, dict) else {}
     surface = [
         payload.get("field"),
+        payload.get("label"),
         target.get("rid"),
         target.get("text"),
         target.get("id"),
@@ -875,6 +1020,9 @@ def action_text(action: object) -> str:
         return "erase app data"
     target = getattr(action, "target", None)
     parts = []
+    if str(getattr(action, "op", "") or "") == "fill":
+        # A fill names its field by LABEL and carries no target.
+        parts.append(str(getattr(action, "label", "") or ""))
     if target is not None:
         parts.append(str(getattr(target, "text", "") or ""))
         parts.append(str(getattr(target, "rid", "") or ""))
@@ -1232,7 +1380,7 @@ def _miss(
 def describe_vocabulary() -> dict:
     """The machine-readable spec handed to the model. Data only, never raises."""
     return {
-        "max_actions": MAX_ACTIONS,
+        "max_actions": MAX_MODEL_ACTIONS,
         "ops": list(OPS),
         "target": (
             "one of {id, rid, role, label, text}, and they are CROSS-CHECKED: "
@@ -1266,21 +1414,32 @@ def describe_vocabulary() -> dict:
             "you mean instead; that is judged by its own label.",
             "type carries secret=true ONLY for a value the tester supplied; never "
             "invent a credential and never put one in a plan.",
-            "wait takes until_text (PREFERRED), until_rid (an element by its "
-            "resource id: present, or gone with until_gone=true) or ms (<= "
+            "Every wait waits FOR something and comes back the moment it "
+            "happens: wait_until_text(text) until that text is on the screen, "
+            "wait_until_gone(text) until it is not (a spinner, 'Loading'), "
+            "wait_until_changed until the screen is a different screen, "
+            "wait_until_idle until two reads in a row are the same. Each takes "
+            "max_s (default "
+            + str(WAIT_UNTIL_DEFAULT_S)
+            + ", at most "
+            + str(WAIT_UNTIL_MAX_S)
+            + "), which is only the bound on a condition that never comes, and "
+            "each stops early and names what appeared instead when a dialog, a "
+            "call, another app or an error text takes the screen. There is no "
+            "fixed wait: the older wait takes until_text, until_rid (an element "
+            "by its resource id: present, or gone with until_gone=true) or ms (<= "
             + str(MAX_WAIT_MS)
-            + "). until_text names what you are waiting FOR and returns the moment "
-            "it appears; a flat ms always sleeps the whole amount whether or not "
-            "the reply already arrived, and pays a full screen re-read on top of "
-            "it. assert kinds are "
+            + "), and wait ms now runs as wait_until_changed bounded by that ms. "
+            "Never sleep in a shell (sleep, Start-Sleep, timeout) between "
+            "calls: the phone is not watched while you do. assert kinds are "
             + ", ".join(ASSERT_KINDS)
             + ". text_present/text_absent take the string to look for in "
             "`text` OR in `target.text` -- either is accepted, and `text` "
-            "wins if you send both.",
-            "THE TWO WAITS ARE NOT EQUIVALENT: a wait carrying only `ms` spends "
-            "every millisecond of it, while `until_text` comes back the moment "
-            "that text is on the screen. Name what you are waiting FOR whenever "
-            "you can -- it is the same action for a fraction of the clock.",
+            "wins if you send both. assert visual takes a `note` (what to "
+            "judge) and must be the LAST action: the replay stops there and "
+            "your next reply carries the screenshot, so judge it and send done "
+            "or the next script. Use it only for what the element list cannot "
+            "say (layout, colour, an image, a chart).",
             "To check that the app REPLIED, use assert new_text (optionally with "
             "contains): it passes only when text appeared that was not on the "
             "previous screen. screen_changed is WEAK -- any navigation "
@@ -1316,9 +1475,16 @@ def describe_vocabulary() -> dict:
 
 
 def response_schema() -> dict:
-    """JSON schema for a script, for the packet's ``response_schema`` field."""
+    """JSON schema for a script, for the packet's ``response_schema`` field.
+
+    ``Script`` keeps the saved cap (:data:`MAX_ACTIONS`) because a folded queue
+    may reach it, but the model is held to :data:`MAX_MODEL_ACTIONS`, so the
+    schema it is shown says that one -- one cap, not two.
+    """
     try:
-        return Script.model_json_schema()
+        schema = Script.model_json_schema()
+        schema["properties"]["actions"]["maxItems"] = MAX_MODEL_ACTIONS
+        return schema
     except Exception:  # pragma: no cover - defensive
         logger.exception("mobile.actions.response_schema failed")
         return {"type": "object"}

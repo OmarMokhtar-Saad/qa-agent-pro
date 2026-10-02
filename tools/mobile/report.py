@@ -218,6 +218,10 @@ OP_KIND = {
     "scroll": "step",
     "assert": "event",
     "wait": "log",
+    "wait_until_text": "log",
+    "wait_until_gone": "log",
+    "wait_until_changed": "log",
+    "wait_until_idle": "log",
     "done": "done",
     "escape": "note",
     "ask": "note",
@@ -242,9 +246,11 @@ def _compact_js(js: str) -> str:
     # or regex with "/*" in it; test_the_page_script_keeps_no_comment binds that.
     js = re.sub(r"/\*.*?\*/", "", js, flags=re.S)
     lines = (line.strip() for line in js.splitlines())
-    return "\n" + "\n".join(
-        line for line in lines if line and not line.startswith("//")
-    ) + "\n"
+    return (
+        "\n"
+        + "\n".join(line for line in lines if line and not line.startswith("//"))
+        + "\n"
+    )
 
 
 def _read_shell() -> str:
@@ -268,8 +274,15 @@ def _read_shell() -> str:
     body, rest = rest.split("\n<script>", 1)
     js, tail = rest.split("</script>", 1)
     return (
-        head + "<style>" + _compact_css(css) + "</style>" + body
-        + "\n<script>" + _compact_js(js) + "</script>" + tail
+        head
+        + "<style>"
+        + _compact_css(css)
+        + "</style>"
+        + body
+        + "\n<script>"
+        + _compact_js(js)
+        + "</script>"
+        + tail
     )
 
 
@@ -363,7 +376,11 @@ def _page_style(markup: str) -> str:
     for at, rule in _css_rules(SHELL_STYLE) + [(None, "")]:
         if at != group:
             if rules:
-                out.append((group + "{" + "\n".join(rules) + "}") if group else "\n".join(rules))
+                out.append(
+                    (group + "{" + "\n".join(rules) + "}")
+                    if group
+                    else "\n".join(rules)
+                )
             group, rules = at, []
         if at is not None and usable(rule):
             rules.append(rule)
@@ -419,7 +436,9 @@ def esc(value: object, limit: int = MAX_TEXT) -> str:
     reader -- or a model asked to summarise the report later. So markers are
     neutralised before escaping.
     """
-    return html.escape(_neutralize_markers(_text(_mask_prose(value), limit)), quote=True)
+    return html.escape(
+        _neutralize_markers(_text(_mask_prose(value), limit)), quote=True
+    )
 
 
 #: A credential NAMED in prose, and the value written after it: "password Qwerty123",
@@ -433,12 +452,9 @@ def esc(value: object, limit: int = MAX_TEXT) -> str:
 #: Deliberately NOT a key=value sweep: ``tenantToken=UNMARKED-CANARY-42`` still
 #: renders, as `test_the_secret_refusal_cannot_catch_an_unmarked_value` pins. The terms
 #: are whole words, so ``tenantToken`` is not ``token`` (which is not a term here).
-_CREDENTIAL_TERMS = (
-    r"\b(national[ -]?id(?: number)?|id number|iqama|password|passwd|passcode|pin(?: code)?|otp)\b"
-)
+_CREDENTIAL_TERMS = r"\b(national[ -]?id(?: number)?|id number|iqama|password|passwd|passcode|pin(?: code)?|otp)\b"
 _PROSE_CREDENTIAL = re.compile(
-    _CREDENTIAL_TERMS
-    + r"(\s*(?:is|was|=|:)?\s*)"
+    _CREDENTIAL_TERMS + r"(\s*(?:is|was|=|:)?\s*)"
     r"([^\s,;\"'<>]*\d[^\s,;\"'<>]*?)(?=[.)]?(?:[\s,;\"'<>]|$))",
     re.IGNORECASE,
 )
@@ -446,8 +462,7 @@ _PROSE_CREDENTIAL = re.compile(
 #: ``=`` ("password: Hunter"), or quoted ("password is 'Hunter Horse'"). Group 3 keeps
 #: the quotes, so the mask replaces them too.
 _PROSE_CREDENTIAL_SET = re.compile(
-    _CREDENTIAL_TERMS
-    + r"(\s*[:=]\s*|\s+(?:(?:is|was)\s+)?(?=[\"']))"
+    _CREDENTIAL_TERMS + r"(\s*[:=]\s*|\s+(?:(?:is|was)\s+)?(?=[\"']))"
     r"(\"[^\"<>\n]+\"|'[^'<>\n]+'|[^\s,;\"'<>]+?)(?=[.)]?(?:[\s,;\"'<>]|$))",
     re.IGNORECASE,
 )
@@ -597,9 +612,7 @@ def _case_type(case: object, manifest: dict) -> str:
 def _run_kind(cases: object, manifest: dict | None = None) -> str:
     """``exploratory``, ``scripted`` or ``mixed``; an empty run is ``scripted``."""
     manifest = manifest if isinstance(manifest, dict) else {}
-    kinds = {
-        _case_type(case, manifest) == EXPLORATORY for case in list(cases or [])
-    }
+    kinds = {_case_type(case, manifest) == EXPLORATORY for case in list(cases or [])}
     if kinds == {True}:
         return "exploratory"
     if True in kinds:
@@ -623,7 +636,7 @@ def _goal_of(case: object, manifest: dict) -> str:
     for step in planned.get("steps") or []:
         action = _text(step.get("action") if isinstance(step, dict) else "", 2000)
         if action.startswith(EXPLORE_GOAL_PREFIX):
-            return action[len(EXPLORE_GOAL_PREFIX):].strip()
+            return action[len(EXPLORE_GOAL_PREFIX) :].strip()
     return ""
 
 
@@ -649,15 +662,20 @@ def _derive_goals(cases: object, manifest: dict) -> list:
         if not goal:
             body = case if isinstance(case, dict) else {}
             groups.append(
-                {"goal": _text(body.get("title") or body.get("tc_id"), 250),
-                 "cases": [case]}
+                {
+                    "goal": _text(body.get("title") or body.get("tc_id"), 250),
+                    "cases": [case],
+                }
             )
             continue
         # A charter goal is stored whole while a turn's copy may be the
         # truncated title-length form: match on the shared prefix.
         match = next(
-            (g for text, g in by_goal.items()
-             if text == goal or text.startswith(goal) or goal.startswith(text)),
+            (
+                g
+                for text, g in by_goal.items()
+                if text == goal or text.startswith(goal) or goal.startswith(text)
+            ),
             None,
         )
         if match is None:
@@ -1826,8 +1844,12 @@ def _trace_rows(trace: object) -> list:
                 "action": _action_line(safe.get("action")),
                 "plain": _plain_action(action),
                 "act": action,
-                "target_id": _text((action.get("target") or {}).get("id")
-                                   if isinstance(action.get("target"), dict) else "", 40),
+                "target_id": _text(
+                    (action.get("target") or {}).get("id")
+                    if isinstance(action.get("target"), dict)
+                    else "",
+                    40,
+                ),
                 "outcome": _text(safe.get("outcome"), 40) or "-",
                 "ms": _ms(safe.get("ms")),
                 "detail": _text(safe.get("detail"), MAX_TEXT),
@@ -2390,17 +2412,29 @@ def _card_html(
             '<ol class="steplist">'
             + "".join(
                 _step_html(
-                    facts["slug"], i, row, screens, app, last if i == len(rows) - 1 else ()
+                    facts["slug"],
+                    i,
+                    row,
+                    screens,
+                    app,
+                    last if i == len(rows) - 1 else (),
                 )
                 for i, row in enumerate(rows)
             )
             + "</ol>"
         )
     else:
-        steps = '<p class="empty-note big">No step has been replayed for this case yet.</p>' + (
-            ('<div class="steppics">' + _look_pic(first_key, screens, "On screen", app) + "</div>")
-            if first_key
-            else ""
+        steps = (
+            '<p class="empty-note big">No step has been replayed for this case yet.</p>'
+            + (
+                (
+                    '<div class="steppics">'
+                    + _look_pic(first_key, screens, "On screen", app)
+                    + "</div>"
+                )
+                if first_key
+                else ""
+            )
         )
     # What the app heard and answered inside this case's window (plan P3), the
     # wire, and this case's own API capture -- folded, as in a Journey turn.
@@ -3544,7 +3578,9 @@ OUTCOME_WORDS = {
     "done": "finished",
     "assert_pass": "check passed",
     "assert_fail": "check failed",
+    "visual_check": "visual check (judged by the model)",
     "left_app": "left the app",
+    "route_mismatch": "screen not as saved",
     "supplied": "tester answered",
     "-": "not run",
 }
@@ -3676,12 +3712,26 @@ def _plain_action(action: object) -> list:
         if until:
             return ["Waited for ", _q(until), " to appear"]
         return ["Waited " + fmt_ms(_ms(body.get("ms")) or 0)]
+    if op == "wait_until_text":
+        return ["Waited for ", _q(_text(body.get("text"), 80)), " to appear"]
+    if op == "wait_until_gone":
+        return ["Waited for ", _q(_text(body.get("text"), 80)), " to go"]
+    if op == "wait_until_changed":
+        return ["Waited for the screen to change"]
+    if op == "wait_until_idle":
+        return ["Waited for the screen to settle"]
     if op == "assert":
         text = _text(body.get("text") or body.get("contains"), 80)
-        return ["Checked that ", _q(text), " is on screen"] if text else ["Checked the screen"]
+        return (
+            ["Checked that ", _q(text), " is on screen"]
+            if text
+            else ["Checked the screen"]
+        )
     if op == "done":
         reason = _text(body.get("reason"), 200)
-        return ["Finished the turn" + (": " if reason else "")] + ([_q(reason)] if reason else [])
+        return ["Finished the turn" + (": " if reason else "")] + (
+            [_q(reason)] if reason else []
+        )
     if op == "ask_tester":
         field = _text(body.get("field"), 24)
         return ["Asked the tester for " + (field or "input")]
@@ -3850,7 +3900,10 @@ def _step_html(
         )
     elif before and (
         before == after
-        or (after and _same_gap(_resolve_look(before, library), _resolve_look(after, library)))
+        or (
+            after
+            and _same_gap(_resolve_look(before, library), _resolve_look(after, library))
+        )
     ):
         # Neither end has a picture and both miss it for the same reason: one
         # note for the pair, not the same sentence twice side by side.
@@ -3872,7 +3925,11 @@ def _step_html(
         + "</p>"
         + _outcome_pill(word)
         + "</div>"
-        + (('<p class="stepnote" dir="auto">' + esc(detail, 300) + "</p>") if detail else "")
+        + (
+            ('<p class="stepnote" dir="auto">' + esc(detail, 300) + "</p>")
+            if detail
+            else ""
+        )
         + (('<div class="steppics">' + pics + "</div>") if pics else "")
         + "</li>"
     )
@@ -3887,7 +3944,9 @@ def _clip_html(rec: object) -> str:
     poster = ""
     book = _IMAGES.get()
     if book is not None:
-        got = report_images.ensure_poster(book["media_dir"] / str(body.get("file")), book["media_dir"])
+        got = report_images.ensure_poster(
+            book["media_dir"] / str(body.get("file")), book["media_dir"]
+        )
         _image_note(got.get("error"))
         if got.get("path"):
             poster = ' poster="' + esc(MEDIA_DIR + "/" + str(got["path"]), 200) + '"'
@@ -3918,7 +3977,9 @@ def _thumb_html(n: int, f: dict, frame: dict, library: object) -> str:
     img = ""
     if frame and book is not None:
         name = str(frame.get("file"))
-        img = _img_html(MEDIA_DIR, name, book["media_dir"] / name, "Turn " + str(n), THUMB_SIZES)
+        img = _img_html(
+            MEDIA_DIR, name, book["media_dir"] / name, "Turn " + str(n), THUMB_SIZES
+        )
     elif book is not None:
         ident, screen, verdict = _resolve_look(f["last_look"] or f["last"], library)
         filename = str(((_SHOTS.get() or {}).get("frames") or {}).get(ident) or "")
@@ -3944,7 +4005,9 @@ def _thumb_html(n: int, f: dict, frame: dict, library: object) -> str:
 def _finding_of(f: dict, manifest: dict, n: int) -> str:
     if f.get("finding"):
         return f["finding"]
-    explore = manifest.get("explore") if isinstance(manifest.get("explore"), dict) else {}
+    explore = (
+        manifest.get("explore") if isinstance(manifest.get("explore"), dict) else {}
+    )
     for item in list(explore.get("findings") or []):
         if isinstance(item, dict) and str(item.get("turn")) == str(n):
             return _text(item.get("note"), 200)
@@ -3975,10 +4038,13 @@ def _turn_html(
     word = _unify_verdict(verdict)
     pill = _result_pill(word) if verdict in DONE_VERDICTS else ""
     rows = f["rows"]
-    steps = "".join(_step_html(f["slug"], i, row, library, app) for i, row in enumerate(rows))
+    steps = "".join(
+        _step_html(f["slug"], i, row, library, app) for i, row in enumerate(rows)
+    )
     clips = "".join(
         _clip_html(rec)
-        for rec in ((media_map or {}).get("clips") or {}).get(_media_key(f["tc_id"])) or []
+        for rec in ((media_map or {}).get("clips") or {}).get(_media_key(f["tc_id"]))
+        or []
     )
     meta = [_count(len(rows), "step")]
     if f["wall"] is not None:
@@ -4018,7 +4084,11 @@ def _turn_html(
         + esc(" · ".join(meta), 60)
         + "</span></header>"
         + clips
-        + (('<ol class="steplist">' + steps + "</ol>") if steps else '<p class="picnote">No step was replayed in this turn.</p>')
+        + (
+            ('<ol class="steplist">' + steps + "</ol>")
+            if steps
+            else '<p class="picnote">No step was replayed in this turn.</p>'
+        )
         + '<details class="tech"><summary>Technical detail</summary><dl class="techlist">'
         + tech_rows
         + "</dl>"
@@ -4040,7 +4110,11 @@ def _journey_html(
     order = {tc: i + 1 for i, tc in enumerate(facts_by_id)}
     out = []
     for gi, group in enumerate(groups, 1):
-        facts = [facts_by_id[_text(c.get("tc_id"), 40)] for c in group["cases"] if _text(c.get("tc_id"), 40) in facts_by_id]
+        facts = [
+            facts_by_id[_text(c.get("tc_id"), 40)]
+            for c in group["cases"]
+            if _text(c.get("tc_id"), 40) in facts_by_id
+        ]
         if not facts:
             continue
         steps = sum(len(f["rows"]) for f in facts)
@@ -4049,7 +4123,9 @@ def _journey_html(
         if walls:
             meta.append(fmt_ms(sum(walls)))
         film = "".join(
-            _thumb_html(order[f["tc_id"]], f, _turn_frame(f["tc_id"], cases_by_id), library)
+            _thumb_html(
+                order[f["tc_id"]], f, _turn_frame(f["tc_id"], cases_by_id), library
+            )
             for f in facts
         )
         turns = "".join(
@@ -4103,7 +4179,9 @@ def _issues_html(facts: list, kinds: dict) -> str:
 def _results_html(groups: list, scripted: list, tally_: dict, total: int) -> str:
     """The header's result lines, inside the totals the selfcheck compares."""
     ordered = [(name, int(tally_.get(name) or 0)) for name in TILES]
-    ordered += [(name, int(c)) for name, c in sorted(tally_.items()) if name not in TILES]
+    ordered += [
+        (name, int(c)) for name, c in sorted(tally_.items()) if name not in TILES
+    ]
     attrs = "".join(
         " data-" + name.replace("_", "-") + '="' + str(int(count)) + '"'
         for name, count in ordered
@@ -4126,11 +4204,16 @@ def _results_html(groups: list, scripted: list, tally_: dict, total: int) -> str
             '<li class="result"><span class="rcount">'
             + esc(_count(len(scripted), "scripted case"), 40)
             + "</span><span>"
-            + esc(" · ".join(str(words[w]) + " " + w for w in RESULTS if words.get(w)), 120)
+            + esc(
+                " · ".join(str(words[w]) + " " + w for w in RESULTS if words.get(w)),
+                120,
+            )
             + "</span></li>"
         )
     if not lines:
-        lines.append('<li class="result"><span>No case has been checkpointed yet.</span></li>')
+        lines.append(
+            '<li class="result"><span>No case has been checkpointed yet.</span></li>'
+        )
     return (
         '<div id="'
         + SUMMARY_ID
@@ -4169,15 +4252,19 @@ def _meta_html(
     model = _text(device.get("model"), 40)
     api = _text(device.get("api"), 8)
     kind = DEVICE_KINDS.get(str(device.get("kind") or ""), "")
-    what = " · ".join(
-        bit
-        for bit in (
-            model or _text(manifest.get("avd"), 40),
-            ("Android API " + api) if api else "",
-            kind,
+    what = (
+        " · ".join(
+            bit
+            for bit in (
+                model or _text(manifest.get("avd"), 40),
+                ("Android API " + api) if api else "",
+                kind,
+            )
+            if bit
         )
-        if bit
-    ) or _text(manifest.get("serial"), 40) or "device not recorded"
+        or _text(manifest.get("serial"), 40)
+        or "device not recorded"
+    )
     items = [("Device", what), ("Date", _short_stamp(manifest.get("created")))]
     took = _duration(manifest, cases)
     if took:
@@ -4203,7 +4290,9 @@ def _meta_html(
     if tally:
         items.append(("Typed fields", tally))
     return "".join(
-        "<span><b>" + esc(k, 20) + "</b> " + esc(v, 200) + "</span>" for k, v in items if v
+        "<span><b>" + esc(k, 20) + "</b> " + esc(v, 200) + "</span>"
+        for k, v in items
+        if v
     )
 
 
@@ -4235,12 +4324,24 @@ def _capture_table(screens: object) -> str:
     cols = [k for k in CAPTURE_FIELDS if any(r[k] not in ("", "0") for _sid, r in rows)]
     if not rows or not cols:
         return ""
-    head = "<th>screen</th>" + "".join("<th>" + esc(k.replace("_", " "), 40) + "</th>" for k in cols)
+    head = "<th>screen</th>" + "".join(
+        "<th>" + esc(k.replace("_", " "), 40) + "</th>" for k in cols
+    )
     body = "".join(
-        "<tr><td>" + esc(sid, 40) + "</td>" + "".join("<td>" + esc(r[k], 60) + "</td>" for k in cols) + "</tr>"
+        "<tr><td>"
+        + esc(sid, 40)
+        + "</td>"
+        + "".join("<td>" + esc(r[k], 60) + "</td>" for k in cols)
+        + "</tr>"
         for sid, r in rows
     )
-    return '<div class="tablewrap"><table class="cov"><thead><tr>' + head + "</tr></thead><tbody>" + body + "</tbody></table></div>"
+    return (
+        '<div class="tablewrap"><table class="cov"><thead><tr>'
+        + head
+        + "</tr></thead><tbody>"
+        + body
+        + "</tbody></table></div>"
+    )
 
 
 def _diag_part(sid: str, title: str, note: str, body: str) -> str:
@@ -4248,7 +4349,9 @@ def _diag_part(sid: str, title: str, note: str, body: str) -> str:
     if not body:
         return ""
     return (
-        '<details class="diag" id="' + sid + '"><summary>'
+        '<details class="diag" id="'
+        + sid
+        + '"><summary>'
         + esc(title, 60)
         + (('<span class="diagnote">' + esc(note, 120) + "</span>") if note else "")
         + '</summary><div class="diagbody">'
@@ -4318,9 +4421,14 @@ def _about_html() -> str:
         ),
     ]
     rows += [(term, why) for term, why in PAGE_LIMITS]
-    return '<dl class="about">' + "".join(
-        "<dt>" + esc(term, 120) + "</dt><dd>" + esc(why, 600) + "</dd>" for term, why in rows
-    ) + "</dl>"
+    return (
+        '<dl class="about">'
+        + "".join(
+            "<dt>" + esc(term, 120) + "</dt><dd>" + esc(why, 600) + "</dd>"
+            for term, why in rows
+        )
+        + "</dl>"
+    )
 
 
 def _document_body(
@@ -4502,7 +4610,11 @@ def _document_body(
                 "TITLE": '<span dir="auto">'
                 + esc(app, 80)
                 + "</span>"
-                + ((' <span class="build">' + esc(build, 40) + "</span>") if build else ""),
+                + (
+                    (' <span class="build">' + esc(build, 40) + "</span>")
+                    if build
+                    else ""
+                ),
                 "META": _meta_html(manifest, cases, partial, coverage),
                 "RESULTS": _results_html(groups, scripted, tally, len(facts)),
                 "SECTIONS": sections,

@@ -33,7 +33,8 @@ import logging
 import re
 from pathlib import Path
 
-from tools.mobile import adb, downloader, paths
+from tools.mobile import adb, downloader, ime_nonce, paths
+from tools.untrusted import wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,10 @@ def manifest() -> dict:
                 "input": str(getattr(module, "ACTION_INPUT", package + ".INPUT")),
                 "clear": str(getattr(module, "ACTION_CLEAR", package + ".CLEAR")),
                 "query": str(getattr(module, "ACTION_QUERY", package + ".QUERY")),
+                # Batch 4b: only the new APK answers these; 1.0.0 ignores them.
+                "arm": str(getattr(module, "ACTION_ARM", package + ".ARM")),
+                "disarm": str(getattr(module, "ACTION_DISARM", package + ".DISARM")),
+                "dump": str(getattr(module, "ACTION_DUMP", package + ".DUMP")),
             },
         },
     }
@@ -220,6 +225,94 @@ async def installed(serial: str) -> dict:
         "error": None,
         "content": {"installed": package in (listed.get("content") or [])},
     }
+
+
+# `pm path` answers `package:<absolute path>`. That path goes into a device shell
+# argv, so a hostile answer must not reach it: only this shape is accepted.
+_PM_PATH_RE = re.compile(r"package:(/[A-Za-z0-9_.=~+@/-]{1,300})")
+_SHA256_TOKEN_RE = re.compile(r"[0-9a-fA-F]{64}")
+
+
+def _verdict(pinned: bool | None, detail: str) -> dict:
+    """One verify_pinned answer. ``pinned`` None means NOT DETERMINED."""
+    return {"error": None, "content": {"pinned": pinned, "detail": detail}}
+
+
+def _shell_out(result: dict) -> str | None:
+    """stdout of a device command that ran and exited 0, else None."""
+    body = result.get("content") or {}
+    if result.get("error") or body.get("rc") not in (0, None):
+        return None
+    return str(body.get("out") or "")
+
+
+async def _installed_path(serial: str, package: str) -> str | dict:
+    """The device path of the installed APK, or a verdict that ends the check."""
+    found = await adb.shell(
+        serial, ["pm", "path", package], timeout=adb.PM_LIST_TIMEOUT_S
+    )
+    out = _shell_out(found)
+    if out is None:
+        return _verdict(None, "pm path failed")
+    if not out.strip():
+        return _verdict(None, "pm path printed nothing")
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip().startswith("package:")]
+    if len(lines) > 1:
+        return _verdict(False, "installed as a split APK; the pinned build is one file")
+    matched = _PM_PATH_RE.fullmatch(lines[0]) if lines else None
+    if matched is None:
+        return _verdict(None, "pm path answered an unexpected shape")
+    return matched.group(1)
+
+
+async def verify_pinned(serial: str) -> dict:
+    """Is the package on the device the PINNED build, not just one with its name?
+
+    ``installed`` matches the package name only, so any app installed under the
+    keyboard's package id would be enabled and selected and then receive every
+    typed value, credentials included. This hashes the installed file on the
+    device and compares it with the manifest's sha256 (case-insensitive).
+
+    ``{"error": None, "content": {"pinned": True | False | None, "detail"}}``.
+    None means could not be determined (the manifest has no usable hash, `pm path`
+    failed or was silent or of an unexpected shape, no `sha256sum`, no hex digest)
+    and is never read as a match or as a mismatch. A split install is False: the
+    pinned build is a single file. With no usable hash this returns None BEFORE
+    any adb call. Never raises on a bad answer; adb errors become None.
+    """
+    info = manifest().get("content") or {}
+    want = str(info.get("sha256") or "").strip().lower()
+    if not downloader.valid_sha256(want):
+        return _verdict(None, "the manifest names no usable hash")
+    located = await _installed_path(serial, str(info.get("package") or ""))
+    if isinstance(located, dict):
+        return located
+    hashed = await adb.shell(
+        serial, ["sha256sum", located], timeout=adb.PM_LIST_TIMEOUT_S
+    )
+    tokens = (_shell_out(hashed) or "").split()
+    if not tokens or not _SHA256_TOKEN_RE.fullmatch(tokens[0]):
+        return _verdict(None, "sha256sum gave no digest")
+    if tokens[0].lower() == want:
+        return _verdict(True, "the installed build matches the pinned hash")
+    return _verdict(False, "the installed build differs from the pinned hash")
+
+
+async def is_foreign_build(serial: str) -> bool:
+    """True ONLY when the device proved the installed build is not the pinned one.
+
+    Unverifiable is logged and answers False: a device without `sha256sum` must
+    not be reinstalled on every run, and the pinned APK is still what the host
+    downloads and verifies.
+    """
+    verdict = (await verify_pinned(serial)).get("content") or {}
+    if verdict.get("pinned") is None:
+        logger.warning(
+            "mobile.ime: could not verify the installed keyboard against the "
+            "pinned build (%s)",
+            verdict.get("detail"),
+        )
+    return verdict.get("pinned") is False
 
 
 async def install(serial: str) -> dict:
@@ -355,7 +448,9 @@ async def resolve_installed_id(serial: str) -> dict:
     pinned = str((resolved["content"] or {})["ime_id"])
     listed = await _list_ime_ids(serial)
     if not listed:
-        logger.warning("mobile.ime: the device listed no input methods; sending the pin")
+        logger.warning(
+            "mobile.ime: the device listed no input methods; sending the pin"
+        )
         return {"error": None, "content": pinned}
     for candidate in listed:
         if same_component(candidate, pinned):
@@ -506,13 +601,61 @@ def _broadcast_line(action: str, b64: str = "") -> dict:
     return {"error": None, "content": line}
 
 
-async def _broadcast(serial: str, action: str, b64: str = "") -> dict:
+async def _send(serial: str, action: str, b64: str = "", nonce: str = "") -> dict:
     built = _broadcast_line(action, b64)
     if built.get("error"):
         return built
-    # THE point of this module: an EMPTY argv plus stdin. The payload is never
-    # an element of the host command line.
-    return await adb.shell(serial, [], stdin_data=str(built["content"]).encode("utf-8"))
+    line = str(built["content"])
+    if nonce:
+        # Validated BEFORE it is quoted into the shell line, like the payload.
+        if not ime_nonce.valid_nonce(nonce):
+            return {
+                "error": "Refusing to broadcast a malformed nonce; nothing was sent.",
+                "content": None,
+            }
+        line = line.rstrip("\n") + " --es nonce '" + nonce + "'\n"
+    # THE point of this module: an EMPTY argv plus stdin. The payload and the
+    # nonce are never an element of the host command line.
+    return await adb.shell(serial, [], stdin_data=line.encode("utf-8"))
+
+
+def reply_of(sent: dict) -> dict:
+    """The parsed reply of a broadcast envelope; no field text is revealed."""
+    payload = sent.get("content") or {}
+    if not isinstance(payload, dict):
+        return _parse_reply("", reveal_text=False)
+    raw = str(payload.get("out") or "") + str(payload.get("err") or "")
+    return _parse_reply(raw, reveal_text=False)
+
+
+def _refusal_of(sent: dict) -> str:
+    reply = reply_of(sent)
+    if int(reply.get("result", -1)) != ime_nonce.REPLY_REFUSED:
+        return ""
+    return str(reply.get("refusal") or "unknown")
+
+
+async def _broadcast(serial: str, action: str, b64: str = "") -> dict:
+    """Send one broadcast with this serial's nonce, if it holds one.
+
+    ``not_armed`` (idle timeout, restart) re-arms with a FRESH nonce and retries
+    ``REARM_MAX_RETRIES`` times; ``bad_nonce`` is never retried.
+    """
+    nonce = ime_nonce.get(serial)
+    sent = await _send(serial, action, b64, nonce)
+    for _ in range(ime_nonce.REARM_MAX_RETRIES):
+        if not nonce or sent.get("error") or _refusal_of(sent) != "not_armed":
+            break
+        if (await arm(serial, fresh=True)).get("error"):
+            return sent
+        nonce = ime_nonce.get(serial)
+        sent = await _send(serial, action, b64, nonce)
+    return sent
+
+
+async def send(serial: str, action: str) -> dict:
+    """Public seam for the a11y module: one authorised broadcast."""
+    return await _broadcast(serial, action)
 
 
 def _parse_reply(text: str, reveal_text: bool = True) -> dict:
@@ -537,6 +680,9 @@ def _parse_reply(text: str, reveal_text: bool = True) -> dict:
     field = ""
     visible = False
     field_text = ""
+    refusal = ""
+    protocol = 0
+    dump = ""
     for part in str(data).split(";"):
         part = part.strip()
         if part.startswith("t:"):
@@ -550,11 +696,24 @@ def _parse_reply(text: str, reveal_text: bool = True) -> dict:
             field = part[2:]
         elif part.startswith("k:"):
             visible = part[2:].strip() == "1"
+        elif part.startswith("e:"):
+            refusal = part[2:].strip()[:40]
+        elif part.startswith("p:"):
+            protocol = int(part[2:]) if part[2:].strip().isdigit() else 0
+        elif part.startswith("x:"):
+            dump = part[2:].strip()
     reply = {
         "result": result,
         "field": field,
         "ime_visible": visible,
     }
+    # Present only when non-empty, so a legacy reply keeps its exact shape.
+    if refusal:
+        reply["refusal"] = refusal
+    if protocol:
+        reply["protocol"] = protocol
+    if dump:
+        reply["dump"] = dump
     if reveal_text:
         reply["text"] = field_text
     else:
@@ -575,6 +734,11 @@ async def query(serial: str, reveal_text: bool = True) -> dict:
     sent = await _broadcast(serial, str(actions["query"]))
     if sent.get("error"):
         return sent
+    # A refusal still standing after the re-arm retries is not an answer: parsed as
+    # one, its missing field would read as empty and the probe would report OK.
+    refused = _refusal_of(sent)
+    if refused:
+        return {"error": ime_nonce.refusal_text(refused), "content": None}
     payload = sent["content"] or {}
     raw_text = str(payload.get("out") or "") + str(payload.get("err") or "")
     return {"error": None, "content": _parse_reply(raw_text, reveal_text=reveal_text)}
@@ -765,6 +929,8 @@ async def _focused_field(serial: str, actions: dict) -> str:
     code = _reply_code(sent)
     if code < 0:
         return NO_RECEIVER
+    if code == ime_nonce.REPLY_REFUSED:
+        return ime_nonce.refusal_text(_refusal_of(sent))
     if code == 0:
         return NO_FOCUSED_FIELD
     return ""
@@ -779,7 +945,12 @@ async def _undelivered(serial: str, actions: dict, sent: dict) -> str:
     LANDED is the open item in docs/DECISIONS.md). On that path ONE query
     tells a dead receiver from a field that lost focus.
     """
-    if _reply_code(sent) >= 0:
+    code = _reply_code(sent)
+    if code == ime_nonce.REPLY_REFUSED:
+        # The new APK refused (not armed / wrong nonce): NOT a delivery, even
+        # though 4 >= 0. Named, so the tester is told why nothing was typed.
+        return ime_nonce.refusal_text(_refusal_of(sent))
+    if code >= 0:
         return ""
     return (await _focused_field(serial, actions)) or NO_RECEIVER
 
@@ -855,6 +1026,113 @@ async def type_text(
         return {"error": str(exc), "content": None}
 
 
+def fallback_notice(reason: str, serial: str = "") -> str:
+    """What a tester is told when the QA keyboard could not be set up (R1d).
+
+    States THAT typing fell back to ``adb shell input text``, WHY, what that costs,
+    and the exact command that fixes it. The run is not blocked.
+    """
+    target = str(serial or "").strip() or "<serial>"
+    apk = ""
+    try:
+        version = str(((manifest() or {}).get("content") or {}).get("version") or "")
+        if version and Path(apk_cache_path(version)).is_file():
+            apk = str(apk_cache_path(version))
+    except Exception:
+        logger.debug("mobile.ime: no apk path for the fallback notice", exc_info=True)
+    head = (
+        "The QA keyboard is not available on this device, so typing fell back to "
+        "`adb shell input text` (printable ASCII only, and the text cannot be read "
+        "back to confirm it landed). Why: "
+        # The reason is adb's or the device's own text, so it is data for the reader.
+        + (
+            wrap_untrusted("adb", " ".join(str(reason or "").split()), limit=300)
+            or "unknown"
+        )
+    )
+    tail = " Taps, swipes and screen checks are unaffected."
+    if not apk:
+        # No APK on disk: an install command would name a file that is not
+        # there, so the fix is the download, not `install -r`.
+        return (
+            head + " Fix: the QA keyboard APK was not downloaded to this machine; start"
+            " the run again once this machine is online so it can be fetched." + tail
+        )
+    return (
+        head
+        + " Fix: run `adb -s "
+        + target
+        + ' install -r "'
+        + apk
+        + '"` and start the run again.'
+        + tail
+    )
+
+
+_INPUT_UNSAFE_RE = re.compile(r"[^\x20-\x7e]|%")
+
+
+async def type_via_input(
+    serial: str, text: str, secret: bool = False, receiver_known: bool = True
+) -> dict:
+    """The fallback typer: ``input text`` fed to ``adb shell`` over STDIN (R1d).
+
+    The payload rides on stdin and never becomes an argv entry, exactly like
+    :func:`type_text`. Printable ASCII only (``input text`` cannot carry anything
+    else), and ``%`` is refused because ``input`` reads ``%s`` as a space. The
+    verdict is always ``unknown``: nothing reads the field back, so the caller's
+    landed check sends the step to the model instead of passing it silently.
+    ``receiver_known`` is accepted for signature parity and ignored.
+    """
+    try:
+        value = "" if text is None else str(text)
+        if len(value) > MAX_TEXT_CHARS:
+            return {
+                "error": "Refusing to type "
+                + str(len(value))
+                + " characters; the limit is "
+                + str(MAX_TEXT_CHARS)
+                + ".",
+                "content": None,
+            }
+        if _INPUT_UNSAFE_RE.search(value):
+            return {
+                "error": (
+                    "The fallback typing path (`adb shell input text`) types printable "
+                    "ASCII only and cannot type `%`, so this text was not typed. Install "
+                    "the QA keyboard to type it (see the note about the QA keyboard)."
+                ),
+                "content": None,
+                # A refusal the model can route around (different text, or ask the
+                # tester), like the password refusal: NOT a device error that
+                # ends the case.
+                "needs_model": True,
+            }
+        quoted = "'" + value.replace(" ", "%s").replace("'", "'\\''") + "'"
+        sent = await adb.shell(
+            serial, [], stdin_data=("input text " + quoted + "\n").encode("ascii")
+        )
+        if sent.get("error"):
+            return sent
+        logger.info(
+            "mobile.ime: typed %d character(s) by input text%s",
+            len(value),
+            " (secret)" if secret else "",
+        )
+        return {
+            "error": None,
+            "content": {
+                "typed": len(value),
+                "secret": bool(secret),
+                "landed": LANDED_UNKNOWN,
+                "fallback": True,
+            },
+        }
+    except Exception as exc:
+        logger.exception("mobile.ime.type_via_input failed")
+        return {"error": str(exc), "content": None}
+
+
 async def clear(serial: str, receiver_known: bool = False) -> dict:
     """Clear the focused field through the IME."""
     resolved = manifest()
@@ -872,3 +1150,99 @@ async def clear(serial: str, receiver_known: bool = False) -> dict:
     if refused:
         return {"error": refused, "content": None}
     return {"error": None, "content": {"cleared": True}}
+
+
+#: Said when ARM finds the keyboard already armed and this process holds no nonce.
+ALREADY_ARMED = (
+    "The QA keyboard is already armed by another session (a run that crashed "
+    "leaves it armed until its idle timeout), so typing falls back to `adb "
+    "shell input text`. Wait about five minutes or reselect the keyboard, then "
+    "start again."
+)
+
+#: Said when ARM answers with anything that is neither the new APK's arm nor the silence
+#: of 1.0.0. Such a keyboard is NOT ready: no unnonced broadcast is ever sent to it.
+UNEXPECTED_ARM_REPLY = (
+    "The QA keyboard gave an unexpected reply to its arming request, so it is treated "
+    "as not ready and typing falls back to `adb shell input text` for this run"
+)
+
+
+async def arm(serial: str, fresh: bool = False) -> dict:
+    """Arm the keyboard with a new nonce; detect the APK generation by the reply.
+
+    ``content`` is ``{"armed", "protocol"}``. ONLY ``result=0`` (what 1.0.0 returns for ARM,
+    an action it does not know) means legacy: nothing is held and the legacy path is used
+    unchanged. ``result=1`` with ``p:2`` or more arms. ``result=2`` is the named
+    already-armed error. EVERYTHING else (``result=-1`` unparseable or lost, ``result=1``
+    without ``p:``, any other code) is an error, never legacy: the callers turn an error
+    into the run's one sticky fallback to ``input text`` with a notice. With a nonce
+    already held (and ``fresh`` false) ONE nonce-bearing QUERY decides whether it is still
+    ours before any second ARM.
+    """
+    try:
+        resolved = manifest()
+        if resolved.get("error"):
+            return resolved
+        actions = (resolved["content"] or {})["actions"]
+        held = ime_nonce.get(serial)
+        if held and not fresh:
+            asked = await _send(serial, str(actions["query"]), "", held)
+            if not asked.get("error") and _reply_code(asked) in (0, 1):
+                return {
+                    "error": None,
+                    "content": {"armed": True, "protocol": ime_nonce.protocol(serial)},
+                }
+        ime_nonce.forget(serial)
+        nonce = ime_nonce.new_nonce()
+        sent = await _send(serial, str(actions["arm"]), "", nonce)
+        if sent.get("error"):
+            return sent
+        reply = reply_of(sent)
+        code = int(reply.get("result", -1))
+        if (
+            code == ime_nonce.REPLY_OK
+            and int(reply.get("protocol", 0)) >= ime_nonce.PROTOCOL_NONCE
+        ):
+            ime_nonce.hold(serial, nonce)
+            ime_nonce.set_protocol(serial, int(reply["protocol"]))
+            return {
+                "error": None,
+                "content": {"armed": True, "protocol": int(reply["protocol"])},
+            }
+        if code == ime_nonce.REPLY_ALREADY_ARMED:
+            return {"error": ALREADY_ARMED, "content": None}
+        if code == 0:
+            ime_nonce.set_protocol(serial, ime_nonce.PROTOCOL_LEGACY)
+            return {
+                "error": None,
+                "content": {"armed": False, "protocol": ime_nonce.PROTOCOL_LEGACY},
+            }
+        return {
+            "error": UNEXPECTED_ARM_REPLY + " (result " + str(code) + ").",
+            "content": None,
+        }
+    except Exception as exc:
+        logger.exception("mobile.ime.arm failed")
+        return {"error": str(exc), "content": None}
+
+
+async def disarm(serial: str) -> dict:
+    """Disarm the keyboard. The nonce is forgotten FIRST: a disarm that cannot reach the
+    device must not leave a usable secret here. Never raises."""
+    try:
+        held = ime_nonce.get(serial)
+        ime_nonce.forget(serial)
+        if not held:
+            return {"error": None, "content": {"disarmed": False}}
+        resolved = manifest()
+        if resolved.get("error"):
+            return resolved
+        actions = (resolved["content"] or {})["actions"]
+        sent = await _send(serial, str(actions["disarm"]), "", held)
+        if sent.get("error"):
+            return sent
+        return {"error": None, "content": {"disarmed": True}}
+    except Exception as exc:
+        logger.exception("mobile.ime.disarm failed")
+        return {"error": str(exc), "content": None}

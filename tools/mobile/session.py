@@ -265,7 +265,6 @@ async def _final_packet(ctx: object, budget: object) -> dict | None:
         return None
 
 
-
 def mint_session() -> str:
     """A lease identity for one chat. Matches ``run_store``'s session pattern."""
     return "s-" + secrets.token_hex(8)
@@ -417,9 +416,10 @@ async def ensure_device(
             # `emulator -avd ""`.
             return {
                 "error": (
-                    "No emulator (AVD) is named, and this server creates none. "
-                    "Call `qa_mobile_test` again with `avd` set to one of the "
-                    "AVDs in Android Studio's Device Manager."
+                    "No emulator (AVD) is named. Call `qa_mobile_test` again with "
+                    "`avd` set to one of the AVDs in Android Studio's Device "
+                    "Manager. `emulator=list` shows them and `emulator=create` "
+                    "makes one from an installed system image."
                 ),
                 "content": None,
             }
@@ -446,6 +446,11 @@ async def ensure_device(
         # Only this branch spawns, so only this branch can set the locale from
         # the first frame. A device we ADOPTED (either branch above) is handled
         # by `apply_locale`, which reads back rather than assuming.
+        # B5: if the emulator this server spawned last time already DIED, say so in
+        # its own words instead of spawning over it and reporting "booting" again.
+        gone = emulator.exit_report(name)
+        if gone:
+            return {"error": gone["error"], "content": None}
         started = await emulator.start(name, locale=str(locale or ""))
         if started.get("error"):
             return started
@@ -674,12 +679,11 @@ def start_install(serial: str, apk_path: str, package: str) -> dict:
     present, because a pid that exited proves nothing and an install that failed
     must never read as success.
 
-    Reads the kill-switch ITSELF. The handler that normally calls this checks
-    both the lane predicate and ``apply``, but those are guards on a CALLER, and
-    this function spawns a detached install on the tester's device -- an effect
-    that outlives the call. A guard on a caller is only as good as the list of
-    callers, which is the same lesson ``provisioner.run`` learned when a check on
-    the parent process did not cover ``python -m``.
+    Reads NO switch: the mobile lane ships on with no flag. The handler that
+    normally calls this checks the lane predicate and ``apply``, and those are
+    guards on that CALLER only, while this function spawns a detached install
+    on the tester's device -- an effect that outlives the call. A new caller
+    has to bring its own consent; nothing here asks for it.
     """
     try:
         if not valid_package_name(package):
@@ -701,6 +705,18 @@ def start_install(serial: str, apk_path: str, package: str) -> dict:
                     "No .apk file at "
                     + str(path)[:200]
                     + ". Give the full path to the file, and nothing is installed."
+                ),
+                "content": None,
+            }
+        problem = adb.apk_problem(path)
+        if problem:
+            return {
+                "error": (
+                    "Not installing "
+                    + str(path)[:200]
+                    + ": "
+                    + problem
+                    + ". Nothing was installed."
                 ),
                 "content": None,
             }
@@ -1570,9 +1586,21 @@ async def finish_device(owner: str, **release_kwargs) -> dict:
     still calls a one-keyword function, which is what every existing caller and
     every existing test double expects.
     """
-    from tools.mobile import ime_session
+    from tools.mobile import a11y, animations, ime, ime_session
 
+    # DISARM first (G4): the nonce is forgotten even when the device is gone.
+    try:
+        await ime.disarm(serial_of(str(owner)) or "")
+    except Exception:
+        logger.debug("mobile.session.finish_device: disarm skipped", exc_info=True)
     restored = await ime_session.restore(str(owner))
+    # The run's animation scales go back too, on the same chokepoint and for the
+    # same reason: every teardown path reaches this function.
+    anim = await animations.restore(str(owner))
+    # The a11y service goes off and the tester's accessibility settings come back.
+    a11y_restored = await a11y.restore(str(owner))
+    a11y_stale = {}
+    anim_stale = {}
     # AND ANY KEYBOARD AN EARLIER RUN CRASHED OUT OF. Done here as well as at
     # run start because the two reach different machines: run start covers the
     # tester who runs the lane again, this covers the run that is ending on a
@@ -1587,6 +1615,12 @@ async def finish_device(owner: str, **release_kwargs) -> dict:
         if serial:
             swept = (
                 await ime_session.restore_stale(serial, skip_run_id=str(owner)) or {}
+            ).get("content") or {}
+            anim_stale = (
+                await animations.restore_stale(serial, skip_run_id=str(owner)) or {}
+            ).get("content") or {}
+            a11y_stale = (
+                await a11y.restore_stale(serial, skip_run_id=str(owner)) or {}
             ).get("content") or {}
     except Exception:
         logger.debug("mobile.session.finish_device: stale sweep skipped", exc_info=True)
@@ -1607,6 +1641,12 @@ async def finish_device(owner: str, **release_kwargs) -> dict:
             # and a reader that had to tell them apart from one field would be
             # guessing.
             "ime_stale": swept,
+            "animations": anim.get("content")
+            or {"restored": False, "detail": str(anim.get("error") or "")},
+            "animations_stale": anim_stale,
+            "a11y": a11y_restored.get("content")
+            or {"restored": False, "detail": str(a11y_restored.get("error") or "")},
+            "a11y_stale": a11y_stale,
         },
     }
 
@@ -1833,6 +1873,7 @@ def reset_app_record(body: object) -> dict:
         "package": str(given.get("package") or ""),
         "cleared": bool(given.get("cleared")),
     }
+
 
 def reset_step_status(resolved: object, cases: object) -> dict:
     """What "reset" means for the relay block: requested from EITHER the
@@ -2288,7 +2329,7 @@ def _explore_prior_turn_blocked(run_id: str) -> bool:
             if not isinstance(item, dict):
                 continue
             action = item.get("action") if isinstance(item.get("action"), dict) else {}
-            if str(action.get("op") or "") in ("type", "clear") and str(
+            if str(action.get("op") or "") in ("type", "fill", "clear") and str(
                 item.get("outcome") or ""
             ) in ("device_error", "refused"):
                 return True
@@ -2668,13 +2709,13 @@ SINGLE_ACTION_NOTICE = (
 
 
 def _single_action_notice(raw_script: object) -> str:
-    """"" unless *raw_script* parses to exactly one action.
+    """ "" unless *raw_script* parses to exactly one action.
 
     Never raises and never refuses: read AFTER `case_runner.submit_case`
     already validated and replayed the same script, so a parse failure here
     can only mean the script changed between the two reads, which never
     happens on this call's own object. Audit item 3 -- the schema already
-    allowed up to `actions.MAX_ACTIONS`; nothing said so where a planner
+    allowed up to `actions.MAX_MODEL_ACTIONS`; nothing said so where a planner
     would see it before scripting one action per submit. VERIFIED (not
     UNVERIFIED): `actions_mod.parse_script`'s own docstring says it
     "[a]ccepts the packet shape ({\"actions\": [...]}), a bare list, or a
@@ -2686,7 +2727,9 @@ def _single_action_notice(raw_script: object) -> str:
         parsed = actions_mod.parse_script(raw_script)
         script = parsed.get("content")
         if script is not None and len(script.actions) == 1:
-            return SINGLE_ACTION_NOTICE.format(max_actions=actions_mod.MAX_ACTIONS)
+            return SINGLE_ACTION_NOTICE.format(
+                max_actions=actions_mod.MAX_MODEL_ACTIONS
+            )
     except Exception:
         logger.debug("mobile.session._single_action_notice failed", exc_info=True)
     return ""
@@ -2703,6 +2746,7 @@ async def submit(
     tester_inputs: dict | None = None,
     confirm_destructive: bool = False,
     budget: object = None,
+    route_expect: object = None,
 ) -> dict:
     """Replay one answered packet and return the verdict plus the NEXT packet.
 
@@ -2754,6 +2798,12 @@ async def submit(
         if carried or merged_inputs:
             ctx.tester_inputs = dict(carried, **dict(merged_inputs or {}))
         ctx.confirm_destructive = bool(confirm_destructive)
+        # S10 saved route (PROVISIONAL): empty unless the wrapper is replaying a route.
+        ctx.route_expect = (
+            tuple(str(item) for item in route_expect)
+            if isinstance(route_expect, (list, tuple))
+            else ()
+        )
         if str(body.get("lane")) == LANE_EXPLORE:
             explored = await _submit_explore(run_id, raw_script, ctx, body)
             content = explored.get("content") if isinstance(explored, dict) else None
@@ -2841,7 +2891,14 @@ async def _submit_explore(
                 },
             }
         payload["actions"] = combined["actions"]
-    parsed = actions_mod.parse_script(payload.get("actions"))
+    # A folded queue was already held to both caps by the combine, so only a
+    # bare submission is held to the model cap here.
+    parsed = actions_mod.parse_script(
+        payload.get("actions"),
+        max_actions=(
+            actions_mod.MAX_ACTIONS if queued_in else actions_mod.MAX_MODEL_ACTIONS
+        ),
+    )
     if parsed.get("error"):
         return {
             "error": None,
@@ -3104,9 +3161,9 @@ def audit_detail(
                 "value": run_store.SECRET_MASK,
             }
         if fields:
-            names = [
-                str(name)[:80] for name in fields if str(name or "").strip()
-            ][:MOBILE_MAX_TESTER_INPUTS]
+            names = [str(name)[:80] for name in fields if str(name or "").strip()][
+                :MOBILE_MAX_TESTER_INPUTS
+            ]
             if names:
                 detail["tester_fields"] = [
                     {"secret": True, "field": name, "value": run_store.SECRET_MASK}

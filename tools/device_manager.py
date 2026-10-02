@@ -89,6 +89,11 @@ def _adb_binary() -> str:
 #: commands, not the mobile lane's per-action calls (audit item 1).
 SLOW_CALL_CEILING_S = 5.0
 
+#: Hard cap on the quiet ``adb start-server`` that runs before ``adb devices -l``
+#: (Batch 1b, B4). A wedged adb daemon used to surface only as a silent empty
+#: device list after the full command timeout; now the tester is told.
+ADB_START_SERVER_TIMEOUT_S = 8.0
+
 
 async def _run(cmd: list[str], timeout: int) -> tuple[int, bytes, bytes]:
     """Run *cmd* (argument list, NO shell) and return (returncode, stdout, stderr).
@@ -97,12 +102,16 @@ async def _run(cmd: list[str], timeout: int) -> tuple[int, bytes, bytes]:
     to a friendly error) and ``asyncio.TimeoutError`` when the call overruns
     *timeout*.
     """
+    # ``started`` is taken BEFORE the spawn so a slow exec counts toward the
+    # duration line, and stdin is DEVNULL so a child that reads stdin cannot hang
+    # on the server's own (MCP stdio) pipe.
+    started = time.monotonic()
     proc = await asyncio.create_subprocess_exec(
         *cmd,
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    started = time.monotonic()
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -366,6 +375,73 @@ def _android_row(parsed: dict) -> dict:
     return row
 
 
+class _AndroidListing(tuple):
+    """``(usable, unusable, dropped_lines)`` plus a ``.problem`` sentence.
+
+    A tuple subclass so every existing consumer that unpacks three values keeps
+    working; ``problem`` is None when adb answered cleanly, else one sentence
+    saying what went wrong and how to fix it (B4).
+    """
+
+    problem: str | None
+
+    def __new__(cls, usable, unusable, dropped, problem=None):
+        self = super().__new__(cls, (usable, unusable, dropped))
+        self.problem = problem
+        return self
+
+
+async def _start_adb_server() -> str | None:
+    """Bounded, quiet ``adb start-server``. None when fine, else a sentence.
+
+    EVERY stdio handle is DEVNULL on purpose: the daemon it forks inherits them,
+    and a daemon holding our pipe makes ``communicate()`` wait for the daemon to
+    exit, which it never does. A missing adb is not a problem here (the listing
+    step reports that itself). Never raises.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            _adb_binary(),
+            "start-server",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+    try:
+        await asyncio.wait_for(proc.communicate(), timeout=ADB_START_SERVER_TIMEOUT_S)
+    except asyncio.CancelledError:
+        # A caller's own deadline cancelled us: do not leave the child behind.
+        try:
+            proc.kill()
+        except OSError:
+            logger.debug(
+                "device_manager: kill after start-server cancel failed", exc_info=True
+            )
+        raise
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            logger.debug(
+                "device_manager: kill after start-server timeout failed", exc_info=True
+            )
+        logger.warning(
+            "device_manager: adb start-server timed out after %ss",
+            ADB_START_SERVER_TIMEOUT_S,
+        )
+        return (
+            f"`adb start-server` did not finish within {ADB_START_SERVER_TIMEOUT_S:.0f} s. "
+            "Fix: run `adb kill-server` then `adb start-server` in a terminal; if it "
+            "still hangs, another adb (Android Studio, a phone-mirroring tool) may "
+            "hold port 5037 -- close it and retry."
+        )
+    except Exception:
+        logger.debug("device_manager: adb start-server probe failed", exc_info=True)
+    return None
+
+
 async def _list_android_all() -> tuple[list[dict], list[dict], int]:
     """``(usable, unusable)`` from ``adb devices -l``. ``([], [])`` if adb missing.
 
@@ -376,18 +452,27 @@ async def _list_android_all() -> tuple[list[dict], list[dict], int]:
     passed to a subprocess.
     """
     try:
+        problem = await _start_adb_server()
         rc, out, err = await _run([_adb_binary(), "devices", "-l"], _cmd_timeout())
     except FileNotFoundError:
         logger.info("device_manager: adb not installed -- skipping Android devices")
-        return ([], [], 0)
+        return _AndroidListing([], [], 0, None)
     except asyncio.TimeoutError:
-        return ([], [], 0)
-    if rc != 0:
-        logger.warning(
-            "device_manager: adb devices failed: %s",
-            err.decode(errors="replace")[:200],
+        # Was a silent ([], [], 0): the tester saw "no devices" for a wedged adb.
+        return _AndroidListing(
+            [],
+            [],
+            0,
+            problem
+            or (
+                f"`adb devices -l` did not answer within {_cmd_timeout()} s. "
+                "Fix: run `adb kill-server` then `adb start-server`, then retry."
+            ),
         )
-        return ([], [], 0)
+    if rc != 0:
+        detail = err.decode(errors="replace")[:200]
+        logger.warning("device_manager: adb devices failed: %s", detail)
+        return _AndroidListing([], [], 0, f"`adb devices -l` failed: {detail}")
     usable: list[dict] = []
     unusable: list[dict] = []
     rows = parse_adb_devices(out.decode(errors="replace"))
@@ -396,7 +481,7 @@ async def _list_android_all() -> tuple[list[dict], list[dict], int]:
     # THE THIRD ELEMENT IS THE POINT: a list that is missing transports must
     # not be reported as the whole truth. `list_devices` carries it to the
     # renderer, which tells the tester in our own prose.
-    return (usable, unusable, rows.dropped_lines)
+    return _AndroidListing(usable, unusable, rows.dropped_lines, problem)
 
 
 async def _list_android() -> list[dict]:
@@ -415,15 +500,28 @@ async def _list_android() -> list[dict]:
 
 
 #: TTL for the whole-device-listing result (audit item 5: discovery forked
-#: xcrun on every call). Long enough to collapse the menu-then-run burst
-#: within one MCP exchange, short enough that a device plugged in mid-run is
-#: still found soon.
-DISCOVERY_CACHE_TTL_S = 10.0
+#: xcrun on every call). Long enough to span a menu-then-run exchange on a
+#: slow Windows host (Cursor/Windows audit S5); a device plugged in mid-run is
+#: still found at once by ``qa_list_devices``, which always passes
+#: ``refresh=True``, and a device that drops off drops the cache
+#: (``invalidate_discovery_cache``).
+DISCOVERY_CACHE_TTL_S = 60.0
 
 #: ``(cached_at, result)`` from the last successful ``list_devices`` probe, or
 #: ``None`` before the first call. Process-local; ``tests/conftest.py`` resets
 #: it between tests.
 _discovery_cache: tuple[float, dict] | None = None
+
+
+def invalidate_discovery_cache() -> None:
+    """Forget the cached listing, so the next ``list_devices`` re-probes.
+
+    Called when adb reports that a device went away; a cached listing that
+    still shows it would otherwise be served for up to the whole TTL.
+    """
+    global _discovery_cache
+    _discovery_cache = None
+
 
 #: Whether full Xcode (not just the Command Line Tools) is installed, detected
 #: once per process and cached -- mirrors ``host_privileges.probe``'s shape.
@@ -571,6 +669,8 @@ async def list_devices(refresh: bool = False) -> dict:
             _list_ios_physical(),
         )
         usable_android, unusable_android, dropped_lines = android
+        # Plain 3-tuples (tests, older callers) carry no problem.
+        adb_problem = getattr(android, "problem", None)
         devices = [*usable_android, *simulators, *physical]
         logger.info(
             "device_manager: discovered %d device(s), %d attached but unusable",
@@ -584,9 +684,15 @@ async def list_devices(refresh: bool = False) -> dict:
             # present, including on the error path below, so no reader has to
             # special-case its absence -- the same rule `unusable` follows.
             "adb_dropped_lines": dropped_lines,
+            # One sentence when `adb start-server` / `adb devices -l` timed out or
+            # failed (B4); None otherwise. Always present, like `unusable`.
+            "adb_problem": adb_problem,
             "error": None,
         }
-        _discovery_cache = (now, dict(result))
+        # A failed adb probe is not a result: cached, it would keep telling the
+        # tester about a problem they have already fixed.
+        if adb_problem is None:
+            _discovery_cache = (now, dict(result))
         return result
     except Exception as exc:
         logger.exception("device_manager: unexpected error listing devices")
@@ -595,6 +701,7 @@ async def list_devices(refresh: bool = False) -> dict:
             "content": None,
             "unusable": [],
             "adb_dropped_lines": 0,
+            "adb_problem": None,
         }
 
 

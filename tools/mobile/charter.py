@@ -316,6 +316,7 @@ def defaults() -> dict:
         "stop_on": "budget",
     }
 
+
 #: Reset-shaped goals get a NAMED hint toward `destructive: "reversible"`
 #: rather than a silent default flip. Flipping the shipped default risks a
 #: false positive on a free-text goal that only mentions a reset in passing,
@@ -334,7 +335,7 @@ RESET_HINT_WORDS = (
 
 
 def destructive_hint(raw: object, goal: object) -> str:
-    """"" unless *raw* left `destructive` unset AND *goal* names a reset.
+    """ "" unless *raw* left `destructive` unset AND *goal* names a reset.
 
     Never changes the charter: `defaults()` above still ships
     `destructive: "none"`, which REFUSES every destructive op. This is a
@@ -353,9 +354,9 @@ def destructive_hint(raw: object, goal: object) -> str:
         return ""
     return (
         "This goal reads like it wants a reset, but no `destructive` was "
-        "sent, so the charter defaults to `destructive: \"none\"` and every "
+        'sent, so the charter defaults to `destructive: "none"` and every '
         "irreversible action REFUSES. Start again with "
-        "`destructive: \"reversible\"` if the reset should actually run."
+        '`destructive: "reversible"` if the reset should actually run.'
     )
 
 

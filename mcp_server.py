@@ -38,6 +38,7 @@ from tools import dispatch_guard  # noqa: E402
 from tools import guidance  # noqa: E402
 from tools import mcp_handlers  # noqa: E402
 from tools import telemetry  # noqa: E402
+from tools import tool_briefs  # noqa: E402
 from tools import selfcheck as selfcheck_module  # noqa: E402
 
 logger = logging.getLogger("qa_agents.mcp")
@@ -357,6 +358,26 @@ def _drift_watch() -> None:
             logger.debug("drift check failed", exc_info=True)
 
 
+def _device_ref(device_id: str = "", serial: str = "") -> str:
+    """ONE device reference from the two names a caller may use.
+
+    ``device_id`` is the canonical parameter on every device-taking tool and
+    ``serial`` is accepted as an alias for the same value (a model that read
+    one tool's schema guessed the other's name). Both given and different is a
+    contradiction the server will not resolve by guessing which phone to drive,
+    so it raises; FastMCP returns the message to the caller as the tool error.
+    """
+    first = str(device_id or "").strip()
+    second = str(serial or "").strip()
+    if first and second and first != second:
+        raise ValueError(
+            "device_id and serial name different devices (device_id=%r, "
+            "serial=%r). Pass ONE of them: serial is an alias for device_id."
+            % (first, second)
+        )
+    return first or second
+
+
 async def _tracked(name, ctx, coro):
     """Await a tool handler while emitting a best-effort telemetry
     ``tool_called`` event (name, duration, ok/error_type, host client) and, on
@@ -382,6 +403,11 @@ async def _tracked(name, ctx, coro):
     One line, INFO, per call: the file already reaches ~220 KB on a busy install,
     and ``mcp.server.lowlevel.server`` is silenced in ``_configure_logging`` so
     the per-call volume is unchanged rather than doubled."""
+    # The client identity is read HERE, before the handler runs, so every tool
+    # (qa_host_check included) logs and tags its real editor. It used to be read
+    # only from `_make_progress`, which tools that report no progress never
+    # reached, leaving `client` unknown. Never raises (see `_note_client`).
+    _note_client(ctx)
     start = time.monotonic()
     ok = True
     error_type = None
@@ -430,9 +456,7 @@ async def _tracked(name, ctx, coro):
                     "duration_ms": duration_ms,
                     "ok": ok,
                     "error_type": error_type,
-                    "status": (
-                        "timed_out" if degraded else ("ok" if ok else "error")
-                    ),
+                    "status": ("timed_out" if degraded else ("ok" if ok else "error")),
                 },
             )
         except Exception:
@@ -459,6 +483,12 @@ async def _tracked(name, ctx, coro):
 # than the call. Same reasoning and same order of magnitude as
 # _ROOTS_TIMEOUT_S; kept separate because they answer to different clients'
 # capabilities and should be tunable apart.
+async def _tracked_noted(name, ctx, coro):
+    """``_tracked`` plus the tool's own note (``tools/tool_briefs.TOOL_NOTES``)
+    appended to a text reply. ``_tracked`` itself stays a pure pass-through."""
+    return tool_briefs.append_tool_note(name, await _tracked(name, ctx, coro))
+
+
 _PROGRESS_TIMEOUT_S = 5.0
 
 
@@ -496,6 +526,14 @@ def _make_progress(ctx):
         except Exception:
             logger.debug("mcp report_progress failed for %r", message, exc_info=True)
 
+    # S16: a long mobile wait (boot, a loading screen) reports through the same
+    # channel. Bound per call context; the mobile modules may be absent.
+    try:
+        from tools.mobile import watch
+
+        watch.bind_progress(progress)
+    except ImportError:
+        pass
     return progress
 
 
@@ -804,6 +842,19 @@ def build_server():
         + reload_notice,
     )
 
+    # Log the calls FastMCP rejects on argument validation (they never reach
+    # `_tracked`). Guarded twice: the test doubles lack `add_middleware`, and the
+    # pinned fastmcp (3.4.7) is unverified against the installed 2.14.7.
+    try:
+        if hasattr(mcp, "add_middleware"):
+            from tools import mcp_rejection_log
+
+            _rejection_log = mcp_rejection_log.build_middleware()
+            if _rejection_log is not None:
+                mcp.add_middleware(_rejection_log)
+    except Exception:
+        logger.debug("rejection-log middleware not installed", exc_info=True)
+
     @mcp.tool()
     async def qa_generate_test_cases(
         ctx: Context,
@@ -817,68 +868,13 @@ def build_server():
         image_gate_ack: bool = False,
         image_carry_ack: bool = False,
     ) -> str:
-        """Generate a structured test suite. feature_or_url can be a feature
-        description, a Jira/issue URL, a web page URL, or a Swagger/OpenAPI
-        spec URL.
+        """Generate a structured test suite. feature_or_url: a description, Jira/issue URL, web page URL or Swagger/OpenAPI URL; omit it if the user did not say, the server asks.
 
-        For a Jira URL the first reply is a DIRECTIVE: fetch the issue with
-        your own mcp__atlassian__getJiraIssue, call `qa_stage_jira` with the
-        raw result right after each fetch, then call again with the SAME
-        `stage_token` -- the preferred path, since no fetch result has to
-        survive inside one argument. A client that cannot stage incrementally
-        may still pass `jira_content_json` set to the raw result as a JSON
-        STRING (`json.dumps(result)` -- that parameter is typed `str`, and an
-        object is rejected by schema validation before this server sees the
-        ticket).
+        Returns a PREPARE PAYLOAD: YOU write the cases. Continue exactly as for qa_prepare_test_cases (qa_get_category_job(prep_id, "all") once, qa_submit_category per category, qa_submit_suite to finalize). Relay the .xlsx path from that reply; do NOT ask which export format or offer to push.
 
-        When the user asks for test cases WITHOUT saying where the feature
-        comes from, call this immediately with feature_or_url omitted — I will
-        ask them myself (describe / Jira / web / Swagger / mobile screens /
-        Jira + mobile) via a dialog or menu.
+        Jira URL: a DIRECTIVE first; fetch with your own mcp__atlassian__getJiraIssue, `qa_stage_jira` each result, call again with the SAME `stage_token` (or `jira_content_json` as a JSON STRING).
 
-        Returns a PREPARE PAYLOAD, not a finished suite: a prep_id, the
-        grounded generation prompts and the per-category job list. NOTHING is
-        generated yet -- this server calls no model, so YOU write the cases.
-        Continue exactly as for qa_prepare_test_cases: call
-        qa_get_category_job(prep_id, "all") ONCE for every job packet, generate
-        each category, qa_submit_category each one as soon as it is written,
-        then qa_submit_suite with the same prep_id to finalize. THAT finalize
-        reply is the one carrying the persisted suite_id and the path to the
-        written .xlsx: relay that path to the user as the deliverable and do
-        NOT ask which export format they want or offer to push anywhere. Call
-        qa_export_suite only when the user names a different format themselves.
-
-        For an under-specified or no-UI ticket the reply may instead be a short
-        list of clarifying questions (no suite is generated) — relay them to the
-        user. Once they answer, call again with the fuller text, or set
-        proceed_anyway=true to generate anyway with whatever is available.
-
-        IMAGE GATE (always on). This tool runs the
-        generation in YOUR chat model. ASK FIRST: for a Jira URL, ask the USER
-        where the ticket's SCREENS come from BEFORE your first call and pass
-        `source_plan` on it -- this server cannot read images out of Jira, only
-        text, and asking up front costs ZERO extra tool calls. Only pass
-        `source_plan` if the user ANSWERED -- never guess it, and never send
-        `image_gate_ack=true` unless the user explicitly said the screens do not
-        matter: that pair skips BOTH asks, including the informed one that names
-        the screens the fetched ticket really has. Without a plan the FIRST reply
-        is ONLY that question (nothing fetched, nothing prepared) and you must
-        call again with
-        the SAME feature_or_url plus `source_plan` (`jira` = ticket text only,
-        `jira_attach`, `jira_device`, `jira_both`, `device`); with `jira_attach`
-        also pass `attached_image_count`, and with `jira_device` call
-        `qa_capture_screens` first and pass its `capture_ids`. A second, informed
-        reply may NAME the screens the fetched ticket has; supply them or pass
-        `image_gate_ack=true` (send it together with `source_plan='jira'` up
-        front when the user has already said the screens do not matter).
-
-        RE-RUNNING THE SAME SOURCE: if a recent preparation for this source was
-        grounded on screens and your new call carries none, this server either
-        carries those screens forward itself or REFUSES and names them.
-        `proceed_anyway=true` does NOT dismiss that -- re-send the screens, or
-        pass `image_carry_ack=true` if the user really wants the cases written
-        without them.
-        """
+        IMAGE GATE. ASK FIRST: for a Jira URL, ask the USER where the ticket's screens come from before your first call and pass `source_plan`; never guess it, and never send image_gate_ack=true unless the user explicitly said the screens do not matter."""
         _cache_key = (
             "qa_generate_test_cases",
             feature_or_url,
@@ -924,19 +920,7 @@ def build_server():
     async def qa_stage_jira(
         ctx: Context, stage_token: str, part: str, json: str
     ) -> str:
-        """Stage ONE raw Jira fetch result right after you fetch it, so a ticket's
-        issue/parent/siblings never have to survive inside one giant argument.
-
-        Call this immediately after each `getJiraIssue`/JQL call the
-        `qa_prepare_test_cases`/`qa_generate_test_cases` directive told you to make
-        -- `part='issue'` after the ticket fetch, `part='parent'` after the parent
-        fetch (if any), `part='siblings'` after the sibling JQL (if any). `json`
-        is that ONE result, stringified (`json.dumps(result)`), under ~20KB --
-        request only the fields the directive named if a part is rejected for
-        size. Once every part the directive asked for is staged, call
-        `qa_prepare_test_cases` again with the SAME `feature_or_url` and the SAME
-        `stage_token` -- do not pass `jira_content_json`.
-        """
+        """Stage ONE raw Jira fetch result right after you fetch it. Call it after each getJiraIssue/JQL call the qa_prepare_test_cases/qa_generate_test_cases directive asked for: part='issue', 'parent' or 'siblings'. `json` is that ONE result, stringified (json.dumps(result)), under ~20KB. When every part is staged, call qa_prepare_test_cases again with the SAME feature_or_url and `stage_token`, not jira_content_json."""
         return await _tracked(
             "qa_stage_jira",
             ctx,
@@ -956,91 +940,15 @@ def build_server():
         image_gate_ack: bool = False,
         image_carry_ack: bool = False,
     ) -> list[ContentBlock]:
-        """HOST-MODE generation. Instead of the server calling an LLM, THIS tool
-        returns a grounded generation payload (a system prompt, the grounded
-        feature/ticket context, a JSON schema, and 8 category instructions) for
-        YOU, the host model, to run yourself.
+        """HOST-MODE generation: returns a grounded generation payload for YOU, the host model, to run; the server calls no LLM. Call it first for any test-case request.
 
-        feature_or_url can be a feature description, a Jira/issue URL, a web page
-        URL, or a Swagger/OpenAPI spec URL -- exactly like qa_generate_test_cases.
+        feature_or_url: a description, Jira/issue URL, web page URL or Swagger/OpenAPI URL. A Jira URL first returns a DIRECTIVE: fetch with your own `mcp__atlassian__getJiraIssue`, `qa_stage_jira` each raw result, then call again with the SAME feature_or_url and `stage_token` (or `jira_content_json` as a JSON STRING, json.dumps(result)).
 
-        JIRA URLS ARE A TWO-STEP BOOMERANG. This server holds no Jira
-        credentials. For a Jira URL the FIRST reply is a DIRECTIVE telling you to
-        call your OWN `mcp__atlassian__getJiraIssue` (and once more for the
-        parent issue, when there is one), calling `qa_stage_jira` with each raw
-        result right after that fetch, then call this tool AGAIN with the same
-        feature_or_url plus the SAME `stage_token` -- the preferred path, since
-        no fetch result has to survive inside one argument. A client that cannot
-        stage incrementally may still pass `jira_content_json` set to the raw
-        result as a JSON STRING -- stringified JSON, i.e. `json.dumps(result)`,
-        because that parameter is typed `str`; do not pass the object itself. Do
-        not summarise, translate or invent ticket content, and do not generate
-        from the URL alone. If you have no `atlassian` MCP server connected, show
-        the user the connection steps the directive includes.
+        With `orchestration` in the payload: generate each category, stage it with `qa_submit_category`, then `qa_prep_status`, then `qa_submit_suite`. Otherwise generate the full suite and call `qa_submit_suite`.
 
-        WHAT TO DO WITH THE RESULT: when the payload includes `orchestration`
-        (mode `staged_categories`), generate the categories yourself and stage
-        each one with `qa_submit_category` AS SOON AS it is written (Path A),
-        then `qa_prep_status` until ready and `qa_submit_suite` with an empty
-        suite_json or the review sidecar. Path A is recommended for two reasons,
-        neither of which is speed: staged categories survive a chat reload, and
-        the server's duplicate prescreen runs only over a staged set. Path B
-        (merge everything, one `qa_submit_suite` call) is supported for a client
-        that cannot hold a multi-call session, but nothing is saved until that
-        single call. Without orchestration, generate the full merged suite
-        yourself and call `qa_submit_suite`. The server
-        validates, de-duplicates, scores, exports and persists it, and replies
-        with the finished suite + file path OR gaps to regenerate under the SAME
-        prep_id. Use `qa_get_category_job` with category_name="all" for every
-        category packet in ONE call (or one name for a single packet).
+        IMAGE GATE. ASK FIRST: for a Jira URL, ask the USER where the ticket's screens come from before your first call and pass `source_plan` (jira, jira_attach, jira_device, jira_both, device); never guess it, and never send image_gate_ack=true unless the user explicitly said the screens do not matter.
 
-        IMAGE GATE (always on). ASK FIRST: for a Jira
-        URL, ask the USER where the ticket's SCREENS come from BEFORE your first
-        call and pass `source_plan` on it -- this server cannot read images out of
-        Jira, only text, so it has to know, and asking up front costs ZERO extra
-        tool calls. Only pass `source_plan` if the user ANSWERED -- never guess it,
-        and never send `image_gate_ack=true` unless the user explicitly said the
-        screens do not matter: that pair skips BOTH asks, including the informed
-        one that names the screens the fetched ticket really has, which makes the
-        gate quieter rather than cheaper. If you call without a plan, the FIRST
-        reply is ONLY that question (nothing is fetched and nothing is prepared)
-        and you must call again with
-        the SAME feature_or_url plus `source_plan` (`jira` =
-        ticket text only, `jira_attach`, `jira_device`, `jira_both`, `device`).
-        For `jira_attach` also pass `attached_image_count` = how many images the
-        user attached to THIS chat (the bytes stay with you; the payload then
-        asks you to describe them and return `image_descriptions`). For
-        `jira_device` call `qa_capture_screens` first and pass its `capture_ids`
-        -- many screens are fine, and the ids stay valid across the Jira fetch
-        directive and any failed attempt, so re-send them unchanged. Once the
-        ticket is fetched a SECOND short reply may NAME the screens the ticket
-        actually has and ask again for `jira_attach`/`jira_device`/`jira_both`/
-        `device`; supply them, or ASK THE TESTER FIRST whether skipping is
-        acceptable and, only if they agree, pass `image_gate_ack=true`: the
-        server then shows the tester a confirmation dialog and only their own
-        skip pick generates from the ticket text. `source_plan='jira'` (ticket
-        text only) never gets that second ask -- picking it IS the tester's
-        own answer to where the screens come from.
-
-        RE-PREPARING THE SAME SOURCE: if a recent preparation for this source was
-        grounded on screens and your new call carries none, this server either
-        CARRIES THEM FORWARD (device captures it still holds -- re-sending the
-        same `capture_ids` also still works) or REFUSES and names them.
-        `proceed_anyway=true` does NOT dismiss that refusal -- either re-send the
-        screens (`qa_capture_screens` again, or re-attach them with
-        `attached_image_count`), or pass `image_carry_ack=true` once the user has
-        agreed to generate without them.
-
-        If any ticket screenshots were available they are attached as image
-        content -- inspect them directly. For an under-specified or no-UI ticket
-        the reply may instead be clarifying questions (no payload); relay them, or
-        pass proceed_anyway=true to prepare anyway.
-
-        RULES: qa_* MCP tools are the only path -- never import handlers or
-        spawn your own MCP client; never read tokens/keychains; generate NEW
-        cases, never resubmit an old export; never edit or strip the staged
-        ticket content.
-        """
+        Under-specified ticket: relay the questions, or pass proceed_anyway=true. Each prepared (non-clarify) reply carries the standing rules."""
         result = await _tracked(
             "qa_prepare_test_cases",
             ctx,
@@ -1070,67 +978,11 @@ def build_server():
         step_assertion_ack: bool = False,
         quality_gate_ack: bool = False,
     ) -> str:
-        """Submit a host-generated test suite back to the server to be validated,
-        finalized, exported and persisted (the BACK half of host mode).
+        """Submit a host-generated suite to be validated, finalized, exported and persisted (the BACK half of host mode). Call AFTER qa_prepare_test_cases with its `prep_id` and `suite_json`: one JSON object with a merged `test_cases` array per the payload's response_schema (an object, or a JSON string).
 
-        Call this AFTER qa_prepare_test_cases: pass the `prep_id` it returned and
-        `suite_json` -- the ONE JSON object you generated from the payload (a
-        single merged `test_cases` array conforming to the payload's
-        response_schema). Pass it as a JSON OBJECT when your client can send one
-        -- there is no need to serialise it into a string first. A JSON string is
-        still accepted unchanged, so either form works. The reply is EITHER the
-        finished suite summary plus the
-        exported file path, OR a short structured list of coverage gaps and vague
-        cases to fix; if so, regenerate just those and call this again with the
-        SAME prep_id. Relay the file path to the user as the deliverable; do not
-        ask which export format they want.
+        Path A (after qa_submit_category): pass a small review SIDECAR, a JSON object with `duplicate_groups` (empty list if none) and NO `test_cases`; suite_json="" also finalizes but forfeits this review.
 
-        Two routes finalize, and this description used to name only the first.
-        PATH B is the merged `suite_json` above. PATH A is per-category: stage
-        each category with `qa_submit_category`, then call this with the same
-        prep_id and a small review SIDECAR -- a JSON object carrying
-        `duplicate_groups` (an empty list if you found none) and NO
-        `test_cases`. The sidecar is what KEEPS the cross-category duplicate
-        review; finalizing with `suite_json=""` also works and is equally
-        crash-safe, but FORFEITS that review.
-
-        If the reply refuses the submission for being below the per-category
-        volume this prep's payload asked for, generate the missing cases and
-        resubmit the COMPLETE suite under the same prep_id. `volume_floor_ack`
-        is IGNORED on the first submit by design: it only works after that
-        refusal, and only the USER may decide it -- show them the numbers and
-        pass it on the retry if they confirm, never on your own judgement.
-
-        If the reply refuses the submission because an attached screen was
-        judged `relevant: "no"` (or no verdict came back at all), capture or
-        attach the correct screen and prepare again, or resubmit the same suite
-        with the per-image verdicts filled in. `image_relevance_ack` follows the
-        SAME two-beat rule as `volume_floor_ack`: ignored on the first submit,
-        honoured only after that refusal, and only ever on the USER's word.
-
-        If the reply refuses the submission because a whole category's steps have
-        an `expected_result` that only restates the `action` ("The step completes
-        successfully: ..."), rewrite those expected results to name the concrete
-        observable outcome -- the on-screen message, the field/button state, or
-        the resulting screen -- and resubmit under the same prep_id. A step that
-        restates its action passes whether the software works or not, so it
-        measures nothing. `step_assertion_ack` follows the SAME two-beat rule as
-        the two acks above: ignored on the first submit, honoured only after that
-        refusal, and only ever on the USER's word.
-
-        If the reply refuses the submission for CASE QUALITY -- steps with no
-        concrete `test_data`, an `expected_result` that only restates its own
-        `action`, or two cases sharing a title -- fix those cases and resubmit
-        under the same prep_id. `quality_gate_ack` follows the SAME two-beat rule
-        as the three acks above: ignored on the first submit, honoured only after
-        that refusal, and only ever on the USER's word. Nothing is exported or
-        saved on a refusal, so nothing is lost by fixing the cases instead.
-
-        RULES: qa_* MCP tools are the only path -- never import handlers or
-        spawn your own MCP client; never read tokens/keychains; generate NEW
-        cases, never resubmit an old export; never edit or strip the staged
-        ticket content.
-        """
+        The reply is the finished suite plus the exported file path (relay it, do not ask which format), OR refusals and gaps: fix just those and call again with the SAME prep_id. The acks (volume_floor_ack, image_relevance_ack, step_assertion_ack, quality_gate_ack) work only after that refusal and only on the USER's word, never your own judgement."""
         return await _tracked(
             "qa_submit_suite",
             ctx,
@@ -1148,15 +1000,7 @@ def build_server():
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def qa_prep_status(ctx: Context, prep_id: str = "") -> str:
-        """Show which categories are staged for a host-mode prep_id and whether
-        the per-category (Path A) finalize is allowed yet.
-
-        Use while staging categories with qa_submit_category. ready=yes means you
-        may call qa_submit_suite with a small review SIDECAR carrying
-        duplicate_groups -- or with suite_json="", which also finalizes but
-        carries no review. Path B (full merged suite_json) does not require
-        ready=yes.
-        """
+        """Show which categories are staged for a host-mode prep_id and whether the per-category (Path A) finalize is allowed yet. Use while staging with qa_submit_category. ready=yes means you may call qa_submit_suite with a small review SIDECAR carrying duplicate_groups, or suite_json="" (no review). Path B (full merged suite_json) does not need ready=yes."""
         return await _tracked(
             "qa_prep_status",
             ctx,
@@ -1167,21 +1011,7 @@ def build_server():
     async def qa_get_category_job(
         ctx: Context, prep_id: str = "", category_name: str = ""
     ) -> str:
-        """Return ONE self-contained category generation job for a prep_id
-        (system_prompt + user_context + instruction + response_schema).
-
-        Use to fetch one category's packet without re-parsing the full prepare
-        payload. category_name should match orchestration.expected_categories.
-        Pass category_name="all" (or "*") to get EVERY job in ONE call with
-        the shared prompt blocks hoisted once -- always preferred; never fetch
-        packets one call per category.
-
-        Generation itself is invisible to this server (no model call happens
-        here) and can run 6.5-24 minutes per category from the caller's own
-        chat model. Tell the tester a short status line -- "Generating
-        <category>..." -- before you start writing each category, so a long
-        gap is never silent.
-        """
+        """Return ONE self-contained category generation job for a prep_id (system_prompt + user_context + instruction + response_schema). category_name should match orchestration.expected_categories; pass "all" (or "*") for EVERY job in ONE call, always preferred. Generation runs 6.5-24 minutes per category in your own chat model: tell the tester a short status line -- "Generating <category>..." -- before you start writing each category, so a long gap is never silent."""
         _cache_key = ("qa_get_category_job", prep_id, category_name)
         _cached = _recent_call_cached(_cache_key)
         if _cached is not None:
@@ -1202,31 +1032,7 @@ def build_server():
         suite_json: str | dict = "",
         replace_smaller: bool = False,
     ) -> str:
-        """Submit ONE category's cases for a host that generates incrementally.
-
-        Use this for Path A, the recommended route -- stage each category as soon
-        as you finish it: pass the `prep_id` from qa_prepare_test_cases,
-        the category name (canonical or known alias), and `suite_json` for THAT
-        category -- as a JSON OBJECT when your client can send one, which avoids
-        serialising a large payload into a string argument; a JSON string is still
-        accepted unchanged. Names are normalized server-side. Re-submitting REPLACES that
-        category (newest wins) and the reply SAYS SO -- do NOT re-submit a
-        category that is already staged unless a reply asked you to; check
-        `qa_prep_status` first. A re-submission carrying FEWER cases than the
-        staged row is REFUSED (nothing is saved, the staged row survives) because
-        that is usually a truncated output; pass `replace_smaller=true`
-        only when dropping those cases is deliberate -- it is always reported.
-        When every expected category is staged, call
-        qa_submit_suite with the same prep_id and an EMPTY suite_json -- or with
-        a small review SIDECAR, which is how the duplicate review rides this
-        route (it works on EITHER route; what it needs is the field, not a
-        particular route). Check progress with qa_prep_status.
-
-        RULES: qa_* MCP tools are the only path -- never import handlers or
-        spawn your own MCP client; never read tokens/keychains; generate NEW
-        cases, never resubmit an old export; never edit or strip the staged
-        ticket content.
-        """
+        """Submit ONE category's cases (Path A, recommended): stage each category as soon as it is written. Pass the `prep_id` from qa_prepare_test_cases, the category name and `suite_json` for THAT category (a JSON object, or a string). Re-submitting REPLACES that category; do not re-submit a staged one unless a reply asked (check `qa_prep_status`). Fewer cases than staged is REFUSED; replace_smaller=true only when deliberate. When all are staged, call qa_submit_suite with the same prep_id and an empty suite_json or a review SIDECAR."""
         return await _tracked(
             "qa_submit_category",
             ctx,
@@ -1247,28 +1053,7 @@ def build_server():
         output_dir: str = "",
         prep_id: str = "",
     ) -> str:
-        """Export a previously generated suite (by suite_id) to one of:
-        csv | xlsx | gherkin | playwright | testrail.
-        Returns the written file path. Reuses the stored suite; live-push dry-run
-        defaults are preserved (this writes files, it never pushes to a TMS).
-
-        `output_dir` is OPTIONAL and is where the tester wants the file: pass a
-        FULL path (`~/Desktop`, `/Users/you/Documents`). A bare relative answer
-        like `desktop` is refused with the full path it probably meant, and the
-        configured default is used instead. Leave it empty and each format keeps
-        its own default location -- a secure temp folder, which since the
-        Zephyr pair was deleted on 2026-08-15 is every format there is.
-        The .xlsx that generation auto-exports is unaffected: it always
-        lands in QA_EXPORT_DIR with no question asked.
-
-        `prep_id` is NOT an export key and exports nothing on its own. It is
-        accepted only so that a host holding a prep that was never finalized
-        gets told the next call instead of a raw validation error -- 2026-08-12,
-        after a session answered three volume refusals by calling this tool with
-        a prep_id, reading the pydantic error as a dead end, and hand-writing a
-        CSV outside the pipeline. A prep becomes exportable only once
-        `qa_submit_suite` finalizes it and returns a suite_id.
-        """
+        """Export a stored suite (by suite_id) to csv | xlsx | gherkin | playwright | testrail; returns the written file path. Writes files only, never pushes to a TMS. `output_dir` is optional: a FULL path (`~/Desktop`); a bare relative word is refused. `prep_id` is NOT an export key: only the suite_id `qa_submit_suite` returns is."""
         return await _tracked(
             "qa_export_suite",
             ctx,
@@ -1311,6 +1096,7 @@ def build_server():
             apply: bool = False,
             continue_run: bool = False,
             serial: str = "",
+            device_id: str = "",
             avd: str = "",
             new_run: bool = False,
             locale: str = "",
@@ -1319,110 +1105,18 @@ def build_server():
             reset_app: bool = False,
             charter: str = "",
             note: str = "",
+            screenshot: bool = False,
+            emulator: str = "",
+            system_image: str = "",
+            confirm_destructive: bool = False,
         ) -> list[ContentBlock]:
             """Drive an Android device: ad-hoc steps (goal=...), cases, exploration.
 
-            ANY action on an Android emulator or device -- install, launch, switch
-            environment, log in, tap, type, explore -- goes through this tool. For
-            ad-hoc steps pass goal="..." with apply=true (no suite, no cases needed)
-            and it drives the device step by step. Do NOT use raw adb or shell
-            commands for device actions (adb shell input/am/pm, uiautomator dumps,
-            ADB Keyboard broadcasts): this tool owns the destructive guard, keyboard
-            install/restore, the run folder, evidence and per-step screenshots, and a
-            raw command skips every one of them. To reset the app under test, pass
-            `reset_app=true` (clears its data and relaunches it) or send a
-            `clear_app_data` op to `qa_submit_mobile_step`; either needs `apply=true`
-            and never touches a different app. A goal charter (explore lane)
-            defaults to `destructive: "none"`, which REFUSES every irreversible
-            op it meets -- a goal that reads like a reset gets a named hint to
-            resend with `destructive: "reversible"` rather than failing on its
-            first step with no explanation. An out-of-enum charter field (e.g.
-            `depth: "functional"`) is never silently accepted either: the reply
-            names the field, what was sent, what was used instead, and a fenced
-            JSON block carrying the field's real `enum` values, sourced from
-            this server's own charter vocabulary rather than restated by hand.
+            ANY Android device action goes through this tool; ad-hoc: goal="..." with apply=true. Do NOT use raw adb or shell: this tool owns the destructive guard, run folder and evidence.
 
-            To save something you learned about THIS app for its later runs on this
-            machine, pass note as a JSON object string, e.g. '{"kind": "wait",
-            "text": "the reply takes a few seconds", "when": {"rid": "send"},
-            "then": {"until_rid": "reply"}}'. kind `wait` waits (bounded) for what
-            `then` names before the op on `when.rid`; kind `avoid` refuses that op.
-            Never put a password, a code or a personal number in a note: it is
-            stored as plain text. The server refuses obvious secrets (digit runs,
-            a credential word next to a value, values typed in this run) but
-            cannot catch every one. `qa_mobile_notes` lists and retires them.
+            Call with NO arguments to start. Install/download/launch needs apply=true. No SDK/AVD: setup_required. run_id continues a run in ANY chat. ONE packet at a time; answer each with qa_submit_mobile_step. Install key in `source`, its value in `app` (or `package`); `device_id`: a running emulator's adb serial; `avd`: one to boot; `emulator`: list/boot/create/delete AVDs; `charter`: JSON, no secrets; `locale`, `reset_app=true` need apply=true; new_run=true only if the tester asks. `note`: JSON lesson about THIS app for later runs, e.g. '{"kind":"wait","when":{"rid":"send"},"then":{"until_rid":"reply"}}' (`avoid` refuses that op); plain text, so never a secret.
 
-            Call with NO arguments to start: it answers with whatever the machine
-            needs next (a setup guide, an install source, a preflight list, or
-            the start menu) and asks the tester itself. Every step that installs,
-            downloads or launches needs apply=true, and nothing is installed or
-            downloaded without it. With no Android SDK or no emulator (AVD) on
-            this machine it answers with a setup guide (`setup_required: true`):
-            relay its steps to the tester -- this server downloads no SDK and
-            creates no emulator. Pass run_id to continue a run in ANY chat --
-            that takes the run over and the previous chat is told. It hands you
-            ONE packet at a time; answer each with qa_submit_mobile_step.
-
-            The install menu's key goes in `source` and its value in `app`
-            (a path, a URL or a package name); for `source=installed_package`
-            specifically, `package` is also accepted for that value and is
-            preferred when both are given. The run menu (current_suite,
-            stored_suite, own_cases, explore, rerun_failures, resume) is a
-            SEPARATE question answered by that same `source` argument in a
-            later call -- send the run menu's key once the app is confirmed
-            installed, or give `goal`/`cases`/`suite_id` instead and skip the
-            question entirely.
-
-            Choosing to explore freely with no goal answers with a CHARTER
-            INTAKE packet: the server's own questions about the run's terms
-            (goal, depth, scope, destructive, budget). Put them to the tester
-            in your own words, ask no others, and call again with `charter`
-            set to a JSON object using the field names the packet gives. Never
-            put a password, an OTP or any personal value in it: the charter is
-            written into the run's report on disk, and it has no field for a
-            secret. Anything left out takes a default, and the report names
-            every default it used.
-
-            `locale` sets the DEVICE's language for the run -- `ar`, `ar-EG`,
-            `en-US`. It is applied before anything is installed, read back off
-            the device, and shown in the report header, so a run always states
-            the language it actually ran in. When the device will not take it
-            the call REFUSES and says what the device is in rather than running
-            under the wrong language. Needs apply=true. It takes effect from the
-            first frame only on an emulator this server booted itself; on one
-            the tester already started, `persist.sys.locale` usually needs root,
-            and the refusal says so and how to set it by hand.
-
-            If the tester already has an emulator running, pass its adb serial
-            (e.g. `emulator-5554`) in `serial` -- that skips the AVD lookup
-            entirely and never spawns a second one underneath it. `avd` names
-            which AVD to boot when none is running and more than one is
-            configured; leave both empty to let the server look and, if it
-            finds exactly one booted device, use it.
-
-            If the same cases are already an unfinished run of the same app,
-            this answers with THAT run's id instead of starting another one.
-            Pass new_run=true only when the tester has asked for a fresh run:
-            a second run of the same cases produces a second report of the
-            same work.
-
-            A PNG of the current screen is attached to every packet reply as
-            image content: LOOK AT IT before you plan. The element list comes
-            from the accessibility tree and an app that draws its own UI puts
-            almost nothing there, so on those apps the picture is the only
-            description of the screen you get. Coordinates still come from the
-            element list. If a capture did not succeed the packet says so.
-
-            Never report a screen state, field value or login outcome that was
-            not read from a qa_* observation. If the server cannot type or act,
-            stop and report the blocker by name. Do not fall back to raw adb
-            input, and do not claim a result.
-
-            A finished run's reply STARTS with a short verdict block (verdict,
-            each requested step, the typed-field tally). Relay that block to
-            the tester word for word -- never upgrade, soften or summarise it
-            into a plainer claim than it makes.
-            """
+            Never report a screen state, field value or login outcome that was not read from a qa_* observation. If the server cannot type or act, stop and report the blocker by name. Do not fall back to raw adb input, and do not claim a result. Relay a finished run's verdict block word for word."""
             from mcp.types import TextContent
 
             text, specs = await _tracked(
@@ -1439,7 +1133,7 @@ def build_server():
                     session_token,
                     apply,
                     continue_run,
-                    serial=serial,
+                    serial=_device_ref(device_id, serial),
                     avd=avd,
                     new_run=new_run,
                     locale=locale,
@@ -1448,6 +1142,10 @@ def build_server():
                     reset_app=reset_app,
                     charter=charter,
                     note=note,
+                    screenshot=screenshot,
+                    emulator=emulator,
+                    system_image=system_image,
+                    confirm_destructive=confirm_destructive,
                     **_make_elicitors(ctx),
                     progress=_make_progress(ctx),
                 ),
@@ -1475,75 +1173,18 @@ def build_server():
             confirm_destructive: bool = False,
             tester_inputs: str = "",
             note: str = "",
+            screenshot: bool = False,
+            flow: str = "",
+            flow_params: str = "",
+            save_flow: str = "",
+            route: str = "",
+            save_route: str = "",
         ) -> list[ContentBlock]:
             """Submit the action script YOU planned for a mobile packet.
 
-            The server validates it against the action vocabulary, replays it on
-            the device, and returns the verdict plus the NEXT packet. When a
-            packet asked for a credential, ask the TESTER for that one field and
-            pass it as tester_input with tester_input_field set to the field
-            name: it is typed into the app and stored nowhere -- not in the
-            report, the checkpoint or the audit log.
+            It is validated and replayed on the device; the reply is the verdict plus the NEXT packet. For a credential, ask the TESTER for that field and pass it as tester_input with tester_input_field (several: tester_inputs='{"login_password": "...", "login_otp": "..."}'); it is typed into the app and stored nowhere. A script may carry up to 10 actions: batch them. Wait FOR something (wait_until_text/gone/changed/idle), never for a number or a shell sleep. {"op": "clear_app_data"} wipes this run's own app. After the destructive guard stops a control and the TESTER confirms, resubmit the SAME op on the SAME element with confirm_destructive=true.
 
-            When a packet asks for TWO OR MORE fields in the same turn (a
-            password plus a one-time code, say), pass them all at once as
-            tester_inputs, a JSON object string mapping field name to value,
-            e.g. '{"login_password": "...", "login_otp": "..."}' -- still
-            masked, still typed into the app and stored nowhere. Example: type
-            the ID, type the password ({"op": "type", "target": ..., "field":
-            "login_password", "secret": true}), tap send, wait until_text for
-            the one-time-code screen, type the code the same way ({"op":
-            "type", "target": ..., "field": "login_otp", "secret": true}),
-            assert, then done -- with both login_password and login_otp
-            supplied via tester_inputs on that SAME submit. The final assert
-            and done belong in the same script as the step before them, and
-            wait until_text is preferred over a fixed-ms wait.
-
-            Send {"op": "clear_app_data"} as a script action to wipe this run's
-            OWN app's data and relaunch it -- gated by the same destructive
-            guard as every other irreversible action, and never a different app.
-            If the first packet already says app data was cleared at run start
-            (reset_app=true), do not send clear_app_data again for that reason.
-
-            One script may carry SEVERAL actions -- up to actions.MAX_ACTIONS,
-            replayed in order until one needs the screen re-read or the case
-            ends -- so batch what you already know you want done rather than
-            one action per call: {"actions": [{"op": "tap", "text": "Email"},
-            {"op": "type", "text": "user@example.com"}, {"op": "tap",
-            "text": "Continue"}, {"op": "assert", "kind": "new_text",
-            "text": "Password"}]} is ONE submit, not four. A script that
-            carries exactly one action still runs, but the reply says so: use
-            more of the budget you already have per call.
-
-            The NEXT packet arrives with a PNG of the screen attached as image
-            content: look at it before you plan the next script. If a capture
-            did not succeed the packet says so rather than leaving you to
-            wonder.
-
-            To save something you learned about this app for its later runs, pass
-            note as a JSON object string (same shape as on `qa_mobile_test`).
-            Never put a password, a code or a personal number in a note: the
-            server refuses obvious secrets but cannot catch every one.
-
-            When the destructive guard stops a control and the TESTER confirms
-            it, resubmit with confirm_destructive=true: it unlocks only the
-            control THIS case's last stop named, not any control -- resubmit
-            the SAME op against the SAME element the stop pointed at. A
-            different op, a different element, or a submission before any
-            stop was recorded, refuses by name and does NOT spend the
-            confirm, so the next, correctly-aimed resubmission can still use
-            it. A run whose charter says `destructive: none` still refuses.
-
-            Never report a screen state, field value or login outcome that was
-            not read from a qa_* observation. If the server cannot type or act,
-            stop and report the blocker by name. Do not fall back to raw adb
-            input, and do not claim a result.
-
-            A finished run's reply STARTS with a short verdict block (verdict,
-            each requested step, the typed-field tally). Relay that block to
-            the tester word for word -- never upgrade, soften or summarise it
-            into a plainer claim than it makes.
-            """
+            `note`: as on `qa_mobile_test`. Never report a screen state, field value or login outcome that was not read from a qa_* observation. If the server cannot type or act, stop and report the blocker by name. Do not fall back to raw adb input, and do not claim a result."""
             from mcp.types import TextContent
 
             text, specs = await _tracked(
@@ -1559,6 +1200,12 @@ def build_server():
                     confirm_destructive=confirm_destructive,
                     tester_inputs=tester_inputs,
                     note=note,
+                    screenshot=screenshot,
+                    flow=flow,
+                    flow_params=flow_params,
+                    save_flow=save_flow,
+                    route=route,
+                    save_route=save_route,
                     progress=_make_progress(ctx),
                 ),
             )
@@ -1575,18 +1222,9 @@ def build_server():
             session_token: str = "",
             report_now: bool = False,
         ) -> str:
-            """Where a mobile run stands, read from disk. Touches no device.
+            """Where a mobile run stands, read from disk. Touches no device. Device actions go through `qa_mobile_test` (goal=... for ad-hoc steps), never raw adb.
 
-            Device actions go through `qa_mobile_test` (goal=... for ad-hoc steps),
-            never raw adb.
-
-            The emulator, the lease holder and the cases done/failed/remaining.
-            Call this after anything that outlives a tool call -- a large
-            install, a cold boot. With no run_id it
-            lists the runs on this machine. Pass report_now=true to also write
-            that run's standalone HTML report and get its path back; a mid-run
-            report is fine and says it is partial.
-            """
+            Emulator, lease holder, cases done/failed/remaining. Call after anything outliving a tool call (big install, cold boot). No run_id lists runs; report_now=true writes the HTML report and returns its path."""
             return await _tracked(
                 "qa_mobile_status",
                 ctx,
@@ -1607,24 +1245,15 @@ def build_server():
             serial: str = "",
             package: str = "",
             apply: bool = False,
+            device_id: str = "",
         ) -> str:
-            """Watch what a device puts on the wire, passively and root-free.
-
-            The SAME mechanism a mobile run uses (emulator console pcap plus a
-            `/proc/net/tcp` owner sampler), given an entry point that needs no
-            run: `action="start"` (needs `apply=true` -- it touches the
-            device), `"stop"` (never needs it: stopping REVERTS), `"status"`.
-
-            Emulator only -- a physical device is refused by name, because the
-            console does not exist there. Host names come from the TLS
-            ClientHello and from DNS; **paths and query strings are not visible
-            and are never guessed**. The pcap is parsed and DELETED; only the
-            summary comes back.
-            """
-            return await _tracked(
+            """Watch what an emulator puts on the wire, passively, root-free. `device_id`: adb serial (alias `serial`). `action="start"` needs `apply=true`; `"stop"` (REVERTS) never does; `"status"`. Hosts come from TLS ClientHello and DNS; **paths and query strings are not visible and never guessed**. The pcap is parsed and DELETED; only the summary returns."""
+            return await _tracked_noted(
                 "qa_network_watch",
                 ctx,
-                mcp_handlers.handle_network_watch(action, serial, package, apply),
+                mcp_handlers.handle_network_watch(
+                    action, _device_ref(device_id, serial), package, apply
+                ),
             )
 
         @mcp.tool()
@@ -1636,15 +1265,9 @@ def build_server():
             note_id: int = 0,
             reason: str = "",
         ) -> str:
-            """List or retire the notes saved about ONE Android app.
+            """List or retire ONE app's saved notes (by `package` or `run_id`).
 
-            `action="list"` shows the app's active notes and how often each was
-            confirmed or contradicted; `action="retire"` retires `note_id` (it is
-            kept in history, never deleted; `reason` is optional and must not
-            contain a secret). Name the app with `package` or a `run_id`. Notes
-            are saved through the `note` parameter of `qa_mobile_test` and
-            `qa_submit_mobile_step`.
-            """
+            "list": active notes, confirmed/contradicted counts; "retire": `note_id`, kept in history (`reason` holds no secret). Saved via `note` on qa_mobile_test."""
             return await _tracked(
                 "qa_mobile_notes",
                 ctx,
@@ -1654,27 +1277,37 @@ def build_server():
             )
 
         @mcp.tool()
+        async def qa_mobile_flows(
+            ctx: Context,
+            action: str = "list",
+            package: str = "",
+            run_id: str = "",
+            name: str = "",
+            kind: str = "flow",
+        ) -> str:
+            """List, show or delete one app's saved flows."""
+            return await _tracked(
+                "qa_mobile_flows",
+                ctx,
+                mcp_handlers.handle_mobile_flows(action, package, run_id, name, kind),
+            )
+
+        @mcp.tool()
         async def qa_setup_capture(
             ctx: Context,
             serial: str = "",
             action: str = "prepare",
             apply: bool = False,
             capture_ack: bool = False,
+            device_id: str = "",
         ) -> str:
-            """Prepare, check or remove API capture on a device AHEAD of a run.
-
-            `action="prepare"` installs the qa-agents proxy certificate and
-            proves decryption functionally -- the SAME routine the consent
-            step inside `qa_mobile_test` calls, so this tool never re-decides
-            anything a run already decided. `action="status"` reads the
-            device's trust from disk, touching nothing. `action="remove"`
-            clears the live proxy and forgets the device's trust; like every
-            other device-touching step in this lane it needs `apply=true`.
-            """
-            return await _tracked(
+            """Prepare, check or remove API capture on a device AHEAD of a run. `device_id` is the adb serial (`serial` is an alias). `action="prepare"` installs the qa-agents proxy certificate and proves decryption; `"status"` reads the device's trust from disk; `"remove"` clears the live proxy. prepare and remove need `apply=true`."""
+            return await _tracked_noted(
                 "qa_setup_capture",
                 ctx,
-                mcp_handlers.handle_setup_capture(serial, action, apply, capture_ack),
+                mcp_handlers.handle_setup_capture(
+                    _device_ref(device_id, serial), action, apply, capture_ack
+                ),
             )
 
     # Full edition only — the distribution build exposes test-case tools alone.
@@ -1682,12 +1315,7 @@ def build_server():
 
         @mcp.tool()
         async def qa_bug_report(description: str, ctx: Context) -> str:
-            """Start a structured bug report from a plain-language description.
-
-            Chat-only: the server makes NO model call. It returns a task envelope
-            (system_prompt + untrusted-wrapped context) that YOU answer, then you
-            call qa_submit_bug_report with the task_id and your markdown report.
-            """
+            """Start a structured bug report from a plain-language description. Chat-only: the server makes NO model call. It returns a task envelope that YOU answer, then call qa_submit_bug_report with the task_id and your markdown report."""
             return await _tracked(
                 "qa_bug_report",
                 ctx,
@@ -1700,14 +1328,7 @@ def build_server():
         async def qa_explore_step(
             feature: str, session_id: str, ctx: Context, tester_response: str = ""
         ) -> str:
-            """Start the next step of an exploratory-testing coaching session.
-
-            Chat-only: the server returns a task envelope that YOU answer, then you
-            call qa_submit_explore_step with the task_id and your coaching step.
-
-            Pass a stable session_id to keep coverage memory across calls; include
-            tester_response with what you observed after the previous step.
-            """
+            """Start the next step of an exploratory-testing coaching session. Chat-only: the server returns a task envelope that YOU answer, then call qa_submit_explore_step with the task_id and your coaching step. Pass a stable session_id to keep coverage memory across calls; include tester_response with what you observed after the previous step."""
             return await _tracked(
                 "qa_explore_step",
                 ctx,
@@ -1718,14 +1339,7 @@ def build_server():
 
         @mcp.tool()
         async def qa_submit_bug_report(task_id: str, report: str, ctx: Context) -> str:
-            """Submit the bug report YOU wrote for a task opened by qa_bug_report.
-
-            qa_bug_report makes no model call: it hands you a task envelope. Write
-            the report exactly as its system_prompt specifies, then call this with
-            that task_id and the full markdown as `report`. The server validates
-            the required sections, saves it to the corpus, and either returns the
-            finished report or asks you to re-emit it against a NEW task id.
-            """
+            """Submit the bug report YOU wrote for a task opened by qa_bug_report: pass the task_id and the full markdown as `report`, written exactly as the envelope's system_prompt specifies. The server validates the required sections, saves it to the corpus, and either returns the finished report or asks you to re-emit it against a NEW task id."""
             return await _tracked(
                 "qa_submit_bug_report",
                 ctx,
@@ -1745,14 +1359,7 @@ def build_server():
                 apply: bool = False,
                 ctx: Context = None,
             ) -> str:
-                """Push a stored test suite into TestRail or Xray.
-
-                target="testrail" (needs the numeric project_id from the TestRail
-                URL) or target="xray". Defaults to a PREVIEW: it reports what would
-                be created and sends nothing. A real push needs apply=true AND the
-                target's kill-switch flag enabled in .env. Nothing here can delete
-                the cases afterwards.
-                """
+                """Push a stored test suite into TestRail or Xray. target="testrail" (needs the numeric project_id from the TestRail URL) or "xray". Defaults to a PREVIEW that sends nothing. A real push needs apply=true AND the target's kill-switch flag enabled in .env. Nothing here can delete the cases afterwards."""
                 return await _tracked(
                     "qa_push_suite",
                     ctx,
@@ -1772,18 +1379,8 @@ def build_server():
             async def qa_api_project(
                 create: str = "", use: str = "", ctx: Context = None
             ) -> str:
-                """Create a new API test project, or continue with an existing one.
-
-                Every API flow starts here. Call with NO arguments to get the
-                choice plus the projects already registered, and ask the tester in
-                plain chat. create="<name>" fetches the public project template,
-                renames it to that project, makes ONE local commit (no remote,
-                nothing pushed) and proves it compiles before keeping it.
-                use="<name or path>" continues with an existing project; an
-                existing api-automation-framework checkout is adopted in place.
-                Then call qa_prepare_api_tests.
-                """
-                return await _tracked(
+                """Create a new API test project, or continue an existing one. Every API flow starts here. With NO arguments it returns the choice plus registered projects: ask the tester in plain chat. create="<name>" fetches the public template, renames it, makes ONE local commit (nothing pushed) and proves it compiles. use="<name or path>" continues an existing project. Then call qa_prepare_api_tests."""
+                return await _tracked_noted(
                     "qa_api_project",
                     ctx,
                     mcp_handlers.handle_api_project(
@@ -1799,20 +1396,8 @@ def build_server():
                 project: str = "",
                 ctx: Context = None,
             ) -> str:
-                """Start (or continue) an API endpoint test intake.
-
-                Chat-only: the server makes NO model call. Paste a filled/partial
-                contract template, a curl command, an OpenAPI URL/JSON, or prose.
-                Returns an intake card (with the questions to ask) or, once complete
-                and confirmed=true, a generation task envelope YOU answer, then call
-                qa_submit_api_tests with the task_id and your cases.
-
-                project="<name>" scopes the endpoint and auth-flow registry, so a
-                dependency you already built is reused instead of rebuilt. Pass it
-                once, on the first call; it is remembered for the rest of the
-                intake. Omit it and everything still works for this session only.
-                """
-                return await _tracked(
+                """Start (or continue) an API endpoint test intake. Chat-only: no model call. Paste a contract template, curl command, OpenAPI URL/JSON or prose. Returns an intake card (questions to ask) or, once complete and confirmed=true, a task envelope YOU answer, then call qa_submit_api_tests with the task_id and your cases. project="<name>" scopes the endpoint registry; pass it once, on the first call."""
+                return await _tracked_noted(
                     "qa_prepare_api_tests",
                     ctx,
                     mcp_handlers.handle_prepare_api_tests(
@@ -1828,13 +1413,7 @@ def build_server():
             async def qa_submit_api_tests(
                 task_id: str, suite: str, ctx: Context
             ) -> str:
-                """Submit the API test cases YOU generated for a qa_prepare_api_tests task.
-
-                Send the task_id and your JSON {"cases": [...]}. The server grounds
-                every assertion against the confirmed contract (dropping hallucinated
-                fields, refusing cases that cannot fail) and returns the grounded
-                suite + a suite_id for qa_write_api_test.
-                """
+                """Submit the API test cases YOU generated for a qa_prepare_api_tests task: the task_id and your JSON {"cases": [...]}. The server grounds every assertion against the confirmed contract (dropping hallucinated fields, refusing cases that cannot fail) and returns the suite + a suite_id for qa_write_api_test."""
                 return await _tracked(
                     "qa_submit_api_tests",
                     ctx,
@@ -1850,18 +1429,8 @@ def build_server():
                 project: str = "",
                 ctx: Context = None,
             ) -> str:
-                """Render + (dry-run or) write the Java tests for a finalized suite.
-
-                apply=false (default) returns the branch, target paths and the full
-                Java source — nothing is written. apply=true writes via the framework
-                repo's own ops pipeline (branch -> write -> spotless -> test-compile
-                -> commit), and only when QA_API_FRAMEWORK_WRITE_ENABLED is on and
-                QA_API_FRAMEWORK_WRITE_DRY_RUN is off. Never main, never push.
-
-                project="<name>" targets a project registered by qa_api_project;
-                omit it to use QA_API_FRAMEWORK_PATH.
-                """
-                return await _tracked(
+                """Render + (dry-run or) write the Java tests for a finalized suite. apply=false (default) returns the branch, target paths and Java source, writing nothing. apply=true writes via the framework repo's ops pipeline, only when QA_API_FRAMEWORK_WRITE_ENABLED is on and QA_API_FRAMEWORK_WRITE_DRY_RUN is off. Never main, never push. project="<name>" targets a qa_api_project project; omit it for QA_API_FRAMEWORK_PATH."""
+                return await _tracked_noted(
                     "qa_write_api_test",
                     ctx,
                     mcp_handlers.handle_write_api_test(
@@ -1871,12 +1440,7 @@ def build_server():
 
         @mcp.tool()
         async def qa_submit_explore_step(task_id: str, step: str, ctx: Context) -> str:
-            """Submit the coaching step YOU wrote for a task opened by qa_explore_step.
-
-            Include the trailing <meta>area: …; phase: …</meta> line the task's
-            system_prompt asks for: the server parses it to track coverage, then
-            strips it before the tester sees the step.
-            """
+            """Submit the coaching step YOU wrote for a task opened by qa_explore_step. Include the trailing <meta>area: …; phase: …</meta> line the system_prompt asks for: the server parses it to track coverage, then strips it."""
             return await _tracked(
                 "qa_submit_explore_step",
                 ctx,
@@ -1907,23 +1471,8 @@ def build_server():
         api_token: str = "",
         atlassian_verify_json: str = "",
     ) -> str:
-        """DEPRECATED as of 2026-08-01 — Jira needs no credentials here any more.
-
-        Jira tickets are read through YOUR OWN Atlassian MCP connection
-        (mcp.atlassian.com, OAuth, Jira Cloud). This tool now returns the
-        per-client connection steps and stores NOTHING. Do not ask the user for
-        an API token, and never invent one. If a ticket URL fails, call
-        qa_prepare_test_cases and follow the directive it returns.
-
-        It IS still useful for one thing: VERIFYING that connection. Called with
-        no arguments it returns a directive telling you to call
-        mcp__atlassian__atlassianUserInfo (read-only, no parameters). Call it
-        again with atlassian_verify_json set to that call's RAW JSON result — or
-        to {"error": "<what happened>"} when the call fails or the tool does not
-        exist — and the server reports a real verified / not-connected verdict
-        plus the exact connection steps for this editor. The result is read once
-        and discarded; nothing is stored."""
-        return await _tracked(
+        """DEPRECATED: Jira needs no credentials here; tickets are read through YOUR OWN Atlassian MCP connection. This tool returns connection steps and stores NOTHING; never ask for an API token. If a ticket URL fails, call qa_prepare_test_cases and follow its directive. To VERIFY the connection, call with no arguments (it directs you to mcp__atlassian__atlassianUserInfo), then again with atlassian_verify_json set to that RAW JSON result (or {"error": "..."})."""
+        return await _tracked_noted(
             "qa_configure_jira",
             ctx,
             mcp_handlers.handle_configure_jira(
@@ -1946,10 +1495,7 @@ def build_server():
 
     @mcp.tool()
     async def qa_mirror_hold(ctx: Context, serial: str, action: str = "status") -> str:
-        """Desktop Mirror screen only: hold, release or read ONE device's lock
-        (action=acquire|release|status) so no test run drives a phone that is
-        being mirrored. Sends no device command. Returns JSON with owner and
-        mirror_hold."""
+        """Desktop Mirror only: acquire|release|status ONE device's lock so no run drives a mirrored phone. No device command; returns JSON (owner, mirror_hold)."""
 
         async def _hold() -> str:
             return mcp_handlers.handle_mirror_hold(serial, action)
@@ -1973,37 +1519,21 @@ def build_server():
         count: int = 1,
         rescan: bool = False,
         names: str = "",
+        serial: str = "",
+        peek: bool = False,
     ) -> list[ContentBlock]:
-        """Capture screenshots from a connected phone / emulator / simulator and
-        return them as image content PLUS one capture_id per screen.
-
-        Use this when the user wants test cases grounded in the REAL screens --
-        especially for a Jira ticket, because this server cannot read images out
-        of Jira (the Atlassian MCP connection returns attachment metadata, never
-        image bytes). Capture as many screens as you need with `count`, then call
-        `qa_prepare_test_cases` (or `qa_generate_test_cases`) with the returned
-        `capture_ids` so the generated cases can reference each screen BY NAME.
-
-        Screens are named automatically -- from the ticket's own image labels when
-        a prepare disclosed them, else screen_1..N. Pass `names` (comma-separated,
-        in capture order, e.g. "Login screen, OTP screen") ONLY if the user told you
-        what to call them. Never ask them a separate question about it.
-
-        Omit device_id to get a device picker (it includes a Rescan option for a
-        phone plugged in after the list was built); pass rescan=true to force a
-        fresh scan. The capture_ids stay valid until a preparation actually uses
-        them, and expire after 30 minutes.
-        """
+        """Capture screenshots from a connected phone/emulator/simulator: images PLUS one capture_id per screen. Use it to ground test cases in REAL screens, especially for a Jira ticket (its images are unreadable here): pass the `capture_ids` to `qa_prepare_test_cases`/`qa_generate_test_cases`. `count` = screens. `peek`=true: text. `names` (comma-separated) ONLY if the user told you; never ask. `serial` aliases `device_id`; omit it for a picker; ids expire after 30 minutes."""
         from mcp.types import TextContent
 
         text, specs = await _tracked(
             "qa_capture_screens",
             ctx,
             mcp_handlers.handle_capture_screens(
-                device_id=device_id,
+                device_id=_device_ref(device_id, serial),
                 count=count,
                 rescan=rescan,
                 names=names,
+                peek=peek,
                 **_make_elicitors(ctx),
                 progress=_make_progress(ctx),
             ),
@@ -2025,14 +1555,7 @@ def build_server():
 
         @mcp.tool()
         async def qa_wizard(ctx: Context) -> str:
-            """Guided entry point for testers: pick a workflow (Test cases / Bug
-            report / Exploratory) and I walk you through it
-            END-TO-END. Test cases asks where the feature comes from (describe it /
-            Jira ticket / mobile screens / Jira + mobile), captures device screens
-            when relevant, and returns the generated suite. (The inline Feature
-            Analysis report tier was deleted -- call `qa_feature_analysis` for
-            one.) No tool names or parameters needed. On clients
-            without MCP elicitation it returns a concise markdown menu instead."""
+            """Guided entry point: pick a workflow (Test cases / Bug report / Exploratory); it walks you END-TO-END, asking where the feature comes from (description / Jira ticket / mobile screens / Jira + mobile), and returns the suite. Feature Analysis: `qa_feature_analysis`. No parameters; without MCP elicitation, a markdown menu."""
             return await _tracked(
                 "qa_wizard",
                 ctx,
@@ -2044,21 +1567,13 @@ def build_server():
 
     @mcp.tool(name="qa-doctor")
     async def qa_doctor(ctx: Context, fix: bool = False) -> str:
-        """Check whether THIS machine is ready: overall verdict, environment,
-        integrations (Jira/Atlassian), CLI tooling (adb/xcrun),
-        enabled features and action items. It reports NO model backend --
-        there is none: every generative step runs in YOUR chat model.
-        Read-only by default (2026-09-25): pass fix=true to let it repair what
-        it can -- rewrite `.env` (keeping a timestamped `.env.bak-*`) and write
-        the hosted `atlassian` entry into this client's MCP config. Run this
-        first on a new machine; call again with fix=true once you see a repair
-        it can make."""
+        """Is THIS machine ready? Verdict, environment, integrations (Jira/Atlassian), CLI tooling (adb/xcrun), features, action items. Reports NO model backend: every generative step runs in YOUR chat model. Read-only by default; fix=true repairs what it can (rewrites `.env` with a backup, writes the hosted `atlassian` entry into this client's MCP config). Run first on a new machine."""
         progress = _make_progress(ctx)
         # Resolved BEFORE entering _tracked: this is a round trip back to the
         # client, not part of the report's own work, and _tracked owns the
         # in-flight counter that gates the drift restart.
         roots = await _workspace_roots(ctx)
-        return await _tracked(
+        return await _tracked_noted(
             "qa-doctor",
             ctx,
             mcp_handlers.handle_setup_check(
@@ -2076,20 +1591,8 @@ def build_server():
     # edition, which ships no tools/mobile/ on disk.
     @mcp.tool()
     async def qa_host_check(ctx: Context, refresh: bool = False) -> str:
-        """What OS is this and can this account elevate? Call this BEFORE
-        proposing any install or provision command, so you offer the route the
-        tester can actually run: on a locked-down corporate laptop an elevated
-        command is a dead end they cannot diagnose.
-
-        ADVISORY ONLY -- it blocks no run, no provision and no install; it tells
-        you which steps are attemptable, names the admin-free route first, and
-        reports "cannot determine" as UNDETERMINED rather than as a refusal.
-
-        The probe never prompts for a password and stores no credential. The
-        verdict is cached for this server process and the reply says so; pass
-        `refresh=true` to probe again after IT changes something.
-        """
-        return await _tracked(
+        """What OS is this and can this account elevate? Call BEFORE proposing any install or provision command. ADVISORY ONLY: blocks nothing, names the admin-free route first, reports "cannot determine" as UNDETERMINED, never prompts for a password. Cached per process; `refresh=true` re-probes."""
+        return await _tracked_noted(
             "qa_host_check",
             ctx,
             mcp_handlers.handle_host_check(refresh=bool(refresh)),
@@ -2104,20 +1607,8 @@ def build_server():
     # tool no chat should call.
     @mcp.tool()
     async def qa_machine_report(ctx: Context, section: str = "all") -> str:
-        """Machine-readable rows about THIS install, for a non-chat client.
-
-        Returns JSON: `backend` (version + edition in one call), `doctor`
-        (component/status/detail/fix_hint rows from the same producers
-        `qa-doctor` uses), `clients` (which MCP clients are installed and
-        whether the entry they carry points at THIS install) and
-        `provisioning` (one fixed `off` row: this server provisions no SDK
-        or emulator).
-
-        READ-ONLY -- unlike `qa-doctor` it repairs nothing, writes no `.env`
-        and edits no client config, so it is safe to poll. Humans should read
-        `qa-doctor` instead; this reply is for a GUI.
-        """
-        return await _tracked(
+        """Machine-readable rows about THIS install for a non-chat client. JSON: `backend`, `doctor` (component/status/detail/fix_hint rows), `clients` (MCP clients and whether their entry points at THIS install) and `provisioning`. READ-ONLY, safe to poll; `qa-doctor` is the human-read one."""
+        return await _tracked_noted(
             "qa_machine_report",
             ctx,
             mcp_handlers.handle_machine_report(section),
@@ -2125,22 +1616,8 @@ def build_server():
 
     @mcp.tool(name=selfcheck_module.SELF_TOOL_NAME)
     async def qa_selfcheck(ctx: Context) -> str:
-        """Check whether THIS build's own replies still describe it: call every
-        registered tool with its declared defaults and report any reply that
-        names a deleted setting, a deleted module, a model this server cannot
-        call, or a tool this edition does not register.
-
-        Read-only for your data and incapable of an external write: every
-        handler is called with its own defaults, so no acknowledgement and no
-        `apply=true` is ever sent, and outbound connections are blocked for the
-        duration. Complements `qa-doctor`, which reports on the MACHINE rather
-        than on the build's own text.
-
-        The live server is passed in from here because it is the only reference
-        to the built registry -- and it is the CONFIGURED edition, so the answer
-        is about the install in front of you.
-        """
-        return await _tracked(
+        """Check whether THIS build's own replies still describe it: call every registered tool with defaults; report any reply naming a deleted setting or module, a model this server cannot call, or a tool this edition does not register. Read-only: no `apply=true`, outbound connections blocked. `qa-doctor` covers the MACHINE."""
+        return await _tracked_noted(
             selfcheck_module.SELF_TOOL_NAME,
             ctx,
             mcp_handlers.handle_selfcheck(server=mcp),
@@ -2168,34 +1645,18 @@ def build_server():
             mode: str = "",
             device_id: str = "",
             jira_content_json: str = "",
+            serial: str = "",
         ) -> list[ContentBlock]:
-            """Start a compact enterprise Feature Analysis Report.
-
-            Chat-only: the server makes NO model call. It returns a task envelope
-            (system_prompt + untrusted-wrapped context + a response_schema) that
-            YOU answer, then you call qa_submit_feature_analysis with the task_id
-            and your JSON report.
-
-            mode is one of: jira (analyse a feature description or Jira/issue
-            URL), mobile (capture screens from a connected device), or
-            jira_mobile (merge the ticket with captured screens). Omit mode and I'll ask; the mobile modes also ask for the
-            device and offer a capture-another-screen loop, and the captured
-            screens are attached to the reply as images for YOUR model to read
-            -- this server makes no vision call.
-
-            For a Jira URL the reply may be a DIRECTIVE asking you to fetch the
-            issue with your own mcp__atlassian__getJiraIssue tool and call again
-            with jira_content_json set to its raw result as a JSON STRING
-            (stringified JSON -- that parameter is typed `str`)."""
+            """Start a compact enterprise Feature Analysis Report. Chat-only: no model call; it returns a task envelope YOU answer, then call qa_submit_feature_analysis with the task_id and your JSON report. mode: jira (description or Jira URL), mobile (capture device screens) or jira_mobile; omit it and the server asks. A Jira URL may first return a DIRECTIVE: fetch with your own mcp__atlassian__getJiraIssue and call again with jira_content_json set to the raw result as a JSON STRING."""
             from mcp.types import TextContent
 
-            reply = await _tracked(
+            reply = await _tracked_noted(
                 "qa_feature_analysis",
                 ctx,
                 mcp_handlers.handle_feature_analysis(
                     feature_or_url,
                     mode=mode,
-                    device_id=device_id,
+                    device_id=_device_ref(device_id, serial),
                     choose=_make_chooser(ctx),
                     progress=_make_progress(ctx),
                     jira_content_json=jira_content_json,
@@ -2212,16 +1673,7 @@ def build_server():
         async def qa_submit_feature_analysis(
             task_id: str, report_json: str, ctx: Context
         ) -> str:
-            """Submit the Feature Analysis JSON YOU wrote for a task opened by
-            qa_feature_analysis.
-
-            qa_feature_analysis makes no model call: it hands you a task envelope
-            carrying a system_prompt, an untrusted-wrapped user_context and a
-            response_schema. Produce a SINGLE JSON object matching that schema,
-            then call this with the task_id and the JSON as `report_json`. The
-            server validates it, renders the report, and — if the submission
-            carried no usable object — hands you ONE resubmit round against a new
-            task_id."""
+            """Submit the Feature Analysis JSON YOU wrote for a task opened by qa_feature_analysis. Produce a SINGLE JSON object matching the envelope's response_schema and pass it with the task_id as `report_json`. The server validates it, renders the report, and, if the submission carried no usable object, gives ONE resubmit round against a new task_id."""
             return await _tracked(
                 "qa_submit_feature_analysis",
                 ctx,

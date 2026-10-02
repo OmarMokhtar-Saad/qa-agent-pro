@@ -263,9 +263,7 @@ def doctor_rows() -> list:
             Row(
                 "adb",
                 "ok" if adb_path else "fail",
-                "adb at " + resolved_adb
-                if adb_path
-                else "No adb in the located SDK.",
+                "adb at " + resolved_adb if adb_path else "No adb in the located SDK.",
                 ""
                 if adb_path
                 else "Install Platform-Tools from Android Studio's SDK Manager; "
@@ -584,10 +582,11 @@ def provisioning_rows() -> list:
             Row(
                 "provisioning",
                 "off",
-                "Auto-provisioning is retired: this server no longer downloads "
-                "an Android SDK or creates an emulator. When none is found, "
+                "Auto-provisioning is retired: this server downloads no Android "
+                "SDK, and creates no emulator unasked. When none is found, "
                 "`qa_mobile_test` answers with a setup guide (install Android "
-                "Studio, create an AVD in its Device Manager).",
+                "Studio and a system image; then create an AVD in its Device "
+                "Manager or ask with `qa_mobile_test(emulator=create)`).",
             )
         ]
     )
