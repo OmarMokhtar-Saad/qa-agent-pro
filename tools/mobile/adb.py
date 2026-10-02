@@ -25,6 +25,7 @@ from pathlib import Path
 
 from tools.device_manager import (
     _valid_device_id,
+    invalidate_discovery_cache,
     parse_adb_devices,
     valid_package_name,
 )
@@ -60,6 +61,16 @@ MAX_DUMP_BYTES = 4 * 1024 * 1024
 #: here is also the only thing between a device that answers `screencap` with
 #: something enormous and this process's memory.
 MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024
+
+#: The largest file ``install`` will hand to a device. A real APK is tens of
+#: megabytes; the cap exists so a tester-supplied path to something enormous is
+#: refused on the host rather than pushed at the device (and, for
+#: ``session.start_install``, into a detached process that outlives the call).
+MAX_APK_BYTES = 512 * 1024 * 1024
+
+#: The ZIP local-file-header signature. An APK is a ZIP archive and its first
+#: entry starts with these four bytes, so a renamed text file or image does not.
+APK_MAGIC = b"PK\x03\x04"
 
 #: PNG's own eight-byte signature. ``exec-out screencap -p`` writes the image to
 #: STDOUT, so a device that refused instead writes TEXT there -- and the same
@@ -206,6 +217,15 @@ async def raw(
         return {"error": str(exc), "content": None}
 
 
+#: What adb prints when the selected device is no longer usable. Any of these
+#: drops the device-listing cache (S5), so a stale listing is not served.
+_DEVICE_GONE_RE = re.compile(
+    r"device '[^']*' not found|device offline|device unauthorized"
+    r"|device still authorizing|no devices/emulators found",
+    re.IGNORECASE,
+)
+
+
 async def _device(
     serial: str,
     args: list[str],
@@ -217,7 +237,15 @@ async def _device(
             "error": "Refusing to use " + repr(str(serial)[:40]) + " as a device id.",
             "content": None,
         }
-    return await raw(["-s", str(serial)] + list(args), timeout, stdin_data)
+    result = await raw(["-s", str(serial)] + list(args), timeout, stdin_data)
+    body = result.get("content")
+    if (
+        isinstance(body, dict)
+        and body.get("rc")
+        and _DEVICE_GONE_RE.search(str(body.get("err") or "")[:2000])
+    ):
+        invalidate_discovery_cache()
+    return result
 
 
 async def devices() -> dict:
@@ -500,20 +528,64 @@ async def current_activity(serial: str, timeout: int = 20) -> dict:
     return {"error": None, "content": ""}
 
 
+def apk_problem(path: Path) -> str:
+    """Why ``path`` must not be installed, in plain words; ``""`` when it is fine.
+
+    A host-side sanity gate (right suffix, bounded size, starts like a ZIP), not
+    an integrity proof. The file is opened ONCE and its size and first bytes
+    come from that one handle, so there is no stat-then-open gap inside the
+    check. A missing file or a directory named ``x.apk`` is a reason, not an
+    exception. Callers check ``is_file()`` first, and need to: a FIFO would block
+    the open, and a NUL in the path raises ``ValueError``.
+    """
+    path = Path(str(path))
+    if path.suffix.lower() != ".apk":
+        return "the file does not end in .apk"
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(0)
+            head = handle.read(len(APK_MAGIC))
+    except OSError as exc:
+        return "the file could not be read (" + type(exc).__name__ + ")"
+    if size > MAX_APK_BYTES:
+        return (
+            "the file is larger than the "
+            + str(MAX_APK_BYTES // (1024 * 1024))
+            + " MiB limit"
+        )
+    if head != APK_MAGIC:
+        return "the file does not start like an APK (an APK is a ZIP archive)"
+    return ""
+
+
 async def install(serial: str, apk_path: str) -> dict:
     """``adb install -r -g <apk>`` for a local file that must already exist.
 
-    Reads the kill-switch ITSELF. Installing an app onto a tester's device is
-    one of the effects the contract names, and it outlives this call. Every
-    caller today is gated, but a guard on a caller is only as good as the list
-    of callers -- which is how the same switch came to be missing from
-    ``provisioner.run`` and then ``session.start_install``.
+    Reads NO switch: the mobile lane ships on with no flag, so this function
+    gates nothing and the only refusal here is a missing file. Installing an
+    app onto a tester's device is one of the effects the contract names, and
+    it outlives this call, so whatever consent a caller owes the tester is
+    that caller's to collect before it gets here.
     """
     try:
         path = Path(str(apk_path)).expanduser()
         if not path.is_file():
             return {
                 "error": "No APK at " + str(path) + ". Nothing was installed.",
+                "content": None,
+            }
+        problem = apk_problem(path)
+        if problem:
+            return {
+                "error": (
+                    "Not installing "
+                    + str(path)[:200]
+                    + ": "
+                    + problem
+                    + ". Nothing was installed."
+                ),
                 "content": None,
             }
         result = await _device(serial, ["install", "-r", "-g", str(path)], timeout=300)
@@ -533,12 +605,11 @@ async def install(serial: str, apk_path: str) -> dict:
 
 
 async def uninstall(serial: str, package: str) -> dict:
-    """Remove a package, refusing unless the lane is on.
+    """Remove a package, refusing a name that is not a valid package id.
 
-    An uninstall is the one adb effect that repeating cannot undo, so it reads
-    the switch for the same reason :func:`install` does. The flag is checked
-    BEFORE the package-name validation: a tester whose lane is off should be
-    told that, not handed a name error they cannot act on.
+    An uninstall is the one adb effect that repeating cannot undo. Like
+    :func:`install` it reads no switch, so the package-name validation is the
+    only refusal made here.
     """
     if not valid_package_name(package):
         return {
@@ -992,7 +1063,21 @@ _DUMP_COMMAND = (
 )
 
 
-async def uiautomator_dump(serial: str) -> dict:
+#: Per-serial fast dump providers (the qa-ime AccessibilityService, see a11y.py).
+#: A provider answers ``{"error", "content": xml}``; anything but a clean,
+#: capped, ``<``-led answer falls through to the uiautomator path below.
+_DUMP_PROVIDERS: dict = {}
+
+
+def set_dump_provider(serial: str, provider) -> None:
+    _DUMP_PROVIDERS[str(serial)] = provider
+
+
+def clear_dump_provider(serial: str) -> None:
+    _DUMP_PROVIDERS.pop(str(serial), None)
+
+
+async def uiautomator_dump(serial: str, *, use_provider: bool = True) -> dict:
     """The current screen's uiautomator XML, as a string.
 
     ONE adb round trip -- see :data:`_DUMP_COMMAND` for why it is shaped the way
@@ -1009,6 +1094,21 @@ async def uiautomator_dump(serial: str) -> dict:
     was ignored on both calls before and is ignored now; with `;` it would be
     `cat`'s rc either way.
     """
+    provider = _DUMP_PROVIDERS.get(str(serial)) if use_provider else None
+    if provider is not None:
+        try:
+            fast = await provider(serial) or {}
+            fast_xml = str(fast.get("content") or "")
+            if (
+                not fast.get("error")
+                and fast_xml.lstrip().startswith("<")
+                and len(fast_xml.encode("utf-8", errors="replace")) <= MAX_DUMP_BYTES
+            ):
+                return {"error": None, "content": fast_xml}
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "mobile.adb: dump provider failed; using uiautomator", exc_info=True
+            )
     read = await shell(serial, [_DUMP_COMMAND], timeout=DUMP_TIMEOUT_S)
     if read.get("error"):
         if read.get("timed_out"):
@@ -1118,9 +1218,7 @@ async def screencap(serial: str, *, timeout_s: float | None = None) -> dict:
 
         tool_status.mark_timed_out("screencap")
         return {
-            "error": (
-                "screencap did not answer within " + str(int(wait_s)) + "s."
-            ),
+            "error": ("screencap did not answer within " + str(int(wait_s)) + "s."),
             "timed_out": True,
             "content": None,
         }
@@ -1262,11 +1360,10 @@ async def screenrecord_spawn(serial: str, remote: str, seconds: int) -> dict:
     and can bound from above.
     """
     try:
-        # Reads the kill-switch ITSELF. A recording is an effect that
-        # OUTLIVES this call -- it leaves a process running on a tester's
-        # device and a file on its disk -- which is exactly the class
-        # `install` and `uninstall` guard here rather than at a caller. A
-        # guard on a caller is only as good as the list of callers.
+        # Reads NO switch (the lane ships on with no flag). A recording is an
+        # effect that OUTLIVES this call -- it leaves a process running on a
+        # tester's device and a file on its disk -- so the refusals below,
+        # on the device id and the remote path, are all that is guarded here.
         if not _valid_device_id(serial):
             return {
                 "error": "Refusing to use "

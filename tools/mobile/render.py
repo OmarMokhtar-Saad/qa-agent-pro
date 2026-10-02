@@ -389,6 +389,34 @@ def install_source_for_label(label: str) -> str:
     return ""
 
 
+#: Both package ids Firebase App Tester has shipped under. Matched EXACTLY: a
+#: package name is device text, so a look-alike must not earn the hint.
+APP_TESTER_PACKAGES = (
+    "com.google.android.apps.firebase.appdistribution",
+    "dev.firebase.appdistribution",
+)
+
+#: Static server text, not device text. It says nothing about HOW a build got onto
+#: the device (the install source is not recorded), only how App Tester updates one.
+APP_TESTER_HINT = (
+    "App Tester (Firebase App Distribution) update flow: open the app's entry in "
+    "its list, use its Download or Update button, then confirm the system "
+    "installer. Signing in to App Tester is the tester's own step; never enter "
+    "credentials for them."
+)
+
+
+def app_tester_hint(package: object) -> str:
+    """The update-flow hint when *package* is App Tester under either id, else ``""``.
+
+    Exact match on a ``str`` after ``strip()``: anything else (a look-alike, a
+    non-string, an empty value) gets no hint. Never raises.
+    """
+    if isinstance(package, str) and package.strip() in APP_TESTER_PACKAGES:
+        return APP_TESTER_HINT
+    return ""
+
+
 def apply_refusal(step: str, detail: str = "") -> str:
     """The preview a tester gets when ``apply`` is not sent."""
     return (
@@ -418,7 +446,7 @@ SETUP_NO_AVD = "no_avd"
 def setup_guide(reason: str) -> dict:
     """What the tester must do by hand before this lane can boot anything.
 
-    This server downloads no Android SDK and creates no emulator
+    This server downloads no Android SDK and creates no emulator unasked
     (docs/RETIRED_CAPABILITIES.md -> 6), so a machine without them gets these
     steps instead. Any ``reason`` other than ``no_avd`` reads as ``no_sdk``: an
     unknown reason must still lead with the install step.
@@ -486,16 +514,31 @@ def preflight_block(content: object, rendered: str = "") -> str:
     """
     body = content if isinstance(content, dict) else {}
     failing = list(body.get("failing") or [])
+    # Count only what BLOCKS. `blocking` / `advisory` come from preflight.check;
+    # a caller that supplies neither (older shape) keeps the old count.
+    blocking = body.get("blocking")
+    must_fix = list(blocking) if isinstance(blocking, list) and blocking else failing
+    advisory = body.get("advisory")
+    advisory = list(advisory) if isinstance(advisory, list) else []
+    note = (
+        " (" + str(len(advisory)) + " advisory note(s), none of them stops a run)"
+        if advisory
+        else ""
+    )
     head = (
-        "## Preflight — all clear\n\n"
+        "## Preflight — all clear" + note + "\n\n"
         if body.get("ok")
-        else "## Preflight — " + str(len(failing)) + " check(s) must be fixed first\n\n"
+        else "## Preflight — "
+        + str(len(must_fix))
+        + " check(s) must be fixed first"
+        + note
+        + "\n\n"
     )
     tail = (
         ""
         if body.get("ok")
-        else "\n\nFix the ❌ items above and call `qa_mobile_test` again. "
-        "Nothing runs until every check passes."
+        else "\n\nFix the ❌ items above and call `qa_mobile_test` again."
+        + (" The ⚠️ advisory items do not stop a run." if advisory else "")
     )
     return head + (str(rendered) or "(no checks were produced)") + tail
 
@@ -934,7 +977,7 @@ def report_line(
 
 
 def _typed_field_tally(rows: list[dict]) -> str:
-    """"N typed fields verified, M failed", naming each failed field.
+    """ "N typed fields verified, M failed", naming each failed field.
 
     Read from each case's own trace: a ``type`` whose outcome is ``ok`` landed
     (``executor._judge_landed`` made every other verdict a failure), and one
@@ -964,6 +1007,7 @@ def _typed_field_tally(rows: list[dict]) -> str:
             line += " and others"
     return line + "\n\n"
 
+
 def typed_field_tally(rows: list[dict]) -> str:
     """Public wrapper around :func:`_typed_field_tally`. :func:`verdict_line`
     (the per-turn submit reply) and ``report.py``'s ``_meta_html`` (the
@@ -974,7 +1018,9 @@ def typed_field_tally(rows: list[dict]) -> str:
     return _typed_field_tally(rows)
 
 
-def relay_block(*, verdict: str = "", reset: object = None, typed_field_line: str = "") -> str:
+def relay_block(
+    *, verdict: str = "", reset: object = None, typed_field_line: str = ""
+) -> str:
     """The block a finished-run reply MUST start with. The calling model is
     told, in the block itself, to relay it word for word -- never upgrade it
     into a plainer claim ("Login succeeded") than the run itself can back.
@@ -1117,7 +1163,7 @@ def takeover_block(message: str) -> str:
 
 
 def starting_heading(avd: str = "") -> str:
-    """"The emulator [<avd>] is still starting" -- ONE sentence, two tools.
+    """ "The emulator [<avd>] is still starting" -- ONE sentence, two tools.
 
     Fix round 3, item 5: ``qa_mobile_test`` said this while ``qa_list_devices``
     said "No devices detected" in the same turn. Both take the words from

@@ -5,7 +5,10 @@ Point your MCP client (Cursor / Claude Code / Claude Desktop) at start.sh.
 This launcher supervises the real MCP server as a child process and keeps
 the install current WITHOUT restarting the editor:
 
-1. On start: update check + MANIFEST.sha256 self-heal + read-only lock.
+1. On start: a local MANIFEST.sha256 integrity check. A clean tree starts
+   the server at once; a tampered one is healed (update check) first.
+   The first update check, self-heal and read-only lock then run in the
+   background as soon as the client has initialized.
 2. While running: re-checks every QA_UPDATE_INTERVAL_MINUTES (default 15).
    A newer release installs in the background; the server then restarts
    itself once no tool is running (within one check interval) and the
@@ -71,6 +74,9 @@ CHILD_REAP_WAIT_S = 1.0
 # outlast CHILD_REAP_WAIT_S + RESPAWN_BACKOFF_MAX_S + RESPAWN_JITTER_S.
 CHILD_WRITE_RETRIES = 8
 CHILD_WRITE_RETRY_SLEEP_S = 1.0
+# How long the watchdog waits for the client's initialize before its first
+# update check anyway, so a client that never initializes still gets one.
+FIRST_CHECK_WAIT_S = 120.0
 
 # Used by the log-file dir below and the client-registration pass.
 # Was referenced without being defined until 2026-08-04: both call
@@ -249,6 +255,11 @@ class Supervisor:
         self.respawn_failures = 0
         self.child_lock = threading.RLock()
         self.handshake = []  # client's initialize + initialized lines
+        # Set when the client's initialize is recorded; the watchdog's first
+        # check waits on it. first_check_on_init is set by main() on a
+        # non-resume start only.
+        self.initialized = threading.Event()
+        self.first_check_on_init = False
         self.swallow_id = None  # drop the child's reply to a REPLAYED initialize
         self.last_activity = time.time()
         self.closing = False
@@ -456,6 +467,7 @@ class Supervisor:
             method = msg.get("method")
             if method == "initialize":
                 self.handshake = [line]
+                self.initialized.set()
                 _write_session_state()
             elif method == "notifications/initialized" and self.handshake:
                 self.handshake = self.handshake[:1] + [line]
@@ -674,8 +686,16 @@ class Supervisor:
         from tools.updater import run_update_check
 
         interval = _interval_seconds()
+        first = self.first_check_on_init
         while not self.closing:
-            time.sleep(interval)
+            if first:
+                # The start no longer checks for updates, so the first check
+                # runs as soon as the client has initialized (bounded, so it
+                # still runs when initialize never comes), then the interval.
+                first = False
+                self.initialized.wait(FIRST_CHECK_WAIT_S)
+            else:
+                time.sleep(interval)
             try:
                 status = run_update_check(
                     force=True, repo_override=DIST_REPO, lock_override=True
@@ -782,12 +802,30 @@ def main() -> int:
             resume_path = ""
     if not resume_path:
         try:
-            from tools.updater import run_update_check
+            from tools.updater import run_update_check, verify_integrity
 
-            status = run_update_check(
-                force=True, repo_override=DIST_REPO, lock_override=True
-            )
-            log.info("Startup update check: %s", status)
+            try:
+                from tools.updater import integrity_problems
+            except ImportError:
+                # An installed updater older than this launcher has no
+                # integrity_problems, and the outer except would skip the
+                # check altogether: fall back to the older, weaker one.
+                integrity_problems = verify_integrity
+
+            # A clean tree starts the server at once: no network, no chmod
+            # before the child. The first update check runs in the
+            # background once the client has initialized. A tampered tree
+            # (or a failed verify) heals FIRST, so tampered code never runs.
+            try:
+                tampered = integrity_problems(INSTALL_DIR)
+            except Exception as exc:
+                log.warning("Integrity check failed (%s) — healing first.", exc)
+                tampered = [str(exc)]
+            if tampered:
+                status = run_update_check(
+                    force=True, repo_override=DIST_REPO, lock_override=True
+                )
+                log.info("Startup update check: %s", status)
         except Exception as exc:  # never block startup
             log.warning("Update check failed (%s) — starting current version.", exc)
         # Fix 7 (the startup client-registration pass) was REMOVED on
@@ -798,6 +836,7 @@ def main() -> int:
         # startup. An editor installed AFTER qa-agent-pro is picked up by
         # running ~/qa-agent-pro/connect.sh, which qa-doctor points at.
     sup = Supervisor()
+    sup.first_check_on_init = not resume_path
     if resume_path:
         try:
             with open(resume_path, "rb") as fh:

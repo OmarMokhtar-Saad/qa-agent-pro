@@ -1,6 +1,6 @@
 [project]
 name = "qa-agent-pro"
-version = "1.103.6"
+version = "1.104.0"
 requires-python = ">=3.10"
 dependencies = [
     "pyyaml>=6.0",  # contracts + OpenAPI specs are YAML (api_test agent)
@@ -121,6 +121,14 @@ target-version = "py310"
 # everyone the moment those artifacts appeared.
 extend-exclude = [".claude", ".tmp"]
 
+# The release gate refuses when its own code changed since the last wrapper
+# release (AGENTS.md, Quality gates), and a reformat is such a change. These two
+# are therefore left exactly as released and kept out of `ruff format --check .`;
+# `ruff check .` still lints them. Drop an entry when that file is next changed
+# on purpose and format it in the same commit.
+[tool.ruff.format]
+exclude = ["scripts/release.py", "scripts/build_dist.py"]
+
 # mypy had NO configuration at all, so `mypy .` -- the lint_cmd the pre-push
 # hook runs -- walked into the ops executor's own backups/ directories, found
 # two copies of every module and died on duplicate module names before checking
@@ -146,3 +154,13 @@ ignore = ["E501"]
 [tool.ruff.lint.per-file-ignores]
 "scripts/*" = ["T201"]
 "tests/*" = ["T201"]
+
+# Clean-code limits (.claude/agents/_shared/CODE_QUALITY_STANDARD.md). These
+# equal ruff's defaults and are written out to pin them. The rules are NOT in
+# `select` above: the existing breaches would turn `ruff check .` red. They are
+# enforced as a per-file ratchet by tests/test_code_quality_ratchet.py instead.
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-args = 5

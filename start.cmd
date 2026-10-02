@@ -1,7 +1,7 @@
 @echo off
 rem QA Agent Pro - MCP server entry point (native Windows). Point your MCP
-rem client at this file. It runs the launcher (update-check + integrity
-rem self-heal + read-only lock) and then serves MCP over stdio.
+rem client at this file. It runs the launcher (integrity check, then update-
+rem check + self-heal + read-only lock in the background) and serves MCP over stdio.
 rem
 rem NOTHING may be echoed to stdout: stdout IS the MCP transport, and one
 rem stray line makes the client reject the handshake. Hence @echo off, and

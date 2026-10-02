@@ -359,9 +359,12 @@ back saying the budget was reached, nothing was lost -- the actions that ran
 are recorded and the screen you were given is the current one; send the rest
 as a second, shorter script.
 
-Wait for what the reply must SAY, not for a number: `wait until_text` polls and
-continues the moment that text appears, while a flat `wait ms` spends its whole
-amount even when the answer landed in the first second.
+Wait for what the reply must SAY, not for a number: `wait_until_text` continues
+the moment that text appears, `wait_until_gone` when a spinner or 'Loading'
+leaves, `wait_until_changed` / `wait_until_idle` when the screen moves or
+settles. `max_s` only bounds a condition that never comes; no wait is a fixed
+sleep. Never sleep in a shell (sleep, Start-Sleep, timeout) between calls: the
+phone is not watched while you do.
 
 To check that the app REPLIED, use `assert new_text` (optionally with
 `contains`), or `text_present` naming something the reply must say. Never

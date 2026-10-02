@@ -62,8 +62,13 @@ IME_VERIFY_TIMEOUT_S = 15.0
 #: `ime.same_component`.
 IME_SELECT_MAX_ATTEMPTS = 3
 
-#: Delay between one failed enable+select attempt and the next.
+#: The LONGEST pause between one failed enable+select attempt and the next.
+#: It is a bound, not a sleep (S17): :func:`_await_listed` ends it as soon as
+#: the device lists the QA keyboard.
 IME_SELECT_RETRY_DELAY_S = 1.0
+
+#: How often :func:`_await_listed` asks the device for its keyboards.
+IME_RETRY_POLL_S = 0.25
 
 #: Reads of `state()` after a successful enable+select before treating the
 #: keyboard as stuck. A single read cannot distinguish "refused" from "not yet
@@ -83,6 +88,20 @@ async def _sleep(seconds: float) -> None:
     """``asyncio.sleep`` under its own name, so a test can monkeypatch retry
     and poll delays to zero without touching the shared ``asyncio`` module."""
     await asyncio.sleep(seconds)
+
+
+async def _await_listed(serial: str) -> None:
+    """Pause before the next enable+select attempt until the device lists the
+    QA keyboard, at most :data:`IME_SELECT_RETRY_DELAY_S` (S17: no fixed
+    waits). An install is registered asynchronously; the fixed second this
+    replaced was spent in full even when the keyboard was listed at once."""
+    left = IME_SELECT_RETRY_DELAY_S
+    while left > 0:
+        step = min(IME_RETRY_POLL_S, left)
+        await _sleep(step)
+        left -= step
+        if not (await ime.resolve_installed_id(serial)).get("error"):
+            return
 
 
 def _record_path(run_id: str):
@@ -337,7 +356,11 @@ async def restore_stale(serial: str, *, skip_run_id: str = "") -> dict:
 
 
 async def state(serial: str) -> dict:
-    """``{"installed", "selected", "current"}`` for one device. Never raises."""
+    """``{"installed", "selected", "current", "pinned"}`` for one device.
+
+    ``pinned`` is True/False/None; None is not determined, or not installed.
+    Never raises.
+    """
     try:
         resolved = ime.manifest()
         if resolved.get("error"):
@@ -350,10 +373,17 @@ async def state(serial: str) -> dict:
         if current.get("error"):
             return current
         now = str(current.get("content") or "")
+        installed = bool((present.get("content") or {}).get("installed"))
+        # Only an installed package has a build to compare; None is never a match.
+        pinned = None
+        if installed:
+            verdict = await ime.verify_pinned(serial)
+            pinned = (verdict.get("content") or {}).get("pinned")
         return {
             "error": None,
             "content": {
-                "installed": bool((present.get("content") or {}).get("installed")),
+                "installed": installed,
+                "pinned": pinned,
                 # By COMPONENT IDENTITY, not spelling. A device stores the
                 # shorthand `pkg/.Class` while the manifest pins the expanded
                 # form, and `==` answers "that is not our keyboard" about our
@@ -367,6 +397,47 @@ async def state(serial: str) -> dict:
         return {"error": str(exc), "content": None}
 
 
+#: The run's MEMOISED failure to set the keyboard up (R1d). Its own file, NOT
+#: ``ime.json``: that record means "there is a keyboard to give back" and the
+#: restore path reads it, so a failure written there would be restored as one.
+FALLBACK_FILE = "ime-fallback.json"
+
+#: Seconds a memoised keyboard failure is trusted. A timeout on a still-booting
+#: device, or a download that failed offline, may clear within a run; past this
+#: the next typing case tries the install again.
+FALLBACK_TTL_S = 600.0
+
+
+def read_fallback(run_id: str) -> dict:
+    """The run's memoised keyboard failure, or ``{}`` once stale. Never raises."""
+    if not str(run_id or ""):
+        return {}
+    try:
+        body = run_store._read_json(run_store.run_path(str(run_id)) / FALLBACK_FILE)
+    except Exception:
+        logger.debug("mobile.ime_session.read_fallback failed", exc_info=True)
+        return {}
+    if not isinstance(body, dict):
+        return {}
+    at = body.get("at")
+    if not isinstance(at, (int, float)) or time.time() - float(at) > FALLBACK_TTL_S:
+        return {}
+    return body
+
+
+def write_fallback(run_id: str, reason: str) -> None:
+    """Remember that this run could not set the keyboard up. Never raises."""
+    if not str(run_id or ""):
+        return
+    try:
+        run_store._write_json(
+            run_store.run_path(str(run_id)) / FALLBACK_FILE,
+            {"error": str(reason)[:600], "at": time.time()},
+        )
+    except Exception:
+        logger.debug("mobile.ime_session.write_fallback failed", exc_info=True)
+
+
 async def ensure_ready(serial: str, run_id: str) -> dict:
     """Make the QA IME the active keyboard for this run, once, within a bound.
 
@@ -376,21 +447,38 @@ async def ensure_ready(serial: str, run_id: str) -> dict:
     refusal naming the device, never as a success -- typing into a keyboard that
     never became active is the exact silence this whole change exists to end.
     """
+    # A failure is decided ONCE per run: every later case that types is told the
+    # same thing at once instead of retrying a 120 s install (R1d). The tester's
+    # keyboard is untouched by a failed install, and the existing restore path
+    # (ime.json) still runs at the end of the run.
+    known = read_fallback(run_id)
+    if known.get("error"):
+        return {"error": str(known["error"]), "content": None}
     try:
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             _ensure_ready(serial, run_id), timeout=IME_READY_TIMEOUT_S
         )
     except asyncio.TimeoutError:
-        return {
+        result = {
             "error": (
                 "The QA input method did not become ready on "
                 + str(serial)[:64]
                 + " within "
                 + str(int(IME_READY_TIMEOUT_S))
-                + "s. Nothing was typed."
+                + "s."
             ),
             "content": None,
         }
+    if not result.get("error"):
+        # G4: arm-once nonce. A keyboard that cannot be armed (armed by a crashed
+        # run, a refused ARM, or an unexpected ARM reply) is a keyboard that is not
+        # ready: the run's one sticky fallback to `input text` applies, with the usual notice.
+        armed = await ime.arm(serial)
+        if armed.get("error"):
+            result = {"error": str(armed["error"]), "content": None}
+    if result.get("error"):
+        write_fallback(run_id, str(result["error"]))
+    return result
 
 
 async def _ensure_ready(serial: str, run_id: str) -> dict:
@@ -398,10 +486,11 @@ async def _ensure_ready(serial: str, run_id: str) -> dict:
 
     Idempotent: a device already installed-and-selected is reported as ready
     and nothing is written, installed, enabled or selected. It is NOT free --
-    it costs the two adb reads `state()` makes, one for the package list and one
-    for the active input method. Worth stating precisely because the per-case
-    fallback calls this on every case that types, and "no-op" would be a wider
-    claim than the two reads it actually makes.
+    it costs the adb reads `state()` makes: the package list and the active input
+    method, plus `pm path` and `sha256sum` when the keyboard is installed and the
+    manifest pins a hash. Worth stating precisely because the per-case fallback
+    calls this on every case that types, and "no-op" would be a wider claim than
+    the reads it actually makes.
 
     Otherwise the tester's current keyboard
     is remembered FIRST -- before anything is installed, enabled or selected --
@@ -414,7 +503,11 @@ async def _ensure_ready(serial: str, run_id: str) -> dict:
         if now.get("error"):
             return now
         body = now.get("content") or {}
-        if body.get("installed") and body.get("selected"):
+        if (
+            body.get("installed")
+            and body.get("selected")
+            and body.get("pinned") is not False
+        ):
             return {
                 "error": None,
                 "content": {
@@ -457,7 +550,7 @@ async def _ensure_ready(serial: str, run_id: str) -> dict:
                     "content": None,
                 }
 
-        if not body.get("installed"):
+        if not body.get("installed") or body.get("pinned") is False:
             installed = await ime.install(serial)
             if installed.get("error"):
                 return installed
@@ -469,13 +562,13 @@ async def _ensure_ready(serial: str, run_id: str) -> dict:
             if enabled.get("error"):
                 last_failure_text = str(enabled.get("error") or "")
                 if attempt < IME_SELECT_MAX_ATTEMPTS:
-                    await _sleep(IME_SELECT_RETRY_DELAY_S)
+                    await _await_listed(serial)
                 continue
             chosen = await ime.select(serial)
             if chosen.get("error"):
                 last_failure_text = str(chosen.get("error") or "")
                 if attempt < IME_SELECT_MAX_ATTEMPTS:
-                    await _sleep(IME_SELECT_RETRY_DELAY_S)
+                    await _await_listed(serial)
                 continue
 
             last_failure_text = ""
@@ -497,7 +590,7 @@ async def _ensure_ready(serial: str, run_id: str) -> dict:
                 if poll < IME_POLL_MAX_ATTEMPTS - 1:
                     await _sleep(IME_POLL_INTERVAL_S)
             if attempt < IME_SELECT_MAX_ATTEMPTS:
-                await _sleep(IME_SELECT_RETRY_DELAY_S)
+                await _await_listed(serial)
 
         if not reached_poll:
             after = await state(serial)

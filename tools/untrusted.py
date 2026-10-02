@@ -86,7 +86,12 @@ def strip_spoof_tags(text: object) -> str:
     the regex here would have changed rtm's behaviour silently, without even an
     ImportError to notice. Wrapping is still the default and the rule; this is
     for the cases where the text is not a block. Never raises."""
-    return _SPOOF_PATTERN.sub("", text if isinstance(text, str) else str(text or ""))
+    cleaned = text if isinstance(text, str) else str(text or "")
+    # Until stable: one pass turns `</untrusted_</untrusted_content>content>` into
+    # a real closing tag. Every pass removes characters, so this terminates.
+    while _SPOOF_PATTERN.search(cleaned):
+        cleaned = _SPOOF_PATTERN.sub("", cleaned)
+    return cleaned
 
 
 # Non-alphanumeric characters are replaced with "_" in the label so it can
@@ -109,7 +114,7 @@ def wrap_untrusted(label: str, body: str, limit: int = 4000) -> str:
     if not text.strip():
         return ""
 
-    cleaned = _SPOOF_PATTERN.sub("", text)
+    cleaned = strip_spoof_tags(text)
     truncated = cleaned[:limit]
     if len(cleaned) > limit:
         truncated += "\n...[truncated]"

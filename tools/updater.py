@@ -32,6 +32,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import re
@@ -44,6 +45,7 @@ import tempfile
 import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -59,6 +61,17 @@ _GITHUB_API = "https://api.github.com"
 _INSTALL_DIR = Path(__file__).resolve().parent.parent
 # Generous cap for the post-update dependency install (network + build).
 _PIP_TIMEOUT = 600
+# Worker threads for the manifest hash pass in verify_integrity(). Hashing is
+# disk-read plus hashlib (which drops the GIL on large buffers), so a handful
+# of threads overlaps the I/O; more only adds seek contention.
+_INTEGRITY_MAX_WORKERS = 8
+# SECONDS a manifest-only heal (MANIFEST.sha256 missing or empty) is not retried
+# after an attempt, finished or not. A release that ships no manifest can never
+# restore it, and the launcher checks every 15 minutes: without a floor that is a
+# full archive download per check, forever.
+MANIFEST_HEAL_RETRY_INTERVAL_S = 6 * 3600
+# BYTES read from the heal marker; a larger file reads as "no attempt".
+_HEAL_MARKER_MAX_BYTES = 4096
 
 # Operator-local state a code update must NEVER overwrite. Entries are POSIX
 # paths relative to the install root; a path is protected if it equals one of
@@ -117,7 +130,7 @@ _LOCK_EXTRA = ("MANIFEST.sha256", "MANIFEST.sig", "launcher.py", "VERSION")
 # key => signature verification is inert (logged) and the
 # QA_UPDATE_REQUIRE_SIGNATURE gate decides whether an unsigned release proceeds.
 _RELEASE_PUBLIC_KEY_HEX = (
-    "4c43769703fb44da543f15402a88c590990f0b0f7c0574caa935c6e16353beff"
+    "78a4e6d773483159637930e01db8de2448112117706aa908172e87211e0ac2d9"
 )
 
 
@@ -173,11 +186,33 @@ def load_manifest(install_dir: Path) -> dict:
 def verify_integrity(install_dir: Path) -> list:
     """Return manifest-listed files whose on-disk content is missing or differs
     from the release hash (i.e. locally edited). Empty manifest -> ``[]``."""
-    mismatched = []
-    for rel, digest in sorted(load_manifest(install_dir).items()):
-        if _file_sha256(install_dir / rel) != digest:
-            mismatched.append(rel)
-    return mismatched
+    items = sorted(load_manifest(install_dir).items())
+    if not items:
+        return []
+    # No hash cache: every start re-reads every file, which is the point of
+    # the check. Only the serial loop became a bounded pool; the result is
+    # still the sorted list of missing or differing paths.
+    workers = min(_INTEGRITY_MAX_WORKERS, len(items))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        matches = list(
+            pool.map(lambda item: _file_sha256(install_dir / item[0]) == item[1], items)
+        )
+    return [rel for (rel, _digest), ok in zip(items, matches) if not ok]
+
+
+def integrity_problems(install_dir: Path) -> list:
+    """What a start-up GATE should heal: ``verify_integrity``'s list, plus
+    ``[MANIFEST.sha256]`` when the manifest yields no usable entry at all.
+
+    ``verify_integrity`` / ``load_manifest`` read a missing, empty or unparseable
+    manifest as "nothing to check". That is right for the consumers that merely
+    look (the drift watch, ``lock_files``, the prune pass) and wrong for a gate:
+    deleting or emptying the manifest would switch the check off. A heal from the
+    same-version release restores the file, so the state converges. Never
+    raises beyond what ``verify_integrity`` does."""
+    if not load_manifest(install_dir):
+        return [_MANIFEST_NAME]
+    return verify_integrity(install_dir)
 
 
 def lock_files(install_dir: Path) -> int:
@@ -1205,6 +1240,66 @@ def _pip_install(install_dir: Path) -> None:
         )
 
 
+def _heal_marker(install_dir: Path) -> Path:
+    """``data`` is a PROTECTED path, so a swap never overwrites or prunes this."""
+    return install_dir / "data" / ".manifest-heal.json"
+
+
+def _read_heal_marker(install_dir: Path) -> dict:
+    """The last manifest-heal attempt as a dict, or {} for a missing, unreadable or
+    mis-shaped marker. Never raises: a bad marker must read as "no attempt"."""
+    try:
+        with _heal_marker(install_dir).open("rb") as fh:
+            raw = fh.read(_HEAL_MARKER_MAX_BYTES + 1)
+        if len(raw) > _HEAL_MARKER_MAX_BYTES:
+            return {}
+        doc = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def _write_heal_marker(install_dir: Path, remote: object, outcome: str) -> None:
+    """Record a heal attempt for ``remote`` (``attempted`` | ``healed`` |
+    ``no-manifest``). Best effort: an unwritable data directory must not break the
+    update check, it only costs a retry."""
+    marker = _heal_marker(install_dir)
+    doc = {"version": str(remote).lstrip("vV"), "outcome": outcome, "at": time.time()}
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps(doc), encoding="utf-8")
+    except OSError as exc:
+        logger.debug("Could not record the manifest-heal marker (%s).", exc)
+
+
+def _healed_outcome(install_dir: Path) -> str:
+    """``healed`` when the manifest is usable again after a heal, else
+    ``no-manifest``: the release ships none, so a heal cannot restore it."""
+    return "healed" if load_manifest(install_dir) else "no-manifest"
+
+
+def _manifest_heal_deferred(
+    install_dir: Path, mismatched: list, remote: object
+) -> bool:
+    """True when the ONLY problem is the manifest itself and a heal from this release
+    was already tried inside the floor, whether it failed or found that the release
+    ships no manifest. Both are time-bound: with the manifest gone no other tamper is
+    visible, so no marker may switch the heal off for good. A real file mismatch is
+    never deferred, and a finished heal (``healed``) is not a reason to wait: a
+    manifest deleted again after it is worth healing at once."""
+    if mismatched != [_MANIFEST_NAME]:
+        return False
+    doc = _read_heal_marker(install_dir)
+    if doc.get("version") != str(remote).lstrip("vV"):
+        return False
+    at = doc.get("at")
+    if doc.get("outcome") not in ("attempted", "no-manifest"):
+        return False
+    if type(at) not in (int, float):
+        return False
+    return 0 <= time.time() - at < MANIFEST_HEAL_RETRY_INTERVAL_S
+
+
 def run_update_check(
     install_dir: Optional[Path] = None,
     *,
@@ -1292,7 +1387,10 @@ def run_update_check(
             return "updated"
         status = "up-to-date"
         if lock:
-            mismatched = verify_integrity(install_dir)
+            # integrity_problems, not verify_integrity: a deleted or emptied
+            # MANIFEST.sha256 must heal (same release, same signature and
+            # binding gates) rather than read as a clean tree.
+            mismatched = integrity_problems(install_dir)
             # Heal only when the latest release matches the installed version —
             # that zipball is the exact tree the local MANIFEST.sha256 describes.
             same_release = (
@@ -1300,6 +1398,15 @@ def run_update_check(
                 and _parse_version(remote or "") is not None
                 and _parse_version(remote or "") == _parse_version(local or "")
             )
+            if same_release and _manifest_heal_deferred(
+                install_dir, mismatched, remote
+            ):
+                logger.info(
+                    "Manifest heal for %s deferred: already tried within %d h.",
+                    remote,
+                    MANIFEST_HEAL_RETRY_INTERVAL_S // 3600,
+                )
+                mismatched = []
             if mismatched and same_release:
                 logger.warning(
                     "Integrity check: %d locally modified file(s) %s — healing from release %s.",
@@ -1307,6 +1414,7 @@ def run_update_check(
                     mismatched[:5],
                     remote,
                 )
+                _write_heal_marker(install_dir, remote, "attempted")
                 with tempfile.TemporaryDirectory(prefix="qa-heal-") as tmp:
                     new_tree = download_and_extract(
                         download_url, token, timeout, Path(tmp)
@@ -1324,6 +1432,10 @@ def run_update_check(
                         status = (
                             "healed" if healed_backup is not None else "heal-skipped"
                         )
+                        if healed_backup is not None:
+                            _write_heal_marker(
+                                install_dir, remote, _healed_outcome(install_dir)
+                            )
                     else:
                         logger.warning(
                             "Self-heal aborted: release signature/manifest not "

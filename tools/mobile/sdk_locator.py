@@ -321,6 +321,11 @@ def _avd_name_is_safe(name: str) -> bool:
     )
 
 
+def avd_name_is_safe(name: str) -> bool:
+    """Public name of :func:`_avd_name_is_safe`, for ``avd_manage``: one rule, one producer."""
+    return _avd_name_is_safe(name)
+
+
 def _avd_config_texts(name: str) -> list[str]:
     """The head of every ``config.ini`` AVD *name* has, in the emulator's order.
 

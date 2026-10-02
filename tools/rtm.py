@@ -759,7 +759,6 @@ def rtm_rows(acs: list, test_cases: list, *, derived: bool = False) -> list:
         return []
 
 
-
 def rtm_oneline(
     acs: list[AcceptanceCriterion],
     test_cases: list[TestCase],
@@ -899,4 +898,3 @@ def format_ac_prompt_block(acs: list[AcceptanceCriterion]) -> str:
             "overstates coverage for everyone downstream.\n"
         )
     )
-

@@ -134,6 +134,7 @@ MANIFEST_FILE = "manifest.json"
 #: :func:`briefed_session`. NOT kept in the lease, which is rewritten wholesale
 #: on every heartbeat -- surviving that is the marker's whole job.
 BRIEFING_FILE = "briefing.json"
+SCREEN_MEMO_FILE = "screen_memo.json"
 CASES_DIR = "cases"
 SCREENS_DIR = "screens"
 OBSERVATIONS_DIR = "observations"
@@ -354,9 +355,7 @@ def read_resolved_app(task_key: str) -> dict:
         return {}
 
 
-def write_resolved_app(
-    task_key: str, package: str, serial: str, charter: dict
-) -> None:
+def write_resolved_app(task_key: str, package: str, serial: str, charter: dict) -> None:
     """Remember *package*/*serial*/*charter* for *task_key*. Never raises.
 
     Bounded to MAX_RESOLVED_APPS entries (oldest `cached_at` evicted first)
@@ -379,9 +378,7 @@ def write_resolved_app(
             "cached_at": time.time(),
         }
         if len(store) > MAX_RESOLVED_APPS:
-            oldest = sorted(
-                store.items(), key=lambda kv: kv[1].get("cached_at") or 0
-            )
+            oldest = sorted(store.items(), key=lambda kv: kv[1].get("cached_at") or 0)
             for stale_key, _ in oldest[: len(store) - MAX_RESOLVED_APPS]:
                 store.pop(stale_key, None)
         _write_json(path, store)
@@ -1141,6 +1138,69 @@ def clear_briefing(run_id: str) -> dict:
         return {"error": None, "content": {"cleared": True}}
     except Exception as exc:
         logger.exception("mobile.run_store.clear_briefing failed")
+        return {"error": str(exc), "content": None}
+
+
+def _screen_memo_path(run_id: str) -> Path:
+    return run_path(run_id) / SCREEN_MEMO_FILE
+
+
+def last_screen(run_id: str) -> dict:
+    """The screen block this run last sent, as ``{session, fingerprint, position}``.
+
+    The briefing memo's pattern, for the element list: a packet whose screen is
+    byte-identical to the one the SAME chat was just handed says so in one line
+    instead of repeating it. Never raises; an unreadable memo reads as "nothing
+    sent", which makes the next packet go out whole -- the safe direction.
+    """
+    try:
+        if not valid_run_id(run_id):
+            return {"error": "Invalid run id.", "content": {}}
+        body = _read_json(_screen_memo_path(run_id))
+        if not isinstance(body, dict):
+            return {"error": None, "content": {}}
+        return {
+            "error": None,
+            "content": {
+                key: str(body.get(key) or "")
+                for key in ("session", "fingerprint", "position")
+            },
+        }
+    except Exception as exc:
+        logger.exception("mobile.run_store.last_screen failed")
+        return {"error": str(exc), "content": {}}
+
+
+def mark_screen(run_id: str, session_id: str, fingerprint: str, position: str) -> dict:
+    """Record the screen block *session_id* was just handed, and where."""
+    try:
+        if not valid_run_id(run_id) or not str(session_id or "").strip():
+            return {"error": "Invalid run id or session.", "content": None}
+        memo = {
+            "session": str(session_id),
+            "fingerprint": str(fingerprint or ""),
+            "position": str(position or ""),
+        }
+        _write_json(_screen_memo_path(run_id), memo)
+        return {"error": None, "content": memo}
+    except Exception as exc:
+        logger.exception("mobile.run_store.mark_screen failed")
+        return {"error": str(exc), "content": None}
+
+
+def clear_screen(run_id: str) -> dict:
+    """Forget the last screen sent, so the NEXT packet carries it whole.
+
+    Called wherever :func:`clear_briefing` is: the same signal says the model
+    may no longer hold what it was sent.
+    """
+    try:
+        if not valid_run_id(run_id):
+            return {"error": "Invalid run id.", "content": None}
+        _screen_memo_path(run_id).unlink(missing_ok=True)
+        return {"error": None, "content": {"cleared": True}}
+    except Exception as exc:
+        logger.exception("mobile.run_store.clear_screen failed")
         return {"error": str(exc), "content": None}
 
 

@@ -15,6 +15,7 @@ not worth failing on.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from tools import host_privileges
@@ -253,6 +254,45 @@ def _unanswered(name: str, result: object, fix: str = "") -> dict | None:
     )
 
 
+def _dns_probe(serial: str):
+    """The name-resolution ping of step 4b, as one awaitable.
+
+    The ADB CALL carries the budget and `-W` is left to do the one job it can
+    do -- see DNS_PROBE_TIMEOUT_S for the numbers that decide which is which.
+    """
+    return adb.shell(
+        serial,
+        ["ping", "-c", "1", "-W", str(DNS_PING_WAIT_S), DNS_PROBE_HOST],
+        timeout=DNS_PROBE_TIMEOUT_S,
+    )
+
+
+def _start_early_probes(serial: str, target_package: str) -> dict:
+    """Start the read-only probes of steps 4b-9 at once. ``{}`` without a serial.
+
+    Only probes whose step WILL make the call are started, under the same
+    conditions that step checks, so no answer is fetched that nothing reads.
+    None of them changes the device: a ping, a package list, and three reads
+    of input-method state. Never raises; a probe that cannot be started is
+    simply left to its step.
+    """
+    tasks: dict = {}
+    if not serial:
+        return tasks
+    try:
+        tasks["dns"] = asyncio.ensure_future(_dns_probe(serial))
+        package = str(target_package or "").strip()
+        if package and valid_package_name(package):
+            tasks["packages"] = asyncio.ensure_future(adb.installed_packages(serial))
+        if bool(((ime.manifest_status() or {}).get("content") or {}).get("ok")):
+            tasks["ime_installed"] = asyncio.ensure_future(ime.installed(serial))
+            tasks["ime_selected"] = asyncio.ensure_future(ime.current_ime(serial))
+            tasks["ime_oracle"] = asyncio.ensure_future(ime.probe(serial))
+    except Exception:
+        logger.debug("mobile.preflight: early probes not started", exc_info=True)
+    return tasks
+
+
 async def check(
     target_package: str = "", serial: str = "", needs_typing: bool = False
 ) -> dict:
@@ -265,20 +305,12 @@ async def check(
     """
     checks: list[dict] = []
     resolved_serial = str(serial or "")
+    early: dict = {}
     try:
         # 1. virtualization -----------------------------------------------
-        try:
-            virt = (platform_info.virtualization() or {}).get("content") or {}
-            checks.append(
-                _record(
-                    "virtualization",
-                    bool(virt.get("ok")),
-                    str(virt.get("detail") or ""),
-                    str(virt.get("fix") or ""),
-                )
-            )
-        except Exception as exc:
-            checks.append(_record("virtualization", False, "check failed: " + str(exc)))
+        # (Computed at step 4a, once the serial is known, and inserted at
+        # position 0 so the row order is unchanged: a physical handset has no
+        # use for the emulator-accelerator answer.)
 
         # 2. adb responds --------------------------------------------------
         serials: list[str] = []
@@ -420,6 +452,38 @@ async def check(
                 _record("emulator_booted", False, "check failed: " + str(exc))
             )
 
+        # 4a. virtualization (an EMULATOR question) -------------------------
+        # Asked only when an emulator may be involved: no serial at all (one may
+        # have to be started) or an `emulator-*` serial. A physical serial skips
+        # it, because the Windows probe needs an elevated shell and used to
+        # refuse a run that never touched a hypervisor. An UNDETERMINED answer
+        # (the query itself failed) is advisory, never a refusal.
+        try:
+            if not resolved_serial or str(resolved_serial).startswith("emulator-"):
+                virt = (platform_info.virtualization() or {}).get("content") or {}
+                virt_record = _record(
+                    "virtualization",
+                    bool(virt.get("ok")),
+                    str(virt.get("detail") or ""),
+                    str(virt.get("fix") or ""),
+                )
+                if virt.get("undetermined"):
+                    virt_record["blocking"] = False
+                checks.insert(0, virt_record)
+        except Exception as exc:
+            checks.insert(
+                0, _record("virtualization", False, "check failed: " + str(exc))
+            )
+
+        # THE READ-ONLY DEVICE PROBES, STARTED TOGETHER (S13). Steps 4b-9 each
+        # made one adb round trip and waited for it before the next began, so a
+        # slow resolver (the DNS ping has its own multi-second budget) held up
+        # four probes that do not depend on it. Each step still awaits ITS task
+        # at its own place, inside its own try, so the row order and every
+        # step's failure handling are exactly what the serial version produced;
+        # a step that finds no task makes the call itself.
+        early = _start_early_probes(resolved_serial, target_package)
+
         # 4b. the device can resolve a name ---------------------------------
         try:
             if not resolved_serial:
@@ -436,18 +500,7 @@ async def check(
                 # The ADB CALL carries the budget and `-W` is left to do the
                 # one job it can do -- see DNS_PROBE_TIMEOUT_S for the numbers
                 # that decide which is which.
-                named = await adb.shell(
-                    resolved_serial,
-                    [
-                        "ping",
-                        "-c",
-                        "1",
-                        "-W",
-                        str(DNS_PING_WAIT_S),
-                        DNS_PROBE_HOST,
-                    ],
-                    timeout=DNS_PROBE_TIMEOUT_S,
-                )
+                named = await (early.pop("dns", None) or _dns_probe(resolved_serial))
                 # A probe that OUTLASTED the budget is a FINDING, not a check
                 # that could not be made: adb was reachable enough to be left
                 # waiting on the resolver. So it does NOT go to `_unanswered`,
@@ -584,7 +637,10 @@ async def check(
                     )
                 )
             else:
-                installed = await adb.installed_packages(resolved_serial)
+                installed = await (
+                    early.pop("packages", None)
+                    or adb.installed_packages(resolved_serial)
+                )
                 unanswered = _unanswered("package_installed", installed)
                 if unanswered:
                     checks.append(unanswered)
@@ -655,7 +711,12 @@ async def check(
                         )
                     )
                 else:
-                    present = (await ime.installed(resolved_serial)) or {}
+                    present = (
+                        await (
+                            early.pop("ime_installed", None)
+                            or ime.installed(resolved_serial)
+                        )
+                    ) or {}
                     # `ime.installed` propagates `adb.installed_packages`'s
                     # envelope verbatim (ime.py:197-198), so the evidence is
                     # here and used to be dropped: a failed probe rendered
@@ -674,8 +735,9 @@ async def check(
                                 (
                                     ""
                                     if ok
-                                    else "The mobile lane installs the QA keyboard "
-                                    "itself on the next run with apply=true."
+                                    else "This does not block a run. The mobile lane "
+                                    "installs the QA keyboard itself at the start of "
+                                    "a run whose script types or clears text."
                                 ),
                             )
                         )
@@ -689,7 +751,10 @@ async def check(
                         _record("ime_selected", False, "cannot check without a device")
                     )
                 else:
-                    current = await ime.current_ime(resolved_serial)
+                    current = await (
+                        early.pop("ime_selected", None)
+                        or ime.current_ime(resolved_serial)
+                    )
                     # THE SAME HOLE AS THE TWO ABOVE, found while checking the
                     # neighbour: `ime.current_ime` returns its adb envelope
                     # verbatim (ime.py:264-265), and reading only `content` made
@@ -728,7 +793,9 @@ async def check(
                         _record("ime_oracle", False, "cannot check without a device")
                     )
                 else:
-                    probed = await ime.probe(resolved_serial)
+                    probed = await (
+                        early.pop("ime_oracle", None) or ime.probe(resolved_serial)
+                    )
                     if probed.get("error"):
                         checks.append(
                             _record(
@@ -865,19 +932,38 @@ async def check(
     except Exception as exc:
         logger.exception("mobile.preflight.check failed")
         return {"error": str(exc), "content": None}
+    finally:
+        # A task no step reached (the function failed part-way) is cancelled
+        # rather than left to finish against a device nobody is reading.
+        for task in early.values():
+            task.cancel()
 
 
 def render(content: dict) -> str:
     """The checks as tester-facing markdown, failures first with their fixes."""
     lines: list[str] = []
     body = dict(content or {})
+
+    def _advisory_failure(record: dict) -> bool:
+        return (not record.get("ok")) and record.get("blocking", True) is False
+
+    # Blocking failures first, then advisory ones, then the passes.
     ordered = sorted(
-        body.get("checks") or [], key=lambda record: (bool(record.get("ok")),)
+        body.get("checks") or [],
+        key=lambda record: (bool(record.get("ok")), _advisory_failure(record)),
     )
     for record in ordered:
-        mark = "✅" if record.get("ok") else "❌"
+        advisory = _advisory_failure(record)
+        mark = "✅" if record.get("ok") else ("⚠️" if advisory else "❌")
+        label = " (advisory, does not block a run)" if advisory else ""
         lines.append(
-            mark + " **" + str(record.get("name")) + "** — " + str(record.get("detail"))
+            mark
+            + " **"
+            + str(record.get("name"))
+            + "**"
+            + label
+            + " — "
+            + str(record.get("detail"))
         )
         if not record.get("ok") and record.get("fix"):
             lines.append("   ↳ " + str(record["fix"]))

@@ -914,6 +914,7 @@ def prune(
             scrollable = _flag(node, "scrollable")
             editable = _is_editable(full_class)
             secure = _flag(node, "password")
+            hint = _clean(node.get("hint"))
             if not (text or desc or rid or clickable or scrollable or editable):
                 # Pure layout scaffolding: not a target, not assertable.
                 continue
@@ -923,6 +924,7 @@ def prune(
                 texts.append(text)
             elements.append(
                 {
+                    **({"hint": hint} if hint else {}),
                     "id": "",
                     "cls": _short_class(full_class),
                     "text": text,
@@ -1662,3 +1664,44 @@ def to_prompt_block(pruned: object) -> str:
     except Exception:  # pragma: no cover - defensive
         logger.exception("mobile.perception.to_prompt_block failed")
         return ""
+
+
+# Below this many elements the list is not a screen a model can act on from
+# text alone: a splash, a canvas with one overlay, a dump taken mid-transition.
+MIN_USABLE_ELEMENTS = 3
+
+
+def dump_unusable(screen: object) -> str:
+    """Why the element list is NOT enough to act on, or ``""`` when it is.
+
+    The screenshot goes to the model only when this names a reason, the model
+    asked for it, or a ``visual`` assert is being judged. A wrong ``""`` costs
+    a blind step and a wrong reason costs one image, so the rules lean towards
+    naming a reason. Never raises: a screen this cannot read is ``no_dump``,
+    which attaches the picture.
+    """
+    try:
+        body = screen if isinstance(screen, dict) else None
+        if body is None or body.get("error"):
+            return "no_dump"
+        if isinstance(body.get("content"), dict):
+            body = body["content"]
+        elements = _rows(body.get("elements"))
+        if not elements:
+            return "no_elements"
+        if len(elements) < MIN_USABLE_ELEMENTS:
+            return "few_elements"
+        if any("webview" in str(e.get("cls") or "").lower() for e in elements):
+            return "webview"
+        clickable = [e for e in elements if e.get("clickable")]
+        unlabeled = [
+            e
+            for e in clickable
+            if not (e.get("text") or e.get("desc") or e.get("label"))
+        ]
+        if len(unlabeled) >= 2 and 2 * len(unlabeled) >= len(clickable):
+            return "unlabeled_controls"
+        return ""
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("mobile.perception.dump_unusable failed")
+        return "no_dump"

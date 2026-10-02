@@ -1,10 +1,10 @@
 """How long THIS device takes to dump its screen, and what a wait may assume.
 
-Fix round 3, items 2 and 4. ``executor.MIN_POLL_MARGIN_MS`` is a FLOOR written
-for a Pixel-class AVD; on a heavy AVD behind an overloaded host one dump took
-longer than that floor, so the last poll of a wait landed after its deadline.
-This module keeps a rolling p90 of REAL dump times per serial, and the margin a
-polled wait keeps is the larger of the floor and that p90 (:func:`margin_ms`).
+Fix round 3, items 2 and 4. On a heavy AVD behind an overloaded host one dump
+took longer than a Pixel-class floor, so the last poll of a wait landed after
+its deadline. This module keeps a rolling p90 of REAL dump times per serial
+(:func:`p90_ms`) for the slow-host warning; since S17 a wait no longer keeps a
+margin at all -- each poll's dump is cut at the wait's deadline instead.
 
 It also owns the ONE dump in flight per serial. Every dump writes the same
 ``adb.DUMP_REMOTE_PATH``, so a dump cut by a wait's deadline must not be
@@ -77,11 +77,6 @@ def p90_ms(serial: str) -> int | None:
     ordered = sorted(samples)
     index = max(0, math.ceil(0.9 * len(ordered)) - 1)
     return int(ordered[index] * 1000)
-
-
-def margin_ms(serial: str, floor: int) -> int:
-    """The larger of *floor* and this device's p90 dump time, in ms."""
-    return max(int(floor), p90_ms(serial) or 0)
 
 
 async def _timed(serial: str, awaitable: Awaitable[Any]) -> Any:

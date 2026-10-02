@@ -118,9 +118,7 @@ _STATED_DIGITS_RE = re.compile(
 #: as ``_DIGITS_RE``. Drag coordinates read as prose without the word "pin".
 _PROSE_WORD = "pin"
 _UNIT_AFTER_RE = re.compile(r"\s*(?i:px|dp|sp|pt)\b")
-_MORE_DIGITS_RE = re.compile(
-    r"[^\w\n]*(?:(?i:is|was|and|then|at|or|to)\b[^\w\n]*)*\d"
-)
+_MORE_DIGITS_RE = re.compile(r"[^\w\n]*(?:(?i:is|was|and|then|at|or|to)\b[^\w\n]*)*\d")
 _THOUSANDS_RE = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
 _MEASURE_GROUP_DIGITS = 3
 _MEASURE_MAX_DIGITS = 6
@@ -129,6 +127,9 @@ _MEASURE_MAX_DIGITS = 6
 #: value anyway (``_is_value_token``). ASCII digits only: ``int`` would read
 #: fullwidth digits too.
 _DATE_RE = re.compile(r"([0-9]{1,2})/([0-9]{1,2})")
+#: Every line boundary ``str.splitlines`` knows, so a bare CR, U+2028, NEL,
+#: VT or FF after "pin" starts a new line just as LF and CRLF do.
+_LINE_BREAK_RE = re.compile(r"[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]")
 
 
 def _states_digits(segment: str) -> bool:
@@ -139,7 +140,9 @@ def _states_digits(segment: str) -> bool:
     """
     for match in _STATED_DIGITS_RE.finditer(segment):
         word, run = (g for g in match.groups() if g)
-        if word.lower() != _PROSE_WORD or "\n" in match.group()[: -len(run)]:
+        if word.lower() != _PROSE_WORD or _LINE_BREAK_RE.search(
+            match.group()[: -len(run)]
+        ):
             return True
         if not (_is_measurement(segment, match.end(), run) or _is_date(run)):
             return True
@@ -163,7 +166,10 @@ def _is_date(run: str) -> bool:
     if not date:
         return False
     first, second = int(date.group(1)), int(date.group(2))
-    return (1 <= first <= 12 and 1 <= second <= 31) or (1 <= second <= 12 and 1 <= first <= 31)
+    return (1 <= first <= 12 and 1 <= second <= 31) or (
+        1 <= second <= 12 and 1 <= first <= 31
+    )
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -470,6 +476,13 @@ def _secret_reason(blob: str, secrets: object, source_run: object) -> str:
     ):
         return "it states a credential value"
     return ""
+
+
+def secret_reason(blob: object, secrets: object = (), source_run: object = "") -> str:
+    """Public face of the note scrub: why *blob* looks like it holds a secret, or ``""``.
+
+    Flows reuse it so a saved screen string passes the SAME test a saved note does."""
+    return _secret_reason(str(blob or ""), secrets, source_run)
 
 
 def _add_event(conn, note_id, event: str, detail: object, run_id: object) -> bool:
@@ -782,5 +795,5 @@ def render(package: str, notes: object) -> str:
     )
     return (
         "App notes for `%s` (%d):\n%s\nRetire one with "
-        "qa_mobile_notes(action=\"retire\", note_id=N)." % (package, len(items), body)
+        'qa_mobile_notes(action="retire", note_id=N).' % (package, len(items), body)
     )

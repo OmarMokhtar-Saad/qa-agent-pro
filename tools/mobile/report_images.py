@@ -61,8 +61,13 @@ def ensure_variants(source: Path, media_dir: Path) -> dict:
     keyed by its own width: the same pixels as WebP, which for a PNG
     screenshot is several times smaller. ``names`` are relative to ``media_dir``.
     """
-    out = {"hash": None, "width": None, "height": None,
-           "widths": {w: None for w in WIDTHS}, "error": None}
+    out = {
+        "hash": None,
+        "width": None,
+        "height": None,
+        "widths": {w: None for w in WIDTHS},
+        "error": None,
+    }
     try:
         out["hash"] = _digest(Path(source))
         if Image is None:
@@ -86,7 +91,8 @@ def ensure_variants(source: Path, media_dir: Path) -> dict:
                     derived.mkdir(parents=True, exist_ok=True)
                     tmp = target.with_suffix(".tmp")
                     rgb.resize((w, h), Image.Resampling.LANCZOS).save(
-                        tmp, "WEBP", quality=WEBP_QUALITY, method=WEBP_METHOD)
+                        tmp, "WEBP", quality=WEBP_QUALITY, method=WEBP_METHOD
+                    )
                     tmp.replace(target)
                 out["widths"][w] = name
     except Exception as exc:
@@ -119,9 +125,24 @@ def ensure_poster(clip: Path, media_dir: Path) -> dict:
         target = Path(media_dir) / name
         if not target.exists():
             proc = subprocess.run(
-                [exe, "-nostdin", "-v", "error", "-i", str(clip), "-frames:v", "1",
-                 "-f", "image2pipe", "-vcodec", "png", "-"],
-                capture_output=True, timeout=FFMPEG_TIMEOUT_S, check=False,
+                [
+                    exe,
+                    "-nostdin",
+                    "-v",
+                    "error",
+                    "-i",
+                    str(clip),
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "image2pipe",
+                    "-vcodec",
+                    "png",
+                    "-",
+                ],
+                capture_output=True,
+                timeout=FFMPEG_TIMEOUT_S,
+                check=False,
             )
             if proc.returncode != 0 or not proc.stdout:
                 out["error"] = f"ffmpeg could not read {Path(clip).name}"
@@ -133,7 +154,8 @@ def ensure_poster(clip: Path, media_dir: Path) -> dict:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 tmp = target.with_suffix(".tmp")
                 frame.convert("RGB").resize((w, h), Image.Resampling.LANCZOS).save(
-                    tmp, "WEBP", quality=WEBP_QUALITY, method=WEBP_METHOD)
+                    tmp, "WEBP", quality=WEBP_QUALITY, method=WEBP_METHOD
+                )
                 tmp.replace(target)
         out["path"] = name
     except Exception as exc:
@@ -164,15 +186,27 @@ def overlay_style(bounds, dev_w, dev_h) -> dict | None:
         y1, y2 = _clamp(top / dev_h * 100), _clamp(bottom / dev_h * 100)
         x1, x2 = sorted((x1, x2))
         y1, y2 = sorted((y1, y2))
-        return {"left": x1, "top": y1, "width": round(x2 - x1, 2),
-                "height": round(y2 - y1, 2),
-                "dot_x": round((x1 + x2) / 2, 2), "dot_y": round((y1 + y2) / 2, 2)}
+        return {
+            "left": x1,
+            "top": y1,
+            "width": round(x2 - x1, 2),
+            "height": round(y2 - y1, 2),
+            "dot_x": round((x1 + x2) / 2, 2),
+            "dot_y": round((y1 + y2) / 2, 2),
+        }
     except Exception:
         return None
 
 
-def srcset_markup(esc, media_rel_dir, content_hash, widths, original_name,
-                  original_width, original_dir=None) -> dict:
+def srcset_markup(
+    esc,
+    media_rel_dir,
+    content_hash,
+    widths,
+    original_name,
+    original_width,
+    original_dir=None,
+) -> dict:
     """``{"src", "srcset", "sizes", "hash", "error"}``, each value passed through ``esc``.
 
     ``widths`` is the ``widths`` dict from :func:`ensure_variants`; the original
@@ -192,21 +226,33 @@ def srcset_markup(esc, media_rel_dir, content_hash, widths, original_name,
                 ow = int(original_width) if original_width else 0
             except (TypeError, ValueError, OverflowError):
                 ow = 0
-        candidates = [(f"{base}/{name}", int(w)) for w, name in sorted(
-            (widths or {}).items()) if name and not isinstance(w, bool)]
+        candidates = [
+            (f"{base}/{name}", int(w))
+            for w, name in sorted((widths or {}).items())
+            if name and not isinstance(w, bool)
+        ]
         parts = [f"{esc(url)} {w}w" for url, w in candidates]
         # A native-width copy already serves the original's descriptor, and
         # two candidates with one width make the whole srcset invalid.
         if ow > 0 and not any(w >= ow for _url, w in candidates):
             parts.append(f"{esc(original)} {ow}w")
         src = candidates[0][0] if candidates else original
-        return {"src": esc(src), "srcset": ", ".join(parts),
-                "sizes": esc("(max-width: 600px) 92vw, 480px"),
-                "hash": esc(content_hash or ""), "error": None}
+        return {
+            "src": esc(src),
+            "srcset": ", ".join(parts),
+            "sizes": esc("(max-width: 600px) 92vw, 480px"),
+            "hash": esc(content_hash or ""),
+            "error": None,
+        }
     except Exception as exc:
         logger.warning("mobile.report_images.srcset_markup failed: %s", exc)
-        out = {"src": "", "srcset": "", "sizes": "", "hash": "",
-               "error": f"no srcset: {type(exc).__name__}"}
+        out = {
+            "src": "",
+            "srcset": "",
+            "sizes": "",
+            "hash": "",
+            "error": f"no srcset: {type(exc).__name__}",
+        }
         try:
             home = media_rel_dir if original_dir is None else original_dir
             out["src"] = esc(f"{str(home).rstrip('/')}/{original_name}")

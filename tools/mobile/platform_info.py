@@ -287,8 +287,15 @@ def _os_error_detail(cmd: list[str], exc: OSError) -> str:
     return raw
 
 
-def _run_sync(cmd: list[str], timeout: int = TIMEOUT_S) -> tuple[int, str, str]:
+def _run_sync(
+    cmd: list[str], timeout: int = TIMEOUT_S, *, stdin_text: str | None = None
+) -> tuple[int, str, str]:
     """Run *cmd* with no shell and a mandatory timeout.
+
+    ``stdin_text`` (default ``None``: the child inherits stdin, as before) is
+    written to the child's stdin and then EOF is sent, so a prompt -- the
+    hardware-profile question ``avdmanager`` asks -- is answered and the child
+    can never read this process's own stdin, which is the MCP transport.
 
     Returns ``(rc, stdout, stderr)``. A missing binary reports ``127``, an
     overrun ``124`` and any other OS error ``126`` -- reported, never raised,
@@ -302,6 +309,7 @@ def _run_sync(cmd: list[str], timeout: int = TIMEOUT_S) -> tuple[int, str, str]:
             timeout=timeout,
             check=False,
             **no_window_kwargs(),
+            **({} if stdin_text is None else {"input": stdin_text.encode()}),
         )
     except FileNotFoundError:
         return 127, "", "not found: " + (cmd[0] if cmd else "")
@@ -492,6 +500,9 @@ def _windows_virtualization() -> dict:
         detail = (err.strip() or "rc=" + str(rc))[:200]
         return {
             "ok": False,
+            # A failed query is NOT a verdict: Get-WindowsOptionalFeature needs an
+            # elevated shell. preflight treats this row as advisory (R1a).
+            "undetermined": True,
             "detail": (
                 "could not query the "
                 + WHPX_FEATURE

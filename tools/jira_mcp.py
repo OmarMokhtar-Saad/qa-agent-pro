@@ -1861,6 +1861,24 @@ def _local_atlassian_entry_exists(
     return False
 
 
+def atlassian_entry_configured(workspace_roots: list[Path] | None = None) -> bool:
+    """Read-only: is an ``atlassian`` entry on disk for ANY file-configured client?
+
+    Covers Cursor and Claude Code (the clients whose entry is a local JSON file),
+    searching ``workspace_roots`` first exactly as ``_local_atlassian_entry_exists``
+    does. True proves the entry is CONFIGURED, never that it is connected or
+    authorized. qa-doctor uses it to decide whether Jira is already in use.
+    Never raises.
+    """
+    for key in ("cursor", "claude-code"):
+        try:
+            if _local_atlassian_entry_exists(key, workspace_roots=workspace_roots):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def connect_hint_line(
     workspace_roots: list[Path] | None = None, *, verify_offered: bool = False
 ) -> str:

@@ -26,7 +26,7 @@ import logging
 
 from tools.mobile import actions as actions_mod
 from tools.mobile import charter as charter_mod
-from tools.mobile import perception, run_store, screen_audit
+from tools.mobile import perception, render, run_store, screen_audit
 from tools.untrusted import _GUARD, wrap_untrusted
 
 logger = logging.getLogger(__name__)
@@ -145,7 +145,7 @@ _EXPLORE_INSTRUCTION = (
     "This is one turn of a bounded exploratory session. The budget is TURNS, "
     "not actions, so put the WHOLE of your next intent in ONE script rather "
     "than spending a turn per action -- a script may carry up to "
-    + str(actions_mod.MAX_ACTIONS)
+    + str(actions_mod.MAX_MODEL_ACTIONS)
     + " actions under a "
     + str(actions_mod.SUBMIT_BUDGET_MS // 1000)
     + "s device budget, and you get the screen back when it ends. A whole "
@@ -191,9 +191,10 @@ def _screen_block(screen: object) -> str:
     block = perception.to_prompt_block(screen)
     note = screen_audit.summary_text(body.get("accessibility"))
     wrapped = wrap_untrusted("accessibility", note, limit=4000) if note else ""
-    if block and wrapped:
-        return block + "\n" + wrapped
-    return block or wrapped
+    # I3: the update-flow hint rides on the screen block for App Tester under
+    # either package id, and is "" (the old bytes) for every other app.
+    hint = render.app_tester_hint(body.get("package"))
+    return "\n".join(part for part in (block, wrapped, hint) if part)
 
 
 def _case_block(view: object) -> str:
@@ -269,6 +270,9 @@ def build_case_job(
             {
                 "kind": "case",
                 "observation_id": _observation_key(screen),
+                # ROUTING, like observation_id: `_mobile_packet_text` pops it and
+                # attaches the screenshot only when it names a reason.
+                "screen_unusable": perception.dump_unusable(screen),
                 "case_block": _case_block(view),
                 "screen_block": _screen_block(screen),
                 "instruction": _CASE_INSTRUCTION,
@@ -321,6 +325,7 @@ def build_escape_job(
             {
                 "kind": "escape",
                 "observation_id": _observation_key(screen),
+                "screen_unusable": perception.dump_unusable(screen),
                 "case_block": _case_block(view),
                 "screen_block": _screen_block(screen),
                 "trace": _trace_block(trace),
@@ -496,6 +501,7 @@ def build_explore_turn(
             {
                 "kind": "explore",
                 "observation_id": _observation_key(screen),
+                "screen_unusable": perception.dump_unusable(screen),
                 "goal": wrap_untrusted("goal", str(body.get("goal") or ""), limit=1200),
                 # Fix round 3, item 1. The full goal above goes to a chat ONCE
                 # per run (mcp_handlers elides it with `render.without_goal`);
