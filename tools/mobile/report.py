@@ -2304,6 +2304,89 @@ def _case_card(
     return _card_html(facts, screens, app, None, media_map)
 
 
+def _card_attrs(facts: dict, loaded: dict | None) -> str:
+    """The card's ``data-*`` attributes: what the report toolbar filters and searches on.
+
+    Their order is the page's: ``loaded`` evidence may override a key in place or
+    add one at the end, and an empty value is dropped rather than rendered.
+    """
+    verdict = facts["verdict"]
+    rows = facts["rows"]
+    search = " ".join(
+        [
+            facts["tc_id"],
+            facts["title"],
+            facts["module"],
+            facts["priority"],
+            facts["type"],
+            verdict,
+            facts["reason"],
+        ]
+        + [row["action"] for row in rows]
+        + [row["detail"] for row in rows]
+    ).lower()[:4000]
+    data = {
+        "data-tc": facts["tc_id"],
+        "data-verdict": verdict,
+        # The kind, so the toolbar can filter on it and
+        # `report_selfcheck._pin_crashes` can pin the page against the store.
+        # Empty means no crash: falsy values are dropped from the attributes.
+        "data-crash": str((facts.get("crash") or {}).get("kind") or ""),
+        "data-module": facts["module"],
+        "data-priority": facts["priority"],
+        "data-type": facts["type"],
+        "data-steps": str(len(rows)),
+        "data-wall": str(facts["wall"]) if facts["wall"] is not None else "",
+        "data-escapes": str(facts["escapes"]),
+        "data-plans": str(facts["plans"]),
+        "data-lat": facts["lat"],
+        "data-search": search,
+    }
+    if loaded:
+        data.update(ev_render.card_data(loaded, facts["tc_id"]))
+    return " ".join(
+        name + '="' + esc(value, 4000) + '"'
+        for name, value in data.items()
+        if value not in (None, "")
+    )
+
+
+def _card_tech(facts: dict, screens: object, loaded: dict | None) -> str:
+    """The body of the card's folded "Technical detail" block."""
+    rows = facts["rows"]
+    # What the app heard and answered inside this case's window (plan P3), the
+    # wire, and this case's own API capture -- folded, as in a Journey turn.
+    # The network and capture blocks are NOT gated on `loaded`: the case runner
+    # writes both onto the checkpoint, so a run with no app profile has them.
+    merged = (
+        ev_exchanges.seqlist(
+            ev_render.sequence_items(
+                loaded,
+                facts["tc_id"],
+                rows,
+                _seq_frames(rows, screens),
+            )
+        )
+        if loaded
+        else ""
+    )
+    return (
+        (ev_render.turns_table(loaded, facts["tc_id"]) if _app_logged(loaded) else "")
+        + ev_render.case_network(facts.get("network"))
+        + ev_render.case_capture(facts.get("capture"))
+        + (
+            _sec_block(
+                "Run sequence",
+                merged,
+                count=len(rows) if rows else None,
+                note="the app's records and the lane's actions on one clock",
+            )
+            if merged
+            else ""
+        )
+    )
+
+
 def _card_html(
     facts: dict,
     screens: object,
@@ -2348,43 +2431,7 @@ def _card_html(
     if loaded:
         # The app's side of the same case: LLM / API / tool counts, tokens, cost.
         bits += ev_render.card_metrics(loaded, facts["tc_id"])
-    search = " ".join(
-        [
-            facts["tc_id"],
-            facts["title"],
-            facts["module"],
-            facts["priority"],
-            facts["type"],
-            verdict,
-            facts["reason"],
-        ]
-        + [row["action"] for row in rows]
-        + [row["detail"] for row in rows]
-    ).lower()[:4000]
-    data = {
-        "data-tc": facts["tc_id"],
-        "data-verdict": verdict,
-        # The kind, so the toolbar can filter on it and
-        # `report_selfcheck._pin_crashes` can pin the page against the store.
-        # Empty means no crash: falsy values are dropped from the attributes.
-        "data-crash": str((facts.get("crash") or {}).get("kind") or ""),
-        "data-module": facts["module"],
-        "data-priority": facts["priority"],
-        "data-type": facts["type"],
-        "data-steps": str(len(rows)),
-        "data-wall": str(facts["wall"]) if facts["wall"] is not None else "",
-        "data-escapes": str(facts["escapes"]),
-        "data-plans": str(facts["plans"]),
-        "data-lat": facts["lat"],
-        "data-search": search,
-    }
-    if loaded:
-        data.update(ev_render.card_data(loaded, facts["tc_id"]))
-    attrs = " ".join(
-        name + '="' + esc(value, 4000) + '"'
-        for name, value in data.items()
-        if value not in (None, "")
-    )
+    attrs = _card_attrs(facts, loaded)
     expected = (
         esc(facts["expected"], 600)
         if facts["expected"]
@@ -2436,37 +2483,7 @@ def _card_html(
                 else ""
             )
         )
-    # What the app heard and answered inside this case's window (plan P3), the
-    # wire, and this case's own API capture -- folded, as in a Journey turn.
-    # The network and capture blocks are NOT gated on `loaded`: the case runner
-    # writes both onto the checkpoint, so a run with no app profile has them.
-    merged = (
-        ev_exchanges.seqlist(
-            ev_render.sequence_items(
-                loaded,
-                facts["tc_id"],
-                rows,
-                _seq_frames(rows, screens),
-            )
-        )
-        if loaded
-        else ""
-    )
-    tech = (
-        (ev_render.turns_table(loaded, facts["tc_id"]) if _app_logged(loaded) else "")
-        + ev_render.case_network(facts.get("network"))
-        + ev_render.case_capture(facts.get("capture"))
-        + (
-            _sec_block(
-                "Run sequence",
-                merged,
-                count=len(rows) if rows else None,
-                note="the app's records and the lane's actions on one clock",
-            )
-            if merged
-            else ""
-        )
-    )
+    tech = _card_tech(facts, screens, loaded)
     return (
         '\n<details class="case rail-'
         + RAIL.get(verdict, "none")

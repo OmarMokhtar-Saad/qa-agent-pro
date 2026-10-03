@@ -3475,6 +3475,174 @@ def _bounded_json_spans(raw: str, *, budget: int):
         i += 1
 
 
+def _pop_sidecar_fields(data) -> tuple[dict, object, dict]:
+    """Pop every submission-level key off a COPY of ``data``.
+
+    Returns ``(copy, raw_duplicate_groups, sidecar)``; ``sidecar`` holds the
+    ``ParsedSubmission`` kwargs that both of ``_validate_suite``'s returns share.
+    """
+    # Piece 1: duplicate_groups is a SUBMISSION-level field, not a TestSuite field
+    # (TestSuite is also the LLM response_model, so its schema must stay clean), and
+    # TestSuite sets extra="forbid" -- so pop it from a COPY before validating.
+    # Popping also keeps the fast path working: without it, a submission carrying the
+    # field would ALWAYS fail whole-suite validation and fall into the salvage branch.
+    data = dict(data) if isinstance(data, dict) else {}
+    sidecar = {
+        "duplicate_review_offered": "duplicate_groups" in data,
+        # Piece 2: same reasoning, one field further -- pop it from the COPY so a
+        # submission carrying it still takes the fast whole-suite validation path.
+        "raw_requirement_matches": data.pop("requirement_matches", None),
+        # Same reasoning again for the AC boomerang's return field.
+        "raw_acceptance_criteria": data.pop("acceptance_criteria", None),
+        # Same again for the entailment review's verdicts.
+        "raw_grounding_verdicts": data.pop("grounding_verdicts", None),
+        # ...and the ambiguity job's verdict, which is what makes its
+        # `blocking: True` observable to the server at all.
+        "raw_ambiguity_result": data.pop("ambiguity_result", None),
+        # ...and the image job's descriptions of the screenshots this server
+        # forwarded to the host INSTEAD of describing them itself.
+        "raw_image_descriptions": data.pop("image_descriptions", None),
+        # Residue R4: the checklist job's return field. Leaving it in place would
+        # push EVERY submission carrying it into the salvage branch and silently
+        # drop cases. It reaches BOTH return sites through this one dict, so the
+        # checklist cannot vanish on the weak-host submissions that need it most.
+        "raw_checklist_items": data.pop("checklist_items", None),
+    }
+    # The two Phase-3a post_merge return fields. RISK_JOB and TEST_PLAN_JOB were
+    # DELETED on 2026-08-16 (dead-code deletion P2-H) and nothing reads either
+    # field now -- but the POPS stay, because they never depended on the jobs.
+    # TestSuite sets extra="forbid", so a submission carrying a stray
+    # `risk_scores` or `test_plan_report` key would fail whole-suite validation
+    # and drop into the salvage branch, silently losing cases. The values are
+    # discarded.
+    data.pop("risk_scores", None)
+    data.pop("test_plan_report", None)
+    return data, data.pop("duplicate_groups", None), sidecar
+
+
+def _parsed_submission(
+    suite: TestSuite, raw_groups, sidecar: dict, drops: dict | None = None
+) -> ParsedSubmission:
+    """The one ``ParsedSubmission`` build both ``_validate_suite`` paths return.
+
+    ``drops`` carries the salvage path's dropped/salvaged delta; the fast path has none.
+    """
+    groups, dup_notes = _extract_duplicate_groups(
+        raw_groups, {tc.tc_id for tc in suite.test_cases}
+    )
+    return ParsedSubmission(
+        suite=suite,
+        duplicate_groups=groups,
+        duplicate_notes=dup_notes,
+        **sidecar,
+        **(drops or {}),
+    )
+
+
+def _salvage_case(c) -> tuple:
+    """Validate ONE submitted case: ``(tc, dropped_reason, salvaged_reason)``.
+
+    Exactly one of ``tc`` / ``dropped_reason`` is set; ``salvaged_reason`` is set
+    only when the case was kept without its ``test_data`` plan.
+    """
+    if not isinstance(c, dict):
+        return None, "a non-object entry in test_cases", None
+    try:
+        return TestCase(**c), None, None
+    except Exception as exc:
+        raw_id = c.get("tc_id")
+        tcid = raw_id if isinstance(raw_id, str) else "?"
+        # 2026-08-31 (F9): `test_data` is an OPTIONAL per-case provisioning
+        # plan, and ONE wrong key inside it ("example" for `example_value`,
+        # "seed account" for `seed_account`) used to discard the whole case.
+        # Measured: 4 of 9 cases lost, the category then accepted at 5 with
+        # a success-shaped reply. TestDataItem's own docstring justifies the
+        # strict enum by "the per-category retry regenerates it" -- there is
+        # no retry on this path. Salvage the CASE, drop only the plan, and
+        # say so.
+        tc = None
+        if isinstance(c.get("test_data"), list) and c.get("test_data"):
+            try:
+                tc = TestCase(**{k: v for k, v in c.items() if k != "test_data"})
+            except Exception:
+                tc = None
+        if tc is None:
+            # F15 (2026-08-30): the class name alone ("failed validation
+            # (ValidationError)") does not say WHICH field or WHICH rule,
+            # so a host cannot fix the case without re-deriving the schema.
+            # Name up to two field/message pairs; the messages are
+            # pydantic's own text, never the rejected VALUE, so nothing
+            # untrusted is echoed back.
+            return None, f"{tcid}: failed validation ({_validation_detail(exc)})", None
+        salvaged_reason = (
+            f"{tcid}: kept, but its `test_data` plan was dropped "
+            f"({_validation_detail(exc)})"
+        )
+        return tc, None, salvaged_reason
+
+
+def _all_dropped_error(dropped: list) -> PrepParseError:
+    """The error raised when NO submitted case survived validation."""
+    # 2026-08-31: this raised with the COUNT alone and discarded `dropped`
+    # -- the per-case field/rule detail F15 had just built. The all-dropped
+    # case is where that detail matters MOST: every case failing at once is
+    # what ONE systematic schema mistake looks like, so a single reason
+    # usually fixes the whole suite. Without it the host was told
+    # "(8 dropped)" and had to re-derive the schema by guessing. Measured:
+    # 8 cases missing `module` and `type` reported nothing but the number.
+    # Collapsed by REASON, not listed per case. Every case failing at once
+    # is almost always ONE systematic mistake, and repeating an identical
+    # sentence eighty times buries the single fact that fixes the suite --
+    # while costing the host's context to read it.
+    _by_reason: dict[str, list[str]] = {}
+    for _d in dropped:
+        _id, _, _reason = str(_d).partition(": ")
+        _by_reason.setdefault(_reason or str(_d), []).append(_id)
+    _parts: list[str] = []
+    for _reason, _ids in list(_by_reason.items())[:_MAX_DROPPED_REASONS]:
+        if len(_ids) == 1:
+            _parts.append(f"{_ids[0]}: {_reason}")
+        else:
+            _parts.append(f"{len(_ids)} cases ({_ids[0]}..{_ids[-1]}): {_reason}")
+    _why = "; ".join(_parts)
+    _more = len(_by_reason) - _MAX_DROPPED_REASONS
+    if _more > 0:
+        _why += f" (+{_more} more distinct reason(s))"
+    return PrepParseError(
+        f"no valid test cases in the submitted suite ({len(dropped)} "
+        f"dropped). Why: {_why}"
+    )
+
+
+def _validate_cases(cases) -> tuple[list, list, list]:
+    """The salvage loop: ``(valid, dropped, salvaged)``, in submission order.
+
+    Keeps every individually-valid case, drops malformed ones and any repeated
+    tc_id, and records each drop. Raises PrepParseError when nothing is valid.
+    """
+    if not isinstance(cases, list):
+        raise PrepParseError("submitted suite has no 'test_cases' list")
+    valid: list[TestCase] = []
+    seen_ids: set[str] = set()
+    dropped: list[str] = []
+    salvaged: list[str] = []
+    for c in cases:
+        tc, dropped_reason, salvaged_reason = _salvage_case(c)
+        if salvaged_reason:
+            salvaged.append(salvaged_reason)
+        if tc is None:
+            dropped.append(dropped_reason)
+            continue
+        if tc.tc_id in seen_ids:
+            dropped.append(f"{tc.tc_id}: duplicate tc_id")
+            continue
+        seen_ids.add(tc.tc_id)
+        valid.append(tc)
+    if not valid:
+        raise _all_dropped_error(dropped)
+    return valid, dropped, salvaged
+
+
 def _validate_suite(data: dict) -> ParsedSubmission:
     """Validate a candidate suite dict into a ParsedSubmission.
 
@@ -3488,167 +3656,25 @@ def _validate_suite(data: dict) -> ParsedSubmission:
     regardless of checklist config. Raises PrepParseError only when
     NOTHING valid remains.
     """
-    # Piece 1: duplicate_groups is a SUBMISSION-level field, not a TestSuite field
-    # (TestSuite is also the LLM response_model, so its schema must stay clean), and
-    # TestSuite sets extra="forbid" -- so pop it from a COPY before validating.
-    # Popping also keeps the fast path working: without it, a submission carrying the
-    # field would ALWAYS fail whole-suite validation and fall into the salvage branch.
-    data = dict(data) if isinstance(data, dict) else {}
-    dup_offered = "duplicate_groups" in data
-    raw_groups = data.pop("duplicate_groups", None)
-    # Piece 2: same reasoning, one field further -- pop it from the COPY so a
-    # submission carrying it still takes the fast whole-suite validation path.
-    raw_req_matches = data.pop("requirement_matches", None)
-    # Same reasoning again for the AC boomerang's return field.
-    raw_acs = data.pop("acceptance_criteria", None)
-    # Same again for the entailment review's verdicts.
-    raw_grounding = data.pop("grounding_verdicts", None)
-    # ...and the ambiguity job's verdict, which is what makes its
-    # `blocking: True` observable to the server at all.
-    raw_amb = data.pop("ambiguity_result", None)
-    # ...and the image job's descriptions of the screenshots this server
-    # forwarded to the host INSTEAD of describing them itself. Popped off the
-    # same COPY so a submission carrying it still takes the fast whole-suite
-    # validation path against TestSuite's extra="forbid".
-    raw_image_descriptions = data.pop("image_descriptions", None)
-    # The two Phase-3a post_merge return fields. RISK_JOB and TEST_PLAN_JOB were
-    # DELETED on 2026-08-16 (dead-code deletion P2-H) and nothing reads either
-    # field now -- but the POPS stay, because they never depended on the jobs.
-    # TestSuite sets extra="forbid", so a submission carrying a stray
-    # `risk_scores` or `test_plan_report` key would fail whole-suite validation
-    # and drop into the salvage branch, silently losing cases. Popped off the
-    # same COPY as every field above; the values are discarded.
-    data.pop("risk_scores", None)
-    data.pop("test_plan_report", None)
-    # Residue R4: the checklist job's return field, popped off the same COPY for
-    # the same reason. Leaving it in place would push EVERY submission carrying
-    # it into the salvage branch below and silently drop cases -- and it is
-    # threaded into BOTH ParsedSubmission return sites, because a single-site
-    # edit here would make the checklist vanish on exactly the weak-host
-    # submissions that need it most.
-    raw_checklist_items = data.pop("checklist_items", None)
+    data, raw_groups, sidecar = _pop_sidecar_fields(data)
     try:
         suite = TestSuite(**data)
     except Exception:
         logger.debug("whole-suite validation failed; salvaging valid cases")
     else:
-        groups, dup_notes = _extract_duplicate_groups(
-            raw_groups, {tc.tc_id for tc in suite.test_cases}
-        )
-        return ParsedSubmission(
-            suite=suite,
-            duplicate_groups=groups,
-            duplicate_notes=dup_notes,
-            duplicate_review_offered=dup_offered,
-            raw_requirement_matches=raw_req_matches,
-            raw_acceptance_criteria=raw_acs,
-            raw_grounding_verdicts=raw_grounding,
-            raw_ambiguity_result=raw_amb,
-            raw_image_descriptions=raw_image_descriptions,
-            raw_checklist_items=raw_checklist_items,
-        )
+        return _parsed_submission(suite, raw_groups, sidecar)
 
-    cases = data.get("test_cases")
-    if not isinstance(cases, list):
-        raise PrepParseError("submitted suite has no 'test_cases' list")
-    valid: list[TestCase] = []
-    seen_ids: set[str] = set()
-    dropped: list[str] = []
-    salvaged: list[str] = []
-    for c in cases:
-        if not isinstance(c, dict):
-            dropped.append("a non-object entry in test_cases")
-            continue
-        tc = None
-        try:
-            tc = TestCase(**c)
-        except Exception as exc:
-            raw_id = c.get("tc_id")
-            tcid = raw_id if isinstance(raw_id, str) else "?"
-            # 2026-08-31 (F9): `test_data` is an OPTIONAL per-case provisioning
-            # plan, and ONE wrong key inside it ("example" for `example_value`,
-            # "seed account" for `seed_account`) used to discard the whole case.
-            # Measured: 4 of 9 cases lost, the category then accepted at 5 with
-            # a success-shaped reply. TestDataItem's own docstring justifies the
-            # strict enum by "the per-category retry regenerates it" -- there is
-            # no retry on this path. Salvage the CASE, drop only the plan, and
-            # say so.
-            if isinstance(c.get("test_data"), list) and c.get("test_data"):
-                try:
-                    tc = TestCase(**{k: v for k, v in c.items() if k != "test_data"})
-                except Exception:
-                    tc = None
-            if tc is None:
-                # F15 (2026-08-30): the class name alone ("failed validation
-                # (ValidationError)") does not say WHICH field or WHICH rule,
-                # so a host cannot fix the case without re-deriving the schema.
-                # Name up to two field/message pairs; the messages are
-                # pydantic's own text, never the rejected VALUE, so nothing
-                # untrusted is echoed back.
-                dropped.append(f"{tcid}: failed validation ({_validation_detail(exc)})")
-                continue
-            salvaged.append(
-                f"{tcid}: kept, but its `test_data` plan was dropped "
-                f"({_validation_detail(exc)})"
-            )
-        if tc.tc_id in seen_ids:
-            dropped.append(f"{tc.tc_id}: duplicate tc_id")
-            continue
-        seen_ids.add(tc.tc_id)
-        valid.append(tc)
-    if not valid:
-        # 2026-08-31: this raised with the COUNT alone and discarded `dropped`
-        # -- the per-case field/rule detail F15 had just built one loop above.
-        # The all-dropped case is where that detail matters MOST: every case
-        # failing at once is what ONE systematic schema mistake looks like, so
-        # a single reason usually fixes the whole suite. Without it the host
-        # was told "(8 dropped)" and had to re-derive the schema by guessing.
-        # Measured: 8 cases missing `module` and `type` reported nothing but
-        # the number.
-        # Collapsed by REASON, not listed per case. Every case failing at once
-        # is almost always ONE systematic mistake, and repeating an identical
-        # sentence eighty times buries the single fact that fixes the suite --
-        # while costing the host's context to read it.
-        _by_reason: dict[str, list[str]] = {}
-        for _d in dropped:
-            _id, _, _reason = str(_d).partition(": ")
-            _by_reason.setdefault(_reason or str(_d), []).append(_id)
-        _parts: list[str] = []
-        for _reason, _ids in list(_by_reason.items())[:_MAX_DROPPED_REASONS]:
-            if len(_ids) == 1:
-                _parts.append(f"{_ids[0]}: {_reason}")
-            else:
-                _parts.append(f"{len(_ids)} cases ({_ids[0]}..{_ids[-1]}): {_reason}")
-        _why = "; ".join(_parts)
-        _more = len(_by_reason) - _MAX_DROPPED_REASONS
-        if _more > 0:
-            _why += f" (+{_more} more distinct reason(s))"
-        raise PrepParseError(
-            f"no valid test cases in the submitted suite ({len(dropped)} "
-            f"dropped). Why: {_why}"
-        )
+    valid, dropped, salvaged = _validate_cases(data.get("test_cases"))
     try:
         suite = TestSuite(test_cases=valid)
     except Exception as exc:
         raise PrepParseError(f"could not assemble a valid suite: {exc}") from exc
-    groups, dup_notes = _extract_duplicate_groups(
-        raw_groups, {tc.tc_id for tc in suite.test_cases}
-    )
-    return ParsedSubmission(
-        suite=suite,
-        dropped_count=len(dropped),
-        dropped_reasons=dropped[:_MAX_DROPPED_REASONS],
-        salvaged_reasons=salvaged[:_MAX_DROPPED_REASONS],
-        duplicate_groups=groups,
-        duplicate_notes=dup_notes,
-        duplicate_review_offered=dup_offered,
-        raw_requirement_matches=raw_req_matches,
-        raw_acceptance_criteria=raw_acs,
-        raw_grounding_verdicts=raw_grounding,
-        raw_ambiguity_result=raw_amb,
-        raw_image_descriptions=raw_image_descriptions,
-        raw_checklist_items=raw_checklist_items,
-    )
+    drops = {
+        "dropped_count": len(dropped),
+        "dropped_reasons": dropped[:_MAX_DROPPED_REASONS],
+        "salvaged_reasons": salvaged[:_MAX_DROPPED_REASONS],
+    }
+    return _parsed_submission(suite, raw_groups, sidecar, drops)
 
 
 def _dup_text(tc) -> str:

@@ -2559,16 +2559,35 @@ SCROLL_TARGET_MISSED = (
 )
 
 
-def budget_stop_reason(ran: int, total: int, queued: int | None = None) -> str:
+def _route_budget_stop_reason(ran: int, remaining: int) -> str:
+    """``budget_stop_reason`` for a saved route, which queues nothing."""
+    return (
+        "budget reached after "
+        + str(int(ran))
+        + " action(s) of this saved route; the remaining "
+        + str(remaining)
+        + " were NOT run and NOT queued, because a route step runs only "
+        "after its screen is checked against the saved one: carry on from "
+        "the screen below and send the steps still needed."
+    )
+
+
+def budget_stop_reason(
+    ran: int, total: int, queued: int | None = None, route: bool = False
+) -> str:
     """What the model is told when the wall clock ended a replay early.
 
     ``queued`` is how many of the remaining actions the queue really holds.
     ``_serialize_queued`` ends the queue at a literal typed at a credential
     field, so telling the model "do not resend" for the dropped tail would
     skip those steps silently: they are named and asked for again instead.
+    ``route`` is a saved-route replay, which queues nothing: its remainder
+    has not been checked against the saved screens, so it is asked for again.
     """
     remaining = max(0, int(total) - int(ran))
     limit = " One submit replays for at most " + str(int(SUBMIT_BUDGET_S)) + "s."
+    if route:
+        return _route_budget_stop_reason(ran, remaining) + limit
     kept = remaining if queued is None else max(0, min(int(queued), remaining))
     if kept == remaining:
         return (
@@ -2861,7 +2880,7 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                         screen,
                         "",
                         budget_stop_reason(
-                            index, len(items), None if is_route else len(queued)
+                            index, len(items), len(queued), route=is_route
                         ),
                         index,
                         # NOT an escape. The budget can stop a script the
