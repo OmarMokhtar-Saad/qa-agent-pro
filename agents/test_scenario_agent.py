@@ -1804,6 +1804,286 @@ def grounding_sections(
         return "", ""
 
 
+def _checklist_section(suite, checklist_items, checklist_audit) -> str:
+    """The checklist GRANULARITY audit section ("" when no checklist was
+    built), attaching the checklist artifacts to ``suite`` for the exporters.
+    Never raises on the attach."""
+    if not checklist_items:
+        return ""
+    section = granularity_warning_section(checklist_audit)
+    try:
+        suite._checklist_artifacts = {
+            "items": checklist_to_dicts(checklist_items),
+            "audit": checklist_audit,
+        }
+    except Exception:
+        logger.debug("attaching checklist artifacts failed", exc_info=True)
+    return section
+
+
+def _rule_pack_report(suite, renumbered, rule_packs, rule_pack_ctx) -> str:
+    """Batch 3: the rule-pack advisory report + the MECHANICAL [ASSUMED]
+    notes. Runs on the FINAL renumbered suite so every tc_id in the report
+    and in the Notes column matches the exported file. The assumption
+    label is a fixed code constant plus the sanitised ticket reference --
+    never an LLM-written citation, so it can never become "per RFC 9110"
+    for an RFC nobody cited."""
+    rule_pack_notes_map = rule_pack_notes(renumbered, rule_packs)
+    if rule_pack_notes_map:
+        try:
+            suite._rule_pack_notes = rule_pack_notes_map
+        except Exception:
+            logger.debug("attaching rule-pack notes failed", exc_info=True)
+    rule_pack_ctx["notes"] = rule_pack_notes_map
+    return rule_pack_section(
+        rule_packs,
+        renumbered,
+        rule_pack_ctx,
+    )
+
+
+def _priority_and_risk_counts(test_cases) -> tuple[str, dict[str, int]]:
+    """The "N Critical, N High, ..." priority summary and the per-label risk
+    counts, shared by the compact and verbose summaries."""
+    priority_counts: dict[str, int] = {}
+    risk_counts: dict[str, int] = {}
+    for tc in test_cases:
+        priority_counts[tc.priority.value] = (
+            priority_counts.get(tc.priority.value, 0) + 1
+        )
+        if tc.risk_label:
+            risk_counts[tc.risk_label] = risk_counts.get(tc.risk_label, 0) + 1
+
+    order = ["Critical", "High", "Medium", "Low"]
+    priority_summary = ", ".join(
+        f"{priority_counts[p]} {p}" for p in order if p in priority_counts
+    )
+    return priority_summary, risk_counts
+
+
+def _partial_warning(failed) -> tuple[str, str]:
+    """The skipped-categories warning and the run status ("partial"/"ok")."""
+    if not failed:
+        return "", "ok"
+    skipped_names = ", ".join(f"**{r.category_name}**" for r in failed)
+    partial_warning = (
+        f"\n\n> ⚠️  {len(failed)} of {len(CATEGORIES)} test categories couldn't be completed "
+        f"({skipped_names}) — those test cases aren't included, "
+        "but everything else is here."
+    )
+    return partial_warning, "partial"
+
+
+def _risk_line(risk_counts: dict[str, int]) -> str:
+    """The compact summary's one-line risk breakdown ("" when no case has a
+    risk label)."""
+    risk_summary = " · ".join(
+        f"{label.upper()} {risk_counts[label]}"
+        for label in ("CRITICAL", "HIGH", "MEDIUM", "LOW")
+        if label in risk_counts
+    )
+    return f"\n\n**Risk:** {risk_summary}" if risk_summary else ""
+
+
+_XLSX_WARNING = (
+    "\n\n> ⚠️  The Excel file couldn't be created this time "
+    "(there may be a disk space or file permission issue). "
+    "The test case list above is complete — you can paste it into your test tool manually."
+)
+_CSV_WARNING = (
+    "\n\n> ⚠️  The CSV export couldn't be created this time "
+    "(there may be a disk space or file permission issue). "
+    "The test case list above is complete."
+)
+_TESTRAIL_WARNING = (
+    "\n\n> ⚠️  The TestRail CSV export couldn't be created this time "
+    "(there may be a disk space or file permission issue). "
+    "The other files above are unaffected."
+)
+_XLSX_FILE_NOTE = (
+    "\n\nThe Excel file is attached below. "
+    "All test cases default to **Not Run** status. "
+    "Use the **Status** dropdown in column N to record results as you execute."
+)
+
+
+async def _run_exporter(
+    generator, suite, failure_log: str, warning: str
+) -> tuple[str, str]:
+    """Run one file exporter off the event loop: (path, "") on success,
+    ("", warning) when it raises."""
+    try:
+        return await asyncio.to_thread(generator, suite), ""
+    except Exception:
+        logger.exception(failure_log)
+        return "", warning
+
+
+async def _export_files(suite) -> tuple[str, str, str, str, str]:
+    """Write the XLSX, generic CSV and TestRail CSV for ``suite``. Returns
+    (xlsx_path, csv_path, testrail_path, file_note, export_section). The
+    generators are looked up at call time, so a patched module attribute is
+    the one that runs."""
+    xlsx_path, xlsx_warning = await _run_exporter(
+        generate_test_case_xlsx, suite, "XLSX generation failed", _XLSX_WARNING
+    )
+    csv_path, csv_warning = await _run_exporter(
+        generate_test_case_csv, suite, "CSV generation failed", _CSV_WARNING
+    )
+    testrail_path, testrail_warning = await _run_exporter(
+        generate_testrail_csv,
+        suite,
+        "TestRail CSV generation failed",
+        _TESTRAIL_WARNING,
+    )
+    file_note = _XLSX_FILE_NOTE if xlsx_path else xlsx_warning
+
+    export_section = ""
+    if csv_path or testrail_path:
+        export_lines = ["\n\n## Export Files"]
+        if csv_path:
+            export_lines.append(f"- CSV (generic): `{csv_path}`")
+        if testrail_path:
+            export_lines.append(f"- TestRail CSV: `{testrail_path}`")
+        export_section = "\n".join(export_lines)
+    export_section += csv_warning + testrail_warning
+    return xlsx_path, csv_path, testrail_path, file_note, export_section
+
+
+# ops-4c: the DETERMINISTIC quality warnings print ahead of the
+# variable-length sections. checklist_section grows one line per
+# requirement, so with it in front shape_generation_result's 4000-char cap
+# could silently delete the Data Quality Notes -- and that block is the ONLY
+# report that a step is too vague to execute, because the rewrite pass that
+# used to fix such steps was deleted on 2026-08-16. Advisory prose gets
+# truncated instead. Both orders keep quality ahead of checklist.
+_COMPACT_SUMMARY_ORDER = (
+    "risk_line",
+    "rtm_line",
+    "quality",
+    "consistency",
+    "grounding",
+    "host_suppress",
+    "checklist",
+    "test_data",
+    "anchoring",
+    "scope",
+    "rule_pack",
+    "semantic_dedup",
+)
+_FULL_SUMMARY_ORDER = (
+    "file_note",
+    "rtm",
+    "quality",
+    "consistency",
+    "grounding",
+    "host_suppress",
+    "checklist",
+    "risk",
+    "test_data",
+    "anchoring",
+    "scope",
+    "rule_pack",
+    "semantic_dedup",
+    "export",
+)
+
+
+def _compose_summary(head: str, sections: dict, order: tuple[str, ...]) -> str:
+    """``head`` followed by each named section, in ``order``."""
+    return head + "".join(f"{sections[name]}" for name in order)
+
+
+def _quality_sections(renumbered, checklist_section: str) -> dict[str, str]:
+    """The deterministic quality block and the host-suppression disclosure
+    that sits next to it, keyed by their summary section names."""
+    # Cheap heuristic quality gate: flag any vague steps / placeholder test data
+    # that survived generation + the per-category retry, so drift can't reach
+    # the exported files silently. Never raises.
+    quality_section = quality_warning_section(renumbered)
+    # Residue R2: the two server-side review steps a HOST submit suppressed,
+    # disclosed next to the deterministic quality block they relate to and
+    # AHEAD of the two variable-length sections -- the same reply-cap reason
+    # ops-4c moved quality_section here. "" on every server route, so no
+    # non-host caller's summary changes by a byte. (That invariant used to be
+    # pinned by a server-mode equivalence test with golden fixtures; both the
+    # test and the fixtures are gone, so it is now asserted by this comment
+    # only.)
+    host_suppress_section = _host_suppression_section(
+        renumbered,
+        deterministic_coverage=bool(checklist_section),
+    )
+    return {"quality": quality_section, "host_suppress": host_suppress_section}
+
+
+def _advisory_sections(prepared, renumbered, out_of_scope_ids) -> dict[str, str]:
+    """The advisory section builders (test data, AC anchoring, sub-task
+    scope, consistency, grounding), keyed by their summary section names."""
+    source_acs = prepared.source_acs
+    # One-line-per-case test-data note. Empty string when no case declares a data
+    # plan, so the summary is byte-identical when unused.
+    test_data_section = data_notes_section(renumbered)
+
+    # TICKET-7154 Fix 3: advisory AC-anchoring report — only when the ticket
+    # carried REAL (source-parsed) ACs. Flags cases not traceable to any real AC
+    # so hallucinated/unanchored coverage is visible rather than silently trusted.
+    anchoring_section = anchoring_warning_section(renumbered, source_acs)
+
+    # Advisory sub-task scope report — cases that read as covering the parent
+    # story's background instead of the target. FLAG ONLY: nothing was dropped,
+    # and the ids are the FINAL post-renumber tc_ids (matched by stable_id).
+    scope_section = scope_warning_section(renumbered, out_of_scope_ids)
+
+    # Grounding + consistency advisories (Batch A modules). Deterministic and
+    # model-free; "" when the suite and ticket are clean, so an unaffected run's
+    # summary does not change by a byte.
+    consistency_section, grounding_section = grounding_sections(
+        renumbered,
+        getattr(prepared, "target_description", "") or "",
+        user_msg=prepared.user_msg,
+        ac_texts=[ac.description for ac in (source_acs or [])],
+    )
+    return {
+        "test_data": test_data_section,
+        "anchoring": anchoring_section,
+        "scope": scope_section,
+        "consistency": consistency_section,
+        "grounding": grounding_section,
+    }
+
+
+def _log_finalize_funnel(suite, renumbered, quality_section: str) -> None:
+    """The one closing funnel log line. Never raises."""
+    # ops-5 (issue 7): the closing funnel line. Deliberately ONE line carrying
+    # everything a reader needs to spot a silent change: the count and whether
+    # the quality gate flagged anything.
+    try:
+        logger.info(
+            # TICKET-5138 (2026-08-21). Two more facts on the SAME line, no new
+            # call. D1: 15 of 64 cases shipped a blank Test Data column and the
+            # only durable record was the workbook, so a truncated reply left
+            # nothing to grep in data/logs/. D2: the Module column was the
+            # literal "View Store" on all 64 rows -- a single-value column
+            # carries no information, and until now answering "was this suite
+            # uniform or FRAGMENTED?" (the failure normalize_module_names
+            # exists to fix, and the one this count actually detects) needed a
+            # hand read of the file. Both are counts over `renumbered`, i.e.
+            # the cases actually shipped.
+            "finalize: %d case(s) final | quality flags=%s"
+            " | empty test_data=%d/%d | module labels=%d",
+            len(getattr(suite, "test_cases", None) or []),
+            "yes" if quality_section else "no",
+            sum(1 for _tc in renumbered if not getattr(_tc, "test_data", None)),
+            len(renumbered),
+            len(
+                {(getattr(_tc, "module", "") or "").strip() for _tc in renumbered}
+                - {""}
+            ),
+        )
+    except Exception:
+        logger.debug("finalize summary log failed", exc_info=True)
+
+
 async def _finalize_generation(
     prepared: PreparedGeneration,
     all_cases: list[TestCase],
@@ -1833,7 +2113,6 @@ async def _finalize_generation(
     guarded were deleted together. ``_host_suppression_section`` still discloses
     the two losses on the reply.
     """
-    user_msg = prepared.user_msg
     feature_text = prepared.feature_text
     acs = prepared.acs
     source_acs = prepared.source_acs
@@ -2053,76 +2332,21 @@ async def _finalize_generation(
     # with no tracing case is reported as an orphaned requirement -- no
     # similarity scoring, no confidence band, no coverage percentage. The
     # checklist GRANULARITY audit is unrelated to matching and still runs.
-    checklist_section = ""
-    if checklist_items:
-        checklist_section = granularity_warning_section(checklist_audit)
-        try:
-            suite._checklist_artifacts = {
-                "items": checklist_to_dicts(checklist_items),
-                "audit": checklist_audit,
-            }
-        except Exception:
-            logger.debug("attaching checklist artifacts failed", exc_info=True)
+    checklist_section = _checklist_section(suite, checklist_items, checklist_audit)
 
-    # Batch 3: the rule-pack advisory report + the MECHANICAL [ASSUMED]
-    # notes. Runs on the FINAL renumbered suite so every tc_id in the report
-    # and in the Notes column matches the exported file. The assumption
-    # label is a fixed code constant plus the sanitised ticket reference --
-    # never an LLM-written citation, so it can never become "per RFC 9110"
-    # for an RFC nobody cited.
-    rule_pack_notes_map = rule_pack_notes(renumbered, rule_packs)
-    if rule_pack_notes_map:
-        try:
-            suite._rule_pack_notes = rule_pack_notes_map
-        except Exception:
-            logger.debug("attaching rule-pack notes failed", exc_info=True)
-    rule_pack_ctx["notes"] = rule_pack_notes_map
-    rule_pack_section_md = rule_pack_section(
-        rule_packs,
-        renumbered,
-        rule_pack_ctx,
+    rule_pack_section_md = _rule_pack_report(
+        suite, renumbered, rule_packs, rule_pack_ctx
     )
 
-    # Cheap heuristic quality gate: flag any vague steps / placeholder test data
-    # that survived generation + the per-category retry, so drift can't reach
-    # the exported files silently. Never raises.
-    quality_section = quality_warning_section(renumbered)
-    # Residue R2: the two server-side review steps a HOST submit suppressed,
-    # disclosed next to the deterministic quality block they relate to and
-    # AHEAD of the two variable-length sections -- the same reply-cap reason
-    # ops-4c moved quality_section here. "" on every server route, so no
-    # non-host caller's summary changes by a byte. (That invariant used to be
-    # pinned by a server-mode equivalence test with golden fixtures; both the
-    # test and the fixtures are gone, so it is now asserted by this comment
-    # only.)
-    host_suppress_section = _host_suppression_section(
-        renumbered,
-        deterministic_coverage=bool(checklist_section),
-    )
-
-    # One-line-per-case test-data note. Empty string when no case declares a data
-    # plan, so the summary is byte-identical when unused.
-    test_data_section = data_notes_section(renumbered)
-
-    # TICKET-7154 Fix 3: advisory AC-anchoring report — only when the ticket
-    # carried REAL (source-parsed) ACs. Flags cases not traceable to any real AC
-    # so hallucinated/unanchored coverage is visible rather than silently trusted.
-    anchoring_section = anchoring_warning_section(renumbered, source_acs)
-
-    # Advisory sub-task scope report — cases that read as covering the parent
-    # story's background instead of the target. FLAG ONLY: nothing was dropped,
-    # and the ids are the FINAL post-renumber tc_ids (matched by stable_id).
-    scope_section = scope_warning_section(renumbered, out_of_scope_ids)
-
-    # Grounding + consistency advisories (Batch A modules). Deterministic and
-    # model-free; "" when the suite and ticket are clean, so an unaffected run's
-    # summary does not change by a byte.
-    consistency_section, grounding_section = grounding_sections(
-        renumbered,
-        getattr(prepared, "target_description", "") or "",
-        user_msg=user_msg,
-        ac_texts=[ac.description for ac in (source_acs or [])],
-    )
+    sections = {
+        "rtm": rtm_section,
+        "checklist": checklist_section,
+        "risk": risk_section,
+        "rule_pack": rule_pack_section_md,
+        "semantic_dedup": semantic_dedup_note,
+        **_quality_sections(renumbered, checklist_section),
+        **_advisory_sections(prepared, renumbered, out_of_scope_ids),
+    }
 
     # Test-plan artifacts -- DELETED 2026-08-16 (dead-code deletion P2-H).
     # The two server-side ask_json builders went in P2-F3 with the
@@ -2135,34 +2359,7 @@ async def _finalize_generation(
     # deletion; that decision was taken on 2026-08-30, and the sheets,
     # tools/test_plan_report.py and the private attribute are all gone.
 
-    # ops-5 (issue 7): the closing funnel line. Deliberately ONE line carrying
-    # everything a reader needs to spot a silent change: the count and whether
-    # the quality gate flagged anything.
-    try:
-        logger.info(
-            # TICKET-5138 (2026-08-21). Two more facts on the SAME line, no new
-            # call. D1: 15 of 64 cases shipped a blank Test Data column and the
-            # only durable record was the workbook, so a truncated reply left
-            # nothing to grep in data/logs/. D2: the Module column was the
-            # literal "View Store" on all 64 rows -- a single-value column
-            # carries no information, and until now answering "was this suite
-            # uniform or FRAGMENTED?" (the failure normalize_module_names
-            # exists to fix, and the one this count actually detects) needed a
-            # hand read of the file. Both are counts over `renumbered`, i.e.
-            # the cases actually shipped.
-            "finalize: %d case(s) final | quality flags=%s"
-            " | empty test_data=%d/%d | module labels=%d",
-            len(getattr(suite, "test_cases", None) or []),
-            "yes" if quality_section else "no",
-            sum(1 for _tc in renumbered if not getattr(_tc, "test_data", None)),
-            len(renumbered),
-            len(
-                {(getattr(_tc, "module", "") or "").strip() for _tc in renumbered}
-                - {""}
-            ),
-        )
-    except Exception:
-        logger.debug("finalize summary log failed", exc_info=True)
+    _log_finalize_funnel(suite, renumbered, sections["quality"])
 
     # Shared counts used by both the compact and verbose summaries.
     tc_count = len(suite.test_cases)
@@ -2179,31 +2376,8 @@ async def _finalize_generation(
     if on_progress is not None:
         await on_progress(tc_count)
 
-    priority_counts: dict[str, int] = {}
-    risk_counts: dict[str, int] = {}
-    for tc in suite.test_cases:
-        priority_counts[tc.priority.value] = (
-            priority_counts.get(tc.priority.value, 0) + 1
-        )
-        if tc.risk_label:
-            risk_counts[tc.risk_label] = risk_counts.get(tc.risk_label, 0) + 1
-
-    order = ["Critical", "High", "Medium", "Low"]
-    priority_summary = ", ".join(
-        f"{priority_counts[p]} {p}" for p in order if p in priority_counts
-    )
-
-    if failed:
-        skipped_names = ", ".join(f"**{r.category_name}**" for r in failed)
-        partial_warning = (
-            f"\n\n> ⚠️  {len(failed)} of {len(CATEGORIES)} test categories couldn't be completed "
-            f"({skipped_names}) — those test cases aren't included, "
-            "but everything else is here."
-        )
-        status = "partial"
-    else:
-        partial_warning = ""
-        status = "ok"
+    priority_summary, risk_counts = _priority_and_risk_counts(suite.test_cases)
+    partial_warning, status = _partial_warning(failed)
 
     # The inline "Enterprise Feature Analysis Report" was DELETED on 2026-08-16
     # (P2-E3). It ran analyze_feature -- one server-side ask_json, measured at
@@ -2216,131 +2390,37 @@ async def _finalize_generation(
     # the host from build_feature_analysis_prompt and rendered by
     # finalize_feature_report + render_report_markdown.
     feature_report = ""
-
+    head = (
+        f"{feature_report}"
+        f"Generated **{tc_count} test cases** ({priority_summary})."
+        f"{partial_warning}"
+        f"{image_notice}"
+    )
     # Compact mode: hand the suite back for on-demand export and return a short
     # summary (counts + gaps) without the full per-case tables, which now live
     # only in the exported file.
     if defer_files:
         if on_suite_ready is not None:
             on_suite_ready(suite)
-        risk_summary = " · ".join(
-            f"{label.upper()} {risk_counts[label]}"
-            for label in ("CRITICAL", "HIGH", "MEDIUM", "LOW")
-            if label in risk_counts
-        )
-        risk_line = f"\n\n**Risk:** {risk_summary}" if risk_summary else ""
+        sections["risk_line"] = _risk_line(risk_counts)
         # 2026-08-03: `acs` may be MODEL-DERIVED rather than read from the ticket.
         # tools/mcp_handlers sets prepared.acs from the host's AC_JOB when the
         # ticket carried none, and deliberately leaves source_acs empty, so the two
         # fields together ARE the provenance -- no extra plumbing needed. Without
         # this the headline line claimed "6/6 acceptance criteria traced, all
         # covered" for six criteria the model had invented.
-        rtm_line = rtm_oneline(
+        sections["rtm_line"] = rtm_oneline(
             acs, suite.test_cases, derived=bool(acs) and not source_acs
         )
-        compact = (
-            f"{feature_report}"
-            f"Generated **{tc_count} test cases** ({priority_summary})."
-            f"{partial_warning}"
-            f"{image_notice}"
-            f"{risk_line}"
-            f"{rtm_line}"
-            # ops-4c: the DETERMINISTIC quality warnings print ahead of the
-            # variable-length section below. checklist_section grows one line
-            # per requirement, so with it in front shape_generation_result's
-            # 4000-char cap could silently delete the Data Quality Notes -- and
-            # that block is the ONLY report that a step is too vague to
-            # execute, because the rewrite pass that used to fix such steps was
-            # deleted on 2026-08-16. Advisory prose gets truncated instead.
-            f"{quality_section}"
-            f"{consistency_section}"
-            f"{grounding_section}"
-            f"{host_suppress_section}"
-            f"{checklist_section}"
-            f"{test_data_section}"
-            f"{anchoring_section}"
-            f"{scope_section}"
-            f"{rule_pack_section_md}"
-            f"{semantic_dedup_note}"
-        )
+        compact = _compose_summary(head, sections, _COMPACT_SUMMARY_ORDER)
         return compact, "", "", "", status
 
-    xlsx_path = ""
-    xlsx_warning = ""
-    try:
-        xlsx_path = await asyncio.to_thread(generate_test_case_xlsx, suite)
-    except Exception:
-        logger.exception("XLSX generation failed")
-        xlsx_warning = (
-            "\n\n> ⚠️  The Excel file couldn't be created this time "
-            "(there may be a disk space or file permission issue). "
-            "The test case list above is complete — you can paste it into your test tool manually."
-        )
-
-    csv_path = ""
-    csv_warning = ""
-    try:
-        csv_path = await asyncio.to_thread(generate_test_case_csv, suite)
-    except Exception:
-        logger.exception("CSV generation failed")
-        csv_warning = (
-            "\n\n> ⚠️  The CSV export couldn't be created this time "
-            "(there may be a disk space or file permission issue). "
-            "The test case list above is complete."
-        )
-
-    testrail_path = ""
-    testrail_warning = ""
-    try:
-        testrail_path = await asyncio.to_thread(generate_testrail_csv, suite)
-    except Exception:
-        logger.exception("TestRail CSV generation failed")
-        testrail_warning = (
-            "\n\n> ⚠️  The TestRail CSV export couldn't be created this time "
-            "(there may be a disk space or file permission issue). "
-            "The other files above are unaffected."
-        )
-
-    if xlsx_path:
-        file_note = (
-            "\n\nThe Excel file is attached below. "
-            "All test cases default to **Not Run** status. "
-            "Use the **Status** dropdown in column N to record results as you execute."
-        )
-    else:
-        file_note = xlsx_warning
-
-    export_section = ""
-    if csv_path or testrail_path:
-        export_lines = ["\n\n## Export Files"]
-        if csv_path:
-            export_lines.append(f"- CSV (generic): `{csv_path}`")
-        if testrail_path:
-            export_lines.append(f"- TestRail CSV: `{testrail_path}`")
-        export_section = "\n".join(export_lines)
-    export_section += csv_warning + testrail_warning
-
-    summary = (
-        f"{feature_report}"
-        f"Generated **{tc_count} test cases** ({priority_summary})."
-        f"{partial_warning}"
-        f"{image_notice}"
-        f"{file_note}"
-        f"{rtm_section}"
-        # ops-4c: see the compact summary above -- deterministic quality
-        # warnings must precede the variable-length checklist / gap sections so
-        # the 4000-char reply cap can never delete them.
-        f"{quality_section}"
-        f"{consistency_section}"
-        f"{grounding_section}"
-        f"{host_suppress_section}"
-        f"{checklist_section}"
-        f"{risk_section}"
-        f"{test_data_section}"
-        f"{anchoring_section}"
-        f"{scope_section}"
-        f"{rule_pack_section_md}"
-        f"{semantic_dedup_note}"
-        f"{export_section}"
-    )
+    (
+        xlsx_path,
+        csv_path,
+        testrail_path,
+        sections["file_note"],
+        sections["export"],
+    ) = await _export_files(suite)
+    summary = _compose_summary(head, sections, _FULL_SUMMARY_ORDER)
     return summary, xlsx_path, csv_path, testrail_path, status

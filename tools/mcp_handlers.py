@@ -3183,6 +3183,12 @@ def _mobile_lane_disclosure(state: str, adb_path: str | None) -> list[str]:
 #: what a tester runs when nothing works.
 _MOBILE_PROBE_S = 8.0
 
+#: How long qa-doctor's keyboard STATE read may take per device. Not the one
+#: probe above: ``ime_session.state`` makes up to four adb calls (package list,
+#: active input method, ``pm path``, ``sha256sum``), and 8 s cut the build check
+#: off on a slow device, which the row then reported as "could not check".
+_MOBILE_IME_STATE_S = 20.0
+
 
 async def _mobile_non_android(serial: str) -> str:
     """The refusal when *serial* names a device this lane cannot drive, else "".
@@ -3289,11 +3295,17 @@ async def _mobile_ime_rows(serials: list) -> list:
         where = str(serial or "?")
         try:
             found = await asyncio.wait_for(
-                ime_session.state(where), timeout=_MOBILE_PROBE_S
+                ime_session.state(where), timeout=_MOBILE_IME_STATE_S
             )
         except Exception as exc:
+            # A timeout's str() is empty, which printed "did not finish ()".
+            why = (
+                "within " + str(int(_MOBILE_IME_STATE_S)) + "s"
+                if isinstance(exc, asyncio.TimeoutError)
+                else "(" + str(exc)[:80] + ")"
+            )
             found = {
-                "error": "the keyboard probe did not finish (" + str(exc)[:80] + ")",
+                "error": "the keyboard probe did not finish " + why,
                 "content": None,
             }
         if found.get("error") or found.get("content") is None:
@@ -3313,6 +3325,16 @@ async def _mobile_ime_rows(serials: list) -> list:
                 + where
                 + " yet, so typing is unavailable there until a run installs "
                 "it; the run hands your own keyboard back when it finishes"
+            )
+            continue
+        if body.get("pinned") is False:
+            # Only False: None is "could not tell" (no sha256sum, say), which a
+            # run also accepts, so it is no reason to warn.
+            out.append(
+                "- ⬜ The QA keyboard on "
+                + where
+                + " is not the build this release ships, so the next run that "
+                "types replaces it first; nothing for you to do"
             )
             continue
         if not body.get("selected"):
@@ -7945,6 +7967,40 @@ def _host_task_reply(prep_id: str, record: object) -> str:
     )
 
 
+async def _load_open_prep(
+    prep_id: str, *, require_dict: bool = False, wrap_final=None
+) -> tuple[object, str]:
+    """Load a generation prep and run the refusals every prep tool shares.
+
+    Returns ``(envelope, "")`` when the prep can be used, ``(None, reply)`` when
+    one of the four refuses. The order is fixed and the same at all four load
+    sites (``qa_prep_status``, ``qa_get_category_job``, ``qa_submit_category``,
+    ``qa_submit_suite``): a host-task id, a store READ failure, no prep, a prep
+    that already finalized. A new refusal belongs HERE, so no tool can act on a
+    prep the others refuse.
+
+    ``require_dict`` reports any non-dict envelope as a missing prep (only
+    ``qa_submit_suite`` asks for that); ``wrap_final(prep_id, note)`` reshapes
+    the finalized note (``qa_prep_status`` gives it its terminal status shape).
+    Raises whatever ``prep_store.load_prep`` raises: callers keep their own
+    ``try``.
+    """
+    loaded = await prep_store.load_prep(prep_id)
+    envelope = loaded.get("content")
+    refusal = _host_task_reply(prep_id, envelope) or _prep_store_error_reply(
+        prep_id, loaded
+    )
+    if refusal:
+        return None, refusal
+    missing = not isinstance(envelope, dict) if require_dict else envelope is None
+    if missing:
+        return None, _prep_missing_reply(prep_id)
+    final_note = _finalized_reply(prep_id, envelope)
+    if final_note:
+        return None, wrap_final(prep_id, final_note) if wrap_final else final_note
+    return envelope, ""
+
+
 async def _unfinished_preps_note(exclude_prep_id: str = "") -> str:
     """Markdown disclosure of in-flight preps (fetched worker packets or
     staged category rows) so an interrupted host-mode run is resumable
@@ -9239,25 +9295,17 @@ async def handle_prep_status(prep_id: str) -> str:
     if not prep_id:
         return "⚠️ Missing prep_id."
     try:
-        loaded = await prep_store.load_prep(prep_id)
-        envelope = loaded.get("content")
-        _task_note = _host_task_reply(prep_id, envelope)
-        if _task_note:
-            return _task_note
-        _store_note = _prep_store_error_reply(prep_id, loaded)
-        if _store_note:
-            return _store_note
-        if envelope is None:
-            return _prep_missing_reply(prep_id)
         # Fix 5b: a finalized prep now LOADS, so every reader must check the stamp
         # before rehydrating. Without this, prep_status would report `staged: 0/8`
         # and then recommend the Path A finalize -- actively instructing a re-stage
         # of all 8 categories for a suite that is already finished.
         # B1 (2026-08-21): wrapped in the status shape so the finalized case is a
         # readable TERMINAL state and not only prose. The note itself is unchanged.
-        _final_note = _finalized_reply(prep_id, envelope)
-        if _final_note:
-            return _prep_status_finalized_reply(prep_id, _final_note)
+        envelope, refusal = await _load_open_prep(
+            prep_id, wrap_final=_prep_status_finalized_reply
+        )
+        if refusal:
+            return refusal
         meta = envelope.get("meta") or {}
         expected = list(meta.get("expected_categories") or [])
         if not expected and not meta.get("parallel_fanout"):
@@ -9335,22 +9383,12 @@ async def handle_get_category_job(prep_id: str, category_name: str) -> str:
     if not category_name:
         return "⚠️ Missing category_name."
     try:
-        loaded = await prep_store.load_prep(prep_id)
-        envelope = loaded.get("content")
-        _task_note = _host_task_reply(prep_id, envelope)
-        if _task_note:
-            return _task_note
-        _store_note = _prep_store_error_reply(prep_id, loaded)
-        if _store_note:
-            return _store_note
-        if envelope is None:
-            return _prep_missing_reply(prep_id)
-        # Fix 5b: without this, a finalized prep would be served a FRESH worker
-        # packet and touch_prep would slide its TTL -- re-arming exactly the
-        # regenerate-after-finish loop this fix exists to stop.
-        _final_note = _finalized_reply(prep_id, envelope)
-        if _final_note:
-            return _final_note
+        # Fix 5b: without the finalized refusal, a finalized prep would be served
+        # a FRESH worker packet and touch_prep would slide its TTL -- re-arming
+        # exactly the regenerate-after-finish loop this fix exists to stop.
+        envelope, refusal = await _load_open_prep(prep_id)
+        if refusal:
+            return refusal
         prepared = host_mode.deserialize_prepared(envelope.get("prepared") or {})
         # 2026-07-31 incident: fetching a worker packet is real orchestration
         # activity -- that run fetched 8 and staged none. prep_store gates the
@@ -9507,20 +9545,12 @@ async def handle_submit_category(
     # and it has to see the same value the replies mean.
     _cat = _clip_echo(category_name, 60)
     try:
-        loaded = await prep_store.load_prep(prep_id)
-        _task_note = _host_task_reply(prep_id, loaded.get("content"))
-        if _task_note:
-            return _task_note
-        _store_note = _prep_store_error_reply(prep_id, loaded)
-        if _store_note:
-            return _store_note
-        if loaded.get("content") is None:
-            return _prep_missing_reply(prep_id)
-        # Fix 5b: without this, rows could be staged onto a finalized prep and a
-        # later empty finalize would build a SECOND suite from a subset of them.
-        _final_note = _finalized_reply(prep_id, loaded.get("content"))
-        if _final_note:
-            return _final_note
+        # Fix 5b: without the finalized refusal, rows could be staged onto a
+        # finalized prep and a later empty finalize would build a SECOND suite
+        # from a subset of them.
+        envelope, refusal = await _load_open_prep(prep_id)
+        if refusal:
+            return refusal
         try:
             parsed = host_mode.parse_host_suite(suite_json)
         except host_mode.PrepSerdeError as exc:
@@ -9535,7 +9565,7 @@ async def handle_submit_category(
         # load_submissions on this path (the counting one below is today's only
         # one); the two cannot be merged, because this one must observe the
         # PRE-write state and that one must observe the POST-write state.
-        _meta = (loaded.get("content") or {}).get("meta") or {}
+        _meta = (envelope or {}).get("meta") or {}
         _prior = _prior_category_count(
             await prep_store.load_submissions(prep_id), category_name
         )
@@ -9809,11 +9839,11 @@ async def handle_submit_category(
         # Phase 2 (QA_DUP_SHORTLIST_ENABLED, default OFF): "" unless THIS
         # submission completed the expected set and the prescreen found pairs.
         _shortlist = await _dup_shortlist_note(
-            (loaded.get("content") or {}).get("meta"), rows.get("content") or []
+            (envelope or {}).get("meta"), rows.get("content") or []
         )
         # 2026-08-04: say COMPLETE out loud -- see _all_staged_banner.
         _staged_all = _all_staged_banner(
-            (loaded.get("content") or {}).get("meta"), rows.get("content") or []
+            (envelope or {}).get("meta"), rows.get("content") or []
         )
         # A4: warn on EVERY category submit from an unrecognised client, not
         # only at finalize -- "" (no-op) whenever this call's own client is a
@@ -10183,6 +10213,304 @@ def _oversized_submission_note(obj: object) -> str:
     )
 
 
+async def _mark_assertion_refused(prep_id: str, envelope: dict, meta: dict) -> None:
+    """Two-beat ack: stamp the prep so a LATER step_assertion_ack is honoured.
+    Non-fatal: an unpersisted mark only means the next ack is refused again."""
+    try:
+        _mark = await prep_store.update_prep(
+            prep_id,
+            {**envelope, "meta": {**meta, "assertion_refused": True}},
+        )
+        if (_mark or {}).get("error"):
+            logger.warning(
+                "prep %s not marked assertion_refused (%s)",
+                prep_id,
+                (_mark or {}).get("error"),
+            )
+    except Exception:  # pragma: no cover - must never block the refusal
+        logger.debug("assertion_refused mark failed", exc_info=True)
+
+
+async def _volume_floor_gate(
+    prep_id: str, envelope: dict, all_cases: list, staged_rows: int, ack: bool
+) -> tuple[str | None, str]:
+    """The generation-VOLUME gate, run on BOTH finalize routes.
+
+    Returns ``(refusal, note)``: the refusal text (the caller prefixes its
+    version note) or None to carry on, and the reply disclosure. A refusal
+    destroys nothing; volume is measured pre-dedup."""
+    meta = envelope.get("meta") or {}
+    _vmode, _vmd = _volume_floor_note(
+        meta, all_cases, prep_id, ack=bool(ack), staged=staged_rows
+    )
+    if _vmode == "refuse":
+        # TWO-BEAT ack: mark the prep refused so a LATER volume_floor_ack is
+        # honoured. Non-fatal: an unpersisted mark fails safe. 2026-08-12: the
+        # count is stamped so the NEXT refusal can say the resubmission shrank.
+        try:
+            _mark = await prep_store.update_prep(
+                prep_id,
+                {
+                    **envelope,
+                    "meta": {
+                        **meta,
+                        "volume_refused": True,
+                        "volume_last_count": len(all_cases),
+                    },
+                },
+            )
+            if (_mark or {}).get("error"):
+                logger.warning(
+                    "prep %s not marked volume_refused (%s)",
+                    prep_id,
+                    (_mark or {}).get("error"),
+                )
+        except Exception:  # pragma: no cover - must never block the refusal
+            logger.debug("volume_refused mark failed", exc_info=True)
+        await _audit(
+            "mcp_submit_suite_refused",
+            entity_id=prep_id,
+            detail={"reason": "volume_floor", "submitted_cases": len(all_cases)},
+        )
+        return _vmd, ""
+    if _vmode == "acked":
+        await _audit(
+            "mcp_submit_suite_volume_override",
+            entity_id=prep_id,
+            detail={"reason": "volume_floor_ack", "submitted_cases": len(all_cases)},
+        )
+    return None, (_vmd if _vmode else "")
+
+
+async def _assertion_ack_shape(prep_id: str) -> str:
+    """How the tester finalizes as-is: with rows staged the ack alone is the
+    whole retry; otherwise nothing extra is said."""
+    rows = ((await prep_store.load_submissions(prep_id)) or {}).get("content") or []
+    if not rows:
+        return ""
+    return (
+        " and "
+        + _finalize_route_phrase(short=True)
+        + " -- the staged categories are held server-side, so do not resend them"
+    )
+
+
+def _assertion_refusal_text(
+    prep_id: str, over: list, findings: list, first_beat: str, ack_shape: str
+) -> str:
+    """The step-assertion refusal body (the caller prefixes its version note)."""
+    detail = "\n".join(
+        f"- **{name}**: {hit} of {total} step(s) ({ratio:.0%})"
+        for name, hit, total, ratio in over
+    )
+    return (
+        "⛔ **Submission refused:** in the "
+        "categor(ies) below, most steps have an `expected_result` "
+        "that asserts nothing the `action` did not already say -- "
+        "typically a restatement of the action itself. A step like "
+        "that passes against correct software AND against broken "
+        "software, so executing it measures nothing.\n\n"
+        f"{detail}\n\n"
+        f"{step_assertion.step_assertion_detail(findings)}\n\n"
+        "Rewrite those expected results to name the concrete "
+        "observable outcome -- the exact on-screen message, the "
+        "field/button state, or the resulting screen -- and resubmit "
+        f"under the SAME prep_id `{prep_id}`. **Nothing was "
+        "discarded**: the prep and every staged category row "
+        "survive. To finalize as-is "
+        "anyway, ask the tester first and then resend with "
+        f"`step_assertion_ack=true`{ack_shape}.{first_beat}"
+    )
+
+
+async def _step_assertion_gate(
+    prep_id: str, envelope: dict, all_cases: list, findings: list, ack: bool
+) -> tuple[str | None, str]:
+    """F4 (2026-08-29): the ENFORCEMENT gate against steps whose expected_result
+    merely restates the action. Same ``(refusal, note)`` contract as
+    ``_volume_floor_gate``; placed beside it and before finalize for the same
+    reason: a refusal costs one round trip and destroys nothing."""
+    over = step_assertion.categories_over_threshold(all_cases)
+    if not over:
+        return None, ""
+    meta = envelope.get("meta") or {}
+    refused_before = bool(meta.get("assertion_refused"))
+    categories = [row[0] for row in over]
+    detail = {"categories": categories, "flagged_steps": len(findings)}
+    if ack and refused_before:
+        await _audit(
+            "mcp_submit_suite_assertion_override",
+            entity_id=prep_id,
+            detail={"reason": "step_assertion_ack", **detail},
+        )
+        return None, (
+            "> ⚠️  Finalized with `step_assertion_ack=true` over "
+            f"{len(findings)} step(s) whose expected_result asserts "
+            "nothing the action did not already state.\n\n"
+        )
+    first_beat = ""
+    if ack:
+        first_beat = (
+            "\n\n> ⚠️  `step_assertion_ack=true` arrived on the "
+            "FIRST submit for this prep and was IGNORED -- the finding "
+            "below had not been shown to anyone yet."
+        )
+    await _mark_assertion_refused(prep_id, envelope, meta)
+    await _audit(
+        "mcp_submit_suite_refused",
+        entity_id=prep_id,
+        detail={"reason": "step_assertion", **detail},
+    )
+    ack_shape = await _assertion_ack_shape(prep_id)
+    return _assertion_refusal_text(prep_id, over, findings, first_beat, ack_shape), ""
+
+
+def _skipped_attachments_gen_notes(meta: dict) -> list:
+    """Generation note: attachments the tester's own text-only pick skipped."""
+    try:
+        note = _text_only_image_skip_note(meta)
+        return [("Skipped attachments", note)] if note else []
+    except Exception:
+        logger.debug("skipped-attachments gen note failed", exc_info=True)
+        return []
+
+
+async def _recent_suite_gen_notes(source_text: str) -> list:
+    """Generation note: a suite for this same source was saved recently."""
+    try:
+        note = await _recent_suite_warning_note(
+            source_text, _RECENT_SUITE_WARN_WINDOW_S
+        )
+        return [("Recent suite for this source", note)] if note else []
+    except Exception:
+        logger.debug("recent-suite gen note failed", exc_info=True)
+        return []
+
+
+async def _early_gen_notes(
+    meta: dict, dup_note: str, source_text: str, provenance: dict, suite: object
+) -> list:
+    """A1 (2026-09-26): signals that already exist server-side but never
+    reached the Generation Notes sheet, up to the volume shortfall. Each is
+    independent and best-effort; the order is the sheet's order."""
+    notes = _skipped_attachments_gen_notes(meta)
+    if dup_note:
+        notes.append(("Duplicate cases", dup_note))
+    notes += await _recent_suite_gen_notes(source_text)
+    provenance_detail = _provenance_gen_note_detail(provenance)
+    if provenance_detail:
+        notes.append(("Session provenance", provenance_detail))
+    screen_ref = str(meta.get("image_reference_advisory") or "")
+    if screen_ref:
+        notes.append(("Screen references without attachments", screen_ref))
+    vol_detail = _volume_shortfall_detail(
+        meta, list(getattr(suite, "test_cases", None) or [])
+    )
+    if vol_detail:
+        notes.append(("Under-generated categories", vol_detail))
+    return notes
+
+
+def _checklist_gap_gen_notes(checklist_gap: bool) -> list:
+    """Generation note: the run returned no usable requirements checklist."""
+    if not checklist_gap:
+        return []
+    return [
+        (
+            "No requirements checklist",
+            "The requirement decomposition runs in the tester's chat "
+            "model, not on this server, and this run returned no "
+            "usable `checklist_items`. There is therefore NO "
+            "requirements checklist for this suite, and no "
+            "Requirements Checklist sheet. "
+            "Nothing was invented to fill the gap -- treat the "
+            "suite's coverage as unmeasured, not as complete.",
+        )
+    ]
+
+
+def _ambiguity_gen_notes(amb_result: object) -> list:
+    """Generation notes from the ambiguity preflight: it did not run, it rated
+    the source medium/high (element names are inferred), and any unreadable
+    field recorded in ``result.notes`` (the chat reply is transient; the
+    workbook is what the tester keeps)."""
+    notes: list = []
+    ran = getattr(amb_result, "ran", False)
+    if amb_result is not None and not ran:
+        notes.append(
+            (
+                "Ambiguity preflight did not run",
+                "The testability pre-pass (TICKET-7154 protection) was "
+                "declared `blocking: true` in the prepare payload, but "
+                "it runs inside the tester's chat model and this "
+                "submission came back with no readable result -- so "
+                "there is no evidence it ran, and this server cannot "
+                "enforce a step it does not execute. These cases were "
+                "generated against a ticket nothing checked for being "
+                "too under-specified to test. That is NOT the same as "
+                "'checked and found nothing'.",
+            )
+        )
+    if amb_result is not None and ran:
+        if getattr(amb_result, "severity", "") in ("medium", "high"):
+            notes.append(
+                (
+                    "UI element names may be inferred",
+                    "The testability preflight rated this source "
+                    f"`{amb_result.severity}`. Where the source names no "
+                    "screen, no control and no label, the screen names, "
+                    "element names and UI copy in these cases were "
+                    "inferred by the generating model, not promised by "
+                    "the ticket. Confirm an element exists before "
+                    "raising a defect for its absence, and treat a "
+                    "mismatch in wording as a question for the BA rather "
+                    "than a bug.",
+                )
+            )
+    amb_note = host_mode.ambiguity_notes_gen_note(amb_result)
+    if amb_note is not None:
+        notes.append(amb_note)
+    return notes
+
+
+def _step_assertion_gen_notes(findings: list, data_findings: list) -> list:
+    """F4 (2026-08-29): advisory notes in the workbook the tester keeps. The
+    REFUSAL is the gate; the test_data finding never gates at all."""
+    notes: list = []
+    assert_detail = step_assertion.step_assertion_detail(findings)
+    if assert_detail:
+        notes.append(("Steps that cannot fail", assert_detail))
+    data_detail = step_assertion.test_data_detail(data_findings)
+    if data_detail:
+        notes.append(("Test data that restates the field name", data_detail))
+    return notes
+
+
+def _quality_advisory_gen_notes(
+    all_cases: list, source_text: str, summary: str
+) -> list:
+    """C1 (2026-09-26) suite-quality advisories, then F8 (2026-08-30) the FULL
+    generation advisory when the chat reply cut it at ``_SUMMARY_CAP``. Both
+    are best-effort: a note must never cost the tester the export."""
+    notes: list = []
+    try:
+        for title, detail in compute_suite_quality_advisories(
+            all_cases, staged_text=source_text
+        ):
+            notes.append((title, detail))
+    except Exception:  # pragma: no cover - advisory never blocks export
+        logger.debug("compute_suite_quality_advisories failed", exc_info=True)
+    try:
+        full_summary = (summary or "").strip()
+        if len(full_summary) > _SUMMARY_CAP:
+            notes.append(
+                ("Full generation advisory (the chat reply was cut)", full_summary)
+            )
+    except Exception:  # pragma: no cover - a note never blocks the export
+        logger.debug("full-advisory note attachment failed", exc_info=True)
+    return notes
+
+
 async def handle_submit_suite(
     prep_id: str,
     suite_json,
@@ -10210,21 +10538,11 @@ async def handle_submit_suite(
             "submit with the prep_id it returned."
         )
     try:
-        loaded = await prep_store.load_prep(prep_id)
-        envelope = loaded.get("content")
-        _task_note = _host_task_reply(prep_id, envelope)
-        if _task_note:
-            return _task_note
-        _store_note = _prep_store_error_reply(prep_id, loaded)
-        if _store_note:
-            return _store_note
-        if not isinstance(envelope, dict):
-            return _prep_missing_reply(prep_id)
-        # Fix 5b: without this, a resubmit would reach the sidecar/merge branches
-        # and finalize the same prep twice.
-        _final_note = _finalized_reply(prep_id, envelope)
-        if _final_note:
-            return _final_note
+        # Fix 5b: without the finalized refusal, a resubmit would reach the
+        # sidecar/merge branches and finalize the same prep twice.
+        envelope, refusal = await _load_open_prep(prep_id, require_dict=True)
+        if refusal:
+            return refusal
 
         try:
             prepared = host_mode.deserialize_prepared(envelope.get("prepared") or {})
@@ -10640,180 +10958,24 @@ async def handle_submit_suite(
                 "category with `qa_submit_category` for a server-derived "
                 "category instead.\n\n"
             )
-        # Batch 1 (2026-08-09): the generation-VOLUME gate, and the only place
-        # the fan-out completeness contract reaches a MERGED submission. It
-        # runs on BOTH finalize routes on purpose -- Path A is what
-        # build_orchestration marks `preferred`, so gating only Path B would
-        # leave the recommended route as a free bypass (8 staged rows of 1 case
-        # each satisfy _fanout_incomplete_note and ship the 08-09 suite again).
-        # It runs HERE: after the has_full loop above normalised every
-        # self-reported `category`, and before the ambiguity gate, the
-        # finalize, the export and the persist -- so a refusal costs one round
-        # trip and destroys nothing (the prep is kept, no staged row is
-        # dropped), exactly like the
-        # ambiguity refusal below. version_note is prefixed for the same reason
-        # that one prefixes amb_note: a prep staged on one install and
-        # submitted to another is a plausible cause of a host ignoring the
-        # orchestration contract, and it must not be dropped by an early
-        # return. Volume is measured on the SUBMITTED cases (pre-dedup) -- see
-        # the post-dedup re-check after finalize.
-        volume_note = ""
-        _vmode, _vmd = _volume_floor_note(
-            meta,
-            all_cases,
-            prep_id,
-            ack=bool(volume_floor_ack),
-            staged=staged_rows,
+        # Batch 1 (2026-08-09) volume gate and F4 (2026-08-29) step-assertion
+        # gate, in that order, on BOTH finalize routes. They run HERE: after
+        # the has_full loop above normalised every self-reported `category`,
+        # and before the ambiguity gate, the finalize, the export and the
+        # persist -- so a refusal costs one round trip and destroys nothing.
+        # version_note is prefixed to each refusal: a prep staged on one
+        # install and submitted to another must not lose it to an early return.
+        _refusal, volume_note = await _volume_floor_gate(
+            prep_id, envelope, all_cases, staged_rows, volume_floor_ack
         )
-        if _vmode == "refuse":
-            # TWO-BEAT ack (the image gate's pattern): mark the prep as refused
-            # so that a LATER volume_floor_ack is honoured, while an ack sent on
-            # the FIRST submit -- which the tester cannot have seen these
-            # numbers for -- is refused and told so. Non-fatal: an unpersisted
-            # mark only means the next ack is refused again.
-            try:
-                _mark = await prep_store.update_prep(
-                    prep_id,
-                    {
-                        **envelope,
-                        "meta": {
-                            **meta,
-                            "volume_refused": True,
-                            # 2026-08-12: the count is stamped so the NEXT
-                            # refusal can say the resubmission got smaller.
-                            # One session went 27 -> 26 -> 24 cases across
-                            # three refusals that read identically, because
-                            # the gate recomputes from scratch every time.
-                            "volume_last_count": len(all_cases),
-                        },
-                    },
-                )
-                if (_mark or {}).get("error"):
-                    logger.warning(
-                        "prep %s not marked volume_refused (%s)",
-                        prep_id,
-                        (_mark or {}).get("error"),
-                    )
-            except Exception:  # pragma: no cover - must never block the refusal
-                logger.debug("volume_refused mark failed", exc_info=True)
-            await _audit(
-                "mcp_submit_suite_refused",
-                entity_id=prep_id,
-                detail={
-                    "reason": "volume_floor",
-                    "submitted_cases": len(all_cases),
-                },
-            )
-            return f"{version_note}{_vmd}"
-        if _vmode == "acked":
-            await _audit(
-                "mcp_submit_suite_volume_override",
-                entity_id=prep_id,
-                detail={
-                    "reason": "volume_floor_ack",
-                    "submitted_cases": len(all_cases),
-                },
-            )
-        volume_note = _vmd if _vmode else ""
-        # F4 (2026-08-29): an ENFORCEMENT gate, not a prompt one -- the
-        # system_prompt has always demanded a verifiable expected_result. On the
-        # TICKET-5692 run two regenerated categories came back with 65 steps whose
-        # expected_result merely restated the action ("The step completes
-        # successfully: <action>"), 74% and 78% of their steps, while the other
-        # six scored zero. Placed HERE, beside the volume floor and before
-        # finalize, for the same reason that one is: a refusal costs one round
-        # trip and destroys nothing.
-        assertion_note = ""
+        if _refusal is not None:
+            return f"{version_note}{_refusal}"
         _assert_findings = step_assertion.find_tautological_steps(all_cases)
-        _assert_over = step_assertion.categories_over_threshold(all_cases)
-        if _assert_over:
-            _assert_detail = "\n".join(
-                f"- **{name}**: {hit} of {total} step(s) ({ratio:.0%})"
-                for name, hit, total, ratio in _assert_over
-            )
-            _assert_refused_before = bool(meta.get("assertion_refused"))
-            if not (step_assertion_ack and _assert_refused_before):
-                if step_assertion_ack and not _assert_refused_before:
-                    _first_beat = (
-                        "\n\n> \u26a0\ufe0f  `step_assertion_ack=true` arrived on the "
-                        "FIRST submit for this prep and was IGNORED -- the finding "
-                        "below had not been shown to anyone yet."
-                    )
-                else:
-                    _first_beat = ""
-                # Two-beat, exactly like volume_floor_ack / image_relevance_ack:
-                # an unpersisted mark only means the next ack is refused again,
-                # which fails safe.
-                try:
-                    _mark = await prep_store.update_prep(
-                        prep_id,
-                        {**envelope, "meta": {**meta, "assertion_refused": True}},
-                    )
-                    if (_mark or {}).get("error"):
-                        logger.warning(
-                            "prep %s not marked assertion_refused (%s)",
-                            prep_id,
-                            (_mark or {}).get("error"),
-                        )
-                except Exception:  # pragma: no cover - must never block the refusal
-                    logger.debug("assertion_refused mark failed", exc_info=True)
-                await _audit(
-                    "mcp_submit_suite_refused",
-                    entity_id=prep_id,
-                    detail={
-                        "reason": "step_assertion",
-                        "categories": [row[0] for row in _assert_over],
-                        "flagged_steps": len(_assert_findings),
-                    },
-                )
-                # Rewriting needs new content, so that half of the message is
-                # right as it stands. Finalizing as-is does not: with rows
-                # staged the ack alone is the whole retry.
-                _ack_shape = (
-                    ""
-                    if not (
-                        ((await prep_store.load_submissions(prep_id)) or {}).get(
-                            "content"
-                        )
-                        or []
-                    )
-                    else " and "
-                    + _finalize_route_phrase(short=True)
-                    + " -- the staged categories are "
-                    "held server-side, so do not resend them"
-                )
-                return (
-                    f"{version_note}\u26d4 **Submission refused:** in the "
-                    "categor(ies) below, most steps have an `expected_result` "
-                    "that asserts nothing the `action` did not already say -- "
-                    "typically a restatement of the action itself. A step like "
-                    "that passes against correct software AND against broken "
-                    "software, so executing it measures nothing.\n\n"
-                    f"{_assert_detail}\n\n"
-                    f"{step_assertion.step_assertion_detail(_assert_findings)}\n\n"
-                    "Rewrite those expected results to name the concrete "
-                    "observable outcome -- the exact on-screen message, the "
-                    "field/button state, or the resulting screen -- and resubmit "
-                    f"under the SAME prep_id `{prep_id}`. **Nothing was "
-                    "discarded**: the prep and every staged category row "
-                    "survive. To finalize as-is "
-                    "anyway, ask the tester first and then resend with "
-                    f"`step_assertion_ack=true`{_ack_shape}.{_first_beat}"
-                )
-            await _audit(
-                "mcp_submit_suite_assertion_override",
-                entity_id=prep_id,
-                detail={
-                    "reason": "step_assertion_ack",
-                    "categories": [row[0] for row in _assert_over],
-                    "flagged_steps": len(_assert_findings),
-                },
-            )
-            assertion_note = (
-                "> \u26a0\ufe0f  Finalized with `step_assertion_ack=true` over "
-                f"{len(_assert_findings)} step(s) whose expected_result asserts "
-                "nothing the action did not already state.\n\n"
-            )
+        _refusal, assertion_note = await _step_assertion_gate(
+            prep_id, envelope, all_cases, _assert_findings, step_assertion_ack
+        )
+        if _refusal is not None:
+            return f"{version_note}{_refusal}"
         _data_findings = step_assertion.find_echoed_test_data(all_cases)
         dropped_note = _dropped_note(parsed)
         # The ambiguity job's verdict. QA_HOST_AMBIGUITY_REVIEW_ENABLED
@@ -11515,158 +11677,13 @@ async def handle_submit_suite(
         # Best-effort: a suite with nothing to report gets no sheet at all, and
         # a failure here must never cost the tester the export.
         try:
-            _gen_notes: list = []
-            # A1 (2026-09-26, v1.98 scope A): five signals that already exist
-            # server-side but never reached the Generation Notes sheet. Each
-            # is independent and best-effort -- a failure in one must never
-            # drop the others or block export, matching every append below.
-            try:
-                _skip_gen_note = _text_only_image_skip_note(meta)
-                if _skip_gen_note:
-                    _gen_notes.append(("Skipped attachments", _skip_gen_note))
-            except Exception:
-                logger.debug("skipped-attachments gen note failed", exc_info=True)
-            if _dup_note:
-                _gen_notes.append(("Duplicate cases", _dup_note))
-            try:
-                _recent_gen_note = await _recent_suite_warning_note(
-                    source_text, _RECENT_SUITE_WARN_WINDOW_S
-                )
-                if _recent_gen_note:
-                    _gen_notes.append(
-                        ("Recent suite for this source", _recent_gen_note)
-                    )
-            except Exception:
-                logger.debug("recent-suite gen note failed", exc_info=True)
-            _provenance_gen_detail = _provenance_gen_note_detail(_provenance)
-            if _provenance_gen_detail:
-                _gen_notes.append(("Session provenance", _provenance_gen_detail))
-            _screen_ref_gen_note = str(meta.get("image_reference_advisory") or "")
-            if _screen_ref_gen_note:
-                _gen_notes.append(
-                    ("Screen references without attachments", _screen_ref_gen_note)
-                )
-            _vol_detail = _volume_shortfall_detail(
-                meta, list(getattr(suite, "test_cases", None) or [])
+            _gen_notes = await _early_gen_notes(
+                meta, _dup_note, source_text, _provenance, suite
             )
-            if _vol_detail:
-                _gen_notes.append(("Under-generated categories", _vol_detail))
-            if checklist_gap:
-                _gen_notes.append(
-                    (
-                        "No requirements checklist",
-                        "The requirement decomposition runs in the tester's chat "
-                        "model, not on this server, and this run returned no "
-                        "usable `checklist_items`. There is therefore NO "
-                        "requirements checklist for this suite, and no "
-                        "Requirements Checklist sheet. "
-                        "Nothing was invented to fill the gap -- treat the "
-                        "suite's coverage as unmeasured, not as complete.",
-                    )
-                )
-            if amb_result is not None and not getattr(amb_result, "ran", False):
-                _gen_notes.append(
-                    (
-                        "Ambiguity preflight did not run",
-                        "The testability pre-pass (TICKET-7154 protection) was "
-                        "declared `blocking: true` in the prepare payload, but "
-                        "it runs inside the tester's chat model and this "
-                        "submission came back with no readable result -- so "
-                        "there is no evidence it ran, and this server cannot "
-                        "enforce a step it does not execute. These cases were "
-                        "generated against a ticket nothing checked for being "
-                        "too under-specified to test. That is NOT the same as "
-                        "'checked and found nothing'.",
-                    )
-                )
-            # F6 (2026-08-30): the ambiguity verdict is the ONE signal the
-            # server holds about whether the source named a screen at all, and
-            # nothing downstream consumed it. On a live run a `medium` verdict
-            # whose first listed issue was "the ticket names no screen or URL"
-            # was printed once, and 59 cases were then written against an
-            # invented home screen, 15 of them instructing a tester to verify an
-            # "indicator dot" that no ticket, mockup or comment mentions. The
-            # tester looks for a UI element that may not exist and files its
-            # absence as a defect. Nothing here judges the cases -- it records,
-            # in the artifact the tester keeps, that the element NAMES in them
-            # are inferred rather than promised.
-            if amb_result is not None and getattr(amb_result, "ran", False):
-                if getattr(amb_result, "severity", "") in ("medium", "high"):
-                    _gen_notes.append(
-                        (
-                            "UI element names may be inferred",
-                            "The testability preflight rated this source "
-                            f"`{amb_result.severity}`. Where the source names no "
-                            "screen, no control and no label, the screen names, "
-                            "element names and UI copy in these cases were "
-                            "inferred by the generating model, not promised by "
-                            "the ticket. Confirm an element exists before "
-                            "raising a defect for its absence, and treat a "
-                            "mismatch in wording as a question for the BA rather "
-                            "than a bug.",
-                        )
-                    )
-            # v1.97.0 cursor-hardening (item 9): extract_ambiguity_result
-            # already records a rejected `testable_surface` (or other
-            # unreadable ambiguity_result field) in result.notes, and
-            # build_ambiguity_result_section already renders those notes into
-            # the CHAT REPLY -- but the chat reply is transient and the
-            # workbook is what the tester keeps. Mirrors the F4/F8 rationale
-            # below: the same signal, once more, in the artifact that
-            # survives.
-            _amb_gen_note = host_mode.ambiguity_notes_gen_note(amb_result)
-            if _amb_gen_note is not None:
-                _gen_notes.append(_amb_gen_note)
-            # F4 (2026-08-29): the .xlsx is what the tester keeps; a step that
-            # cannot fail has to be visible there and not only in a chat reply.
-            # Both notes are advisory here -- the REFUSAL above is the gate, and
-            # the test_data finding never gates at all.
-            _assert_detail_text = step_assertion.step_assertion_detail(_assert_findings)
-            if _assert_detail_text:
-                _gen_notes.append(("Steps that cannot fail", _assert_detail_text))
-            _data_detail_text = step_assertion.test_data_detail(_data_findings)
-            if _data_detail_text:
-                _gen_notes.append(
-                    ("Test data that restates the field name", _data_detail_text)
-                )
-            # C1 (2026-09-26, v1.98 scope C): tools.suite_quality_signals is
-            # mature (17 unit tests) and warn-only, but had zero non-test
-            # callers -- computed advisories never reached a tester. Call it
-            # here, the same place every other advisory-only signal above
-            # already lands in _gen_notes. compute_suite_quality_advisories
-            # never raises on its own, but it is wrapped anyway so a future
-            # change to it can never cost the tester the export. The
-            # dedup-contradiction argument is intentionally left at its
-            # default (a no-op): its evidence is computed after workbook
-            # export and reordering that is OUT OF SCOPE for this change.
-            try:
-                for _qs_title, _qs_detail in compute_suite_quality_advisories(
-                    all_cases, staged_text=source_text
-                ):
-                    _gen_notes.append((_qs_title, _qs_detail))
-            except Exception:  # pragma: no cover - advisory never blocks export
-                logger.debug("compute_suite_quality_advisories failed", exc_info=True)
-            # F8 (2026-08-30): the finalize reply truncates at _SUMMARY_CAP and
-            # told the tester to "re-submit a smaller suite" to read the
-            # advisories it cut -- i.e. to regenerate the work in order to read a
-            # comment about it. The advisories being cut are among the most
-            # actionable output this server produces (on one run the cut landed
-            # mid-sentence in "2 test class(es) an experienced tester would
-            # expect are missing"). The workbook already carries a Generation
-            # Notes sheet and is what the tester keeps, so the FULL advisory goes
-            # there. Gated on the static cap, which is the ceiling every dynamic
-            # budget sits under, so a run whose summary fits is unchanged.
-            try:
-                _full_summary = (summary or "").strip()
-                if len(_full_summary) > _SUMMARY_CAP:
-                    _gen_notes.append(
-                        (
-                            "Full generation advisory (the chat reply was cut)",
-                            _full_summary,
-                        )
-                    )
-            except Exception:  # pragma: no cover - a note never blocks the export
-                logger.debug("full-advisory note attachment failed", exc_info=True)
+            _gen_notes += _checklist_gap_gen_notes(checklist_gap)
+            _gen_notes += _ambiguity_gen_notes(amb_result)
+            _gen_notes += _step_assertion_gen_notes(_assert_findings, _data_findings)
+            _gen_notes += _quality_advisory_gen_notes(all_cases, source_text, summary)
             if _gen_notes:
                 suite._generation_notes = _gen_notes
         except Exception:  # pragma: no cover - defensive; must never block export

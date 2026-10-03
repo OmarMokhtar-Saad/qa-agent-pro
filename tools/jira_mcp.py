@@ -3056,6 +3056,334 @@ def _screen_reference_advisory(
         return ""
 
 
+def _load_error_result(load_error: str, source_url: str) -> dict:
+    """The early-return dict for a payload ``_load_payload`` refused."""
+    if "too large" in load_error:
+        # B4 (2026-09-26, v1.98 scope B): the generic wrap below built
+        # a garbled composite ("I couldn't read the payload (That
+        # Jira payload is too large...)") whose own instruction then
+        # told the agent to RESEND the same oversized payload
+        # unmodified -- guaranteed to fail identically again. Name
+        # the size (already inside load_error) and the real escape
+        # hatch: staged parts, not a retry of the thing just refused.
+        return {
+            "error": (
+                f"⚠️ {load_error} Sending it again unmodified will "
+                "fail the same way -- switch to staged parts instead. "
+                "Call `qa_prepare_test_cases` again with the SAME "
+                "`feature_or_url` and NO `jira_content_json` to get a "
+                f"fresh `stage_token`, then call `{fetch_tool_name()}` "
+                "for each part you still need and stage that ONE "
+                "result with `qa_stage_jira(stage_token=..., "
+                "part='issue'|'parent'|'siblings', json=<that "
+                "result>)` -- request only the fields the directive "
+                "named if a part is rejected for size too -- then "
+                "call `qa_prepare_test_cases` again with that SAME "
+                "`stage_token`."
+            ),
+            "content": None,
+            "needs_jira_mcp": False,
+        }
+    return {
+        "error": (
+            "⚠️ I couldn't read the Jira payload you sent back "
+            f"({load_error}). Re-run the `getJiraIssue` call and pass its "
+            "RAW JSON result as `jira_content_json`, unmodified."
+            if load_error not in ("empty",)
+            else jira_mcp_required_result(source_url)["error"]
+        ),
+        "content": None,
+        "needs_jira_mcp": load_error == "empty",
+    }
+
+
+def _unwrapped_issue(payload: dict) -> tuple[dict, object, dict]:
+    """``(payload, issue, fields)`` after the one-level MCP-envelope fallback."""
+    # Some clients return the MCP envelope rather than the tool's result.
+    # Unwrap ONE level -- but ONLY as a fallback, when the payload does not
+    # already carry an issue. _unwrap_mcp_content returns the inner object
+    # whenever ANY top-level content[*].text parses as JSON, discarding the
+    # rest, so applying it unconditionally turned two payloads that generate
+    # today into refusals: one carrying a top-level `content` list ALONGSIDE
+    # a real issue, and a flattened one whose ADF text node happened to be
+    # JSON-shaped (an API ticket pasting a snippet). Guarding on the happy
+    # path costs one condition and makes this a true no-op everywhere else.
+    if not _issue_fields(
+        payload.get("issue") if isinstance(payload.get("issue"), dict) else payload
+    ):
+        payload = _unwrap_mcp_content(payload)
+    issue = payload.get("issue") if isinstance(payload.get("issue"), dict) else payload
+    return payload, issue, _issue_fields(issue)
+
+
+def _no_fields_result(payload: dict, issue: object) -> dict:
+    """The early-return dict for a payload that carries no ``fields`` object."""
+    # A payload with no `fields` is USUALLY a trimmed result -- but it is
+    # also exactly what Jira returns when the caller cannot READ the
+    # issue, and telling that tester to "call getJiraIssue again" is an
+    # instruction to repeat a call that will fail the same way. Say what
+    # Jira actually said when Jira said anything.
+    reason = _jira_failure_reason(payload) or _jira_failure_reason(
+        issue if isinstance(issue, dict) else {}
+    )
+    return {
+        "error": (
+            f"⚠️ Jira did not return that issue: {reason}. Check the "
+            "issue key and that your Atlassian account can see it, then "
+            "re-run `getJiraIssue`."
+            if reason
+            else "⚠️ That Jira payload has no `fields` object, so there "
+            "is nothing to generate from. Call `getJiraIssue` again and pass "
+            "its RAW result (the whole object, including `fields`)."
+        ),
+        "content": None,
+        "needs_jira_mcp": False,
+    }
+
+
+def _issue_key_claim(issue: object, source_url: str) -> tuple[str, str, str]:
+    """``(raw_payload_key, payload_key, url_key)`` for the identity guard."""
+    # The key is read from the SAME node the fields came from (see
+    # _issue_node): on the live `{"issues": {"nodes": [...]}}` envelope the
+    # outer dict has no `key` at all, and reading it there made the guard
+    # in _check_issue_identity unreachable for exactly the payload shape the
+    # host really sends.
+    _key_node = _issue_node(issue)
+    # Presence is decided BEFORE any truthiness collapse: `or ""` turned
+    # `key: 0` / `False` / `[]` / `{}` -- present and unreadable, state 3 --
+    # into state 1 and let them through (round-3 review).
+    _raw_key_value = (_key_node or {}).get("key")
+    _raw_payload_key = "" if _raw_key_value is None else str(_raw_key_value).strip()
+    payload_key = _valid_issue_key(_raw_payload_key)
+    return _raw_payload_key, payload_key, issue_key_from_url(source_url)
+
+
+def _unreadable_key_result(url_key: str) -> dict:
+    """Refusal: the payload's ``key`` is present but not a readable issue key."""
+    return {
+        "error": (
+            "⚠️ I can't tell which ticket that Jira payload is "
+            f"for. The URL names `{url_key}`, but the JSON's own `key` "
+            "field is not a readable Jira issue key, so I cannot check "
+            "that the two agree -- and generating anyway would stamp "
+            f"`{url_key}` on requirements that may come from a different "
+            "ticket. Call `getJiraIssue` again and pass its RAW, "
+            "unmodified result as `jira_content_json`."
+        ),
+        "content": None,
+        "needs_jira_mcp": False,
+    }
+
+
+def _key_mismatch_result(url_key: str, payload_key: str) -> dict:
+    """Refusal: the payload is for a different ticket than the link."""
+    return {
+        "error": (
+            "⚠️ That Jira payload is for a different ticket "
+            f"than the link. The URL names `{url_key}`, but the JSON "
+            f"handed back is `{payload_key}`. I won't generate from a "
+            "ticket the tester didn't ask for, and I can't tell which "
+            "one they meant. If the ticket you want is "
+            f"`{payload_key}`, start again with ITS url and pass this "
+            "same JSON. If you want "
+            f"`{url_key}`, re-run `getJiraIssue` for `{url_key}` and "
+            "pass THAT raw JSON -- but note that an issue MOVED between "
+            f"projects keeps its old key as an alias, so if `{url_key}` "
+            f"keeps coming back as `{payload_key}` then `{payload_key}` "
+            "is the live key and the first route is the one to take."
+        ),
+        "content": None,
+        "needs_jira_mcp": False,
+    }
+
+
+def _check_issue_identity(issue: object, source_url: str) -> dict | tuple[str, bool]:
+    """A refusal dict, or ``(key, key_assumed_from_url)`` when the payload may proceed."""
+    _raw_payload_key, payload_key, url_key = _issue_key_claim(issue, source_url)
+    # 2026-09-02 audit F5. The host fetches the ticket with its OWN
+    # Atlassian MCP connection and hands the JSON back, so nothing but this
+    # comparison ties the payload to the URL the tester actually gave. When
+    # they disagree the whole downstream reply is wrong in a way no tester
+    # can see: the ticket key, the export filename and the traceability
+    # table come from one issue while every requirement in the prompt comes
+    # from the other. There are THREE states here, and collapsing the last
+    # two is what the first cut of this guard got wrong (round-2 review, H2):
+    #   absent       -- no `key` field at all. A trimmed result; the URL's
+    #                   key remains the only claim on the record. Proceed.
+    #   readable     -- compare it. Disagreement is a refusal.
+    #   unreadable   -- a `key` IS present but does not parse as an issue
+    #                   key (`TICKET_9999`, an 11-digit number, a non-ASCII
+    #                   digit). Treating that as absent meant the payload
+    #                   claimed one ticket, the record named another, and
+    #                   nothing compared them -- silently, which is the
+    #                   whole defect. It is unverifiable, so refuse.
+    # Refuse by NAME rather than pick a winner in either case: only the
+    # tester knows which ticket they meant.
+    if _raw_payload_key and not payload_key and url_key:
+        return _unreadable_key_result(url_key)
+    if payload_key and url_key and payload_key != url_key:
+        return _key_mismatch_result(url_key, payload_key)
+    # 2026-09-02 verification of audit F5: the ABSENT state above proceeds by
+    # design (a trimmed result must not be refused), but it proceeded
+    # SILENTLY -- the reply then named the URL's key as if the payload had
+    # confirmed it. Record the assumption so the grounding note can say so.
+    return payload_key or url_key, bool(url_key) and not payload_key
+
+
+def _source_text(fields: dict) -> tuple[str, str, bool, str, bool]:
+    """``(summary, description, description_truncated, ac, any_truncated)``.
+
+    Emptiness is judged on these SOURCE fields, BEFORE any fallback value is
+    applied to `title`. Judging it afterwards (on `title` / `raw_text`) would
+    let a ticket whose summary AND description are both empty look "grounded"
+    purely because the issue KEY was substituted for the title, and a whole
+    suite would then be generated from nothing.
+    """
+    summary_src = str(fields.get("summary") or "").strip()
+    description_raw, description_truncated = adf_text_with_depth_flag(
+        fields.get("description")
+    )
+    # The AC field is ADF too, so the same cap can empty it silently -- the
+    # very defect this fix exists to close, one field over.
+    ac_raw, ac_truncated = adf_text_with_depth_flag(fields.get(settings.jira_ac_field))
+    # `description_truncated` keeps its literal meaning; `any_truncated`
+    # drives the disclosure, because an unread AC field is just as silent.
+    any_truncated = description_truncated or ac_truncated
+    return (
+        summary_src,
+        description_raw.strip(),
+        description_truncated,
+        ac_raw.strip(),
+        any_truncated,
+    )
+
+
+def _empty_source_result(any_truncated: bool) -> dict:
+    """The early-return dict for an issue with no summary, description or AC."""
+    return {
+        "error": (
+            "⚠️ That Jira issue's text is nested deeper than I parse, "
+            "so none of it reached me and there is nothing to generate "
+            "from. Paste the ticket text and I'll work from that."
+            if any_truncated
+            else "⚠️ That Jira issue came back with no summary, no "
+            "description and no acceptance criteria, so there is nothing to "
+            "generate from. Check the issue key, or paste the ticket text "
+            "and I'll work from that."
+        ),
+        "content": None,
+        "needs_jira_mcp": False,
+    }
+
+
+def _parent_grounding(fields: dict, payload: dict, key: str) -> tuple:
+    """``(parent, subtasks, issuelinks, siblings, parent_context)``; all empty
+    unless ``settings.jira_fetch_parent`` is on."""
+    parent: dict | None = None
+    subtasks: list[dict] = []
+    issuelinks: list[dict] = []
+    siblings: list[dict] = []
+    parent_context = ""
+    if settings.jira_fetch_parent:
+        parent = _extract_parent_ref(fields)
+        subtasks = _extract_subtasks(fields)
+        issuelinks = _extract_issuelinks(fields)
+        if parent:
+            parent = {**parent, **_parent_body(payload.get("parent_issue"))}
+        else:
+            # No `fields.parent`, but the client may still have fetched the
+            # story this ticket IMPLEMENTS. Accepted only when that key is
+            # already linked from here -- see _linked_parent_ref.
+            parent = _linked_parent_ref(fields, payload.get("parent_issue"))
+        siblings = _extract_sibling_bodies(payload, key)
+        parent_context = _build_parent_context(
+            parent,
+            subtasks,
+            issuelinks,
+            siblings,
+            sibling_total=_count_sibling_candidates(payload, key),
+        )
+    return parent, subtasks, issuelinks, siblings, parent_context
+
+
+def _compose_meta_block(
+    fields: dict, any_truncated: bool, priority: str, labels: list, components: list
+) -> str:
+    """The ``Issue type / Status / Priority / ...`` lines that open ``raw_text``."""
+    # F14 (2026-08-30): the fetch DIRECTIVE asks the host for `issuetype` and
+    # `status` by name, and neither reached the model -- 79 cases were
+    # written against a ticket still in "BA Validation" without the generator
+    # ever being told it was not a settled requirement. Both are echoed with
+    # the same sanitiser `updated` uses (one line, URL-free, backtick-free,
+    # capped), so a host that trimmed `fields` simply contributes nothing.
+    issuetype_name = _sanitize_echo(_name_of(fields.get("issuetype")), 40)
+    status_name = _sanitize_echo(_name_of(fields.get("status")), 40)
+    meta_lines = []
+    if any_truncated:
+        # Never silent: the generator and the tester both have to know that
+        # part of the ticket did not reach them, or thin coverage reads as a
+        # thin ticket.
+        meta_lines.append(
+            "Ticket text: PARTIALLY UNREAD -- part of this ticket is nested "
+            "deeper than I parse, so some of it is missing below. Treat gaps "
+            "as unknown, not as absent, and ask for the missing section."
+        )
+    if issuetype_name:
+        meta_lines.append(f"Issue type: {issuetype_name}")
+    if status_name:
+        meta_lines.append(
+            f"Status: {status_name} "
+            "(workflow state at the time this snapshot was taken -- a ticket "
+            "not yet in a done/approved state may still change)"
+        )
+    if priority:
+        meta_lines.append(f"Priority: {priority}")
+    if labels:
+        meta_lines.append(f"Labels: {', '.join(labels)}")
+    if components:
+        meta_lines.append(f"Components: {', '.join(components)}")
+    return ("\n".join(meta_lines) + "\n") if meta_lines else ""
+
+
+def _compose_raw_text(
+    title: str, meta_block: str, description: str, comments: list
+) -> str:
+    """Title, meta block, description and the ``## Comments`` dump."""
+    raw_text = f"{title}\n{meta_block}{description}".strip()
+    # The raw "## Comments" dump, unchanged from the REST implementation
+    # and now UNCONDITIONAL. It was briefly conditional: while
+    # tools/comment_reconciler was enabled the thread was SUPPRESSED here
+    # deliberately, so its fenced, deterministically-resolved, URL-stripped
+    # AMENDMENTS block could be the only comment-derived input the
+    # generator saw. That seam became a False constant on 2026-08-14 and
+    # the module was DELETED on 2026-08-15 (dead-code deletion batch D5),
+    # so the dump is restored permanently -- which is what every install
+    # has actually done since the pin. A revival must re-suppress it here;
+    # see docs/RETIRED_CAPABILITIES.md section 4.
+    if comments:
+        raw_text += "\n\n## Comments\n" + "\n".join(f"- {c}" for c in comments)
+    return raw_text
+
+
+def _ranked_attachments(fields: dict) -> tuple[list[dict], list]:
+    """``(attachments, media_refs)``: inline-first, then capped."""
+    # ORDER MATTERS, and it is the whole point of this block. Extract every
+    # candidate (bounded by _MAX_IMAGE_ATTACHMENTS_SCANNED), join the ADF
+    # media nodes on so `inline` exists, rank inline-first, and only THEN
+    # apply the delivery cap. Truncating before the join -- which is what
+    # this did until the ordering fix -- dropped the mockup pasted into a
+    # comment in favour of whatever stray upload sat at the top.
+    attachments = _extract_image_attachments(fields)
+    # Inline (pasted-into-the-body) images, from the description AND the
+    # comment thread, joined onto the attachment records by filename.
+    media_refs = extract_media_refs(fields)
+    _match_media_to_attachments(media_refs, attachments)
+    # `jira_max_images = 0` is a legitimate "allow none" cap and still
+    # yields nothing, because the slice runs after the ranking, not instead
+    # of it.
+    return _ordered(attachments)[: max(0, settings.jira_max_images)], media_refs
+
+
 def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
     """Turn a host-submitted Atlassian MCP issue payload into the grounded dict
     the REST path used to return.
@@ -3069,195 +3397,27 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
     UNTRUSTED input: size-capped, ``json.loads``-only, issue keys regex-gated,
     URLs stripped from BACKGROUND text. Never raises - a malformed payload comes
     back as ``{"error": <actionable text>, "content": None}``.
+
+    The phase helpers above have no try/except of their own: every one is
+    called inside the single ``try`` below, which is the never-raise boundary,
+    and every refusal they build is returned from here.
     """
     try:
         payload, load_error = _load_payload(raw)
         if load_error:
-            if "too large" in load_error:
-                # B4 (2026-09-26, v1.98 scope B): the generic wrap below built
-                # a garbled composite ("I couldn't read the payload (That
-                # Jira payload is too large...)") whose own instruction then
-                # told the agent to RESEND the same oversized payload
-                # unmodified -- guaranteed to fail identically again. Name
-                # the size (already inside load_error) and the real escape
-                # hatch: staged parts, not a retry of the thing just refused.
-                return {
-                    "error": (
-                        f"⚠️ {load_error} Sending it again unmodified will "
-                        "fail the same way -- switch to staged parts instead. "
-                        "Call `qa_prepare_test_cases` again with the SAME "
-                        "`feature_or_url` and NO `jira_content_json` to get a "
-                        f"fresh `stage_token`, then call `{fetch_tool_name()}` "
-                        "for each part you still need and stage that ONE "
-                        "result with `qa_stage_jira(stage_token=..., "
-                        "part='issue'|'parent'|'siblings', json=<that "
-                        "result>)` -- request only the fields the directive "
-                        "named if a part is rejected for size too -- then "
-                        "call `qa_prepare_test_cases` again with that SAME "
-                        "`stage_token`."
-                    ),
-                    "content": None,
-                    "needs_jira_mcp": False,
-                }
-            return {
-                "error": (
-                    "⚠️ I couldn't read the Jira payload you sent back "
-                    f"({load_error}). Re-run the `getJiraIssue` call and pass its "
-                    "RAW JSON result as `jira_content_json`, unmodified."
-                    if load_error not in ("empty",)
-                    else jira_mcp_required_result(source_url)["error"]
-                ),
-                "content": None,
-                "needs_jira_mcp": load_error == "empty",
-            }
-
-        # Some clients return the MCP envelope rather than the tool's result.
-        # Unwrap ONE level -- but ONLY as a fallback, when the payload does not
-        # already carry an issue. _unwrap_mcp_content returns the inner object
-        # whenever ANY top-level content[*].text parses as JSON, discarding the
-        # rest, so applying it unconditionally turned two payloads that generate
-        # today into refusals: one carrying a top-level `content` list ALONGSIDE
-        # a real issue, and a flattened one whose ADF text node happened to be
-        # JSON-shaped (an API ticket pasting a snippet). Guarding on the happy
-        # path costs one condition and makes this a true no-op everywhere else.
-        if not _issue_fields(
-            payload.get("issue") if isinstance(payload.get("issue"), dict) else payload
-        ):
-            payload = _unwrap_mcp_content(payload)
-        issue = (
-            payload.get("issue") if isinstance(payload.get("issue"), dict) else payload
-        )
-        fields = _issue_fields(issue)
+            return _load_error_result(load_error, source_url)
+        payload, issue, fields = _unwrapped_issue(payload)
         if not fields:
-            # A payload with no `fields` is USUALLY a trimmed result -- but it is
-            # also exactly what Jira returns when the caller cannot READ the
-            # issue, and telling that tester to "call getJiraIssue again" is an
-            # instruction to repeat a call that will fail the same way. Say what
-            # Jira actually said when Jira said anything.
-            reason = _jira_failure_reason(payload) or _jira_failure_reason(
-                issue if isinstance(issue, dict) else {}
-            )
-            return {
-                "error": (
-                    f"⚠️ Jira did not return that issue: {reason}. Check the "
-                    "issue key and that your Atlassian account can see it, then "
-                    "re-run `getJiraIssue`."
-                    if reason
-                    else "⚠️ That Jira payload has no `fields` object, so there "
-                    "is nothing to generate from. Call `getJiraIssue` again and pass "
-                    "its RAW result (the whole object, including `fields`)."
-                ),
-                "content": None,
-                "needs_jira_mcp": False,
-            }
-
-        # The key is read from the SAME node the fields came from (see
-        # _issue_node): on the live `{"issues": {"nodes": [...]}}` envelope the
-        # outer dict has no `key` at all, and reading it there made the guard
-        # below unreachable for exactly the payload shape the host really sends.
-        _key_node = _issue_node(issue)
-        # Presence is decided BEFORE any truthiness collapse: `or ""` turned
-        # `key: 0` / `False` / `[]` / `{}` -- present and unreadable, state 3 --
-        # into state 1 and let them through (round-3 review).
-        _raw_key_value = (_key_node or {}).get("key")
-        _raw_payload_key = "" if _raw_key_value is None else str(_raw_key_value).strip()
-        payload_key = _valid_issue_key(_raw_payload_key)
-        url_key = issue_key_from_url(source_url)
-        # 2026-09-02 audit F5. The host fetches the ticket with its OWN
-        # Atlassian MCP connection and hands the JSON back, so nothing but this
-        # comparison ties the payload to the URL the tester actually gave. When
-        # they disagree the whole downstream reply is wrong in a way no tester
-        # can see: the ticket key, the export filename and the traceability
-        # table come from one issue while every requirement in the prompt comes
-        # from the other. Refuse by NAME rather than pick a winner -- either key
-        # could be the intended one, and only the tester knows which.
-        # There are THREE states here, and collapsing the last two is what the
-        # first cut of this guard got wrong (round-2 review, H2):
-        #   absent       -- no `key` field at all. A trimmed result; the URL's
-        #                   key remains the only claim on the record. Proceed.
-        #   readable     -- compare it. Disagreement is a refusal.
-        #   unreadable   -- a `key` IS present but does not parse as an issue
-        #                   key (`TICKET_9999`, an 11-digit number, a non-ASCII
-        #                   digit). Treating that as absent meant the payload
-        #                   claimed one ticket, the record named another, and
-        #                   nothing compared them -- silently, which is the
-        #                   whole defect. It is unverifiable, so refuse.
-        # Refuse by NAME rather than pick a winner in either case: only the
-        # tester knows which ticket they meant.
-        if _raw_payload_key and not payload_key and url_key:
-            return {
-                "error": (
-                    "\u26a0\ufe0f I can't tell which ticket that Jira payload is "
-                    f"for. The URL names `{url_key}`, but the JSON's own `key` "
-                    "field is not a readable Jira issue key, so I cannot check "
-                    "that the two agree -- and generating anyway would stamp "
-                    f"`{url_key}` on requirements that may come from a different "
-                    "ticket. Call `getJiraIssue` again and pass its RAW, "
-                    "unmodified result as `jira_content_json`."
-                ),
-                "content": None,
-                "needs_jira_mcp": False,
-            }
-        if payload_key and url_key and payload_key != url_key:
-            return {
-                "error": (
-                    "\u26a0\ufe0f That Jira payload is for a different ticket "
-                    f"than the link. The URL names `{url_key}`, but the JSON "
-                    f"handed back is `{payload_key}`. I won't generate from a "
-                    "ticket the tester didn't ask for, and I can't tell which "
-                    "one they meant. If the ticket you want is "
-                    f"`{payload_key}`, start again with ITS url and pass this "
-                    "same JSON. If you want "
-                    f"`{url_key}`, re-run `getJiraIssue` for `{url_key}` and "
-                    "pass THAT raw JSON -- but note that an issue MOVED between "
-                    f"projects keeps its old key as an alias, so if `{url_key}` "
-                    f"keeps coming back as `{payload_key}` then `{payload_key}` "
-                    "is the live key and the first route is the one to take."
-                ),
-                "content": None,
-                "needs_jira_mcp": False,
-            }
-        key = payload_key or url_key
-        # 2026-09-02 verification of audit F5: the ABSENT state above proceeds by
-        # design (a trimmed result must not be refused), but it proceeded
-        # SILENTLY -- the reply then named the URL's key as if the payload had
-        # confirmed it. Record the assumption so the grounding note can say so.
-        key_assumed_from_url = bool(url_key) and not payload_key
-
-        # Emptiness is judged on the SOURCE fields, BEFORE any fallback value is
-        # applied to `title`. Judging it afterwards (on `title` / `raw_text`)
-        # would let a ticket whose summary AND description are both empty look
-        # "grounded" purely because the issue KEY was substituted for the title,
-        # and a whole suite would then be generated from nothing.
-        summary_src = str(fields.get("summary") or "").strip()
-        description_raw, description_truncated = adf_text_with_depth_flag(
-            fields.get("description")
+            return _no_fields_result(payload, issue)
+        identity = _check_issue_identity(issue, source_url)
+        if isinstance(identity, dict):
+            return identity
+        key, key_assumed_from_url = identity
+        summary_src, description_src, description_truncated, ac_src, any_truncated = (
+            _source_text(fields)
         )
-        description_src = description_raw.strip()
-        # The AC field is ADF too, so the same cap can empty it silently -- the
-        # very defect this fix exists to close, one field over.
-        ac_raw, ac_truncated = adf_text_with_depth_flag(
-            fields.get(settings.jira_ac_field)
-        )
-        ac_src = ac_raw.strip()
-        # `description_truncated` keeps its literal meaning; `any_truncated`
-        # drives the disclosure, because an unread AC field is just as silent.
-        any_truncated = description_truncated or ac_truncated
         if not (summary_src or description_src or ac_src):
-            return {
-                "error": (
-                    "⚠️ That Jira issue's text is nested deeper than I parse, "
-                    "so none of it reached me and there is nothing to generate "
-                    "from. Paste the ticket text and I'll work from that."
-                    if any_truncated
-                    else "⚠️ That Jira issue came back with no summary, no "
-                    "description and no acceptance criteria, so there is nothing to "
-                    "generate from. Check the issue key, or paste the ticket text "
-                    "and I'll work from that."
-                ),
-                "content": None,
-                "needs_jira_mcp": False,
-            }
+            return _empty_source_result(any_truncated)
 
         title = summary_src or key or "Jira issue"
         description = description_src
@@ -3275,99 +3435,20 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
         comment_records = _extract_comment_records(fields)
         comments = _comment_lines(comment_records)[-settings.jira_max_comments :][::-1]
 
-        parent: dict | None = None
-        subtasks: list[dict] = []
-        issuelinks: list[dict] = []
-        siblings: list[dict] = []
-        parent_context = ""
-        if settings.jira_fetch_parent:
-            parent = _extract_parent_ref(fields)
-            subtasks = _extract_subtasks(fields)
-            issuelinks = _extract_issuelinks(fields)
-            if parent:
-                parent = {**parent, **_parent_body(payload.get("parent_issue"))}
-            else:
-                # No `fields.parent`, but the client may still have fetched the
-                # story this ticket IMPLEMENTS. Accepted only when that key is
-                # already linked from here -- see _linked_parent_ref.
-                parent = _linked_parent_ref(fields, payload.get("parent_issue"))
-            siblings = _extract_sibling_bodies(payload, key)
-            parent_context = _build_parent_context(
-                parent,
-                subtasks,
-                issuelinks,
-                siblings,
-                sibling_total=_count_sibling_candidates(payload, key),
-            )
-
-        # F14 (2026-08-30): the fetch DIRECTIVE asks the host for `issuetype` and
-        # `status` by name, and neither reached the model -- 79 cases were
-        # written against a ticket still in "BA Validation" without the generator
-        # ever being told it was not a settled requirement. Both are echoed with
-        # the same sanitiser `updated` uses (one line, URL-free, backtick-free,
-        # capped), so a host that trimmed `fields` simply contributes nothing.
-        issuetype_name = _sanitize_echo(_name_of(fields.get("issuetype")), 40)
-        status_name = _sanitize_echo(_name_of(fields.get("status")), 40)
-        meta_lines = []
-        if any_truncated:
-            # Never silent: the generator and the tester both have to know that
-            # part of the ticket did not reach them, or thin coverage reads as a
-            # thin ticket.
-            meta_lines.append(
-                "Ticket text: PARTIALLY UNREAD -- part of this ticket is nested "
-                "deeper than I parse, so some of it is missing below. Treat gaps "
-                "as unknown, not as absent, and ask for the missing section."
-            )
-        if issuetype_name:
-            meta_lines.append(f"Issue type: {issuetype_name}")
-        if status_name:
-            meta_lines.append(
-                f"Status: {status_name} "
-                "(workflow state at the time this snapshot was taken -- a ticket "
-                "not yet in a done/approved state may still change)"
-            )
-        if priority:
-            meta_lines.append(f"Priority: {priority}")
-        if labels:
-            meta_lines.append(f"Labels: {', '.join(labels)}")
-        if components:
-            meta_lines.append(f"Components: {', '.join(components)}")
-        meta_block = ("\n".join(meta_lines) + "\n") if meta_lines else ""
-
-        raw_text = f"{title}\n{meta_block}{description}".strip()
-        # The raw "## Comments" dump, unchanged from the REST implementation
-        # and now UNCONDITIONAL. It was briefly conditional: while
-        # tools/comment_reconciler was enabled the thread was SUPPRESSED here
-        # deliberately, so its fenced, deterministically-resolved, URL-stripped
-        # AMENDMENTS block could be the only comment-derived input the
-        # generator saw. That seam became a False constant on 2026-08-14 and
-        # the module was DELETED on 2026-08-15 (dead-code deletion batch D5),
-        # so the dump is restored permanently -- which is what every install
-        # has actually done since the pin. A revival must re-suppress it here;
-        # see docs/RETIRED_CAPABILITIES.md section 4.
-        if comments:
-            raw_text += "\n\n## Comments\n" + "\n".join(f"- {c}" for c in comments)
+        parent, subtasks, issuelinks, siblings, parent_context = _parent_grounding(
+            fields, payload, key
+        )
+        meta_block = _compose_meta_block(
+            fields, any_truncated, priority, labels, components
+        )
+        raw_text = _compose_raw_text(title, meta_block, description, comments)
 
         # resolve_ac_field re-checks usability and, when enabled, looks for a
         # custom field whose value actually reads like requirements.
         _ac_field_id, _ac_value, _ac_reason = resolve_ac_field(fields)
         acceptance_criteria = _ac_value or _extract_ac_from_description(description)
 
-        # ORDER MATTERS, and it is the whole point of this block. Extract every
-        # candidate (bounded by _MAX_IMAGE_ATTACHMENTS_SCANNED), join the ADF
-        # media nodes on so `inline` exists, rank inline-first, and only THEN
-        # apply the delivery cap. Truncating before the join -- which is what
-        # this did until the ordering fix -- dropped the mockup pasted into a
-        # comment in favour of whatever stray upload sat at the top.
-        attachments = _extract_image_attachments(fields)
-        # Inline (pasted-into-the-body) images, from the description AND the
-        # comment thread, joined onto the attachment records by filename.
-        media_refs = extract_media_refs(fields)
-        _match_media_to_attachments(media_refs, attachments)
-        # `jira_max_images = 0` is a legitimate "allow none" cap and still
-        # yields nothing, because the slice runs after the ranking, not instead
-        # of it.
-        attachments = _ordered(attachments)[: max(0, settings.jira_max_images)]
+        attachments, media_refs = _ranked_attachments(fields)
         result = {
             "title": title,
             "description": description,
