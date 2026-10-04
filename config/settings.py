@@ -1133,8 +1133,8 @@ class Settings(BaseSettings):
 
     # Release-signature enforcement for auto-updates (Ed25519). When ON, an
     # update or self-heal is REFUSED unless the release ships a MANIFEST.sig
-    # that verifies against the public key embedded in
-    # tools/updater._RELEASE_PUBLIC_KEY_HEX. Default OFF for exactly ONE
+    # that verifies against ANY public key in the keyring embedded in
+    # tools/updater._RELEASE_PUBLIC_KEYS_HEX. Default OFF for exactly ONE
     # migration release so installs predating signing still update (they log a
     # prominent unsigned-release warning); an INVALID signature is ALWAYS
     # rejected regardless of this flag. Flip ON (see runbook) once every live

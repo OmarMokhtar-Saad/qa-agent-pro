@@ -123,14 +123,25 @@ _MANIFEST_SIG_NAME = "MANIFEST.sig"
 # launcher itself, so "python launcher.py" cannot be edited out from under us).
 _LOCK_EXTRA = ("MANIFEST.sha256", "MANIFEST.sig", "launcher.py", "VERSION")
 
-# Ed25519 release-signing PUBLIC key (hex, 32 bytes). The matching PRIVATE key
-# is held ONLY by the release maintainer and never lives in this repo. Filled
-# in once a keypair is generated with `python scripts/build_dist.py
-# --generate-signing-key` (paste the printed hex here). Empty => no embedded
+# Ed25519 release-signing PUBLIC keys (hex, 32 bytes each): the KEYRING. A
+# release is trusted when ANY key here verifies its MANIFEST.sig. The matching
+# PRIVATE keys are held ONLY by the release maintainer and never live in this
+# repo. Generate a keypair with `python scripts/build_dist.py
+# --generate-signing-key` and ADD the printed hex here. Empty => no embedded
 # key => signature verification is inert (logged) and the
 # QA_UPDATE_REQUIRE_SIGNATURE gate decides whether an unsigned release proceeds.
-_RELEASE_PUBLIC_KEY_HEX = (
-    "78a4e6d773483159637930e01db8de2448112117706aa908172e87211e0ac2d9"
+#
+# NEVER replace a key outright. An install trusts only the keys it already
+# carries, so dropping the old key strands every install that holds only that
+# one: a rotation that shipped without a bridge did exactly that to every
+# install from before it. Rotate by ADDING the new key in a release signed with
+# the OLD one, and drop an old key only once no install can still depend on it.
+# The first entry is the current signing key. See operations/runbook.md,
+# "Release signing".
+_RELEASE_PUBLIC_KEYS_HEX: tuple[str, ...] = (
+    "78a4e6d773483159637930e01db8de2448112117706aa908172e87211e0ac2d9",
+    # Previous signing key: installs from before the rotation carry only this.
+    "4c43769703fb44da543f15402a88c590990f0b0f7c0574caa935c6e16353beff",
 )
 
 
@@ -256,9 +267,40 @@ def lock_files(install_dir: Path) -> int:
     return locked
 
 
+def _release_keys() -> tuple[str, ...]:
+    """The usable keyring: stripped, blanks dropped. Empty => no embedded key."""
+    return tuple(k.strip() for k in _RELEASE_PUBLIC_KEYS_HEX if k and k.strip())
+
+
+def _any_key_verifies(keys: tuple[str, ...], sig: bytes, payload: bytes) -> bool:
+    """True when ANY public key in ``keys`` (hex) verifies ``sig`` over
+    ``payload``. An unusable entry (bad hex / wrong length) is skipped with a
+    warning, never fatal: one bad keyring entry must not hide a good one. Raises
+    ImportError when ``cryptography`` is absent -- the caller decides what that
+    means. Also used by scripts/build_dist.py's pre-push gate, so the build asks
+    exactly the question the client asks."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    for key_hex in keys:
+        try:
+            Ed25519PublicKey.from_public_bytes(bytes.fromhex(key_hex)).verify(
+                sig, payload
+            )
+            return True
+        except InvalidSignature:
+            continue
+        except (ValueError, TypeError) as exc:
+            logger.warning(
+                "Skipping an unusable release public key %s... (%s).", key_hex[:8], exc
+            )
+    return False
+
+
 def verify_manifest_signature(tree: Path) -> str:
     """Verify ``MANIFEST.sig`` (base64 Ed25519 signature over the raw bytes of
-    ``MANIFEST.sha256``) against the embedded public key. Returns one of:
+    ``MANIFEST.sha256``) against the embedded keyring: valid when ANY key
+    verifies. Returns one of:
 
     * ``"valid"``   -- signature present and cryptographically verified
     * ``"missing"`` -- no ``MANIFEST.sig``, no embedded key, or cryptography absent
@@ -269,34 +311,31 @@ def verify_manifest_signature(tree: Path) -> str:
     ``"missing"`` so the caller's policy gate can decide."""
     manifest = tree / _MANIFEST_NAME
     sig_file = tree / _MANIFEST_SIG_NAME
-    if not _RELEASE_PUBLIC_KEY_HEX.strip():
+    keys = _release_keys()
+    if not keys:
         return "missing"
     if not sig_file.is_file() or not manifest.is_file():
         return "missing"
     try:
-        from cryptography.exceptions import InvalidSignature
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-            Ed25519PublicKey,
-        )
+        signature = base64.b64decode(sig_file.read_text(encoding="utf-8").strip())
+        if _any_key_verifies(keys, signature, manifest.read_bytes()):
+            return "valid"
     except ImportError:
         logger.warning(
             "cryptography not installed -- cannot verify MANIFEST.sig (treating "
             "as unsigned)."
         )
         return "missing"
-    try:
-        pub = Ed25519PublicKey.from_public_bytes(
-            bytes.fromhex(_RELEASE_PUBLIC_KEY_HEX.strip())
-        )
-        signature = base64.b64decode(sig_file.read_text(encoding="utf-8").strip())
-        pub.verify(signature, manifest.read_bytes())
-        return "valid"
-    except InvalidSignature:
-        logger.warning("MANIFEST.sig failed Ed25519 verification (%s).", tree)
-        return "invalid"
     except Exception as exc:
         logger.warning("MANIFEST.sig verification error (%s) at %s.", exc, tree)
         return "invalid"
+    logger.warning(
+        "MANIFEST.sig failed Ed25519 verification against all %d embedded release "
+        "key(s) (%s).",
+        len(keys),
+        tree,
+    )
+    return "invalid"
 
 
 def _signature_gate_ok(tree: Path, *, require: bool, context: str) -> bool:
@@ -427,10 +466,11 @@ def _manifest_binding_ok(new_tree: Path) -> bool:
 
 def _check_embedded_pubkey() -> None:
     """Startup footgun guard: warn if QA_UPDATE_REQUIRE_SIGNATURE is ON but
-    _RELEASE_PUBLIC_KEY_HEX is empty -- the setting would reject every release."""
-    if settings.qa_update_require_signature and not _RELEASE_PUBLIC_KEY_HEX.strip():
+    the release keyring (_RELEASE_PUBLIC_KEYS_HEX) is empty -- the setting would
+    reject every release."""
+    if settings.qa_update_require_signature and not _release_keys():
         logger.warning(
-            "QA_UPDATE_REQUIRE_SIGNATURE is ON but _RELEASE_PUBLIC_KEY_HEX is empty "
+            "QA_UPDATE_REQUIRE_SIGNATURE is ON but _RELEASE_PUBLIC_KEYS_HEX is empty "
             "in tools/updater.py -- every release will be REJECTED. "
             "Either (a) embed a public key and rebuild, or (b) set "
             "QA_UPDATE_REQUIRE_SIGNATURE=false in .env to allow unsigned releases "
