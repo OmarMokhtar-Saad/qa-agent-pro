@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.105.2] - 2026-10-05
+## [1.105.3] - 2026-10-05
 
 ### Added
 
@@ -29,10 +29,5 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- App Tester updates scroll the App Tester list to find the app's card
-  when it is not on the first screen (a bounded number of scrolls).
-
-### Fixed
-
-- An app chosen by name from further up the App Tester list is scrolled
-  back to and opened, instead of failing to tap.
+- Release build: the packaged tree is checked against the build's own
+  Python environment. Nothing changes in how the tools behave.
