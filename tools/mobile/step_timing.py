@@ -24,15 +24,24 @@ unchanged. Timing is a report, never a behaviour.
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from contextvars import ContextVar
-from typing import Any, Awaitable
+from typing import Any, Awaitable, Optional
 
 #: Distinct phase names one call may record. The instrumented sites name six;
 #: a name past this is dropped rather than grown into an unbounded dict that
 #: ends up in a reply. Bounded from above in
 #: ``tests/mobile/test_mobile_bounds_upper.py``.
 MAX_TIMED_PHASES = 20
+
+#: Per-step rows kept for one run's record; past it the oldest are dropped and
+#: the dropped count is reported (``bound_rows``). Bounded from above in
+#: ``tests/mobile/bounds_rows/stream_e.py``.
+MAX_STEP_TIMING_ROWS = 200
+
+#: Characters of a tree-source name kept in a row.
+MAX_SOURCE_CHARS = 40
 
 _PHASES: ContextVar = ContextVar("_STEP_PHASES", default=None)
 
@@ -91,6 +100,71 @@ def summary() -> dict:
             for name, (total, count) in state["phases"].items()
         },
     }
+
+
+@dataclasses.dataclass(frozen=True)
+class StepTiming:
+    """One submitted step's timing, in the shape a run record stores."""
+
+    index: int
+    duration_ms: int = 0
+    dumps: int = 0
+    dump_ms: int = 0
+    wait_ms: int = 0
+    source: str = ""
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: object) -> Optional["StepTiming"]:
+        """The row a stored dict describes, or None when it is not one."""
+        if not isinstance(data, dict):
+            return None
+        try:
+            return cls(
+                index=int(data.get("index", 0)),
+                duration_ms=max(0, int(data.get("duration_ms", 0))),
+                dumps=max(0, int(data.get("dumps", 0))),
+                dump_ms=max(0, int(data.get("dump_ms", 0))),
+                wait_ms=max(0, int(data.get("wait_ms", 0))),
+                source=str(data.get("source") or "")[:MAX_SOURCE_CHARS],
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
+def note_source(name: str) -> None:
+    """Record which tree source served the latest dump. Unarmed: nothing."""
+    state = _PHASES.get()
+    if state is not None:
+        state["source"] = str(name or "")[:MAX_SOURCE_CHARS]
+
+
+def current_row(index: int) -> Optional[StepTiming]:
+    """The armed breakdown as one :class:`StepTiming`, or None when not armed."""
+    data = summary()
+    if not data:
+        return None
+    phases = data["phases"]
+    dump = phases.get("ui_dump") or {}
+    wait = phases.get("wait") or {}
+    return StepTiming(
+        index=int(index),
+        duration_ms=int(data["total_ms"]),
+        dumps=int(dump.get("n", 0)),
+        dump_ms=int(dump.get("ms", 0)),
+        wait_ms=int(wait.get("ms", 0)),
+        source=str((_PHASES.get() or {}).get("source") or ""),
+    )
+
+
+def bound_rows(rows: list) -> tuple:
+    """``(kept, dropped)``: the newest :data:`MAX_STEP_TIMING_ROWS` rows and how
+    many older ones were dropped."""
+    items = list(rows or [])
+    kept = items[-MAX_STEP_TIMING_ROWS:]
+    return kept, len(items) - len(kept)
 
 
 def line() -> str:

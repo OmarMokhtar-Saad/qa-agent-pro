@@ -781,6 +781,37 @@ def _register_prompts(
         mcp.prompt(name=name, description=description)(fn)
 
 
+def _with_script_doc(fn):
+    """Append the step-script format (``script_help.SCRIPT_FORMAT_DOC``) to a
+    tool's description, so the model reads it before it writes a script."""
+    from tools.mobile import script_help
+
+    fn.__doc__ = (fn.__doc__ or "") + "\n\n" + script_help.SCRIPT_FORMAT_DOC
+    return fn
+
+
+def _register_mobile_defaults() -> None:
+    """Register the mobile lane's default dialog handlers, install sources and
+    tree sources once at startup. Every register call is idempotent; a failure
+    is logged and leaves the rest of the server up."""
+    if not mcp_handlers._mobile_lane_enabled():
+        return
+    try:
+        from tools.mobile import (
+            dialog_defaults,
+            dump_tree_source,
+            install_sources,
+            u2_tree_source,
+        )
+
+        dialog_defaults.register_default_handlers()
+        install_sources.register_defaults()
+        dump_tree_source.register_dump_source()
+        u2_tree_source.register_u2_source()
+    except (ImportError, OSError, RuntimeError, ValueError):
+        logger.warning("mobile default registration failed", exc_info=True)
+
+
 def build_server():
     """Construct and return the FastMCP server with every qa_* tool registered.
 
@@ -1083,6 +1114,45 @@ def build_server():
     if mcp_handlers._mobile_lane_enabled():
 
         @mcp.tool()
+        async def qa_mobile_stop(ctx: Context, target: str = "") -> str:
+            """Stop ONE mobile run and free its device. `target`: run id or device serial. Do not guess a run or device: ask the user."""
+            return await _tracked(
+                "qa_mobile_stop",
+                ctx,
+                mcp_handlers.handle_mobile_stop(target, **_make_elicitors(ctx)),
+            )
+
+        @mcp.tool()
+        async def qa_app_info(
+            ctx: Context, app: str = "", package: str = "", device_id: str = ""
+        ) -> str:
+            """Read an installed app's version on a device. Touches nothing. Do not guess an app, package or device: ask the user."""
+            return await _tracked(
+                "qa_app_info",
+                ctx,
+                mcp_handlers.handle_app_info(
+                    app, package, device_id, **_make_elicitors(ctx)
+                ),
+            )
+
+        @mcp.tool()
+        async def qa_update_app(
+            ctx: Context,
+            app: str = "",
+            package: str = "",
+            device_id: str = "",
+            source: str = "",
+        ) -> str:
+            """Update an app on a device from an install `source`; a downgrade asks before uninstalling. Do not guess an app, package, device or source: ask the user."""
+            return await _tracked(
+                "qa_update_app",
+                ctx,
+                mcp_handlers.handle_update_app(
+                    app, package, device_id, source, **_make_elicitors(ctx)
+                ),
+            )
+
+        @mcp.tool()
         async def qa_mobile_test(
             ctx: Context,
             source: str = "",
@@ -1112,11 +1182,11 @@ def build_server():
         ) -> list[ContentBlock]:
             """Drive an Android device: ad-hoc steps (goal=...), cases, exploration.
 
-            ANY Android device action goes through this tool; ad-hoc: goal="..." with apply=true. Do NOT use raw adb or shell: this tool owns the destructive guard, run folder and evidence.
+            ANY Android device action goes through this tool. Do NOT use raw adb or shell: this tool owns the destructive guard, run folder and evidence.
 
-            Call with NO arguments to start. Install/download/launch needs apply=true. No SDK/AVD: setup_required. run_id continues a run in ANY chat. ONE packet at a time; answer each with qa_submit_mobile_step. Install key in `source`, its value in `app` (or `package`); `device_id`: a running emulator's adb serial; `avd`: one to boot; `emulator`: list/boot/create/delete AVDs; `charter`: JSON, no secrets; `locale`, `reset_app=true` need apply=true; new_run=true only if the tester asks. `note`: JSON lesson about THIS app for later runs, e.g. '{"kind":"wait","when":{"rid":"send"},"then":{"until_rid":"reply"}}' (`avoid` refuses that op); plain text, so never a secret.
+            Call with NO arguments to start. Install/download/launch needs apply=true. run_id continues a run in ANY chat. ONE packet at a time; answer each with qa_submit_mobile_step. Install key in `source`, its value in `app` (or `package`); `device_id`: an adb serial; `avd`: one to boot; `charter`: JSON, no secrets; `locale`, `reset_app=true` need apply=true; new_run=true only if the tester asks. `note`: JSON lesson about THIS app for later runs; plain text, so never a secret.
 
-            Never report a screen state, field value or login outcome that was not read from a qa_* observation. If the server cannot type or act, stop and report the blocker by name. Do not fall back to raw adb input, and do not claim a result. Relay a finished run's verdict block word for word."""
+            Never report a screen state, field value or login outcome that was not read from a qa_* observation. If the server cannot type or act, stop and report the blocker by name. Do not fall back to raw adb input, and do not claim a result. Relay a finished run's verdict block word for word. Ask, never guess, the app, package, device or source."""
             from mcp.types import TextContent
 
             text, specs = await _tracked(
@@ -1162,6 +1232,7 @@ def build_server():
             ]
 
         @mcp.tool()
+        @_with_script_doc
         async def qa_submit_mobile_step(
             run_id: str,
             ctx: Context,
@@ -1179,12 +1250,13 @@ def build_server():
             save_flow: str = "",
             route: str = "",
             save_route: str = "",
+            finding: str = "",
         ) -> list[ContentBlock]:
             """Submit the action script YOU planned for a mobile packet.
 
-            It is validated and replayed on the device; the reply is the verdict plus the NEXT packet. For a credential, ask the TESTER for that field and pass it as tester_input with tester_input_field (several: tester_inputs='{"login_password": "...", "login_otp": "..."}'); it is typed into the app and stored nowhere. A script may carry up to 10 actions: batch them. Wait FOR something (wait_until_text/gone/changed/idle), never for a number or a shell sleep. {"op": "clear_app_data"} wipes this run's own app. After the destructive guard stops a control and the TESTER confirms, resubmit the SAME op on the SAME element with confirm_destructive=true.
+            The reply is the verdict plus the NEXT packet. For a credential, ask the TESTER for that field and pass it as tester_input with tester_input_field (several: tester_inputs='{"login_password": "...", "login_otp": "..."}'); it is typed into the app and stored nowhere. Pass confirm_destructive=true only after the TESTER confirms a guard stop.
 
-            `note`: as on `qa_mobile_test`. Never report a screen state, field value or login outcome that was not read from a qa_* observation. If the server cannot type or act, stop and report the blocker by name. Do not fall back to raw adb input, and do not claim a result."""
+            `note`: as on `qa_mobile_test`. Never report a screen state, field value or login outcome that was not read from a qa_* observation. If the server cannot type or act, stop and report the blocker by name. Do not fall back to raw adb input, and do not claim a result. `finding`: explore runs only, one observation per turn."""
             from mcp.types import TextContent
 
             text, specs = await _tracked(
@@ -1206,6 +1278,7 @@ def build_server():
                     save_flow=save_flow,
                     route=route,
                     save_route=save_route,
+                    finding=finding,
                     progress=_make_progress(ctx),
                 ),
             )
@@ -1776,6 +1849,7 @@ def main() -> None:
         logger.debug("server-LLM disclosure failed", exc_info=True)
     telemetry.startup_notice()
     server = build_server()
+    _register_mobile_defaults()
     telemetry.server_start()
 
     # _prewarm_backend stood here until 2026-08-16 (dead-code deletion P2-G2b).

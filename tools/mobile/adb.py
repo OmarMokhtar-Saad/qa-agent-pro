@@ -30,6 +30,7 @@ from tools.device_manager import (
     valid_package_name,
 )
 from tools.mobile import platform_info, sdk_locator
+from tools.mobile.install_errors import parse_failure
 
 logger = logging.getLogger(__name__)
 
@@ -594,9 +595,11 @@ async def install(serial: str, apk_path: str) -> dict:
         payload = result["content"] or {}
         text = str(payload.get("out") or "") + str(payload.get("err") or "")
         if int(payload.get("rc") or 0) != 0 or "Success" not in text:
+            failure = parse_failure(text)
             return {
-                "error": "adb install failed: " + text.strip()[:400],
+                "error": failure.message,
                 "content": None,
+                "code": failure.code,
             }
         return {"error": None, "content": {"path": str(path)}}
     except Exception as exc:
@@ -1892,6 +1895,35 @@ async def reverse_remove(
             "content": None,
         }
     return await _device(serial, ["reverse", "--remove", str(remote)], timeout)
+
+
+async def forward(
+    serial: str, local: str, remote: str, timeout: int = DEFAULT_TIMEOUT_S
+) -> dict:
+    """``adb -s <serial> forward <local> <remote>``.
+
+    Both sides must be ``tcp:<port>`` (same spec as :func:`reverse`). ``raw``
+    reports ``error`` None even when adb exits non-zero, and a refused forward
+    exits non-zero, so a non-zero exit is turned into an ``error`` here: the
+    caller only reads ``error``. See :func:`reverse` on *timeout*.
+    """
+    if not _REVERSE_SPEC_RE.fullmatch(str(local or "")):
+        return {
+            "error": "Refusing forward local " + repr(str(local)[:40]),
+            "content": None,
+        }
+    if not _REVERSE_SPEC_RE.fullmatch(str(remote or "")):
+        return {
+            "error": "Refusing forward remote " + repr(str(remote)[:40]),
+            "content": None,
+        }
+    got = await _device(serial, ["forward", str(local), str(remote)], timeout)
+    body = got.get("content")
+    if got.get("error") or not isinstance(body, dict) or not body.get("rc"):
+        return got
+    text = " ".join(str(body.get("err") or body.get("out") or "").split())
+    detail = text[:200] or "exit code " + str(body["rc"])
+    return {"error": "adb forward failed: " + detail, "content": None}
 
 
 async def global_setting_get(

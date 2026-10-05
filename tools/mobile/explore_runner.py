@@ -19,7 +19,7 @@ import logging
 import re
 import time
 
-from tools.mobile import adb, executor, run_store
+from tools.mobile import adb, executor, finding_nag, run_store
 from tools.mobile import charter as charter_mod
 from tools.mobile.providers import composite
 
@@ -106,10 +106,7 @@ EXTENSION_REFUSAL = (
 #: session's stops on it. The report says the same thing from the other end --
 #: it counts the turns that recorded nothing -- so the gap stays visible even
 #: if this line is ignored in chat.
-NO_FINDING_NOTICE = (
-    "This turn recorded no `finding`, so the report has nothing to show for it. "
-    "Add one sentence next turn, even when the turn went fine."
-)
+NO_FINDING_NOTICE = finding_nag.FINDING_REMINDER
 EXTENSION_SPENT = (
     "This session has already used its one extension, so the budget stands. "
     "Report what was found and stop."
@@ -492,7 +489,11 @@ def apply_turn_result(state: object, raw: object, *, now: float | None = None) -
             # Disclosed, never refused -- see NO_FINDING_NOTICE. An extension
             # verdict overwrites this below, on purpose: that one is about the
             # budget, which matters more than a nudge.
-            notice = NO_FINDING_NOTICE
+            notice = finding_nag.reminder(
+                int(body.get("turn") or 0),
+                int(body.get("turns_budget") or MAX_TURNS),
+                final=bool(reply.get("goal_reached")),
+            )
 
         # THE STEP IT IS ON NOW (fix round 3, item 1). The full goal goes to a
         # chat once per run; this short line rides every packet after it. A

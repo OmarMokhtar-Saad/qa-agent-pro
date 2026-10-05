@@ -63,25 +63,31 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 from tools.device_manager import _valid_device_id, valid_package_name
 from tools.mobile import actions as actions_mod
 from tools.mobile import (
     adb,
+    carry_policy,
     case_runner,
     downloader,
     emulator,
     executor,
     explore_runner,
+    heartbeat,
     importers,
+    lock_reaper,
     locks,
     media,
     paths,
     platform_info,
     preflight,
+    run_finalize,
     run_store,
     scheduler,
     sdk_locator,
+    stop_run,
 )
 
 # ITS OWN LINE, after the parenthesised block: ruff's isort (I001) wants an
@@ -306,6 +312,21 @@ def claim(run_id: str, session_token: str = "", *, force: bool = False) -> dict:
                     "No run `" + str(run_id)[:64] + "` on this machine. "
                     "Nothing was created. `qa_mobile_status` lists the runs "
                     "this install knows about."
+                ),
+                "content": None,
+            }
+        stopped = run_finalize.stop_text(
+            run_store.read_manifest(run_id).get("content") or {}
+        )
+        if stopped:
+            # A run ended by qa_mobile_stop or the idle release takes no more
+            # steps: its verdict is recorded, and a later step would restart
+            # the heartbeat and retake the device under a run that says it ended.
+            return {
+                "error": (
+                    "Run `" + str(run_id)[:64] + "` has ended (" + stopped[:40] + ") "
+                    "and takes no more steps. `qa_mobile_status` shows its result; "
+                    "start a new run to test again."
                 ),
                 "content": None,
             }
@@ -1282,7 +1303,7 @@ def resolve(run_id: str, session_token: str = "") -> dict:
             state = STATE_REPORT if explore_stop else STATE_RUNNING
         else:
             point = (scheduler.next_case(run_id) or {}).get("content") or {}
-            if point.get("finished"):
+            if point.get("finished") or run_finalize.stop_text(manifest):
                 state = STATE_REPORT
             elif point.get("gate"):
                 state = STATE_GATE
@@ -1400,6 +1421,63 @@ def new_provisioning_owner() -> str:
     :func:`relabel_device_lock` hands the lock to the run.
     """
     return locks.new_provisioning_owner()
+
+
+def stop_ports() -> stop_run.StopPorts:
+    """The ports ``stop_run.stop`` needs, from this module's own helpers.
+
+    UNVERIFIED: ``active_runs`` sees only this process's heartbeats. ``finalize``
+    writes ``manifest["final"]`` once (idempotent), so a second stop records no
+    second verdict; ``release`` frees only a device this run really holds.
+    """
+
+    def active_runs(serial=None):
+        runs = [stop_run.ActiveRun(r, serial_of(r)) for r in heartbeat.active()]
+        return [r for r in runs if not serial or r.serial == serial]
+
+    return SimpleNamespace(
+        active_runs=active_runs,
+        stop_heartbeat=heartbeat.stop,
+        finalize=_finalizer(run_finalize.STOP_TESTER),
+        release=release_if_held,
+    )
+
+
+def idle_ports() -> lock_reaper.ReleasePorts:
+    """The ports ``lock_reaper.release_if_idle`` needs to end an idle holder.
+
+    Same providers as :func:`stop_ports`, with the verdict recorded as
+    ``released_idle``: the new run, not the tester, ended the old one.
+    """
+    return SimpleNamespace(
+        stop_heartbeat=heartbeat.stop,
+        finalize=_finalizer(run_finalize.STOP_IDLE),
+        release_lock=release_if_held,
+    )
+
+
+def _finalizer(stop: str):
+    """A ``finalize(run_id, verdict)`` port that records ``stop`` with the verdict."""
+
+    def finalize(run_id, verdict):
+        return run_finalize.finalize(run_id, verdict, stop=stop)
+
+    return finalize
+
+
+def release_if_held(serial: str, run_id: str) -> dict:
+    """Compare-and-release: free ``serial`` only if ``run_id`` holds it.
+
+    A run that holds nothing, or holds a DIFFERENT device, releases nothing, so a
+    stop or an idle release can never free the device of the run that took over.
+    An empty ``serial`` means the caller does not know the device: the owner's
+    own holds are released, exactly what ``release_device_lock`` does by owner.
+    """
+    held = locks.names_held_by(run_id)
+    name = locks.device_lock_name(serial)
+    if not held or (name and name not in held):
+        return {"error": None, "content": {"released": False, "reason": "not held"}}
+    return release_device_lock(run_id, force=True)
 
 
 def serial_of(run_id: str) -> str:
@@ -2762,6 +2840,7 @@ async def submit(
         resolved = resolve(run_id, session_token)
         if resolved.get("error"):
             return resolved
+        lock_reaper.touch_activity(run_id)
         body = resolved["content"] or {}
         ctx = context_for(body)
         if budget is not None:
@@ -2853,6 +2932,37 @@ async def submit(
         return {"error": str(exc), "content": None}
 
 
+def _explore_needs_model(reason: str, resolved: dict) -> dict:
+    """A refused explore turn: logged, then handed back to the model to rewrite."""
+    case_runner.note_refusal(reason)
+    return {
+        "error": None,
+        "content": {
+            "state": STATE_RUNNING,
+            "case": {"status": case_runner.NEEDS_MODEL, "reason": reason},
+            "packet": None,
+            "next": {},
+            "field": "",
+            "resolved": resolved,
+        },
+    }
+
+
+def _prime_explore_turn(run_id: str, ctx: executor.Context, payload: dict) -> None:
+    """Expect the apps this turn names; carry the screen only after an inert turn."""
+    from tools.mobile import actions as actions_mod
+
+    ctx.expect_apps = tuple(actions_mod.expect_apps_from(payload))
+    ctx.carry_screen = carry_policy.allowed(run_id)
+
+
+def _noted_outcome(run_id: str, replayed: dict) -> dict:
+    """The replay's content, after noting whether the turn actuated anything."""
+    outcome = replayed.get("content") or {}
+    carry_policy.note(run_id, outcome.get("trace"))
+    return outcome
+
+
 async def _submit_explore(
     run_id: str, raw: object, ctx: executor.Context, resolved: dict
 ) -> dict:
@@ -2876,20 +2986,7 @@ async def _submit_explore(
             queued_in, list(payload.get("actions") or [])
         )
         if not combined.get("ok"):
-            return {
-                "error": None,
-                "content": {
-                    "state": STATE_RUNNING,
-                    "case": {
-                        "status": case_runner.NEEDS_MODEL,
-                        "reason": str(combined.get("reason") or ""),
-                    },
-                    "packet": None,
-                    "next": {},
-                    "field": "",
-                    "resolved": resolved,
-                },
-            }
+            return _explore_needs_model(str(combined.get("reason") or ""), resolved)
         payload["actions"] = combined["actions"]
     # A folded queue was already held to both caps by the combine, so only a
     # bare submission is held to the model cap here.
@@ -2900,17 +2997,7 @@ async def _submit_explore(
         ),
     )
     if parsed.get("error"):
-        return {
-            "error": None,
-            "content": {
-                "state": STATE_RUNNING,
-                "case": {"status": case_runner.NEEDS_MODEL, "reason": parsed["error"]},
-                "packet": None,
-                "next": {},
-                "field": "",
-                "resolved": resolved,
-            },
-        }
+        return _explore_needs_model(parsed["error"], resolved)
     # HAND-OVER TO THE TARGET APP (fix round 3, item 1). A multi-app goal
     # (App Tester -> the app under test) moves into a second app, and every guard that
     # asks "is this the app under test" reads `ctx.package` -- which stayed
@@ -2965,6 +3052,7 @@ async def _submit_explore(
     clip = (
         await media.start_clip(run_id, clip_tc_id, parsed["content"], ctx.serial)
     ).get("content")
+    _prime_explore_turn(run_id, ctx, payload)
     replayed = await executor.replay(parsed["content"], ctx)
     if replayed.get("error"):
         # The turn is over and no checkpoint will be written for it, so the
@@ -2980,7 +3068,7 @@ async def _submit_explore(
             await _explore_abort_network(run_id, resolved.get("explore") or {}, ctx),
         )
         return replayed
-    outcome = replayed.get("content") or {}
+    outcome = _noted_outcome(run_id, replayed)
     folded = explore_runner.apply_turn_result(resolved.get("explore") or {}, payload)
     if folded.get("error"):
         return folded

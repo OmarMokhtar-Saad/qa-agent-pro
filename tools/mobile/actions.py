@@ -46,6 +46,7 @@ from typing import Annotated, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from tools.device_manager import valid_package_name
 from tools.mobile.fill_label import FILL_MAX_LABEL_CHARS
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,12 @@ WAIT_UNTIL_DEFAULT_S = 10
 WAIT_OPS = frozenset({"wait", *WAIT_UNTIL_OPS})
 MAX_TEXT_CHARS = 4000
 MAX_ERROR_CHARS = 600
+
+#: How many packages one step may declare in ``expect_apps``: the apps a step
+#: expects to move into (an installer, the App Tester, the app under test). Each
+#: id is whitelist-validated and the executor lets a foreign-app screen through
+#: ONLY for these, so the list is kept short and the model has to name them.
+MAX_EXPECT_APPS = 8
 SECRET_MASK = "***"
 
 #: Words that make a field a CREDENTIAL by name, whatever the model marked.
@@ -439,8 +446,32 @@ class WaitUntilAction(_Base):
         return self
 
 
+def is_package_id(value: object) -> bool:
+    """True for a well-formed Android package id with no stray whitespace.
+
+    ``device_manager.valid_package_name`` anchors its pattern with ``$``, which
+    also matches before a trailing newline, so ``com.a.b\n`` passes it. A package
+    id reaches a subprocess argument list, so the extra strip check is kept here.
+    """
+    return (
+        isinstance(value, str) and valid_package_name(value) and value == value.strip()
+    )
+
+
 class LaunchAction(_Base):
+    # No docstring on purpose: it would ship to the model in every response_schema.
+    # ``package`` None reopens the run's own app; a package opens ONE other app, and
+    # launch_guard.launch_allowed decides which at replay time.
     op: Literal["launch"]
+    package: Optional[str] = Field(default=None, max_length=200)
+
+    @model_validator(mode="after")
+    def package_is_well_formed(self) -> "LaunchAction":
+        if self.package is not None and not is_package_id(self.package):
+            raise ValueError(
+                "launch package must be an Android package id such as com.example.app"
+            )
+        return self
 
 
 class ClearAppDataAction(_Base):
@@ -771,11 +802,44 @@ TURN_FIELD_SCHEMA: dict = {
     # full goal. 200 = explore_runner.MAX_PACKAGE_CHARS / MAX_SUB_GOAL_CHARS.
     "app": {"type": "string", "maxLength": 200},
     "sub_goal": {"type": "string", "maxLength": 200},
+    # Item 8: the packages THIS step may walk into (installer, App Tester, the
+    # app under test). A foreign-app screen outside the list still cuts the script.
+    "expect_apps": {
+        "type": "array",
+        "items": {"type": "string", "maxLength": 200},
+        "maxItems": MAX_EXPECT_APPS,
+    },
 }
 
 #: Just the names, for callers that only need to know what rides beside the
 #: actions.
 TURN_FIELDS: tuple[str, ...] = tuple(TURN_FIELD_SCHEMA)
+
+
+def expect_apps_from(payload: object) -> list[str]:
+    """The package ids a decoded turn declared in ``expect_apps``, validated.
+
+    An id that is not a well-formed package id is DROPPED, not refused: a shorter
+    list only narrows what the executor lets through, so it fails closed. Duplicates
+    collapse and the list is cut at :data:`MAX_EXPECT_APPS`.
+    """
+    listed = payload.get("expect_apps") if isinstance(payload, dict) else None
+    if not isinstance(listed, list):
+        return []
+    out: list[str] = []
+    for item in listed[:MAX_EXPECT_APPS]:
+        if is_package_id(item) and item not in out:
+            out.append(item)
+    return out
+
+
+def script_finding(payload: object) -> str:
+    """The ``finding`` a decoded turn (or a tool kwarg) carried, whitespace-folded
+    and cut at the advertised cap; empty when there is none or it is not text."""
+    raw = payload.get("finding") if isinstance(payload, dict) else None
+    if not isinstance(raw, str):
+        return ""
+    return " ".join(raw.split())[: TURN_FIELD_SCHEMA["finding"]["maxLength"]]
 
 
 def decode_reply(raw: object) -> dict:
@@ -871,6 +935,32 @@ def too_many_actions(count: int, limit: int = MAX_MODEL_ACTIONS) -> str:
     )
 
 
+def _refused(message: str) -> dict:
+    """A refusal that teaches: the message, then the op format (script_help)."""
+    from tools.mobile import script_help
+
+    return {"error": message + "\n" + script_help.generic_help(), "content": None}
+
+
+def _validation_refusal(exc: ValidationError, payload: object) -> dict:
+    """A schema refusal: up to five problems (cut at MAX_ERROR_CHARS), then the
+    failing op's fragment and a corrected example from script_help."""
+    from tools.mobile import script_help
+
+    errors = exc.errors()
+    problems = []
+    for problem in errors[:5]:
+        where = ".".join(str(part) for part in problem.get("loc") or ())
+        problems.append((where or "actions") + ": " + str(problem.get("msg") or ""))
+    head = ("This script was refused and nothing was replayed. " + "; ".join(problems))[
+        :MAX_ERROR_CHARS
+    ]
+    return {
+        "error": head + "\n" + script_help.refusal_help(errors, payload),
+        "content": None,
+    }
+
+
 def parse_script(raw: object, *, max_actions: int = MAX_MODEL_ACTIONS) -> dict:
     """A model's reply -> a validated :class:`Script`. Never raises.
 
@@ -891,21 +981,15 @@ def parse_script(raw: object, *, max_actions: int = MAX_MODEL_ACTIONS) -> dict:
         if isinstance(payload, str):
             text = payload.strip()
             if not text:
-                return {"error": "The script was empty.", "content": None}
+                return _refused("The script was empty.")
             try:
                 payload = json.loads(text)
             except ValueError:
-                return {
-                    "error": "The script was not valid JSON and was not replayed.",
-                    "content": None,
-                }
+                return _refused("The script was not valid JSON and was not replayed.")
         if isinstance(payload, list):
             payload = {"actions": payload}
         if not isinstance(payload, dict):
-            return {
-                "error": "The script must be a JSON object with an `actions` list.",
-                "content": None,
-            }
+            return _refused("The script must be a JSON object with an `actions` list.")
         listed = payload.get("actions")
         if isinstance(listed, list) and len(listed) > max_actions:
             return {
@@ -915,17 +999,7 @@ def parse_script(raw: object, *, max_actions: int = MAX_MODEL_ACTIONS) -> dict:
         script = Script.model_validate(payload)
         return {"error": None, "content": script}
     except ValidationError as exc:
-        problems = []
-        for problem in exc.errors()[:5]:
-            where = ".".join(str(part) for part in problem.get("loc") or ())
-            problems.append((where or "actions") + ": " + str(problem.get("msg") or ""))
-        return {
-            "error": (
-                "This script was refused and nothing was replayed. "
-                + "; ".join(problems)
-            )[:MAX_ERROR_CHARS],
-            "content": None,
-        }
+        return _validation_refusal(exc, payload)
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.actions.parse_script failed")
         return {"error": str(exc), "content": None}

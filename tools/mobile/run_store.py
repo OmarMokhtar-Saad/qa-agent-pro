@@ -501,6 +501,63 @@ def list_screens(run_id: str) -> dict:
         return {"error": str(exc), "content": None}
 
 
+def latest_screen(run_id: str) -> dict:
+    """The most recently written pruned screen of the run, or ``{}``.
+
+    ``write_screen`` rewrites a screen's file on every look at it, so the newest
+    file by modification time is the screen the last step ended on. Never
+    raises."""
+    try:
+        if not valid_run_id(run_id):
+            return {}
+        directory = run_path(run_id) / SCREENS_DIR
+        if not directory.is_dir():
+            return {}
+        files = sorted(directory.glob("*.json"), key=lambda p: p.stat().st_mtime)
+        body = _read_json(files[-1]) if files else None
+        return body if isinstance(body, dict) else {}
+    except OSError:
+        logger.exception("mobile.run_store.latest_screen failed")
+        return {}
+
+
+def append_step_timing(run_id: str, row: object) -> dict:
+    """Append one step's timing row to ``manifest["step_timings"]``.
+
+    The row is numbered after the highest index already stored and the list is
+    bounded to the newest ``step_timing.MAX_STEP_TIMING_ROWS`` rows. A ``row``
+    that is not a ``StepTiming`` (an unarmed timer gives ``None``) or a run with
+    no manifest writes nothing. Never raises."""
+    try:
+        from tools.mobile import step_timing
+
+        if not valid_run_id(run_id):
+            return {"error": "Invalid run id.", "content": None}
+        manifest = _read_json(run_path(run_id) / MANIFEST_FILE)
+        if not isinstance(row, step_timing.StepTiming) or not isinstance(
+            manifest, dict
+        ):
+            return {"error": None, "content": {"written": False}}
+        stored = [
+            parsed
+            for parsed in map(
+                step_timing.StepTiming.from_dict, manifest.get("step_timings") or []
+            )
+            if parsed is not None
+        ]
+        number = max([parsed.index for parsed in stored] + [0]) + 1
+        numbered = step_timing.StepTiming(**{**row.to_dict(), "index": number})
+        kept, _dropped = step_timing.bound_rows(
+            [parsed.to_dict() for parsed in stored] + [numbered.to_dict()]
+        )
+        manifest["step_timings"] = kept
+        _write_json(run_path(run_id) / MANIFEST_FILE, manifest)
+        return {"error": None, "content": {"written": True, "index": number}}
+    except (OSError, TypeError, ValueError):
+        logger.exception("mobile.run_store.append_step_timing failed")
+        return {"error": "step timing not recorded", "content": None}
+
+
 def observation_key(screen_id: object, screen_hash: object) -> str:
     """The id of ONE observation: ``<screen_id>-<12 hex of the content hash>``.
 

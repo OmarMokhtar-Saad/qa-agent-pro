@@ -89,9 +89,12 @@ from tools.mobile import (
     paths,
     platform_info,
     report_images,
+    run_finalize,
     run_store,
     screen_audit,
     screen_phone,
+    step_timing,
+    timings_view,
 )
 from tools.mobile import render as mobile_render
 from tools.mobile_capture import flows as api_flows
@@ -3521,10 +3524,10 @@ def _logs_section(manifest: object, facts: object, turns: int) -> str:
     """
     book = manifest if isinstance(manifest, dict) else {}
     body = _findings_section(book, turns) or ""
-    stop = explore_stop(book)
+    stop = explore_stop(book) or run_finalize.stop_text(book)
     if stop:
         body += '<div class="guard"><p class="gapterm">why this run stopped</p>'
-        body += '<p class="gsub">' + stop + "</p></div>"
+        body += '<p class="gsub">' + esc(stop, 300) + "</p></div>"
     body += (
         '<div class="card"><p class="elab">device errors by class</p>'
         '<p class="logline">'
@@ -4361,6 +4364,24 @@ def _capture_table(screens: object) -> str:
     )
 
 
+def _timings_part(manifest: object) -> str:
+    """The Step timings Diagnostics part, or ``""`` when none were recorded.
+
+    Reads ``manifest["step_timings"]``, bounded to the newest
+    ``step_timing.MAX_STEP_TIMING_ROWS`` rows; the dropped count is stated."""
+    raw = (manifest if isinstance(manifest, dict) else {}).get("step_timings")
+    kept, dropped = step_timing.bound_rows(raw if isinstance(raw, list) else [])
+    summary = timings_view.summarize(kept)
+    body = timings_view.html_section(summary)
+    if not body:
+        return ""
+    if dropped:
+        body += "<p>" + esc(str(dropped) + " older steps are not shown.", 80) + "</p>"
+    return _diag_part(
+        "step-timings", "Step timings", timings_view.summary_line(summary), body
+    )
+
+
 def _diag_part(sid: str, title: str, note: str, body: str) -> str:
     """One collapsed Diagnostics part, or ``""`` when it has nothing to say."""
     if not body:
@@ -4573,6 +4594,7 @@ def _document_body(
             "logs", "Logs and findings", "", _logs_section(manifest, facts, len(facts))
         )
         + _diag_part("diag-a11y", "Accessibility", "", a11y)
+        + _timings_part(manifest)
         + _diag_part(
             "env",
             "Environment",

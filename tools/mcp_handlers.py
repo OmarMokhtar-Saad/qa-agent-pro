@@ -12560,6 +12560,9 @@ async def handle_mobile_test(
             held = (session.take_device_lock(pre_run_owner, serial=serial) or {}).get(
                 "content"
             ) or {}
+            held, idle_note = await _mobile_retake_after_idle(
+                held, pre_run_owner, serial
+            )
             if not held.get("acquired"):
                 return mobile_render.device_busy_block(held)
             # Given back BEFORE the long steps, not after, or the concurrency
@@ -12586,8 +12589,14 @@ async def handle_mobile_test(
             )
             if capture_stage:
                 return capture_stage
+            if apply:
+                from tools.mobile import u2_consent
+
+                # Item 4: asked once per device per server, only when the helper
+                # is importable and not yet on; a no never blocks the run.
+                await u2_consent.offer(serial, _mobile_ask(choose))
             app_stage, target = await _mobile_app_stage(
-                serial, package, source, app, apply, progress=progress
+                serial, package, source, app, apply, progress=progress, choose=choose
             )
             if app_stage:
                 return app_stage
@@ -12639,7 +12648,7 @@ async def handle_mobile_test(
                 capture=capture_result,
                 reset_app=reset_result,
             )
-            return await _mobile_heavy_avd_note(serial) + reply
+            return idle_note + await _mobile_heavy_avd_note(serial) + reply
         finally:
             if not handed_off:
                 # Only ever THIS call's own label, so a sibling call's hold
@@ -12656,6 +12665,36 @@ async def handle_mobile_test(
         logger.exception("mcp mobile_test failed")
         _capture_error(exc, "qa_mobile_test")
         return "⚠️ The mobile run could not continue: " + _safe(str(exc), 200)
+
+
+async def _mobile_retake_after_idle(held: dict, owner: str, serial: str) -> tuple:
+    """``(held, note)``: end an IDLE run that holds the device, then retake it.
+
+    Only a holder shaped like a run id this lane mints is considered; a
+    pre-run label or a lease from another process is left alone. The reaper
+    decides idleness (``lock_reaper.release_if_idle``) and a holder with no known
+    activity is never freed. The note names the old run, so it is wrapped as
+    untrusted text. Never raises: a failure keeps the busy answer."""
+    holder = str(held.get("holder") or "")
+    if held.get("acquired") or not holder:
+        return held, ""
+    try:
+        from tools.mobile import app_tools, lock_reaper, run_store, session
+
+        if not run_store.looks_like_a_run_id(holder):
+            return held, ""
+        ports = session.idle_ports()
+        notice = await lock_reaper.release_if_idle(holder, serial, ports)
+        if notice is None:
+            return held, ""
+        taken = session.take_device_lock(owner, serial=serial) or {}
+        retaken = taken.get("content") or {}
+        cap = app_tools.MAX_TOOL_TEXT_CHARS
+        text = wrap_untrusted("mobile_release", notice.message(), cap)
+    except _MOBILE_TOOL_FAILURES:
+        logger.warning("idle release of %s failed", holder, exc_info=True)
+        return held, ""
+    return retaken, text + "\n"
 
 
 async def _mobile_heavy_avd_note(serial: str) -> str:
@@ -13139,6 +13178,17 @@ async def _mobile_capture_stage(
     return None, result
 
 
+def _mobile_ask(choose: ChooseCb):
+    """The tester-question callback the mobile resolve-or-ask helpers take, or
+    None when this client cannot elicit. After one timed-out question the rest
+    of that client's questions skip the wait (``tools/mobile/mobile_elicit``)."""
+    from tools.mobile import mobile_elicit
+
+    return mobile_elicit.make_mobile_ask(
+        choose, _elicit_choice, client_key=_elicit_client_key
+    )
+
+
 async def _mobile_app_stage(
     serial: str,
     package: str,
@@ -13147,6 +13197,7 @@ async def _mobile_app_stage(
     apply: bool,
     *,
     progress: ProgressCb = None,
+    choose: ChooseCb = None,
 ) -> tuple:
     """Get the app under test onto the device. ``(markdown_or_empty, package)``.
 
@@ -13171,6 +13222,10 @@ async def _mobile_app_stage(
     # `app_tester`.
     install_source = mobile_render.install_source_for_label(chosen)
     target = str(package or "").strip()
+    # PER SERIAL: a package chosen on one device is never replayed on another.
+    from tools.mobile import resolve_cache
+
+    answer_key = resolve_cache.cache_key(serial, value) if value else ""
     if not target and install_source == "installed_package":
         # A REMEMBERED RESOLUTION, tried before the raw hint. A rerun of the
         # same goal used to re-send the same free-text app name and re-walk
@@ -13178,8 +13233,21 @@ async def _mobile_app_stage(
         # by the same `session.install_state` probe every other path below
         # takes -- this only skips guessing the bundle id again, never the
         # "is it actually installed" check.
-        cached_target = run_store.read_resolved_app(value) if value else {}
-        target = str(cached_target.get("package") or "") or value
+        cached_target = run_store.read_resolved_app(answer_key) if value else {}
+        target = str(cached_target.get("package") or "")
+        if not target:
+            # RESOLVE-OR-ASK over what is installed on THIS device; an empty
+            # outcome keeps the old raw-hint path (and its suggestions).
+            from tools.mobile import app_stage_pick
+
+            picked = await app_stage_pick.pick_installed(
+                serial, value, _mobile_ask(choose)
+            )
+            if picked.menu:
+                return picked.menu, ""
+            if picked.said:
+                await _emit(progress, picked.said)
+            target = picked.package or value
 
     # WHETHER THE DEVICE ANSWERED, read from the one witness that knows.
     # `session.install_state` publishes `probed` on its CONTENT; this used to
@@ -13197,7 +13265,7 @@ async def _mobile_app_stage(
         suggestions = [str(s) for s in (body.get("suggestions") or [])][:5]
         if body.get("installed"):
             if value:
-                run_store.write_resolved_app(value, target, serial, {})
+                run_store.write_resolved_app(answer_key, target, serial, {})
             return "", target
         if body.get("pending"):
             return (
@@ -14102,6 +14170,9 @@ async def handle_submit_mobile_step(
                     parsed_inputs = loaded
             except Exception:
                 parsed_inputs = {}
+        previous_screen_id = str(
+            (run_store.latest_screen(run_id) or {}).get("screen_id") or ""
+        )
         result = await step_timing.timed(
             "replay",
             session.submit(
@@ -14157,7 +14228,11 @@ async def handle_submit_mobile_step(
                 and isinstance(_want, dict)
             ):
                 _want["visual"] = True
-        line = mobile_render.verdict_line(case)
+        line = mobile_render.verdict_line(
+            case,
+            screen=run_store.latest_screen(run_id),
+            previous_id=previous_screen_id,
+        )
         notice = str(body.get("notice") or "")
         if body.get("packet"):
             reply = (
@@ -14176,6 +14251,7 @@ async def handle_submit_mobile_step(
         # say which phase spent it.
         timing = step_timing.line()
         logger.info("mobile step %s %s: %s", run_id, tc_id, timing)
+        run_store.append_step_timing(run_id, step_timing.current_row(0))
         # This device's dump latency and -- once per run -- the warning that
         # the host or the AVD is the bottleneck (fix round 3, item 2). The
         # serial is the run body's own, the one `_mobile_packet_text` reads.
@@ -15108,6 +15184,7 @@ async def handle_submit_mobile_step_content(*args, **kwargs) -> tuple:
     save_flow = str(kwargs.pop("save_flow", "") or "").strip()
     route_name = str(kwargs.pop("route", "") or "").strip()
     save_route = str(kwargs.pop("save_route", "") or "").strip()
+    finding = str(kwargs.pop("finding", "") or "").strip()
     if (route_name or save_route) and (flow_name or save_flow):
         return _FLOW_WARN + "Pass a flow OR a route, not both. Nothing was touched.", []
     flow_plan: dict = {}
@@ -15126,6 +15203,7 @@ async def handle_submit_mobile_step_content(*args, **kwargs) -> tuple:
         if route_plan.get("refusal"):
             return route_plan["refusal"], []
         args, kwargs = _with_script(args, kwargs, route_plan["script"])
+    args, kwargs, finding_note = await _mobile_fold_finding(args, kwargs, finding)
     want = _MOBILE_SHOT_WANT.set({"asked": bool(kwargs.pop("screenshot", False))})
     token = _MOBILE_IMAGE_SPECS.set([])
     held = {"held": False, "route_expect": list(route_plan.get("expect") or [])}
@@ -15157,13 +15235,178 @@ async def handle_submit_mobile_step_content(*args, **kwargs) -> tuple:
         route_line = ""
         if route_plan:
             route_line = await asyncio.to_thread(_mobile_route_finish, route_plan, held)
-        return route_line + flow_line + note_line + body, list(
+        return finding_note + route_line + flow_line + note_line + body, list(
             _MOBILE_IMAGE_SPECS.get() or []
         )
     finally:
         _MOBILE_STEP_HELD.reset(held_token)
         _MOBILE_IMAGE_SPECS.reset(token)
         _MOBILE_SHOT_WANT.reset(want)
+
+
+_MOBILE_TOOL_FAILURES = (
+    OSError,
+    RuntimeError,
+    TimeoutError,
+    ValueError,
+    LookupError,
+    TypeError,
+    ImportError,
+)
+
+
+def _mobile_tool_failed(exc: BaseException, tool: str) -> str:
+    """The text a mobile tool returns when it fails; the cause is logged."""
+    logger.exception("%s failed", tool)
+    _capture_error(exc, tool)
+    return (
+        "\u26a0\ufe0f `"
+        + tool
+        + "` failed ("
+        + type(exc).__name__
+        + "). Check `qa_mobile_status` before retrying."
+    )
+
+
+def _mobile_unresolved(noun: str, res) -> str:
+    """The question for a device or app pick that did not settle on one value."""
+    from tools.mobile import app_tools
+    from tools.untrusted import wrap_untrusted
+
+    options = ", ".join(str(getattr(o, "key", o)) for o in tuple(res.options or ()))
+    question = str(res.question or "") or ("Ask the user which " + noun + " to use.")
+    body = question + ("\nOptions: " + options if options else "")
+    return (
+        "\u26a0\ufe0f The "
+        + noun
+        + " is not settled. Do not guess; ask the user. Nothing was touched.\n"
+        + wrap_untrusted("mobile_pick", body, app_tools.MAX_TOOL_TEXT_CHARS)
+    )
+
+
+def _mobile_merge_finding(args: tuple, kwargs: dict, finding: object) -> tuple:
+    """``(args, kwargs, note)`` with ``finding`` folded into the step script.
+
+    Explore lane only (``step_finding.merge_finding``); on any other lane the
+    script is untouched and the note says the finding was left out. An
+    unreadable run or script is left alone: the step itself reports that."""
+    from tools.mobile import actions, run_store, step_finding
+    from tools.mobile.session import LANE_SUITE
+
+    run_id = _call_arg(handle_submit_mobile_step, args, kwargs, "run_id")
+    manifest = run_store.read_manifest(run_id).get("content")
+    script = _call_arg(handle_submit_mobile_step, args, kwargs, "script")
+    payload = actions.decode_reply(script)
+    if not isinstance(manifest, dict) or (script.strip() and not payload):
+        return args, kwargs, ""
+    merged, refusal = step_finding.merge_finding(
+        payload, finding, lane=str(manifest.get("lane") or LANE_SUITE)
+    )
+    if refusal:
+        return args, kwargs, refusal + "\n\n"
+    if not script.strip():
+        merged["actions"] = []
+    args, kwargs = _with_script(args, kwargs, json.dumps(merged))
+    return args, kwargs, ""
+
+
+async def _mobile_fold_finding(args: tuple, kwargs: dict, finding: str) -> tuple:
+    """``_mobile_merge_finding`` off the event loop; no finding, no change."""
+    if not finding:
+        return args, kwargs, ""
+    return await asyncio.to_thread(_mobile_merge_finding, args, kwargs, finding)
+
+
+async def handle_mobile_stop(
+    target: str = "", *, choose: ChooseCb = None, **_elicitors
+) -> str:
+    """``qa_mobile_stop``: stop ONE run, named by run id or device serial.
+
+    ``stop_run.stop`` decides; a target that names no single run is asked,
+    never guessed. Never raises."""
+    if not _mobile_lane_enabled():
+        return _mobile_lane_off_message()
+    try:
+        from tools.mobile import app_tools, session, stop_run
+
+        result = await stop_run.stop(
+            str(target or "").strip() or None,
+            session.stop_ports(),
+            _mobile_ask(choose),
+        )
+    except _MOBILE_TOOL_FAILURES as exc:
+        return _mobile_tool_failed(exc, "qa_mobile_stop")
+    head = "Stopped." if result.ok else "\u26a0\ufe0f Not stopped."
+    return (
+        head
+        + "\n"
+        + wrap_untrusted("mobile_stop", result.message, app_tools.MAX_TOOL_TEXT_CHARS)
+    )
+
+
+async def handle_app_info(
+    app: str = "",
+    package: str = "",
+    serial: str = "",
+    *,
+    choose: ChooseCb = None,
+    **_elicitors,
+) -> str:
+    """``qa_app_info``: the installed version of one app on one device.
+
+    The device and the app are resolved or asked, never guessed; a read
+    touches nothing on the device. Never raises."""
+    if not _mobile_lane_enabled():
+        return _mobile_lane_off_message()
+    try:
+        from tools.mobile import app_pick, app_tools, device_pick
+        from tools.mobile.resolve import RESOLVED
+
+        ask = _mobile_ask(choose)
+        device = await device_pick.pick_device(str(serial or "").strip(), ask=ask)
+        if device.status != RESOLVED:
+            return _mobile_unresolved("device", device)
+        picked = await app_pick.pick_package(
+            app_pick.PickRequest(str(app or ""), device.value, str(package or "")),
+            ask=ask,
+        )
+        if picked.status != RESOLVED:
+            return _mobile_unresolved("app", picked)
+        return await app_tools.app_info_text(device.value, picked.value)
+    except _MOBILE_TOOL_FAILURES as exc:
+        return _mobile_tool_failed(exc, "qa_app_info")
+
+
+async def handle_update_app(
+    app: str = "",
+    package: str = "",
+    serial: str = "",
+    source: str = "",
+    *,
+    choose: ChooseCb = None,
+    **_elicitors,
+) -> str:
+    """``qa_update_app``: update one app to the source's latest build through
+    ``app_tools.run_update``.
+
+    ``update_app`` resolves or asks the device and the app; a version it
+    cannot install over is offered as an uninstall the tester must confirm.
+    With no target version the verify needs a code above the previous one.
+    Never raises."""
+    if not _mobile_lane_enabled():
+        return _mobile_lane_off_message()
+    try:
+        from tools.mobile import app_tools, update_app
+
+        request = update_app.UpdateRequest(
+            serial=str(serial or "").strip(),
+            app_text=str(app or ""),
+            package=str(package or "").strip(),
+            source=str(source or "").strip() or update_app.SOURCE_DEFAULT,
+        )
+        return await app_tools.run_update(request, ask=_mobile_ask(choose))
+    except _MOBILE_TOOL_FAILURES as exc:
+        return _mobile_tool_failed(exc, "qa_update_app")
 
 
 async def handle_setup_capture(

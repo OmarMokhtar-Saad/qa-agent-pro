@@ -35,6 +35,7 @@ moved the defect rather than removed the class.
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import logging
 import re
@@ -44,11 +45,16 @@ from tools.mobile import actions as actions_mod
 from tools.mobile import (
     adb,
     app_knowledge,
+    dialog_handlers,
     dump_latency,
     fill_label,
     ime,
+    latency_scale,
+    launch_guard,
     perception,
     step_timing,
+    tree_optin,
+    tree_source,
     watch,
 )
 from tools.mobile.providers import base as providers_base
@@ -228,6 +234,14 @@ LAUNCHER_PACKAGES: frozenset = frozenset(
 #: script doing exactly what it asked to do.
 LEAVES_ON_PURPOSE: frozenset = frozenset({"home", "open_url"})
 
+#: Interruptions a dialog handler may answer in ONE settle. An installer is
+#: Update then Done (two); past three the screen is not a dialog sequence the
+#: handlers know, so the replay stops and the model decides.
+MAX_DIALOG_TAPS = 3
+
+#: Pause between a handler's tap and the re-read, so the dialog can leave.
+DIALOG_SETTLE_S = 0.4
+
 MAX_TRACE = 80
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -378,6 +392,14 @@ class Context:
     # S10 saved route (PROVISIONAL): the screen_id each step must START on, in script order.
     # Empty = not a route replay. Set by session.submit; read ONLY by _route_expected.
     route_expect: tuple = ()
+    # Whether the last screen this device read may stand for the NEXT call's
+    # first read (``_take_carried``). False is today's behaviour: every call
+    # starts with its own dump. The session seam sets it.
+    carry_screen: bool = False
+    # Packages this step expects in front besides the run's own app (a launch
+    # into the App Tester, an installer). A screen of one is NOT 'left the
+    # app'. Empty (the default) is today's behaviour. Set by the caller.
+    expect_apps: tuple = ()
 
 
 #: The ONLY ops the destructive guard skips, because none can actuate anything:
@@ -877,6 +899,120 @@ DUMP_CUT_DETAIL = (
 )
 
 
+#: How old a carried screen may be and still stand for the next call's first
+#: read. The tester can touch the phone between calls, so this is short.
+REUSE_MAX_AGE_S = 15.0
+
+#: Devices whose last screen is carried; the least recently read is dropped.
+MAX_CARRIED_SERIALS = 16
+
+#: Seconds the live focus probe may take when confirming a carried screen.
+REUSE_PROBE_S = 3.0
+
+#: What a tree source may fail with. CancelledError is not here.
+SOURCE_FAILURES = (OSError, ValueError, RuntimeError, asyncio.TimeoutError)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Carried:
+    """The last observed screen of one device and what it was read against."""
+
+    result: dict
+    taken: float
+    package: str
+    activity: str
+
+
+_CARRIED: dict = {}
+
+
+def _drop_carried(serial: str) -> None:
+    """Forget the carried screen: something that can change it is about to run."""
+    _CARRIED.pop(str(serial or ""), None)
+
+
+def _remember(ctx: Context, observed: object) -> None:
+    """Keep a successful observation for the next call when the context allows."""
+    if not ctx.carry_screen:
+        return
+    content = observed.get("content") if isinstance(observed, dict) else None
+    if not isinstance(content, dict) or observed.get("error"):
+        _drop_carried(ctx.serial)
+        return
+    key = str(ctx.serial or "")
+    _CARRIED.pop(key, None)
+    _CARRIED[key] = _Carried(
+        copy.deepcopy(observed),
+        time.monotonic(),
+        str(content.get("package") or ""),
+        str(content.get("activity") or ""),
+    )
+    while len(_CARRIED) > MAX_CARRIED_SERIALS:
+        del _CARRIED[next(iter(_CARRIED))]
+
+
+async def _take_carried(ctx: Context) -> dict | None:
+    """The carried screen when it is still safe to treat as a fresh read.
+
+    Used at most once (it is popped), and only when it is young, belongs to the
+    run's package, and the device's LIVE focus still equals the activity it was
+    read on. An unknown focus is not a match. Any actuating op, and the keyboard
+    swaps, drop it before this is reached.
+    """
+    if not ctx.carry_screen:
+        return None
+    held = _CARRIED.pop(str(ctx.serial or ""), None)
+    if held is None or time.monotonic() - held.taken > REUSE_MAX_AGE_S:
+        return None
+    if ctx.package and held.package != ctx.package:
+        return None
+    focus = await _focus_probe(ctx.serial, REUSE_PROBE_S)
+    if not focus or focus != held.activity:
+        return None
+    step_timing.mark("dump_carried")
+    return held.result
+
+
+async def _first_screen(ctx: Context) -> dict:
+    """The first read of a call: the carried screen if valid, else a dump."""
+    carried = await _take_carried(ctx)
+    if carried is not None:
+        return carried
+    return await _dump(ctx)
+
+
+async def _pick_source(serial: str) -> object:
+    try:
+        return await tree_source.select_tree_source(serial, tree_optin.allowed)
+    except SOURCE_FAILURES:
+        logger.warning("mobile.executor: tree source selection failed", exc_info=True)
+        return None
+
+
+async def _raw_dump(serial: str) -> dict:
+    """ONE raw dump through the selected tree source; the adb dump on any miss.
+
+    Only a source ``tree_optin.allowed`` lets through is ever tried, so without
+    the tester's consent this is exactly the adb dump. A source that returns
+    nothing or raises falls back to the adb dump in the same call.
+    """
+    source = await _pick_source(serial)
+    if source is not None and source.name != tree_source.FALLBACK_SOURCE:
+        timeout = latency_scale.scale_timeout(
+            latency_scale.TREE_TIMEOUT_S, dump_latency.p90_ms(serial)
+        )
+        try:
+            result = await source.dump(serial, timeout)
+        except SOURCE_FAILURES:
+            logger.warning("mobile.executor: tree source failed", exc_info=True)
+            result = None
+        if result is not None and result.xml:
+            step_timing.note_source(result.source)
+            return {"error": None, "content": result.xml}
+    step_timing.note_source(tree_source.FALLBACK_SOURCE)
+    return await adb.uiautomator_dump(serial)
+
+
 async def _dump(ctx: Context, deadline: float | None = None) -> dict:
     """Re-dump and re-prune. Returns the ``{"error","content"}`` shape.
 
@@ -896,7 +1032,7 @@ async def _dump(ctx: Context, deadline: float | None = None) -> dict:
     elif not await dump_latency.join(serial, deadline - time.monotonic()):
         step_timing.mark("dump_cut")
         return {"error": DUMP_CUT_DETAIL, "content": None}
-    task = dump_latency.start(serial, adb.uiautomator_dump(serial))
+    task = dump_latency.start(serial, _raw_dump(serial))
     try:
         if deadline is None:
             raw = await step_timing.timed("ui_dump", asyncio.shield(task))
@@ -919,12 +1055,14 @@ async def _dump(ctx: Context, deadline: float | None = None) -> dict:
     # Cached per serial like the size above, so the accessibility floor is this
     # device's 48dp rather than an assumed one, at no extra round trip.
     dpi = await adb.display_density(ctx.serial)
-    return composite.observe(
+    observed = composite.observe(
         raw.get("content"),
         await resolve_activity(ctx),
         display=sized.get("content"),
         density=dpi.get("content"),
     )
+    _remember(ctx, observed)
+    return observed
 
 
 async def resolve_activity(ctx: object) -> str:
@@ -1557,7 +1695,9 @@ async def _auto_settle(ctx: Context, screen: object, before_hash: str) -> object
     the latest good read, which is at worst the read the caller already had.
     Each dump is cut at the deadline, so the bound is the wall clock.
     """
-    deadline = time.monotonic() + AUTO_SETTLE_MAX_S
+    deadline = time.monotonic() + latency_scale.scale_settle(
+        AUTO_SETTLE_MAX_S, dump_latency.p90_ms(ctx.serial)
+    )
     current = screen
     moving = False
     last: tuple | None = None
@@ -1588,6 +1728,160 @@ async def _auto_settle(ctx: Context, screen: object, before_hash: str) -> object
         last = key
 
 
+def _expected_here(ctx: Context, extra: object = ()) -> frozenset:
+    """Packages the step expects in front besides the run's own app: the
+    context's ``expect_apps`` plus *extra* (the package a ``launch`` just
+    opened). Empty values are dropped, so a missing one widens nothing."""
+    declared = (*tuple(getattr(ctx, "expect_apps", ()) or ()), *tuple(extra or ()))
+    return frozenset(str(p) for p in declared if p)
+
+
+def _cut_of(ctx: Context, screen: object, op: str, extra: object = ()) -> tuple:
+    """``(outcome, package)`` for why the replay must stop on *screen*, or
+    ``('', '')``. THE one place the system-dialog and left-the-app rules are
+    decided, so the cut and the dialog answerer cannot disagree. A package in
+    ``expect_apps`` (or *extra*) is not another app."""
+    dialog = system_dialog_package(screen)
+    if dialog:
+        return "system_dialog", dialog
+    package = _screen_package(screen)
+    if (
+        package
+        and ctx.package
+        and package != ctx.package
+        and package not in _expected_here(ctx, extra)
+        and str(op or "") not in LEAVES_ON_PURPOSE
+    ):
+        return "left_app", package
+    return "", ""
+
+
+def _cut_detail(kind: str, foreign: str, ctx: Context, entry: dict) -> str:
+    """The refusal sentence for a cut, plus the guard's own sentence when a
+    handler's tap was refused (so the model learns WHY nothing was answered)."""
+    base = (
+        system_dialog_detail(foreign)
+        if kind == "system_dialog"
+        else left_app_detail(foreign, ctx.package)
+    )
+    refused = str(entry.get("dialog_refused") or "")
+    return (base + " " + refused).strip() if refused else base
+
+
+def _dialog_element(action: object, screen: object) -> dict | None:
+    """The pruned-screen element a handler's action names, or None when it is
+    absent or ambiguous (no blind taps)."""
+    if action.kind == dialog_handlers.TAP_TEXT:
+        found = resolve_tap_text(action.value, screen)
+        chosen = None if found.get("ambiguous") else found.get("element")
+    elif action.kind == dialog_handlers.TAP_RID:
+        try:
+            target = actions_mod.Target(rid=action.value)
+        except ValueError:
+            return None
+        resolved = (actions_mod.resolve_target(target, screen) or {}).get("content")
+        chosen = (resolved or {}).get("element")
+    else:
+        chosen = None
+    return chosen if isinstance(chosen, dict) else None
+
+
+def _dialog_tap_refusal(
+    ctx: Context, action: object, element: dict, screen: object
+) -> str:
+    """Why the destructive guard refuses a handler's tap on *element*, or ''.
+
+    The SAME derivation a tester's tap is judged by (the named label, the
+    actuated node on its own strings, then screen_hit on the judged node), and
+    deliberately NOT gated on ``ctx.guard_destructive``: a handler is not the
+    tester. ``_consume_confirm`` is never called -- a confirm is bound to the
+    tester's own op fingerprint, so a handler can never spend one."""
+    actuated = actuated_element(screen, _center(element))
+    labels = [str(action.value)] if action.kind == dialog_handlers.TAP_TEXT else []
+    labels.append(element_label(element, screen))
+    if actuated is not None and actuated is not element:
+        labels.append(element_label(actuated))
+    judged = actuated if actuated is not None else element
+    term = destructive_hit(" ".join(labels).strip())
+    if not term:
+        term = screen_hit(screen, "", judged=judged)
+    return guard_detail(term, screen, ctx.package) if term else ""
+
+
+async def _answer_one_dialog(
+    ctx: Context, screen: object, foreign: str, extra: object
+) -> dict | None:
+    """Answer ONE interruption: ``None`` when nothing was done (no usable raw
+    dump, no handler recognised it, the control is absent, the tap failed),
+    ``{'refused': text}`` when the guard stopped the tap, else ``{'label',
+    'screen'[, 'stop']}`` after the tap and a re-read."""
+    raw = await dump_raw(ctx.serial)
+    xml = raw.get("content") if isinstance(raw, dict) else None
+    if not isinstance(xml, str) or not xml:
+        return None
+    expected = frozenset({ctx.package, *_expected_here(ctx, extra)}) - {""}
+    action = dialog_handlers.handle(
+        dialog_handlers.DialogContext(
+            serial=ctx.serial, package=foreign, expected_apps=expected, xml=xml
+        )
+    )
+    if action is None:
+        return None
+    back = action.kind == dialog_handlers.BACK
+    point = None
+    if not back:
+        element = _dialog_element(action, screen)
+        point = _center(element) if element is not None else None
+        if point is None:
+            return None
+        refusal = _dialog_tap_refusal(ctx, action, element, screen)
+        if refusal:
+            return {"refused": refusal[:400]}
+    _drop_carried(ctx.serial)
+    if back:
+        tapped = await adb.keyevent(ctx.serial, "KEYCODE_BACK")
+    else:
+        tapped = await adb.tap(ctx.serial, point[0], point[1])
+    if tapped.get("error"):
+        return None
+    label = "back" if back else str(action.value)[:MAX_GUARD_NODE_CHARS]
+    await asyncio.sleep(DIALOG_SETTLE_S)
+    dumped = await _dump(ctx)
+    if dumped.get("error"):
+        return {"label": label, "screen": screen, "stop": True}
+    return {"label": label, "screen": dumped.get("content")}
+
+
+async def _answer_dialogs(
+    ctx: Context, entry: dict, screen: object, op: str, extra: object = ()
+) -> object:
+    """Answer up to :data:`MAX_DIALOG_TAPS` interruptions and return the screen
+    as it stands. ONE ``dialog_handlers.handle`` per interruption. Stops when
+    the interruption is gone, nothing recognises it, or the guard refuses the
+    tap (recorded as ``entry['dialog_refused']``). With no handler registered it
+    does nothing at all, so a run that never registered one is unchanged."""
+    if not dialog_handlers.handler_names():
+        return screen
+    answered: list = []
+    for _ in range(MAX_DIALOG_TAPS):
+        kind, foreign = _cut_of(ctx, screen, op, extra)
+        if not kind:
+            break
+        step = await _answer_one_dialog(ctx, screen, foreign, extra)
+        if step is None:
+            break
+        if step.get("refused"):
+            entry["dialog_refused"] = step["refused"]
+            break
+        answered.append(step["label"])
+        screen = step["screen"]
+        if step.get("stop"):
+            break
+    if answered:
+        entry["dialog_taps"] = answered
+    return screen
+
+
 async def _settle(
     ctx: Context,
     entry: dict,
@@ -1598,6 +1892,7 @@ async def _settle(
     redump: bool,
     mark_no_change: bool,
     op: str = "",
+    extra_expected: tuple = (),
 ) -> tuple:
     """Re-read the screen after an action that could have changed it.
 
@@ -1628,6 +1923,10 @@ async def _settle(
                 STATUS_ERROR, trace, screen, "", entry["detail"], index
             )
         screen = dumped.get("content")
+    # A registered dialog handler answers a known interruption BEFORE the screen
+    # is stamped, so the entry records the screen the replay actually continues
+    # on. No handler registered: this returns the screen untouched.
+    screen = await _answer_dialogs(ctx, entry, screen, op, extra_expected)
     # BOTH halves, through the one producer. This site used to write the hash
     # alone and re-derive the id inline for the comparison below -- so it was
     # simultaneously the only site stamping a look AND a second derivation of
@@ -1659,24 +1958,12 @@ async def _settle(
     # miss against a screen that belongs to somebody else, which is how one
     # mistaken tap spent a case's three escapes and reported `blocked` without
     # ever mentioning that the app had been left.
-    package = _screen_package(screen)
-    dialog = system_dialog_package(screen)
-    if dialog:
-        entry["outcome"] = "system_dialog"
-        entry["detail"] = system_dialog_detail(dialog)
-        _stamp_after(entry, screen)
-        _append(trace, entry)
-        return screen, _result(
-            STATUS_NEEDS_MODEL, trace, screen, "", entry["detail"], index
-        )
-    if (
-        package
-        and ctx.package
-        and package != ctx.package
-        and str(op or "") not in LEAVES_ON_PURPOSE
-    ):
+    kind, foreign = _cut_of(ctx, screen, op, extra_expected)
+    if kind:
         entry["outcome"] = "left_app"
-        entry["detail"] = left_app_detail(package, ctx.package)
+        if kind == "system_dialog":
+            entry["outcome"] = "system_dialog"
+        entry["detail"] = _cut_detail(kind, foreign, ctx, entry)
         _stamp_after(entry, screen)
         _append(trace, entry)
         return screen, _result(
@@ -1751,7 +2038,9 @@ async def _wait_for(
     until a poll has replaced the screen the wait started on.
     """
     budget = (ms / 1000.0) if ms else DEFAULT_WAIT_UNTIL_TEXT_S
-    deadline = time.monotonic() + budget
+    deadline = time.monotonic() + latency_scale.scale_timeout(
+        budget, dump_latency.p90_ms(ctx.serial)
+    )
     previous: object = None
     current = screen
     ticker = watch.Ticker(label)
@@ -2147,7 +2436,9 @@ async def _wait_until_changed(
     reusable. An empty answer on either side is unknown, never a change.
     """
     before = _screen_hash(screen)
-    deadline = time.monotonic() + (ms / 1000.0)
+    deadline = time.monotonic() + latency_scale.scale_timeout(
+        ms / 1000.0, dump_latency.p90_ms(ctx.serial)
+    )
     # The baseline is PROBED here, never read from `ctx.activity`: that is
     # memoised once per replay (`resolve_activity`) and is stale after the
     # first navigation, when every later probe would differ from it and end
@@ -2674,6 +2965,7 @@ async def keyboard_up(serial: str) -> dict:
     failure AFTER the select still carries ``previous`` so it is restored.
     Never raises.
     """
+    _drop_carried(serial)  # the keyboard changes what is on screen
     try:
         remembered = await ime.remember_previous(serial)
         if remembered.get("error"):
@@ -2739,6 +3031,7 @@ async def keyboard_up(serial: str) -> dict:
 
 async def keyboard_down(serial: str, previous: str) -> dict:
     """Put the remembered keyboard back. ``content.note`` is what to tell."""
+    _drop_carried(serial)  # the keyboard changes what is on screen
     try:
         restored = await ime.restore_previous(serial, previous)
         if restored.get("error"):
@@ -2844,7 +3137,7 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                 ),
             }
         if screen is None:
-            dumped = await _dump(ctx)
+            dumped = await _first_screen(ctx)
             if dumped.get("error"):
                 return {
                     "error": None,
@@ -3540,7 +3833,9 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
             # heavy AVD. ONLY the dump is skipped: `_settle` still runs on the
             # screen in hand, so `no_change` and the system-dialog and
             # left-app checks are kept.
-            front = op == "launch" and _brought_to_front(outcome, screen, ctx)
+            front = op == "launch" and _brought_to_front(
+                outcome, screen, ctx, named=getattr(action, "package", None)
+            )
             if front:
                 step_timing.mark("dump_skipped")
             if op in actions_mod.MUTATING_OPS:
@@ -3553,6 +3848,11 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                     redump=not front,
                     mark_no_change=True,
                     op=op,
+                    extra_expected=(
+                        (str(getattr(action, "package", "") or ""),)
+                        if op == "launch"
+                        else ()
+                    ),
                 )
                 if stop is not None:
                     return {"error": None, "content": stop}
@@ -3904,14 +4204,20 @@ def _evaluate_assert(
 BROUGHT_TO_FRONT = "brought to the front"
 
 
-def _brought_to_front(outcome: object, screen: object, ctx: object) -> bool:
+def _brought_to_front(
+    outcome: object, screen: object, ctx: object, *, named: object = None
+) -> bool:
     """True when a `launch` only moved THIS app's task to the front of a screen
     that was already this app, so the screen in hand is still current.
 
     The package check is what makes the skip safe: `am start` says the same
     words when the app was in the BACKGROUND, and then the screen in hand is
-    the launcher and must be re-read.
+    the launcher and must be re-read. A launch that NAMED another package
+    (an App Tester, say) never counts: the screen in hand is the target's,
+    the app now in front is not, so the redump must run.
     """
+    if named and str(named) != str(getattr(ctx, "package", "") or ""):
+        return False
     body = outcome.get("content") if isinstance(outcome, dict) else None
     if not isinstance(body, dict):
         return False
@@ -3933,11 +4239,29 @@ async def _perform(
 ) -> dict:
     """One device op. Every argv is built by ``adb``, which validates again."""
     serial = ctx.serial
+    # Any device op can change the screen, so a carried read is stale from here.
+    _drop_carried(serial)
     if op == "back":
         return await adb.keyevent(serial, "KEYCODE_BACK")
     if op == "home":
         return await adb.keyevent(serial, "KEYCODE_HOME")
     if op == "launch":
+        named = getattr(action, "package", None)
+        if named:
+            # A named package is judged by launch_guard BEFORE anything is
+            # started; a refusal is recoverable (the model fixes the step).
+            # `launch_allowed` is reached only when a package is set.
+            allowed, why = launch_guard.launch_allowed(
+                named,
+                target=ctx.package,
+                expect_apps=(
+                    *tuple(getattr(ctx, "expect_apps", ()) or ()),
+                    getattr(ctx, "home_package", ""),
+                ),
+            )
+            if not allowed:
+                return {"error": why, "content": None, "needs_model": True}
+            return await adb.launch(serial, named)
         if not ctx.package:
             return {"error": "No app package is set for this run.", "content": None}
         return await adb.launch(serial, ctx.package)

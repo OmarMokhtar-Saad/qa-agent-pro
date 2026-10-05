@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 
+from tools.mobile import case_label, perception
 from tools.mobile_evidence import crash_detector
 from tools.untrusted import wrap_untrusted
 
@@ -688,8 +689,91 @@ def crash_note(case: object) -> str:
     return head + (("\n\n" + block) if block else "")
 
 
-def verdict_line(case: object) -> str:
+#: The screen summary a step reply carries: element lines shown, total
+#: characters, and characters of any one device-supplied value in its header.
+MAX_SUMMARY_LINES = 8
+MAX_SUMMARY_CHARS = 600
+MAX_SUMMARY_FIELD_CHARS = 60
+
+
+def _summary_text(value: object) -> str:
+    return _field(value)[:MAX_SUMMARY_FIELD_CHARS]
+
+
+def _summary_header(body: dict, elements: list, previous_id: object) -> str:
+    """The one header line: app, title, element count, focus, changed or not."""
+    parts = []
+    package = _summary_text(body.get("package"))
+    title = _summary_text(body.get("title") or body.get("activity"))
+    if package:
+        parts.append(package)
+    if title:
+        parts.append(title)
+    parts.append(str(len(elements)) + " elements")
+    focused = next((e for e in elements if e.get("focused")), None)
+    if focused:
+        name = (
+            focused.get("label")
+            or focused.get("text")
+            or focused.get("desc")
+            or focused.get("rid")
+            or focused.get("id")
+        )
+        parts.append("focused " + _summary_text(name))
+    screen_id = str(body.get("screen_id") or "")
+    if screen_id and previous_id:
+        parts.append("changed" if screen_id != str(previous_id) else "unchanged")
+    return "Screen: " + ", ".join(parts)
+
+
+def _summary_line(element: dict) -> str:
+    try:
+        return " ".join(perception.element_line(element).split())
+    except (TypeError, ValueError, AttributeError):
+        return ""
+
+
+def compact_summary(screen: object, previous_id: object = "") -> str:
+    """A short, bounded description of a pruned screen, or ``""`` when it has
+    no elements.
+
+    A header line plus at most ``MAX_SUMMARY_LINES`` element lines. Whole lines
+    are dropped from the end to stay within ``MAX_SUMMARY_CHARS``; a line is
+    never cut in the middle. Never raises."""
+    body = screen if isinstance(screen, dict) else {}
+    raw = body.get("elements")
+    elements = [
+        e for e in (raw if isinstance(raw, list) else []) if isinstance(e, dict)
+    ]
+    if not elements:
+        return ""
+    lines = [_summary_header(body, elements, previous_id)]
+    screen_id = str(body.get("screen_id") or "")
+    if screen_id and previous_id and screen_id == str(previous_id):
+        # The step ended on the screen it began on: as with the elided
+        # dump-first packet, the elements are not repeated.
+        return lines[0]
+    shown = (_summary_line(e) for e in elements[:MAX_SUMMARY_LINES])
+    lines += [line for line in shown if line]
+    while len(lines) > 1 and len("\n".join(lines)) > MAX_SUMMARY_CHARS:
+        lines.pop()
+    return "\n".join(lines)[:MAX_SUMMARY_CHARS]
+
+
+def screen_block(screen: object, previous_id: object = "") -> str:
+    """``compact_summary`` as an untrusted block: the text comes from the app
+    on the device, so it is never an instruction."""
+    summary = compact_summary(screen, previous_id)
+    if not summary:
+        return ""
+    return wrap_untrusted("screen_summary", summary, MAX_SUMMARY_CHARS)
+
+
+def verdict_line(case: object, screen: object = None, previous_id: str = "") -> str:
     """ONE line per case. A run of 200 cases is 200 lines, not 200 sections.
+
+    ``screen`` (the pruned screen the step ended on) and ``previous_id`` (the
+    screen id before it) add a bounded screen summary after the tally.
 
     A case the SERVER failed because the app died carries its disclosure here --
     both chat surfaces reach this function (the submit reply directly, and
@@ -712,10 +796,11 @@ def verdict_line(case: object) -> str:
     reason = _field(body.get("reason"))[:160]
     note = crash_note(case)
     tally = _typed_field_tally([body])
+    block = screen_block(screen, previous_id)
     return (
         marks.get(verdict, "•")
         + " `"
-        + _field(body.get("tc_id"), "?")
+        + case_label.label_for({"tc_id": _field(body.get("tc_id"))})
         + "` "
         + _field(body.get("title"))[:80]
         + " — **"
@@ -724,6 +809,7 @@ def verdict_line(case: object) -> str:
         + ((" — " + reason) if reason else "")
         + (("\n\n" + note) if note else "")
         + (("\n\n" + tally.strip()) if tally else "")
+        + (("\n\n" + block) if block else "")
     )
 
 
@@ -1224,7 +1310,7 @@ def device_pending_block(state: object) -> str:
 
 
 def device_busy_block(refusal: object) -> str:
-    """Another run holds the emulator. Say WHO, and say how to get it.
+    """Another run holds the device. Say WHO, and say how to get it.
 
     A refusal that does not name a way forward is a dead end, and this one has
     two: take that run over (which is what makes the holder let go), or wait for
@@ -1271,10 +1357,10 @@ def device_busy_block(refusal: object) -> str:
         who = ""
     if str(body.get("reason") or "") == "no_lock_facility":
         return (
-            "## The emulator lane cannot guarantee one run at a time here\n\n"
+            "## The mobile lane cannot guarantee one run at a time here\n\n"
             "This platform offers neither `fcntl` nor `msvcrt`, so nothing can "
             "stop a second chat driving the same device — and two runs on one "
-            "emulator produce two reports that each describe a run that did not "
+            "device produce two reports that each describe a run that did not "
             "happen as recorded. Refusing is the safe answer; nothing was "
             "started."
         )
@@ -1293,12 +1379,12 @@ def device_busy_block(refusal: object) -> str:
         except Exception:  # pragma: no cover - a refusal may not fail to render
             finished = False
 
-    lines = ["## Another run is using the emulator\n"]
+    lines = ["## Another run is using the device\n"]
     if who.startswith("provisioning:"):
         lines.append(
             "A run is being set up on this device right now"
             + (" in this same server" if same else " by another chat")
-            + " — the emulator is being picked, booted or the app installed. "
+            + " — the device is being picked, booted or the app installed. "
             "That step finishes within the call that started it, so call "
             "`qa_mobile_test` again in a moment."
         )
@@ -1331,7 +1417,7 @@ def device_busy_block(refusal: object) -> str:
             "`qa_mobile_test run_id=...` is what releases the device."
         )
     lines.append(
-        "\nOne lock covers the whole lane, not one per device: the emulator is "
+        "\nOne lock covers the whole lane, not one per device: the device is "
         "chosen and booted before any serial exists, so there is nothing to key "
         "a per-device lock on at the moment it matters most."
     )

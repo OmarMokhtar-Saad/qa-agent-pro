@@ -64,7 +64,7 @@ SCREEN PEEK: `qa_capture_screens(peek=true)` returns the current Android screen'
 
 AVDS: never run `avdmanager`, `sdkmanager` or `emulator` yourself in a shell. Use `qa_mobile_test(emulator=...)`: `list` (read-only), `boot` (`avd=NAME`, `apply=true`), `create` (`avd=NAME`, `system_image=` an installed image id shown by `list`, `apply=true`) and `delete` (`avd=NAME`, `apply=true` AND `confirm_destructive=true`, only after the TESTER says yes). A name is letters, digits, `.`, `_`, `-`, not starting with `.` or `-`. Create uses only system images that are already installed and downloads nothing: if none is, relay the steps in the reply. If the reply says this computer cannot run the emulator (no hypervisor), relay its fix text and suggest a real device; do not look for another way to start one.
 
-Never sleep in a shell between calls: a shell sleep is a wait nobody watches; use a `wait` action with a condition.
+Never sleep in a shell between calls: a shell sleep is a wait nobody watches; use a `wait` action with a condition. A `wait` waits for `ms`, for `until_text`, or for an element by resource id: `until_rid` (present), with `until_gone=true` (gone) or `until_rid_text` (its text or description contains it). `until_text` and `until_rid` never go together.
 """
 
 FLOW_BRIEF = """\

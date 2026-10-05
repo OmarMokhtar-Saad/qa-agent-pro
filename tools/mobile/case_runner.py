@@ -20,12 +20,26 @@ import logging
 import time
 
 from tools.mobile import actions as actions_mod
-from tools.mobile import adb, executor, ime_session, media, run_store, step_timing
+from tools.mobile import (
+    adb,
+    executor,
+    ime_session,
+    media,
+    run_store,
+    run_verdict,
+    step_timing,
+)
 from tools.mobile.providers import composite
 from tools.mobile_capture import flows as api_flows
 from tools.mobile_evidence import capture, crash_detector
 
 logger = logging.getLogger(__name__)
+
+
+def note_refusal(error: object) -> str:
+    """Write the one INFO ``refused:`` line for a refused script and return it."""
+    return run_verdict.log_refusal(error)
+
 
 MAX_ESCAPES = 3
 
@@ -587,6 +601,7 @@ async def submit_case(
                 queued_in, list(decoded.get("actions") or [])
             )
             if not combined.get("ok"):
+                note_refusal(combined.get("reason"))
                 return {
                     "error": None,
                     "content": _checkpoint(
@@ -613,6 +628,7 @@ async def submit_case(
             ),
         )
         if parsed.get("error"):
+            note_refusal(parsed["error"])
             # A refused script is NOT an escape: nothing was replayed, so the
             # planner gets the same screen back and one of its escapes is not
             # spent on our own validation.

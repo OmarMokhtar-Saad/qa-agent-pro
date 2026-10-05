@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.104.2] - 2026-10-04
+## [1.105.0] - 2026-10-05
 
 ### Added
 
@@ -27,12 +27,28 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Anonymous, opt-out usage analytics (telemetry). See the README
   'Telemetry & privacy' section; disable with DO_NOT_TRACK=1.
 
+### Changed
+
+- New mobile tools: qa_update_app updates an app in one call (resolve,
+  current version, fetch, install, launch, verify the new version) and
+  ends with a verdict; qa_app_info shows the installed versionName and
+  versionCode; qa_mobile_stop stops a run, and a stopped run takes no
+  more steps.
+
 ### Fixed
 
-- Installs on 1.103.x can update again. They could not check the
-  signature of 1.104.0 and 1.104.1, which were signed with a new key,
-  so they refused every update. This release ships without a
-  signature, which those installs accept, and it trusts both the old
-  and the new key, so signed updates install again from here on.
-  Installs that stay offline past the next signed release need a
-  manual reinstall.
+- Mobile runs never guess an app, package, device, build flavour or
+  release: one exact match is used and named, otherwise you are asked.
+- The device lock is released when a run ends or sits idle, so the next
+  run no longer waits on a stale lock.
+- Every run ends with a verdict and a per-step summary instead of
+  'unverified', and refused cases keep their test-case id and title.
+- Mobile scripts accept the step shapes models actually write (launch
+  target, scroll direction, tap by resource id, long waits) instead of
+  refusing them.
+- App Tester installs drive the App Tester app on the device instead of
+  opening an empty Play Store listing.
+- Install, permission and App Tester dialogs are handled by the run,
+  with no blind taps; install failures report the real cause.
+- Faster runs: fewer duplicate screen dumps, and per-step timings
+  (duration, dumps, waits) in the run record and report.
