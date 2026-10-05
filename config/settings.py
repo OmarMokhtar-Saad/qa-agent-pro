@@ -7,7 +7,7 @@ to its documented default with a logged warning instead of crashing the whole
 app at import time.
 
 Field names map 1:1 to their upper-case environment variables (case-insensitive):
-``qa_llm_backend`` <- ``QA_LLM_BACKEND``, ``jira_base_url`` <- ``JIRA_BASE_URL``,
+``qa_export_dir`` <- ``QA_EXPORT_DIR``, ``jira_base_url`` <- ``JIRA_BASE_URL``,
 and so on.
 """
 

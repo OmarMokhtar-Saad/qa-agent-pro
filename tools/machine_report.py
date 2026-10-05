@@ -20,7 +20,10 @@ on a timer without a tester wondering what a refresh just changed.
 
 Imports of the producers are LAZY, inside each builder, for the reason
 ``tools/flag_registry.py`` states about itself: importing this module must cost
-nothing and can never create a cycle back into the composition root.
+nothing. None of those producers imports the composition root
+(``tools/mcp_handlers.py``), and this module does not import it either: the
+edition facts only the composition root knows arrive INJECTED, as the
+``edition_probe`` callable ``handle_machine_report`` hands to ``collect``.
 """
 
 from __future__ import annotations
@@ -29,6 +32,10 @@ import logging
 import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -156,9 +163,12 @@ def local_version() -> str | None:
     return _local_version(install_dir())
 
 
-def backend_info() -> dict:
+def backend_info(edition_probe: Callable[[], dict] | None = None) -> dict:
     """Version AND edition in one call -- what a client needs to decide whether
-    the backend it found is one it can talk to."""
+    the backend it found is one it can talk to.
+
+    ``edition_probe`` supplies the edition facts; with none, or when it raises,
+    the edition is ``{}``, which a client reads as "unknown"."""
     version, root = "unknown", ""
     try:
         version = str(local_version() or "unknown")
@@ -167,12 +177,7 @@ def backend_info() -> dict:
         logger.info("machine_report: version unavailable: %s", exc)
     edition = {}
     try:
-        from tools import mcp_handlers
-
-        edition = {
-            "test_cases_only": bool(mcp_handlers._test_cases_only()),
-            "mobile_modules_present": bool(mcp_handlers._mobile_modules_present()),
-        }
+        edition = edition_probe() if edition_probe else {}
     except Exception as exc:
         logger.info("machine_report: edition unavailable: %s", exc)
     return {"version": version, "install_dir": root, "edition": edition}
@@ -592,14 +597,18 @@ def provisioning_rows() -> list:
     )
 
 
-def collect(section: str = "all") -> dict:
-    """The whole report, or one section of it. Never raises."""
+def collect(
+    section: str = "all", *, edition_probe: Callable[[], dict] | None = None
+) -> dict:
+    """The whole report, or one section of it. Never raises.
+
+    ``edition_probe`` is passed on to ``backend_info``."""
     want = (section or "all").strip().lower()
     if want not in _SECTIONS and want != "all":
         return {"error": "unknown section: " + want, "sections": list(_SECTIONS)}
     out: dict = {"error": None, "section": want}
     if want in ("all", "backend"):
-        out["backend"] = backend_info()
+        out["backend"] = backend_info(edition_probe)
     if want in ("all", "doctor"):
         out["doctor"] = doctor_rows()
     if want in ("all", "clients"):

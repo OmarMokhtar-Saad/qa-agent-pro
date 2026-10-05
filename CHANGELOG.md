@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.105.3] - 2026-10-05
+## [1.106.0] - 2026-10-06
 
 ### Added
 
@@ -29,5 +29,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Release build: the packaged tree is checked against the build's own
-  Python environment. Nothing changes in how the tools behave.
+- Internal clean-up: large test-generation, suite-submission, setup-check
+  and mobile-replay steps are split into smaller named parts, and
+  duplicate detection moves into its own module. Nothing changes in how
+  the tools behave.
+- More regression tests guard these steps.

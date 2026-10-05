@@ -35,6 +35,7 @@ import collections
 import datetime
 import json
 import re
+from dataclasses import dataclass, field
 from typing import Iterable
 
 SCHEMA = "qa-agents.mobile-evidence.report/1"
@@ -436,6 +437,875 @@ def runlog_lane(head: str, profile, compiled) -> str:
     return "log"
 
 
+def _join_invocations(invocations, recovered) -> None:
+    """One tool call from two half-witnesses: the invocation line carries the outcome,
+    the model's own reply carries the real arguments. Edits ``invocations`` in place."""
+    if not invocations:
+        return
+    pool = list(recovered)
+    for entry in invocations:
+        for i, cand in enumerate(pool):
+            if cand["tool"] == entry["tool"]:
+                entry["args"] = cand["args"]
+                entry["argsRecovered"] = True
+                pool.pop(i)
+                break
+
+
+def _pick_tools(tools, invocations, recovered) -> list:
+    """The list the report calls its tools: the structured ones when there are any,
+    else the invocations, else the recovered calls. Never a copy."""
+    if invocations:
+        return tools if tools else invocations
+    if not tools and recovered:
+        return recovered
+    return tools
+
+
+def _count_tools(tools, turns, runs) -> None:
+    """Add each tool to the count of its turn and of its app run."""
+    for t in tools:
+        if t.get("turnId") and t["turnId"] in turns:
+            turns[t["turnId"]]["tools"] += 1
+        if t.get("appRunId") and t["appRunId"] in runs:
+            runs[t["appRunId"]]["tools"] += 1
+
+
+def _count_turns(turns, runs) -> None:
+    """Add each turn to the count of its app run."""
+    for t in turns.values():
+        if t.get("appRunId") and t["appRunId"] in runs:
+            runs[t["appRunId"]]["turns"] += 1
+
+
+def _disabled_streams(compiled) -> list:
+    """The profile's own disabled pairs, then every stream with no pattern."""
+    disabled = _disabled_pairs(compiled)
+    for name in STREAMS:
+        if _pat(compiled, name) is None and not any(d[0] == name for d in disabled):
+            disabled.append((name, "no pattern in the profile"))
+    return disabled
+
+
+@dataclass
+class _ParseState:
+    """Everything one ``parse`` call keeps across events."""
+
+    bindings: list = field(default_factory=list)
+    llm: list = field(default_factory=list)
+    tools: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
+    errors: list = field(default_factory=list)
+    runlog: list = field(default_factory=list)
+    recovered: list = field(default_factory=list)
+    utterances: list = field(default_factory=list)
+    answers: list = field(default_factory=list)
+    invocations: list = field(default_factory=list)
+    flow_states: list = field(default_factory=list)
+    cards: list = field(default_factory=list)
+    configs: list = field(default_factory=list)
+    open_binding: dict = field(default_factory=dict)
+    open_llm: int | None = None
+    last_usage: dict | None = None
+    turns: dict = field(default_factory=dict)
+    runs: dict = field(default_factory=dict)
+    clock: dict = field(default_factory=dict)
+    # A fresh sentinel per call, so the first event always starts a new run.
+    run_index: object = field(default_factory=object)
+
+
+@dataclass(frozen=True)
+class _Line:
+    """The fields of one event that every stream reads."""
+
+    ev: dict
+    seq: object
+    ts: object
+    run: str | None
+    turn: object
+    msg: str
+    fields: dict
+    cat: object
+
+
+@dataclass(frozen=True)
+class _Grammar:
+    """The profile settings ``parse`` reads once, before the first event."""
+
+    profile: object
+    compiled: dict
+    tool_cat: object
+    cost_cat: object
+    config_cat: object
+    tool_msgs: object
+    cost_msgs: object
+    config_msgs: object
+    bad_marks: list
+    head_re: re.Pattern
+
+
+def _grammar_of(profile, compiled) -> _Grammar:
+    """Read the structured categories, run-log marks and head prefix of ``profile``."""
+    structured = getattr(profile, "structured", None) or {}
+    return _Grammar(
+        profile=profile,
+        compiled=compiled,
+        tool_cat=structured.get("tool_category"),
+        cost_cat=structured.get("cost_category"),
+        config_cat=structured.get("config_category"),
+        tool_msgs=structured.get("tool_msgs") or [],
+        cost_msgs=structured.get("cost_msgs") or [],
+        config_msgs=structured.get("config_msg") or [],
+        bad_marks=_names(getattr(profile, "runlog_bad", None) or []),
+        head_re=_head_re(profile, compiled),
+    )
+
+
+def _enter_run(state: _ParseState, ev) -> None:
+    """At a ``runIndex`` change, forget the open calls of the run before."""
+    if ev.get("runIndex") != state.run_index:
+        state.run_index = ev.get("runIndex")
+        state.open_binding, state.open_llm, state.last_usage = {}, None, None
+
+
+def _line_of(ev, run_index) -> _Line:
+    """The event's fields, with its app run named from ``run_index`` when it has none."""
+    run = ev.get("appRunId") or (
+        "run-%s" % run_index if run_index is not None else None
+    )
+    return _Line(
+        ev=ev,
+        seq=ev.get("seq"),
+        ts=ev.get("ts"),
+        run=run,
+        turn=ev.get("turnId"),
+        msg=ev.get("msg") or "",
+        fields=ev.get("fields") or {},
+        cat=ev.get("category"),
+    )
+
+
+def _record_run(state: _ParseState, line: _Line) -> None:
+    """Open or extend the app run record of ``line`` and clock its timestamp."""
+    run, seq, ts = line.run, line.seq, line.ts
+    if not run:
+        return
+    r = state.runs.setdefault(
+        run,
+        {
+            "appRunId": run,
+            "runIndex": state.run_index,
+            "firstSeq": seq,
+            "lastSeq": seq,
+            "firstTs": ts,
+            "lastTs": ts,
+            "llm": 0,
+            "bindings": 0,
+            "tools": 0,
+            "errors": 0,
+            "turns": 0,
+        },
+    )
+    r["lastSeq"] = seq
+    # A structured log carries epoch ms; a logcat capture carries the raw
+    # ``MM-DD HH:MM:SS.mmm`` stamp, which orders lexicographically within a
+    # year and is made numeric by ``evidence.normalise_clock``. Either way the
+    # clock is recorded, so a logcat-only run still has a window.
+    if isinstance(ts, (int, float, str)) and not isinstance(ts, bool) and ts != "":
+        try:
+            if r["firstTs"] is None or ts < r["firstTs"]:
+                r["firstTs"] = ts
+            if r["lastTs"] is None or ts > r["lastTs"]:
+                r["lastTs"] = ts
+        except TypeError:
+            pass
+        state.clock.setdefault(run, {})[str(seq)] = ts
+
+
+def _record_turn(state: _ParseState, line: _Line) -> None:
+    """Open or extend the turn record of ``line``."""
+    turn, seq = line.turn, line.seq
+    if not turn:
+        return
+    t = state.turns.setdefault(
+        turn,
+        {
+            "turnId": turn,
+            "connectionId": line.ev.get("connectionId"),
+            "appRunId": line.run,
+            "firstSeq": seq,
+            "lastSeq": seq,
+            "llm": 0,
+            "bindings": 0,
+            "tools": 0,
+            "errors": 0,
+        },
+    )
+    t["lastSeq"] = seq
+
+
+def _bump(state: _ParseState, line: _Line, key: str) -> None:
+    """Add one to ``key`` on the turn and the app run of ``line``, when it has them."""
+    if line.turn:
+        state.turns[line.turn][key] += 1
+    if line.run:
+        state.runs[line.run][key] += 1
+
+
+def _parse_result(state: _ParseState, merged: int, disabled: list) -> dict:
+    """Join and count what the events left in ``state``, in the result's key order."""
+    unresolved = [
+        state.bindings[i]["binding"] for q in state.open_binding.values() for i in q
+    ]
+    _join_invocations(state.invocations, state.recovered)
+    tools = _pick_tools(state.tools, state.invocations, state.recovered)
+    _count_tools(tools, state.turns, state.runs)
+    _count_turns(state.turns, state.runs)
+    turns, runs = state.turns, state.runs
+    return {
+        "clock": state.clock,
+        "bindings": state.bindings,
+        "llm": state.llm,
+        "tools": tools,
+        "notes": state.notes,
+        "errors": state.errors,
+        "runlog": state.runlog,
+        "utterances": state.utterances,
+        "answers": state.answers,
+        "flowStates": state.flow_states,
+        "cards": state.cards,
+        "configs": state.configs,
+        "turns": [
+            turns[k] for k in sorted(turns, key=lambda k: turns[k]["firstSeq"] or 0)
+        ],
+        "appRuns": sorted(runs.values(), key=lambda r: r["runIndex"]),
+        "unresolvedBindings": unresolved,
+        "mergedNetworkLines": merged,
+        "disabled": disabled,
+    }
+
+
+def _on_tool_event(state: _ParseState, line: _Line, gram: _Grammar) -> bool:
+    """Record a structured tool event; True when ``line`` was one."""
+    msg, fields = line.msg, line.fields
+    if not (
+        gram.tool_cat and line.cat == gram.tool_cat and _msg_in(msg, gram.tool_msgs)
+    ):
+        return False
+    entry = {
+        "seq": line.seq,
+        "turnId": line.turn,
+        "appRunId": line.run,
+        "tool": fields.get("tool"),
+        "status": msg.split(".", 1)[1] if "." in msg else msg,
+        "kind": fields.get("kind"),
+        "args": _body_shape(fields.get("body.args")),
+        "durationMs": line.ev.get("durationMs"),
+    }
+    state.tools.append(entry)
+    _bump(state, line, "tools")
+    if entry["status"] == "failed":
+        state.errors.append({"seq": line.seq, "kind": "tool", "detail": entry})
+        _bump(state, line, "errors")
+    return True
+
+
+def _attach_usage(state: _ParseState, line: _Line, usage: dict) -> None:
+    """Attach ``usage`` to the open llm call, merge it into the last, or add an orphan."""
+    if state.open_llm is not None and state.llm[state.open_llm].get("tokens") is None:
+        state.llm[state.open_llm]["tokens"] = usage
+        state.llm[state.open_llm]["endSeq"] = line.seq
+        state.last_usage = state.llm[state.open_llm]["tokens"]
+    elif _same_usage(state.last_usage, usage):
+        # The same round-trip, reported twice (prose then structured): the
+        # structured form replaces the prose in place, never appends.
+        state.last_usage.update(usage)
+    else:
+        state.llm.append(
+            {
+                "seq": line.seq,
+                "turnId": line.turn,
+                "appRunId": line.run,
+                "model": usage["model"],
+                "tokens": usage,
+                "promptMessages": [],
+                "orphanUsage": True,
+            }
+        )
+        state.last_usage = state.llm[-1]["tokens"]
+
+
+def _on_cost_event(state: _ParseState, line: _Line, gram: _Grammar) -> bool:
+    """Record a structured cost event as llm usage; True when ``line`` was one."""
+    msg, fields = line.msg, line.fields
+    if not (
+        gram.cost_cat and line.cat == gram.cost_cat and _msg_in(msg, gram.cost_msgs)
+    ):
+        return False
+    usage = {
+        "seq": line.seq,
+        "turnId": line.turn,
+        "appRunId": line.run,
+        "source": msg,
+        "model": fields.get("model"),
+        "requested": fields.get("requested"),
+        "in": _int_or_none(fields.get("promptTokens")),
+        "out": _int_or_none(fields.get("responseTokens")),
+        "total": _int_or_none(fields.get("totalTokens")),
+        "unattributed": _int_or_none(fields.get("unattributed")),
+        "finish": fields.get("finishReason"),
+        "structured": True,
+    }
+    _attach_usage(state, line, usage)
+    state.open_llm = None
+    return True
+
+
+def _on_config_event(state: _ParseState, line: _Line, gram: _Grammar) -> bool:
+    """Record a structured config event; True when ``line`` was one."""
+    if not (
+        gram.config_cat
+        and line.cat == gram.config_cat
+        and _msg_in(line.msg, gram.config_msgs)
+    ):
+        return False
+    state.configs.append(
+        {
+            "seq": line.seq,
+            "turnId": line.turn,
+            "appRunId": line.run,
+            "fields": dict(line.fields),
+        }
+    )
+    return True
+
+
+def _on_structured(state: _ParseState, line: _Line, gram: _Grammar) -> bool:
+    """Try the tool, cost and config arms in that order; True when one took ``line``."""
+    return (
+        _on_tool_event(state, line, gram)
+        or _on_cost_event(state, line, gram)
+        or _on_config_event(state, line, gram)
+    )
+
+
+def _on_bind_req(state: _ParseState, line: _Line, m, gram: _Grammar) -> bool:
+    """Open a narrated binding call from a ``bind_req`` match; always True."""
+    g = m.groupdict()
+    state.bindings.append(
+        {
+            "seq": line.seq,
+            "turnId": line.turn,
+            "appRunId": line.run,
+            "binding": g.get("name"),
+            "verb": g.get("verb"),
+            "url": g.get("url"),
+            "args": _maybe_json(g.get("args")) or g.get("args"),
+            "forDependentSuffix": g.get("dep"),
+            "status": None,
+            "statusKnown": False,
+            "ok": None,
+            "response": None,
+            "retried": False,
+            "endSeq": None,
+        }
+    )
+    state.open_binding.setdefault(g.get("name"), []).append(len(state.bindings) - 1)
+    _bump(state, line, "bindings")
+    return True
+
+
+def _on_call_req(state: _ParseState, line: _Line, m, gram: _Grammar) -> bool:
+    """Open a shorthand call from a ``call_req`` match; always True."""
+    g = m.groupdict()
+    target = (g.get("target") or "").strip()
+    is_url = target.startswith(("http://", "https://"))
+    state.bindings.append(
+        {
+            "seq": line.seq,
+            "turnId": line.turn,
+            "appRunId": line.run,
+            "binding": g.get("name"),
+            "verb": g.get("verb"),
+            "url": target if is_url else None,
+            "target": None if is_url else target,
+            "args": g.get("args"),
+            "retried": False,
+            "ok": None,
+            "status": None,
+            "statusKnown": False,
+            "response": None,
+            "endSeq": None,
+        }
+    )
+    state.open_binding.setdefault("sh:" + str(g.get("name")), []).append(
+        len(state.bindings) - 1
+    )
+    _bump(state, line, "bindings")
+    return True
+
+
+def _on_call_res(state: _ParseState, line: _Line, m, gram: _Grammar) -> bool:
+    """Close the open shorthand call of a ``call_res`` match in place.
+
+    False when no call is open: an unpaired shorthand response is NOT a call, and
+    falls through to the narrated lane it has always been in.
+    """
+    g = m.groupdict()
+    idx = _take_open(state.open_binding, "sh:" + str(g.get("name")))
+    status, body = g.get("status"), g.get("body")
+    summary = (g.get("summary") or "").strip()
+    entry = {
+        "text": body if body else summary,
+        "omitted": 0,
+        "json": _maybe_json(body) if body else None,
+    }
+    if idx is None:
+        return False
+    state.bindings[idx].update(
+        {
+            "ok": True,
+            "status": int(status) if status else None,
+            "statusKnown": bool(status),
+            "summary": summary,
+            "response": entry,
+            "endSeq": line.seq,
+        }
+    )
+    return True
+
+
+def _on_bind_res(state: _ParseState, line: _Line, m, gram: _Grammar) -> bool:
+    """Close the open binding of a ``bind_res`` match in place, or add an orphan; True."""
+    g = m.groupdict()
+    idx = _take_open(state.open_binding, g.get("name"))
+    body = g.get("body") or ""
+    clipped = RE_TRUNC_TAIL.search(body)
+    entry = {
+        "text": RE_TRUNC_TAIL.sub("", body) if clipped else body,
+        "omitted": int(clipped.group(1)) if clipped else 0,
+        "json": _maybe_json(RE_TRUNC_TAIL.sub("", body)),
+    }
+    target = (
+        state.bindings[idx]
+        if idx is not None
+        else {
+            "seq": line.seq,
+            "turnId": line.turn,
+            "appRunId": line.run,
+            "binding": g.get("name"),
+            "verb": None,
+            "url": None,
+            "args": None,
+            "orphanResponse": True,
+            "retried": False,
+        }
+    )
+    # Success is known; the exact 2xx is NOT -- never a fabricated 200.
+    target.update(
+        {
+            "ok": True,
+            "status": None,
+            "statusKnown": False,
+            "response": entry,
+            "endSeq": line.seq,
+        }
+    )
+    if idx is None:
+        state.bindings.append(target)
+        _bump(state, line, "bindings")
+    return True
+
+
+def _on_bind_err(state: _ParseState, line: _Line, m, gram: _Grammar) -> bool:
+    """Fail the open binding of a ``bind_err`` match, or add an orphan; True.
+
+    The error's ``detail`` is the binding object itself, never a copy.
+    """
+    g = m.groupdict()
+    idx = _take_open(state.open_binding, g.get("name"))
+    detail = {
+        "ok": False,
+        "status": _int_or_none(g.get("status")),
+        "statusKnown": g.get("status") is not None,
+        "endSeq": line.seq,
+        "response": {
+            "text": g.get("body"),
+            "omitted": None,
+            "json": _maybe_json(g.get("body")),
+        },
+    }
+    if idx is not None:
+        state.bindings[idx].update(detail)
+        state.errors.append(
+            {"seq": line.seq, "kind": "binding", "detail": state.bindings[idx]}
+        )
+    else:
+        orphan = {
+            "seq": line.seq,
+            "turnId": line.turn,
+            "appRunId": line.run,
+            "binding": g.get("name"),
+            "verb": None,
+            "url": None,
+            "args": None,
+            "retried": False,
+            "orphanResponse": True,
+        }
+        orphan.update(detail)
+        state.bindings.append(orphan)
+        state.errors.append({"seq": line.seq, "kind": "binding", "detail": orphan})
+        _bump(state, line, "bindings")
+    _bump(state, line, "errors")
+    return True
+
+
+def _on_bind_retry(state: _ParseState, line: _Line, m, gram: _Grammar) -> bool:
+    """Mark the oldest open call of a ``bind_retry`` match as retried; always True."""
+    queue = state.open_binding.get(m.groupdict().get("name"))
+    if queue:
+        state.bindings[queue[0]]["retried"] = True
+    return True
+
+
+def _prompt_tail(state: _ParseState, tail: str, compiled) -> None:
+    """Add the prompt messages on ``tail`` to the open llm call.
+
+    This is the structured path: the messages ride on the same record. A body
+    that spans lines is appended to the message before it.
+    """
+    for piece in tail.split("\n"):
+        _p = _match(compiled, "prompt_msg", piece)
+        if _p:
+            state.llm[state.open_llm]["promptMessages"].append(
+                _body_shape(_p.group("body"))
+            )
+        elif state.llm[state.open_llm]["promptMessages"] and piece.strip():
+            _prev = state.llm[state.open_llm]["promptMessages"][-1]
+            if isinstance(_prev, dict) and isinstance(_prev.get("text"), str):
+                _prev["text"] += "\n" + piece
+
+
+def _on_llm_req(state: _ParseState, line: _Line, m, gram: _Grammar) -> bool:
+    """Open an llm call from an ``llm_req`` match; always True."""
+    g = m.groupdict()
+    state.llm.append(
+        {
+            "seq": line.seq,
+            "turnId": line.turn,
+            "appRunId": line.run,
+            "model": g.get("model"),
+            "stream": bool(g.get("stream")),
+            "msgs": _int_or_none(g.get("msgs")),
+            "tools": _int_or_none(g.get("tools")),
+            "promptMessages": [],
+            "frames": 0,
+            "response": None,
+            "tokens": None,
+            "error": None,
+            "endSeq": None,
+        }
+    )
+    state.open_llm = len(state.llm) - 1
+    _prompt_tail(state, line.msg[m.end() :], gram.compiled)
+    _bump(state, line, "llm")
+    return True
+
+
+def _on_prompt_msg(state: _ParseState, line: _Line, m, gram: _Grammar) -> bool:
+    """Add a ``prompt_msg`` match to the open llm call; False when no call is open."""
+    if state.open_llm is None:
+        return False
+    state.llm[state.open_llm]["promptMessages"].append(_body_shape(m.group("body")))
+    return True
+
+
+def _on_llm_frame(state: _ParseState, line: _Line, m, gram: _Grammar) -> bool:
+    """Count an ``llm_frame`` match on the open llm call; False when no call is open."""
+    if state.open_llm is None:
+        return False
+    state.llm[state.open_llm]["frames"] += 1
+    return True
+
+
+def _on_llm_res(state: _ParseState, line: _Line, m, gram: _Grammar) -> bool:
+    """Set the open call's response and recover the tool calls in it; always True."""
+    body = m.groupdict().get("body") or ""
+    if state.open_llm is not None:
+        state.llm[state.open_llm]["response"] = _body_shape(body)
+        state.llm[state.open_llm]["endSeq"] = line.seq
+    tool_call = _pat(gram.compiled, "tool_call")
+    if tool_call is not None:
+        for call in tool_call.finditer(body):
+            state.recovered.append(
+                {
+                    "seq": line.seq,
+                    "turnId": line.turn,
+                    "appRunId": line.run,
+                    "tool": call.group("tool"),
+                    "status": "called",
+                    "kind": None,
+                    "args": _body_shape(call.group("args")),
+                    "durationMs": None,
+                    "argsRecovered": True,
+                }
+            )
+    return True
+
+
+def _on_llm_err(state: _ParseState, line: _Line, m, gram: _Grammar) -> bool:
+    """Record an ``llm_err`` match; it closes the open call only before a response."""
+    g = m.groupdict()
+    err = {"class": g.get("cls"), "message": g.get("msg")}
+    if state.open_llm is not None and state.llm[state.open_llm].get("response") is None:
+        state.llm[state.open_llm]["error"] = err
+        state.llm[state.open_llm]["endSeq"] = line.seq
+        state.open_llm = None
+    state.errors.append(
+        {
+            "seq": line.seq,
+            "kind": "llm",
+            "turnId": line.turn,
+            "appRunId": line.run,
+            "detail": err,
+        }
+    )
+    _bump(state, line, "errors")
+    return True
+
+
+def _on_usage(state: _ParseState, line: _Line, m, gram: _Grammar) -> bool:
+    """Record a prose ``usage`` match; the open llm call stays open. Always True."""
+    g = m.groupdict()
+    usage = {
+        "seq": line.seq,
+        "turnId": line.turn,
+        "source": "prose",
+        "model": g.get("model"),
+        "requested": g.get("requested"),
+        "in": _int_or_none(g.get("in")),
+        "out": _int_or_none(g.get("out")),
+        # ``total`` is authoritative -- never recomputed as in+out.
+        "total": _int_or_none(g.get("total")),
+        "unattributed": _int_or_none(g.get("unattr")),
+        "finish": g.get("finish"),
+        "structured": False,
+    }
+    _attach_usage(state, line, usage)
+    return True
+
+
+def _on_note(state: _ParseState, line: _Line, m, gram: _Grammar) -> bool:
+    """Record a ``note`` match with its reading direction. Always True."""
+    g = m.groupdict()
+    state.notes.append(
+        {
+            "seq": line.seq,
+            "turnId": line.turn,
+            "appRunId": line.run,
+            "noteId": g.get("id"),
+            "text": g.get("text"),
+            "lang": "rtl" if _has_rtl(line.msg) else "ltr",
+        }
+    )
+    return True
+
+
+def _on_agent_turn(state: _ParseState, line: _Line, m, gram: _Grammar) -> bool:
+    """Record an ``agent_turn`` match as an utterance. Always True."""
+    g = m.groupdict()
+    state.utterances.append(
+        {
+            "seq": line.seq,
+            "turnId": line.turn,
+            "appRunId": line.run,
+            "text": g.get("text"),
+            "history": _int_or_none(g.get("history")),
+        }
+    )
+    return True
+
+
+def _on_agent_answer(state: _ParseState, line: _Line, m, gram: _Grammar) -> bool:
+    """Record an ``agent_answer`` match. Always True."""
+    state.answers.append(
+        {
+            "seq": line.seq,
+            "turnId": line.turn,
+            "appRunId": line.run,
+            "text": m.groupdict().get("text"),
+        }
+    )
+    return True
+
+
+def _on_tool_invoke(state: _ParseState, line: _Line, m, gram: _Grammar) -> bool:
+    """Open a narrated tool invocation from a ``tool_invoke`` match. Always True."""
+    g = m.groupdict()
+    state.invocations.append(
+        {
+            "seq": line.seq,
+            "turnId": line.turn,
+            "appRunId": line.run,
+            "tool": g.get("tool"),
+            "status": "called",
+            "kind": None,
+            "durationMs": None,
+            "args": None,
+            "loggedArgs": g.get("args"),
+            "resultText": None,
+            "endSeq": None,
+        }
+    )
+    return True
+
+
+def _on_tool_done(state: _ParseState, line: _Line, m, gram: _Grammar) -> bool:
+    """Close the newest open invocation of the same tool, if any. Always True."""
+    g = m.groupdict()
+    for entry in reversed(state.invocations):
+        if entry["tool"] == g.get("tool") and entry["resultText"] is None:
+            entry["resultText"] = g.get("result")
+            entry["status"] = "done"
+            entry["endSeq"] = line.seq
+            break
+    return True
+
+
+def _on_flow_state(state: _ParseState, line: _Line, m, gram: _Grammar) -> bool:
+    """Record a ``flow_state`` match: its head fields, then the fixed keys. Always True."""
+    g = m.groupdict()
+    rest = g.get("rest") or ""
+    head, _, note = rest.partition("note=")
+    field_pat = _pat(gram.compiled, "flow_field")
+    record = dict(field_pat.findall(head)) if field_pat is not None else {}
+    record.update(
+        {
+            "seq": line.seq,
+            "turnId": line.turn,
+            "appRunId": line.run,
+            "tool": g.get("tool"),
+            "note": note.strip() or None,
+        }
+    )
+    state.flow_states.append(record)
+    return True
+
+
+def _on_card_push(state: _ParseState, line: _Line, m, gram: _Grammar) -> bool:
+    """Record a ``card_push`` match. Always True."""
+    g = m.groupdict()
+    state.cards.append(
+        {
+            "seq": line.seq,
+            "turnId": line.turn,
+            "appRunId": line.run,
+            "kind": g.get("kind"),
+            "replaced": g.get("replaced") == "true",
+        }
+    )
+    return True
+
+
+# The prose matchers, tried in this order after the structured events. The order is the
+# behaviour: the first handler that returns True claims the line. ``call_res`` (unpaired),
+# ``prompt_msg`` and ``llm_frame`` (no open call) return False, so the later ones still run.
+_PROSE_ARMS = (
+    ("bind_req", _on_bind_req),
+    ("call_req", _on_call_req),
+    ("call_res", _on_call_res),
+    ("bind_res", _on_bind_res),
+    ("bind_err", _on_bind_err),
+    ("bind_retry", _on_bind_retry),
+    ("llm_req", _on_llm_req),
+    ("prompt_msg", _on_prompt_msg),
+    ("llm_frame", _on_llm_frame),
+    ("llm_res", _on_llm_res),
+    ("llm_err", _on_llm_err),
+    ("usage", _on_usage),
+    ("note", _on_note),
+    ("agent_turn", _on_agent_turn),
+    ("agent_answer", _on_agent_answer),
+    ("tool_invoke", _on_tool_invoke),
+    ("tool_done", _on_tool_done),
+    ("flow_state", _on_flow_state),
+    ("card_push", _on_card_push),
+)
+
+
+def _on_failure(state: _ParseState, line: _Line, gram: _Grammar) -> None:
+    """Record an ``agent_fail`` match, else an error-level line, as an error."""
+    m = _match(gram.compiled, "agent_fail", line.msg)
+    if m:
+        state.errors.append(
+            {
+                "seq": line.seq,
+                "kind": "agent",
+                "turnId": line.turn,
+                "appRunId": line.run,
+                "detail": {"message": (m.groupdict().get("msg") or "").strip()},
+            }
+        )
+        _bump(state, line, "errors")
+    elif line.ev.get("level") in ("E", "ERROR"):
+        state.errors.append(
+            {
+                "seq": line.seq,
+                "kind": "log",
+                "turnId": line.turn,
+                "appRunId": line.run,
+                "detail": {"category": line.cat, "message": line.msg},
+            }
+        )
+        _bump(state, line, "errors")
+
+
+def _runlog_entry(line: _Line, gram: _Grammar) -> dict | None:
+    """The run-log record of a line no matcher claimed, or None for a continuation or no head."""
+    if line.ev.get("cont"):
+        return None
+    head, _sep, rest = line.msg.partition("\n")
+    head = gram.head_re.sub("", head, count=1).strip()
+    if not head:
+        return None
+    net = _match(gram.compiled, "net", head)
+    ng = net.groupdict() if net else {}
+    return {
+        "seq": line.seq,
+        "turnId": line.turn,
+        "appRunId": line.run,
+        "lane": runlog_lane(head, gram.profile, gram.compiled),
+        "head": head,
+        "body": rest.strip() or None,
+        "verb": ng.get("verb"),
+        "url": ng.get("url"),
+        "outcome": ng.get("outcome"),
+        "bad": any(b in head for b in gram.bad_marks),
+        "category": line.cat,
+        "level": line.ev.get("level"),
+    }
+
+
+def _parse_event(state: _ParseState, ev, gram: _Grammar) -> None:
+    """Read one event: bookkeeping, then the first stream that claims it, else the run log."""
+    _enter_run(state, ev)
+    line = _line_of(ev, state.run_index)
+    _record_run(state, line)
+    _record_turn(state, line)
+    # Structured events first: they carry fields the prose cannot.
+    if _on_structured(state, line, gram):
+        return
+    for name, handler in _PROSE_ARMS:
+        m = _match(gram.compiled, name, line.msg)
+        if m and handler(state, line, m, gram):
+            return
+    _on_failure(state, line, gram)
+    # The fall-through stream: every narrated line no matcher claimed, kept whole.
+    entry = _runlog_entry(line, gram)
+    if entry is not None:
+        state.runlog.append(entry)
+
+
 def parse(events, logcat_lines, profile, compiled) -> dict:
     """Every stream the profile's grammar can read out of ``events``.
 
@@ -447,669 +1317,10 @@ def parse(events, logcat_lines, profile, compiled) -> dict:
     merged = 0
     if logcat_lines:
         merged = merge_logcat_network(events, logcat_lines, profile, compiled)
-    structured = getattr(profile, "structured", None) or {}
-    tool_cat = structured.get("tool_category")
-    cost_cat = structured.get("cost_category")
-    config_cat = structured.get("config_category")
-    tool_msgs = structured.get("tool_msgs") or []
-    cost_msgs = structured.get("cost_msgs") or []
-    config_msgs = structured.get("config_msg") or []
-    bad_marks = _names(getattr(profile, "runlog_bad", None) or [])
-    head_re = _head_re(profile, compiled)
-
-    bindings, llm, tools, notes, errors, runlog = [], [], [], [], [], []
-    open_binding: dict = {}
-    recovered = []
-    utterances, answers, invocations, flow_states, cards, configs = (
-        [],
-        [],
-        [],
-        [],
-        [],
-        [],
-    )
-    open_llm = None
-    last_usage = None
-    turns: dict = {}
-    runs: dict = {}
-    clock: dict = {}
-    run_index = object()
-
+    gram, state = _grammar_of(profile, compiled), _ParseState()
     for ev in events:
-        if ev.get("runIndex") != run_index:
-            run_index = ev.get("runIndex")
-            open_binding, open_llm, last_usage = {}, None, None
-        run = ev.get("appRunId") or (
-            "run-%s" % run_index if run_index is not None else None
-        )
-        seq = ev.get("seq")
-        ts = ev.get("ts")
-        if run:
-            r = runs.setdefault(
-                run,
-                {
-                    "appRunId": run,
-                    "runIndex": run_index,
-                    "firstSeq": seq,
-                    "lastSeq": seq,
-                    "firstTs": ts,
-                    "lastTs": ts,
-                    "llm": 0,
-                    "bindings": 0,
-                    "tools": 0,
-                    "errors": 0,
-                    "turns": 0,
-                },
-            )
-            r["lastSeq"] = seq
-            # A structured log carries epoch ms; a logcat capture carries the raw
-            # ``MM-DD HH:MM:SS.mmm`` stamp, which orders lexicographically within a
-            # year and is made numeric by ``evidence.normalise_clock``. Either way the
-            # clock is recorded, so a logcat-only run still has a window.
-            if (
-                isinstance(ts, (int, float, str))
-                and not isinstance(ts, bool)
-                and ts != ""
-            ):
-                try:
-                    if r["firstTs"] is None or ts < r["firstTs"]:
-                        r["firstTs"] = ts
-                    if r["lastTs"] is None or ts > r["lastTs"]:
-                        r["lastTs"] = ts
-                except TypeError:
-                    pass
-                clock.setdefault(run, {})[str(seq)] = ts
-
-        msg = ev.get("msg") or ""
-        fields = ev.get("fields") or {}
-        cat = ev.get("category")
-        turn = ev.get("turnId")
-        if turn:
-            t = turns.setdefault(
-                turn,
-                {
-                    "turnId": turn,
-                    "connectionId": ev.get("connectionId"),
-                    "appRunId": run,
-                    "firstSeq": seq,
-                    "lastSeq": seq,
-                    "llm": 0,
-                    "bindings": 0,
-                    "tools": 0,
-                    "errors": 0,
-                },
-            )
-            t["lastSeq"] = seq
-
-        def bump(key):
-            if turn:
-                turns[turn][key] += 1
-            if run:
-                runs[run][key] += 1
-
-        # -- structured events first: they carry fields the prose cannot --
-        if tool_cat and cat == tool_cat and _msg_in(msg, tool_msgs):
-            entry = {
-                "seq": seq,
-                "turnId": turn,
-                "appRunId": run,
-                "tool": fields.get("tool"),
-                "status": msg.split(".", 1)[1] if "." in msg else msg,
-                "kind": fields.get("kind"),
-                "args": _body_shape(fields.get("body.args")),
-                "durationMs": ev.get("durationMs"),
-            }
-            tools.append(entry)
-            bump("tools")
-            if entry["status"] == "failed":
-                errors.append({"seq": seq, "kind": "tool", "detail": entry})
-                bump("errors")
-            continue
-
-        if cost_cat and cat == cost_cat and _msg_in(msg, cost_msgs):
-            usage = {
-                "seq": seq,
-                "turnId": turn,
-                "appRunId": run,
-                "source": msg,
-                "model": fields.get("model"),
-                "requested": fields.get("requested"),
-                "in": _int_or_none(fields.get("promptTokens")),
-                "out": _int_or_none(fields.get("responseTokens")),
-                "total": _int_or_none(fields.get("totalTokens")),
-                "unattributed": _int_or_none(fields.get("unattributed")),
-                "finish": fields.get("finishReason"),
-                "structured": True,
-            }
-            if open_llm is not None and llm[open_llm].get("tokens") is None:
-                llm[open_llm]["tokens"] = usage
-                llm[open_llm]["endSeq"] = seq
-                last_usage = llm[open_llm]["tokens"]
-            elif _same_usage(last_usage, usage):
-                # The same round-trip, reported twice (prose then structured): the
-                # structured form replaces the prose in place, never appends.
-                last_usage.update(usage)
-            else:
-                llm.append(
-                    {
-                        "seq": seq,
-                        "turnId": turn,
-                        "appRunId": run,
-                        "model": usage["model"],
-                        "tokens": usage,
-                        "promptMessages": [],
-                        "orphanUsage": True,
-                    }
-                )
-                last_usage = llm[-1]["tokens"]
-            open_llm = None
-            continue
-
-        if config_cat and cat == config_cat and _msg_in(msg, config_msgs):
-            configs.append(
-                {"seq": seq, "turnId": turn, "appRunId": run, "fields": dict(fields)}
-            )
-            continue
-
-        # -- narrated prose, by stream --
-        m = _match(compiled, "bind_req", msg)
-        if m:
-            g = m.groupdict()
-            bindings.append(
-                {
-                    "seq": seq,
-                    "turnId": turn,
-                    "appRunId": run,
-                    "binding": g.get("name"),
-                    "verb": g.get("verb"),
-                    "url": g.get("url"),
-                    "args": _maybe_json(g.get("args")) or g.get("args"),
-                    "forDependentSuffix": g.get("dep"),
-                    "status": None,
-                    "statusKnown": False,
-                    "ok": None,
-                    "response": None,
-                    "retried": False,
-                    "endSeq": None,
-                }
-            )
-            open_binding.setdefault(g.get("name"), []).append(len(bindings) - 1)
-            bump("bindings")
-            continue
-
-        m = _match(compiled, "call_req", msg)
-        if m:
-            g = m.groupdict()
-            target = (g.get("target") or "").strip()
-            is_url = target.startswith(("http://", "https://"))
-            bindings.append(
-                {
-                    "seq": seq,
-                    "turnId": turn,
-                    "appRunId": run,
-                    "binding": g.get("name"),
-                    "verb": g.get("verb"),
-                    "url": target if is_url else None,
-                    "target": None if is_url else target,
-                    "args": g.get("args"),
-                    "retried": False,
-                    "ok": None,
-                    "status": None,
-                    "statusKnown": False,
-                    "response": None,
-                    "endSeq": None,
-                }
-            )
-            open_binding.setdefault("sh:" + str(g.get("name")), []).append(
-                len(bindings) - 1
-            )
-            bump("bindings")
-            continue
-
-        m = _match(compiled, "call_res", msg)
-        if m:
-            g = m.groupdict()
-            idx = _take_open(open_binding, "sh:" + str(g.get("name")))
-            status, body = g.get("status"), g.get("body")
-            summary = (g.get("summary") or "").strip()
-            entry = {
-                "text": body if body else summary,
-                "omitted": 0,
-                "json": _maybe_json(body) if body else None,
-            }
-            if idx is not None:
-                bindings[idx].update(
-                    {
-                        "ok": True,
-                        "status": int(status) if status else None,
-                        "statusKnown": bool(status),
-                        "summary": summary,
-                        "response": entry,
-                        "endSeq": seq,
-                    }
-                )
-                continue
-            # An unpaired shorthand response is NOT a call: it falls through to the
-            # narrated lane it has always been in.
-
-        m = _match(compiled, "bind_res", msg)
-        if m:
-            g = m.groupdict()
-            idx = _take_open(open_binding, g.get("name"))
-            body = g.get("body") or ""
-            clipped = RE_TRUNC_TAIL.search(body)
-            entry = {
-                "text": RE_TRUNC_TAIL.sub("", body) if clipped else body,
-                "omitted": int(clipped.group(1)) if clipped else 0,
-                "json": _maybe_json(RE_TRUNC_TAIL.sub("", body)),
-            }
-            target = (
-                bindings[idx]
-                if idx is not None
-                else {
-                    "seq": seq,
-                    "turnId": turn,
-                    "appRunId": run,
-                    "binding": g.get("name"),
-                    "verb": None,
-                    "url": None,
-                    "args": None,
-                    "orphanResponse": True,
-                    "retried": False,
-                }
-            )
-            # Success is known; the exact 2xx is NOT -- never a fabricated 200.
-            target.update(
-                {
-                    "ok": True,
-                    "status": None,
-                    "statusKnown": False,
-                    "response": entry,
-                    "endSeq": seq,
-                }
-            )
-            if idx is None:
-                bindings.append(target)
-                bump("bindings")
-            continue
-
-        m = _match(compiled, "bind_err", msg)
-        if m:
-            g = m.groupdict()
-            idx = _take_open(open_binding, g.get("name"))
-            detail = {
-                "ok": False,
-                "status": _int_or_none(g.get("status")),
-                "statusKnown": g.get("status") is not None,
-                "endSeq": seq,
-                "response": {
-                    "text": g.get("body"),
-                    "omitted": None,
-                    "json": _maybe_json(g.get("body")),
-                },
-            }
-            if idx is not None:
-                bindings[idx].update(detail)
-                errors.append({"seq": seq, "kind": "binding", "detail": bindings[idx]})
-            else:
-                orphan = {
-                    "seq": seq,
-                    "turnId": turn,
-                    "appRunId": run,
-                    "binding": g.get("name"),
-                    "verb": None,
-                    "url": None,
-                    "args": None,
-                    "retried": False,
-                    "orphanResponse": True,
-                }
-                orphan.update(detail)
-                bindings.append(orphan)
-                errors.append({"seq": seq, "kind": "binding", "detail": orphan})
-                bump("bindings")
-            bump("errors")
-            continue
-
-        m = _match(compiled, "bind_retry", msg)
-        if m:
-            queue = open_binding.get(m.groupdict().get("name"))
-            if queue:
-                bindings[queue[0]]["retried"] = True
-            continue
-
-        m = _match(compiled, "llm_req", msg)
-        if m:
-            g = m.groupdict()
-            llm.append(
-                {
-                    "seq": seq,
-                    "turnId": turn,
-                    "appRunId": run,
-                    "model": g.get("model"),
-                    "stream": bool(g.get("stream")),
-                    "msgs": _int_or_none(g.get("msgs")),
-                    "tools": _int_or_none(g.get("tools")),
-                    "promptMessages": [],
-                    "frames": 0,
-                    "response": None,
-                    "tokens": None,
-                    "error": None,
-                    "endSeq": None,
-                }
-            )
-            open_llm = len(llm) - 1
-            # Prompt messages on the tail of the same record (structured path); a body
-            # that spans lines is appended to the message before it.
-            for _line in msg[m.end() :].split("\n"):
-                _p = _match(compiled, "prompt_msg", _line)
-                if _p:
-                    llm[open_llm]["promptMessages"].append(
-                        _body_shape(_p.group("body"))
-                    )
-                elif llm[open_llm]["promptMessages"] and _line.strip():
-                    _prev = llm[open_llm]["promptMessages"][-1]
-                    if isinstance(_prev, dict) and isinstance(_prev.get("text"), str):
-                        _prev["text"] += "\n" + _line
-            bump("llm")
-            continue
-
-        m = _match(compiled, "prompt_msg", msg)
-        if m and open_llm is not None:
-            llm[open_llm]["promptMessages"].append(_body_shape(m.group("body")))
-            continue
-
-        m = _match(compiled, "llm_frame", msg)
-        if m and open_llm is not None:
-            llm[open_llm]["frames"] += 1
-            continue
-
-        m = _match(compiled, "llm_res", msg)
-        if m:
-            body = m.groupdict().get("body") or ""
-            if open_llm is not None:
-                llm[open_llm]["response"] = _body_shape(body)
-                llm[open_llm]["endSeq"] = seq
-            tool_call = _pat(compiled, "tool_call")
-            if tool_call is not None:
-                for call in tool_call.finditer(body):
-                    recovered.append(
-                        {
-                            "seq": seq,
-                            "turnId": turn,
-                            "appRunId": run,
-                            "tool": call.group("tool"),
-                            "status": "called",
-                            "kind": None,
-                            "args": _body_shape(call.group("args")),
-                            "durationMs": None,
-                            "argsRecovered": True,
-                        }
-                    )
-            continue
-
-        m = _match(compiled, "llm_err", msg)
-        if m:
-            g = m.groupdict()
-            err = {"class": g.get("cls"), "message": g.get("msg")}
-            if open_llm is not None and llm[open_llm].get("response") is None:
-                llm[open_llm]["error"] = err
-                llm[open_llm]["endSeq"] = seq
-                open_llm = None
-            errors.append(
-                {
-                    "seq": seq,
-                    "kind": "llm",
-                    "turnId": turn,
-                    "appRunId": run,
-                    "detail": err,
-                }
-            )
-            bump("errors")
-            continue
-
-        m = _match(compiled, "usage", msg)
-        if m:
-            g = m.groupdict()
-            usage = {
-                "seq": seq,
-                "turnId": turn,
-                "source": "prose",
-                "model": g.get("model"),
-                "requested": g.get("requested"),
-                "in": _int_or_none(g.get("in")),
-                "out": _int_or_none(g.get("out")),
-                # ``total`` is authoritative -- never recomputed as in+out.
-                "total": _int_or_none(g.get("total")),
-                "unattributed": _int_or_none(g.get("unattr")),
-                "finish": g.get("finish"),
-                "structured": False,
-            }
-            if open_llm is not None and llm[open_llm].get("tokens") is None:
-                llm[open_llm]["tokens"] = usage
-                llm[open_llm]["endSeq"] = seq
-                last_usage = llm[open_llm]["tokens"]
-            elif _same_usage(last_usage, usage):
-                last_usage.update(usage)
-            else:
-                llm.append(
-                    {
-                        "seq": seq,
-                        "turnId": turn,
-                        "appRunId": run,
-                        "model": usage["model"],
-                        "tokens": usage,
-                        "promptMessages": [],
-                        "orphanUsage": True,
-                    }
-                )
-                last_usage = llm[-1]["tokens"]
-            continue
-
-        m = _match(compiled, "note", msg)
-        if m:
-            g = m.groupdict()
-            notes.append(
-                {
-                    "seq": seq,
-                    "turnId": turn,
-                    "appRunId": run,
-                    "noteId": g.get("id"),
-                    "text": g.get("text"),
-                    "lang": "rtl" if _has_rtl(msg) else "ltr",
-                }
-            )
-            continue
-
-        m = _match(compiled, "agent_turn", msg)
-        if m:
-            g = m.groupdict()
-            utterances.append(
-                {
-                    "seq": seq,
-                    "turnId": turn,
-                    "appRunId": run,
-                    "text": g.get("text"),
-                    "history": _int_or_none(g.get("history")),
-                }
-            )
-            continue
-
-        m = _match(compiled, "agent_answer", msg)
-        if m:
-            answers.append(
-                {
-                    "seq": seq,
-                    "turnId": turn,
-                    "appRunId": run,
-                    "text": m.groupdict().get("text"),
-                }
-            )
-            continue
-
-        m = _match(compiled, "tool_invoke", msg)
-        if m:
-            g = m.groupdict()
-            invocations.append(
-                {
-                    "seq": seq,
-                    "turnId": turn,
-                    "appRunId": run,
-                    "tool": g.get("tool"),
-                    "status": "called",
-                    "kind": None,
-                    "durationMs": None,
-                    "args": None,
-                    "loggedArgs": g.get("args"),
-                    "resultText": None,
-                    "endSeq": None,
-                }
-            )
-            continue
-
-        m = _match(compiled, "tool_done", msg)
-        if m:
-            g = m.groupdict()
-            for entry in reversed(invocations):
-                if entry["tool"] == g.get("tool") and entry["resultText"] is None:
-                    entry["resultText"] = g.get("result")
-                    entry["status"] = "done"
-                    entry["endSeq"] = seq
-                    break
-            continue
-
-        m = _match(compiled, "flow_state", msg)
-        if m:
-            g = m.groupdict()
-            rest = g.get("rest") or ""
-            head, _, note = rest.partition("note=")
-            field_pat = _pat(compiled, "flow_field")
-            state = dict(field_pat.findall(head)) if field_pat is not None else {}
-            state.update(
-                {
-                    "seq": seq,
-                    "turnId": turn,
-                    "appRunId": run,
-                    "tool": g.get("tool"),
-                    "note": note.strip() or None,
-                }
-            )
-            flow_states.append(state)
-            continue
-
-        m = _match(compiled, "card_push", msg)
-        if m:
-            g = m.groupdict()
-            cards.append(
-                {
-                    "seq": seq,
-                    "turnId": turn,
-                    "appRunId": run,
-                    "kind": g.get("kind"),
-                    "replaced": g.get("replaced") == "true",
-                }
-            )
-            continue
-
-        m = _match(compiled, "agent_fail", msg)
-        if m:
-            errors.append(
-                {
-                    "seq": seq,
-                    "kind": "agent",
-                    "turnId": turn,
-                    "appRunId": run,
-                    "detail": {"message": (m.groupdict().get("msg") or "").strip()},
-                }
-            )
-            bump("errors")
-        elif ev.get("level") in ("E", "ERROR"):
-            errors.append(
-                {
-                    "seq": seq,
-                    "kind": "log",
-                    "turnId": turn,
-                    "appRunId": run,
-                    "detail": {"category": cat, "message": msg},
-                }
-            )
-            bump("errors")
-
-        # The fall-through stream: every narrated line no matcher claimed, kept whole.
-        if ev.get("cont"):
-            continue
-        head, _sep, rest = msg.partition("\n")
-        head = head_re.sub("", head, count=1).strip()
-        if not head:
-            continue
-        net = _match(compiled, "net", head)
-        ng = net.groupdict() if net else {}
-        runlog.append(
-            {
-                "seq": seq,
-                "turnId": turn,
-                "appRunId": run,
-                "lane": runlog_lane(head, profile, compiled),
-                "head": head,
-                "body": rest.strip() or None,
-                "verb": ng.get("verb"),
-                "url": ng.get("url"),
-                "outcome": ng.get("outcome"),
-                "bad": any(b in head for b in bad_marks),
-                "category": cat,
-                "level": ev.get("level"),
-            }
-        )
-
-    unresolved = [bindings[i]["binding"] for q in open_binding.values() for i in q]
-    # One tool call from two half-witnesses: the invocation line carries the outcome,
-    # the model's own reply carries the real arguments.
-    if invocations:
-        pool = list(recovered)
-        for entry in invocations:
-            for i, cand in enumerate(pool):
-                if cand["tool"] == entry["tool"]:
-                    entry["args"] = cand["args"]
-                    entry["argsRecovered"] = True
-                    pool.pop(i)
-                    break
-        if not tools:
-            tools = invocations
-    elif not tools and recovered:
-        tools = recovered
-    for t in tools:
-        if t.get("turnId") and t["turnId"] in turns:
-            turns[t["turnId"]]["tools"] += 1
-        if t.get("appRunId") and t["appRunId"] in runs:
-            runs[t["appRunId"]]["tools"] += 1
-    for t in turns.values():
-        if t.get("appRunId") and t["appRunId"] in runs:
-            runs[t["appRunId"]]["turns"] += 1
-
-    disabled = _disabled_pairs(compiled)
-    for name in STREAMS:
-        if _pat(compiled, name) is None and not any(d[0] == name for d in disabled):
-            disabled.append((name, "no pattern in the profile"))
-    return {
-        "clock": clock,
-        "bindings": bindings,
-        "llm": llm,
-        "tools": tools,
-        "notes": notes,
-        "errors": errors,
-        "runlog": runlog,
-        "utterances": utterances,
-        "answers": answers,
-        "flowStates": flow_states,
-        "cards": cards,
-        "configs": configs,
-        "turns": [
-            turns[k] for k in sorted(turns, key=lambda k: turns[k]["firstSeq"] or 0)
-        ],
-        "appRuns": sorted(runs.values(), key=lambda r: r["runIndex"]),
-        "unresolvedBindings": unresolved,
-        "mergedNetworkLines": merged,
-        "disabled": disabled,
-    }
+        _parse_event(state, ev, gram)
+    return _parse_result(state, merged, _disabled_streams(compiled))
 
 
 # ── the system prompt, reassembled at the LINE level ───────────────────────────

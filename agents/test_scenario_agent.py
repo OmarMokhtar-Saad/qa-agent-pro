@@ -1111,6 +1111,145 @@ class PreparedGeneration:
     target_description: str = ""
 
 
+def _source_acs(
+    url_content: dict | None, stripped_feature: str, feature_text: str
+) -> tuple[list[AcceptanceCriterion], list[AcceptanceCriterion], bool, bool]:
+    """AC sourcing phase of ``_prepare_generation``.
+
+    Returns ``(acs, source_acs, need_acs, host_ac_job)``. ``source_acs`` holds
+    only REAL, source-parsed criteria (empty when the host must derive them),
+    the one ground truth the AC-anchoring check may anchor against. When no
+    criteria exist the HOST derives them (``agents.host_mode.AC_JOB``); there is
+    no server-side synthesis, so ``host_ac_job`` always equals ``need_acs``.
+    """
+    acs: list[AcceptanceCriterion] = []
+    source_acs: list[AcceptanceCriterion] = []
+    if url_content and not url_content.get("error"):
+        acs = parse_acceptance_criteria(
+            url_content.get("acceptance_criteria", "") or ""
+        )
+        if acs:
+            source_acs = list(acs)
+            logger.info("Parsed %d acceptance criteria for RTM", len(acs))
+
+    # PASTED-TEXT path: a pasted feature carrying its own "Acceptance Criteria"
+    # heading has WRITTEN source criteria. Same parser as the Jira path, over
+    # ``stripped_feature`` (the text exactly as pasted, never the rewritten
+    # feature_text), and gated on ``not url_content`` so the Jira path is
+    # untouched in both directions.
+    if not acs and not url_content:
+        pasted_ac = _extract_ac_from_description(stripped_feature)
+        if pasted_ac:
+            acs = parse_acceptance_criteria(pasted_ac)
+            if acs:
+                source_acs = list(acs)
+                logger.info(
+                    "Parsed %d acceptance criteria from the pasted feature text",
+                    len(acs),
+                )
+
+    need_acs = not acs and bool(feature_text and feature_text.strip())
+    return acs, source_acs, need_acs, need_acs
+
+
+def _build_rtm_hint(
+    acs: list[AcceptanceCriterion],
+    nav_scope_directive: str,
+    parent_scope_directive: str,
+    rule_packs: object,
+    host_ac_job: bool,
+) -> str:
+    """The hint injected into every category system prompt.
+
+    The AC block, the source-URL scope directive (never navigate to the Jira
+    link) and the parent scope directive come first; the rule-pack clause is
+    appended after them. It carries only code constants, never untrusted text.
+    The host AC directive is last, and only when the ticket carried no criteria
+    at all, so the HOST derives them.
+    """
+    rtm_hint = (
+        format_ac_prompt_block(acs) + nav_scope_directive + parent_scope_directive
+    )
+    rtm_hint = rtm_hint + format_rule_pack_prompt_block(rule_packs)
+    if host_ac_job:
+        rtm_hint = rtm_hint + _HOST_AC_JOB_DIRECTIVE
+    return rtm_hint
+
+
+def _jira_prompt_parts(
+    url_content: dict | None,
+    raw_ac_text: str,
+    parent_context: str,
+    feature_text: str,
+) -> tuple[list[str], str, str, bool]:
+    """Jira blocks: (parts, jira_context_text, target_description, has_jira_images).
+
+    No ticket, or an errored one, gives ``([], "", feature_text or "", False)``:
+    the pasted-description path grounds on the tester's own text. A ticket's
+    target_description is its DESCRIPTION only (raw_text carries the comment
+    thread), so an empty description gives "" -- never feature_text.
+    Caps go TO wrap_untrusted (2026-08-31, F1/F2): slicing first defeated its
+    "...[truncated]" marker and cut tickets silently. The parent story keeps its
+    OWN label and appears only when a parent exists, so a parentless prompt is
+    byte-identical (the containment test counts untrusted blocks). Ticket images
+    ride to the host's own model (IMAGE_JOB); only their presence is recorded.
+    """
+    if not url_content or url_content.get("error"):
+        return [], "", feature_text or "", False
+    parts: list[str] = []
+    jira_context_text = _strip_html(
+        url_content.get("raw_text", "") or url_content.get("description", "")
+    )
+    target_description = _strip_html(url_content.get("description", "") or "")
+    if jira_context_text:
+        limit = settings.jira_max_context_chars or 12000
+        parts.append(
+            "## Feature Documentation\n"
+            + wrap_untrusted("jira_or_web_content", jira_context_text, limit=limit)
+        )
+    if raw_ac_text:
+        limit = settings.jira_max_ac_chars or 6000
+        parts.append(
+            "## Acceptance Criteria\n"
+            + wrap_untrusted("jira_acceptance_criteria", raw_ac_text, limit=limit)
+        )
+    if parent_context:
+        limit = settings.jira_max_parent_chars
+        parts.append(
+            "## Parent Story (BACKGROUND ONLY — do not test this directly)\n"
+            + wrap_untrusted("jira_parent_story", parent_context, limit=limit)
+        )
+    has_jira_images = bool(url_content.get("images"))
+    return parts, jira_context_text, target_description, has_jira_images
+
+
+def _source_doc_parts(
+    spec_text: str | None, openapi_text: str | None, ui_content: dict | None
+) -> list[str]:
+    """Untrusted spec, OpenAPI and live-UI blocks, in that order.
+
+    The spec cap (20_000) is INLINED: settings.qa_max_spec_chars was deleted in
+    batch D1 (2026-08-15) with tools/doc_ingest.py, spec_text's only producer,
+    so the block is latent and a revived producer inherits the same bound.
+    """
+    parts: list[str] = []
+    if spec_text and spec_text.strip():
+        parts.append(
+            "## Requirements / Spec Document\n"
+            + wrap_untrusted("spec_document", spec_text, limit=20_000)
+        )
+    if openapi_text and openapi_text.strip():
+        parts.append(
+            "## API Specification (OpenAPI/Swagger)\n"
+            + wrap_untrusted("openapi_spec", openapi_text[:12000])
+        )
+    if ui_content and not ui_content.get("error"):
+        ui_block = _build_ui_prompt_block(ui_content)
+        if ui_block:
+            parts.append(wrap_untrusted("live_ui_structure", ui_block))
+    return parts
+
+
 async def _prepare_generation(
     feature_text: str,
     url_content: dict | None = None,
@@ -1254,53 +1393,11 @@ async def _prepare_generation(
     # three AND the containment control that sanitised the block --
     # docs/RETIRED_CAPABILITIES.md section 4.
 
-    # Parse explicit acceptance criteria from Jira content first (sync, fast; an
-    # empty list for non-Jira URLs). This decides whether AC synthesis is needed.
-    acs: list[AcceptanceCriterion] = []
-    # REAL, source-parsed ACs (empty when they are synthesized below) — the only
-    # ground truth the AC-anchoring check (Fix 3) may anchor against.
-    source_acs: list[AcceptanceCriterion] = []
-    if url_content and not url_content.get("error"):
-        raw_ac = url_content.get("acceptance_criteria", "") or ""
-        acs = parse_acceptance_criteria(raw_ac)
-        if acs:
-            source_acs = list(acs)
-            logger.info("Parsed %d acceptance criteria for RTM", len(acs))
-
-    # PASTED-TEXT path (2026-08-15). A tester who pastes a feature description
-    # carrying its own "Acceptance Criteria" heading has WRITTEN source criteria,
-    # but nothing parsed them: _extract_ac_from_description only ever ran on a
-    # Jira DESCRIPTION. So prepare reported "this ticket carries no acceptance
-    # criteria", shipped AC_JOB, and the tester's own criteria came back labelled
-    # MODEL-DERIVED (live repro: prep 4be6301e86ea4ec0bc0e28a69a970161, 7 written
-    # ACs demoted). Everything downstream follows from source_acs/acs being set
-    # here -- _need_acs, the _HOST_AC_JOB_DIRECTIVE, mcp_handlers' _ac_job (and
-    # with it the AC job and its notice), and the finalize RTM's
-    # `derived=bool(acs) and not source_acs`.
-    #
-    # The SAME parser as the Jira path, deliberately, so the two can never
-    # disagree about what an AC block is. Over ``stripped_feature`` -- the text
-    # exactly as pasted -- and never ``feature_text``, which _scope_feature_text
-    # has already rewritten with title/UI/scope material by this line.
-    #
-    # Gated on ``not url_content``, so the Jira path is untouched in BOTH
-    # directions: a fetched ticket keeps parsing only its own AC field, and a
-    # ticket whose fetch errored does not get its URL string scanned instead.
-    if not acs and not url_content:
-        pasted_ac = _extract_ac_from_description(stripped_feature)
-        if pasted_ac:
-            acs = parse_acceptance_criteria(pasted_ac)
-            if acs:
-                source_acs = list(acs)
-                logger.info(
-                    "Parsed %d acceptance criteria from the pasted feature text",
-                    len(acs),
-                )
-
-    # T-05 (I-028): the independent enrichment calls — compliance web search, RAG
-    # query, and (when no explicit ACs) AC synthesis — depend only on feature_text,
-    # so fan them out concurrently instead of awaiting them one after another.
-    _need_acs = not acs and bool(feature_text and feature_text.strip())
+    # Explicit ACs from the Jira field or the pasted text; `host_ac_job` asks
+    # the HOST to derive them when none exist (agents.host_mode.AC_JOB).
+    acs, source_acs, _, host_ac_job = _source_acs(
+        url_content, stripped_feature, feature_text
+    )
     # Batch 2 Pass 1: the atomic requirements checklist. Joins the EXISTING
     # concurrent enrichment gather so its single ask_json costs no extra wall
     # clock. decompose_to_checklist returns [] with ZERO LLM calls when the
@@ -1328,13 +1425,6 @@ async def _prepare_generation(
             :MAX_DESCRIPTION_CHARS
         ]
 
-    # synthesize_acs / decompose_checklist / warm_cache went with the three
-    # server-side calls they gated. This is what remains of the AC decision:
-    # when the ticket carries no criteria the HOST derives them, and the
-    # directive below is how it is asked (agents.host_mode.AC_JOB). It is now
-    # unconditional -- there is no server-side synthesis left to prefer.
-    _host_ac_job = _need_acs
-
     # The atomic checklist is derived by the tester's OWN model
     # (agents.host_mode.CHECKLIST_JOB, stage step_zero) and arrives on the
     # SUBMISSION, where tools/mcp_handlers.py validates its shape and sets
@@ -1353,8 +1443,6 @@ async def _prepare_generation(
     # its constant {} so nothing downstream reads it by ABSENCE.
     checklist_audit: dict = {}
 
-    parts: list[str] = []
-
     # jira_image_text / attached_image_text / image_notice are retained as
     # PreparedGeneration fields and are now always "": the server-side vision
     # calls that populated them were deleted on 2026-08-16 (P2-F1). The
@@ -1362,72 +1450,13 @@ async def _prepare_generation(
     # still lights up for a ticket or chat attachment.
     jira_image_text = ""
     attached_image_text = ""
-    jira_context_text = ""
     image_notice = ""
-    # Falls back to the tester's own feature text on the pasted-description path,
-    # where there is no ticket to read a description from.
-    target_description = feature_text or ""
-    has_jira_images = False
     has_attached_images = False
-
-    if url_content and not url_content.get("error"):
-        jira_context_text = _strip_html(
-            url_content.get("raw_text", "") or url_content.get("description", "")
-        )
-        # DESCRIPTION only -- deliberately not raw_text, which has the comment
-        # thread appended to it. The grounding checks read this.
-        target_description = _strip_html(url_content.get("description", "") or "")
-        if jira_context_text:
-            # 2026-08-31 (F1): this was `jira_context_text[:3000]`. Slicing
-            # BEFORE wrap_untrusted defeated its own "...[truncated]" marker,
-            # so a 4.6 KB ticket lost its message table, its design link and
-            # all sixteen comments with nothing said anywhere. Hand the cap to
-            # wrap_untrusted instead and let it disclose the cut.
-            parts.append(
-                "## Feature Documentation\n"
-                + wrap_untrusted(
-                    "jira_or_web_content",
-                    jira_context_text,
-                    limit=settings.jira_max_context_chars or 12000,
-                )
-            )
-        # _raw_ac_text is the SAME _strip_html(acceptance_criteria) value,
-        # hoisted above the enrichment gather for Pass 1 — computed once here
-        # rather than maintained in two places.
-        if _raw_ac_text:
-            # 2026-08-31 (F2): same defect, same fix -- the 2000-char slice cut
-            # TICKET-10051's acceptance criteria mid-word at "BR07: Upon", so
-            # seven of fourteen rules never reached the model OR the coverage
-            # report, undisclosed.
-            parts.append(
-                "## Acceptance Criteria\n"
-                + wrap_untrusted(
-                    "jira_acceptance_criteria",
-                    _raw_ac_text,
-                    limit=settings.jira_max_ac_chars or 6000,
-                )
-            )
-        if parent_context:
-            # Its OWN untrusted label, never folded into jira_or_web_content:
-            # parent text is authored by other people, so the containment
-            # boundary and the source attribution must stay distinct. Emitted
-            # ONLY when a parent actually exists, so a parentless ticket's prompt
-            # is byte-identical to before (prompt-injection containment test
-            # counts the untrusted blocks).
-            parts.append(
-                "## Parent Story (BACKGROUND ONLY — do not test this directly)\n"
-                + wrap_untrusted(
-                    "jira_parent_story",
-                    parent_context,
-                    limit=settings.jira_max_parent_chars,
-                )
-            )
-        images = url_content.get("images") or []
-        if images:
-            # The raw screenshots ride to the host's OWN multimodal model as MCP
-            # image content (agents/host_mode.IMAGE_JOB); record only that images
-            # are present so the rule packs still see images_present.
-            has_jira_images = True
+    # _raw_ac_text is the SAME _strip_html(acceptance_criteria) value hoisted
+    # above for Pass 1, so it is computed once rather than in two places.
+    parts, jira_context_text, target_description, has_jira_images = _jira_prompt_parts(
+        url_content, _raw_ac_text, parent_context, feature_text
+    )
 
     if attached_images:
         # Same as the ticket images above: the raw screenshots ride to the host's
@@ -1437,27 +1466,7 @@ async def _prepare_generation(
         # path that needs no key at all.
         has_attached_images = True
 
-    if spec_text and spec_text.strip():
-        # 20_000 was settings.qa_max_spec_chars, DELETED 2026-08-15
-        # (batch D1) together with tools/doc_ingest.py, which was the
-        # only producer spec_text ever had -- no caller passes it today,
-        # so this block is latent. The cap is INLINED rather than
-        # dropped so a revived producer inherits the same bound.
-        parts.append(
-            "## Requirements / Spec Document\n"
-            + wrap_untrusted("spec_document", spec_text, limit=20_000)
-        )
-
-    if openapi_text and openapi_text.strip():
-        parts.append(
-            "## API Specification (OpenAPI/Swagger)\n"
-            + wrap_untrusted("openapi_spec", openapi_text[:12000])
-        )
-
-    if ui_content and not ui_content.get("error"):
-        ui_block = _build_ui_prompt_block(ui_content)
-        if ui_block:
-            parts.append(wrap_untrusted("live_ui_structure", ui_block))
+    parts += _source_doc_parts(spec_text, openapi_text, ui_content)
 
     # --- Batch 3 rule packs -----------------------------------------
     # Three domain rules (EN/AR bilingual, atomicity/anti-bundling,
@@ -1524,53 +1533,13 @@ async def _prepare_generation(
 
     user_msg = "\n\n".join(parts)
 
-    # Build RTM hint once — injected into every category system prompt. The
-    # source-URL scope directive (Fix 1) rides along so every category is told
-    # the Jira link is a reference, never a navigation target.
-    # Batch 2: the checklist hint is ADDITIVE to the acceptance-criteria block,
-    # never a replacement for it. Superseding format_ac_prompt_block made the
-    # model tag cases with CL ids, which normalize_ac_id cannot parse — so
-    # build_rtm_summary printed "0 of N ACs covered" plus an orphan-test list and
-    # ac_anchor printed "Cite a non-existent AC id", immediately above a
-    # checklist section claiming ~95%. Two contradictory coverage numbers in one
-    # report destroy the auditability this feature exists to create. Keeping both
-    # blocks keeps requirement_id AC-shaped (the hint explicitly forbids CL ids
-    # there), so every legacy AC-layer behaviour is untouched by the flag and the
-    # checklist adds a clearly-labelled SECOND, externally-computed view.
-    # checklist_scope_directive left this expression with the checklist
-    # block above: checklist_generation_hint was called only
-    # `if checklist_items`, so it produced "" on every prepare and
-    # contributed nothing to rtm_hint.
-    rtm_hint = (
-        format_ac_prompt_block(acs) + nav_scope_directive + parent_scope_directive
+    # RTM hint, built once and injected into every category system prompt (and
+    # the remediation round, quality retry and cursor-fallback rebuild). The
+    # checklist hint is ADDITIVE to the AC block, never a replacement: CL ids
+    # are not AC-shaped, so superseding it printed contradictory coverage numbers.
+    rtm_hint = _build_rtm_hint(
+        acs, nav_scope_directive, parent_scope_directive, rule_packs, host_ac_job
     )
-
-    # Batch 3: the rule-pack clause rides in the SYSTEM prompt via
-    # rtm_hint, so it reaches every category, the remediation round, the
-    # quality retry and the cursor-fallback rebuild -- the same carrier the
-    # AC block and the nav/parent scope directives already use.
-    #
-    # APPENDED as a separate statement instead of edited into the
-    # `rtm_hint = ( ... )` expression above: several batches have rewritten
-    # that expression over time -- Batch 2's checklist_generation_hint
-    # (deleted by 3a on 2026-08-16) and Batch 1's amendment_directive
-    # (deleted by batch D5 on 2026-08-15) -- and several batches editing
-    # the same three lines means whichever lands first destroys the
-    # others' anchor. This anchor is untouched by all of them.
-    #
-    # The block carries ONLY code constants, opaque EN/AR message keys and
-    # the sanitised source reference -- never untrusted ticket text -- so it
-    # needs no wrap_untrusted boundary and adds no untrusted block to the
-    # user message (the prompt-injection containment test counts those).
-    rtm_hint = rtm_hint + format_rule_pack_prompt_block(rule_packs)
-
-    # Host AC boomerang: appended as a SEPARATE statement for the same
-    # reason the rule-pack block above is -- three batches already rewrite
-    # the `rtm_hint = ( ... )` expression, and whichever lands first would
-    # destroy the others' anchor. Empty unless the ticket carried no
-    # acceptance criteria at all, in which case the HOST derives them.
-    if _host_ac_job:
-        rtm_hint = rtm_hint + _HOST_AC_JOB_DIRECTIVE
 
     # The prompt-cache warm-up lived here until 2026-08-16 (dead-code deletion
     # P2-F2). Under `warm_cache and prompt_cache_enabled()` it made one

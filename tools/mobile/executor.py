@@ -3116,6 +3116,817 @@ async def _replay_keyboard(script: object, ctx: Context) -> dict:
     return replied
 
 
+@dataclasses.dataclass(frozen=True)
+class _ReplayRun:
+    """What one replay carries from step to step: the context, the actions and
+    the trace being built. Passed to the step helpers of ``_replay_steps``."""
+
+    ctx: Context
+    items: list
+    trace: list[dict]
+
+
+async def _replay_first_screen(
+    ctx: Context, items: list, screen: dict | None, trace: list[dict]
+) -> tuple[dict | None, dict | None]:
+    """The screen the first action sees, or the reply that ends the replay
+    before it starts: ``(screen, reply)``, ``reply`` is ``None`` to go on."""
+    if not items:
+        return screen, {
+            "error": None,
+            "content": _result(
+                STATUS_ERROR, trace, screen, "", "The script had no actions.", -1
+            ),
+        }
+    if screen is None:
+        dumped = await _first_screen(ctx)
+        if dumped.get("error"):
+            return screen, {
+                "error": None,
+                "content": _result(
+                    STATUS_ERROR, trace, None, "", str(dumped["error"]), -1
+                ),
+            }
+        screen = dumped.get("content")
+    return screen, None
+
+
+def _budget_stop(run: _ReplayRun, index: int, screen: dict | None) -> dict:
+    """The reply for a replay that ran out of wall-clock before action *index*."""
+    # SERVER-SIDE queue (defect F2): the unreached actions ride along on THIS
+    # reply so the next submit can run them first instead of the model
+    # retyping them.
+    # A route replay queues NOTHING: the remainder has not been checked
+    # against its saved screens and must not run blind.
+    is_route = bool(getattr(run.ctx, "route_expect", None))
+    queued = [] if is_route else _serialize_queued(run.items[index:])
+    return {
+        "error": None,
+        "content": _result(
+            STATUS_NEEDS_MODEL,
+            run.trace,
+            screen,
+            "",
+            budget_stop_reason(index, len(run.items), len(queued), route=is_route),
+            index,
+            # NOT an escape. The budget can stop a script the validator called
+            # legal -- the per-wait re-dump costs wall clock that the wait cap
+            # does not count -- and charging one of three escapes for obeying
+            # our own bound is how a correct case becomes `blocked`.
+            budget_stop=True,
+            queued_actions=queued,
+        ),
+    }
+
+
+def _route_mismatch_stop(
+    run: _ReplayRun, index: int, entry: dict, screen: dict | None
+) -> dict:
+    """The reply for a saved-route step whose live screen is not the one it was
+    saved from. Nothing has been actuated for this step."""
+    entry["outcome"] = "route_mismatch"
+    entry["detail"] = ROUTE_MISMATCH_DETAIL
+    _stamp_after(entry, screen)
+    _append(run.trace, entry)
+    return {
+        "error": None,
+        "content": _result(
+            STATUS_NEEDS_MODEL,
+            run.trace,
+            screen,
+            "",
+            ROUTE_MISMATCH_DETAIL,
+            index,
+            # Uncharged by case_runner while nothing has actuated (the free
+            # stop for a stale selector); a hop AFTER an actuated one is charged.
+            selector_stale=True,
+            actuated=_actuated(run.trace),
+        ),
+    }
+
+
+def _done_stop(
+    run: _ReplayRun, action: object, index: int, entry: dict, screen: dict | None
+) -> dict:
+    """The reply for a ``done`` step. A ``pass`` nothing verified is downgraded."""
+    verdict = str(getattr(action, "verdict", ""))
+    reason = str(getattr(action, "reason", ""))[:400]
+    if verdict == "pass" and not _verified(run.trace, run.ctx):
+        verdict = STATUS_UNVERIFIED
+        reason = (
+            "verdict=pass was not accepted: nothing in this run "
+            "has recorded an assert_pass, so nothing was verified. "
+            "Add an `assert` for what the case is supposed to "
+            "show. " + reason
+        ).strip()
+    elif (
+        verdict == "pass"
+        and run.ctx.prior_turn_blocked
+        and not _asserts_new_element(run.trace)
+    ):
+        verdict = STATUS_UNVERIFIED
+        reason = (
+            "verdict=pass was not accepted: the previous turn failed "
+            "to type or changed nothing on screen, and this turn "
+            "asserts no new element. Add an `assert` of kind "
+            "`element` or `new_text` for what the step produced. " + reason
+        ).strip()
+    entry["outcome"] = "done"
+    entry["detail"] = reason
+    _stamp_after(entry, screen)
+    _append(run.trace, entry)
+    return {
+        "error": None,
+        "content": _result(
+            STATUS_DONE,
+            run.trace,
+            screen,
+            verdict,
+            reason,
+            index,
+        ),
+    }
+
+
+def _ask_tester_step(
+    run: _ReplayRun, action: object, index: int, entry: dict, screen: dict | None
+) -> dict | None:
+    """An ``ask_tester`` step: the reply that asks, or ``None`` when the tester
+    already supplied the field and the replay goes on."""
+    field = str(getattr(action, "field", ""))
+    supplied = (run.ctx.tester_inputs or {}).get(field)
+    if supplied is None:
+        entry["outcome"] = "needs_tester"
+        entry["detail"] = str(getattr(action, "prompt", ""))[:300]
+        _stamp_after(entry, screen)
+        _append(run.trace, entry)
+        return {
+            "error": None,
+            "content": _result(
+                STATUS_NEEDS_TESTER,
+                run.trace,
+                screen,
+                "",
+                entry["detail"],
+                index,
+                field=field,
+            ),
+        }
+    entry["outcome"] = "supplied"
+    entry["detail"] = "the tester supplied " + field
+    _stamp_after(entry, screen)
+    _append(run.trace, entry)
+    return None
+
+
+def _knowledge_stop(
+    run: _ReplayRun, index: int, entry: dict, screen: dict | None, note_stop: str
+) -> dict:
+    """The reply for a step a saved ``avoid`` note refuses."""
+    entry["outcome"] = "knowledge_avoid"
+    entry["detail"] = note_stop
+    _stamp_after(entry, screen)
+    _append(run.trace, entry)
+    return {
+        "error": None,
+        "content": _result(STATUS_NEEDS_MODEL, run.trace, screen, "", note_stop, index),
+    }
+
+
+def _assert_step(
+    run: _ReplayRun,
+    action: object,
+    entry: dict,
+    screen: dict | None,
+    baseline_texts: set | None,
+) -> dict | None:
+    """An ``assert`` step: ``None`` when it passed and the replay goes on, else
+    the reply that stops it (a failed assert, or a visual check)."""
+    index = entry["index"]
+    if str(getattr(action, "kind", "")) == "visual":
+        # Nothing here can judge a picture. Stop, and let the next
+        # reply carry the screenshot of THIS screen to the model;
+        # `Script` already refused a visual that is not last.
+        entry["outcome"] = "visual_check"
+        entry["detail"] = ("Visual check: " + str(getattr(action, "note", "")))[
+            :MAX_VISUAL_DETAIL_CHARS
+        ]
+        _stamp_after(entry, screen)
+        _append(run.trace, entry)
+        return {
+            "error": None,
+            "content": _result(
+                STATUS_NEEDS_MODEL,
+                run.trace,
+                screen,
+                "",
+                entry["detail"],
+                index,
+                visual_check=True,
+            ),
+        }
+    ok, detail = _evaluate_assert(action, screen, run.trace, baseline_texts)
+    entry["outcome"] = "assert_pass" if ok else "assert_fail"
+    entry["detail"] = detail
+    _stamp_after(entry, screen)
+    _append(run.trace, entry)
+    if ok:
+        return None
+    return {
+        "error": None,
+        "content": _result(STATUS_NEEDS_MODEL, run.trace, screen, "", detail, index),
+    }
+
+
+def _tap_text_element(
+    run: _ReplayRun, action: object, entry: dict, screen: dict | None
+) -> tuple[object, dict | None]:
+    """A ``tap_text`` step's element, or ``None`` and the reply that stops on a
+    text that names no control or several."""
+    picked = resolve_tap_text(getattr(action, "text", ""), screen)
+    element = picked.get("element")
+    if element is not None:
+        return element, None
+    wanted = str(getattr(action, "text", ""))[:80]
+    entry["outcome"] = (
+        actions_mod.TAP_TEXT_AMBIGUOUS if picked.get("ambiguous") else "missing_element"
+    )
+    entry["detail"] = (
+        "`"
+        + wanted
+        + "` is on "
+        + str(picked.get("candidates"))
+        + " different controls on this screen, so nothing was "
+        "tapped. Use `tap` with a narrower target to say which "
+        "one you mean."
+        if picked.get("ambiguous")
+        else "Nothing on this screen carries the text `" + wanted + "`."
+    )
+    _stamp_after(entry, screen)
+    _append(run.trace, entry)
+    return element, {
+        "error": None,
+        "content": _result(
+            STATUS_NEEDS_MODEL,
+            run.trace,
+            screen,
+            "",
+            entry["detail"],
+            entry["index"],
+        ),
+    }
+
+
+def _fill_element(
+    run: _ReplayRun, action: object, entry: dict, screen: dict | None
+) -> tuple[object, dict | None]:
+    """A ``fill`` step's field, or ``None`` and the reply that stops on a label
+    that names no field or several."""
+    picked = fill_label.resolve_fill(
+        getattr(action, "label", ""), _screen_elements(screen)
+    )
+    element = picked.get("element")
+    if element is not None:
+        return element, None
+    entry["outcome"] = "missing_element"
+    entry["detail"] = fill_label.refusal_detail(getattr(action, "label", ""), picked)
+    _stamp_after(entry, screen)
+    _append(run.trace, entry)
+    return element, {
+        "error": None,
+        "content": _result(
+            STATUS_NEEDS_MODEL,
+            run.trace,
+            screen,
+            "",
+            entry["detail"],
+            entry["index"],
+        ),
+    }
+
+
+def _selector_stale(resolution: dict) -> bool:
+    """Read by ``case_runner``: a stop caused by OUR OWN selector going stale,
+    before anything touched the device, is not the tester's case failing to
+    make progress -- see MAX_FREE_STOPS there.
+
+    Intersected with ``actions.OURS`` rather than taken from the bare ``stale``
+    flag. Measured: ``{"rid": <gone>, "text": <matches>}`` -- no `id` anywhere
+    -- reported stale and was UNCHARGED, while OURS' own docstring said a rid
+    or text naming something absent is charged like any other boomerang. A
+    conflict is charged too: two selectors the MODEL chose disagreeing is a
+    stale plan, not our bookkeeping.
+    """
+    return any(
+        name in actions_mod.OURS for name in (resolution.get("stale_selectors") or ())
+    )
+
+
+def _target_element(
+    run: _ReplayRun, op: str, target: object, entry: dict, screen: dict | None
+) -> tuple[object, bool, dict | None]:
+    """The element a step's ``target`` names, whether a ``scroll`` missed it,
+    and the reply that stops on a missing element (``None`` to go on)."""
+    resolved = actions_mod.resolve_target(target, screen)
+    element = ((resolved or {}).get("content") or {}).get("element")
+    # ``assert`` is exempt for the same reason ``scroll`` is, and it
+    # matters more: a missing element IS the answer an
+    # ``assert kind="element"`` was asked for. Letting the generic
+    # boomerang intercept it meant that assert could never FAIL --
+    # the one verdict it exists to produce. It returned
+    # ``needs_model`` instead, so a tester who required an element
+    # that was absent got a re-plan, three spent escapes and a
+    # ``blocked`` case rather than the failure they asked for.
+    # ``_evaluate_assert`` decides presence itself.
+    # The DEGRADATION below is deliberate and stays; what changes
+    # is that it is now visible. Recorded before the branch so the
+    # flag cannot drift from the condition that produces it.
+    scroll_missed = element is None and op == "scroll"
+    if element is None and op not in ("scroll", "assert"):
+        resolution = (resolved or {}).get("content") or {}
+        entry["outcome"] = "missing_element"
+        entry["detail"] = missing_element_detail(resolution)
+        _stamp_after(entry, screen)
+        _append(run.trace, entry)
+        return (
+            element,
+            scroll_missed,
+            {
+                "error": None,
+                "content": _result(
+                    STATUS_NEEDS_MODEL,
+                    run.trace,
+                    screen,
+                    "",
+                    entry["detail"],
+                    entry["index"],
+                    selector_stale=_selector_stale(resolution),
+                    actuated=_actuated(run.trace),
+                ),
+            },
+        )
+    return element, scroll_missed, None
+
+
+def _resolve_element(
+    run: _ReplayRun, op: str, action: object, entry: dict, screen: dict | None
+) -> tuple[object, bool, dict | None]:
+    """The element a step acts on, whether a ``scroll`` missed its target, and
+    the reply that stops the replay on a miss (``None`` to go on)."""
+    target = getattr(action, "target", None)
+    element = None
+    # Per ACTION, not per replay: a scroll whose target missed must not
+    # colour the note of a later scroll that resolved.
+    scroll_missed = False
+    if op == "tap_text":
+        # Resolved HERE, into the same `element` every other op uses, so
+        # the destructive guard below judges `actuated_element` for this
+        # op exactly as it does for a `tap`. An op that resolved its own
+        # element AFTER the guard would be a bypass, which is the defect
+        # class `NON_ACTUATING_OPS` exists to make explicit.
+        element, reply = _tap_text_element(run, action, entry, screen)
+        if reply is not None:
+            return element, scroll_missed, reply
+    if op == "fill":
+        # Resolved HERE, for the reason `tap_text` is: the destructive
+        # guard below must judge the field a fill will touch. The
+        # refusal names the label and, when ambiguous, bounded
+        # candidates -- never a field's contents.
+        element, reply = _fill_element(run, action, entry, screen)
+        if reply is not None:
+            return element, scroll_missed, reply
+    if target is not None:
+        return _target_element(run, op, target, entry, screen)
+    return element, scroll_missed, None
+
+
+def _guard_label(
+    op: str, action: object, element: object, screen: dict | None
+) -> tuple[str, object]:
+    """The words the destructive guard judges, and the node it judges: the
+    node the action ACTUATES where the touch resolved one, else the one it
+    NAMES. Builds the label only; the decision stays in ``_replay_steps``."""
+    actuated = None
+    labels = [
+        actions_mod.action_text(action),
+        element_label(element, screen),
+    ]
+    if element is not None:
+        actuated = actuated_element(
+            screen,
+            _touch_point(op, action, element, _clamp_source(screen)),
+        )
+        # The actuated node is judged on its OWN strings -- no
+        # `screen`, so no containment. It is an ANCESTOR by
+        # construction, and an ancestor's contained text is every
+        # word inside it: with containment, tapping "Notifications"
+        # inside a clickable settings list that also held "Delete
+        # account" was refused (an executing review measured it).
+        # The named element keeps its containment rule; the residual
+        # is a wrapper with no strings of its own whose destructive
+        # word lives only in a SIBLING of the child that was named.
+        # Appended only when it IS a different node. When the named
+        # element is itself the smallest clickable under the finger
+        # (the common case) appending it again would join its label
+        # to itself, and `destructive_hit` matches multi-word terms
+        # as a token RUN: "Money ... send" followed by "Money ..."
+        # manufactures "send money" at the seam -- a false stop, and
+        # a stop is terminal for a scripted case.
+        if actuated is not None and actuated is not element:
+            labels.append(element_label(actuated))
+    # The node the action ACTUATES where the touch resolved one,
+    # else the node it NAMES. The same derivation the actuated-node
+    # guard already uses -- not a second one.
+    judged_node = actuated if actuated is not None else element
+    label = " ".join(labels).strip()
+    return label, judged_node
+
+
+async def _poll_condition(
+    ctx: Context, action: object, spec: tuple[str, str, int], screen: object
+) -> tuple[bool, object, str]:
+    """Poll one wait condition: ``(found, screen, interruption)``.
+
+    *spec* is ``(kind, wait_text, wait_ms)`` from ``_wait_spec``. The sentence a
+    watched interruption left in ``ctx.wait_interruption`` is cleared before the
+    poll and read (and cleared) after it.
+    """
+    kind, wait_text, wait_ms = spec
+    ctx.wait_interruption = ""
+    if kind == "element":
+        found, screen, _timed_out = await _wait_until_element(
+            ctx,
+            screen,
+            wait_text,
+            str(getattr(action, "until_rid_text", "") or ""),
+            bool(getattr(action, "until_gone", False)),
+            wait_ms,
+        )
+    elif kind == "idle":
+        found, screen, _timed_out = await _wait_until_idle(ctx, screen, wait_ms)
+    else:
+        found, screen, _timed_out = await _wait_until_text(
+            ctx, screen, wait_text, wait_ms, gone=kind == "gone"
+        )
+    interruption, ctx.wait_interruption = ctx.wait_interruption, ""
+    return found, screen, interruption
+
+
+def _condition_words(action: object, kind: str, wait_text: str) -> tuple[str, str, str]:
+    """The ``(met, missed, label)`` sentences for a wait condition."""
+    if kind != "element":
+        return _wait_words(kind, wait_text)
+    gone = bool(getattr(action, "until_gone", False))
+    label = "element " + repr(wait_text[:120]) + (" gone" if gone else " present")
+    return "found " + label, "timed out waiting for " + label, label
+
+
+async def _condition_wait(
+    run: _ReplayRun,
+    action: object,
+    spec: tuple[str, str, int],
+    entry: dict,
+    screen: object,
+) -> tuple[object, dict | None]:
+    """A wait on a text, element or idle condition: ``(screen, reply)``.
+
+    ``reply`` is ``None`` when the condition was met and the replay goes on.
+    """
+    kind, wait_text, _wait_ms = spec
+    op = str(getattr(action, "op", "") or "")
+    found, screen, interruption = await _poll_condition(run.ctx, action, spec, screen)
+    met, missed, label = _condition_words(action, kind, wait_text)
+    if found:
+        entry["outcome"] = "ok"
+        entry["detail"] = met
+        # No re-dump: the poll already left a fresh screen.
+        screen, stop = await _settle(
+            run.ctx,
+            entry,
+            screen,
+            run.trace,
+            entry["index"],
+            redump=False,
+            mark_no_change=False,
+            op=op,
+        )
+        if stop is not None:
+            return screen, {"error": None, "content": stop}
+    elif interruption:
+        entry["outcome"] = "interrupted"
+        entry["detail"] = interruption + " (while " + label + ")"
+    else:
+        entry["outcome"] = "wait_timeout"
+        entry["detail"] = missed
+    _stamp_after(entry, screen)
+    _append(run.trace, entry)
+    if found:
+        return screen, None
+    return screen, {
+        "error": None,
+        "content": _result(
+            STATUS_NEEDS_MODEL, run.trace, screen, "", entry["detail"], entry["index"]
+        ),
+    }
+
+
+def _changed_detail(op: str, wait_ms: int, changed: bool) -> str:
+    """What a wait on the screen changing DID, not what it was allowed to do.
+
+    Reporting "waited 8000ms" for a wait that came back in a quarter of a
+    second is the true-shaped sentence this lane has been burned by before, and
+    the trace is read back in the report and in the next packet.
+    """
+    if op == "wait":
+        return (
+            ("waited for the screen to change, inside the " + str(wait_ms) + "ms")
+            if changed
+            else ("waited " + str(wait_ms) + "ms")
+        )
+    return (
+        "the screen changed"
+        if changed
+        else "the screen did not change in " + _secs(wait_ms)
+    )
+
+
+async def _watch_after_wait(
+    ctx: Context, screen: object, before_wait: object, changed: bool, reusable: bool
+) -> tuple[object, bool, str]:
+    """WATCHED (B6): ``(screen, reusable, interruption)`` after a changed wait.
+
+    A change that is a dialog, a call, another app or an error text is NAMED and
+    the replay stops for the model, instead of an "ok" that hands the next
+    action a screen the script never expected.
+
+    A FOCUS change returns the pre-wait screen un-read (the probe saw a new
+    window, no dump was taken), so on that path the screen is read once here:
+    comparing the baseline with itself could never name the call or app that
+    took focus. That read IS the post-wait screen, so the settle reuses it
+    rather than dumping a second time.
+
+    A dump that fails here is left to ``_settle``, which reports it as
+    ``dump_failed`` unless the device names a disconnect.
+    """
+    interruption = ""
+    if changed and screen is before_wait:
+        reread = await _dump(ctx)
+        if reread.get("error"):
+            interruption = watch.classify_error(reread["error"])
+        else:
+            screen = reread.get("content")
+            reusable = True
+    if changed and not interruption:
+        interruption = _interruption_of(ctx, screen, before_wait)
+    return screen, reusable, interruption
+
+
+def _interrupted_stop(
+    run: _ReplayRun, entry: dict, screen: object, interruption: str
+) -> dict:
+    """The reply for a changed wait that a watched interruption cut short."""
+    entry["outcome"] = "interrupted"
+    entry["detail"] = interruption
+    _stamp_after(entry, screen)
+    _append(run.trace, entry)
+    return {
+        "error": None,
+        "content": _result(
+            STATUS_NEEDS_MODEL,
+            run.trace,
+            screen,
+            "",
+            interruption,
+            entry["index"],
+        ),
+    }
+
+
+def _wait_timeout_stop(run: _ReplayRun, entry: dict, screen: object) -> dict:
+    """The reply for a non-`wait` op whose screen never changed.
+
+    The model said the screen would change and it did not: hand it the screen
+    rather than run the rest of a script written for a screen that never came.
+    The legacy `wait` carries on, as it always has. The caller has already
+    stamped the entry.
+    """
+    entry["outcome"] = "wait_timeout"
+    _append(run.trace, entry)
+    return {
+        "error": None,
+        "content": _result(
+            STATUS_NEEDS_MODEL,
+            run.trace,
+            screen,
+            "",
+            entry["detail"],
+            entry["index"],
+        ),
+    }
+
+
+async def _changed_wait(
+    run: _ReplayRun, op: str, wait_ms: int, entry: dict, screen: object
+) -> tuple[object, dict | None]:
+    """A wait for the screen to change: ``(screen, reply)``.
+
+    ``reply`` is ``None`` when the replay goes on to the next action.
+    """
+    before_wait = screen
+    screen, changed, reusable = await _wait_until_changed(run.ctx, screen, wait_ms)
+    entry["outcome"] = "ok"
+    entry["detail"] = _changed_detail(op, wait_ms, changed)
+    # `redump=not reusable`: only a wait whose LAST poll dumped the unchanged
+    # screen hands back a post-wait screen (`_wait_until_changed` says when).
+    # Every other path holds a screen from before the wait ended, and skipping
+    # the dump there would hand the next action a screen older than the wait
+    # itself -- the defect `_settle`'s docstring records.
+    screen, reusable, interruption = await _watch_after_wait(
+        run.ctx, screen, before_wait, changed, reusable
+    )
+    if interruption:
+        return screen, _interrupted_stop(run, entry, screen, interruption)
+    if reusable:
+        step_timing.mark("dump_reused")
+    screen, stop = await _settle(
+        run.ctx,
+        entry,
+        screen,
+        run.trace,
+        entry["index"],
+        redump=not reusable,
+        mark_no_change=False,
+        op=op,
+    )
+    if stop is not None:
+        return screen, {"error": None, "content": stop}
+    _stamp_after(entry, screen)
+    if op != "wait" and not changed:
+        return screen, _wait_timeout_stop(run, entry, screen)
+    _append(run.trace, entry)
+    return screen, None
+
+
+def _device_error_stop(
+    run: _ReplayRun, outcome: dict, entry: dict, screen: object
+) -> dict:
+    """The reply for a device action that came back with an error."""
+    if outcome.get("mask_text") and isinstance(entry.get("action"), dict):
+        for key in ("text", "value"):
+            if key in entry["action"]:
+                entry["action"][key] = actions_mod.SECRET_MASK
+    recoverable = bool(outcome.get("needs_model"))
+    entry["outcome"] = "refused" if recoverable else "device_error"
+    entry["detail"] = _confirmed(entry, str(outcome["error"]))[:400]
+    _stamp_after(entry, screen)
+    _append(run.trace, entry)
+    return {
+        "error": None,
+        "content": _result(
+            PASSWORD_REFUSAL_STATUS if recoverable else STATUS_ERROR,
+            run.trace,
+            screen,
+            "",
+            entry["detail"],
+            entry["index"],
+        ),
+    }
+
+
+async def _settle_device(
+    run: _ReplayRun, step: _Step, outcome: dict, entry: dict, screen: object
+) -> tuple[object, dict | None]:
+    """Settle after a device action: ``(screen, reply)``.
+
+    ``reply`` is ``None`` when the replay goes on to the next action.
+    """
+    op, action = step.op, step.action
+    # A `launch` whose `am start` only brought this app's own task to
+    # the front of a screen that was ALREADY this app changed nothing a
+    # dump would see. The one redump it skips is the costliest call on a
+    # heavy AVD. ONLY the dump is skipped: `_settle` still runs on the
+    # screen in hand, so `no_change` and the system-dialog and
+    # left-app checks are kept.
+    front = op == "launch" and _brought_to_front(
+        outcome, screen, run.ctx, named=getattr(action, "package", None)
+    )
+    if front:
+        step_timing.mark("dump_skipped")
+    if op in actions_mod.MUTATING_OPS:
+        screen, stop = await _settle(
+            run.ctx,
+            entry,
+            screen,
+            run.trace,
+            entry["index"],
+            redump=not front,
+            mark_no_change=True,
+            op=op,
+            extra_expected=(
+                (str(getattr(action, "package", "") or ""),) if op == "launch" else ()
+            ),
+        )
+        if stop is not None:
+            return screen, {"error": None, "content": stop}
+    _stamp_after(entry, screen)
+    _append(run.trace, entry)
+    return screen, None
+
+
+def _record_guard_stop(
+    run: _ReplayRun, op: str, hit: str, entry: dict, screen: object
+) -> bool:
+    """Write the trace entry of a guard stop and say whether the run refuses.
+
+    WHAT the guard stopped is decided in ``_replay_steps`` and is not touched
+    here. This decides only what happens AFTER the hit, which is the one thing
+    a charter's ``destructive`` field is allowed to decide. The reply that
+    carries the term stays in ``_replay_steps``, the reviewed sink.
+    """
+    entry["outcome"] = "guard_stop"
+    refuses = bool(getattr(run.ctx, "guard_refuses", False))
+    mismatched = bool(entry.get("guard_confirm_mismatch"))
+    # ONE call, not a chain. The chain that was here handled two
+    # sentinels and gave every future one the control wording --
+    # the same half-wiring at the other consumer is what round 3
+    # fixed, and this site still had it.
+    entry["detail"] = (
+        GUARD_DETAIL_REFUSED
+        if refuses
+        else _with_confirm_hint(
+            guard_detail(hit, screen, run.ctx.package),
+            op,
+            hit,
+            mismatched,
+        )
+    )
+    _stamp_after(entry, screen)
+    _append(run.trace, entry)
+    return refuses
+
+
+@dataclasses.dataclass(frozen=True)
+class _Step:
+    """One action that passed the guard, with the target it resolved to."""
+
+    op: str
+    action: object
+    entry: dict
+    element: object
+    scroll_missed: bool
+
+
+async def _wait_step(
+    run: _ReplayRun, step: _Step, screen: object
+) -> tuple[object, dict | None]:
+    """Run a wait op: ``(screen, reply)``, ``reply`` is ``None`` to go on.
+
+    Every wait is a condition with a bound (S17): the legacy `wait` maps onto
+    the same four through `_wait_spec`.
+    """
+    spec = _wait_spec(step.action, run.items)
+    if spec[0] != "changed":
+        return await _condition_wait(run, step.action, spec, step.entry, screen)
+    return await _changed_wait(run, step.op, spec[2], step.entry, screen)
+
+
+async def _device_step(
+    run: _ReplayRun, step: _Step, screen: object
+) -> tuple[object, dict | None]:
+    """Run a device op: ``(screen, reply)``, ``reply`` is ``None`` to go on."""
+    entry = step.entry
+    # ONE rectangle for the guard and the device -- see
+    # `_swipe_points`. Both read this packet's own root_bounds
+    # rather than each asking adb, whose answer expires.
+    outcome = await _perform(
+        step.op, step.action, step.element, run.ctx, _clamp_source(screen)
+    )
+    if outcome.get("error"):
+        return screen, _device_error_stop(run, outcome, entry, screen)
+    entry["outcome"] = "ok"
+    entry["detail"] = _confirmed(
+        entry, str((outcome.get("content") or {}).get("detail") or "")
+    )
+    if step.scroll_missed:
+        entry["detail"] = (SCROLL_TARGET_MISSED + " " + entry["detail"]).strip()
+    return await _settle_device(run, step, outcome, entry, screen)
+
+
+async def _dispatch_op(
+    run: _ReplayRun, step: _Step, screen: object, baseline_texts: set | None
+) -> tuple[object, dict | None]:
+    """Run an action that passed the guard: an assert, a wait or a device op.
+
+    ``(screen, reply)``; ``reply`` is ``None`` when the replay goes on.
+    """
+    if step.op == "assert":
+        reply = _assert_step(run, step.action, step.entry, screen, baseline_texts)
+        return screen, reply
+    if step.op in actions_mod.WAIT_OPS:
+        return await _wait_step(run, step, screen)
+    return await _device_step(run, step, screen)
+
+
 async def _replay_steps(script: object, ctx: Context) -> dict:
     """Execute *script* against ``ctx``. Never raises.
 
@@ -3129,23 +3940,10 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
     screen = ctx.screen if isinstance(ctx.screen, dict) else None
     try:
         items = list(getattr(script, "actions", None) or [])
-        if not items:
-            return {
-                "error": None,
-                "content": _result(
-                    STATUS_ERROR, trace, screen, "", "The script had no actions.", -1
-                ),
-            }
-        if screen is None:
-            dumped = await _first_screen(ctx)
-            if dumped.get("error"):
-                return {
-                    "error": None,
-                    "content": _result(
-                        STATUS_ERROR, trace, None, "", str(dumped["error"]), -1
-                    ),
-                }
-            screen = dumped.get("content")
+        screen, reply = await _replay_first_screen(ctx, items, screen, trace)
+        if reply is not None:
+            return reply
+        run = _ReplayRun(ctx, items, trace)
 
         deadline = time.monotonic() + _budget_seconds(ctx)
         #: The screen content as it was before the last screen-changing action.
@@ -3158,33 +3956,7 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
             # short budget would turn every case into `blocked` without ever
             # touching the device.
             if index and time.monotonic() >= deadline:
-                # SERVER-SIDE queue (defect F2): the unreached actions ride
-                # along on THIS reply so the next submit can run them first
-                # instead of the model retyping them.
-                # A route replay queues NOTHING: the remainder has not been
-                # checked against its saved screens and must not run blind.
-                is_route = bool(getattr(ctx, "route_expect", None))
-                queued = [] if is_route else _serialize_queued(items[index:])
-                return {
-                    "error": None,
-                    "content": _result(
-                        STATUS_NEEDS_MODEL,
-                        trace,
-                        screen,
-                        "",
-                        budget_stop_reason(
-                            index, len(items), len(queued), route=is_route
-                        ),
-                        index,
-                        # NOT an escape. The budget can stop a script the
-                        # validator called legal -- the per-wait re-dump costs
-                        # wall clock that the wait cap does not count -- and
-                        # charging one of three escapes for obeying our own
-                        # bound is how a correct case becomes `blocked`.
-                        budget_stop=True,
-                        queued_actions=queued,
-                    ),
-                }
+                return _budget_stop(run, index, screen)
             started = time.monotonic()
             entry = _entry(
                 index, action, _screen_id(screen), started, _screen_hash(screen)
@@ -3194,28 +3966,7 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
             # saved from. Checked BEFORE the guard and before anything is actuated.
             expected_id = _route_expected(ctx, index, len(items))
             if expected_id and expected_id != _screen_id(screen):
-                entry["outcome"] = "route_mismatch"
-                entry["detail"] = ROUTE_MISMATCH_DETAIL
-                _stamp_after(entry, screen)
-                _append(trace, entry)
-                return {
-                    "error": None,
-                    "content": _result(
-                        STATUS_NEEDS_MODEL,
-                        trace,
-                        screen,
-                        "",
-                        ROUTE_MISMATCH_DETAIL,
-                        index,
-                        # Uncharged by case_runner while nothing has actuated (the free
-                        # stop for a stale selector); a hop AFTER an actuated one is charged.
-                        selector_stale=True,
-                        actuated=_actuated(trace),
-                    ),
-                }
-            # Per ACTION, not per replay: a scroll whose target missed must not
-            # colour the note of a later scroll that resolved.
-            scroll_missed = False
+                return _route_mismatch_stop(run, index, entry, screen)
             # The BEFORE set for ``assert new_text``, captured for every op that
             # can change the screen -- ``wait`` included, which is the whole
             # point: the reply a case is waiting for arrives during the wait.
@@ -3224,67 +3975,11 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
 
             # --- terminal ops -------------------------------------------------
             if op == "done":
-                verdict = str(getattr(action, "verdict", ""))
-                reason = str(getattr(action, "reason", ""))[:400]
-                if verdict == "pass" and not _verified(trace, ctx):
-                    verdict = STATUS_UNVERIFIED
-                    reason = (
-                        "verdict=pass was not accepted: nothing in this run "
-                        "has recorded an assert_pass, so nothing was verified. "
-                        "Add an `assert` for what the case is supposed to "
-                        "show. " + reason
-                    ).strip()
-                elif (
-                    verdict == "pass"
-                    and ctx.prior_turn_blocked
-                    and not _asserts_new_element(trace)
-                ):
-                    verdict = STATUS_UNVERIFIED
-                    reason = (
-                        "verdict=pass was not accepted: the previous turn failed "
-                        "to type or changed nothing on screen, and this turn "
-                        "asserts no new element. Add an `assert` of kind "
-                        "`element` or `new_text` for what the step produced. " + reason
-                    ).strip()
-                entry["outcome"] = "done"
-                entry["detail"] = reason
-                _stamp_after(entry, screen)
-                _append(trace, entry)
-                return {
-                    "error": None,
-                    "content": _result(
-                        STATUS_DONE,
-                        trace,
-                        screen,
-                        verdict,
-                        reason,
-                        index,
-                    ),
-                }
+                return _done_stop(run, action, index, entry, screen)
             if op == "ask_tester":
-                field = str(getattr(action, "field", ""))
-                supplied = (ctx.tester_inputs or {}).get(field)
-                if supplied is None:
-                    entry["outcome"] = "needs_tester"
-                    entry["detail"] = str(getattr(action, "prompt", ""))[:300]
-                    _stamp_after(entry, screen)
-                    _append(trace, entry)
-                    return {
-                        "error": None,
-                        "content": _result(
-                            STATUS_NEEDS_TESTER,
-                            trace,
-                            screen,
-                            "",
-                            entry["detail"],
-                            index,
-                            field=field,
-                        ),
-                    }
-                entry["outcome"] = "supplied"
-                entry["detail"] = "the tester supplied " + field
-                _stamp_after(entry, screen)
-                _append(trace, entry)
+                reply = _ask_tester_step(run, action, index, entry, screen)
+                if reply is not None:
+                    return reply
                 continue
 
             # Saved app notes, BEFORE the target resolves. A wait note polls
@@ -3294,138 +3989,14 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                 ctx, action, op, entry, screen, items, deadline
             )
             if note_stop is not None:
-                entry["outcome"] = "knowledge_avoid"
-                entry["detail"] = note_stop
-                _stamp_after(entry, screen)
-                _append(trace, entry)
-                return {
-                    "error": None,
-                    "content": _result(
-                        STATUS_NEEDS_MODEL, trace, screen, "", note_stop, index
-                    ),
-                }
+                return _knowledge_stop(run, index, entry, screen, note_stop)
 
             # --- target resolution -------------------------------------------
-            target = getattr(action, "target", None)
-            element = None
-            if op == "tap_text":
-                # Resolved HERE, into the same `element` every other op uses, so
-                # the destructive guard below judges `actuated_element` for this
-                # op exactly as it does for a `tap`. An op that resolved its own
-                # element AFTER the guard would be a bypass, which is the defect
-                # class `NON_ACTUATING_OPS` exists to make explicit.
-                picked = resolve_tap_text(getattr(action, "text", ""), screen)
-                element = picked.get("element")
-                if element is None:
-                    wanted = str(getattr(action, "text", ""))[:80]
-                    entry["outcome"] = (
-                        actions_mod.TAP_TEXT_AMBIGUOUS
-                        if picked.get("ambiguous")
-                        else "missing_element"
-                    )
-                    entry["detail"] = (
-                        "`"
-                        + wanted
-                        + "` is on "
-                        + str(picked.get("candidates"))
-                        + " different controls on this screen, so nothing was "
-                        "tapped. Use `tap` with a narrower target to say which "
-                        "one you mean."
-                        if picked.get("ambiguous")
-                        else "Nothing on this screen carries the text `" + wanted + "`."
-                    )
-                    _stamp_after(entry, screen)
-                    _append(trace, entry)
-                    return {
-                        "error": None,
-                        "content": _result(
-                            STATUS_NEEDS_MODEL,
-                            trace,
-                            screen,
-                            "",
-                            entry["detail"],
-                            index,
-                        ),
-                    }
-            if op == "fill":
-                # Resolved HERE, for the reason `tap_text` is: the destructive
-                # guard below must judge the field a fill will touch. The
-                # refusal names the label and, when ambiguous, bounded
-                # candidates -- never a field's contents.
-                picked = fill_label.resolve_fill(
-                    getattr(action, "label", ""), _screen_elements(screen)
-                )
-                element = picked.get("element")
-                if element is None:
-                    entry["outcome"] = "missing_element"
-                    entry["detail"] = fill_label.refusal_detail(
-                        getattr(action, "label", ""), picked
-                    )
-                    _stamp_after(entry, screen)
-                    _append(trace, entry)
-                    return {
-                        "error": None,
-                        "content": _result(
-                            STATUS_NEEDS_MODEL,
-                            trace,
-                            screen,
-                            "",
-                            entry["detail"],
-                            index,
-                        ),
-                    }
-            if target is not None:
-                resolved = actions_mod.resolve_target(target, screen)
-                element = ((resolved or {}).get("content") or {}).get("element")
-                # ``assert`` is exempt for the same reason ``scroll`` is, and it
-                # matters more: a missing element IS the answer an
-                # ``assert kind="element"`` was asked for. Letting the generic
-                # boomerang intercept it meant that assert could never FAIL --
-                # the one verdict it exists to produce. It returned
-                # ``needs_model`` instead, so a tester who required an element
-                # that was absent got a re-plan, three spent escapes and a
-                # ``blocked`` case rather than the failure they asked for.
-                # ``_evaluate_assert`` decides presence itself.
-                # The DEGRADATION below is deliberate and stays; what changes
-                # is that it is now visible. Recorded before the branch so the
-                # flag cannot drift from the condition that produces it.
-                scroll_missed = element is None and op == "scroll"
-                if element is None and op not in ("scroll", "assert"):
-                    resolution = (resolved or {}).get("content") or {}
-                    entry["outcome"] = "missing_element"
-                    entry["detail"] = missing_element_detail(resolution)
-                    _stamp_after(entry, screen)
-                    _append(trace, entry)
-                    return {
-                        "error": None,
-                        "content": _result(
-                            STATUS_NEEDS_MODEL,
-                            trace,
-                            screen,
-                            "",
-                            entry["detail"],
-                            index,
-                            # Read by ``case_runner``: a stop caused by OUR
-                            # OWN selector going stale, before anything touched
-                            # the device, is not the tester's case failing to
-                            # make progress -- see MAX_FREE_STOPS there.
-                            #
-                            # Intersected with ``actions.OURS`` rather than
-                            # taken from the bare ``stale`` flag. Measured:
-                            # ``{"rid": <gone>, "text": <matches>}`` -- no `id`
-                            # anywhere -- reported stale and was UNCHARGED,
-                            # while OURS' own docstring said a rid or text
-                            # naming something absent is charged like any other
-                            # boomerang. A conflict is charged too: two
-                            # selectors the MODEL chose disagreeing is a stale
-                            # plan, not our bookkeeping.
-                            selector_stale=any(
-                                name in actions_mod.OURS
-                                for name in (resolution.get("stale_selectors") or ())
-                            ),
-                            actuated=_actuated(trace),
-                        ),
-                    }
+            element, scroll_missed, reply = _resolve_element(
+                run, op, action, entry, screen
+            )
+            if reply is not None:
+                return reply
 
             # --- destructive guard -------------------------------------------
             # DENY BY DEFAULT, and judge the node the action ACTUATES, not the
@@ -3461,39 +4032,7 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
             # scripted case, so the pan stays unjudged and the decision is
             # pinned in both directions by tests/mobile.
             if ctx.guard_destructive and op not in NON_ACTUATING_OPS:
-                actuated = None
-                labels = [
-                    actions_mod.action_text(action),
-                    element_label(element, screen),
-                ]
-                if element is not None:
-                    actuated = actuated_element(
-                        screen,
-                        _touch_point(op, action, element, _clamp_source(screen)),
-                    )
-                    # The actuated node is judged on its OWN strings -- no
-                    # `screen`, so no containment. It is an ANCESTOR by
-                    # construction, and an ancestor's contained text is every
-                    # word inside it: with containment, tapping "Notifications"
-                    # inside a clickable settings list that also held "Delete
-                    # account" was refused (an executing review measured it).
-                    # The named element keeps its containment rule; the residual
-                    # is a wrapper with no strings of its own whose destructive
-                    # word lives only in a SIBLING of the child that was named.
-                    # Appended only when it IS a different node. When the named
-                    # element is itself the smallest clickable under the finger
-                    # (the common case) appending it again would join its label
-                    # to itself, and `destructive_hit` matches multi-word terms
-                    # as a token RUN: "Money ... send" followed by "Money ..."
-                    # manufactures "send money" at the seam -- a false stop, and
-                    # a stop is terminal for a scripted case.
-                    if actuated is not None and actuated is not element:
-                        labels.append(element_label(actuated))
-                # The node the action ACTUATES where the touch resolved one,
-                # else the node it NAMES. The same derivation the actuated-node
-                # guard already uses -- not a second one.
-                judged_node = actuated if actuated is not None else element
-                label = " ".join(labels).strip()
+                label, judged_node = _guard_label(op, action, element, screen)
                 hit = destructive_hit(label)
                 if not hit and op == "press":
                     # The key fires the FORM's IME action, and no dump names the
@@ -3516,30 +4055,7 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                     ctx, hit, screen, op, entry, label
                 )
                 if hit and not confirmed:
-                    entry["outcome"] = "guard_stop"
-                    # WHAT the guard stopped is decided above and is not
-                    # touched here. This branch decides only what happens
-                    # AFTER the hit, which is the one thing a charter's
-                    # ``destructive`` field is allowed to decide.
-                    refuses = bool(getattr(ctx, "guard_refuses", False))
-                    mismatched = bool(entry.get("guard_confirm_mismatch"))
-                    # ONE call, not a chain. The chain that was here handled two
-                    # sentinels and gave every future one the control wording --
-                    # the same half-wiring at the other consumer is what round 3
-                    # fixed, and this site still had it.
-                    entry["detail"] = (
-                        GUARD_DETAIL_REFUSED
-                        if refuses
-                        else _with_confirm_hint(
-                            guard_detail(hit, screen, ctx.package),
-                            op,
-                            hit,
-                            mismatched,
-                        )
-                    )
-                    _stamp_after(entry, screen)
-                    _append(trace, entry)
-                    if refuses:
+                    if _record_guard_stop(run, op, hit, entry, screen):
                         # EXPLICIT KEYWORDS, never a dict splat. The sentinel
                         # ratchet forbids ``**kwargs`` into this sink because
                         # ``guard_term``'s provenance must be traceable by
@@ -3577,364 +4093,99 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
                         ),
                     }
 
-            # --- asserts ------------------------------------------------------
-            if op == "assert":
-                if str(getattr(action, "kind", "")) == "visual":
-                    # Nothing here can judge a picture. Stop, and let the next
-                    # reply carry the screenshot of THIS screen to the model;
-                    # `Script` already refused a visual that is not last.
-                    entry["outcome"] = "visual_check"
-                    entry["detail"] = (
-                        "Visual check: " + str(getattr(action, "note", ""))
-                    )[:MAX_VISUAL_DETAIL_CHARS]
-                    _stamp_after(entry, screen)
-                    _append(trace, entry)
-                    return {
-                        "error": None,
-                        "content": _result(
-                            STATUS_NEEDS_MODEL,
-                            trace,
-                            screen,
-                            "",
-                            entry["detail"],
-                            index,
-                            visual_check=True,
-                        ),
-                    }
-                ok, detail = _evaluate_assert(action, screen, trace, baseline_texts)
-                entry["outcome"] = "assert_pass" if ok else "assert_fail"
-                entry["detail"] = detail
-                _stamp_after(entry, screen)
-                _append(trace, entry)
-                if ok:
-                    continue
-                return {
-                    "error": None,
-                    "content": _result(
-                        STATUS_NEEDS_MODEL, trace, screen, "", detail, index
-                    ),
-                }
+            # --- asserts, waits and device ops --------------------------------
+            step = _Step(op, action, entry, element, scroll_missed)
+            screen, reply = await _dispatch_op(run, step, screen, baseline_texts)
+            if reply is not None:
+                return reply
 
-            # --- waits --------------------------------------------------------
-            # Every wait is a condition with a bound (S17): the legacy `wait`
-            # maps onto the same four through `_wait_spec`.
-            if op in actions_mod.WAIT_OPS:
-                kind, wait_text, wait_ms = _wait_spec(action, items)
-                if kind != "changed":
-                    ctx.wait_interruption = ""
-                    if kind == "element":
-                        gone = bool(getattr(action, "until_gone", False))
-                        found, screen, _timed_out = await _wait_until_element(
-                            ctx,
-                            screen,
-                            wait_text,
-                            str(getattr(action, "until_rid_text", "") or ""),
-                            gone,
-                            wait_ms,
-                        )
-                    elif kind == "idle":
-                        found, screen, _timed_out = await _wait_until_idle(
-                            ctx, screen, wait_ms
-                        )
-                    else:
-                        found, screen, _timed_out = await _wait_until_text(
-                            ctx, screen, wait_text, wait_ms, gone=kind == "gone"
-                        )
-                    interruption, ctx.wait_interruption = ctx.wait_interruption, ""
-                    if kind == "element":
-                        label = (
-                            "element "
-                            + repr(wait_text[:120])
-                            + (" gone" if gone else " present")
-                        )
-                        met, missed = "found " + label, "timed out waiting for " + label
-                    else:
-                        met, missed, label = _wait_words(kind, wait_text)
-                    if found:
-                        entry["outcome"] = "ok"
-                        entry["detail"] = met
-                    elif interruption:
-                        entry["outcome"] = "interrupted"
-                        entry["detail"] = interruption + " (while " + label + ")"
-                    else:
-                        entry["outcome"] = "wait_timeout"
-                        entry["detail"] = missed
-                    if found:
-                        # No re-dump: the poll already left a fresh screen.
-                        screen, stop = await _settle(
-                            ctx,
-                            entry,
-                            screen,
-                            trace,
-                            index,
-                            redump=False,
-                            mark_no_change=False,
-                            op=op,
-                        )
-                        if stop is not None:
-                            return {"error": None, "content": stop}
-                        _stamp_after(entry, screen)
-                        _append(trace, entry)
-                        continue
-                    _stamp_after(entry, screen)
-                    _append(trace, entry)
-                    return {
-                        "error": None,
-                        "content": _result(
-                            STATUS_NEEDS_MODEL,
-                            trace,
-                            screen,
-                            "",
-                            entry["detail"],
-                            index,
-                        ),
-                    }
-                before_wait = screen
-                screen, changed, reusable = await _wait_until_changed(
-                    ctx, screen, wait_ms
-                )
-                entry["outcome"] = "ok"
-                # The detail says what the wait DID, not what it was allowed to
-                # do. Reporting "waited 8000ms" for a wait that came back in a
-                # quarter of a second is the true-shaped sentence this lane has
-                # been burned by before, and the trace is read back in the
-                # report and in the next packet.
-                if op == "wait":
-                    entry["detail"] = (
-                        (
-                            "waited for the screen to change, inside the "
-                            + str(wait_ms)
-                            + "ms"
-                        )
-                        if changed
-                        else ("waited " + str(wait_ms) + "ms")
-                    )
-                else:
-                    entry["detail"] = (
-                        "the screen changed"
-                        if changed
-                        else "the screen did not change in " + _secs(wait_ms)
-                    )
-                # `redump=not reusable`. Only a wait whose LAST poll dumped
-                # the unchanged screen hands back a post-wait screen
-                # (`_wait_until_changed` says when). Every other path -- an
-                # early return on a change, a cut dump -- holds a screen from
-                # before the wait ended, and skipping the dump there would
-                # stamp `after_screen_hash` from before the wait and hand the
-                # next action's target resolution and destructive guard a
-                # screen older than the wait itself -- the defect `_settle`'s
-                # docstring records, where every assert after a wait was
-                # evaluated against the pre-wait screen.
-                # WATCHED (B6): a change that is a dialog, a call, another app or
-                # an error text is NAMED and the replay stops for the model,
-                # instead of an "ok" that hands the next action a screen the
-                # script never expected.
-                # A FOCUS change returns the pre-wait screen un-read (the
-                # probe saw a new window, no dump was taken), so on that path
-                # the screen is read once here: comparing the baseline with
-                # itself could never name the call or app that took focus.
-                # That read IS the post-wait screen, so the settle reuses it
-                # rather than dumping a second time.
-                # A dump that fails here is left to `_settle`, which reports
-                # it as `dump_failed` unless the device names a disconnect.
-                interruption = ""
-                if changed and screen is before_wait:
-                    reread = await _dump(ctx)
-                    if reread.get("error"):
-                        interruption = watch.classify_error(reread["error"])
-                    else:
-                        screen = reread.get("content")
-                        reusable = True
-                if changed and not interruption:
-                    interruption = _interruption_of(ctx, screen, before_wait)
-                if interruption:
-                    entry["outcome"] = "interrupted"
-                    entry["detail"] = interruption
-                    _stamp_after(entry, screen)
-                    _append(trace, entry)
-                    return {
-                        "error": None,
-                        "content": _result(
-                            STATUS_NEEDS_MODEL, trace, screen, "", interruption, index
-                        ),
-                    }
-                if reusable:
-                    step_timing.mark("dump_reused")
-                screen, stop = await _settle(
-                    ctx,
-                    entry,
-                    screen,
-                    trace,
-                    index,
-                    redump=not reusable,
-                    mark_no_change=False,
-                    op=op,
-                )
-                if stop is not None:
-                    return {"error": None, "content": stop}
-                _stamp_after(entry, screen)
-                if op != "wait" and not changed:
-                    # The model said the screen would change and it did not:
-                    # hand it the screen rather than run the rest of a script
-                    # written for a screen that never came. The legacy `wait`
-                    # carries on, as it always has.
-                    entry["outcome"] = "wait_timeout"
-                    _append(trace, entry)
-                    return {
-                        "error": None,
-                        "content": _result(
-                            STATUS_NEEDS_MODEL,
-                            trace,
-                            screen,
-                            "",
-                            entry["detail"],
-                            index,
-                        ),
-                    }
-                _append(trace, entry)
-                continue
-
-            # --- device ops ---------------------------------------------------
-            # ONE rectangle for the guard and the device -- see
-            # `_swipe_points`. Both read this packet's own root_bounds
-            # rather than each asking adb, whose answer expires.
-            outcome = await _perform(op, action, element, ctx, _clamp_source(screen))
-            if outcome.get("error"):
-                if outcome.get("mask_text") and isinstance(entry.get("action"), dict):
-                    for key in ("text", "value"):
-                        if key in entry["action"]:
-                            entry["action"][key] = actions_mod.SECRET_MASK
-                recoverable = bool(outcome.get("needs_model"))
-                entry["outcome"] = "refused" if recoverable else "device_error"
-                entry["detail"] = _confirmed(entry, str(outcome["error"]))[:400]
-                _stamp_after(entry, screen)
-                _append(trace, entry)
-                return {
-                    "error": None,
-                    "content": _result(
-                        PASSWORD_REFUSAL_STATUS if recoverable else STATUS_ERROR,
-                        trace,
-                        screen,
-                        "",
-                        entry["detail"],
-                        index,
-                    ),
-                }
-            entry["outcome"] = "ok"
-            entry["detail"] = _confirmed(
-                entry, str((outcome.get("content") or {}).get("detail") or "")
-            )
-            if scroll_missed:
-                entry["detail"] = (SCROLL_TARGET_MISSED + " " + entry["detail"]).strip()
-
-            # A `launch` whose `am start` only brought this app's own task to
-            # the front of a screen that was ALREADY this app changed nothing a
-            # dump would see. The one redump it skips is the costliest call on a
-            # heavy AVD. ONLY the dump is skipped: `_settle` still runs on the
-            # screen in hand, so `no_change` and the system-dialog and
-            # left-app checks are kept.
-            front = op == "launch" and _brought_to_front(
-                outcome, screen, ctx, named=getattr(action, "package", None)
-            )
-            if front:
-                step_timing.mark("dump_skipped")
-            if op in actions_mod.MUTATING_OPS:
-                screen, stop = await _settle(
-                    ctx,
-                    entry,
-                    screen,
-                    trace,
-                    index,
-                    redump=not front,
-                    mark_no_change=True,
-                    op=op,
-                    extra_expected=(
-                        (str(getattr(action, "package", "") or ""),)
-                        if op == "launch"
-                        else ()
-                    ),
-                )
-                if stop is not None:
-                    return {"error": None, "content": stop}
-            _stamp_after(entry, screen)
-            _append(trace, entry)
-
-        # A script that never calls done() lands here. It used to hand back an
-        # empty verdict, which `case_runner` reads as PASS -- so omitting one
-        # word bypassed the whole verification rule the done() branch enforces.
-        # The same rule applies on both exits or it is not a rule.
-        # ``_verified``, not ``_has_verification``: the done() branch above asks
-        # the run-wide question (:1533) and this exit asked the narrower one, so
-        # an explore run whose earlier turn DID assert was still told nothing had
-        # been verified whenever a turn omitted done(). That is the refusal
-        # ``prior_verified`` exists to remove, surviving on the other exit -- and
-        # the scripted lane is unmoved, because that field defaults to False.
-        ended_verified = _verified(trace, ctx)
-        # A VERIFIED run must say what it verified. The reason used to open
-        # "The script finished without a done() action" on BOTH exits, so a
-        # tester reading a pass was told about an omission in the script rather
-        # than about the app. The omission is still disclosed -- second
-        # sentence -- because it is why there is no model-written reason here.
-        # FOUR branches, because two questions are being answered: was anything
-        # verified, and -- if not -- is that an omission in THIS unit of work?
-        #
-        # The verified branch is split. ``_verification_summary`` describes THIS
-        # trace, so when the evidence came from an earlier turn of the run there
-        # is nothing for it to summarise, and the old fallback ("the asserts in
-        # this script passed") would make a per-script claim about run-wide
-        # evidence -- inaccurate on exactly the path ``_verified`` opens here.
-        summary = _verification_summary(trace)
-        reason = (
-            (
-                "Verified: "
-                + summary
-                + ". The script ended without a done() action, so this verdict "
-                "rests on the asserts above."
-            )
-            if ended_verified and summary
-            else (
-                "This turn ended without a done() action. It asserted nothing "
-                "itself; an earlier turn of this run did, and that is what the "
-                "verdict rests on."
-            )
-            if ended_verified
-            else (
-                "The script finished without a done() action. Nothing in it "
-                "asserted anything, so there is no evidence this case passed "
-                "-- a screen that moved is activity, not verification."
-            )
-            if ctx.asserts_expected
-            else (
-                "This turn ended without a done() action and asserted nothing, "
-                "which is ordinary for an exploratory turn -- it recorded what "
-                "the screen did. No verdict is claimed for it. The run's "
-                "verdict comes from the turn that judges the goal."
-            )
-        )
-        # THE TRACE THIS REASON IS SUMMARISING, actually read. Every branch
-        # above is derived from `ended_verified` and `ctx.asserts_expected`
-        # alone, so all four claimed the script did something -- "it recorded
-        # what the screen did" -- on a script where every action came back
-        # `no_change`. Appended rather than folded into the ladder because it
-        # is orthogonal to all four: a verified turn and an exploratory one are
-        # equally worth telling that nothing moved.
-        inert = inert_ops(trace)
-        if inert:
-            reason = (NOTHING_MOVED_NOTE % ", ".join(inert)) + reason
-        return {
-            "error": None,
-            "content": _result(
-                STATUS_DONE,
-                trace,
-                screen,
-                "" if ended_verified else STATUS_UNVERIFIED,
-                reason,
-                len(items) - 1,
-            ),
-        }
+        return _end_of_script(run, screen)
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.executor.replay failed")
         return {"error": str(exc), "content": None}
+
+
+def _no_done_reason(ended_verified: bool, summary: str, asserts_expected: bool) -> str:
+    """The reason a script that never called done() ends with.
+
+    A VERIFIED run must say what it verified. The reason used to open "The
+    script finished without a done() action" on BOTH exits, so a tester
+    reading a pass was told about an omission in the script rather than about
+    the app. The omission is still disclosed -- second sentence -- because it
+    is why there is no model-written reason here.
+    FOUR branches, because two questions are being answered: was anything
+    verified, and -- if not -- is that an omission in THIS unit of work?
+
+    The verified branch is split. ``_verification_summary`` describes THIS
+    trace, so when the evidence came from an earlier turn of the run there is
+    nothing for it to summarise, and the old fallback ("the asserts in this
+    script passed") would make a per-script claim about run-wide evidence --
+    inaccurate on exactly the path ``_verified`` opens here.
+    """
+    if ended_verified and summary:
+        return (
+            "Verified: "
+            + summary
+            + ". The script ended without a done() action, so this verdict "
+            "rests on the asserts above."
+        )
+    if ended_verified:
+        return (
+            "This turn ended without a done() action. It asserted nothing "
+            "itself; an earlier turn of this run did, and that is what the "
+            "verdict rests on."
+        )
+    if asserts_expected:
+        return (
+            "The script finished without a done() action. Nothing in it "
+            "asserted anything, so there is no evidence this case passed "
+            "-- a screen that moved is activity, not verification."
+        )
+    return (
+        "This turn ended without a done() action and asserted nothing, "
+        "which is ordinary for an exploratory turn -- it recorded what "
+        "the screen did. No verdict is claimed for it. The run's "
+        "verdict comes from the turn that judges the goal."
+    )
+
+
+def _end_of_script(run: _ReplayRun, screen: dict | None) -> dict:
+    """A script that never calls done() lands here. It used to hand back an
+    empty verdict, which `case_runner` reads as PASS -- so omitting one word
+    bypassed the whole verification rule the done() branch enforces. The same
+    rule applies on both exits or it is not a rule."""
+    ctx, trace = run.ctx, run.trace
+    # ``_verified``, not ``_has_verification``: the done() branch asks the
+    # run-wide question (:1533) and this exit asked the narrower one, so an
+    # explore run whose earlier turn DID assert was still told nothing had been
+    # verified whenever a turn omitted done(). That is the refusal
+    # ``prior_verified`` exists to remove, surviving on the other exit -- and
+    # the scripted lane is unmoved, because that field defaults to False.
+    ended_verified = _verified(trace, ctx)
+    reason = _no_done_reason(
+        ended_verified, _verification_summary(trace), ctx.asserts_expected
+    )
+    # THE TRACE THIS REASON IS SUMMARISING, actually read. Every branch above
+    # is derived from `ended_verified` and `ctx.asserts_expected` alone, so all
+    # four claimed the script did something -- "it recorded what the screen
+    # did" -- on a script where every action came back `no_change`. Appended
+    # rather than folded into the ladder because it is orthogonal to all four:
+    # a verified turn and an exploratory one are equally worth telling that
+    # nothing moved.
+    inert = inert_ops(trace)
+    if inert:
+        reason = (NOTHING_MOVED_NOTE % ", ".join(inert)) + reason
+    return {
+        "error": None,
+        "content": _result(
+            STATUS_DONE,
+            trace,
+            screen,
+            "" if ended_verified else STATUS_UNVERIFIED,
+            reason,
+            len(run.items) - 1,
+        ),
+    }
 
 
 def _append(trace: list[dict], entry: dict) -> None:
