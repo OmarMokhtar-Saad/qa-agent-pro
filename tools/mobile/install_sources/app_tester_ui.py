@@ -5,7 +5,9 @@ API, CLI or credential is involved (owner decision, 2026-10-05). The flow, one
 screen at a time, is bounded by ``MAX_APP_TESTER_STEPS`` steps and
 ``APP_TESTER_FLOW_TIMEOUT_S`` seconds:
 
-1. open App Tester and find the app card by its display label (resolve-or-ask:
+1. open App Tester and find the app card: by the package id when the list shows
+   it (scrolling the list at most ``MAX_LISTING_SCROLLS`` times to look), else
+   by its display label (resolve-or-ask:
    several cards for one label are asked about, never picked);
 2. on the app page, choose a release when several are listed (the request's
    release or target version code decides, otherwise ask) and tap Update /
@@ -69,6 +71,10 @@ APP_TESTER_FLOW_TIMEOUT_S = 240
 
 #: Loop bound: screens examined before the flow gives up.
 MAX_APP_TESTER_STEPS = 30
+
+#: Scrolls of the App Tester list made to look for the package id; each one is
+#: a screen dump, so this bounds the search, not the list.
+MAX_LISTING_SCROLLS = 6
 
 #: Pause between screens while something loads or installs.
 APP_TESTER_POLL_S = 1.0
@@ -375,12 +381,29 @@ class AppTesterUiSource:
             return await self._open_card(run, texts)
         return await self._detail(run, texts)
 
+    async def _scan_listing(self, run: _Run, texts) -> tuple:
+        """Scroll the list until the package id shows, a scroll adds no new text
+        (end of list), a screen cannot be read, or MAX_LISTING_SCROLLS scrolls
+        were made. Returns (package shown, every text read)."""
+        seen = set(texts)
+        for _ in range(MAX_LISTING_SCROLLS):
+            if run.request.package in seen:
+                break
+            await run.ui.scroll_down()
+            shot = await run.ui.screen()
+            fresh = visible_texts(shot.xml) if shot is not None else set()
+            if fresh <= seen:
+                break
+            seen |= fresh
+        return run.request.package in seen, seen
+
     async def _open_card(self, run: _Run, texts) -> Optional[InstallOutcome]:
-        if run.request.package in texts:
+        found, seen = await self._scan_listing(run, texts)
+        if found:
             return await self._tap_card(run, run.request.package)
         if not run.request.app_label.strip():
             return _label_required()
-        cands = [Candidate(text) for text in sorted(texts) if _is_card_text(text)]
+        cands = [Candidate(text) for text in sorted(seen) if _is_card_text(text)]
         got = await resolve_or_ask(
             run.request.app_label,
             cands,
@@ -390,10 +413,21 @@ class AppTesterUiSource:
         if not got.resolved:
             code = "app_not_found" if got.status == NONE else "app_ambiguous"
             return InstallOutcome(False, code, _unresolved_message(got))
-        return await self._tap_card(run, got.value)
+        return await self._tap_card(run, got.value, scroll_back=True)
 
-    async def _tap_card(self, run: _Run, text: str) -> Optional[InstallOutcome]:
-        if not await run.ui.tap_text(text):
+    async def _tap_card(
+        self, run: _Run, text: str, scroll_back: bool = False
+    ) -> Optional[InstallOutcome]:
+        """Tap the card. With scroll_back (a label resolved over every screen the
+        scan read), a card that is not on the current screen is looked for by
+        scrolling up, at most MAX_LISTING_SCROLLS times."""
+        tapped = await run.ui.tap_text(text)
+        for _ in range(MAX_LISTING_SCROLLS if scroll_back else 0):
+            if tapped:
+                break
+            await run.ui.scroll_up()
+            tapped = await run.ui.tap_text(text)
+        if not tapped:
             return _tap_failed(text)
         run.card_tapped = True
         await self._sleep(APP_TESTER_POLL_S)

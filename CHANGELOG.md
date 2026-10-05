@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.105.1] - 2026-10-05
+## [1.105.2] - 2026-10-05
 
 ### Added
 
@@ -29,15 +29,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- App Tester updates find the app by its package id on the App Tester
-  list; the app's display name is needed only when the package is not
-  on screen, and the choices offered are app names only.
+- App Tester updates scroll the App Tester list to find the app's card
+  when it is not on the first screen (a bounded number of scrolls).
 
 ### Fixed
 
-- qa_update_app from App Tester no longer fails asking for a display
-  name: the app name you give is used.
-- A run waiting on your answer keeps the device; an idle run is released
-  and the next run takes the device without a stale 'busy'.
-- qa_mobile_status shows a stopped run's final result.
-- An unreadable screen is named in the error instead of left blank.
+- An app chosen by name from further up the App Tester list is scrolled
+  back to and opened, instead of failing to tap.
