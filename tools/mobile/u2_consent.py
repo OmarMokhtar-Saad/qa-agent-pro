@@ -32,7 +32,15 @@ _MAX_SERIAL_SHOWN = 64
 _MAX_DECLINED = 64
 _declined: dict[str, None] = {}
 # What a prompt or opt-in store failure can raise; anything else is a bug.
-_FAILURES = (OSError, RuntimeError, TimeoutError, ValueError, LookupError, TypeError)
+_FAILURES = (
+    OSError,
+    RuntimeError,
+    TimeoutError,
+    ValueError,
+    LookupError,
+    TypeError,
+    AttributeError,
+)
 
 
 def _installed() -> bool:
@@ -77,6 +85,18 @@ def _explicit_decline(answers: list) -> bool:
     return isinstance(last, str) and bool(last.strip())
 
 
+def _enable_or_remember(serial: str, key: str, consent: object) -> bool:
+    """Save a yes; one that cannot be saved is remembered like a no (asked once)."""
+    try:
+        saved = bool(tree_optin.enable(serial, consent))
+    except _FAILURES:
+        log.warning("u2_consent: the opt-in could not be saved", exc_info=True)
+        saved = False
+    if not saved:
+        _remember_decline(key)
+    return saved
+
+
 async def offer(serial: str, ask: Optional[AskCb]) -> bool:
     """Ask the tester about the helper for ``serial``; True only on a saved yes."""
     key = str(serial or "")
@@ -93,7 +113,7 @@ async def offer(serial: str, ask: Optional[AskCb]) -> bool:
             if _explicit_decline(answers):
                 _remember_decline(key)
             return False
-        return bool(tree_optin.enable(serial, consent))
+        return _enable_or_remember(serial, key, consent)
     except _FAILURES:  # an offer must never break the run it rides on
         log.warning("u2_consent: the offer failed", exc_info=True)
         return False

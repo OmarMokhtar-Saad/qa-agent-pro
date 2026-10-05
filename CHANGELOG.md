@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.105.0] - 2026-10-05
+## [1.105.1] - 2026-10-05
 
 ### Added
 
@@ -29,26 +29,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- New mobile tools: qa_update_app updates an app in one call (resolve,
-  current version, fetch, install, launch, verify the new version) and
-  ends with a verdict; qa_app_info shows the installed versionName and
-  versionCode; qa_mobile_stop stops a run, and a stopped run takes no
-  more steps.
+- App Tester updates find the app by its package id on the App Tester
+  list; the app's display name is needed only when the package is not
+  on screen, and the choices offered are app names only.
 
 ### Fixed
 
-- Mobile runs never guess an app, package, device, build flavour or
-  release: one exact match is used and named, otherwise you are asked.
-- The device lock is released when a run ends or sits idle, so the next
-  run no longer waits on a stale lock.
-- Every run ends with a verdict and a per-step summary instead of
-  'unverified', and refused cases keep their test-case id and title.
-- Mobile scripts accept the step shapes models actually write (launch
-  target, scroll direction, tap by resource id, long waits) instead of
-  refusing them.
-- App Tester installs drive the App Tester app on the device instead of
-  opening an empty Play Store listing.
-- Install, permission and App Tester dialogs are handled by the run,
-  with no blind taps; install failures report the real cause.
-- Faster runs: fewer duplicate screen dumps, and per-step timings
-  (duration, dumps, waits) in the run record and report.
+- qa_update_app from App Tester no longer fails asking for a display
+  name: the app name you give is used.
+- A run waiting on your answer keeps the device; an idle run is released
+  and the next run takes the device without a stale 'busy'.
+- qa_mobile_status shows a stopped run's final result.
+- An unreadable screen is named in the error instead of left blank.

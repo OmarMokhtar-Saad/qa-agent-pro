@@ -131,7 +131,15 @@ async def call_port(port: Any, *args: Any) -> Any:
 
 #: What a failing port (heartbeat, verdict write, lock release) may raise. Caught
 #: so one failing step never leaves the device locked; anything else is a bug.
-PORT_FAILURES = (OSError, RuntimeError, TimeoutError, ValueError, LookupError)
+PORT_FAILURES = (
+    OSError,
+    RuntimeError,
+    TimeoutError,
+    ValueError,
+    LookupError,
+    TypeError,
+    AttributeError,
+)
 
 
 async def _finalize(ports: ReleasePorts, run_id: str, verdict: Any) -> None:
@@ -154,6 +162,7 @@ async def _free(ports: ReleasePorts, notice: ReleaseNotice, verdict: Any) -> boo
     if isinstance(body, dict) and body.get("released") is False:
         # The run is ended, but the device was not freed: never say it was.
         logger.warning("lock_reaper: %s held no lock to free", notice.run_id)
+        forget(notice.run_id)
         return False
     return True
 

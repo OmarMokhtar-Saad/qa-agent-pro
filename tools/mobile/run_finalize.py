@@ -85,3 +85,9 @@ def stop_text(manifest: object) -> str:
     """The recorded stop code of a finished run, or ``""``. Total: never raises."""
     final = manifest.get("final") if isinstance(manifest, dict) else None
     return str(final.get("stop") or "") if isinstance(final, dict) else ""
+
+
+def recorded(manifest: object) -> dict:
+    """The recorded final verdict of a finished run, or ``{}``. Total: never raises."""
+    final = manifest.get("final") if isinstance(manifest, dict) else None
+    return final if isinstance(final, dict) else {}

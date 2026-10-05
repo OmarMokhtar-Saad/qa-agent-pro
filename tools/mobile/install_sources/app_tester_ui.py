@@ -77,6 +77,9 @@ ACTION_LABELS = ("Update", "Download", "Install")
 OPEN_LABEL = "Open"
 _PROGRESS_STARTS = ("downloading", "installing", "pending", "preparing")
 _VERSION_RE = re.compile(r"\b(\d+(?:\.\d+)*)\s*\((\d+)\)")
+#: Listing lines that are not app names: a card's release count, the list header.
+_RELEASE_COUNT_RE = re.compile(r"^\d+\s+releases?$", re.IGNORECASE)
+_LISTING_HEADERS = ("Test apps",)
 
 SleepFn = Callable[[float], Awaitable[None]]
 VersionFn = Callable[[str, str], Awaitable[Optional[AppVersion]]]
@@ -144,14 +147,17 @@ def _refuse_request(request: InstallRequest) -> Optional[InstallOutcome]:
             + repr(str(request.package)[:60])
             + ". Ask the tester for the exact package.",
         )
-    if not request.app_label.strip():
-        return InstallOutcome(
-            False,
-            "label_required",
-            "App Tester lists apps by display name. Ask the tester what the app "
-            "is called in App Tester (for example Acme QA).",
-        )
     return None
+
+
+def _label_required() -> InstallOutcome:
+    return InstallOutcome(
+        False,
+        "label_required",
+        "App Tester does not show this package on screen and lists apps by display "
+        "name. Ask the tester what the app is called in App Tester (for example "
+        "Acme QA).",
+    )
 
 
 def _quoted(texts) -> str:
@@ -179,7 +185,9 @@ def _tap_failed(text: str) -> InstallOutcome:
 def _is_card_text(text: str) -> bool:
     if len(text) < 2 or text in ACTION_LABELS or text == OPEN_LABEL:
         return False
-    return _VERSION_RE.search(text) is None
+    if text in _LISTING_HEADERS or _RELEASE_COUNT_RE.match(text):
+        return False
+    return not (valid_package_name(text) or _VERSION_RE.search(text))
 
 
 def _explicit_release(request: InstallRequest, releases: list) -> Optional[str]:
@@ -219,7 +227,7 @@ def _foreign_stop(front: str, texts) -> InstallOutcome:
         False,
         "unrecognised_screen",
         "Stopped on a screen of "
-        + front
+        + (front or "an app that could not be read")
         + " that no dialog handler knows. "
         + _quoted(texts)
         + " Nothing was tapped.",
@@ -368,6 +376,10 @@ class AppTesterUiSource:
         return await self._detail(run, texts)
 
     async def _open_card(self, run: _Run, texts) -> Optional[InstallOutcome]:
+        if run.request.package in texts:
+            return await self._tap_card(run, run.request.package)
+        if not run.request.app_label.strip():
+            return _label_required()
         cands = [Candidate(text) for text in sorted(texts) if _is_card_text(text)]
         got = await resolve_or_ask(
             run.request.app_label,
@@ -378,8 +390,11 @@ class AppTesterUiSource:
         if not got.resolved:
             code = "app_not_found" if got.status == NONE else "app_ambiguous"
             return InstallOutcome(False, code, _unresolved_message(got))
-        if not await run.ui.tap_text(got.value):
-            return _tap_failed(got.value)
+        return await self._tap_card(run, got.value)
+
+    async def _tap_card(self, run: _Run, text: str) -> Optional[InstallOutcome]:
+        if not await run.ui.tap_text(text):
+            return _tap_failed(text)
         run.card_tapped = True
         await self._sleep(APP_TESTER_POLL_S)
         return None

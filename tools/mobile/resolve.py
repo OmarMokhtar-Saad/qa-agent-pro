@@ -41,7 +41,15 @@ AskCb = Callable[[str, list], Awaitable[Optional[str]]]
 #: What a failing ask transport may raise. A well-behaved AskCb returns None
 #: instead (``_elicit_choice`` does); these are caught so a raising one still
 #: degrades to the text menu rather than crashing the tool call.
-ASK_FAILURES = (OSError, RuntimeError, TimeoutError, ValueError)
+ASK_FAILURES = (
+    OSError,
+    RuntimeError,
+    TimeoutError,
+    ValueError,
+    LookupError,
+    TypeError,
+    AttributeError,
+)
 
 _IGNORED_WORDS = frozenset({"app", "apk", "application", "the", "my"})
 

@@ -864,6 +864,21 @@ def _count(value: object) -> int:
         return 0
 
 
+def _final_lines(final: object) -> list[str]:
+    """The recorded verdict of an ended run as a one-row list, or ``[]``."""
+    if not isinstance(final, dict) or not final:
+        return []
+    reason = _field(final.get("reason"))
+    stop = _field(final.get("stop"))
+    return [
+        "- result: **"
+        + _field(final.get("outcome"), "unknown")
+        + "**"
+        + (" \u2014 " + reason if reason else "")
+        + (" (`" + stop + "`)" if stop else "")
+    ]
+
+
 def status_block(resolved: object, coverage_line: str = "") -> str:
     """What ``qa_mobile_status`` prints: where the run is, from disk only.
 
@@ -889,6 +904,7 @@ def status_block(resolved: object, coverage_line: str = "") -> str:
         capture = body.get("capture")
         if isinstance(capture, dict) and capture:
             lines.append(capture_line(capture))
+        lines.extend(_final_lines(body.get("final")))
         # LEADS the block, on purpose, and that ordering is the whole point: a
         # forward action below the fold is one a model does not act on.
         # Observed -- a model that met a stopped run and got only a status

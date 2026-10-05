@@ -28,6 +28,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 
+from tools.device_manager import valid_package_name
 from tools.mobile import (
     app_info,
     app_pick,
@@ -83,6 +84,16 @@ class UpdateRequest:
     source: str = SOURCE_DEFAULT
     app_label: str = ""
     target_version_code: Optional[int] = None
+
+
+def _install_label(request: UpdateRequest) -> str:
+    """The display name an install source lists the app by: the explicit label,
+    else the tester's own words for the app unless they are a package id."""
+    label = str(request.app_label or "").strip()
+    if label:
+        return label
+    text = str(request.app_text or "").strip()
+    return "" if valid_package_name(text) else text
 
 
 @dataclass(frozen=True)
@@ -295,7 +306,7 @@ class _Run:
         install_request = InstallRequest(
             self.serial,
             self.package,
-            request.app_label,
+            _install_label(request),
             None,
             request.target_version_code,
         )

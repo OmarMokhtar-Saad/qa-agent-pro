@@ -306,7 +306,8 @@ def claim(run_id: str, session_token: str = "", *, force: bool = False) -> dict:
         # while its lease sat on disk. The check lives here rather than in the
         # handlers for the reason the docstring above already gives: two copies
         # of one test is how the two handlers drift.
-        if not (run_store.read_manifest(run_id).get("content") or {}):
+        on_disk = run_store.read_manifest(run_id).get("content") or {}
+        if not on_disk:
             return {
                 "error": (
                     "No run `" + str(run_id)[:64] + "` on this machine. "
@@ -315,9 +316,7 @@ def claim(run_id: str, session_token: str = "", *, force: bool = False) -> dict:
                 ),
                 "content": None,
             }
-        stopped = run_finalize.stop_text(
-            run_store.read_manifest(run_id).get("content") or {}
-        )
+        stopped = run_finalize.stop_text(on_disk)
         if stopped:
             # A run ended by qa_mobile_stop or the idle release takes no more
             # steps: its verdict is recorded, and a later step would restart
@@ -1354,6 +1353,7 @@ def resolve(run_id: str, session_token: str = "") -> dict:
                 if is_explore
                 else bool(point.get("finished")),
                 "explore_stop": explore_stop,
+                "final": run_finalize.recorded(manifest),
                 "explore": explore,
                 "holder": str(lease.get("holder") or ""),
                 "lease_state": str(lease.get("state") or run_store.NONE),
@@ -1454,6 +1454,37 @@ def idle_ports() -> lock_reaper.ReleasePorts:
         finalize=_finalizer(run_finalize.STOP_IDLE),
         release_lock=release_if_held,
     )
+
+
+def last_checkpoint_ts(run_id: str) -> float | None:
+    """When the newest case checkpoint of *run_id* was written, or None.
+
+    The idle release's persisted clock for a holder this process no longer
+    tracks (evicted from the reaper table, or the server restarted). Never the
+    lease stamp: the heartbeat refreshes that for as long as the run lives.
+    Never raises.
+    """
+    try:
+        cases = run_store.run_path(run_id) / run_store.CASES_DIR
+        stamps = [p.stat().st_mtime for p in cases.glob("TC-*.json")]
+    except (OSError, ValueError):
+        return None
+    return max(stamps, default=None)
+
+
+def awaits_tester(run_id: str) -> bool:
+    """True when a case of *run_id* is paused for the tester (no verdict yet)."""
+    cases = (run_store.list_cases(run_id) or {}).get("content") or []
+    return any(
+        c.get("status") == case_runner.NEEDS_TESTER and not c.get("verdict")
+        for c in cases
+    )
+
+
+def run_ended(run_id: str) -> bool:
+    """True when the run's manifest records a stop (tester stop or idle release)."""
+    read = run_store.read_manifest(run_id).get("content")
+    return bool(run_finalize.stop_text(read))
 
 
 def _finalizer(stop: str):

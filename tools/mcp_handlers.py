@@ -12667,6 +12667,16 @@ async def handle_mobile_test(
         return "⚠️ The mobile run could not continue: " + _safe(str(exc), 200)
 
 
+def _mobile_retake(session, owner: str, serial: str, held: dict) -> dict:
+    """The lock answer once the holder was freed; ``held`` (busy) if the retake fails."""
+    try:
+        taken = session.take_device_lock(owner, serial=serial) or {}
+    except _MOBILE_TOOL_FAILURES:
+        logger.warning("retake of device %s failed", serial, exc_info=True)
+        return held
+    return taken.get("content") or held
+
+
 async def _mobile_retake_after_idle(held: dict, owner: str, serial: str) -> tuple:
     """``(held, note)``: end an IDLE run that holds the device, then retake it.
 
@@ -12683,18 +12693,26 @@ async def _mobile_retake_after_idle(held: dict, owner: str, serial: str) -> tupl
 
         if not run_store.looks_like_a_run_id(holder):
             return held, ""
-        ports = session.idle_ports()
-        notice = await lock_reaper.release_if_idle(holder, serial, ports)
-        if notice is None:
+        if session.awaits_tester(holder):
+            # Waiting on the TESTER (a credential, a confirm) is not abandonment:
+            # the agent has nothing to submit until they answer.
             return held, ""
-        taken = session.take_device_lock(owner, serial=serial) or {}
-        retaken = taken.get("content") or {}
+        ports = session.idle_ports()
+        notice = await lock_reaper.release_if_idle(
+            holder, serial, ports, persisted_ts=session.last_checkpoint_ts(holder)
+        )
+        if notice is None:
+            # A holder the reaper just ended but could not report freed may
+            # have a free lock: ask once instead of answering a stale busy.
+            if session.run_ended(holder):
+                return _mobile_retake(session, owner, serial, held), ""
+            return held, ""
         cap = app_tools.MAX_TOOL_TEXT_CHARS
         text = wrap_untrusted("mobile_release", notice.message(), cap)
     except _MOBILE_TOOL_FAILURES:
         logger.warning("idle release of %s failed", holder, exc_info=True)
         return held, ""
-    return retaken, text + "\n"
+    return _mobile_retake(session, owner, serial, held), text + "\n"
 
 
 async def _mobile_heavy_avd_note(serial: str) -> str:
@@ -15251,6 +15269,7 @@ _MOBILE_TOOL_FAILURES = (
     ValueError,
     LookupError,
     TypeError,
+    AttributeError,
     ImportError,
 )
 
