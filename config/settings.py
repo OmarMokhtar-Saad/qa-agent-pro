@@ -1137,8 +1137,8 @@ class Settings(BaseSettings):
     # tools/updater._RELEASE_PUBLIC_KEYS_HEX. Default OFF for exactly ONE
     # migration release so installs predating signing still update (they log a
     # prominent unsigned-release warning); an INVALID signature is ALWAYS
-    # rejected regardless of this flag. Flip ON (see runbook) once every live
-    # release is signed. Lenient never-raising bool coercion like the rest.
+    # rejected regardless of this flag. Releases ship UNSIGNED now, so keep it
+    # OFF: ON refuses every update. Lenient never-raising bool coercion.
     qa_update_require_signature: bool = False
 
     # --- Usage analytics (telemetry) - opt-out; ON only in the dist. ---

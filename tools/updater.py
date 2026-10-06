@@ -126,8 +126,8 @@ _LOCK_EXTRA = ("MANIFEST.sha256", "MANIFEST.sig", "launcher.py", "VERSION")
 # Ed25519 release-signing PUBLIC keys (hex, 32 bytes each): the KEYRING. A
 # release is trusted when ANY key here verifies its MANIFEST.sig. The matching
 # PRIVATE keys are held ONLY by the release maintainer and never live in this
-# repo. Generate a keypair with `python scripts/build_dist.py
-# --generate-signing-key` and ADD the printed hex here. Empty => no embedded
+# repo. Releases now ship UNSIGNED (publisher signing was removed; see
+# docs/DECISIONS.md), so this verifier is dormant. Empty => no embedded
 # key => signature verification is inert (logged) and the
 # QA_UPDATE_REQUIRE_SIGNATURE gate decides whether an unsigned release proceeds.
 #

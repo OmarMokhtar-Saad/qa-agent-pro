@@ -530,7 +530,7 @@ Two things worth knowing:
   `qa-doctor` tells you explicitly when that is the case; otherwise never
   restart.
 - **Read-only by design** — code files are hash-verified against
-  `MANIFEST.sha256`, Ed25519-signed via `MANIFEST.sig`, and chmod'ed read-only
+  `MANIFEST.sha256` and chmod'ed read-only
   on every start. Manual or AI-editor edits fail to save, and anything
   force-edited is restored on the next start. This repo is a build artifact:
   changes land here only through releases.

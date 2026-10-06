@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.106.0] - 2026-10-06
+## [1.106.1] - 2026-10-06
 
 ### Added
 
@@ -29,8 +29,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Internal clean-up: large test-generation, suite-submission, setup-check
-  and mobile-replay steps are split into smaller named parts, and
-  duplicate detection moves into its own module. Nothing changes in how
-  the tools behave.
-- More regression tests guard these steps.
+- Releases are no longer signed. Updates keep installing as before; leave
+  QA_UPDATE_REQUIRE_SIGNATURE off (the default), because turning it on
+  now refuses every update.
+- The Cursor setup writes a portable .cursor/mcp.json.

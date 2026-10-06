@@ -145,7 +145,6 @@ LIVE_ENV: frozenset = frozenset(
         "QA_FORCE",
         "QA_DRIFT_RESTART_ENABLED",
         "QA_DRIFT_CHECK_SECONDS",
-        "QA_RELEASE_SIGNING_KEY",
         "QA_INSTALL_DIR",
         "QA_STAGING_DIR",
         "QA_PY",
