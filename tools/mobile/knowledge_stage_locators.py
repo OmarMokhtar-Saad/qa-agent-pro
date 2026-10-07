@@ -139,6 +139,25 @@ def _update(conn, lc, old: dict, obs: dict) -> bool:
     )
 
 
+def _squats(old: dict) -> bool:
+    """An imported row holding this fp_hash: local evidence never merges into it,
+    whatever its screen_key, so its locators cannot outrank what was observed."""
+    return old.get("trust") == "imported"
+
+
+def _fresh_values(lc, key: tuple, obs: dict, queue: list) -> dict:
+    return {
+        "screen_key": key[0],
+        "fp_json": obs["fp"],
+        "fp_hash": key[1],
+        "locators_json": queue,
+        "hits": obs["hits"],
+        "misses": obs["misses"],
+        "status": "active",
+        "app_version": str(getattr(lc.facts, "app_version", "") or ""),
+    }
+
+
 def _create(conn, lc, key: tuple, obs: dict) -> bool:
     queue = merge([], obs["counts"])
     if not queue:
@@ -146,18 +165,26 @@ def _create(conn, lc, key: tuple, obs: dict) -> bool:
     got = knowledge_db.insert(
         conn,
         "elements",
-        {
-            "screen_key": key[0],
-            "fp_json": obs["fp"],
-            "fp_hash": key[1],
-            "locators_json": queue,
-            "hits": obs["hits"],
-            "misses": obs["misses"],
-            "status": "active",
-            "app_version": str(getattr(lc.facts, "app_version", "") or ""),
-        },
+        _fresh_values(lc, key, obs, queue),
         run_id=lc.run_id,
         why="locator queue",
+    )
+    return got is not None
+
+
+def _replace_imported(conn, lc, old: dict, key: tuple, obs: dict) -> bool:
+    """Supersede a squatting imported row with this run's own observation; the
+    imported row's counters and locators never mix into local evidence."""
+    queue = merge([], obs["counts"])
+    if not queue:
+        return False
+    got = knowledge_db.supersede(
+        conn,
+        "elements",
+        old["id"],
+        _fresh_values(lc, key, obs, queue),
+        run_id=lc.run_id,
+        why="imported element superseded by local observation",
     )
     return got is not None
 
@@ -168,7 +195,9 @@ def run(conn, lc) -> StageResult:
         for key, obs in collect(list(lc.steps or [])).items():
             found = knowledge_db.rows(conn, "elements", _OPEN, (key[1],), 1)
             done = (
-                _update(conn, lc, found[0], obs)
+                _replace_imported(conn, lc, found[0], key, obs)
+                if found and _squats(found[0])
+                else _update(conn, lc, found[0], obs)
                 if found
                 else _create(conn, lc, key, obs)
             )

@@ -515,6 +515,17 @@ def _split_camel(text: str) -> str:
     return perception.split_camel(text)
 
 
+def _label_part(key: str, value: object) -> str:
+    """One identifying field as guard text: cls split, rid raw AND split."""
+    text = str(value or "")
+    if key == "cls":
+        return _split_camel(text)
+    if key == "rid":
+        # Raw keeps one-token words (CheckOut -> checkout); split adds signOut -> sign out.
+        return perception.with_camel_split(text)
+    return text
+
+
 def element_label(element: object, screen: object = None) -> str:
     """Everything about *element* a destructive lexicon should judge.
 
@@ -544,12 +555,7 @@ def element_label(element: object, screen: object = None) -> str:
     """
     if not isinstance(element, dict):
         return ""
-    parts = [
-        _split_camel(str(element.get(key) or ""))
-        if key == "cls"
-        else str(element.get(key) or "")
-        for key in IDENTIFYING_KEYS
-    ]
+    parts = [_label_part(key, element.get(key)) for key in IDENTIFYING_KEYS]
     if element.get("text") or element.get("desc"):
         return " ".join(p for p in parts if p).strip()
     parts.extend(_contained_text(element, screen))
@@ -5034,33 +5040,41 @@ async def _text_entry_op(
     refused = _password_refusal(action, element)
     if refused is not None:
         return refused
-    secret = bool(getattr(action, "secret", False))
-    if secret:
-        field = str(getattr(action, "field", "") or "")
-        value = (ctx.tester_inputs or {}).get(field)
-        # `not value`, not `value is None`: an EMPTY held value types
-        # nothing, and the `landed` verdict cannot speak for a step that
-        # made no claim, so it would pass silently -- the defect that
-        # verdict exists to end. `actions.parse_script` already refuses an
-        # empty `text` on the non-secret path ("type needs text"); this is
-        # the same boundary for the path whose value never appears in the
-        # script.
-        if not value:
-            return {
-                "error": (
-                    "No tester-supplied value is held for the field "
-                    + repr(field[:60])
-                    + ", so nothing was typed. Ask for it first with "
-                    "ask_tester."
-                ),
-                "content": None,
-            }
-        return _judge_landed(
-            await _typer(fallback)(
-                serial, str(value), secret=True, receiver_known=True
+    if bool(getattr(action, "secret", False)):
+        return await _type_secret(action, ctx, fallback)
+    return await _type_plain(action, serial, fallback)
+
+
+async def _type_secret(action: object, ctx: Context, fallback: str) -> dict:
+    """Type the tester-held value for a ``secret`` field, or say none is held."""
+    serial = ctx.serial
+    field = str(getattr(action, "field", "") or "")
+    value = (ctx.tester_inputs or {}).get(field)
+    # `not value`, not `value is None`: an EMPTY held value types
+    # nothing, and the `landed` verdict cannot speak for a step that
+    # made no claim, so it would pass silently -- the defect that
+    # verdict exists to end. `actions.parse_script` already refuses an
+    # empty `text` on the non-secret path ("type needs text"); this is
+    # the same boundary for the path whose value never appears in the
+    # script.
+    if not value:
+        return {
+            "error": (
+                "No tester-supplied value is held for the field "
+                + repr(field[:60])
+                + ", so nothing was typed. Ask for it first with "
+                "ask_tester."
             ),
-            field or "the focused field",
-        )
+            "content": None,
+        }
+    return _judge_landed(
+        await _typer(fallback)(serial, str(value), secret=True, receiver_known=True),
+        field or "the focused field",
+    )
+
+
+async def _type_plain(action: object, serial: str, fallback: str) -> dict:
+    """Type the script's own text and judge whether it landed."""
     return _judge_landed(
         await _typer(fallback)(
             serial,

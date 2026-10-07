@@ -47,7 +47,7 @@ from typing import Annotated, Literal, Optional, Union
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from tools.device_manager import valid_package_name
-from tools.mobile import knowledge_limits
+from tools.mobile import knowledge_limits, perception
 from tools.mobile.fill_label import FILL_MAX_LABEL_CHARS
 
 logger = logging.getLogger(__name__)
@@ -1113,7 +1113,8 @@ def action_text(action: object) -> str:
         parts.append(str(getattr(action, "label", "") or ""))
     if target is not None:
         parts.append(str(getattr(target, "text", "") or ""))
-        parts.append(str(getattr(target, "rid", "") or ""))
+        # camelCase ids are judged raw (CheckOut) AND split (signOut -> sign out).
+        parts.append(perception.with_camel_split(getattr(target, "rid", "")))
     return " ".join(part for part in parts if part).strip()
 
 

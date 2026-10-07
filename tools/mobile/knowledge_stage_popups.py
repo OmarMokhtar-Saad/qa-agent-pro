@@ -69,11 +69,20 @@ def find(steps: object) -> list:
     return [(k, a, r, n) for (k, a, r), n in sorted(found.items())]
 
 
+def _stored_rid(row: dict) -> object:
+    try:
+        got = json.loads(row.get("dismiss_json") or "{}")
+    except ValueError:
+        return None
+    return got.get("rid") if isinstance(got, dict) else None
+
+
 def _upsert(conn, run_id: str, popup: tuple) -> int:
     key, activity, rid, count = popup
     sig = signature(activity, _anchors(conn, key), rid)
     found = knowledge_db.rows(conn, "popups", "signature = ? AND invalid_at IS NULL", (sig,), 1)
-    if found:
+    squat = bool(found) and found[0].get("trust") == "imported" and _stored_rid(found[0]) != rid
+    if found and not squat:
         try:
             runs = json.loads(found[0].get("runs_json") or "[]")
         except ValueError:
@@ -93,6 +102,13 @@ def _upsert(conn, run_id: str, popup: tuple) -> int:
         "runs_seen": 1,
         "status": "candidate",
     }
+    if squat:
+        # An import never earns local credit for a dismiss this install did not
+        # observe: a fresh local row takes its place.
+        got = knowledge_db.supersede(
+            conn, "popups", found[0]["id"], values, run_id=run_id, why="imported popup, other dismiss"
+        )
+        return 1 if got else 0
     return 1 if knowledge_db.insert(conn, "popups", values, run_id=run_id, why="popup candidate") else 0
 
 

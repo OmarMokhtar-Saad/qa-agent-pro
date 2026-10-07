@@ -302,6 +302,19 @@ def split_camel(text: object) -> str:
     return _CAMEL_UPPER_WORD.sub(" ", _CAMEL_LOWER_UPPER.sub(" ", str(text)))
 
 
+def with_camel_split(text: object) -> str:
+    """*text* followed by its ``split_camel`` form, when the two differ.
+
+    For the destructive guard on ids. Splitting alone loses lexicon words that
+    are ONE token: ``CheckOut`` split is ``Check Out``, and ``check out`` is not
+    ``checkout``. Judging both forms keeps every word the raw id matched and
+    adds the words the split exposes (``signOut`` -> ``sign out``).
+    """
+    raw = str(text or "")
+    split = split_camel(raw)
+    return raw if split == raw else raw + " " + split
+
+
 def words(*values: object) -> list:
     """Every lowercase word in *values*, camel-case runs split first."""
     out: list = []

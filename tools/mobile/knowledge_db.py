@@ -101,7 +101,10 @@ def parse_item_id(item_id: object):
 
 
 def _dump(value: object) -> object:
-    return json.dumps(value, sort_keys=True) if isinstance(value, (dict, list, tuple)) else value
+    # allow_nan=False: NaN/Infinity would be stored as non-strict JSON (ValueError).
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, sort_keys=True, allow_nan=False)
+    return value
 
 
 def _event(conn, name: str, where: tuple, what: tuple) -> None:
@@ -197,7 +200,10 @@ def _insert_row(conn, table: str, values: dict, run_id: str) -> tuple:
     cols = knowledge_schema.table_columns(conn, table)
     if not cols:
         return None, "table missing"
-    row = _row(table, cols, values, run_id)
+    try:
+        row = _row(table, cols, values, run_id)
+    except ValueError:
+        return None, "non-finite number in a json value"
     if not row:
         return None, "no known columns"
     reason = _secret(row, run_id)
