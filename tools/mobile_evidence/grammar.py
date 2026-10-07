@@ -1343,6 +1343,13 @@ def system_prompts(source, profile):
     sys_end = markers.get("sys_end")
     if not (sys_mark and next_msg and sys_end):
         return []
+    return _reassemble_prompts(
+        _logcat_messages(source, profile), sys_mark, next_msg, sys_end
+    )
+
+
+def _logcat_messages(source, profile) -> list:
+    """The (seq, message) pairs of a logcat slice, tag-filtered and prefix-stripped."""
     tag = str(getattr(profile, "logcat_tag", "") or "")
     prefix_re = _prefix_re(profile)
     msgs = []
@@ -1353,7 +1360,11 @@ def system_prompts(source, profile):
         msg = m.group("msg")
         pre = prefix_re.match(msg)
         msgs.append((len(msgs), msg[pre.end() :] if pre else msg))
+    return msgs
 
+
+def _reassemble_prompts(msgs, sys_mark, next_msg, sys_end) -> list:
+    """Join the messages between the open and close markers into (text, complete, seq)."""
     out, buf, start = [], None, None
     for seq, s in msgs:
         if buf is None:

@@ -266,42 +266,97 @@ def sni_of(payload: bytes) -> str:
     which is the shape a malformed capture uses to make a parser read on.
     """
     try:
-        if len(payload) < 45 or payload[0] != 0x16:
+        record = _client_hello(payload)
+        if record is None:
             return ""
-        record = payload[5 : 5 + ((payload[3] << 8) | payload[4])]
-        if len(record) < 39 or record[0] != 0x01:
+        span = _extension_span(record)
+        if span is None:
             return ""
-        pos = 4 + 2 + 32
-        if len(record) < pos + 1:
-            return ""
-        pos += 1 + record[pos]
-        if len(record) < pos + 2:
-            return ""
-        pos += 2 + ((record[pos] << 8) | record[pos + 1])
-        if len(record) < pos + 1:
-            return ""
-        pos += 1 + record[pos]
-        if len(record) < pos + 2:
-            return ""
-        end = min(len(record), pos + 2 + ((record[pos] << 8) | record[pos + 1]))
-        pos += 2
-        while pos + 4 <= end:
-            etype = (record[pos] << 8) | record[pos + 1]
-            elen = (record[pos + 2] << 8) | record[pos + 3]
-            pos += 4
-            if pos + elen > end:
-                return ""
-            if etype == 0x0000:
-                entry = record[pos : pos + elen]
-                if len(entry) < 5:
-                    return ""
-                nlen = (entry[3] << 8) | entry[4]
-                name = entry[5 : 5 + nlen]
-                return _hostname(name) if len(name) == nlen else ""
-            pos += elen
+        return _server_name(record, span[0], span[1])
     except (IndexError, ValueError):  # pragma: no cover - the bounds above cover it
         return ""
+
+
+def _client_hello(payload: bytes):
+    """The handshake record of a one-record ClientHello, or None."""
+    if len(payload) < 45 or payload[0] != 0x16:
+        return None
+    record = payload[5 : 5 + ((payload[3] << 8) | payload[4])]
+    if len(record) < 39 or record[0] != 0x01:
+        return None
+    return record
+
+
+def _extension_span(record: bytes):
+    """``(start, end)`` of the extension block inside ``record``, or None."""
+    pos = 4 + 2 + 32
+    if len(record) < pos + 1:
+        return None
+    pos += 1 + record[pos]
+    if len(record) < pos + 2:
+        return None
+    pos += 2 + ((record[pos] << 8) | record[pos + 1])
+    if len(record) < pos + 1:
+        return None
+    pos += 1 + record[pos]
+    if len(record) < pos + 2:
+        return None
+    end = min(len(record), pos + 2 + ((record[pos] << 8) | record[pos + 1]))
+    return pos + 2, end
+
+
+def _server_name(record: bytes, pos: int, end: int) -> str:
+    """The host name of the server_name extension in ``record[pos:end]``, or ""."""
+    while pos + 4 <= end:
+        etype = (record[pos] << 8) | record[pos + 1]
+        elen = (record[pos + 2] << 8) | record[pos + 3]
+        pos += 4
+        if pos + elen > end:
+            return ""
+        if etype == 0x0000:
+            entry = record[pos : pos + elen]
+            if len(entry) < 5:
+                return ""
+            nlen = (entry[3] << 8) | entry[4]
+            name = entry[5 : 5 + nlen]
+            return _hostname(name) if len(name) == nlen else ""
+        pos += elen
     return ""
+
+
+def _query_count(payload: bytes) -> int:
+    """The question count of a well-formed DNS query header, or 0 if invalid."""
+    if len(payload) < 12 or len(payload) > 4096:
+        return 0
+    flags = (payload[2] << 8) | payload[3]
+    if flags & 0x8000:
+        return 0
+    if (flags >> 11) & 0x0F:
+        return 0
+    questions = (payload[4] << 8) | payload[5]
+    answers = (payload[6] << 8) | payload[7]
+    authority = (payload[8] << 8) | payload[9]
+    if questions < 1 or questions > 4 or answers or authority:
+        return 0
+    return questions
+
+
+def _read_qname(payload: bytes, pos: int):
+    """``(labels, pos after the name)`` read at ``pos``, or None if malformed."""
+    labels = []
+    while True:
+        if pos >= len(payload):
+            return None
+        size = payload[pos]
+        pos += 1
+        if size == 0:
+            return labels, pos
+        # A query carries no compression pointer, so a length byte with the
+        # top bits set is not a query this parser vouches for.
+        if size > 63 or pos + size > len(payload):
+            return None
+        labels.append(payload[pos : pos + size])
+        pos += size
 
 
 def dns_names(payload: bytes) -> list:
@@ -313,35 +368,16 @@ def dns_names(payload: bytes) -> list:
     and a random UDP payload all fail one of those, so a name here was really
     asked for by this device.
     """
-    if len(payload) < 12 or len(payload) > 4096:
-        return []
-    flags = (payload[2] << 8) | payload[3]
-    if flags & 0x8000:
-        return []
-    if (flags >> 11) & 0x0F:
-        return []
-    questions = (payload[4] << 8) | payload[5]
-    answers = (payload[6] << 8) | payload[7]
-    authority = (payload[8] << 8) | payload[9]
-    if questions < 1 or questions > 4 or answers or authority:
+    questions = _query_count(payload)
+    if not questions:
         return []
     pos = 12
     names = []
     for _ in range(questions):
-        labels = []
-        while True:
-            if pos >= len(payload):
-                return []
-            size = payload[pos]
-            pos += 1
-            if size == 0:
-                break
-            # A query carries no compression pointer, so a length byte with the
-            # top bits set is not a query this parser vouches for.
-            if size > 63 or pos + size > len(payload):
-                return []
-            labels.append(payload[pos : pos + size])
-            pos += size
+        parsed = _read_qname(payload, pos)
+        if parsed is None:
+            return []
+        labels, pos = parsed
         if pos + 4 > len(payload):
             return []
         pos += 4

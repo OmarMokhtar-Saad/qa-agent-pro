@@ -7498,6 +7498,31 @@ def _host_generation_mode() -> bool:
     return llm.resolve_generation_mode() == "host"
 
 
+def _revive_shelved(capture_ids: list | None) -> None:
+    """Revive any shelved captures; the caller peeks the tray after this."""
+    if capture_ids:
+        _revive_captures(capture_ids)
+
+
+def _beat1_clarify(menu: str, rendered_missing: str) -> str:
+    """The BEAT 1 menu, with the rendered missing-captures note appended when due.
+
+    The caller renders it, so `_render_missing` stays paired with its own
+    `_peek_captures` (tests/test_render_missing_pairing.py)."""
+    if rendered_missing:
+        return menu + _BEAT1_MISSING_HEAD + rendered_missing + _BEAT1_MISSING_TAIL
+    return menu
+
+
+async def _plan_nudge_if_due(
+    plan, image_gate_ack: bool, gctx: _GateCtx, cap_images: list, cap_missing: list
+) -> str | None:
+    """The plan nudge, or None when there is no plan or the gate is acked."""
+    if plan and not image_gate_ack:
+        return await _image_plan_nudge(plan, gctx, cap_images, cap_missing)
+    return None
+
+
 async def handle_prepare_test_cases(
     feature_or_url: str,
     *,
@@ -7546,8 +7571,7 @@ async def handle_prepare_test_cases(
     _shape_refusal = _jira_page_without_issue_note(text)
     if _shape_refusal:
         return PreparePayloadResult(clarify=_shape_refusal)
-    if capture_ids:
-        _revive_captures(capture_ids)
+    _revive_shelved(capture_ids)
     _plan = _normalize_source_plan(source_plan)
     _cap_images, _cap_labels, _cap_missing = _peek_captures(capture_ids)
     _intake = _image_intake(attached_images, _cap_images, attached_image_count)
@@ -7557,19 +7581,18 @@ async def handle_prepare_test_cases(
     )
     _b1 = await _image_gate_beat1(_gctx, _plan, source_plan, choose, ask_text)
     if _b1.menu is not None:
-        _md = _b1.menu
-        if _cap_missing:
-            _md += (
-                _BEAT1_MISSING_HEAD
-                + _render_missing(_cap_missing, capture_ids)
-                + _BEAT1_MISSING_TAIL
+        return PreparePayloadResult(
+            clarify=_beat1_clarify(
+                _b1.menu,
+                _render_missing(_cap_missing, capture_ids) if _cap_missing else "",
             )
-        return PreparePayloadResult(clarify=_md)
+        )
     _plan = _b1.plan
-    if _plan and not image_gate_ack:
-        _nudge = await _image_plan_nudge(_plan, _gctx, _cap_images, _cap_missing)
-        if _nudge is not None:
-            return PreparePayloadResult(clarify=_nudge)
+    _nudge = await _plan_nudge_if_due(
+        _plan, image_gate_ack, _gctx, _cap_images, _cap_missing
+    )
+    if _nudge is not None:
+        return PreparePayloadResult(clarify=_nudge)
     try:
         _host_amb = _host_ac = _host_img = _host_generation_mode()
         grounded = await _ground_and_gate(
@@ -14832,6 +14855,69 @@ async def _app_stage_open_store(
     )
 
 
+async def _installed_package_target(
+    serial: str,
+    value: str,
+    answer_key: str,
+    choose: ChooseCb,
+    progress: ProgressCb,
+) -> tuple:
+    """Resolve the package for the ``installed_package`` source: ``(target, menu)``.
+
+    The remembered resolution comes before the picker; a non-empty ``menu``
+    means the picker needs the tester's answer and the caller returns it.
+    """
+    from tools.mobile import run_store
+
+    # A REMEMBERED RESOLUTION, tried before the raw hint. A rerun of the
+    # same goal used to re-send the same free-text app name and re-walk
+    # the fuzzy-match path every time; a cache hit here is still VERIFIED
+    # by the same `session.install_state` probe every other path below
+    # takes -- this only skips guessing the bundle id again, never the
+    # "is it actually installed" check.
+    cached_target = run_store.read_resolved_app(answer_key) if value else {}
+    target = str(cached_target.get("package") or "")
+    if target:
+        return target, ""
+    # RESOLVE-OR-ASK over what is installed on THIS device; an empty
+    # outcome keeps the old raw-hint path (and its suggestions).
+    from tools.mobile import app_stage_pick
+
+    picked = await app_stage_pick.pick_installed(serial, value, _mobile_ask(choose))
+    if picked.menu:
+        return "", picked.menu
+    if picked.said:
+        await _emit(progress, picked.said)
+    return picked.package or value, ""
+
+
+async def _local_apk_stage(
+    serial: str, value: str, target: str, progress: ProgressCb
+) -> tuple:
+    """The ``local_apk`` source: start the install outside this call."""
+    from tools.mobile import session
+
+    if not target:
+        return (
+            "⚠️ Give the app's `package` name as well as the .apk path: it "
+            "is what the preflight and every relaunch check, and this "
+            "server cannot read it out of the file. Nothing was installed.",
+            "",
+        )
+    await _emit(progress, "\U0001f4e6 Starting the install…")
+    started = session.start_install(serial, value, target)
+    if started.get("error"):
+        return "⚠️ " + str(started["error"])[:300], target
+    return (
+        "## Installing `"
+        + target
+        + "`\n\nThe install runs outside this call (a large APK takes "
+        "longer than a tool call may last). Call `qa_mobile_status`; when "
+        "the package shows as installed, call `qa_mobile_test` again.",
+        target,
+    )
+
+
 async def _mobile_app_stage(
     serial: str,
     package: str,
@@ -14875,21 +14961,11 @@ async def _mobile_app_stage(
         # by the same `session.install_state` probe every other path below
         # takes -- this only skips guessing the bundle id again, never the
         # "is it actually installed" check.
-        cached_target = run_store.read_resolved_app(answer_key) if value else {}
-        target = str(cached_target.get("package") or "")
-        if not target:
-            # RESOLVE-OR-ASK over what is installed on THIS device; an empty
-            # outcome keeps the old raw-hint path (and its suggestions).
-            from tools.mobile import app_stage_pick
-
-            picked = await app_stage_pick.pick_installed(
-                serial, value, _mobile_ask(choose)
-            )
-            if picked.menu:
-                return picked.menu, ""
-            if picked.said:
-                await _emit(progress, picked.said)
-            target = picked.package or value
+        target, menu = await _installed_package_target(
+            serial, value, answer_key, choose, progress
+        )
+        if menu:
+            return menu, ""
 
     # WHETHER THE DEVICE ANSWERED, read from the one witness that knows.
     # `session.install_state` publishes `probed` on its CONTENT; this used to
@@ -14927,25 +15003,7 @@ async def _mobile_app_stage(
             target,
         )
     if install_source == "local_apk":
-        if not target:
-            return (
-                "⚠️ Give the app's `package` name as well as the .apk path: it "
-                "is what the preflight and every relaunch check, and this "
-                "server cannot read it out of the file. Nothing was installed.",
-                "",
-            )
-        await _emit(progress, "\U0001f4e6 Starting the install…")
-        started = session.start_install(serial, value, target)
-        if started.get("error"):
-            return "⚠️ " + str(started["error"])[:300], target
-        return (
-            "## Installing `"
-            + target
-            + "`\n\nThe install runs outside this call (a large APK takes "
-            "longer than a tool call may last). Call `qa_mobile_status`; when "
-            "the package shows as installed, call `qa_mobile_test` again.",
-            target,
-        )
+        return await _local_apk_stage(serial, value, target, progress)
     if install_source == "installed_package":
         return await _app_stage_not_installed(serial, target, probed, suggestions)
     return await _app_stage_open_store(serial, install_source, value, target)

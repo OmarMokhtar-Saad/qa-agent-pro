@@ -589,7 +589,7 @@ def _quarter_turned(rotation: object) -> bool:
         # twenty-digit number into a quarter turn, so the frame's axes
         # swapped on garbage. A value out of range is one we cannot read --
         # and because an unreadable rotation would otherwise leave the frame
-        # narrower than a landscape dump, the widening below is what stops
+        # narrower than a landscape dump, the frame widening in _display_rect is what stops
         # that being a lost screen too.
         return int(rotation) in (1, 3)
     except (TypeError, ValueError, OverflowError):

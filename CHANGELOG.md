@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.107.3] - 2026-10-07
+## [1.107.4] - 2026-10-07
 
 ### Added
 
@@ -29,6 +29,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- The destructive-action guard no longer stops a step on ids such as
-  OutBox_log, where the end of the id and the start of its split form
-  only looked like "log out" when read together.
+- A destructive-action stop on a camelCase id such as btnLogOut no
+  longer puts an invisible control character in the stopped element's
+  name sent to your chat client, and confirming a stop recorded before
+  v1.107.3 releases it again instead of refusing it as a different control.

@@ -37,6 +37,7 @@ from __future__ import annotations
 import calendar
 import datetime
 import json
+from typing import NamedTuple
 
 from tools.mobile_evidence import grammar
 
@@ -637,6 +638,14 @@ def _join_from_placed(timed, acc):
 # ── the joined run ─────────────────────────────────────────────────────────────
 
 
+class _LlmSpend(NamedTuple):
+    calls: int
+    tin: int
+    tout: int
+    ambiguous: int
+    unplaceable: int
+
+
 class Evidence:
     """One run, joined: the report, the fence, the case windows, the mapping."""
 
@@ -910,16 +919,30 @@ class Evidence:
         """What the paired turns spent; ``ambiguous`` and ``unplaceable`` named separately."""
         mine = self.mine()
         amb = {tid for tid, _n in self.join.ambiguous}
-        tin = tout = calls = binds = tools = ambiguous = unplaceable = 0
+        spend = self._paired_llm_spend(mine, amb)
+        binds, unplaced_binds = self._count_turn_rows("bindings", mine)
+        tools, unplaced_tools = self._count_turn_rows("tools", mine)
+        return {
+            "llm": spend.calls,
+            "in": spend.tin,
+            "out": spend.tout,
+            "total": spend.tin + spend.tout,
+            "bindings": binds,
+            "tools": tools,
+            "ambiguous": spend.ambiguous,
+            "unplaceable": spend.unplaceable + unplaced_binds + unplaced_tools,
+        }
 
-        def tid_of(rec):
-            tid = rec.get("turnId")
-            if not tid and self.join.synthetic:
-                tid = self._synthetic_turn_of(rec.get("appRunId"), rec)
-            return tid
+    def _turn_id_of(self, rec):
+        tid = rec.get("turnId")
+        if not tid and self.join.synthetic:
+            tid = self._synthetic_turn_of(rec.get("appRunId"), rec)
+        return tid
 
+    def _paired_llm_spend(self, mine, amb):
+        tin = tout = calls = ambiguous = unplaceable = 0
         for call in self.report.get("llm") or []:
-            tid = tid_of(call)
+            tid = self._turn_id_of(call)
             if tid is None:
                 unplaceable += 1
                 continue
@@ -932,28 +955,18 @@ class Evidence:
             tok = call.get("tokens") or {}
             tin += tok.get("in") or 0
             tout += tok.get("out") or 0
-        for b in self.report.get("bindings") or []:
-            tid = tid_of(b)
+        return _LlmSpend(calls, tin, tout, ambiguous, unplaceable)
+
+    def _count_turn_rows(self, key, mine):
+        """(rows on a paired turn, rows with no placeable turn) for one report list."""
+        matched = unplaceable = 0
+        for row in self.report.get(key) or []:
+            tid = self._turn_id_of(row)
             if tid is None:
                 unplaceable += 1
             elif tid in mine:
-                binds += 1
-        for t in self.report.get("tools") or []:
-            tid = tid_of(t)
-            if tid is None:
-                unplaceable += 1
-            elif tid in mine:
-                tools += 1
-        return {
-            "llm": calls,
-            "in": tin,
-            "out": tout,
-            "total": tin + tout,
-            "bindings": binds,
-            "tools": tools,
-            "ambiguous": ambiguous,
-            "unplaceable": unplaceable,
-        }
+                matched += 1
+        return matched, unplaceable
 
     def excluded_totals(self):
         mine = self.mine()

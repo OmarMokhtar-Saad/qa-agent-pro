@@ -1627,7 +1627,7 @@ def _consume_confirm(
         current = {
             "term": str(hit)[:80],
             "op": str(op)[:40],
-            "node": str(label)[:MAX_GUARD_NODE_CHARS],
+            "node": _guard_node(label),
         }
         if not stopped or stopped != current:
             entry["guard_confirm_mismatch"] = True
@@ -1635,6 +1635,16 @@ def _consume_confirm(
     ctx.confirm_destructive = False
     entry["guard_confirmed"] = {"op": op, "term": str(hit)[:80]}
     return True
+
+
+def _guard_node(label: object) -> str:
+    """The stopped node as the confirm fingerprint and the host see it.
+
+    ``SEGMENT_BREAK`` is an internal seam, so it leaves as a space: the host
+    never gets a control character, and a stop fingerprinted before the seam
+    existed still matches.
+    """
+    return str(label).replace(perception.SEGMENT_BREAK, " ")[:MAX_GUARD_NODE_CHARS]
 
 
 def _with_confirm_hint(detail: str, op: str, hit: str, mismatched: bool = False) -> str:
@@ -4160,10 +4170,10 @@ def _record_guard_stop(
 ) -> bool:
     """Write the trace entry of a guard stop and say whether the run refuses.
 
-    WHAT the guard stopped is decided in ``_replay_steps`` and is not touched
+    WHAT the guard stopped is decided in ``_guard_stop`` and is not touched
     here. This decides only what happens AFTER the hit, which is the one thing
     a charter's ``destructive`` field is allowed to decide. The reply that
-    carries the term stays in ``_replay_steps``, the reviewed sink.
+    carries the term stays in ``_guard_stop``, the reviewed sink.
     """
     entry["outcome"] = "guard_stop"
     refuses = bool(getattr(run.ctx, "guard_refuses", False))
@@ -4307,7 +4317,9 @@ def _before_texts(op: str, screen: object, previous: set | None) -> set | None:
 # comparison against the detail PROSE, which the tester reads and may reword.
 
 
-def _guard_stop(run: _ReplayRun, step: _Step, screen: object, index: int):
+def _guard_stop(
+    run: _ReplayRun, step: _Step, screen: object, index: int
+) -> dict | None:
     """The reply that ends the replay at the destructive guard, else ``None``.
 
     Deny by default; judges the node the action ACTUATES. See the comment above.
@@ -4349,7 +4361,7 @@ def _guard_stop(run: _ReplayRun, step: _Step, screen: object, index: int):
             index,
             guard_term=hit,
             guard_op=op,
-            guard_node=str(label)[:MAX_GUARD_NODE_CHARS],
+            guard_node=_guard_node(label),
         ),
     }
 
