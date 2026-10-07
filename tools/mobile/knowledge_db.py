@@ -66,7 +66,15 @@ _NO_WRITE = frozenset({"id"})
 
 
 #: Failures a helper turns into a safe default; anything else is a bug.
-_ERRORS = (sqlite3.Error, ValueError, TypeError, KeyError, AttributeError, OSError)
+_ERRORS = (
+    sqlite3.Error,
+    ValueError,
+    TypeError,
+    KeyError,
+    AttributeError,
+    OSError,
+    OverflowError,
+)
 
 
 def open_rw(package: object):
@@ -157,6 +165,12 @@ def _finish(conn, owns: bool, ok: bool) -> None:
 def _refuse(conn, table: str, run_id: str, why: object, reason: str) -> None:
     try:
         _event(conn, "refused", (table, None), (run_id, "%s (%s)" % (reason, why), None))
+        # A bulk import logs one refusal per row: keep only the newest.
+        conn.execute(
+            "DELETE FROM events WHERE id IN (SELECT id FROM events WHERE event = 'refused'"
+            " ORDER BY id DESC LIMIT -1 OFFSET ?)",
+            (knowledge_limits.MAX_REFUSED_EVENTS,),
+        )
     except sqlite3.Error:
         logger.info("knowledge db: could not log a refusal")
 

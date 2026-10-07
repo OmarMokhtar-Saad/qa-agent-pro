@@ -116,6 +116,10 @@ def activate_seeds(conn: object, package: str, recs: list, run_id: str = "") -> 
             steps = json.loads(row.get("steps_json") or "[]")
         except ValueError:
             continue
+        if not isinstance(steps, list) or not all(
+            isinstance(s, dict) and isinstance(s.get("op"), str) and isinstance(s.get("rid"), str) for s in steps
+        ):
+            continue
         start, end = _find_run(recs, steps) if steps else ("", "")
         if not start or not end or start.startswith("sk1d:"):
             continue

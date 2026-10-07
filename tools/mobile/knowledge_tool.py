@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from contextlib import closing
 
@@ -25,6 +26,8 @@ from tools.mobile import (
 )
 from tools.mobile import knowledge_db as kdb
 from tools.mobile import knowledge_gate as gate
+from tools.mobile import knowledge_plug_locators as plug_locators
+from tools.mobile import knowledge_stage_popups as popups_stage
 from tools.untrusted import single_line, wrap_untrusted
 
 logger = logging.getLogger(__name__)
@@ -436,35 +439,123 @@ def _export(package: str) -> str:
 
 
 _SKIP_IMPORT = set(gate._KEEP_OUT) | {"_table", "recheck_at", "created"}
+#: Evidence an imported row must earn again on this install. Every numeric
+#: column with a schema default (counters, timings, retention) is dropped so the
+#: default applies; measured samples and locally observed element state restart
+#: empty. One local run therefore cannot activate or outrank an import.
+_EVIDENCE_NUMERIC = frozenset(
+    re.findall(
+        r"(\w+) (?:INTEGER|REAL) DEFAULT",
+        "".join(knowledge_schema._TABLES.values()) + knowledge_schema._COMMON,
+    )
+)
+_EVIDENCE = {
+    "samples_json": "[]",
+    "bound_field": "",
+    "missing_at": "",
+    "last_used_run": "",
+}
+#: The only tables an import may write. The rest are learned on this install
+#: alone: a shortcut or route seed activates after one replay, an imported
+#: mistake can be credited to tester trust by one local correction, and an
+#: imported edge never promotes yet shadows the local one.
+_IMPORTABLE = frozenset({"notes", "lessons", "timings", "popups", "elements"})
+#: Open imported rows may take at most this share of a table's row cap, so
+#: imports can never leave local learning refused as "cap: full".
+_IMPORT_SHARE = 0.5
+#: table -> {json column: the shape its schema default has (dict or list)}.
+_JSON_SHAPES = {
+    table: {
+        col: dict if default == "{}" else list
+        for col, default in re.findall(
+            r"(\w+_json) TEXT DEFAULT '(\{\}|\[\])'", cols + knowledge_schema._COMMON
+        )
+    }
+    for table, cols in knowledge_schema._TABLES.items()
+}
+
+
+def _import_note(values: dict) -> bool:
+    # One malformed row is skipped, never aborts the whole import.
+    try:
+        when = json.loads(values.get("when_json") or "{}")
+        then = json.loads(values.get("then_json") or "{}")
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(when, dict) or not isinstance(then, dict):
+        return False
+    got = app_knowledge._validate(values.get("text"), values.get("kind"), when, then)
+    if isinstance(got, str):
+        return False
+    values.update(
+        text=got[0],
+        when_json=json.dumps(got[1], sort_keys=True),
+        then_json=json.dumps(got[2], sort_keys=True),
+    )
+    values["scope_key"] = "%s|%s" % (values["kind"], values["when_json"])
+    return True
+
+
+def _import_learned(table: str, values: dict) -> bool:
+    """Each JSON column must parse to its schema shape; a destructive-looking
+    popup dismiss is refused, as the popups stage never records one."""
+    for col, shape in _JSON_SHAPES.get(table, {}).items():
+        if col not in values or col == "runs_json":
+            continue
+        raw = values[col]
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except ValueError:
+            return False
+        if not isinstance(parsed, shape):
+            return False
+        values[col] = json.dumps(parsed, sort_keys=True)
+    if table == "popups":
+        dismiss = json.loads(values.get("dismiss_json") or "{}")
+        if popups_stage.looks_destructive(dismiss.get("rid")):
+            return False
+    if table == "elements" and "locators_json" in values:
+        # Per-locator hit counts are evidence too; only the locators carry over.
+        queue = json.loads(values["locators_json"])
+        values["locators_json"] = json.dumps(
+            [
+                {"l": e["l"], "h": 0, "m": 0}
+                for e in queue
+                if isinstance(e, dict)
+                and isinstance(e.get("l"), str)
+                and plug_locators.split_locator(e["l"])[0]
+            ],
+            sort_keys=True,
+        )
+    values.update({col: v for col, v in _EVIDENCE.items() if col in values})
+    for col in _EVIDENCE_NUMERIC:
+        values.pop(col, None)
+    return True
+
+
+def _import_room(conn, table: str) -> bool:
+    cap = kdb._cap(table)
+    if not cap:
+        return True
+    (held,) = conn.execute(
+        "SELECT COUNT(*) FROM %s WHERE trust = 'imported' AND invalid_at IS NULL"
+        % table
+    ).fetchone()
+    return held < int(cap * _IMPORT_SHARE)
 
 
 def _import_row(conn, table: str, raw: dict, run_id: str) -> bool:
+    if table not in _IMPORTABLE or not _import_room(conn, table):
+        return False
     values = {
         k: v for k, v in raw.items() if k not in _SKIP_IMPORT and isinstance(k, str)
     }
     values.update(
         trust="imported", status="candidate", source_run="import", runs_json="[]"
     )
-    if table == "notes":
-        # One malformed row is skipped, never aborts the whole import.
-        try:
-            when = json.loads(values.get("when_json") or "{}")
-            then = json.loads(values.get("then_json") or "{}")
-        except (TypeError, ValueError):
-            return False
-        if not isinstance(when, dict) or not isinstance(then, dict):
-            return False
-        got = app_knowledge._validate(
-            values.get("text"), values.get("kind"), when, then
-        )
-        if isinstance(got, str):
-            return False
-        values.update(
-            text=got[0],
-            when_json=json.dumps(got[1], sort_keys=True),
-            then_json=json.dumps(got[2], sort_keys=True),
-        )
-        values["scope_key"] = "%s|%s" % (values["kind"], values["when_json"])
+    ok = _import_note(values) if table == "notes" else _import_learned(table, values)
+    if not ok:
+        return False
     return kdb.insert(conn, table, values, run_id=run_id, why="import") is not None
 
 

@@ -523,6 +523,59 @@ def _is_editable(full_class: str) -> bool:
     return any(hint in text for hint in EDITABLE_CLASS_HINTS)
 
 
+def _extent(nodes: list) -> tuple[int, int]:
+    """The largest right and bottom edge over the positive-area nodes."""
+    right = 0
+    bottom = 0
+    for node in nodes:
+        bounds = parse_bounds(node.get("bounds"))
+        if bounds is None or _area(bounds) <= 0:
+            continue
+        right = max(right, bounds[2])
+        bottom = max(bottom, bounds[3])
+    return right, bottom
+
+
+def _display_size(display: object) -> list[int] | None:
+    """The device-reported ``[width, height]``, or None when it is not usable."""
+    size = None
+    if isinstance(display, (list, tuple)) and len(display) == 2:
+        numbers = []
+        for value in display:
+            if isinstance(value, bool):
+                numbers = []
+                break
+            try:
+                numbers.append(int(value))
+            except (TypeError, ValueError, OverflowError):
+                numbers = []
+                break
+        # `numbers` rather than `len(numbers) == 2`: the arity is decided ONCE,
+        # by the `len(display) == 2` above. Checking it twice meant neither
+        # check was graded -- a mutant dropping either one was caught by the
+        # other and SURVIVED, which reads as a verification gap and is really a
+        # second layer doing the first layer's job.
+        if numbers and all(0 < n <= MAX_DISPLAY_EXTENT for n in numbers):
+            size = numbers
+    return size
+
+
+def _quarter_turned(rotation: object) -> bool:
+    """True when the dump's rotation is a quarter turn (1 or 3)."""
+    try:
+        # `in (1, 3)`, NOT `% 4 in (1, 3)`. A rotation is 0..3; anything else
+        # is not a rotation this dump can have and must be treated as no
+        # turn. The modulo was worse than useless -- it made `-1` and a
+        # twenty-digit number into a quarter turn, so the frame's axes
+        # swapped on garbage. A value out of range is one we cannot read --
+        # and because an unreadable rotation would otherwise leave the frame
+        # narrower than a landscape dump, the widening below is what stops
+        # that being a lost screen too.
+        return int(rotation) in (1, 3)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _display_rect(tree: object, display: object, rotation: object) -> tuple:
     """``(display, frame, axes)`` -- the screen, the region an element may
     occupy, and what is known of the screen PER AXIS.
@@ -610,73 +663,30 @@ def _display_rect(tree: object, display: object, rotation: object) -> tuple:
     display lose a clamp it should have had. *frame* is ``None`` only when no
     positive-area node has a positive right or bottom edge.
     """
-    right = 0
-    bottom = 0
-    panel_right = 0
-    panel_bottom = 0
     try:
         laid_out = list(tree.iter("node"))
         windows = [child for child in tree if getattr(child, "tag", None) == "node"]
     except (TypeError, AttributeError):
         laid_out = []
         windows = []
-    for node in laid_out:
-        # EVERY node for the FRAME. "At least as large as everything laid out on
-        # it" is the promise, and a child laid out beyond its own window is
-        # still laid out.
-        bounds = parse_bounds(node.get("bounds"))
-        if bounds is None or _area(bounds) <= 0:
-            continue
-        right = max(right, bounds[2])
-        bottom = max(bottom, bounds[3])
-    for node in windows:
-        # The depth-1 WINDOWS for the panel estimate, which is a different
-        # question with a different consumer. A window is a display-sized thing
-        # and a child is not, so when the device could not tell us the display,
-        # the union of the windows is the closest honest guess at the panel --
-        # and an overhanging row must NOT be allowed to define it. Actions clamp
-        # to this rectangle: `executor` will not swipe outside the panel, and a
-        # row dragged out to its own far edge would silently turn that clamp
-        # into a no-op and send a gesture the device ignores.
-        bounds = parse_bounds(node.get("bounds"))
-        if bounds is None or _area(bounds) <= 0:
-            continue
-        panel_right = max(panel_right, bounds[2])
-        panel_bottom = max(panel_bottom, bounds[3])
+    # EVERY node for the FRAME. "At least as large as everything laid out on
+    # it" is the promise, and a child laid out beyond its own window is
+    # still laid out.
+    right, bottom = _extent(laid_out)
+    # The depth-1 WINDOWS for the panel estimate, which is a different
+    # question with a different consumer. A window is a display-sized thing
+    # and a child is not, so when the device could not tell us the display,
+    # the union of the windows is the closest honest guess at the panel --
+    # and an overhanging row must NOT be allowed to define it. Actions clamp
+    # to this rectangle: `executor` will not swipe outside the panel, and a
+    # row dragged out to its own far edge would silently turn that clamp
+    # into a no-op and send a gesture the device ignores.
+    panel_right, panel_bottom = _extent(windows)
 
-    size = None
-    if isinstance(display, (list, tuple)) and len(display) == 2:
-        numbers = []
-        for value in display:
-            if isinstance(value, bool):
-                numbers = []
-                break
-            try:
-                numbers.append(int(value))
-            except (TypeError, ValueError, OverflowError):
-                numbers = []
-                break
-        # `numbers` rather than `len(numbers) == 2`: the arity is decided ONCE,
-        # by the `len(display) == 2` above. Checking it twice meant neither
-        # check was graded -- a mutant dropping either one was caught by the
-        # other and SURVIVED, which reads as a verification gap and is really a
-        # second layer doing the first layer's job.
-        if numbers and all(0 < n <= MAX_DISPLAY_EXTENT for n in numbers):
-            size = numbers
+    size = _display_size(display)
 
     if size is not None:
-        try:
-            # `in (1, 3)`, NOT `% 4 in (1, 3)`. A rotation is 0..3; anything else
-            # is not a rotation this dump can have and must be treated as no
-            # turn. The modulo was worse than useless -- it made `-1` and a
-            # twenty-digit number into a quarter turn, so the frame's axes
-            # swapped on garbage. A value out of range is one we cannot read --
-            # and because an unreadable rotation would otherwise leave the frame
-            # narrower than a landscape dump, the widening below is what stops
-            # that being a lost screen too.
-            turned = int(rotation) in (1, 3)
-        except (TypeError, ValueError, OverflowError):
-            turned = False
+        turned = _quarter_turned(rotation)
         width, height = (size[1], size[0]) if turned else (size[0], size[1])
     else:
         # The window walk's answer and NOTHING ELSE -- never `or right`, which

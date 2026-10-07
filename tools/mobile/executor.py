@@ -2705,6 +2705,35 @@ def _clamp_source(screen: object) -> object:
     return body.get("root_bounds")
 
 
+def _on_screen_box(element: dict, display: object) -> tuple[int, int, int, int]:
+    """The ON-SCREEN part of *element*'s bounds as ``(x1, y1, x2, y2)``."""
+    x1, y1, x2, y2 = (int(v) for v in element["bounds"])
+    # The ON-SCREEN part. Near edges always: a negative edge is where
+    # `adb._coord` refuses to put the finger. Far edges too WHEN the caller
+    # knows the display, because a partly-visible node keeps its far edges and
+    # a gesture built from them lands off the panel and silently no-ops.
+    # Everything below is computed from this box, so no later clamp can move an
+    # endpoint after the invariant has been checked.
+    x1, y1 = max(0, x1), max(0, y1)
+    frame = _display_box(display)
+    if frame is not None:
+        # Near edges from the whole rectangle when there is one. A panel's origin
+        # is always (0, 0), so this only ever matters for a stored packet that
+        # carries something else.
+        x1, y1 = max(x1, frame[0]), max(y1, frame[1])
+    # FAR edges PER AXIS. An axis the panel's own rule could not answer is left
+    # unclamped rather than clamped to a guess -- and before this, ONE
+    # unanswerable axis cost the clamp BOTH, so a window laid out above the
+    # display produced a swipe to x=2300 against a 1080 panel that the device
+    # silently ignored while the step reported success.
+    x_far, y_far = _panel_far_edges(display)
+    if x_far is not None:
+        x2 = min(x2, x_far)
+    if y_far is not None:
+        y2 = min(y2, y_far)
+    return x1, y1, x2, y2
+
+
 def _swipe_points(
     direction: str, element: object, display: object = None
 ) -> tuple | None:
@@ -2769,30 +2798,7 @@ def _swipe_points(
     center = _center(element)
     if center is None:
         return points
-    x1, y1, x2, y2 = (int(v) for v in element["bounds"])
-    # The ON-SCREEN part. Near edges always: a negative edge is where
-    # `adb._coord` refuses to put the finger. Far edges too WHEN the caller
-    # knows the display, because a partly-visible node keeps its far edges and
-    # a gesture built from them lands off the panel and silently no-ops.
-    # Everything below is computed from this box, so no later clamp can move an
-    # endpoint after the invariant has been checked.
-    x1, y1 = max(0, x1), max(0, y1)
-    frame = _display_box(display)
-    if frame is not None:
-        # Near edges from the whole rectangle when there is one. A panel's origin
-        # is always (0, 0), so this only ever matters for a stored packet that
-        # carries something else.
-        x1, y1 = max(x1, frame[0]), max(y1, frame[1])
-    # FAR edges PER AXIS. An axis the panel's own rule could not answer is left
-    # unclamped rather than clamped to a guess -- and before this, ONE
-    # unanswerable axis cost the clamp BOTH, so a window laid out above the
-    # display produced a swipe to x=2300 against a 1080 panel that the device
-    # silently ignored while the step reported success.
-    x_far, y_far = _panel_far_edges(display)
-    if x_far is not None:
-        x2 = min(x2, x_far)
-    if y_far is not None:
-        y2 = min(y2, y_far)
+    x1, y1, x2, y2 = _on_screen_box(element, display)
     if x2 <= x1 or y2 <= y1:
         return None
     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
@@ -4173,7 +4179,7 @@ def _record_guard_stop(
 
 @dataclasses.dataclass(frozen=True)
 class _Step:
-    """One action that passed the guard, with the target it resolved to."""
+    """One action with the target it resolved to; built before the guard judges it."""
 
     op: str
     action: object
@@ -4233,6 +4239,156 @@ async def _dispatch_op(
     return await _device_step(run, step, screen)
 
 
+def _before_texts(op: str, screen: object, previous: set | None) -> set | None:
+    """The BEFORE set for ``assert new_text``.
+
+    Captured for every op that can change the screen -- ``wait`` included,
+    which is the whole point: the reply a case is waiting for arrives during
+    the wait. Any other op keeps the set it had.
+    """
+    baseline_texts = previous
+    if op in actions_mod.MUTATING_OPS:
+        baseline_texts = _texts(screen)
+    return baseline_texts
+
+
+def _guard_stop(run: _ReplayRun, step: _Step, screen: object, index: int):
+    """The reply that ends the replay at the destructive guard, else ``None``.
+
+    DENY BY DEFAULT, and judge the node the action ACTUATES, not the node it
+    NAMES. Both halves were learned by shipping the failure.
+
+    The op half: this was an allow-list of ops believed to tap, and it was
+    wrong twice -- 'clear' taps to focus the field, and a TARGETED 'scroll'
+    swipes on the resolved element. So every op is guarded unless it is
+    declared inert in NON_ACTUATING_OPS.
+
+    The node half: the guard judged the RESOLVED element, and Android does not
+    deliver a touch to the resolved element. A tap on a non-clickable child
+    goes to the nearest CLICKABLE ancestor, so `tap {"text": "OK"}` on the
+    child of a `btn_delete_account` wrapper reached the device while `tap
+    {"rid": ...}` on the wrapper itself was stopped; and a targeted swipe
+    re-centred only its X, so `scroll left` naming a benign row swiped across
+    "Slide to confirm payment" at the table's Y. Measured through
+    adb._run_argv, both. So the guard ALSO judges `actuated_element` at the
+    very point `_perform` will touch, and a targeted swipe is confined to the
+    element it names (see `_swipe_points`).
+
+    The property this buys: acting on X through a child gets the SAME verdict
+    as acting on X directly, so no new false-positive class -- a wrapper that
+    stops a tap on its child already stopped a tap on itself.
+
+    A target-less pan names nothing and is judged on nothing. THE RESIDUAL,
+    stated: the finger starts at the table point, and a slide-to-confirm
+    control lying there would be actuated. Widening to that point would stop
+    every pan over a transactions list whose row reads "Transfer to ...", and
+    a guard stop is terminal for a scripted case, so the pan stays unjudged and
+    the decision is pinned in both directions by tests/mobile.
+    """
+    ctx = run.ctx
+    trace = run.trace
+    op = step.op
+    action = step.action
+    entry = step.entry
+    element = step.element
+    if ctx.guard_destructive and op not in NON_ACTUATING_OPS:
+        label, judged_node = _guard_label(op, action, element, screen)
+        hit = destructive_hit(label)
+        if not hit and op == "press":
+            # The key fires the FORM's IME action, and no dump names the
+            # control that action reaches (uiautomator emits no
+            # imeOptions). The actuated node is unknown BY CONSTRUCTION,
+            # so the scope is every element the packet carries -- and a
+            # packet that does not carry the whole screen cannot clear
+            # it. Measured before this line existed: `tap {"text":
+            # "Confirm payment"}` was refused while `press enter
+            # {"rid": amount}` on the same form sent KEYCODE_ENTER.
+            hit = screen_hit(screen, ctx.package)
+        if not hit and judged_node is not None:
+            # LAST, and only with a node in hand: a path that has a term
+            # today keeps it, and `judged=None` can never reach the
+            # fidelity branch, so nothing else about this guard moves.
+            hit = screen_hit(screen, "", judged=judged_node)
+        # A flag, not `hit = ""`: the sentinel ratchet requires
+        # `hit` be bound ONLY by destructive_hit/screen_hit.
+        confirmed = bool(hit) and _consume_confirm(ctx, hit, screen, op, entry, label)
+        if hit and not confirmed:
+            if _record_guard_stop(run, op, hit, entry, screen):
+                # EXPLICIT KEYWORDS, never a dict splat. The sentinel
+                # ratchet forbids ``**kwargs`` into this sink because
+                # ``guard_term``'s provenance must be traceable by
+                # reading the call, and it is right: a splat hides
+                # which keys reach the payload. ``guard_refused`` is
+                # an EXPLICIT marker rather than a comparison against
+                # the detail PROSE -- a reader that matches on wording
+                # breaks the moment the wording is improved, and the
+                # wording is the part the tester actually reads.
+                return {
+                    "error": None,
+                    "content": _result(
+                        STATUS_ERROR,
+                        trace,
+                        screen,
+                        "",
+                        entry["detail"],
+                        index,
+                        guard_term=hit,
+                        guard_refused=True,
+                    ),
+                }
+            return {
+                "error": None,
+                "content": _result(
+                    STATUS_NEEDS_TESTER,
+                    trace,
+                    screen,
+                    "",
+                    entry["detail"],
+                    index,
+                    guard_term=hit,
+                    guard_op=op,
+                    guard_node=str(label)[:MAX_GUARD_NODE_CHARS],
+                ),
+            }
+    return None
+
+
+async def _knowledge_before(
+    run: _ReplayRun, cursor: _StepCursor, step_at: tuple, screen, deadline: float
+) -> tuple:
+    """Saved app notes for one step, BEFORE its target resolves.
+
+    ``(screen, reply, inserted)``. A wait note polls (bounded) and an avoid
+    note refuses -- ``reply`` is then the stop; ``inserted`` means a note put
+    steps in front of this one and the loop must move to them.
+    """
+    index, action, entry = step_at
+    op = str(getattr(action, "op", "") or "")
+    screen, note_stop = await _apply_knowledge(
+        run.ctx, action, op, entry, screen, run.items, deadline
+    )
+    if note_stop is not None:
+        return screen, _knowledge_stop(run, index, entry, screen, note_stop), False
+    reply, inserted = await _knowledge_pre(run, cursor, step_at, screen, deadline)
+    return screen, reply, inserted
+
+
+async def _target_step(run: _ReplayRun, step_at: tuple, op: str, screen) -> tuple:
+    """Resolve the step's target, then run the destructive guard (`_guard_stop`).
+
+    ``(step, reply)``; ``reply`` is not None when resolution or the guard stops.
+    """
+    index, action, entry = step_at
+    element, scroll_missed, reply = _resolve_element(run, op, action, entry, screen)
+    element, reply = await _knowledge_target(
+        run, entry, action, screen, (element, reply)
+    )
+    if reply is not None:
+        return None, reply
+    step = _Step(op, action, entry, element, scroll_missed)
+    return step, _guard_stop(run, step, screen, index)
+
+
 async def _replay_steps(script: object, ctx: Context) -> dict:
     """Execute *script* against ``ctx``. Never raises.
 
@@ -4277,8 +4433,7 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
             # The BEFORE set for ``assert new_text``, captured for every op that
             # can change the screen -- ``wait`` included, which is the whole
             # point: the reply a case is waiting for arrives during the wait.
-            if op in actions_mod.MUTATING_OPS:
-                baseline_texts = _texts(screen)
+            baseline_texts = _before_texts(op, screen, baseline_texts)
 
             # --- terminal ops -------------------------------------------------
             if op == "done":
@@ -4292,12 +4447,7 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
             # Saved app notes, BEFORE the target resolves. A wait note polls
             # (bounded); an avoid note refuses. The destructive guard below
             # still runs and still outranks both.
-            screen, note_stop = await _apply_knowledge(
-                ctx, action, op, entry, screen, items, deadline
-            )
-            if note_stop is not None:
-                return _knowledge_stop(run, index, entry, screen, note_stop)
-            reply, inserted = await _knowledge_pre(
+            screen, reply, inserted = await _knowledge_before(
                 run, cursor, (index, action, entry), screen, deadline
             )
             if reply is not None:
@@ -4305,113 +4455,12 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
             if inserted:
                 continue
 
-            # --- target resolution -------------------------------------------
-            element, scroll_missed, reply = _resolve_element(
-                run, op, action, entry, screen
-            )
-            element, reply = await _knowledge_target(
-                run, entry, action, screen, (element, reply)
-            )
+            # --- target resolution, then the destructive guard ----------------
+            step, reply = await _target_step(run, (index, action, entry), op, screen)
             if reply is not None:
                 return reply
 
-            # --- destructive guard -------------------------------------------
-            # DENY BY DEFAULT, and judge the node the action ACTUATES, not the
-            # node it NAMES. Both halves were learned by shipping the failure.
-            #
-            # The op half: this was an allow-list of ops believed to tap, and it
-            # was wrong twice -- 'clear' taps to focus the field, and a TARGETED
-            # 'scroll' swipes on the resolved element. So every op is guarded
-            # unless it is declared inert in NON_ACTUATING_OPS.
-            #
-            # The node half: the guard judged the RESOLVED element, and Android
-            # does not deliver a touch to the resolved element. A tap on a
-            # non-clickable child goes to the nearest CLICKABLE ancestor, so
-            # `tap {"text": "OK"}` on the child of a `btn_delete_account`
-            # wrapper reached the device while `tap {"rid": ...}` on the wrapper
-            # itself was stopped; and a targeted swipe re-centred only its X, so
-            # `scroll left` naming a benign row swiped across "Slide to confirm
-            # payment" at the table's Y. Measured through adb._run_argv, both.
-            # So the guard ALSO judges `actuated_element` at the very point
-            # `_perform` will touch, and a targeted swipe is confined to the
-            # element it names (see `_swipe_points`).
-            #
-            # The property this buys: acting on X through a child gets the SAME
-            # verdict as acting on X directly, so no new false-positive class --
-            # a wrapper that stops a tap on its child already stopped a tap on
-            # itself.
-            #
-            # A target-less pan names nothing and is judged on nothing. THE
-            # RESIDUAL, stated: the finger starts at the table point, and a
-            # slide-to-confirm control lying there would be actuated. Widening
-            # to that point would stop every pan over a transactions list whose
-            # row reads "Transfer to ...", and a guard stop is terminal for a
-            # scripted case, so the pan stays unjudged and the decision is
-            # pinned in both directions by tests/mobile.
-            if ctx.guard_destructive and op not in NON_ACTUATING_OPS:
-                label, judged_node = _guard_label(op, action, element, screen)
-                hit = destructive_hit(label)
-                if not hit and op == "press":
-                    # The key fires the FORM's IME action, and no dump names the
-                    # control that action reaches (uiautomator emits no
-                    # imeOptions). The actuated node is unknown BY CONSTRUCTION,
-                    # so the scope is every element the packet carries -- and a
-                    # packet that does not carry the whole screen cannot clear
-                    # it. Measured before this line existed: `tap {"text":
-                    # "Confirm payment"}` was refused while `press enter
-                    # {"rid": amount}` on the same form sent KEYCODE_ENTER.
-                    hit = screen_hit(screen, ctx.package)
-                if not hit and judged_node is not None:
-                    # LAST, and only with a node in hand: a path that has a term
-                    # today keeps it, and `judged=None` can never reach the
-                    # fidelity branch, so nothing else about this guard moves.
-                    hit = screen_hit(screen, "", judged=judged_node)
-                # A flag, not `hit = ""`: the sentinel ratchet requires
-                # `hit` be bound ONLY by destructive_hit/screen_hit.
-                confirmed = bool(hit) and _consume_confirm(
-                    ctx, hit, screen, op, entry, label
-                )
-                if hit and not confirmed:
-                    if _record_guard_stop(run, op, hit, entry, screen):
-                        # EXPLICIT KEYWORDS, never a dict splat. The sentinel
-                        # ratchet forbids ``**kwargs`` into this sink because
-                        # ``guard_term``'s provenance must be traceable by
-                        # reading the call, and it is right: a splat hides
-                        # which keys reach the payload. ``guard_refused`` is
-                        # an EXPLICIT marker rather than a comparison against
-                        # the detail PROSE -- a reader that matches on wording
-                        # breaks the moment the wording is improved, and the
-                        # wording is the part the tester actually reads.
-                        return {
-                            "error": None,
-                            "content": _result(
-                                STATUS_ERROR,
-                                trace,
-                                screen,
-                                "",
-                                entry["detail"],
-                                index,
-                                guard_term=hit,
-                                guard_refused=True,
-                            ),
-                        }
-                    return {
-                        "error": None,
-                        "content": _result(
-                            STATUS_NEEDS_TESTER,
-                            trace,
-                            screen,
-                            "",
-                            entry["detail"],
-                            index,
-                            guard_term=hit,
-                            guard_op=op,
-                            guard_node=str(label)[:MAX_GUARD_NODE_CHARS],
-                        ),
-                    }
-
             # --- asserts, waits and device ops --------------------------------
-            step = _Step(op, action, entry, element, scroll_missed)
             before = screen
             screen, reply = await _dispatch_op(run, step, screen, baseline_texts)
             _knowledge_post(run, entry, before, screen)
@@ -4816,38 +4865,9 @@ async def _perform(
     if op == "home":
         return await adb.keyevent(serial, "KEYCODE_HOME")
     if op == "launch":
-        named = getattr(action, "package", None)
-        if named:
-            # A named package is judged by launch_guard BEFORE anything is
-            # started; a refusal is recoverable (the model fixes the step).
-            # `launch_allowed` is reached only when a package is set.
-            allowed, why = launch_guard.launch_allowed(
-                named,
-                target=ctx.package,
-                expect_apps=(
-                    *tuple(getattr(ctx, "expect_apps", ()) or ()),
-                    getattr(ctx, "home_package", ""),
-                ),
-            )
-            if not allowed:
-                return {"error": why, "content": None, "needs_model": True}
-            return await adb.launch(serial, named)
-        if not ctx.package:
-            return {"error": "No app package is set for this run.", "content": None}
-        return await adb.launch(serial, ctx.package)
+        return await _launch_op(action, ctx)
     if op == "clear_app_data":
-        # Only ever THIS run's own package -- `ctx.home_package` (falling back
-        # to `ctx.package` for a Context built without one), never a value
-        # read off the script, and never the app a multi-app goal handed over
-        # to: a hand-over moves what the guard compares against, not what may
-        # be wiped.
-        home = getattr(ctx, "home_package", "") or ctx.package
-        if not home:
-            return {"error": "No app package is set for this run.", "content": None}
-        cleared = await adb.clear_app_data(serial, home)
-        if cleared.get("error"):
-            return cleared
-        return await adb.launch(serial, home)
+        return await _clear_app_data_op(ctx)
     if op == "open_url":
         return await adb.open_url(serial, str(getattr(action, "url", "")))
     if op in actions_mod.WAIT_OPS:
@@ -4855,19 +4875,7 @@ async def _perform(
         # a wait reaching here would otherwise fall through to the unknown op.
         return {"error": "A wait is not a device op.", "content": None}
     if op == "scroll":
-        direction = str(getattr(action, "dir", "") or "")
-        if direction not in _SWIPE:
-            return {"error": "Unknown scroll direction.", "content": None}
-        points = _swipe_points(direction, element, display)
-        if not points:
-            return {
-                "error": TOO_SMALL_TO_SWIPE,
-                "content": None,
-                # A re-plan, not a device failure: the model can drop the
-                # target or name the scrollable list instead.
-                "needs_model": True,
-            }
-        return await adb.swipe(serial, *points)
+        return await _scroll_op(action, element, display, serial)
     if op in ("tap", "tap_text"):
         # ONE device path for both. `tap_text` differs only in how its element
         # was chosen; once chosen a tap is a tap, and a second `adb.tap` call
@@ -4877,109 +4885,191 @@ async def _perform(
             return {"error": "That element has no usable bounds.", "content": None}
         return await adb.tap(serial, center[0], center[1])
     if op == "press":
-        # The key goes to whatever holds FOCUS, so the target is not decorative:
-        # tap it first, exactly as `type` and `clear` do. The keycode comes from
-        # `actions.PRESS_KEYS` -- our own allowlist, never the model's string --
-        # and `adb.keyevent` validates it a second time.
-        code = actions_mod.PRESS_KEYS.get(str(getattr(action, "key", "") or ""))
-        if not code:
-            return {"error": "Unsupported press key.", "content": None}
-        center = _center(element) if isinstance(element, dict) else None
-        if not center:
-            return {"error": "That field has no usable bounds.", "content": None}
-        focused = await adb.tap(serial, center[0], center[1])
-        if focused.get("error"):
-            return focused
-        return await adb.keyevent(serial, code)
+        return await _press_op(action, element, serial)
     if op in ("type", "fill", "clear"):
-        fallback = str(getattr(ctx, "typing_fallback", "") or "")
-        if fallback and op == "clear":
+        return await _text_entry_op(op, action, element, ctx)
+    return {"error": "Unsupported action " + repr(op), "content": None}
+
+
+async def _launch_op(action: object, ctx: Context) -> dict:
+    """``launch``: start a named package (guarded) or this run's own package."""
+    serial = ctx.serial
+    named = getattr(action, "package", None)
+    if named:
+        # A named package is judged by launch_guard BEFORE anything is
+        # started; a refusal is recoverable (the model fixes the step).
+        # `launch_allowed` is reached only when a package is set.
+        allowed, why = launch_guard.launch_allowed(
+            named,
+            target=ctx.package,
+            expect_apps=(
+                *tuple(getattr(ctx, "expect_apps", ()) or ()),
+                getattr(ctx, "home_package", ""),
+            ),
+        )
+        if not allowed:
+            return {"error": why, "content": None, "needs_model": True}
+        return await adb.launch(serial, named)
+    if not ctx.package:
+        return {"error": "No app package is set for this run.", "content": None}
+    return await adb.launch(serial, ctx.package)
+
+
+async def _clear_app_data_op(ctx: Context) -> dict:
+    """``clear_app_data``: wipe this run's own package, then relaunch it."""
+    serial = ctx.serial
+    # Only ever THIS run's own package -- `ctx.home_package` (falling back
+    # to `ctx.package` for a Context built without one), never a value
+    # read off the script, and never the app a multi-app goal handed over
+    # to: a hand-over moves what the guard compares against, not what may
+    # be wiped.
+    home = getattr(ctx, "home_package", "") or ctx.package
+    if not home:
+        return {"error": "No app package is set for this run.", "content": None}
+    cleared = await adb.clear_app_data(serial, home)
+    if cleared.get("error"):
+        return cleared
+    return await adb.launch(serial, home)
+
+
+async def _scroll_op(
+    action: object, element: object, display: object, serial: str
+) -> dict:
+    """``scroll``: swipe in the named direction, within the target if any."""
+    direction = str(getattr(action, "dir", "") or "")
+    if direction not in _SWIPE:
+        return {"error": "Unknown scroll direction.", "content": None}
+    points = _swipe_points(direction, element, display)
+    if not points:
+        return {
+            "error": TOO_SMALL_TO_SWIPE,
+            "content": None,
+            # A re-plan, not a device failure: the model can drop the
+            # target or name the scrollable list instead.
+            "needs_model": True,
+        }
+    return await adb.swipe(serial, *points)
+
+
+async def _press_op(action: object, element: object, serial: str) -> dict:
+    """``press``: focus the target by a tap, then send the allowlisted key."""
+    # The key goes to whatever holds FOCUS, so the target is not decorative:
+    # tap it first, exactly as `type` and `clear` do. The keycode comes from
+    # `actions.PRESS_KEYS` -- our own allowlist, never the model's string --
+    # and `adb.keyevent` validates it a second time.
+    code = actions_mod.PRESS_KEYS.get(str(getattr(action, "key", "") or ""))
+    if not code:
+        return {"error": "Unsupported press key.", "content": None}
+    center = _center(element) if isinstance(element, dict) else None
+    if not center:
+        return {"error": "That field has no usable bounds.", "content": None}
+    focused = await adb.tap(serial, center[0], center[1])
+    if focused.get("error"):
+        return focused
+    return await adb.keyevent(serial, code)
+
+
+def _password_refusal(action: object, element: object) -> dict | None:
+    """The refusal for typing a non-secret value into a password field, else None."""
+    # A PASSWORD INPUT TAKES ONLY A TESTER-SUPPLIED VALUE. Refused by name
+    # rather than typed and masked afterwards, and decided on the ELEMENT
+    # rather than on the action's chosen names: a field named in an alphabet
+    # this server cannot read is exactly the case a name-matching rule
+    # cannot judge, and it is also the case where the dump still says
+    # `password="true"`.
+    secret = bool(getattr(action, "secret", False))
+    if (
+        not secret
+        and isinstance(element, dict)
+        and (element.get("secure") or element.get("role") == "password")
+    ):
+        return {
+            "error": PASSWORD_REFUSAL,
+            "content": None,
+            # NEEDS_MODEL rather than the device_error every other `_perform`
+            # failure becomes: this one names a recovery, and an error ends
+            # the case before the model can take it.
+            "needs_model": True,
+            # REFUSING TO TYPE IT IS NOT ENOUGH. The trace entry was built
+            # before the element was known, so it still carries the literal
+            # -- and the trace is checkpointed, rendered and audited. This
+            # asks the caller to mask it, which is the only place that can:
+            # `redact_action` sees the action alone and this value is a
+            # credential because of the ELEMENT it was aimed at.
+            "mask_text": True,
+        }
+    return None
+
+
+async def _text_entry_op(
+    op: str, action: object, element: object, ctx: Context
+) -> dict:
+    """``type`` / ``fill`` / ``clear``: focus the field, then enter or clear text."""
+    serial = ctx.serial
+    fallback = str(getattr(ctx, "typing_fallback", "") or "")
+    if fallback and op == "clear":
+        return {
+            "error": (
+                "Clearing a field needs the QA keyboard, which is not set up on this "
+                "device. Clear it by hand, or install the keyboard as the note "
+                "about the QA keyboard says. Reason:\n"
+                + wrap_untrusted("adb", fallback, limit=200)
+            ),
+            "content": None,
+            "needs_model": True,
+        }
+    blocked = None if fallback else await _qa_ime_blocker(serial)
+    if blocked is not None:
+        return blocked
+    center = _center(element) if isinstance(element, dict) else None
+    if not center:
+        return {"error": "That field has no usable bounds.", "content": None}
+    focused = await adb.tap(serial, center[0], center[1])
+    if focused.get("error"):
+        return focused
+    if op == "clear":
+        # `replay` ran keyboard_up (its one QUERY) for every script
+        # carrying type/clear, so the receiver is known to answer.
+        return await ime.clear(serial, receiver_known=True)
+    refused = _password_refusal(action, element)
+    if refused is not None:
+        return refused
+    secret = bool(getattr(action, "secret", False))
+    if secret:
+        field = str(getattr(action, "field", "") or "")
+        value = (ctx.tester_inputs or {}).get(field)
+        # `not value`, not `value is None`: an EMPTY held value types
+        # nothing, and the `landed` verdict cannot speak for a step that
+        # made no claim, so it would pass silently -- the defect that
+        # verdict exists to end. `actions.parse_script` already refuses an
+        # empty `text` on the non-secret path ("type needs text"); this is
+        # the same boundary for the path whose value never appears in the
+        # script.
+        if not value:
             return {
                 "error": (
-                    "Clearing a field needs the QA keyboard, which is not set up on this "
-                    "device. Clear it by hand, or install the keyboard as the note "
-                    "about the QA keyboard says. Reason:\n"
-                    + wrap_untrusted("adb", fallback, limit=200)
+                    "No tester-supplied value is held for the field "
+                    + repr(field[:60])
+                    + ", so nothing was typed. Ask for it first with "
+                    "ask_tester."
                 ),
                 "content": None,
-                "needs_model": True,
             }
-        blocked = None if fallback else await _qa_ime_blocker(serial)
-        if blocked is not None:
-            return blocked
-        center = _center(element) if isinstance(element, dict) else None
-        if not center:
-            return {"error": "That field has no usable bounds.", "content": None}
-        focused = await adb.tap(serial, center[0], center[1])
-        if focused.get("error"):
-            return focused
-        if op == "clear":
-            # `replay` ran keyboard_up (its one QUERY) for every script
-            # carrying type/clear, so the receiver is known to answer.
-            return await ime.clear(serial, receiver_known=True)
-        # A PASSWORD INPUT TAKES ONLY A TESTER-SUPPLIED VALUE. Refused by name
-        # rather than typed and masked afterwards, and decided on the ELEMENT
-        # rather than on the action's chosen names: a field named in an alphabet
-        # this server cannot read is exactly the case a name-matching rule
-        # cannot judge, and it is also the case where the dump still says
-        # `password="true"`.
-        secret = bool(getattr(action, "secret", False))
-        if (
-            not secret
-            and isinstance(element, dict)
-            and (element.get("secure") or element.get("role") == "password")
-        ):
-            return {
-                "error": PASSWORD_REFUSAL,
-                "content": None,
-                # NEEDS_MODEL rather than the device_error every other `_perform`
-                # failure becomes: this one names a recovery, and an error ends
-                # the case before the model can take it.
-                "needs_model": True,
-                # REFUSING TO TYPE IT IS NOT ENOUGH. The trace entry was built
-                # before the element was known, so it still carries the literal
-                # -- and the trace is checkpointed, rendered and audited. This
-                # asks the caller to mask it, which is the only place that can:
-                # `redact_action` sees the action alone and this value is a
-                # credential because of the ELEMENT it was aimed at.
-                "mask_text": True,
-            }
-        if secret:
-            field = str(getattr(action, "field", "") or "")
-            value = (ctx.tester_inputs or {}).get(field)
-            # `not value`, not `value is None`: an EMPTY held value types
-            # nothing, and the `landed` verdict cannot speak for a step that
-            # made no claim, so it would pass silently -- the defect that
-            # verdict exists to end. `actions.parse_script` already refuses an
-            # empty `text` on the non-secret path ("type needs text"); this is
-            # the same boundary for the path whose value never appears in the
-            # script.
-            if not value:
-                return {
-                    "error": (
-                        "No tester-supplied value is held for the field "
-                        + repr(field[:60])
-                        + ", so nothing was typed. Ask for it first with "
-                        "ask_tester."
-                    ),
-                    "content": None,
-                }
-            return _judge_landed(
-                await _typer(fallback)(
-                    serial, str(value), secret=True, receiver_known=True
-                ),
-                field or "the focused field",
-            )
         return _judge_landed(
             await _typer(fallback)(
-                serial,
-                str(getattr(action, "text", "") or ""),
-                secret=False,
-                receiver_known=True,
+                serial, str(value), secret=True, receiver_known=True
             ),
-            str(getattr(action, "field", "") or "") or "the focused field",
+            field or "the focused field",
         )
-    return {"error": "Unsupported action " + repr(op), "content": None}
+    return _judge_landed(
+        await _typer(fallback)(
+            serial,
+            str(getattr(action, "text", "") or ""),
+            secret=False,
+            receiver_known=True,
+        ),
+        str(getattr(action, "field", "") or "") or "the focused field",
+    )
 
 
 def _judge_landed(result: object, field: str) -> dict:
