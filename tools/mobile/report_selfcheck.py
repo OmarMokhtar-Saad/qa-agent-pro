@@ -182,20 +182,13 @@ class _Page(HTMLParser):
         if tag in MEDIA_TAGS and "src" in pairs:
             self.media.append((tag, pairs["src"]))
         if tag == "img":
-            self.images.append(pairs.get("src", ""))
-            for candidate in pairs.get("srcset", "").split(","):
-                if candidate.strip():
-                    self.images.append(candidate.split()[0])
-            if "data-full" in pairs:
-                self.images.append(pairs["data-full"])
+            self._record_images(pairs)
         # A poster is fetched as soon as the page paints: judged as media.
         if tag == "video" and "poster" in pairs:
             self.media.append(("poster", pairs["poster"]))
         if tag == "style":
             self._in_style = True
-        for name in pairs:
-            if name.startswith("on"):
-                self.handlers.append(tag + "@" + name)
+        self._record_handlers(tag, pairs)
         if "data-tc" in pairs:
             self.cards.append(pairs["data-tc"])
             self.crashes[pairs["data-tc"]] = pairs.get("data-crash", "")
@@ -203,6 +196,19 @@ class _Page(HTMLParser):
             self.summary = pairs
         if pairs.get("id") == report.END_ID:
             self.end = pairs
+
+    def _record_images(self, pairs) -> None:
+        self.images.append(pairs.get("src", ""))
+        for candidate in pairs.get("srcset", "").split(","):
+            if candidate.strip():
+                self.images.append(candidate.split()[0])
+        if "data-full" in pairs:
+            self.images.append(pairs["data-full"])
+
+    def _record_handlers(self, tag, pairs) -> None:
+        for name in pairs:
+            if name.startswith("on"):
+                self.handlers.append(tag + "@" + name)
 
     def handle_endtag(self, tag) -> None:
         if tag == "style":

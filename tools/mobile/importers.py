@@ -720,6 +720,27 @@ def _sheet_xml(archive: zipfile.ZipFile) -> dict:
     return _member_text(archive, target)
 
 
+def _cell_value(cell: ElementTree.Element, shared: list[str]) -> str:
+    kind = str(cell.get("t") or "")
+    value = ""
+    for child in cell:
+        name = _strip_ns(child.tag)
+        if name == "v":
+            value = child.text or ""
+        elif name == "is":
+            value = "".join(
+                node.text or ""
+                for node in child.iter()
+                if _strip_ns(node.tag) == "t"
+            )
+    if kind == "s":
+        try:
+            value = shared[int(value)]
+        except (ValueError, IndexError):
+            value = ""
+    return value
+
+
 def _sheet_rows(sheet_xml: str, shared: list[str]) -> dict:
     try:
         root = ElementTree.fromstring(sheet_xml)
@@ -736,24 +757,7 @@ def _sheet_rows(sheet_xml: str, shared: list[str]) -> dict:
             column = _column_index(cell.get("r") or "")
             if column < 0:
                 column = len(cells)
-            kind = str(cell.get("t") or "")
-            value = ""
-            for child in cell:
-                name = _strip_ns(child.tag)
-                if name == "v":
-                    value = child.text or ""
-                elif name == "is":
-                    value = "".join(
-                        node.text or ""
-                        for node in child.iter()
-                        if _strip_ns(node.tag) == "t"
-                    )
-            if kind == "s":
-                try:
-                    value = shared[int(value)]
-                except (ValueError, IndexError):
-                    value = ""
-            cells[column] = _clean(value)
+            cells[column] = _clean(_cell_value(cell, shared))
         if not cells:
             rows.append([])
             continue

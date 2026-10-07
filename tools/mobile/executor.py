@@ -883,6 +883,10 @@ def destructive_hit(text: object) -> str:
     ``["deleted", "items"]`` and matches nothing; ``"Confirm payment"`` matches
     ``confirm``. A multi-word entry is matched as a contiguous token run.
     """
+    segments = str(text or "").split(perception.SEGMENT_BREAK)
+    if len(segments) > 1:
+        # raw/split forms of one id: each judged alone, no cross-junction run.
+        return next((hit for hit in map(destructive_hit, segments) if hit), "")
     tokens = _tokens(text)
     if not tokens:
         return ""
@@ -4258,105 +4262,96 @@ def _before_texts(op: str, screen: object, previous: set | None) -> set | None:
     return baseline_texts
 
 
+# --- _guard_stop: why the destructive guard is shaped this way ---------------
+#
+# DENY BY DEFAULT, and judge the node the action ACTUATES, not the node it
+# NAMES. Both halves were learned by shipping the failure.
+#
+# The op half: this was an allow-list of ops believed to tap, and it was
+# wrong twice -- 'clear' taps to focus the field, and a TARGETED 'scroll'
+# swipes on the resolved element. So every op is guarded unless it is
+# declared inert in NON_ACTUATING_OPS.
+#
+# The node half: the guard judged the RESOLVED element, and Android does not
+# deliver a touch to the resolved element. A tap on a non-clickable child
+# goes to the nearest CLICKABLE ancestor, so `tap {"text": "OK"}` on the
+# child of a `btn_delete_account` wrapper reached the device while `tap
+# {"rid": ...}` on the wrapper itself was stopped; and a targeted swipe
+# re-centred only its X, so `scroll left` naming a benign row swiped across
+# "Slide to confirm payment" at the table's Y. Measured through
+# adb._run_argv, both. So the guard ALSO judges `actuated_element` at the
+# very point `_perform` will touch, and a targeted swipe is confined to the
+# element it names (see `_swipe_points`).
+#
+# The property this buys: acting on X through a child gets the SAME verdict
+# as acting on X directly, so no new false-positive class -- a wrapper that
+# stops a tap on its child already stopped a tap on itself.
+#
+# A target-less pan names nothing and is judged on nothing. THE RESIDUAL,
+# stated: the finger starts at the table point, and a slide-to-confirm
+# control lying there would be actuated. Widening to that point would stop
+# every pan over a transactions list whose row reads "Transfer to ...", and
+# a guard stop is terminal for a scripted case, so the pan stays unjudged and
+# the decision is pinned in both directions by tests/mobile.
+#
+# Press branch: the key fires the FORM's IME action and no dump names the control
+# that action reaches (uiautomator emits no imeOptions), so the scope is every
+# element the packet carries, and a packet that does not carry the whole screen
+# cannot clear it. Measured: `tap {"text": "Confirm payment"}` was refused while
+# `press enter {"rid": amount}` on the same form sent KEYCODE_ENTER. The judged-
+# node probe runs LAST, only with a node in hand, so `judged=None` never reaches
+# the fidelity branch. `confirmed` is a flag, not `hit = ""`: the sentinel ratchet
+# requires `hit` be bound ONLY by destructive_hit/screen_hit. The replies use
+# EXPLICIT keywords, never a dict splat: guard_term's provenance must be
+# traceable by reading the call. guard_refused is an explicit marker, not a
+# comparison against the detail PROSE, which the tester reads and may reword.
+
+
 def _guard_stop(run: _ReplayRun, step: _Step, screen: object, index: int):
     """The reply that ends the replay at the destructive guard, else ``None``.
 
-    DENY BY DEFAULT, and judge the node the action ACTUATES, not the node it
-    NAMES. Both halves were learned by shipping the failure.
-
-    The op half: this was an allow-list of ops believed to tap, and it was
-    wrong twice -- 'clear' taps to focus the field, and a TARGETED 'scroll'
-    swipes on the resolved element. So every op is guarded unless it is
-    declared inert in NON_ACTUATING_OPS.
-
-    The node half: the guard judged the RESOLVED element, and Android does not
-    deliver a touch to the resolved element. A tap on a non-clickable child
-    goes to the nearest CLICKABLE ancestor, so `tap {"text": "OK"}` on the
-    child of a `btn_delete_account` wrapper reached the device while `tap
-    {"rid": ...}` on the wrapper itself was stopped; and a targeted swipe
-    re-centred only its X, so `scroll left` naming a benign row swiped across
-    "Slide to confirm payment" at the table's Y. Measured through
-    adb._run_argv, both. So the guard ALSO judges `actuated_element` at the
-    very point `_perform` will touch, and a targeted swipe is confined to the
-    element it names (see `_swipe_points`).
-
-    The property this buys: acting on X through a child gets the SAME verdict
-    as acting on X directly, so no new false-positive class -- a wrapper that
-    stops a tap on its child already stopped a tap on itself.
-
-    A target-less pan names nothing and is judged on nothing. THE RESIDUAL,
-    stated: the finger starts at the table point, and a slide-to-confirm
-    control lying there would be actuated. Widening to that point would stop
-    every pan over a transactions list whose row reads "Transfer to ...", and
-    a guard stop is terminal for a scripted case, so the pan stays unjudged and
-    the decision is pinned in both directions by tests/mobile.
+    Deny by default; judges the node the action ACTUATES. See the comment above.
     """
-    ctx = run.ctx
-    trace = run.trace
-    op = step.op
-    action = step.action
-    entry = step.entry
-    element = step.element
-    if ctx.guard_destructive and op not in NON_ACTUATING_OPS:
-        label, judged_node = _guard_label(op, action, element, screen)
-        hit = destructive_hit(label)
-        if not hit and op == "press":
-            # The key fires the FORM's IME action, and no dump names the
-            # control that action reaches (uiautomator emits no
-            # imeOptions). The actuated node is unknown BY CONSTRUCTION,
-            # so the scope is every element the packet carries -- and a
-            # packet that does not carry the whole screen cannot clear
-            # it. Measured before this line existed: `tap {"text":
-            # "Confirm payment"}` was refused while `press enter
-            # {"rid": amount}` on the same form sent KEYCODE_ENTER.
-            hit = screen_hit(screen, ctx.package)
-        if not hit and judged_node is not None:
-            # LAST, and only with a node in hand: a path that has a term
-            # today keeps it, and `judged=None` can never reach the
-            # fidelity branch, so nothing else about this guard moves.
-            hit = screen_hit(screen, "", judged=judged_node)
-        # A flag, not `hit = ""`: the sentinel ratchet requires
-        # `hit` be bound ONLY by destructive_hit/screen_hit.
-        confirmed = bool(hit) and _consume_confirm(ctx, hit, screen, op, entry, label)
-        if hit and not confirmed:
-            if _record_guard_stop(run, op, hit, entry, screen):
-                # EXPLICIT KEYWORDS, never a dict splat. The sentinel
-                # ratchet forbids ``**kwargs`` into this sink because
-                # ``guard_term``'s provenance must be traceable by
-                # reading the call, and it is right: a splat hides
-                # which keys reach the payload. ``guard_refused`` is
-                # an EXPLICIT marker rather than a comparison against
-                # the detail PROSE -- a reader that matches on wording
-                # breaks the moment the wording is improved, and the
-                # wording is the part the tester actually reads.
-                return {
-                    "error": None,
-                    "content": _result(
-                        STATUS_ERROR,
-                        trace,
-                        screen,
-                        "",
-                        entry["detail"],
-                        index,
-                        guard_term=hit,
-                        guard_refused=True,
-                    ),
-                }
-            return {
-                "error": None,
-                "content": _result(
-                    STATUS_NEEDS_TESTER,
-                    trace,
-                    screen,
-                    "",
-                    entry["detail"],
-                    index,
-                    guard_term=hit,
-                    guard_op=op,
-                    guard_node=str(label)[:MAX_GUARD_NODE_CHARS],
-                ),
-            }
-    return None
+    ctx, trace, op, entry = run.ctx, run.trace, step.op, step.entry
+    if not ctx.guard_destructive or op in NON_ACTUATING_OPS:
+        return None
+    label, judged_node = _guard_label(op, step.action, step.element, screen)
+    hit = destructive_hit(label)
+    if not hit and op == "press":
+        hit = screen_hit(screen, ctx.package)
+    if not hit and judged_node is not None:
+        hit = screen_hit(screen, "", judged=judged_node)
+    confirmed = bool(hit) and _consume_confirm(ctx, hit, screen, op, entry, label)
+    if not hit or confirmed:
+        return None
+    if _record_guard_stop(run, op, hit, entry, screen):
+        return {
+            "error": None,
+            "content": _result(
+                STATUS_ERROR,
+                trace,
+                screen,
+                "",
+                entry["detail"],
+                index,
+                guard_term=hit,
+                guard_refused=True,
+            ),
+        }
+    return {
+        "error": None,
+        "content": _result(
+            STATUS_NEEDS_TESTER,
+            trace,
+            screen,
+            "",
+            entry["detail"],
+            index,
+            guard_term=hit,
+            guard_op=op,
+            guard_node=str(label)[:MAX_GUARD_NODE_CHARS],
+        ),
+    }
 
 
 async def _knowledge_before(

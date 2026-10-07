@@ -4112,6 +4112,85 @@ def _object_nesting_depth(obj, limit: int) -> int:
     return deepest
 
 
+def _check_submitted_object(text_or_obj, enforce_size_cap: bool) -> None:
+    """Depth and size checks for an already-parsed submitted object."""
+    # 2026-08-03 (Fix 1): the MCP tool signatures now accept an OBJECT for
+    # suite_json, so this branch is reachable from a real submission for the
+    # first time. It MUST honour the same size cap as the string branch
+    # below -- otherwise widening the annotation would have silently removed
+    # the only bound on submission size, since the cap sits after this early
+    # return. Serialising to measure costs the same order of memory as the
+    # string path already does.
+    if _object_nesting_depth(text_or_obj, _MAX_JSON_DEPTH) > _MAX_JSON_DEPTH:
+        raise PrepParseError(
+            f"submitted JSON nests deeper than {_MAX_JSON_DEPTH} levels"
+        )
+    cap = int(getattr(settings, "qa_prep_max_bytes", 0) or 0)
+    if cap and enforce_size_cap:
+        try:
+            size = len(
+                json.dumps(text_or_obj, ensure_ascii=False).encode(
+                    "utf-8", "ignore"
+                )
+            )
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise PrepParseError(
+                f"submitted object is not JSON-serialisable: {exc}"
+            ) from exc
+        if size > cap:
+            raise PrepParseError(f"submitted JSON exceeds the {cap}-byte cap")
+
+
+def _strip_json_fence(stripped: str) -> str:
+    """Remove a leading ```json fence and a trailing ``` fence, if present."""
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+        # 2026-09-02 audit F10b. This was re.sub(r"\s*```$", "", stripped).
+        # An unbounded whitespace run in front of an ANCHORED literal makes the
+        # REFUSAL path quadratic: the engine restarts `\s*` at every position of
+        # the run and each restart walks to the end of it. A fenced payload
+        # whose JSON carries one long internal whitespace run and no closing
+        # fence therefore cost x4 per doubling -- 40,000 spaces measured 2.7 s,
+        # on EVERY qa_submit_suite / qa_submit_category.
+        #
+        # rstrip + endswith is the same transformation in one linear pass. It is
+        # EQUIVALENT, not merely close: `$` could only ever match at the end of
+        # this string, because the .strip() above has already removed any
+        # trailing newline, and `\s*` could only ever consume the whitespace
+        # immediately before the closing fence.
+        stripped = stripped.rstrip()
+        if stripped.endswith("```"):
+            stripped = stripped[:-3]
+        stripped = stripped.strip()
+    return stripped
+
+
+def _largest_suite_object(stripped: str) -> dict | None:
+    """The largest balanced JSON object carrying ``test_cases``, else None."""
+    # A hard ceiling equal to the input length: the single-pass scanner visits
+    # each character at most once, so this never trips for legitimate input; it
+    # is an explicit invariant guard, while the caller's size cap bounds the input.
+    best: dict | None = None
+    best_len = -1
+    for span in _bounded_json_spans(stripped, budget=len(stripped) + 1):
+        try:
+            obj = json.loads(span)
+        except (json.JSONDecodeError, ValueError, RecursionError):
+            continue
+        if isinstance(obj, dict) and "test_cases" in obj and len(span) > best_len:
+            best, best_len = obj, len(span)
+
+    if best is None:
+        # Last resort: the whole stripped string as one object.
+        try:
+            obj = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError, RecursionError):
+            obj = None
+        if isinstance(obj, dict) and "test_cases" in obj:
+            best = obj
+    return best
+
+
 def parse_host_suite(text_or_obj, *, enforce_size_cap: bool = True) -> ParsedSubmission:
     """Tolerantly extract the host's generated suite into a ParsedSubmission
     (suite + salvage delta).
@@ -4137,31 +4216,7 @@ def parse_host_suite(text_or_obj, *, enforce_size_cap: bool = True) -> ParsedSub
     bad submission into a tester-readable message.
     """
     if isinstance(text_or_obj, dict):
-        # 2026-08-03 (Fix 1): the MCP tool signatures now accept an OBJECT for
-        # suite_json, so this branch is reachable from a real submission for the
-        # first time. It MUST honour the same size cap as the string branch
-        # below -- otherwise widening the annotation would have silently removed
-        # the only bound on submission size, since the cap sits after this early
-        # return. Serialising to measure costs the same order of memory as the
-        # string path already does.
-        if _object_nesting_depth(text_or_obj, _MAX_JSON_DEPTH) > _MAX_JSON_DEPTH:
-            raise PrepParseError(
-                f"submitted JSON nests deeper than {_MAX_JSON_DEPTH} levels"
-            )
-        cap = int(getattr(settings, "qa_prep_max_bytes", 0) or 0)
-        if cap and enforce_size_cap:
-            try:
-                size = len(
-                    json.dumps(text_or_obj, ensure_ascii=False).encode(
-                        "utf-8", "ignore"
-                    )
-                )
-            except (TypeError, ValueError, RecursionError) as exc:
-                raise PrepParseError(
-                    f"submitted object is not JSON-serialisable: {exc}"
-                ) from exc
-            if size > cap:
-                raise PrepParseError(f"submitted JSON exceeds the {cap}-byte cap")
+        _check_submitted_object(text_or_obj, enforce_size_cap)
         return _validate_suite(text_or_obj)
     if not isinstance(text_or_obj, str):
         raise PrepParseError(
@@ -4177,53 +4232,14 @@ def parse_host_suite(text_or_obj, *, enforce_size_cap: bool = True) -> ParsedSub
     ):
         raise PrepParseError(f"submitted JSON exceeds the {max_bytes}-byte cap")
 
-    stripped = text_or_obj.strip()
-    if stripped.startswith("```"):
-        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
-        # 2026-09-02 audit F10b. This was re.sub(r"\s*```$", "", stripped).
-        # An unbounded whitespace run in front of an ANCHORED literal makes the
-        # REFUSAL path quadratic: the engine restarts `\s*` at every position of
-        # the run and each restart walks to the end of it. A fenced payload
-        # whose JSON carries one long internal whitespace run and no closing
-        # fence therefore cost x4 per doubling -- 40,000 spaces measured 2.7 s,
-        # on EVERY qa_submit_suite / qa_submit_category.
-        #
-        # rstrip + endswith is the same transformation in one linear pass. It is
-        # EQUIVALENT, not merely close: `$` could only ever match at the end of
-        # this string, because the .strip() above has already removed any
-        # trailing newline, and `\s*` could only ever consume the whitespace
-        # immediately before the closing fence.
-        stripped = stripped.rstrip()
-        if stripped.endswith("```"):
-            stripped = stripped[:-3]
-        stripped = stripped.strip()
+    stripped = _strip_json_fence(text_or_obj.strip())
 
     if _text_nesting_depth(stripped) > _MAX_JSON_DEPTH:
         raise PrepParseError(
             f"submitted JSON nests deeper than {_MAX_JSON_DEPTH} levels"
         )
 
-    # A hard ceiling equal to the input length: the single-pass scanner visits
-    # each character at most once, so this never trips for legitimate input; it
-    # is an explicit invariant guard, while the size cap above bounds the input.
-    best: dict | None = None
-    best_len = -1
-    for span in _bounded_json_spans(stripped, budget=len(stripped) + 1):
-        try:
-            obj = json.loads(span)
-        except (json.JSONDecodeError, ValueError, RecursionError):
-            continue
-        if isinstance(obj, dict) and "test_cases" in obj and len(span) > best_len:
-            best, best_len = obj, len(span)
-
-    if best is None:
-        # Last resort: the whole stripped string as one object.
-        try:
-            obj = json.loads(stripped)
-        except (json.JSONDecodeError, ValueError, RecursionError):
-            obj = None
-        if isinstance(obj, dict) and "test_cases" in obj:
-            best = obj
+    best = _largest_suite_object(stripped)
 
     if best is None:
         raise PrepParseError(

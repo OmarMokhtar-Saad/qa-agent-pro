@@ -3746,15 +3746,24 @@ def _rid_tail(rid: object) -> str:
     return str(rid or "").rsplit("/", 1)[-1].replace("_", " ")
 
 
-def _plain_action(action: object) -> list:
-    """A trace action as plain words: text parts and :func:`_q` quotes.
+_TARGET_VERBS = {
+    "tap": "Tapped ",
+    "long_press": "Long-pressed ",
+    "clear": "Cleared ",
+}
 
-    Typed text goes through :func:`_typed_literal`, so a credential is the
-    mask here exactly as it is in the step table.
-    """
-    body = action if isinstance(action, dict) else {}
-    op = str(body.get("op") or "")
-    target = body.get("target")
+_FIXED_WORDS = {
+    "wait_until_changed": "Waited for the screen to change",
+    "wait_until_idle": "Waited for the screen to settle",
+    "launch": "Opened the app",
+}
+
+_WAIT_OPS = ("wait", "wait_until_text", "wait_until_gone")
+_TURN_OPS = ("assert", "done", "ask_tester")
+
+
+def _named_target(target: object) -> tuple:
+    """The target's quoted name, its role, and the words that point at it."""
     target = target if isinstance(target, dict) else {}
     name = _text(
         target.get("text")
@@ -3765,12 +3774,50 @@ def _plain_action(action: object) -> list:
     )
     role = _text(target.get("role"), 24)
     thing = [_q(name)] if name else ["the " + role if role else "an unlabelled element"]
-    if op == "tap":
-        return ["Tapped "] + thing
-    if op == "long_press":
-        return ["Long-pressed "] + thing
-    if op == "clear":
-        return ["Cleared "] + thing
+    return name, role, thing
+
+
+def _plain_wait(op: str, body: dict) -> list:
+    """The plain words of the three waits that name a text or a time."""
+    if op == "wait_until_text":
+        return ["Waited for ", _q(_text(body.get("text"), 80)), " to appear"]
+    if op == "wait_until_gone":
+        return ["Waited for ", _q(_text(body.get("text"), 80)), " to go"]
+    until = _text(body.get("until_text"), 80)
+    if until:
+        return ["Waited for ", _q(until), " to appear"]
+    return ["Waited " + fmt_ms(_ms(body.get("ms")) or 0)]
+
+
+def _plain_turn_op(op: str, body: dict) -> list:
+    """The plain words of the ops that end or check a turn."""
+    if op == "assert":
+        text = _text(body.get("text") or body.get("contains"), 80)
+        if text:
+            return ["Checked that ", _q(text), " is on screen"]
+        return ["Checked the screen"]
+    if op == "done":
+        reason = _text(body.get("reason"), 200)
+        if reason:
+            return ["Finished the turn: ", _q(reason)]
+        return ["Finished the turn"]
+    field = _text(body.get("field"), 24)
+    return ["Asked the tester for " + (field or "input")]
+
+
+def _plain_action(action: object) -> list:
+    """A trace action as plain words: text parts and :func:`_q` quotes.
+
+    Typed text goes through :func:`_typed_literal`, so a credential is the
+    mask here exactly as it is in the step table.
+    """
+    body = action if isinstance(action, dict) else {}
+    op = str(body.get("op") or "")
+    name, role, thing = _named_target(body.get("target"))
+    if op in _TARGET_VERBS:
+        return [_TARGET_VERBS[op]] + thing
+    if op in _FIXED_WORDS:
+        return [_FIXED_WORDS[op]]
     if op == "type":
         typed = _typed_literal(body)
         return ["Typed ", _q(typed)] + ([" into "] + thing if name or role else [])
@@ -3778,36 +3825,10 @@ def _plain_action(action: object) -> list:
         return ["Scrolled " + (_text(body.get("dir"), 12) or "the screen")]
     if op in ("back", "home"):
         return ["Pressed " + op.capitalize()]
-    if op == "wait":
-        until = _text(body.get("until_text"), 80)
-        if until:
-            return ["Waited for ", _q(until), " to appear"]
-        return ["Waited " + fmt_ms(_ms(body.get("ms")) or 0)]
-    if op == "wait_until_text":
-        return ["Waited for ", _q(_text(body.get("text"), 80)), " to appear"]
-    if op == "wait_until_gone":
-        return ["Waited for ", _q(_text(body.get("text"), 80)), " to go"]
-    if op == "wait_until_changed":
-        return ["Waited for the screen to change"]
-    if op == "wait_until_idle":
-        return ["Waited for the screen to settle"]
-    if op == "assert":
-        text = _text(body.get("text") or body.get("contains"), 80)
-        return (
-            ["Checked that ", _q(text), " is on screen"]
-            if text
-            else ["Checked the screen"]
-        )
-    if op == "done":
-        reason = _text(body.get("reason"), 200)
-        return ["Finished the turn" + (": " if reason else "")] + (
-            [_q(reason)] if reason else []
-        )
-    if op == "ask_tester":
-        field = _text(body.get("field"), 24)
-        return ["Asked the tester for " + (field or "input")]
-    if op == "launch":
-        return ["Opened the app"]
+    if op in _WAIT_OPS:
+        return _plain_wait(op, body)
+    if op in _TURN_OPS:
+        return _plain_turn_op(op, body)
     return [_action_line(body)]
 
 

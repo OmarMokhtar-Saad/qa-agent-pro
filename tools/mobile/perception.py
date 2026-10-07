@@ -302,17 +302,24 @@ def split_camel(text: object) -> str:
     return _CAMEL_UPPER_WORD.sub(" ", _CAMEL_LOWER_UPPER.sub(" ", str(text)))
 
 
+#: Joins the raw and split forms of one id. ``executor.destructive_hit`` judges
+#: each side of it on its own, so a multi-word term cannot match across the
+#: junction (``OutBox_log`` raw ends ``log``, split starts ``out``: "log out").
+SEGMENT_BREAK = "\x1f"
+
+
 def with_camel_split(text: object) -> str:
     """*text* followed by its ``split_camel`` form, when the two differ.
 
     For the destructive guard on ids. Splitting alone loses lexicon words that
     are ONE token: ``CheckOut`` split is ``Check Out``, and ``check out`` is not
     ``checkout``. Judging both forms keeps every word the raw id matched and
-    adds the words the split exposes (``signOut`` -> ``sign out``).
+    adds the words the split exposes (``signOut`` -> ``sign out``). The two are
+    joined by ``SEGMENT_BREAK``, never a space, so no term spans the seam.
     """
     raw = str(text or "")
     split = split_camel(raw)
-    return raw if split == raw else raw + " " + split
+    return raw if split == raw else raw + SEGMENT_BREAK + split
 
 
 def words(*values: object) -> list:
