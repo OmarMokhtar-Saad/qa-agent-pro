@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import NamedTuple
 
 from tools.mobile import actions as actions_mod
 from tools.mobile import (
@@ -283,49 +284,56 @@ def merge_traces(prior: object, new: object) -> list:
     merged = [item for item in list(prior or []) if isinstance(item, dict)]
     merged += [item for item in list(new or []) if isinstance(item, dict)]
     if len(merged) > MAX_CASE_TRACE:
-        keep = (MAX_CASE_TRACE - 1) // 2
-        # EVERY action ever dropped, not just this pass's. The count came from
-        # the current list, which already held the previous marker as a single
-        # entry -- so each re-trim forgot what the last one dropped and the
-        # evidence said 61 where 182 were gone. Budget stops are cheap and
-        # therefore common, so a second trim is the expected path.
-        already = 0
-        for entry in merged:
-            if str(entry.get("outcome") or "") != "trimmed":
-                continue
-            try:
-                already += int(str(entry.get("detail") or "0").split()[0])
-            except (TypeError, ValueError, IndexError):
-                continue
-        merged = [
-            entry for entry in merged if str(entry.get("outcome") or "") != "trimmed"
-        ]
-        # No `+ 1`: the marker this pass strips was never an ACTION, so counting
-        # it as one over-reported by exactly the number of trims. Caught by the
-        # test that compares the marker against the real arithmetic instead of
-        # against itself.
-        dropped = already + len(merged) - (keep * 2)
-        merged = (
-            merged[:keep]
-            + [
-                {
-                    "action": {"op": "..."},
-                    "outcome": "trimmed",
-                    "detail": (
-                        str(dropped)
-                        + " actions in the middle of this case were dropped to "
-                        "bound the trace; the start and the end are kept"
-                    ),
-                    "before_screen_id": "",
-                    "after_screen_id": "",
-                    "ms": 0,
-                }
-            ]
-            + merged[-keep:]
-        )
+        merged = _trim_trace_middle(merged, (MAX_CASE_TRACE - 1) // 2)
     for index, entry in enumerate(merged):
         entry["index"] = index
     return merged
+
+
+def _already_dropped(merged: list) -> int:
+    """EVERY action ever dropped, as recorded by earlier trim markers.
+
+    Not just this pass's. The count came from the current list, which already
+    held the previous marker as a single entry -- so each re-trim forgot what
+    the last one dropped and the evidence said 61 where 182 were gone. Budget
+    stops are cheap and therefore common, so a second trim is the expected path.
+    """
+    already = 0
+    for entry in merged:
+        if str(entry.get("outcome") or "") != "trimmed":
+            continue
+        try:
+            already += int(str(entry.get("detail") or "0").split()[0])
+        except (TypeError, ValueError, IndexError):
+            continue
+    return already
+
+
+def _trim_marker(dropped: int) -> dict:
+    """The single trace entry that says how many middle actions were dropped."""
+    return {
+        "action": {"op": "..."},
+        "outcome": "trimmed",
+        "detail": (
+            str(dropped) + " actions in the middle of this case were dropped to "
+            "bound the trace; the start and the end are kept"
+        ),
+        "before_screen_id": "",
+        "after_screen_id": "",
+        "ms": 0,
+    }
+
+
+def _trim_trace_middle(merged: list, keep: int) -> list:
+    """Keep *keep* entries at each end and put a marker where the middle was."""
+    already = _already_dropped(merged)
+    merged = [entry for entry in merged if str(entry.get("outcome") or "") != "trimmed"]
+    # No `+ 1`: the marker this pass strips was never an ACTION, so counting
+    # it as one over-reported by exactly the number of trims. Caught by the
+    # test that compares the marker against the real arithmetic instead of
+    # against itself.
+    dropped = already + len(merged) - (keep * 2)
+    return merged[:keep] + [_trim_marker(dropped)] + merged[-keep:]
 
 
 def escapes_used(run_id: str, tc_id: str) -> int:
@@ -363,187 +371,200 @@ async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
     try:
         view = case_view(case)
         tc_id = view.get("tc_id") or ""
-        if not run_store.valid_tc_id(tc_id):
-            return {
-                "error": (
-                    "Refusing to run case id "
-                    + repr(str(tc_id)[:40])
-                    + "; it must look like TC-001."
-                ),
-                "content": None,
-            }
-        if not ctx.package:
-            return {
-                "error": "No app package is set for this run; nothing was launched.",
-                "content": None,
-            }
+        refusal = _start_refusal(tc_id, ctx)
+        if refusal:
+            return refusal
 
         # Invariant 1. Unconditional, and in this order.
         stopped = await adb.force_stop(ctx.serial, ctx.package)
         if stopped.get("error"):
             return stopped
-        # App evidence (plan D5): the ring buffer is cleared BETWEEN the stop
-        # and the launch, so a slice begins with the app's own start-up. With
-        # no profile for this package, or the flag off, ``begin_case`` makes
-        # no adb call and says why; a failure here never blocks the case.
-        evidence = _evidence_record(
-            await capture.begin_case(ctx.serial, ctx.package, run_id, tc_id)
-        )
-        # The wire, beside the log (plan mobile-network-capture). Started HERE
-        # for the same reason the ring buffer is cleared here: the capture has
-        # to cover the app own start-up. A physical device, a console that
-        # refused, or a flag that is off all land as a record which SAYS so --
-        # none of them can block the case, and none of them can be a blank.
-        evidence["network"] = network_record(
-            await capture.begin_network(ctx.serial, ctx.package, run_id, tc_id, 0)
-        )
-        # The API-capture lane's own per-case boundary (Phase 6, T6.2), beside
-        # the pcap lane's above -- a second, independent dimension on the same
-        # seam. Never branched on: an evidence fault here can no more change a
-        # verdict than a failed log slice can.
-        evidence["capture"] = capture_record(api_flows.mark_case_current(run_id, tc_id))
+        evidence = await _begin_evidence(run_id, tc_id, ctx)
         launched = await adb.launch(ctx.serial, ctx.package)
         if launched.get("error"):
             return await _abandon(run_id, tc_id, ctx, evidence, launched)
 
-        # WAIT FOR THE APP TO BE IN FRONT. `adb.launch` returns when the intent
-        # is delivered, not when the app is drawn, so this dump used to race it.
-        # THE WALL CLOCK, not the sum of the sleeps. `waited` accumulated only
-        # the poll interval, so a constant named as an 8-second budget also
-        # bought 17 full uiautomator dumps -- 15-40s on a real device, inside
-        # the tool call the client is timing. The dumps are the expensive part,
-        # so the budget has to measure the thing that actually elapses.
-        # The MODULE-LEVEL `time`, not a function-local alias. The alias
-        # shadowed it and defeated `monkeypatch.setattr(case_runner, "time",
-        # ...)`, which is the ordinary seam -- and with no seam the deadline
-        # could only be pinned by grepping this function's source for the word
-        # "monotonic", a check any deadline bug that keeps the word survives.
-        deadline = time.monotonic() + FOREGROUND_TIMEOUT_S
-        polls = 0
-        screen = {}
-        seen = ""
-        in_front = False
-        while True:
-            dumped = await executor.dump_raw(ctx.serial)
-            if dumped.get("error"):
-                return await _abandon(run_id, tc_id, ctx, evidence, dumped)
-            sized = await adb.display_size(ctx.serial)
-            # The density is a DEVICE fact for the same reason the size is, and
-            # is cached per serial the same way -- so the accessibility audit
-            # measures 48dp against THIS device rather than assuming a density.
-            dpi = await adb.display_density(ctx.serial)
-            # THE SETTLE PRUNE, and it passes NO activity on purpose. It answers
-            # ONE question -- "is the app in front yet?" -- inside the loop that
-            # exists BECAUSE the answer is often no: `launch` returns when the
-            # intent is delivered, not when the app is drawn.
-            # `executor.resolve_activity` MEMOISES what it probes, so probing
-            # from in here would freeze whatever held focus mid-launch (the
-            # launcher, an IME, a permission dialog) onto the context and hash
-            # the app's own screen with it -- reinstating the very split this
-            # lane was fixed for, under exactly the condition this loop was
-            # written to survive. The identity is resolved once, after the loop,
-            # and only the screen pruned WITH it is stored.
-            pruned = composite.observe(
-                dumped.get("content"),
-                "",
-                display=sized.get("content"),
-                density=dpi.get("content"),
-            )
-            if pruned.get("error"):
-                return await _abandon(run_id, tc_id, ctx, evidence, pruned)
-            screen = pruned.get("content") or {}
-            seen = str(screen.get("package") or "")
-            if not seen or seen == ctx.package:
-                # An empty package is a dump that named none -- not evidence of
-                # another app, so it is accepted rather than waited out.
-                #
-                # TWO break paths, and only ONE of them establishes that the app
-                # is in front. The distinction is recorded rather than re-derived
-                # below, because "the loop ended" and "the app is up" are two
-                # facts and reading the first as the second is what freezes a
-                # foreign activity onto the screen -- see the resolve below.
-                in_front = seen == ctx.package
-                break
-            # TWO bounds, and the second is not redundant: the first is only
-            # as honest as the clock it reads. See MAX_FOREGROUND_POLLS.
-            if time.monotonic() >= deadline or polls >= MAX_FOREGROUND_POLLS:
-                return await _abandon(
-                    run_id,
-                    tc_id,
-                    ctx,
-                    evidence,
-                    {
-                        "error": _foreground_refusal(seen, ctx.package),
-                        "content": None,
-                    },
-                )
-            polls += 1
-            await _sleep(FOREGROUND_POLL_S)
-
-        # THE IDENTITY, resolved once, and ONLY on the break path that actually
-        # established the app is in front. ONE producer, shared with the replay
-        # -- see `executor.resolve_activity`. The dump is re-pruned rather than
-        # re-fetched: same bytes, one more dimension in the hash, no extra
-        # device round trip.
-        #
-        # Not resolving is the SAFE answer, not a degraded one. The other break
-        # path is a dump that named no package at all, where the focused window
-        # may still be whatever the launch was moving away from; `resolve_activity`
-        # memoises, so probing there stamps a foreign activity onto this screen
-        # -- the same freeze this lane was fixed for, one break path over. A
-        # failure to resolve or re-prune likewise leaves the settle screen
-        # standing, which is the weaker two-dimensional identity this lane had
-        # before any of this -- never no screen at all.
-        settled_activity = ""
-        if in_front:
-            settled_activity = await executor.resolve_activity(ctx)
-        if settled_activity:
-            settled = composite.observe(
-                dumped.get("content"),
-                settled_activity,
-                display=sized.get("content"),
-                density=dpi.get("content"),
-            )
-            if not settled.get("error"):
-                screen = settled.get("content") or screen
-
-        # The report joins a trace's screen ids to this library. A failure
-        # here may never change a verdict, so the result is deliberately
-        # not read: a lost wireframe beats a lost verdict.
-        run_store.write_screen(run_id, screen)
-
-        from agents import mobile_run
-
-        used = escapes_used(run_id, tc_id)
-        packet = mobile_run.build_case_job(
-            view, screen, run_id=run_id, tc_id=tc_id, escapes=used
-        )
-        run_store.write_case(
-            run_id,
-            tc_id,
-            {
-                "tc_id": tc_id,
-                "title": view.get("title") or "",
-                "verdict": "",
-                "status": "planning",
-                "escapes": used,
-                "screen_id": screen.get("screen_id") or "",
-                "started": time.time(),
-                "evidence": evidence,
-            },
-        )
-        return {
-            "error": None,
-            "content": {
-                "tc_id": tc_id,
-                "screen": screen,
-                "packet": packet,
-                "escapes": used,
-            },
-        }
+        settle = await _wait_for_foreground(ctx)
+        if settle.error:
+            return await _abandon(run_id, tc_id, ctx, evidence, settle.error)
+        screen = await _settled_screen(ctx, settle)
+        return _write_planning(run_id, tc_id, view, screen, evidence)
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.case_runner.start_case failed")
         return {"error": str(exc), "content": None}
+
+
+def _start_refusal(tc_id: object, ctx: executor.Context) -> dict | None:
+    """The error payload for a case that must not start, or None."""
+    if not run_store.valid_tc_id(tc_id):
+        return {
+            "error": (
+                "Refusing to run case id "
+                + repr(str(tc_id)[:40])
+                + "; it must look like TC-001."
+            ),
+            "content": None,
+        }
+    if not ctx.package:
+        return {
+            "error": "No app package is set for this run; nothing was launched.",
+            "content": None,
+        }
+    return None
+
+
+async def _begin_evidence(run_id: str, tc_id: str, ctx: executor.Context) -> dict:
+    """Open the per-case evidence lanes, between the force-stop and the launch.
+
+    None of them can block the case or change a verdict: a lane that is off,
+    refused or unavailable lands as a record which SAYS so, never a blank.
+    """
+    # App evidence (plan D5): the ring buffer is cleared BETWEEN the stop
+    # and the launch, so a slice begins with the app's own start-up.
+    evidence = _evidence_record(
+        await capture.begin_case(ctx.serial, ctx.package, run_id, tc_id)
+    )
+    # The wire, beside the log (plan mobile-network-capture), started HERE so
+    # the capture covers the app's own start-up.
+    evidence["network"] = network_record(
+        await capture.begin_network(ctx.serial, ctx.package, run_id, tc_id, 0)
+    )
+    # The API-capture lane's own per-case boundary (Phase 6, T6.2): a second,
+    # independent dimension on the same seam.
+    evidence["capture"] = capture_record(api_flows.mark_case_current(run_id, tc_id))
+    return evidence
+
+
+class _Settle(NamedTuple):
+    """What the foreground wait saw: the last dump, its size and density."""
+
+    error: dict | None
+    dumped: dict
+    sized: dict
+    dpi: dict
+    screen: dict
+    in_front: bool
+
+
+async def _observe_settle(ctx: executor.Context) -> _Settle:
+    """One dump pruned WITHOUT an activity (``in_front`` is not decided here).
+
+    THE SETTLE PRUNE passes NO activity on purpose: it answers ONE question --
+    "is the app in front yet?" -- inside a loop that exists BECAUSE the answer
+    is often no. `executor.resolve_activity` MEMOISES what it probes, so
+    probing from in here would freeze whatever held focus mid-launch (the
+    launcher, an IME, a permission dialog) onto the context. The identity is
+    resolved once, after the loop. The density is a DEVICE fact like the size,
+    so the accessibility audit measures 48dp against THIS device.
+    """
+    dumped = await executor.dump_raw(ctx.serial)
+    if dumped.get("error"):
+        return _Settle(dumped, dumped, {}, {}, {}, False)
+    sized = await adb.display_size(ctx.serial)
+    dpi = await adb.display_density(ctx.serial)
+    pruned = composite.observe(
+        dumped.get("content"),
+        "",
+        display=sized.get("content"),
+        density=dpi.get("content"),
+    )
+    if pruned.get("error"):
+        return _Settle(pruned, dumped, sized, dpi, {}, False)
+    return _Settle(None, dumped, sized, dpi, pruned.get("content") or {}, False)
+
+
+async def _wait_for_foreground(ctx: executor.Context) -> _Settle:
+    """WAIT FOR THE APP TO BE IN FRONT; ``error`` is set when it never was.
+
+    `adb.launch` returns when the intent is delivered, not when the app is
+    drawn, so the first dump used to race it. The budget is THE WALL CLOCK,
+    not the sum of the sleeps (each dump costs 15-40s on a real device). It
+    reads the MODULE-LEVEL `time`, so `monkeypatch.setattr(case_runner, "time",
+    ...)` is the seam that pins the deadline.
+    """
+    deadline = time.monotonic() + FOREGROUND_TIMEOUT_S
+    polls = 0
+    while True:
+        seen_now = await _observe_settle(ctx)
+        if seen_now.error:
+            return seen_now
+        seen = str(seen_now.screen.get("package") or "")
+        if not seen or seen == ctx.package:
+            # An empty package is a dump that named none -- accepted, not
+            # waited out. TWO exits, and only ONE establishes the app is in
+            # front: "the loop ended" and "the app is up" are two facts.
+            return seen_now._replace(in_front=seen == ctx.package)
+        # TWO bounds, and the second is not redundant: the first is only as
+        # honest as the clock it reads. See MAX_FOREGROUND_POLLS.
+        if time.monotonic() >= deadline or polls >= MAX_FOREGROUND_POLLS:
+            refusal = {"error": _foreground_refusal(seen, ctx.package), "content": None}
+            return seen_now._replace(error=refusal)
+        polls += 1
+        await _sleep(FOREGROUND_POLL_S)
+
+
+async def _settled_screen(ctx: executor.Context, settle: _Settle) -> dict:
+    """THE IDENTITY, resolved once, and ONLY when the app was in front.
+
+    ONE producer, shared with the replay -- see `executor.resolve_activity`.
+    The dump is re-pruned rather than re-fetched. Not resolving is the SAFE
+    answer: the other exit is a dump that named no package, where the focused
+    window may still be what the launch was moving away from, and
+    `resolve_activity` memoises. A failure to resolve or re-prune leaves the
+    settle screen standing -- never no screen at all.
+    """
+    activity = await executor.resolve_activity(ctx) if settle.in_front else ""
+    if not activity:
+        return settle.screen
+    settled = composite.observe(
+        settle.dumped.get("content"),
+        activity,
+        display=settle.sized.get("content"),
+        density=settle.dpi.get("content"),
+    )
+    if settled.get("error"):
+        return settle.screen
+    return settled.get("content") or settle.screen
+
+
+def _write_planning(
+    run_id: str, tc_id: str, view: dict, screen: dict, evidence: dict
+) -> dict:
+    """Store the screen and the planning checkpoint; return the packet payload."""
+    # The report joins a trace's screen ids to this library. A failure
+    # here may never change a verdict, so the result is deliberately
+    # not read: a lost wireframe beats a lost verdict.
+    run_store.write_screen(run_id, screen)
+
+    from agents import mobile_run
+
+    used = escapes_used(run_id, tc_id)
+    packet = mobile_run.build_case_job(
+        view, screen, run_id=run_id, tc_id=tc_id, escapes=used
+    )
+    run_store.write_case(
+        run_id,
+        tc_id,
+        {
+            "tc_id": tc_id,
+            "title": view.get("title") or "",
+            "verdict": "",
+            "status": "planning",
+            "escapes": used,
+            "screen_id": screen.get("screen_id") or "",
+            "started": time.time(),
+            "evidence": evidence,
+        },
+    )
+    return {
+        "error": None,
+        "content": {
+            "tc_id": tc_id,
+            "screen": screen,
+            "packet": packet,
+            "escapes": used,
+        },
+    }
 
 
 #: Ops that put text on the screen through the QA keyboard.
@@ -689,19 +710,11 @@ async def submit_case(
             # a step with no result has nowhere to show a picture or a reason.
             await media.abandon(ctx.serial, clip)
             return replayed
-        result = replayed.get("content") or {}
-        status = str(result.get("status") or "")
-        trace = list(result.get("trace") or [])
-        new_screen = (
-            result.get("screen") if isinstance(result.get("screen"), dict) else {}
-        )
-        used = escapes_used(run_id, tc_id)
-        if new_screen:
-            run_store.write_screen(run_id, new_screen)
-        # Outside the `if`: a step that changed nothing still started a
+        step = _read_step(run_id, tc_id, replayed)
+        # Outside any `if`: a step that changed nothing still started a
         # recorder, and a recorder nobody stops is a device process that
         # outlives the run. This writes the media records onto the case, and
-        # `_checkpoint` below rebuilds that body whole -- which is why it
+        # `_checkpoint` rebuilds that body whole -- which is why it
         # carries `media` forward explicitly.
         await step_timing.timed(
             "evidence",
@@ -710,214 +723,246 @@ async def submit_case(
                 tc_id,
                 ctx.serial,
                 clip,
-                str((new_screen or {}).get("screen_id") or ""),
+                str((step.new_screen or {}).get("screen_id") or ""),
             ),
         )
         # App evidence (plan D5): ONE slice per replay, after the trace is
         # final and before the checkpoint that carries the record forward.
-        # The refused-script path above never reaches here: nothing ran, so
+        # The refused-script path never reaches here: nothing ran, so
         # there is nothing to slice.
         crash = await step_timing.timed("evidence", _slice_evidence(run_id, tc_id, ctx))
+        return _outcome_checkpoint(step, view, crash)
 
-        from agents import mobile_run
-
-        if status == executor.STATUS_DONE:
-            verdict = str(result.get("verdict") or "") or VERDICT_PASS
-            if verdict not in (
-                VERDICT_PASS,
-                VERDICT_FAIL,
-                VERDICT_BLOCKED,
-                VERDICT_UNVERIFIED,
-            ):
-                verdict = VERDICT_BLOCKED
-            # A model-declared `pass` over a case whose app DIED is a false pass,
-            # and the lane captured the proof and then never read it. The
-            # override happens here and nowhere else: this is already the one
-            # place a terminal verdict is normalised, so a second site would be a
-            # second answer to the same question.
-            verdict, done_reason = _crash_override(
-                verdict, str(result.get("reason") or ""), crash
-            )
-            return {
-                "error": None,
-                "content": _checkpoint(
-                    run_id,
-                    tc_id,
-                    view,
-                    verdict=verdict,
-                    status=executor.STATUS_DONE,
-                    reason=done_reason,
-                    trace=trace,
-                    escapes=used,
-                    packet=None,
-                ),
-            }
-
-        if status == executor.STATUS_NEEDS_TESTER:
-            packet = mobile_run.build_tester_request(
-                str(result.get("field") or ""),
-                str(result.get("reason") or ""),
-                run_id=run_id,
-                tc_id=tc_id,
-                guard_term=str(result.get("guard_term") or ""),
-            )
-            return {
-                "error": None,
-                "content": _checkpoint(
-                    run_id,
-                    tc_id,
-                    view,
-                    verdict="",
-                    status=NEEDS_TESTER,
-                    reason=str(result.get("reason") or ""),
-                    trace=trace,
-                    escapes=used,
-                    packet=packet,
-                    guard_stop={
-                        "term": str(result.get("guard_term") or "")[:80],
-                        "op": str(result.get("guard_op") or "")[:40],
-                        "node": str(result.get("guard_node") or "")[
-                            : executor.MAX_GUARD_NODE_CHARS
-                        ],
-                    },
-                ),
-            }
-
-        if status == executor.STATUS_ERROR:
-            return {
-                "error": None,
-                "content": _checkpoint(
-                    run_id,
-                    tc_id,
-                    view,
-                    verdict=VERDICT_BLOCKED,
-                    status=executor.STATUS_ERROR,
-                    reason=str(result.get("reason") or ""),
-                    trace=trace,
-                    escapes=used,
-                    packet=None,
-                ),
-            }
-
-        # needs_model -- the escape hatch. Invariant 2.
-        #
-        # TWO reasons a stop is not charged as an escape, ONE mechanism.
-        #
-        # A BUDGET STOP IS NOT AN ESCAPE. The executor stops a replay that would
-        # outlive the client's tool timeout; the script was legal, the actions
-        # that ran are in the trace, and the model is being asked to continue
-        # rather than to re-plan. Charging one of three escapes for obeying our
-        # own bound turns a correct case into `blocked`.
-        #
-        # A STALE-SELECTOR STOP IS NOT AN ESCAPE EITHER, when nothing touched
-        # the device first: `perception` mints the id, and the app moving an
-        # element is not the tester's case failing to make progress.
-        #
-        # The caps differ because the evidence differs -- a long case
-        # legitimately budget-stops many times, a plan whose own selector went
-        # stale should not get many retries -- so they are held per reason in
-        # UNCHARGED_CAPS rather than as one number. One counter, one disclosure,
-        # one carry-forward; two bounds, neither laxer than it was alone.
-        uncharged = uncharged_stops(run_id, tc_id)
-        reason_key = ""
-        if result.get("budget_stop"):
-            reason_key = REASON_BUDGET
-        elif bool(result.get("selector_stale")) and not result.get("actuated"):
-            reason_key = REASON_SELECTOR
-        elif result.get("visual_check"):
-            reason_key = REASON_VISUAL
-        if reason_key and uncharged[reason_key] < UNCHARGED_CAPS[reason_key]:
-            uncharged[reason_key] += 1
-            # ONE number per reason. This used to read MAX_BUDGET_STOPS while
-            # the exemption above read UNCHARGED_CAPS, so for the budget reason
-            # the dict entry was INERT -- measured 2026-09-04: raising it to 99
-            # changed no behaviour and passed all 1410 mobile tests, while
-            # raising the constant was caught by the peer's own static guard. A
-            # redundant bound that reads as authoritative is how a later retune
-            # of the unified counter silently does nothing.
-            if (
-                reason_key == REASON_BUDGET
-                and uncharged[reason_key] >= UNCHARGED_CAPS[reason_key]
-            ):
-                return {
-                    "error": None,
-                    "content": _checkpoint(
-                        run_id,
-                        tc_id,
-                        view,
-                        verdict=VERDICT_BLOCKED,
-                        status=VERDICT_BLOCKED,
-                        reason=BUDGET_CAP_REASON,
-                        trace=trace,
-                        escapes=used,
-                        packet=None,
-                        uncharged=uncharged,
-                    ),
-                }
-        else:
-            used += 1
-        if used >= MAX_ESCAPES:
-            return {
-                "error": None,
-                "content": _checkpoint(
-                    run_id,
-                    tc_id,
-                    view,
-                    verdict=VERDICT_BLOCKED,
-                    status=VERDICT_BLOCKED,
-                    # No `uncharged=` here, and that is deliberate rather
-                    # than an omission. This exit is only reached by ORDINARY
-                    # escapes, on whose branch the counter is read straight
-                    # from disk and never incremented -- so passing it is
-                    # identical
-                    # to the carry-forward default, which mutation proved by
-                    # deleting it and changing no result. The cap exit above
-                    # passes it because that is the branch that increments.
-                    reason=ESCAPE_CAP_REASON
-                    + " Last stop: "
-                    + str(result.get("reason") or ""),
-                    trace=trace,
-                    escapes=used,
-                    packet=None,
-                    uncharged=uncharged,
-                ),
-            }
-        packet = mobile_run.build_escape_job(
-            view,
-            new_screen,
-            trace,
-            run_id=run_id,
-            tc_id=tc_id,
-            escapes=used,
-            reason=str(result.get("reason") or ""),
-        )
-        return {
-            "error": None,
-            "content": _checkpoint(
-                run_id,
-                tc_id,
-                view,
-                verdict="",
-                status=NEEDS_MODEL,
-                reason=str(result.get("reason") or ""),
-                trace=trace,
-                escapes=used,
-                packet=packet,
-                uncharged=uncharged,
-                # A fresh budget stop's real remainder, and ONLY that -- a
-                # selector-stale or ordinary escape stop clears the queue by
-                # passing None, same as every other checkpoint that omits
-                # this keyword.
-                queued_actions=(
-                    result.get("queued_actions")
-                    if reason_key == REASON_BUDGET
-                    else None
-                ),
-            ),
-        }
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.case_runner.submit_case failed")
         return {"error": str(exc), "content": None}
+
+
+class _Step(NamedTuple):
+    """What one replay left behind: the facts every verdict branch reads."""
+
+    run_id: str
+    tc_id: str
+    result: dict
+    trace: list
+    used: int
+    new_screen: dict
+
+
+def _read_step(run_id: str, tc_id: str, replayed: dict) -> _Step:
+    """Unpack a replay's result and persist the screen it ended on."""
+    result = replayed.get("content") or {}
+    trace = list(result.get("trace") or [])
+    new_screen = result.get("screen") if isinstance(result.get("screen"), dict) else {}
+    used = escapes_used(run_id, tc_id)
+    if new_screen:
+        run_store.write_screen(run_id, new_screen)
+    return _Step(run_id, tc_id, result, trace, used, new_screen)
+
+
+def _outcome_checkpoint(step: _Step, view: dict, crash: object) -> dict:
+    """The checkpoint for a replayed step, by the status the executor ended on."""
+    result = step.result
+    status = str(result.get("status") or "")
+    reason = str(result.get("reason") or "")
+    if status == executor.STATUS_DONE:
+        # A model-declared `pass` over a case whose app DIED is a false pass,
+        # and the lane captured the proof and then never read it. The
+        # override happens here and nowhere else: this is already the one
+        # place a terminal verdict is normalised, so a second site would be a
+        # second answer to the same question.
+        verdict, done_reason = _crash_override(_terminal_verdict(result), reason, crash)
+        return _step_payload(
+            step,
+            view,
+            verdict=verdict,
+            status=executor.STATUS_DONE,
+            reason=done_reason,
+            packet=None,
+        )
+    if status == executor.STATUS_NEEDS_TESTER:
+        return _tester_payload(step, view)
+    if status == executor.STATUS_ERROR:
+        return _step_payload(
+            step,
+            view,
+            verdict=VERDICT_BLOCKED,
+            status=executor.STATUS_ERROR,
+            reason=reason,
+            packet=None,
+        )
+    return _escape_checkpoint(step, view)
+
+
+def _tester_payload(step: _Step, view: dict) -> dict:
+    """The needs_tester outcome: a credential request and the guard that stopped."""
+    from agents import mobile_run
+
+    result = step.result
+    reason = str(result.get("reason") or "")
+    packet = mobile_run.build_tester_request(
+        str(result.get("field") or ""),
+        reason,
+        run_id=step.run_id,
+        tc_id=step.tc_id,
+        guard_term=str(result.get("guard_term") or ""),
+    )
+    return _step_payload(
+        step,
+        view,
+        verdict="",
+        status=NEEDS_TESTER,
+        reason=reason,
+        packet=packet,
+        guard_stop={
+            "term": str(result.get("guard_term") or "")[:80],
+            "op": str(result.get("guard_op") or "")[:40],
+            "node": str(result.get("guard_node") or "")[
+                : executor.MAX_GUARD_NODE_CHARS
+            ],
+        },
+    )
+
+
+def _terminal_verdict(result: dict) -> str:
+    """The executor's verdict, defaulting to pass and clamped to a known one."""
+    verdict = str(result.get("verdict") or "") or VERDICT_PASS
+    known = (VERDICT_PASS, VERDICT_FAIL, VERDICT_BLOCKED, VERDICT_UNVERIFIED)
+    return verdict if verdict in known else VERDICT_BLOCKED
+
+
+def _step_payload(step: _Step, view: dict, **fields: object) -> dict:
+    """``{"error": None, "content": <checkpoint>}`` for *step*.
+
+    ``escapes`` defaults to the step's own count; a branch that charged one
+    passes the new total.
+    """
+    fields.setdefault("escapes", step.used)
+    return {
+        "error": None,
+        "content": _checkpoint(
+            step.run_id, step.tc_id, view, trace=step.trace, **fields
+        ),
+    }
+
+
+def _escape_checkpoint(step: _Step, view: dict) -> dict:
+    """The needs_model outcome: charge or exempt the stop, then ask or give up."""
+    result, used = step.result, step.used
+    uncharged = uncharged_stops(step.run_id, step.tc_id)
+    reason_key = _uncharged_reason(result)
+    if reason_key and uncharged[reason_key] < UNCHARGED_CAPS[reason_key]:
+        uncharged[reason_key] += 1
+        # ONE number per reason: see `_uncharged_reason`.
+        if (
+            reason_key == REASON_BUDGET
+            and uncharged[reason_key] >= UNCHARGED_CAPS[reason_key]
+        ):
+            return _step_payload(
+                step,
+                view,
+                verdict=VERDICT_BLOCKED,
+                status=VERDICT_BLOCKED,
+                reason=BUDGET_CAP_REASON,
+                packet=None,
+                uncharged=uncharged,
+            )
+    else:
+        used += 1
+    reason = str(result.get("reason") or "")
+    if used >= MAX_ESCAPES:
+        # No `uncharged=` here, and that is deliberate rather
+        # than an omission. This exit is only reached by ORDINARY
+        # escapes, on whose branch the counter is read straight
+        # from disk and never incremented -- so passing it is
+        # identical to the carry-forward default, which mutation
+        # proved by deleting it and changing no result. The cap exit
+        # above passes it because that is the branch that increments.
+        return _step_payload(
+            step,
+            view,
+            verdict=VERDICT_BLOCKED,
+            status=VERDICT_BLOCKED,
+            reason=ESCAPE_CAP_REASON + " Last stop: " + reason,
+            escapes=used,
+            packet=None,
+            uncharged=uncharged,
+        )
+    return _ask_model_payload(step, view, used, uncharged, reason_key)
+
+
+def _ask_model_payload(
+    step: _Step, view: dict, used: int, uncharged: dict, reason_key: str
+) -> dict:
+    """Hand the model the escape-hatch job for a stop that is still allowed."""
+    from agents import mobile_run
+
+    result = step.result
+    reason = str(result.get("reason") or "")
+    packet = mobile_run.build_escape_job(
+        view,
+        step.new_screen,
+        step.trace,
+        run_id=step.run_id,
+        tc_id=step.tc_id,
+        escapes=used,
+        reason=reason,
+    )
+    return _step_payload(
+        step,
+        view,
+        verdict="",
+        status=NEEDS_MODEL,
+        reason=reason,
+        escapes=used,
+        packet=packet,
+        uncharged=uncharged,
+        # A fresh budget stop's real remainder, and ONLY that -- a
+        # selector-stale or ordinary escape stop clears the queue by
+        # passing None, same as every other checkpoint that omits
+        # this keyword.
+        queued_actions=(
+            result.get("queued_actions") if reason_key == REASON_BUDGET else None
+        ),
+    )
+
+
+def _uncharged_reason(result: dict) -> str:
+    """Which exempt-from-escape reason a needs_model stop carries, else ``""``.
+
+    TWO reasons a stop is not charged as an escape, ONE mechanism.
+
+    A BUDGET STOP IS NOT AN ESCAPE. The executor stops a replay that would
+    outlive the client's tool timeout; the script was legal, the actions
+    that ran are in the trace, and the model is being asked to continue
+    rather than to re-plan. Charging one of three escapes for obeying our
+    own bound turns a correct case into `blocked`.
+
+    A STALE-SELECTOR STOP IS NOT AN ESCAPE EITHER, when nothing touched
+    the device first: `perception` mints the id, and the app moving an
+    element is not the tester's case failing to make progress.
+
+    The caps differ because the evidence differs -- a long case
+    legitimately budget-stops many times, a plan whose own selector went
+    stale should not get many retries -- so they are held per reason in
+    UNCHARGED_CAPS rather than as one number. One counter, one disclosure,
+    one carry-forward; two bounds, neither laxer than it was alone.
+
+    ONE number per reason. The cap check used to read MAX_BUDGET_STOPS while
+    the exemption read UNCHARGED_CAPS, so for the budget reason the dict
+    entry was INERT -- measured 2026-09-04: raising it to 99 changed no
+    behaviour and passed all 1410 mobile tests, while raising the constant
+    was caught by the peer's own static guard. A redundant bound that reads
+    as authoritative is how a later retune of the unified counter silently
+    does nothing.
+    """
+    if result.get("budget_stop"):
+        return REASON_BUDGET
+    if bool(result.get("selector_stale")) and not result.get("actuated"):
+        return REASON_SELECTOR
+    if result.get("visual_check"):
+        return REASON_VISUAL
+    return ""
 
 
 def _checkpoint(

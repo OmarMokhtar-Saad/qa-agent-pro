@@ -235,25 +235,7 @@ async def start(serial: str, *, run_id: str) -> dict:
                 return capped
 
             port = _free_port()
-            # *run_id* and the capture tmp directory reach the addon ONLY
-            # through the CHILD's environment (T5.1): they cannot be new
-            # arguments on `_spawn` itself without breaking every existing
-            # fake that patches `_spawn` with its ORIGINAL two-argument
-            # shape (tests/mobile_capture/test_proxy_start.py and
-            # test_proxy_uncovered_branches.py both do). `_spawn` still
-            # reads `os.environ` un-touched (its own `env=None` default),
-            # so the mutation below is scoped to the single synchronous
-            # statement that calls it -- no `await` sits between the two,
-            # so no other task in this process can observe it, and the
-            # `finally` restores the parent's environment unconditionally.
-            _prev_env = dict(os.environ)
-            try:
-                os.environ[ADDON_RUN_ID_ENV] = paths.safe_name(run_id)
-                os.environ[ADDON_DIR_ENV] = str(paths.tmp_dir())
-                proc = _spawn(port, paths.ca_dir())
-            finally:
-                os.environ.clear()
-                os.environ.update(_prev_env)
+            proc = _start_spawn(run_id, port)
             if not _wait_port_open(port, START_TIMEOUT_S):
                 # The leaked-process class: a spawn that never binds must not
                 # be left running, and must never have the proxy setting
@@ -261,45 +243,9 @@ async def start(serial: str, *, run_id: str) -> dict:
                 teardown.kill_process(proc.pid)
                 return {"error": REASON_PROXY_START_FAILED, "content": None}
 
-            proxy_set = False
-            try:
-                write_marker(
-                    serial,
-                    {
-                        "pid": proc.pid,
-                        "port": port,
-                        "run_id": str(run_id),
-                        "serial": serial,
-                        "started_ms": int(time.time() * 1000),
-                        "boot_id": teardown.boot_id(),
-                    },
-                )
-                rev = await adb.reverse(serial, "tcp:" + str(port), "tcp:" + str(port))
-                if rev.get("error"):
-                    return {"error": rev["error"], "content": None}
-                put = await adb.global_setting_put(
-                    serial, HTTP_PROXY_SETTING, "127.0.0.1:" + str(port)
-                )
-                if put.get("error"):
-                    return {"error": put["error"], "content": None}
-                read = await adb.global_setting_get(serial, HTTP_PROXY_SETTING)
-                if read.get("error"):
-                    return {"error": read["error"], "content": None}
-                proxy_set = True
-                succeeded = True
-                return {
-                    "error": None,
-                    "content": {
-                        "port": port,
-                        "pid": proc.pid,
-                        "http_proxy": str(read.get("content") or ""),
-                    },
-                }
-            finally:
-                if not proxy_set:
-                    await teardown.clear(
-                        serial, owner=str(run_id), reason="start_failed"
-                    )
+            reply = await _start_apply(serial, run_id, port, proc)
+            succeeded = reply["error"] is None
+            return reply
         finally:
             # The LOCK invariant, mirrored from the proxy-setting invariant
             # above. A caller who did not hold this lock before calling us
@@ -311,3 +257,67 @@ async def start(serial: str, *, run_id: str) -> dict:
     except Exception as exc:
         logger.exception("mobile_capture.proxy.start failed")
         return {"error": str(exc), "content": None}
+
+
+def _start_spawn(run_id: str, port: int):
+    """Spawn ``mitmdump`` with the addon's env set only around the spawn call."""
+    # *run_id* and the capture tmp directory reach the addon ONLY
+    # through the CHILD's environment (T5.1): they cannot be new
+    # arguments on `_spawn` itself without breaking every existing
+    # fake that patches `_spawn` with its ORIGINAL two-argument
+    # shape (tests/mobile_capture/test_proxy_start.py and
+    # test_proxy_uncovered_branches.py both do). `_spawn` still
+    # reads `os.environ` un-touched (its own `env=None` default),
+    # so the mutation below is scoped to the single synchronous
+    # statement that calls it -- no `await` sits between the two,
+    # so no other task in this process can observe it, and the
+    # `finally` restores the parent's environment unconditionally.
+    _prev_env = dict(os.environ)
+    try:
+        os.environ[ADDON_RUN_ID_ENV] = paths.safe_name(run_id)
+        os.environ[ADDON_DIR_ENV] = str(paths.tmp_dir())
+        proc = _spawn(port, paths.ca_dir())
+    finally:
+        os.environ.clear()
+        os.environ.update(_prev_env)
+    return proc
+
+
+async def _start_apply(serial: str, run_id: str, port: int, proc) -> dict:
+    """Write the marker, point the device at the proxy, undo it on any failure."""
+    proxy_set = False
+    try:
+        write_marker(
+            serial,
+            {
+                "pid": proc.pid,
+                "port": port,
+                "run_id": str(run_id),
+                "serial": serial,
+                "started_ms": int(time.time() * 1000),
+                "boot_id": teardown.boot_id(),
+            },
+        )
+        rev = await adb.reverse(serial, "tcp:" + str(port), "tcp:" + str(port))
+        if rev.get("error"):
+            return {"error": rev["error"], "content": None}
+        put = await adb.global_setting_put(
+            serial, HTTP_PROXY_SETTING, "127.0.0.1:" + str(port)
+        )
+        if put.get("error"):
+            return {"error": put["error"], "content": None}
+        read = await adb.global_setting_get(serial, HTTP_PROXY_SETTING)
+        if read.get("error"):
+            return {"error": read["error"], "content": None}
+        proxy_set = True
+        return {
+            "error": None,
+            "content": {
+                "port": port,
+                "pid": proc.pid,
+                "http_proxy": str(read.get("content") or ""),
+            },
+        }
+    finally:
+        if not proxy_set:
+            await teardown.clear(serial, owner=str(run_id), reason="start_failed")

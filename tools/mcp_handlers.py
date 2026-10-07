@@ -515,6 +515,23 @@ def _safe_elicited_dir(
     raw = (answer or "").strip()
     if not raw:
         return "", ""
+    screened = _screen_elicited_dir(raw, sentinel_ok, fallback_label)
+    if screened is not None:
+        return screened
+    try:
+        return _resolve_elicited_dir(raw, fallback_label)
+    except Exception:
+        logger.debug("elicited export dir rejected", exc_info=True)
+        return "", (
+            "\n> ℹ️  The folder you replied with could not be used, "
+            f"so {fallback_label} was used instead."
+        )
+
+
+def _screen_elicited_dir(
+    raw: str, sentinel_ok: bool, fallback_label: str
+) -> tuple[str, str] | None:
+    """Text-only checks of `_safe_elicited_dir`; None means "go on to the path checks"."""
     if sentinel_ok and raw.lower() == "default":
         # K3 (2026-08-10): Cursor will not submit an EMPTY elicitation value, so
         # the prompt's old "leave blank for the default" was unreachable and the
@@ -537,49 +554,49 @@ def _safe_elicited_dir(
             "than a folder (it contains a comment marker or a line break), "
             f"so {fallback_label} was used instead."
         )
-    try:
-        import tempfile
+    return None
 
-        from tools.updater import _INSTALL_DIR
 
-        # F2 (2026-08-10): an ELICITED answer is free-text a tester typed, so a
-        # bare word like "desktop" must never be resolved against the process
-        # CWD -- that is the install dir, which is itself an allowed root, so the
-        # check below APPROVED it and the deliverable landed inside the
-        # installation. Only absolute / ~-rooted answers reach that check.
-        if not Path(raw).expanduser().is_absolute():
-            suggestion = _WELL_KNOWN_FOLDERS.get(raw.lower())
-            if suggestion:
-                return "", (
-                    "\n> ℹ️  I need the FULL path of that folder, so "
-                    f"{fallback_label} was used instead. Reply "
-                    f"`{suggestion}` if that is the one you meant."
-                )
+def _resolve_elicited_dir(raw: str, fallback_label: str) -> tuple[str, str]:
+    """Path half of `_safe_elicited_dir`: absolute check, then the allowed roots.
+
+    May raise; the caller turns any failure into a rejection note."""
+    import tempfile
+
+    from tools.updater import _INSTALL_DIR
+
+    # F2 (2026-08-10): an ELICITED answer is free-text a tester typed, so a
+    # bare word like "desktop" must never be resolved against the process
+    # CWD -- that is the install dir, which is itself an allowed root, so the
+    # check below APPROVED it and the deliverable landed inside the
+    # installation. Only absolute / ~-rooted answers reach that check.
+    if not Path(raw).expanduser().is_absolute():
+        suggestion = _WELL_KNOWN_FOLDERS.get(raw.lower())
+        if suggestion:
             return "", (
-                "\n> ℹ️  The folder you replied with is not a full path "
-                "(it would have been read relative to the server's own folder), "
-                f"so {fallback_label} was used instead."
+                "\n> ℹ️  I need the FULL path of that folder, so "
+                f"{fallback_label} was used instead. Reply "
+                f"`{suggestion}` if that is the one you meant."
             )
-
-        resolved = Path(raw).expanduser().resolve()
-        roots = [
-            Path(_INSTALL_DIR).resolve(),
-            Path.home().resolve(),
-            Path(tempfile.gettempdir()).resolve(),
-        ]
-        if not any(resolved == r or r in resolved.parents for r in roots):
-            return "", (
-                "\n> ℹ️  The folder you replied with is outside the install "
-                "folder, your home folder and the temp folder, "
-                f"so {fallback_label} was used instead."
-            )
-        return str(resolved), ""
-    except Exception:
-        logger.debug("elicited export dir rejected", exc_info=True)
         return "", (
-            "\n> ℹ️  The folder you replied with could not be used, "
+            "\n> ℹ️  The folder you replied with is not a full path "
+            "(it would have been read relative to the server's own folder), "
             f"so {fallback_label} was used instead."
         )
+
+    resolved = Path(raw).expanduser().resolve()
+    roots = [
+        Path(_INSTALL_DIR).resolve(),
+        Path.home().resolve(),
+        Path(tempfile.gettempdir()).resolve(),
+    ]
+    if not any(resolved == r or r in resolved.parents for r in roots):
+        return "", (
+            "\n> ℹ️  The folder you replied with is outside the install "
+            "folder, your home folder and the temp folder, "
+            f"so {fallback_label} was used instead."
+        )
+    return str(resolved), ""
 
 
 def _code_changed_since_start() -> bool:
@@ -1769,29 +1786,7 @@ def assemble_finalize_reply(sections: list[ReplySection], cap: int = _REPLY_CAP)
         joined = "".join(s.text for s in sections)
         if len(joined) <= cap:
             return joined
-        trimmable = [
-            (i, s) for i, s in enumerate(sections) if not s.protected and s.text
-        ]
-        used = len(joined)
-        dropped: list[int] = []
-        # STRICT order: cheapest-to-lose first, and every one of them goes until
-        # the reply fits. No greedy back-fill -- see the docstring.
-        #
-        # The reserve is what the marker would cost IF THE LOOP STOPPED HERE, so
-        # it is recomputed from the names dropped so far. Reserving for every
-        # trimmable name up front (the round-3 review, MINOR 4) over-charged a
-        # borderline reply and could drop one more section than it needed to --
-        # the tester paying a section for a disclosure that was never emitted.
-        for idx, sec in sorted(trimmable, key=lambda pair: (pair[1].priority, pair[0])):
-            reserve = (
-                len(_omission_marker([sections[i].name for i in dropped]))
-                if dropped
-                else 0
-            )
-            if used + reserve <= cap:
-                break
-            used -= len(sec.text)
-            dropped.append(idx)
+        dropped = _sections_to_drop(sections, len(joined), cap)
         if not dropped:
             return joined
         gone = set(dropped)
@@ -1810,13 +1805,41 @@ def assemble_finalize_reply(sections: list[ReplySection], cap: int = _REPLY_CAP)
             "finalize reply budget failed - returning the reply unbounded",
             exc_info=True,
         )
-        parts: list[str] = []
-        for sec in sections or []:
-            try:
-                parts.append(str(getattr(sec, "text", "") or ""))
-            except Exception:  # pragma: no cover - defence in depth
-                continue
-        return "".join(parts)
+        return _unbounded_reply(sections)
+
+
+def _sections_to_drop(sections: list[ReplySection], used: int, cap: int) -> list[int]:
+    """Indexes of the trimmable sections to drop, cheapest-to-lose first."""
+    trimmable = [(i, s) for i, s in enumerate(sections) if not s.protected and s.text]
+    dropped: list[int] = []
+    # STRICT order: cheapest-to-lose first, and every one of them goes until
+    # the reply fits. No greedy back-fill -- see the docstring.
+    #
+    # The reserve is what the marker would cost IF THE LOOP STOPPED HERE, so
+    # it is recomputed from the names dropped so far. Reserving for every
+    # trimmable name up front (the round-3 review, MINOR 4) over-charged a
+    # borderline reply and could drop one more section than it needed to --
+    # the tester paying a section for a disclosure that was never emitted.
+    for idx, sec in sorted(trimmable, key=lambda pair: (pair[1].priority, pair[0])):
+        reserve = (
+            len(_omission_marker([sections[i].name for i in dropped])) if dropped else 0
+        )
+        if used + reserve <= cap:
+            break
+        used -= len(sec.text)
+        dropped.append(idx)
+    return dropped
+
+
+def _unbounded_reply(sections: list[ReplySection]) -> str:
+    """Fail-open join: tolerates malformed sections, never raises."""
+    parts: list[str] = []
+    for sec in sections or []:
+        try:
+            parts.append(str(getattr(sec, "text", "") or ""))
+        except Exception:  # pragma: no cover - defence in depth
+            continue
+    return "".join(parts)
 
 
 def shape_generation_result(
@@ -1850,16 +1873,6 @@ def shape_generation_result(
     if suite_id:
         hint = "" if auto_export else " — pass this to `qa_export_suite`."
         lines.append(f"**Suite ID:** `{suite_id}`{hint}")
-    # ops-5 (issue 8): `status` is an INTERNAL token and this reply goes to a
-    # non-technical tester. "fallback" in particular means "structured generation
-    # FAILED, this is markdown instead" -- it reads as benign, and a real run on
-    # 2026-07-29 reported exactly that with 0 cases. Translate it.
-    _STATUS_TEXT = {
-        "ok": "Complete",
-        "partial": "⚠️ Incomplete — some categories failed, cases are missing",
-        "fallback": "❌ Generation failed — no structured test cases were produced",
-        "error": "❌ Error — generation did not complete",
-    }
     if submitted_count is not None and submitted_count != cases:
         lines.append(
             f"**Cases:** {cases} "
@@ -1868,38 +1881,55 @@ def shape_generation_result(
         )
     else:
         lines.append(f"**Cases:** {cases}")
-    lines.append(f"**Status:** {_STATUS_TEXT.get(status, status)}")
+    lines.append(f"**Status:** {_GENERATION_STATUS_TEXT.get(status, status)}")
     body = (summary or "").strip()
     if body:
-        if len(body) > summary_cap:
-            tail = (
-                "the Excel file below has every case"
-                if auto_export
-                else "export the suite for the full set"
-            )
-            # What the marker may promise depends on WHAT was cut. The claim
-            # above is about CASES, and it is true of them. It is false of the
-            # advisory sections the summary also carries -- Suite Consistency,
-            # Test Data, the grounding notes -- because none of those is written
-            # into the workbook: the export carries the cases and (since F06)
-            # their requirement ids, and no advisory at all. F14 measured the
-            # Suite Consistency block alone at 4173 bytes against a 4000
-            # _SUMMARY_CAP, so a squeeze reaching an advisory heading is
-            # reachable, not theoretical. Telling that tester the export has it
-            # sends them to look for something that is not there.
-            cut = body[summary_cap:]
-            if "\n## " in cut or cut.lstrip().startswith("## "):
-                tail += (
-                    ". Some advisory notes were cut from THIS reply -- read them "
-                    'in full on the workbook\'s "Generation Notes" sheet, which '
-                    "carries the whole advisory verbatim"
-                    if auto_export
-                    else ". Some advisory notes were cut and are NOT in the "
-                    "export -- re-submit a smaller suite to read them"
-                )
-            body = body[:summary_cap].rstrip() + f"\n\n…(truncated — {tail})"
-        lines += ["", body]
+        lines += ["", _truncate_summary(body, summary_cap, auto_export)]
     return "\n".join(lines)
+
+
+# ops-5 (issue 8): `status` is an INTERNAL token and this reply goes to a
+# non-technical tester. "fallback" in particular means "structured generation
+# FAILED, this is markdown instead" -- it reads as benign, and a real run on
+# 2026-07-29 reported exactly that with 0 cases. Translate it.
+_GENERATION_STATUS_TEXT = {
+    "ok": "Complete",
+    "partial": "⚠️ Incomplete — some categories failed, cases are missing",
+    "fallback": "❌ Generation failed — no structured test cases were produced",
+    "error": "❌ Error — generation did not complete",
+}
+
+
+def _truncate_summary(body: str, summary_cap: int, auto_export: bool) -> str:
+    """*body* cut to *summary_cap* with an honest truncation marker."""
+    if len(body) <= summary_cap:
+        return body
+    tail = (
+        "the Excel file below has every case"
+        if auto_export
+        else "export the suite for the full set"
+    )
+    # What the marker may promise depends on WHAT was cut. The claim
+    # above is about CASES, and it is true of them. It is false of the
+    # advisory sections the summary also carries -- Suite Consistency,
+    # Test Data, the grounding notes -- because none of those is written
+    # into the workbook: the export carries the cases and (since F06)
+    # their requirement ids, and no advisory at all. F14 measured the
+    # Suite Consistency block alone at 4173 bytes against a 4000
+    # _SUMMARY_CAP, so a squeeze reaching an advisory heading is
+    # reachable, not theoretical. Telling that tester the export has it
+    # sends them to look for something that is not there.
+    cut = body[summary_cap:]
+    if "\n## " in cut or cut.lstrip().startswith("## "):
+        tail += (
+            ". Some advisory notes were cut from THIS reply -- read them "
+            'in full on the workbook\'s "Generation Notes" sheet, which '
+            "carries the whole advisory verbatim"
+            if auto_export
+            else ". Some advisory notes were cut and are NOT in the "
+            "export -- re-submit a smaller suite to read them"
+        )
+    return body[:summary_cap].rstrip() + f"\n\n…(truncated — {tail})"
 
 
 def shape_export_result(suite_id: str, fmt: str, path: str, count: int) -> str:
@@ -2163,53 +2193,55 @@ _UNREADABLE_ROW = {
 }
 
 
+# Design notes for `_android_device_details` (kept as a comment so the function
+# itself stays within the 50-line limit):
+#
+# A tester asked which emulator was running and could not be told: the row
+# said `sdk gphone64 arm64` and nothing else -- no AVD name, no API level
+# (2026-09-08).
+#
+# NO NEW PRODUCER. ``tools.mobile.emulator.avd_name_of`` stays the one
+# producer of an AVD name and ``tools.mobile.adb.device_facts`` the one
+# producer of the API level; nothing is re-derived here, because two
+# derivations of one fact drift.
+#
+# THE STATED ELSE: a build with no ``tools/mobile`` on disk (the
+# test-cases-only edition -- ``_mobile_modules_present`` is this file's single
+# predicate for that) gets its rows EXACTLY as before, rather than a second,
+# duplicate `adb` probe written here. A probe that fails, times out or finds
+# nothing also leaves its row untouched: ``device_manager`` never raises, and
+# this must not be the thing that changes that. Each probe is bounded by
+# ``_MOBILE_PROBE_S`` for the reason ``_mobile_doctor_section`` states -- a
+# device probe that hangs turns a listing into the symptom.
+#
+# Returns COPIES, so no caller's dicts are mutated under it, and the added
+# keys are purely additive for every other reader of a device row.
+#
+# ONE ROW OUT PER ROW IN. A row this server cannot read used to be DROPPED,
+# and `handle_list_devices` audits `len(devices)` -- so the count followed the
+# drop and the listing under-reported what `device_manager` produced, with no
+# trace. It is normalised instead, and rendered as unreadable.
+#
+# THE BUDGET GATES STARTING WORK, NEVER THE WORK ALREADY STARTED. Each probe
+# was bounded and the LISTING was not: five hanging devices cost five budgets
+# inside a single MCP call (40s measured). A device that is ADMITTED keeps
+# both of its own full `_MOBILE_PROBE_S` probes, so a single slow-but-working
+# device answers exactly as it does today -- sharing one budget ACROSS a
+# row's two probes would time the second one out where it succeeds now, which
+# is a regression this bound is not worth. What is bounded is the listing:
+# once the budget is spent no further device is probed, so the worst case is
+# one budget plus ONE ROW'S TWO PROBES whatever the device count -- three
+# times ``_MOBILE_PROBE_S``, because the gate is checked BEFORE a row and a
+# row admitted just inside the budget still runs both of its own probes. This
+# said "one budget plus one probe", i.e. 16s; measured, it is 23.9s. A
+# documented bound that measurement contradicts is a false claim, and a
+# reader sizing a client timeout off it would size it short. A device reached
+# after that keeps its row exactly as it arrived -- the same degradation a
+# failed or timed-out probe already had.
 async def _android_device_details(devices: list) -> list:
     """*devices* with ``avd`` / ``api`` filled in for Android rows. Never raises.
 
-    A tester asked which emulator was running and could not be told: the row
-    said `sdk gphone64 arm64` and nothing else -- no AVD name, no API level
-    (2026-09-08).
-
-    NO NEW PRODUCER. ``tools.mobile.emulator.avd_name_of`` stays the one
-    producer of an AVD name and ``tools.mobile.adb.device_facts`` the one
-    producer of the API level; nothing is re-derived here, because two
-    derivations of one fact drift.
-
-    THE STATED ELSE: a build with no ``tools/mobile`` on disk (the
-    test-cases-only edition -- ``_mobile_modules_present`` is this file's single
-    predicate for that) gets its rows EXACTLY as before, rather than a second,
-    duplicate `adb` probe written here. A probe that fails, times out or finds
-    nothing also leaves its row untouched: ``device_manager`` never raises, and
-    this must not be the thing that changes that. Each probe is bounded by
-    ``_MOBILE_PROBE_S`` for the reason ``_mobile_doctor_section`` states -- a
-    device probe that hangs turns a listing into the symptom.
-
-    Returns COPIES, so no caller's dicts are mutated under it, and the added
-    keys are purely additive for every other reader of a device row.
-
-    ONE ROW OUT PER ROW IN. A row this server cannot read used to be DROPPED,
-    and `handle_list_devices` audits `len(devices)` -- so the count followed the
-    drop and the listing under-reported what `device_manager` produced, with no
-    trace. It is normalised instead, and rendered as unreadable.
-
-    THE BUDGET GATES STARTING WORK, NEVER THE WORK ALREADY STARTED. Each probe
-    was bounded and the LISTING was not: five hanging devices cost five budgets
-    inside a single MCP call (40s measured). A device that is ADMITTED keeps
-    both of its own full `_MOBILE_PROBE_S` probes, so a single slow-but-working
-    device answers exactly as it does today -- sharing one budget ACROSS a
-    row's two probes would time the second one out where it succeeds now, which
-    is a regression this bound is not worth. What is bounded is the listing:
-    once the budget is spent no further device is probed, so the worst case is
-    one budget plus ONE ROW'S TWO PROBES whatever the device count -- three
-    times ``_MOBILE_PROBE_S``, because the gate is checked BEFORE a row and a
-    row admitted just inside the budget still runs both of its own probes. This
-    said "one budget plus one probe", i.e. 16s; measured, it is 23.9s. A
-    documented bound that measurement contradicts is a false claim, and a
-    reader sizing a client timeout off it would size it short. A device reached
-    after
-    that keeps its row exactly as it arrived -- the same degradation a failed or
-    timed-out probe already had.
-    """
+    Rationale and the probe-budget bound: the comment block above."""
     rows = [
         dict(dev) if isinstance(dev, dict) else dict(_UNREADABLE_ROW)
         for dev in (devices or [])
@@ -2269,6 +2301,21 @@ def shape_devices(
     a tester must never read "No devices detected" while a phone is plugged in.
     """
     attached = list(unusable or [])
+    notice = _adb_notice(adb_dropped_lines, adb_problem)
+    if not devices and not attached:
+        return _no_devices_reply(booting, empty_hint) + notice
+    if not devices:
+        lines = ["## Devices (0)", "", "Nothing is usable yet — see below."]
+    else:
+        lines = [f"## Devices ({len(devices)})", ""]
+    lines.extend(_device_row_line(dev) for dev in devices)
+    if attached:
+        lines.extend(_attached_devices_lines(attached))
+    return "\n".join(lines) + notice
+
+
+def _adb_notice(adb_dropped_lines: int, adb_problem: str) -> str:
+    """The adb warnings appended to every device reply ("" when there are none)."""
     try:
         dropped = max(0, int(adb_dropped_lines or 0))
     except (TypeError, ValueError, OverflowError):
@@ -2297,86 +2344,89 @@ def shape_devices(
         # OUR sentence about adb (B4): a timed-out `adb start-server` or
         # `adb devices -l` is otherwise indistinguishable from "no devices".
         notice += "\n\n> \u26a0\ufe0f " + " ".join(str(adb_problem).split())[:400]
-    if not devices and not attached:
-        # The notice belongs on THIS branch most of all: 200+ unparseable lines
-        # yield zero rows, and "No devices detected" while a phone is plugged
-        # in is the very defect this section exists to prevent.
-        # BOOTING, not absent (fix round 3, item 5): `booting` is
-        # `emulator.recently_started()`, passed only when both lists are
-        # empty. The heading is `render.starting_heading`, the sentence
-        # `qa_mobile_test` already says for the same state.
-        if booting:
-            from tools.mobile import render as mobile_render
+    return notice
 
-            block = mobile_render.booting_devices_block(booting)
-            if block:
-                return block + notice
-        return (
-            "No devices detected. Connect an Android device/emulator or boot an "
-            "iOS simulator, then retry `qa_list_devices`."
-            + ("\n\n" + str(empty_hint) if empty_hint else "")
-        ) + notice
-    lines: list[str] = []
-    if not devices:
-        lines = ["## Devices (0)", "", "Nothing is usable yet — see below."]
-    else:
-        lines = [f"## Devices ({len(devices)})", ""]
-    for dev in devices:
-        row = (
-            f"- `{dev.get('id')}` — {dev.get('name')} "
-            f"({dev.get('platform')}/{dev.get('kind')})"
+
+def _no_devices_reply(booting: list | None, empty_hint: str) -> str:
+    """The reply for "nothing listed at all", without the adb notice."""
+    # The notice belongs on THIS branch most of all: 200+ unparseable lines
+    # yield zero rows, and "No devices detected" while a phone is plugged
+    # in is the very defect this section exists to prevent.
+    # BOOTING, not absent (fix round 3, item 5): `booting` is
+    # `emulator.recently_started()`, passed only when both lists are
+    # empty. The heading is `render.starting_heading`, the sentence
+    # `qa_mobile_test` already says for the same state.
+    if booting:
+        from tools.mobile import render as mobile_render
+
+        block = mobile_render.booting_devices_block(booting)
+        if block:
+            return block
+    return (
+        "No devices detected. Connect an Android device/emulator or boot an "
+        "iOS simulator, then retry `qa_list_devices`."
+        + ("\n\n" + str(empty_hint) if empty_hint else "")
+    )
+
+
+def _device_row_line(dev: dict) -> str:
+    """One bullet of the device pick list."""
+    row = (
+        f"- `{dev.get('id')}` — {dev.get('name')} "
+        f"({dev.get('platform')}/{dev.get('kind')})"
+    )
+    # Printed only when a producer answered. An absent AVD name or API
+    # level renders the row exactly as it did before, which is what makes
+    # the enrichment safe to fail.
+    detail = ", ".join(
+        part
+        for part in (
+            ("AVD `" + str(dev.get("avd"))[:60] + "`") if dev.get("avd") else "",
+            ("API " + str(dev.get("api"))[:8]) if dev.get("api") else "",
         )
-        # Printed only when a producer answered. An absent AVD name or API
-        # level renders the row exactly as it did before, which is what makes
-        # the enrichment safe to fail.
-        detail = ", ".join(
-            part
-            for part in (
-                ("AVD `" + str(dev.get("avd"))[:60] + "`") if dev.get("avd") else "",
-                ("API " + str(dev.get("api"))[:8]) if dev.get("api") else "",
-            )
-            if part
-        )
-        lines.append(row + (" — " + detail if detail else ""))
-    if attached:
-        lines.extend(
-            [
-                "",
-                f"## Detected but not usable yet ({len(attached)})",
-                "",
-                "These are plugged in, but this server cannot drive them until "
-                "the step below is done — so they are not offered as a choice.",
-                "",
-            ]
-        )
-        reported: list[str] = []
-        steps: list[str] = []
-        for dev in attached:
-            serial = str(dev.get("id") or "?")[:80]
-            state = str(dev.get("raw_state") or dev.get("state") or "unknown")[:80]
-            reported.append(serial + " — adb reports: " + state)
-            fix = str(dev.get("remediation") or "").strip()
-            if fix and fix not in steps:
-                steps.append(fix)
-        # THE DEVICE'S OWN WORDS, WRAPPED. The serial and the state token are
-        # read off a USB device this server does not control, and this reply
-        # goes straight to the tester's chat model, so they are
-        # externally-sourced text under the same hard rule as fetched URLs and
-        # Jira content. No exemption was available: the bounded state
-        # vocabulary constrains `state`, NOT `raw_state` on the unknown branch
-        # and not `-l` metadata, so escaping alone is not the standard here.
-        # Wrapping also strips a device that tries to close the block itself --
-        # the raw-state cap is wider than the closing tag.
-        lines.append(
-            wrap_untrusted("attached_devices_adb", "\n".join(reported), limit=2000)
-        )
-        # OUR text, deliberately OUTSIDE the block and de-duplicated: this is
-        # what the tester acts on, and a device must never be able to dress its
-        # own words as the instruction.
-        if steps:
-            lines.extend(["", "**What to do**", ""])
-            lines.extend("- " + step for step in steps)
-    return "\n".join(lines) + notice
+        if part
+    )
+    return row + (" — " + detail if detail else "")
+
+
+def _attached_devices_lines(attached: list) -> list[str]:
+    """The "Detected but not usable yet" section, one entry per output line."""
+    lines = [
+        "",
+        f"## Detected but not usable yet ({len(attached)})",
+        "",
+        "These are plugged in, but this server cannot drive them until "
+        "the step below is done — so they are not offered as a choice.",
+        "",
+    ]
+    reported: list[str] = []
+    steps: list[str] = []
+    for dev in attached:
+        serial = str(dev.get("id") or "?")[:80]
+        state = str(dev.get("raw_state") or dev.get("state") or "unknown")[:80]
+        reported.append(serial + " — adb reports: " + state)
+        fix = str(dev.get("remediation") or "").strip()
+        if fix and fix not in steps:
+            steps.append(fix)
+    # THE DEVICE'S OWN WORDS, WRAPPED. The serial and the state token are
+    # read off a USB device this server does not control, and this reply
+    # goes straight to the tester's chat model, so they are
+    # externally-sourced text under the same hard rule as fetched URLs and
+    # Jira content. No exemption was available: the bounded state
+    # vocabulary constrains `state`, NOT `raw_state` on the unknown branch
+    # and not `-l` metadata, so escaping alone is not the standard here.
+    # Wrapping also strips a device that tries to close the block itself --
+    # the raw-state cap is wider than the closing tag.
+    lines.append(
+        wrap_untrusted("attached_devices_adb", "\n".join(reported), limit=2000)
+    )
+    # OUR text, deliberately OUTSIDE the block and de-duplicated: this is
+    # what the tester acts on, and a device must never be able to dress its
+    # own words as the instruction.
+    if steps:
+        lines.extend(["", "**What to do**", ""])
+        lines.extend("- " + step for step in steps)
+    return lines
 
 
 def shape_explore_step(session_id: str, sess: dict, step: str) -> str:
@@ -2448,108 +2498,124 @@ async def handle_configure_jira(
     kept, which is what the tester-facing reply promises.
     """
     try:
-        host = ""
-        malformed_url = False
-        # A hostile base_url can carry a newline: urlparse() STRIPS it, so
-        # the tail ("QA_UPDATE_REPO=attacker/repo") would be glued onto the
-        # hostname and rendered into the tester's chat. Nothing is written
-        # to .env any more, so this can no longer inject a setting -- but
-        # echoing it is still wrong, so a value carrying any line-splitting
-        # character loses its host mention entirely rather than being
-        # partially rendered. The tester still learns their input looked
-        # malformed -- just never the raw value.
-        if base_url:
-            if _has_control_chars(base_url):
-                malformed_url = True
-            else:
-                candidate = base_url if "://" in base_url else "https://" + base_url
-                host = _clip_echo((urlparse(candidate).hostname or "").lower(), 80)
+        host, malformed_url = _echoed_jira_host(base_url)
         await _emit(progress, "\U0001f517 Checking how Jira is connected\u2026")
         verification = str(atlassian_verify_json or "").strip()
-        await _audit(
-            "mcp_configure_jira",
-            detail={
-                "mode": "mcp",
-                "credentials_stored": False,
-                # PRESENCE only -- the payload itself is never logged.
-                "verification_supplied": bool(verification),
-            },
-        )
+        await _audit_configure_jira(bool(verification))
         if verification:
-            # Return half of the live check: the AGENT already made the
-            # read-only atlassianUserInfo call with its OWN Atlassian MCP
-            # connection, so all that is left here is parsing what it handed
-            # back. No LLM call, no HTTP request.
-            status, message = verify_outcome(verification)
-            # 2026-09-01 (item A): the VERDICT is persisted, the payload is not.
-            # Only {verified, at, tool} reaches the store -- never the account
-            # id, the email, the display name, or any fragment of the raw JSON
-            # -- so the "we did not keep that identity" promise this reply makes
-            # still holds, while qa-doctor stops re-raising a question that was
-            # just answered (and can therefore reach "Ready" again).
-            #
-            # "unknown" establishes NOTHING and deliberately does not overwrite
-            # an earlier verdict: an agent that fumbles the hand-back must not
-            # be able to erase a good result.
-            # 2026-09-01: five statuses, not three. wrong_site is a NEGATIVE
-            # verdict -- the sign-in works and cannot reach this tester's Jira --
-            # so it persists as verified=False and reads as "failed" downstream.
-            # verified_no_access is a positive identity with the access half
-            # unchecked, recorded so the report can say which of the two it is.
-            _persistable = {
-                "verified": (True, True),
-                "verified_no_access": (True, False),
-                "wrong_site": (False, True),
-                "failed": (False, False),
-            }
-            if status in _persistable:
-                from tools.jira_mcp import probe_provenance
-                from tools.verify_store import record_verdict
-
-                _verified_flag, _site_checked = _persistable[status]
-                _stored = await record_verdict(
-                    _verified_flag, probe_provenance(), _site_checked
-                )
-                # verify_store never raises -- it reports. A discarded report is
-                # how the reply came to promise a week of remembered state that
-                # a locked suites.db had not written.
-                if not (isinstance(_stored, dict) and _stored.get("content")):
-                    logger.warning(
-                        "verify_store: the verdict was not recorded (%s)",
-                        (_stored or {}).get("error"),
-                    )
-                    message = message.replace(
-                        "It records only that a check succeeded, when, and "
-                        "which tool was called, so `qa-doctor` stops asking "
-                        "again for the next week.",
-                        "I could not write this result down, so `qa-doctor` "
-                        "will ask again -- the check itself still stands.",
-                    )
-            return message
-        preamble = (
-            "\u2139\ufe0f **Nothing was saved -- and nothing needs to be.**\n\n"
-            if (email or api_token)
-            else ""
-        )
-        if malformed_url:
-            preamble += (
-                "\u26a0\ufe0f That URL looked malformed (it contained a line "
-                "break or control character), so I ignored it.\n\n"
-            )
-        where = f" for `{host}`" if host else ""
-        return (
-            preamble + f"Jira access{where} no longer uses an API token stored on this "
-            "machine. It runs through **your own Atlassian MCP connection** "
-            "(OAuth, in your editor), so there is nothing to copy, nothing to "
-            "rotate, and your own Jira permissions apply.\n\n"
-            + connect_steps()
-            + "\n\n"
-            + verify_directive()
-        )
+            return await _verified_jira_reply(verification)
+        return _jira_connect_reply(host, malformed_url, bool(email or api_token))
     except Exception as exc:
         logger.exception("handle_configure_jira failed")
         _capture_error(exc, "qa_configure_jira")
         return connect_steps()
+
+
+async def _audit_configure_jira(verification_supplied: bool) -> None:
+    """Audit row for `handle_configure_jira`; nothing is stored, only PRESENCE."""
+    await _audit(
+        "mcp_configure_jira",
+        detail={
+            "mode": "mcp",
+            "credentials_stored": False,
+            # PRESENCE only -- the payload itself is never logged.
+            "verification_supplied": verification_supplied,
+        },
+    )
+
+
+def _echoed_jira_host(base_url: str) -> tuple[str, bool]:
+    """``(host_to_echo, malformed)`` for the *base_url* argument."""
+    # A hostile base_url can carry a newline: urlparse() STRIPS it, so
+    # the tail ("QA_UPDATE_REPO=attacker/repo") would be glued onto the
+    # hostname and rendered into the tester's chat. Nothing is written
+    # to .env any more, so this can no longer inject a setting -- but
+    # echoing it is still wrong, so a value carrying any line-splitting
+    # character loses its host mention entirely rather than being
+    # partially rendered. The tester still learns their input looked
+    # malformed -- just never the raw value.
+    if not base_url:
+        return "", False
+    if _has_control_chars(base_url):
+        return "", True
+    candidate = base_url if "://" in base_url else "https://" + base_url
+    return _clip_echo((urlparse(candidate).hostname or "").lower(), 80), False
+
+
+async def _verified_jira_reply(verification: str) -> str:
+    """Return half of the live check: parse the hand-back, persist the verdict."""
+    # The AGENT already made the read-only atlassianUserInfo call with its OWN
+    # Atlassian MCP connection, so all that is left here is parsing what it
+    # handed back. No LLM call, no HTTP request.
+    status, message = verify_outcome(verification)
+    # 2026-09-01 (item A): the VERDICT is persisted, the payload is not.
+    # Only {verified, at, tool} reaches the store -- never the account
+    # id, the email, the display name, or any fragment of the raw JSON
+    # -- so the "we did not keep that identity" promise this reply makes
+    # still holds, while qa-doctor stops re-raising a question that was
+    # just answered (and can therefore reach "Ready" again).
+    #
+    # "unknown" establishes NOTHING and deliberately does not overwrite
+    # an earlier verdict: an agent that fumbles the hand-back must not
+    # be able to erase a good result.
+    # 2026-09-01: five statuses, not three. wrong_site is a NEGATIVE
+    # verdict -- the sign-in works and cannot reach this tester's Jira --
+    # so it persists as verified=False and reads as "failed" downstream.
+    # verified_no_access is a positive identity with the access half
+    # unchecked, recorded so the report can say which of the two it is.
+    _persistable = {
+        "verified": (True, True),
+        "verified_no_access": (True, False),
+        "wrong_site": (False, True),
+        "failed": (False, False),
+    }
+    if status not in _persistable:
+        return message
+    from tools.jira_mcp import probe_provenance
+    from tools.verify_store import record_verdict
+
+    _verified_flag, _site_checked = _persistable[status]
+    _stored = await record_verdict(_verified_flag, probe_provenance(), _site_checked)
+    # verify_store never raises -- it reports. A discarded report is
+    # how the reply came to promise a week of remembered state that
+    # a locked suites.db had not written.
+    if not (isinstance(_stored, dict) and _stored.get("content")):
+        logger.warning(
+            "verify_store: the verdict was not recorded (%s)",
+            (_stored or {}).get("error"),
+        )
+        message = message.replace(
+            "It records only that a check succeeded, when, and "
+            "which tool was called, so `qa-doctor` stops asking "
+            "again for the next week.",
+            "I could not write this result down, so `qa-doctor` "
+            "will ask again -- the check itself still stands.",
+        )
+    return message
+
+
+def _jira_connect_reply(host: str, malformed_url: bool, had_credentials: bool) -> str:
+    """The "nothing was saved" reply of `handle_configure_jira` (no verification)."""
+    preamble = (
+        "\u2139\ufe0f **Nothing was saved -- and nothing needs to be.**\n\n"
+        if had_credentials
+        else ""
+    )
+    if malformed_url:
+        preamble += (
+            "\u26a0\ufe0f That URL looked malformed (it contained a line "
+            "break or control character), so I ignored it.\n\n"
+        )
+    where = f" for `{host}`" if host else ""
+    return (
+        preamble + f"Jira access{where} no longer uses an API token stored on this "
+        "machine. It runs through **your own Atlassian MCP connection** "
+        "(OAuth, in your editor), so there is nothing to copy, nothing to "
+        "rotate, and your own Jira permissions apply.\n\n"
+        + connect_steps()
+        + "\n\n"
+        + verify_directive()
+    )
 
 
 def _jira_config_hint(url: str) -> str:
@@ -3413,6 +3479,126 @@ async def _mobile_off_attached_note() -> list:
     ]
 
 
+async def _mobile_avd_rows() -> list:
+    """The AVD lines of the mobile doctor section: configured emulators, heavy
+    AVDs and host load."""
+    from tools.mobile import avd_guard, sdk_locator
+    from tools.mobile import emulator as doctor_emulator
+    from tools.mobile import render as doctor_render
+
+    lines: list = []
+    # The SAME producer the run's device stage asks. `list_avds` runs its
+    # subprocess on a worker thread, so this wait really is the bound.
+    try:
+        avds = await asyncio.wait_for(
+            doctor_emulator.list_avds(), timeout=_MOBILE_PROBE_S
+        )
+    except Exception:  # a slow probe is not a missing AVD
+        avds = {"error": "the AVD probe did not finish", "content": None}
+    names = list(avds.get("content") or [])
+    if avds.get("error"):
+        lines.append("- ⬜ Emulators (AVDs) not checked: " + str(avds["error"])[:160])
+    elif names:
+        lines.append(
+            "- ✅ "
+            + str(len(names))
+            + " emulator(s) configured: "
+            + ", ".join("`" + str(n)[:40] + "`" for n in names[:5])
+        )
+    else:
+        lines.append(
+            "- ⬜ No AVD → create one in Android Studio's Device Manager ("
+            + doctor_render.AVD_GUIDE_URL
+            + "); `qa_mobile_test` answers with the same setup guide"
+        )
+    # Fix round 2, item 7: a heavy AVD is read from its config.ini and
+    # the host load from the OS, so this needs no booted device.
+    for name in names[:5]:
+        shown = sdk_locator.avd_display(name).get("content") or {}
+        heavy = avd_guard.assess(
+            shown.get("width", 0), shown.get("height", 0), shown.get("density")
+        )
+        if heavy:
+            lines.append("- ⚠️ `" + str(name)[:40] + "`: " + heavy)
+    loaded = avd_guard.assess(load_per_core=avd_guard.host_load())
+    if loaded:
+        lines.append("- ⚠️ " + loaded)
+    return lines
+
+
+async def _mobile_attached_devices() -> dict:
+    """Ask adb which devices are attached; a slow probe is not an absent device.
+
+    THE DEVICE LOCKS, ONE PER DEVICE, ASKED BY NAME: the design's honest bound
+    (plan §5.6) is that a holder whose heartbeat writer never started is NOT
+    force-released, and the cost of that choice is disclosed instead."""
+    from tools.mobile import adb as mobile_adb
+
+    try:
+        return await asyncio.wait_for(mobile_adb.devices(), timeout=_MOBILE_PROBE_S)
+    except Exception as exc:  # a slow probe is not an absent device
+        return {
+            "error": "the device probe did not finish (" + str(exc)[:80] + ")",
+            "content": None,
+        }
+
+
+def _mobile_lock_row_line(row: dict) -> str:
+    """One doctor line for one device's lock row."""
+    where = str(row.get("serial") or "?")
+    if row.get("error"):
+        return (
+            "- ⚠️ Could not check whether a run holds "
+            + where
+            + ": "
+            + str(row.get("error"))[:160]
+        )
+    if row.get("held_too_long"):
+        return (
+            "- ⚠️ "
+            + where
+            + " has been held by pid "
+            + str(row.get("pid") or "?")
+            + " (run `"
+            + str(row.get("owner") or "?")
+            + "`) for "
+            + str(int(row.get("age") or 0))
+            + "s. Nothing here will break that hold — a lock taken "
+            "from a live holder means two runs on one device. If "
+            "that process is wedged, quit the editor holding it."
+        )
+    if row.get("held"):
+        return (
+            "- ✅ "
+            + where
+            + " is in use by run `"
+            + str(row.get("owner") or "?")
+            + "` — one run drives a device at a time, and the other "
+            "devices below are unaffected"
+        )
+    return "- ✅ " + where + " is free"
+
+
+def _mobile_lock_rows(attached: dict) -> list:
+    """The device-lock lines, ONE PER DEVICE.
+
+    IT MUST NAME THE DEVICE: a probe with no argument reads a lock nobody takes
+    and reports "free" while a device is being driven."""
+    from tools.mobile import locks as mobile_locks
+
+    if attached.get("error") or attached.get("content") is None:
+        # FAILS CLOSED: "no run holds a device" would be a guess, and the wrong one.
+        return [
+            "- ⚠️ Could not check which devices are attached, so nothing "
+            "here says whether a run holds one: "
+            + str(attached.get("error") or "the probe failed")[:160]
+        ]
+    serials = [str(s) for s in (attached.get("content") or [])]
+    lines = [] if serials else ["- ⬜ No device is attached, so no run holds one"]
+    lines += [_mobile_lock_row_line(r) for r in mobile_locks.device_holders(serials)]
+    return lines
+
+
 async def _mobile_doctor_section() -> list:
     """The qa-doctor lines for the mobile lane. Never raises, never blocks.
 
@@ -3432,7 +3618,6 @@ async def _mobile_doctor_section() -> list:
         " evidence.",
     ]
     try:
-        from tools.mobile import emulator as doctor_emulator
         from tools.mobile import ime, sdk_locator
         from tools.mobile import render as doctor_render
 
@@ -3451,46 +3636,7 @@ async def _mobile_doctor_section() -> list:
             + "). This server downloads no SDK."
         )
         if root:
-            # The SAME producer the run's device stage asks. `list_avds` runs its
-            # subprocess on a worker thread, so this wait really is the bound.
-            try:
-                avds = await asyncio.wait_for(
-                    doctor_emulator.list_avds(), timeout=_MOBILE_PROBE_S
-                )
-            except Exception:  # a slow probe is not a missing AVD
-                avds = {"error": "the AVD probe did not finish", "content": None}
-            names = list(avds.get("content") or [])
-            if avds.get("error"):
-                lines.append(
-                    "- ⬜ Emulators (AVDs) not checked: " + str(avds["error"])[:160]
-                )
-            elif names:
-                lines.append(
-                    "- ✅ "
-                    + str(len(names))
-                    + " emulator(s) configured: "
-                    + ", ".join("`" + str(n)[:40] + "`" for n in names[:5])
-                )
-            else:
-                lines.append(
-                    "- ⬜ No AVD → create one in Android Studio's Device Manager ("
-                    + doctor_render.AVD_GUIDE_URL
-                    + "); `qa_mobile_test` answers with the same setup guide"
-                )
-            # Fix round 2, item 7: a heavy AVD is read from its config.ini and
-            # the host load from the OS, so this needs no booted device.
-            from tools.mobile import avd_guard
-
-            for name in names[:5]:
-                shown = sdk_locator.avd_display(name).get("content") or {}
-                heavy = avd_guard.assess(
-                    shown.get("width", 0), shown.get("height", 0), shown.get("density")
-                )
-                if heavy:
-                    lines.append("- ⚠️ `" + str(name)[:40] + "`: " + heavy)
-            loaded = avd_guard.assess(load_per_core=avd_guard.host_load())
-            if loaded:
-                lines.append("- ⚠️ " + loaded)
+            lines += await _mobile_avd_rows()
         # THE DEVICE LOCKS, ONE PER DEVICE, ASKED BY NAME. The design's honest
         # bound (plan §5.6) is that a holder whose heartbeat writer never
         # started is NOT force-released -- breaking a live holder's lock is the
@@ -3502,64 +3648,8 @@ async def _mobile_doctor_section() -> list:
         # probe reads a lock nobody ever takes and reports "free" while a device
         # is being driven -- the same consumer-left-behind failure this file's
         # `content is None` branch already exists for, one layer up.
-        from tools.mobile import adb as mobile_adb
-        from tools.mobile import locks as mobile_locks
-
-        try:
-            attached = await asyncio.wait_for(
-                mobile_adb.devices(), timeout=_MOBILE_PROBE_S
-            )
-        except Exception as exc:  # a slow probe is not an absent device
-            attached = {
-                "error": "the device probe did not finish (" + str(exc)[:80] + ")",
-                "content": None,
-            }
-        if attached.get("error") or attached.get("content") is None:
-            # FAILS CLOSED, for the same reason it always did: "no run holds a
-            # device" would be a guess, and the wrong one.
-            lines.append(
-                "- ⚠️ Could not check which devices are attached, so nothing "
-                "here says whether a run holds one: "
-                + str(attached.get("error") or "the probe failed")[:160]
-            )
-        else:
-            serials = [str(s) for s in (attached.get("content") or [])]
-            if not serials:
-                lines.append("- ⬜ No device is attached, so no run holds one")
-            for row in mobile_locks.device_holders(serials):
-                where = str(row.get("serial") or "?")
-                if row.get("error"):
-                    lines.append(
-                        "- ⚠️ Could not check whether a run holds "
-                        + where
-                        + ": "
-                        + str(row.get("error"))[:160]
-                    )
-                elif row.get("held_too_long"):
-                    lines.append(
-                        "- ⚠️ "
-                        + where
-                        + " has been held by pid "
-                        + str(row.get("pid") or "?")
-                        + " (run `"
-                        + str(row.get("owner") or "?")
-                        + "`) for "
-                        + str(int(row.get("age") or 0))
-                        + "s. Nothing here will break that hold — a lock taken "
-                        "from a live holder means two runs on one device. If "
-                        "that process is wedged, quit the editor holding it."
-                    )
-                elif row.get("held"):
-                    lines.append(
-                        "- ✅ "
-                        + where
-                        + " is in use by run `"
-                        + str(row.get("owner") or "?")
-                        + "` — one run drives a device at a time, and the other "
-                        "devices below are unaffected"
-                    )
-                else:
-                    lines.append("- ✅ " + where + " is free")
+        attached = await _mobile_attached_devices()
+        lines += _mobile_lock_rows(attached)
         pinned = (ime.manifest_status() or {}).get("content") or {}
         lines.append(
             "- ✅ QA input method " + str(pinned.get("detail") or "pinned")
@@ -4149,6 +4239,175 @@ def _reprep_image_loss_refusal(
         )
 
 
+class _CarryPlan(NamedTuple):
+    """The arithmetic of one carry-forward decision, before any wording.
+
+    UNITS (2026-08-09): `prior_shipped_cap` is the prior prep's SHIPPED captured
+    count (post jira_max_images / byte budget) while `prior_ids` is EVERY id
+    that prep was CALLED with, pre-budget. Conflating them was review H1.
+
+    PER-CHANNEL (review H1): each channel is compared against what THIS call
+    actually RESOLVED, not against a raw "does this call carry images?" boolean.
+
+    SURPLUS comes from the OBSERVED (captured) channel only (review C1, C1-R):
+    an attached_image_count is an unverifiable host assertion and must never
+    cancel a captured-channel loss. It is the SMALLER of "resolved screens the
+    prior prep did not have" and "resolved beyond what that prep shipped", so a
+    new screen may close the gap or pay a surplus, never both. Surplus is
+    applied AFTER recovery is attempted. Residual (W6): a captured surplus can
+    net out an expired-id shortfall silently -- the substitution semantics. A
+    prep row with a captured count but NO `capture_ids` credits by count alone.
+
+    _resolvable_captures fails toward the disclosure (its except reports
+    nothing resolvable): the cost is one dismissible refusal.
+    """
+
+    from_prep: str
+    age_s: float
+    merged_ids: list
+    revived_ids: list
+    resolved_cap: int
+    resolved_att: int
+    prior_shipped_cap: int
+    prior_att: int
+    gap_cap: int
+    gap_att: int
+    recovered_cap: int
+    surplus_cap: int
+    short_total: int
+    identity_cap: int
+
+
+def _dedup_ids(raw) -> list:
+    """Stripped, non-empty ids, first occurrence wins (review M1:
+    capture_ids=["cap_A", "cap_A"] used to resolve to TWO screens, which
+    satisfied a two-screen prior prep with one screen)."""
+    return list(
+        dict.fromkeys(
+            str(x or "").strip() for x in list(raw or []) if str(x or "").strip()
+        )
+    )
+
+
+def _carry_age(prep: dict) -> float:
+    try:
+        return float(prep.get("age_s") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _carry_plan(
+    prep: dict | None, capture_ids: list | None, have_attested: int
+) -> "_CarryPlan | None":
+    """The per-channel gap, surplus and recovery arithmetic (rules: see
+    ``_CarryPlan``); ``None`` when the prior prep grounded on no screens at all.
+    May raise: the caller fails open."""
+    _prep = prep or {}
+    prior_shipped_cap = _clamped_count(_prep.get("captured_image_count"))
+    prior_att = _clamped_count(_prep.get("attached_image_count"))
+    if prior_shipped_cap + prior_att <= 0:
+        return None
+    call_ids = _dedup_ids(capture_ids)
+    prior_ids = _dedup_ids(_prep.get("capture_ids"))
+    resolved_ids = _resolvable_captures(call_ids)
+    resolved_cap = len(resolved_ids)
+    resolved_att = _clamped_count(have_attested)
+    gap_cap = max(0, prior_shipped_cap - resolved_cap)
+    gap_att = max(0, prior_att - resolved_att)
+    new_cap = len([c for c in resolved_ids if c not in prior_ids])
+    surplus_cap = min(new_cap, max(0, resolved_cap - prior_shipped_cap))
+    # Only ids this call does NOT already hold can close the captured gap:
+    # counting a screen it already resolved would "recover" it twice.
+    wanted_ids = [c for c in prior_ids if c not in call_ids]
+    revived_ids = _revive_captures(wanted_ids) if (wanted_ids and gap_cap) else []
+    recovered_cap = min(len(revived_ids), gap_cap)
+    # MERGED, never replaced -- this call's own ids (including unknown ones,
+    # which must survive to be DISCLOSED through _cap_missing) come first.
+    merged_ids = call_ids + [c for c in revived_ids if c not in call_ids]
+    return _CarryPlan(
+        from_prep=str(_prep.get("prep_id") or ""),
+        age_s=_carry_age(_prep),
+        merged_ids=merged_ids,
+        revived_ids=revived_ids,
+        resolved_cap=resolved_cap,
+        resolved_att=resolved_att,
+        prior_shipped_cap=prior_shipped_cap,
+        prior_att=prior_att,
+        gap_cap=gap_cap,
+        gap_att=gap_att,
+        recovered_cap=recovered_cap,
+        surplus_cap=surplus_cap,
+        short_total=max(0, gap_cap + gap_att - recovered_cap - surplus_cap),
+        # IDENTITY, not arithmetic residual (2026-08-10): only a revived shelf
+        # screen or a re-sent id the prior prep was itself called with counts
+        # toward "the previous preparation had"; a surplus is its own clause.
+        identity_cap=recovered_cap + len([c for c in resolved_ids if c in prior_ids]),
+    )
+
+
+def _carry_verdict(
+    plan: "_CarryPlan", image_carry_ack: bool, prep: dict | None
+) -> tuple:
+    """``(note, refusal)`` for a plan with a recovery or a shortfall."""
+    if plan.short_total <= 0:
+        # W4: recovered_cap counts screens RESTORED to the tray, not screens that
+        # will fit the reply; _select_prepare_images names every image it drops.
+        # The count here is deliberately the RECOVERY, not the shipment.
+        return (
+            f"> \U0001f4f8 Carried forward {plan.recovered_cap} device "
+            f"screen(s) from the previous preparation `{plan.from_prep}` for "
+            "this same "
+            "source: this call did not carry them, and generating "
+            "without them would have silently dropped the grounding. "
+            "Pass `image_carry_ack=true` to generate WITHOUT them "
+            "instead."
+        ), ""
+    if not image_carry_ack:
+        return "", _carry_refusal(plan, prep)
+    return _carry_acked_note(plan), ""
+
+
+def _carry_refusal(plan: "_CarryPlan", prep: dict | None) -> str:
+    return _reprep_image_loss_refusal(
+        prep_id=plan.from_prep or "?",
+        age_s=plan.age_s,
+        # The per-channel SHORTFALL, not the prior prep's totals: the refusal
+        # must describe what would go missing on this call.
+        captured=plan.gap_cap,
+        attested=plan.gap_att,
+        recovered=plan.recovered_cap,
+        # ... and the prior prep's TOTALS separately (review M2).
+        prior_captured=plan.prior_shipped_cap,
+        prior_attested=plan.prior_att,
+        # What this call DOES carry (review C1), plus the surplus-credited
+        # shortfall it must actually report.
+        carries_captured=plan.resolved_cap,
+        carries_attested=plan.resolved_att,
+        shortfall=plan.short_total,
+        labels=list((prep or {}).get("captured_image_labels") or []),
+    )
+
+
+def _carry_acked_note(plan: "_CarryPlan") -> str:
+    # L1: "the screen(s) the previous preparation had" is a PRIOR TOTAL, not
+    # the sum of the two GAPS.
+    prior_total = plan.prior_shipped_cap + plan.prior_att
+    substitute_clause = (
+        f" {plan.surplus_cap} other screen(s) on this call were counted in their place."
+        if plan.surplus_cap
+        else ""
+    )
+    return (
+        f"> ⚠️ Generating with {plan.identity_cap} of "
+        f"the {prior_total} screen(s) the previous preparation "
+        f"`{plan.from_prep}` for this same source had: `image_carry_ack=true` "
+        f"was sent and {plan.short_total} could not be recovered (chat "
+        "attachments never reach this server, and captured screens "
+        f"expire).{substitute_clause} Anything that exists only in those "
+        f"{plan.short_total} screen(s) is NOT reflected in the cases below."
+    )
+
+
 def _carry_forward_or_refuse(
     prep: dict | None,
     *,
@@ -4173,196 +4432,20 @@ def _carry_forward_or_refuse(
     any internal error every element comes back empty and the prepare proceeds
     exactly as it does today, because a guard must fail OPEN."""
     try:
-        # UNITS (2026-08-09, adversarial review of 2dcdc73) -- see the same block
-        # in _reprep_image_loss_refusal. `prior_shipped_cap` is the prior prep's
-        # SHIPPED captured count (post jira_max_images / byte budget, which is
-        # what review M1 made that stamp mean), while `prior_ids` below is EVERY
-        # id that prep was CALLED with, pre-budget. Conflating those two is
-        # exactly what H1 was, so each now says which one it is in its own name.
-        _prep = prep or {}
-        prior_shipped_cap = _clamped_count(_prep.get("captured_image_count"))
-        prior_att = _clamped_count(_prep.get("attached_image_count"))
-        prior_total = prior_shipped_cap + prior_att
-        if prior_total <= 0:
+        plan = _carry_plan(prep, capture_ids, have_attested)
+        if plan is None or (plan.short_total <= 0 and not plan.recovered_cap):
+            # Nothing to carry, or nothing carried and nothing missing: this call
+            # simply carries the screens on a different channel (review C1).
+            # Silent by design -- a note about a substitution the tester made
+            # deliberately is noise.
             return ([], [], "", "", "")
-        # PER-CHANNEL (2026-08-09, review H1). This used to be reached only when
-        # an all-or-nothing "does this call carry images?" boolean said NO, and
-        # that boolean was computed from the RAW arguments -- so a re-sent
-        # capture id whose screen had EXPIRED still counted as "carried" and
-        # skipped this decision entirely, and a mixed re-prepare (the prior prep
-        # had a captured screen, this call brings only a chat attachment)
-        # satisfied it while losing the captured screen silently. Each channel is
-        # now compared against what THIS call actually RESOLVED.
-        #
-        # SURPLUS IS CREDITED FROM THE OBSERVED CHANNEL ONLY (review C1, then
-        # C1-R). A per-channel gap on its own would REFUSE a healthy
-        # SUBSTITUTION -- the prior prep attested 2 chat screenshots and the
-        # tester re-captures 2 device screens instead -- which is not what this
-        # guard is for: it exists to catch screens that VANISHED, not screens
-        # that moved channel. Only a CAPTURED surplus (screens this server
-        # actually resolved in its own tray) pays down a gap: an
-        # attached_image_count is an unverifiable host assertion and must never
-        # cancel a captured-channel loss. Surplus is applied AFTER recovery is
-        # attempted, never instead of it. Recorded residual (review W6): a
-        # captured surplus can net out an expired-id shortfall with nothing
-        # recovered and return silently -- that is the substitution semantics,
-        # by decision, not by accident.
-        #
-        # _resolvable_captures fails toward the disclosure (its except reports
-        # nothing resolvable), which is the deliberate direction for a guard
-        # against a silent loss: the cost is one dismissible refusal, and the
-        # reply names the exact ack that clears it.
-        # DEDUPED (2026-08-09, review M1): capture_ids=["cap_A", "cap_A"] used to
-        # resolve to TWO screens, which satisfied a two-screen prior prep with
-        # one screen and defeated the whole per-channel check.
-        call_ids = list(
-            dict.fromkeys(
-                str(x or "").strip()
-                for x in list(capture_ids or [])
-                if str(x or "").strip()
-            )
-        )
-        prior_ids = list(
-            dict.fromkeys(
-                str(x or "").strip()
-                for x in list(_prep.get("capture_ids") or [])
-                if str(x or "").strip()
-            )
-        )
-        resolved_ids = _resolvable_captures(call_ids)
-        resolved_cap = len(resolved_ids)
-        resolved_att = _clamped_count(have_attested)
-        gap_cap = max(0, prior_shipped_cap - resolved_cap)
-        gap_att = max(0, prior_att - resolved_att)
-        # SURPLUS, ON BOTH AXES (2026-08-09, review H1 and its follow-up). This
-        # was `max(0, resolved_cap - prior_shipped_cap)`, which compared two
-        # different units: the prior prep stamped what it SHIPPED (3, post
-        # jira_max_images) beside ALL 5 ids it was called with, so a faithful
-        # re-send of those same 5 ids scored a phantom surplus of 2 -- screens
-        # the very same budget will drop again -- and that phantom silently
-        # cancelled a GENUINE loss of 2 chat-attested screenshots.
-        #
-        # IDENTITY alone is not enough either: a screen that is NEW to this call
-        # may CLOSE the captured gap or PAY a surplus, never both. Two expired
-        # captured screens replaced by one fresh one is a real loss of one, and
-        # crediting that fresh screen on both axes made it silent. So the
-        # surplus is the SMALLER of the two readings -- how many resolved screens
-        # the prior prep did not have, and how many this call holds beyond what
-        # that prep actually shipped.
-        #
-        # Recorded residual: a pre-carry-forward prep row with a captured count
-        # but NO `capture_ids` credits by count alone, exactly as today -- with
-        # no ids there is nothing to compare, and that case fails in the
-        # pre-existing direction.
-        _new_cap = len([c for c in resolved_ids if c not in prior_ids])
-        surplus_cap = min(_new_cap, max(0, resolved_cap - prior_shipped_cap))
-        gap_total = gap_cap + gap_att
-        from_prep = str(_prep.get("prep_id") or "")
-        # Only ids this call does NOT already hold can close the captured gap:
-        # counting a screen the call already resolved would "recover" it twice
-        # and hide a real shortfall behind its own input.
-        wanted_ids = [c for c in prior_ids if c not in call_ids]
-        revived_ids = _revive_captures(wanted_ids) if (wanted_ids and gap_cap) else []
-        recovered_cap = min(len(revived_ids), gap_cap)
-        short_total = max(0, gap_total - recovered_cap - surplus_cap)
-        # MERGED, never replaced -- this call's own ids (including unknown ones,
-        # which must survive to be DISCLOSED through _cap_missing) come first.
-        merged_ids = call_ids + [c for c in revived_ids if c not in call_ids]
-        try:
-            _age = float(_prep.get("age_s") or 0)
-        except (TypeError, ValueError, OverflowError):
-            _age = 0.0
-        if short_total <= 0:
-            if not recovered_cap:
-                # Nothing was carried forward and nothing is missing: this call
-                # simply carries the screens on a different channel (review C1).
-                # Silent by design -- there is no loss to disclose, and a note
-                # about a substitution the tester made deliberately is noise.
-                return ([], [], "", "", "")
-            # W4: recovered_cap counts screens RESTORED to the tray, not screens
-            # that will fit the reply. _select_prepare_images applies the
-            # jira_max_images / byte budget afterwards and NAMES every image it
-            # drops in this same reply, so an above-cap revival reads as
-            # "Carried forward 5" beside "2 ticket screenshot(s) were NOT
-            # attached". The two paragraphs are consistent and neither is
-            # silent; the count here is deliberately the RECOVERY, not the
-            # shipment, because that is the fact this note is about.
-            return (
-                merged_ids,
-                list(revived_ids),
-                from_prep,
-                (
-                    f"> \U0001f4f8 Carried forward {recovered_cap} device "
-                    f"screen(s) from the previous preparation `{from_prep}` for "
-                    "this same "
-                    "source: this call did not carry them, and generating "
-                    "without them would have silently dropped the grounding. "
-                    "Pass `image_carry_ack=true` to generate WITHOUT them "
-                    "instead."
-                ),
-                "",
-            )
-        if not image_carry_ack:
-            return (
-                merged_ids,
-                list(revived_ids),
-                from_prep,
-                "",
-                _reprep_image_loss_refusal(
-                    prep_id=from_prep or "?",
-                    age_s=_age,
-                    # The per-channel SHORTFALL, not the prior prep's totals: the
-                    # refusal must describe what would go missing on this call.
-                    captured=gap_cap,
-                    attested=gap_att,
-                    recovered=recovered_cap,
-                    # ... and the prior prep's TOTALS separately (review M2), for
-                    # the "was grounded on" clause, which is about that prep and
-                    # was rendering these same GAPS.
-                    prior_captured=prior_shipped_cap,
-                    prior_attested=prior_att,
-                    # What this call DOES carry, so the refusal can stop claiming
-                    # "no images at all" (review C1), plus the surplus-credited
-                    # shortfall it must actually report.
-                    carries_captured=resolved_cap,
-                    carries_attested=resolved_att,
-                    shortfall=short_total,
-                    labels=list(_prep.get("captured_image_labels") or []),
-                ),
-            )
-        # L1 (2026-08-09): "the screen(s) the previous preparation had" is a
-        # PRIOR TOTAL. It used to interpolate the sum of the two GAPS, so a prep
-        # grounded on 3 + 2 with one screen still in hand reported that it had
-        # had 4. What is generated WITH is the prior total minus the residual;
-        # what is missing stays short_total.
-        # IDENTITY, not arithmetic residual (2026-08-10): `prior_total -
-        # short_total` counted a channel-SUBSTITUTE surplus as if it were one
-        # of the prior prep's own screens, so a prep whose two screens both
-        # expired off the shelf, re-sent with one fresh capture, reported
-        # "1 of the 2" present when 0 of that prep's own screens survived.
-        # Only a revived shelf screen or a re-sent id the prior prep was
-        # itself called with counts toward "the previous preparation had"; a
-        # surplus screen is named in its own clause instead.
-        identity_cap = recovered_cap + len([c for c in resolved_ids if c in prior_ids])
-        _substitute_clause = (
-            f" {surplus_cap} other screen(s) on this call were counted in their place."
-            if surplus_cap
-            else ""
-        )
+        note, refusal = _carry_verdict(plan, image_carry_ack, prep)
         return (
-            merged_ids,
-            list(revived_ids),
-            from_prep,
-            (
-                f"> \u26a0\ufe0f Generating with {identity_cap} of "
-                f"the {prior_total} screen(s) the previous preparation "
-                f"`{from_prep}` for this same source had: `image_carry_ack=true` "
-                f"was sent and {short_total} could not be recovered (chat "
-                "attachments never reach this server, and captured screens "
-                f"expire).{_substitute_clause} Anything that exists only in those "
-                f"{short_total} screen(s) is NOT reflected in the cases below."
-            ),
-            "",
+            plan.merged_ids,
+            list(plan.revived_ids),
+            plan.from_prep,
+            note,
+            refusal,
         )
     except Exception:
         logger.debug("_carry_forward_or_refuse failed", exc_info=True)
@@ -4692,6 +4775,162 @@ def _export_ticket_slug(source_url: str) -> str:
         return ""
 
 
+def _unanswered_dir_note(asked) -> str:
+    """The note for a save-folder question that got no answer, per cause."""
+    # The two causes get DIFFERENT sentences. Saying "no answer arrived
+    # within 55s" when no dialog was ever shown -- which is what a spent
+    # budget means -- would be untrue, and _auto_export_xlsx is reached
+    # at the very end of a full generation, so that is the likely case
+    # on the generate path rather than an exotic one.
+    if asked.timed_out:
+        logger.warning(
+            "auto-export: no save-folder answer within %ss -- using the "
+            "default export folder",
+            int(_ELICIT_TIMEOUT_S),
+        )
+        return (
+            "\n> ℹ️  No answer to the save-folder question arrived "
+            f"within {int(_ELICIT_TIMEOUT_S)}s, so the default export "
+            "folder was used."
+        )
+    logger.warning(
+        "auto-export: save-folder dialog skipped (per-call "
+        "elicitation budget spent) -- using the default folder"
+    )
+    return (
+        "\n> ℹ️  This call had already run past its interactive "
+        "budget, so the save-folder question was not asked and the "
+        "default export folder was used."
+    )
+
+
+async def _auto_export_ask_dir(
+    ask_text: AskCb, progress: ProgressCb
+) -> tuple[str, str]:
+    """Ask the tester where to save; returns (export_dir, reject_note)."""
+    export_dir = ""
+    reject_note = ""
+    await _emit(progress, "📂 Asking where to save the Excel file…")
+    # K1 (2026-08-10): the outer asyncio.wait_for F1b added here is gone --
+    # _elicit_text bounds itself now, so wrapping it again would just be a
+    # second, looser bound on the same await.
+    #
+    # "leave blank" was a LIE: Cursor renders the dialog with a REQUIRED
+    # Value* field and will not submit an empty answer, so the advertised
+    # optional path was unreachable. The word `default` is reachable, and
+    # _safe_elicited_dir(sentinel_ok=True) understands it.
+    asked = await _elicit_text(
+        ask_text,
+        "Where should the Excel file be saved? Reply with a full folder "
+        "path, or reply `default` to use the default (a secure temp "
+        f"folder). No answer within {int(_ELICIT_TIMEOUT_S)}s also uses "
+        "the default.",
+    )
+    if _unanswered(asked):
+        reject_note = _unanswered_dir_note(asked)
+    if asked.status == CHOSEN and (asked.value or "").strip():
+        # ops-6 (bug 3): UNTRUSTED host text -- validate before it
+        # becomes a real directory. A rejected answer keeps the
+        # configured default AND says so.
+        # export_dir is EMPTY in this branch (the dialog is only
+        # asked when the configured folder did not resolve), so a
+        # rejected answer falls back to the secure temp dir -- and
+        # the note has to name that one, not a configured folder.
+        picked, why = _safe_elicited_dir(
+            asked.value,
+            sentinel_ok=True,
+            fallback_label=_TEMP_EXPORT_LABEL,
+        )
+        if picked:
+            export_dir = picked
+        elif why:
+            reject_note = why
+    return export_dir, reject_note
+
+
+def _auto_export_target(suite, export_dir: str, source_url: str) -> str | None:
+    """The workbook path inside export_dir, or None when it is unusable."""
+    try:
+        dest = Path(export_dir).expanduser()
+        dest.mkdir(parents=True, exist_ok=True)
+        frag = (getattr(suite, "suite_id", "") or "suite")[:16]
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        # F11: ticket key FIRST, because that is what a tester scans a
+        # folder for. The `qa_test_cases_` prefix is kept (every
+        # cleanup_temp_files glob keys off it) and so are the suite_id
+        # fragment and the timestamp, so uniqueness and every existing
+        # consumer are unchanged. "" for a non-Jira source -> the
+        # previous name exactly.
+        ticket = _export_ticket_slug(source_url)
+        return str(
+            (
+                dest
+                / (
+                    f"qa_test_cases_{ticket}_{frag}_{stamp}.xlsx"
+                    if ticket
+                    else f"qa_test_cases_{frag}_{stamp}.xlsx"
+                )
+            ).resolve()
+        )
+    except OSError:
+        logger.warning(
+            "qa_export_dir %r unusable -- falling back to temp export",
+            export_dir,
+            exc_info=True,
+        )
+        return None
+
+
+async def _auto_export_write(
+    suite, output_path: str | None, on_path: Callable[[str], None] | None
+) -> str:
+    """Write the workbook (explicit path or secure temp) and hand on the path."""
+    if output_path is not None:
+        path = await asyncio.to_thread(generate_test_case_xlsx, suite, output_path)
+    else:
+        path = await asyncio.to_thread(_EXPORTERS["xlsx"], suite)
+    if on_path is not None:
+        # Hands the caller the path the tester actually got,
+        # including an elicited custom folder. Added so the
+        # Zephyr pair could land beside the workbook; that
+        # exporter was DELETED on 2026-08-15 (batch D4) and
+        # handle_submit_suite still reports the path.
+        try:
+            on_path(path)
+        except Exception:
+            logger.debug("auto-export on_path callback failed", exc_info=True)
+    return path
+
+
+async def _auto_export_reply(path: str, reject_note: str) -> str:
+    """The reply block for a written export: the path, a link and how to open it."""
+    try:
+        uri = Path(path).as_uri()
+    except (ValueError, OSError):
+        uri = ""
+    await _audit("mcp_auto_export_xlsx", detail={"path": path})
+    link = f"[Open the file]({uri})\n\n" if uri else ""
+    # This path IS the deliverable, and the only channel an MCP tool result
+    # has for it is TEXT -- so it has to survive a chat model that
+    # paraphrases the reply instead of quoting it. Hence the explicit
+    # show-this-verbatim instruction, and hence the callers placing this
+    # block FIRST in their response rather than after the suite body: on
+    # 2026-08-03 a real run generated 98 cases and exported cleanly, and the
+    # tester never saw a path.
+    return (
+        "### \U0001f4c4 Your Excel file is ready\n\n"
+        "**\U0001f4c2 SHOW THIS PATH TO THE TESTER, VERBATIM \u2014 it is "
+        "the deliverable they asked for:**\n\n"
+        f"`{path}`\n\n"
+        f"{link}"
+        "Open it (macOS):\n\n"
+        f'```bash\nopen "{path}"\n```\n\n'
+        "_That spreadsheet is the finished deliverable — nothing else to "
+        "run. Need CSV, Gherkin, Playwright or TestRail instead? Just say "
+        "so._" + reject_note
+    )
+
+
 async def _auto_export_xlsx(
     suite,
     ask_text: AskCb = None,
@@ -4731,139 +4970,15 @@ async def _auto_export_xlsx(
             # -- open on a client that may never answer, and the retried submit
             # then produced a second suite. An empty export_dir is the legacy
             # secure-temp install, where the tester's answer is the only signal.
-            await _emit(progress, "📂 Asking where to save the Excel file…")
-            # K1 (2026-08-10): the outer asyncio.wait_for F1b added here is gone --
-            # _elicit_text bounds itself now, so wrapping it again would just be a
-            # second, looser bound on the same await.
-            #
-            # "leave blank" was a LIE: Cursor renders the dialog with a REQUIRED
-            # Value* field and will not submit an empty answer, so the advertised
-            # optional path was unreachable. The word `default` is reachable, and
-            # _safe_elicited_dir(sentinel_ok=True) understands it.
-            asked = await _elicit_text(
-                ask_text,
-                "Where should the Excel file be saved? Reply with a full folder "
-                "path, or reply `default` to use the default (a secure temp "
-                f"folder). No answer within {int(_ELICIT_TIMEOUT_S)}s also uses "
-                "the default.",
-            )
-            if _unanswered(asked):
-                # The two causes get DIFFERENT sentences. Saying "no answer arrived
-                # within 55s" when no dialog was ever shown -- which is what a spent
-                # budget means -- would be untrue, and _auto_export_xlsx is reached
-                # at the very end of a full generation, so that is the likely case
-                # on the generate path rather than an exotic one.
-                if asked.timed_out:
-                    logger.warning(
-                        "auto-export: no save-folder answer within %ss -- using the "
-                        "default export folder",
-                        int(_ELICIT_TIMEOUT_S),
-                    )
-                    reject_note = (
-                        "\n> ℹ️  No answer to the save-folder question arrived "
-                        f"within {int(_ELICIT_TIMEOUT_S)}s, so the default export "
-                        "folder was used."
-                    )
-                else:
-                    logger.warning(
-                        "auto-export: save-folder dialog skipped (per-call "
-                        "elicitation budget spent) -- using the default folder"
-                    )
-                    reject_note = (
-                        "\n> ℹ️  This call had already run past its interactive "
-                        "budget, so the save-folder question was not asked and the "
-                        "default export folder was used."
-                    )
-            if asked.status == CHOSEN and (asked.value or "").strip():
-                # ops-6 (bug 3): UNTRUSTED host text -- validate before it
-                # becomes a real directory. A rejected answer keeps the
-                # configured default AND says so.
-                # export_dir is EMPTY in this branch (the dialog is only
-                # asked when the configured folder did not resolve), so a
-                # rejected answer falls back to the secure temp dir -- and
-                # the note has to name that one, not a configured folder.
-                picked, why = _safe_elicited_dir(
-                    asked.value,
-                    sentinel_ok=True,
-                    fallback_label=_TEMP_EXPORT_LABEL,
-                )
-                if picked:
-                    export_dir = picked
-                elif why:
-                    reject_note = why
+            export_dir, reject_note = await _auto_export_ask_dir(ask_text, progress)
         if export_dir:
-            try:
-                dest = Path(export_dir).expanduser()
-                dest.mkdir(parents=True, exist_ok=True)
-                frag = (getattr(suite, "suite_id", "") or "suite")[:16]
-                stamp = time.strftime("%Y%m%d_%H%M%S")
-                # F11: ticket key FIRST, because that is what a tester scans a
-                # folder for. The `qa_test_cases_` prefix is kept (every
-                # cleanup_temp_files glob keys off it) and so are the suite_id
-                # fragment and the timestamp, so uniqueness and every existing
-                # consumer are unchanged. "" for a non-Jira source -> the
-                # previous name exactly.
-                ticket = _export_ticket_slug(source_url)
-                output_path = str(
-                    (
-                        dest
-                        / (
-                            f"qa_test_cases_{ticket}_{frag}_{stamp}.xlsx"
-                            if ticket
-                            else f"qa_test_cases_{frag}_{stamp}.xlsx"
-                        )
-                    ).resolve()
-                )
-            except OSError:
-                logger.warning(
-                    "qa_export_dir %r unusable -- falling back to temp export",
-                    export_dir,
-                    exc_info=True,
-                )
-                output_path = None
-        if output_path is not None:
-            path = await asyncio.to_thread(generate_test_case_xlsx, suite, output_path)
-        else:
-            path = await asyncio.to_thread(_EXPORTERS["xlsx"], suite)
-        if on_path is not None:
-            # Hands the caller the path the tester actually got,
-            # including an elicited custom folder. Added so the
-            # Zephyr pair could land beside the workbook; that
-            # exporter was DELETED on 2026-08-15 (batch D4) and
-            # handle_submit_suite still reports the path.
-            try:
-                on_path(path)
-            except Exception:
-                logger.debug("auto-export on_path callback failed", exc_info=True)
-        try:
-            uri = Path(path).as_uri()
-        except (ValueError, OSError):
-            uri = ""
-        await _audit("mcp_auto_export_xlsx", detail={"path": path})
-        link = f"[Open the file]({uri})\n\n" if uri else ""
-        # This path IS the deliverable, and the only channel an MCP tool result
-        # has for it is TEXT -- so it has to survive a chat model that
-        # paraphrases the reply instead of quoting it. Hence the explicit
-        # show-this-verbatim instruction, and hence the callers placing this
-        # block FIRST in their response rather than after the suite body: on
-        # 2026-08-03 a real run generated 98 cases and exported cleanly, and the
-        # tester never saw a path.
-        return (
-            "### \U0001f4c4 Your Excel file is ready\n\n"
-            "**\U0001f4c2 SHOW THIS PATH TO THE TESTER, VERBATIM \u2014 it is "
-            "the deliverable they asked for:**\n\n"
-            f"`{path}`\n\n"
-            f"{link}"
-            "Open it (macOS):\n\n"
-            f'```bash\nopen "{path}"\n```\n\n'
-            "_That spreadsheet is the finished deliverable — nothing else to "
-            "run. Need CSV, Gherkin, Playwright or TestRail instead? Just say "
-            "so._" + reject_note
-        )
+            output_path = _auto_export_target(suite, export_dir, source_url)
+        path = await _auto_export_write(suite, output_path, on_path)
+        return await _auto_export_reply(path, reject_note)
     except Exception as exc:
         logger.exception("mcp auto-export xlsx failed")
         return (
-            f"\u26a0\ufe0f Auto-export to Excel failed: {exc} \u2014 you can still "
+            f"⚠️ Auto-export to Excel failed: {exc} — you can still "
             "export the suite with `qa_export_suite`."
         )
 
@@ -5050,6 +5165,35 @@ async def _recent_suite_warning_note(source_url: str, window_s: float) -> str:
         return ""
 
 
+def _corpus_rows(cases: list, source_key: str, feature_text_capped: str) -> list:
+    """(content, metadata) for each case that serializes; one that does not is
+    logged and skipped."""
+    rows: list = []
+    for tc in cases:
+        try:
+            steps_text = "\n".join(
+                f"{s.step_number}. {s.action} -> {s.expected_result}" for s in tc.steps
+            )
+            content = f"{tc.title}\n{steps_text}"
+            metadata = {
+                "feature": tc.module,
+                "module": tc.module,
+                "tc_id": tc.tc_id,
+                "stable_id": tc.stable_id,
+            }
+            if source_key:
+                # The identity replace_source_entries matches on the next
+                # generation of this same source.
+                metadata["source_key"] = source_key
+            if feature_text_capped:
+                metadata["feature_text"] = feature_text_capped
+        except Exception:
+            logger.warning("RAG: could not serialize a test case for corpus — skipping")
+            continue
+        rows.append((content, metadata))
+    return rows
+
+
 async def _persist_suite_to_corpus(
     suite: object, feature_text: str = "", source_url: str = ""
 ) -> None:
@@ -5092,27 +5236,7 @@ async def _persist_suite_to_corpus(
     source_key = _corpus_source_key(source_url, feature_text)
     written = 0
     fresh_ids: list = []
-    for tc in cases:
-        try:
-            steps_text = "\n".join(
-                f"{s.step_number}. {s.action} -> {s.expected_result}" for s in tc.steps
-            )
-            content = f"{tc.title}\n{steps_text}"
-            metadata = {
-                "feature": tc.module,
-                "module": tc.module,
-                "tc_id": tc.tc_id,
-                "stable_id": tc.stable_id,
-            }
-            if source_key:
-                # The identity replace_source_entries matches on the next
-                # generation of this same source.
-                metadata["source_key"] = source_key
-            if feature_text_capped:
-                metadata["feature_text"] = feature_text_capped
-        except Exception:
-            logger.warning("RAG: could not serialize a test case for corpus — skipping")
-            continue
+    for content, metadata in _corpus_rows(cases, source_key, feature_text_capped):
         try:
             result = await add_to_corpus("test_case", content, metadata)
             if not result.get("error"):
@@ -5244,37 +5368,72 @@ class _Grounding:
     openapi_text: str | None = None
 
 
-async def _ground_and_gate(
+def _page_fetch_refusal(text: str, url_content: dict) -> str | None:
+    """The markdown to relay when the ticket / page fetch failed in a way that
+    must stop generation, else None (a generic page may still fall through)."""
+    # needs_jira_mcp: the agent has not fetched the ticket yet. The
+    # error IS the directive -- relay it verbatim so the agent acts
+    # on it, instead of proceeding with no ticket content (which is
+    # what fabricated suites from an empty Jira SPA shell).
+    if url_content.get("needs_jira_mcp"):
+        return str(url_content.get("error") or not_connected_message())
+    hint = _jira_config_hint(text)
+    if hint:
+        return hint
+    # 2026-08-31. Every OTHER error used to fall through to
+    # generation. That silently swallowed the two anti-fabrication
+    # refusals normalize_issue_payload raises with
+    # needs_jira_mcp=False -- "that payload has no `fields` object"
+    # and "no summary, no description and no acceptance criteria" --
+    # and a full suite was written from nothing. When the SOURCE is
+    # Jira, an unreadable source is a refusal, not a warning. A
+    # generic page that failed to fetch still falls through: the
+    # tester's own words may carry the feature.
+    if looks_like_jira_url(text) or url_content.get("jira_page_without_issue"):
+        return str(url_content.get("error"))
+    return None
+
+
+async def _extract_page_ui(
+    text: str, attached_images: list | None, url_content: dict
+) -> dict | None:
+    """UI extraction for a fetched page; None when skipped or when it fails."""
+    if _skip_ui_extraction(text, attached_images):
+        logger.info(
+            "ui_extractor: skipped -- %s carries no app UI to extract",
+            "the Jira ticket page",
+        )
+        return None
+    try:
+        return await extract_ui_elements(text, prefetched=url_content)
+    except Exception:
+        logger.debug("mcp: UI extraction failed -- continuing", exc_info=True)
+        return None
+
+
+@dataclass(frozen=True)
+class _HostCallbacks:
+    """The host's interactive callbacks, passed around as one value."""
+
+    choose: ChooseCb = None
+    ask_text: AskCb = None
+    progress: ProgressCb = None
+
+
+async def _grounding_fetch(
     text: str,
     *,
-    attached_images: list | None = None,
-    proceed_anyway: bool = False,
-    choose: ChooseCb = None,
-    ask_text: AskCb = None,
-    progress: ProgressCb = None,
-    audit_source: str = "prepare",
-    jira_content_json: str = "",
+    attached_images: list | None,
+    callbacks: _HostCallbacks,
+    jira_content_json: str,
 ) -> "str | _Grounding":
-    """Run the shared front half: URL/Jira fetch, _jira_preflight, Swagger
-    ingest, UI extraction and the (fail-safe) ambiguity gate. Returns a markdown
-    STRING to short-circuit (setup hint / preflight / clarifying questions) or a
-    _Grounding to proceed.
-
-    Comment reconciliation left that list on 2026-08-15: dead-code deletion
-    batch D5 deleted tools/comment_reconciler.py, the amendment gate that could
-    short-circuit here, and the suppress_comment_llm parameter that governed it.
-    A ticket's comment thread now reaches generation exactly as it did before
-    the pipeline existed -- as the raw "## Comments" dump jira_mcp leaves in the
-    ticket text -- which is what every install has actually done since the seam
-    was pinned False on 2026-08-14. See docs/RETIRED_CAPABILITIES.md section 4.
-
-    A faithful re-derivation of the front half of handle_generate_test_cases; it
-    is intentionally a SEPARATE helper rather than a refactor of that handler, so
-    this additive batch cannot change server-mode behaviour. The duplication is
-    accepted deliberately: server byte-identity beats DRY here, and ops-3d-3 may
-    converge the two only if it can be shown byte-identical against the
-    equivalence fixtures.
-    """
+    """URL/Jira fetch: setup hint, _jira_preflight, Swagger ingest and UI
+    extraction. Returns a markdown STRING to short-circuit or a _Grounding."""
+    choose, ask_text, progress = (
+        callbacks.choose,
+        callbacks.ask_text,
+        callbacks.progress,
+    )
     url_content = None
     ui_content = None
     openapi_text = None
@@ -5313,62 +5472,83 @@ async def _ground_and_gate(
             else:
                 url_content = await fetch_url_content(text)
             if url_content.get("error"):
-                # needs_jira_mcp: the agent has not fetched the ticket yet. The
-                # error IS the directive -- relay it verbatim so the agent acts
-                # on it, instead of proceeding with no ticket content (which is
-                # what fabricated suites from an empty Jira SPA shell).
-                if url_content.get("needs_jira_mcp"):
-                    return str(url_content.get("error") or not_connected_message())
-                hint = _jira_config_hint(text)
-                if hint:
-                    return hint
-                # 2026-08-31. Every OTHER error used to fall through to
-                # generation. That silently swallowed the two anti-fabrication
-                # refusals normalize_issue_payload raises with
-                # needs_jira_mcp=False -- "that payload has no `fields` object"
-                # and "no summary, no description and no acceptance criteria" --
-                # and a full suite was written from nothing. When the SOURCE is
-                # Jira, an unreadable source is a refusal, not a warning. A
-                # generic page that failed to fetch still falls through: the
-                # tester's own words may carry the feature.
-                if looks_like_jira_url(text) or url_content.get(
-                    "jira_page_without_issue"
-                ):
-                    return str(url_content.get("error"))
-            if _skip_ui_extraction(text, attached_images):
-                logger.info(
-                    "ui_extractor: skipped -- %s carries no app UI to extract",
-                    "the Jira ticket page",
-                )
-                ui_content = None
-            else:
-                try:
-                    ui_content = await extract_ui_elements(text, prefetched=url_content)
-                except Exception:
-                    logger.debug(
-                        "mcp: UI extraction failed -- continuing", exc_info=True
-                    )
-                    ui_content = None
-
-    if not proceed_anyway and not attached_images:
-        # The server-side ambiguity pre-pass is GONE (P2-J, 2026-08-16), so
-        # there is no branch here any more and no progress line announcing a
-        # check this process does not perform. The audit event is KEPT: an
-        # operator reading the trail must still see that the gate was
-        # DELEGATED rather than silently absent.
-        logger.info(
-            "prepare: ambiguity gate runs on the host (no server-side classifier call)"
-        )
-        await _audit(
-            "mcp_ambiguity_gate",
-            detail={"source": audit_source, "skipped": "host_ambiguity_review"},
-        )
+                refusal = _page_fetch_refusal(text, url_content)
+                if refusal is not None:
+                    return refusal
+            ui_content = await _extract_page_ui(text, attached_images, url_content)
 
     return _Grounding(
         url_content=url_content,
         ui_content=ui_content,
         openapi_text=openapi_text,
     )
+
+
+async def _grounding_gates(
+    *, proceed_anyway: bool, attached_images: list | None, audit_source: str
+) -> None:
+    """The (fail-safe) ambiguity gate: audit-only, the review runs on the host."""
+    if proceed_anyway or attached_images:
+        return
+    # The server-side ambiguity pre-pass is GONE (P2-J, 2026-08-16), so
+    # there is no branch here any more and no progress line announcing a
+    # check this process does not perform. The audit event is KEPT: an
+    # operator reading the trail must still see that the gate was
+    # DELEGATED rather than silently absent.
+    logger.info(
+        "prepare: ambiguity gate runs on the host (no server-side classifier call)"
+    )
+    await _audit(
+        "mcp_ambiguity_gate",
+        detail={"source": audit_source, "skipped": "host_ambiguity_review"},
+    )
+
+
+async def _ground_and_gate(
+    text: str,
+    *,
+    attached_images: list | None = None,
+    proceed_anyway: bool = False,
+    choose: ChooseCb = None,
+    ask_text: AskCb = None,
+    progress: ProgressCb = None,
+    audit_source: str = "prepare",
+    jira_content_json: str = "",
+) -> "str | _Grounding":
+    """Run the shared front half: URL/Jira fetch, _jira_preflight, Swagger
+    ingest, UI extraction and the (fail-safe) ambiguity gate. Returns a markdown
+    STRING to short-circuit (setup hint / preflight / clarifying questions) or a
+    _Grounding to proceed.
+
+    Comment reconciliation left that list on 2026-08-15: dead-code deletion
+    batch D5 deleted tools/comment_reconciler.py, the amendment gate that could
+    short-circuit here, and the suppress_comment_llm parameter that governed it.
+    A ticket's comment thread now reaches generation exactly as it did before
+    the pipeline existed -- as the raw "## Comments" dump jira_mcp leaves in the
+    ticket text -- which is what every install has actually done since the seam
+    was pinned False on 2026-08-14. See docs/RETIRED_CAPABILITIES.md section 4.
+
+    A faithful re-derivation of the front half of handle_generate_test_cases; it
+    is intentionally a SEPARATE helper rather than a refactor of that handler, so
+    this additive batch cannot change server-mode behaviour. The duplication is
+    accepted deliberately: server byte-identity beats DRY here, and ops-3d-3 may
+    converge the two only if it can be shown byte-identical against the
+    equivalence fixtures.
+    """
+    grounding = await _grounding_fetch(
+        text,
+        attached_images=attached_images,
+        callbacks=_HostCallbacks(choose, ask_text, progress),
+        jira_content_json=jira_content_json,
+    )
+    if isinstance(grounding, str):
+        return grounding
+    await _grounding_gates(
+        proceed_anyway=proceed_anyway,
+        attached_images=attached_images,
+        audit_source=audit_source,
+    )
+    return grounding
 
 
 @dataclass
@@ -7307,6 +7487,17 @@ _BEAT1_MISSING_TAIL = (
 # Whether the AC job was actually SHIPPED, which is narrower than the
 # flag: a ticket that carried real acceptance criteria needs no job at
 # all (source_acs is non-empty and nothing was synthesized either way).
+def _host_generation_mode() -> bool:
+    """True when generation runs in host mode.
+
+    Evening-ops repair: `llm` is NOT imported at module scope in this file,
+    so it is imported here; a failure still surfaces in the caller's except
+    as "Preparation failed"."""
+    import llm
+
+    return llm.resolve_generation_mode() == "host"
+
+
 async def handle_prepare_test_cases(
     feature_or_url: str,
     *,
@@ -7380,15 +7571,7 @@ async def handle_prepare_test_cases(
         if _nudge is not None:
             return PreparePayloadResult(clarify=_nudge)
     try:
-        # Evening-ops repair: `llm` is NOT imported at module scope in
-        # this file (only locally, inside one other handler), so the
-        # llm.resolve_generation_mode() calls below raise NameError --
-        # swallowed by this function's except into "Preparation failed".
-        import llm
-
-        _host_amb = llm.resolve_generation_mode() == "host"
-        _host_ac = llm.resolve_generation_mode() == "host"
-        _host_img = llm.resolve_generation_mode() == "host"
+        _host_amb = _host_ac = _host_img = _host_generation_mode()
         grounded = await _ground_and_gate(
             text,
             attached_images=attached_images,
@@ -9266,6 +9449,131 @@ def _volume_shortfall_detail(meta: object, cases: list) -> str:
 _IMAGE_GATE_MAX_NAMED = 8
 
 
+def _relevance_refusal(
+    mode: str, facts: str, prep_id: str, staged_hint: str, *, ignore_ack: bool
+) -> str:
+    """The markdown body of _image_relevance_gate for an ``acked`` override or a
+    ``refuse``; *ignore_ack* means an ack arrived on the FIRST submit."""
+    if mode == "acked":
+        return (
+            "> \u26a0\ufe0f  Image relevance below the bar this prep asked "
+            "for (refusal OVERRIDDEN by `image_relevance_ack=true`):\n"
+            + "".join(f">   {line}\n" for line in facts.splitlines() if line.strip())
+            + ">   The suite below was accepted as submitted. If that is not "
+            "deliberate, capture or attach the correct screen and prepare "
+            "again with `proceed_anyway=true` (a prep for this source is "
+            "already open).\n\n"
+        )
+    ignored_ack = ""
+    if ignore_ack:
+        ignored_ack = (
+            "\n\n> \u26a0\ufe0f  `image_relevance_ack=true` arrived on the "
+            "FIRST submit for this prep and was IGNORED: the tester cannot "
+            "have seen these screens yet. Show them the finding above; if "
+            "they confirm the suite is right anyway, resubmit it unchanged "
+            "with the ack and it WILL be honoured."
+        )
+    return (
+        "\u26d4 **Submission refused:** `QA_HOST_IMAGE_REQUIRE_RELEVANT` is "
+        "on for this prep and this submission carries no clean per-image "
+        "verdict for the screens it was generated from.\n\n"
+        + facts
+        + ignored_ack
+        + f"\n\nNothing was discarded and prep `{prep_id}` is intact -- the "
+        "prepared context and every staged category are still there.\n\n"
+        "**Pick one:**\n"
+        "1. If the screen really is the wrong one, capture or attach the "
+        "correct screen and run `qa_prepare_test_cases` again WITH "
+        "`proceed_anyway=true` -- a prep for this source is already open, "
+        "so the duplicate-prep guard (default ON) refuses that call "
+        "without it. Cases grounded on the wrong screen are the defect "
+        "this refusal exists to catch.\n"
+        "2. If you did read the screens and simply did not report it, "
+        + (
+            # Staged route: the cases are already on the server, so the
+            # retry carries the missing field ALONE. The wording is REUSED
+            # from _staged_resubmit_hint rather than paraphrased, so this
+            # refusal and the ambiguity one read the same way to a host.
+            # The array's SHAPE is handed to that helper (`field_shape`)
+            # rather than appended here: appended, it landed after the
+            # hint's closing "...cases the tester already reviewed" and so
+            # after "and nothing else", dangling off the wrong noun.
+            staged_hint + ".\n"
+            if staged_hint
+            else f"resubmit the SAME suite with the SAME prep_id `{prep_id}` "
+            "and a top-level `image_descriptions` array carrying one "
+            "`relevant` verdict per image (the bare string `yes`, `no` or "
+            "`unsure`) plus a one-line `relevance_reason`. On the "
+            "per-category route send it in the finalize sidecar.\n"
+        )
+        + "3. Or, ONLY if the TESTER has seen the finding above and confirms "
+        "the suite is right anyway, resubmit it unchanged with "
+        "`image_relevance_ack=true`. Ask them first -- do not decide that on "
+        "your own judgement."
+    )
+
+
+def _relevance_facts(forwarded: int, counts: dict, off: list) -> str:
+    """The findings block of _image_relevance_gate: the off-topic screens, or the
+    absence of any usable verdict."""
+    if off:
+        named = "\n".join(
+            f"   - `{i.get('image_id', '?')}` \u2014 "
+            f"{i.get('relevance_reason', '') or i.get('description', '')}"
+            for i in off[:_IMAGE_GATE_MAX_NAMED]
+        )
+        if len(off) > _IMAGE_GATE_MAX_NAMED:
+            named += f"\n   - (+{len(off) - _IMAGE_GATE_MAX_NAMED} more)"
+        return (
+            f"- **{len(off)} of {counts.get('images', 0)} described "
+            'screen(s) came back `relevant: "no"`** -- your own chat '
+            "model's verdict, MODEL-DERIVED and not verified by this "
+            "server, which made no vision call:\n" + named
+        )
+    return (
+        f"- **No usable `relevant` verdict came back for any image**, "
+        f"although this prep forwarded {forwarded} screen(s) to your "
+        "chat and asked for one per image. This server made no vision "
+        "call of its own, so there is NO record that the screens were "
+        "looked at -- and silence must not read as `yes`."
+    )
+
+
+def _relevance_verdicts(meta: object, result: object) -> "tuple | None":
+    """What _image_relevance_gate needs to judge a submission, or None when the
+    gate passes outright. Returns (forwarded, counts, off, refused_before).
+    Called inside the gate's ``try``, so an error still fails OPEN there."""
+    if not isinstance(meta, dict):
+        return None
+    if not meta.get("host_image_require_relevant"):
+        return None
+    if not meta.get("host_image_relevance"):
+        return None
+    try:
+        forwarded = int(meta.get("captured_image_count") or 0) + int(
+            meta.get("attached_image_count") or 0
+        )
+    except (TypeError, ValueError, OverflowError):
+        forwarded = 0
+    if forwarded <= 0:
+        return None
+    counts = host_mode.image_relevance_counts(result)
+    off = host_mode.off_topic_images(result)
+    if counts.get("ran") and not counts.get("no"):
+        return None
+    # Review H1: a resubmit is not asked to resend `image_descriptions`,
+    # so an ABSENT field on a later submit means "the server did not ask
+    # for it", NOT "the check was forfeited". Refusing there would reject
+    # a suite THIS gate had already passed. The submit that DID answer
+    # stamps `image_relevance_seen` -- the same carry-forward
+    # discipline as serialize_adopted_state and the carried checklist
+    # beside it. Only ABSENCE is forgiven: a verdict that IS resent is
+    # judged normally, so a fresh `no` on a later round still refuses.
+    if not counts.get("ran") and meta.get("image_relevance_seen"):
+        return None
+    return forwarded, counts, off, bool(meta.get("image_relevance_refused"))
+
+
 def _image_relevance_gate(
     meta: object,
     result: object,
@@ -9323,116 +9631,14 @@ def _image_relevance_gate(
     _volume_floor_note and _fanout_incomplete_note.
     """
     try:
-        if not isinstance(meta, dict):
+        verdicts = _relevance_verdicts(meta, result)
+        if verdicts is None:
             return "", ""
-        if not meta.get("host_image_require_relevant"):
-            return "", ""
-        if not meta.get("host_image_relevance"):
-            return "", ""
-        try:
-            forwarded = int(meta.get("captured_image_count") or 0) + int(
-                meta.get("attached_image_count") or 0
-            )
-        except (TypeError, ValueError, OverflowError):
-            forwarded = 0
-        if forwarded <= 0:
-            return "", ""
-        counts = host_mode.image_relevance_counts(result)
-        off = host_mode.off_topic_images(result)
-        if counts.get("ran") and not counts.get("no"):
-            return "", ""
-        # Review H1: a resubmit is not asked to resend `image_descriptions`,
-        # so an ABSENT field on a later submit means "the server did not ask
-        # for it", NOT "the check was forfeited". Refusing there would reject
-        # a suite THIS gate had already passed. The submit that DID answer
-        # stamps `image_relevance_seen` -- the same carry-forward
-        # discipline as serialize_adopted_state and the carried checklist
-        # beside it. Only ABSENCE is forgiven: a verdict that IS resent is
-        # judged normally, so a fresh `no` on a later round still refuses.
-        if not counts.get("ran") and meta.get("image_relevance_seen"):
-            return "", ""
-        refused_before = bool(meta.get("image_relevance_refused"))
+        forwarded, counts, off, refused_before = verdicts
         mode = "acked" if (ack and refused_before) else "refuse"
-        if off:
-            named = "\n".join(
-                f"   - `{i.get('image_id', '?')}` \u2014 "
-                f"{i.get('relevance_reason', '') or i.get('description', '')}"
-                for i in off[:_IMAGE_GATE_MAX_NAMED]
-            )
-            if len(off) > _IMAGE_GATE_MAX_NAMED:
-                named += f"\n   - (+{len(off) - _IMAGE_GATE_MAX_NAMED} more)"
-            facts = (
-                f"- **{len(off)} of {counts.get('images', 0)} described "
-                'screen(s) came back `relevant: "no"`** -- your own chat '
-                "model's verdict, MODEL-DERIVED and not verified by this "
-                "server, which made no vision call:\n" + named
-            )
-        else:
-            facts = (
-                f"- **No usable `relevant` verdict came back for any image**, "
-                f"although this prep forwarded {forwarded} screen(s) to your "
-                "chat and asked for one per image. This server made no vision "
-                "call of its own, so there is NO record that the screens were "
-                "looked at -- and silence must not read as `yes`."
-            )
-        if mode == "acked":
-            return mode, (
-                "> \u26a0\ufe0f  Image relevance below the bar this prep asked "
-                "for (refusal OVERRIDDEN by `image_relevance_ack=true`):\n"
-                + "".join(
-                    f">   {line}\n" for line in facts.splitlines() if line.strip()
-                )
-                + ">   The suite below was accepted as submitted. If that is not "
-                "deliberate, capture or attach the correct screen and prepare "
-                "again with `proceed_anyway=true` (a prep for this source is "
-                "already open).\n\n"
-            )
-        ignored_ack = ""
-        if ack and not refused_before:
-            ignored_ack = (
-                "\n\n> \u26a0\ufe0f  `image_relevance_ack=true` arrived on the "
-                "FIRST submit for this prep and was IGNORED: the tester cannot "
-                "have seen these screens yet. Show them the finding above; if "
-                "they confirm the suite is right anyway, resubmit it unchanged "
-                "with the ack and it WILL be honoured."
-            )
-        return mode, (
-            "\u26d4 **Submission refused:** `QA_HOST_IMAGE_REQUIRE_RELEVANT` is "
-            "on for this prep and this submission carries no clean per-image "
-            "verdict for the screens it was generated from.\n\n"
-            + facts
-            + ignored_ack
-            + f"\n\nNothing was discarded and prep `{prep_id}` is intact -- the "
-            "prepared context and every staged category are still there.\n\n"
-            "**Pick one:**\n"
-            "1. If the screen really is the wrong one, capture or attach the "
-            "correct screen and run `qa_prepare_test_cases` again WITH "
-            "`proceed_anyway=true` -- a prep for this source is already open, "
-            "so the duplicate-prep guard (default ON) refuses that call "
-            "without it. Cases grounded on the wrong screen are the defect "
-            "this refusal exists to catch.\n"
-            "2. If you did read the screens and simply did not report it, "
-            + (
-                # Staged route: the cases are already on the server, so the
-                # retry carries the missing field ALONE. The wording is REUSED
-                # from _staged_resubmit_hint rather than paraphrased, so this
-                # refusal and the ambiguity one read the same way to a host.
-                # The array's SHAPE is handed to that helper (`field_shape`)
-                # rather than appended here: appended, it landed after the
-                # hint's closing "...cases the tester already reviewed" and so
-                # after "and nothing else", dangling off the wrong noun.
-                staged_hint + ".\n"
-                if staged_hint
-                else f"resubmit the SAME suite with the SAME prep_id `{prep_id}` "
-                "and a top-level `image_descriptions` array carrying one "
-                "`relevant` verdict per image (the bare string `yes`, `no` or "
-                "`unsure`) plus a one-line `relevance_reason`. On the "
-                "per-category route send it in the finalize sidecar.\n"
-            )
-            + "3. Or, ONLY if the TESTER has seen the finding above and confirms "
-            "the suite is right anyway, resubmit it unchanged with "
-            "`image_relevance_ack=true`. Ask them first -- do not decide that on "
-            "your own judgement."
+        facts = _relevance_facts(forwarded, counts, off)
+        return mode, _relevance_refusal(
+            mode, facts, prep_id, staged_hint, ignore_ack=ack and not refused_before
         )
     except Exception:  # pragma: no cover - defensive, must never block a finalize
         logger.debug("image relevance gate failed", exc_info=True)
@@ -9837,6 +10043,68 @@ async def handle_prep_status(prep_id: str) -> str:
         return f"⚠️ Could not read prep status: {exc}"
 
 
+def _all_jobs_reply(envelope: Any, prepared: Any, prep_id: str) -> str:
+    """The "all" form: every job packet in one fenced JSON, step zero first."""
+    import json as _json
+
+    batch = host_mode.build_category_jobs_batch(prepared, prep_id)
+    if batch is None:
+        return f"⚠️ No category jobs available for prep_id `{prep_id}`."
+    # F3 (2026-08-30): serve the step-zero jobs HERE, in the one call the
+    # instructions tell a host to make. Stamped at prepare time -- see
+    # the persist site in _prepare_generation for the defect this closes.
+    # FIRST key in the dict on purpose: a host reading the JSON top-down
+    # meets the blocking preflight before the categories. An envelope
+    # written before this key existed simply carries none, and that
+    # reply is byte-identical to today's.
+    _sz = envelope.get("step_zero") if isinstance(envelope, dict) else None
+    if isinstance(_sz, dict) and _sz.get("jobs_to_run"):
+        batch = {"step_zero": _sz, **batch}
+    _n = len(batch["jobs"])
+    return (
+        f"## Category jobs — ALL {_n} categories (one fetch)\n\n"
+        f"`prep_id`: `{prep_id}`\n\n"
+        "`shared` applies to EVERY job; `shared` plus one `jobs[]` "
+        "entry is the same packet the single-category form returns. "
+        # D3 (2026-08-21): this line used to ask the host to launch
+        # one same-session sub-context per `jobs[]` entry, all at once.
+        # It was the SECOND place this server asked for that, and the
+        # one a host reads at the exact moment it decides how to
+        # generate -- so retiring the ask in host_mode alone would have
+        # left the contradiction here. The retired wording is NOT quoted
+        # back: a tombstone comment is how an absence grep gets armed by
+        # the very change that satisfied it.
+        "**Run every `step_zero` job FIRST, before you generate a single "
+        "case.** The ambiguity preflight is `blocking: true`, and the "
+        "acceptance-criteria job produces the ac_ids each case's "
+        "`requirement_id` has to cite — a case written before those "
+        "ids exist can only be tagged null, and the only way to fix that "
+        "afterwards is to regenerate the suite. Then generate each "
+        "`jobs[]` entry and call `qa_submit_category` for it as soon as "
+        "its cases are written — do not fetch categories one call at "
+        "a time.\n\n"
+        "```json\n" + _json.dumps(batch, ensure_ascii=False, indent=2) + "\n```\n"
+    )
+
+
+def _single_job_reply(prepared: Any, prep_id: str, name: str) -> str:
+    """The one-category form: that job packet as fenced JSON, or a refusal."""
+    import json as _json
+
+    job = host_mode.build_category_job(prepared, prep_id, name)
+    if job is None:
+        return (
+            f"⚠️ Unknown category `{_clip_echo(name, 80)}` "
+            f"for prep_id `{_clip_echo(prep_id, 80)}`. "
+            "Use a name from orchestration.expected_categories / categories[].name."
+        )
+    return (
+        f"## Category job — **{job.get('category_name')}**\n\n"
+        f"`prep_id`: `{prep_id}`\n\n"
+        "```json\n" + _json.dumps(job, ensure_ascii=False, indent=2) + "\n```\n"
+    )
+
+
 async def handle_get_category_job(prep_id: str, category_name: str) -> str:
     """Return one self-contained category job packet as fenced JSON. Never raises."""
     # UNTRUSTED at every one of these entry points: the id is whatever the
@@ -9866,62 +10134,8 @@ async def handle_get_category_job(prep_id: str, category_name: str) -> str:
         # fetch is never blocked by it.
         await prep_store.touch_prep(prep_id)
         if category_name.lower() in ("all", "*"):
-            import json as _json
-
-            batch = host_mode.build_category_jobs_batch(prepared, prep_id)
-            if batch is None:
-                return f"⚠️ No category jobs available for prep_id `{prep_id}`."
-            # F3 (2026-08-30): serve the step-zero jobs HERE, in the one call the
-            # instructions tell a host to make. Stamped at prepare time -- see
-            # the persist site in _prepare_generation for the defect this closes.
-            # FIRST key in the dict on purpose: a host reading the JSON top-down
-            # meets the blocking preflight before the categories. An envelope
-            # written before this key existed simply carries none, and that
-            # reply is byte-identical to today's.
-            _sz = envelope.get("step_zero") if isinstance(envelope, dict) else None
-            if isinstance(_sz, dict) and _sz.get("jobs_to_run"):
-                batch = {"step_zero": _sz, **batch}
-            _n = len(batch["jobs"])
-            return (
-                f"## Category jobs — ALL {_n} categories (one fetch)\n\n"
-                f"`prep_id`: `{prep_id}`\n\n"
-                "`shared` applies to EVERY job; `shared` plus one `jobs[]` "
-                "entry is the same packet the single-category form returns. "
-                # D3 (2026-08-21): this line used to ask the host to launch
-                # one same-session sub-context per `jobs[]` entry, all at once.
-                # It was the SECOND place this server asked for that, and the
-                # one a host reads at the exact moment it decides how to
-                # generate -- so retiring the ask in host_mode alone would have
-                # left the contradiction here. The retired wording is NOT quoted
-                # back: a tombstone comment is how an absence grep gets armed by
-                # the very change that satisfied it.
-                "**Run every `step_zero` job FIRST, before you generate a single "
-                "case.** The ambiguity preflight is `blocking: true`, and the "
-                "acceptance-criteria job produces the ac_ids each case's "
-                "`requirement_id` has to cite — a case written before those "
-                "ids exist can only be tagged null, and the only way to fix that "
-                "afterwards is to regenerate the suite. Then generate each "
-                "`jobs[]` entry and call `qa_submit_category` for it as soon as "
-                "its cases are written — do not fetch categories one call at "
-                "a time.\n\n"
-                "```json\n"
-                + _json.dumps(batch, ensure_ascii=False, indent=2)
-                + "\n```\n"
-            )
-        job = host_mode.build_category_job(prepared, prep_id, category_name)
-        if job is None:
-            return (
-                f"⚠️ Unknown category `{_clip_echo(category_name, 80)}` "
-                f"for prep_id `{_clip_echo(prep_id, 80)}`. "
-                "Use a name from orchestration.expected_categories / categories[].name."
-            )
-        import json as _json
-
-        return (
-            f"## Category job — **{job.get('category_name')}**\n\n"
-            f"`prep_id`: `{prep_id}`\n\n"
-            "```json\n" + _json.dumps(job, ensure_ascii=False, indent=2) + "\n```\n"
-        )
+            return _all_jobs_reply(envelope, prepared, prep_id)
+        return _single_job_reply(prepared, prep_id, category_name)
     except host_mode.PrepSerdeError as exc:
         return f"⚠️ Could not read this prep: {exc}"
     except Exception as exc:
@@ -13235,6 +13449,144 @@ def _relocate_export(path: str, target_dir: str) -> tuple[str, str]:
 _PUSH_TARGETS = ("testrail", "xray")
 
 
+def _push_suite_refusal(target: str, apply: bool, enabled: bool, flag_name: str) -> str:
+    """The refusal text for an unknown target or a flag-OFF real push, else ""."""
+    from tools.untrusted import single_line as _safe
+
+    if target not in _PUSH_TARGETS:
+        return (
+            "⚠️ Unknown push target "
+            + repr(_safe(target, 40))
+            + ". Choose one of: "
+            + ", ".join(_PUSH_TARGETS)
+            + "."
+        )
+    if apply and not enabled:
+        return (
+            "⚠️ **Nothing was sent.** A real push to "
+            + target
+            + " needs `"
+            + flag_name
+            + "=true` in `.env` and an MCP server restart. Re-run with `apply=false` "
+            "for a preview of exactly what would be created."
+        )
+    return ""
+
+
+@dataclass(frozen=True)
+class _PushRequest:
+    """What one qa_push_suite call asks for, after normalisation."""
+
+    suite_id: str
+    target: str
+    apply: bool
+    project_id: Any = 0
+    section_name: str = ""
+
+
+async def _push_suite_cases(
+    suite: Any, req: _PushRequest, progress: ProgressCb
+) -> "dict | str":
+    """Run the pusher for ``req.target``; a str return is a ready reply, not a result."""
+    from tools.untrusted import single_line as _safe
+
+    suite_id, target, apply = req.suite_id, req.target, req.apply
+    section_name = req.section_name
+    verb = "Pushing" if apply else "Previewing"
+    if target != "testrail":
+        from tools import xray_pusher
+
+        await _emit(progress, "\U0001f4e4 " + verb + " to Xray…")
+        return await xray_pusher.push_suite(suite, dry_run=not apply)
+    try:
+        project_id = int(req.project_id or 0)
+    except (TypeError, ValueError, OverflowError):
+        project_id = 0
+    if project_id <= 0:
+        return (
+            "⚠️ TestRail needs the numeric project id: "
+            '`qa_push_suite(suite_id="'
+            + _safe(suite_id, 80)
+            + '", target="testrail", project_id=<id>)`. '
+            "It is the number in the TestRail URL for that project."
+        )
+    from tools import testrail_pusher
+
+    await _emit(progress, "\U0001f4e4 " + verb + " to TestRail…")
+    return await testrail_pusher.push_suite(
+        suite,
+        project_id,
+        section_name=(section_name or "QA Assistant Export"),
+        dry_run=not apply,
+    )
+
+
+def _push_suite_reply(
+    content: dict,
+    req: _PushRequest,
+    *,
+    enabled: bool,
+    flag_name: str,
+    total: int,
+) -> str:
+    """Format the preview or the pushed reply, with the batch-cap note."""
+    from tools.untrusted import single_line as _safe
+
+    suite_id, target, apply = req.suite_id, req.target, req.apply
+
+    pushed = int(content.get("pushed") or 0)
+    skipped = int(content.get("skipped") or 0)
+    would = int(content.get("would_push") or 0)
+    # The pushers cap the case list BEFORE counting, so `would_push`/`pushed` can
+    # never reveal the truncation on their own -- compare against the suite.
+    counted = would if not apply else pushed + skipped
+    cap_note = ""
+    if total and counted and counted < total:
+        cap_note = (
+            "\n\n⚠️ Only the first "
+            + str(counted)
+            + " of "
+            + str(total)
+            + " cases were included — this pusher caps the batch. The rest were "
+            "NOT sent."
+        )
+    if not apply:
+        return (
+            "## Push preview — "
+            + target
+            + "\n\n**Nothing was sent.** "
+            + str(would)
+            + " case(s) from suite `"
+            + _safe(suite_id, 80)
+            + "` would be created"
+            + (
+                " under section '" + _safe(content.get("section_name"), 60) + "'"
+                if content.get("section_name")
+                else ""
+            )
+            + ".\n\nRe-run with `apply=true` to push for real"
+            + ("" if enabled else " (needs `" + flag_name + "=true` first)")
+            + "."
+            + cap_note
+        )
+    created = content.get("case_ids") or content.get("issue_keys") or []
+    return (
+        "✅ Pushed **"
+        + str(pushed)
+        + "** case(s) to "
+        + target
+        + (" (" + str(skipped) + " skipped)" if skipped else "")
+        + ".\n\n"
+        + (
+            "- created: `" + _safe(", ".join(str(c) for c in created[:20]), 300) + "`\n"
+            if created
+            else ""
+        )
+        + "\nThis left your organisation and **nothing here deletes those cases — "
+        "remove them in " + target + " if this was a mistake.**" + cap_note
+    )
+
+
 async def handle_push_suite(
     suite_id: str,
     target: str,
@@ -13275,14 +13627,6 @@ async def handle_push_suite(
     from tools.untrusted import single_line as _safe
 
     target = (target or "").strip().lower()
-    if target not in _PUSH_TARGETS:
-        return (
-            "\u26a0\ufe0f Unknown push target "
-            + repr(_safe(target, 40))
-            + ". Choose one of: "
-            + ", ".join(_PUSH_TARGETS)
-            + "."
-        )
     flag_name = (
         "QA_TESTRAIL_PUSH_ENABLED" if target == "testrail" else "QA_XRAY_PUSH_ENABLED"
     )
@@ -13291,15 +13635,9 @@ async def handle_push_suite(
         if target == "testrail"
         else settings.qa_xray_push_enabled
     )
-    if apply and not enabled:
-        return (
-            "\u26a0\ufe0f **Nothing was sent.** A real push to "
-            + target
-            + " needs `"
-            + flag_name
-            + "=true` in `.env` and an MCP server restart. Re-run with `apply=false` "
-            "for a preview of exactly what would be created."
-        )
+    refusal = _push_suite_refusal(target, apply, enabled, flag_name)
+    if refusal:
+        return refusal
     suite_id = (suite_id or "").strip()
     if not suite_id:
         return await _recent_suites_markdown("qa_push_suite")
@@ -13317,44 +13655,10 @@ async def handle_push_suite(
             # F21: same two facts as qa_export_suite, said apart.
             return _suite_unreadable_reply(suite_id, loaded)
         total = len(getattr(suite, "test_cases", []) or [])
-        if target == "testrail":
-            try:
-                project_id = int(project_id or 0)
-            except (TypeError, ValueError, OverflowError):
-                project_id = 0
-            if project_id <= 0:
-                return (
-                    "\u26a0\ufe0f TestRail needs the numeric project id: "
-                    '`qa_push_suite(suite_id="'
-                    + _safe(suite_id, 80)
-                    + '", target="testrail", project_id=<id>)`. '
-                    "It is the number in the TestRail URL for that project."
-                )
-            from tools import testrail_pusher
-
-            await _emit(
-                progress,
-                "\U0001f4e4 "
-                + ("Pushing" if apply else "Previewing")
-                + " to TestRail\u2026",
-            )
-            result = await testrail_pusher.push_suite(
-                suite,
-                project_id,
-                section_name=(section_name or "QA Assistant Export"),
-                dry_run=not apply,
-            )
-        else:
-            from tools import xray_pusher
-
-            await _emit(
-                progress,
-                "\U0001f4e4 "
-                + ("Pushing" if apply else "Previewing")
-                + " to Xray\u2026",
-            )
-            result = await xray_pusher.push_suite(suite, dry_run=not apply)
-
+        req = _PushRequest(suite_id, target, apply, project_id, section_name)
+        result = await _push_suite_cases(suite, req, progress)
+        if isinstance(result, str):
+            return result
         if result.get("error"):
             return "\u26a0\ufe0f " + _safe(result["error"], 400)
         content = result.get("content") or {}
@@ -13372,59 +13676,130 @@ async def handle_push_suite(
                 "would_push": would,
             },
         )
-        # The pushers cap the case list BEFORE counting, so `would_push`/`pushed` can
-        # never reveal the truncation on their own -- compare against the suite.
-        counted = would if not apply else pushed + skipped
-        cap_note = ""
-        if total and counted and counted < total:
-            cap_note = (
-                "\n\n\u26a0\ufe0f Only the first "
-                + str(counted)
-                + " of "
-                + str(total)
-                + " cases were included \u2014 this pusher caps the batch. The rest were "
-                "NOT sent."
-            )
-        if not apply:
-            return (
-                "## Push preview \u2014 "
-                + target
-                + "\n\n**Nothing was sent.** "
-                + str(would)
-                + " case(s) from suite `"
-                + _safe(suite_id, 80)
-                + "` would be created"
-                + (
-                    " under section '" + _safe(content.get("section_name"), 60) + "'"
-                    if content.get("section_name")
-                    else ""
-                )
-                + ".\n\nRe-run with `apply=true` to push for real"
-                + ("" if enabled else " (needs `" + flag_name + "=true` first)")
-                + "."
-                + cap_note
-            )
-        created = content.get("case_ids") or content.get("issue_keys") or []
-        return (
-            "\u2705 Pushed **"
-            + str(pushed)
-            + "** case(s) to "
-            + target
-            + (" (" + str(skipped) + " skipped)" if skipped else "")
-            + ".\n\n"
-            + (
-                "- created: `"
-                + _safe(", ".join(str(c) for c in created[:20]), 300)
-                + "`\n"
-                if created
-                else ""
-            )
-            + "\nThis left your organisation and **nothing here deletes those cases \u2014 "
-            "remove them in " + target + " if this was a mistake.**" + cap_note
+        return _push_suite_reply(
+            content, req, enabled=enabled, flag_name=flag_name, total=total
         )
     except Exception as exc:  # never-raise contract
         logger.exception("mcp push_suite failed")
         return "\u26a0\ufe0f Push to " + target + " failed: " + _safe(str(exc), 200)
+
+
+async def _mobile_resume_device_lock(run_id: str, token: str, budget: object) -> str:
+    # Function-local imports, like handle_mobile_test: tools.mobile is absent
+    # from the distribution build.
+    from tools.mobile import render as mobile_render
+    from tools.mobile import session
+
+    # THE DEVICE LOCK, RE-ACQUIRED ON EVERY RESUME. The MCP process
+    # restarts on every code and `.env` edit and a run survives that on
+    # disk, so a resumed run has to take the lock again -- the kernel
+    # dropped the old one when the old process died. Idempotent for a
+    # run this process already holds: no syscall, no write.
+    #
+    # THE HEARTBEAT STARTS BEFORE THE LOCK, and the order is the
+    # fix, not a detail. It used to start after
+    # `_mobile_resume_device_stage`, which returns POINTER replies ("the
+    # emulator is still starting", a re-run preflight) -- so a resume
+    # that hit one of those held the device with `heartbeat._WRITERS`
+    # still empty, and nothing in this process could ever give it back.
+    # Abandon that chat and the emulator is dead to every other process
+    # until the server restarts, which is precisely the hazard this
+    # design refuses to accept for the pre-run phase.
+    #
+    # Starting it first is safe: this chat already holds the run's LEASE
+    # (checked by the caller), which is the only thing the writer refreshes.
+    _mobile_start_heartbeat(run_id, token)
+    # The device this run is on comes from its own manifest, inside
+    # `take_device_lock`: a resume must hold the device it recorded, not
+    # whatever is attached now.
+    taken = (session.take_device_lock(run_id, lease=token) or {}).get("content") or {}
+    if not taken.get("acquired"):
+        return mobile_render.device_busy_block(taken)
+    device = await _mobile_resume_device_stage(run_id, budget=budget)
+    if device:
+        return device
+    # A REBOOTED EMULATOR COMES BACK ON A DIFFERENT SERIAL, and the
+    # stage above writes the fresh one to the manifest. The lock taken a
+    # moment ago names the OLD device, so re-take: the acquire is a
+    # no-op when nothing moved, and when something did it takes the real
+    # device and drops the stale hold rather than driving a device this
+    # run does not own.
+    retaken = (session.take_device_lock(run_id, lease=token) or {}).get("content") or {}
+    if not retaken.get("acquired"):
+        return mobile_render.device_busy_block(retaken)
+    return ""
+
+
+async def _mobile_release_lost_run(run_id: str, claimed: dict) -> str:
+    from tools.mobile import render as mobile_render
+    from tools.mobile import run_store, session
+
+    held = claimed.get("content") or {}
+    # Displaced. Give the device back NOW rather than waiting
+    # for this process's heartbeat writer to notice on its next
+    # beat: this is the holder releasing its own lock,
+    # synchronously, in the call that learned it lost the run.
+    #
+    # PRESENT THIS CHAT'S OWN LEASE. This branch has just been told
+    # it lost the run, so it must NOT claim holder authority: if the
+    # lock is held under this chat's token the release is right, and
+    # if it is held under the NEW holder's token it must be refused.
+    # Passing nothing used to mean `as_holder=True`, which released
+    # the lock the current holder was driving under.
+    await session.finish_device(
+        run_id,
+        lease=str((claimed.get("content") or {}).get("session_token") or ""),
+    )
+    return mobile_render.takeover_block(
+        run_store.takeover_message(run_id, str(held.get("holder") or "?"))
+    )
+
+
+async def _mobile_resume(
+    run_id: str,
+    session_token: str,
+    *,
+    continue_run: bool,
+    budget: object,
+    progress: ProgressCb,
+) -> str:
+    # An existing run: lease first, then the device, then the next packet.
+    from tools.mobile import render as mobile_render
+    from tools.mobile import run_store, session
+    from tools.untrusted import single_line as _safe
+
+    claimed = session.claim(run_id, session_token, force=not session_token)
+    if claimed.get("error"):
+        return "\u26a0\ufe0f " + _safe(claimed["error"], 300)
+    held = claimed.get("content") or {}
+    if held.get("state") != run_store.HELD:
+        return await _mobile_release_lost_run(run_id, claimed)
+    token = str(held.get("session_token") or "")
+    # A resume can arrive days later, in a new chat, on a machine that
+    # has rebooted since: check the DEVICE before producing a packet for
+    # it. Deliberately AFTER the lease check, so a displaced chat can
+    # never boot an emulator it does not own or take its lock.
+    blocked = await _mobile_resume_device_lock(run_id, token, budget)
+    if blocked:
+        return blocked
+    resolved = session.resolve(run_id, token)
+    if resolved.get("error"):
+        return "\u26a0\ufe0f " + _safe(resolved["error"], 400)
+    body = resolved["content"] or {}
+    if body.get("gate") and not continue_run:
+        return mobile_render.gate_block(
+            {
+                "done": body.get("done"),
+                "total": body.get("total"),
+                "failed": body.get("failed"),
+            }
+        )
+    # `past_gate` rides along: without it the gate is re-decided inside
+    # _mobile_next, which does not know the tester already answered, and
+    # the run never advances past case 20.
+    return await _mobile_next(
+        run_id, token, progress=progress, past_gate=continue_run, budget=budget
+    )
 
 
 async def handle_mobile_test(
@@ -13481,8 +13856,7 @@ async def handle_mobile_test(
     if not _mobile_lane_enabled():
         return _mobile_lane_off_message()
 
-    from tools.mobile import render as mobile_render
-    from tools.mobile import run_store, session
+    from tools.mobile import session
 
     try:
         budget = session.new_budget()
@@ -13496,103 +13870,17 @@ async def handle_mobile_test(
 
         # --- an existing run: lease first, then the next packet ------------
         if run_id:
-            claimed = session.claim(run_id, session_token, force=not session_token)
-            if claimed.get("error"):
-                return "⚠️ " + _safe(claimed["error"], 300)
-            held = claimed.get("content") or {}
-            if held.get("state") != run_store.HELD:
-                # Displaced. Give the device back NOW rather than waiting
-                # for this process's heartbeat writer to notice on its next
-                # beat: this is the holder releasing its own lock,
-                # synchronously, in the call that learned it lost the run.
-                #
-                # PRESENT THIS CHAT'S OWN LEASE. This branch has just been told
-                # it lost the run, so it must NOT claim holder authority: if the
-                # lock is held under this chat's token the release is right, and
-                # if it is held under the NEW holder's token it must be refused.
-                # Passing nothing used to mean `as_holder=True`, which released
-                # the lock the current holder was driving under.
-                await session.finish_device(
-                    run_id,
-                    lease=str(
-                        (claimed.get("content") or {}).get("session_token") or ""
-                    ),
-                )
-                return mobile_render.takeover_block(
-                    run_store.takeover_message(run_id, str(held.get("holder") or "?"))
-                )
-            token = str(held.get("session_token") or "")
-            # A resume can arrive days later, in a new chat, on a machine that
-            # has rebooted since: check the DEVICE before producing a packet for
-            # it. Deliberately AFTER the lease check, so a displaced chat can
-            # never boot an emulator it does not own.
-            # THE DEVICE LOCK, RE-ACQUIRED ON EVERY RESUME. The MCP process
-            # restarts on every code and `.env` edit and a run survives that on
-            # disk, so a resumed run has to take the lock again -- the kernel
-            # dropped the old one when the old process died. Idempotent for a
-            # run this process already holds: no syscall, no write.
-            #
-            # AFTER the lease check, for the reason the comment below gives: a
-            # displaced chat must never be able to take the device.
-            # THE HEARTBEAT STARTS BEFORE THE LOCK, and the order is the
-            # fix, not a detail. It used to start after
-            # `_mobile_resume_device_stage`, which returns POINTER replies ("the
-            # emulator is still starting", a re-run preflight) -- so a resume
-            # that hit one of those held the device with `heartbeat._WRITERS`
-            # still empty, and nothing in this process could ever give it back.
-            # Abandon that chat and the emulator is dead to every other process
-            # until the server restarts, which is precisely the hazard this
-            # design refuses to accept for the pre-run phase.
-            #
-            # Starting it first is safe: this chat already holds the run's LEASE
-            # (checked above), which is the only thing the writer refreshes.
-            _mobile_start_heartbeat(run_id, token)
-            # The device this run is on comes from its own manifest, inside
-            # `take_device_lock`: a resume must hold the device it recorded, not
-            # whatever is attached now.
-            taken = (session.take_device_lock(run_id, lease=token) or {}).get(
-                "content"
-            ) or {}
-            if not taken.get("acquired"):
-                return mobile_render.device_busy_block(taken)
-            device = await _mobile_resume_device_stage(run_id, budget=budget)
-            if device:
-                return device
-            # A REBOOTED EMULATOR COMES BACK ON A DIFFERENT SERIAL, and the
-            # stage above writes the fresh one to the manifest. The lock taken a
-            # moment ago names the OLD device, so re-take: the acquire is a
-            # no-op when nothing moved, and when something did it takes the real
-            # device and drops the stale hold rather than driving a device this
-            # run does not own.
-            retaken = (session.take_device_lock(run_id, lease=token) or {}).get(
-                "content"
-            ) or {}
-            if not retaken.get("acquired"):
-                return mobile_render.device_busy_block(retaken)
-            resolved = session.resolve(run_id, token)
-            if resolved.get("error"):
-                return "⚠️ " + _safe(resolved["error"], 400)
-            body = resolved["content"] or {}
-            if body.get("gate") and not continue_run:
-                return mobile_render.gate_block(
-                    {
-                        "done": body.get("done"),
-                        "total": body.get("total"),
-                        "failed": body.get("failed"),
-                    }
-                )
-            # `past_gate` rides along: without it the gate is re-decided inside
-            # _mobile_next, which does not know the tester already answered, and
-            # the run never advances past case 20.
-            return await _mobile_next(
+            return await _mobile_resume(
                 run_id,
-                token,
-                progress=progress,
-                past_gate=continue_run,
+                session_token,
+                continue_run=continue_run,
                 budget=budget,
+                progress=progress,
             )
 
         # --- a new run: device, app, preflight, then the menu --------------
+        # The body lives in `_mobile_new_run`; the notes on WHY the lock is
+        # taken where it is stay here, with the call that starts the sequence.
         # THE LOCK IS TAKEN BEFORE THE DEVICE STAGE. Booting, downloading and
         # installing are device-touching too, and they run before any run_id
         # exists -- so the lock is held under a label THIS CALL mints, and
@@ -13617,173 +13905,299 @@ async def handle_mobile_test(
         # `adb devices` answer, so serialising two calls that read the same
         # state produces the same outcome twice. See
         # `.claude/plans/plan-emulator-lock-2026-09-04.md` §5.2.
-        # THE SOURCE IS PICKED BEFORE ANY DEVICE WORK (fix round 2, item 3).
-        # The menu is a question about the arguments, not the device, and it
-        # used to be asked LAST -- after the device was selected and locked,
-        # the locale read, the app resolved and launched and the preflight run
-        # -- so a bare "what should the emulator run?" cost 50 s on the Air,
-        # and up to the boot wait on a cold emulator. `_mobile_pick_source`
-        # touches no device (it elicits through `choose` at most), so moving it
-        # here changes the order of questions only: source, then device.
-        picked = await _mobile_pick_source(
-            source,
-            suite_id=suite_id,
-            goal=goal,
-            cases=cases,
-            choose=choose,
-        )
-        # An INSTALL-menu key in `source` (`play_store`, `installed_package`,
-        # ...) answers the app question, not this one: that call still runs
-        # the device and app stages first and is asked this menu after them,
-        # exactly as before the move.
-        install_only = bool(
-            mobile_render.install_source_for_label(str(source or "").strip())
-        )
-        if not picked and not install_only:
-            # Two start arguments implying different lanes ask the NARROW
-            # question; nothing given asks the menu. One entry point, so a
-            # conflict cannot be rendered by an untested path.
-            # `source` reaches here ONLY when it matched no option key --
-            # `_mobile_pick_source` returns the key for everything it
-            # recognises -- so passing it cannot mislabel a good answer.
-            return mobile_render.source_menu_markdown(
-                conflict=mobile_render.implied_sources(
-                    suite_id=suite_id, goal=goal, cases=cases
-                ),
-                unmatched=source,
-            )
-        pre_run_owner = session.new_provisioning_owner()
-        # SELECTION FIRST, THEN THE DEVICE. Choosing is a question about the
-        # machine -- it reads `adb devices` and may spawn the shared emulator --
-        # so it is serialised under the lane's select lock, which is the lock
-        # this line has always taken. Driving is a question about ONE device, so
-        # the moment the stage names one this call takes that device's own lock
-        # and hands selection back. Two runs on two devices then overlap through
-        # the install, the preflight and the whole run; two runs on ONE device
-        # still serialise, on the device lock, exactly as they did before.
-        taken = (session.take_select_lock(pre_run_owner) or {}).get("content") or {}
-        if not taken.get("acquired"):
-            return mobile_render.device_busy_block(taken)
-        handed_off = False
-        try:
-            staged, serial = await _mobile_device_stage(
-                apply,
-                serial=serial,
-                avd=avd,
-                locale=locale,
-                choose=choose,
-                progress=progress,
-            )
-            if staged:
-                return staged
-            held = (session.take_device_lock(pre_run_owner, serial=serial) or {}).get(
-                "content"
-            ) or {}
-            held, idle_note = await _mobile_retake_after_idle(
-                held, pre_run_owner, serial
-            )
-            if not held.get("acquired"):
-                return mobile_render.device_busy_block(held)
-            # Given back BEFORE the long steps, not after, or the concurrency
-            # this sequencing exists for would be nominal: install and preflight
-            # are the minutes, and they touch only the device now named.
-            session.release_select_lock(pre_run_owner)
-            # THE LANGUAGE, applied and CONFIRMED before anything is installed or
-            # replayed. A run whose report says Arabic over English screens is
-            # the success-shaped reply this lane refuses everywhere else, so a
-            # request that did not take stops here instead. Inside the same
-            # `try`, so the `finally` below still gives the device back.
-            locale_stage, locale_taken = await _mobile_locale_stage(
-                serial, locale, apply
-            )
-            if locale_stage:
-                return locale_stage
-            # T6.1: BETWEEN locale and install -- the device is addressable,
-            # the language is settled, and nothing has been installed yet, so
-            # a tester who declines here has spent no minutes. Inside the same
-            # `try` as every other stage, so the `finally` below still gives
-            # the device back.
-            capture_stage, capture_result = await _mobile_capture_stage(
-                serial, apply, capture, capture_ack, owner=pre_run_owner
-            )
-            if capture_stage:
-                return capture_stage
-            if apply:
-                from tools.mobile import u2_consent
-
-                # Item 4: asked once per device per server, only when the helper
-                # is importable and not yet on; a no never blocks the run.
-                await u2_consent.offer(serial, _mobile_ask(choose))
-            app_stage, target = await _mobile_app_stage(
-                serial, package, source, app, apply, progress=progress, choose=choose
-            )
-            if app_stage:
-                return app_stage
-            if target:
-                # D3: bring the confirmed app to the foreground before the
-                # preflight/first packet, so the first screen shown is the
-                # app the tester asked to test rather than whatever the
-                # emulator already had up -- matters most for
-                # `installed_package`, whose app never goes through an
-                # install step that would have launched it. Best-effort: a
-                # launch failure here is not fatal, preflight still runs.
-                from tools.mobile import adb as mobile_adb
-
-                await mobile_adb.launch(serial, target)
-            reset_stage, reset_result = await _mobile_reset_app_stage(
-                serial, target, reset_app, apply
-            )
-            if reset_stage:
-                return reset_stage
-            checked = await session.preflight_for({"package": target, "serial": serial})
-            if checked.get("error"):
-                return "⚠️ " + _safe(checked["error"], 300)
-            from tools.mobile import preflight as mobile_preflight
-
-            pf = checked.get("content") or {}
-            if not pf.get("ok"):
-                return mobile_render.preflight_block(pf, mobile_preflight.render(pf))
-            if not picked:
-                # Only an install-only call gets here (see the source pick
-                # above): its run menu was deferred past the app stage.
-                return mobile_render.source_menu_markdown(
-                    conflict=mobile_render.implied_sources(
-                        suite_id=suite_id, goal=goal, cases=cases
-                    ),
-                    unmatched=source,
-                )
-            reply, handed_off = await _mobile_start(
-                picked,
+        return await _mobile_new_run(
+            _MobileTestRequest(
+                source=source,
                 suite_id=suite_id,
                 goal=goal,
                 cases=cases,
-                charter=charter,
-                package=target,
+                app=app,
+                package=package,
+                apply=apply,
                 serial=serial,
-                pre_run_owner=pre_run_owner,
-                progress=progress,
+                avd=avd,
                 new_run=new_run,
-                locale=locale_taken,
-                capture=capture_result,
-                reset_app=reset_result,
+                locale=locale,
+                capture=capture,
+                capture_ack=capture_ack,
+                reset_app=reset_app,
+                charter=charter,
+                choose=choose,
+                progress=progress,
             )
-            return idle_note + await _mobile_heavy_avd_note(serial) + reply
-        finally:
-            if not handed_off:
-                # Only ever THIS call's own label, so a sibling call's hold
-                # cannot be released here. `as_holder` is stated because the
-                # placeholder has no lease to present -- this call minted the
-                # label and is unambiguously its owner.
-                # The pre-run placeholder never typed, so the restore
-                # inside this is a reported no-op. It goes through the
-                # same door anyway, so the "no direct release in this
-                # file" pin can be absolute rather than a list of
-                # exceptions somebody has to keep correct.
-                await session.finish_device(pre_run_owner, as_holder=True)
+        )
     except Exception as exc:  # never-raise contract
         logger.exception("mcp mobile_test failed")
         _capture_error(exc, "qa_mobile_test")
         return "⚠️ The mobile run could not continue: " + _safe(str(exc), 200)
+
+
+@dataclass(frozen=True)
+class _MobileTestRequest:
+    """Every start argument of ``handle_mobile_test``, for the new-run helpers."""
+
+    source: str
+    suite_id: str
+    goal: str
+    cases: str
+    app: str
+    package: str
+    apply: bool
+    serial: str
+    avd: str
+    new_run: bool
+    locale: str
+    capture: str
+    capture_ack: bool
+    reset_app: bool
+    charter: str
+    choose: ChooseCb
+    progress: ProgressCb
+
+    def source_menu(self) -> str:
+        """The source menu (or the narrow conflict question) for these arguments."""
+        from tools.mobile import render as mobile_render
+
+        return mobile_render.source_menu_markdown(
+            conflict=mobile_render.implied_sources(
+                suite_id=self.suite_id, goal=self.goal, cases=self.cases
+            ),
+            unmatched=self.source,
+        )
+
+    def start_kwargs(self) -> dict:
+        """The request-owned keyword arguments ``_mobile_start`` takes."""
+        return {
+            "suite_id": self.suite_id,
+            "goal": self.goal,
+            "cases": self.cases,
+            "charter": self.charter,
+            "progress": self.progress,
+            "new_run": self.new_run,
+        }
+
+
+async def _mobile_pick_or_menu(req: _MobileTestRequest) -> tuple[str, str]:
+    """``(picked, menu_reply)``: the source key, or the menu to send back.
+
+    No device work happens here, and the menu is shown before any lock."""
+    from tools.mobile import render as mobile_render
+
+    # THE SOURCE IS PICKED BEFORE ANY DEVICE WORK (fix round 2, item 3).
+    # The menu is a question about the arguments, not the device, and it
+    # used to be asked LAST -- after the device was selected and locked,
+    # the locale read, the app resolved and launched and the preflight run
+    # -- so a bare "what should the emulator run?" cost 50 s on the Air,
+    # and up to the boot wait on a cold emulator. `_mobile_pick_source`
+    # touches no device (it elicits through `choose` at most), so moving it
+    # here changes the order of questions only: source, then device.
+    picked = await _mobile_pick_source(
+        req.source,
+        suite_id=req.suite_id,
+        goal=req.goal,
+        cases=req.cases,
+        choose=req.choose,
+    )
+    # An INSTALL-menu key in `source` (`play_store`, `installed_package`,
+    # ...) answers the app question, not this one: that call still runs
+    # the device and app stages first and is asked this menu after them,
+    # exactly as before the move.
+    install_only = bool(
+        mobile_render.install_source_for_label(str(req.source or "").strip())
+    )
+    if not picked and not install_only:
+        # Two start arguments implying different lanes ask the NARROW
+        # question; nothing given asks the menu. One entry point, so a
+        # conflict cannot be rendered by an untested path.
+        # `source` reaches here ONLY when it matched no option key --
+        # `_mobile_pick_source` returns the key for everything it
+        # recognises -- so passing it cannot mislabel a good answer.
+        return picked, req.source_menu()
+    return picked, ""
+
+
+async def _mobile_claim_device(req: _MobileTestRequest, owner: str) -> tuple[str, str]:
+    """``(reply, serial)``: stage and lock the device, then give selection back.
+
+    An empty ``serial`` means stop and send ``reply``. Otherwise ``reply`` is
+    the idle-release note to put above the run-start reply (often empty)."""
+    from tools.mobile import render as mobile_render
+    from tools.mobile import session
+
+    staged, serial = await _mobile_device_stage(
+        req.apply,
+        serial=req.serial,
+        avd=req.avd,
+        locale=req.locale,
+        choose=req.choose,
+        progress=req.progress,
+    )
+    if staged:
+        return staged, ""
+    held = (session.take_device_lock(owner, serial=serial) or {}).get("content") or {}
+    held, idle_note = await _mobile_retake_after_idle(held, owner, serial)
+    if not held.get("acquired"):
+        return mobile_render.device_busy_block(held), ""
+    # Given back BEFORE the long steps, not after, or the concurrency
+    # this sequencing exists for would be nominal: install and preflight
+    # are the minutes, and they touch only the device now named.
+    session.release_select_lock(owner)
+    return idle_note, serial
+
+
+async def _mobile_launch_target(serial: str, target: str) -> None:
+    """Bring the confirmed app to the foreground; best-effort."""
+    if target:
+        # D3: bring the confirmed app to the foreground before the
+        # preflight/first packet, so the first screen shown is the
+        # app the tester asked to test rather than whatever the
+        # emulator already had up -- matters most for
+        # `installed_package`, whose app never goes through an
+        # install step that would have launched it. Best-effort: a
+        # launch failure here is not fatal, preflight still runs.
+        from tools.mobile import adb as mobile_adb
+
+        await mobile_adb.launch(serial, target)
+
+
+async def _mobile_preflight_reply(serial: str, target: str) -> str:
+    """The reply that stops the run when preflight fails, or ``""``."""
+    from tools.mobile import preflight as mobile_preflight
+    from tools.mobile import render as mobile_render
+    from tools.mobile import session
+    from tools.untrusted import single_line as _safe
+
+    checked = await session.preflight_for({"package": target, "serial": serial})
+    if checked.get("error"):
+        return "⚠️ " + _safe(checked["error"], 300)
+    pf = checked.get("content") or {}
+    if not pf.get("ok"):
+        return mobile_render.preflight_block(pf, mobile_preflight.render(pf))
+    return ""
+
+
+async def _mobile_offer_u2(req: _MobileTestRequest, serial: str) -> None:
+    """Offer the helper app on an applying call."""
+    if req.apply:
+        from tools.mobile import u2_consent
+
+        # Item 4: asked once per device per server, only when the helper
+        # is importable and not yet on; a no never blocks the run.
+        await u2_consent.offer(serial, _mobile_ask(req.choose))
+
+
+async def _mobile_prepare_app(
+    req: _MobileTestRequest, serial: str, owner: str
+) -> tuple[str, object]:
+    """``(stop_reply, prepared)``: locale, capture, app, launch, reset, preflight.
+
+    ``prepared`` is ``(target, locale_taken, capture_result, reset_result)``;
+    a non-empty ``stop_reply`` means send it back and stop."""
+    # THE LANGUAGE, applied and CONFIRMED before anything is installed or
+    # replayed. A run whose report says Arabic over English screens is
+    # the success-shaped reply this lane refuses everywhere else, so a
+    # request that did not take stops here instead. Inside the same
+    # `try`, so the `finally` below still gives the device back.
+    locale_stage, locale_taken = await _mobile_locale_stage(
+        serial, req.locale, req.apply
+    )
+    if locale_stage:
+        return locale_stage, None
+    # T6.1: BETWEEN locale and install -- the device is addressable,
+    # the language is settled, and nothing has been installed yet, so
+    # a tester who declines here has spent no minutes. Inside the same
+    # `try` as every other stage, so the `finally` below still gives
+    # the device back.
+    capture_stage, capture_result = await _mobile_capture_stage(
+        serial, req.apply, req.capture, req.capture_ack, owner=owner
+    )
+    if capture_stage:
+        return capture_stage, None
+    await _mobile_offer_u2(req, serial)
+    app_stage, target = await _mobile_app_stage(
+        serial,
+        req.package,
+        req.source,
+        req.app,
+        req.apply,
+        progress=req.progress,
+        choose=req.choose,
+    )
+    if app_stage:
+        return app_stage, None
+    await _mobile_launch_target(serial, target)
+    reset_stage, reset_result = await _mobile_reset_app_stage(
+        serial, target, req.reset_app, req.apply
+    )
+    if reset_stage:
+        return reset_stage, None
+    failed = await _mobile_preflight_reply(serial, target)
+    return failed, (target, locale_taken, capture_result, reset_result)
+
+
+async def _mobile_finish_pre_run(owner: str) -> None:
+    """Give back this call's own pre-run hold, for a call that handed nothing off."""
+    from tools.mobile import session
+
+    # Only ever THIS call's own label, so a sibling call's hold
+    # cannot be released here. `as_holder` is stated because the
+    # placeholder has no lease to present -- this call minted the
+    # label and is unambiguously its owner.
+    # The pre-run placeholder never typed, so the restore
+    # inside this is a reported no-op. It goes through the
+    # same door anyway, so the "no direct release in this
+    # file" pin can be absolute rather than a list of
+    # exceptions somebody has to keep correct.
+    await session.finish_device(owner, as_holder=True)
+
+
+async def _mobile_new_run(req: _MobileTestRequest) -> str:
+    """The new-run path: pick the source, claim a device, prepare, start."""
+    from tools.mobile import render as mobile_render
+    from tools.mobile import session
+
+    picked, menu_reply = await _mobile_pick_or_menu(req)
+    if menu_reply:
+        return menu_reply
+    pre_run_owner = session.new_provisioning_owner()
+    # SELECTION FIRST, THEN THE DEVICE. Choosing is a question about the
+    # machine -- it reads `adb devices` and may spawn the shared emulator --
+    # so it is serialised under the lane's select lock, which is the lock
+    # this line has always taken. Driving is a question about ONE device, so
+    # the moment the stage names one this call takes that device's own lock
+    # and hands selection back. Two runs on two devices then overlap through
+    # the install, the preflight and the whole run; two runs on ONE device
+    # still serialise, on the device lock, exactly as they did before.
+    taken = (session.take_select_lock(pre_run_owner) or {}).get("content") or {}
+    if not taken.get("acquired"):
+        return mobile_render.device_busy_block(taken)
+    handed_off = False
+    try:
+        idle_note, serial = await _mobile_claim_device(req, pre_run_owner)
+        if not serial:
+            return idle_note
+        stopped, prepared = await _mobile_prepare_app(req, serial, pre_run_owner)
+        if stopped:
+            return stopped
+        target, locale_taken, capture_result, reset_result = prepared
+        if not picked:
+            # Only an install-only call gets here (see the source pick
+            # above): its run menu was deferred past the app stage.
+            return req.source_menu()
+        reply, handed_off = await _mobile_start(
+            picked,
+            **req.start_kwargs(),
+            package=target,
+            serial=serial,
+            pre_run_owner=pre_run_owner,
+            locale=locale_taken,
+            capture=capture_result,
+            reset_app=reset_result,
+        )
+        return idle_note + await _mobile_heavy_avd_note(serial) + reply
+    finally:
+        if not handed_off:
+            await _mobile_finish_pre_run(pre_run_owner)
 
 
 def _mobile_retake(session, owner: str, serial: str, held: dict) -> dict:
@@ -13928,117 +14342,68 @@ async def _mobile_pick_source(
     return ""
 
 
-async def _mobile_device_stage(
-    apply: bool,
-    *,
-    serial: str = "",
-    avd: str = "",
-    locale: str = "",
-    choose: ChooseCb = None,
-    progress: ProgressCb = None,
-) -> tuple:
-    """Device selection, then -- only if nothing is already booted --
-    the tester's own AVD, or the setup guide. Returns
-    ``(markdown_to_send_back, serial)``.
-
-    A tuple rather than a string because the caller needs the serial and asking
-    for it twice would mean two device probes per call -- and, worse, two
-    answers that could disagree.
-
-    Device selection runs FIRST: an explicit ``serial`` or an already-booted
-    emulator means there is nothing to boot. Only when NOTHING is connected
-    does this look for the tester's AVDs, and spawning still needs
-    ``apply=true``.
-
-    Neither the spawn nor a boot-wait is allowed to block this call: the
-    emulator is started and
-    then polled with an explicit bounded budget, so the reply is always a
-    pointer to ``qa_mobile_status`` rather than a tool call the client kills
-    at its own timeout.
-    """
-    from tools.mobile import emulator, session
+async def _mobile_ensure_ready(serial: str, avd: str = "") -> tuple:
+    """``(markdown_to_send_back, serial)`` for one named device: an empty
+    markdown means the device is ready."""
     from tools.mobile import render as mobile_render
+    from tools.mobile import session
 
-    given_serial = str(serial or "").strip()
-    if given_serial:
-        # BEFORE the device is touched: a serial the tester copied out of
-        # `qa_list_devices` may name an iOS simulator or phone, which this lane
-        # cannot drive. Fails open -- see `_mobile_non_android`.
-        refusal = await _mobile_non_android(given_serial)
-        if refusal:
-            return refusal, ""
-        ready = await session.ensure_device(serial=given_serial, avd=str(avd or ""))
-        if ready.get("error"):
-            return "⚠️ " + str(ready["error"])[:300], ""
-        state = ready.get("content") or {}
-        picked_serial = str(state.get("serial") or "")
-        if str(state.get("state") or "") != "ready":
-            return mobile_render.device_pending_block(state), picked_serial
-        return "", picked_serial
+    ready = await session.ensure_device(serial=serial, avd=avd)
+    if ready.get("error"):
+        return "⚠️ " + str(ready["error"])[:300], ""
+    state = ready.get("content") or {}
+    picked_serial = str(state.get("serial") or "")
+    if str(state.get("state") or "") != "ready":
+        return mobile_render.device_pending_block(state), picked_serial
+    return "", picked_serial
 
-    running = await emulator.list_running()
-    if running.get("error"):
-        return "⚠️ " + str(running["error"])[:300], ""
-    booted = running.get("content") or []
-    if len(booted) == 1:
-        only = booted[0]
-        ready = await session.ensure_device(serial=str(only.get("serial") or ""))
-        if ready.get("error"):
-            return "⚠️ " + str(ready["error"])[:300], ""
-        state = ready.get("content") or {}
-        picked_serial = str(state.get("serial") or "")
-        if str(state.get("state") or "") != "ready":
-            return mobile_render.device_pending_block(state), picked_serial
-        return "", picked_serial
-    if len(booted) > 1:
-        labels = [
-            str(item.get("serial") or "")
-            + " ("
-            + (str(item.get("avd") or "") or "unknown AVD")
-            + ")"
-            for item in booted
-        ]
-        picked = await _elicit_choice(
-            choose,
-            "Several emulators are running. Which one should this run use?",
-            labels,
+
+async def _device_stage_pick(booted: list, choose: ChooseCb) -> tuple:
+    """Several emulators are running: let the tester pick one, then ready it."""
+
+    labels = [
+        str(item.get("serial") or "")
+        + " ("
+        + (str(item.get("avd") or "") or "unknown AVD")
+        + ")"
+        for item in booted
+    ]
+    picked = await _elicit_choice(
+        choose,
+        "Several emulators are running. Which one should this run use?",
+        labels,
+    )
+    if picked.status != CHOSEN:
+        menu = "\n".join(str(i + 1) + ". " + label for i, label in enumerate(labels))
+        return (
+            "## Several emulators are running\n\n"
+            + menu
+            + "\n\nCall `qa_mobile_test` again with `serial` set to the "
+            "one you want.",
+            "",
         )
-        if picked.status != CHOSEN:
-            menu = "\n".join(
-                str(i + 1) + ". " + label for i, label in enumerate(labels)
-            )
-            return (
-                "## Several emulators are running\n\n"
-                + menu
-                + "\n\nCall `qa_mobile_test` again with `serial` set to the "
-                "one you want.",
-                "",
-            )
-        # The label came back from the CLIENT, so the serial in it is not
-        # evidence. Only a serial we actually enumerated may be driven.
-        chosen_serial = str(picked.value or "").split(" ", 1)[0].strip()
-        if chosen_serial not in {str(item.get("serial") or "") for item in booted}:
-            return (
-                "## That device is not one of the running emulators\n\n"
-                "Call `qa_mobile_test` again with `serial` set to one of: "
-                + ", ".join("`" + str(i.get("serial") or "") + "`" for i in booted),
-                "",
-            )
-        ready = await session.ensure_device(serial=chosen_serial)
-        if ready.get("error"):
-            return "⚠️ " + str(ready["error"])[:300], ""
-        state = ready.get("content") or {}
-        picked_serial = str(state.get("serial") or "")
-        if str(state.get("state") or "") != "ready":
-            return mobile_render.device_pending_block(state), picked_serial
-        return "", picked_serial
+    # The label came back from the CLIENT, so the serial in it is not
+    # evidence. Only a serial we actually enumerated may be driven.
+    chosen_serial = str(picked.value or "").split(" ", 1)[0].strip()
+    if chosen_serial not in {str(item.get("serial") or "") for item in booted}:
+        return (
+            "## That device is not one of the running emulators\n\n"
+            "Call `qa_mobile_test` again with `serial` set to one of: "
+            + ", ".join("`" + str(i.get("serial") or "") + "`" for i in booted),
+            "",
+        )
+    return await _mobile_ensure_ready(chosen_serial)
 
+
+async def _device_stage_boot(avd: str, apply: bool, locale: str) -> tuple:
+    """Nothing is booted: show the setup guide, or boot the tester's own AVD."""
     # Nothing booted at all. This server downloads no SDK and makes no AVD unasked
     # (docs/RETIRED_CAPABILITIES.md -> 6), so a machine without them gets the
     # setup guide, and only an AVD the TESTER created can be booted. The one
     # question the guide turns on -- is there an emulator binary -- is asked of
     # the same `locate_sdk` every other SDK consumer asks.
-    from tools.mobile import sdk_locator
+    from tools.mobile import emulator, sdk_locator, session
+    from tools.mobile import render as mobile_render
 
     located = (sdk_locator.locate_sdk() or {}).get("content") or {}
     if not str((located.get("tools") or {}).get("emulator") or ""):
@@ -14087,6 +14452,58 @@ async def _mobile_device_stage(
     if str(state.get("state") or "") != "ready":
         return mobile_render.device_pending_block(state), picked_serial
     return "", picked_serial
+
+
+async def _mobile_device_stage(
+    apply: bool,
+    *,
+    serial: str = "",
+    avd: str = "",
+    locale: str = "",
+    choose: ChooseCb = None,
+    progress: ProgressCb = None,
+) -> tuple:
+    """Device selection, then -- only if nothing is already booted --
+    the tester's own AVD, or the setup guide. Returns
+    ``(markdown_to_send_back, serial)``.
+
+    A tuple rather than a string because the caller needs the serial and asking
+    for it twice would mean two device probes per call -- and, worse, two
+    answers that could disagree.
+
+    Device selection runs FIRST: an explicit ``serial`` or an already-booted
+    emulator means there is nothing to boot. Only when NOTHING is connected
+    does this look for the tester's AVDs, and spawning still needs
+    ``apply=true``.
+
+    Neither the spawn nor a boot-wait is allowed to block this call: the
+    emulator is started and
+    then polled with an explicit bounded budget, so the reply is always a
+    pointer to ``qa_mobile_status`` rather than a tool call the client kills
+    at its own timeout.
+    """
+    from tools.mobile import emulator
+
+    given_serial = str(serial or "").strip()
+    if given_serial:
+        # BEFORE the device is touched: a serial the tester copied out of
+        # `qa_list_devices` may name an iOS simulator or phone, which this lane
+        # cannot drive. Fails open -- see `_mobile_non_android`.
+        refusal = await _mobile_non_android(given_serial)
+        if refusal:
+            return refusal, ""
+        return await _mobile_ensure_ready(given_serial, str(avd or ""))
+
+    running = await emulator.list_running()
+    if running.get("error"):
+        return "⚠️ " + str(running["error"])[:300], ""
+    booted = running.get("content") or []
+    if len(booted) == 1:
+        only = booted[0]
+        return await _mobile_ensure_ready(str(only.get("serial") or ""))
+    if len(booted) > 1:
+        return await _device_stage_pick(booted, choose)
+    return await _device_stage_boot(avd, apply, locale)
 
 
 async def _mobile_locale_stage(serial: str, locale: str, apply: bool) -> tuple:
@@ -14326,6 +14743,95 @@ def _mobile_ask(choose: ChooseCb):
     )
 
 
+async def _mobile_not_installed_reply(
+    serial: str, target: str, suggestions: list[str]
+) -> str:
+    """The "not installed" reply, with whatever hints the device can give."""
+    from tools import device_manager as _device_manager
+    from tools.mobile import run_store as _run_store
+
+    hint = (
+        (" Closest installed match: `" + "`, `".join(suggestions) + "`.")
+        if suggestions
+        else ""
+    )
+    try:
+        installed = await _device_manager.list_installed_apps(
+            {"id": serial, "platform": "android"}
+        )
+        names = [
+            str(app.get("id") or "")
+            for app in (installed.get("content") or [])
+            if isinstance(app, dict) and app.get("id")
+        ]
+        if names:
+            hint += "\n\nInstalled third-party packages: " + ", ".join(names[:20])
+        last = _run_store.last_used_package(serial)
+        if last:
+            hint += "\n\nLast used on this device: `" + last + "`"
+    except Exception:
+        pass
+    return (
+        "⚠️ `"
+        + (target or "(none given)")
+        + "` is not installed on the emulator, so there is nothing to run."
+        + hint
+        + "\n\nPick another install source, or install it and try again."
+    )
+
+
+async def _app_stage_not_installed(
+    serial: str, target: str, probed: bool, suggestions: list[str]
+) -> tuple:
+    """The ``installed_package`` source found no such app: say so, with hints."""
+    # The SECOND absence assertion on this path, and it is reachable with an
+    # unanswered probe exactly as the menu was. Same rule: only a probe that
+    # answered may say the app is not there.
+    if not probed:
+        return (
+            "⚠️ Could not check whether `"
+            + (target or "(none given)")
+            + "` is on the emulator -- the device did not answer, so this "
+            "server will not say either way. Check the emulator is still "
+            "running (`qa_list_devices`) and call `qa_mobile_test` again. "
+            "Nothing was installed or started.",
+            target,
+        )
+    return await _mobile_not_installed_reply(serial, target, suggestions), target
+
+
+async def _app_stage_open_store(
+    serial: str, install_source: str, value: str, target: str
+) -> tuple:
+    """Open the Play Store page (or Firebase App Tester) inside the emulator."""
+    from tools.mobile import adb as mobile_adb
+    from tools.mobile import render as mobile_render
+
+    url = value
+    if install_source == "play_store":
+        url = (
+            value
+            if value.startswith("market://")
+            else "market://details?id=" + (value or target)
+        )
+    if install_source == "app_tester":
+        url = "market://details?id=com.google.android.apps.firebase.appdistribution"
+    opened = await mobile_adb.open_url(serial, url)
+    if opened.get("error"):
+        return "⚠️ " + str(opened["error"])[:300], target
+    return (
+        "## Opened on the emulator\n\nFinish the install in the emulator's own "
+        "UI, then call `qa_mobile_test` again with the app's `package` name and "
+        "`source=installed_package`. Nothing was downloaded by this server."
+        + (
+            "\n\n" + mobile_render.app_tester_hint(mobile_render.APP_TESTER_PACKAGES[0])
+            if install_source == "app_tester"
+            else ""
+        ),
+        target,
+    )
+
+
 async def _mobile_app_stage(
     serial: str,
     package: str,
@@ -14348,7 +14854,6 @@ async def _mobile_app_stage(
     -- Firebase App Tester is reached through the emulator's own Play Store and
     is never redistributed by this project.
     """
-    from tools.mobile import adb as mobile_adb
     from tools.mobile import render as mobile_render
     from tools.mobile import run_store, session
 
@@ -14442,74 +14947,8 @@ async def _mobile_app_stage(
             target,
         )
     if install_source == "installed_package":
-        # The SECOND absence assertion on this path, and it is reachable with an
-        # unanswered probe exactly as the menu was. Same rule: only a probe that
-        # answered may say the app is not there.
-        if not probed:
-            return (
-                "⚠️ Could not check whether `"
-                + (target or "(none given)")
-                + "` is on the emulator -- the device did not answer, so this "
-                "server will not say either way. Check the emulator is still "
-                "running (`qa_list_devices`) and call `qa_mobile_test` again. "
-                "Nothing was installed or started.",
-                target,
-            )
-        from tools import device_manager as _device_manager
-        from tools.mobile import run_store as _run_store
-
-        hint = (
-            (" Closest installed match: `" + "`, `".join(suggestions) + "`.")
-            if suggestions
-            else ""
-        )
-        try:
-            installed = await _device_manager.list_installed_apps(
-                {"id": serial, "platform": "android"}
-            )
-            names = [
-                str(app.get("id") or "")
-                for app in (installed.get("content") or [])
-                if isinstance(app, dict) and app.get("id")
-            ]
-            if names:
-                hint += "\n\nInstalled third-party packages: " + ", ".join(names[:20])
-            last = _run_store.last_used_package(serial)
-            if last:
-                hint += "\n\nLast used on this device: `" + last + "`"
-        except Exception:
-            pass
-        return (
-            "⚠️ `"
-            + (target or "(none given)")
-            + "` is not installed on the emulator, so there is nothing to run."
-            + hint
-            + "\n\nPick another install source, or install it and try again.",
-            target,
-        )
-    url = value
-    if install_source == "play_store":
-        url = (
-            value
-            if value.startswith("market://")
-            else "market://details?id=" + (value or target)
-        )
-    if install_source == "app_tester":
-        url = "market://details?id=com.google.android.apps.firebase.appdistribution"
-    opened = await mobile_adb.open_url(serial, url)
-    if opened.get("error"):
-        return "⚠️ " + str(opened["error"])[:300], target
-    return (
-        "## Opened on the emulator\n\nFinish the install in the emulator's own "
-        "UI, then call `qa_mobile_test` again with the app's `package` name and "
-        "`source=installed_package`. Nothing was downloaded by this server."
-        + (
-            "\n\n" + mobile_render.app_tester_hint(mobile_render.APP_TESTER_PACKAGES[0])
-            if install_source == "app_tester"
-            else ""
-        ),
-        target,
-    )
+        return await _app_stage_not_installed(serial, target, probed, suggestions)
+    return await _app_stage_open_store(serial, install_source, value, target)
 
 
 async def _mobile_avd_of(serial: str) -> str:
@@ -14532,6 +14971,134 @@ async def _mobile_avd_of(serial: str) -> str:
     except Exception:  # pragma: no cover - the planners default without it
         logger.debug("mobile: could not read the AVD name for a serial")
         return ""
+
+
+def _mobile_resume_hint() -> str:
+    """The reply for the "resume" start-menu choice: a pointer, never a run."""
+    from tools.mobile import session
+    from tools.untrusted import single_line as _safe
+
+    return "⚠️ To resume, call `qa_mobile_test` with the `run_id`. " + _safe(
+        (
+            "Recent runs: "
+            + ", ".join(
+                "`" + str(row.get("run_id")) + "`"
+                for row in ((session.list_runs(5) or {}).get("content") or [])
+            )
+        )
+        or "No runs have been recorded on this machine yet.",
+        400,
+    )
+
+
+@dataclass(frozen=True)
+class _MobileStartContext:
+    """What `_mobile_start` has already resolved by the time a path runs."""
+
+    package: str
+    serial: str
+    avd: str
+    device_facts: dict
+    locale: object
+    capture: object
+    reset_app: object
+    owner: str
+    progress: ProgressCb = None
+
+
+def _mobile_charter_intake(parsed: dict, package: str) -> str:
+    """The charter-intake packet plus the once-per-chat tool brief."""
+    from agents import mobile_run as mobile_run_agent
+    from tools.mobile import render as mobile_render
+
+    # The intake is the FIRST mobile packet and has no run to memoise
+    # a briefing on, so it always carries the mobile brief (same
+    # heading `_mobile_packet_text` uses).
+    return (
+        mobile_render.packet_block(
+            mobile_run_agent.build_charter_intake(
+                package=package, charter=parsed.get("raw") or {}
+            )
+        )
+        + "\n\n### Tool brief (sent once per chat)\n"
+        + MOBILE_BRIEF.strip()
+    )
+
+
+def _mobile_plan_explore(goal: str, parsed: dict, ctx: _MobileStartContext) -> dict:
+    """Plan the explore run from the RAW charter body (see the note below)."""
+    from tools.mobile import session
+
+    # THE RAW (schema-stripped) BODY, never the normalised `terms`.
+    # `new_state` normalises what it is given, and `normalize` STRIPS
+    # DEFAULTS_KEY/REJECTED_KEY (the anti-spoof strip) and then re-derives
+    # the verdict against a body whose every field is already filled -- so
+    # handing it `terms` records "no defaults used" for EVERY run started
+    # through this handler, including the goal-only start whose whole
+    # justification is that the report names every default it used.
+    # Measured on the merge tree: `terms` -> [], the raw body ->
+    # ['depth','scope','destructive','budget','stop_on']. `parse` already
+    # injected the caller's `goal` into this body, so nothing is lost by
+    # passing it. Normalise ONCE, at the one writer. Graded at the HANDLER
+    # by M14 / test_a_goal_only_start_through_the_handler_names_its_defaults.
+    return session.plan_explore_run(
+        goal,
+        charter=parsed.get("raw") or {},
+        package=ctx.package,
+        serial=ctx.serial,
+        avd=ctx.avd,
+        device=ctx.device_facts,
+        locale=ctx.locale,
+        capture=ctx.capture,
+        reset_app=ctx.reset_app,
+    )
+
+
+async def _mobile_start_explore(
+    charter: str, goal: str, ctx: _MobileStartContext
+) -> tuple[str, bool]:
+    """The "explore" start-menu choice: parse the charter, then plan and hand off."""
+    from tools.mobile import charter as mobile_charter
+    from tools.untrusted import single_line as _safe
+
+    # THE CHARTER (step 4). `charter.parse` is the only reader of the
+    # host-submitted string: size-capped, json.loads only, every field
+    # coerced to the server's typed schema.
+    parsed = mobile_charter.parse(charter, goal=goal)
+    if parsed.get("error"):
+        return "⚠️ " + _safe(parsed["error"], 300), False
+    terms = parsed.get("content") or {}
+    raw_charter = parsed.get("raw") or {}
+    # Audit item 4: the destructive hint reaches the LIVE reply. (Item 5,
+    # an out-of-enum value, never gets this far: `charter.parse` above
+    # refuses it by name, listing the valid choices.) Read off
+    # `raw_charter`, never `terms`: same M11 reason `normalize`'s own
+    # docstring gives.
+    disclosures = mobile_charter.destructive_hint(
+        raw_charter, terms.get("goal") or goal
+    )
+    if not str(terms.get("goal") or ""):
+        # Neither a charter nor a goal: ASK, once, with the SERVER's own
+        # questions, as a packet KIND on this same return path -- never a
+        # tool, because intake is only ever the first packet of a run.
+        # This replaces the bare "give the exploratory goal in a sentence"
+        # refusal. A start that already carries a goal is untouched: it
+        # runs under the default charter, whose defaults the report NAMES.
+        # THE RAW BODY, never `terms`: normalisation fills every field, so
+        # handing the builder the normalised charter makes four of the five
+        # questions read as ANSWERED and the intake asks ONE -- measured.
+        return _mobile_charter_intake(parsed, ctx.package), False
+    planned = _mobile_plan_explore(terms.get("goal") or goal, parsed, ctx)
+    if planned.get("error"):
+        return "⚠️ " + _safe(planned["error"], 300), False
+    handed_text, handed_started = await _mobile_hand_off(
+        str((planned.get("content") or {}).get("run_id") or ""),
+        pre_run_owner=ctx.owner,
+        progress=ctx.progress,
+    )
+    return (
+        (disclosures + "\n\n" + handed_text) if disclosures else handed_text
+    ), handed_started
 
 
 async def _mobile_start(
@@ -14564,27 +15131,8 @@ async def _mobile_start(
     below may release the lock (a run that lands straight on its report), and a
     release under a stale owner label would silently fail and leak the hold.
     """
-    # tools.untrusted, not agents.api_test_agent -- see handle_mobile_test.
-    from tools.mobile import importers as mobile_importers
-    from tools.mobile import render as mobile_render
-    from tools.mobile import session
-    from tools.untrusted import single_line as _safe
-
     if picked == "resume":
-        return (
-            "\u26a0\ufe0f To resume, call `qa_mobile_test` with the `run_id`. "
-            + _safe(
-                (
-                    "Recent runs: "
-                    + ", ".join(
-                        "`" + str(row.get("run_id")) + "`"
-                        for row in ((session.list_runs(5) or {}).get("content") or [])
-                    )
-                )
-                or "No runs have been recorded on this machine yet.",
-                400,
-            )
-        ), False
+        return _mobile_resume_hint(), False
     # ONE PRODUCER, at the one moment a run is created. Kind, model and API
     # level are read here and STORED on the manifest; every later reader --
     # status, the report, a resume in another chat -- reads that record instead
@@ -14601,86 +15149,64 @@ async def _mobile_start(
         mobile_adb.device_facts(serial), _mobile_avd_of(serial)
     )
     device_facts = (facts_result or {}).get("content") or {}
+    ctx = _MobileStartContext(
+        package=package,
+        serial=serial,
+        avd=avd,
+        device_facts=device_facts,
+        locale=locale,
+        capture=capture,
+        reset_app=reset_app,
+        owner=pre_run_owner,
+        progress=progress,
+    )
     if picked == "explore":
-        # THE CHARTER (step 4). `charter.parse` is the only reader of the
-        # host-submitted string: size-capped, json.loads only, every field
-        # coerced to the server's typed schema.
-        from tools.mobile import charter as mobile_charter
+        return await _mobile_start_explore(charter, goal, ctx)
 
-        parsed = mobile_charter.parse(charter, goal=goal)
-        if parsed.get("error"):
-            return "\u26a0\ufe0f " + _safe(parsed["error"], 300), False
-        terms = parsed.get("content") or {}
-        raw_charter = parsed.get("raw") or {}
-        # Audit item 4: the destructive hint reaches the LIVE reply. (Item 5,
-        # an out-of-enum value, never gets this far: `charter.parse` above
-        # refuses it by name, listing the valid choices.) Read off
-        # `raw_charter`, never `terms`: same M11 reason `normalize`'s own
-        # docstring gives.
-        disclosures = mobile_charter.destructive_hint(
-            raw_charter, terms.get("goal") or goal
-        )
-        if not str(terms.get("goal") or ""):
-            # Neither a charter nor a goal: ASK, once, with the SERVER's own
-            # questions, as a packet KIND on this same return path -- never a
-            # tool, because intake is only ever the first packet of a run.
-            # This replaces the bare "give the exploratory goal in a sentence"
-            # refusal. A start that already carries a goal is untouched: it
-            # runs under the default charter, whose defaults the report NAMES.
-            # THE RAW BODY, never `terms`: normalisation fills every field, so
-            # handing the builder the normalised charter makes four of the five
-            # questions read as ANSWERED and the intake asks ONE -- measured.
-            from agents import mobile_run as mobile_run_agent
+    reply, collected, filters = await _mobile_collect_cases(
+        picked, suite_id, cases, progress
+    )
+    if reply:
+        return reply, False
+    return await _mobile_start_suite(picked, collected, filters, ctx, new_run)
 
-            # The intake is the FIRST mobile packet and has no run to memoise
-            # a briefing on, so it always carries the mobile brief (same
-            # heading `_mobile_packet_text` uses).
-            return (
-                mobile_render.packet_block(
-                    mobile_run_agent.build_charter_intake(
-                        package=package, charter=parsed.get("raw") or {}
-                    )
-                )
-                + "\n\n### Tool brief (sent once per chat)\n"
-                + MOBILE_BRIEF.strip(),
-                False,
-            )
-        # THE RAW (schema-stripped) BODY, never the normalised `terms`.
-        # `new_state` normalises what it is given, and `normalize` STRIPS
-        # DEFAULTS_KEY/REJECTED_KEY (the anti-spoof strip) and then re-derives
-        # the verdict against a body whose every field is already filled -- so
-        # handing it `terms` records "no defaults used" for EVERY run started
-        # through this handler, including the goal-only start whose whole
-        # justification is that the report names every default it used.
-        # Measured on the merge tree: `terms` -> [], the raw body ->
-        # ['depth','scope','destructive','budget','stop_on']. `parse` already
-        # injected the caller's `goal` into this body, so nothing is lost by
-        # passing it. Normalise ONCE, at the one writer. Graded at the HANDLER
-        # by M14 / test_a_goal_only_start_through_the_handler_names_its_defaults.
-        planned = session.plan_explore_run(
-            terms.get("goal") or goal,
-            charter=parsed.get("raw") or {},
-            package=package,
-            serial=serial,
-            avd=avd,
-            device=device_facts,
-            locale=locale,
-            capture=capture,
-            reset_app=reset_app,
-        )
-        if planned.get("error"):
-            return "\u26a0\ufe0f " + _safe(planned["error"], 300), False
-        handed_text, handed_started = await _mobile_hand_off(
-            str((planned.get("content") or {}).get("run_id") or ""),
-            pre_run_owner=pre_run_owner,
-            progress=progress,
-        )
+
+def _mobile_rerun_failures_cases() -> tuple[str, list, dict]:
+    """The "rerun_failures" choice: the failed cases of the latest run."""
+    from tools.mobile import session
+    from tools.untrusted import single_line as _safe
+
+    runs = (session.list_runs(1) or {}).get("content") or []
+    if not runs:
         return (
-            (disclosures + "\n\n" + handed_text) if disclosures else handed_text
-        ), handed_started
+            ("\u26a0\ufe0f There is no previous run to re-run failures from."),
+            [],
+            {},
+        )
+    previous = str(runs[0].get("run_id") or "")
+    loaded = session.load_run_cases(previous)
+    if loaded.get("error"):
+        return "\u26a0\ufe0f " + _safe(loaded["error"], 300), [], {}
+    return (
+        "",
+        list(loaded.get("content") or []),
+        {"failed_last_run": previous},
+    )
 
-    collected: list = []
-    filters: dict = {}
+
+async def _mobile_collect_cases(
+    picked: str, suite_id: str, cases: str, progress: ProgressCb
+) -> tuple[str, list, dict]:
+    """The cases a start-menu choice names: ``(reply, collected, filters)``.
+
+    A non-empty *reply* is the whole answer (a menu, a refusal); an empty one
+    means *collected* and *filters* are ready to plan.
+    """
+    from tools.mobile import importers as mobile_importers
+    from tools.mobile import render as mobile_render
+    from tools.mobile import session
+    from tools.untrusted import single_line as _safe
+
     if picked in ("stored_suite", "current_suite"):
         # ONE branch for two menu options, deliberately. This server has no
         # notion of "this chat": the suite generated a moment ago is reached by
@@ -14688,41 +15214,49 @@ async def _mobile_start(
         # lists it first. Two code paths would only differ in their wording,
         # and would drift.
         if not suite_id:
-            return await _recent_suites_markdown("qa_mobile_test"), False
+            return await _recent_suites_markdown("qa_mobile_test"), [], {}
         loaded = await load_suite(suite_id)
         if loaded.get("error") or loaded.get("content") is None:
-            return "\u26a0\ufe0f Could not load suite `" + _safe(
-                suite_id, 80
-            ) + "`.", False
-        collected = list(getattr(loaded["content"], "test_cases", []) or [])
-    elif picked == "own_cases":
+            return (
+                "\u26a0\ufe0f Could not load suite `" + _safe(suite_id, 80) + "`.",
+                [],
+                {},
+            )
+        return "", list(getattr(loaded["content"], "test_cases", []) or []), {}
+    if picked == "own_cases":
         imported = session.import_cases(cases)
         if imported.get("error"):
-            return "\u26a0\ufe0f " + _safe(imported["error"], 400), False
+            return "\u26a0\ufe0f " + _safe(imported["error"], 400), [], {}
         body = imported.get("content") or {}
         collected = list(body.get("cases") or [])
         rejections = mobile_importers.render_rejections(body)
         if not collected:
             return (
-                "\u26a0\ufe0f No case could be read from that, so no run was "
-                "created.\n\n" + rejections
-            ), False
+                (
+                    "\u26a0\ufe0f No case could be read from that, so no run was "
+                    "created.\n\n" + rejections
+                ),
+                [],
+                {},
+            )
         if rejections:
             await _emit(progress, "\u26a0\ufe0f Some rows were not imported.")
-    elif picked == "rerun_failures":
-        runs = (session.list_runs(1) or {}).get("content") or []
-        if not runs:
-            return (
-                "\u26a0\ufe0f There is no previous run to re-run failures from."
-            ), False
-        previous = str(runs[0].get("run_id") or "")
-        loaded = session.load_run_cases(previous)
-        if loaded.get("error"):
-            return "\u26a0\ufe0f " + _safe(loaded["error"], 300), False
-        collected = list(loaded.get("content") or [])
-        filters = {"failed_last_run": previous}
-    else:
-        return mobile_render.source_menu_markdown(), False
+        return "", collected, {}
+    if picked == "rerun_failures":
+        return _mobile_rerun_failures_cases()
+    return mobile_render.source_menu_markdown(), [], {}
+
+
+async def _mobile_start_suite(
+    picked: str,
+    collected: list,
+    filters: dict,
+    ctx: _MobileStartContext,
+    new_run: bool,
+) -> tuple[str, bool]:
+    """Offer the earlier run, else plan the suite run and hand it off."""
+    from tools.mobile import session
+    from tools.untrusted import single_line as _safe
 
     # E5 (2026-09-04): the same cases against the same app, again. Eight runs
     # of ONE case were started in seventeen minutes because nothing said that
@@ -14739,29 +15273,29 @@ async def _mobile_start(
     # that is gone.
     if not new_run:
         existing = session.find_resumable_run(
-            session.case_signature(package, collected)
+            session.case_signature(ctx.package, collected)
         )
         if existing:
             return _mobile_repeat_offer(existing), False
 
     planned = session.plan_suite_run(
         collected,
-        package=package,
-        serial=serial,
+        package=ctx.package,
+        serial=ctx.serial,
         source=picked,
         filters=filters,
-        avd=avd,
-        device=device_facts,
-        locale=locale,
-        capture=capture,
-        reset_app=reset_app,
+        avd=ctx.avd,
+        device=ctx.device_facts,
+        locale=ctx.locale,
+        capture=ctx.capture,
+        reset_app=ctx.reset_app,
     )
     if planned.get("error"):
         return "\u26a0\ufe0f " + _safe(planned["error"], 400), False
     return await _mobile_hand_off(
         str((planned.get("content") or {}).get("run_id") or ""),
-        pre_run_owner=pre_run_owner,
-        progress=progress,
+        pre_run_owner=ctx.owner,
+        progress=ctx.progress,
     )
 
 
@@ -14825,9 +15359,10 @@ async def _mobile_hand_off(
     run lands straight on its report: a release under the placeholder label
     would silently fail and leak the hold.
     """
+    from tools.mobile import knowledge_run, session
     from tools.mobile import render as mobile_render
-    from tools.mobile import session
 
+    await asyncio.to_thread(knowledge_run.init_manifest, run_id, _MOBILE_RUN_ENV.get())
     claimed = session.claim(run_id, "", force=True)
     token = str((claimed.get("content") or {}).get("session_token") or "")
     if claimed.get("error") or not token:
@@ -15143,6 +15678,7 @@ async def _mobile_next(
         # lease this call is driving with, so a chat that has been displaced
         # since cannot free the new holder's device on its way out.
         await session.finish_device(run_id, lease=str(session_token or ""))
+        _mobile_learn_after(run_id)
         listed = session.summary(run_id)
         # The SECOND consumer of the verdict-coverage value, and the one a
         # tester reads to answer "did this run pass". Without it,
@@ -15230,6 +15766,46 @@ async def _mobile_next(
     )
 
 
+def _parse_tester_inputs(tester_inputs: str) -> dict:
+    """The tester's per-field values as a dict; anything unparseable is ``{}``."""
+    if not tester_inputs:
+        return {}
+    try:
+        loaded = json.loads(tester_inputs)
+    except Exception:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _forget_briefing_if_needs_model(run_id: str, case: dict) -> None:
+    """Forget the run's briefing when the replay needed the model.
+
+    A script this server could not parse is the observable signal that the
+    model no longer has the static block in front of it -- a compacted chat, or
+    one that never received it. Forgetting the briefing is what makes the
+    omission self-healing: the very next packet carries the whole block again.
+    Constraint 5 of the contract."""
+    from tools.mobile import case_runner as _case_runner
+    from tools.mobile import run_store
+
+    if str(case.get("status") or "") != _case_runner.NEEDS_MODEL:
+        return
+    run_store.clear_briefing(run_id)
+    run_store.clear_screen(run_id)
+    # A `visual` assert stopped this replay (S1): the model asked to judge THIS
+    # screen, so the next packet carries its picture. The LAST entry only -- the
+    # trace is merged across submits.
+    _trace = case.get("trace") if isinstance(case.get("trace"), list) else []
+    _want = _MOBILE_SHOT_WANT.get()
+    if (
+        _trace
+        and isinstance(_trace[-1], dict)
+        and _trace[-1].get("outcome") == "visual_check"
+        and isinstance(_want, dict)
+    ):
+        _want["visual"] = True
+
+
 async def handle_submit_mobile_step(
     run_id: str,
     tc_id: str = "",
@@ -15299,14 +15875,7 @@ async def handle_submit_mobile_step(
         if not taken.get("acquired"):
             return mobile_render.device_busy_block(taken)
         _mark_mobile_step_held()
-        parsed_inputs: dict = {}
-        if tester_inputs:
-            try:
-                loaded = json.loads(tester_inputs)
-                if isinstance(loaded, dict):
-                    parsed_inputs = loaded
-            except Exception:
-                parsed_inputs = {}
+        parsed_inputs = _parse_tester_inputs(tester_inputs)
         previous_screen_id = str(
             (run_store.latest_screen(run_id) or {}).get("screen_id") or ""
         )
@@ -15348,23 +15917,7 @@ async def handle_submit_mobile_step(
         # what makes the omission self-healing: the very next packet carries the
         # whole block again, at the cost of the one turn that already went wrong
         # rather than of the run. Constraint 5 of the contract.
-        from tools.mobile import case_runner as _case_runner
-
-        if str(case.get("status") or "") == _case_runner.NEEDS_MODEL:
-            run_store.clear_briefing(run_id)
-            run_store.clear_screen(run_id)
-            # A `visual` assert stopped this replay (S1): the model asked to
-            # judge THIS screen, so the next packet carries its picture. The
-            # LAST entry only -- the trace is merged across submits.
-            _trace = case.get("trace") if isinstance(case.get("trace"), list) else []
-            _want = _MOBILE_SHOT_WANT.get()
-            if (
-                _trace
-                and isinstance(_trace[-1], dict)
-                and _trace[-1].get("outcome") == "visual_check"
-                and isinstance(_want, dict)
-            ):
-                _want["visual"] = True
+        _forget_briefing_if_needs_model(run_id, case)
         line = mobile_render.verdict_line(
             case,
             screen=run_store.latest_screen(run_id),
@@ -15437,6 +15990,35 @@ async def handle_submit_mobile_step(
 #: readers drain it.
 _MOBILE_IMAGE_SPECS: ContextVar = ContextVar("_MOBILE_IMAGE_SPECS", default=None)
 
+#: The run-level ``env=`` the tester declared on THIS ``qa_mobile_test`` call,
+#: parsed and validated. ``_mobile_hand_off`` stores it once in the manifest;
+#: a ContextVar because the value has to cross frames that do not carry it.
+_MOBILE_RUN_ENV: ContextVar = ContextVar("_MOBILE_RUN_ENV", default=None)
+
+#: Strong references to in-flight learn tasks (the loop only keeps weak ones).
+_MOBILE_LEARN_TASKS: set = set()
+
+
+def _mobile_learn_after(run_id: str) -> None:
+    """Schedule per-app learning for a finished run. Never raises, never waits."""
+    try:
+        if not run_id or not _mobile_lane_enabled():
+            return
+        from tools.mobile import knowledge_runner, session
+
+        body = (session.resolve(run_id) or {}).get("content") or {}
+        package = str(body.get("package") or "")
+        if not package:
+            return
+        task = asyncio.get_running_loop().create_task(
+            knowledge_runner.after_result(package, run_id)
+        )
+        _MOBILE_LEARN_TASKS.add(task)
+        task.add_done_callback(_MOBILE_LEARN_TASKS.discard)
+    except _MOBILE_TOOL_FAILURES:
+        logger.exception("mcp mobile: could not schedule learning for %s", run_id)
+
+
 #: Armed by ``handle_submit_mobile_step_content`` and marked by
 #: ``handle_submit_mobile_step`` once the call HOLDS the run (claim, then the
 #: device lock). The wrapper saves the call's ``note`` only when it was marked,
@@ -15484,6 +16066,94 @@ _MOBILE_SAME_SCREEN_NOTE = (
 )
 
 
+async def _capture_and_pick_spec(
+    serial: str, packet: object, body: dict, budget: object
+) -> tuple:
+    """``(note, spec)``: capture the screen, retrying a timeout once if the
+    turn's budget has room. ``spec`` is ``None`` when nothing was captured."""
+    from tools.mobile import adb as mobile_adb
+    from tools.mobile import screenshot as mobile_screenshot
+    from tools.mobile import step_timing
+
+    note = mobile_screenshot.CAPTURE_FAILED_NOTE
+    try:
+        shot = await step_timing.timed("screenshot", mobile_screenshot.capture(serial))
+        if (shot or {}).get("timed_out"):
+            # At most ONE retry, and only when the turn's budget has room for it
+            # (fix round 3, item 3): a first timeout already spent up to 30 s,
+            # and a second full wait would overrun the call. The first timeout
+            # is already marked on the call by `adb.screencap` or
+            # `adb.screencap_raw`, so `_tracked` reports it as `timed_out`
+            # whatever the retry does.
+            wait = mobile_screenshot.retry_timeout_s(
+                None if budget is None else budget.remaining(),
+                mobile_adb.DEFAULT_TIMEOUT_S,
+            )
+            if wait is not None:
+                shot = await step_timing.timed(
+                    "screenshot", mobile_adb.screencap(serial, timeout_s=wait)
+                )
+            if (shot or {}).get("timed_out"):
+                # Said as a TIMEOUT, not as the generic failure.
+                note = mobile_screenshot.CAPTURE_TIMED_OUT_NOTE
+        spec = mobile_screenshot.to_spec(
+            (shot or {}).get("content"),
+            run_id=body.get("run_id"),
+            tc_id=(packet.get("tc_id") if isinstance(packet, dict) else ""),
+        )
+    except Exception:  # never-raise: a picture is not a verdict
+        logger.exception("mcp mobile screen capture failed")
+        spec = None
+    return note, spec
+
+
+def _store_mobile_shot(packet: object, body: dict, spec: dict) -> None:
+    """Keep the picture, so the HTML report can show the screen rather than
+    only a drawing of it. The SAME bytes the model was handed.
+
+    Keyed on the packet's `observation_id` -- the look -- and never on a screen
+    id, which is invariant across the turns of a chat. Best-effort exactly like
+    `case_runner`'s `write_screen`: a failure is swallowed, because a lost
+    picture may never cost the tester the packet."""
+    try:
+        from tools.mobile import run_store as mobile_run_store
+
+        mobile_run_store.write_shot(
+            str(body.get("run_id") or ""),
+            str(packet.get("observation_id") or "") if isinstance(packet, dict) else "",
+            spec.get("data"),
+        )
+    except Exception:  # never-raise: a picture is not a verdict
+        logger.exception("mcp mobile screen store failed")
+
+
+async def _mobile_capture_screen_note(
+    packet: object, body: dict, attach: bool, budget: object
+) -> str:
+    """Capture this turn's screen and return the note that says what happened;
+    a captured picture is appended to the image sink when it is to be attached."""
+    from tools.mobile import screenshot as mobile_screenshot
+
+    sink = _MOBILE_IMAGE_SPECS.get()
+    serial = str(body.get("serial") or "")
+    if sink is None:
+        # No image channel on this path. NOT an attempt that failed -- so no
+        # device call is made and the note says exactly that.
+        return mobile_screenshot.NO_IMAGE_CHANNEL_NOTE
+    if not serial:
+        # A run with no device yet (an explore turn before provisioning): there
+        # is nothing to capture FROM.
+        return mobile_screenshot.CAPTURE_FAILED_NOTE
+    note, spec = await _capture_and_pick_spec(serial, packet, body, budget)
+    if spec is None:
+        return note
+    _store_mobile_shot(packet, body, spec)
+    if not attach:
+        return mobile_screenshot.NOT_ATTACHED_NOTE
+    sink.append(spec)
+    return mobile_screenshot.ATTACHED_NOTE
+
+
 async def _mobile_packet_text(
     packet: object,
     session_token: str,
@@ -15506,15 +16176,11 @@ async def _mobile_packet_text(
     Never raises and never loses the packet: a capture that fails, times out,
     or blows up leaves the note saying so and the packet otherwise untouched.
     """
-    from tools.mobile import adb as mobile_adb
     from tools.mobile import render as mobile_render
     from tools.mobile import run_store as mobile_run_store
     from tools.mobile import screenshot as mobile_screenshot
 
     body = resolved if isinstance(resolved, dict) else {}
-    sink = _MOBILE_IMAGE_SPECS.get()
-    serial = str(body.get("serial") or "")
-    spec = None
     # DUMP FIRST (S1). The picture is still taken and stored every step -- the
     # report shows it -- but it goes to the model only when the element list is
     # not enough, or the model asked. A packet without the routing key (not
@@ -15527,82 +16193,7 @@ async def _mobile_packet_text(
     want = _MOBILE_SHOT_WANT.get()
     want = want if isinstance(want, dict) else {}
     attach = bool(unusable or want.get("asked") or want.get("visual"))
-    if sink is None:
-        # No image channel on this path. NOT an attempt that failed -- so no
-        # device call is made and the note says exactly that.
-        note = mobile_screenshot.NO_IMAGE_CHANNEL_NOTE
-    elif not serial:
-        # A run with no device yet (an explore turn before provisioning). There
-        # is nothing to capture FROM, and asking adb would produce a refusal
-        # about a device id where a packet belongs.
-        note = mobile_screenshot.CAPTURE_FAILED_NOTE
-    else:
-        note = mobile_screenshot.CAPTURE_FAILED_NOTE
-        try:
-            from tools.mobile import step_timing
-
-            shot = await step_timing.timed(
-                "screenshot", mobile_screenshot.capture(serial)
-            )
-            if (shot or {}).get("timed_out"):
-                # At most ONE retry, and only when the turn's budget has room
-                # for it (fix round 3, item 3): a first timeout already spent
-                # up to 30 s, and a second full wait would overrun the call.
-                # The first timeout is already marked on the call by
-                # `adb.screencap` or `adb.screencap_raw`, so `_tracked` reports it
-                # as `timed_out` whatever the retry does.
-                wait = mobile_screenshot.retry_timeout_s(
-                    None if budget is None else budget.remaining(),
-                    mobile_adb.DEFAULT_TIMEOUT_S,
-                )
-                if wait is not None:
-                    shot = await step_timing.timed(
-                        "screenshot",
-                        mobile_adb.screencap(
-                            serial,
-                            timeout_s=wait,
-                        ),
-                    )
-                if (shot or {}).get("timed_out"):
-                    # Said as a TIMEOUT, not as the generic failure.
-                    note = mobile_screenshot.CAPTURE_TIMED_OUT_NOTE
-            spec = mobile_screenshot.to_spec(
-                (shot or {}).get("content"),
-                run_id=body.get("run_id"),
-                tc_id=(packet.get("tc_id") if isinstance(packet, dict) else ""),
-            )
-        except Exception:  # never-raise: a picture is not a verdict
-            logger.exception("mcp mobile screen capture failed")
-            spec = None
-        if spec is not None and not attach:
-            note = mobile_screenshot.NOT_ATTACHED_NOTE
-        elif spec is not None:
-            note = mobile_screenshot.ATTACHED_NOTE
-            sink.append(spec)
-        if spec is not None:
-            # ... and keep it, so the HTML report can show the screen rather
-            # than only a drawing of it. The SAME bytes the model was handed:
-            # one screenshot of one look, at one size, two consumers.
-            #
-            # Keyed on the packet's `observation_id` -- the look -- and never on
-            # a screen id, which is invariant across the turns of a chat and
-            # would keep one frame for a whole conversation.
-            #
-            # Best-effort exactly like `case_runner`'s `write_screen`: the
-            # result is deliberately not read and a failure is swallowed here,
-            # because a lost picture may never cost the tester the packet.
-            try:
-                from tools.mobile import run_store as mobile_run_store
-
-                mobile_run_store.write_shot(
-                    str(body.get("run_id") or ""),
-                    str(packet.get("observation_id") or "")
-                    if isinstance(packet, dict)
-                    else "",
-                    spec.get("data"),
-                )
-            except Exception:  # never-raise: a picture is not a verdict
-                logger.exception("mcp mobile screen store failed")
+    note = await _mobile_capture_screen_note(packet, body, attach, budget)
     brief_needed = True
     shown = packet
     if isinstance(shown, dict):
@@ -15728,7 +16319,8 @@ def _mobile_note_target(run_id: str = "", package: str = "") -> tuple:
     return (
         "",
         rid,
-        "pass `package` (or a `run_id`) so it is filed under the right app",
+        "pass `package` (the app's Android package name, or `app` when it is one) "
+        "or a `run_id` so it is filed under the right app",
     )
 
 
@@ -15770,6 +16362,15 @@ def _call_arg(fn: Callable, args: tuple, kwargs: dict, name: str) -> str:
     return str(bound.arguments.get(name) or "")
 
 
+def _mobile_note_spec(note: object) -> dict | None:
+    """The ``note`` parameter as a dict, or ``None`` when it is not a JSON object."""
+    try:
+        spec = json.loads(note) if isinstance(note, str) else note
+    except ValueError:
+        return None
+    return spec if isinstance(spec, dict) else None
+
+
 def mobile_note_intake(
     note: object = "",
     run_id: str = "",
@@ -15784,11 +16385,8 @@ def mobile_note_intake(
         from tools.mobile import app_knowledge
         from tools.untrusted import single_line
 
-        try:
-            spec = json.loads(note) if isinstance(note, str) else note
-        except ValueError:
-            spec = None
-        if not isinstance(spec, dict):
+        spec = _mobile_note_spec(note)
+        if spec is None:
             return (
                 "Note not saved: pass `note` as a JSON object like "
                 '{"kind": "wait", "text": "...", "when": {"rid": "send"}, '
@@ -15810,7 +16408,10 @@ def mobile_note_intake(
             return "Note not saved: " + single_line(saved["error"], 300) + "\n\n"
         made = saved["content"]
         line = "Saved app note #%s for `%s` (%s). " % (made["id"], pkg, made["kind"])
-        line += "It applies to this app's later steps on this machine; "
+        scoped = "It is scoped to an environment and is saved, not applied yet: "
+        scoped += "no step is changed by it today; "
+        local = "It applies to this app's later steps on this machine; "
+        line += scoped if (made.get("when") or {}).get("env") else local
         line += "`qa_mobile_notes` lists or retires it.\n" + app_knowledge.echo(made)
         if made.get("superseded"):
             line += "\nSuperseded: " + ", ".join("#%s" % n for n in made["superseded"])
@@ -15828,12 +16429,13 @@ async def handle_mobile_notes(
     reason: str = "",
 ) -> str:
     """``qa_mobile_notes``: list or retire the notes saved about one app.
-    Never raises."""
+
+    A thin alias kept for one release; ``qa_mobile_knowledge`` is the full tool
+    (``handle_mobile_knowledge``). Output is unchanged. Never raises."""
     if not _mobile_lane_enabled():
         return _mobile_lane_off_message()
     try:
-        from tools.mobile import app_knowledge
-        from tools.untrusted import single_line
+        from tools.mobile import knowledge_tool
 
         verb = str(action or "list").strip().lower()
         if verb not in ("list", "retire"):
@@ -15843,25 +16445,45 @@ async def handle_mobile_notes(
             return "\u26a0\ufe0f " + refusal + "."
         if verb == "list":
             # SQLite with a busy timeout: off the event loop, like the note intake.
-            listed = await asyncio.to_thread(app_knowledge.list_notes, pkg)
-            if listed.get("error"):
-                return "\u26a0\ufe0f " + single_line(listed["error"], 300)
-            return app_knowledge.render(pkg, listed["content"])
+            return await asyncio.to_thread(knowledge_tool.notes_list, pkg)
         if not note_id:
             return "\u26a0\ufe0f `retire` needs `note_id`."
-        done = await asyncio.to_thread(
-            app_knowledge.retire_note,
-            pkg,
-            note_id,
-            reason=str(reason or ""),
-            run_id=rid,
+        return await asyncio.to_thread(
+            knowledge_tool.notes_retire, pkg, note_id, str(reason or ""), rid
         )
-        if done.get("error"):
-            return "\u26a0\ufe0f " + single_line(done["error"], 300)
-        return "Retired app note #%s for `%s`. It stays in history." % (note_id, pkg)
     except Exception:
         logger.exception("mobile notes failed")
         return "\u26a0\ufe0f The notes store could not be read."
+
+
+async def handle_mobile_knowledge(
+    action: str = "list",
+    package: str = "",
+    item_id: int | str = 0,
+    run_id: str = "",
+    data: dict | None = None,
+) -> str:
+    """``qa_mobile_knowledge``: one app's saved knowledge. A shim over
+    ``tools.mobile.knowledge_tool.handle``. Never raises."""
+    if not _mobile_lane_enabled():
+        return _mobile_lane_off_message()
+    try:
+        from tools.mobile import knowledge_tool
+
+        pkg, _rid, refusal = _mobile_note_target(run_id, package)
+        if refusal:
+            return "\u26a0\ufe0f " + refusal + "."
+        return await asyncio.to_thread(
+            knowledge_tool.handle,
+            action,
+            pkg,
+            item_id,
+            run_id,
+            data,
+        )
+    except Exception:
+        logger.exception("mobile knowledge failed")
+        return "\u26a0\ufe0f The knowledge store could not be read."
 
 
 def _mobile_arg(args: tuple, kwargs: dict, name: str):
@@ -15918,6 +16540,16 @@ async def _mobile_avd_reply(
         return "\u26a0\ufe0f The emulator action failed; nothing further was run."
 
 
+def _mobile_parse_env(raw: object) -> tuple:
+    """``(env, error)``; the refusal never repeats the value it refused."""
+    try:
+        from tools.mobile import knowledge_run
+
+        return knowledge_run.parse_env_checked(raw)
+    except _MOBILE_TOOL_FAILURES:
+        return {}, "env could not be read"
+
+
 async def handle_mobile_test_content(*args, **kwargs) -> tuple:
     """``handle_mobile_test``'s text PLUS the image specs of the screens it took.
 
@@ -15938,8 +16570,12 @@ async def handle_mobile_test_content(*args, **kwargs) -> tuple:
     if avd_action:
         reply = await _mobile_avd_reply(avd_action, args, kwargs, system_image, confirm)
         return reply, []
+    run_env, env_error = _mobile_parse_env(kwargs.pop("env", ""))
+    if env_error:
+        return "Not started: " + env_error + ".", []
     want = _MOBILE_SHOT_WANT.set({"asked": bool(kwargs.pop("screenshot", False))})
     token = _MOBILE_IMAGE_SPECS.set([])
+    env_token = _MOBILE_RUN_ENV.set(run_env)
     try:
         note = kwargs.pop("note", "")
         # The store is SQLite with a busy timeout: off the event loop. Values
@@ -15949,11 +16585,13 @@ async def handle_mobile_test_content(*args, **kwargs) -> tuple:
             mobile_note_intake,
             note,
             run_id=_call_arg(handle_mobile_test, args, kwargs, "run_id"),
-            package=_call_arg(handle_mobile_test, args, kwargs, "package"),
+            package=_call_arg(handle_mobile_test, args, kwargs, "package")
+            or _call_arg(handle_mobile_test, args, kwargs, "app"),
         )
         text = note_line + await handle_mobile_test(*args, **kwargs)
         return text, list(_MOBILE_IMAGE_SPECS.get() or [])
     finally:
+        _MOBILE_RUN_ENV.reset(env_token)
         _MOBILE_IMAGE_SPECS.reset(token)
         _MOBILE_SHOT_WANT.reset(want)
 
@@ -15994,6 +16632,17 @@ def _with_script(args: tuple, kwargs: dict, script: str) -> tuple:
     return args, {**kwargs, "script": script}
 
 
+def _flow_prepare_checks(name: str, save_name: str, script: str) -> str:
+    """The refusal text for a flow call whose arguments contradict, or ``""``."""
+    if name and save_name:
+        return "Pass `flow` (replay a saved flow) OR `save_flow` (save this script as one), not both."
+    if name and script.strip():
+        return "`flow` replays a saved flow; leave `script` empty."
+    if save_name and not script.strip():
+        return "`save_flow` saves this call's `script`; pass one."
+    return ""
+
+
 def _mobile_flow_prepare(
     args: tuple, kwargs: dict, name: str, raw_params: object, save_name: str
 ) -> dict:
@@ -16007,14 +16656,9 @@ def _mobile_flow_prepare(
 
     try:
         script = _call_arg(handle_submit_mobile_step, args, kwargs, "script")
-        if name and save_name:
-            return stop(
-                "Pass `flow` (replay a saved flow) OR `save_flow` (save this script as one), not both."
-            )
-        if name and script.strip():
-            return stop("`flow` replays a saved flow; leave `script` empty.")
-        if save_name and not script.strip():
-            return stop("`save_flow` saves this call's `script`; pass one.")
+        why = _flow_prepare_checks(name, save_name, script)
+        if why:
+            return stop(why)
         pkg, _rid, refusal = _mobile_note_target(
             _call_arg(handle_submit_mobile_step, args, kwargs, "run_id"), ""
         )
@@ -16092,6 +16736,21 @@ def _mobile_flow_finish(plan: dict, held: dict) -> str:
         return ""
 
 
+def _route_prepare_checks(name: str, save_name: str, script: str) -> str:
+    """The refusal text for a route call whose arguments contradict, or ``""``."""
+    from tools.mobile import app_flows
+
+    if name and save_name:
+        return "Pass `route` (replay a saved route) OR `save_route` (save this script as one), not both."
+    if name and script.strip():
+        return "`route` replays a saved route; leave `script` empty."
+    if save_name and not script.strip():
+        return "`save_route` saves this call's `script`; pass one."
+    if save_name and not app_flows.valid_name(save_name):
+        return "`save_route` is not a valid route name."
+    return ""
+
+
 def _mobile_route_prepare(
     args: tuple, kwargs: dict, name: str, raw_params: object, save_name: str
 ) -> dict:
@@ -16106,16 +16765,9 @@ def _mobile_route_prepare(
 
     try:
         script = _call_arg(handle_submit_mobile_step, args, kwargs, "script")
-        if name and save_name:
-            return stop(
-                "Pass `route` (replay a saved route) OR `save_route` (save this script as one), not both."
-            )
-        if name and script.strip():
-            return stop("`route` replays a saved route; leave `script` empty.")
-        if save_name and not script.strip():
-            return stop("`save_route` saves this call's `script`; pass one.")
-        if save_name and not app_flows.valid_name(save_name):
-            return stop("`save_route` is not a valid route name.")
+        why = _route_prepare_checks(name, save_name, script)
+        if why:
+            return stop(why)
         pkg, _rid, refusal = _mobile_note_target(
             _call_arg(handle_submit_mobile_step, args, kwargs, "run_id"), ""
         )
@@ -16245,6 +16897,44 @@ async def _mobile_routes_manage(verb: str, pkg: str, name: str) -> str:
     return "Deleted route `%s` for `%s`." % (name, pkg)
 
 
+async def _mobile_flows_action(verb: str, pkg: str, name: str) -> str:
+    """Run one validated ``qa_mobile_flows`` flow action: list, show or delete."""
+    from tools.mobile import app_flows
+    from tools.untrusted import single_line
+
+    if verb == "list":
+        listed = await asyncio.to_thread(app_flows.list_flows, pkg)
+        rows = listed.get("content") or []
+        if not rows:
+            return "No saved flows for `%s`." % pkg
+        lines = ["Saved flows for `%s`:" % pkg]
+        for row in rows:
+            lines.append(
+                "- `%s`: %d steps; params: %s; secret fields: %s"
+                % (
+                    row["name"],
+                    row["steps"],
+                    ", ".join(row["params"]) or "none",
+                    ", ".join(row["fields"]) or "none",
+                )
+            )
+        return "\n".join(lines)
+    if verb == "show":
+        got = await asyncio.to_thread(app_flows.get_flow, pkg, name)
+        if got.get("error"):
+            return _FLOW_WARN + single_line(got["error"], 300) + "."
+        lines = ["Flow `%s` for `%s`:" % (name, pkg)]
+        for index, step in enumerate(got["content"]["steps"], 1):
+            lines.append(
+                "%d. %s" % (index, single_line(json.dumps(step, sort_keys=True), 300))
+            )
+        return "\n".join(lines)
+    gone = await asyncio.to_thread(app_flows.delete_flow, pkg, name)
+    if gone.get("error"):
+        return _FLOW_WARN + single_line(gone["error"], 300) + "."
+    return "Deleted flow `%s` for `%s`." % (name, pkg)
+
+
 async def handle_mobile_flows(
     action: str = "list",
     package: str = "",
@@ -16257,7 +16947,6 @@ async def handle_mobile_flows(
     if not _mobile_lane_enabled():
         return _mobile_lane_off_message()
     try:
-        from tools.mobile import app_flows
         from tools.untrusted import single_line
 
         verb = str(action or "list").strip().lower()
@@ -16271,38 +16960,7 @@ async def handle_mobile_flows(
             return _FLOW_WARN + "`kind` must be `flow` or `route`."
         if kind_name == "route":
             return await _mobile_routes_manage(verb, pkg, name)
-        if verb == "list":
-            listed = await asyncio.to_thread(app_flows.list_flows, pkg)
-            rows = listed.get("content") or []
-            if not rows:
-                return "No saved flows for `%s`." % pkg
-            lines = ["Saved flows for `%s`:" % pkg]
-            for row in rows:
-                lines.append(
-                    "- `%s`: %d steps; params: %s; secret fields: %s"
-                    % (
-                        row["name"],
-                        row["steps"],
-                        ", ".join(row["params"]) or "none",
-                        ", ".join(row["fields"]) or "none",
-                    )
-                )
-            return "\n".join(lines)
-        if verb == "show":
-            got = await asyncio.to_thread(app_flows.get_flow, pkg, name)
-            if got.get("error"):
-                return _FLOW_WARN + single_line(got["error"], 300) + "."
-            lines = ["Flow `%s` for `%s`:" % (name, pkg)]
-            for index, step in enumerate(got["content"]["steps"], 1):
-                lines.append(
-                    "%d. %s"
-                    % (index, single_line(json.dumps(step, sort_keys=True), 300))
-                )
-            return "\n".join(lines)
-        gone = await asyncio.to_thread(app_flows.delete_flow, pkg, name)
-        if gone.get("error"):
-            return _FLOW_WARN + single_line(gone["error"], 300) + "."
-        return "Deleted flow `%s` for `%s`." % (name, pkg)
+        return await _mobile_flows_action(verb, pkg, name)
     except Exception:
         logger.exception("mobile flows failed")
         return _FLOW_WARN + "the flow store is unavailable."
@@ -16347,6 +17005,7 @@ async def handle_submit_mobile_step_content(*args, **kwargs) -> tuple:
     held_token = _MOBILE_STEP_HELD.set(held)
     try:
         note = kwargs.pop("note", "")
+        kwargs.pop("env", None)
         run_id = _call_arg(handle_submit_mobile_step, args, kwargs, "run_id")
         # Copied BEFORE the step: a step that reaches the report forgets the
         # run's held values, and the note must still be checked against them.
@@ -16474,6 +17133,8 @@ async def handle_mobile_stop(
         )
     except _MOBILE_TOOL_FAILURES as exc:
         return _mobile_tool_failed(exc, "qa_mobile_stop")
+    if result.ok:
+        _mobile_learn_after(str(getattr(result, "run_id", "") or ""))
     head = "Stopped." if result.ok else "\u26a0\ufe0f Not stopped."
     return (
         head
@@ -16811,6 +17472,87 @@ def _mobile_run_row(row: object) -> str:
     return line
 
 
+async def _export_suite_reply(
+    suite, suite_id: str, fmt: str, output_dir: str, progress: ProgressCb
+) -> str:
+    """Write the loaded suite in *fmt*, relocate it if asked, shape the reply."""
+    await _emit(progress, f"📦 Exporting suite to {fmt}…")
+    # I4 (2026-08-10): UNTRUSTED folder text, validated by exactly the same
+    # rules as an elicited answer -- absolute / ~-rooted only, no config
+    # lines, length-capped, root-allowlisted, with the "did you mean
+    # ~/Desktop?" correction for a bare well-known word. Every branch below
+    # keys off `target_dir`, the RESOLVED value: a rejected answer is
+    # truthy as raw text but resolves to "", and must not send the file
+    # anywhere. A rejection keeps the default destination AND says so.
+    target_dir, dir_note = "", ""
+    if (output_dir or "").strip():
+        target_dir, _why = _safe_elicited_dir(
+            output_dir, fallback_label=_TEMP_EXPORT_LABEL
+        )
+        if not target_dir:
+            dir_note = _why
+    try:
+        path = await asyncio.to_thread(_available_exporters()[fmt], suite)
+    except Exception as exc:
+        logger.exception("mcp export failed")
+        return f"⚠️ Export to {fmt} failed: {exc}"
+    if target_dir:
+        # Every surviving format writes ONE file, so relocating it is
+        # safe. The exception was the Zephyr PAIR, which wrote itself
+        # into target_dir and would have been split from its
+        # zfj_import_config.json by a move; that exporter was DELETED
+        # on 2026-08-15 (dead-code deletion batch D4).
+        path, _move_note = _relocate_export(path, target_dir)
+        if _move_note:
+            dir_note += _move_note
+    telemetry.add_tool_properties(format=fmt, case_count=len(suite.test_cases))
+    await _audit(
+        "mcp_export_suite",
+        entity_id=suite_id,
+        detail={"format": fmt, "path": path, "custom_dir": bool(target_dir)},
+    )
+    result = shape_export_result(suite_id, fmt, path, len(suite.test_cases))
+    if dir_note:
+        result += dir_note
+    return result
+
+
+async def _export_suite_resolve(
+    suite_id: str, fmt: str, choose: ChooseCb
+) -> tuple[str, str, str | None]:
+    """Settle the format and suite id; the third item is a reply that ends the call."""
+    fmt = (fmt or "").strip().lower()
+    if not fmt and _elicit_enabled():
+        picked = await _elicit_choice(
+            choose, "Which export format?", list(sorted(_available_exporters()))
+        )
+        if picked.status == CHOSEN:
+            fmt = (picked.value or "").strip().lower()
+        elif picked.status == DECLINED:
+            return fmt, suite_id, "👍 Cancelled — no export format selected."
+        else:
+            return fmt, suite_id, _format_menu_markdown()
+    if fmt not in _available_exporters():
+        return (
+            fmt,
+            suite_id,
+            f"⚠️ Unknown format '{_clip_echo(fmt, 60)}'. Choose one of: "
+            f"{', '.join(sorted(_available_exporters()))}.",
+        )
+    suite_id = (suite_id or "").strip()
+    if not suite_id and _elicit_enabled():
+        picked = await _elicit_suite(choose)
+        if picked.status == CHOSEN:
+            suite_id = (picked.value or "").strip()
+        elif picked.status == DECLINED:
+            return fmt, suite_id, "👍 Cancelled — no suite selected."
+        else:
+            return fmt, suite_id, await _recent_suites_markdown("qa_export_suite")
+    if not suite_id:
+        return fmt, suite_id, await _recent_suites_markdown("qa_export_suite")
+    return fmt, suite_id, None
+
+
 async def handle_export_suite(
     suite_id: str,
     fmt: str,
@@ -16857,33 +17599,9 @@ async def handle_export_suite(
             "Do NOT write the suite to a file yourself -- see the refusal note "
             "on `qa_submit_suite`."
         )
-    fmt = (fmt or "").strip().lower()
-    if not fmt and _elicit_enabled():
-        picked = await _elicit_choice(
-            choose, "Which export format?", list(sorted(_available_exporters()))
-        )
-        if picked.status == CHOSEN:
-            fmt = (picked.value or "").strip().lower()
-        elif picked.status == DECLINED:
-            return "👍 Cancelled — no export format selected."
-        else:
-            return _format_menu_markdown()
-    if fmt not in _available_exporters():
-        return (
-            f"⚠️ Unknown format '{_clip_echo(fmt, 60)}'. Choose one of: "
-            f"{', '.join(sorted(_available_exporters()))}."
-        )
-    suite_id = (suite_id or "").strip()
-    if not suite_id and _elicit_enabled():
-        picked = await _elicit_suite(choose)
-        if picked.status == CHOSEN:
-            suite_id = (picked.value or "").strip()
-        elif picked.status == DECLINED:
-            return "👍 Cancelled — no suite selected."
-        else:
-            return await _recent_suites_markdown("qa_export_suite")
-    if not suite_id:
-        return await _recent_suites_markdown("qa_export_suite")
+    fmt, suite_id, early = await _export_suite_resolve(suite_id, fmt, choose)
+    if early is not None:
+        return early
     try:
         loaded = await load_suite(suite_id)
         if loaded.get("error"):
@@ -16894,45 +17612,7 @@ async def handle_export_suite(
         suite = loaded.get("content")
         if suite is None:
             return _suite_unreadable_reply(suite_id, loaded)
-        await _emit(progress, f"📦 Exporting suite to {fmt}…")
-        # I4 (2026-08-10): UNTRUSTED folder text, validated by exactly the same
-        # rules as an elicited answer -- absolute / ~-rooted only, no config
-        # lines, length-capped, root-allowlisted, with the "did you mean
-        # ~/Desktop?" correction for a bare well-known word. Every branch below
-        # keys off `target_dir`, the RESOLVED value: a rejected answer is
-        # truthy as raw text but resolves to "", and must not send the file
-        # anywhere. A rejection keeps the default destination AND says so.
-        target_dir, dir_note = "", ""
-        if (output_dir or "").strip():
-            target_dir, _why = _safe_elicited_dir(
-                output_dir, fallback_label=_TEMP_EXPORT_LABEL
-            )
-            if not target_dir:
-                dir_note = _why
-        try:
-            path = await asyncio.to_thread(_available_exporters()[fmt], suite)
-        except Exception as exc:
-            logger.exception("mcp export failed")
-            return f"⚠️ Export to {fmt} failed: {exc}"
-        if target_dir:
-            # Every surviving format writes ONE file, so relocating it is
-            # safe. The exception was the Zephyr PAIR, which wrote itself
-            # into target_dir and would have been split from its
-            # zfj_import_config.json by a move; that exporter was DELETED
-            # on 2026-08-15 (dead-code deletion batch D4).
-            path, _move_note = _relocate_export(path, target_dir)
-            if _move_note:
-                dir_note += _move_note
-        telemetry.add_tool_properties(format=fmt, case_count=len(suite.test_cases))
-        await _audit(
-            "mcp_export_suite",
-            entity_id=suite_id,
-            detail={"format": fmt, "path": path, "custom_dir": bool(target_dir)},
-        )
-        result = shape_export_result(suite_id, fmt, path, len(suite.test_cases))
-        if dir_note:
-            result += dir_note
-        return result
+        return await _export_suite_reply(suite, suite_id, fmt, output_dir, progress)
     except Exception as exc:
         logger.exception("handle_export_suite failed")
         _capture_error(exc, "qa_export_suite")
@@ -17087,6 +17767,175 @@ def _render_api_write_result(r: dict) -> str:
     return f"⚠️ {r.get('error') or 'write failed'}"
 
 
+async def _api_project_menu() -> str:
+    """The card offered when neither ``create`` nor ``use`` was passed."""
+    from agents.api_test_agent import _safe
+    from tools import api_project
+
+    listed = await api_project.list_projects()
+    rows = listed.get("content") or []
+    lines = [
+        "## API test project",
+        "",
+        "Every API flow starts with a project. Two ways forward \u2014 ask the tester which:",
+        "",
+        '1. **A new project** \u2014 `qa_api_project(create="<name>")`. The name becomes the '
+        "Maven artifactId and the Java package, so it must be lowercase letters, digits "
+        "and single hyphens (for example `wallet-api`).",
+        '2. **Continue with an existing one** \u2014 `qa_api_project(use="<name or path>")`.',
+        "",
+    ]
+    if rows:
+        lines.append("Already registered:")
+        lines += [
+            "- `"
+            + _safe(r.get("name"), 60)
+            + "` \u2014 `"
+            + _safe(r.get("path"), 200)
+            + "`"
+            for r in rows
+        ]
+    else:
+        lines.append("No projects are registered yet.")
+    await _audit("mcp_api_project_menu")
+    return "\n".join(lines)
+
+
+async def _api_project_use(use: str) -> str:
+    """The ``use=`` path: resolve a registered project and confirm it."""
+    from agents.api_test_agent import _safe
+    from tools import api_project
+
+    resolved = await api_project.resolve_project(use)
+    if resolved.get("error"):
+        return "\u26a0\ufe0f " + _safe(resolved["error"], 500)
+    identity = resolved.get("content") or {}
+    await _audit("mcp_api_project_use", entity_id=identity.get("name"))
+    notes = "\n".join("- " + _safe(n, 300) for n in (identity.get("notes") or []))
+    return "\n".join(
+        p
+        for p in [
+            "\u2705 Using project **" + _safe(identity.get("name"), 60) + "**",
+            "",
+            "- path: `" + _safe(identity.get("path"), 200) + "`",
+            "- java package: `" + _safe(identity.get("package_root"), 100) + "`",
+            notes,
+            "",
+            "Next: `qa_prepare_api_tests` with the endpoint source \u2014 a curl command, an "
+            "OpenAPI spec, or a plain description.",
+        ]
+        if p
+    )
+
+
+async def _api_project_create(create: str, progress: ProgressCb) -> str:
+    """The ``create=`` path: bootstrap from the template, register, reply."""
+    import asyncio as _asyncio
+
+    from config.settings import settings as _s
+    from tools import api_project, framework_template
+
+    repo = (_s.qa_api_template_repo or "").strip()
+    if not repo:
+        return (
+            "\u26a0\ufe0f Set `QA_API_TEMPLATE_REPO` to the public template repo, e.g. `owner/name`, "
+            "in your `.env` and restart \u2014 a new project is created from its latest release. "
+            "Nothing was created."
+        )
+    projects_dir = (_s.qa_api_projects_dir or "").strip()
+    if not projects_dir:
+        return (
+            "\u26a0\ufe0f Set `QA_API_PROJECTS_DIR` to the folder new API projects should be created "
+            "in, then restart. Nothing was created."
+        )
+    await _emit(
+        progress,
+        "\U0001f4e6 Fetching the project template and proving it compiles\u2026",
+    )
+    created = await _asyncio.to_thread(
+        framework_template.bootstrap,
+        name=create,
+        dest_root=projects_dir,
+        repo=repo,
+    )
+    if created.get("error"):
+        return await _api_project_create_failed(created)
+    registered = await api_project.register_project(
+        name=created["name"],
+        path=created["path"],
+        artifact_id=created["artifact_id"],
+        package_root=created["package_root"],
+        template_repo=created["template_repo"],
+        template_version=created["template_version"],
+    )
+    await _audit("mcp_api_project_created", entity_id=created["name"])
+    return _api_project_created_reply(created, registered)
+
+
+def _api_project_created_reply(created: dict, registered: dict) -> str:
+    """The success card for a created project, with any registry warning."""
+    from agents.api_test_agent import _safe
+
+    warning = ""
+    # A colliding slug repoints an existing row. R8 records it; disclose it HERE
+    # too, or the create path stays silent about it (review MINOR).
+    moved_from = str((registered.get("content") or {}).get("repointed_from") or "")
+    if moved_from:
+        warning += (
+            "\n\n\u26a0\ufe0f A project named that was already registered at `"
+            + _safe(moved_from, 200)
+            + "` and now points here. If those are two different projects, give one"
+            " of them a different name."
+        )
+    if registered.get("error"):
+        warning = (
+            "\n\n\u26a0\ufe0f The project was created but could not be added to the registry ("
+            + _safe(registered["error"], 200)
+            + '); continue with `qa_api_project(use="'
+            + _safe(created["path"], 200)
+            + '")`.'
+        )
+    return (
+        "\u2705 Created project **" + _safe(created["name"], 60) + "**\n\n"
+        "- path: `" + _safe(created["path"], 200) + "`\n"
+        "- java package: `" + _safe(created["package_root"], 100) + "`\n"
+        "- template: `"
+        + _safe(created["template_repo"], 120)
+        + "` `"
+        + _safe(created["template_version"], 60)
+        + "`\n"
+        "- one local commit, no remote, nothing pushed; `-B test-compile` is green\n\n"
+        "Next: `qa_prepare_api_tests` with the endpoint source." + warning
+    )
+
+
+async def _api_project_create_failed(created: dict) -> str:
+    """The reply for a template bootstrap that returned an error."""
+    from agents.api_test_agent import _safe
+
+    output = created.get("output")
+    # Build output comes from the DOWNLOADED template repo: externally-
+    # sourced text reaching a model, so it goes through wrap_untrusted like
+    # every other such payload (hard constraint). The backtick swap is a
+    # SEPARATE concern -- it stops the output breaking out of the fence of
+    # the server-authored card around it.
+    from tools.untrusted import wrap_untrusted
+
+    fenced = (
+        wrap_untrusted(
+            "template build output",
+            str(output)[-2000:].replace("```", "'''"),
+        )
+        if output
+        else ""
+    )
+    tail = "\n\n```\n" + fenced + "\n```" if output else ""
+    await _audit("mcp_api_project_create_failed", detail={"gate": created.get("gate")})
+    return (
+        "\u26a0\ufe0f " + _safe(created["error"], 400) + " Nothing was created." + tail
+    )
+
+
 async def handle_api_project(
     create: str = "", use: str = "", *, progress: ProgressCb = None
 ) -> str:
@@ -17099,8 +17948,6 @@ async def handle_api_project(
     server-authored text the host model reads as trusted, so every value it
     echoes -- a project name, a path, a marker field -- is fence-sanitised.
     Never raises."""
-    import asyncio as _asyncio
-
     from config.settings import settings as _s
 
     if not _s.qa_api_test_enabled:
@@ -17110,154 +17957,11 @@ async def handle_api_project(
     if create and use:
         return '\u26a0\ufe0f Pass either `create="<new project name>"` or `use="<name or path>"` \u2014 not both.'
     try:
-        from agents.api_test_agent import _safe
-        from tools import api_project, framework_template
-
         if not create and not use:
-            listed = await api_project.list_projects()
-            rows = listed.get("content") or []
-            lines = [
-                "## API test project",
-                "",
-                "Every API flow starts with a project. Two ways forward \u2014 ask the tester which:",
-                "",
-                '1. **A new project** \u2014 `qa_api_project(create="<name>")`. The name becomes the '
-                "Maven artifactId and the Java package, so it must be lowercase letters, digits "
-                "and single hyphens (for example `wallet-api`).",
-                '2. **Continue with an existing one** \u2014 `qa_api_project(use="<name or path>")`.',
-                "",
-            ]
-            if rows:
-                lines.append("Already registered:")
-                lines += [
-                    "- `"
-                    + _safe(r.get("name"), 60)
-                    + "` \u2014 `"
-                    + _safe(r.get("path"), 200)
-                    + "`"
-                    for r in rows
-                ]
-            else:
-                lines.append("No projects are registered yet.")
-            await _audit("mcp_api_project_menu")
-            return "\n".join(lines)
-
+            return await _api_project_menu()
         if use:
-            resolved = await api_project.resolve_project(use)
-            if resolved.get("error"):
-                return "\u26a0\ufe0f " + _safe(resolved["error"], 500)
-            identity = resolved.get("content") or {}
-            await _audit("mcp_api_project_use", entity_id=identity.get("name"))
-            notes = "\n".join(
-                "- " + _safe(n, 300) for n in (identity.get("notes") or [])
-            )
-            return "\n".join(
-                p
-                for p in [
-                    "\u2705 Using project **" + _safe(identity.get("name"), 60) + "**",
-                    "",
-                    "- path: `" + _safe(identity.get("path"), 200) + "`",
-                    "- java package: `"
-                    + _safe(identity.get("package_root"), 100)
-                    + "`",
-                    notes,
-                    "",
-                    "Next: `qa_prepare_api_tests` with the endpoint source \u2014 a curl command, an "
-                    "OpenAPI spec, or a plain description.",
-                ]
-                if p
-            )
-
-        repo = (_s.qa_api_template_repo or "").strip()
-        if not repo:
-            return (
-                "\u26a0\ufe0f Set `QA_API_TEMPLATE_REPO` to the public template repo, e.g. `owner/name`, "
-                "in your `.env` and restart \u2014 a new project is created from its latest release. "
-                "Nothing was created."
-            )
-        projects_dir = (_s.qa_api_projects_dir or "").strip()
-        if not projects_dir:
-            return (
-                "\u26a0\ufe0f Set `QA_API_PROJECTS_DIR` to the folder new API projects should be created "
-                "in, then restart. Nothing was created."
-            )
-        await _emit(
-            progress,
-            "\U0001f4e6 Fetching the project template and proving it compiles\u2026",
-        )
-        created = await _asyncio.to_thread(
-            framework_template.bootstrap,
-            name=create,
-            dest_root=projects_dir,
-            repo=repo,
-        )
-        if created.get("error"):
-            output = created.get("output")
-            # Build output comes from the DOWNLOADED template repo: externally-
-            # sourced text reaching a model, so it goes through wrap_untrusted like
-            # every other such payload (hard constraint). The backtick swap is a
-            # SEPARATE concern -- it stops the output breaking out of the fence of
-            # the server-authored card around it.
-            from tools.untrusted import wrap_untrusted
-
-            fenced = (
-                wrap_untrusted(
-                    "template build output",
-                    str(output)[-2000:].replace("```", "'''"),
-                )
-                if output
-                else ""
-            )
-            tail = "\n\n```\n" + fenced + "\n```" if output else ""
-            await _audit(
-                "mcp_api_project_create_failed", detail={"gate": created.get("gate")}
-            )
-            return (
-                "\u26a0\ufe0f "
-                + _safe(created["error"], 400)
-                + " Nothing was created."
-                + tail
-            )
-        registered = await api_project.register_project(
-            name=created["name"],
-            path=created["path"],
-            artifact_id=created["artifact_id"],
-            package_root=created["package_root"],
-            template_repo=created["template_repo"],
-            template_version=created["template_version"],
-        )
-        warning = ""
-        # A colliding slug repoints an existing row. R8 records it; disclose it HERE
-        # too, or the create path stays silent about it (review MINOR).
-        moved_from = str((registered.get("content") or {}).get("repointed_from") or "")
-        if moved_from:
-            warning += (
-                "\n\n\u26a0\ufe0f A project named that was already registered at `"
-                + _safe(moved_from, 200)
-                + "` and now points here. If those are two different projects, give one"
-                " of them a different name."
-            )
-        if registered.get("error"):
-            warning = (
-                "\n\n\u26a0\ufe0f The project was created but could not be added to the registry ("
-                + _safe(registered["error"], 200)
-                + '); continue with `qa_api_project(use="'
-                + _safe(created["path"], 200)
-                + '")`.'
-            )
-        await _audit("mcp_api_project_created", entity_id=created["name"])
-        return (
-            "\u2705 Created project **" + _safe(created["name"], 60) + "**\n\n"
-            "- path: `" + _safe(created["path"], 200) + "`\n"
-            "- java package: `" + _safe(created["package_root"], 100) + "`\n"
-            "- template: `"
-            + _safe(created["template_repo"], 120)
-            + "` `"
-            + _safe(created["template_version"], 60)
-            + "`\n"
-            "- one local commit, no remote, nothing pushed; `-B test-compile` is green\n\n"
-            "Next: `qa_prepare_api_tests` with the endpoint source." + warning
-        )
+            return await _api_project_use(use)
+        return await _api_project_create(create, progress)
     except Exception as exc:
         logger.exception("handle_api_project failed")
         return f"\u26a0\ufe0f API project step failed ({type(exc).__name__}) \u2014 see the server log."
@@ -17808,6 +18512,53 @@ def _mirror_hold_json(payload: dict) -> str:
     return json.dumps(payload, sort_keys=True)
 
 
+def _mirror_hold_acquire(mobile_locks, name: str, base: dict) -> bool:
+    """Take the lock; False when *base* already holds the final refusal."""
+    res = mobile_locks.acquire(name, owner=_MIRROR_HOLD_OWNER)
+    body = res.get("content")
+    if res.get("error") or body is None:
+        base["reason"] = str(res.get("error") or "the lock could not be taken")
+        return False
+    if not body.get("acquired"):
+        base["reason"] = str(body.get("reason") or "held")
+        base["owner"] = str(body.get("holder") or "")
+        return False
+    return True
+
+
+def _mirror_hold_release(mobile_locks, name: str, base: dict) -> bool:
+    """Release the lock; False when *base* already holds the final answer."""
+    res = mobile_locks.release(name, owner=_MIRROR_HOLD_OWNER, as_holder=True)
+    body = res.get("content")
+    if res.get("error") or body is None:
+        base["reason"] = str(res.get("error") or "the lock could not be released")
+        return False
+    base["reason"] = str(body.get("reason") or "")
+    if not body.get("released") and str(base["reason"]).startswith("held by "):
+        base["owner"] = str(base["reason"])[len("held by ") :]
+        return False
+    return True
+
+
+def _mirror_hold_probe(mobile_locks, name: str, base: dict) -> None:
+    """Read the lock's state into *base* (ok, owner, mine, mirror_hold, reason)."""
+    probed = mobile_locks.holder(name)
+    info = probed.get("content")
+    if probed.get("error") or info is None:
+        base["reason"] = str(probed.get("error") or "the lock could not be read")
+        return
+    held = bool(info.get("held"))
+    owner = str(info.get("owner") or "") if held else ""
+    mine = held and bool(info.get("mine"))
+    base.update(
+        ok=True,
+        owner=owner,
+        mine=mine,
+        mirror_hold=mine and owner.startswith(_MIRROR_OWNER_PREFIX),
+        reason=base["reason"] or ("held" if held else "free"),
+    )
+
+
 def handle_mirror_hold(serial: str = "", action: str = "status") -> str:
     """``qa_mirror_hold``: acquire, release or read ONE device's lock.
 
@@ -17838,42 +18589,12 @@ def handle_mirror_hold(serial: str = "", action: str = "status") -> str:
             base["reason"] = "that is not a device serial"
             return _mirror_hold_json(base)
         if what == "acquire":
-            res = mobile_locks.acquire(name, owner=_MIRROR_HOLD_OWNER)
-            body = res.get("content")
-            if res.get("error") or body is None:
-                base["reason"] = str(res.get("error") or "the lock could not be taken")
-                return _mirror_hold_json(base)
-            if not body.get("acquired"):
-                base["reason"] = str(body.get("reason") or "held")
-                base["owner"] = str(body.get("holder") or "")
+            if not _mirror_hold_acquire(mobile_locks, name, base):
                 return _mirror_hold_json(base)
         elif what == "release":
-            res = mobile_locks.release(name, owner=_MIRROR_HOLD_OWNER, as_holder=True)
-            body = res.get("content")
-            if res.get("error") or body is None:
-                base["reason"] = str(
-                    res.get("error") or "the lock could not be released"
-                )
+            if not _mirror_hold_release(mobile_locks, name, base):
                 return _mirror_hold_json(base)
-            base["reason"] = str(body.get("reason") or "")
-            if not body.get("released") and str(base["reason"]).startswith("held by "):
-                base["owner"] = str(base["reason"])[len("held by ") :]
-                return _mirror_hold_json(base)
-        probed = mobile_locks.holder(name)
-        info = probed.get("content")
-        if probed.get("error") or info is None:
-            base["reason"] = str(probed.get("error") or "the lock could not be read")
-            return _mirror_hold_json(base)
-        held = bool(info.get("held"))
-        owner = str(info.get("owner") or "") if held else ""
-        mine = held and bool(info.get("mine"))
-        base.update(
-            ok=True,
-            owner=owner,
-            mine=mine,
-            mirror_hold=mine and owner.startswith(_MIRROR_OWNER_PREFIX),
-            reason=base["reason"] or ("held" if held else "free"),
-        )
+        _mirror_hold_probe(mobile_locks, name, base)
         return _mirror_hold_json(base)
     except Exception as exc:
         logger.exception("handle_mirror_hold failed")
@@ -18785,6 +19506,128 @@ async def _capture_peek(device_id: str) -> str:
         )
 
 
+def _capture_want(count: object) -> tuple:
+    """``(want, clamp_note)``: the screen count, clamped to _CAPTURE_COUNT_MAX.
+
+    A clamped request is DISCLOSED in *clamp_note*; a bad count means 1."""
+    try:
+        want_raw = max(1, int(count or 1))
+    except (TypeError, ValueError, OverflowError):
+        want_raw = 1
+    want = min(want_raw, _CAPTURE_COUNT_MAX)
+    if want_raw <= want:
+        return want, ""
+    return want, (
+        f"\n\n> ℹ️ You asked for {want_raw} screens; {want} is the "
+        "per-call maximum. Call `qa_capture_screens` again for more -- "
+        "capture_ids from several calls can be passed together."
+    )
+
+
+def _capture_labels(names: object, n_screens: int) -> tuple:
+    """``(labels, label_note)`` for the captured screens. NOT pure: with no
+    typed names it CONSUMES the shelved ticket labels, so call it only once
+    a capture has succeeded.
+
+    K2 (2026-08-10): no elicitation. Names resolve server-side:
+      1. the `names` parameter (the tester's own words, via chat)
+      2. the ticket's own labels, shelved by image-gate beat 2
+      3. screen_N -- already _stash_captures' default"""
+    labels: list = []
+    label_note = ""
+    typed = [_safe_image_name(p) for p in str(names or "").split(",")]
+    typed = [p for p in typed if p]
+    if typed:
+        labels = typed
+    else:
+        shelved, source = _take_ticket_image_labels()
+        if shelved:
+            labels = shelved
+            src_name = _safe_image_name(source) or "the ticket"
+            label_note = f" (from the labels on `{src_name}`)"
+    if labels and len(labels) < n_screens:
+        # _stash_captures indexes positionally, so the surplus screens keep
+        # screen_N. Say so rather than letting the tester assume naming failed.
+        label_note += (
+            f" — {len(labels)} name(s) for {n_screens} screen(s), so the "
+            "rest keep their default names"
+        )
+    return labels, label_note
+
+
+def _capture_specs(ids: list) -> list:
+    """The image attachments, built from the TRAY ENTRIES of *ids* so the
+    headline count, the id rows and the attached images are one list. Reads
+    the global tray: call it only after ``_stash_captures``."""
+    specs = []
+    for cid in ids:
+        _t = _CAPTURE_TRAY.get(cid) or {}
+        if _t.get("data"):
+            specs.append(
+                {
+                    "filename": _t.get("filename") or "screen.png",
+                    "mime": _t.get("mime") or "image/png",
+                    "data": bytes(_t["data"]),
+                }
+            )
+    return specs
+
+
+def _capture_rows(ids: list) -> list:
+    """One ``- `id` — label`` markdown row per id. Reads the global tray: call
+    it only after ``_stash_captures``."""
+    rows = []
+    for i, cid in enumerate(ids):
+        label = (_CAPTURE_TRAY.get(cid) or {}).get("label") or f"screen_{i + 1}"
+        rows.append(f"- `{cid}` — {label}")
+    return rows
+
+
+def _capture_tray_notes(
+    capture_error: object, dropped: int, unusable: int, pushed_out: list
+) -> str:
+    """The disclosure notes appended to the capture reply, each NAMED."""
+    note = ""
+    if capture_error:
+        note = (
+            f"\n\n> ⚠️ Capturing stopped early: {capture_error}. The screens "
+            "listed above WERE captured."
+        )
+    if dropped > 0:
+        # NAMED, not silent. The tray is bounded by bytes as well as by
+        # count, and the oldest go first -- so what was dropped is the
+        # START of the flow, which is the opposite of what a tester would
+        # assume from a truncated list.
+        note += (
+            f"\n\n> ⚠️ {dropped} earlier screen(s) did not fit the capture "
+            "tray and were dropped — the tray is bounded by total bytes, "
+            "and the OLDEST go first, so these are the first shots of the "
+            "run. The ones listed above are all usable. Capture fewer "
+            "screens per call, or re-capture the ones you still need."
+        )
+    if unusable > 0:
+        note += (
+            f"\n\n> ⚠️ {unusable} screen(s) came back from the device in a "
+            "form this server cannot hold (not image bytes) and were not "
+            "kept. The ones listed above are all usable; re-capture if "
+            "those screens matter."
+        )
+    if pushed_out:
+        # ACROSS calls, not just within one. These are ids an EARLIER
+        # reply told the tester they held; this call's screens evicted
+        # them, oldest first, and a prepare that still sends them would be
+        # grounded on fewer screens than it names.
+        _shown = ", ".join(f"`{c}`" for c in sorted(pushed_out)[:8])
+        _more = f" and {len(pushed_out) - 8} more" if len(pushed_out) > 8 else ""
+        note += (
+            f"\n\n> ⚠️ This call pushed {len(pushed_out)} EARLIER capture "
+            f"id(s) out of the tray (oldest first): {_shown}{_more}. They "
+            "no longer resolve — drop them from any `capture_ids` you were "
+            "about to send, or re-capture those screens."
+        )
+    return note
+
+
 async def handle_capture_screens(
     device_id: str = "",
     count: int = 1,
@@ -18845,18 +19688,7 @@ async def handle_capture_screens(
                 device = await _resolve_device(picked.value or "")
             if device is None:
                 return (await _device_menu_markdown("qa_capture_screens"), [])
-        try:
-            _want_raw = max(1, int(count or 1))
-        except (TypeError, ValueError, OverflowError):
-            _want_raw = 1
-        want = min(_want_raw, _CAPTURE_COUNT_MAX)
-        clamp_note = ""
-        if _want_raw > want:
-            clamp_note = (
-                f"\n\n> ℹ️ You asked for {_want_raw} screens; {want} is the "
-                "per-call maximum. Call `qa_capture_screens` again for more -- "
-                "capture_ids from several calls can be passed together."
-            )
+        want, clamp_note = _capture_want(count)
         screens, capture_error = await _fa_capture_screens(
             device, count=want, choose=choose, progress=progress
         )
@@ -18867,33 +19699,8 @@ async def handle_capture_screens(
                 "unlocked and still connected (`qa_list_devices`).",
                 [],
             )
-        # K2 (2026-08-10): NO elicitation here any more. This dialog was the third
-        # question about the same screenshot (device -> count -> name), it rendered
-        # collapsed in Cursor so the tester never saw it, its "or leave blank" was
-        # impossible to satisfy, and an unanswered one killed the whole tool call at
-        # the client's idle timeout. Names are resolved server-side instead:
-        #   1. the `names` parameter (the tester's own words, via chat)
-        #   2. the ticket's own labels, shelved by image-gate beat 2
-        #   3. screen_N -- already _stash_captures' default
-        labels: list = []
-        label_note = ""
-        _typed = [_safe_image_name(p) for p in str(names or "").split(",")]
-        _typed = [p for p in _typed if p]
-        if _typed:
-            labels = _typed
-        else:
-            _shelved, _source = _take_ticket_image_labels()
-            if _shelved:
-                labels = _shelved
-                _src_name = _safe_image_name(_source) or "the ticket"
-                label_note = f" (from the labels on `{_src_name}`)"
-        if labels and len(labels) < len(screens):
-            # _stash_captures indexes positionally, so the surplus screens keep
-            # screen_N. Say so rather than letting the tester assume naming failed.
-            label_note += (
-                f" — {len(labels)} name(s) for {len(screens)} screen(s), so the "
-                "rest keep their default names"
-            )
+        # Must stay AFTER the `not screens` exit: it consumes shelved labels.
+        labels, label_note = _capture_labels(names, len(screens))
         # The SAME predicate the stash applies, so `dropped` can only ever mean
         # "evicted", which is what the note below says it means. What the
         # device handed back in a form the tray cannot hold is counted
@@ -18917,64 +19724,14 @@ async def handle_capture_screens(
         # headline count, the id rows, the names and the attached images are
         # one list. Building them from `screens` attached every offered image,
         # 12 beside a headline that said 10.
-        specs = []
-        for cid in ids:
-            _t = _CAPTURE_TRAY.get(cid) or {}
-            if _t.get("data"):
-                specs.append(
-                    {
-                        "filename": _t.get("filename") or "screen.png",
-                        "mime": _t.get("mime") or "image/png",
-                        "data": bytes(_t["data"]),
-                    }
-                )
+        specs = _capture_specs(ids)
         await _audit(
             "mcp_capture_screens",
             detail={"count": len(ids), "device": device.get("id", "")},
         )
-        rows = []
-        for i, cid in enumerate(ids):
-            label = (_CAPTURE_TRAY.get(cid) or {}).get("label") or f"screen_{i + 1}"
-            rows.append(f"- `{cid}` — {label}")
+        rows = _capture_rows(ids)
         id_list = ", ".join(f'"{c}"' for c in ids)
-        note = ""
-        if capture_error:
-            note = (
-                f"\n\n> ⚠️ Capturing stopped early: {capture_error}. The screens "
-                "listed above WERE captured."
-            )
-        if dropped > 0:
-            # NAMED, not silent. The tray is bounded by bytes as well as by
-            # count, and the oldest go first -- so what was dropped is the
-            # START of the flow, which is the opposite of what a tester would
-            # assume from a truncated list.
-            note += (
-                f"\n\n> ⚠️ {dropped} earlier screen(s) did not fit the capture "
-                "tray and were dropped — the tray is bounded by total bytes, "
-                "and the OLDEST go first, so these are the first shots of the "
-                "run. The ones listed above are all usable. Capture fewer "
-                "screens per call, or re-capture the ones you still need."
-            )
-        if unusable > 0:
-            note += (
-                f"\n\n> ⚠️ {unusable} screen(s) came back from the device in a "
-                "form this server cannot hold (not image bytes) and were not "
-                "kept. The ones listed above are all usable; re-capture if "
-                "those screens matter."
-            )
-        if pushed_out:
-            # ACROSS calls, not just within one. These are ids an EARLIER
-            # reply told the tester they held; this call's screens evicted
-            # them, oldest first, and a prepare that still sends them would be
-            # grounded on fewer screens than it names.
-            _shown = ", ".join(f"`{c}`" for c in sorted(pushed_out)[:8])
-            _more = f" and {len(pushed_out) - 8} more" if len(pushed_out) > 8 else ""
-            note += (
-                f"\n\n> ⚠️ This call pushed {len(pushed_out)} EARLIER capture "
-                f"id(s) out of the tray (oldest first): {_shown}{_more}. They "
-                "no longer resolve — drop them from any `capture_ids` you were "
-                "about to send, or re-capture those screens."
-            )
+        note = _capture_tray_notes(capture_error, dropped, unusable, pushed_out)
         _named = ", ".join(
             f"`{(_CAPTURE_TRAY.get(cid) or {}).get('label') or ''}`" for cid in ids
         )
@@ -19136,18 +19893,10 @@ def _tc_source_menu_markdown() -> str:
     )
 
 
-async def _guided_test_cases(
-    *,
-    choose: ChooseCb = None,
-    ask_text: AskCb = None,
-    progress: ProgressCb = None,
-) -> str:
-    """Guided source picker for test-case generation (Chainlit-starter parity).
-
-    Asks where the feature comes from — describe / Jira / web URL / Swagger
-    link / mobile screens / Jira + mobile — collects the missing input, and
-    runs the full generation. Dialogs where the client supports elicitation;
-    a markdown menu otherwise. Never raises."""
+async def _guided_source_choice(
+    choose: ChooseCb, ask_text: AskCb, progress: ProgressCb
+) -> tuple[str | None, str]:
+    """Ask where the feature comes from; (reply to return or None, chosen source)."""
     sources = _tc_sources()
     source = await _elicit_choice(
         choose, "Where is the feature coming from?", list(sources)
@@ -19161,12 +19910,16 @@ async def _guided_test_cases(
             "Describe the feature to test (or paste a Jira / web / Swagger URL):",
         )
         if asked.status == CHOSEN and (asked.value or "").strip():
-            return await handle_generate_test_cases(
-                asked.value.strip(), progress=progress
+            return (
+                await handle_generate_test_cases(
+                    asked.value.strip(), progress=progress
+                ),
+                "",
             )
         return (
             "ℹ️ The picker dialog was dismissed — no problem, here are the "
-            "options:\n\n" + _tc_source_menu_markdown()
+            "options:\n\n" + _tc_source_menu_markdown(),
+            "",
         )
     src = sources.get(source.value or "", "")
     if source.status != CHOSEN or not src:
@@ -19176,50 +19929,81 @@ async def _guided_test_cases(
             "Describe the feature to test (or paste a Jira / web / Swagger URL):",
         )
         if asked.status == CHOSEN and (asked.value or "").strip():
-            return await handle_generate_test_cases(
-                asked.value.strip(), progress=progress
+            return (
+                await handle_generate_test_cases(
+                    asked.value.strip(), progress=progress
+                ),
+                "",
             )
-        return _tc_source_menu_markdown()
+        return _tc_source_menu_markdown(), ""
+    return None, src
+
+
+async def _guided_capture_images(
+    src: str, choose: ChooseCb, progress: ProgressCb
+) -> tuple[str | None, list]:
+    """Capture screens for the mobile sources; (refusal or None, images)."""
+    if src not in ("mobile", "jira_mobile"):
+        return None, []
+    if not _mobile_capture():
+        if src == "mobile":
+            return "ℹ️ Mobile capture is disabled in this build.", []
+        # jira_mobile continues from the ticket alone (parity with the
+        # Chainlit wizard's capture-off fallback).
+        return None, []
+    picked_dev = await _elicit_device(choose)
+    if picked_dev.status == DECLINED:
+        return "👍 Cancelled — no device selected.", []
+    if _unanswered(picked_dev):
+        # K1 (2026-08-10): this is dialog #3-4 of a qa_wizard call, so a
+        # spent budget is its TYPICAL unanswered state, not an edge case.
+        # The old text claimed no devices were connected -- but
+        # _elicit_device only reaches a dialog AFTER list_devices returned
+        # some, so that was simply untrue whenever the tester just did not
+        # answer.
+        return await _device_menu_markdown("qa_wizard"), []
+    if picked_dev.status != CHOSEN:
+        return (
+            "⚠️ No connected devices found. Attach a device or boot an "
+            "emulator/simulator, then try again (check with "
+            "`qa_list_devices`).",
+            [],
+        )
+    device = await _resolve_device(picked_dev.value or "")
+    if device is None:
+        return "⚠️ Device not found — run qa_list_devices and retry.", []
+    screens, capture_error = await _fa_capture_screens(
+        device, choose=choose, progress=progress
+    )
+    if capture_error and not screens:
+        return f"⚠️ Couldn't capture a screenshot: {capture_error}", []
+    return None, screens
+
+
+async def _guided_test_cases(
+    *,
+    choose: ChooseCb = None,
+    ask_text: AskCb = None,
+    progress: ProgressCb = None,
+) -> str:
+    """Guided source picker for test-case generation (Chainlit-starter parity).
+
+    Asks where the feature comes from — describe / Jira / web URL / Swagger
+    link / mobile screens / Jira + mobile — collects the missing input, and
+    runs the full generation. Dialogs where the client supports elicitation;
+    a markdown menu otherwise. Never raises."""
+    reply, src = await _guided_source_choice(choose, ask_text, progress)
+    if reply is not None:
+        return reply
     text = ""
     if src in _TC_SOURCE_PROMPTS:
         asked = await _elicit_text(ask_text, _TC_SOURCE_PROMPTS[src])
         if asked.status != CHOSEN or not (asked.value or "").strip():
             return _tc_source_menu_markdown()
         text = asked.value.strip()
-    images: list = []
-    if src in ("mobile", "jira_mobile"):
-        if not _mobile_capture():
-            if src == "mobile":
-                return "ℹ️ Mobile capture is disabled in this build."
-            # jira_mobile continues from the ticket alone (parity with the
-            # Chainlit wizard's capture-off fallback).
-        else:
-            picked_dev = await _elicit_device(choose)
-            if picked_dev.status == DECLINED:
-                return "👍 Cancelled — no device selected."
-            if _unanswered(picked_dev):
-                # K1 (2026-08-10): this is dialog #3-4 of a qa_wizard call, so a
-                # spent budget is its TYPICAL unanswered state, not an edge case.
-                # The old text claimed no devices were connected -- but
-                # _elicit_device only reaches a dialog AFTER list_devices returned
-                # some, so that was simply untrue whenever the tester just did not
-                # answer.
-                return await _device_menu_markdown("qa_wizard")
-            if picked_dev.status != CHOSEN:
-                return (
-                    "⚠️ No connected devices found. Attach a device or boot an "
-                    "emulator/simulator, then try again (check with "
-                    "`qa_list_devices`)."
-                )
-            device = await _resolve_device(picked_dev.value or "")
-            if device is None:
-                return "⚠️ Device not found — run qa_list_devices and retry."
-            screens, capture_error = await _fa_capture_screens(
-                device, choose=choose, progress=progress
-            )
-            if capture_error and not screens:
-                return f"⚠️ Couldn't capture a screenshot: {capture_error}"
-            images = screens
+    refusal, images = await _guided_capture_images(src, choose, progress)
+    if refusal is not None:
+        return refusal
     # The Feature Analysis wizard generates the full suite for every source.
     # It used to pass force_feature_report=True as well; that argument stopped
     # reaching anything at 41e0ec5 (which deleted the server fall-through that
@@ -19364,6 +20148,249 @@ def _fa_vision_disclosure(screens_captured: int) -> str:
         return ""
 
 
+class _FaTicket(NamedTuple):
+    """What the ticket step read: its text and whether a URL was fetched."""
+
+    text: str = ""
+    used_url: bool = False
+
+
+class _FaCapture(NamedTuple):
+    """What the capture step produced: the screen count and the raw screens."""
+
+    screens_captured: int = 0
+    forwarded: tuple = ()
+
+
+def _fa_normalize_mode(mode: str) -> str:
+    mode = (mode or "").strip().lower().replace("+", "_").replace(" ", "_")
+    return "jira_mobile" if mode == "jira_and_mobile" else mode
+
+
+async def _fa_resolve_mode(mode: str, text: str, choose: ChooseCb) -> tuple[str, str]:
+    """Settle the mode: ``(mode, reply)``; a non-empty reply ends the call."""
+    if mode:
+        return mode, ""
+    if _elicit_enabled():
+        picked = await _elicit_choice(
+            choose, "Which Feature Analysis mode?", list(_FA_MODE_LABELS)
+        )
+        if picked.status == CHOSEN:
+            mode = _FA_MODE_LABELS.get(picked.value or "", "")
+        elif picked.status == DECLINED:
+            return "", "👍 Cancelled — no Feature Analysis mode selected."
+        elif _unanswered(picked):
+            # K1 (2026-08-10): with feature_or_url supplied -- the common case --
+            # the fallthrough below silently picked mode="jira" and spent a full
+            # text-only analysis on an unanswered question. Hand back the menu.
+            return "", _fa_mode_menu_markdown()
+    if mode:
+        return mode, ""
+    if text:
+        return "jira", ""  # single-shot back-compat when elicitation is off
+    return "", _fa_mode_menu_markdown()
+
+
+def _fa_bare_key_reply(text: str, mode: str) -> str:
+    """The refusal for a BARE issue key given as the feature, else "".
+
+    2026-09-02 audit F8, round 2 (H3). The prepare handler learned that a BARE
+    issue key is a ticket reference and not a feature; this entry point had
+    not, and opened an analysis task whose whole "ticket text" was the eight
+    characters of the key. Same input, same defect, same remedy -- fixing one
+    call site of a class is not fixing the class.
+    Only the modes that READ A TICKET: `mobile` analyses captured screens and
+    never resolves a key, so a screen set named `LOGIN-2` is not a ticket
+    reference there (round-3 review, L1).
+    """
+    bare_key = bare_issue_key(text) if mode in ("jira", "jira_mobile") else ""
+    if not bare_key:
+        return ""
+    bare_url = issue_url_for_key(bare_key)
+    logger.info("feature analysis: bare issue key %s read as a ticket", bare_key)
+    if bare_url:
+        return (
+            f"⚠️ `{bare_key}` looks like a Jira issue key, not a feature "
+            "description -- analysing the key alone would report on those "
+            "characters rather than on the ticket. On this install that key "
+            f"is <{bare_url}>. Re-send THAT url and I'll read the "
+            f"ticket. If `{bare_key}` is really the feature's name, "
+            "describe it in a sentence or two instead."
+        )
+    return (
+        f"⚠️ `{bare_key}` looks like a Jira issue key, not a feature "
+        "description, and this install has no `JIRA_BASE_URL` configured, so "
+        "I can't turn the key into a link myself. Send the full ticket URL "
+        "instead, or paste the ticket's text and I'll analyse that."
+    )
+
+
+def _fa_input_gate_reply(mode: str, text: str) -> str:
+    """The refusal for an unusable mode or input, else ""."""
+    if mode not in _FA_MODES:
+        return f"⚠️ Unknown mode '{mode}'. Choose one of: {', '.join(_FA_MODES)}."
+    if mode in ("jira", "jira_mobile") and not text:
+        return "⚠️ Provide a feature description or a Jira/issue URL as feature_or_url."
+    return _fa_bare_key_reply(text, mode)
+
+
+def _fa_jira_directive_reply(url_content: dict) -> str:
+    """The reply for a fetch that came back unusable, else "".
+
+    The Atlassian-MCP fetch directive (``needs_jira_mcp``) is relayed WORD FOR
+    WORD (AGENTS.md hard rule) rather than analysing a ticket we could not read.
+    """
+    if url_content.get("needs_jira_mcp"):
+        return str(url_content.get("error") or not_connected_message())
+    if url_content.get("error"):
+        # 2026-08-31, the same defect as the prepare path: mode="jira"
+        # means the TICKET is the input, so an unreadable one is a
+        # refusal. This used to fall through and analyse an empty string.
+        return str(url_content.get("error"))
+    return ""
+
+
+async def _fa_fetch_ticket(
+    mode: str, text: str, jira_content_json: str, progress: ProgressCb
+) -> tuple[_FaTicket, str]:
+    """Read the ticket behind a URL: ``(ticket, reply)``; a reply ends the call."""
+    if mode not in ("jira", "jira_mobile") or not _is_url(text):
+        return _FaTicket(), ""
+    await _emit(progress, "\U0001f517 Fetching the ticket…")
+    hint = _jira_config_hint(text)
+    if hint:
+        return _FaTicket(), hint
+    if jira_content_json:
+        url_content = await fetch_url_content(text, jira_content=jira_content_json)
+    else:
+        url_content = await fetch_url_content(text)
+    reply = _fa_jira_directive_reply(url_content)
+    if reply:
+        return _FaTicket(), reply
+    return _FaTicket(url_content.get("content") or "", True), ""
+
+
+async def _fa_pick_device_id(device_id: str, choose: ChooseCb) -> tuple[str, str]:
+    """The device id to capture from: ``(device_id, reply)``."""
+    device_id = (device_id or "").strip()
+    if device_id or not _elicit_enabled():
+        return device_id, ""
+    picked = await _elicit_device(choose)
+    if picked.status == CHOSEN:
+        return picked.value or "", ""
+    if picked.status == DECLINED:
+        return "", "👍 Cancelled — no device selected."
+    return "", await _device_menu_markdown(tool="qa_feature_analysis")
+
+
+async def _fa_capture_stage(
+    mode: str, device_id: str, choose: ChooseCb, progress: ProgressCb
+) -> tuple[_FaCapture, str]:
+    """Capture the device screens on the mobile modes: ``(capture, reply)``."""
+    if mode not in ("mobile", "jira_mobile"):
+        return _FaCapture(), ""
+    if not _mobile_capture():
+        if mode == "mobile":
+            return _FaCapture(), "ℹ️ Mobile capture is disabled in this build."
+        return _FaCapture(), ""  # jira_mobile continues from the ticket alone
+    device_id, reply = await _fa_pick_device_id(device_id, choose)
+    if reply:
+        return _FaCapture(), reply
+    device, why_not = await _resolve_device_with_reason(device_id)
+    if device is None:
+        return _FaCapture(), (
+            f"⚠️ Device `{device_id}` not found. Run qa_list_devices to "
+            "see connected devices, then pass a listed id." + why_not
+        )
+    screens, capture_error = await _fa_capture_screens(
+        device, choose=choose, progress=progress
+    )
+    if capture_error and not screens:
+        return _FaCapture(), f"⚠️ Couldn't capture a screenshot: {capture_error}"
+    if screens:
+        # NO server vision call: the raw screens ride to the tester's own
+        # multimodal model as MCP image content, exactly as qa_capture_screens
+        # already returns them and as IMAGE_JOB does on the generation path.
+        await _emit(
+            progress,
+            f"🖼️ Attaching {len(screens)} captured screen(s) for your model…",
+        )
+    return _FaCapture(len(screens), tuple(screens)), ""
+
+
+def _fa_reply_header(mode: str, capture: _FaCapture) -> str:
+    """The mode line and the honest note on what happened to the screens."""
+    header = ""
+    if mode != "jira":
+        header = f"_Mode: {mode} · screens captured: {capture.screens_captured}_\n\n"
+    if capture.forwarded:
+        # The screens are ATTACHED to this reply, so the old two-branch
+        # vision disclosure would now be a lie in both directions: nothing
+        # was described server-side, and nothing was lost either.
+        header += (
+            "> ℹ️  "
+            f"{len(capture.forwarded)} captured screen(s) are attached to "
+            "this message as images. This server made NO vision call — "
+            "read them yourself.\n\n"
+        )
+    elif capture.screens_captured:
+        # Screens were captured and NOTHING described them (the server makes
+        # no vision call): the tester must not be left believing they were read.
+        header += _fa_vision_disclosure(capture.screens_captured)
+    return header
+
+
+async def _fa_prepare_reply(
+    mode: str,
+    text: str,
+    ticket: _FaTicket,
+    capture: _FaCapture,
+    progress: ProgressCb,
+) -> str | FeatureAnalysisReply:
+    """Open the analysis task, audit it and render the reply for the host."""
+    screens_captured = capture.screens_captured
+    source = "jira" if ticket.used_url else "mobile" if screens_captured else "text"
+    await _emit(progress, "📋 Preparing the Feature Analysis task for your chat model…")
+    opened = await prepare_feature_analysis(
+        text or "Feature captured from mobile device screens.",
+        ticket.text,
+        "",
+        mode=mode,
+        screens=screens_captured,
+        source=source,
+    )
+    if opened.get("error"):
+        return f"⚠️ Feature Analysis preparation failed: {opened['error']}"
+    opened_content = opened.get("content") or {}
+    task_id = str(opened_content.get("task_id") or "")
+    telemetry.add_tool_properties(source=source)
+    await _audit(
+        "mcp_feature_analysis_prepare",
+        entity_id=task_id,
+        detail={
+            "mode": mode,
+            "source": "url" if ticket.used_url else "text",
+            "screens": screens_captured,
+        },
+    )
+    envelope = opened_content.get("envelope") or {}
+    # F16 (2026-08-30): `shape_host_task`'s response_schema is opt-IN; without
+    # it the host guesses field names and a wrong guess fails INVISIBLY
+    # (finalize_feature_report drops unknown keys by design).
+    return FeatureAnalysisReply(
+        _fa_reply_header(mode, capture)
+        + shape_host_task(
+            "Feature Analysis — your turn",
+            task_id,
+            envelope,
+            "qa_submit_feature_analysis",
+            "field `report_json`",
+            response_schema=envelope.get("response_schema"),
+        ),
+        list(capture.forwarded),
+    )
+
+
 async def handle_feature_analysis(
     feature_or_url: str = "",
     mode: str = "",
@@ -19396,213 +20423,19 @@ async def handle_feature_analysis(
     if not _feature_analysis_enabled():
         return "ℹ️ Feature Analysis is disabled in this build."
     text = (feature_or_url or "").strip()
-    mode = (mode or "").strip().lower().replace("+", "_").replace(" ", "_")
-    if mode == "jira_and_mobile":
-        mode = "jira_mobile"
-
-    if not mode:
-        if _elicit_enabled():
-            picked = await _elicit_choice(
-                choose, "Which Feature Analysis mode?", list(_FA_MODE_LABELS)
-            )
-            if picked.status == CHOSEN:
-                mode = _FA_MODE_LABELS.get(picked.value or "", "")
-            elif picked.status == DECLINED:
-                return "👍 Cancelled — no Feature Analysis mode selected."
-            elif _unanswered(picked):
-                # K1 (2026-08-10): with feature_or_url supplied -- the common case --
-                # the fallthrough below silently picked mode="jira" and spent a full
-                # text-only analysis on an unanswered question. Hand back the menu.
-                return _fa_mode_menu_markdown()
-        if not mode:
-            if text:
-                mode = "jira"  # single-shot back-compat when elicitation is off
-            else:
-                return _fa_mode_menu_markdown()
-    if mode not in _FA_MODES:
-        return f"⚠️ Unknown mode '{mode}'. Choose one of: {', '.join(_FA_MODES)}."
-    if mode in ("jira", "jira_mobile") and not text:
-        return "⚠️ Provide a feature description or a Jira/issue URL as feature_or_url."
-    # 2026-09-02 audit F8, round 2 (H3). The prepare handler learned that a BARE
-    # issue key is a ticket reference and not a feature; this entry point had
-    # not, and opened an analysis task whose whole "ticket text" was the eight
-    # characters of the key. Same input, same defect, same remedy -- fixing one
-    # call site of a class is not fixing the class.
-    # Only the modes that READ A TICKET: `mobile` analyses captured screens and
-    # never resolves a key, so a screen set named `LOGIN-2` is not a ticket
-    # reference there (round-3 review, L1).
-    _fa_bare_key = bare_issue_key(text) if mode in ("jira", "jira_mobile") else ""
-    if _fa_bare_key:
-        _fa_bare_url = issue_url_for_key(_fa_bare_key)
-        logger.info(
-            "feature analysis: bare issue key %s read as a ticket", _fa_bare_key
-        )
-        if _fa_bare_url:
-            return (
-                f"⚠️ `{_fa_bare_key}` looks like a Jira issue key, not a feature "
-                "description -- analysing the key alone would report on those "
-                "characters rather than on the ticket. On this install that key "
-                f"is <{_fa_bare_url}>. Re-send THAT url and I'll read the "
-                f"ticket. If `{_fa_bare_key}` is really the feature's name, "
-                "describe it in a sentence or two instead."
-            )
-        return (
-            f"⚠️ `{_fa_bare_key}` looks like a Jira issue key, not a feature "
-            "description, and this install has no `JIRA_BASE_URL` configured, so "
-            "I can't turn the key into a link myself. Send the full ticket URL "
-            "instead, or paste the ticket's text and I'll analyse that."
-        )
+    mode, reply = await _fa_resolve_mode(_fa_normalize_mode(mode), text, choose)
+    reply = reply or _fa_input_gate_reply(mode, text)
+    if reply:
+        return reply
 
     try:
-        jira_text = ""
-        used_url = False
-        if mode in ("jira", "jira_mobile") and _is_url(text):
-            await _emit(progress, "\U0001f517 Fetching the ticket\u2026")
-            hint = _jira_config_hint(text)
-            if hint:
-                return hint
-            if jira_content_json:
-                url_content = await fetch_url_content(
-                    text, jira_content=jira_content_json
-                )
-            else:
-                url_content = await fetch_url_content(text)
-            used_url = True
-            if url_content.get("needs_jira_mcp"):
-                # Relay the Atlassian-MCP fetch directive verbatim rather than
-                # analysing a ticket we could not read.
-                return str(url_content.get("error") or not_connected_message())
-            if url_content.get("error"):
-                # 2026-08-31, the same defect as the prepare path: mode="jira"
-                # means the TICKET is the input, so an unreadable one is a
-                # refusal. This used to fall through and analyse an empty string.
-                return str(url_content.get("error"))
-            jira_text = url_content.get("content") or ""
-
-        screen_descriptions = ""
-        forwarded_screens: list = []
-        screens_captured = 0
-        if mode in ("mobile", "jira_mobile"):
-            if not _mobile_capture():
-                if mode == "mobile":
-                    return "ℹ️ Mobile capture is disabled in this build."
-                # jira_mobile continues from the ticket alone (parity with app.py)
-            else:
-                device_id = (device_id or "").strip()
-                if not device_id and _elicit_enabled():
-                    picked = await _elicit_device(choose)
-                    if picked.status == CHOSEN:
-                        device_id = picked.value or ""
-                    elif picked.status == DECLINED:
-                        return "👍 Cancelled — no device selected."
-                    else:
-                        return await _device_menu_markdown(tool="qa_feature_analysis")
-                device, why_not = await _resolve_device_with_reason(device_id)
-                if device is None:
-                    return (
-                        f"⚠️ Device `{device_id}` not found. Run qa_list_devices to "
-                        "see connected devices, then pass a listed id." + why_not
-                    )
-                screens, capture_error = await _fa_capture_screens(
-                    device, choose=choose, progress=progress
-                )
-                if capture_error and not screens:
-                    return f"⚠️ Couldn't capture a screenshot: {capture_error}"
-                screens_captured = len(screens)
-                if screens:
-                    # NO server vision call: the raw screens ride to the
-                    # tester's own multimodal model as MCP image content,
-                    # exactly as qa_capture_screens already returns them and
-                    # as IMAGE_JOB does on the generation path.
-                    await _emit(
-                        progress,
-                        f"🖼️ Attaching {screens_captured} captured screen(s) for your model…",
-                    )
-                    forwarded_screens = list(screens)
-
-        feature_text = text or "Feature captured from mobile device screens."
-        await _emit(
-            progress, "📋 Preparing the Feature Analysis task for your chat model…"
-        )
-        opened = await prepare_feature_analysis(
-            feature_text,
-            jira_text,
-            screen_descriptions,
-            mode=mode,
-            screens=screens_captured,
-            source=("jira" if used_url else "mobile" if screens_captured else "text"),
-        )
-        if opened.get("error"):
-            return f"⚠️ Feature Analysis preparation failed: {opened['error']}"
-        opened_content = opened.get("content") or {}
-        task_id = str(opened_content.get("task_id") or "")
-        telemetry.add_tool_properties(
-            source=("jira" if used_url else "mobile" if screens_captured else "text"),
-        )
-        await _audit(
-            "mcp_feature_analysis_prepare",
-            entity_id=task_id,
-            detail={
-                "mode": mode,
-                "source": "url" if used_url else "text",
-                "screens": screens_captured,
-            },
-        )
-        header = ""
-        if mode != "jira":
-            header = f"_Mode: {mode} · screens captured: {screens_captured}_\n\n"
-        if forwarded_screens:
-            # The screens are ATTACHED to this reply, so the old two-branch
-            # vision disclosure would now be a lie in both directions: nothing
-            # was described server-side, and nothing was lost either.
-            header += (
-                "> ℹ️  "
-                f"{len(forwarded_screens)} captured screen(s) are attached to "
-                "this message as images. This server made NO vision call — "
-                "read them yourself.\n\n"
-            )
-        elif screen_descriptions:
-            # Honesty: the ANALYSIS is chat-only from here, but the screenshot
-            # descriptions above were produced by THIS server's vision call
-            # (ledger row `image_description.describe_images`, whose terminal
-            # status is `disabled (disclosed)` -- residue sub-phase R3 -- exactly
-            # because THIS half of it has no host analog: a tools/host_llm
-            # envelope is text and this tool returns a str, so the raw screens
-            # cannot ride to the tester's own multimodal model the way
-            # IMAGE_JOB carries the generation path's images).
-            # Saying so beats letting the tool look fully chat-only when it is not.
-            header += (
-                "> ℹ️ The screenshot descriptions in this task were produced by "
-                "this server's own vision call — only the ANALYSIS is "
-                "chat-only.\n\n"
-            )
-        elif screens_captured:
-            # The other half of the same honesty, and the reason that ledger row
-            # can read `disabled (disclosed)` at all: screens were captured and
-            # NOTHING described them. Today that happens on cli/cursor; after the
-            # Phase-6 flip it happens on every backend. Either way the tester must
-            # not be left believing the screens were read.
-            header += _fa_vision_disclosure(screens_captured)
-        return FeatureAnalysisReply(
-            header
-            # F16 (2026-08-30): `shape_host_task`'s response_schema is opt-IN and
-            # this call site never passed it, so the envelope the host received
-            # carried NO schema -- while the tool description promises one. Field
-            # names then have to be guessed, and a wrong guess fails INVISIBLY:
-            # finalize_feature_report drops unknown keys by design. A live run
-            # lost `feature_summary` to exactly that.
-            + shape_host_task(
-                "Feature Analysis — your turn",
-                task_id,
-                opened_content.get("envelope") or {},
-                "qa_submit_feature_analysis",
-                "field `report_json`",
-                response_schema=(opened_content.get("envelope") or {}).get(
-                    "response_schema"
-                ),
-            ),
-            forwarded_screens,
-        )
+        ticket, reply = await _fa_fetch_ticket(mode, text, jira_content_json, progress)
+        if reply:
+            return reply
+        capture, reply = await _fa_capture_stage(mode, device_id, choose, progress)
+        if reply:
+            return reply
+        return await _fa_prepare_reply(mode, text, ticket, capture, progress)
     except Exception as exc:
         logger.exception("handle_feature_analysis failed")
         _capture_error(exc, "qa_feature_analysis")
@@ -19662,6 +20495,80 @@ async def _write_feature_analysis_file(task_id: str, markdown: str) -> str:
         return ""
 
 
+async def _fa_resubmit_reply(task_id: str, meta: dict, usable: bool) -> str | None:
+    """The round-2 resubmit task for an unusable report, or None to render as is."""
+    round_no = int(meta.get("round") or 1)
+    mode = str(meta.get("mode") or "")
+    screens_n = int(meta.get("screens") or 0)
+    if not usable and round_no < _MAX_FEATURE_ANALYSIS_ROUNDS:
+        reopened = await prepare_feature_analysis(
+            str(meta.get("feature_text") or ""),
+            str(meta.get("jira_text") or ""),
+            str(meta.get("screen_descriptions") or ""),
+            mode=mode,
+            screens=screens_n,
+            source=str(meta.get("source") or ""),
+            round_no=round_no + 1,
+        )
+        reopened_content = reopened.get("content") or {}
+        if not reopened.get("error") and reopened_content.get("task_id"):
+            return (
+                "> ⚠️ That submission carried no usable Feature Analysis "
+                "object. Re-emit it as a SINGLE JSON object matching "
+                "`response_schema` and submit it against the NEW task id "
+                "below.\n\n"
+                + shape_host_task(
+                    "Feature Analysis — resubmit (round 2 of 2)",
+                    str(reopened_content.get("task_id") or ""),
+                    reopened_content.get("envelope") or {},
+                    "qa_submit_feature_analysis",
+                    "field `report_json`",
+                    response_schema=(reopened_content.get("envelope") or {}).get(
+                        "response_schema"
+                    ),
+                )
+            )
+        logger.warning(
+            "could not open a resubmit round for feature-analysis task %s — "
+            "rendering what the host sent",
+            task_id,
+        )
+    return None
+
+
+async def _fa_report_reply(
+    task_id: str, meta: dict, report: object, usable: bool
+) -> str:
+    """Audit the submission and render the report, with a note on the saved file."""
+    round_no = int(meta.get("round") or 1)
+    mode = str(meta.get("mode") or "")
+    screens_n = int(meta.get("screens") or 0)
+    await _audit(
+        "mcp_feature_analysis",
+        entity_id=task_id,
+        detail={
+            "mode": mode,
+            "source": str(meta.get("source") or ""),
+            "screens": screens_n,
+            "round": round_no,
+            "usable": usable,
+        },
+    )
+    header = "## Feature Analysis\n\n"
+    if mode and mode != "jira":
+        header += f"_Mode: {mode} · screens captured: {screens_n}_\n\n"
+    if not usable:
+        header += (
+            "> ⚠️ The submitted JSON carried no usable report, so every "
+            "section below is empty. Call `qa_feature_analysis` again to "
+            "retry.\n\n"
+        )
+    file_note = await _write_feature_analysis_file(
+        task_id, header + render_report_markdown(report)
+    )
+    return header + file_note + render_report_markdown(report, compact=True)
+
+
 async def handle_submit_feature_analysis(
     task_id: str, report_json: str, *, progress: ProgressCb = None
 ) -> str:
@@ -19696,66 +20603,10 @@ async def handle_submit_feature_analysis(
         content = closed.get("content") or {}
         meta = content.get("meta") or {}
         report, usable = finalize_feature_report(content.get("payload"))
-        round_no = int(meta.get("round") or 1)
-        mode = str(meta.get("mode") or "")
-        screens_n = int(meta.get("screens") or 0)
-        if not usable and round_no < _MAX_FEATURE_ANALYSIS_ROUNDS:
-            reopened = await prepare_feature_analysis(
-                str(meta.get("feature_text") or ""),
-                str(meta.get("jira_text") or ""),
-                str(meta.get("screen_descriptions") or ""),
-                mode=mode,
-                screens=screens_n,
-                source=str(meta.get("source") or ""),
-                round_no=round_no + 1,
-            )
-            reopened_content = reopened.get("content") or {}
-            if not reopened.get("error") and reopened_content.get("task_id"):
-                return (
-                    "> ⚠️ That submission carried no usable Feature Analysis "
-                    "object. Re-emit it as a SINGLE JSON object matching "
-                    "`response_schema` and submit it against the NEW task id "
-                    "below.\n\n"
-                    + shape_host_task(
-                        "Feature Analysis — resubmit (round 2 of 2)",
-                        str(reopened_content.get("task_id") or ""),
-                        reopened_content.get("envelope") or {},
-                        "qa_submit_feature_analysis",
-                        "field `report_json`",
-                        response_schema=(reopened_content.get("envelope") or {}).get(
-                            "response_schema"
-                        ),
-                    )
-                )
-            logger.warning(
-                "could not open a resubmit round for feature-analysis task %s — "
-                "rendering what the host sent",
-                task_id,
-            )
-        await _audit(
-            "mcp_feature_analysis",
-            entity_id=task_id,
-            detail={
-                "mode": mode,
-                "source": str(meta.get("source") or ""),
-                "screens": screens_n,
-                "round": round_no,
-                "usable": usable,
-            },
-        )
-        header = "## Feature Analysis\n\n"
-        if mode and mode != "jira":
-            header += f"_Mode: {mode} · screens captured: {screens_n}_\n\n"
-        if not usable:
-            header += (
-                "> ⚠️ The submitted JSON carried no usable report, so every "
-                "section below is empty. Call `qa_feature_analysis` again to "
-                "retry.\n\n"
-            )
-        file_note = await _write_feature_analysis_file(
-            task_id, header + render_report_markdown(report)
-        )
-        return header + file_note + render_report_markdown(report, compact=True)
+        resubmit = await _fa_resubmit_reply(task_id, meta, usable)
+        if resubmit is not None:
+            return resubmit
+        return await _fa_report_reply(task_id, meta, report, usable)
     except Exception as exc:
         logger.exception("handle_submit_feature_analysis failed")
         _capture_error(exc, "qa_submit_feature_analysis")
@@ -19816,6 +20667,76 @@ def _wizard_handoff_markdown(choice: str) -> str:
     return f"## {choice}\n\nGreat — call `{tool}` next. {hint}"
 
 
+async def _wizard_route(
+    choice: str,
+    options: list[str],
+    choose: ChooseCb,
+    ask_text: AskCb,
+    progress: ProgressCb,
+) -> str:
+    """Run the flow the tester chose, or the handoff or menu for it."""
+    if choice == "Generate test cases":
+        return await _guided_test_cases(
+            choose=choose, ask_text=ask_text, progress=progress
+        )
+
+    if choice == "Report a bug":
+        return await _wizard_report_bug(choice, ask_text, progress)
+
+    if choice == "Exploratory testing coach":
+        return await _wizard_explore(choice, ask_text, progress)
+
+    if choice in _WIZARD_HANDOFFS:
+        return _wizard_handoff_markdown(choice)
+    # Unrecognised selection — fall back to the full menu.
+    return _wizard_menu_markdown(options)
+
+
+async def _wizard_report_bug(choice: str, ask_text: AskCb, progress: ProgressCb) -> str:
+    """The wizard's bug-report flow: ask for the bug, then prepare the report."""
+    asked = await _elicit_text(ask_text, "Describe the bug in plain language:")
+    if asked.status == CHOSEN and (asked.value or "").strip():
+        # PREPARE half only (host-boomerang Phase 2): qa_bug_report hands
+        # back a task envelope, so the wizard must name the SUBMIT tool
+        # as the immediate next call or the open task is abandoned.
+        prepared = await handle_bug_report(asked.value.strip(), progress=progress)
+        return prepared + (
+            "\n\n_Next: write the report exactly as the task above "
+            "asks, then call `qa_submit_bug_report` with its `task_id`._"
+        )
+    if asked.status == DECLINED:
+        return "👍 Cancelled."
+    return _wizard_handoff_markdown(choice)
+
+
+async def _wizard_explore(choice: str, ask_text: AskCb, progress: ProgressCb) -> str:
+    """The wizard's exploratory flow: ask for the feature, then prepare a step."""
+    asked = await _elicit_text(
+        ask_text, "Which feature or area do you want to explore?"
+    )
+    if asked.status == CHOSEN and (asked.value or "").strip():
+        feature = asked.value.strip()
+        # Deterministic id: running the wizard again with the same
+        # feature continues the same coaching session.
+        session_id = (
+            "wizard-" + hashlib.sha1(feature.lower().encode("utf-8")).hexdigest()[:10]
+        )
+        step = await handle_explore_step(feature, session_id, progress=progress)
+        # PREPARE half only (host-boomerang Phase 2): qa_explore_step no
+        # longer returns a coaching turn, so qa_submit_explore_step --
+        # not qa_wizard -- is the immediate next call.
+        return step + (
+            "\n\n_Next: write the coaching step the task above asks "
+            "for and call `qa_submit_explore_step` with its `task_id`. "
+            "After that, run `qa_wizard` again with the same feature, "
+            f"or call `qa_explore_step` with session_id `{session_id}` "
+            "and your `tester_response`._"
+        )
+    if asked.status == DECLINED:
+        return "👍 Cancelled."
+    return _wizard_handoff_markdown(choice)
+
+
 async def handle_wizard(
     *,
     choose: ChooseCb = None,
@@ -19850,60 +20771,7 @@ async def handle_wizard(
                 "`qa_wizard` again anytime.\n\n" + _wizard_menu_markdown(options)
             )
         choice = top.value
-
-        if choice == "Generate test cases":
-            return await _guided_test_cases(
-                choose=choose, ask_text=ask_text, progress=progress
-            )
-
-        if choice == "Report a bug":
-            asked = await _elicit_text(ask_text, "Describe the bug in plain language:")
-            if asked.status == CHOSEN and (asked.value or "").strip():
-                # PREPARE half only (host-boomerang Phase 2): qa_bug_report hands
-                # back a task envelope, so the wizard must name the SUBMIT tool
-                # as the immediate next call or the open task is abandoned.
-                prepared = await handle_bug_report(
-                    asked.value.strip(), progress=progress
-                )
-                return prepared + (
-                    "\n\n_Next: write the report exactly as the task above "
-                    "asks, then call `qa_submit_bug_report` with its `task_id`._"
-                )
-            if asked.status == DECLINED:
-                return "👍 Cancelled."
-            return _wizard_handoff_markdown(choice)
-
-        if choice == "Exploratory testing coach":
-            asked = await _elicit_text(
-                ask_text, "Which feature or area do you want to explore?"
-            )
-            if asked.status == CHOSEN and (asked.value or "").strip():
-                feature = asked.value.strip()
-                # Deterministic id: running the wizard again with the same
-                # feature continues the same coaching session.
-                session_id = (
-                    "wizard-"
-                    + hashlib.sha1(feature.lower().encode("utf-8")).hexdigest()[:10]
-                )
-                step = await handle_explore_step(feature, session_id, progress=progress)
-                # PREPARE half only (host-boomerang Phase 2): qa_explore_step no
-                # longer returns a coaching turn, so qa_submit_explore_step --
-                # not qa_wizard -- is the immediate next call.
-                return step + (
-                    "\n\n_Next: write the coaching step the task above asks "
-                    "for and call `qa_submit_explore_step` with its `task_id`. "
-                    "After that, run `qa_wizard` again with the same feature, "
-                    f"or call `qa_explore_step` with session_id `{session_id}` "
-                    "and your `tester_response`._"
-                )
-            if asked.status == DECLINED:
-                return "👍 Cancelled."
-            return _wizard_handoff_markdown(choice)
-
-        if choice in _WIZARD_HANDOFFS:
-            return _wizard_handoff_markdown(choice)
-        # Unrecognised selection — fall back to the full menu.
-        return _wizard_menu_markdown(options)
+        return await _wizard_route(choice, options, choose, ask_text, progress)
     except Exception as exc:
         logger.exception("handle_wizard failed")
         return f"⚠️ Wizard failed: {exc}"

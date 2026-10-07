@@ -198,6 +198,52 @@ def _attributes(kind: str, message: str, matcher) -> bool:
     return bool(matcher.search(message))
 
 
+def _parse_lines(lines: list[str]) -> list[tuple[str, str, str]]:
+    """``(tag, message, raw line)`` per line; an unparseable line has an empty tag."""
+    parsed = []
+    for line in lines:
+        hit = _LINE_RE.match(line)
+        parsed.append((hit.group(2), hit.group(3), line) if hit else ("", "", line))
+    return parsed
+
+
+def _find_marker(parsed: list, matcher) -> tuple[tuple[int, str] | None, str]:
+    """``((index, kind) of the first attributed marker or None, last kind seen)``."""
+    seen_marker = ""
+    for index, (tag, message, _line) in enumerate(parsed):
+        if not tag:
+            continue
+        kind = _kind_of(tag, message)
+        if not kind:
+            continue
+        seen_marker = kind
+        window = parsed[index : index + 1 + MAX_ATTRIBUTION_LINES]
+        if any(_attributes(kind, entry[1], matcher) for entry in window if entry[0]):
+            return (index, kind), seen_marker
+    return None, seen_marker
+
+
+def _excerpt(parsed: list, index: int) -> str:
+    return "\n".join(
+        _neutralize(entry[2]) for entry in parsed[index : index + MAX_EXCERPT_LINES]
+    )[:MAX_EXCERPT_CHARS]
+
+
+def _missed(seen_marker: str, pkg: str, lines: int, truncated: bool) -> dict:
+    """The not-detected record, saying whether another process's marker was seen."""
+    if seen_marker:
+        reason = (
+            "the "
+            + seen_marker
+            + " marker in this slice names another process, not "
+            + pkg[:80]
+            + ", so it is not this case's failure"
+        )
+    else:
+        reason = "no fatal-event marker from the platform is in this slice"
+    return _empty(reason, lines=lines, truncated=truncated)
+
+
 def scan(text: object, package: object) -> dict:
     """Judge one slice. ``{"detected", "kind", "label", "marker", "excerpt",
     "package", "lines_scanned", "truncated", "reason"}``. Never raises.
@@ -224,54 +270,22 @@ def scan(text: object, package: object) -> dict:
             body = raw[-MAX_SCAN_BYTES:].decode("utf-8", errors="replace")
         lines = body.splitlines()
         matcher = _package_re(pkg)
-        parsed = []
-        for line in lines:
-            hit = _LINE_RE.match(line)
-            parsed.append((hit.group(2), hit.group(3), line) if hit else ("", "", line))
-        seen_marker = ""
-        for index, (tag, message, line) in enumerate(parsed):
-            if not tag:
-                continue
-            kind = _kind_of(tag, message)
-            if not kind:
-                continue
-            seen_marker = kind
-            window = parsed[index : index + 1 + MAX_ATTRIBUTION_LINES]
-            attributed = any(
-                _attributes(kind, entry[1], matcher) for entry in window if entry[0]
-            )
-            if not attributed:
-                continue
-            excerpt = "\n".join(
-                _neutralize(entry[2])
-                for entry in parsed[index : index + MAX_EXCERPT_LINES]
-            )[:MAX_EXCERPT_CHARS]
+        parsed = _parse_lines(lines)
+        found, seen_marker = _find_marker(parsed, matcher)
+        if found is not None:
+            index, kind = found
             return {
                 "detected": True,
                 "kind": kind,
                 "label": KIND_LABELS.get(kind, "the app under test died"),
-                "marker": _neutralize(line)[:MAX_MARKER_CHARS],
-                "excerpt": excerpt,
+                "marker": _neutralize(parsed[index][2])[:MAX_MARKER_CHARS],
+                "excerpt": _excerpt(parsed, index),
                 "package": pkg[:120],
                 "lines_scanned": len(lines),
                 "truncated": truncated,
                 "reason": "",
             }
-        if seen_marker:
-            return _empty(
-                "the "
-                + seen_marker
-                + " marker in this slice names another process, not "
-                + pkg[:80]
-                + ", so it is not this case's failure",
-                lines=len(lines),
-                truncated=truncated,
-            )
-        return _empty(
-            "no fatal-event marker from the platform is in this slice",
-            lines=len(lines),
-            truncated=truncated,
-        )
+        return _missed(seen_marker, pkg, len(lines), truncated)
     except Exception:  # never-raise: a detector that raises is a detector that is off
         logger.exception("mobile_evidence.crash_detector.scan failed")
         return _empty("the slice could not be scanned")

@@ -223,56 +223,67 @@ def _bindings_in_line(line: str, start: int, end: int) -> list:
     return out
 
 
+def _collect_bindings(raw: str) -> tuple[dict, list]:
+    """Bindings per normalised identifier, plus the identifiers in first-seen order."""
+    by_id: dict = {}
+    order: list = []
+    seen = 0
+    for line in raw.splitlines():
+        if seen > _MAX_OCCURRENCES:
+            break
+        for m in _ID_RE.finditer(line):
+            seen += 1
+            if seen > _MAX_OCCURRENCES:
+                break
+            ident = f"{m.group(1).upper()}{int(m.group(2)):02d}"
+            if ident not in by_id:
+                if len(by_id) >= _MAX_IDENTIFIERS:
+                    continue
+                by_id[ident] = []
+                order.append(ident)
+            bucket = by_id[ident]
+            if len(bucket) >= _MAX_BINDINGS_PER_ID:
+                continue
+            bucket.extend(_bindings_in_line(line, m.start(), m.end()))
+    return by_id, order
+
+
+def _first_conflict(bucket: list) -> tuple | None:
+    """The first (definition, other) pair in ``bucket`` that truly disagrees."""
+    for d in bucket:
+        if d[0] != "definition":
+            continue
+        for other in bucket:
+            if other is d:
+                continue
+            if _is_translation(d[2], other[2]):
+                continue
+            if len(d[2] & other[2]) / len(d[2] | other[2]) > _MAX_OVERLAP:
+                continue
+            return (d, other)
+    return None
+
+
+def _conflict_labels(hit: tuple) -> list:
+    labels: list = []
+    for b in hit:
+        if b[1] and b[1] not in labels:
+            labels.append(b[1])
+    return labels
+
+
 def find_identifier_collisions(text: object) -> list:
     findings: list = []
     try:
         raw = str(text or "")[:_MAX_INPUT_CHARS]
         if not raw:
             return []
-        by_id: dict = {}
-        order: list = []
-        seen = 0
-        for line in raw.splitlines():
-            if seen > _MAX_OCCURRENCES:
-                break
-            for m in _ID_RE.finditer(line):
-                seen += 1
-                if seen > _MAX_OCCURRENCES:
-                    break
-                ident = f"{m.group(1).upper()}{int(m.group(2)):02d}"
-                if ident not in by_id:
-                    if len(by_id) >= _MAX_IDENTIFIERS:
-                        continue
-                    by_id[ident] = []
-                    order.append(ident)
-                bucket = by_id[ident]
-                if len(bucket) >= _MAX_BINDINGS_PER_ID:
-                    continue
-                bucket.extend(_bindings_in_line(line, m.start(), m.end()))
+        by_id, order = _collect_bindings(raw)
         for ident in order:
-            hit = None
-            bucket = by_id.get(ident) or []
-            for d in bucket:
-                if d[0] != "definition":
-                    continue
-                for other in bucket:
-                    if other is d:
-                        continue
-                    if _is_translation(d[2], other[2]):
-                        continue
-                    if len(d[2] & other[2]) / len(d[2] | other[2]) > _MAX_OVERLAP:
-                        continue
-                    hit = (d, other)
-                    break
-                if hit:
-                    break
+            hit = _first_conflict(by_id.get(ident) or [])
             if hit is None:
                 continue
-            labels = []
-            for b in hit:
-                if b[1] and b[1] not in labels:
-                    labels.append(b[1])
-            findings.append({"identifier": ident, "bindings": labels})
+            findings.append({"identifier": ident, "bindings": _conflict_labels(hit)})
             if len(findings) >= _MAX_FINDINGS:
                 break
     except Exception:

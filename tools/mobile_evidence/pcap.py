@@ -481,93 +481,199 @@ def _merge(rows: dict, row: dict) -> None:
             held["local_ports"].append(port)
 
 
+def _flow_base(conv: dict) -> dict:
+    """The fields every row of one flow shares."""
+    client, server = conv["client"], conv["server"]
+    return {
+        "packets": conv["packets"],
+        "bytes": conv["bytes"],
+        "first_ms": conv["first_ms"],
+        "last_ms": conv["last_ms"],
+        "local_ports": [client[1]] if client else [],
+        "connections": 1,
+        # The ADDRESS, beside whatever name this flow managed to learn. The
+        # socket table can state an address and never a name, so this is the
+        # only field the two sources can be joined on.
+        "server": server[0] if server else None,
+        "undetermined": False,
+    }
+
+
+def _dns_rows(conv: dict, base: dict) -> list:
+    """One row per name a DNS flow asked for."""
+    server = conv["server"]
+    rows = []
+    for name, count in conv["qnames"].items():
+        row = dict(base)
+        row.update(
+            {
+                "host": name,
+                "port": server[1] if server else None,
+                "proto": PROTO_DNS,
+                "source": SOURCE_DNS,
+                "connections": count,
+                # NOT a share of the flow bytes: a per-name byte count
+                # is not a thing this capture measured, and a number
+                # nobody measured is worse on a page than a blank.
+                "bytes": None,
+            }
+        )
+        rows.append(row)
+    return rows
+
+
+def _flow_row(conv: dict, base: dict) -> dict:
+    """The single row of a non-DNS flow, named by the best evidence it has."""
+    server = conv["server"]
+    row = dict(base)
+    if conv["sni"]:
+        row.update(
+            {
+                "host": conv["sni"],
+                "port": server[1],
+                "proto": PROTO_TLS,
+                "source": SOURCE_SNI,
+            }
+        )
+    elif conv["http_host"]:
+        # KEYED ON THE HOST, not on a list of request lines. It was `elif
+        # conv["targets"]`, and dropping the request target would have made
+        # this branch unreachable -- every plaintext row would have fallen
+        # through to ip-only and the feature would have silently stopped
+        # naming hosts it had correctly parsed.
+        row.update(
+            {
+                "host": conv["http_host"],
+                "port": server[1],
+                "proto": PROTO_HTTP,
+                "source": SOURCE_HTTP,
+            }
+        )
+    elif server is not None:
+        row.update(
+            {
+                "host": server[0],
+                "port": server[1],
+                "proto": conv["transport"],
+                "source": SOURCE_IP,
+            }
+        )
+    else:
+        # NOTHING in this flow identified a client, so neither end is the
+        # server. Said, not guessed -- and with no local port, so the owner
+        # attribution can only report it unsampled.
+        row.update(
+            {
+                "host": conv["ends"],
+                "port": None,
+                "proto": conv["transport"],
+                "source": SOURCE_IP,
+                "local_ports": [],
+                "undetermined": True,
+            }
+        )
+    return row
+
+
 def _rows(flows: dict) -> list:
     merged: dict = {}
     for conv in flows.values():
-        client, server = conv["client"], conv["server"]
-        base = {
-            "packets": conv["packets"],
-            "bytes": conv["bytes"],
-            "first_ms": conv["first_ms"],
-            "last_ms": conv["last_ms"],
-            "local_ports": [client[1]] if client else [],
-            "connections": 1,
-            # The ADDRESS, beside whatever name this flow managed to learn. The
-            # socket table can state an address and never a name, so this is the
-            # only field the two sources can be joined on.
-            "server": server[0] if server else None,
-            "undetermined": False,
-        }
+        base = _flow_base(conv)
         if conv["qnames"]:
-            for name, count in conv["qnames"].items():
-                row = dict(base)
-                row.update(
-                    {
-                        "host": name,
-                        "port": server[1] if server else None,
-                        "proto": PROTO_DNS,
-                        "source": SOURCE_DNS,
-                        "connections": count,
-                        # NOT a share of the flow bytes: a per-name byte count
-                        # is not a thing this capture measured, and a number
-                        # nobody measured is worse on a page than a blank.
-                        "bytes": None,
-                    }
-                )
+            for row in _dns_rows(conv, base):
                 _merge(merged, row)
-            continue
-        row = dict(base)
-        if conv["sni"]:
-            row.update(
-                {
-                    "host": conv["sni"],
-                    "port": server[1],
-                    "proto": PROTO_TLS,
-                    "source": SOURCE_SNI,
-                }
-            )
-        elif conv["http_host"]:
-            # KEYED ON THE HOST, not on a list of request lines. It was `elif
-            # conv["targets"]`, and dropping the request target would have made
-            # this branch unreachable -- every plaintext row would have fallen
-            # through to ip-only and the feature would have silently stopped
-            # naming hosts it had correctly parsed.
-            row.update(
-                {
-                    "host": conv["http_host"],
-                    "port": server[1],
-                    "proto": PROTO_HTTP,
-                    "source": SOURCE_HTTP,
-                }
-            )
-        elif server is not None:
-            row.update(
-                {
-                    "host": server[0],
-                    "port": server[1],
-                    "proto": conv["transport"],
-                    "source": SOURCE_IP,
-                }
-            )
         else:
-            # NOTHING in this flow identified a client, so neither end is the
-            # server. Said, not guessed -- and with no local port, so the owner
-            # attribution can only report it unsampled.
-            row.update(
-                {
-                    "host": conv["ends"],
-                    "port": None,
-                    "proto": conv["transport"],
-                    "source": SOURCE_IP,
-                    "local_ports": [],
-                    "undetermined": True,
-                }
-            )
-        _merge(merged, row)
+            _merge(merged, _flow_row(conv, base))
     return sorted(
         merged.values(),
         key=lambda item: (-int(item["connections"]), str(item["host"])),
     )
+
+
+def _frame_layer(frame: bytes, linktype: int):
+    """The decoded layers of one frame, or None when it cannot be read."""
+    try:
+        return _layers(frame, linktype)
+    except Exception:  # pragma: no cover - the bounds above cover it
+        return None
+
+
+def _count_packet(conv: dict, incl: int, stamp: int) -> None:
+    """Add one packet of *incl* bytes seen at *stamp* ms to its flow."""
+    conv["packets"] += 1
+    conv["bytes"] += incl
+    conv["first_ms"] = (
+        stamp if conv["first_ms"] is None else min(conv["first_ms"], stamp)
+    )
+    conv["last_ms"] = stamp if conv["last_ms"] is None else max(conv["last_ms"], stamp)
+
+
+def _parse_notes(
+    supported: bool, linktype: int, truncated: bool, dropped_flows: int
+) -> list:
+    """The caveats a parse carries, one string each."""
+    notes = []
+    if not supported:
+        notes.append(
+            "the capture link type is " + str(linktype) + ", which this parser "
+            "does not read, so no flow was extracted from it"
+        )
+    if truncated:
+        notes.append("the capture was longer than this parser reads, so it is partial")
+    if dropped_flows:
+        notes.append(
+            str(dropped_flows)
+            + " flow(s) past the "
+            + str(MAX_FLOWS)
+            + "-flow limit were not counted"
+        )
+    return notes
+
+
+def _read_records(
+    raw: bytes, prefix: str, nanos: bool, linktype: int, supported: bool
+) -> tuple[dict, tuple[int, int, int, int], bool]:
+    """Walk the packet records: (flows, (packets, bytes, unparsed, dropped_flows), cut).
+
+    ``cut`` is True when a record lied about its length or records were left unread.
+    """
+    flows: dict = {}
+    dropped_flows = 0
+    packets = 0
+    total = 0
+    unparsed = 0
+    cut = False
+    pos = _GLOBAL_LEN
+    while pos + _RECORD_LEN <= len(raw) and packets < MAX_PACKETS:
+        stamp_a, stamp_b, incl, _orig = struct.unpack(
+            prefix + "IIII", raw[pos : pos + _RECORD_LEN]
+        )
+        pos += _RECORD_LEN
+        if incl > len(raw) - pos:
+            cut = True
+            break
+        frame = raw[pos : pos + incl]
+        pos += incl
+        packets += 1
+        total += incl
+        stamp = stamp_a * 1000 + (stamp_b // 1000000 if nanos else stamp_b // 1000)
+        layer = _frame_layer(frame, linktype) if supported else None
+        if layer is None:
+            unparsed += 1
+            continue
+        key = _key(layer)
+        conv = flows.get(key)
+        if conv is None:
+            if len(flows) >= MAX_FLOWS:
+                dropped_flows += 1
+                continue
+            conv = _new_flow(key)
+            flows[key] = conv
+        _count_packet(conv, incl, stamp)
+        _absorb(conv, layer)
+    if pos + _RECORD_LEN <= len(raw):
+        cut = True
+    return flows, (packets, total, unparsed, dropped_flows), cut
 
 
 def parse(data: object) -> dict:
@@ -605,69 +711,10 @@ def parse(data: object) -> dict:
         _LINKTYPE_RAW4,
         _LINKTYPE_RAW6,
     )
-    flows: dict = {}
-    dropped_flows = 0
-    packets = 0
-    total = 0
-    unparsed = 0
-    pos = _GLOBAL_LEN
-    while pos + _RECORD_LEN <= len(raw) and packets < MAX_PACKETS:
-        stamp_a, stamp_b, incl, _orig = struct.unpack(
-            prefix + "IIII", raw[pos : pos + _RECORD_LEN]
-        )
-        pos += _RECORD_LEN
-        if incl > len(raw) - pos:
-            truncated = True
-            break
-        frame = raw[pos : pos + incl]
-        pos += incl
-        packets += 1
-        total += incl
-        stamp = stamp_a * 1000 + (stamp_b // 1000000 if nanos else stamp_b // 1000)
-        if not supported:
-            unparsed += 1
-            continue
-        try:
-            layer = _layers(frame, linktype)
-        except Exception:  # pragma: no cover - the bounds above cover it
-            layer = None
-        if layer is None:
-            unparsed += 1
-            continue
-        key = _key(layer)
-        conv = flows.get(key)
-        if conv is None:
-            if len(flows) >= MAX_FLOWS:
-                dropped_flows += 1
-                continue
-            conv = _new_flow(key)
-            flows[key] = conv
-        conv["packets"] += 1
-        conv["bytes"] += incl
-        conv["first_ms"] = (
-            stamp if conv["first_ms"] is None else min(conv["first_ms"], stamp)
-        )
-        conv["last_ms"] = (
-            stamp if conv["last_ms"] is None else max(conv["last_ms"], stamp)
-        )
-        _absorb(conv, layer)
-    if pos + _RECORD_LEN <= len(raw):
-        truncated = True
-    notes = []
-    if not supported:
-        notes.append(
-            "the capture link type is " + str(linktype) + ", which this parser "
-            "does not read, so no flow was extracted from it"
-        )
-    if truncated:
-        notes.append("the capture was longer than this parser reads, so it is partial")
-    if dropped_flows:
-        notes.append(
-            str(dropped_flows)
-            + " flow(s) past the "
-            + str(MAX_FLOWS)
-            + "-flow limit were not counted"
-        )
+    flows, counts, cut = _read_records(raw, prefix, nanos, linktype, supported)
+    packets, total, unparsed, dropped_flows = counts
+    truncated = truncated or cut
+    notes = _parse_notes(supported, linktype, truncated, dropped_flows)
     return {
         "error": None,
         "content": {

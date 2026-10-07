@@ -321,6 +321,57 @@ def _is_boundary_contrast(tokens_a: frozenset, tokens_b: frozenset) -> bool:
         return False
 
 
+def _shortlist_entries(merged_cases: list) -> list:
+    """``(tc_id, title, title_tokens)`` for each usable dict case, capped."""
+    entries = []
+    for c in (merged_cases or [])[:_DUP_SHORTLIST_MAX_CASES]:
+        if not isinstance(c, dict):
+            continue
+        tid = str(c.get("tc_id") or "")
+        toks = _dup_title_tokens(c)
+        if tid and toks:
+            entries.append((tid, str(c.get("title") or ""), toks))
+    return entries
+
+
+def _pair_ratio(a: frozenset, b: frozenset) -> float:
+    """Jaccard of two token sets, or 0.0 when the pair is not a candidate."""
+    # |a & b| <= min(|a|, |b|) and |a | b| >= max(|a|, |b|), so this
+    # bounds the Jaccard from above without building either set.
+    if min(len(a), len(b)) < _DUP_SHORTLIST_MIN_RATIO * max(len(a), len(b)):
+        return 0.0
+    union = len(a | b)
+    if not union:
+        return 0.0
+    ratio = len(a & b) / union
+    if ratio < _DUP_SHORTLIST_MIN_RATIO:
+        return 0.0
+    # F5: a deliberate contrast pair is not a duplicate candidate.
+    if _is_boundary_contrast(a, b):
+        return 0.0
+    return ratio
+
+
+def _shortlist_pairs(entries: list) -> list:
+    """Every candidate pair row over ``entries`` (unsorted, uncapped)."""
+    pairs: list = []
+    for i in range(len(entries)):
+        for j in range(i + 1, len(entries)):
+            ratio = _pair_ratio(entries[i][2], entries[j][2])
+            if not ratio:
+                continue
+            pairs.append(
+                {
+                    "id_a": entries[i][0],
+                    "title_a": entries[i][1],
+                    "id_b": entries[j][0],
+                    "title_b": entries[j][1],
+                    "ratio": round(ratio, 3),
+                }
+            )
+    return pairs
+
+
 def build_dup_shortlist_counted(merged_cases: list) -> tuple[list, int]:
     """Candidate duplicate PAIRS over the merged, renumbered cases, WITH
     the uncapped total.
@@ -352,40 +403,7 @@ def build_dup_shortlist_counted(merged_cases: list) -> tuple[list, int]:
     above for why the character-level difflib score was dropped.
     """
     try:
-        entries = []
-        for c in (merged_cases or [])[:_DUP_SHORTLIST_MAX_CASES]:
-            if not isinstance(c, dict):
-                continue
-            tid = str(c.get("tc_id") or "")
-            toks = _dup_title_tokens(c)
-            if tid and toks:
-                entries.append((tid, str(c.get("title") or ""), toks))
-        pairs: list = []
-        for i in range(len(entries)):
-            for j in range(i + 1, len(entries)):
-                a, b = entries[i][2], entries[j][2]
-                # |a & b| <= min(|a|, |b|) and |a | b| >= max(|a|, |b|), so this
-                # bounds the Jaccard from above without building either set.
-                if min(len(a), len(b)) < _DUP_SHORTLIST_MIN_RATIO * max(len(a), len(b)):
-                    continue
-                union = len(a | b)
-                if not union:
-                    continue
-                ratio = len(a & b) / union
-                if ratio < _DUP_SHORTLIST_MIN_RATIO:
-                    continue
-                # F5: a deliberate contrast pair is not a duplicate candidate.
-                if _is_boundary_contrast(a, b):
-                    continue
-                pairs.append(
-                    {
-                        "id_a": entries[i][0],
-                        "title_a": entries[i][1],
-                        "id_b": entries[j][0],
-                        "title_b": entries[j][1],
-                        "ratio": round(ratio, 3),
-                    }
-                )
+        pairs = _shortlist_pairs(_shortlist_entries(merged_cases))
         pairs.sort(key=lambda p: (-p["ratio"], p["id_a"], p["id_b"]))
         return pairs[:_DUP_SHORTLIST_MAX_PAIRS], len(pairs)
     except Exception:
@@ -481,6 +499,21 @@ def dup_shortlist_cases_json(cases: list) -> list:
     return out
 
 
+def _headline_cap_note(n: int, total) -> str:
+    """NO SILENT CAPS: when _DUP_SHORTLIST_MAX_PAIRS truncated the list, say so
+    in the same breath as the count. A saturated list read as a complete one
+    is exactly how the F08 replay was misread the first time."""
+    try:
+        if int(total) > n:
+            return (
+                f" {int(total)} pair(s) cleared the bar in all; only the "
+                f"closest {n} are listed."
+            )
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return ""
+
+
 def build_dup_contradiction_headline(found: int, total: int) -> str:
     """The PROTECTED finalize-reply CLAIM: the host's empty duplicate review is
     contradicted by the server's own prescreen. "" when nothing was found.
@@ -520,18 +553,7 @@ def build_dup_contradiction_headline(found: int, total: int) -> str:
         return ""
     if n <= 0:
         return ""
-    # NO SILENT CAPS: when _DUP_SHORTLIST_MAX_PAIRS truncated the list, say so
-    # in the same breath as the count. A saturated list read as a complete one
-    # is exactly how the F08 replay was misread the first time.
-    more = ""
-    try:
-        if int(total) > n:
-            more = (
-                f" {int(total)} pair(s) cleared the bar in all; only the "
-                f"closest {n} are listed."
-            )
-    except (TypeError, ValueError, OverflowError):
-        more = ""
+    more = _headline_cap_note(n, total)
     return (
         "> \u267b\ufe0f  **That duplicate review is CONTRADICTED by the "
         "server's own prescreen.** You reported no cross-category duplicates; "
@@ -626,6 +648,106 @@ def _low_text_ratio() -> float:
     return max(0.0, min(1.0, cfg))
 
 
+def _dup_group_caps() -> tuple[int, int]:
+    """``(max_groups, max_size)`` from settings, clamped to the hard ceilings."""
+    try:
+        cfg_groups = int(
+            getattr(settings, "qa_host_dedup_max_groups", _DUP_MAX_GROUPS)
+            or _DUP_MAX_GROUPS
+        )
+    except (TypeError, ValueError, OverflowError):
+        cfg_groups = _DUP_MAX_GROUPS
+    try:
+        cfg_size = int(
+            getattr(settings, "qa_host_dedup_max_group_size", _DUP_MAX_GROUP_SIZE)
+            or _DUP_MAX_GROUP_SIZE
+        )
+    except (TypeError, ValueError, OverflowError):
+        cfg_size = _DUP_MAX_GROUP_SIZE
+    return (
+        min(_DUP_MAX_GROUPS, max(1, cfg_groups)),
+        min(_DUP_MAX_GROUP_SIZE, max(2, cfg_size)),
+    )
+
+
+def _append_note(notes: list, msg: str) -> None:
+    if len(notes) < _MAX_DUP_NOTES:
+        notes.append(msg)
+
+
+def _collect_group_members(
+    entry: list, known: set, claimed: set, max_size: int, notes: list
+) -> list:
+    """The valid, unclaimed, de-duplicated tc_ids of one group entry (noting drops)."""
+    members: list = []
+    for m in entry:
+        if not isinstance(m, str):
+            _append_note(notes, "a non-string tc_id in `duplicate_groups` was ignored.")
+            continue
+        tid = m.strip()
+        if tid not in known:
+            # Strip backticks/newlines: this id is UNTRUSTED host text
+            # interpolated inside a backtick span, and a crafted value
+            # could otherwise break out of it.
+            safe_tid = tid[:32].replace("`", "").replace("\n", " ")
+            _append_note(
+                notes,
+                f"`{safe_tid}` is not a tc_id in the submitted suite -- ignored.",
+            )
+            continue
+        if tid in members:
+            # Self-reference / repeat inside one group: collapse silently.
+            continue
+        if tid in claimed:
+            _append_note(
+                notes,
+                f"`{tid}` was already in an earlier duplicate group -- "
+                "ignored in the later one.",
+            )
+            continue
+        if len(members) >= max_size:
+            _append_note(
+                notes,
+                f"a duplicate group named more than {max_size} cases -- the "
+                "extra ids were ignored.",
+            )
+            break
+        members.append(tid)
+    return members
+
+
+def _walk_duplicate_groups(raw: list, valid_ids, notes: list) -> list:
+    """Shape-validate each entry of the ``duplicate_groups`` list, noting drops."""
+    max_groups, max_size = _dup_group_caps()
+    known = {str(i) for i in (valid_ids or ())}
+    claimed: set = set()
+    groups: list = []
+    if len(raw) > max_groups:
+        _append_note(
+            notes,
+            f"`duplicate_groups` named {len(raw)} groups -- only the first "
+            f"{max_groups} were considered.",
+        )
+    for entry in raw[:max_groups]:
+        if not isinstance(entry, list):
+            _append_note(
+                notes, "a `duplicate_groups` entry was not a list of tc_ids -- skipped."
+            )
+            continue
+        members = _collect_group_members(entry, known, claimed, max_size, notes)
+        if len(members) < 2:
+            if members:
+                _append_note(
+                    notes,
+                    "a duplicate group named fewer than two distinct known "
+                    "cases -- skipped.",
+                )
+            continue
+        claimed.update(members)
+        groups.append(members)
+    return groups
+
+
 def _extract_duplicate_groups(raw, valid_ids) -> tuple[list, list]:
     """Validate the SHAPE of the UNTRUSTED top-level ``duplicate_groups`` field.
 
@@ -655,11 +777,6 @@ def _extract_duplicate_groups(raw, valid_ids) -> tuple[list, list]:
       * beyond the group / group-size / note caps -> truncated + noted
     """
     notes: list = []
-
-    def _note(msg: str) -> None:
-        if len(notes) < _MAX_DUP_NOTES:
-            notes.append(msg)
-
     try:
         if raw is None:
             return [], []
@@ -668,76 +785,7 @@ def _extract_duplicate_groups(raw, valid_ids) -> tuple[list, list]:
                 "`duplicate_groups` was not a list of groups -- the whole field was "
                 "ignored (no case was removed or reported as a duplicate)."
             ]
-        try:
-            cfg_groups = int(
-                getattr(settings, "qa_host_dedup_max_groups", _DUP_MAX_GROUPS)
-                or _DUP_MAX_GROUPS
-            )
-        except (TypeError, ValueError, OverflowError):
-            cfg_groups = _DUP_MAX_GROUPS
-        try:
-            cfg_size = int(
-                getattr(settings, "qa_host_dedup_max_group_size", _DUP_MAX_GROUP_SIZE)
-                or _DUP_MAX_GROUP_SIZE
-            )
-        except (TypeError, ValueError, OverflowError):
-            cfg_size = _DUP_MAX_GROUP_SIZE
-        max_groups = min(_DUP_MAX_GROUPS, max(1, cfg_groups))
-        max_size = min(_DUP_MAX_GROUP_SIZE, max(2, cfg_size))
-
-        known = {str(i) for i in (valid_ids or ())}
-        claimed: set = set()
-        groups: list = []
-        if len(raw) > max_groups:
-            _note(
-                f"`duplicate_groups` named {len(raw)} groups -- only the first "
-                f"{max_groups} were considered."
-            )
-        for entry in raw[:max_groups]:
-            if not isinstance(entry, list):
-                _note("a `duplicate_groups` entry was not a list of tc_ids -- skipped.")
-                continue
-            members: list = []
-            for m in entry:
-                if not isinstance(m, str):
-                    _note("a non-string tc_id in `duplicate_groups` was ignored.")
-                    continue
-                tid = m.strip()
-                if tid not in known:
-                    # Strip backticks/newlines: this id is UNTRUSTED host text
-                    # interpolated inside a backtick span, and a crafted value
-                    # could otherwise break out of it.
-                    _safe_tid = tid[:32].replace("`", "").replace("\n", " ")
-                    _note(
-                        f"`{_safe_tid}` is not a tc_id in the submitted suite -- "
-                        "ignored."
-                    )
-                    continue
-                if tid in members:
-                    # Self-reference / repeat inside one group: collapse silently.
-                    continue
-                if tid in claimed:
-                    _note(
-                        f"`{tid}` was already in an earlier duplicate group -- "
-                        "ignored in the later one."
-                    )
-                    continue
-                if len(members) >= max_size:
-                    _note(
-                        f"a duplicate group named more than {max_size} cases -- the "
-                        "extra ids were ignored."
-                    )
-                    break
-                members.append(tid)
-            if len(members) < 2:
-                if members:
-                    _note(
-                        "a duplicate group named fewer than two distinct known "
-                        "cases -- skipped."
-                    )
-                continue
-            claimed.update(members)
-            groups.append(members)
+        groups = _walk_duplicate_groups(raw, valid_ids, notes)
         return groups, notes[:_MAX_DUP_NOTES]
     except Exception:
         logger.warning(
@@ -755,6 +803,16 @@ def _group_indices(cases: list, members: list) -> list:
     for i, tc in enumerate(cases):
         by_id.setdefault(tc.tc_id, i)
     return [by_id[m] for m in members if m in by_id]
+
+
+def _group_agreement(cases: list, members: list) -> float:
+    """Lowest text agreement between a group's keeper and its other members."""
+    idxs = _group_indices(cases, members)
+    if len(idxs) < 2:
+        return 0.0
+    keep_idx = min(((i, cases[i]) for i in idxs), key=_dup_keeper_key)[0]
+    ratios = [_dup_text_ratio(cases[i], cases[keep_idx]) for i in idxs if i != keep_idx]
+    return min(ratios) if ratios else 0.0
 
 
 def dup_agreements(cases: list, groups: list) -> list:
@@ -794,21 +852,52 @@ def dup_agreements(cases: list, groups: list) -> list:
     out: list = []
     try:
         for members in groups or []:
-            idxs = _group_indices(cases or [], members or [])
-            if len(idxs) < 2:
-                out.append(0.0)
-                continue
-            keep_idx = min(((i, cases[i]) for i in idxs), key=_dup_keeper_key)[0]
-            ratios = [
-                _dup_text_ratio(cases[i], cases[keep_idx])
-                for i in idxs
-                if i != keep_idx
-            ]
-            out.append(min(ratios) if ratios else 0.0)
+            out.append(_group_agreement(cases or [], members or []))
     except Exception:
         logger.warning("dup_agreements failed -- omitting the labels", exc_info=True)
         return [0.0 for _ in (groups or [])]
     return out
+
+
+def _screen_group_sizes(cases: list, groups: list, refusals: list) -> list:
+    """Groups as ``[keeper_id, *others]``; an oversized group is refused (noted in
+    ``refusals``, never truncated)."""
+    screened: list = []
+    for members in groups:
+        idxs = _group_indices(cases, members)
+        if len(idxs) < 2:
+            continue
+        if len(idxs) > _DUP_MAX_APPLY_GROUP_SIZE:
+            if len(refusals) < _MAX_DUP_NOTES:
+                refusals.append(
+                    f"a group naming {len(idxs)} cases was NOT removed: more than "
+                    f"{_DUP_MAX_APPLY_GROUP_SIZE} cases in one duplicate cluster "
+                    "is not a duplicate, so it is reported for review instead."
+                )
+            continue
+        keep_idx = min(((i, cases[i]) for i in idxs), key=_dup_keeper_key)[0]
+        screened.append(
+            [cases[keep_idx].tc_id] + [cases[i].tc_id for i in idxs if i != keep_idx]
+        )
+    return screened
+
+
+def _removal_refusal(removable: int, total: int, limit: int) -> str:
+    """Log and word the whole-review refusal for the proportional cap."""
+    logger.warning(
+        "host duplicate review refused: %d of %d cases proposed for removal (bound %d)",
+        removable,
+        total,
+        limit,
+    )
+    return (
+        f"REFUSED: the submitted duplicate review would remove {removable} "
+        f"of {total} submitted case(s), above the "
+        f"{_removal_ratio():.0%} safety bound ({limit} case(s)). NOTHING was "
+        "removed and NO group is treated as a duplicate. A review that large "
+        "is handled as untrusted input, not as a judgement -- the groups are "
+        "still listed below for you to act on yourself."
+    )
 
 
 def screen_duplicate_groups(cases: list, groups: list) -> tuple[list, list]:
@@ -847,42 +936,11 @@ def screen_duplicate_groups(cases: list, groups: list) -> tuple[list, list]:
     if not cases or not groups:
         return [], refusals
     try:
-        screened: list = []
-        for members in groups:
-            idxs = _group_indices(cases, members)
-            if len(idxs) < 2:
-                continue
-            if len(idxs) > _DUP_MAX_APPLY_GROUP_SIZE:
-                if len(refusals) < _MAX_DUP_NOTES:
-                    refusals.append(
-                        f"a group naming {len(idxs)} cases was NOT removed: more than "
-                        f"{_DUP_MAX_APPLY_GROUP_SIZE} cases in one duplicate cluster "
-                        "is not a duplicate, so it is reported for review instead."
-                    )
-                continue
-            keep_idx = min(((i, cases[i]) for i in idxs), key=_dup_keeper_key)[0]
-            screened.append(
-                [cases[keep_idx].tc_id]
-                + [cases[i].tc_id for i in idxs if i != keep_idx]
-            )
+        screened = _screen_group_sizes(cases, groups, refusals)
         removable = sum(len(g) - 1 for g in screened)
         limit = max(1, int(len(cases) * _removal_ratio()))
         if removable > limit:
-            logger.warning(
-                "host duplicate review refused: %d of %d cases proposed for removal "
-                "(bound %d)",
-                removable,
-                len(cases),
-                limit,
-            )
-            return [], [
-                f"REFUSED: the submitted duplicate review would remove {removable} "
-                f"of {len(cases)} submitted case(s), above the "
-                f"{_removal_ratio():.0%} safety bound ({limit} case(s)). NOTHING was "
-                "removed and NO group is treated as a duplicate. A review that large "
-                "is handled as untrusted input, not as a judgement -- the groups are "
-                "still listed below for you to act on yourself."
-            ]
+            return [], [_removal_refusal(removable, len(cases), limit)]
         return screened, refusals
     except Exception:
         logger.warning(
@@ -892,6 +950,50 @@ def screen_duplicate_groups(cases: list, groups: list) -> tuple[list, list]:
             "`duplicate_groups` could not be screened -- no group was honoured and "
             "nothing was removed."
         ]
+
+
+def _plan_drops(cases: list, groups: list) -> dict:
+    """``{case index: keeper tc_id}`` for every non-keeper member of each group."""
+    drop: dict = {}
+    keepers: set = set()
+    for members in groups or []:
+        idxs = _group_indices(cases, members)
+        if len(idxs) < 2:
+            continue
+        keep_idx = min(((i, cases[i]) for i in idxs), key=_dup_keeper_key)[0]
+        keepers.add(keep_idx)
+        for i in idxs:
+            if i != keep_idx and i not in drop and i not in keepers:
+                drop[i] = cases[keep_idx].tc_id
+    return drop
+
+
+def _rescue_sole_requirements(cases: list, drop: dict, notes: list) -> None:
+    """Un-drop (in place) any case that is the only one tracing its requirement."""
+
+    def _req(idx: int) -> str:
+        return normalize_ac_id(getattr(cases[idx], "requirement_id", "") or "")
+
+    covered = {_req(i) for i in range(len(cases)) if i not in drop and _req(i)}
+    for i in sorted(drop):
+        req = _req(i)
+        if req and req not in covered:
+            covered.add(req)
+            drop.pop(i)
+            if len(notes) < _MAX_DUP_NOTES:
+                notes.append(
+                    f"`{cases[i].tc_id}` was KEPT despite being grouped as a "
+                    f"duplicate: it is the only case tracing {req}."
+                )
+
+
+def _log_removed(removed: int, total: int) -> None:
+    if removed:
+        logger.info(
+            "host-reviewed dedup removed %d near-duplicate case(s) of %d",
+            removed,
+            total,
+        )
 
 
 def apply_duplicate_groups(cases: list, groups: list) -> tuple[list, list, list]:
@@ -925,48 +1027,157 @@ def apply_duplicate_groups(cases: list, groups: list) -> tuple[list, list, list]
     if not cases or not groups:
         return list(cases), [], notes
     try:
-        drop: dict = {}
-        keepers: set = set()
-        for members in groups or []:
-            idxs = _group_indices(cases, members)
-            if len(idxs) < 2:
-                continue
-            keep_idx = min(((i, cases[i]) for i in idxs), key=_dup_keeper_key)[0]
-            keepers.add(keep_idx)
-            for i in idxs:
-                if i != keep_idx and i not in drop and i not in keepers:
-                    drop[i] = cases[keep_idx].tc_id
-
-        def _req(idx: int) -> str:
-            return normalize_ac_id(getattr(cases[idx], "requirement_id", "") or "")
-
-        covered = {_req(i) for i in range(len(cases)) if i not in drop and _req(i)}
-        for i in sorted(drop):
-            req = _req(i)
-            if req and req not in covered:
-                covered.add(req)
-                drop.pop(i)
-                if len(notes) < _MAX_DUP_NOTES:
-                    notes.append(
-                        f"`{cases[i].tc_id}` was KEPT despite being grouped as a "
-                        f"duplicate: it is the only case tracing {req}."
-                    )
+        drop = _plan_drops(cases, groups)
+        _rescue_sole_requirements(cases, drop, notes)
         kept = [tc for i, tc in enumerate(cases) if i not in drop]
         if not kept:  # unreachable (a keeper is always kept); belt-and-braces
             return list(cases), [], notes
         removed = [(cases[i].tc_id, drop[i]) for i in sorted(drop)]
-        if removed:
-            logger.info(
-                "host-reviewed dedup removed %d near-duplicate case(s) of %d",
-                len(removed),
-                len(cases),
-            )
+        _log_removed(len(removed), len(cases))
         return kept, removed, notes
     except Exception:
         logger.warning(
             "apply_duplicate_groups failed -- keeping every case", exc_info=True
         )
         return list(cases), [], notes
+
+
+def _render_dup_member(m, sub_by_id: dict, final_by_stable: dict, removed_set: set):
+    """One group member as the tester will see it. Pure."""
+    tc = sub_by_id.get(m)
+    title = ((getattr(tc, "title", "") or "") if tc else "")[:80]
+    sid = (getattr(tc, "stable_id", "") or "") if tc else ""
+    final_id = final_by_stable.get(sid) if sid else ""
+    if m in removed_set:
+        return f'`{m}` "{title}" -- REMOVED as a duplicate'
+    if final_id:
+        return f'`{final_id}` "{title}" (submitted as `{m}`)'
+    return (
+        f'`{m}` "{title}" -- not in the final suite (already '
+        "collapsed as an exact duplicate)"
+    )
+
+
+def _render_dup_group_lines(
+    groups: list, render_member, agreements: list, low: float
+) -> list:
+    """The bullet line per group, cut at ``_MAX_DUP_SECTION_CHARS`` characters
+    (always at least one line). ``render_member`` maps a tc_id to its text. Pure."""
+    budget = _MAX_DUP_SECTION_CHARS
+    out: list = []
+    for gi, members in enumerate(groups):
+        rendered = [render_member(m) for m in members]
+        label = ""
+        if gi < len(agreements):
+            score = agreements[gi]
+            flag = " — LOW, review before trusting" if score < low else ""
+            label = f" _(agreement {score:.2f}{flag})_"
+        line = "- " + "; ".join(rendered) + label
+        if out and len(line) > budget:
+            break
+        budget -= len(line)
+        out.append(line)
+    return out
+
+
+def _member_renderer(submitted_cases: list, final_cases: list, removed: list):
+    """A tc_id -> display text function bound to the submitted/final suites."""
+    sub_by_id = {tc.tc_id: tc for tc in (submitted_cases or [])}
+    final_by_stable: dict = {}
+    for tc in final_cases or []:
+        sid = getattr(tc, "stable_id", "") or ""
+        if sid:
+            final_by_stable.setdefault(sid, tc.tc_id)
+    removed_set = {r[0] for r in removed if r}
+    return lambda m: _render_dup_member(m, sub_by_id, final_by_stable, removed_set)
+
+
+def _dup_review_intro_lines(n_groups: int, removed: list, applied: bool) -> list:
+    """Heading plus the explanatory paragraph(s) above the group list."""
+    if applied and removed:
+        state = "cases REMOVED"
+    elif applied:
+        state = "APPLY ON -- nothing met the safety bounds, nothing removed"
+    else:
+        state = "REPORTED ONLY -- nothing removed"
+    lines = [f"## ♻️ Duplicate review ({state})", ""]
+    lines.append(
+        f"Your chat model grouped **{n_groups}** set(s) of submitted cases "
+        "as verifying the same behaviour."
+    )
+    if applied and removed:
+        lines.append(
+            f"**{len(removed)}** case(s) were removed -- one representative "
+            "kept per group (highest priority, earliest submitted). Every "
+            "removal passed two deterministic server-side bounds: no cluster "
+            f"larger than {_DUP_MAX_APPLY_GROUP_SIZE} cases, and no more than "
+            f"{_removal_ratio():.0%} of the submitted suite removed in total."
+        )
+    elif not applied:
+        lines.append(
+            "Nothing was deleted. A near-duplicate judgement has no "
+            "calibrated precision, and removing a case that is not really a "
+            "duplicate destroys coverage a tester cannot recover -- so this "
+            "is advisory. Review the groups below, or set "
+            "QA_HOST_DEDUP_APPLY=true to let the server drop them (still "
+            "subject to the same two bounds)."
+        )
+    lines.append(
+        "*Agreement* is a server-measured textual similarity, shown so you "
+        "can spot a grouping the wording does not support. It is a reading "
+        "aid, NOT a correctness check: a genuine duplicate phrased "
+        "differently can score low, so it never decides anything."
+    )
+    lines.append("")
+    return lines
+
+
+def _dup_truncation_lines(n_hidden: int, removed_ids: list) -> list:
+    """The "…and N more" line, plus every removed id (a cut list never hides a deletion)."""
+    lines = [
+        f"- …and {n_hidden} more group(s); the list is "
+        f"truncated at ~{_MAX_DUP_SECTION_CHARS} characters."
+    ]
+    if removed_ids:
+        head = ", ".join(f"`{i}`" for i in removed_ids[:_MAX_DUP_REMOVED_IDS])
+        extra = (
+            f" (+{len(removed_ids) - _MAX_DUP_REMOVED_IDS} more)"
+            if len(removed_ids) > _MAX_DUP_REMOVED_IDS
+            else ""
+        )
+        lines += [
+            "",
+            "**Every removed case id** (listed in full because the group "
+            f"list above was truncated): {head}{extra}",
+        ]
+    return lines
+
+
+def _dup_review_lines(
+    groups: list, removed: list, applied: bool, agreements: list, render_member
+) -> list:
+    """The whole review block: intro, bounded group list, truncation disclosure."""
+    lines = _dup_review_intro_lines(len(groups), removed, applied)
+    group_lines = _render_dup_group_lines(
+        groups, render_member, agreements, _low_text_ratio()
+    )
+    lines += group_lines
+    if len(group_lines) < len(groups):
+        removed_ids = [r[0] for r in removed if r]
+        lines += _dup_truncation_lines(len(groups) - len(group_lines), removed_ids)
+    lines.append("")
+    return lines
+
+
+def _dup_notes_lines(notes: list) -> list:
+    """The quoted notes block (UNTRUSTED field, capped at ``_MAX_DUP_NOTES``)."""
+    lines = [
+        "> ℹ️  Duplicate-review notes (the field is UNTRUSTED and is "
+        "screened server-side):"
+    ]
+    lines += [f">   - {n}" for n in notes[:_MAX_DUP_NOTES]]
+    lines.append("")
+    return lines
 
 
 def build_duplicate_section(
@@ -1007,108 +1218,14 @@ def build_duplicate_section(
         agreements = list(agreements or [])
         if not groups and not notes and not removed:
             return ""
-        sub_by_id = {tc.tc_id: tc for tc in (submitted_cases or [])}
-        final_by_stable: dict = {}
-        for tc in final_cases or []:
-            sid = getattr(tc, "stable_id", "") or ""
-            if sid:
-                final_by_stable.setdefault(sid, tc.tc_id)
-        removed_ids = [r[0] for r in removed if r]
-        removed_set = set(removed_ids)
-        low = _low_text_ratio()
         lines: list = []
         if groups or removed:
-            if applied and removed:
-                state = "cases REMOVED"
-            elif applied:
-                state = "APPLY ON -- nothing met the safety bounds, nothing removed"
-            else:
-                state = "REPORTED ONLY -- nothing removed"
-            lines += [f"## ♻️ Duplicate review ({state})", ""]
-            lines.append(
-                f"Your chat model grouped **{len(groups)}** set(s) of submitted cases "
-                "as verifying the same behaviour."
+            render_member = _member_renderer(submitted_cases, final_cases, removed)
+            lines += _dup_review_lines(
+                groups, removed, applied, agreements, render_member
             )
-            if applied and removed:
-                lines.append(
-                    f"**{len(removed)}** case(s) were removed -- one representative "
-                    "kept per group (highest priority, earliest submitted). Every "
-                    "removal passed two deterministic server-side bounds: no cluster "
-                    f"larger than {_DUP_MAX_APPLY_GROUP_SIZE} cases, and no more than "
-                    f"{_removal_ratio():.0%} of the submitted suite removed in total."
-                )
-            elif not applied:
-                lines.append(
-                    "Nothing was deleted. A near-duplicate judgement has no "
-                    "calibrated precision, and removing a case that is not really a "
-                    "duplicate destroys coverage a tester cannot recover -- so this "
-                    "is advisory. Review the groups below, or set "
-                    "QA_HOST_DEDUP_APPLY=true to let the server drop them (still "
-                    "subject to the same two bounds)."
-                )
-            lines.append(
-                "*Agreement* is a server-measured textual similarity, shown so you "
-                "can spot a grouping the wording does not support. It is a reading "
-                "aid, NOT a correctness check: a genuine duplicate phrased "
-                "differently can score low, so it never decides anything."
-            )
-            lines.append("")
-            budget = _MAX_DUP_SECTION_CHARS
-            shown = 0
-            for gi, members in enumerate(groups):
-                rendered: list = []
-                for m in members:
-                    tc = sub_by_id.get(m)
-                    title = ((getattr(tc, "title", "") or "") if tc else "")[:80]
-                    sid = (getattr(tc, "stable_id", "") or "") if tc else ""
-                    final_id = final_by_stable.get(sid) if sid else ""
-                    if m in removed_set:
-                        rendered.append(f'`{m}` "{title}" -- REMOVED as a duplicate')
-                    elif final_id:
-                        rendered.append(f'`{final_id}` "{title}" (submitted as `{m}`)')
-                    else:
-                        rendered.append(
-                            f'`{m}` "{title}" -- not in the final suite (already '
-                            "collapsed as an exact duplicate)"
-                        )
-                label = ""
-                if gi < len(agreements):
-                    score = agreements[gi]
-                    flag = " — LOW, review before trusting" if score < low else ""
-                    label = f" _(agreement {score:.2f}{flag})_"
-                line = "- " + "; ".join(rendered) + label
-                if shown and len(line) > budget:
-                    break
-                budget -= len(line)
-                lines.append(line)
-                shown += 1
-            if shown < len(groups):
-                lines.append(
-                    f"- …and {len(groups) - shown} more group(s); the list is "
-                    f"truncated at ~{_MAX_DUP_SECTION_CHARS} characters."
-                )
-                if removed_ids:
-                    head = ", ".join(
-                        f"`{i}`" for i in removed_ids[:_MAX_DUP_REMOVED_IDS]
-                    )
-                    extra = (
-                        f" (+{len(removed_ids) - _MAX_DUP_REMOVED_IDS} more)"
-                        if len(removed_ids) > _MAX_DUP_REMOVED_IDS
-                        else ""
-                    )
-                    lines += [
-                        "",
-                        "**Every removed case id** (listed in full because the group "
-                        f"list above was truncated): {head}{extra}",
-                    ]
-            lines.append("")
         if notes:
-            lines.append(
-                "> ℹ️  Duplicate-review notes (the field is UNTRUSTED and is "
-                "screened server-side):"
-            )
-            lines += [f">   - {n}" for n in notes[:_MAX_DUP_NOTES]]
-            lines.append("")
+            lines += _dup_notes_lines(notes)
         return "\n".join(lines) + "\n"
     except Exception:
         logger.warning(

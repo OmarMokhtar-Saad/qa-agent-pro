@@ -275,6 +275,114 @@ def remaining(state: object, *, now: float | None = None) -> dict:
     return {"turns": turns, "seconds": seconds}
 
 
+async def _observe_screen(ctx: object) -> dict:
+    """Dump and prune the foreground screen: the pruned result, or an error dict."""
+    dumped = await executor.dump_raw(getattr(ctx, "serial", ""))
+    if dumped.get("error"):
+        return dumped
+    sized = await adb.display_size(getattr(ctx, "serial", ""))
+    # Same device fact, same cache, same reason as the case lane's.
+    dpi = await adb.display_density(getattr(ctx, "serial", ""))
+    return composite.observe(
+        dumped.get("content"),
+        # ONE producer, shared with the replay: see resolve_activity.
+        await executor.resolve_activity(ctx),
+        display=sized.get("content"),
+        density=dpi.get("content"),
+    )
+
+
+def _record_scope(body: dict, screen: dict) -> None:
+    """Write the scope verdict, the foreground package and any off-charter record."""
+    # THE SCOPE VERDICT, COMPUTED ONCE. The packet builder READS
+    # ``state["scope_verdict"]`` and never re-derives it: one writer, one
+    # reader, so what the model is told and what the run records cannot
+    # disagree. Three-valued and POSITIVE -- see charter.scope_verdict.
+    verdict = charter_mod.scope_verdict(body.get("charter"), screen)
+    body["scope_verdict"] = verdict
+    # THE FOREGROUND PACKAGE THE SERVER SAW, for the one reader that needs
+    # it: `handover` accepts a model's `app` only when it is THIS value,
+    # so the guard cannot be handed to an app that is not actually in
+    # front (fix round 3, item 1).
+    body["screen_package"] = str(screen.get("package") or "")[:MAX_PACKAGE_CHARS]
+    if verdict.get("state") == charter_mod.SCOPE_OUT:
+        # RECORDED, never silently explored. The run is NOT stopped here:
+        # nothing grades a scope-driven stop because nothing implements
+        # one -- follow-up. The list is bounded, because it lands in a
+        # manifest that a report reads.
+        # ONE producer of the record, which owns BOTH the identity rule
+        # (one entry per screen_id + matched line, not one per turn the
+        # model lingered) and the cap. The same screen is seen on every
+        # turn until the model leaves it, so an unconditional append
+        # recorded one fact many times -- measured.
+        body["off_charter"] = charter_mod.record_off_charter(
+            body.get("off_charter"),
+            {
+                "turn": int(body.get("turn") or 0) + 1,
+                "screen_id": str(screen.get("screen_id") or "")[:80],
+                "matched": str(verdict.get("matched") or "")[:200],
+            },
+        )
+
+
+def _allocate_turn(body: dict) -> None:
+    """Commit the previous turn and hand out the PROVISIONAL next turn number."""
+    # A turn number is consumed by a replay HAVING HAPPENED, not by a packet
+    # having gone out. This increment was unconditional and
+    # ``session.next_packet`` persists the result immediately, so the number
+    # was durable the moment the packet was built: run
+    # mrun-20260905-051728-bd1777 shows TC-001, TC-002, TC-004 with its third
+    # turn titled "turn 4" -- the refusal had no number to decline, because
+    # the number was already spent on disk.
+    #
+    # So the number handed out here is PROVISIONAL. It is re-derived
+    # identically on every packet build until a submit that actually replayed
+    # something commits it (``session._submit_explore``), which is also what
+    # keeps ``session.explore_turn_tc_id`` stable across a refused script or a
+    # resumed chat -- ``committed + 1`` is a pure function of a value that did
+    # not change.
+    #
+    # ``turn`` keeps its MEANING -- the highest number allocated -- so
+    # ``stop_reason``, ``remaining`` and everything downstream of them (the
+    # packet's ``turns_left``, the renderer, the report) are unchanged in code
+    # and read it exactly as before. Its VALUE differs from the old behaviour
+    # in TWO places, both deliberate. First: a REFUSED turn no longer advances the
+    # ladder, so ``turns_left`` reads 2, 2, 2 across two refusals where it
+    # used to read 3, 2, 1. That is the correction -- the ladder bounds work
+    # done ON THE DEVICE and a refused script does none -- and it means the
+    # bound on a model that keeps emitting malformed scripts is the
+    # wall-clock deadline rather than ``turns_budget``. Second: a refusal on
+    # the LAST rung still ends the run, so that number is never committed and
+    # no record is written for it -- the run stops one card short rather than
+    # writing a card for a turn that did nothing. Pinned by ``test_l8``, whose
+    # docstring states it; this comment used to omit it.
+    #
+    # This function is also the MIGRATION writer, and the write below is
+    # UNCONDITIONAL on every build by design -- do not "simplify" it into a
+    # write-only-when-absent. The line after it bumps ``turn``, so a seed
+    # that was derived and not written back would be re-derived from the
+    # bumped value on the next build and drift one higher on every re-issue
+    # of a legacy run's packet. Writing the same value again is idempotent;
+    # not writing it is a numbering leak.
+    #
+    # An ABSENT key is a state written before this ledger existed and is read
+    # as fully committed. A CORRUPT key falls back to the same place, never
+    # to 0: a live run at turn 7 restarted at TC-001 would have
+    # ``run_store.write_case`` overwrite the cards it already wrote. If
+    # ``turn`` is junk too this raises and ``next_turn``'s handler answers
+    # with an error -- the same answer ``stop_reason`` above already gives for
+    # that state, which is why there is no third fallback here.
+    committed = body.get("committed_turn")
+    if committed is None:
+        committed = body.get("turn")
+    try:
+        committed = int(committed or 0)
+    except (TypeError, ValueError, OverflowError):
+        committed = int(body.get("turn") or 0)
+    body["committed_turn"] = committed
+    body["turn"] = committed + 1
+
+
 async def next_turn(
     run_id: str, state: object, ctx: object, *, now: float | None = None
 ) -> dict:
@@ -299,19 +407,7 @@ async def next_turn(
                 },
             }
 
-        dumped = await executor.dump_raw(getattr(ctx, "serial", ""))
-        if dumped.get("error"):
-            return dumped
-        sized = await adb.display_size(getattr(ctx, "serial", ""))
-        # Same device fact, same cache, same reason as the case lane's.
-        dpi = await adb.display_density(getattr(ctx, "serial", ""))
-        pruned = composite.observe(
-            dumped.get("content"),
-            # ONE producer, shared with the replay: see resolve_activity.
-            await executor.resolve_activity(ctx),
-            display=sized.get("content"),
-            density=dpi.get("content"),
-        )
+        pruned = await _observe_screen(ctx)
         if pruned.get("error"):
             return pruned
         screen = pruned.get("content") or {}
@@ -319,90 +415,8 @@ async def next_turn(
         # Same contract as case_runner's: a screen the report can draw,
         # stored best-effort, never able to stop a turn.
         run_store.write_screen(run_id, screen)
-        # THE SCOPE VERDICT, COMPUTED ONCE. The packet builder READS
-        # ``state["scope_verdict"]`` and never re-derives it: one writer, one
-        # reader, so what the model is told and what the run records cannot
-        # disagree. Three-valued and POSITIVE -- see charter.scope_verdict.
-        verdict = charter_mod.scope_verdict(body.get("charter"), screen)
-        body["scope_verdict"] = verdict
-        # THE FOREGROUND PACKAGE THE SERVER SAW, for the one reader that needs
-        # it: `handover` accepts a model's `app` only when it is THIS value,
-        # so the guard cannot be handed to an app that is not actually in
-        # front (fix round 3, item 1).
-        body["screen_package"] = str(screen.get("package") or "")[:MAX_PACKAGE_CHARS]
-        if verdict.get("state") == charter_mod.SCOPE_OUT:
-            # RECORDED, never silently explored. The run is NOT stopped here:
-            # nothing grades a scope-driven stop because nothing implements
-            # one -- follow-up. The list is bounded, because it lands in a
-            # manifest that a report reads.
-            # ONE producer of the record, which owns BOTH the identity rule
-            # (one entry per screen_id + matched line, not one per turn the
-            # model lingered) and the cap. The same screen is seen on every
-            # turn until the model leaves it, so an unconditional append
-            # recorded one fact many times -- measured.
-            body["off_charter"] = charter_mod.record_off_charter(
-                body.get("off_charter"),
-                {
-                    "turn": int(body.get("turn") or 0) + 1,
-                    "screen_id": str(screen.get("screen_id") or "")[:80],
-                    "matched": str(verdict.get("matched") or "")[:200],
-                },
-            )
-
-        # A turn number is consumed by a replay HAVING HAPPENED, not by a packet
-        # having gone out. This increment was unconditional and
-        # ``session.next_packet`` persists the result immediately, so the number
-        # was durable the moment the packet was built: run
-        # mrun-20260905-051728-bd1777 shows TC-001, TC-002, TC-004 with its third
-        # turn titled "turn 4" -- the refusal had no number to decline, because
-        # the number was already spent on disk.
-        #
-        # So the number handed out here is PROVISIONAL. It is re-derived
-        # identically on every packet build until a submit that actually replayed
-        # something commits it (``session._submit_explore``), which is also what
-        # keeps ``session.explore_turn_tc_id`` stable across a refused script or a
-        # resumed chat -- ``committed + 1`` is a pure function of a value that did
-        # not change.
-        #
-        # ``turn`` keeps its MEANING -- the highest number allocated -- so
-        # ``stop_reason``, ``remaining`` and everything downstream of them (the
-        # packet's ``turns_left``, the renderer, the report) are unchanged in code
-        # and read it exactly as before. Its VALUE differs from the old behaviour
-        # in TWO places, both deliberate. First: a REFUSED turn no longer advances the
-        # ladder, so ``turns_left`` reads 2, 2, 2 across two refusals where it
-        # used to read 3, 2, 1. That is the correction -- the ladder bounds work
-        # done ON THE DEVICE and a refused script does none -- and it means the
-        # bound on a model that keeps emitting malformed scripts is the
-        # wall-clock deadline rather than ``turns_budget``. Second: a refusal on
-        # the LAST rung still ends the run, so that number is never committed and
-        # no record is written for it -- the run stops one card short rather than
-        # writing a card for a turn that did nothing. Pinned by ``test_l8``, whose
-        # docstring states it; this comment used to omit it.
-        #
-        # This function is also the MIGRATION writer, and the write below is
-        # UNCONDITIONAL on every build by design -- do not "simplify" it into a
-        # write-only-when-absent. The line after it bumps ``turn``, so a seed
-        # that was derived and not written back would be re-derived from the
-        # bumped value on the next build and drift one higher on every re-issue
-        # of a legacy run's packet. Writing the same value again is idempotent;
-        # not writing it is a numbering leak.
-        #
-        # An ABSENT key is a state written before this ledger existed and is read
-        # as fully committed. A CORRUPT key falls back to the same place, never
-        # to 0: a live run at turn 7 restarted at TC-001 would have
-        # ``run_store.write_case`` overwrite the cards it already wrote. If
-        # ``turn`` is junk too this raises and ``next_turn``'s handler answers
-        # with an error -- the same answer ``stop_reason`` above already gives for
-        # that state, which is why there is no third fallback here.
-        committed = body.get("committed_turn")
-        if committed is None:
-            committed = body.get("turn")
-        try:
-            committed = int(committed or 0)
-        except (TypeError, ValueError, OverflowError):
-            committed = int(body.get("turn") or 0)
-        body["committed_turn"] = committed
-        body["turn"] = committed + 1
+        _record_scope(body, screen)
+        _allocate_turn(body)
         left = remaining(body, now=now)
 
         from agents import mobile_run
@@ -468,6 +482,149 @@ def handover(state: object, reply: object) -> str:
         return ""
 
 
+def _extension_notice(body: dict, reply: dict, now: float | None) -> str:
+    """Handle an extension request: grant it into *body*, or refuse it.
+
+    Returns the notice to show. *body* is written only on a GRANT.
+    """
+    reason = " ".join(str(reply.get("extension_reason") or "").split())[:400]
+    # Computed BEFORE the notice text is chosen, and pure: nothing in
+    # this block touches turn/turns_budget/deadline ahead of a GRANT,
+    # so this is the exact value `status` gets at the return below.
+    # See EXTENSION_SPENT_CONTINUE's comment -- the text must match it.
+    ending = bool(stop_reason(body, now=now))
+    if int(body.get("extensions_used") or 0) >= MAX_EXTENSIONS:
+        return EXTENSION_SPENT if ending else EXTENSION_SPENT_CONTINUE
+    if not reason:
+        return EXTENSION_REFUSAL
+    had_turns = int(body.get("turns_budget") or MAX_TURNS)
+    had_deadline = float(body.get("deadline") or _now(now))
+    turns, deadline = _clamped_extension(body, had_turns, had_deadline, now)
+    gained_turns = turns - had_turns
+    gained_seconds = deadline - had_deadline
+    if gained_turns <= 0 and gained_seconds <= 0:
+        # REFUSE BY NAME. The clamp above left BOTH numbers where
+        # they were, so granting here would consume the session's
+        # one extension, change nothing, and REPORT a gain of 15
+        # turns and 10 minutes -- measured, and for EVERY charter
+        # naming a steps or minutes budget, because ``new_state``
+        # already clamped to that same figure. A success-shaped
+        # reply for work that did not happen is the worse failure:
+        # the model plans against turns it does not have and the
+        # run dies at the next budget check with nothing in the
+        # record explaining why. So nothing is written,
+        # ``extensions_used`` is NOT incremented,
+        # ``extension_reason`` is left unwritten, and the refusal
+        # names the ceiling that bound it. Mutant M6f deletes this
+        # branch; the upper-bound assertions in
+        # test_an_extension_cannot_outrun_the_charters_budget
+        # CANNOT see it, because an inequality is satisfied by the
+        # collapse -- the pin asserts this notice and
+        # ``extensions_used`` instead.
+        return EXTENSION_NOT_GRANTED if ending else EXTENSION_NOT_GRANTED_CONTINUE
+    body["extensions_used"] = int(body.get("extensions_used") or 0) + 1
+    body["turns_budget"] = turns
+    body["deadline"] = deadline
+    body["extension_reason"] = reason
+    return (
+        "Extended once by "
+        + _granted_text(gained_turns, gained_seconds)
+        + ": "
+        + reason
+    )
+
+
+def _clamped_extension(
+    body: dict, had_turns: int, had_deadline: float, now: float | None
+) -> tuple[int, float]:
+    """The turns budget and deadline an extension would give, charter-clamped.
+
+    THE SECOND WRITER of this run's budget. ``new_state``
+    clamped these two numbers through ``charter.budget_for``;
+    this site ADDS to them, so "a charter can never lengthen a
+    run" is false here unless it re-clamps. ``budget_cap`` is
+    the one producer of what the tester asked for and returns 0
+    where they asked for nothing, so a run with no charter
+    extends exactly as it always has.
+    """
+    cap_turns, cap_seconds = charter_mod.budget_cap(body.get("charter"))
+    turns = had_turns + EXTENSION_TURNS
+    if cap_turns:
+        turns = min(turns, min(cap_turns, MAX_TURNS))
+    deadline = had_deadline + EXTENSION_S
+    if cap_seconds:
+        # ``is not None``, never ``or``: ``started`` is 0.0 on
+        # every test clock and in any run whose epoch is 0, and
+        # the ``or`` form silently REBASES the deadline onto NOW
+        # -- lengthening the very run this clamp exists to bound.
+        # That is mutant M6c, killed by
+        # test_an_extension_cannot_outrun_the_charters_budget,
+        # which builds the state at now=0.0 and asserts the
+        # deadline stays at or below 120.0. Do not "tidy" it back.
+        _started = body.get("started")
+        started = float(_started if _started is not None else _now(now))
+        deadline = min(deadline, started + min(cap_seconds, DEADLINE_S))
+    return turns, deadline
+
+
+def _granted_text(gained_turns: int, gained_seconds: float) -> str:
+    """WHAT WAS ACTUALLY GRANTED, never the full figure.
+
+    A PARTIAL grant (one axis moves, the other does not) names
+    only the axis that moved, for the same reason the clamp
+    sentence in ``charter.describe_terms`` names only the
+    axis that clamped: printing a number the run did not get
+    is a false statement about the run the tester just had.
+    """
+    granted = []
+    if gained_turns > 0:
+        granted.append(str(int(gained_turns)) + " turns")
+    if gained_seconds >= 60:
+        granted.append(str(int(gained_seconds // 60)) + " minutes")
+    elif gained_seconds > 0:
+        granted.append("under a minute")
+    return " and ".join(granted)
+
+
+def _early_stop(body: dict, reply: dict, finding: str, notice: str) -> dict | None:
+    """The result for a turn that ends the run now (goal reached, or first finding).
+
+    ``None`` when the turn does not end it; *body* gets ``stop`` only when it does.
+    """
+    if bool(reply.get("goal_reached")):
+        body["stop"] = STOP_GOAL
+        return {
+            "error": None,
+            "content": {"state": body, "status": STOP_GOAL, "notice": notice},
+        }
+
+    # THE CHARTER'S STOP CONDITION, deliberately BELOW the
+    # ``goal_reached`` return and not above it. A turn may report BOTH
+    # a finding and ``goal_reached``; measured on the ordering this
+    # replaces, that run returned ``first_finding`` and ``stop_reason``
+    # then named the stop as ``first_finding`` for a run whose goal was
+    # actually REACHED -- a false statement about the run in the
+    # artifact whose purpose is reconstructing it. Goal-reached is the
+    # stronger and more informative outcome, and the finding is still
+    # recorded in ``body["findings"]`` either way, so precedence
+    # is expressed STRUCTURALLY by this order rather than by a second
+    # condition that could drift from the return above it. Ordering
+    # mutant M15 swaps the two blocks back;
+    # test_a_turn_that_reports_both_a_finding_and_the_goal_says_goal_reached
+    # is the pin that goes red.
+    #
+    # ``stop`` is the state's own existing stop field and
+    # ``stop_reason`` remains its ONLY reader, so this adds a writer
+    # and not a second derivation.
+    if finding and charter_mod.stop_on(body.get("charter")) == "first_finding":
+        body["stop"] = STOP_FINDING
+        return {
+            "error": None,
+            "content": {"state": body, "status": STOP_FINDING, "notice": notice},
+        }
+    return None
+
+
 def apply_turn_result(state: object, raw: object, *, now: float | None = None) -> dict:
     """Fold a turn reply into the state: goal, a finding, or an extension.
 
@@ -502,136 +659,13 @@ def apply_turn_result(state: object, raw: object, *, now: float | None = None) -
         if sub_goal:
             body["sub_goal"] = sub_goal[:MAX_SUB_GOAL_CHARS]
 
-        if bool(reply.get("goal_reached")):
-            body["stop"] = STOP_GOAL
-            return {
-                "error": None,
-                "content": {"state": body, "status": STOP_GOAL, "notice": notice},
-            }
-
-        # ANCHOR NOTE: this text is inserted by REPLACING the statement that
-        # FOLLOWS the ``if bool(reply.get("goal_reached")):`` block -- the
-        # ``requested = ...`` assignment, a SIBLING at function-body
-        # indentation -- and not by anchoring on that if-block's ``return``.
-        # Anchoring on the return placed this text INSIDE the if-body, after an
-        # unconditional return, where it was dead code and ``stop_on:
-        # first_finding`` never fired at all. A following sibling statement is
-        # the anchor that provably lands outside the block: its own indentation
-        # IS the insertion point, so the block cannot be swallowed by the
-        # branch above it. The suite caught the dead placement in one run.
-        # THE CHARTER'S STOP CONDITION, deliberately BELOW the
-        # ``goal_reached`` return and not above it. A turn may report BOTH
-        # a finding and ``goal_reached``; measured on the ordering this
-        # replaces, that run returned ``first_finding`` and ``stop_reason``
-        # then named the stop as ``first_finding`` for a run whose goal was
-        # actually REACHED -- a false statement about the run in the
-        # artifact whose purpose is reconstructing it. Goal-reached is the
-        # stronger and more informative outcome, and the finding is still
-        # recorded in ``body["findings"]`` above either way, so precedence
-        # is expressed STRUCTURALLY by this order rather than by a second
-        # condition that could drift from the return above it. Ordering
-        # mutant M15 swaps the two blocks back;
-        # test_a_turn_that_reports_both_a_finding_and_the_goal_says_goal_reached
-        # is the pin that goes red.
-        #
-        # ``stop`` is the state's own existing stop field and
-        # ``stop_reason`` remains its ONLY reader, so this adds a writer
-        # and not a second derivation.
-        if finding and charter_mod.stop_on(body.get("charter")) == "first_finding":
-            body["stop"] = STOP_FINDING
-            return {
-                "error": None,
-                "content": {
-                    "state": body,
-                    "status": STOP_FINDING,
-                    "notice": notice,
-                },
-            }
+        stopped = _early_stop(body, reply, finding, notice)
+        if stopped is not None:
+            return stopped
 
         requested = reply.get("request_extension")
         if requested:
-            reason = " ".join(str(reply.get("extension_reason") or "").split())[:400]
-            # Computed BEFORE the notice text is chosen, and pure: nothing in
-            # this block touches turn/turns_budget/deadline ahead of a GRANT,
-            # so this is the exact value `status` gets at the return below.
-            # See EXTENSION_SPENT_CONTINUE's comment -- the text must match it.
-            ending = bool(stop_reason(body, now=now))
-            if int(body.get("extensions_used") or 0) >= MAX_EXTENSIONS:
-                notice = EXTENSION_SPENT if ending else EXTENSION_SPENT_CONTINUE
-            elif not reason:
-                notice = EXTENSION_REFUSAL
-            else:
-                # THE SECOND WRITER of this run's budget. ``new_state``
-                # clamped these two numbers through ``charter.budget_for``;
-                # this site ADDS to them, so "a charter can never lengthen a
-                # run" is false here unless it re-clamps. ``budget_cap`` is
-                # the one producer of what the tester asked for and returns 0
-                # where they asked for nothing, so a run with no charter
-                # extends exactly as it always has.
-                cap_turns, cap_seconds = charter_mod.budget_cap(body.get("charter"))
-                had_turns = int(body.get("turns_budget") or MAX_TURNS)
-                turns = had_turns + EXTENSION_TURNS
-                if cap_turns:
-                    turns = min(turns, min(cap_turns, MAX_TURNS))
-                had_deadline = float(body.get("deadline") or _now(now))
-                deadline = had_deadline + EXTENSION_S
-                if cap_seconds:
-                    # ``is not None``, never ``or``: ``started`` is 0.0 on
-                    # every test clock and in any run whose epoch is 0, and
-                    # the ``or`` form silently REBASES the deadline onto NOW
-                    # -- lengthening the very run this clamp exists to bound.
-                    # That is mutant M6c, killed by
-                    # test_an_extension_cannot_outrun_the_charters_budget,
-                    # which builds the state at now=0.0 and asserts the
-                    # deadline stays at or below 120.0. Do not "tidy" it back.
-                    _started = body.get("started")
-                    started = float(_started if _started is not None else _now(now))
-                    deadline = min(deadline, started + min(cap_seconds, DEADLINE_S))
-                gained_turns = turns - had_turns
-                gained_seconds = deadline - had_deadline
-                if gained_turns <= 0 and gained_seconds <= 0:
-                    # REFUSE BY NAME. The clamp above left BOTH numbers where
-                    # they were, so granting here would consume the session's
-                    # one extension, change nothing, and REPORT a gain of 15
-                    # turns and 10 minutes -- measured, and for EVERY charter
-                    # naming a steps or minutes budget, because ``new_state``
-                    # already clamped to that same figure. A success-shaped
-                    # reply for work that did not happen is the worse failure:
-                    # the model plans against turns it does not have and the
-                    # run dies at the next budget check with nothing in the
-                    # record explaining why. So nothing is written,
-                    # ``extensions_used`` is NOT incremented,
-                    # ``extension_reason`` is left unwritten, and the refusal
-                    # names the ceiling that bound it. Mutant M6f deletes this
-                    # branch; the upper-bound assertions in
-                    # test_an_extension_cannot_outrun_the_charters_budget
-                    # CANNOT see it, because an inequality is satisfied by the
-                    # collapse -- the pin asserts this notice and
-                    # ``extensions_used`` instead.
-                    notice = (
-                        EXTENSION_NOT_GRANTED
-                        if ending
-                        else EXTENSION_NOT_GRANTED_CONTINUE
-                    )
-                else:
-                    body["extensions_used"] = int(body.get("extensions_used") or 0) + 1
-                    body["turns_budget"] = turns
-                    body["deadline"] = deadline
-                    body["extension_reason"] = reason
-                    # WHAT WAS ACTUALLY GRANTED, never the full figure. A
-                    # PARTIAL grant (one axis moves, the other does not) names
-                    # only the axis that moved, for the same reason the clamp
-                    # sentence in ``charter.describe_terms`` names only the
-                    # axis that clamped: printing a number the run did not get
-                    # is a false statement about the run the tester just had.
-                    granted = []
-                    if gained_turns > 0:
-                        granted.append(str(int(gained_turns)) + " turns")
-                    if gained_seconds >= 60:
-                        granted.append(str(int(gained_seconds // 60)) + " minutes")
-                    elif gained_seconds > 0:
-                        granted.append("under a minute")
-                    notice = "Extended once by " + " and ".join(granted) + ": " + reason
+            notice = _extension_notice(body, reply, now)
 
         status = stop_reason(body, now=now) or RUNNING
         body["stop"] = status if status != RUNNING else ""

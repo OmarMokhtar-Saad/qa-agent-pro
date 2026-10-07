@@ -48,114 +48,149 @@ async def prepare(serial: str, *, owner: str = "", apply_: bool = False) -> dict
     an exception a caller has to separately handle.
     """
     from tools.mobile import session
-    from tools.mobile_capture import (
-        ca,
-        cert,
-        ladder,
-        ledger,
-        mitm_provision,
-        probe,
-        proxy,
-    )
+    from tools.mobile_capture import cert, ladder, proxy
 
     serial = str(serial or "")
     minted = not str(owner or "").strip()
     label = str(owner or "").strip() or session.new_provisioning_owner()
-
-    def _none(reason: str, *, fingerprint: str = "") -> dict:
-        return {
-            "error": None,
-            "content": ladder.record(
-                {
-                    "tier": ladder.TIER_NONE,
-                    "reason": reason,
-                    "serial": serial,
-                    "fingerprint": fingerprint,
-                    "run_id": label,
-                }
-            ),
-        }
 
     try:
         held = (session.take_device_lock(label, serial=serial) or {}).get(
             "content"
         ) or {}
         if not held.get("acquired"):
-            return _none(proxy.REASON_DEVICE_BUSY)
+            return _none_reply(serial, label, proxy.REASON_DEVICE_BUSY)
         if not apply_:
-            return _none(ladder.REASON_NO_APPLY)
+            return _none_reply(serial, label, ladder.REASON_NO_APPLY)
 
-        ca_made = ca.ensure_ca()
-        fingerprint = (
-            (ca_made.get("content") or {}).get("fingerprint")
-            if not ca_made.get("error")
-            else ""
-        )
-        prior = ledger.tier_for(serial, fingerprint) if fingerprint else {"content": {}}
-        prior_tier = (prior.get("content") or {}).get("tier")
+        fingerprint, prior_tier = _ca_fingerprint_and_prior(serial)
 
         installed = await cert.install(serial, apply=apply_, owner=label)
         if installed.get("error"):
             if installed["error"] in (proxy.REASON_DEVICE_BUSY, ladder.REASON_FLAG_OFF):
-                return _none(installed["error"], fingerprint=fingerprint or "")
-            return _none(ladder.REASON_CERT_NOT_TRUSTED, fingerprint=fingerprint or "")
-
-        found = mitm_provision.find_mitmdump()
-        binary = (
-            (found.get("content") or {}).get("path") if not found.get("error") else ""
-        )
-        if not binary:
-            provisioned = mitm_provision.provision(apply=apply_)
-            binary = (
-                (provisioned.get("content") or {}).get("path")
-                if not provisioned.get("error")
-                else ""
-            )
-        if not binary:
-            return _none(ladder.REASON_NO_MITMDUMP, fingerprint=fingerprint or "")
-
-        started = await proxy.start(serial, run_id=label)
-        proxy_started = not started.get("error")
-        started_content = started.get("content") if proxy_started else {}
-        port = (started_content or {}).get("port")
-
-        probe_state = None
-        if proxy_started and port:
-            probed = await probe.run(serial, port)
-            probe_state = (
-                (probed.get("content") or {}).get("state")
-                if not probed.get("error")
-                else None
+                return _none_reply(serial, label, installed["error"], fingerprint)
+            return _none_reply(
+                serial, label, ladder.REASON_CERT_NOT_TRUSTED, fingerprint
             )
 
-        decided = ladder.decide(
-            consent=True,
-            apply_=apply_,
-            mitmdump_available=True,
-            proxy_started=proxy_started,
-            probe_state=probe_state,
-            ledger_prior_tier=prior_tier,
-        )
-        if fingerprint:
-            ledger.record(
-                serial, fingerprint, decided["tier"], note=decided.get("reason") or ""
-            )
-        return {
-            "error": None,
-            "content": ladder.record(
-                {
-                    "tier": decided["tier"],
-                    "reason": decided.get("reason"),
-                    "serial": serial,
-                    "fingerprint": fingerprint or "",
-                    "run_id": label,
-                    "started_ms": (started_content or {}).get("started_ms"),
-                }
-            ),
-        }
+        if not _mitmdump_binary(apply_):
+            return _none_reply(serial, label, ladder.REASON_NO_MITMDUMP, fingerprint)
+
+        run = await _start_and_probe(serial, label)
+        return _decide_reply(serial, label, fingerprint, prior_tier, run)
     except Exception:
         logger.exception("mobile_capture.prepare failed")
-        return _none(ladder.REASON_DEVICE_GONE)
+        return _none_reply(serial, label, ladder.REASON_DEVICE_GONE)
     finally:
         if minted:
             session.release_device_lock(label, as_holder=True)
+
+
+def _none_reply(serial: str, label: str, reason: str, fingerprint: str = "") -> dict:
+    """A refusal-by-name reply at ``TIER_NONE``."""
+    from tools.mobile_capture import ladder
+
+    return {
+        "error": None,
+        "content": ladder.record(
+            {
+                "tier": ladder.TIER_NONE,
+                "reason": reason,
+                "serial": serial,
+                "fingerprint": fingerprint or "",
+                "run_id": label,
+            }
+        ),
+    }
+
+
+def _ca_fingerprint_and_prior(serial: str) -> tuple[str, str | None]:
+    """Ensure the CA exists; return its fingerprint and the ledger's prior tier."""
+    from tools.mobile_capture import ca, ledger
+
+    ca_made = ca.ensure_ca()
+    fingerprint = (
+        (ca_made.get("content") or {}).get("fingerprint")
+        if not ca_made.get("error")
+        else ""
+    )
+    prior = ledger.tier_for(serial, fingerprint) if fingerprint else {"content": {}}
+    return fingerprint, (prior.get("content") or {}).get("tier")
+
+
+def _mitmdump_binary(apply_: bool) -> str:
+    """Path of a usable mitmdump (found, else provisioned), or ``""``."""
+    from tools.mobile_capture import mitm_provision
+
+    found = mitm_provision.find_mitmdump()
+    binary = (found.get("content") or {}).get("path") if not found.get("error") else ""
+    if binary:
+        return binary
+    provisioned = mitm_provision.provision(apply=apply_)
+    return (
+        (provisioned.get("content") or {}).get("path")
+        if not provisioned.get("error")
+        else ""
+    )
+
+
+async def _start_and_probe(serial: str, label: str) -> tuple[bool, dict, str | None]:
+    """Start the proxy and probe it; ``(proxy_started, started_content, probe_state)``."""
+    from tools.mobile_capture import probe, proxy
+
+    started = await proxy.start(serial, run_id=label)
+    proxy_started = not started.get("error")
+    started_content = (started.get("content") if proxy_started else {}) or {}
+    port = started_content.get("port")
+
+    probe_state = None
+    if proxy_started and port:
+        probed = await probe.run(serial, port)
+        probe_state = (
+            (probed.get("content") or {}).get("state")
+            if not probed.get("error")
+            else None
+        )
+    return proxy_started, started_content, probe_state
+
+
+def _decide_reply(
+    serial: str,
+    label: str,
+    fingerprint: str,
+    prior_tier: str | None,
+    run: tuple[bool, dict, str | None],
+) -> dict:
+    """Decide the tier, record it in the ledger and build the final reply.
+
+    Only reached once ``apply_`` is true (``prepare`` refuses earlier), so the
+    ladder is always asked with ``apply_=True``.
+    """
+    from tools.mobile_capture import ladder, ledger
+
+    proxy_started, started_content, probe_state = run
+    decided = ladder.decide(
+        consent=True,
+        apply_=True,
+        mitmdump_available=True,
+        proxy_started=proxy_started,
+        probe_state=probe_state,
+        ledger_prior_tier=prior_tier,
+    )
+    if fingerprint:
+        ledger.record(
+            serial, fingerprint, decided["tier"], note=decided.get("reason") or ""
+        )
+    return {
+        "error": None,
+        "content": ladder.record(
+            {
+                "tier": decided["tier"],
+                "reason": decided.get("reason"),
+                "serial": serial,
+                "fingerprint": fingerprint or "",
+                "run_id": label,
+                "started_ms": started_content.get("started_ms"),
+            }
+        ),
+    }

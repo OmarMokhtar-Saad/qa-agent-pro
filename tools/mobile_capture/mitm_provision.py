@@ -338,51 +338,70 @@ def _extract_zip(archive_path: Path, dest_dir: Path) -> dict:
                 ),
                 "content": None,
             }
-        targets: list[tuple[zipfile.ZipInfo, Path]] = []
-        total = 0
-        for info in infos:
-            target = _safe_join(dest_dir, info.filename)
-            if info.is_dir():
-                targets.append((info, target))
-                continue
-            if info.file_size > MAX_ARCHIVE_BYTES:
-                return {
-                    "error": (
-                        info.filename
-                        + " inside the archive is "
-                        + str(info.file_size)
-                        + " bytes, over MAX_ARCHIVE_BYTES -- refusing"
-                    ),
-                    "content": None,
-                }
-            total += info.file_size
-            if total > MAX_ARCHIVE_TOTAL_BYTES:
-                return {
-                    "error": (
-                        "the archive's extracted total exceeds "
-                        "MAX_ARCHIVE_TOTAL_BYTES -- refusing"
-                    ),
-                    "content": None,
-                }
-            targets.append((info, target))
+        refused, targets = _extract_zip_validate(infos, dest_dir)
+        if refused is not None:
+            return refused
         # Every member validated (size, count, containment) before any byte
         # is written -- a rejected archive leaves nothing behind.
-        for info, target in targets:
-            if info.is_dir():
-                target.mkdir(parents=True, exist_ok=True)
-                continue
-            data = zf.read(info)
-            if len(data) > MAX_ARCHIVE_BYTES:
-                return {
-                    "error": (
-                        info.filename
-                        + " exceeds MAX_ARCHIVE_BYTES once read -- refusing"
-                    ),
-                    "content": None,
-                }
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
+        refused = _extract_zip_write(zf, targets)
+        if refused is not None:
+            return refused
     return {"error": None, "content": {"dest_dir": str(dest_dir)}}
+
+
+def _extract_zip_validate(
+    infos: list[zipfile.ZipInfo], dest_dir: Path
+) -> tuple[dict | None, list[tuple[zipfile.ZipInfo, Path]]]:
+    """Check every member; return (refusal or None, the validated targets)."""
+    targets: list[tuple[zipfile.ZipInfo, Path]] = []
+    total = 0
+    for info in infos:
+        target = _safe_join(dest_dir, info.filename)
+        if info.is_dir():
+            targets.append((info, target))
+            continue
+        if info.file_size > MAX_ARCHIVE_BYTES:
+            return {
+                "error": (
+                    info.filename
+                    + " inside the archive is "
+                    + str(info.file_size)
+                    + " bytes, over MAX_ARCHIVE_BYTES -- refusing"
+                ),
+                "content": None,
+            }, targets
+        total += info.file_size
+        if total > MAX_ARCHIVE_TOTAL_BYTES:
+            return {
+                "error": (
+                    "the archive's extracted total exceeds "
+                    "MAX_ARCHIVE_TOTAL_BYTES -- refusing"
+                ),
+                "content": None,
+            }, targets
+        targets.append((info, target))
+    return None, targets
+
+
+def _extract_zip_write(
+    zf: zipfile.ZipFile, targets: list[tuple[zipfile.ZipInfo, Path]]
+) -> dict | None:
+    """Write the validated members; return a refusal if one is too big once read."""
+    for info, target in targets:
+        if info.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        data = zf.read(info)
+        if len(data) > MAX_ARCHIVE_BYTES:
+            return {
+                "error": (
+                    info.filename + " exceeds MAX_ARCHIVE_BYTES once read -- refusing"
+                ),
+                "content": None,
+            }
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    return None
 
 
 def _extract_archive(archive_path: Path, dest_dir: Path) -> dict:
@@ -457,75 +476,92 @@ def provision(apply: bool = False) -> dict:
                 },
             }
         pin = _pin_for_platform()
-        if (
-            not pin
-            or not pin.get("url")
-            or not downloader.valid_sha256(pin.get("sha256"))
-        ):
-            key = _platform_key()
-            return {
-                "error": REASON_NO_MITM_PIN,
-                "content": {
-                    "found": False,
-                    "path": "",
-                    "detail": (
-                        "No qa-agents release pins mitmdump's SHA-256 for "
-                        "this host (" + key[0] + "/" + key[1] + ") yet, so "
-                        "it cannot be downloaded and verified. Install "
-                        "mitmproxy yourself (https://mitmproxy.org/downloads/) "
-                        "and put `mitmdump` on PATH, or wait for a pinned "
-                        "release."
-                    ),
-                },
-            }
-        url = pin["url"]
-        sha256 = pin["sha256"]
-        dest_dir = _version_dir(MITM_VERSION)
-        archive_dest = mitm_dir() / ("download" + _archive_suffix(url))
-        got = downloader.download(
-            url,
-            archive_dest,
-            sha256,
-            payload_bytes=MAX_ARCHIVE_BYTES,
-        )
-        if got["error"]:
-            return {"error": got["error"], "content": None}
-        extracted = _extract_archive(Path(got["content"]["path"]), dest_dir)
-        try:
-            Path(got["content"]["path"]).unlink(missing_ok=True)
-        except OSError:
-            pass
-        if extracted["error"]:
-            return {"error": extracted["error"], "content": None}
-        binary = _resolve_binary(Path(extracted["content"]["dest_dir"]), _leaf())
-        if binary is None:
-            return {
-                "error": REASON_NO_MITM_BINARY,
-                "content": {
-                    "detail": (
-                        "the archive extracted cleanly but no "
-                        + _leaf()
-                        + " was found anywhere under "
-                        + extracted["content"]["dest_dir"]
-                    ),
-                },
-            }
-        try:
-            binary.chmod(0o755)
-        except OSError:
-            logger.info(
-                "mobile_capture.mitm_provision: could not set the executable bit on %s",
-                binary,
-            )
-        return {
-            "error": None,
-            "content": {
-                "path": str(binary),
-                "source": "downloaded",
-                "found": True,
-                "downloaded": True,
-            },
-        }
+        refused = _provision_unpinned_reply(pin)
+        if refused is not None:
+            return refused
+        failed, extracted = _provision_fetch_and_extract(pin)
+        if failed is not None:
+            return failed
+        return _provision_resolved_reply(extracted)
     except Exception as exc:
         logger.exception("mobile_capture.mitm_provision.provision failed")
         return {"error": str(exc), "content": None}
+
+
+def _provision_unpinned_reply(pin: dict | None) -> dict | None:
+    """The by-name refusal when this host has no usable pin, else None."""
+    if not pin or not pin.get("url") or not downloader.valid_sha256(pin.get("sha256")):
+        key = _platform_key()
+        return {
+            "error": REASON_NO_MITM_PIN,
+            "content": {
+                "found": False,
+                "path": "",
+                "detail": (
+                    "No qa-agents release pins mitmdump's SHA-256 for "
+                    "this host (" + key[0] + "/" + key[1] + ") yet, so "
+                    "it cannot be downloaded and verified. Install "
+                    "mitmproxy yourself (https://mitmproxy.org/downloads/) "
+                    "and put `mitmdump` on PATH, or wait for a pinned "
+                    "release."
+                ),
+            },
+        }
+    return None
+
+
+def _provision_fetch_and_extract(pin: dict) -> tuple[dict | None, dict | None]:
+    """Download and extract; return (failure reply or None, extraction result)."""
+    url = pin["url"]
+    sha256 = pin["sha256"]
+    dest_dir = _version_dir(MITM_VERSION)
+    archive_dest = mitm_dir() / ("download" + _archive_suffix(url))
+    got = downloader.download(
+        url,
+        archive_dest,
+        sha256,
+        payload_bytes=MAX_ARCHIVE_BYTES,
+    )
+    if got["error"]:
+        return {"error": got["error"], "content": None}, None
+    extracted = _extract_archive(Path(got["content"]["path"]), dest_dir)
+    try:
+        Path(got["content"]["path"]).unlink(missing_ok=True)
+    except OSError:
+        pass
+    if extracted["error"]:
+        return {"error": extracted["error"], "content": None}, None
+    return None, extracted
+
+
+def _provision_resolved_reply(extracted: dict) -> dict:
+    """Resolve the binary inside the extracted tree and build the reply."""
+    binary = _resolve_binary(Path(extracted["content"]["dest_dir"]), _leaf())
+    if binary is None:
+        return {
+            "error": REASON_NO_MITM_BINARY,
+            "content": {
+                "detail": (
+                    "the archive extracted cleanly but no "
+                    + _leaf()
+                    + " was found anywhere under "
+                    + extracted["content"]["dest_dir"]
+                ),
+            },
+        }
+    try:
+        binary.chmod(0o755)
+    except OSError:
+        logger.info(
+            "mobile_capture.mitm_provision: could not set the executable bit on %s",
+            binary,
+        )
+    return {
+        "error": None,
+        "content": {
+            "path": str(binary),
+            "source": "downloaded",
+            "found": True,
+            "downloaded": True,
+        },
+    }

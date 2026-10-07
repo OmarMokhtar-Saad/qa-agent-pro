@@ -71,36 +71,39 @@ def generate_testrail_csv(suite: TestSuite, output_path: str | None = None) -> s
         writer = csv.writer(fh)
         writer.writerow(headers)
         for tc in suite.test_cases:
-            steps_text = sanitize_cell(
-                "\n".join(f"{s.step_number}. {s.action}" for s in tc.steps)
-            )
-            expected_text = sanitize_cell(
-                "\n".join(f"{s.step_number}. {s.expected_result}" for s in tc.steps)
-            )
-            row = [
-                sanitize_cell(tc.title),
-                sanitize_cell(tc.module),
-                tc.type.value,
-                tc.priority.value,
-                "",
-                steps_text,
-                expected_text,
-            ]
-            if has_test_data:
-                row.append(
-                    sanitize_cell("\n".join(format_test_data_lines(tc.test_data)))
-                )
-            if has_refs:
-                # BLANK for an untraced case, not the "(untraced)" label the
-                # xlsx/csv columns use: this file is machine-imported, and a TMS
-                # would ingest that literal as a reference string.
-                row.append(sanitize_cell(display_requirement_id(tc.requirement_id)))
-            writer.writerow(row)
+            writer.writerow(_generate_testrail_csv_row(tc, has_test_data, has_refs))
 
     logger.info(
         "TestRail CSV written: %s (%d test cases)", output_path, len(suite.test_cases)
     )
     return output_path
+
+
+def _generate_testrail_csv_row(tc, has_test_data: bool, has_refs: bool) -> list:
+    """One CSV row for ``tc``, with the optional columns the header carries."""
+    steps_text = sanitize_cell(
+        "\n".join(f"{s.step_number}. {s.action}" for s in tc.steps)
+    )
+    expected_text = sanitize_cell(
+        "\n".join(f"{s.step_number}. {s.expected_result}" for s in tc.steps)
+    )
+    row = [
+        sanitize_cell(tc.title),
+        sanitize_cell(tc.module),
+        tc.type.value,
+        tc.priority.value,
+        "",
+        steps_text,
+        expected_text,
+    ]
+    if has_test_data:
+        row.append(sanitize_cell("\n".join(format_test_data_lines(tc.test_data))))
+    if has_refs:
+        # BLANK for an untraced case, not the "(untraced)" label the
+        # xlsx/csv columns use: this file is machine-imported, and a TMS
+        # would ingest that literal as a reference string.
+        row.append(sanitize_cell(display_requirement_id(tc.requirement_id)))
+    return row
 
 
 def cleanup_temp_files(max_age_seconds: int = 3600) -> int:

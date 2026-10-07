@@ -234,6 +234,76 @@ def _inflight_exit() -> None:
         _INFLIGHT["last_finish"] = time.monotonic()
 
 
+def _drift_interval() -> float:
+    """Seconds between drift ticks (QA_DRIFT_CHECK_SECONDS, floor 5, default 30)."""
+    try:
+        return max(5.0, float(os.environ.get("QA_DRIFT_CHECK_SECONDS", "30")))
+    except (TypeError, ValueError, OverflowError):
+        return 30.0
+
+
+def _log_drift_blocked(blocked: int, mismatched) -> None:
+    """Log a tick whose tree does not verify; escalate every Nth one."""
+    if blocked % _DEFER_WARN_EVERY == 0:
+        logger.warning(
+            "drift: blocked for %d checks — %d file(s) still do not "
+            "match the manifest (%s). This is no longer a transient "
+            "update window; the new version will not be loaded.",
+            blocked,
+            len(mismatched),
+            ", ".join(sorted(mismatched)[:5]),
+        )
+    else:
+        logger.info(
+            "drift: a new version is on disk but the tree does not "
+            "verify yet — waiting for the update to finish."
+        )
+
+
+def _drift_jitter_sleep() -> None:
+    """Sleep a random 0..jitter OUTSIDE the lock (a blocking sleep under it
+    would stall every _inflight_enter, i.e. every tool call). Its whole job is
+    to de-synchronise the peer clients that share this install and detect the
+    same update on the same tick."""
+    try:
+        _jitter = random.uniform(0.0, _DRIFT_EXIT_JITTER_S)
+        # Guarded so a zero jitter never calls sleep: the drift-watch
+        # tests pin random.uniform to 0.0 and count sleep ticks.
+        if _jitter > 0:
+            time.sleep(_jitter)
+    except Exception:  # a jitter failure must never skip the restart
+        logger.debug("drift exit jitter failed", exc_info=True)
+
+
+def _exit_if_idle() -> tuple:
+    """Exit the process when no tool runs and the quiet gap has passed; else
+    return (busy, idle). The exit happens UNDER the lock _inflight_enter also
+    takes, so a tool cannot slip in between the check and the exit."""
+    with _INFLIGHT_LOCK:
+        busy = _INFLIGHT["n"]
+        idle = time.monotonic() - _INFLIGHT["last_finish"]
+        if not busy and idle >= _DRAIN_IDLE_S:
+            os._exit(DRIFT_RESTART_EXIT_CODE)
+    return busy, idle
+
+
+def _log_drift_deferred(deferrals: int, busy, idle) -> None:
+    if deferrals % _DEFER_WARN_EVERY == 0:
+        logger.warning(
+            "drift: restart deferred %d times — this install is not "
+            "picking up releases. Restart the editor to apply it.",
+            deferrals,
+        )
+    else:
+        logger.info(
+            "drift: restart deferred (%d in flight, %.0fs since the last "
+            "tool finished, deferral #%d).",
+            busy,
+            idle,
+            deferrals,
+        )
+
+
 def _drift_watch() -> None:
     """Dist only: replace this process when the install it runs from changes.
 
@@ -272,16 +342,22 @@ def _drift_watch() -> None:
     # to reach the other clients' servers (v1.39.0 rollout: applied 09:04:30,
     # the two stale Cursor servers restarted only at their 09:07 marks). The
     # NETWORK check keeps its own 15-minute clock in the launcher's watchdog.
-    try:
-        interval = max(5.0, float(os.environ.get("QA_DRIFT_CHECK_SECONDS", "30")))
-    except (TypeError, ValueError, OverflowError):
-        interval = 30.0
+    _drift_loop(
+        _drift_interval(),
+        _code_changed_since_start,
+        lambda: verify_integrity(Path(_INSTALL_DIR)),
+    )
+
+
+def _drift_loop(interval: float, code_changed, verify_tree) -> None:
+    """Tick forever: on a verified drift, exit once no tool is running.
+    Never raises; a failed tick is skipped."""
     deferrals = 0
     blocked = 0
     while True:
         time.sleep(interval)
         try:
-            if not _code_changed_since_start():
+            if not code_changed():
                 continue
             # apply_update overlays file-by-file in sorted order, so
             # pyproject.toml/VERSION can land BEFORE tools/. Exiting onto a
@@ -290,23 +366,10 @@ def _drift_watch() -> None:
             # escalates: a PERSISTENT mismatch (a locally edited file, a partial
             # update) would otherwise disable the restart for the life of the
             # process while logging a reassuring "waiting" line forever.
-            mismatched = verify_integrity(Path(_INSTALL_DIR))
+            mismatched = verify_tree()
             if mismatched:
                 blocked += 1
-                if blocked % _DEFER_WARN_EVERY == 0:
-                    logger.warning(
-                        "drift: blocked for %d checks — %d file(s) still do not "
-                        "match the manifest (%s). This is no longer a transient "
-                        "update window; the new version will not be loaded.",
-                        blocked,
-                        len(mismatched),
-                        ", ".join(sorted(mismatched)[:5]),
-                    )
-                else:
-                    logger.info(
-                        "drift: a new version is on disk but the tree does not "
-                        "verify yet — waiting for the update to finish."
-                    )
+                _log_drift_blocked(blocked, mismatched)
                 continue
             blocked = 0
             # Logged BEFORE the lock: os._exit while holding it is safe (the
@@ -316,44 +379,12 @@ def _drift_watch() -> None:
                 "drift: installed version changed since this process loaded — "
                 "restarting as soon as no tool is running."
             )
-            # Jitter ONCE -- on the first tick that sees this drift (deferrals
-            # is still 0) -- and OUTSIDE the lock. Under the lock a blocking
-            # sleep would stall every _inflight_enter, i.e. every tool call; and
-            # re-sleeping on each later deferral tick would only add latency to
-            # a restart that is already waiting. One sleep is enough: its whole
-            # job is to de-synchronise the peer clients that share this install
-            # and detect the same update on the same tick.
+            # Jitter ONCE -- on the first tick that sees this drift.
             if deferrals == 0:
-                try:
-                    _jitter = random.uniform(0.0, _DRIFT_EXIT_JITTER_S)
-                    # Guarded so a zero jitter never calls sleep: the drift-watch
-                    # tests pin random.uniform to 0.0 and count sleep ticks.
-                    if _jitter > 0:
-                        time.sleep(_jitter)
-                except Exception:  # a jitter failure must never skip the restart
-                    logger.debug("drift exit jitter failed", exc_info=True)
-            # The exit happens UNDER the lock _inflight_enter also takes, so a
-            # tool cannot slip in between the check and the exit.
-            with _INFLIGHT_LOCK:
-                busy = _INFLIGHT["n"]
-                idle = time.monotonic() - _INFLIGHT["last_finish"]
-                if not busy and idle >= _DRAIN_IDLE_S:
-                    os._exit(DRIFT_RESTART_EXIT_CODE)
+                _drift_jitter_sleep()
+            busy, idle = _exit_if_idle()
             deferrals += 1
-            if deferrals % _DEFER_WARN_EVERY == 0:
-                logger.warning(
-                    "drift: restart deferred %d times — this install is not "
-                    "picking up releases. Restart the editor to apply it.",
-                    deferrals,
-                )
-            else:
-                logger.info(
-                    "drift: restart deferred (%d in flight, %.0fs since the last "
-                    "tool finished, deferral #%d).",
-                    busy,
-                    idle,
-                    deferrals,
-                )
+            _log_drift_deferred(deferrals, busy, idle)
         except Exception:
             logger.debug("drift check failed", exc_info=True)
 
@@ -376,6 +407,87 @@ def _device_ref(device_id: str = "", serial: str = "") -> str:
             % (first, second)
         )
     return first or second
+
+
+def _settle_outcome(ok, error_type, status_token):
+    """Fold a device timeout into the outcome: (ok, error_type, degraded).
+
+    A handler that RETURNED after a device timeout is not `ok`: the Air run
+    logged "tool qa_mobile_test: ok in 47589 ms" over a screencap that had
+    timed out after 30 s (fix round 3, item 3). A raised exception keeps its
+    own error type."""
+    from tools import tool_status
+
+    timed_out = tool_status.finish(status_token)
+    degraded = ok and bool(timed_out)
+    if degraded:
+        ok = False
+        error_type = ("timed_out:" + ",".join(sorted(set(timed_out))))[:120]
+    return ok, error_type, degraded
+
+
+def _log_tool_line(name, ok, error_type, degraded, duration_ms) -> None:
+    """The one INFO line per call that names the tool."""
+    logger.info(
+        "tool %s: %s in %d ms",
+        name,
+        "ok"
+        if ok
+        else (error_type if degraded else "error %s" % (error_type or "Exception")),
+        duration_ms,
+    )
+
+
+async def _audit_tool_call(name, duration_ms, ok, error_type, degraded) -> None:
+    """Best-effort ``tool_called`` audit event; never raises."""
+    try:
+        from tools import audit_log
+
+        await audit_log.record_event(
+            event_type="tool_called",
+            actor=_CLIENT.get("name", "") or None,
+            detail={
+                "tool": name,
+                "duration_ms": duration_ms,
+                "ok": ok,
+                "error_type": error_type,
+                "status": ("timed_out" if degraded else ("ok" if ok else "error")),
+            },
+        )
+    except Exception:
+        logger.debug("audit_log record_event failed", exc_info=True)
+
+
+def _emit_tool_telemetry(name, duration_ms, ok, error_type) -> None:
+    telemetry.tool_called(
+        name,
+        duration_ms=duration_ms,
+        ok=ok,
+        error_type=error_type,
+        client_name=_CLIENT.get("name", ""),
+        client_version=_CLIENT.get("version", ""),
+        extra=telemetry.pop_tool_properties(),
+    )
+
+
+def _open_tool_call(name, ctx) -> tuple:
+    """Everything `_tracked` does before the handler runs: (start, status
+    token, dispatch token).
+
+    The client identity is read HERE so every tool (qa_host_check included)
+    logs and tags its real editor; it used to be read only from
+    `_make_progress`, which tools that report no progress never reached. Never
+    raises (see `_note_client`). The status token is a per-call sink for facts
+    a returned handler must not report as `ok` -- an adb screencap or dump that
+    timed out (fix round 3, item 3)."""
+    from tools import tool_status
+
+    _note_client(ctx)
+    start = time.monotonic()
+    status_token = tool_status.begin()
+    telemetry.start_tool_trace(name)
+    _inflight_enter()
+    return start, status_token, dispatch_guard.enter_dispatched()
 
 
 async def _tracked(name, ctx, coro):
@@ -403,22 +515,9 @@ async def _tracked(name, ctx, coro):
     One line, INFO, per call: the file already reaches ~220 KB on a busy install,
     and ``mcp.server.lowlevel.server`` is silenced in ``_configure_logging`` so
     the per-call volume is unchanged rather than doubled."""
-    # The client identity is read HERE, before the handler runs, so every tool
-    # (qa_host_check included) logs and tags its real editor. It used to be read
-    # only from `_make_progress`, which tools that report no progress never
-    # reached, leaving `client` unknown. Never raises (see `_note_client`).
-    _note_client(ctx)
-    start = time.monotonic()
+    start, _status_token, _dispatch_token = _open_tool_call(name, ctx)
     ok = True
     error_type = None
-    # A per-call sink for facts a returned handler must not report as `ok`
-    # -- an adb screencap or dump that timed out (fix round 3, item 3).
-    from tools import tool_status
-
-    _status_token = tool_status.begin()
-    telemetry.start_tool_trace(name)
-    _inflight_enter()
-    _dispatch_token = dispatch_guard.enter_dispatched()
     try:
         return await coro
     except Exception as exc:
@@ -428,48 +527,10 @@ async def _tracked(name, ctx, coro):
         raise
     finally:
         duration_ms = int((time.monotonic() - start) * 1000)
-        # A handler that RETURNED after a device timeout is not `ok`: the Air
-        # run logged "tool qa_mobile_test: ok in 47589 ms" over a screencap
-        # that had timed out after 30 s (fix round 3, item 3). A raised
-        # exception keeps its own error type.
-        timed_out = tool_status.finish(_status_token)
-        degraded = ok and bool(timed_out)
-        if degraded:
-            ok = False
-            error_type = ("timed_out:" + ",".join(sorted(set(timed_out))))[:120]
-        logger.info(
-            "tool %s: %s in %d ms",
-            name,
-            "ok"
-            if ok
-            else (error_type if degraded else "error %s" % (error_type or "Exception")),
-            duration_ms,
-        )
-        try:
-            from tools import audit_log
-
-            await audit_log.record_event(
-                event_type="tool_called",
-                actor=_CLIENT.get("name", "") or None,
-                detail={
-                    "tool": name,
-                    "duration_ms": duration_ms,
-                    "ok": ok,
-                    "error_type": error_type,
-                    "status": ("timed_out" if degraded else ("ok" if ok else "error")),
-                },
-            )
-        except Exception:
-            logger.debug("audit_log record_event failed", exc_info=True)
-        telemetry.tool_called(
-            name,
-            duration_ms=duration_ms,
-            ok=ok,
-            error_type=error_type,
-            client_name=_CLIENT.get("name", ""),
-            client_version=_CLIENT.get("version", ""),
-            extra=telemetry.pop_tool_properties(),
-        )
+        ok, error_type, degraded = _settle_outcome(ok, error_type, _status_token)
+        _log_tool_line(name, ok, error_type, degraded, duration_ms)
+        await _audit_tool_call(name, duration_ms, ok, error_type, degraded)
+        _emit_tool_telemetry(name, duration_ms, ok, error_type)
         # LAST in the finally: releasing the slot earlier would let a drift
         # restart fire while telemetry and FastMCP's result serialization still
         # had work to do, and os._exit does not flush buffered stdout.
@@ -812,6 +873,47 @@ def _register_mobile_defaults() -> None:
         logger.warning("mobile default registration failed", exc_info=True)
 
 
+def _reload_notice() -> str:
+    """The `instructions=` suffix naming a pending drift-restart marker, or "".
+
+    P1-4 (Air onboarding fix): a drift restart silently swaps the process
+    under a tester mid-session; the reload marker was previously read only
+    by qa-doctor's next call. Peeking at it here too -- in the
+    `instructions=` block every client reads at `initialize`, before any
+    tool call -- reaches the tester's actual next action. PEEK, never
+    consume: the marker is one-shot and qa-doctor's reload-outcome report
+    must still find it. Read-only report, never a `_tracked()` side effect:
+    never raises, never blocks startup."""
+    try:
+        from tools.mcp_handlers import _peek_reload_marker
+
+        marker = _peek_reload_marker() or {}
+        if marker.get("reason"):
+            return (
+                "\n\nNOTE: this server restarted mid-session ("
+                f"{marker.get('reason')}) to pick up a change. If a reply "
+                "looks stale, say so and I will retry."
+            )
+    except Exception:
+        return ""
+    return ""
+
+
+def _install_rejection_log(mcp) -> None:
+    """Log the calls FastMCP rejects on argument validation (they never reach
+    `_tracked`). Guarded twice: the test doubles lack `add_middleware`, and the
+    pinned fastmcp (3.4.7) is unverified against the installed 2.14.7."""
+    try:
+        if hasattr(mcp, "add_middleware"):
+            from tools import mcp_rejection_log
+
+            _rejection_log = mcp_rejection_log.build_middleware()
+            if _rejection_log is not None:
+                mcp.add_middleware(_rejection_log)
+    except Exception:
+        logger.debug("rejection-log middleware not installed", exc_info=True)
+
+
 def build_server():
     """Construct and return the FastMCP server with every qa_* tool registered.
 
@@ -841,28 +943,6 @@ def build_server():
     # holds nothing but a call to this.
     edition_mobile = mcp_handlers._mobile_lane_enabled()
 
-    # P1-4 (Air onboarding fix): a drift restart silently swaps the process
-    # under a tester mid-session; the reload marker was previously read only
-    # by qa-doctor's next call. Peeking at it here too -- in the
-    # `instructions=` block every client reads at `initialize`, before any
-    # tool call -- reaches the tester's actual next action. PEEK, never
-    # consume: the marker is one-shot and qa-doctor's reload-outcome report
-    # must still find it. Read-only report,
-    # never a `_tracked()` side effect: never raises, never blocks startup.
-    reload_notice = ""
-    try:
-        from tools.mcp_handlers import _peek_reload_marker
-
-        marker = _peek_reload_marker() or {}
-        if marker.get("reason"):
-            reload_notice = (
-                "\n\nNOTE: this server restarted mid-session ("
-                f"{marker.get('reason')}) to pick up a change. If a reply "
-                "looks stale, say so and I will retry."
-            )
-    except Exception:
-        reload_notice = ""
-
     mcp = FastMCP(
         SERVER_NAME,
         instructions=guidance.server_instructions(
@@ -870,21 +950,72 @@ def build_server():
             api_tests=edition_api_tests,
             mobile=edition_mobile,
         )
-        + reload_notice,
+        + _reload_notice(),
+    )
+    _install_rejection_log(mcp)
+
+    _register_core_tools(mcp, Context, ContentBlock)
+    _register_suite_tools(mcp, Context, ToolAnnotations)
+    _register_mobile_tools(mcp, Context, ContentBlock)
+    _register_full_edition_tools(mcp, Context)
+    _register_full_edition_submit_tools(mcp, Context)
+    _register_corpus_and_device_tools(mcp, Context, ContentBlock)
+    _register_machine_tools(mcp, Context)
+    _register_feature_analysis_tools(mcp, Context, ContentBlock)
+    _register_prompts(
+        mcp,
+        test_cases_only=edition_test_cases_only,
+        api_tests=edition_api_tests,
+        mobile=edition_mobile,
     )
 
-    # Log the calls FastMCP rejects on argument validation (they never reach
-    # `_tracked`). Guarded twice: the test doubles lack `add_middleware`, and the
-    # pinned fastmcp (3.4.7) is unverified against the installed 2.14.7.
-    try:
-        if hasattr(mcp, "add_middleware"):
-            from tools import mcp_rejection_log
+    return mcp
 
-            _rejection_log = mcp_rejection_log.build_middleware()
-            if _rejection_log is not None:
-                mcp.add_middleware(_rejection_log)
-    except Exception:
-        logger.debug("rejection-log middleware not installed", exc_info=True)
+
+_DUP_REPLY_PREFIX = (
+    "Already done: an identical `qa_generate_test_cases` call "
+    "finished moments ago, so nothing was re-run. Its reply "
+    "follows; continue from its prep_id.\n\n"
+)
+
+
+def _generate_cache_key(params: dict) -> tuple:
+    """The duplicate-call key of a qa_generate_test_cases call: every argument
+    but `stage_token`, with `capture_ids` made hashable."""
+    return (
+        "qa_generate_test_cases",
+        params["feature_or_url"],
+        params["proceed_anyway"],
+        params["jira_content_json"],
+        params["source_plan"],
+        params["attached_image_count"],
+        tuple(params["capture_ids"] or ()),
+        params["image_gate_ack"],
+        params["image_carry_ack"],
+    )
+
+
+def _prepare_call(handler, ctx, params: dict):
+    """The handler coroutine of a prepare-style tool, from its argument dict."""
+    rest = dict(params)
+    feature_or_url = rest.pop("feature_or_url")
+    return handler(
+        feature_or_url,
+        **_make_elicitors(ctx),
+        progress=_make_progress(ctx),
+        **rest,
+    )
+
+
+def _register_core_tools(mcp, Context, ContentBlock) -> None:
+    """Register the test-case workflow tools every edition ships."""
+    _register_generate_tool(mcp, Context)
+    _register_stage_jira_tool(mcp, Context)
+    _register_prepare_tool(mcp, Context, ContentBlock)
+
+
+def _register_generate_tool(mcp, Context) -> None:
+    """Register qa_generate_test_cases."""
 
     @mcp.tool()
     async def qa_generate_test_cases(
@@ -906,46 +1037,35 @@ def build_server():
         Jira URL: a DIRECTIVE first; fetch with your own mcp__atlassian__getJiraIssue, `qa_stage_jira` each result, call again with the SAME `stage_token` (or `jira_content_json` as a JSON STRING).
 
         IMAGE GATE. ASK FIRST: for a Jira URL, ask the USER where the ticket's screens come from before your first call and pass `source_plan`; never guess it, and never send image_gate_ack=true unless the user explicitly said the screens do not matter."""
-        _cache_key = (
-            "qa_generate_test_cases",
-            feature_or_url,
-            proceed_anyway,
-            jira_content_json,
-            source_plan,
-            attached_image_count,
-            tuple(capture_ids or ()),
-            image_gate_ack,
-            image_carry_ack,
-        )
+        _params = {
+            "feature_or_url": feature_or_url,
+            "proceed_anyway": proceed_anyway,
+            "jira_content_json": jira_content_json,
+            "stage_token": stage_token,
+            "source_plan": source_plan,
+            "attached_image_count": attached_image_count,
+            "capture_ids": list(capture_ids or []),
+            "image_gate_ack": image_gate_ack,
+            "image_carry_ack": image_carry_ack,
+        }
+        _cache_key = _generate_cache_key(_params)
         _cached = _recent_call_cached(_cache_key, _GENERATE_DUP_WINDOW_S)
         if _cached is not None:
-            return (
-                "Already done: an identical `qa_generate_test_cases` call "
-                "finished moments ago, so nothing was re-run. Its reply "
-                "follows; continue from its prep_id.\n\n" + _cached
-            )
+            return _DUP_REPLY_PREFIX + _cached
         _result = await _tracked(
             "qa_generate_test_cases",
             ctx,
-            mcp_handlers.handle_generate_test_cases(
-                feature_or_url,
-                proceed_anyway=proceed_anyway,
-                **_make_elicitors(ctx),
-                progress=_make_progress(ctx),
-                jira_content_json=jira_content_json,
-                stage_token=stage_token,
-                source_plan=source_plan,
-                attached_image_count=attached_image_count,
-                capture_ids=list(capture_ids or []),
-                image_gate_ack=image_gate_ack,
-                image_carry_ack=image_carry_ack,
-            ),
+            _prepare_call(mcp_handlers.handle_generate_test_cases, ctx, _params),
         )
         # Only a reply that created a prep: replaying a clarify or a gate
         # block would hide a changed tester answer (e.g. the P0-3 dialog).
         if "**prep_id:** `" in _result:
             _recent_call_store(_cache_key, _result)
         return _result
+
+
+def _register_stage_jira_tool(mcp, Context) -> None:
+    """Register qa_stage_jira."""
 
     @mcp.tool()
     async def qa_stage_jira(
@@ -957,6 +1077,10 @@ def build_server():
             ctx,
             mcp_handlers.handle_stage_jira(stage_token, part, json),
         )
+
+
+def _register_prepare_tool(mcp, Context, ContentBlock) -> None:
+    """Register qa_prepare_test_cases."""
 
     @mcp.tool()
     async def qa_prepare_test_cases(
@@ -999,6 +1123,17 @@ def build_server():
         )
         return _prepare_payload_to_content(result)
 
+
+def _register_suite_tools(mcp, Context, ToolAnnotations) -> None:
+    """Register the submit, status, job, category and export tools."""
+    _register_submit_suite_tool(mcp, Context)
+    _register_suite_status_tools(mcp, Context, ToolAnnotations)
+    _register_category_and_export_tools(mcp, Context)
+
+
+def _register_submit_suite_tool(mcp, Context) -> None:
+    """Register qa_submit_suite."""
+
     @mcp.tool()
     async def qa_submit_suite(
         ctx: Context,
@@ -1029,6 +1164,10 @@ def build_server():
             ),
         )
 
+
+def _register_suite_status_tools(mcp, Context, ToolAnnotations) -> None:
+    """Register the read-only qa_prep_status and qa_get_category_job."""
+
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def qa_prep_status(ctx: Context, prep_id: str = "") -> str:
         """Show which categories are staged for a host-mode prep_id and whether the per-category (Path A) finalize is allowed yet. Use while staging with qa_submit_category. ready=yes means you may call qa_submit_suite with a small review SIDECAR carrying duplicate_groups, or suite_json="" (no review). Path B (full merged suite_json) does not need ready=yes."""
@@ -1054,6 +1193,10 @@ def build_server():
         )
         _recent_call_store(_cache_key, _result)
         return _result
+
+
+def _register_category_and_export_tools(mcp, Context) -> None:
+    """Register qa_submit_category and qa_export_suite."""
 
     @mcp.tool()
     async def qa_submit_category(
@@ -1098,6 +1241,9 @@ def build_server():
             ),
         )
 
+
+def _register_mobile_tools(mcp, Context, ContentBlock) -> None:
+    """Register the mobile emulator lane tools when its modules are present."""
     # The mobile emulator lane. ONE call, and nothing else may join it here:
     # `_mobile_lane_enabled()` is `_mobile_modules_present()` alone, which
     # checks tools/mobile is really on disk -- a build made without the pinned
@@ -1175,6 +1321,7 @@ def build_server():
             reset_app: bool = False,
             charter: str = "",
             note: str = "",
+            env: str = "",
             screenshot: bool = False,
             emulator: str = "",
             system_image: str = "",
@@ -1184,7 +1331,7 @@ def build_server():
 
             ANY Android device action goes through this tool. Do NOT use raw adb or shell: this tool owns the destructive guard, run folder and evidence.
 
-            Call with NO arguments to start. Install/download/launch needs apply=true. run_id continues a run in ANY chat. ONE packet at a time; answer each with qa_submit_mobile_step. Install key in `source`, its value in `app` (or `package`); `device_id`: an adb serial; `avd`: one to boot; `charter`: JSON, no secrets; `locale`, `reset_app=true` need apply=true; new_run=true only if the tester asks. `note`: JSON lesson about THIS app for later runs; plain text, so never a secret.
+            Call with NO arguments to start. Install/download/launch needs apply=true. run_id continues a run in ANY chat. ONE packet at a time; answer each with qa_submit_mobile_step. Install key in `source`, its value in `app` (or `package`); `device_id`: an adb serial; `avd`: one to boot; `charter`: JSON, no secrets; `locale`, `reset_app=true` need apply=true; new_run=true only if the tester asks. `note`: JSON {"text","kind":wait|avoid,"when":{"op","rid"},"then":{"until_text|rid","ms"}} for THIS app; no secrets.
 
             Never report a screen state, field value or login outcome that was not read from a qa_* observation. If the server cannot type or act, stop and report the blocker by name. Do not fall back to raw adb input, and do not claim a result. Relay a finished run's verdict block word for word. Ask, never guess, the app, package, device or source."""
             from mcp.types import TextContent
@@ -1212,6 +1359,7 @@ def build_server():
                     reset_app=reset_app,
                     charter=charter,
                     note=note,
+                    env=env,
                     screenshot=screenshot,
                     emulator=emulator,
                     system_image=system_image,
@@ -1244,6 +1392,7 @@ def build_server():
             confirm_destructive: bool = False,
             tester_inputs: str = "",
             note: str = "",
+            env: str = "",
             screenshot: bool = False,
             flow: str = "",
             flow_params: str = "",
@@ -1272,6 +1421,7 @@ def build_server():
                     confirm_destructive=confirm_destructive,
                     tester_inputs=tester_inputs,
                     note=note,
+                    env=env,
                     screenshot=screenshot,
                     flow=flow,
                     flow_params=flow_params,
@@ -1338,14 +1488,33 @@ def build_server():
             note_id: int = 0,
             reason: str = "",
         ) -> str:
-            """List or retire ONE app's saved notes (by `package` or `run_id`).
-
-            "list": active notes, confirmed/contradicted counts; "retire": `note_id`, kept in history (`reason` holds no secret). Saved via `note` on qa_mobile_test."""
+            """List or retire (`note_id`, kept in history) ONE app's saved notes, by `package` or `run_id`."""
             return await _tracked(
                 "qa_mobile_notes",
                 ctx,
                 mcp_handlers.handle_mobile_notes(
                     action, package, run_id, note_id, reason
+                ),
+            )
+
+        @mcp.tool()
+        async def qa_mobile_knowledge(
+            ctx: Context,
+            action: str = "list",
+            package: str = "",
+            item_id: str = "",
+            data: dict | None = None,
+        ) -> str:
+            """ONE app's learned knowledge: list/show/confirm/reject/edit/export/import. data: table,page,run_id"""
+            return await _tracked(
+                "qa_mobile_knowledge",
+                ctx,
+                mcp_handlers.handle_mobile_knowledge(
+                    action,
+                    package,
+                    item_id,
+                    str((data or {}).get("run_id") or ""),
+                    data,
                 ),
             )
 
@@ -1383,6 +1552,9 @@ def build_server():
                 ),
             )
 
+
+def _register_full_edition_tools(mcp, Context) -> None:
+    """Register the bug-report and exploratory tools (full edition only)."""
     # Full edition only — the distribution build exposes test-case tools alone.
     if not mcp_handlers._test_cases_only():
 
@@ -1409,6 +1581,11 @@ def build_server():
                     feature, session_id, tester_response, progress=_make_progress(ctx)
                 ),
             )
+
+
+def _register_full_edition_submit_tools(mcp, Context) -> None:
+    """Register the bug-report and exploratory submit tools (full edition only)."""
+    if not mcp_handlers._test_cases_only():
 
         @mcp.tool()
         async def qa_submit_bug_report(task_id: str, report: str, ctx: Context) -> str:
@@ -1522,6 +1699,10 @@ def build_server():
                 ),
             )
 
+
+def _register_corpus_and_device_tools(mcp, Context, ContentBlock) -> None:
+    """Register corpus search, Jira setup and the device/capture tools."""
+
     @mcp.tool()
     async def qa_search_corpus(
         query: str, ctx: Context, entry_type: str = "test_case", feature: str = ""
@@ -1615,6 +1796,10 @@ def build_server():
 
     # Full edition only -- the multi-workflow wizard references modules the
     # distribution build does not ship. Two tool pairs that stood here were
+
+
+def _register_machine_tools(mcp, Context) -> None:
+    """Register the wizard, doctor, host-check, machine-report and selfcheck tools."""
     # DELETED on 2026-08-15: `qa_run_mobile_suite` in dead-code deletion
     # batch D2 with tools/maestro_*.py, and `qa_run_web_suite` /
     # `qa_submit_web_run` in batch D3 with tools/web_runner.py. Both had
@@ -1696,6 +1881,9 @@ def build_server():
             mcp_handlers.handle_selfcheck(server=mcp),
         )
 
+
+def _register_feature_analysis_tools(mcp, Context, ContentBlock) -> None:
+    """Register the Feature Analysis pair (full edition, feature on)."""
     # Optional tool — only in the FULL edition, and only when the Feature
     # Analysis feature is on. 2026-08-03: the public qa-agent-pro build is
     # deliberately test-cases-only AND credential-free, and this PAIR was the
@@ -1754,15 +1942,6 @@ def build_server():
                     task_id, report_json, progress=_make_progress(ctx)
                 ),
             )
-
-    _register_prompts(
-        mcp,
-        test_cases_only=edition_test_cases_only,
-        api_tests=edition_api_tests,
-        mobile=edition_mobile,
-    )
-
-    return mcp
 
 
 def _configure_logging() -> None:

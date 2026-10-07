@@ -559,6 +559,44 @@ def _row_index(ref: str) -> int:
     return int(match.group(2)) if match else -1
 
 
+def _archive_rows(archive: zipfile.ZipFile) -> dict:
+    """Size-check the workbook, then read its first sheet's rows."""
+    infos = archive.infolist()
+    if len(infos) > MAX_ZIP_MEMBERS:
+        return {
+            "error": (
+                "That workbook contains "
+                + str(len(infos))
+                + " internal files, more than the "
+                + str(MAX_ZIP_MEMBERS)
+                + " allowed, and was not opened."
+            ),
+            "content": None,
+        }
+    declared = sum(int(info.file_size or 0) for info in infos)
+    if declared > MAX_UNCOMPRESSED_BYTES:
+        return {
+            "error": (
+                "That workbook expands to "
+                + str(declared)
+                + " bytes, more than the "
+                + str(MAX_UNCOMPRESSED_BYTES)
+                + " allowed, and was not opened."
+            ),
+            "content": None,
+        }
+    shared = _shared_strings(archive)
+    if shared.get("error"):
+        return shared
+    sheet = _sheet_xml(archive)
+    if sheet.get("error"):
+        return sheet
+    rows = _sheet_rows(str(sheet["content"]), list(shared["content"]))
+    if rows.get("error"):
+        return rows
+    return {"error": None, "content": list(rows["content"])}
+
+
 def from_xlsx(source: object) -> dict:
     """An ``.xlsx`` read with ``zipfile`` + ``xml.etree``, hardened.
 
@@ -575,41 +613,10 @@ def from_xlsx(source: object) -> dict:
         if path.stat().st_size > MAX_BYTES:
             return {"error": _too_big(path.name), "content": None}
         with zipfile.ZipFile(path) as archive:
-            infos = archive.infolist()
-            if len(infos) > MAX_ZIP_MEMBERS:
-                return {
-                    "error": (
-                        "That workbook contains "
-                        + str(len(infos))
-                        + " internal files, more than the "
-                        + str(MAX_ZIP_MEMBERS)
-                        + " allowed, and was not opened."
-                    ),
-                    "content": None,
-                }
-            declared = sum(int(info.file_size or 0) for info in infos)
-            if declared > MAX_UNCOMPRESSED_BYTES:
-                return {
-                    "error": (
-                        "That workbook expands to "
-                        + str(declared)
-                        + " bytes, more than the "
-                        + str(MAX_UNCOMPRESSED_BYTES)
-                        + " allowed, and was not opened."
-                    ),
-                    "content": None,
-                }
-            shared = _shared_strings(archive)
-            if shared.get("error"):
-                return shared
-            sheet = _sheet_xml(archive)
-            if sheet.get("error"):
-                return sheet
-            rows = _sheet_rows(str(sheet["content"]), list(shared["content"]))
-            if rows.get("error"):
-                return rows
-            table = list(rows["content"])
-        table = [row for row in table if any(cell for cell in row)]
+            rows = _archive_rows(archive)
+        if rows.get("error"):
+            return rows
+        table = [row for row in rows["content"] if any(cell for cell in row)]
         if len(table) < 2:
             return {
                 "error": (

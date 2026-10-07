@@ -305,6 +305,63 @@ def append_service(items: list, ours: str) -> str:
     return ":".join(list(items) + [ours])
 
 
+async def _turn_on(serial: str, run_id: str, state: tuple, ours: str) -> dict | None:
+    """Record the previous settings and write ours; an error dict, or None on success."""
+    services, master = state
+    if services and not _VALUE_RE.fullmatch(services):
+        return {
+            "error": "the enabled accessibility services value cannot be restored safely",
+            "content": None,
+        }
+    written = append_service(_items(services), ours)
+    recorded = write_record(
+        run_id,
+        {
+            "serial": str(serial),
+            "previous_services": services,
+            "previous_master": master,
+            "written": written,
+            "pid": os.getpid(),
+            "recorded_at": time.time(),
+        },
+    )
+    if recorded.get("error"):
+        return recorded
+    put = await _sh(
+        serial,
+        "settings put secure "
+        + SETTING
+        + " '"
+        + written
+        + "' && settings put secure "
+        + MASTER
+        + " 1",
+    )
+    if put.get("error"):
+        await restore(run_id)
+        return put
+    return None
+
+
+async def _verify_parity(serial: str, run_id: str) -> dict:
+    """Wait for the service, compare its dump with uiautomator's; restore on any error."""
+    connected = await _await_connected(serial)
+    if connected.get("error"):
+        await restore(run_id)
+        return connected
+    from tools.mobile import executor  # lazy: executor's import graph is wide
+
+    slow = await executor.dump_raw(serial, use_provider=False)
+    checked = (
+        slow
+        if slow.get("error")
+        else compare(str(connected["content"]), str(slow["content"]))
+    )
+    if checked.get("error"):
+        await restore(run_id)
+    return checked
+
+
 async def enable(serial: str, run_id: str) -> dict:
     """Turn the service on for *run_id*, verify parity, register the provider.
 
@@ -322,57 +379,14 @@ async def enable(serial: str, run_id: str) -> dict:
         state = await read_state(serial)
         if state.get("error"):
             return state
-        services, master = state["content"]
-        items = _items(services)
-        already = ours in items
+        already = ours in _items(state["content"][0])
         if not already:
-            if services and not _VALUE_RE.fullmatch(services):
-                return {
-                    "error": "the enabled accessibility services value cannot be restored safely",
-                    "content": None,
-                }
-            written = append_service(items, ours)
-            recorded = write_record(
-                run_id,
-                {
-                    "serial": str(serial),
-                    "previous_services": services,
-                    "previous_master": master,
-                    "written": written,
-                    "pid": os.getpid(),
-                    "recorded_at": time.time(),
-                },
-            )
-            if recorded.get("error"):
-                return recorded
-            put = await _sh(
-                serial,
-                "settings put secure "
-                + SETTING
-                + " '"
-                + written
-                + "' && settings put secure "
-                + MASTER
-                + " 1",
-            )
-            if put.get("error"):
-                await restore(run_id)
-                return put
+            failed = await _turn_on(serial, run_id, state["content"], ours)
+            if failed:
+                return failed
         _RUNS[str(run_id)] = str(serial)
-        connected = await _await_connected(serial)
-        if connected.get("error"):
-            await restore(run_id)
-            return connected
-        from tools.mobile import executor  # lazy: executor's import graph is wide
-
-        slow = await executor.dump_raw(serial, use_provider=False)
-        checked = (
-            slow
-            if slow.get("error")
-            else compare(str(connected["content"]), str(slow["content"]))
-        )
+        checked = await _verify_parity(serial, run_id)
         if checked.get("error"):
-            await restore(run_id)
             return checked
         _FAILS[str(serial)] = 0
         adb.set_dump_provider(serial, provider)

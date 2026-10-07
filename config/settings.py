@@ -109,6 +109,60 @@ def _lenient_bool(value: object, field_name: str = "", default: bool = False) ->
     return default
 
 
+def _parse_score(v: object, field_name: str, default: float) -> tuple[float, bool]:
+    """Parse a score to a finite float; return ``(value, ok)``.
+
+    ``ok`` is False when the value is unparseable or not finite; the problem is
+    logged and the caller uses the field default.
+    """
+    try:
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            parsed = float(v)
+        else:
+            parsed = float(str(v).strip())
+    except (TypeError, ValueError, OverflowError):
+        logger.warning(
+            "Invalid %s=%r — using default %s",
+            field_name.upper(),
+            v,
+            default,
+        )
+        return default, False
+    if not math.isfinite(parsed):
+        # A string never overflows float(), it returns inf or nan -- and
+        # nan fails EVERY comparison, so a range check alone lets it
+        # through. QA_RAG_SIMILARITY_THRESHOLD=nan made every
+        # `score >= threshold` False and turned RAG grounding off in
+        # silence, because the coercer had succeeded.
+        logger.warning(
+            "Invalid %s=%r (not a finite number) — using default %s",
+            field_name.upper(),
+            v,
+            default,
+        )
+        return default, False
+    return parsed, True
+
+
+def _clamp_score(parsed: float, field_name: str) -> float:
+    """Clamp a finite score to [0.0, 1.0], logging when it was outside."""
+    # A TOTAL comparison rather than `parsed < 0.0 or parsed > 1.0`, which NaN
+    # defeats by failing both halves. Defence in depth only, and measured as
+    # such: with the finiteness guard in _parse_score running first, reverting
+    # this line to the partial form changes nothing and no test can kill it.
+    # It is here for the day the guards are reordered, not as a bound.
+    if not (0.0 <= parsed <= 1.0):
+        clamped = min(1.0, max(0.0, parsed))
+        logger.warning(
+            "%s=%r is outside the valid [0, 1] range — clamping to %s",
+            field_name.upper(),
+            parsed,
+            clamped,
+        )
+        return clamped
+    return parsed
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -1228,47 +1282,10 @@ class Settings(BaseSettings):
         for a perfectly good suite.
         """
         default = cls.model_fields[info.field_name].default
-        try:
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
-                parsed = float(v)
-            else:
-                parsed = float(str(v).strip())
-        except (TypeError, ValueError, OverflowError):
-            logger.warning(
-                "Invalid %s=%r — using default %s",
-                info.field_name.upper(),
-                v,
-                default,
-            )
+        parsed, ok = _parse_score(v, info.field_name, default)
+        if not ok:
             return default
-        if not math.isfinite(parsed):
-            # A string never overflows float(), it returns inf or nan -- and
-            # nan fails EVERY comparison, so a range check alone lets it
-            # through. QA_RAG_SIMILARITY_THRESHOLD=nan made every
-            # `score >= threshold` False and turned RAG grounding off in
-            # silence, because the coercer had succeeded.
-            logger.warning(
-                "Invalid %s=%r (not a finite number) — using default %s",
-                info.field_name.upper(),
-                v,
-                default,
-            )
-            return default
-        # A TOTAL comparison rather than `parsed < 0.0 or parsed > 1.0`, which NaN
-        # defeats by failing both halves. Defence in depth only, and measured as
-        # such: with the finiteness guard above running first, reverting this
-        # line to the partial form changes nothing and no test can kill it.
-        # It is here for the day the guards are reordered, not as a bound.
-        if not (0.0 <= parsed <= 1.0):
-            clamped = min(1.0, max(0.0, parsed))
-            logger.warning(
-                "%s=%r is outside the valid [0, 1] range — clamping to %s",
-                info.field_name.upper(),
-                parsed,
-                clamped,
-            )
-            return clamped
-        return parsed
+        return _clamp_score(parsed, info.field_name)
 
     @field_validator(
         "qa_host_dedup_max_removal_ratio",
@@ -1397,6 +1414,42 @@ def _offending_fields(exc: ValidationError) -> list[str]:
     return names
 
 
+def _pin_offending_fields(
+    exc: ValidationError, overrides: dict[str, object], degraded: list[str]
+) -> bool:
+    """Pin the not-yet-pinned offending fields to their defaults.
+
+    Returns False when no new offending field could be identified (the
+    caller stops retrying), True when at least one field was pinned.
+    """
+    fresh = [n for n in _offending_fields(exc) if n not in overrides]
+    if not fresh:
+        logger.warning(
+            "Settings rejected the environment and the offending "
+            "field(s) could not be identified (%s).",
+            exc,
+        )
+        return False
+    for name in fresh:
+        overrides[name] = Settings.model_fields[name].get_default(
+            call_default_factory=True
+        )
+        degraded.append(name)
+    return True
+
+
+def _warn_degraded(degraded: list[str]) -> None:
+    """Log which fields were reset to their defaults, if any."""
+    if degraded:
+        logger.warning(
+            "Settings: %d field(s) had an unusable value and were reset to "
+            "their defaults (%s). Every other field kept its configured "
+            "value.",
+            len(degraded),
+            ", ".join(sorted(degraded)),
+        )
+
+
 def _load_settings() -> Settings:
     """Build Settings, degrading FIELD BY FIELD rather than all-or-nothing.
 
@@ -1419,31 +1472,13 @@ def _load_settings() -> Settings:
         try:
             loaded = Settings(**overrides)
         except ValidationError as exc:
-            fresh = [n for n in _offending_fields(exc) if n not in overrides]
-            if not fresh:
-                logger.warning(
-                    "Settings rejected the environment and the offending "
-                    "field(s) could not be identified (%s).",
-                    exc,
-                )
+            if not _pin_offending_fields(exc, overrides, degraded):
                 break
-            for name in fresh:
-                overrides[name] = Settings.model_fields[name].get_default(
-                    call_default_factory=True
-                )
-                degraded.append(name)
             continue
         except Exception as exc:  # pragma: no cover - defensive backstop
             logger.warning("Settings failed to load (%s).", exc)
             break
-        if degraded:
-            logger.warning(
-                "Settings: %d field(s) had an unusable value and were reset to "
-                "their defaults (%s). Every other field kept its configured "
-                "value.",
-                len(degraded),
-                ", ".join(sorted(degraded)),
-            )
+        _warn_degraded(degraded)
         return loaded
     logger.warning(
         "Settings could not parse the environment even after resetting %s — "

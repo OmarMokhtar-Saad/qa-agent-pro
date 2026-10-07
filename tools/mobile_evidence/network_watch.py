@@ -120,6 +120,18 @@ def _watch_id(serial: str) -> str:
     return WATCH_RUN_PREFIX + "-" + (_key(serial) or "unknown")
 
 
+def _watching(key: str, *, already: bool) -> dict:
+    return {
+        "error": None,
+        "content": {
+            "serial": key,
+            "state": "watching",
+            "already": already,
+            "started_at": _WATCHES[key]["started_at"],
+        },
+    }
+
+
 async def start(serial: str, package: str = "", apply: bool = False) -> dict:
     """Begin a watch on ``serial``. Needs ``apply=true``: it touches the device."""
     from tools.mobile_evidence import capture
@@ -144,15 +156,7 @@ async def start(serial: str, package: str = "", apply: bool = False) -> dict:
         # `already` is a FIELD, not a wording difference: a double-clicked
         # Start must not read to a caller as a fresh capture beginning now,
         # because the rows it eventually gets will reach back to the first one.
-        return {
-            "error": None,
-            "content": {
-                "serial": key,
-                "state": "watching",
-                "already": True,
-                "started_at": _WATCHES[key]["started_at"],
-            },
-        }
+        return _watching(key, already=True)
     run_id = _watch_id(key)
     begun = await capture.begin_network(key, str(package or ""), run_id, "watch", 0)
     if begun.get("error"):
@@ -168,15 +172,7 @@ async def start(serial: str, package: str = "", apply: bool = False) -> dict:
         "begun": record,
         "started_at": _now(),
     }
-    return {
-        "error": None,
-        "content": {
-            "serial": key,
-            "state": "watching",
-            "already": False,
-            "started_at": _WATCHES[key]["started_at"],
-        },
-    }
+    return _watching(key, already=False)
 
 
 def watch_dir(serial: str) -> Path:

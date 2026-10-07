@@ -50,6 +50,8 @@ The NEXT packet carries a PNG of the screen only when the element list is not en
 
 When the destructive guard stops a control and the TESTER confirms it, resubmit with confirm_destructive=true: it unlocks only the control THIS case's last stop named, not any control -- resubmit the SAME op against the SAME element the stop pointed at. A different op, a different element, or a submission before any stop was recorded, refuses by name and does NOT spend the confirm, so the next, correctly-aimed resubmission can still use it. A run whose charter says `destructive: none` still refuses.
 
+Optional `env`="name=value,..." on qa_mobile_test declares this run's setup (e.g. backend=staging) so env-scoped app notes apply; a script may carry knowledge_feedback.
+
 Never report a screen state, field value or login outcome that was not read from a qa_* observation. If the server cannot type or act, stop and report the blocker by name. Do not fall back to raw adb input, and do not claim a result.
 
 A finished run's reply STARTS with a short verdict block (verdict, each requested step, the typed-field tally). Relay that block to the tester word for word -- never upgrade, soften or summarise it into a plainer claim than it makes.

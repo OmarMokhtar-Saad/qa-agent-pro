@@ -108,16 +108,8 @@ def classify(shell_result: object) -> str:
         # read as TLS_FAILURE, or a tester is told to fix a certificate that
         # was never reached.
         return INCONCLUSIVE
-    rc = body.get("rc")
+    rc = _classify_rc(body)
     if rc is None:
-        return INCONCLUSIVE
-    try:
-        rc = int(rc)
-    except (TypeError, ValueError, OverflowError):
-        # OverflowError is the third one: int(float("inf")) raises it, and rc
-        # comes from a device-supplied payload. A probe that raises here would
-        # break the never-raise contract for the whole capture stage, on an
-        # input a device can produce.
         return INCONCLUSIVE
     if rc in CURL_TLS_ERROR_CODES:
         return TLS_FAILURE
@@ -135,6 +127,22 @@ def classify(shell_result: object) -> str:
     # garbled: an unparseable answer, never a bare success and never a
     # failure state that implies something about TLS.
     return INCONCLUSIVE
+
+
+def _classify_rc(body: dict) -> int | None:
+    """The curl exit code as an int, or None when it is absent or unreadable."""
+    rc = body.get("rc")
+    if rc is None:
+        return None
+    try:
+        rc = int(rc)
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is the third one: int(float("inf")) raises it, and rc
+        # comes from a device-supplied payload. A probe that raises here would
+        # break the never-raise contract for the whole capture stage, on an
+        # input a device can produce.
+        return None
+    return rc
 
 
 async def run(serial: str, port: int) -> dict:

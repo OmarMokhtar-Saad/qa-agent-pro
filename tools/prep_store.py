@@ -435,22 +435,8 @@ def _list_unfinished_sync(limit: int) -> list[dict]:
     store is one SQLite file per install/user, so there is no cross-tenant
     separation to enforce, and the disclosure is flag-gated OFF by default."""
     lim = max(1, int(limit))
-    conn = _connect()
-    try:
-        touch_col = "p.touched_at" if _has_touched_at(conn) else "NULL"
-        rows = conn.execute(
-            "SELECT p.id, p.created_at, " + touch_col + ", p.payload_json, "
-            "COUNT(s.id) AS staged FROM preps p "
-            "LEFT JOIN prep_submissions s ON s.prep_id = p.id "
-            "GROUP BY p.id "
-            "HAVING staged > 0 OR " + touch_col + " IS NOT NULL "
-            "ORDER BY p.created_at DESC LIMIT ?",
-            (lim * 4,),
-        ).fetchall()
-    finally:
-        conn.close()
     out: list[dict] = []
-    for pid, created, touched, payload_json, staged in rows:
+    for pid, created, touched, payload_json, staged in _unfinished_rows(lim):
         created_f = float(created)
         if _expired(created_f, touched):
             continue
@@ -469,30 +455,53 @@ def _list_unfinished_sync(limit: int) -> list[dict]:
             touched_f = float(touched or 0.0)
         except (TypeError, ValueError, OverflowError):
             touched_f = 0.0
-        anchor = max(created_f, touched_f)
-        if _sliding_ttl_on():
-            expires = min(anchor + _ttl_seconds(), created_f + _max_lifetime_s())
-        else:
-            expires = created_f + _ttl_seconds()
-        expected = 0
-        try:
-            meta = (json.loads(payload_json) or {}).get("meta") or {}
-            expected = len(meta.get("expected_categories") or [])
-        except (ValueError, TypeError, AttributeError):
-            expected = 0
         out.append(
             {
                 "prep_id": pid,
                 "created_at": created_f,
                 "touched_at": touched_f,
                 "staged_count": int(staged or 0),
-                "expected_count": expected,
-                "expires_at": expires,
+                "expected_count": _expected_count(payload_json),
+                "expires_at": _expires_at(created_f, touched_f),
             }
         )
         if len(out) >= lim:
             break
     return out
+
+
+def _unfinished_rows(lim: int) -> list:
+    """Candidate rows (4x ``lim``) with activity, newest first."""
+    conn = _connect()
+    try:
+        touch_col = "p.touched_at" if _has_touched_at(conn) else "NULL"
+        return conn.execute(
+            "SELECT p.id, p.created_at, " + touch_col + ", p.payload_json, "
+            "COUNT(s.id) AS staged FROM preps p "
+            "LEFT JOIN prep_submissions s ON s.prep_id = p.id "
+            "GROUP BY p.id "
+            "HAVING staged > 0 OR " + touch_col + " IS NOT NULL "
+            "ORDER BY p.created_at DESC LIMIT ?",
+            (lim * 4,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def _expires_at(created_f: float, touched_f: float) -> float:
+    anchor = max(created_f, touched_f)
+    if _sliding_ttl_on():
+        return min(anchor + _ttl_seconds(), created_f + _max_lifetime_s())
+    return created_f + _ttl_seconds()
+
+
+def _expected_count(payload_json: str) -> int:
+    """len(meta.expected_categories) of a stored payload; 0 when unreadable."""
+    try:
+        meta = (json.loads(payload_json) or {}).get("meta") or {}
+        return len(meta.get("expected_categories") or [])
+    except (ValueError, TypeError, AttributeError):
+        return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -670,45 +679,46 @@ def _find_recent_prep_sync(source_url: str, window_s: float) -> dict | None:
         meta = env.get("meta") or {}
         if str(meta.get("source_url") or "") != source_url:
             continue
-        # 2026-08-09: the IMAGE state of that open prep travels with the hit,
-        # so tools/mcp_handlers.py can carry its screens forward into a
-        # re-prepare -- or refuse and NAME them -- instead of silently
-        # generating ungrounded. IDS AND COUNTS ONLY: image bytes are never
-        # persisted here. Every field is coerced defensively, because this whole
-        # lookup is a best-effort guard: a malformed meta must degrade to "no
-        # images", never raise. The isinstance checks matter -- a stray STRING
-        # would otherwise iterate into a list of characters.
-        raw_ids = meta.get("capture_ids")
-        cap_ids = [
-            str(x or "").strip()[:64]
-            for x in (raw_ids if isinstance(raw_ids, (list, tuple)) else [])
-            if str(x or "").strip()
-        ][:24]
-        raw_labels = meta.get("captured_image_labels")
-        cap_labels = [
-            str(x or "").strip()
-            for x in (raw_labels if isinstance(raw_labels, (list, tuple)) else [])
-            if str(x or "").strip()
-        ][:8]
-        try:
-            captured_n = max(0, min(99, int(meta.get("captured_image_count") or 0)))
-        except (TypeError, ValueError, OverflowError):
-            captured_n = 0
-        try:
-            attached_n = max(0, min(99, int(meta.get("attached_image_count") or 0)))
-        except (TypeError, ValueError, OverflowError):
-            attached_n = 0
         return {
             "prep_id": pid,
             "created_at": created_f,
             "age_s": max(0.0, now - created_f),
-            "captured_image_count": captured_n,
-            "attached_image_count": attached_n,
-            "capture_ids": cap_ids,
-            "captured_image_labels": cap_labels,
-            "host_image_job": bool(meta.get("host_image_job")),
+            **_image_state(meta),
         }
     return None
+
+
+def _clamped_count(value: object) -> int:
+    """``value`` as an int clamped to 0..99; anything unreadable is 0."""
+    try:
+        return max(0, min(99, int(value or 0)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _clean_strings(raw: object, limit: int, item_len: int | None = None) -> list[str]:
+    """Non-blank stripped strings of a list/tuple (a stray STRING is ignored,
+    it would otherwise iterate into a list of characters), at most ``limit``."""
+    items = raw if isinstance(raw, (list, tuple)) else []
+    return [str(x or "").strip()[:item_len] for x in items if str(x or "").strip()][
+        :limit
+    ]
+
+
+def _image_state(meta: dict) -> dict:
+    """The IMAGE state of an open prep (2026-08-09), so tools/mcp_handlers.py
+    can carry its screens forward into a re-prepare -- or refuse and NAME them
+    -- instead of silently generating ungrounded. IDS AND COUNTS ONLY: image
+    bytes are never persisted here. Every field is coerced defensively: this
+    lookup is a best-effort guard, a malformed meta degrades to "no images",
+    never raises."""
+    return {
+        "captured_image_count": _clamped_count(meta.get("captured_image_count")),
+        "attached_image_count": _clamped_count(meta.get("attached_image_count")),
+        "capture_ids": _clean_strings(meta.get("capture_ids"), 24, 64),
+        "captured_image_labels": _clean_strings(meta.get("captured_image_labels"), 8),
+        "host_image_job": bool(meta.get("host_image_job")),
+    }
 
 
 async def find_recent_prep_by_source(source_url: str, window_s: float = 1800) -> dict:

@@ -196,6 +196,23 @@ def build_feature_analysis_prompt(
     # Bound token cost: cap the primary text before wrapping (reviewer note 1).
     primary = (jira_text or feature_text or "").strip() or "(none provided)"
 
+    ac_block = _ac_block(acs)
+    ui_block = _ui_block(ui_content)
+    shots_block = _shots_block(screenshot_descriptions, screens_attached)
+    user_msg = (
+        "## Feature / Ticket Text\n"
+        + wrap_untrusted("jira_or_web_content", primary)
+        + ac_block
+        + shots_block
+        + ui_block
+    )
+    has_screens = bool(screenshot_descriptions) or int(screens_attached or 0) > 0
+    rubric = _SYSTEM_PROMPT if has_screens else _SYSTEM_PROMPT_NO_SCREENS
+    return rubric + (reminder or "") + _GUARD, user_msg
+
+
+def _ac_block(acs: list) -> str:
+    """The Parsed Acceptance Criteria section of the user message, or ``""``."""
     ac_block = ""
     if acs:
         ac_lines = "\n".join(
@@ -205,7 +222,11 @@ def build_feature_analysis_prompt(
         ac_block = "\n\n## Parsed Acceptance Criteria\n" + wrap_untrusted(
             "jira_acceptance_criteria", ac_lines
         )
+    return ac_block
 
+
+def _ui_block(ui_content: dict | None) -> str:
+    """The Live UI Structure section of the user message, or ``""``."""
     ui_block = ""
     if ui_content and not ui_content.get("error"):
         content = (ui_content.get("content") or "").strip()
@@ -213,7 +234,11 @@ def build_feature_analysis_prompt(
             ui_block = "\n\n## Live UI Structure\n" + wrap_untrusted(
                 "live_ui_structure", content[:3000]
             )
+    return ui_block
 
+
+def _shots_block(screenshot_descriptions: str, screens_attached: int) -> str:
+    """The screenshots section of the user message."""
     # Screens now ride to the tester's OWN multimodal model as MCP image
     # content, so there is nothing for this server to describe. The
     # instruction below is SERVER-authored and therefore deliberately NOT
@@ -246,16 +271,7 @@ def build_feature_analysis_prompt(
             "\n\n## Screenshot Descriptions (treat as one connected flow)\n"
             + wrap_untrusted("screenshot_descriptions", "(no screenshots provided)")
         )
-    user_msg = (
-        "## Feature / Ticket Text\n"
-        + wrap_untrusted("jira_or_web_content", primary)
-        + ac_block
-        + shots_block
-        + ui_block
-    )
-    has_screens = bool(screenshot_descriptions) or int(screens_attached or 0) > 0
-    rubric = _SYSTEM_PROMPT if has_screens else _SYSTEM_PROMPT_NO_SCREENS
-    return rubric + (reminder or "") + _GUARD, user_msg
+    return shots_block
 
 
 # analyze_feature() lived here until 2026-08-16 (dead-code deletion P2-E3). It
@@ -312,22 +328,34 @@ async def prepare_feature_analysis(
             user,
             return_field="report",
             response_schema=FeatureAnalysisReport.model_json_schema(),
-            meta={
-                "feature_text": (feature_text or "")[:_MAX_META_TEXT_CHARS],
-                "jira_text": (jira_text or "")[:_MAX_META_TEXT_CHARS],
-                "screen_descriptions": (screenshot_descriptions or "")[
-                    :_MAX_META_TEXT_CHARS
-                ],
-                "mode": str(mode or ""),
-                "screens": int(screens or 0),
-                "source": str(source or ""),
-                "round": int(round_no),
-            },
+            meta=_task_meta(
+                (feature_text, jira_text, screenshot_descriptions),
+                mode,
+                screens,
+                source,
+                round_no,
+            ),
             submit_tool=submit_tool,
         )
     except Exception as exc:
         logger.exception("prepare_feature_analysis failed")
         return {"error": str(exc), "content": None}
+
+
+def _task_meta(
+    texts: tuple[str, str, str], mode: str, screens: int, source: str, round_no: int
+) -> dict:
+    """The prompt INPUTS recorded on the host task (``texts`` is feature, jira, screens)."""
+    feature_text, jira_text, screenshot_descriptions = texts
+    return {
+        "feature_text": (feature_text or "")[:_MAX_META_TEXT_CHARS],
+        "jira_text": (jira_text or "")[:_MAX_META_TEXT_CHARS],
+        "screen_descriptions": (screenshot_descriptions or "")[:_MAX_META_TEXT_CHARS],
+        "mode": str(mode or ""),
+        "screens": int(screens or 0),
+        "source": str(source or ""),
+        "round": int(round_no),
+    }
 
 
 def finalize_feature_report(payload: object) -> tuple[FeatureAnalysisReport, bool]:
@@ -391,29 +419,47 @@ def render_report_markdown(report: FeatureAnalysisReport, compact: bool = False)
     "## Conflicts (Jira vs. Screenshots)" subsection is emitted under Requirement
     Analysis only when ``report.conflicts`` is non-empty.
     """
-    lines: list[str] = []
+    lines = _summary_lines(report)
+    # COMPACT mode: the chat view keeps only the key sections (Feature Summary,
+    # Risks, Missing Requirements); the full analysis is delivered as a
+    # downloadable file. Emit those two sections and return before the verbose
+    # Requirement Analysis / UI Analysis / User Flow / Conflicts sections.
+    if compact:
+        lines.extend(_compact_lines(report))
+        return "\n".join(lines)
 
-    # 1. Feature Summary
+    lines.extend(_requirement_lines(report))
+    lines.extend(_closing_lines(report))
+    return "\n".join(lines)
+
+
+def _summary_lines(report: FeatureAnalysisReport) -> list[str]:
+    """Section 1, Feature Summary (shared by the full and compact views)."""
+    lines: list[str] = []
     lines.append("## Feature Summary")
     summary = (report.feature_summary or "").strip()
     lines.append(summary if summary else _EMPTY_NOTE)
     if report.business_objective.strip():
         lines.append("")
         lines.append(f"**Business objective:** {report.business_objective.strip()}")
-    # COMPACT mode: the chat view keeps only the key sections (Feature Summary,
-    # Risks, Missing Requirements); the full analysis is delivered as a
-    # downloadable file. Emit those two sections and return before the verbose
-    # Requirement Analysis / UI Analysis / User Flow / Conflicts sections.
-    if compact:
-        lines.append("")
-        lines.append("## Risks")
-        lines.append(_bullets(report.risks))
-        lines.append("")
-        lines.append("## Missing Requirements")
-        lines.append(_bullets(report.missing_requirements))
-        return "\n".join(lines)
+    return lines
 
-    # 2. Requirement Analysis
+
+def _compact_lines(report: FeatureAnalysisReport) -> list[str]:
+    """The Risks and Missing Requirements sections of the compact view."""
+    lines: list[str] = []
+    lines.append("")
+    lines.append("## Risks")
+    lines.append(_bullets(report.risks))
+    lines.append("")
+    lines.append("## Missing Requirements")
+    lines.append(_bullets(report.missing_requirements))
+    return lines
+
+
+def _requirement_lines(report: FeatureAnalysisReport) -> list[str]:
+    """Section 2, Requirement Analysis (with the optional Conflicts subsection)."""
+    lines: list[str] = []
     lines.append("")
     lines.append("## Requirement Analysis")
     lines.append("### Functional Requirements")
@@ -437,7 +483,12 @@ def render_report_markdown(report: FeatureAnalysisReport, compact: bool = False)
     if report.conflicts:
         lines.append("### Conflicts (Jira vs. Screenshots)")
         lines.append(_bullets(report.conflicts))
+    return lines
 
+
+def _closing_lines(report: FeatureAnalysisReport) -> list[str]:
+    """Sections 3-6: UI Analysis, User Flow, Missing Requirements, Risks."""
+    lines: list[str] = []
     # 3. UI Analysis
     lines.append("")
     lines.append("## UI Analysis")
@@ -457,5 +508,4 @@ def render_report_markdown(report: FeatureAnalysisReport, compact: bool = False)
     lines.append("")
     lines.append("## Risks")
     lines.append(_bullets(report.risks))
-
-    return "\n".join(lines)
+    return lines

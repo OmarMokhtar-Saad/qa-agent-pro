@@ -25,15 +25,16 @@ from contextlib import closing
 from pathlib import Path
 
 from tools import api_redact
-from tools.mobile import actions, held_inputs, paths
+from tools.mobile import actions, held_inputs, knowledge_limits, knowledge_schema, paths
 from tools.untrusted import wrap_untrusted
 
 logger = logging.getLogger(__name__)
 
 #: Notes that may be ACTIVE for one app. Each is a guard read on every replay.
 MAX_ACTIVE_NOTES = 100
-#: Notes ever kept per app, history included: supersede and retire delete
-#: nothing, so this is what stops the file growing without bound.
+#: Notes kept per app, history included: supersede and retire delete nothing,
+#: so this stops the file growing; at the cap the oldest retired or superseded
+#: rows are dropped to make room (an active note never is).
 MAX_NOTE_ROWS = 1000
 #: Characters in one note's text. It is echoed to the host model.
 MAX_NOTE_CHARS = 600
@@ -48,11 +49,13 @@ DB_TIMEOUT_S = 2.0
 DEFAULT_GUARD_WAIT_MS = 5000
 #: A held tester value shorter than this is not searched for in a note.
 HELD_VALUE_LENGTH = 3
-KINDS = ("wait", "avoid")
+KINDS = ("wait", "avoid", "precondition", "fact")
+#: Kinds the executor reads as guards; the others are context only.
+GUARD_KINDS = ("wait", "avoid")
 
 _SCHEMA_VERSION = "1"
 _FIELD_CHARS = 200
-_ENV_ENTRIES = 8
+_ENV_ENTRIES = knowledge_limits.ENV_ENTRIES
 _WHEN_KEYS = ("op", "rid", "activity", "env")
 _THEN_KEYS = ("until_rid", "until_text", "until_gone", "until_rid_text", "ms")
 _PACKAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$")
@@ -274,6 +277,19 @@ def _tighten_store(path: Path) -> None:
             _tighten(member, 0o600)
 
 
+def _migrate_once(conn: sqlite3.Connection) -> None:
+    """Bring a write connection to schema v2 when the file is not there yet.
+    A failure degrades like a v1 file: the slice-1 tables still work."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        if row is None or row[0] != knowledge_schema.SCHEMA_VERSION:
+            knowledge_schema.migrate(conn)
+    except (sqlite3.Error, ValueError, OSError):
+        logger.info("app knowledge: schema migration skipped", exc_info=True)
+
+
 def _connect(path: Path, *, write: bool) -> sqlite3.Connection:
     """WRITE creates the directory (0700), the file (0600) and the schema. READ
     never creates anything (the caller checks the file exists first) and is
@@ -297,6 +313,7 @@ def _connect(path: Path, *, write: bool) -> sqlite3.Connection:
             # The INSERT opened an implicit transaction; close it, or the caller's
             # BEGIN IMMEDIATE raises "cannot start a transaction within a transaction".
             conn.commit()
+            _migrate_once(conn)
         else:
             conn.execute("PRAGMA query_only=ON")
     except BaseException:
@@ -384,6 +401,35 @@ def _validate_then(then: dict, has_when_target: bool) -> tuple:
     return clean, ""
 
 
+def _validate_steps(then: dict) -> tuple:
+    """``(steps, error)`` for a precondition's ``then={"steps": [...]}``."""
+    extra = sorted(str(key) for key in then if key != "steps")
+    if extra:
+        return [], "unknown then key(s): " + ", ".join(extra)
+    steps = then.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return [], "a precondition needs then.steps"
+    if len(steps) > knowledge_limits.PRECONDITION_STEPS:
+        return [], "a precondition has at most %d steps" % (
+            knowledge_limits.PRECONDITION_STEPS
+        )
+    clean = []
+    for step in steps:
+        if not isinstance(step, dict) or not _OP_RE.match(str(step.get("op", ""))):
+            return [], "each precondition step needs an `op` name"
+        item: dict = {}
+        for key, value in step.items():
+            if not isinstance(key, str) or isinstance(value, (dict, list)):
+                return [], "precondition step values must be text, numbers or booleans"
+            if isinstance(value, str):
+                value, problem = _clean(value, "step." + key)
+                if problem:
+                    return [], problem
+            item[key] = value
+        clean.append(item)
+    return clean, ""
+
+
 def _validate(text: object, kind: object, when: object, then: object) -> tuple | str:
     """``(text, when, then)`` cleaned, or an error string."""
     if not isinstance(text, str) or not text.strip():
@@ -402,6 +448,20 @@ def _validate(text: object, kind: object, when: object, then: object) -> tuple |
     clean_when, problem = _validate_when(when)
     if problem:
         return problem
+    return _validate_by_kind(text, kind, clean_when, then)
+
+
+def _validate_by_kind(text: str, kind: str, clean_when: dict, then: dict) -> tuple | str:
+    """The kind-specific part of ``_validate``."""
+    if kind == "fact":
+        if then:
+            return "a fact note takes no `then`"
+        return text, clean_when, {}
+    if kind == "precondition":
+        steps, problem = _validate_steps(then)
+        if problem:
+            return problem
+        return text, clean_when, {"steps": steps}
     if kind == "avoid":
         if "rid" not in clean_when:
             return "an avoid note needs when.rid"
@@ -486,7 +546,14 @@ def secret_reason(blob: object, secrets: object = (), source_run: object = "") -
 
 
 def _add_event(conn, note_id, event: str, detail: object, run_id: object) -> bool:
-    (count,) = conn.execute("SELECT COUNT(*) FROM events").fetchone()
+    # Only slice-1 events count; knowledge_db events carry a table_name and are
+    # pruned by knowledge_db.compact instead. Feedback rows (capped by
+    # knowledge_feedback), learn markers and rollback rows have an empty
+    # table_name too but are not notes' events, so they never use this budget.
+    (count,) = conn.execute(
+        "SELECT COUNT(*) FROM events WHERE (table_name IS NULL OR table_name = '')"
+        " AND event NOT IN ('feedback', 'learn_marker', 'rollback')"
+    ).fetchone()
     if count >= MAX_EVENT_ROWS:
         return False
     conn.execute(
@@ -504,6 +571,16 @@ def _load(raw: object) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _extra_keys(row: sqlite3.Row) -> dict:
+    """Schema-v2 columns when the file has them (a v1 file has none)."""
+    have = row.keys()
+    return {
+        name: row[name]
+        for name in ("trust", "screen_key", "element_fp", "recheck_at")
+        if name in have
+    }
+
+
 def _note(row: sqlite3.Row) -> dict:
     return {
         "id": row["id"],
@@ -517,7 +594,58 @@ def _note(row: sqlite3.Row) -> dict:
         "app_version": row["app_version"],
         "source_run": row["source_run"],
         "supersedes": row["supersedes"],
+        **_extra_keys(row),
     }
+
+
+def _cap_error(conn, superseding: int) -> str:
+    """The refusal text when a new note would break a cap, else ``""``."""
+    (active,) = conn.execute(
+        "SELECT COUNT(*) FROM notes WHERE status = 'active'"
+    ).fetchone()
+    (total,) = conn.execute("SELECT COUNT(*) FROM notes").fetchone()
+    if active - superseding >= MAX_ACTIVE_NOTES:
+        return (
+            "this app already has %d active notes: retire one first "
+            "(qa_mobile_notes action=retire)" % MAX_ACTIVE_NOTES
+        )
+    if total >= MAX_NOTE_ROWS:
+        # Full: make room by dropping the OLDEST retired or superseded rows
+        # (and their events). An active note is never deleted.
+        stale = [
+            r[0]
+            for r in conn.execute(
+                "SELECT id FROM notes WHERE status != 'active' ORDER BY id LIMIT ?",
+                (total - MAX_NOTE_ROWS + 1,),
+            )
+        ]
+        for old_id in stale:
+            conn.execute("DELETE FROM events WHERE note_id = ?", (old_id,))
+            conn.execute("DELETE FROM notes WHERE id = ?", (old_id,))
+        if total - len(stale) >= MAX_NOTE_ROWS:
+            return (
+                "this app's note history is full (%d rows, all active): "
+                "retire one first (qa_mobile_notes action=retire)" % MAX_NOTE_ROWS
+            )
+    return ""
+
+
+def _insert_note(conn, values: tuple, old: list) -> int:
+    """Insert the row, mark the *old* ids superseded, return the new id.
+
+    *values* ends with ``now``, the ``valid_from`` and ``invalid_at`` time."""
+    cur = conn.execute(
+        "INSERT INTO notes (kind, text, when_json, then_json, scope_key, "
+        "app_version, source_run, supersedes, valid_from) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        values,
+    )
+    for old_id in old:
+        conn.execute(
+            "UPDATE notes SET status = 'superseded', invalid_at = ? WHERE id = ?",
+            (values[-1], old_id),
+        )
+    return cur.lastrowid
 
 
 def add_note(
@@ -567,44 +695,25 @@ def add_note(
                     (scope,),
                 )
             ]
-            (active,) = conn.execute(
-                "SELECT COUNT(*) FROM notes WHERE status = 'active'"
-            ).fetchone()
-            (total,) = conn.execute("SELECT COUNT(*) FROM notes").fetchone()
-            if active - len(old) >= MAX_ACTIVE_NOTES:
-                return _err(
-                    "this app already has %d active notes: retire one first "
-                    "(qa_mobile_notes action=retire)" % MAX_ACTIVE_NOTES
-                )
-            if total >= MAX_NOTE_ROWS:
-                return _err(
-                    "this app's note history is full (%d rows); saved notes are "
-                    "never deleted, so no more can be added" % MAX_NOTE_ROWS
-                )
-            cur = conn.execute(
-                "INSERT INTO notes (kind, text, when_json, then_json, scope_key, "
-                "app_version, source_run, supersedes, valid_from) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    kind,
-                    text,
-                    json.dumps(when, sort_keys=True),
-                    json.dumps(then, sort_keys=True),
-                    scope,
-                    str(app_version or "")[:64],
-                    str(source_run or "")[:64],
-                    old[0] if old else None,
-                    now,
-                ),
+            full = _cap_error(conn, len(old))
+            if full:
+                return _err(full)
+            values = (
+                kind,
+                text,
+                json.dumps(when, sort_keys=True),
+                json.dumps(then, sort_keys=True),
+                scope,
+                str(app_version or "")[:64],
+                str(source_run or "")[:64],
+                old[0] if old else None,
+                now,
             )
-            new_id = cur.lastrowid
-            for old_id in old:
-                conn.execute(
-                    "UPDATE notes SET status = 'superseded', invalid_at = ? WHERE id = ?",
-                    (now, old_id),
-                )
+            new_id = _insert_note(conn, values, old)
             _add_event(conn, new_id, "added", kind, source_run)
-        return _ok({"id": new_id, "kind": kind, "text": text, "superseded": old})
+        return _ok(
+            {"id": new_id, "kind": kind, "text": text, "when": when, "superseded": old}
+        )
     except Exception as exc:
         return _fail("add_note", exc)
 
@@ -639,7 +748,9 @@ def list_notes(package: object, *, include_inactive: bool = False) -> dict:
 def load_guards(package: object) -> dict:
     """Every ACTIVE note, for the executor. Read-only; creates nothing."""
     try:
-        notes, problem = _read_notes(package, "WHERE status = 'active'")
+        notes, problem = _read_notes(
+            package, "WHERE status IN ('active', 'needs_recheck')"
+        )
         return _err(problem) if problem else _ok(notes)
     except Exception as exc:
         return _fail("load_guards", exc)
@@ -730,17 +841,37 @@ def rid_matches(have: object, want: object) -> bool:
     return have_n == want_n or have_n.endswith("/" + want_n)
 
 
-def candidates(guards: object, op: str, rids: object) -> list:
+def env_matches(when_env: object, run_env: object) -> bool:
+    """True when a note's ``when.env`` applies to this run: every pair equals the
+    run's declared env. An empty run env never satisfies a non-empty scope (fail
+    closed); a note with no env scope always applies."""
+    if not when_env:
+        return True
+    if not isinstance(when_env, dict) or not isinstance(run_env, dict) or not run_env:
+        return False
+    return all(k in run_env and str(run_env[k]) == str(v) for k, v in when_env.items())
+
+
+def _env_applies(guard: dict, when_env: object, env: object) -> bool:
+    """An env-scoped guard applies when the loader stamped it ``_env_ok`` or the
+    run env satisfies its condition (an absent env never does)."""
+    return bool(guard.get("_env_ok")) or env_matches(when_env, env)
+
+
+def candidates(guards: object, op: str, rids: object, env: object = None) -> list:
     """The guards that apply to this op on this target. *rids* is one resource
     id or every id the action could hit (its own ``rid`` plus the ids of the
     elements its text, label or id selects); a rid-scoped note matches when ANY
-    of them does. Env-scoped notes are stored but NOT applied in this slice, so
-    they never match."""
+    of them does. An env-scoped note applies only when *env* (the run's declared
+    env) matches it (``env_matches``) or the loader stamped it ``_env_ok``;
+    precondition and fact notes are never guards."""
     have = [rids] if isinstance(rids, str) else list(rids or [])
     out = []
     for guard in list(guards or []):
         when = guard.get("when") or {}
-        if when.get("env"):
+        if guard.get("kind", "wait") not in GUARD_KINDS:
+            continue
+        if when.get("env") and not _env_applies(guard, when["env"], env):
             continue
         if when.get("op") and when["op"] != op:
             continue
@@ -761,8 +892,11 @@ def activity_ok(guard: dict, probe: object) -> bool:
 
 def echo(note: dict) -> str:
     """One note as UNTRUSTED text for the host model."""
+    label = "app note #%s (%s)" % (note.get("id"), note.get("kind"))
+    if note.get("status") == "needs_recheck":
+        label += " unverified@%s" % (note.get("recheck_at") or "")
     return wrap_untrusted(
-        "app note #%s (%s)" % (note.get("id"), note.get("kind")),
+        label,
         str(note.get("text") or ""),
         MAX_NOTE_CHARS + 200,
     )
@@ -773,6 +907,8 @@ def render(package: str, notes: object) -> str:
     items = list(notes or [])
     if not items:
         return "No app notes saved for `%s`." % package
+    total = len(items)
+    items = items[-MAX_LIST_ROWS:]
     lines = []
     for item in items:
         when = item.get("when") or {}
@@ -793,7 +929,10 @@ def render(package: str, notes: object) -> str:
         "\n".join(lines),
         MAX_LIST_ROWS * (MAX_NOTE_CHARS + 120),
     )
+    count = "%d" % total
+    if total > len(items):
+        count = "showing the newest %d of %d" % (len(items), total)
     return (
-        "App notes for `%s` (%d):\n%s\nRetire one with "
-        'qa_mobile_notes(action="retire", note_id=N).' % (package, len(items), body)
+        "App notes for `%s` (%s):\n%s\nRetire one with "
+        'qa_mobile_notes(action="retire", note_id=N).' % (package, count, body)
     )

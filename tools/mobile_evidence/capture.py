@@ -234,6 +234,78 @@ def _scrub_lines(text: str, tester_inputs: object) -> tuple[str, int]:
     return ("\n".join(lines) + "\n") if lines else "", len(lines)
 
 
+def _slice_skipped(reason: str) -> dict:
+    return {
+        "error": None,
+        "content": {
+            "skipped": reason,
+            "path": None,
+            "lines": 0,
+            "truncated": False,
+            "crash": None,
+        },
+    }
+
+
+async def _slice_pid(serial: str, package: str, began: dict) -> int | None:
+    """The app's pid for the slice: the begin-time one when valid, else asked again now.
+
+    RE-READ THE PID HERE, and this is the fix rather than a tidy-up.
+    `case_runner` calls force_stop -> begin_case -> launch, so `pidof` at begin
+    time asks about an app that is NOT RUNNING and answers nothing. The pid was
+    therefore always None on the real path, and the refusal in ``slice_case`` --
+    added to stop a device-wide dump -- skipped the slice for every unprofiled
+    app instead. By slice time the app has been launched and driven, so this is
+    the one moment the question has an answer.
+    """
+    pid = began.get("pid")
+    if not (isinstance(pid, int) and pid > 0):
+        pid = await adb.pidof(serial, package)
+    return int(pid) if isinstance(pid, int) and pid > 0 else None
+
+
+def _write_slice(
+    body: dict, run_id: str, tc_id: str, name: str, tester_inputs: object
+) -> tuple[dict, str, int]:
+    """Scrub the dumped text and write it; returns (write result, scrubbed text, line count)."""
+    text, count = _scrub_lines(str(body.get("text") or ""), tester_inputs)
+    return run_store.write_evidence_text(run_id, tc_id, name, text), text, count
+
+
+# THE GENERIC PROFILE HAS NO TAG, so the pid is the ONLY thing narrowing the
+# dump. Without it `logcat -d` carries neither `--pid` nor `-s` and a megabyte
+# of every app on the device is written into this run's evidence and shown in
+# its report -- confirmed by a review that ran it. A real profile still has its
+# tag, so this bound is on the generic path alone.
+_UNSCOPED_GENERIC_REASON = (
+    "the app was not running when the slice was taken, so "
+    "its log could not be told apart from every other "
+    "app's; nothing was captured"
+)
+
+
+async def _dump_slice(serial: str, profile: profiles.Profile, pid: int | None) -> dict:
+    return await adb.logcat_dump(
+        serial,
+        tag=str(profile.logcat_tag or ""),
+        pid=pid,
+        max_bytes=MAX_GENERIC_SLICE_BYTES if _is_generic(profile) else MAX_SLICE_BYTES,
+    )
+
+
+def _slice_record(written: dict, body: dict, count: int, crash: dict) -> dict:
+    return {
+        "error": None,
+        "content": {
+            "skipped": None,
+            "path": str((written.get("content") or {}).get("path") or ""),
+            "lines": count,
+            "truncated": bool(body.get("truncated")),
+            "crash": crash,
+        },
+    }
+
+
 async def slice_case(
     serial: str,
     package: str,
@@ -259,80 +331,24 @@ async def slice_case(
             return {"error": refusal, "content": None}
         began = begin if isinstance(begin, dict) else {}
         if began.get("skipped"):
-            return {
-                "error": None,
-                "content": {
-                    "skipped": str(began["skipped"])[:200],
-                    "path": None,
-                    "lines": 0,
-                    "truncated": False,
-                    "crash": None,
-                },
-            }
+            return _slice_skipped(str(began["skipped"])[:200])
         profile = _profile_or_generic(package)
-        pid = began.get("pid")
-        # RE-READ THE PID HERE, and this is the fix rather than a tidy-up.
-        # `case_runner` calls force_stop -> begin_case -> launch, so `pidof` at
-        # begin time asks about an app that is NOT RUNNING and answers nothing.
-        # The pid was therefore always None on the real path, and the refusal
-        # below -- added to stop a device-wide dump -- skipped the slice for
-        # every unprofiled app instead. Its test was green because it injected
-        # a pid that ordering cannot produce.
-        #
-        # By slice time the app has been launched and driven, so this is the
-        # one moment the question has an answer.
-        if not (isinstance(pid, int) and pid > 0):
-            pid = await adb.pidof(serial, package)
-        # THE GENERIC PROFILE HAS NO TAG, so the pid is the ONLY thing
-        # narrowing the dump. Without it `logcat -d` carries neither `--pid`
-        # nor `-s` and a megabyte of every app on the device is written into
-        # this run's evidence and shown in its report -- confirmed by a review
-        # that ran it. A real profile still has its tag, so this bound is on
-        # the generic path alone.
-        if _is_generic(profile) and not (isinstance(pid, int) and pid > 0):
-            return {
-                "error": None,
-                "content": {
-                    "skipped": (
-                        "the app was not running when the slice was taken, so "
-                        "its log could not be told apart from every other "
-                        "app's; nothing was captured"
-                    ),
-                    "path": None,
-                    "lines": 0,
-                    "truncated": False,
-                    "crash": None,
-                },
-            }
-        dumped = await adb.logcat_dump(
-            serial,
-            tag=str(profile.logcat_tag or ""),
-            pid=int(pid) if isinstance(pid, int) and pid > 0 else None,
-            max_bytes=(
-                MAX_GENERIC_SLICE_BYTES if _is_generic(profile) else MAX_SLICE_BYTES
-            ),
-        )
+        pid = await _slice_pid(serial, package, began)
+        if _is_generic(profile) and pid is None:
+            return _slice_skipped(_UNSCOPED_GENERIC_REASON)
+        dumped = await _dump_slice(serial, profile, pid)
         if dumped.get("error"):
             return dumped
         body = dumped.get("content") or {}
-        text, count = _scrub_lines(str(body.get("text") or ""), tester_inputs)
         name = "logcat-" + str(max(0, int(index or 0))) + ".txt"
-        written = run_store.write_evidence_text(run_id, tc_id, name, text)
+        written, text, count = _write_slice(body, run_id, tc_id, name, tester_inputs)
         if written.get("error"):
             return written
-        return {
-            "error": None,
-            "content": {
-                "skipped": None,
-                "path": str((written.get("content") or {}).get("path") or ""),
-                "lines": count,
-                "truncated": bool(body.get("truncated")),
-                # The slice is judged HERE, on the scrubbed text, once. Reading
-                # it back off disk to judge it would be a second read of the
-                # same bytes and a second place that knows the file layout.
-                "crash": crash_detector.scan(text, package),
-            },
-        }
+        # The slice is judged HERE, on the scrubbed text, once. Reading
+        # it back off disk to judge it would be a second read of the
+        # same bytes and a second place that knows the file layout.
+        crash = crash_detector.scan(text, package)
+        return _slice_record(written, body, count, crash)
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile_evidence.capture.slice_case failed")
         return {"error": str(exc), "content": None}
@@ -366,6 +382,97 @@ def _scrub_record(line: str) -> str:
     return json.dumps(scrub.scrub_json(record), ensure_ascii=False, sort_keys=True)
 
 
+def _no_log_dir_reason(profile: profiles.Profile, package: str) -> str:
+    # The generic profile always lands here: it names no on-device log,
+    # so there is no event stream to pull and the slices are the whole
+    # of the evidence. Said in the reason rather than left as a blank.
+    if _is_generic(profile):
+        return (
+            "no profile for "
+            + str(package)[:80]
+            + "; a "
+            + profiles.GENERIC_PROFILE_NAME
+            + " captured the app's own logcat by pid instead, and there "
+            "is no on-device event log to pull; write a per-app profile "
+            "into ~/.qa-agents/mobile/profiles/ to turn one on"
+        )
+    return "the profile names no on-device log directory"
+
+
+async def _segment_names(
+    serial: str, package: str, profile: profiles.Profile, log_dir: str
+) -> tuple[list[str], dict | None]:
+    """The event segment names, or a logcat-only record saying why there are none."""
+    try:
+        segment_re = re.compile(str(profile.segment_name_regex or ""))
+    except re.error as exc:
+        return [], _logcat_only(
+            "segment name pattern does not compile: " + str(exc)[:120]
+        )
+    if not profile.segment_name_regex:
+        return [], _logcat_only("the profile names no segment file pattern")
+    listed = await adb.run_as_ls(serial, package, log_dir)
+    if listed.get("error"):
+        return [], _logcat_only("run-as refused: " + str(listed["error"])[:200])
+    names = sorted(
+        name
+        for name in (listed.get("content") or [])
+        if _SEGMENT_NAME_RE.match(str(name)) and segment_re.match(str(name))
+    )
+    if not names:
+        return [], _logcat_only("the app's log directory holds no event segment")
+    return names, None
+
+
+async def _read_segments(
+    serial: str, package: str, log_dir: str, names: list[str]
+) -> tuple[dict | None, list[str], bool]:
+    """Fetch and scrub each segment: (logcat-only record on refusal, records, truncated)."""
+    remaining = MAX_EVENTS_BYTES
+    parts: list[str] = []
+    truncated = False
+    for name in names:
+        if remaining <= 0:
+            truncated = True
+            break
+        fetched = await adb.run_as_cat(
+            serial, package, log_dir.rstrip("/") + "/" + name, max_bytes=remaining
+        )
+        if fetched.get("error"):
+            return (
+                _logcat_only("run-as refused: " + str(fetched["error"])[:200]),
+                [],
+                False,
+            )
+        body = fetched.get("content") or {}
+        data = body.get("data")
+        text = (
+            data.decode("utf-8", errors="replace")
+            if isinstance(data, bytes)
+            else str(data or "")
+        )
+        truncated = truncated or bool(body.get("truncated"))
+        remaining -= len(text.encode("utf-8", errors="replace"))
+        parts.extend(c for c in map(_scrub_record, text.splitlines()) if c)
+    return None, parts, truncated
+
+
+def _events_record(written: dict, segments: int, lines: int, truncated: bool) -> dict:
+    return {
+        "error": None,
+        "content": {
+            "events_source": "ndjson",
+            "path": str((written.get("content") or {}).get("path") or ""),
+            "reason": ("the " + str(MAX_EVENTS_BYTES) + " byte cap was reached")
+            if truncated
+            else None,
+            "segments": segments,
+            "lines": lines,
+            "truncated": truncated,
+        },
+    }
+
+
 async def pull_events(
     serial: str, package: str, run_id: str, *, tester_inputs: dict | None = None
 ) -> dict:
@@ -390,94 +497,27 @@ async def pull_events(
         profile = _profile_or_generic(package)
         log_dir = profile.log_dir()
         if not log_dir:
-            # The generic profile always lands here: it names no on-device log,
-            # so there is no event stream to pull and the slices are the whole
-            # of the evidence. Said in the reason rather than left as a blank.
-            if _is_generic(profile):
-                return _logcat_only(
-                    "no profile for "
-                    + str(package)[:80]
-                    + "; a "
-                    + profiles.GENERIC_PROFILE_NAME
-                    + " captured the app's own logcat by pid instead, and there "
-                    "is no on-device event log to pull; write a per-app profile "
-                    "into ~/.qa-agents/mobile/profiles/ to turn one on"
-                )
-            return _logcat_only("the profile names no on-device log directory")
-        try:
-            segment_re = re.compile(str(profile.segment_name_regex or ""))
-        except re.error as exc:
-            return _logcat_only(
-                "segment name pattern does not compile: " + str(exc)[:120]
-            )
-        if not profile.segment_name_regex:
-            return _logcat_only("the profile names no segment file pattern")
-        listed = await adb.run_as_ls(serial, package, log_dir)
-        if listed.get("error"):
-            return _logcat_only("run-as refused: " + str(listed["error"])[:200])
-        names = sorted(
-            name
-            for name in (listed.get("content") or [])
-            if _SEGMENT_NAME_RE.match(str(name)) and segment_re.match(str(name))
-        )
-        if not names:
-            return _logcat_only("the app's log directory holds no event segment")
-        remaining = MAX_EVENTS_BYTES
-        parts: list[str] = []
-        lines = 0
-        truncated = False
+            return _logcat_only(_no_log_dir_reason(profile, package))
+        names, refused = await _segment_names(serial, package, profile, log_dir)
+        if refused is not None:
+            return refused
         typed = set(_TYPED_BY_RUN.get(str(run_id), set()))
         typed.update(str(v) for v in (tester_inputs or {}).values())
         scrub.arm(typed)
         try:
-            for name in names:
-                if remaining <= 0:
-                    truncated = True
-                    break
-                fetched = await adb.run_as_cat(
-                    serial,
-                    package,
-                    log_dir.rstrip("/") + "/" + name,
-                    max_bytes=remaining,
-                )
-                if fetched.get("error"):
-                    return _logcat_only(
-                        "run-as refused: " + str(fetched["error"])[:200]
-                    )
-                body = fetched.get("content") or {}
-                data = body.get("data")
-                text = (
-                    data.decode("utf-8", errors="replace")
-                    if isinstance(data, bytes)
-                    else str(data or "")
-                )
-                truncated = truncated or bool(body.get("truncated"))
-                remaining -= len(text.encode("utf-8", errors="replace"))
-                for line in text.splitlines():
-                    cleaned = _scrub_record(line)
-                    if cleaned:
-                        parts.append(cleaned)
-                        lines += 1
+            refused, parts, truncated = await _read_segments(
+                serial, package, log_dir, names
+            )
         finally:
             scrub.forget_sensitive()
+        if refused is not None:
+            return refused
         written = run_store.write_evidence_text(
             run_id, None, EVENTS_FILE, ("\n".join(parts) + "\n") if parts else ""
         )
         if written.get("error"):
             return written
-        return {
-            "error": None,
-            "content": {
-                "events_source": "ndjson",
-                "path": str((written.get("content") or {}).get("path") or ""),
-                "reason": ("the " + str(MAX_EVENTS_BYTES) + " byte cap was reached")
-                if truncated
-                else None,
-                "segments": len(names),
-                "lines": lines,
-                "truncated": truncated,
-            },
-        }
+        return _events_record(written, len(names), len(parts), truncated)
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile_evidence.capture.pull_events failed")
         return {"error": str(exc), "content": None}
@@ -865,6 +905,92 @@ async def abort_network(
         return _network_skipped(str(exc)[:200], ABANDONED_STAGE)
 
 
+def _read_pcap(located: dict, file_name: object) -> tuple[bytes, dict | None]:
+    """Read and delete the capture file: (bytes, None), or (b"", the skipped record to return)."""
+    if located.get("error"):
+        return b"", _network_skipped(
+            "the capture was taken but the AVD directory could not be "
+            "located, so it could not be read: " + str(located["error"]),
+            "locate",
+        )
+    target = _pcap_path(located.get("content"), file_name)
+    if target is None:
+        return b"", _network_skipped(
+            "the capture file path could not be built from the AVD "
+            "directory the emulator named",
+            "locate",
+        )
+    # The directory is open anyway, so this is the one place a capture left
+    # by a chat that closed can be found without a call of its own.
+    _sweep_orphan_captures(located.get("content"), file_name, now=time.time())
+    data, read_error = _read_and_delete(target)
+    if read_error:
+        return b"", _network_skipped(read_error, "read")
+    return data, None
+
+
+def _attributed_rows(body: dict, state: dict, prior: dict) -> tuple[list, list]:
+    """The scrubbed, capped rows with their offsets, and the socket-table rows merged in."""
+    # THE UNION, and the wire comes first because only it can carry a name.
+    # The socket table contributes every endpoint the capture did not
+    # describe -- which on a real device, or on an emulator whose traffic
+    # does not cross the tapped interface, is all of them.
+    sampled = netattr.endpoint_rows(state.get("endpoints"))
+    rows = _scrub_rows(
+        netattr.merge_rows(
+            netattr.attribute(
+                body.get("rows") or [], state.get("samples") or {}, prior.get("uid")
+            ),
+            sampled,
+        )
+    )[:MAX_NETWORK_ROWS]
+    started_ms = prior.get("started_ms")
+    for row in rows:
+        first = row.get("first_ms")
+        row["first_offset_ms"] = (
+            int(first - started_ms)
+            if isinstance(first, int) and isinstance(started_ms, int)
+            else None
+        )
+    return rows, sampled
+
+
+def _parsed_record(
+    prior: dict, body: dict, state: dict, rows: list, notes: list[str]
+) -> dict:
+    return _network_record(
+        stage="parsed",
+        started=True,
+        file=str(prior.get("file") or ""),
+        uid=prior.get("uid"),
+        rows=rows,
+        packets=int(body.get("packets") or 0),
+        samples=int(state.get("taken") or 0),
+        truncated=bool(body.get("truncated")),
+        note="; ".join(note for note in notes if note),
+        started_ms=prior.get("started_ms"),
+    )
+
+
+def _write_network_summary(
+    run_id: str, tc_id: str, index: object, record: dict
+) -> None:
+    """Write the summary file and set ``record["path"]`` to where it landed."""
+    written = run_store.write_evidence_json(
+        run_id,
+        tc_id,
+        "network-" + str(max(0, int(index or 0))) + ".json",
+        {
+            "rows": record["rows"],
+            "packets": record["packets"],
+            "samples": record["samples"],
+            "truncated": record["truncated"],
+            "note": record["note"],
+        },
+    )
+    record["path"] = str((written.get("content") or {}).get("path") or "")
+
+
 async def finish_network(
     serial: str,
     package: str,
@@ -891,85 +1017,25 @@ async def finish_network(
                 prior.get("skipped") or "no network capture was started for this case",
                 str(prior.get("stage") or "start"),
             )
-        samples = state.get("samples") or {}
         stopped = await adb.emu(serial, "network", "capture", "stop")
         notes = [str(prior.get("note") or "")]
         if stopped.get("error"):
             notes.append("the capture did not stop cleanly: " + str(stopped["error"]))
         located = await _avd_path(serial)
-        if located.get("error"):
-            return _network_skipped(
-                "the capture was taken but the AVD directory could not be "
-                "located, so it could not be read: " + str(located["error"]),
-                "locate",
-            )
-        target = _pcap_path(located.get("content"), prior.get("file"))
-        if target is None:
-            return _network_skipped(
-                "the capture file path could not be built from the AVD "
-                "directory the emulator named",
-                "locate",
-            )
-        # The directory is open anyway, so this is the one place a capture left
-        # by a chat that closed can be found without a call of its own.
-        _sweep_orphan_captures(
-            located.get("content"), prior.get("file"), now=time.time()
-        )
-        data, read_error = _read_and_delete(target)
-        if read_error:
-            return _network_skipped(read_error, "read")
+        data, failed = _read_pcap(located, prior.get("file"))
+        if failed is not None:
+            return failed
         parsed = pcap.parse(data)
         if parsed.get("error"):
             return _network_skipped(str(parsed["error"]), "parse")
         body = parsed.get("content") or {}
         if body.get("note"):
             notes.append(str(body["note"]))
-        # THE UNION, and the wire comes first because only it can carry a name.
-        # The socket table contributes every endpoint the capture did not
-        # describe -- which on a real device, or on an emulator whose traffic
-        # does not cross the tapped interface, is all of them.
-        sampled = netattr.endpoint_rows(state.get("endpoints"))
-        rows = _scrub_rows(
-            netattr.merge_rows(
-                netattr.attribute(body.get("rows") or [], samples, prior.get("uid")),
-                sampled,
-            )
-        )[:MAX_NETWORK_ROWS]
+        rows, sampled = _attributed_rows(body, state, prior)
         if sampled:
             notes.append(netattr.SOCKET_NOTE)
-        started_ms = prior.get("started_ms")
-        for row in rows:
-            first = row.get("first_ms")
-            row["first_offset_ms"] = (
-                int(first - started_ms)
-                if isinstance(first, int) and isinstance(started_ms, int)
-                else None
-            )
-        record = _network_record(
-            stage="parsed",
-            started=True,
-            file=str(prior.get("file") or ""),
-            uid=prior.get("uid"),
-            rows=rows,
-            packets=int(body.get("packets") or 0),
-            samples=int(state.get("taken") or 0),
-            truncated=bool(body.get("truncated")),
-            note="; ".join(note for note in notes if note),
-            started_ms=started_ms,
-        )
-        written = run_store.write_evidence_json(
-            run_id,
-            tc_id,
-            "network-" + str(max(0, int(index or 0))) + ".json",
-            {
-                "rows": rows,
-                "packets": record["packets"],
-                "samples": record["samples"],
-                "truncated": record["truncated"],
-                "note": record["note"],
-            },
-        )
-        record["path"] = str((written.get("content") or {}).get("path") or "")
+        record = _parsed_record(prior, body, state, rows, notes)
+        _write_network_summary(run_id, tc_id, index, record)
         return {"error": None, "content": record}
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile_evidence.capture.finish_network failed")

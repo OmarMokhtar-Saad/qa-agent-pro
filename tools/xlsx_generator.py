@@ -7,6 +7,7 @@ import math
 import tempfile
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import xlsxwriter
 
@@ -247,6 +248,32 @@ def cleanup_temp_files(max_age_seconds: int = 3600) -> int:
     return deleted
 
 
+def _sheet_formats(
+    workbook: xlsxwriter.Workbook, header_bg: str
+) -> tuple[xlsxwriter.format.Format, xlsxwriter.format.Format]:
+    """Header and body formats shared by the plain grid sheets."""
+    header_fmt = workbook.add_format(
+        {
+            "bold": True,
+            "font_color": "#FFFFFF",
+            "bg_color": header_bg,
+            "border": 1,
+            "valign": "vcenter",
+            "text_wrap": True,
+        }
+    )
+    cell_fmt = workbook.add_format({"border": 1, "valign": "top", "text_wrap": True})
+    return header_fmt, cell_fmt
+
+
+def _write_grid(ws: object, rows: list, header_fmt: object, cell_fmt: object) -> None:
+    """Write ``rows`` from A1, row 0 in the header format, every cell sanitised."""
+    for r, row in enumerate(rows):
+        fmt = header_fmt if r == 0 else cell_fmt
+        for c, value in enumerate(row):
+            ws.write(r, c, sanitize_cell(str(value)), fmt)
+
+
 def _write_checklist_sheets(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
     """Append the 'Requirements Checklist' sheet when the suite carries
     ``_checklist_artifacts`` (unconditional since 2026-08-14 --
@@ -269,19 +296,7 @@ def _write_checklist_sheets(workbook: xlsxwriter.Workbook, suite: TestSuite) -> 
         )
 
         items = checklist_from_dicts(artifacts.get("items") or [])
-        header_fmt = workbook.add_format(
-            {
-                "bold": True,
-                "font_color": "#FFFFFF",
-                "bg_color": "#1F4E79",
-                "border": 1,
-                "valign": "vcenter",
-                "text_wrap": True,
-            }
-        )
-        cell_fmt = workbook.add_format(
-            {"border": 1, "valign": "top", "text_wrap": True}
-        )
+        header_fmt, cell_fmt = _sheet_formats(workbook, "#1F4E79")
         for name, rows in (("Requirements Checklist", checklist_rows(items)),):
             if not rows:
                 continue
@@ -289,10 +304,7 @@ def _write_checklist_sheets(workbook: xlsxwriter.Workbook, suite: TestSuite) -> 
                 ws = workbook.add_worksheet(name)
                 ws.set_column(0, 0, 14)
                 ws.set_column(1, max(1, len(rows[0]) - 1), 42)
-                for r, row in enumerate(rows):
-                    fmt = header_fmt if r == 0 else cell_fmt
-                    for c, value in enumerate(row):
-                        ws.write(r, c, sanitize_cell(str(value)), fmt)
+                _write_grid(ws, rows, header_fmt, cell_fmt)
             except Exception:
                 logger.warning(
                     "Failed writing the %s sheet — skipping it", name, exc_info=True
@@ -331,29 +343,14 @@ def _write_rtm_sheet(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
         if not rows:
             return
         # rtm_rows' output is rendered as-is.
-        header_fmt = workbook.add_format(
-            {
-                "bold": True,
-                "font_color": "#FFFFFF",
-                "bg_color": "#1F4E79",
-                "border": 1,
-                "valign": "vcenter",
-                "text_wrap": True,
-            }
-        )
-        cell_fmt = workbook.add_format(
-            {"border": 1, "valign": "top", "text_wrap": True}
-        )
+        header_fmt, cell_fmt = _sheet_formats(workbook, "#1F4E79")
         ws = workbook.add_worksheet("Requirements Traceability")
         ws.set_column(0, 0, 14)
         ws.set_column(1, 1, 72)
         ws.set_column(2, 2, 8)
         ws.set_column(3, 3, 42)
         ws.set_column(4, 4, 14)
-        for r, row in enumerate(rows):
-            fmt = header_fmt if r == 0 else cell_fmt
-            for c, value in enumerate(row):
-                ws.write(r, c, sanitize_cell(str(value)), fmt)
+        _write_grid(ws, rows, header_fmt, cell_fmt)
     except Exception:
         logger.warning(
             "Failed writing the Requirements Traceability sheet - skipping it",
@@ -384,19 +381,7 @@ def _write_generation_notes_sheet(
     if not rows:
         return
     try:
-        header_fmt = workbook.add_format(
-            {
-                "bold": True,
-                "font_color": "#FFFFFF",
-                "bg_color": "#9C2C2C",
-                "border": 1,
-                "valign": "vcenter",
-                "text_wrap": True,
-            }
-        )
-        cell_fmt = workbook.add_format(
-            {"border": 1, "valign": "top", "text_wrap": True}
-        )
+        header_fmt, cell_fmt = _sheet_formats(workbook, "#9C2C2C")
         ws = workbook.add_worksheet("Generation Notes")
         ws.set_column(0, 0, 30)
         ws.set_column(1, 1, 96)
@@ -433,26 +418,11 @@ def _write_assumed_sheet(workbook: xlsxwriter.Workbook, suite: TestSuite) -> Non
         rows = artifacts.get("rows") or []
         if not rows:
             return
-        header_fmt = workbook.add_format(
-            {
-                "bold": True,
-                "font_color": "#FFFFFF",
-                "bg_color": "#8B5E00",
-                "border": 1,
-                "valign": "vcenter",
-                "text_wrap": True,
-            }
-        )
-        cell_fmt = workbook.add_format(
-            {"border": 1, "valign": "top", "text_wrap": True}
-        )
+        header_fmt, cell_fmt = _sheet_formats(workbook, "#8B5E00")
         ws = workbook.add_worksheet("Assumed Requirements")
         ws.set_column(0, 1, 14)
         ws.set_column(2, max(2, len(rows[0]) - 1), 42)
-        for r, row in enumerate(rows):
-            fmt = header_fmt if r == 0 else cell_fmt
-            for c, value in enumerate(row):
-                ws.write(r, c, sanitize_cell(str(value)), fmt)
+        _write_grid(ws, rows, header_fmt, cell_fmt)
     except Exception:
         logger.warning(
             "Failed writing the Assumed Requirements sheet - skipping it",
@@ -469,9 +439,65 @@ def _write_assumed_sheet(workbook: xlsxwriter.Workbook, suite: TestSuite) -> Non
 # attribute itself.
 
 
-def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
-    # ------------------------------------------------------------------ formats
-    header_fmt = workbook.add_format(
+class _CaseFormats(NamedTuple):
+    """Every cell format the 'Test Cases' sheet writes with."""
+
+    header: xlsxwriter.format.Format
+    even: xlsxwriter.format.Format
+    odd: xlsxwriter.format.Format
+    even_rtl: xlsxwriter.format.Format
+    odd_rtl: xlsxwriter.format.Format
+    status_even: xlsxwriter.format.Format
+    status_odd: xlsxwriter.format.Format
+    priority_fill: dict
+
+
+def _priority_fill_formats(workbook: xlsxwriter.Workbook) -> dict:
+    # Direct (baked-in) fills for the Priority column. Apple Numbers drops Excel
+    # *conditional* formatting on import, so the value-based colors of the
+    # conditional rules would vanish there. Writing the color straight onto the
+    # cell makes it show in Numbers too. The conditional_format rules are kept,
+    # so Excel / LibreOffice / Google Sheets still re-color live when a Priority
+    # is changed (a conditional format overrides the direct fill in those apps).
+    fills = {}
+    for name, bg, font, bold in (
+        ("Critical", "#FF4444", "#FFFFFF", True),
+        ("High", "#FFC7CE", "#9C0006", False),
+        ("Medium", "#FFEB9C", "#9C6500", False),
+        ("Low", "#C6EFCE", "#006100", False),
+    ):
+        props = {"bg_color": bg, "font_color": font, "border": 1}
+        if bold:
+            props["bold"] = True
+        fills[name] = workbook.add_format({**props, "valign": "top", "text_wrap": True})
+    return fills
+
+
+def _case_cell_format(
+    workbook: xlsxwriter.Workbook, bg: str, rtl: bool = False
+) -> xlsxwriter.format.Format:
+    props = {
+        "bg_color": bg,
+        "border": 1,
+        "valign": "top",
+        "text_wrap": True,
+    }
+    if rtl:
+        # xlsxwriter's documented `reading_order` format property emits
+        # readingOrder="2" (plus horizontal="right") into the cell
+        # alignment element of xl/styles.xml. Without it Excel lays an
+        # Arabic-majority cell out left-to-right even though the string
+        # itself is correct, and the tester blames the generator. No
+        # monkeypatch or OOXML post-patching is needed -- verified
+        # against xlsxwriter 3.2.9 and asserted at the OOXML level (not
+        # by visual rendering) in tests/test_bilingual_rules.py.
+        props["reading_order"] = 2
+        props["align"] = "right"
+    return workbook.add_format(props)
+
+
+def _case_header_format(workbook: xlsxwriter.Workbook) -> xlsxwriter.format.Format:
+    return workbook.add_format(
         {
             "bold": True,
             "font_color": "#FFFFFF",
@@ -483,31 +509,218 @@ def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
         }
     )
 
-    def _cell_fmt(bg: str, rtl: bool = False) -> xlsxwriter.format.Format:
-        props = {
-            "bg_color": bg,
+
+def _status_base_format(workbook: xlsxwriter.Workbook) -> xlsxwriter.format.Format:
+    # Status column needs its own base formats: centered + no bg so conditional format colors show
+    return workbook.add_format(
+        {
+            "bg_color": "#D9D9D9",
+            "font_color": "#595959",
             "border": 1,
-            "valign": "top",
-            "text_wrap": True,
+            "align": "center",
+            "valign": "vcenter",
         }
-        if rtl:
-            # xlsxwriter's documented `reading_order` format property emits
-            # readingOrder="2" (plus horizontal="right") into the cell
-            # alignment element of xl/styles.xml. Without it Excel lays an
-            # Arabic-majority cell out left-to-right even though the string
-            # itself is correct, and the tester blames the generator. No
-            # monkeypatch or OOXML post-patching is needed -- verified
-            # against xlsxwriter 3.2.9 and asserted at the OOXML level (not
-            # by visual rendering) in tests/test_bilingual_rules.py.
-            props["reading_order"] = 2
-            props["align"] = "right"
-        return workbook.add_format(props)
+    )
 
-    even_fmt = _cell_fmt("#FFFFFF")
-    odd_fmt = _cell_fmt("#EBF3FB")
-    even_rtl_fmt = _cell_fmt("#FFFFFF", rtl=True)
-    odd_rtl_fmt = _cell_fmt("#EBF3FB", rtl=True)
 
+def _build_case_formats(workbook: xlsxwriter.Workbook) -> _CaseFormats:
+    header_fmt = _case_header_format(workbook)
+    even_fmt = _case_cell_format(workbook, "#FFFFFF")
+    odd_fmt = _case_cell_format(workbook, "#EBF3FB")
+    even_rtl_fmt = _case_cell_format(workbook, "#FFFFFF", rtl=True)
+    odd_rtl_fmt = _case_cell_format(workbook, "#EBF3FB", rtl=True)
+    _pri_fill = _priority_fill_formats(workbook)
+    status_odd_fmt = _status_base_format(workbook)
+    status_even_fmt = _status_base_format(workbook)
+    return _CaseFormats(
+        header=header_fmt,
+        even=even_fmt,
+        odd=odd_fmt,
+        even_rtl=even_rtl_fmt,
+        odd_rtl=odd_rtl_fmt,
+        status_even=status_even_fmt,
+        status_odd=status_odd_fmt,
+        priority_fill=_pri_fill,
+    )
+
+
+def _tc_id_key(tc: object) -> int:
+    """Sort key: the digits of the TC-ID (0 when it has none)."""
+    digits = "".join(ch for ch in (getattr(tc, "tc_id", "") or "") if ch.isdigit())
+    return int(digits) if digits else 0
+
+
+def _write_cases_sheet(workbook: xlsxwriter.Workbook, suite: TestSuite) -> int:
+    """Write the 'Test Cases' sheet; returns the last data row (1-based)."""
+    fmts = _build_case_formats(workbook)
+    ws = workbook.add_worksheet("Test Cases")
+
+    for i, w in enumerate(_COL_WIDTHS):
+        ws.set_column(i, i, w)
+
+    ws.freeze_panes(1, 0)
+    ws.autofilter(0, 0, 0, _TOTAL_COLS - 1)
+    ws.write_row(0, 0, _HEADERS, fmts.header)
+    ws.set_row(0, 22)
+
+    # Present rows in TC-ID order. The agent already assigns TC-IDs in final
+    # risk order (highest-risk = TC-001), so sorting by TC-ID keeps the sheet's
+    # row order identical to the IDs — never re-sort by priority/type here, or the
+    # visible IDs would no longer be sequential (that was a reported bug).
+    sorted_cases = sorted(suite.test_cases, key=_tc_id_key)
+
+    # Notes for the Notes column: the Batch 3 standing-rules pack attaches
+    # a mechanical assumption / clarification label per tc_id. Absent =>
+    # every Notes cell stays empty, exactly as before.
+    rule_pack_notes = getattr(suite, "_rule_pack_notes", None) or {}
+
+    for row_idx, tc in enumerate(sorted_cases, start=1):
+        _write_case_row(ws, row_idx, tc, fmts, rule_pack_notes.get(tc.tc_id, ""))
+
+    last_data_row = len(suite.test_cases) + 1
+    _add_priority_rules(workbook, ws, last_data_row)
+    _add_status_rules(workbook, ws, last_data_row)
+    return last_data_row
+
+
+def _write_case_row(
+    ws: object,
+    row_idx: int,
+    tc: object,
+    fmts: _CaseFormats,
+    rule_pack_note: str,
+) -> None:
+    """Write one test case as row *row_idx* and size the row to its content."""
+    odd = row_idx % 2 == 1
+    fmt = fmts.odd if odd else fmts.even
+    status_fmt = fmts.status_odd if odd else fmts.status_even
+    cell = _RowWriter(ws, row_idx, fmt, fmts.odd_rtl if odd else fmts.even_rtl)
+    texts = _case_texts(tc, rule_pack_note)
+
+    ws.write(row_idx, _COL_TCID, tc.tc_id, fmt)
+    cell.text(_COL_MODULE, tc.module)
+    cell.text(_COL_TITLE, tc.title)
+    ws.write(
+        row_idx,
+        _COL_PRIORITY,
+        tc.priority.value,
+        fmts.priority_fill.get(tc.priority.value, fmt),
+    )
+    ws.write(row_idx, _COL_TYPE, tc.type.value, fmt)
+    cell.text(_COL_PRECOND, tc.preconditions or "")
+    cell.prepared(_COL_STEPS, texts.steps)
+    cell.prepared(_COL_TESTDATA, texts.test_data)
+    cell.prepared(_COL_EXPECTED, texts.expected)
+    ws.write(row_idx, _COL_STATUS, "Not Run", status_fmt)
+    cell.text(_COL_NOTES, texts.notes)
+    # F6: which of the 8 generation categories produced this case. Empty when
+    # it could not be resolved -- never guessed. A value self-reported by the
+    # host model is normalised before it reaches here.
+    cell.text(_COL_CATEGORY, getattr(tc, "category", None) or "")
+    # F06: the acceptance criterion this case verifies -- the evidence for
+    # the reply's "N/N traced" claim, in the file the tester keeps.
+    cell.text(_COL_REQUIREMENT, texts.requirement)
+    cell.risk_score(_COL_RISK_SCORE, _risk_score_cell(tc))
+    ws.set_row(row_idx, _row_height_for(_row_cells(tc, texts)))
+
+
+class _RowWriter:
+    """Writes the cells of one 'Test Cases' row with its alternating format."""
+
+    def __init__(self, ws: object, row_idx: int, fmt: object, rtl_fmt: object):
+        self._ws = ws
+        self._row = row_idx
+        self._fmt = fmt
+        self._rtl_fmt = rtl_fmt
+
+    def text(self, col: int, text: str) -> None:
+        """One text cell: sanitised, bidi-isolated, and RTL-formatted
+        when the content is Arabic-majority. Applied to EVERY text column
+        (Module, Title, Preconditions, Steps, Test Data, Expected
+        Results, Notes) -- an Arabic message can legitimately land in any
+        of them, and a cell that is right-to-left in one column and
+        left-to-right in the next reads as a rendering bug."""
+        value = _prepare(text)
+        fmt = self._rtl_fmt if is_rtl_cell(text or "") else self._fmt
+        self._ws.write(self._row, col, value, fmt)
+
+    def prepared(self, col: int, text: str) -> None:
+        """A cell whose text already went through _prepare (multi-line cells)."""
+        fmt = self._rtl_fmt if is_rtl_cell(text) else self._fmt
+        self._ws.write(self._row, col, text, fmt)
+
+    def risk_score(self, col: int, score: int | None) -> None:
+        # v1.97.0 cursor-hardening (item 12): sortable/filterable risk score,
+        # its own column rather than text glued into Notes (see _notes_cell).
+        if score is None:
+            self._ws.write_blank(self._row, col, None, self._fmt)
+        else:
+            self._ws.write_number(self._row, col, score, self._fmt)
+
+
+class _CaseTexts(NamedTuple):
+    """The computed multi-line / derived cell texts of one test case."""
+
+    steps: str
+    expected: str
+    test_data: str
+    notes: str
+    requirement: str
+
+
+def _case_texts(tc: object, rule_pack_note: str) -> _CaseTexts:
+    # Combine steps into a single multi-line string: "1. action\n2. action"
+    # Wrapped in sanitize_cell() -- this text originates from LLM-generated or
+    # Jira-derived content and must not be interpreted as a spreadsheet formula.
+    steps_text = _prepare("\n".join(f"{s.step_number}. {s.action}" for s in tc.steps))
+
+    # Combine expected results: "1. result\n2. result"
+    expected_text = _prepare(
+        "\n".join(f"{s.step_number}. {s.expected_result}" for s in tc.steps)
+    )
+
+    # Combine test data only for steps that have it: "Step N: data"
+    data_lines = [
+        f"Step {s.step_number}: {s.test_data}" for s in tc.steps if s.test_data
+    ]
+    # Case-level data-provisioning plan. Only present when the case declared
+    # test_data; appended after the per-step lines so a case with none renders
+    # byte-identically to before.
+    data_lines.extend(format_test_data_lines(tc.test_data))
+    return _CaseTexts(
+        steps=steps_text,
+        expected=expected_text,
+        test_data=_prepare("\n".join(data_lines)),
+        notes=_notes_cell(tc, rule_pack_note),
+        requirement=_requirement_cell(tc),
+    )
+
+
+def _row_cells(tc: object, texts: _CaseTexts) -> list:
+    """(text, column width) per cell, for fitting the row height to the
+    tallest cell (wrapped text included), not just the step count -- long
+    titles/preconditions/data/expected results no longer clip. Column widths
+    stay fixed (_COL_WIDTHS)."""
+    return [
+        (texts.notes, _COL_WIDTHS[_COL_NOTES]),
+        (getattr(tc, "category", None) or "", _COL_WIDTHS[_COL_CATEGORY]),
+        (texts.requirement, _COL_WIDTHS[_COL_REQUIREMENT]),
+        (tc.tc_id, _COL_WIDTHS[_COL_TCID]),
+        (tc.module, _COL_WIDTHS[_COL_MODULE]),
+        (tc.title, _COL_WIDTHS[_COL_TITLE]),
+        (tc.priority.value, _COL_WIDTHS[_COL_PRIORITY]),
+        (tc.type.value, _COL_WIDTHS[_COL_TYPE]),
+        (tc.preconditions or "", _COL_WIDTHS[_COL_PRECOND]),
+        (texts.steps, _COL_WIDTHS[_COL_STEPS]),
+        (texts.test_data, _COL_WIDTHS[_COL_TESTDATA]),
+        (texts.expected, _COL_WIDTHS[_COL_EXPECTED]),
+    ]
+
+
+def _add_priority_rules(
+    workbook: xlsxwriter.Workbook, ws: object, last_data_row: int
+) -> None:
+    """Conditional format on the Priority column, letter DERIVED from the index."""
     fmt_critical = workbook.add_format(
         {
             "bg_color": "#FF4444",
@@ -526,312 +739,61 @@ def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
     fmt_low = workbook.add_format(
         {"bg_color": "#C6EFCE", "font_color": "#006100", "border": 1, "valign": "top"}
     )
-
-    # Direct (baked-in) fills for the Priority column. Apple Numbers drops Excel
-    # *conditional* formatting on import, so the value-based colors defined above
-    # would vanish there. Writing the color straight onto the cell makes it show
-    # in Numbers too. The conditional_format rules below are kept, so Excel /
-    # LibreOffice / Google Sheets still re-color live when a Priority is changed
-    # (a conditional format overrides the direct fill in those apps).
-    _pri_fill = {
-        "Critical": workbook.add_format(
-            {
-                "bg_color": "#FF4444",
-                "font_color": "#FFFFFF",
-                "border": 1,
-                "bold": True,
-                "valign": "top",
-                "text_wrap": True,
-            }
-        ),
-        "High": workbook.add_format(
-            {
-                "bg_color": "#FFC7CE",
-                "font_color": "#9C0006",
-                "border": 1,
-                "valign": "top",
-                "text_wrap": True,
-            }
-        ),
-        "Medium": workbook.add_format(
-            {
-                "bg_color": "#FFEB9C",
-                "font_color": "#9C6500",
-                "border": 1,
-                "valign": "top",
-                "text_wrap": True,
-            }
-        ),
-        "Low": workbook.add_format(
-            {
-                "bg_color": "#C6EFCE",
-                "font_color": "#006100",
-                "border": 1,
-                "valign": "top",
-                "text_wrap": True,
-            }
-        ),
-    }
-
-    # ------------------------------------------------------------------ sheet 1
-    ws = workbook.add_worksheet("Test Cases")
-
-    for i, w in enumerate(_COL_WIDTHS):
-        ws.set_column(i, i, w)
-
-    ws.freeze_panes(1, 0)
-    ws.autofilter(0, 0, 0, _TOTAL_COLS - 1)
-    ws.write_row(0, 0, _HEADERS, header_fmt)
-    ws.set_row(0, 22)
-
-    # Present rows in TC-ID order. The agent already assigns TC-IDs in final
-    # risk order (highest-risk = TC-001), so sorting by TC-ID keeps the sheet's
-    # row order identical to the IDs — never re-sort by priority/type here, or the
-    # visible IDs would no longer be sequential (that was a reported bug).
-    def _tc_id_key(tc: object) -> int:
-        digits = "".join(ch for ch in (getattr(tc, "tc_id", "") or "") if ch.isdigit())
-        return int(digits) if digits else 0
-
-    sorted_cases = sorted(suite.test_cases, key=_tc_id_key)
-
-    # Status column needs its own base formats: centered + no bg so conditional format colors show
-    status_odd_fmt = workbook.add_format(
-        {
-            "bg_color": "#D9D9D9",
-            "font_color": "#595959",
-            "border": 1,
-            "align": "center",
-            "valign": "vcenter",
-        }
-    )
-    status_even_fmt = workbook.add_format(
-        {
-            "bg_color": "#D9D9D9",
-            "font_color": "#595959",
-            "border": 1,
-            "align": "center",
-            "valign": "vcenter",
-        }
-    )
-
-    # Notes for the Notes column: the Batch 3 standing-rules pack attaches
-    # a mechanical assumption / clarification label per tc_id. Absent =>
-    # every Notes cell stays empty, exactly as before.
-    rule_pack_notes = getattr(suite, "_rule_pack_notes", None) or {}
-
-    for row_idx, tc in enumerate(sorted_cases, start=1):
-        fmt = odd_fmt if row_idx % 2 == 1 else even_fmt
-        rtl_fmt = odd_rtl_fmt if row_idx % 2 == 1 else even_rtl_fmt
-        status_fmt = status_odd_fmt if row_idx % 2 == 1 else status_even_fmt
-
-        def _write_text(col: int, text: str, fmt=fmt, rtl_fmt=rtl_fmt) -> None:
-            """One text cell: sanitised, bidi-isolated, and RTL-formatted
-            when the content is Arabic-majority. Applied to EVERY text column
-            (Module, Title, Preconditions, Steps, Test Data, Expected
-            Results, Notes) -- an Arabic message can legitimately land in any
-            of them, and a cell that is right-to-left in one column and
-            left-to-right in the next reads as a rendering bug."""
-            value = _prepare(text)
-            ws.write(row_idx, col, value, rtl_fmt if is_rtl_cell(text or "") else fmt)
-
-        # Combine steps into a single multi-line string: "1. action\n2. action"
-        # Wrapped in sanitize_cell() -- this text originates from LLM-generated or
-        # Jira-derived content and must not be interpreted as a spreadsheet formula.
-        steps_text = _prepare(
-            "\n".join(f"{s.step_number}. {s.action}" for s in tc.steps)
-        )
-
-        # Combine expected results: "1. result\n2. result"
-        expected_text = _prepare(
-            "\n".join(f"{s.step_number}. {s.expected_result}" for s in tc.steps)
-        )
-
-        # Combine test data only for steps that have it: "Step N: data"
-        data_lines = [
-            f"Step {s.step_number}: {s.test_data}" for s in tc.steps if s.test_data
-        ]
-        # Case-level data-provisioning plan. Only present when the case declared
-        # test_data; appended after the per-step lines so a case with none renders
-        # byte-identically to before.
-        data_lines.extend(format_test_data_lines(tc.test_data))
-        test_data_text = _prepare("\n".join(data_lines))
-
-        ws.write(row_idx, _COL_TCID, tc.tc_id, fmt)
-        _write_text(_COL_MODULE, tc.module)
-        _write_text(_COL_TITLE, tc.title)
-        ws.write(
-            row_idx,
-            _COL_PRIORITY,
-            tc.priority.value,
-            _pri_fill.get(tc.priority.value, fmt),
-        )
-        ws.write(row_idx, _COL_TYPE, tc.type.value, fmt)
-        _write_text(_COL_PRECOND, tc.preconditions or "")
-        ws.write(
-            row_idx,
-            _COL_STEPS,
-            steps_text,
-            rtl_fmt if is_rtl_cell(steps_text) else fmt,
-        )
-        ws.write(
-            row_idx,
-            _COL_TESTDATA,
-            test_data_text,
-            rtl_fmt if is_rtl_cell(test_data_text) else fmt,
-        )
-        ws.write(
-            row_idx,
-            _COL_EXPECTED,
-            expected_text,
-            rtl_fmt if is_rtl_cell(expected_text) else fmt,
-        )
-        ws.write(row_idx, _COL_STATUS, "Not Run", status_fmt)
-        notes_text = _notes_cell(tc, rule_pack_notes.get(tc.tc_id, ""))
-        _write_text(_COL_NOTES, notes_text)
-        # F6: which of the 8 generation categories produced this case. Empty when
-        # it could not be resolved -- never guessed. A value self-reported by the
-        # host model is normalised before it reaches here.
-        _write_text(_COL_CATEGORY, getattr(tc, "category", None) or "")
-        # F06: the acceptance criterion this case verifies -- the evidence for
-        # the reply's "N/N traced" claim, in the file the tester keeps.
-        requirement_text = _requirement_cell(tc)
-        _write_text(_COL_REQUIREMENT, requirement_text)
-        # v1.97.0 cursor-hardening (item 12): sortable/filterable risk score,
-        # its own column rather than text glued into Notes (see _notes_cell).
-        _risk_score = _risk_score_cell(tc)
-        if _risk_score is None:
-            ws.write_blank(row_idx, _COL_RISK_SCORE, None, fmt)
-        else:
-            ws.write_number(row_idx, _COL_RISK_SCORE, _risk_score, fmt)
-
-        # Row height: fit the tallest cell in the row (wrapped text included),
-        # not just the step count -- long titles/preconditions/data/expected
-        # results no longer clip. Column widths stay fixed (_COL_WIDTHS).
-        row_cells = [
-            (notes_text, _COL_WIDTHS[_COL_NOTES]),
-            (getattr(tc, "category", None) or "", _COL_WIDTHS[_COL_CATEGORY]),
-            (requirement_text, _COL_WIDTHS[_COL_REQUIREMENT]),
-            (tc.tc_id, _COL_WIDTHS[_COL_TCID]),
-            (tc.module, _COL_WIDTHS[_COL_MODULE]),
-            (tc.title, _COL_WIDTHS[_COL_TITLE]),
-            (tc.priority.value, _COL_WIDTHS[_COL_PRIORITY]),
-            (tc.type.value, _COL_WIDTHS[_COL_TYPE]),
-            (tc.preconditions or "", _COL_WIDTHS[_COL_PRECOND]),
-            (steps_text, _COL_WIDTHS[_COL_STEPS]),
-            (test_data_text, _COL_WIDTHS[_COL_TESTDATA]),
-            (expected_text, _COL_WIDTHS[_COL_EXPECTED]),
-        ]
-        ws.set_row(row_idx, _row_height_for(row_cells))
-
-    last_data_row = len(suite.test_cases) + 1
-
-    # Conditional format on the Priority column, letter DERIVED from the index.
     _pri = _col_letter(_COL_PRIORITY)
     pri_range = f"{_pri}2:{_pri}{last_data_row}"
-    ws.conditional_format(
-        pri_range,
-        {
-            "type": "cell",
-            "criteria": "equal to",
-            "value": '"Critical"',
-            "format": fmt_critical,
-        },
-    )
-    ws.conditional_format(
-        pri_range,
-        {"type": "cell", "criteria": "equal to", "value": '"High"', "format": fmt_high},
-    )
-    ws.conditional_format(
-        pri_range,
-        {
-            "type": "cell",
-            "criteria": "equal to",
-            "value": '"Medium"',
-            "format": fmt_medium,
-        },
-    )
-    ws.conditional_format(
-        pri_range,
-        {"type": "cell", "criteria": "equal to", "value": '"Low"', "format": fmt_low},
-    )
+    for value, fmt in (
+        ("Critical", fmt_critical),
+        ("High", fmt_high),
+        ("Medium", fmt_medium),
+        ("Low", fmt_low),
+    ):
+        ws.conditional_format(
+            pri_range,
+            {
+                "type": "cell",
+                "criteria": "equal to",
+                "value": f'"{value}"',
+                "format": fmt,
+            },
+        )
 
-    # Status column: color-coded conditional formatting (no align — Excel ignores it in cond. formats)
-    _status_base = {"border": 1, "align": "center", "valign": "vcenter"}
-    fmt_st_pass = workbook.add_format(
-        {**_status_base, "bg_color": "#C6EFCE", "font_color": "#006100", "bold": True}
-    )
-    fmt_st_fail = workbook.add_format(
-        {**_status_base, "bg_color": "#FFC7CE", "font_color": "#9C0006", "bold": True}
-    )
-    fmt_st_blocked = workbook.add_format(
-        {**_status_base, "bg_color": "#FFEB9C", "font_color": "#9C6500", "bold": True}
-    )
-    fmt_st_notrun = workbook.add_format(
-        {**_status_base, "bg_color": "#D9D9D9", "font_color": "#595959"}
-    )
-    fmt_st_inprog = workbook.add_format(
-        {**_status_base, "bg_color": "#BDD7EE", "font_color": "#1F4E79", "bold": True}
-    )
-    fmt_st_skipped = workbook.add_format(
-        {**_status_base, "bg_color": "#E2EFDA", "font_color": "#375623"}
-    )
 
+def _status_rule_formats(workbook: xlsxwriter.Workbook) -> list:
+    """(status value, conditional-format Format) pairs, in rule order."""
+    # (no align — Excel ignores it in cond. formats)
+    base = {"border": 1, "align": "center", "valign": "vcenter"}
+    pairs = []
+    for value, bg, font, bold in (
+        ("Pass", "#C6EFCE", "#006100", True),
+        ("Fail", "#FFC7CE", "#9C0006", True),
+        ("Blocked", "#FFEB9C", "#9C6500", True),
+        ("Not Run", "#D9D9D9", "#595959", False),
+        ("In Progress", "#BDD7EE", "#1F4E79", True),
+        ("Skipped", "#E2EFDA", "#375623", False),
+    ):
+        props = {**base, "bg_color": bg, "font_color": font}
+        if bold:
+            props["bold"] = True
+        pairs.append((value, workbook.add_format(props)))
+    return pairs
+
+
+def _add_status_rules(
+    workbook: xlsxwriter.Workbook, ws: object, last_data_row: int
+) -> None:
+    """Status column: colour-coded conditional formats plus the dropdown."""
     _stat = _col_letter(_COL_STATUS)
     status_col_range = f"{_stat}2:{_stat}{last_data_row}"
-    ws.conditional_format(
-        status_col_range,
-        {
-            "type": "cell",
-            "criteria": "equal to",
-            "value": '"Pass"',
-            "format": fmt_st_pass,
-        },
-    )
-    ws.conditional_format(
-        status_col_range,
-        {
-            "type": "cell",
-            "criteria": "equal to",
-            "value": '"Fail"',
-            "format": fmt_st_fail,
-        },
-    )
-    ws.conditional_format(
-        status_col_range,
-        {
-            "type": "cell",
-            "criteria": "equal to",
-            "value": '"Blocked"',
-            "format": fmt_st_blocked,
-        },
-    )
-    ws.conditional_format(
-        status_col_range,
-        {
-            "type": "cell",
-            "criteria": "equal to",
-            "value": '"Not Run"',
-            "format": fmt_st_notrun,
-        },
-    )
-    ws.conditional_format(
-        status_col_range,
-        {
-            "type": "cell",
-            "criteria": "equal to",
-            "value": '"In Progress"',
-            "format": fmt_st_inprog,
-        },
-    )
-    ws.conditional_format(
-        status_col_range,
-        {
-            "type": "cell",
-            "criteria": "equal to",
-            "value": '"Skipped"',
-            "format": fmt_st_skipped,
-        },
-    )
+    for value, fmt in _status_rule_formats(workbook):
+        ws.conditional_format(
+            status_col_range,
+            {
+                "type": "cell",
+                "criteria": "equal to",
+                "value": f'"{value}"',
+                "format": fmt,
+            },
+        )
 
     # Status dropdown with tooltip indicator
     ws.data_validation(
@@ -844,7 +806,16 @@ def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
         },
     )
 
-    # ------------------------------------------------------------------ sheet 2: Summary
+
+def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
+    last_data_row = _write_cases_sheet(workbook, suite)
+    _write_summary_sheet(workbook, suite, last_data_row)
+
+
+def _write_summary_sheet(
+    workbook: xlsxwriter.Workbook, suite: TestSuite, last_data_row: int
+) -> None:
+    """The 'Summary' sheet: COUNTIF formulas over the 'Test Cases' columns."""
     summary_ws = workbook.add_worksheet("Summary")
     summary_ws.set_column("A:A", 25)
     summary_ws.set_column("B:B", 15)
@@ -886,6 +857,17 @@ def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
         summary_ws.write(i, 0, label, label_fmt)
         summary_ws.write_formula(i, 1, formula, vfmt, cached)
 
+    _write_priority_block(summary_ws, suite, last_data_row, label_fmt, value_fmt)
+    _write_type_block(summary_ws, suite, last_data_row, label_fmt, value_fmt)
+
+
+def _write_priority_block(
+    summary_ws: object,
+    suite: TestSuite,
+    last_data_row: int,
+    label_fmt: xlsxwriter.format.Format,
+    value_fmt: xlsxwriter.format.Format,
+) -> None:
     summary_ws.write("A11", "Priority", label_fmt)
     summary_ws.write("B11", "Count", label_fmt)
     # 2026-07-30 run review, item 5: the Priority and Type blocks were HARDCODED
@@ -903,6 +885,14 @@ def _write_workbook(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
             j, 1, f'=COUNTIF({priority_range},"{pri}")', value_fmt, count
         )
 
+
+def _write_type_block(
+    summary_ws: object,
+    suite: TestSuite,
+    last_data_row: int,
+    label_fmt: xlsxwriter.format.Format,
+    value_fmt: xlsxwriter.format.Format,
+) -> None:
     _type_col = _col_letter(_COL_TYPE)
     type_range = f"'Test Cases'!{_type_col}2:{_type_col}{last_data_row}"
     summary_ws.write("A17", "Test Type", label_fmt)

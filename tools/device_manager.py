@@ -288,6 +288,21 @@ def parse_adb_devices(text: object) -> AdbRows:
 
     Never raises. Anything unparseable is simply not a row.
     """
+    candidates = _adb_candidate_lines(text)
+    rows = AdbRows()
+    # ONE PRODUCER of "how much did we not read", computed at the one site that
+    # drops the lines. Deriving it a second time from the same text in a caller
+    # is how two answers of one question drift apart.
+    rows.dropped_lines = max(0, len(candidates) - _MAX_ADB_LINES)
+    for line in candidates[:_MAX_ADB_LINES]:
+        row = _adb_row(line)
+        if row is not None:
+            rows.append(row)
+    return rows
+
+
+def _adb_candidate_lines(text: object) -> list[str]:
+    """The non-noise lines of adb output, uncapped."""
     # NOISE FIRST, THEN THE CAP. Counting raw lines made the header, blank
     # padding and daemon chatter look like dropped transports: one emulator
     # behind 250 blank lines reported 52 dropped and adb.devices REFUSED, which
@@ -302,48 +317,44 @@ def parse_adb_devices(text: object) -> AdbRows:
         if line.startswith("*"):  # "* daemon started successfully *"
             continue
         candidates.append(line)
-    rows = AdbRows()
-    # ONE PRODUCER of "how much did we not read", computed at the one site that
-    # drops the lines. Deriving it a second time from the same text in a caller
-    # is how two answers of one question drift apart.
-    rows.dropped_lines = max(0, len(candidates) - _MAX_ADB_LINES)
-    for line in candidates[:_MAX_ADB_LINES]:
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        serial = parts[0]
-        rest = parts[1:]
-        first = rest[0].lower()
-        # THE STATE IS THE TOKEN IMMEDIATELY AFTER THE SERIAL. Not a historical
-        # defect -- the code this replaces read `parts[1]`, one positional
-        # token, and was never fooled. The rule is stated, and fixtured, against
-        # a plausible REWRITE of this parser ("state = any token equal to
-        # device", an easy way to think you are handling -l), which would read
-        # an UNAUTHORIZED -l row carrying `device:emu64x` as usable.
-        if first == "no" and len(rest) > 1 and rest[1].lower().startswith("permission"):
-            state = "no_permissions"
-            consumed = 2
-        else:
-            state = first if first in _ADB_KNOWN_STATES else "unknown"
-            consumed = 1
-        raw_state = " ".join(rest[:consumed])[:_MAX_ADB_STATE_CHARS]
-        metadata: dict[str, str] = {}
-        for token in rest[consumed:]:
-            key, sep, value = token.partition(":")
-            if sep and key.isidentifier():
-                metadata[key] = value[:_MAX_ADB_STATE_CHARS]
-        valid_id = _valid_device_id(serial)
-        rows.append(
-            {
-                "serial": serial,
-                "state": state,
-                "raw_state": raw_state,
-                "metadata": metadata,
-                "valid_id": valid_id,
-                "usable": state == "device" and valid_id,
-            }
-        )
-    return rows
+    return candidates
+
+
+def _adb_row(line: str) -> dict | None:
+    """One classified row for a single adb line, or None when it has no state."""
+    parts = line.split()
+    if len(parts) < 2:
+        return None
+    serial = parts[0]
+    rest = parts[1:]
+    first = rest[0].lower()
+    # THE STATE IS THE TOKEN IMMEDIATELY AFTER THE SERIAL. Not a historical
+    # defect -- the code this replaces read `parts[1]`, one positional
+    # token, and was never fooled. The rule is stated, and fixtured, against
+    # a plausible REWRITE of this parser ("state = any token equal to
+    # device", an easy way to think you are handling -l), which would read
+    # an UNAUTHORIZED -l row carrying `device:emu64x` as usable.
+    if first == "no" and len(rest) > 1 and rest[1].lower().startswith("permission"):
+        state = "no_permissions"
+        consumed = 2
+    else:
+        state = first if first in _ADB_KNOWN_STATES else "unknown"
+        consumed = 1
+    raw_state = " ".join(rest[:consumed])[:_MAX_ADB_STATE_CHARS]
+    metadata: dict[str, str] = {}
+    for token in rest[consumed:]:
+        key, sep, value = token.partition(":")
+        if sep and key.isidentifier():
+            metadata[key] = value[:_MAX_ADB_STATE_CHARS]
+    valid_id = _valid_device_id(serial)
+    return {
+        "serial": serial,
+        "state": state,
+        "raw_state": raw_state,
+        "metadata": metadata,
+        "valid_id": valid_id,
+        "usable": state == "device" and valid_id,
+    }
 
 
 def _android_row(parsed: dict) -> dict:
@@ -656,44 +667,13 @@ async def list_devices(refresh: bool = False) -> dict:
     forked ``xcrun simctl``/``devicectl`` on every call, which is slow and,
     without full Xcode, fails outright. ``refresh=True`` bypasses the cache.
     """
-    global _discovery_cache
     now = time.monotonic()
     if not refresh and _discovery_cache is not None:
         cached_at, cached_result = _discovery_cache
         if (now - cached_at) < DISCOVERY_CACHE_TTL_S:
             return dict(cached_result)
     try:
-        android, simulators, physical = await asyncio.gather(
-            _list_android_all(),
-            _list_ios_simulators(),
-            _list_ios_physical(),
-        )
-        usable_android, unusable_android, dropped_lines = android
-        # Plain 3-tuples (tests, older callers) carry no problem.
-        adb_problem = getattr(android, "problem", None)
-        devices = [*usable_android, *simulators, *physical]
-        logger.info(
-            "device_manager: discovered %d device(s), %d attached but unusable",
-            len(devices),
-            len(unusable_android),
-        )
-        result = {
-            "content": devices,
-            "unusable": unusable_android,
-            # Lines of `adb devices` output the parser did not read. Always
-            # present, including on the error path below, so no reader has to
-            # special-case its absence -- the same rule `unusable` follows.
-            "adb_dropped_lines": dropped_lines,
-            # One sentence when `adb start-server` / `adb devices -l` timed out or
-            # failed (B4); None otherwise. Always present, like `unusable`.
-            "adb_problem": adb_problem,
-            "error": None,
-        }
-        # A failed adb probe is not a result: cached, it would keep telling the
-        # tester about a problem they have already fixed.
-        if adb_problem is None:
-            _discovery_cache = (now, dict(result))
-        return result
+        return await _list_devices_discover(now)
     except Exception as exc:
         logger.exception("device_manager: unexpected error listing devices")
         return {
@@ -703,6 +683,42 @@ async def list_devices(refresh: bool = False) -> dict:
             "adb_dropped_lines": 0,
             "adb_problem": None,
         }
+
+
+async def _list_devices_discover(now: float) -> dict:
+    """Run every platform's discovery, build the reply and cache it when clean."""
+    global _discovery_cache
+    android, simulators, physical = await asyncio.gather(
+        _list_android_all(),
+        _list_ios_simulators(),
+        _list_ios_physical(),
+    )
+    usable_android, unusable_android, dropped_lines = android
+    # Plain 3-tuples (tests, older callers) carry no problem.
+    adb_problem = getattr(android, "problem", None)
+    devices = [*usable_android, *simulators, *physical]
+    logger.info(
+        "device_manager: discovered %d device(s), %d attached but unusable",
+        len(devices),
+        len(unusable_android),
+    )
+    result = {
+        "content": devices,
+        "unusable": unusable_android,
+        # Lines of `adb devices` output the parser did not read. Always
+        # present, including on the error path below, so no reader has to
+        # special-case its absence -- the same rule `unusable` follows.
+        "adb_dropped_lines": dropped_lines,
+        # One sentence when `adb start-server` / `adb devices -l` timed out or
+        # failed (B4); None otherwise. Always present, like `unusable`.
+        "adb_problem": adb_problem,
+        "error": None,
+    }
+    # A failed adb probe is not a result: cached, it would keep telling the
+    # tester about a problem they have already fixed.
+    if adb_problem is None:
+        _discovery_cache = (now, dict(result))
+    return result
 
 
 # --------------------------------------------------------------------------- #

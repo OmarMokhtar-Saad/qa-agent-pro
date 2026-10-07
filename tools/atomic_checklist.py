@@ -407,57 +407,14 @@ def audit_granularity(items: list[ChecklistItem]) -> dict:
         if not items:
             return empty
         count = len(items)
-        dist: dict[str, int] = {}
-        short = 0
-        attributed = 0
-        for it in items:
-            dist[it.ears_pattern] = dist.get(it.ears_pattern, 0) + 1
-            if len(_tokens(it.text)) < _SHORT_ITEM_WORDS:
-                short += 1
-            if it.source and it.source != UNATTRIBUTED:
-                attributed += 1
-
-        token_sets = [set(_tokens(it.text)) for it in items]
-        overlapping = 0
-        for i in range(count):
-            for j in range(i + 1, count):
-                if _jaccard(token_sets[i], token_sets[j]) >= _OVERLAP_SIM:
-                    overlapping += 1
-                    break
+        dist, short, attributed, overlapping = _audit_granularity_counts(items)
         short_ratio = short / count
         overlap_ratio = overlapping / count
         provenance_ratio = attributed / count
 
-        warnings: list[str] = []
-        score = 1.0
-        if short_ratio > _MAX_SHORT_RATIO:
-            score -= 0.3
-            warnings.append(
-                f"{short_ratio:.0%} of items are shorter than {_SHORT_ITEM_WORDS} "
-                "words — the decomposition looks OVER-SPLIT (inflation raises the "
-                "coverage %, it does not improve coverage)."
-            )
-        if overlap_ratio > _MAX_OVERLAP_RATIO:
-            score -= 0.3
-            warnings.append(
-                f"{overlap_ratio:.0%} of items are near-duplicates of another item "
-                "— redundant requirements make the tally look better than it is."
-            )
-        if len(dist) <= 1 and count >= 8:
-            score -= 0.2
-            warnings.append(
-                "Every item uses the same EARS pattern — extreme skew usually means "
-                "the decomposition restated one shape instead of analysing the "
-                "behaviours."
-            )
-        if provenance_ratio < _MIN_PROVENANCE_RATIO:
-            score -= 0.2
-            warnings.append(
-                f"Only {provenance_ratio:.0%} of items carry a recognised source "
-                "tag — unattributed requirements cannot be audited back to the "
-                "ticket."
-            )
-        score = max(0.0, min(1.0, score))
+        score, warnings = _audit_granularity_score(
+            short_ratio, overlap_ratio, provenance_ratio, len(dist), count
+        )
         threshold = float(getattr(settings, "qa_checklist_min_granularity", 0.6) or 0.6)
         return {
             "item_count": count,
@@ -473,6 +430,72 @@ def audit_granularity(items: list[ChecklistItem]) -> dict:
     except Exception:
         logger.exception("audit_granularity failed — returning a neutral verdict")
         return empty
+
+
+def _audit_granularity_counts(
+    items: list[ChecklistItem],
+) -> tuple[dict[str, int], int, int, int]:
+    """Count the EARS patterns, short items, attributed items and overlapping items."""
+    count = len(items)
+    dist: dict[str, int] = {}
+    short = 0
+    attributed = 0
+    for it in items:
+        dist[it.ears_pattern] = dist.get(it.ears_pattern, 0) + 1
+        if len(_tokens(it.text)) < _SHORT_ITEM_WORDS:
+            short += 1
+        if it.source and it.source != UNATTRIBUTED:
+            attributed += 1
+
+    token_sets = [set(_tokens(it.text)) for it in items]
+    overlapping = 0
+    for i in range(count):
+        for j in range(i + 1, count):
+            if _jaccard(token_sets[i], token_sets[j]) >= _OVERLAP_SIM:
+                overlapping += 1
+                break
+    return dist, short, attributed, overlapping
+
+
+def _audit_granularity_score(
+    short_ratio: float,
+    overlap_ratio: float,
+    provenance_ratio: float,
+    distinct: int,
+    count: int,
+) -> tuple[float, list[str]]:
+    """Score the three ratios and the pattern skew, with one warning per penalty."""
+    warnings: list[str] = []
+    score = 1.0
+    if short_ratio > _MAX_SHORT_RATIO:
+        score -= 0.3
+        warnings.append(
+            f"{short_ratio:.0%} of items are shorter than {_SHORT_ITEM_WORDS} "
+            "words — the decomposition looks OVER-SPLIT (inflation raises the "
+            "coverage %, it does not improve coverage)."
+        )
+    if overlap_ratio > _MAX_OVERLAP_RATIO:
+        score -= 0.3
+        warnings.append(
+            f"{overlap_ratio:.0%} of items are near-duplicates of another item "
+            "— redundant requirements make the tally look better than it is."
+        )
+    if distinct <= 1 and count >= 8:
+        score -= 0.2
+        warnings.append(
+            "Every item uses the same EARS pattern — extreme skew usually means "
+            "the decomposition restated one shape instead of analysing the "
+            "behaviours."
+        )
+    if provenance_ratio < _MIN_PROVENANCE_RATIO:
+        score -= 0.2
+        warnings.append(
+            f"Only {provenance_ratio:.0%} of items carry a recognised source "
+            "tag — unattributed requirements cannot be audited back to the "
+            "ticket."
+        )
+    score = max(0.0, min(1.0, score))
+    return score, warnings
 
 
 # --------------------------------------------------------------------------- #
@@ -583,42 +606,9 @@ def format_checklist_prompt_block(
     try:
         if not items:
             return "", []
-        cap = int(
-            limit
-            if limit is not None
-            else (
-                getattr(
-                    settings, "qa_checklist_max_prompt_chars", _DEFAULT_MAX_PROMPT_CHARS
-                )
-                or _DEFAULT_MAX_PROMPT_CHARS
-            )
-        )
-        cap = max(_MIN_PROMPT_CHARS, cap)
+        cap = _format_checklist_prompt_block_cap(limit)
 
-        lines: list[str] = []
-        presented: list[str] = []
-        used = 0
-        for n, cluster in enumerate(cluster_items(items), 1):
-            head = f"Group {n}:"
-            pending = [head]
-            pending_ids: list[str] = []
-            cost = len(head) + 1
-            for it in cluster:
-                line = f"- {it.item_id} [{it.ears_pattern}] {it.text}"
-                if used + cost + len(line) + 2 > cap:
-                    # Skip THIS item and keep going. This used to set a `stopped`
-                    # flag and break out of BOTH loops, so a single over-long
-                    # requirement ended the entire presentation with budget still
-                    # unspent and every later (possibly short) item dropped.
-                    continue
-                pending.append(line)
-                pending_ids.append(it.item_id)
-                cost += len(line) + 1
-            if pending_ids:
-                lines.extend(pending)
-                lines.append("")
-                used += cost + 1
-                presented.extend(pending_ids)
+        lines, presented = _format_checklist_prompt_block_lines(items, cap)
 
         body = "\n".join(lines).strip()
         if not body:
@@ -630,22 +620,7 @@ def format_checklist_prompt_block(
             )
             return "", []
 
-        note = ""
-        missing = len(items) - len(presented)
-        if missing > 0:
-            logger.warning(
-                "Atomic checklist prompt block truncated: %d of %d item(s) did not "
-                "fit in QA_CHECKLIST_MAX_PROMPT_CHARS=%d and are reported as "
-                "NOT PRESENTED.",
-                missing,
-                len(items),
-                cap,
-            )
-            note = (
-                f"\n\n[{missing} further checklist item(s) did not fit in this "
-                "prompt and are NOT shown above. They are tracked separately as "
-                "NOT PRESENTED — do not try to guess them.]"
-            )
+        note = _format_checklist_prompt_block_note(items, presented, cap)
         return (
             "## Atomic Requirements Checklist (every item must end up covered)\n"
             + wrap_untrusted("atomic_checklist", body, limit=cap)
@@ -654,6 +629,76 @@ def format_checklist_prompt_block(
     except Exception:
         logger.exception("format_checklist_prompt_block failed — omitting the block")
         return "", []
+
+
+def _format_checklist_prompt_block_cap(limit: int | None) -> int:
+    """The character budget for the block, never below the minimum."""
+    cap = int(
+        limit
+        if limit is not None
+        else (
+            getattr(
+                settings, "qa_checklist_max_prompt_chars", _DEFAULT_MAX_PROMPT_CHARS
+            )
+            or _DEFAULT_MAX_PROMPT_CHARS
+        )
+    )
+    cap = max(_MIN_PROMPT_CHARS, cap)
+    return cap
+
+
+def _format_checklist_prompt_block_lines(
+    items: list[ChecklistItem], cap: int
+) -> tuple[list[str], list[str]]:
+    """Spend ``cap`` item by item; return the lines and the ids that fitted."""
+    lines: list[str] = []
+    presented: list[str] = []
+    used = 0
+    for n, cluster in enumerate(cluster_items(items), 1):
+        head = f"Group {n}:"
+        pending = [head]
+        pending_ids: list[str] = []
+        cost = len(head) + 1
+        for it in cluster:
+            line = f"- {it.item_id} [{it.ears_pattern}] {it.text}"
+            if used + cost + len(line) + 2 > cap:
+                # Skip THIS item and keep going. This used to set a `stopped`
+                # flag and break out of BOTH loops, so a single over-long
+                # requirement ended the entire presentation with budget still
+                # unspent and every later (possibly short) item dropped.
+                continue
+            pending.append(line)
+            pending_ids.append(it.item_id)
+            cost += len(line) + 1
+        if pending_ids:
+            lines.extend(pending)
+            lines.append("")
+            used += cost + 1
+            presented.extend(pending_ids)
+    return lines, presented
+
+
+def _format_checklist_prompt_block_note(
+    items: list[ChecklistItem], presented: list[str], cap: int
+) -> str:
+    """The truncation note, or "" when every item was presented."""
+    note = ""
+    missing = len(items) - len(presented)
+    if missing > 0:
+        logger.warning(
+            "Atomic checklist prompt block truncated: %d of %d item(s) did not "
+            "fit in QA_CHECKLIST_MAX_PROMPT_CHARS=%d and are reported as "
+            "NOT PRESENTED.",
+            missing,
+            len(items),
+            cap,
+        )
+        note = (
+            f"\n\n[{missing} further checklist item(s) did not fit in this "
+            "prompt and are NOT shown above. They are tracked separately as "
+            "NOT PRESENTED — do not try to guess them.]"
+        )
+    return note
 
 
 def checklist_generation_hint(

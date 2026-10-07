@@ -169,6 +169,63 @@ def token_band(chars: int) -> tuple[int, int]:
     return (c // _CHARS_PER_TOKEN_OPTIMISTIC, c // _CHARS_PER_TOKEN_PESSIMISTIC)
 
 
+def _images_line(h) -> str:
+    if not h.image_count:
+        return "- **Images riding along: none.**"
+    return (
+        f"- **Images riding along: {h.image_count}** "
+        f"({h.image_bytes:,} raw bytes). Image tokens are NOT in the "
+        "estimate below -- every model tiles images differently."
+    )
+
+
+def _estimate_line(low: int, high: int) -> str:
+    return (
+        f"- **ROUGH input-token estimate: {low:,}-{high:,} tokens.** This "
+        f"is division, not measurement: character count divided by "
+        f"{_CHARS_PER_TOKEN_OPTIMISTIC} for the low end and "
+        f"{_CHARS_PER_TOKEN_PESSIMISTIC} for the high end. Your model's "
+        "own tokenizer decides the real figure; non-Latin scripts such as "
+        "Arabic land at or ABOVE the high end. OUTPUT tokens are not "
+        "counted at all -- the server cannot know how much your model "
+        "writes -- and there is no price here, because the server does "
+        "not know which model you run or what you pay for it."
+    )
+
+
+def _render_handover(h) -> str:
+    """The full disclosure block for a measurement that has categories."""
+    low, high = token_band(h.total_input_chars)
+    per_cat_instruction = h.instruction_chars // h.categories
+    per_call_low, per_call_high = token_band(h.shared_chars + per_cat_instruction)
+    lines = [
+        "### What this will cost YOUR chat model",
+        "",
+        "This server runs no model of its own: YOUR chat model generates "
+        "every test case, so this work lands on YOUR subscription and this "
+        "server never sees one of those tokens. Measured from the payload "
+        "it just handed you:",
+        "",
+        f"- **Model turns: about {h.model_turns}** -- {h.categories} "
+        f"category generation{_s(h.categories)} plus {h.step_zero_jobs} "
+        f"step-0 job{_s(h.step_zero_jobs)}. One generation per category "
+        "is the intended flow; a client that batches them will make "
+        "fewer, larger calls.",
+        f"- **Shared context, re-sent with every category: "
+        f"{h.shared_chars:,} chars** (prompt + ticket text + response "
+        f"schema), plus about {per_cat_instruction:,} chars of "
+        "category-specific instruction. The shared part is NOT sent once "
+        "-- it goes again with each category.",
+        f"- **Total input handed over: {h.total_input_chars:,} chars** "
+        f"across {h.categories} call{_s(h.categories)} "
+        f"(~{per_call_low:,}-{per_call_high:,} tokens per call). This "
+        f"payload is {h.payload_bytes:,} bytes on the wire.",
+        _images_line(h),
+        _estimate_line(low, high),
+    ]
+    return "\n".join(lines)
+
+
 def handover_line(
     payload: object,
     *,
@@ -188,52 +245,7 @@ def handover_line(
                 "This payload carries no category fan-out, so there is nothing "
                 "to size."
             )
-        low, high = token_band(h.total_input_chars)
-        per_cat_instruction = h.instruction_chars // h.categories
-        per_call_low, per_call_high = token_band(h.shared_chars + per_cat_instruction)
-        lines = [
-            "### What this will cost YOUR chat model",
-            "",
-            "This server runs no model of its own: YOUR chat model generates "
-            "every test case, so this work lands on YOUR subscription and this "
-            "server never sees one of those tokens. Measured from the payload "
-            "it just handed you:",
-            "",
-            f"- **Model turns: about {h.model_turns}** -- {h.categories} "
-            f"category generation{_s(h.categories)} plus {h.step_zero_jobs} "
-            f"step-0 job{_s(h.step_zero_jobs)}. One generation per category "
-            "is the intended flow; a client that batches them will make "
-            "fewer, larger calls.",
-            f"- **Shared context, re-sent with every category: "
-            f"{h.shared_chars:,} chars** (prompt + ticket text + response "
-            f"schema), plus about {per_cat_instruction:,} chars of "
-            "category-specific instruction. The shared part is NOT sent once "
-            "-- it goes again with each category.",
-            f"- **Total input handed over: {h.total_input_chars:,} chars** "
-            f"across {h.categories} call{_s(h.categories)} "
-            f"(~{per_call_low:,}-{per_call_high:,} tokens per call). This "
-            f"payload is {h.payload_bytes:,} bytes on the wire.",
-        ]
-        if h.image_count:
-            lines.append(
-                f"- **Images riding along: {h.image_count}** "
-                f"({h.image_bytes:,} raw bytes). Image tokens are NOT in the "
-                "estimate below -- every model tiles images differently."
-            )
-        else:
-            lines.append("- **Images riding along: none.**")
-        lines.append(
-            f"- **ROUGH input-token estimate: {low:,}-{high:,} tokens.** This "
-            f"is division, not measurement: character count divided by "
-            f"{_CHARS_PER_TOKEN_OPTIMISTIC} for the low end and "
-            f"{_CHARS_PER_TOKEN_PESSIMISTIC} for the high end. Your model's "
-            "own tokenizer decides the real figure; non-Latin scripts such as "
-            "Arabic land at or ABOVE the high end. OUTPUT tokens are not "
-            "counted at all -- the server cannot know how much your model "
-            "writes -- and there is no price here, because the server does "
-            "not know which model you run or what you pay for it."
-        )
-        return "\n".join(lines)
+        return _render_handover(h)
     except Exception:  # pragma: no cover - a disclosure never breaks a prepare
         logger.debug("rendering the handover cost failed", exc_info=True)
         return ""

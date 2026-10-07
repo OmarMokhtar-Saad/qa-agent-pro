@@ -183,9 +183,8 @@ def backend_info(edition_probe: Callable[[], dict] | None = None) -> dict:
     return {"version": version, "install_dir": root, "edition": edition}
 
 
-def doctor_rows() -> list:
-    """The machine-readiness rows, from the doctor's own producers."""
-    rows = []
+def _append_version_row(rows: list) -> None:
+    """Append the ``backend_version`` row."""
     try:
         version = local_version()
         rows.append(
@@ -205,6 +204,10 @@ def doctor_rows() -> list:
                 "Reinstall, or re-run the launcher.",
             )
         )
+
+
+def _append_privileges_row(rows: list) -> None:
+    """Append the ``host_privileges`` row."""
     try:
         from tools import host_privileges
 
@@ -239,6 +242,10 @@ def doctor_rows() -> list:
         )
     except Exception as exc:
         rows.append(Row("host_privileges", "undetermined", str(exc)))
+
+
+def _append_mobile_sdk_rows(rows: list) -> None:
+    """Append the ``mobile_sdk``, ``adb`` and ``sdk_tool:*`` rows."""
     try:
         from tools.mobile import adb as mobile_adb
         from tools.mobile import sdk_locator
@@ -319,6 +326,10 @@ def doctor_rows() -> list:
                     "The mobile modules are not present in this edition.",
                 )
             )
+
+
+def _append_mobile_ime_row(rows: list) -> None:
+    """Append the ``mobile_ime`` row."""
     try:
         from tools.mobile import ime
 
@@ -342,6 +353,15 @@ def doctor_rows() -> list:
                 "The mobile modules are not present in this edition.",
             )
         )
+
+
+def doctor_rows() -> list:
+    """The machine-readiness rows, from the doctor's own producers."""
+    rows = []
+    _append_version_row(rows)
+    _append_privileges_row(rows)
+    _append_mobile_sdk_rows(rows)
+    _append_mobile_ime_row(rows)
     rows.extend(_system_image_items())
     return _rows(rows)
 
@@ -403,6 +423,11 @@ def _system_image_items() -> list:
                 "No emulator is booted, so its system image is unknown.",
             )
         ]
+    return _booted_image_items(booted, component, sdk_locator)
+
+
+def _booted_image_items(booted: list, component: str, sdk_locator) -> list:
+    """One ``Row`` per booted emulator, naming its system image."""
     items = []
     for item in booted:
         serial = str(item.get("serial") or "")[:40]
@@ -424,6 +449,106 @@ def _system_image_items() -> list:
 def system_image_rows() -> list:
     """The system-image rows alone, serialised -- what the pins read."""
     return _rows(_system_image_items())
+
+
+def _client_row(label: str, config_path, by_config: dict, mine: str) -> Row:
+    """The row for one client whose config lives at a known path."""
+    from tools import client_registry
+
+    if not config_path.parent.exists():
+        return Row(
+            label,
+            "off",
+            "Not installed on this machine.",
+            "",
+            str(config_path),
+        )
+    entries = by_config.get(str(config_path)) or []
+    if not entries:
+        return Row(
+            label,
+            "fail",
+            "Installed, with no qa-agents entry in its MCP config.",
+            "Let the setup wizard add the qa-agents entry.",
+            str(config_path),
+        )
+    targets = [
+        client_registry.install_target(
+            str(e.get("command") or ""), e.get("base") or config_path.parent
+        )
+        for e in entries
+    ]
+    if mine in targets:
+        return Row(
+            label,
+            "ok",
+            "Registered, pointing at this install.",
+            "",
+            str(config_path),
+        )
+    return Row(
+        label,
+        "warn",
+        "Registered, but pointing at another install: "
+        + ", ".join(t for t in targets if t),
+        "Re-register this install, or remove the stale entry -- "
+        "two installs live at once is how work stages on one "
+        "and finalizes on the other.",
+        str(config_path),
+    )
+
+
+def _claude_code_row(home, by_config: dict, mine: str) -> Row:
+    """The Claude Code row, detected read-only (it is not in ``default_targets``)."""
+    from pathlib import Path as _Path
+
+    from tools import client_registry
+
+    # Claude Code is NOT in `default_targets` -- it is registered through
+    # `claude mcp add` rather than by editing a file this server knows the
+    # path of, which is exactly why the loop above cannot see it. Decision
+    # (6) names it as one of the three clients the wizard registers, so it
+    # is detected HERE, read-only: the CLI on PATH is what proves it is
+    # installed, and `~/.claude.json` is the config `discover_registrations`
+    # already scans. Detection only -- the WRITE is the desktop app's, with
+    # a backup beside the file.
+    code_config = (
+        _Path(home) / ".claude.json" if home else _Path.home() / ".claude.json"
+    )
+    code_present = bool(shutil.which("claude")) or code_config.is_file()
+    if not code_present:
+        return Row("Claude Code", "off", "Not installed on this machine.", "", "")
+    entries = by_config.get(str(code_config)) or []
+    if not entries:
+        return Row(
+            "Claude Code",
+            "fail",
+            "Installed, with no qa-agents entry in its config.",
+            "Let the setup wizard add the qa-agents entry.",
+            str(code_config),
+        )
+    targets = [
+        client_registry.install_target(
+            str(e.get("command") or ""), e.get("base") or code_config.parent
+        )
+        for e in entries
+    ]
+    if mine in targets:
+        return Row(
+            "Claude Code",
+            "ok",
+            "Registered, pointing at this install.",
+            "",
+            str(code_config),
+        )
+    return Row(
+        "Claude Code",
+        "warn",
+        "Registered, but pointing at another install: "
+        + ", ".join(t for t in targets if t),
+        "Re-register this install, or remove the stale entry.",
+        str(code_config),
+    )
 
 
 def client_rows(home=None) -> list:
@@ -460,115 +585,8 @@ def client_rows(home=None) -> list:
                 continue
             by_config.setdefault(str(entry.get("config") or ""), []).append(entry)
         for label, config_path, _dir in client_registry.default_targets(home):
-            config_path = _Path(config_path)
-            if not config_path.parent.exists():
-                rows.append(
-                    Row(
-                        label,
-                        "off",
-                        "Not installed on this machine.",
-                        "",
-                        str(config_path),
-                    )
-                )
-                continue
-            entries = by_config.get(str(config_path)) or []
-            if not entries:
-                rows.append(
-                    Row(
-                        label,
-                        "fail",
-                        "Installed, with no qa-agents entry in its MCP config.",
-                        "Let the setup wizard add the qa-agents entry.",
-                        str(config_path),
-                    )
-                )
-                continue
-            targets = [
-                client_registry.install_target(
-                    str(e.get("command") or ""), e.get("base") or config_path.parent
-                )
-                for e in entries
-            ]
-            if mine in targets:
-                rows.append(
-                    Row(
-                        label,
-                        "ok",
-                        "Registered, pointing at this install.",
-                        "",
-                        str(config_path),
-                    )
-                )
-            else:
-                rows.append(
-                    Row(
-                        label,
-                        "warn",
-                        "Registered, but pointing at another install: "
-                        + ", ".join(t for t in targets if t),
-                        "Re-register this install, or remove the stale entry -- "
-                        "two installs live at once is how work stages on one "
-                        "and finalizes on the other.",
-                        str(config_path),
-                    )
-                )
-        # Claude Code is NOT in `default_targets` -- it is registered through
-        # `claude mcp add` rather than by editing a file this server knows the
-        # path of, which is exactly why the loop above cannot see it. Decision
-        # (6) names it as one of the three clients the wizard registers, so it
-        # is detected HERE, read-only: the CLI on PATH is what proves it is
-        # installed, and `~/.claude.json` is the config `discover_registrations`
-        # already scans. Detection only -- the WRITE is the desktop app's, with
-        # a backup beside the file.
-        code_config = (
-            _Path(home) / ".claude.json" if home else _Path.home() / ".claude.json"
-        )
-        code_present = bool(shutil.which("claude")) or code_config.is_file()
-        if not code_present:
-            rows.append(
-                Row("Claude Code", "off", "Not installed on this machine.", "", "")
-            )
-        else:
-            entries = by_config.get(str(code_config)) or []
-            if not entries:
-                rows.append(
-                    Row(
-                        "Claude Code",
-                        "fail",
-                        "Installed, with no qa-agents entry in its config.",
-                        "Let the setup wizard add the qa-agents entry.",
-                        str(code_config),
-                    )
-                )
-            else:
-                targets = [
-                    client_registry.install_target(
-                        str(e.get("command") or ""), e.get("base") or code_config.parent
-                    )
-                    for e in entries
-                ]
-                if mine in targets:
-                    rows.append(
-                        Row(
-                            "Claude Code",
-                            "ok",
-                            "Registered, pointing at this install.",
-                            "",
-                            str(code_config),
-                        )
-                    )
-                else:
-                    rows.append(
-                        Row(
-                            "Claude Code",
-                            "warn",
-                            "Registered, but pointing at another install: "
-                            + ", ".join(t for t in targets if t),
-                            "Re-register this install, or remove the stale entry.",
-                            str(code_config),
-                        )
-                    )
+            rows.append(_client_row(label, _Path(config_path), by_config, mine))
+        rows.append(_claude_code_row(home, by_config, mine))
     except Exception as exc:
         rows.append(Row("mcp_clients", "undetermined", str(exc)))
     return _rows(rows)

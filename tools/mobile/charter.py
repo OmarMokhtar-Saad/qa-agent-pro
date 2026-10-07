@@ -471,6 +471,11 @@ def _rejected(body: object) -> list:
     fixture and not the rule.
     """
     src = body if isinstance(body, dict) else {}
+    return _rejected_enums(src) + _rejected_budget(src)
+
+
+def _rejected_enums(src: dict) -> list:
+    """The coerced closed-enum fields (depth, destructive, stop_on) of *src*."""
     blank = defaults()
     out: list = []
     for field, allowed in (
@@ -492,6 +497,12 @@ def _rejected(body: object) -> list:
                     "choices": list(allowed),
                 }
             )
+    return out
+
+
+def _rejected_budget(src: dict) -> list:
+    """The budget axes of *src* whose number was replaced."""
+    out: list = []
     budget = src.get("budget")
     budget = budget if isinstance(budget, dict) else {}
     for axis in ("steps", "minutes"):
@@ -617,6 +628,14 @@ def normalize(raw: object) -> dict:
     # The schema keys are the only keys; everything else, this one included,
     # is dropped here, and the verdict recorded below is the SERVER's own.
     body = _schema_only(raw_body)
+    terms = _coerced_terms(body)
+    terms[DEFAULTS_KEY] = defaults_used(body)
+    terms[REJECTED_KEY] = _rejected(body)
+    return terms
+
+
+def _coerced_terms(body: dict) -> dict:
+    """The schema fields of an already schema-stripped *body*, each coerced."""
     terms = defaults()
     # The goal's length bound belongs to the explore state, which is the thing
     # that stores it; imported HERE rather than at module scope so this module
@@ -639,9 +658,36 @@ def normalize(raw: object) -> dict:
         "minutes": max(0, _int(budget.get("minutes"), 0)),
     }
     terms["stop_on"] = _choice(body.get("stop_on"), STOP_ON, "budget")
-    terms[DEFAULTS_KEY] = defaults_used(body)
-    terms[REJECTED_KEY] = _rejected(body)
     return terms
+
+
+def _decode_charter(text: object) -> tuple:
+    """The submitted string -> ``(body, failure)``; *failure* is the refusal or None."""
+    raw = text if isinstance(text, str) else ""
+    if not raw.strip():
+        return {}, None
+    if len(raw.encode("utf-8", "ignore")) > MAX_CHARTER_BYTES:
+        return None, {
+            "error": (
+                "That charter is larger than this server will read ("
+                + str(MAX_CHARTER_BYTES)
+                + " bytes). Nothing was started -- send the goal, the "
+                "depth, the scope, the destructive setting and the budget, "
+                "and leave the rest out."
+            ),
+            "content": None,
+        }
+    try:
+        return json.loads(raw), None
+    except (TypeError, ValueError, OverflowError) as exc:
+        return None, {
+            "error": (
+                "That charter is not readable as JSON ("
+                + str(exc)[:120]
+                + "). Nothing was started."
+            ),
+            "content": None,
+        }
 
 
 def parse(text: object, goal: str = "") -> dict:
@@ -655,31 +701,9 @@ def parse(text: object, goal: str = "") -> dict:
     start that carries ``goal=`` runs under the default charter instead of
     being sent back for an intake it does not need.
     """
-    body: object = {}
-    raw = text if isinstance(text, str) else ""
-    if raw.strip():
-        if len(raw.encode("utf-8", "ignore")) > MAX_CHARTER_BYTES:
-            return {
-                "error": (
-                    "That charter is larger than this server will read ("
-                    + str(MAX_CHARTER_BYTES)
-                    + " bytes). Nothing was started -- send the goal, the "
-                    "depth, the scope, the destructive setting and the budget, "
-                    "and leave the rest out."
-                ),
-                "content": None,
-            }
-        try:
-            body = json.loads(raw)
-        except (TypeError, ValueError, OverflowError) as exc:
-            return {
-                "error": (
-                    "That charter is not readable as JSON ("
-                    + str(exc)[:120]
-                    + "). Nothing was started."
-                ),
-                "content": None,
-            }
+    body, failure = _decode_charter(text)
+    if failure is not None:
+        return failure
     supplied = _schema_only(body)
     rejected = _rejected(supplied)
     if rejected:

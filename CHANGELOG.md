@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.106.1] - 2026-10-06
+## [1.107.0] - 2026-10-07
 
 ### Added
 
@@ -29,7 +29,20 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Releases are no longer signed. Updates keep installing as before; leave
-  QA_UPDATE_REQUIRE_SIGNATURE off (the default), because turning it on
-  now refuses every update.
-- The Cursor setup writes a portable .cursor/mcp.json.
+- Mobile runs now learn about each Android app as they go: screen
+  timings, popups and how to dismiss them, working locators, shortcuts
+  between screens and past mistakes. Later runs on the same app reuse
+  what was learned, and the run report gains an app-knowledge section.
+- New qa_mobile_knowledge tool: list, show, confirm, reject, edit, export
+  or import what was learned about one app.
+- Notes saved with the `note` argument of qa_mobile_test can name their
+  app with `app=`. The run report shows which notes applied at each step.
+
+### Fixed
+
+- An avoid note no longer refuses assert or wait steps. A wait whose
+  condition already holds is reported as already met.
+- qa_mobile_notes says how many notes it is showing out of the total, and
+  old note history is pruned once it reaches its cap.
+- Stored run history, learning markers and rollback records are capped,
+  so the per-app data no longer grows without limit.

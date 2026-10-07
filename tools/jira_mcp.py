@@ -503,6 +503,337 @@ _UC_MAX_CRITERIA = 12
 _UC_MAX_CRITERION_CHARS = 2500
 
 
+def _uc_row_criterion(line: str) -> str:
+    """One "Label: body" criterion from a UC table row, or "" for any other line."""
+    m = _UC_ROW_RE.match(line.strip())
+    if not m:
+        return ""
+    label = " ".join(m.group(1).split()).strip("*: ").casefold()
+    if label not in _UC_AC_LABELS:
+        return ""
+    body = _UC_CUSTOM_TAG_RE.sub(" ", m.group(2))
+    body = body.replace("|", " ").replace("*", "").replace("\\", "")
+    body = " ".join(body.split())
+    if not body:
+        return ""
+    return f"{m.group(1).strip('*: ').strip()}: {body[:_UC_MAX_CRITERION_CHARS]}"
+
+
+def _own_link_ref(fields: dict, key: str) -> dict | None:
+    """This issue's own link entry for *key*, or None (logged) when not linked."""
+    linked = {
+        item.get("key"): item
+        for item in _extract_issuelinks(fields)
+        if isinstance(item, dict)
+    }
+    if key not in linked:
+        logger.info(
+            "parent_issue %s is not linked from this ticket -- ignoring it.", key
+        )
+        return None
+    return linked[key]
+
+
+def _workspace_config_paths(
+    workspace_roots: list[Path] | None, parts: tuple[str, ...]
+) -> list[Path]:
+    """Config paths under each open workspace root; a garbage root is dropped."""
+    paths: list[Path] = []
+    for root in workspace_roots or []:
+        try:
+            paths.append(Path(root).joinpath(*parts))
+        except Exception:
+            logger.debug("ignoring unusable workspace root %r", root, exc_info=True)
+    return paths
+
+
+def _probe_verdict(probe: dict, sites: object) -> tuple[str, str]:
+    """The verdict for the identity half of a verification payload."""
+    # THE INVARIANT, in the order it has to be applied:
+    #   1. an error marker carrying TEXT is a failure, whatever else is here;
+    #   2. otherwise identity evidence wins -- an EMPTY errorMessages/errors
+    #      container is what a SUCCESSFUL Jira envelope carries, and letting
+    #      it beat a valid account_id persisted "not connected" for a week
+    #      about a working connection;
+    #   3. an error marker with no text and no identity is still a failure;
+    #   4. anything else establishes nothing -- "unknown", never written.
+    failure = _error_text(probe)
+    identified = _has_identity(probe)
+    if failure or (_carries_error_key(probe) and not identified):
+        return (
+            "failed",
+            "\u274c **Not connected** -- that Atlassian call did not "
+            f"return an identity: {failure or _NO_IDENTITY}\n\n" + connect_steps(),
+        )
+    if not probe:
+        return (
+            "unknown",
+            "\u26a0\ufe0f **That verification result was empty**, so I "
+            "still can't confirm the Atlassian connection. Re-run "
+            f"`{verify_tool_name()}` and pass its RAW JSON result as "
+            "`atlassian_verify_json`.\n\n" + connect_hint_line(),
+        )
+    # A payload with no error and no identity establishes NOTHING: a guess
+    # dressed as a result would silence the real question for the week the
+    # verdict is persisted. An unrecognized shape is "unknown".
+    # `identified` DECIDES; the label only renders. Written the other way
+    # round -- label first, evidence as the fallback -- a bare `name` was
+    # its own proof, which is how a Jira status called "High" reported
+    # "connected as High" while _has_identity said False.
+    who = (
+        (_identity_label(probe) or "connected (identity payload received)")
+        if identified
+        else ""
+    )
+    if not who:
+        return (
+            "unknown",
+            "\u26a0\ufe0f **That result carried no identity**, so I still "
+            "can't confirm the Atlassian connection. A working "
+            f"`{verify_tool_name()}` call returns your account details. "
+            "Re-run it and pass its RAW JSON result as "
+            "`atlassian_verify_json`, or pass "
+            '`{"error": "<what happened>"}` if the call failed.\n\n'
+            + connect_hint_line(),
+        )
+    return _render_verified(who, sites)
+
+
+def _probe_and_sites(payload: dict) -> tuple[dict, object]:
+    """Split a payload into the identity half and the accessible-sites half."""
+    # The blob may carry BOTH probe results. `probe` is the half that answers
+    # "is there a session"; every identity check runs on it rather than on the
+    # whole envelope, so a string inside a site entry can never be read as an
+    # identity.
+    identity, sites, envelope = _split_envelope(payload)
+    return (identity if envelope else payload), sites
+
+
+def _directive_optional_steps(prefix: str, token: str, want_parent: bool) -> list[str]:
+    """Steps 2.. of the directive: the parent fetch and the sibling search."""
+    lines: list[str] = []
+    step = 2
+    if want_parent:
+        lines.append(
+            f"{step}. If the result has a `fields.parent`, call "
+            f"`{prefix}getJiraIssue` a SECOND time for that parent key "
+            "(its description usually holds the real requirements). "
+            "If there is NO `fields.parent` but `fields.issuelinks` names "
+            "an issue this one *implements* (or that it *is implemented "
+            "by*), fetch THAT issue the same way and pass it as "
+            "`parent_issue` -- on a backend/task ticket the requirement "
+            "usually lives there, and its one-line link title is not "
+            "enough. Send at most one. Immediately call "
+            f"`qa_stage_jira(stage_token='{token}', part='parent', "
+            "json=<STRINGIFIED result of THIS fetch only>)` before doing "
+            "anything else."
+        )
+        step += 1
+    if want_parent and settings.jira_fetch_sibling_stories:
+        lines.append(
+            f"{step}. If there WAS a parent, also call "
+            f"`{prefix}searchJiraIssuesUsingJql` with `jql` = "
+            '"parent = <THAT PARENT KEY> ORDER BY key", `fields` = '
+            "[`summary`, `status`], `responseContentFormat` = "
+            f'"markdown", `searchResultMode` = "all" '
+            f"and `maxResults` = "
+            f"{settings.jira_max_sibling_stories}. Pass the "
+            f"whole result object back (its `total` lets me "
+            f"say how many stories I did NOT read). The "
+            "sibling user stories under that parent carry requirements this "
+            "ticket inherits, and their one-line titles alone are not "
+            "enough. Skip this step when there is no parent. Immediately "
+            f"call `qa_stage_jira(stage_token='{token}', part='siblings', "
+            "json=<STRINGIFIED result of THIS fetch only>)` when you do "
+            "run it."
+        )
+    return lines
+
+
+def _directive_head(
+    prefix: str, target: str, token: str, want_comments: bool, ac_field: str
+) -> list[str]:
+    """The opening of the fetch directive: the auth hard-stop and step 1."""
+    return [
+        "\U0001f517 **Fetch this Jira ticket with your own Atlassian MCP "
+        "connection, then call me back.**",
+        "",
+        "This server no longer holds Jira credentials - you do, via OAuth. "
+        "Do this now (a read-only fetch; no need to ask first). If the call "
+        "fails with an auth error (401/403, not connected, token expired), "
+        "STOP and tell the user: authenticate `atlassian` in your editor "
+        "(Cursor: MCP settings -> Connect; Claude Code: /mcp), then retry. "
+        "Never read tokens, keychains, credential files, or other "
+        "workspaces' files to get around it:",
+        "",
+        f"1. Call `{prefix}getJiraIssue` for {target} with `fields` "
+        "including `summary,description,priority,labels,components,"
+        "issuetype,status,updated,parent,subtasks,issuelinks,attachment"
+        + (",comment" if want_comments else "")
+        + (f",{ac_field}" if ac_field else "")
+        + "`. Immediately call `qa_stage_jira(stage_token='"
+        + token
+        + "', part='issue', json=<STRINGIFIED result of THIS fetch "
+        "only>)` before doing anything else - do not wait to collect "
+        "the parent or siblings.",
+    ]
+
+
+def _directive_tail(step: int, token: str, url: str) -> list[str]:
+    """The closing step, the verbatim-staging rules and the not-connected text."""
+    return [
+        f"{step}. Call `qa_prepare_test_cases` again with the SAME "
+        "`feature_or_url` plus `stage_token='"
+        + token
+        + "'` - do NOT pass `jira_content_json`; the parts you staged "
+        "with `qa_stage_jira` above are assembled server-side. If a "
+        "staging call was rejected, fix that part and re-stage it "
+        "before calling `qa_prepare_test_cases`.",
+        "",
+        "Stage each fetch VERBATIM. Do NOT summarise, reword, translate "
+        "or truncate it, and do NOT strip fields - `fields.updated` in "
+        "particular is how I tell whether the payload you sent is a fresh "
+        "read or a cached copy, and I say so in the reply.",
+        "",
+        "RULES: qa_* MCP tools are the only path - never import handlers "
+        "or spawn your own MCP client; never read tokens/keychains; "
+        "generate NEW cases, never resubmit an old export; never edit or "
+        "strip the staged ticket content.",
+        "",
+        "**If you have no `atlassian` MCP server connected** (the tools above "
+        "do not exist in your tool list), do NOT guess the ticket contents and "
+        "do NOT generate test cases from the URL alone. Show the user this "
+        "instead:",
+        "",
+        not_connected_message((urlparse(url).hostname or "")),
+    ]
+
+
+def _provenance_block(
+    fields: dict, key: str, key_assumed_from_url: bool, raw_text: str
+) -> dict:
+    """Where the result came from: the key, its source, the snapshot stamp."""
+    return {
+        "content": raw_text,
+        "issue_key": key,
+        # Additive key (2026-09-02): True when the payload carried no `key`
+        # and the URL's key was assumed. Read by _grounding_source_note.
+        "issue_key_from_url": key_assumed_from_url,
+        # Additive key (2026-08-10): the issue's own last-modified stamp,
+        # echoed back so the server can DISCLOSE which snapshot a
+        # generation ran on. UNTRUSTED like every other echoed field: one
+        # line, URL-free, backtick-free, capped. A host that trimmed
+        # `fields` yields "".
+        "updated": _sanitize_echo(fields.get("updated"), 40),
+        "source": "atlassian_mcp",
+        "error": None,
+    }
+
+
+def _description_image_block(description: str, description_truncated: bool) -> dict:
+    """The disclosures about images embedded IN the description."""
+    # Independent of `attachment`, so a host that trims the issue JSON cannot
+    # silence them. `description_truncated` is True when _MAX_ADF_DEPTH stopped
+    # the description walk, so a caller can tell a short ticket from an unread
+    # one (B1, 2026-09-01).
+    return {
+        "description_truncated": description_truncated,
+        "description_image_refs": _count_image_refs(description),
+        "description_image_labels": _image_ref_labels(description),
+    }
+
+
+def _image_block(fields: dict, description: str, description_truncated: bool) -> dict:
+    """Every image-related key: attachments, embedded refs and the disclosures."""
+    attachments, media_refs = _ranked_attachments(fields)
+    return {
+        # The Atlassian MCP server returns attachment METADATA, not bytes,
+        # and this module makes no outbound HTTP requests - so ticket
+        # screenshots cannot ride along any more. Report it rather than
+        # silently pretending the ticket had none.
+        "images": [],
+        "image_attachments": attachments,
+        "images_unavailable": bool(attachments),
+        # Additive key (2026-08-09): ADF media nodes found in the
+        # description and the comment bodies.
+        "media_refs": media_refs,
+        # v1.97.0 cursor-hardening (item 7): cross-checks THREE
+        # independently-tamperable signals (description labels, embedded
+        # media, attachments) so deleting only `fields.attachment` no
+        # longer erases the evidence trail.
+        "image_reference_advisory": _screen_reference_advisory(
+            description, attachments, media_refs
+        ),
+        # "The ticket has no images" and "nobody requested the attachment
+        # field" are different facts, and only the first is safe to stay
+        # quiet about: a host may have trimmed `attachment` out of `fields`.
+        "attachments_unknown": bool(
+            settings.jira_fetch_images
+            and isinstance(fields, dict)
+            and "attachment" not in fields
+        ),
+        **_description_image_block(description, description_truncated),
+    }
+
+
+def _context_block(fields: dict, payload: dict, key: str) -> dict:
+    """Parent, subtasks, links, sibling stories and the folded parent context."""
+    parent, subtasks, issuelinks, siblings, parent_context = _parent_grounding(
+        fields, payload, key
+    )
+    return {
+        "parent": parent,
+        "subtasks": subtasks,
+        "issuelinks": issuelinks,
+        # Additive key (2026-08-03): WHICH sibling stories were folded into
+        # parent_context.
+        "sibling_stories": siblings,
+        "parent_context": parent_context,
+    }
+
+
+def _text_block(
+    fields: dict, title: str, description: str, any_truncated: bool
+) -> dict:
+    """Title, body text, priority, labels, comments and acceptance criteria."""
+    priority = _extract_priority(fields)
+    labels = _extract_names(fields.get("labels"))
+    components = _extract_names(fields.get("components"))
+
+    comment_records = _extract_comment_records(fields)
+    comments = _comment_lines(comment_records)[-settings.jira_max_comments :][::-1]
+    meta_block = _compose_meta_block(
+        fields, any_truncated, priority, labels, components
+    )
+    # resolve_ac_field re-checks usability and, when enabled, looks for a
+    # custom field whose value actually reads like requirements.
+    _ac_field_id, ac_value, _ac_reason = resolve_ac_field(fields)
+    return {
+        "title": title,
+        "description": description,
+        "acceptance_criteria": ac_value or _extract_ac_from_description(description),
+        "priority": priority,
+        "labels": labels,
+        "components": components,
+        "comments": comments,
+        "comments_meta": comment_records,
+        "raw_text": _compose_raw_text(title, meta_block, description, comments),
+    }
+
+
+def _payload_failure_result() -> dict:
+    """The never-raise refusal for a payload that blew up mid-normalisation."""
+    return {
+        "error": (
+            "⚠️ I couldn't process that Jira payload. Re-run the "
+            "`getJiraIssue` call and pass its RAW JSON result unmodified, or "
+            "paste the ticket text and I'll generate test cases from it."
+        ),
+        "content": None,
+        "needs_jira_mcp": False,
+    }
+
+
 def _extract_ac_from_uc_table(description: str) -> str:
     """Pull acceptance criteria out of a USE-CASE TABLE description.
 
@@ -536,21 +867,10 @@ def _extract_ac_from_uc_table(description: str) -> str:
             return ""
         out: list[str] = []
         for line in description.splitlines():
-            m = _UC_ROW_RE.match(line.strip())
-            if not m:
+            criterion = _uc_row_criterion(line)
+            if not criterion:
                 continue
-            label = " ".join(m.group(1).split()).strip("*: ").casefold()
-            if label not in _UC_AC_LABELS:
-                continue
-            body = m.group(2)
-            body = _UC_CUSTOM_TAG_RE.sub(" ", body)
-            body = body.replace("|", " ").replace("*", "").replace("\\", "")
-            body = " ".join(body.split())
-            if not body:
-                continue
-            out.append(
-                f"{m.group(1).strip('*: ').strip()}: {body[:_UC_MAX_CRITERION_CHARS]}"
-            )
+            out.append(criterion)
             if len(out) >= _UC_MAX_CRITERIA:
                 break
         return "\n".join(out)
@@ -616,6 +936,37 @@ def _ac_field_discovery_on() -> bool:
     return False
 
 
+def _discovery_off_reason(raw: str) -> str:
+    """Why the configured AC field was not used when discovery is off."""
+    if raw:
+        return (
+            "configured field holds no requirement text "
+            f"({raw[:40]!r}); discovery is off"
+        )
+    return "configured field is empty; discovery is off"
+
+
+def _discover_ac_field(fields: dict, configured: str) -> tuple[str, str]:
+    """(field_id, value) of the longest plausible other custom field, or ("", "")."""
+    best_id = ""
+    best_val = ""
+    for index, (key, value) in enumerate(fields.items()):
+        if index >= _AC_DISCOVERY_MAX_FIELDS:
+            break
+        if not isinstance(key, str) or not key.startswith("customfield_"):
+            continue
+        if key == configured:
+            continue
+        candidate = _as_text(value).strip()[:_AC_DISCOVERY_MAX_CHARS]
+        if len(candidate) < _AC_DISCOVERY_MIN_CHARS:
+            continue
+        if not _usable_ac_text(candidate):
+            continue
+        if len(candidate) > len(best_val):
+            best_id, best_val = key, candidate
+    return best_id, best_val
+
+
 def resolve_ac_field(fields: object) -> tuple[str, str, str]:
     """(field_id, raw_value, reason) for the acceptance-criteria source.
 
@@ -644,34 +995,9 @@ def resolve_ac_field(fields: object) -> tuple[str, str, str]:
         raw = _as_text(fields.get(configured)).strip()
         if _usable_ac_text(raw):
             return configured, raw, "configured field"
-        rejected = bool(raw)
         if not _ac_field_discovery_on():
-            return (
-                configured,
-                "",
-                (
-                    "configured field holds no requirement text "
-                    f"({raw[:40]!r}); discovery is off"
-                )
-                if rejected
-                else "configured field is empty; discovery is off",
-            )
-        best_id = ""
-        best_val = ""
-        for index, (key, value) in enumerate(fields.items()):
-            if index >= _AC_DISCOVERY_MAX_FIELDS:
-                break
-            if not isinstance(key, str) or not key.startswith("customfield_"):
-                continue
-            if key == configured:
-                continue
-            candidate = _as_text(value).strip()[:_AC_DISCOVERY_MAX_CHARS]
-            if len(candidate) < _AC_DISCOVERY_MIN_CHARS:
-                continue
-            if not _usable_ac_text(candidate):
-                continue
-            if len(candidate) > len(best_val):
-                best_id, best_val = key, candidate
+            return configured, "", _discovery_off_reason(raw)
+        best_id, best_val = _discover_ac_field(fields, configured)
         if best_val:
             logger.info(
                 "AC-field discovery chose %s over the configured %s",
@@ -1118,26 +1444,10 @@ def _extract_image_attachments(fields: dict) -> list[dict]:
             return []
         out: list[dict] = []
         for att in attachments:
-            if not isinstance(att, dict):
+            record = _image_attachment_record(att)
+            if record is None:
                 continue
-            mime = str(att.get("mimeType") or "").lower()
-            if not mime.startswith("image/"):
-                continue
-            out.append(
-                {
-                    "filename": str(att.get("filename") or "attachment"),
-                    "mime": mime,
-                    "size": att.get("size") or 0,
-                    # Metadata only -- see the docstring. Nothing in this
-                    # process reads them: the credentialed fetch that used to is
-                    # retired. Length-capped because they are untrusted stored
-                    # strings.
-                    "id": str(att.get("id") or "")[:_MAX_ATTACHMENT_ID_CHARS],
-                    "content": str(att.get("content") or "")[
-                        :_MAX_ATTACHMENT_URL_CHARS
-                    ],
-                }
-            )
+            out.append(record)
             # NOT `jira_max_images` -- see _MAX_IMAGE_ATTACHMENTS_SCANNED.
             # The delivery cap is applied at the call site, AFTER the inline
             # join and the ordering it feeds; applying it here silently
@@ -1148,6 +1458,25 @@ def _extract_image_attachments(fields: dict) -> list[dict]:
     except Exception:
         logger.exception("Extracting Jira image attachment metadata failed")
         return []
+
+
+def _image_attachment_record(att: object) -> dict | None:
+    """One attachment's metadata record, or None when it is not an image."""
+    if not isinstance(att, dict):
+        return None
+    mime = str(att.get("mimeType") or "").lower()
+    if not mime.startswith("image/"):
+        return None
+    return {
+        "filename": str(att.get("filename") or "attachment"),
+        "mime": mime,
+        "size": att.get("size") or 0,
+        # Metadata only -- see _extract_image_attachments. Nothing in this
+        # process reads them: the credentialed fetch that used to is
+        # retired. Length-capped because they are untrusted stored strings.
+        "id": str(att.get("id") or "")[:_MAX_ATTACHMENT_ID_CHARS],
+        "content": str(att.get("content") or "")[:_MAX_ATTACHMENT_URL_CHARS],
+    }
 
 
 def _extract_parent_ref(fields: dict) -> dict | None:
@@ -1328,6 +1657,49 @@ def _count_sibling_candidates(payload: dict, target_key: str = "") -> int:
         return 0
 
 
+def _sibling_items(payload: dict) -> object:
+    """The raw ``sibling_issues`` list, unwrapped from a JQL response if needed."""
+    items = payload.get("sibling_issues") if isinstance(payload, dict) else None
+    if isinstance(items, dict):
+        # Accept the RAW JQL response shape as well as a bare list, so a
+        # host that pastes the tool result unmodified works. 2026-08-31
+        # (F8): the LIVE server nests one level deeper -- {"issues":
+        # {"totalCount": n, "nodes": [...]}} -- so this unwrapped to a DICT,
+        # failed the list check and dropped every sibling BODY, while
+        # _count_sibling_candidates (which does read totalCount) kept
+        # reporting how many siblings existed. The count and the bodies
+        # disagreed by construction.
+        items = _issue_nodes(items) or items.get("issues")
+    return items
+
+
+def _sibling_record(item: dict, key: str, per_issue: int) -> dict | None:
+    """One sibling's capped record, or None for a title-only sibling."""
+    sfields = _issue_fields(item)
+    desc = _flatten_table_text(_as_text(sfields.get("description")))[:per_issue]
+    # SAME gate as the target ticket's own AC (see _usable_ac_text):
+    # JIRA_AC_FIELD is a per-instance GUESS and is a DATE field on this
+    # workspace, so a live 2026-08-03 run rendered SIX sibling entries as
+    # "Acceptance criteria: 2026-05-06T11:27:27.047+0300". Reusing the
+    # gate keeps this path and rtm's downstream judgement in agreement.
+    sac_raw = _as_text(sfields.get(settings.jira_ac_field))
+    sac = _flatten_table_text(sac_raw)[:per_issue] if _usable_ac_text(sac_raw) else ""
+    if not desc and not sac:
+        # Title-only siblings add nothing _extract_subtasks does not
+        # already list, and each one costs budget.
+        return None
+    itype = sfields.get("issuetype")
+    return {
+        "key": key,
+        "issuetype": (
+            str(itype.get("name") or "").strip() if isinstance(itype, dict) else ""
+        ),
+        "summary": str(sfields.get("summary") or "").strip(),
+        "description": desc,
+        "acceptance_criteria": sac,
+    }
+
+
 def _extract_sibling_bodies(payload: dict, target_key: str = "") -> list[dict]:
     """[{key, issuetype, summary, description, acceptance_criteria}] for the user
     stories under the same parent.
@@ -1348,17 +1720,7 @@ def _extract_sibling_bodies(payload: dict, target_key: str = "") -> list[dict]:
     try:
         if not settings.jira_fetch_sibling_stories:
             return []
-        items = payload.get("sibling_issues") if isinstance(payload, dict) else None
-        if isinstance(items, dict):
-            # Accept the RAW JQL response shape as well as a bare list, so a
-            # host that pastes the tool result unmodified works. 2026-08-31
-            # (F8): the LIVE server nests one level deeper -- {"issues":
-            # {"totalCount": n, "nodes": [...]}} -- so this unwrapped to a DICT,
-            # failed the list check below and dropped every sibling BODY, while
-            # _count_sibling_candidates (which does read totalCount) kept
-            # reporting how many siblings existed. The count and the bodies
-            # disagreed by construction.
-            items = _issue_nodes(items) or items.get("issues")
+        items = _sibling_items(payload)
         if not isinstance(items, list):
             return []
         target = _valid_issue_key(target_key)
@@ -1373,43 +1735,90 @@ def _extract_sibling_bodies(payload: dict, target_key: str = "") -> list[dict]:
             key = _valid_issue_key(item.get("key"))
             if not key or key == target:
                 continue
-            sfields = _issue_fields(item)
-            desc = _flatten_table_text(_as_text(sfields.get("description")))[:per_issue]
-            # SAME gate as the target ticket's own AC (see _usable_ac_text):
-            # JIRA_AC_FIELD is a per-instance GUESS and is a DATE field on this
-            # workspace, so a live 2026-08-03 run rendered SIX sibling entries as
-            # "Acceptance criteria: 2026-05-06T11:27:27.047+0300". Reusing the
-            # gate keeps this path and rtm's downstream judgement in agreement.
-            sac_raw = _as_text(sfields.get(settings.jira_ac_field))
-            sac = (
-                _flatten_table_text(sac_raw)[:per_issue]
-                if _usable_ac_text(sac_raw)
-                else ""
-            )
-            if not desc and not sac:
-                # Title-only siblings add nothing _extract_subtasks does not
-                # already list, and each one costs budget.
+            record = _sibling_record(item, key, per_issue)
+            if record is None:
                 continue
-            itype = sfields.get("issuetype")
-            out.append(
-                {
-                    "key": key,
-                    "issuetype": (
-                        str(itype.get("name") or "").strip()
-                        if isinstance(itype, dict)
-                        else ""
-                    ),
-                    "summary": str(sfields.get("summary") or "").strip(),
-                    "description": desc,
-                    "acceptance_criteria": sac,
-                }
-            )
+            out.append(record)
             if len(out) >= max_stories:
                 break
         return out
     except Exception:
         logger.exception("Extracting sibling user stories failed")
         return []
+
+
+def _context_parent_lines(parent: dict) -> list[str]:
+    """The BACKGROUND lines for the parent issue itself."""
+    label = parent.get("issuetype") or "issue"
+    head = f"Parent {label} {parent['key']}: {parent.get('summary', '')}"
+    lines = [head.strip()]
+    desc = str(parent.get("description") or "").strip()
+    if desc:
+        lines += ["", desc]
+    pac = str(parent.get("acceptance_criteria") or "").strip()
+    if pac:
+        lines += ["", "Parent acceptance criteria:", pac]
+    return lines
+
+
+def _context_subtask_lines(subtasks: list[dict], has_parent: bool) -> list[str]:
+    """The heading plus one line per sub-task for the BACKGROUND block."""
+    heading = (
+        "Other sub-tasks under the same parent (context only):"
+        if has_parent
+        else "Sub-tasks this story is broken down into (context only):"
+    )
+    lines = ["", heading]
+    for sub_task in subtasks:
+        status = str(sub_task.get("status") or "").strip()
+        suffix = f" [{status}]" if status else ""
+        lines.append(
+            f"- {sub_task['key']}: {sub_task.get('summary', '')}{suffix}".rstrip()
+        )
+    return lines
+
+
+def _sibling_block(sib: dict) -> str:
+    """One sibling story rendered as an indented text block."""
+    head = f"- {sib['key']}"
+    itype = str(sib.get("issuetype") or "").strip()
+    if itype:
+        head += f" ({itype})"
+    sib_summary = str(sib.get("summary") or "").strip()
+    if sib_summary:
+        head += f": {sib_summary}"
+    block = [head.rstrip()]
+    sib_desc = str(sib.get("description") or "").strip()
+    if sib_desc:
+        block.append(f"    {sib_desc}")
+    sib_ac = str(sib.get("acceptance_criteria") or "").strip()
+    if sib_ac:
+        block += ["    Acceptance criteria:", f"    {sib_ac}"]
+    return "\n".join(block)
+
+
+def _context_sibling_lines(siblings: list[dict], sibling_total: int) -> list[str]:
+    """The disclosure heading plus the sibling blocks, within the char budget."""
+    # A dropped story is disclosed, never silent: the tester has to know
+    # the background is a SAMPLE before trusting its coverage.
+    shown = len(siblings)
+    scope = f" -- showing {shown} of {sibling_total}" if sibling_total > shown else ""
+    lines = [
+        "",
+        f"Sibling user stories under the same parent{scope} (context only "
+        "-- requirements they state can apply to this ticket, but they "
+        "are NOT the thing under test):",
+    ]
+    budget = max(0, settings.jira_max_sibling_chars)
+    for sib in siblings:
+        if budget <= 0:
+            break
+        chunk = _sibling_block(sib)
+        if len(chunk) > budget:
+            chunk = chunk[:budget]
+        budget -= len(chunk)
+        lines.append(chunk)
+    return lines
 
 
 def _build_parent_context(
@@ -1432,28 +1841,9 @@ def _build_parent_context(
         has_parent = bool(parent and parent.get("key"))
         lines: list[str] = []
         if has_parent:
-            label = parent.get("issuetype") or "issue"
-            head = f"Parent {label} {parent['key']}: {parent.get('summary', '')}"
-            lines.append(head.strip())
-            desc = str(parent.get("description") or "").strip()
-            if desc:
-                lines += ["", desc]
-            pac = str(parent.get("acceptance_criteria") or "").strip()
-            if pac:
-                lines += ["", "Parent acceptance criteria:", pac]
+            lines += _context_parent_lines(parent)
         if subtasks:
-            heading = (
-                "Other sub-tasks under the same parent (context only):"
-                if has_parent
-                else "Sub-tasks this story is broken down into (context only):"
-            )
-            lines += ["", heading]
-            for sub_task in subtasks:
-                status = str(sub_task.get("status") or "").strip()
-                suffix = f" [{status}]" if status else ""
-                lines.append(
-                    f"- {sub_task['key']}: {sub_task.get('summary', '')}{suffix}".rstrip()
-                )
+            lines += _context_subtask_lines(subtasks, has_parent)
         if issuelinks:
             lines += ["", "Linked issues (context only):"]
             lines += [
@@ -1462,43 +1852,7 @@ def _build_parent_context(
                 for ln in issuelinks
             ]
         if siblings:
-            # A dropped story is disclosed, never silent: the tester has to know
-            # the background is a SAMPLE before trusting its coverage.
-            shown = len(siblings)
-            scope = (
-                f" -- showing {shown} of {sibling_total}"
-                if sibling_total > shown
-                else ""
-            )
-            lines += [
-                "",
-                f"Sibling user stories under the same parent{scope} (context only "
-                "-- requirements they state can apply to this ticket, but they "
-                "are NOT the thing under test):",
-            ]
-            budget = max(0, settings.jira_max_sibling_chars)
-            for sib in siblings:
-                if budget <= 0:
-                    break
-                head = f"- {sib['key']}"
-                itype = str(sib.get("issuetype") or "").strip()
-                if itype:
-                    head += f" ({itype})"
-                sib_summary = str(sib.get("summary") or "").strip()
-                if sib_summary:
-                    head += f": {sib_summary}"
-                block = [head.rstrip()]
-                sib_desc = str(sib.get("description") or "").strip()
-                if sib_desc:
-                    block.append(f"    {sib_desc}")
-                sib_ac = str(sib.get("acceptance_criteria") or "").strip()
-                if sib_ac:
-                    block += ["    Acceptance criteria:", f"    {sib_ac}"]
-                chunk = "\n".join(block)
-                if len(chunk) > budget:
-                    chunk = chunk[:budget]
-                budget -= len(chunk)
-                lines.append(chunk)
+            lines += _context_sibling_lines(siblings, sibling_total)
         text = "\n".join(lines).strip()
         if not text:
             return ""
@@ -1575,17 +1929,9 @@ def _linked_parent_ref(fields: dict, parent_issue: object) -> dict | None:
         key = _valid_issue_key(raw_key)
         if not key:
             return None
-        linked = {
-            item.get("key"): item
-            for item in _extract_issuelinks(fields)
-            if isinstance(item, dict)
-        }
-        if key not in linked:
-            logger.info(
-                "parent_issue %s is not linked from this ticket -- ignoring it.", key
-            )
+        ref = _own_link_ref(fields, key)
+        if ref is None:
             return None
-        ref = linked[key]
         return {
             "key": key,
             "summary": str(ref.get("summary") or "").strip(),
@@ -1804,33 +2150,18 @@ def _local_config_paths(
         return []
 
     parts = (".cursor", "mcp.json") if client_key == "cursor" else (".mcp.json",)
-    candidates: list[Path] = []
-    seen: set[str] = set()
-
-    def _add(path: Path) -> None:
-        key = str(path)
-        if key not in seen:
-            seen.add(key)
-            candidates.append(path)
-
-    for root in workspace_roots or []:
-        try:
-            _add(Path(root).joinpath(*parts))
-        except Exception:
-            logger.debug("ignoring unusable workspace root %r", root, exc_info=True)
-            continue
-
-    _add(_INSTALL_ROOT.joinpath(*parts))
+    candidates = _workspace_config_paths(workspace_roots, parts)
+    candidates.append(_INSTALL_ROOT.joinpath(*parts))
     try:
-        _add(Path.cwd().joinpath(*parts))
+        candidates.append(Path.cwd().joinpath(*parts))
     except OSError:
         pass
 
     if client_key == "cursor":
         home = _home_dir()
         if home is not None:
-            _add(home / ".cursor" / "mcp.json")
-    return candidates
+            candidates.append(home / ".cursor" / "mcp.json")
+    return list(dict.fromkeys(candidates))
 
 
 def _local_atlassian_entry_exists(
@@ -1879,6 +2210,39 @@ def atlassian_entry_configured(workspace_roots: list[Path] | None = None) -> boo
     return False
 
 
+def _hint_client_key() -> str:
+    """The detected client key, or "" when the host lookup fails."""
+    try:
+        return _detect_client_key(llm.get_host_client())
+    except Exception:
+        return ""
+
+
+def _entry_on_disk(key: str, workspace_roots: list[Path] | None) -> bool:
+    """Whether an `atlassian` entry is found on disk; a failed lookup is False."""
+    try:
+        return _local_atlassian_entry_exists(key, workspace_roots=workspace_roots)
+    except Exception:
+        return False
+
+
+def _already_configured_hint(key: str) -> str:
+    """The sentence for a client whose `atlassian` entry is already on disk."""
+    return (
+        "An `atlassian` MCP entry is already configured on disk for "
+        f"{key.replace('-', ' ').title()}. I can't tell from here whether "
+        "it's actually authorized - if pasting a Jira ticket URL doesn't "
+        "work, restart your editor (OAuth sessions can also expire and "
+        "need re-authenticating)."
+    )
+
+
+def _client_detail(key: str) -> str:
+    """The per-client connect detail, without its leading label."""
+    detail = _CONNECT_STEPS_BY_CLIENT[key].strip()
+    return detail.split(" - ", 1)[1] if " - " in detail else detail
+
+
 def connect_hint_line(
     workspace_roots: list[Path] | None = None, *, verify_offered: bool = False
 ) -> str:
@@ -1903,19 +2267,10 @@ def connect_hint_line(
     Falls back to a short all-clients summary when the host is
     empty/unrecognized. Never raises.
     """
-    try:
-        key = _detect_client_key(llm.get_host_client())
-    except Exception:
-        key = ""
+    key = _hint_client_key()
     base = "To paste Jira ticket URLs, connect the Atlassian MCP server"
     if key:
-        try:
-            already_configured = _local_atlassian_entry_exists(
-                key, workspace_roots=workspace_roots
-            )
-        except Exception:
-            already_configured = False
-        if already_configured:
+        if _entry_on_disk(key, workspace_roots):
             if verify_offered:
                 # 2026-08-31: the caller already emits a "Fix now" item that
                 # tells the agent how to SETTLE this in one read-only call.
@@ -1923,16 +2278,8 @@ def connect_hint_line(
                 # report answer and shrug at the same question, and buries
                 # the actionable item under a redundant optional one.
                 return ""
-            return (
-                "An `atlassian` MCP entry is already configured on disk for "
-                f"{key.replace('-', ' ').title()}. I can't tell from here whether "
-                "it's actually authorized - if pasting a Jira ticket URL doesn't "
-                "work, restart your editor (OAuth sessions can also expire and "
-                "need re-authenticating)."
-            )
-        detail = _CONNECT_STEPS_BY_CLIENT[key].strip()
-        detail = detail.split(" - ", 1)[1] if " - " in detail else detail
-        return f"{base} - {detail}"
+            return _already_configured_hint(key)
+        return f"{base} - {_client_detail(key)}"
     return (
         f"{base} in your editor (Claude Code: `/mcp`; Claude Desktop: Settings > "
         "Connectors; Cursor: edit `.cursor/mcp.json`; Gemini CLI: `gemini mcp add`). "
@@ -2289,6 +2636,25 @@ def _render_sites(sites: object) -> str:
         return ""
 
 
+def _site_hosts(sites: list) -> tuple[list, list]:
+    """(all hosts read from *sites*, the subset that is EXPLICIT).
+
+    A host is EXPLICIT when the client structured it -- a dict entry, or a
+    string carrying a scheme. A bare dotted hostname is our inference, and
+    an inference may confirm a match but must never establish a miss.
+    """
+    hosts = []
+    explicit = []
+    for entry in sites:
+        host = _site_host(entry)
+        if not host:
+            continue
+        hosts.append(host)
+        if isinstance(entry, dict) or (isinstance(entry, str) and "://" in entry):
+            explicit.append(host)
+    return hosts, explicit
+
+
 def access_verdict(sites: object) -> str:
     """One of ``not_supplied``, ``sites_error``, ``unreadable``, ``empty``,
     ``no_host``, ``no_match``, ``match``.
@@ -2316,18 +2682,7 @@ def access_verdict(sites: object) -> str:
             return "sites_error"
         if not isinstance(sites, list):
             return "unreadable"
-        hosts = []
-        # A host is EXPLICIT when the client structured it -- a dict entry, or a
-        # string carrying a scheme. A bare dotted hostname is our inference, and
-        # an inference may confirm a match but must never establish a miss.
-        explicit = []
-        for entry in sites:
-            host = _site_host(entry)
-            if not host:
-                continue
-            hosts.append(host)
-            if isinstance(entry, dict) or (isinstance(entry, str) and "://" in entry):
-                explicit.append(host)
+        hosts, explicit = _site_hosts(sites)
         if not hosts:
             # ("inferred" joins "unreadable" as a non-accusing outcome: both
             # report the sign-in and decline to judge the site.)
@@ -2781,64 +3136,8 @@ def verify_outcome(raw: object) -> tuple[str, str]:
         parsed = _parse_verify_payload(raw)
         if isinstance(parsed, tuple):
             return parsed
-        payload = _unwrap_mcp_content(parsed)
-        # The blob may now carry BOTH probe results. `probe` is the half
-        # that answers "is there a session"; every identity check below
-        # runs on it rather than on the whole envelope, so a string inside
-        # a site entry can never be read as an identity.
-        identity, sites, envelope = _split_envelope(payload)
-        probe = identity if envelope else payload
-        # THE INVARIANT, in the order it has to be applied:
-        #   1. an error marker carrying TEXT is a failure, whatever else is here;
-        #   2. otherwise identity evidence wins -- an EMPTY errorMessages/errors
-        #      container is what a SUCCESSFUL Jira envelope carries, and letting
-        #      it beat a valid account_id persisted "not connected" for a week
-        #      about a working connection;
-        #   3. an error marker with no text and no identity is still a failure;
-        #   4. anything else establishes nothing -- "unknown", never written.
-        failure = _error_text(probe)
-        identified = _has_identity(probe)
-        if failure or (_carries_error_key(probe) and not identified):
-            return (
-                "failed",
-                "\u274c **Not connected** -- that Atlassian call did not "
-                f"return an identity: {failure or _NO_IDENTITY}\n\n" + connect_steps(),
-            )
-        if not probe:
-            return (
-                "unknown",
-                "\u26a0\ufe0f **That verification result was empty**, so I "
-                "still can't confirm the Atlassian connection. Re-run "
-                f"`{verify_tool_name()}` and pass its RAW JSON result as "
-                "`atlassian_verify_json`.\n\n" + connect_hint_line(),
-            )
-        # A payload with no error and no identity establishes NOTHING. It used
-        # to report "verified -- connected (identity payload received)", which
-        # was a guess dressed as a result; now that the verdict is persisted for
-        # a week, that guess would silence the real question for seven days. An
-        # unrecognized shape is "unknown": the caller writes nothing, and the
-        # tester is told what is missing.
-        # `identified` DECIDES; the label only renders. Written the other way
-        # round -- label first, evidence as the fallback -- a bare `name` was
-        # its own proof, which is how a Jira status called "High" reported
-        # "connected as High" while _has_identity said False.
-        who = (
-            (_identity_label(probe) or "connected (identity payload received)")
-            if identified
-            else ""
-        )
-        if not who:
-            return (
-                "unknown",
-                "\u26a0\ufe0f **That result carried no identity**, so I still "
-                "can't confirm the Atlassian connection. A working "
-                f"`{verify_tool_name()}` call returns your account details. "
-                "Re-run it and pass its RAW JSON result as "
-                "`atlassian_verify_json`, or pass "
-                '`{"error": "<what happened>"}` if the call failed.\n\n'
-                + connect_hint_line(),
-            )
-        return _render_verified(who, sites)
+        probe, sites = _probe_and_sites(_unwrap_mcp_content(parsed))
+        return _probe_verdict(probe, sites)
     except Exception:
         logger.exception("verify_outcome failed - falling back")
         return (
@@ -2871,91 +3170,10 @@ def build_fetch_directive(url: str, issue_key: str = "") -> str:
         # anyway produced `...,comment,`.` -- a trailing comma and an empty field
         # name -- so the request has to drop it instead.
         ac_field = str(getattr(settings, "jira_ac_field", "") or "").strip()
-        lines = [
-            "\U0001f517 **Fetch this Jira ticket with your own Atlassian MCP "
-            "connection, then call me back.**",
-            "",
-            "This server no longer holds Jira credentials - you do, via OAuth. "
-            "Do this now (a read-only fetch; no need to ask first). If the call "
-            "fails with an auth error (401/403, not connected, token expired), "
-            "STOP and tell the user: authenticate `atlassian` in your editor "
-            "(Cursor: MCP settings -> Connect; Claude Code: /mcp), then retry. "
-            "Never read tokens, keychains, credential files, or other "
-            "workspaces' files to get around it:",
-            "",
-            f"1. Call `{prefix}getJiraIssue` for {target} with `fields` "
-            "including `summary,description,priority,labels,components,"
-            "issuetype,status,updated,parent,subtasks,issuelinks,attachment"
-            + (",comment" if want_comments else "")
-            + (f",{ac_field}" if ac_field else "")
-            + "`. Immediately call `qa_stage_jira(stage_token='"
-            + token
-            + "', part='issue', json=<STRINGIFIED result of THIS fetch "
-            "only>)` before doing anything else - do not wait to collect "
-            "the parent or siblings.",
-        ]
-        step = 2
-        if want_parent:
-            lines.append(
-                f"{step}. If the result has a `fields.parent`, call "
-                f"`{prefix}getJiraIssue` a SECOND time for that parent key "
-                "(its description usually holds the real requirements). "
-                "If there is NO `fields.parent` but `fields.issuelinks` names "
-                "an issue this one *implements* (or that it *is implemented "
-                "by*), fetch THAT issue the same way and pass it as "
-                "`parent_issue` -- on a backend/task ticket the requirement "
-                "usually lives there, and its one-line link title is not "
-                "enough. Send at most one. Immediately call "
-                f"`qa_stage_jira(stage_token='{token}', part='parent', "
-                "json=<STRINGIFIED result of THIS fetch only>)` before doing "
-                "anything else."
-            )
-            step += 1
-        if want_parent and settings.jira_fetch_sibling_stories:
-            lines.append(
-                f"{step}. If there WAS a parent, also call "
-                f"`{prefix}searchJiraIssuesUsingJql` with `jql` = "
-                '"parent = <THAT PARENT KEY> ORDER BY key", `fields` = '
-                "[`summary`, `status`], `responseContentFormat` = "
-                f'"markdown", `searchResultMode` = "all" '
-                f"and `maxResults` = "
-                f"{settings.jira_max_sibling_stories}. Pass the "
-                f"whole result object back (its `total` lets me "
-                f"say how many stories I did NOT read). The "
-                "sibling user stories under that parent carry requirements this "
-                "ticket inherits, and their one-line titles alone are not "
-                "enough. Skip this step when there is no parent. Immediately "
-                f"call `qa_stage_jira(stage_token='{token}', part='siblings', "
-                "json=<STRINGIFIED result of THIS fetch only>)` when you do "
-                "run it."
-            )
-            step += 1
-        lines += [
-            f"{step}. Call `qa_prepare_test_cases` again with the SAME "
-            "`feature_or_url` plus `stage_token='"
-            + token
-            + "'` - do NOT pass `jira_content_json`; the parts you staged "
-            "with `qa_stage_jira` above are assembled server-side. If a "
-            "staging call was rejected, fix that part and re-stage it "
-            "before calling `qa_prepare_test_cases`.",
-            "",
-            "Stage each fetch VERBATIM. Do NOT summarise, reword, translate "
-            "or truncate it, and do NOT strip fields - `fields.updated` in "
-            "particular is how I tell whether the payload you sent is a fresh "
-            "read or a cached copy, and I say so in the reply.",
-            "",
-            "RULES: qa_* MCP tools are the only path - never import handlers "
-            "or spawn your own MCP client; never read tokens/keychains; "
-            "generate NEW cases, never resubmit an old export; never edit or "
-            "strip the staged ticket content.",
-            "",
-            "**If you have no `atlassian` MCP server connected** (the tools above "
-            "do not exist in your tool list), do NOT guess the ticket contents and "
-            "do NOT generate test cases from the URL alone. Show the user this "
-            "instead:",
-            "",
-            not_connected_message((urlparse(url).hostname or "")),
-        ]
+        lines = _directive_head(prefix, target, token, want_comments, ac_field)
+        optional = _directive_optional_steps(prefix, token, want_parent)
+        lines += optional
+        lines += _directive_tail(2 + len(optional), token, url)
         return "\n".join(lines)
     except Exception:
         logger.exception("build_fetch_directive failed - returning the fallback")
@@ -3440,115 +3658,17 @@ def normalize_issue_payload(raw: object, source_url: str = "") -> dict:
             return _empty_source_result(any_truncated)
 
         title = summary_src or key or "Jira issue"
-        description = description_src
-        # 2026-08-10 (I2): the issue's own last-modified stamp, echoed back so
-        # the server can DISCLOSE which snapshot a generation ran on and warn
-        # when a host re-sends a cached payload older than one already used.
-        # UNTRUSTED like every other echoed field: one line, URL-free,
-        # backtick-free, capped. A host that trimmed `fields` yields "".
-        updated = _sanitize_echo(fields.get("updated"), 40)
-
-        priority = _extract_priority(fields)
-        labels = _extract_names(fields.get("labels"))
-        components = _extract_names(fields.get("components"))
-
-        comment_records = _extract_comment_records(fields)
-        comments = _comment_lines(comment_records)[-settings.jira_max_comments :][::-1]
-
-        parent, subtasks, issuelinks, siblings, parent_context = _parent_grounding(
-            fields, payload, key
-        )
-        meta_block = _compose_meta_block(
-            fields, any_truncated, priority, labels, components
-        )
-        raw_text = _compose_raw_text(title, meta_block, description, comments)
-
-        # resolve_ac_field re-checks usability and, when enabled, looks for a
-        # custom field whose value actually reads like requirements.
-        _ac_field_id, _ac_value, _ac_reason = resolve_ac_field(fields)
-        acceptance_criteria = _ac_value or _extract_ac_from_description(description)
-
-        attachments, media_refs = _ranked_attachments(fields)
+        text = _text_block(fields, title, description_src, any_truncated)
         result = {
-            "title": title,
-            "description": description,
-            "acceptance_criteria": acceptance_criteria,
-            "priority": priority,
-            "labels": labels,
-            "components": components,
-            "comments": comments,
-            "comments_meta": comment_records,
-            # The Atlassian MCP server returns attachment METADATA, not bytes,
-            # and this module makes no outbound HTTP requests - so ticket
-            # screenshots cannot ride along any more. Report it rather than
-            # silently pretending the ticket had none.
-            "images": [],
-            "image_attachments": attachments,
-            "images_unavailable": bool(attachments),
-            # Embedded-in-description images. Independent of `attachment`, so a
-            # host that trims the issue JSON cannot silence the disclosure -- the
-            # 22:17 live run had three UI screens and said nothing.
-            # True when _MAX_ADF_DEPTH stopped the description walk, so a caller
-            # can tell a short ticket from an unread one (B1, 2026-09-01).
-            "description_truncated": description_truncated,
-            "description_image_refs": _count_image_refs(description),
-            "description_image_labels": _image_ref_labels(description),
-            # Additive key (2026-08-09): ADF media nodes found in the
-            # description and the comment bodies. Downstream consumers that do
-            # not know about it are unaffected.
-            "media_refs": media_refs,
-            # v1.97.0 cursor-hardening (item 7): cross-checks THREE
-            # independently-tamperable signals (description labels, embedded
-            # media, attachments) so deleting only `fields.attachment` no
-            # longer erases the evidence trail. "" when nothing references
-            # screens or when at least one attachment/media node backs the
-            # reference up.
-            "image_reference_advisory": _screen_reference_advisory(
-                description, attachments, media_refs
-            ),
-            # "The ticket has no images" and "nobody requested the attachment
-            # field" are different facts, and only the first is safe to stay
-            # quiet about. A live 2026-08-03 run had three PNG attachments and an
-            # EMPTY image notice, because the host trimmed `attachment` out of
-            # its getJiraIssue `fields` -- silently reproducing the exact blind
-            # spot the notice exists to close.
-            "attachments_unknown": bool(
-                settings.jira_fetch_images
-                and isinstance(fields, dict)
-                and "attachment" not in fields
-            ),
-            "parent": parent,
-            "subtasks": subtasks,
-            "issuelinks": issuelinks,
-            # Additive key (2026-08-03). Downstream consumers read the historical
-            # set and ignore this; it exists so a caller can see WHICH sibling
-            # stories were folded into parent_context.
-            "sibling_stories": siblings,
-            "parent_context": parent_context,
-            "raw_text": raw_text,
-            "content": raw_text,
-            "issue_key": key,
-            # Additive key (2026-09-02): True when the payload carried no `key`
-            # and the URL's key was assumed. Read by _grounding_source_note.
-            "issue_key_from_url": key_assumed_from_url,
-            # Additive key (2026-08-10). Downstream consumers read the
-            # historical key set and are unaffected.
-            "updated": updated,
-            "source": "atlassian_mcp",
-            "error": None,
+            **text,
+            **_image_block(fields, description_src, description_truncated),
+            **_context_block(fields, payload, key),
+            **_provenance_block(fields, key, key_assumed_from_url, text["raw_text"]),
         }
         return result
     except Exception:
         logger.exception("normalize_issue_payload failed")
-        return {
-            "error": (
-                "⚠️ I couldn't process that Jira payload. Re-run the "
-                "`getJiraIssue` call and pass its RAW JSON result unmodified, or "
-                "paste the ticket text and I'll generate test cases from it."
-            ),
-            "content": None,
-            "needs_jira_mcp": False,
-        }
+        return _payload_failure_result()
 
 
 # --------------------------------------------------------------------------- #

@@ -263,6 +263,44 @@ def _pid_is_alive(pid: int | None) -> bool:
         return True  # no os.kill, a silly pid, anything: keep the file
 
 
+def _sweep_candidates(
+    directory: Path, prefix: str, active: str, now_ts: float
+) -> list[tuple[float, Path]]:
+    """Return (mtime, path) for every file the sweep may delete, newest first."""
+    entries: list[tuple[float, Path]] = []
+    for path in directory.glob(f"{prefix}-*.log*"):
+        try:
+            if active and path.name.startswith(active):
+                continue
+            if _pid_is_alive(_pid_from_name(path.name, prefix)):
+                continue
+            mtime = path.stat().st_mtime
+            # See _NON_POSIX_GRACE_S: off POSIX the pid check cannot help.
+            if _off_posix() and (now_ts - mtime) < _NON_POSIX_GRACE_S:
+                continue
+            entries.append((mtime, path))
+        except OSError:
+            continue
+    entries.sort(key=lambda item: item[0], reverse=True)
+    return entries
+
+
+def _delete_stale(
+    entries: list[tuple[float, Path]], keep_n: int, cutoff: float
+) -> list[str]:
+    """Delete entries beyond *keep_n* or older than *cutoff*; return names removed."""
+    removed: list[str] = []
+    for index, (mtime, path) in enumerate(entries):
+        if index < keep_n and mtime >= cutoff:
+            continue
+        try:
+            path.unlink()
+            removed.append(path.name)
+        except OSError:
+            logger.debug("could not delete the old log %s", path, exc_info=True)
+    return removed
+
+
 def sweep_old_logs(
     log_dir: str | Path,
     *,
@@ -297,29 +335,8 @@ def sweep_old_logs(
         now_ts = time.time() if now is None else float(now)
         cutoff = now_ts - max_age * 86400.0
         active = Path(skip).name if skip else ""
-        entries: list[tuple[float, Path]] = []
-        for path in Path(log_dir).glob(f"{prefix}-*.log*"):
-            try:
-                if active and path.name.startswith(active):
-                    continue
-                if _pid_is_alive(_pid_from_name(path.name, prefix)):
-                    continue
-                mtime = path.stat().st_mtime
-                # See _NON_POSIX_GRACE_S: off POSIX the pid check cannot help.
-                if _off_posix() and (now_ts - mtime) < _NON_POSIX_GRACE_S:
-                    continue
-                entries.append((mtime, path))
-            except OSError:
-                continue
-        entries.sort(key=lambda item: item[0], reverse=True)
-        for index, (mtime, path) in enumerate(entries):
-            if index < keep_n and mtime >= cutoff:
-                continue
-            try:
-                path.unlink()
-                removed.append(path.name)
-            except OSError:
-                logger.debug("could not delete the old log %s", path, exc_info=True)
+        entries = _sweep_candidates(Path(log_dir), prefix, active, now_ts)
+        removed.extend(_delete_stale(entries, keep_n, cutoff))
     except Exception:
         logger.debug("the log retention sweep failed", exc_info=True)
     return removed

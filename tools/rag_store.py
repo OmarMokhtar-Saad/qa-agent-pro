@@ -266,35 +266,27 @@ def _prune_sync(path: Path, cap: int) -> None:
         logger.exception("rag_store: prune failed for %s", path)
 
 
-def _delete_source_sync(path: Path, source_key: str, keep_ids: set) -> int:
-    """Drop entries whose ``metadata.source_key`` is *source_key* and whose
-    ``id`` is NOT in *keep_ids*.
+def _file_signature(path: Path) -> tuple[int, int] | None:
+    """The file's (size, mtime_ns), or None when it cannot be stat'ed."""
+    try:
+        st = path.stat()
+        return (st.st_size, st.st_mtime_ns)
+    except OSError:
+        return None
 
-    Returns how many were removed -- 0 when the file is missing, unreadable, or
-    holds nothing to remove. Atomic rewrite through a unique pid+uuid temp name,
-    exactly the discipline _prune_sync uses, so two cross-session writers cannot
-    clobber a shared temp; a failure is logged and NEVER raised, which leaves the
-    corpus untouched and the caller keeps both copies -- the behaviour that
-    predates this function.
 
-    LOST-WRITE GUARD (review W1): this is a read-modify-write over a file another
-    process may be APPENDING to (_save_entry_sync), and a plain rewrite would
-    silently drop anything appended between the read and the replace. The file's
-    (size, mtime_ns) is captured with the read and re-checked immediately before
-    tmp.replace; if it moved, the replace is ABANDONED and 0 is returned. That
-    trades a missed de-duplication (the next run removes it) against never losing
-    another writer's entry. It does not make the pre-existing _prune_sync race
-    disappear -- it only refuses to widen it.
+def _last_keep_index(entries: list, keep_ids: set) -> int:
+    """The insertion-order floor for a source replace.
 
     PRE-WINDOW LOST-WRITE NARROWING (2026-08-09, review M4). The stat guard
-    above only catches appends made INSIDE this call's read window. A peer client
-    whose same-source entries were appended BEFORE the stat is already inside
-    ``entries``, matches ``source_key``, and is not in THIS caller's
-    ``keep_ids`` -- so its fresh suite was deleted. The corpus is append-only
-    JSONL, so file order IS insertion order, and nothing positioned AFTER this
-    caller's own newest kept entry can be superseded work of this caller's:
-    those rows are spared. No clock is involved, so ``added_at``'s 1-second
-    resolution is irrelevant and legacy rows need no new field.
+    in _rewrite_without_source only catches appends made INSIDE the read window.
+    A peer client whose same-source entries were appended BEFORE the stat is
+    already inside ``entries``, matches ``source_key``, and is not in THIS
+    caller's ``keep_ids`` -- so its fresh suite was deleted. The corpus is
+    append-only JSONL, so file order IS insertion order, and nothing positioned
+    AFTER this caller's own newest kept entry can be superseded work of this
+    caller's: those rows are spared. No clock is involved, so ``added_at``'s
+    1-second resolution is irrelevant and legacy rows need no new field.
 
     This NARROWS the race; it does NOT close it, and the difference matters:
 
@@ -307,7 +299,87 @@ def _delete_source_sync(path: Path, source_key: str, keep_ids: set) -> int:
       so the limitation is a recorded decision rather than an accident.
 
     An advisory lockfile would help neither case: the peer's append happened
-    before this call even opened the file.
+    before the call even opened the file."""
+    # The insertion-order floor: the position of the LAST entry this caller
+    # just wrote. -1 means "no floor" -- either the caller passed no
+    # keep_ids (the documented remove-everything contract) or none of them
+    # are in the file, in which case there is nothing to anchor against and
+    # the pre-fix behaviour stands. See the docstring for what this does and
+    # does NOT close.
+    last_keep = -1
+    if keep_ids:
+        for index, entry in enumerate(entries):
+            if isinstance(entry, dict) and str(entry.get("id") or "") in keep_ids:
+                last_keep = index
+    return last_keep
+
+
+def _is_superseded(
+    index: int, entry, source_key: str, keep_ids: set, last_keep: int
+) -> bool:
+    """True when *entry* is this caller's own superseded copy for *source_key*."""
+    if not isinstance(entry, dict):
+        return False
+    md = entry.get("metadata")
+    if not isinstance(md, dict):
+        return False
+    if str(md.get("source_key") or "") != source_key:
+        return False
+    if str(entry.get("id") or "") in keep_ids:
+        return False
+    # Appended AFTER this caller's newest kept entry -> another writer's
+    # later work, never this caller's superseded copy.
+    return not (keep_ids and last_keep >= 0 and index > last_keep)
+
+
+def _rewrite_without_source(path: Path, keep: list, before) -> bool:
+    """Atomically replace *path* with *keep*; False when the replace is abandoned.
+
+    LOST-WRITE GUARD (review W1): this is a read-modify-write over a file another
+    process may be APPENDING to (_save_entry_sync), and a plain rewrite would
+    silently drop anything appended between the read and the replace. The file's
+    (size, mtime_ns) is captured with the read and re-checked immediately before
+    tmp.replace; if it moved, the replace is ABANDONED and False is returned.
+    That trades a missed de-duplication (the next run removes it) against never
+    losing another writer's entry. It does not make the pre-existing _prune_sync
+    race disappear -- it only refuses to widen it."""
+    tmp = path.with_suffix(f".{os.getpid()}.{uuid.uuid4().hex}.jsonl.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            for e in keep:
+                fh.write(json.dumps(e, ensure_ascii=False) + "\n")
+        after = _file_signature(path)
+        if before is not None and after is not None and after != before:
+            logger.warning(
+                "rag_store: %s changed under a source replace -- keeping both "
+                "copies rather than losing a concurrent write",
+                path.name,
+            )
+            return False
+        tmp.replace(path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    return True
+
+
+def _delete_source_sync(path: Path, source_key: str, keep_ids: set) -> int:
+    """Drop entries whose ``metadata.source_key`` is *source_key* and whose
+    ``id`` is NOT in *keep_ids*.
+
+    Returns how many were removed -- 0 when the file is missing, unreadable, or
+    holds nothing to remove. Atomic rewrite through a unique pid+uuid temp name,
+    exactly the discipline _prune_sync uses, so two cross-session writers cannot
+    clobber a shared temp; a failure is logged and NEVER raised, which leaves the
+    corpus untouched and the caller keeps both copies -- the behaviour that
+    predates this function.
+
+    The lost-write guard lives in _rewrite_without_source (review W1) and the
+    pre-window narrowing in _last_keep_index (review M4); read both before
+    changing this function.
 
     It can only ever remove entries THIS code path stamped: ``source_key`` did
     not exist before 2026-08-09, so no legacy entry can match. Entries that are
@@ -319,67 +391,21 @@ def _delete_source_sync(path: Path, source_key: str, keep_ids: set) -> int:
         # observe the state INCLUDING a concurrent append, so the re-check below
         # would compare post-append against post-append and always pass -- an
         # inert guard that still dropped the line.
-        try:
-            st = path.stat()
-            before = (st.st_size, st.st_mtime_ns)
-        except OSError:
-            before = None
+        before = _file_signature(path)
         entries = _load_corpus_sync(path)
 
-        # The insertion-order floor: the position of the LAST entry this caller
-        # just wrote. -1 means "no floor" -- either the caller passed no
-        # keep_ids (the documented remove-everything contract) or none of them
-        # are in the file, in which case there is nothing to anchor against and
-        # the pre-fix behaviour stands. See the docstring for what this does and
-        # does NOT close.
-        last_keep = -1
-        if keep_ids:
-            for index, entry in enumerate(entries):
-                if isinstance(entry, dict) and str(entry.get("id") or "") in keep_ids:
-                    last_keep = index
+        last_keep = _last_keep_index(entries, keep_ids)
 
-        def _drop(index: int, entry) -> bool:
-            if not isinstance(entry, dict):
-                return False
-            md = entry.get("metadata")
-            if not isinstance(md, dict):
-                return False
-            if str(md.get("source_key") or "") != source_key:
-                return False
-            if str(entry.get("id") or "") in keep_ids:
-                return False
-            # Appended AFTER this caller's newest kept entry -> another writer's
-            # later work, never this caller's superseded copy.
-            return not (keep_ids and last_keep >= 0 and index > last_keep)
-
-        keep = [e for i, e in enumerate(entries) if not _drop(i, e)]
+        keep = [
+            e
+            for i, e in enumerate(entries)
+            if not _is_superseded(i, e, source_key, keep_ids, last_keep)
+        ]
         removed = len(entries) - len(keep)
         if removed <= 0:
             return 0
-        tmp = path.with_suffix(f".{os.getpid()}.{uuid.uuid4().hex}.jsonl.tmp")
-        try:
-            with tmp.open("w", encoding="utf-8") as fh:
-                for e in keep:
-                    fh.write(json.dumps(e, ensure_ascii=False) + "\n")
-            try:
-                st2 = path.stat()
-                after = (st2.st_size, st2.st_mtime_ns)
-            except OSError:
-                after = None
-            if before is not None and after is not None and after != before:
-                logger.warning(
-                    "rag_store: %s changed under a source replace -- keeping both "
-                    "copies rather than losing a concurrent write",
-                    path.name,
-                )
-                return 0
-            tmp.replace(path)
-        finally:
-            if tmp.exists():
-                try:
-                    tmp.unlink()
-                except OSError:
-                    pass
+        if not _rewrite_without_source(path, keep, before):
+            return 0
         return removed
     except Exception:
         logger.exception("rag_store: source replace failed for %s", path)
@@ -513,6 +539,103 @@ async def replace_source_entries(
         return {"error": str(exc), "content": None}
 
 
+def _score_entries(query_text: str, query_tokens, usable: list[dict]) -> list:
+    """Pair every usable entry with its similarity score in the configured mode."""
+    mode = (getattr(settings, "qa_rag_similarity_mode", "jaccard") or "jaccard").lower()
+    if mode not in ("jaccard", "cosine", "bm25"):
+        logger.warning(
+            "Unknown QA_RAG_SIMILARITY_MODE=%r — falling back to 'jaccard'",
+            mode,
+        )
+        mode = "jaccard"
+    if mode == "bm25":
+        docs_tokens = [_tokenize_list(e["content"]) for e in usable]
+        bm25 = _bm25_scores(_tokenize_list(query_text), docs_tokens)
+        scored = list(zip(bm25, usable))
+    elif mode == "cosine":
+        # TF-IDF cosine gives rare/discriminative terms more weight than
+        # Jaccard's flat set overlap — better "we already have this" dedup.
+        docs_tokens = [_tokenize_list(e["content"]) for e in usable]
+        cos_scores = _cosine_tfidf_scores(_tokenize_list(query_text), docs_tokens)
+        scored = list(zip(cos_scores, usable))
+    else:
+        scored = [
+            (_jaccard_similarity(query_tokens, _tokenize(e["content"])), e)
+            for e in usable
+        ]
+    return scored
+
+
+def _apply_recency(scored: list) -> list:
+    """Boost newer entries when a recency half-life is configured."""
+    hl_raw = getattr(settings, "qa_rag_recency_half_life_days", 0)
+    half_life = hl_raw if isinstance(hl_raw, int) else 0
+    if half_life > 0:
+        # Freshness boost (research-backed): newer entries get up to +15%,
+        # decaying exponentially with the configured half-life. Capped at
+        # 1.0 so score bounds hold in every mode.
+        import calendar
+        import math
+
+        now = time.time()
+
+        def _age_days(entry: dict) -> float:
+            raw = entry.get("added_at") or ""
+            try:
+                ts = calendar.timegm(time.strptime(raw, "%Y-%m-%dT%H:%M:%SZ"))
+            except (ValueError, OverflowError):
+                return float("inf")
+            return max(0.0, (now - ts) / 86400.0)
+
+        scored = [
+            (
+                min(1.0, s * (1.0 + 0.15 * math.exp(-_age_days(e) / half_life))),
+                e,
+            )
+            for s, e in scored
+        ]
+    return scored
+
+
+def _rank_entries(
+    query_text: str,
+    query_tokens,
+    all_entries: list[dict],
+    metadata_filter: dict | None,
+    top_k: int,
+) -> list[dict]:
+    """Filter, score, recency-boost and cut the entries to the top-k results."""
+    usable = [e for e in all_entries if (e.get("content") or "")]
+
+    if metadata_filter:
+        # Case-insensitive substring match on each requested metadata key —
+        # narrowing before scoring is the highest-value dedup lever.
+        def _md_match(entry: dict) -> bool:
+            md = entry.get("metadata") or {}
+            return all(
+                str(v).lower() in str(md.get(k, "")).lower()
+                for k, v in metadata_filter.items()
+                if v
+            )
+
+        usable = [e for e in usable if _md_match(e)]
+
+    scored = _apply_recency(_score_entries(query_text, query_tokens, usable))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[:top_k]
+
+    return [
+        {
+            "content": entry.get("content", ""),
+            "metadata": entry.get("metadata", {}),
+            "score": round(score, 4),
+        }
+        for score, entry in top
+        if score > 0
+    ]
+
+
 async def query_corpus(
     query_text: str,
     entry_type: str | None = None,
@@ -549,85 +672,9 @@ async def query_corpus(
         if not all_entries:
             return {"error": None, "content": []}
 
-        usable = [e for e in all_entries if (e.get("content") or "")]
-
-        if metadata_filter:
-            # Case-insensitive substring match on each requested metadata key —
-            # narrowing before scoring is the highest-value dedup lever.
-            def _md_match(entry: dict) -> bool:
-                md = entry.get("metadata") or {}
-                return all(
-                    str(v).lower() in str(md.get(k, "")).lower()
-                    for k, v in metadata_filter.items()
-                    if v
-                )
-
-            usable = [e for e in usable if _md_match(e)]
-
-        mode = (
-            getattr(settings, "qa_rag_similarity_mode", "jaccard") or "jaccard"
-        ).lower()
-        if mode not in ("jaccard", "cosine", "bm25"):
-            logger.warning(
-                "Unknown QA_RAG_SIMILARITY_MODE=%r — falling back to 'jaccard'",
-                mode,
-            )
-            mode = "jaccard"
-        if mode == "bm25":
-            docs_tokens = [_tokenize_list(e["content"]) for e in usable]
-            bm25 = _bm25_scores(_tokenize_list(query_text), docs_tokens)
-            scored = list(zip(bm25, usable))
-        elif mode == "cosine":
-            # TF-IDF cosine gives rare/discriminative terms more weight than
-            # Jaccard's flat set overlap — better "we already have this" dedup.
-            docs_tokens = [_tokenize_list(e["content"]) for e in usable]
-            cos_scores = _cosine_tfidf_scores(_tokenize_list(query_text), docs_tokens)
-            scored = list(zip(cos_scores, usable))
-        else:
-            scored = [
-                (_jaccard_similarity(query_tokens, _tokenize(e["content"])), e)
-                for e in usable
-            ]
-
-        hl_raw = getattr(settings, "qa_rag_recency_half_life_days", 0)
-        half_life = hl_raw if isinstance(hl_raw, int) else 0
-        if half_life > 0:
-            # Freshness boost (research-backed): newer entries get up to +15%,
-            # decaying exponentially with the configured half-life. Capped at
-            # 1.0 so score bounds hold in every mode.
-            import calendar
-            import math
-
-            now = time.time()
-
-            def _age_days(entry: dict) -> float:
-                raw = entry.get("added_at") or ""
-                try:
-                    ts = calendar.timegm(time.strptime(raw, "%Y-%m-%dT%H:%M:%SZ"))
-                except (ValueError, OverflowError):
-                    return float("inf")
-                return max(0.0, (now - ts) / 86400.0)
-
-            scored = [
-                (
-                    min(1.0, s * (1.0 + 0.15 * math.exp(-_age_days(e) / half_life))),
-                    e,
-                )
-                for s, e in scored
-            ]
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        top = scored[:top_k]
-
-        results = [
-            {
-                "content": entry.get("content", ""),
-                "metadata": entry.get("metadata", {}),
-                "score": round(score, 4),
-            }
-            for score, entry in top
-            if score > 0
-        ]
+        results = _rank_entries(
+            query_text, query_tokens, all_entries, metadata_filter, top_k
+        )
 
         logger.info(
             "rag_store.query_corpus: query returned %d/%d results (top score %.4f)",

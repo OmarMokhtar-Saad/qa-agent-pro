@@ -238,16 +238,10 @@ def host_of(x: dict) -> str:
     return match.group(1) if match else ""
 
 
-def _ex_bits(x: dict) -> tuple[str, str]:
-    """(one-line head, body panes) for one call. ``ok`` may be None -- a call the capture never
-    resolved either way -- and folding that into "bad" would invent a failure exactly as
-    folding it into "ok" would invent a success. Unknown gets its own tone."""
-    query = x.get("query") or {}
-    gaps = x.get("notCaptured") or {}
-    rq_h = x.get("requestHeaders") or {}
-    rq_b = x.get("requestBody") or ""
-    rs_h = x.get("responseHeaders") or {}
-    rs_b = x.get("responseBody") or ""
+def _ex_head(x: dict) -> tuple[str, str, str]:
+    """(one-line head, badge tone, badge text) for one call. ``ok`` may be None -- a call the
+    capture never resolved either way -- and folding that into "bad" would invent a failure
+    exactly as folding it into "ok" would invent a success. Unknown gets its own tone."""
     status = x.get("status", -1)
     ok = x["ok"] if "ok" in x else (status is not None and 200 <= status < 300)
     shown = x.get("statusLabel") or (
@@ -275,6 +269,18 @@ def _ex_bits(x: dict) -> tuple[str, str]:
         + e(str(shown))
         + "</span>"
     )
+    return head, scls, str(shown)
+
+
+def _ex_bits(x: dict) -> tuple[str, str]:
+    """(one-line head, body panes) for one call."""
+    head, scls, shown = _ex_head(x)
+    query = x.get("query") or {}
+    gaps = x.get("notCaptured") or {}
+    rq_h = x.get("requestHeaders") or {}
+    rq_b = x.get("requestBody") or ""
+    rs_h = x.get("responseHeaders") or {}
+    rs_b = x.get("responseBody") or ""
     inside = str(x.get("inside") or "")
     if not (query or rq_h or str(rq_b).strip() or rs_h or str(rs_b).strip() or inside):
         return head, ""
@@ -296,7 +302,7 @@ def _ex_bits(x: dict) -> tuple[str, str]:
         + '</div><div class="pane"><div class="phead"><span class="dot res"></span>Response <span class="badge '
         + scls
         + ' sm">'
-        + e(str(shown))
+        + e(shown)
         + "</span></div>"
         + section("Headers", kvtable(rs_h), len(rs_h), gaps.get("responseHeaders", ""))
         + section("Body", codebox(rs_b), note=gaps.get("responseBody", ""))
@@ -367,13 +373,8 @@ def _path_of(url: str) -> str:
     return ("/" + rest.split("/", 1)[1]) if "/" in rest else (url if not rest else "/")
 
 
-def binding_exchange(b: dict) -> dict:
-    """One data-layer call. The app logs a success without ever saying WHICH 2xx it was, so
-    the badge is labelled rather than invented: "2xx (code not logged)", never a number the
-    log did not contain."""
-    url = str(b.get("url") or "")
-    path = _path_of(url) or str(b.get("target") or "")
-    resp = b.get("response") or {}
+def _binding_response_body(resp: dict) -> str:
+    """The logged response of a data-layer call as text, noting what the app clipped."""
     body = str(resp.get("text") or "")
     if resp.get("json") is not None:
         body = json.dumps(resp["json"], ensure_ascii=False, indent=1)
@@ -383,17 +384,20 @@ def binding_exchange(b: dict) -> dict:
             + str(resp["omitted"])
             + " chars clipped by the app before it was logged]"
         )
-    args = b.get("args")
-    query = args if isinstance(args, dict) else {}
-    req_body = (
-        ""
-        if isinstance(args, dict)
-        else (
-            json.dumps(args, ensure_ascii=False)
-            if isinstance(args, list)
-            else str(args or "")
-        )
-    )
+    return body
+
+
+def _binding_request_body(args: object) -> str:
+    """The args of a data-layer call as a request body (a dict goes to the query pane)."""
+    if isinstance(args, dict):
+        return ""
+    if isinstance(args, list):
+        return json.dumps(args, ensure_ascii=False)
+    return str(args or "")
+
+
+def _binding_extra(b: dict) -> str:
+    """The small tags beside a data-layer call's path."""
     extra = '<span class="mt">' + e(b.get("binding") or "") + "</span>"
     if b.get("retried"):
         extra += '<span class="mt">token-refresh retry</span>'
@@ -403,6 +407,20 @@ def binding_exchange(b: dict) -> dict:
         )
     if b.get("orphanResponse"):
         extra += '<span class="mt">no request logged</span>'
+    return extra
+
+
+def binding_exchange(b: dict) -> dict:
+    """One data-layer call. The app logs a success without ever saying WHICH 2xx it was, so
+    the badge is labelled rather than invented: "2xx (code not logged)", never a number the
+    log did not contain."""
+    url = str(b.get("url") or "")
+    path = _path_of(url) or str(b.get("target") or "")
+    body = _binding_response_body(b.get("response") or {})
+    args = b.get("args")
+    query = args if isinstance(args, dict) else {}
+    req_body = _binding_request_body(args)
+    extra = _binding_extra(b)
     if b.get("statusKnown"):
         label = None
     elif b.get("ok"):
@@ -470,20 +488,20 @@ def network_exchange(rec: dict) -> dict:
     }
 
 
-def llm_exchange(c: dict) -> dict:
-    """One model round-trip. The prompt is the request, the reply the response, and the badge
-    is how the call ENDED -- answered with a finish reason, thrown, or still open."""
-    tok = c.get("tokens") or {}
-    model = tok.get("model") or c.get("model") or "(unrecorded)"
+def _llm_outcome(c: dict, tok: dict) -> tuple[str, bool | None]:
+    """(badge label, ok) for how a model call ended."""
     err = c.get("error")
     if err:
-        label, ok = str(err.get("class") or "error"), False
-    elif c.get("response") is not None:
-        label, ok = (tok.get("finish") or "answered"), True
-    elif c.get("orphanUsage"):
-        label, ok = "usage only", True
-    else:
-        label, ok = "never returned", None
+        return str(err.get("class") or "error"), False
+    if c.get("response") is not None:
+        return (tok.get("finish") or "answered"), True
+    if c.get("orphanUsage"):
+        return "usage only", True
+    return "never returned", None
+
+
+def _llm_meta(c: dict, tok: dict, model: str) -> collections.OrderedDict:
+    """The query-pane facts of a model call: what was asked, what it cost."""
     meta: collections.OrderedDict = collections.OrderedDict()
     for key, value in (
         ("model", model),
@@ -508,6 +526,11 @@ def llm_exchange(c: dict) -> dict:
         meta["usage source"] = "parsed from the prose line, not the structured event"
     if c.get("orphanUsage"):
         meta["note"] = "usage arrived with no request line to attach it to"
+    return meta
+
+
+def _llm_bodies(c: dict, err: dict | None) -> tuple[str, str]:
+    """(prompt text, reply text) of a model call, each saying why when empty."""
     prompts = "\n\n".join(
         filter(None, (body_text(p) for p in (c.get("promptMessages") or [])))
     )
@@ -527,6 +550,17 @@ def llm_exchange(c: dict) -> dict:
             + ": "
             + str(err.get("message") or "")
         )
+    return prompts, reply
+
+
+def llm_exchange(c: dict) -> dict:
+    """One model round-trip. The prompt is the request, the reply the response, and the badge
+    is how the call ENDED -- answered with a finish reason, thrown, or still open."""
+    tok = c.get("tokens") or {}
+    model = tok.get("model") or c.get("model") or "(unrecorded)"
+    label, ok = _llm_outcome(c, tok)
+    meta = _llm_meta(c, tok, model)
+    prompts, reply = _llm_bodies(c, c.get("error"))
     return {
         "notCaptured": {
             "requestHeaders": "not applicable \u2014 this row is a model round-trip, not an HTTP call",
@@ -544,23 +578,36 @@ def llm_exchange(c: dict) -> dict:
     }
 
 
+def _tool_result(t: dict) -> tuple[str, str]:
+    """(response text, the reason it is empty) of one tool call."""
+    result = t.get("resultText")
+    if result:
+        return str(result), ""
+    if t.get("status") == "done":
+        return (
+            "",
+            "not captured \u2014 the app logged this tool as finished but wrote no result text with it",
+        )
+    return (
+        "",
+        "the tool never reported back \u2014 there is no completion line for this invocation in the capture",
+    )
+
+
+def _tool_request_body(t: dict) -> str:
+    """The arguments of one tool call, flagged when they were recovered."""
+    return body_text(t.get("args")) + (
+        "\n\n[arguments recovered from the model's own reply: the app logs the call with empty args]"
+        if t.get("argsRecovered")
+        else ""
+    )
+
+
 def tool_exchange(t: dict) -> dict:
     """One tool call: what the model asked for, and what came back -- with the reason when
     nothing did."""
     kind = " \u00b7 " + str(t["kind"]) if t.get("kind") else ""
-    result = t.get("resultText")
-    if result:
-        response, gap = str(result), ""
-    elif t.get("status") == "done":
-        response, gap = (
-            "",
-            "not captured \u2014 the app logged this tool as finished but wrote no result text with it",
-        )
-    else:
-        response, gap = (
-            "",
-            "the tool never reported back \u2014 there is no completion line for this invocation in the capture",
-        )
+    response, gap = _tool_result(t)
     return {
         "notCaptured": {
             "requestHeaders": "not applicable \u2014 this row is a tool invocation, not an HTTP call",
@@ -576,12 +623,7 @@ def tool_exchange(t: dict) -> dict:
         else (False if t.get("status") else None),
         "statusLabel": t.get("status") or "unknown",
         "durationMs": _duration(t),
-        "requestBody": body_text(t.get("args"))
-        + (
-            "\n\n[arguments recovered from the model's own reply: the app logs the call with empty args]"
-            if t.get("argsRecovered")
-            else ""
-        ),
+        "requestBody": _tool_request_body(t),
         "responseBody": response,
     }
 

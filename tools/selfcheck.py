@@ -72,7 +72,7 @@ import logging
 import re
 import socket
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
@@ -477,6 +477,50 @@ class Collected:
     registered: frozenset
 
 
+async def _collect_tool(
+    out: Collected, key: str, tool: Any, factory: Callable, timeout: float
+) -> None:
+    fn = getattr(tool, "fn", None)
+    if not callable(fn):
+        out.skips.append(Skip(key, "the registry entry exposes no callable"))
+        return
+    schema = getattr(tool, "parameters", None)
+    kwargs, unseedable = build_payload(schema)
+    if unseedable:
+        out.skips.append(
+            Skip(
+                key,
+                "no fixture value for required parameter(s): " + ", ".join(unseedable),
+            )
+        )
+        return
+    if _accepts_ctx(fn):
+        kwargs["ctx"] = factory()
+    try:
+        result = await asyncio.wait_for(_maybe_await(fn(**kwargs)), timeout)
+    except Exception as exc:  # never raise to the caller
+        logger.warning("self-check: %s raised", key, exc_info=True)
+        out.findings.append(
+            Finding("invocation_error", key, f"{type(exc).__name__}: {exc}"[:300])
+        )
+        return
+    out.surfaces[key] = _as_text(result)
+
+
+async def _collect_prompt(out: Collected, key: str, prompt: Any) -> None:
+    fn = getattr(prompt, "fn", None)
+    if not callable(fn):
+        out.skips.append(Skip(key, "the registry entry exposes no callable"))
+        return
+    try:
+        out.surfaces[key] = _as_text(await _maybe_await(fn()))
+    except Exception as exc:  # never raise to the caller
+        logger.warning("self-check: %s raised", key, exc_info=True)
+        out.findings.append(
+            Finding("invocation_error", key, f"{type(exc).__name__}: {exc}"[:300])
+        )
+
+
 async def collect(
     server: Any,
     *,
@@ -488,80 +532,36 @@ async def collect(
     factory = ctx_factory or FixtureContext
     tools = await capabilities.tools_by_name(server)
     prompts = await capabilities.prompts_by_name(server)
-    surfaces: dict = {}
-    skips: list = []
-    findings: list = []
-    egress: list = []
+    out = Collected(
+        surfaces={}, skips=[], findings=[], egress=[], registered=frozenset(tools)
+    )
 
     instructions = getattr(server, "instructions", "") or ""
     if instructions:
-        surfaces["instructions"] = instructions
+        out.surfaces["instructions"] = instructions
     else:
-        skips.append(Skip("instructions", "this server exposes no instructions block"))
+        out.skips.append(
+            Skip("instructions", "this server exposes no instructions block")
+        )
 
     at: dict = {"surface": ""}
-    with egress_guard(egress, lambda: at["surface"]):
+    with egress_guard(out.egress, lambda: at["surface"]):
         for name in sorted(tools):
             key = f"tool:{name}"
             at["surface"] = key
             if name == self_name:
-                skips.append(
+                out.skips.append(
                     Skip(key, "the self-check itself; invoking it would recurse")
                 )
                 continue
-            fn = getattr(tools[name], "fn", None)
-            if not callable(fn):
-                skips.append(Skip(key, "the registry entry exposes no callable"))
-                continue
-            schema = getattr(tools[name], "parameters", None)
-            kwargs, unseedable = build_payload(schema)
-            if unseedable:
-                skips.append(
-                    Skip(
-                        key,
-                        "no fixture value for required parameter(s): "
-                        + ", ".join(unseedable),
-                    )
-                )
-                continue
-            if _accepts_ctx(fn):
-                kwargs["ctx"] = factory()
-            try:
-                result = await asyncio.wait_for(_maybe_await(fn(**kwargs)), timeout)
-            except Exception as exc:  # never raise to the caller
-                logger.warning("self-check: %s raised", key, exc_info=True)
-                findings.append(
-                    Finding(
-                        "invocation_error", key, f"{type(exc).__name__}: {exc}"[:300]
-                    )
-                )
-                continue
-            surfaces[key] = _as_text(result)
+            await _collect_tool(out, key, tools[name], factory, timeout)
 
         for name in sorted(prompts):
             key = f"prompt:{name}"
             at["surface"] = key
-            fn = getattr(prompts[name], "fn", None)
-            if not callable(fn):
-                skips.append(Skip(key, "the registry entry exposes no callable"))
-                continue
-            try:
-                surfaces[key] = _as_text(await _maybe_await(fn()))
-            except Exception as exc:  # never raise to the caller
-                logger.warning("self-check: %s raised", key, exc_info=True)
-                findings.append(
-                    Finding(
-                        "invocation_error", key, f"{type(exc).__name__}: {exc}"[:300]
-                    )
-                )
+            await _collect_prompt(out, key, prompts[name])
 
-    return Collected(
-        surfaces=surfaces,
-        skips=skips,
-        findings=findings,
-        egress=egress,
-        registered=frozenset(tools),
-    )
+    return out
 
 
 # -------------------------------------------------------------- scanning ---- #
@@ -609,6 +609,48 @@ def _module_exists(root: Path, rel: str) -> bool:
     )
 
 
+@dataclass
+class _ScanTally:
+    """The judging context of one scan and what it has seen so far."""
+
+    registered: Any
+    live: Any
+    llm_symbols: Any
+    root: Path
+    findings: list = field(default_factory=list)
+    tool_mentions: set = field(default_factory=set)
+    flag_tokens: set = field(default_factory=set)
+    module_tokens: set = field(default_factory=set)
+    model_tokens: set = field(default_factory=set)
+
+
+def _scan_surface(tally: _ScanTally, surface: str, text: str) -> None:
+    findings = tally.findings
+    for token in sorted(set(_TOKEN.findall(text))):
+        if token.endswith("_"):  # a prefix reference, never a field name
+            continue
+        tally.flag_tokens.add(token)
+        if token not in tally.live:
+            findings.append(Finding("dead_flag", surface, token))
+    for rel in sorted(set(_MODULE.findall(text))):
+        tally.module_tokens.add(rel)
+        if not _module_exists(tally.root, rel):
+            findings.append(Finding("dead_module", surface, rel))
+    for symbol in sorted(set(_LLM_SYMBOL.findall(text))):
+        if symbol not in tally.llm_symbols:
+            findings.append(Finding("absent_llm_symbol", surface, f"llm.{symbol}"))
+    for hit in sorted({m.group(0) for m in _MODEL.finditer(text)}):
+        tally.model_tokens.add(hit)
+        findings.append(Finding("model_reference", surface, hit))
+    for hit in sorted({m.group(0) for m in _SERVER_MODEL_CLAIM.finditer(text)}):
+        tally.model_tokens.add(hit)
+        findings.append(Finding("server_model_claim", surface, hit))
+    for name in sorted(set(_TOOL.findall(text))):
+        tally.tool_mentions.add(name)
+        if name not in tally.registered:
+            findings.append(Finding("unregistered_tool", surface, name))
+
+
 def scan(
     surfaces: Mapping,
     *,
@@ -624,47 +666,21 @@ def scan(
     so each one reports how many candidates it actually saw, and the tests turn
     those counts into floors.
     """
-    findings: list = []
-    tool_mentions: set = set()
-    flag_tokens: set = set()
-    module_tokens: set = set()
-    model_tokens: set = set()
-
+    tally = _ScanTally(
+        registered=registered, live=live, llm_symbols=llm_symbols, root=root
+    )
     for surface in sorted(surfaces):
-        text = surfaces[surface] or ""
-        for token in sorted(set(_TOKEN.findall(text))):
-            if token.endswith("_"):  # a prefix reference, never a field name
-                continue
-            flag_tokens.add(token)
-            if token not in live:
-                findings.append(Finding("dead_flag", surface, token))
-        for rel in sorted(set(_MODULE.findall(text))):
-            module_tokens.add(rel)
-            if not _module_exists(root, rel):
-                findings.append(Finding("dead_module", surface, rel))
-        for symbol in sorted(set(_LLM_SYMBOL.findall(text))):
-            if symbol not in llm_symbols:
-                findings.append(Finding("absent_llm_symbol", surface, f"llm.{symbol}"))
-        for hit in sorted({m.group(0) for m in _MODEL.finditer(text)}):
-            model_tokens.add(hit)
-            findings.append(Finding("model_reference", surface, hit))
-        for hit in sorted({m.group(0) for m in _SERVER_MODEL_CLAIM.finditer(text)}):
-            model_tokens.add(hit)
-            findings.append(Finding("server_model_claim", surface, hit))
-        for name in sorted(set(_TOOL.findall(text))):
-            tool_mentions.add(name)
-            if name not in registered:
-                findings.append(Finding("unregistered_tool", surface, name))
+        _scan_surface(tally, surface, surfaces[surface] or "")
 
     scanned = {
         "surfaces": len(surfaces),
         "chars": sum(len(t or "") for t in surfaces.values()),
-        "tool_mentions": len(tool_mentions),
-        "flag_tokens": len(flag_tokens),
-        "module_tokens": len(module_tokens),
-        "model_tokens": len(model_tokens),
+        "tool_mentions": len(tally.tool_mentions),
+        "flag_tokens": len(tally.flag_tokens),
+        "module_tokens": len(tally.module_tokens),
+        "model_tokens": len(tally.model_tokens),
     }
-    return findings, scanned
+    return tally.findings, scanned
 
 
 def unaccounted(collected: Collected) -> list:
@@ -756,6 +772,39 @@ async def run(
     }
 
 
+def _verdict_line(findings: list, floors: list) -> str:
+    if findings:
+        return (
+            f"❌ **{len(findings)} finding(s).** A reply below names "
+            "something this build cannot deliver, so a tester acting on it "
+            "gets nothing."
+        )
+    if floors:
+        return (
+            "⚠️ **No findings, but the pass did not scan enough to "
+            "mean it** — treat this as INCONCLUSIVE, not clean: " + ", ".join(floors)
+        )
+    return "✅ **No findings.**"
+
+
+def _render_findings(findings: list) -> list:
+    lines = ["", "### Findings"]
+    for item in findings:
+        lines.append(
+            f"- **{item.get('kind')}** in `{item.get('surface')}`: "
+            f"`{item.get('detail')}`"
+        )
+    return lines
+
+
+def _render_egress(egress: list) -> list:
+    return [
+        "",
+        "### Outbound connections blocked during the pass",
+        "Nothing left this machine; each attempt was refused and recorded.",
+    ] + [f"- `{item.get('surface')}` → `{item.get('host')}`" for item in egress]
+
+
 def render(report: Mapping) -> str:
     """The tester-facing reply. Markdown, and honest about what it did not do."""
     scanned = report.get("scanned") or {}
@@ -764,19 +813,7 @@ def render(report: Mapping) -> str:
     floors = list(report.get("floors") or ())
     egress = list(report.get("egress") or ())
     lines = ["## Self-check — what this install's replies actually say", ""]
-    if findings:
-        lines.append(
-            f"❌ **{len(findings)} finding(s).** A reply below names "
-            "something this build cannot deliver, so a tester acting on it "
-            "gets nothing."
-        )
-    elif floors:
-        lines.append(
-            "⚠️ **No findings, but the pass did not scan enough to "
-            "mean it** — treat this as INCONCLUSIVE, not clean: " + ", ".join(floors)
-        )
-    else:
-        lines.append("✅ **No findings.**")
+    lines.append(_verdict_line(findings, floors))
     lines += [
         "",
         f"- Text surfaces read: **{scanned.get('surfaces', 0)}** "
@@ -788,25 +825,13 @@ def render(report: Mapping) -> str:
         f"references found (any is a finding): **{scanned.get('model_tokens', 0)}**",
     ]
     if findings:
-        lines += ["", "### Findings"]
-        for item in findings:
-            lines.append(
-                f"- **{item.get('kind')}** in `{item.get('surface')}`: "
-                f"`{item.get('detail')}`"
-            )
+        lines += _render_findings(findings)
     if skips:
         lines += ["", f"### Not checked ({len(skips)})"]
         for item in skips:
             lines.append(f"- `{item.get('surface')}` — {item.get('reason')}")
     if egress:
-        lines += [
-            "",
-            "### Outbound connections blocked during the pass",
-            "Nothing left this machine; each attempt was refused and recorded.",
-        ]
-        lines += [
-            f"- `{item.get('surface')}` → `{item.get('host')}`" for item in egress
-        ]
+        lines += _render_egress(egress)
     lines += [
         "",
         "_Every handler was called with its own declared defaults, so no "

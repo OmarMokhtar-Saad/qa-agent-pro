@@ -220,6 +220,106 @@ def _stamped(report, run, rec):
     )
 
 
+def _collect_record_spans(report, out, mine, tid_of):
+    """Derived ms of every llm / api / tool record of a paired turn, into ``out``."""
+    for kind, stream in (("llm", "llm"), ("api", "bindings"), ("tool", "tools")):
+        for rec in report.get(stream) or []:
+            if tid_of(rec) not in mine:
+                continue
+            ms = _derived_ms(report, rec.get("appRunId"), rec)
+            if ms is None:
+                continue
+            if kind == "llm" and rec.get("error"):
+                out["llmfail"].append(float(ms))
+            else:
+                out[kind].append(float(ms))
+
+
+def _first_clock_by_turn(report, stream, mine, keep_first):
+    """``turnId`` -> the clock of its record in ``stream``, for paired turns only."""
+    found = {}
+    for rec in report.get(stream) or []:
+        if rec.get("turnId") in mine:
+            ts = _ts_of(report, rec.get("appRunId"), rec.get("seq"))
+            if keep_first:
+                found.setdefault(rec["turnId"], ts)
+            else:
+                found[rec["turnId"]] = ts
+    return found
+
+
+def _collect_turn_spans(report, out, mine):
+    """Utterance -> answer (or error) durations of every paired turn, into ``out``."""
+    said = _first_clock_by_turn(report, "utterances", mine, False)
+    heard = _first_clock_by_turn(report, "answers", mine, True)
+    threw = _first_clock_by_turn(report, "errors", mine, False)
+    for tid, start in said.items():
+        if start is None:
+            continue
+        end, bucket = heard.get(tid), "turn"
+        if end is None:
+            end, bucket = threw.get(tid), "turnfail"
+        if end is not None and end >= start:
+            out[bucket].append(float(end - start))
+
+
+def _session_slot(r, manifests):
+    """The empty per-run bucket of :meth:`Evidence.session`, with its manifest."""
+    run = r.get("appRunId")
+    rec = {
+        "appRunId": run,
+        "runIndex": r.get("runIndex"),
+        "from": r.get("firstTs"),
+        "to": r.get("lastTs"),
+        "turns": r.get("turns") or 0,
+        "llm": r.get("llm") or 0,
+        "bindings": r.get("bindings") or 0,
+        "tools": r.get("tools") or 0,
+        "errors": r.get("errors") or 0,
+        "manifest": None,
+        "entry": [],
+        "failed": [],
+        "other": [],
+    }
+    for m in manifests or []:
+        if m.get("appRunId") == run:
+            rec["manifest"] = m
+    return rec
+
+
+def _net_log_call(slot, x, entry_key):
+    """A net-lane runlog line no binding drew, as a ``network log only`` call."""
+    outcome = (x.get("outcome") or "").upper()
+    ok = True if outcome == "SUCCESS" else (False if outcome == "ERROR" else None)
+    key = entry_key(x.get("verb"), x.get("url"))
+    drawn = {
+        entry_key(b.get("verb"), b.get("url"))
+        for b in slot["entry"]
+        if b.get("binding") != "network log only"
+    }
+    if key in drawn:
+        return
+    call = dict(x, binding="network log only", ok=ok, statusKnown=False)
+    slot["entry"].append(call)
+    if ok is False:
+        slot["failed"].append(call)
+
+
+def _file_outside_turn(slot, stream, x, entry_key):
+    """Put one stamped record that belongs to no turn into its run's bucket."""
+    if stream == "bindings":
+        slot["entry"].append(x)
+        if x.get("ok") is False:
+            slot["failed"].append(x)
+    elif stream == "runlog" and x.get("lane") == "net" and x.get("url"):
+        _net_log_call(slot, x, entry_key)
+    elif stream == "errors":
+        if x.get("kind") != "binding":
+            slot["failed"].append(x)
+    else:
+        slot["other"].append(x)
+
+
 # ── the case windows ───────────────────────────────────────────────────────────
 
 
@@ -251,48 +351,68 @@ INVERTED_NOTE = (
 )
 
 
+def _window_row(case, tolerance_ms):
+    """The raw (unclipped) window row for one case dict."""
+    started = _ms(case.get("started"))
+    updated = _ms(case.get("updated"))
+    if started is None and updated is None:
+        return {
+            "tc_id": str(case.get("tc_id") or ""),
+            "lo": None,
+            "hi": None,
+            "exact": False,
+            "clipped": False,
+            "note": "this case carries no start or end time, so no window can be drawn",
+        }
+    started = started if started is not None else updated
+    updated = updated if updated is not None else started
+    if updated < started:
+        started, updated = updated, started
+    offset = case.get("clock_offset_ms")
+    exact = isinstance(offset, (int, float)) and not isinstance(offset, bool)
+    return {
+        "tc_id": str(case.get("tc_id") or ""),
+        "started": started,
+        "updated": updated,
+        "lo": started + (int(offset) if exact else -tolerance_ms),
+        "hi": updated + (int(offset) if exact else tolerance_ms),
+        "exact": exact,
+        "clipped": False,
+        "note": "" if exact else NO_CLOCK_NOTE,
+    }
+
+
+def _clip_to_neighbours(timed, i, row):
+    """Clip one widened window at the midpoint to each neighbour."""
+    if i > 0:
+        prev = timed[i - 1]
+        mid = (prev["updated"] + row["started"]) // 2
+        if row["lo"] < mid:
+            row["lo"], row["clipped"] = mid, True
+    if i + 1 < len(timed):
+        nxt = timed[i + 1]
+        mid = (row["updated"] + nxt["started"]) // 2
+        if row["hi"] > mid:
+            row["hi"], row["clipped"] = mid, True
+
+
+def _clamp_inverted(row):
+    """Nested cases (one started and ended inside another) clip to lo > hi: an
+    inverted window matches nothing and reads as "the app did nothing". Clamp
+    to a point and SAY so, rather than joining nothing in silence."""
+    row["inverted"] = False
+    if row["hi"] < row["lo"]:
+        row["hi"], row["inverted"] = row["lo"], True
+        row["note"] = (row["note"] + " " if row["note"] else "") + INVERTED_NOTE
+
+
 def case_windows(cases, tolerance_ms=TOLERANCE_MS):
     """One device-clock window per case, exact when the offset is known, clipped when not.
 
     Returns a list sorted by ``started`` of ``{tc_id, lo, hi, exact, clipped, note}``.
     A case with no usable ``started``/``updated`` has ``lo``/``hi`` None and joins nothing.
     """
-    rows = []
-    for case in cases or []:
-        if not isinstance(case, dict):
-            continue
-        started = _ms(case.get("started"))
-        updated = _ms(case.get("updated"))
-        if started is None and updated is None:
-            rows.append(
-                {
-                    "tc_id": str(case.get("tc_id") or ""),
-                    "lo": None,
-                    "hi": None,
-                    "exact": False,
-                    "clipped": False,
-                    "note": "this case carries no start or end time, so no window can be drawn",
-                }
-            )
-            continue
-        started = started if started is not None else updated
-        updated = updated if updated is not None else started
-        if updated < started:
-            started, updated = updated, started
-        offset = case.get("clock_offset_ms")
-        exact = isinstance(offset, (int, float)) and not isinstance(offset, bool)
-        rows.append(
-            {
-                "tc_id": str(case.get("tc_id") or ""),
-                "started": started,
-                "updated": updated,
-                "lo": started + (int(offset) if exact else -tolerance_ms),
-                "hi": updated + (int(offset) if exact else tolerance_ms),
-                "exact": exact,
-                "clipped": False,
-                "note": "" if exact else NO_CLOCK_NOTE,
-            }
-        )
+    rows = [_window_row(c, tolerance_ms) for c in cases or [] if isinstance(c, dict)]
     timed = sorted((r for r in rows if r["lo"] is not None), key=lambda r: r["started"])
     # Clip the WIDENED windows at the midpoint to each neighbour, so two windows never
     # overlap. An exact window is never widened, so it never needs clipping -- but a
@@ -300,23 +420,8 @@ def case_windows(cases, tolerance_ms=TOLERANCE_MS):
     for i, row in enumerate(timed):
         if row["exact"]:
             continue
-        if i > 0:
-            prev = timed[i - 1]
-            mid = (prev["updated"] + row["started"]) // 2
-            if row["lo"] < mid:
-                row["lo"], row["clipped"] = mid, True
-        if i + 1 < len(timed):
-            nxt = timed[i + 1]
-            mid = (row["updated"] + nxt["started"]) // 2
-            if row["hi"] > mid:
-                row["hi"], row["clipped"] = mid, True
-        # Nested cases (one started and ended inside another) clip to lo > hi: an
-        # inverted window matches nothing and reads as "the app did nothing". Clamp
-        # to a point and SAY so, rather than joining nothing in silence.
-        row["inverted"] = False
-        if row["hi"] < row["lo"]:
-            row["hi"], row["inverted"] = row["lo"], True
-            row["note"] = (row["note"] + " " if row["note"] else "") + INVERTED_NOTE
+        _clip_to_neighbours(timed, i, row)
+        _clamp_inverted(row)
     return timed + [r for r in rows if r["lo"] is None]
 
 
@@ -396,6 +501,23 @@ def _typed_texts(case):
     return out
 
 
+def _join_note_bits(timed, ambiguous, unclocked):
+    """The caveats a join carries, one string each."""
+    note_bits = []
+    if any(not w["exact"] for w in timed):
+        note_bits.append(NO_CLOCK_NOTE)
+    if ambiguous:
+        note_bits.append(
+            "%d turn(s) fell between two cases and are shown on neither card: %s"
+            % (len(ambiguous), ", ".join(str(t) for t, _n in ambiguous))
+        )
+    if unclocked:
+        note_bits.append(
+            "%d turn(s) carry no clock and could not be placed" % len(unclocked)
+        )
+    return note_bits
+
+
 def join(report, cases, windows=None):
     """Attribute every app turn to exactly one case window, or say why not."""
     windows = windows if windows is not None else case_windows(cases)
@@ -419,60 +541,67 @@ def join(report, cases, windows=None):
             else "no case window and no app turn: nothing to join",
         )
 
-    pairs, ambiguous, outside, unclocked = [], [], [], []
-    confirmed = unconfirmed = mismatched = 0
-    claimed_cases = set()
+    acc = {
+        "pairs": [],
+        "ambiguous": [],
+        "outside": [],
+        "unclocked": [],
+        "confirmed": 0,
+        "unconfirmed": 0,
+        "mismatched": 0,
+        "claimed": set(),
+    }
     for t in turns:
-        run = t.get("appRunId")
-        a = _ts_of(report, run, t.get("firstSeq"))
-        b = _ts_of(report, run, t.get("lastSeq"))
-        tid = t.get("turnId")
-        if a is None or b is None:
-            unclocked.append(tid)
-            continue
-        hits = [w for w in timed if a <= w["hi"] and b >= w["lo"]]
-        if len(hits) == 1:
-            tc_id = hits[0]["tc_id"]
-            pairs.append((tc_id, tid))
-            claimed_cases.add(tc_id)
-            typed = _typed_texts(by_tc.get(tc_id))
-            heard = said.get(tid, "")
-            if not typed:
-                unconfirmed += 1
-            elif heard in typed:
-                confirmed += 1
-            else:
-                mismatched += 1
-            continue
-        if len(hits) > 1:
-            ambiguous.append(
-                (tid, AMBIGUOUS_NOTE + " (overlaps %d windows)" % len(hits))
-            )
-            continue
-        if timed and a > timed[0]["lo"] and b < timed[-1]["hi"]:
-            ambiguous.append((tid, AMBIGUOUS_NOTE))
+        _place_turn(report, t, timed, by_tc, said, acc)
+    return _join_from_placed(timed, acc)
+
+
+def _place_turn(report, t, timed, by_tc, said, acc):
+    """Attribute one turn to a window, or record why it could not be."""
+    run = t.get("appRunId")
+    a = _ts_of(report, run, t.get("firstSeq"))
+    b = _ts_of(report, run, t.get("lastSeq"))
+    tid = t.get("turnId")
+    if a is None or b is None:
+        acc["unclocked"].append(tid)
+        return
+    hits = [w for w in timed if a <= w["hi"] and b >= w["lo"]]
+    if len(hits) == 1:
+        tc_id = hits[0]["tc_id"]
+        acc["pairs"].append((tc_id, tid))
+        acc["claimed"].add(tc_id)
+        typed = _typed_texts(by_tc.get(tc_id))
+        heard = said.get(tid, "")
+        if not typed:
+            acc["unconfirmed"] += 1
+        elif heard in typed:
+            acc["confirmed"] += 1
         else:
-            outside.append(
-                (
-                    tid,
-                    "served at %s, outside every case window of this run" % stamp(a),
-                )
-            )
+            acc["mismatched"] += 1
+        return
+    if len(hits) > 1:
+        acc["ambiguous"].append(
+            (tid, AMBIGUOUS_NOTE + " (overlaps %d windows)" % len(hits))
+        )
+        return
+    if timed and a > timed[0]["lo"] and b < timed[-1]["hi"]:
+        acc["ambiguous"].append((tid, AMBIGUOUS_NOTE))
+    else:
+        acc["outside"].append(
+            (tid, "served at %s, outside every case window of this run" % stamp(a))
+        )
+
+
+def _join_from_placed(timed, acc):
+    """The Join for a run with turns, from what ``_place_turn`` accumulated."""
+    pairs, ambiguous = acc["pairs"], acc["ambiguous"]
+    outside, unclocked = acc["outside"], acc["unclocked"]
+    confirmed, unconfirmed = acc["confirmed"], acc["unconfirmed"]
+    mismatched = acc["mismatched"]
     empty = [
-        w["tc_id"] for w in timed if w["tc_id"] and w["tc_id"] not in claimed_cases
+        w["tc_id"] for w in timed if w["tc_id"] and w["tc_id"] not in acc["claimed"]
     ]
-    note_bits = []
-    if any(not w["exact"] for w in timed):
-        note_bits.append(NO_CLOCK_NOTE)
-    if ambiguous:
-        note_bits.append(
-            "%d turn(s) fell between two cases and are shown on neither card: %s"
-            % (len(ambiguous), ", ".join(str(t) for t, _n in ambiguous))
-        )
-    if unclocked:
-        note_bits.append(
-            "%d turn(s) carry no clock and could not be placed" % len(unclocked)
-        )
+    note_bits = _join_note_bits(timed, ambiguous, unclocked)
     if not pairs and timed:
         # NOT ONE TURN LANDED. Whatever turns the file holds describe other
         # sessions of the app, so keeping them costs every case its evidence and
@@ -599,28 +728,7 @@ class Evidence:
         """Per app run: the work the app did outside every turn (start-up, sign-in, between cases)."""
         if self._session is not None:
             return self._session
-        out = []
-        for r in self.included:
-            run = r.get("appRunId")
-            rec = {
-                "appRunId": run,
-                "runIndex": r.get("runIndex"),
-                "from": r.get("firstTs"),
-                "to": r.get("lastTs"),
-                "turns": r.get("turns") or 0,
-                "llm": r.get("llm") or 0,
-                "bindings": r.get("bindings") or 0,
-                "tools": r.get("tools") or 0,
-                "errors": r.get("errors") or 0,
-                "manifest": None,
-                "entry": [],
-                "failed": [],
-                "other": [],
-            }
-            for m in self.report.get("manifests") or []:
-                if m.get("appRunId") == run:
-                    rec["manifest"] = m
-            out.append(rec)
+        out = [_session_slot(r, self.report.get("manifests")) for r in self.included]
         index = {r["appRunId"]: r for r in out}
         for stream in STREAMS:
             for x in self.report.get(stream) or []:
@@ -632,42 +740,67 @@ class Evidence:
                 )
                 if tid:
                     continue
-                slot = index[run]
-                x = _stamped(self.report, run, x)
-                if stream == "bindings":
-                    slot["entry"].append(x)
-                    if x.get("ok") is False:
-                        slot["failed"].append(x)
-                elif stream == "runlog" and x.get("lane") == "net" and x.get("url"):
-                    outcome = (x.get("outcome") or "").upper()
-                    ok = (
-                        True
-                        if outcome == "SUCCESS"
-                        else (False if outcome == "ERROR" else None)
-                    )
-                    key = self._entry_key(x.get("verb"), x.get("url"))
-                    drawn = {
-                        self._entry_key(b.get("verb"), b.get("url"))
-                        for b in slot["entry"]
-                        if b.get("binding") != "network log only"
-                    }
-                    if key not in drawn:
-                        call = dict(
-                            x, binding="network log only", ok=ok, statusKnown=False
-                        )
-                        slot["entry"].append(call)
-                        if ok is False:
-                            slot["failed"].append(call)
-                elif stream == "errors":
-                    if x.get("kind") != "binding":
-                        slot["failed"].append(x)
-                else:
-                    slot["other"].append(x)
+                _file_outside_turn(
+                    index[run], stream, _stamped(self.report, run, x), self._entry_key
+                )
         for slot in out:
             slot["entry"].sort(key=lambda b: b.get("seq") or 0)
             slot["failed"].sort(key=lambda b: b.get("seq") or 0)
         self._session = out
         return out
+
+    def _session_slot(self, r):
+        """The empty per-run record ``session`` fills."""
+        run = r.get("appRunId")
+        rec = {
+            "appRunId": run,
+            "runIndex": r.get("runIndex"),
+            "from": r.get("firstTs"),
+            "to": r.get("lastTs"),
+            "turns": r.get("turns") or 0,
+            "llm": r.get("llm") or 0,
+            "bindings": r.get("bindings") or 0,
+            "tools": r.get("tools") or 0,
+            "errors": r.get("errors") or 0,
+            "manifest": None,
+            "entry": [],
+            "failed": [],
+            "other": [],
+        }
+        for m in self.report.get("manifests") or []:
+            if m.get("appRunId") == run:
+                rec["manifest"] = m
+        return rec
+
+    def _file_outside_turn(self, slot, stream, x):
+        """Put one out-of-turn record in the right list of its run's slot."""
+        if stream == "bindings":
+            slot["entry"].append(x)
+            if x.get("ok") is False:
+                slot["failed"].append(x)
+        elif stream == "runlog" and x.get("lane") == "net" and x.get("url"):
+            self._file_net_log_call(slot, x)
+        elif stream == "errors":
+            if x.get("kind") != "binding":
+                slot["failed"].append(x)
+        else:
+            slot["other"].append(x)
+
+    def _file_net_log_call(self, slot, x):
+        """A network-log call no binding drew: add it as "network log only"."""
+        outcome = (x.get("outcome") or "").upper()
+        ok = True if outcome == "SUCCESS" else (False if outcome == "ERROR" else None)
+        key = self._entry_key(x.get("verb"), x.get("url"))
+        drawn = {
+            self._entry_key(b.get("verb"), b.get("url"))
+            for b in slot["entry"]
+            if b.get("binding") != "network log only"
+        }
+        if key not in drawn:
+            call = dict(x, binding="network log only", ok=ok, statusKnown=False)
+            slot["entry"].append(call)
+            if ok is False:
+                slot["failed"].append(call)
 
     def ambiguous_records(self):
         """Every record of a turn the join called ambiguous -- for the run-level block."""
@@ -705,39 +838,8 @@ class Evidence:
                 tid = self._synthetic_turn_of(run, rec)
             return tid
 
-        for kind, stream in (("llm", "llm"), ("api", "bindings"), ("tool", "tools")):
-            for rec in self.report.get(stream) or []:
-                if tid_of(rec) not in mine:
-                    continue
-                ms = _derived_ms(self.report, rec.get("appRunId"), rec)
-                if ms is None:
-                    continue
-                if kind == "llm" and rec.get("error"):
-                    out["llmfail"].append(float(ms))
-                else:
-                    out[kind].append(float(ms))
-        said, heard, threw = {}, {}, {}
-        for u in self.report.get("utterances") or []:
-            if u.get("turnId") in mine:
-                said[u["turnId"]] = _ts_of(self.report, u.get("appRunId"), u.get("seq"))
-        for a in self.report.get("answers") or []:
-            if a.get("turnId") in mine:
-                heard.setdefault(
-                    a["turnId"], _ts_of(self.report, a.get("appRunId"), a.get("seq"))
-                )
-        for x in self.report.get("errors") or []:
-            if x.get("turnId") in mine:
-                threw[x["turnId"]] = _ts_of(
-                    self.report, x.get("appRunId"), x.get("seq")
-                )
-        for tid, start in said.items():
-            if start is None:
-                continue
-            end, bucket = heard.get(tid), "turn"
-            if end is None:
-                end, bucket = threw.get(tid), "turnfail"
-            if end is not None and end >= start:
-                out[bucket].append(float(end - start))
+        _collect_record_spans(self.report, out, mine, tid_of)
+        _collect_turn_spans(self.report, out, mine)
         return out
 
     def endpoints(self):
@@ -932,6 +1034,37 @@ def empty_report():
     }
 
 
+def _resolve_report(profile, compiled, report, ndjson, logcat):
+    """``(report, note, error)``: the report given, parsed, or the empty one."""
+    note = ""
+    if report is None:
+        if ndjson is None and logcat is None:
+            report = empty_report()
+            note = (
+                "this run holds no app capture -- no structured log and no logcat were "
+                "recorded -- so what the lane did is shown and what the app did is not "
+                "available for any case"
+            )
+        else:
+            parsed = grammar.build(profile, compiled, ndjson=ndjson, logcat=logcat)
+            if parsed.get("error"):
+                return None, "", parsed["error"]
+            report = parsed["content"]
+    if not isinstance(report, dict):
+        return None, "", "the app report is not a mapping"
+    return report, note, None
+
+
+def _latest_run_end(report):
+    """The latest ``lastTs`` over the app runs, or None when none is a number."""
+    anchor = None
+    for r in report.get("appRuns") or []:
+        ts = r.get("lastTs")
+        if isinstance(ts, (int, float)):
+            anchor = ts if anchor is None else max(anchor, ts)
+    return anchor
+
+
 def build(cases, profile, compiled, *, report=None, ndjson=None, logcat=None) -> dict:
     """Parse (or take) the app report and join it to ``cases``. Never raises.
 
@@ -940,36 +1073,16 @@ def build(cases, profile, compiled, *, report=None, ndjson=None, logcat=None) ->
     own rows and nothing else.
     """
     try:
-        if report is None:
-            if ndjson is None and logcat is None:
-                report = empty_report()
-                note = (
-                    "this run holds no app capture -- no structured log and no logcat were "
-                    "recorded -- so what the lane did is shown and what the app did is not "
-                    "available for any case"
-                )
-            else:
-                parsed = grammar.build(profile, compiled, ndjson=ndjson, logcat=logcat)
-                if parsed.get("error"):
-                    return {"error": parsed["error"], "content": None}
-                report = parsed["content"]
-                note = ""
-        else:
-            note = ""
-        if not isinstance(report, dict):
-            return {"error": "the app report is not a mapping", "content": None}
+        report, note, error = _resolve_report(profile, compiled, report, ndjson, logcat)
+        if error:
+            return {"error": error, "content": None}
         offset = capture_offset(ndjson) if ndjson is not None else 0
-        anchor = None
-        for r in report.get("appRuns") or []:
-            ts = r.get("lastTs")
-            if isinstance(ts, (int, float)):
-                anchor = ts if anchor is None else max(anchor, ts)
         windows = case_windows(cases)
+        timed = [w for w in windows if w.get("lo") is not None]
+        anchor = _latest_run_end(report)
         if anchor is None:
-            timed = [w for w in windows if w.get("lo") is not None]
             anchor = timed[-1]["hi"] if timed else None
         normalise_clock(report, offset, anchor)
-        timed = [w for w in windows if w.get("lo") is not None]
         window = {
             "from": min(w["lo"] for w in timed) if timed else None,
             "to": max(w["hi"] for w in timed) if timed else None,

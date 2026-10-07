@@ -286,6 +286,155 @@ def _is_pinned_ime(url: object, sha256: object) -> bool:
         return False
 
 
+def _download_refusal(url: str, sha256: str) -> str:
+    """The reason *url* may not be fetched at all, or ``""`` when it may."""
+    if not settings.qa_mobile_https_capture_enabled and not _is_pinned_ime(url, sha256):
+        return (
+            "Refusing to download: HTTPS capture needs "
+            "`QA_MOBILE_HTTPS_CAPTURE_ENABLED=true` in `.env` and an "
+            "MCP server restart. Nothing was fetched."
+        )
+    parts = urlsplit(str(url))
+    if parts.scheme != "https":
+        return (
+            "Refusing to download over "
+            + (parts.scheme or "an empty scheme")
+            + ": the mobile lane fetches over HTTPS only."
+        )
+    if not parts.hostname:
+        return "Refusing to download from a URL with no host."
+    if not host_allowed(parts.hostname):
+        return (
+            "Refusing to download from "
+            + str(parts.hostname)
+            + ": the mobile lane downloads only from "
+            + ", ".join(ALLOWED_HOST_SUFFIXES)
+            + ". Nothing was fetched."
+        )
+    if not valid_sha256(sha256):
+        name = (parts.path or "").rsplit("/", 1)[-1] or "the requested file"
+        return (
+            "Refusing to download "
+            + name
+            + ": no valid SHA-256 is pinned for it (got "
+            + repr(str(sha256 or "")[:16])
+            + "). An unverifiable download is not attempted."
+        )
+    return ""
+
+
+def _open_resuming(url: str, part: Path, start: int):
+    """Open *url* from byte *start*; restart from 0 if the server won't resume.
+
+    Returns ``(response, start)`` with the offset actually in force.
+    """
+    try:
+        return _open(url, start), start
+    except urllib.error.HTTPError as exc:
+        if start and exc.code in (400, 416, 501):
+            # The server will not resume. Start over rather than fail: a
+            # stale .part from an aborted run must not wedge the lane.
+            part.unlink(missing_ok=True)
+            return _open(url, 0), 0
+        raise
+
+
+def _stream_to_part(
+    response,
+    part: Path,
+    start: int,
+    progress_path: str | Path | None,
+    progress_base: dict,
+) -> None:
+    """Write the body to *part* (appending from *start*), reporting progress.
+
+    *progress_base* holds the progress fields that do not change mid-download.
+    """
+    mode = "ab" if start else "wb"
+    try:
+        declared = int(response.headers.get("Content-Length") or 0)
+    except (TypeError, ValueError, OverflowError):
+        declared = 0
+    total = start + declared
+    got = start
+    last_write = 0.0
+    with open(part, mode) as handle:
+        while True:
+            block = response.read(CHUNK)
+            if not block:
+                break
+            handle.write(block)
+            got += len(block)
+            now = time.time()
+            if now - last_write >= _PROGRESS_INTERVAL_S:
+                last_write = now
+                write_progress(
+                    progress_path,
+                    {
+                        **progress_base,
+                        "pct": int(got * 100 / total) if total else 0,
+                        "bytes": got,
+                        "total": total,
+                        "updated": now,
+                    },
+                )
+
+
+def _delivered(dest_path: Path, *, cached: bool) -> dict:
+    return {
+        "error": None,
+        "content": {
+            "path": str(dest_path),
+            "bytes": dest_path.stat().st_size,
+            "cached": cached,
+            "verified": True,
+        },
+    }
+
+
+def _fetch_part(
+    url: str,
+    part: Path,
+    start: int,
+    progress_path: str | Path | None,
+    base: dict,
+) -> str:
+    """Stream *url* into *part*; return a refusal text if it left HTTPS, else ``""``."""
+    response, start = _open_resuming(url, part, start)
+    with response:
+        final = str(getattr(response, "url", "") or url)
+        if urlsplit(final).scheme != "https":
+            return (
+                "Refusing to follow a redirect off HTTPS (to "
+                + (urlsplit(final).scheme or "an empty scheme")
+                + "). Nothing was written."
+            )
+        if start and int(getattr(response, "status", 200) or 200) != 206:
+            # A 200 to a Range request means the whole body is coming.
+            start = 0
+        _stream_to_part(response, part, start, progress_path, base)
+    return ""
+
+
+def _hash_mismatch(part: Path, name: str, want: str, actual: str) -> dict:
+    size = part.stat().st_size
+    part.unlink(missing_ok=True)
+    return {
+        "error": (
+            "Hash mismatch for "
+            + name
+            + ": expected SHA-256 "
+            + want
+            + " but the "
+            + str(size)
+            + " bytes received hash to "
+            + actual
+            + ". The partial file was deleted and nothing was installed."
+        ),
+        "content": None,
+    }
+
+
 def download(
     url: str,
     dest: str | Path,
@@ -306,67 +455,16 @@ def download(
     grew by one in the very commit meant to close that class.
     """
     try:
-        if not settings.qa_mobile_https_capture_enabled and not _is_pinned_ime(
-            url, sha256
-        ):
-            return {
-                "error": (
-                    "Refusing to download: HTTPS capture needs "
-                    "`QA_MOBILE_HTTPS_CAPTURE_ENABLED=true` in `.env` and an "
-                    "MCP server restart. Nothing was fetched."
-                ),
-                "content": None,
-            }
-        parts = urlsplit(str(url))
-        if parts.scheme != "https":
-            return {
-                "error": (
-                    "Refusing to download over "
-                    + (parts.scheme or "an empty scheme")
-                    + ": the mobile lane fetches over HTTPS only."
-                ),
-                "content": None,
-            }
-        if not parts.hostname:
-            return {
-                "error": "Refusing to download from a URL with no host.",
-                "content": None,
-            }
-        if not host_allowed(parts.hostname):
-            return {
-                "error": (
-                    "Refusing to download from "
-                    + str(parts.hostname)
-                    + ": the mobile lane downloads only from "
-                    + ", ".join(ALLOWED_HOST_SUFFIXES)
-                    + ". Nothing was fetched."
-                ),
-                "content": None,
-            }
-        name = (parts.path or "").rsplit("/", 1)[-1] or "the requested file"
-        if not valid_sha256(sha256):
-            return {
-                "error": (
-                    "Refusing to download "
-                    + name
-                    + ": no valid SHA-256 is pinned for it (got "
-                    + repr(str(sha256 or "")[:16])
-                    + "). An unverifiable download is not attempted."
-                ),
-                "content": None,
-            }
+        refusal = _download_refusal(url, sha256)
+        if refusal:
+            return {"error": refusal, "content": None}
+        name = (urlsplit(str(url)).path or "").rsplit("/", 1)[-1] or (
+            "the requested file"
+        )
         want = str(sha256).strip().lower()
         dest_path = Path(dest)
         if dest_path.is_file() and digest_file(dest_path) == want:
-            return {
-                "error": None,
-                "content": {
-                    "path": str(dest_path),
-                    "bytes": dest_path.stat().st_size,
-                    "cached": True,
-                    "verified": True,
-                },
-            }
+            return _delivered(dest_path, cached=True)
         disk = (check_disk(payload_bytes, dest_path.parent) or {}).get("content") or {}
         if not disk.get("ok", False) and required_bytes(payload_bytes) > 0:
             return {
@@ -376,90 +474,20 @@ def download(
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         part = dest_path.with_name(dest_path.name + ".part")
         start = part.stat().st_size if part.is_file() else 0
-        try:
-            response = _open(str(url), start)
-        except urllib.error.HTTPError as exc:
-            if start and exc.code in (400, 416, 501):
-                # The server will not resume. Start over rather than fail: a
-                # stale .part from an aborted run must not wedge the lane.
-                part.unlink(missing_ok=True)
-                start = 0
-                response = _open(str(url), 0)
-            else:
-                raise
-        with response:
-            final = str(getattr(response, "url", "") or url)
-            if urlsplit(final).scheme != "https":
-                return {
-                    "error": (
-                        "Refusing to follow a redirect off HTTPS (to "
-                        + (urlsplit(final).scheme or "an empty scheme")
-                        + "). Nothing was written."
-                    ),
-                    "content": None,
-                }
-            if start and int(getattr(response, "status", 200) or 200) != 206:
-                # A 200 to a Range request means the whole body is coming.
-                start = 0
-            mode = "ab" if start else "wb"
-            try:
-                declared = int(response.headers.get("Content-Length") or 0)
-            except (TypeError, ValueError, OverflowError):
-                declared = 0
-            total = start + declared
-            got = start
-            last_write = 0.0
-            with open(part, mode) as handle:
-                while True:
-                    block = response.read(CHUNK)
-                    if not block:
-                        break
-                    handle.write(block)
-                    got += len(block)
-                    now = time.time()
-                    if now - last_write >= _PROGRESS_INTERVAL_S:
-                        last_write = now
-                        write_progress(
-                            progress_path,
-                            {
-                                "phase": phase,
-                                "pct": int(got * 100 / total) if total else 0,
-                                "bytes": got,
-                                "total": total,
-                                "message": "downloading " + name,
-                                "error": None,
-                                "pid": os.getpid(),
-                                "updated": now,
-                            },
-                        )
+        base = {
+            "phase": phase,
+            "message": "downloading " + name,
+            "error": None,
+            "pid": os.getpid(),
+        }
+        off_https = _fetch_part(str(url), part, start, progress_path, base)
+        if off_https:
+            return {"error": off_https, "content": None}
         actual = digest_file(part)
         if actual != want:
-            size = part.stat().st_size
-            part.unlink(missing_ok=True)
-            return {
-                "error": (
-                    "Hash mismatch for "
-                    + name
-                    + ": expected SHA-256 "
-                    + want
-                    + " but the "
-                    + str(size)
-                    + " bytes received hash to "
-                    + actual
-                    + ". The partial file was deleted and nothing was installed."
-                ),
-                "content": None,
-            }
+            return _hash_mismatch(part, name, want, actual)
         os.replace(part, dest_path)
-        return {
-            "error": None,
-            "content": {
-                "path": str(dest_path),
-                "bytes": dest_path.stat().st_size,
-                "cached": False,
-                "verified": True,
-            },
-        }
+        return _delivered(dest_path, cached=False)
     except RedirectRefused as exc:
         # Ahead of the ValueError clause below on purpose: a refused hop is a
         # decision this module made, and the tester must read it as a refusal

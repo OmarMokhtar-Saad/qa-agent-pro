@@ -265,6 +265,66 @@ _BARE_SECTION_RE = re.compile(
 )
 
 
+def _split_ac_lines(raw: str) -> list[str]:
+    """Split raw AC text into candidate lines (list markers, paragraphs, labels)."""
+    # Split on bullet or numbered list markers at the start of a line,
+    # or on double-newlines (paragraph breaks).
+    lines = re.split(_AC_SPLIT_RE, raw)
+
+    # If that produced only one non-empty chunk -- or if any single chunk
+    # STILL carries more than one `ACn:` label, which is exactly what a
+    # trailing paragraph used to hide -- fall back to single-newline split.
+    non_empty = [ln.strip() for ln in lines if ln.strip()]
+    if len(non_empty) <= 1 or any(
+        len(_AC_LABEL_RE.findall(ln)) > 1 for ln in non_empty
+    ):
+        lines = raw.splitlines()
+
+    # 2026-08-31 (F3): a Business-Rules table flattens to ONE line carrying
+    # every `BRnn:` label, so neither split above separates anything. Split
+    # on the label itself -- only where at least two are present.
+    expanded: list[str] = []
+    for _ln in lines:
+        _text = _ln if isinstance(_ln, str) else ""
+        if len(_ANY_LABEL_RE.findall(_text)) >= _MIN_INLINE_LABELS:
+            expanded += [p for p in _INLINE_LABEL_SPLIT_RE.split(_text) if p.strip()]
+        else:
+            expanded.append(_text)
+    return expanded
+
+
+def _accept_ac_candidate(line: str) -> str:
+    """Return the cleaned criterion text for one candidate line, or "" to drop it."""
+    line = line.strip()
+    # Strip any residual leading list marker that survived the split.
+    # A bare digit is CONTENT (e.g. "3 failed logins", "200ms"); only
+    # strip a leading number when it is a real list marker — i.e. it is
+    # immediately followed by a delimiter (./)/]) AND whitespace.
+    line = re.sub(
+        r"^\s*(?:[-*•]|\d+[.)\]]|AC\s*-?\s*\d{1,3}\s*[:.)\]-])\s+",
+        "",
+        line,
+    ).strip()
+    if len(line) < 5:
+        return ""
+    # A trailing "Notes:"/"Links:" paragraph is prose ABOUT the ticket,
+    # not a criterion -- see _NON_AC_PREFIX_RE.
+    if _BARE_SECTION_RE.match(line):
+        logger.debug("Dropping bare section heading: %.60r", line)
+        return ""
+    if _NON_AC_PREFIX_RE.match(line):
+        logger.debug("Dropping non-criterion section label: %.60r", line)
+        return ""
+    # A configured AC field can return something that is not a
+    # requirement at all (a date, an id, a number). Letting it
+    # through creates a bogus AC that every downstream anchoring
+    # check then treats as ground truth.
+    if not looks_like_requirement_text(line):
+        logger.debug("Dropping non-requirement AC candidate: %.60r", line)
+        return ""
+    return line
+
+
 def parse_acceptance_criteria(raw: str) -> list[AcceptanceCriterion]:
     """Parse raw acceptance criteria text into numbered AcceptanceCriterion items.
 
@@ -280,63 +340,11 @@ def parse_acceptance_criteria(raw: str) -> list[AcceptanceCriterion]:
         if not raw or not raw.strip():
             return []
 
-        # Split on bullet or numbered list markers at the start of a line,
-        # or on double-newlines (paragraph breaks).
-        lines = re.split(_AC_SPLIT_RE, raw)
-
-        # If that produced only one non-empty chunk -- or if any single chunk
-        # STILL carries more than one `ACn:` label, which is exactly what a
-        # trailing paragraph used to hide -- fall back to single-newline split.
-        non_empty = [ln.strip() for ln in lines if ln.strip()]
-        if len(non_empty) <= 1 or any(
-            len(_AC_LABEL_RE.findall(ln)) > 1 for ln in non_empty
-        ):
-            lines = raw.splitlines()
-
-        # 2026-08-31 (F3): a Business-Rules table flattens to ONE line carrying
-        # every `BRnn:` label, so neither split above separates anything. Split
-        # on the label itself -- only where at least two are present.
-        expanded: list[str] = []
-        for _ln in lines:
-            _text = _ln if isinstance(_ln, str) else ""
-            if len(_ANY_LABEL_RE.findall(_text)) >= _MIN_INLINE_LABELS:
-                expanded += [
-                    p for p in _INLINE_LABEL_SPLIT_RE.split(_text) if p.strip()
-                ]
-            else:
-                expanded.append(_text)
-        lines = expanded
-
-        items: list[str] = []
-        for line in lines:
-            line = line.strip()
-            # Strip any residual leading list marker that survived the split.
-            # A bare digit is CONTENT (e.g. "3 failed logins", "200ms"); only
-            # strip a leading number when it is a real list marker — i.e. it is
-            # immediately followed by a delimiter (./)/]) AND whitespace.
-            line = re.sub(
-                r"^\s*(?:[-*•]|\d+[.)\]]|AC\s*-?\s*\d{1,3}\s*[:.)\]-])\s+",
-                "",
-                line,
-            ).strip()
-            if len(line) < 5:
-                continue
-            # A trailing "Notes:"/"Links:" paragraph is prose ABOUT the ticket,
-            # not a criterion -- see _NON_AC_PREFIX_RE.
-            if _BARE_SECTION_RE.match(line):
-                logger.debug("Dropping bare section heading: %.60r", line)
-                continue
-            if _NON_AC_PREFIX_RE.match(line):
-                logger.debug("Dropping non-criterion section label: %.60r", line)
-                continue
-            # A configured AC field can return something that is not a
-            # requirement at all (a date, an id, a number). Letting it
-            # through creates a bogus AC that every downstream anchoring
-            # check then treats as ground truth.
-            if not looks_like_requirement_text(line):
-                logger.debug("Dropping non-requirement AC candidate: %.60r", line)
-                continue
-            items.append(line)
+        items = [
+            item
+            for item in (_accept_ac_candidate(ln) for ln in _split_ac_lines(raw))
+            if item
+        ]
 
         if not items:
             return []
@@ -540,6 +548,28 @@ def traceability_warning_section(acs: list, test_cases: list) -> str:
         return ""
 
 
+def _summary_table(
+    acs: list[AcceptanceCriterion], ac_to_tcs: dict[str, list[str]]
+) -> str:
+    """The markdown RTM table of build_rtm_summary, one row per criterion."""
+    rows: list[str] = []
+    for ac in acs:
+        linked = ac_to_tcs[ac.ac_id]
+        linked_str = ", ".join(linked) if linked else ""
+        status = "Covered" if linked else "ORPHAN"
+        desc = (
+            ac.description[:80] + "..." if len(ac.description) > 80 else ac.description
+        )
+        rows.append(f"| {ac.ac_id} | {desc} | {linked_str} | {status} |")
+
+    return (
+        "\n\n---\n\n"
+        "## Requirements Traceability Matrix\n\n"
+        "| AC ID | Acceptance Criterion | Linked TCs | Status |\n"
+        "|-------|----------------------|------------|--------|\n" + "\n".join(rows)
+    )
+
+
 def build_rtm_summary(
     acs: list[AcceptanceCriterion], test_cases: list[TestCase]
 ) -> str:
@@ -555,23 +585,7 @@ def build_rtm_summary(
     total_count = len(acs)
     pct = int(covered_count / total_count * 100) if total_count else 0
 
-    # Build table rows
-    rows: list[str] = []
-    for ac in acs:
-        linked = ac_to_tcs[ac.ac_id]
-        linked_str = ", ".join(linked) if linked else ""
-        status = "Covered" if linked else "ORPHAN"
-        desc = (
-            ac.description[:80] + "..." if len(ac.description) > 80 else ac.description
-        )
-        rows.append(f"| {ac.ac_id} | {desc} | {linked_str} | {status} |")
-
-    table = (
-        "\n\n---\n\n"
-        "## Requirements Traceability Matrix\n\n"
-        "| AC ID | Acceptance Criterion | Linked TCs | Status |\n"
-        "|-------|----------------------|------------|--------|\n" + "\n".join(rows)
-    )
+    table = _summary_table(acs, ac_to_tcs)
 
     coverage_line = (
         f"\n\n**Coverage: {covered_count} of {total_count} ACs covered ({pct}%)."
@@ -801,30 +815,36 @@ def rtm_oneline(
         kind = "MODEL-DERIVED acceptance criteria" if derived else "acceptance criteria"
         line = f"\n\n**Requirements:** {covered}/{total} {kind} traced"
         line += f", {orphans} orphan(s)." if orphans else ", all covered."
-        # F04 (2026-08-16): the AC figure ALONE read "7/7 acceptance criteria
-        # traced, all covered" over a suite whose deterministic checklist matcher
-        # mapped 21 of its 96 cases. The two figures answer different questions —
-        # how many criteria got at least one case, versus how many cases verify a
-        # stated criterion — and printing only the first is what let a suite of
-        # convenience tags read as fully traced. They travel together from here,
-        # so "all covered" can never stand alone. Counts only (the clause grows
-        # with integer WIDTH, never with the suite), and silent when there are no
-        # cases at all, which keeps the stored-suite re-render byte-identical.
-        cases = list(test_cases or [])
-        if cases:
-            untraced = len(orphan_tc_ids)
-            traced = len(cases) - untraced
-            line += f" {traced} of {len(cases)} case(s) trace to one of them"
-            line += f"; {untraced} trace to none." if untraced else "."
-        if derived:
-            line += (
-                " They were synthesized because the ticket carried none, so this "
-                "measures self-consistency, NOT coverage of stated requirements."
-            )
+        line += _oneline_tail(list(test_cases or []), orphan_tc_ids, derived)
         return line
     except Exception:  # pragma: no cover - defensive, never break the summary
         logger.exception("rtm_oneline failed — returning empty string")
         return ""
+
+
+def _oneline_tail(cases: list, orphan_tc_ids: list, derived: bool) -> str:
+    """The case-trace clause and the derived-criteria disclosure of rtm_oneline."""
+    # F04 (2026-08-16): the AC figure ALONE read "7/7 acceptance criteria
+    # traced, all covered" over a suite whose deterministic checklist matcher
+    # mapped 21 of its 96 cases. The two figures answer different questions —
+    # how many criteria got at least one case, versus how many cases verify a
+    # stated criterion — and printing only the first is what let a suite of
+    # convenience tags read as fully traced. They travel together from here,
+    # so "all covered" can never stand alone. Counts only (the clause grows
+    # with integer WIDTH, never with the suite), and silent when there are no
+    # cases at all, which keeps the stored-suite re-render byte-identical.
+    tail = ""
+    if cases:
+        untraced = len(orphan_tc_ids)
+        traced = len(cases) - untraced
+        tail += f" {traced} of {len(cases)} case(s) trace to one of them"
+        tail += f"; {untraced} trace to none." if untraced else "."
+    if derived:
+        tail += (
+            " They were synthesized because the ticket carried none, so this "
+            "measures self-consistency, NOT coverage of stated requirements."
+        )
+    return tail
 
 
 def format_ac_prompt_block(acs: list[AcceptanceCriterion]) -> str:

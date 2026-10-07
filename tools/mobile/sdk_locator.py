@@ -163,6 +163,30 @@ def tool_path(root: Path, tool: str) -> Path:
     return Path(root).joinpath(*rel, leaf)
 
 
+def _sdk_candidate(source: str, root: Path) -> dict | None:
+    """What SDK tools *root* holds, or None when *root* is not a directory."""
+    try:
+        if not root.is_dir():
+            return None
+    except OSError:
+        return None
+    tools = {}
+    for tool in TOOL_NAMES:
+        found_path = tool_path(root, tool)
+        try:
+            tools[tool] = str(found_path) if found_path.is_file() else ""
+        except OSError:
+            tools[tool] = ""
+    missing = sorted(name for name, value in tools.items() if not value)
+    return {
+        "sdk_root": str(root),
+        "source": source,
+        "tools": tools,
+        "missing": missing,
+        "found": True,
+    }
+
+
 def locate_sdk() -> dict:
     """The best available SDK.
 
@@ -176,26 +200,10 @@ def locate_sdk() -> dict:
     try:
         best: dict | None = None
         for source, root in _candidate_sdk_roots():
-            try:
-                if not root.is_dir():
-                    continue
-            except OSError:
+            candidate = _sdk_candidate(source, root)
+            if candidate is None:
                 continue
-            tools = {}
-            for tool in TOOL_NAMES:
-                found_path = tool_path(root, tool)
-                try:
-                    tools[tool] = str(found_path) if found_path.is_file() else ""
-                except OSError:
-                    tools[tool] = ""
-            missing = sorted(name for name, value in tools.items() if not value)
-            candidate = {
-                "sdk_root": str(root),
-                "source": source,
-                "tools": tools,
-                "missing": missing,
-                "found": True,
-            }
+            missing = candidate["missing"]
             if not missing:
                 return {"error": None, "content": candidate}
             if best is None or len(missing) < len(best["missing"]):

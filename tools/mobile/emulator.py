@@ -539,6 +539,36 @@ def exit_report(
     }
 
 
+def _boot_timeout_error(budget: int, last: str, tunable: bool) -> str:
+    """The message for a boot that outlived its *budget*."""
+    # The remedy, and the ONE thing that decides it: whose budget was this?
+    # Both branches name Android Studio, because warming the snapshot
+    # shortens the BOOT and so helps either way; only the first offers the
+    # setting, because only there does raising it change what happens next.
+    remedy = (
+        "Raise QA_MOBILE_BOOT_TIMEOUT_S, or start the AVD from "
+        "Android Studio once to warm its snapshot."
+        if tunable
+        else (
+            "Nothing is blocked on it: QA_MOBILE_BOOT_TIMEOUT_S does not "
+            "extend this slice, which is the most one tool call may spend "
+            "before it answers. A cold emulator commonly needs a minute or "
+            "two, so wait and ask again; start the AVD from Android Studio "
+            "once to warm its snapshot if it always takes this long."
+        )
+    )
+    return (
+        "The emulator did not finish booting within "
+        + str(budget)
+        + "s (last "
+        + BOOT_PROP
+        + "="
+        + repr(last[:60])
+        + "). "
+        + remedy
+    )
+
+
 async def wait_boot(
     serial: str, timeout: int = 0, *, tunable: bool = True, avd: str = ""
 ) -> dict:
@@ -581,38 +611,48 @@ async def wait_boot(
             if not prop.get("error") and str(prop.get("content") or "").strip() == "1":
                 return {"error": None, "content": {"serial": serial, "booted": True}}
             await asyncio.sleep(POLL_INTERVAL_S)
-        # The remedy, and the ONE thing that decides it: whose budget was this?
-        # Both branches name Android Studio, because warming the snapshot
-        # shortens the BOOT and so helps either way; only the first offers the
-        # setting, because only there does raising it change what happens next.
-        remedy = (
-            "Raise QA_MOBILE_BOOT_TIMEOUT_S, or start the AVD from "
-            "Android Studio once to warm its snapshot."
-            if tunable
-            else (
-                "Nothing is blocked on it: QA_MOBILE_BOOT_TIMEOUT_S does not "
-                "extend this slice, which is the most one tool call may spend "
-                "before it answers. A cold emulator commonly needs a minute or "
-                "two, so wait and ask again; start the AVD from Android Studio "
-                "once to warm its snapshot if it always takes this long."
-            )
-        )
-        return {
-            "error": (
-                "The emulator did not finish booting within "
-                + str(budget)
-                + "s (last "
-                + BOOT_PROP
-                + "="
-                + repr(last[:60])
-                + "). "
-                + remedy
-            ),
-            "content": None,
-        }
+        return {"error": _boot_timeout_error(budget, last, tunable), "content": None}
     except Exception as exc:
         logger.exception("mobile.emulator.wait_boot failed")
         return {"error": str(exc), "content": None}
+
+
+def _spawn_command(binary: str, avd: str, locale: str) -> list[str]:
+    """The emulator command line for *avd*, with the locale prop when valid."""
+    command = [
+        binary,
+        "-avd",
+        str(avd),
+        "-no-snapshot-save",
+        "-no-boot-anim",
+    ]
+    # THE ONE MECHANISM THAT WORKS UNPRIVILEGED. `persist.sys.locale` is a
+    # `persist.*` property, so `adb shell setprop` needs root that the
+    # `google_apis_playstore` user build does not give -- and even where the
+    # write lands, the running system keeps its old configuration until it
+    # restarts. Set at SPAWN, the device comes up in the language from its
+    # first frame, and it survives every later reboot of that AVD.
+    #
+    # APPENDED, never inserted: `test_boot_spawns_detached_when_nothing_is_
+    # running` reads `cmd[1:3]` by index.
+    wanted = str(locale or "").strip()
+    if wanted and adb.LOCALE_TAG.match(wanted):
+        command += ["-prop", adb.PERSIST_LOCALE_PROP + "=" + wanted]
+    return command
+
+
+def _spawn_kwargs(avd: str) -> tuple[dict, str]:
+    """The detached-spawn keyword arguments and the log path ('' if none)."""
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    kwargs.update(platform_info.detach_kwargs())
+    log_path = _emulator_log_path(str(avd))
+    if log_path:
+        kwargs["log_path"] = log_path
+    return kwargs, log_path
 
 
 async def start(avd: str, *, locale: str = "") -> dict:
@@ -647,34 +687,8 @@ async def start(avd: str, *, locale: str = "") -> dict:
                 "content": None,
             }
         paths.ensure_tree()
-        command = [
-            binary,
-            "-avd",
-            str(avd),
-            "-no-snapshot-save",
-            "-no-boot-anim",
-        ]
-        # THE ONE MECHANISM THAT WORKS UNPRIVILEGED. `persist.sys.locale` is a
-        # `persist.*` property, so `adb shell setprop` needs root that the
-        # `google_apis_playstore` user build does not give -- and even where the
-        # write lands, the running system keeps its old configuration until it
-        # restarts. Set at SPAWN, the device comes up in the language from its
-        # first frame, and it survives every later reboot of that AVD.
-        #
-        # APPENDED, never inserted: `test_boot_spawns_detached_when_nothing_is_
-        # running` reads `cmd[1:3]` by index.
-        wanted = str(locale or "").strip()
-        if wanted and adb.LOCALE_TAG.match(wanted):
-            command += ["-prop", adb.PERSIST_LOCALE_PROP + "=" + wanted]
-        kwargs = {
-            "stdin": subprocess.DEVNULL,
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
-        }
-        kwargs.update(platform_info.detach_kwargs())
-        log_path = _emulator_log_path(str(avd))
-        if log_path:
-            kwargs["log_path"] = log_path
+        command = _spawn_command(binary, avd, locale)
+        kwargs, log_path = _spawn_kwargs(avd)
         pid = _spawn(command, **kwargs)
         # Recorded AFTER the spawn returned, so a failed spawn is never listed
         # as booting (fix round 3, item 5).
@@ -684,6 +698,82 @@ async def start(avd: str, *, locale: str = "") -> dict:
     except Exception as exc:
         logger.exception("mobile.emulator.start failed")
         return {"error": str(exc), "content": None}
+
+
+async def _await_serial(avd: str, deadline: float) -> tuple[str, dict | None]:
+    """Poll ``adb devices`` until *avd* lists a serial or *deadline* passes.
+
+    Returns ``(serial, failure)``: *failure* is the error result when the
+    emulator process died first, else ``None``; *serial* is empty on timeout.
+    """
+    serial = ""
+    ticker = watch.Ticker("emulator starting")
+    while time.monotonic() < deadline and not serial:
+        await asyncio.sleep(BOOT_SERIAL_POLL_S)
+        await ticker.tick()
+        found = (await find_running(avd)).get("content") or {}
+        serial = str(found.get("serial") or "")
+        if not serial:
+            # B5: a process that already died will never appear in adb.
+            # Say so now, in the emulator's own words, not after the budget.
+            gone = exit_report(avd)
+            if gone:
+                return serial, {"error": gone["error"], "content": None}
+    return serial, None
+
+
+def _never_listed_error(avd: str, pid: int, budget: int) -> str:
+    """The message for an emulator that was spawned but never reached adb."""
+    return (
+        str(avd)
+        + " was started (pid "
+        + str(pid)
+        + ") but never appeared in `adb devices` within "
+        + str(budget)
+        + "s. Start it once from Android Studio to see the "
+        "emulator's own error."
+    )
+
+
+def _booted(avd: str, serial: object, *, reattached: bool, pid: int) -> dict:
+    """The success result :func:`boot` returns."""
+    return {
+        "error": None,
+        "content": {
+            "serial": serial,
+            "avd": str(avd),
+            "reattached": reattached,
+            "pid": pid,
+        },
+    }
+
+
+async def _reattach(avd: str, serial: object, timeout: int) -> dict:
+    """Wait for an already-running emulator to finish booting."""
+    waited = await wait_boot(str(serial), timeout)
+    if waited.get("error"):
+        return waited
+    return _booted(avd, serial, reattached=True, pid=0)
+
+
+async def _spawn_and_wait(avd: str, timeout: int) -> dict:
+    """Spawn *avd*, wait for it to list in adb, then for it to finish booting."""
+    started = await start(avd)
+    if started.get("error"):
+        return started
+    pid = int((started.get("content") or {}).get("pid") or 0)
+    budget = int(timeout or boot_timeout_s())
+
+    deadline = time.monotonic() + budget
+    serial, failure = await _await_serial(avd, deadline)
+    if failure:
+        return failure
+    if not serial:
+        return {"error": _never_listed_error(avd, pid, budget), "content": None}
+    waited = await wait_boot(serial, max(1, int(deadline - time.monotonic())), avd=avd)
+    if waited.get("error"):
+        return waited
+    return _booted(avd, serial, reattached=False, pid=pid)
 
 
 async def boot(avd: str, timeout: int = 0) -> dict:
@@ -724,65 +814,8 @@ async def boot(avd: str, timeout: int = 0) -> dict:
             return probe
         running = probe.get("content") or {}
         if running.get("serial"):
-            waited = await wait_boot(str(running["serial"]), timeout)
-            if waited.get("error"):
-                return waited
-            return {
-                "error": None,
-                "content": {
-                    "serial": running["serial"],
-                    "avd": str(avd),
-                    "reattached": True,
-                    "pid": 0,
-                },
-            }
-        started = await start(avd)
-        if started.get("error"):
-            return started
-        pid = int((started.get("content") or {}).get("pid") or 0)
-        budget = int(timeout or boot_timeout_s())
-
-        deadline = time.monotonic() + budget
-        serial = ""
-        ticker = watch.Ticker("emulator starting")
-        while time.monotonic() < deadline and not serial:
-            await asyncio.sleep(BOOT_SERIAL_POLL_S)
-            await ticker.tick()
-            found = (await find_running(avd)).get("content") or {}
-            serial = str(found.get("serial") or "")
-            if not serial:
-                # B5: a process that already died will never appear in adb.
-                # Say so now, in the emulator's own words, not after the budget.
-                gone = exit_report(avd)
-                if gone:
-                    return {"error": gone["error"], "content": None}
-        if not serial:
-            return {
-                "error": (
-                    str(avd)
-                    + " was started (pid "
-                    + str(pid)
-                    + ") but never appeared in `adb devices` within "
-                    + str(budget)
-                    + "s. Start it once from Android Studio to see the "
-                    "emulator's own error."
-                ),
-                "content": None,
-            }
-        waited = await wait_boot(
-            serial, max(1, int(deadline - time.monotonic())), avd=avd
-        )
-        if waited.get("error"):
-            return waited
-        return {
-            "error": None,
-            "content": {
-                "serial": serial,
-                "avd": str(avd),
-                "reattached": False,
-                "pid": pid,
-            },
-        }
+            return await _reattach(avd, running["serial"], timeout)
+        return await _spawn_and_wait(avd, timeout)
     except Exception as exc:
         logger.exception("mobile.emulator.boot failed")
         return {"error": str(exc), "content": None}

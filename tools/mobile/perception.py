@@ -404,6 +404,23 @@ def label_of(element: object, elements: object) -> str:
     outer = _bounds_tuple(element)
     if outer is None:
         return ""
+    return _largest_contained_label(element, outer, elements)
+
+
+def _contained_area(other: object, outer: tuple) -> int | None:
+    """The area of *other* when its bounds lie inside *outer*, else ``None``."""
+    inner = _bounds_tuple(other)
+    if inner is None:
+        return None
+    x1, y1, x2, y2 = outer
+    a1, b1, a2, b2 = inner
+    if a1 < x1 or b1 < y1 or a2 > x2 or b2 > y2:
+        return None
+    return max(0, a2 - a1) * max(0, b2 - b1)
+
+
+def _largest_contained_label(element: object, outer: tuple, elements: object) -> str:
+    """The label of the largest contained element that fills enough of *outer*."""
     x1, y1, x2, y2 = outer
     own_area = max(0, x2 - x1) * max(0, y2 - y1)
     best = ""
@@ -411,14 +428,8 @@ def label_of(element: object, elements: object) -> str:
     for other in list(elements or []):
         if not isinstance(other, dict) or other is element:
             continue
-        inner = _bounds_tuple(other)
-        if inner is None:
-            continue
-        a1, b1, a2, b2 = inner
-        if a1 < x1 or b1 < y1 or a2 > x2 or b2 > y2:
-            continue
-        area = max(0, a2 - a1) * max(0, b2 - b1)
-        if area < own_area * MIN_LABEL_AREA_SHARE:
+        area = _contained_area(other, outer)
+        if area is None or area < own_area * MIN_LABEL_AREA_SHARE:
             continue
         text = _own_label(other)
         if not text:
@@ -850,6 +861,319 @@ def _assign_ids(elements: list) -> None:
         element["id"] = base if count == 1 else base + "-" + str(count)
 
 
+def _collect_elements(
+    root: ElementTree.Element, frame: tuple | None
+) -> tuple[list[dict], list[str], str, int]:
+    """Walk the dump once: ``(elements, texts, first package, nodes considered)``."""
+    root_bounds = frame
+    elements: list[dict] = []
+    texts: list[str] = []
+    package = ""
+    considered = 0
+    for node in root.iter("node"):
+        considered += 1
+        bounds = parse_bounds(node.get("bounds"))
+        if bounds is None or _area(bounds) <= 0:
+            continue
+        if root_bounds is None:
+            root_bounds = bounds
+        elif (
+            bounds[0] >= root_bounds[2]
+            or bounds[1] >= root_bounds[3]
+            or bounds[2] <= root_bounds[0]
+            or bounds[3] <= root_bounds[1]
+        ):
+            # Entirely off-screen: laid out but not visible to the tester.
+            continue
+
+        element = _node_element(node, bounds)
+        if element is None:
+            continue
+        package = package or _clean(node.get("package"))
+        if element["text"]:
+            texts.append(element["text"])
+        elements.append(element)
+    return elements, texts, package, considered
+
+
+def _node_element(node: ElementTree.Element, bounds: tuple) -> dict | None:
+    """One node as an element row, or ``None`` for pure layout scaffolding."""
+    full_class = str(node.get("class") or "")
+    text = _clean(node.get("text"))
+    desc = _clean(node.get("content-desc"))
+    rid = _clean(node.get("resource-id"))
+    clickable = _flag(node, "clickable") or _flag(node, "long-clickable")
+    scrollable = _flag(node, "scrollable")
+    editable = _is_editable(full_class)
+    secure = _flag(node, "password")
+    hint = _clean(node.get("hint"))
+    if not (text or desc or rid or clickable or scrollable or editable):
+        # Pure layout scaffolding: not a target, not assertable.
+        return None
+    return {
+        **({"hint": hint} if hint else {}),
+        "id": "",
+        "cls": _short_class(full_class),
+        "text": text,
+        "desc": desc,
+        "rid": rid,
+        "bounds": list(bounds),
+        "clickable": clickable,
+        "editable": editable,
+        # A password input, from the dump's own attribute. It is
+        # the only signal that survives a field named in an
+        # alphabet this server cannot read, which is why the
+        # credential rule leans on the ELEMENT here and not on the
+        # action's chosen names alone.
+        "secure": secure,
+        "checked": _flag(node, "checked"),
+        "scrollable": scrollable,
+        # Kept per element only so the root-package fallback in
+        # `prune` has something to fall back TO; stripped before the
+        # packet is rendered, because it is the same on every element.
+        "package": _clean(node.get("package")),
+    }
+
+
+def _classify_by_panel(
+    elements: list[dict], selected: tuple
+) -> list[tuple[dict, bool]]:
+    """Pair each element with whether its box intersects the panel.
+
+    Classified ONCE, into a list, because the same visibility test written
+    twice is two conditions that drift apart.
+    """
+    classified = []
+    for element in elements:
+        box = element.get("bounds") or []
+        classified.append(
+            (
+                element,
+                len(box) == 4
+                and not (
+                    box[0] >= selected[2]
+                    or box[1] >= selected[3]
+                    or box[2] <= selected[0]
+                    or box[3] <= selected[1]
+                ),
+            )
+        )
+    return classified
+
+
+# THE TOTAL IS BOUNDED; THE OUTSIDE CLASS IS NOT CAPPED.
+#
+# Outside elements get whatever the total leaves after the inside
+# class has taken its own cap. Capping the outside class instead
+# deleted content from dumps that FIT -- 110 elements on a tablet
+# under a stale panel lost 25 of the tester's controls, where
+# today's code carries all 110 -- and it deleted them from the one
+# class whose membership we have already decided we cannot trust.
+#
+# `min(inside_count, MAX_ELEMENTS)` IS THE INVARIANT (in `_cap_elements`).
+# Delete the clamp and the outside budget keeps growing with the inside
+# class, so inside overflow starts eating the outside budget and the two
+# classes are competing again -- which is the defect all four ordering rules
+# died of. With the clamp, the budget is pinned at the headroom once
+# the inside class is full, so inside overflow adds NOTHING to
+# outside loss.
+def _cap_elements(
+    elements: list[dict], selected: tuple | None
+) -> tuple[list[dict], int, int, int]:
+    """Apply the element budget: ``(kept, dropped_inside, dropped_outside, dropped_unclassified)``."""
+    if selected is None:
+        # No panel, so no classification to make: one budget, document
+        # order, and the drops are counted under their own name. Attributing
+        # them to the inside class would be inventing a classification from
+        # a rectangle we do not have, which is the mistake `prune`'s
+        # whole history is made of.
+        return (
+            elements[:MAX_ELEMENTS],
+            0,
+            0,
+            max(0, len(elements) - MAX_ELEMENTS),
+        )
+    classified = _classify_by_panel(elements, selected)
+    inside_count = sum(1 for _, visible in classified if visible)
+    outside_budget = (
+        MAX_ELEMENTS + MAX_PACKET_HEADROOM - min(inside_count, MAX_ELEMENTS)
+    )
+    kept: list[dict] = []
+    dropped_inside = 0
+    dropped_outside = 0
+    used_inside = 0
+    used_outside = 0
+    for element, visible in classified:
+        # DOCUMENT ORDER, and the independence is ONE-DIRECTIONAL: an
+        # inside decision reads only the inside counter and its own cap,
+        # so nothing the outside class does can evict an inside element.
+        # The reverse is not true and does not need to be -- the outside
+        # budget is a function of `inside_count` -- and the clamp above
+        # is what stops that dependence turning back into competition.
+        if visible:
+            if used_inside >= MAX_ELEMENTS:
+                dropped_inside += 1
+                continue
+            used_inside += 1
+        else:
+            if used_outside >= outside_budget:
+                dropped_outside += 1
+                continue
+            used_outside += 1
+        kept.append(element)
+    return kept, dropped_inside, dropped_outside, 0
+
+
+def _parse_dump(xml: object) -> tuple[ElementTree.Element | None, str]:
+    """``(root, "")`` for a usable dump, ``(None, refusal)`` for a refused one."""
+    if not isinstance(xml, str) or not xml.strip():
+        return None, NOT_XML_REFUSAL
+    if len(xml.encode("utf-8", errors="replace")) > MAX_DUMP_BYTES:
+        return None, OVERSIZE_REFUSAL
+    if _DECL_RE.search(xml):
+        return None, DOCTYPE_REFUSAL
+    try:
+        return ElementTree.fromstring(xml), ""
+    except ElementTree.ParseError:
+        return None, NOT_XML_REFUSAL
+
+
+def _system_dialog_package(elements: list, package: str) -> str:
+    """The first system-dialog package any element carries other than *package*."""
+    for element in elements:
+        name = str(element.get("package") or "")
+        if name in SYSTEM_DIALOG_PACKAGES and name != package:
+            return name
+    return ""
+
+
+def _cap_and_label(elements: list, selected: tuple) -> tuple[list, bool, tuple]:
+    """``(elements, truncated, (inside, outside, unclassified))`` after the cap.
+
+    Also assigns ids and labels the survivors.
+    """
+    # OFF-PANEL CROWDING MAY NEVER DELETE AN ON-PANEL CONTROL.
+    #
+    # The frame is the display WIDENED to cover everything the dump
+    # lays out, which is what stops a stale device size deleting the
+    # tester's screen. But widening admits off-display elements into the same
+    # `MAX_ELEMENTS` budget in DOCUMENT order, so an adjacent pager page or
+    # an incoming activity laid out one screen width away could fill the cap
+    # and evict the control the tester is looking at. Measured: 150 rows of
+    # an incoming activity listed first, and `Delete account` gone from the
+    # packet, with a CORRECT display.
+    #
+    # Promoting what intersects the panel fixed that and broke its mirror
+    # image. Measured the other way: a tablet dump under a STALE phone size
+    # -- the case the widening above exists for -- classified `Delete
+    # account` at document index 0 as off-display and evicted it, while both
+    # the correct display and the dump-derived fallback kept it.
+    #
+    # The two cannot be told apart from here. A panel narrower than the dump
+    # extent is either a stale panel (keep the extra) or an app drawing
+    # off-screen (drop it), and the geometry is identical in kind -- rounds 3
+    # and 4 already made that trade in both directions.
+    #
+    # FOUR passes at spending one budget between the two classes each fixed
+    # the previous pass's worst case and created a new one further out:
+    # document order lost the visible control behind a full cap of off-panel
+    # rows; promotion lost the control a STALE panel misclassified;
+    # reserving half the budget for document order lost 25 visible controls
+    # behind 75 off-panel ones; reinstating that reserve lost 35 at 130.
+    # Each was measured, and the pattern is the point -- at a fixed cap,
+    # "every on-panel element survives" and "every element the dump listed
+    # first survives" are JOINTLY UNSATISFIABLE. That is a counting fact and
+    # no ordering rule repeals it.
+    #
+    # So the fix leaves the ordering axis: the packet's TOTAL grew by
+    # :data:`MAX_PACKET_HEADROOM`, the inside class keeps its own cap, the
+    # outside class takes what the total leaves, and the walk preserves
+    # DOCUMENT order. The headroom is spent only when the dump disagrees
+    # with the panel, so an ordinary screen is capped exactly as it was.
+    #
+    # When something IS dropped, `dropped_inside_panel` /
+    # `dropped_outside_panel` say which side of the panel it was on, because
+    # a screen thinned without saying so is one the model plans against
+    # believing it is complete.
+    #
+    # The properties that hold over ANY dump, which are the ones worth
+    # grading: off-panel crowding never removes an on-panel element, and no
+    # dump loses more elements than it loses without any of this.
+    # UNCHANGED MEANING, deliberately: "the dump offered more than
+    # `MAX_ELEMENTS`". `screen_hit` refuses a press on a truncated packet --
+    # a CLAUDE.md hard rule, because the control a key reaches is not in the
+    # dump at all -- so redefining this flag as "something was dropped"
+    # would relax a destructive guard as a side effect of a budget change,
+    # on a lane that reaches real installs. The new counts below carry the
+    # better information without touching what this gates.
+    truncated = len(elements) > MAX_ELEMENTS
+    elements, inside, outside, unclassified = _cap_elements(elements, selected)
+    _assign_ids(elements)
+    # AFTER the cap and the ids, so a label is only ever borrowed from an
+    # element the model can actually see and name. It reads cls/text/desc
+    # and writes label/role, so the five observables the ids are derived
+    # from are already final when it runs.
+    annotate({"elements": elements})
+    return elements, truncated, (inside, outside, unclassified)
+
+
+def _geometry_fields(
+    selected: tuple, frame: tuple, panel_axes: tuple, drops: tuple
+) -> dict:
+    """The display, frame, per-class drop counts and per-axis panel of a screen."""
+    dropped_inside, dropped_outside, dropped_unclassified = drops
+    return {
+        # The DISPLAY. Stored because the tallest element bottom is NOT
+        # the viewport: a scroll container reports its CONTENT height, and
+        # deriving the device size from a max() walk shrank every element on
+        # every scrollable screen. `[]` when the dump carried no positive-area
+        # window at all, so the key means exactly one thing and a reader can
+        # treat an empty value and an older build's missing value alike.
+        "root_bounds": list(selected) if selected else [],
+        # The FRAME, under its OWN name because it answers a different
+        # question: `root_bounds` is the display, and this is the region an
+        # element may occupy -- at least as large as everything the dump
+        # lays out. Stored because the report needs a scale even when the
+        # panel is unknown, and the alternative was `report._device_size`
+        # improvising one from a max() walk over the elements, which returns
+        # a scroll container's CONTENT height: the one value that whole
+        # function documents as the thing the scale must never be. Two
+        # rectangles, two names, one meaning each.
+        #
+        # From `frame`, NOT from a node's own box -- storing that would put
+        # a node's box under a name that promises the frame, which is the
+        # one-name-two-meanings defect this key exists to end.
+        "frame_bounds": list(frame) if frame else [],
+        # WHICH class lost elements, because "truncated" alone cannot say
+        # whether the tester's own screen was thinned or an adjacent pager
+        # page was. A model told only that something was cut plans against a
+        # screen it believes is complete.
+        #
+        # NAMED FOR THE PANEL, NOT FOR THE TESTER'S EYES, because the panel
+        # can be wrong and these inherit its error. Under a stale display a
+        # control the tester is looking at falls OUTSIDE the panel, so
+        # `dropped_outside_panel` would have been read as "only an adjacent
+        # page was thinned" when the opposite is true. "Inside"/"outside"
+        # says what was actually measured -- which side of a rectangle -- and
+        # `root_bounds == []` tells a reader that rectangle was never known.
+        # A count named after what the tester can SEE would be presenting
+        # the panel's guess as provenance, which is the confident wrongness
+        # the rest of prune exists to avoid.
+        "dropped_inside_panel": dropped_inside,
+        "dropped_outside_panel": dropped_outside,
+        # No panel at all: not attributable to either side.
+        "dropped_unclassified": dropped_unclassified,
+        # The panel PER AXIS, `0` for an axis its own rule could not answer.
+        # `root_bounds` above is the same panel when BOTH axes are known and
+        # `[]` otherwise, which is what the report needs -- a scale must be a
+        # whole rectangle or absent. The gesture clamp needs the other shape:
+        # it can bind one axis while leaving the other alone, and collapsing
+        # that into the rectangle is what cost a real clamp on a window laid
+        # out above the display. Two consumers, two values, one meaning each.
+        "panel_axes": list(panel_axes),
+    }
+
+
 def prune(
     xml: object,
     activity: str = "",
@@ -864,16 +1188,9 @@ def prune(
     render, and a bare dict has nowhere to put it.
     """
     try:
-        if not isinstance(xml, str) or not xml.strip():
-            return {"error": NOT_XML_REFUSAL, "content": None}
-        if len(xml.encode("utf-8", errors="replace")) > MAX_DUMP_BYTES:
-            return {"error": OVERSIZE_REFUSAL, "content": None}
-        if _DECL_RE.search(xml):
-            return {"error": DOCTYPE_REFUSAL, "content": None}
-        try:
-            root = ElementTree.fromstring(xml)
-        except ElementTree.ParseError:
-            return {"error": NOT_XML_REFUSAL, "content": None}
+        root, refusal = _parse_dump(xml)
+        if refusal:
+            return {"error": refusal, "content": None}
 
         # The DISPLAY -- from the device where the caller had it, and from the
         # extent of the dump's own windows where it did not. Never inferred from
@@ -885,202 +1202,9 @@ def prune(
         # visibility filter, because a filter smaller than the dump deletes the
         # tester's screen in silence. See `_display_rect`.
         selected, frame, panel_axes = _display_rect(root, display, root.get("rotation"))
-        root_bounds = frame
-        elements: list[dict] = []
-        texts: list[str] = []
-        package = ""
-        considered = 0
-        for node in root.iter("node"):
-            considered += 1
-            bounds = parse_bounds(node.get("bounds"))
-            if bounds is None or _area(bounds) <= 0:
-                continue
-            if root_bounds is None:
-                root_bounds = bounds
-            elif (
-                bounds[0] >= root_bounds[2]
-                or bounds[1] >= root_bounds[3]
-                or bounds[2] <= root_bounds[0]
-                or bounds[3] <= root_bounds[1]
-            ):
-                # Entirely off-screen: laid out but not visible to the tester.
-                continue
+        elements, texts, package, considered = _collect_elements(root, frame)
 
-            full_class = str(node.get("class") or "")
-            text = _clean(node.get("text"))
-            desc = _clean(node.get("content-desc"))
-            rid = _clean(node.get("resource-id"))
-            clickable = _flag(node, "clickable") or _flag(node, "long-clickable")
-            scrollable = _flag(node, "scrollable")
-            editable = _is_editable(full_class)
-            secure = _flag(node, "password")
-            hint = _clean(node.get("hint"))
-            if not (text or desc or rid or clickable or scrollable or editable):
-                # Pure layout scaffolding: not a target, not assertable.
-                continue
-
-            package = package or _clean(node.get("package"))
-            if text:
-                texts.append(text)
-            elements.append(
-                {
-                    **({"hint": hint} if hint else {}),
-                    "id": "",
-                    "cls": _short_class(full_class),
-                    "text": text,
-                    "desc": desc,
-                    "rid": rid,
-                    "bounds": list(bounds),
-                    "clickable": clickable,
-                    "editable": editable,
-                    # A password input, from the dump's own attribute. It is
-                    # the only signal that survives a field named in an
-                    # alphabet this server cannot read, which is why the
-                    # credential rule leans on the ELEMENT here and not on the
-                    # action's chosen names alone.
-                    "secure": secure,
-                    "checked": _flag(node, "checked"),
-                    "scrollable": scrollable,
-                    # Kept per element only so the root-package fallback above
-                    # has something to fall back TO; stripped before the packet
-                    # is rendered, because it is the same on every element.
-                    "package": _clean(node.get("package")),
-                }
-            )
-
-        # OFF-PANEL CROWDING MAY NEVER DELETE AN ON-PANEL CONTROL.
-        #
-        # The frame above is the display WIDENED to cover everything the dump
-        # lays out, which is what stops a stale device size deleting the
-        # tester's screen. But widening admits off-display elements into the same
-        # `MAX_ELEMENTS` budget in DOCUMENT order, so an adjacent pager page or
-        # an incoming activity laid out one screen width away could fill the cap
-        # and evict the control the tester is looking at. Measured: 150 rows of
-        # an incoming activity listed first, and `Delete account` gone from the
-        # packet, with a CORRECT display.
-        #
-        # Promoting what intersects the panel fixed that and broke its mirror
-        # image. Measured the other way: a tablet dump under a STALE phone size
-        # -- the case the widening above exists for -- classified `Delete
-        # account` at document index 0 as off-display and evicted it, while both
-        # the correct display and the dump-derived fallback kept it.
-        #
-        # The two cannot be told apart from here. A panel narrower than the dump
-        # extent is either a stale panel (keep the extra) or an app drawing
-        # off-screen (drop it), and the geometry is identical in kind -- rounds 3
-        # and 4 already made that trade in both directions.
-        #
-        # FOUR passes at spending one budget between the two classes each fixed
-        # the previous pass's worst case and created a new one further out:
-        # document order lost the visible control behind a full cap of off-panel
-        # rows; promotion lost the control a STALE panel misclassified;
-        # reserving half the budget for document order lost 25 visible controls
-        # behind 75 off-panel ones; reinstating that reserve lost 35 at 130.
-        # Each was measured, and the pattern is the point -- at a fixed cap,
-        # "every on-panel element survives" and "every element the dump listed
-        # first survives" are JOINTLY UNSATISFIABLE. That is a counting fact and
-        # no ordering rule repeals it.
-        #
-        # So the fix leaves the ordering axis: the packet's TOTAL grew by
-        # :data:`MAX_PACKET_HEADROOM`, the inside class keeps its own cap, the
-        # outside class takes what the total leaves, and the walk preserves
-        # DOCUMENT order. The headroom is spent only when the dump disagrees
-        # with the panel, so an ordinary screen is capped exactly as it was.
-        #
-        # When something IS dropped, `dropped_inside_panel` /
-        # `dropped_outside_panel` say which side of the panel it was on, because
-        # a screen thinned without saying so is one the model plans against
-        # believing it is complete.
-        #
-        # The properties that hold over ANY dump, which are the ones worth
-        # grading: off-panel crowding never removes an on-panel element, and no
-        # dump loses more elements than it loses without any of this.
-        # UNCHANGED MEANING, deliberately: "the dump offered more than
-        # `MAX_ELEMENTS`". `screen_hit` refuses a press on a truncated packet --
-        # a CLAUDE.md hard rule, because the control a key reaches is not in the
-        # dump at all -- so redefining this flag as "something was dropped"
-        # would relax a destructive guard as a side effect of a budget change,
-        # on a lane that reaches real installs. The new counts below carry the
-        # better information without touching what this gates.
-        truncated = len(elements) > MAX_ELEMENTS
-        dropped_inside = 0
-        dropped_outside = 0
-        dropped_unclassified = 0
-        if selected is not None:
-            # Classified ONCE, into a list, because the same visibility test
-            # written twice is two conditions that drift apart -- and the box is
-            # bound once per element for the same reason.
-            classified = []
-            for element in elements:
-                box = element.get("bounds") or []
-                classified.append(
-                    (
-                        element,
-                        len(box) == 4
-                        and not (
-                            box[0] >= selected[2]
-                            or box[1] >= selected[3]
-                            or box[2] <= selected[0]
-                            or box[3] <= selected[1]
-                        ),
-                    )
-                )
-            inside_count = sum(1 for _, visible in classified if visible)
-            # THE TOTAL IS BOUNDED; THE OUTSIDE CLASS IS NOT CAPPED.
-            #
-            # Outside elements get whatever the total leaves after the inside
-            # class has taken its own cap. Capping the outside class instead
-            # deleted content from dumps that FIT -- 110 elements on a tablet
-            # under a stale panel lost 25 of the tester's controls, where
-            # today's code carries all 110 -- and it deleted them from the one
-            # class whose membership we have already decided we cannot trust.
-            #
-            # `min(inside_count, MAX_ELEMENTS)` IS THE INVARIANT. Delete the
-            # clamp and this term keeps growing with the inside class, so inside
-            # overflow starts eating the outside budget and the two classes are
-            # competing again -- which is the defect all four ordering rules
-            # died of. With the clamp, the budget is pinned at the headroom once
-            # the inside class is full, so inside overflow adds NOTHING to
-            # outside loss.
-            outside_budget = (
-                MAX_ELEMENTS + MAX_PACKET_HEADROOM - min(inside_count, MAX_ELEMENTS)
-            )
-            kept: list[dict] = []
-            used_inside = 0
-            used_outside = 0
-            for element, visible in classified:
-                # DOCUMENT ORDER, and the independence is ONE-DIRECTIONAL: an
-                # inside decision reads only the inside counter and its own cap,
-                # so nothing the outside class does can evict an inside element.
-                # The reverse is not true and does not need to be -- the outside
-                # budget is a function of `inside_count` -- and the clamp above
-                # is what stops that dependence turning back into competition.
-                if visible:
-                    if used_inside >= MAX_ELEMENTS:
-                        dropped_inside += 1
-                        continue
-                    used_inside += 1
-                else:
-                    if used_outside >= outside_budget:
-                        dropped_outside += 1
-                        continue
-                    used_outside += 1
-                kept.append(element)
-            elements = kept
-        else:
-            # No panel, so no classification to make: one budget, document
-            # order, and the drops are counted under their own name. Attributing
-            # them to the inside class would be inventing a classification from
-            # a rectangle we do not have, which is the mistake this function's
-            # whole history is made of.
-            dropped_unclassified = max(0, len(elements) - MAX_ELEMENTS)
-            elements = elements[:MAX_ELEMENTS]
-        _assign_ids(elements)
-        # AFTER the cap and the ids, so a label is only ever borrowed from an
-        # element the model can actually see and name. It reads cls/text/desc
-        # and writes label/role, so the five observables the ids are derived
-        # from are already final when it runs.
-        annotate({"elements": elements})
+        elements, truncated, drops = _cap_and_label(elements, selected)
 
         # The SCREEN hash and every ELEMENT id come from the same per-element
         # seed, so "did this screen change" and "is this the same element"
@@ -1090,11 +1214,7 @@ def prune(
         # ANY element's, not the dominant one's: an overlay is smaller than the
         # window it covers by definition, so these are two different questions
         # about one dump and each needs its own answer.
-        dialog = ""
-        for element in elements:
-            name = str(element.get("package") or "")
-            if not dialog and name in SYSTEM_DIALOG_PACKAGES and name != package:
-                dialog = name
+        dialog = _system_dialog_package(elements, package)
         for element in elements:
             element.pop("package", None)
         content = {
@@ -1106,56 +1226,7 @@ def prune(
             "package": package,
             "dialog_package": dialog,
             "activity": _clean(activity),
-            # The DISPLAY. Stored because the tallest element bottom is NOT
-            # the viewport: a scroll container reports its CONTENT height, and
-            # deriving the device size from a max() walk shrank every element on
-            # every scrollable screen. `[]` when the dump carried no positive-area
-            # window at all, so the key means exactly one thing and a reader can
-            # treat an empty value and an older build's missing value alike.
-            "root_bounds": list(selected) if selected else [],
-            # The FRAME, under its OWN name because it answers a different
-            # question: `root_bounds` is the display, and this is the region an
-            # element may occupy -- at least as large as everything the dump
-            # lays out. Stored because the report needs a scale even when the
-            # panel is unknown, and the alternative was `report._device_size`
-            # improvising one from a max() walk over the elements, which returns
-            # a scroll container's CONTENT height: the one value that whole
-            # function documents as the thing the scale must never be. Two
-            # rectangles, two names, one meaning each.
-            #
-            # From `frame`, NOT from the local `root_bounds` above -- that local
-            # is reassigned to the first positive-area node when the frame is
-            # None, so storing it would put a node's own box under a name that
-            # promises the frame, which is the one-name-two-meanings defect this
-            # key exists to end.
-            "frame_bounds": list(frame) if frame else [],
-            # WHICH class lost elements, because "truncated" alone cannot say
-            # whether the tester's own screen was thinned or an adjacent pager
-            # page was. A model told only that something was cut plans against a
-            # screen it believes is complete.
-            #
-            # NAMED FOR THE PANEL, NOT FOR THE TESTER'S EYES, because the panel
-            # can be wrong and these inherit its error. Under a stale display a
-            # control the tester is looking at falls OUTSIDE the panel, so
-            # `dropped_outside_panel` would have been read as "only an adjacent
-            # page was thinned" when the opposite is true. "Inside"/"outside"
-            # says what was actually measured -- which side of a rectangle -- and
-            # `root_bounds == []` tells a reader that rectangle was never known.
-            # A count named after what the tester can SEE would be presenting
-            # the panel's guess as provenance, which is the confident wrongness
-            # the rest of this function exists to avoid.
-            "dropped_inside_panel": dropped_inside,
-            "dropped_outside_panel": dropped_outside,
-            # No panel at all: not attributable to either side.
-            "dropped_unclassified": dropped_unclassified,
-            # The panel PER AXIS, `0` for an axis its own rule could not answer.
-            # `root_bounds` above is the same panel when BOTH axes are known and
-            # `[]` otherwise, which is what the report needs -- a scale must be a
-            # whole rectangle or absent. The gesture clamp needs the other shape:
-            # it can bind one axis while leaving the other alone, and collapsing
-            # that into the rectangle is what cost a real clamp on a window laid
-            # out above the display. Two consumers, two values, one meaning each.
-            "panel_axes": list(panel_axes),
+            **_geometry_fields(selected, frame, panel_axes, drops),
             "truncated": truncated,
             "considered": considered,
         }
@@ -1277,41 +1348,47 @@ def render_lines(elements: object) -> list[str]:
     Every element keeps its ``id``, which is what makes a referenced element
     still targetable rather than merely still described.
     """
-    rows = _rows(elements)
     anchors: dict = {}
     out: list = []
-    for element in rows:
+    for element in _rows(elements):
         plain = element_line(element)
         eid = str(element.get("id") or "")
-        refs: dict = {}
-        for field in ("text", "desc"):
-            value = str(element.get(field) or "")
-            if len(value) < MIN_DEDUPE_CHARS:
-                continue
-            if (field + '="' + value + '"') not in plain:
-                # Already suppressed by the within-node rule, or truncated to
-                # something this element does not literally print. Either way
-                # there is nothing here to replace, and replacing blind is how a
-                # reference ends up pointing at a string nobody printed.
-                continue
-            seen = anchors.get(value)
-            if seen and seen != eid:
-                # Recorded as a FIELD to point at, and rendered by
-                # `element_line` on the part itself. The previous version did a
-                # `str.replace` on this finished line and could rewrite an
-                # occurrence sitting inside a DIFFERENT attribute's value.
-                refs[field] = seen
-            elif eid:
-                anchors.setdefault(value, eid)
-        label = str(element.get("label") or "")
-        if (
-            len(label) >= MIN_DEDUPE_CHARS
-            and eid
-            and ('label="' + label + '"') in plain
-        ):
-            anchors.setdefault(label, eid)
+        refs = _field_refs(element, plain, eid, anchors)
+        _anchor_label(element, plain, eid, anchors)
         out.append(element_line(element, refs) if refs else plain)
     return out
+
+
+def _field_refs(element: dict, plain: str, eid: str, anchors: dict) -> dict:
+    """The ``text`` / ``desc`` fields to print as references; records new anchors."""
+    refs: dict = {}
+    for field in ("text", "desc"):
+        value = str(element.get(field) or "")
+        if len(value) < MIN_DEDUPE_CHARS:
+            continue
+        if (field + '="' + value + '"') not in plain:
+            # Already suppressed by the within-node rule, or truncated to
+            # something this element does not literally print. Either way
+            # there is nothing here to replace, and replacing blind is how a
+            # reference ends up pointing at a string nobody printed.
+            continue
+        seen = anchors.get(value)
+        if seen and seen != eid:
+            # Recorded as a FIELD to point at, and rendered by
+            # `element_line` on the part itself. The previous version did a
+            # `str.replace` on this finished line and could rewrite an
+            # occurrence sitting inside a DIFFERENT attribute's value.
+            refs[field] = seen
+        elif eid:
+            anchors.setdefault(value, eid)
+    return refs
+
+
+def _anchor_label(element: dict, plain: str, eid: str, anchors: dict) -> None:
+    """Record a long ``label`` as an anchor; it is never itself replaced."""
+    label = str(element.get("label") or "")
+    if len(label) >= MIN_DEDUPE_CHARS and eid and ('label="' + label + '"') in plain:
+        anchors.setdefault(label, eid)
 
 
 def _eid(element: object) -> str:
@@ -1396,6 +1473,99 @@ def _count(value: object) -> int:
     return number if number > 0 else 0
 
 
+_LEGEND_STAGES = (
+    (True, REFERENCE_LEGEND),
+    (True, REFERENCE_LEGEND_SHORT),
+    (False, ""),
+)
+
+
+def _block_notice(
+    content: dict, drops: tuple[int, int, int], shown_count: int, too_big: int
+) -> str:
+    """The notice for a given outcome -- recomputed, never patched.
+
+    It has to be a function of the count because the count is what the
+    fixed point in `to_prompt_block` changes: drop a line and both the shown
+    number and the not-carried number move, so a notice composed once and
+    reused is a notice about a block that no longer exists.
+    ``drops`` is ``(inside, outside, unknown)``.
+    """
+    inside, outside, unknown = drops
+    missing = inside + outside + unknown + too_big
+    if missing:
+        note = "...[%d elements shown; %d not carried" % (shown_count, missing)
+        if inside:
+            # The one a planner must act on: the screen it can SEE is
+            # incomplete, so the next step should scroll, not assume.
+            note += ", %d of them on this screen" % inside
+        if outside:
+            note += ", %d off the display" % outside
+        if unknown:
+            note += ", %d with no display to place them" % unknown
+        if too_big:
+            # Deliberately NOT split by side of the panel: the split for
+            # the budget drops is known, this one is not, and claiming a
+            # precision we do not have is the defect this message has
+            # already had twice.
+            note += (
+                ", %d beyond the size of this message (some of those may "
+                "be on this screen too)" % too_big
+            )
+        return note + "]"
+    if content.get("truncated"):
+        # `truncated` still means "the dump offered more than
+        # MAX_ELEMENTS" -- it gates `screen_hit`'s press refusal and is
+        # deliberately unchanged -- so it can be true while the headroom
+        # carried everything. Say that, rather than claim a loss that
+        # did not happen.
+        return (
+            "...[%d elements shown; this screen exceeded the usual cap "
+            "but nothing was dropped]" % shown_count
+        )
+    return ""
+
+
+def _best_fit(
+    base: list,
+    rendered: list,
+    plain: list,
+    content: dict,
+    drops: tuple[int, int, int],
+) -> tuple:
+    """The (text, count) that shows the MOST element lines under `base`.
+
+    EVERY stage is measured and the widest wins -- it is not a
+    first-fit. First-fit does not work here and the failure is silent:
+    popping element lines eventually removes the last REFERENCE, at
+    which point the legend is no longer needed, the block fits, and the
+    loop stops -- with one element line, having never tried the cheaper
+    explanation that would have carried eight. Measured on a packet with
+    an 11540-character header. The tie goes to the earliest stage, which
+    is the fullest explanation.
+    """
+    best_text = ""
+    best_count = -1
+    for use_refs, legend_text in _LEGEND_STAGES:
+        source = rendered if use_refs else plain
+        count = len(source)
+        while True:
+            body = source[:count]
+            legend = (
+                [legend_text] if legend_text and any("=@" in x for x in body) else []
+            )
+            note = _block_notice(content, drops, count, len(source) - count)
+            text = "\n".join(base + legend + ([note] if note else []) + body)
+            if len(text) <= MAX_BLOCK_CHARS:
+                if count > best_count:
+                    best_text, best_count = text, count
+                break
+            if not count:
+                break
+            count -= 1
+    return best_text, best_count
+
+
 def to_prompt_block(pruned: object) -> str:
     """The pruned screen, wrapped for a prompt. ``""`` when there is nothing.
 
@@ -1425,245 +1595,183 @@ def to_prompt_block(pruned: object) -> str:
         activity = str(content.get("activity") or "")
         if activity:
             header.append("activity " + activity)
-        lines = [" | ".join(header)]
-        # The two summaries a chat screen needed and did not have: which element
-        # takes typing, and which controls can be tapped and what each is
-        # called. Without them the model read three identical unlabelled Views
-        # and tapped Voice mode as Send.
-        fields = [element for element in elements if element.get("editable")]
-        controls = [
-            element
-            for element in elements
-            if element.get("clickable") and element.get("label")
-        ]
-        # Computed over ALL elements, not per summary: a field and a control
-        # whose abbreviations collide are as confusing as two controls, and the
-        # stricter input costs nothing.
-        summary_labels = _summary_labels(elements)
-        if fields:
-            lines.append(
-                "fields (type into these): "
-                + "; ".join(
-                    _eid(element)
-                    + " "
-                    + (
-                        summary_labels.get(id(element))
-                        or str(element.get("label") or "")
-                        or "(unlabelled)"
-                    )
-                    for element in fields[:10]
-                )
-            )
-        if controls:
-            lines.append(
-                "controls (tap these): "
-                + "; ".join(
-                    _eid(element)
-                    + " "
-                    + (
-                        summary_labels.get(id(element))
-                        or str(element.get("label") or "")
-                    )
-                    + (
-                        " [" + str(element.get("role")) + "]"
-                        if element.get("role")
-                        else ""
-                    )
-                    for element in controls[:20]
-                )
-            )
-        # BEFORE the element lines, because `wrap_untrusted` caps the block at
-        # :data:`MAX_BLOCK_CHARS` and a 225-element packet runs past it -- so a
-        # notice appended at the END was cut off on exactly the packets that
-        # dropped the most, which are the only ones it exists for. Measured
-        # while writing the fixture that grades it. It also reads better here: a
-        # planner learns the screen is incomplete before it reads 225 rows
-        # rather than after.
-        #
-        # WHAT ACTUALLY HAPPENED, not what the old single budget would have done.
-        # "Only the first MAX_ELEMENTS are shown" became false in both
-        # directions once the packet gained headroom: it denied elements it was
-        # rendering on a screen that dropped nothing, and it understated a
-        # 224-element loss as 150. And `truncated` alone cannot say WHICH side of
-        # the panel was thinned, which is the difference between "ask for a
-        # scroll" and "plan against this screen as if it were complete".
-        inside = int(_count(content.get("dropped_inside_panel")))
-        outside = int(_count(content.get("dropped_outside_panel")))
-        unknown = int(_count(content.get("dropped_unclassified")))
-
-        # THE BLOCK OWNS ITS OWN SIZE, so the count in the notice is true by
-        # construction rather than by hoping nothing downstream trims it.
-        #
-        # There are TWO truncations here: the element budget in `prune`, and
-        # `wrap_untrusted`'s character cap. A notice derived from the packet
-        # knows only the first. Round 8f moved this notice ABOVE the element
-        # lines so the cap would stop cutting the notice -- and the cap then cut
-        # the LINES while the notice went on claiming them. Measured: 225
-        # claimed, 181 present, and 45 on-panel elements absent while the notice
-        # said 20 were lost on screen, which understates the tester's own loss
-        # worse than the message that was replaced.
-        #
-        # So the lines are trimmed HERE, to what the budget can actually carry,
-        # and the notice reports what was emitted. The cap can no longer cut an
-        # element line, so `wrap_untrusted` cannot make this message false.
-        rendered = render_lines(elements)
-        # The SAME elements with no references, for the branch that cannot
-        # afford the legend. Built once; the loop chooses between them.
-        plain = [element_line(element) for element in elements]
-
-        def _notice(shown_count: int, too_big: int) -> str:
-            """The notice for a given outcome -- recomputed, never patched.
-
-            It has to be a function of the count because the count is what the
-            fixed point below changes: drop a line and both the shown number and
-            the not-carried number move, so a notice composed once and reused is
-            a notice about a block that no longer exists.
-            """
-            missing = inside + outside + unknown + too_big
-            if missing:
-                note = "...[%d elements shown; %d not carried" % (
-                    shown_count,
-                    missing,
-                )
-                if inside:
-                    # The one a planner must act on: the screen it can SEE is
-                    # incomplete, so the next step should scroll, not assume.
-                    note += ", %d of them on this screen" % inside
-                if outside:
-                    note += ", %d off the display" % outside
-                if unknown:
-                    note += ", %d with no display to place them" % unknown
-                if too_big:
-                    # Deliberately NOT split by side of the panel: the split for
-                    # the budget drops is known, this one is not, and claiming a
-                    # precision we do not have is the defect this message has
-                    # already had twice.
-                    note += (
-                        ", %d beyond the size of this message (some of those may "
-                        "be on this screen too)" % too_big
-                    )
-                return note + "]"
-            if content.get("truncated"):
-                # `truncated` still means "the dump offered more than
-                # MAX_ELEMENTS" -- it gates `screen_hit`'s press refusal and is
-                # deliberately unchanged -- so it can be true while the headroom
-                # carried everything. Say that, rather than claim a loss that
-                # did not happen.
-                return (
-                    "...[%d elements shown; this screen exceeded the usual cap "
-                    "but nothing was dropped]" % shown_count
-                )
-            return ""
-
-        # A FIXED POINT, because the artifact must be measured AFTER the notice
-        # is written. The previous version reserved a guessed number of
-        # characters for the notice and trimmed against it -- and the notice grew
-        # past the guess at three-digit counts, so `wrap_untrusted` cut an
-        # element line after the count had already been printed. The cut landed
-        # mid-`at[...]`, which hands the planner a rectangle in the SHRINKING
-        # direction: worse than the false count it was meant to prevent.
-        #
-        # So: compose the whole block, measure it, drop the LAST element line,
-        # and recompose -- until it fits. Terminates because `shown` strictly
-        # shrinks. The header is dropped only as a last resort, and the notice is
-        # never what goes: a notice the cap cuts off is not a notice.
-        head_base = list(lines)
-        # BOUNDED BEFORE THE LOOP. The loop re-joins the body each iteration, so
-        # it is quadratic in the number of lines: measured 0.001s at 225
-        # elements and 50s at 60000, which a stored packet can carry even though
-        # `prune` cannot produce it. No live packet exceeds this bound, so the
-        # cut costs nothing that was going to be rendered anyway.
-        rendered = rendered[: MAX_ELEMENTS + MAX_PACKET_HEADROOM]
-        plain = plain[: MAX_ELEMENTS + MAX_PACKET_HEADROOM]
-        # REFERENCES ARE A PAIR: the `@id` notation and the legend that explains
-        # it travel together or neither travels. The first version decided the
-        # legend ONCE, from the full `rendered` list, and inserted it at head
-        # index 1 -- above both summaries. Two things followed, and an
-        # adversarial review measured both. Above the summaries, the head-drop
-        # path ate `controls`, then `fields`, then every element line before it
-        # touched the legend: 11 element lines with the legend suppressed, 0
-        # with it present, on the same packet. And decided from `rendered`
-        # rather than from what survives, it was emitted for references the tail
-        # trim had already removed, and omitted while 7 surviving lines still
-        # carried `text=@e0`.
-        #
-        # So the choice is made INSIDE the loop, from `shown`, and the pair
-        # degrades in the order that costs the tester least. An unexplained
-        # `@e0` is worse than the bytes it saves, but so is throwing the
-        # notation away: measured, dropping the references to keep the paragraph
-        # left ONE element line where the referenced form fit eleven, because a
-        # plain line is three times longer. So the EXPLANATION degrades first
-        # (paragraph, then one line), and only if even one line cannot be
-        # afforded do the references go -- `plain` is the same elements with
-        # none, which is why both lists are carried.
-        STAGES = ((True, REFERENCE_LEGEND), (True, REFERENCE_LEGEND_SHORT), (False, ""))
-
-        def _best(base: list) -> tuple:
-            """The (text, count) that shows the MOST element lines under `base`.
-
-            EVERY stage is measured and the widest wins -- it is not a
-            first-fit. First-fit does not work here and the failure is silent:
-            popping element lines eventually removes the last REFERENCE, at
-            which point the legend is no longer needed, the block fits, and the
-            loop stops -- with one element line, having never tried the cheaper
-            explanation that would have carried eight. Measured on a packet with
-            an 11540-character header. The tie goes to the earliest stage, which
-            is the fullest explanation.
-            """
-            best_text = ""
-            best_count = -1
-            for use_refs, legend_text in STAGES:
-                source = rendered if use_refs else plain
-                count = len(source)
-                while True:
-                    body = source[:count]
-                    legend = (
-                        [legend_text]
-                        if legend_text and any("=@" in x for x in body)
-                        else []
-                    )
-                    note = _notice(count, len(source) - count)
-                    text = "\n".join(base + legend + ([note] if note else []) + body)
-                    if len(text) <= MAX_BLOCK_CHARS:
-                        if count > best_count:
-                            best_text, best_count = text, count
-                        break
-                    if not count:
-                        break
-                    count -= 1
-            return best_text, best_count
-
-        while True:
-            text, count = _best(head_base)
-            if count >= 0 and (count or len(head_base) <= 1):
-                break
-            if len(head_base) > 1:
-                # THE FREED ROOM BELONGS TO THE ELEMENTS. Dropping a header line
-                # without restoring them spent 11793 characters on nothing:
-                # measured 0 of 20 elements emitted where 18 fitted, so the
-                # planner got a screen with no actionable element and scrolled
-                # or gave up instead of tapping.
-                #
-                # Controls first, FIELDS only if that was not enough -- the
-                # fields summary is the only thing that says which element takes
-                # typing, and it exists because a model tapped Voice mode as
-                # Send. Neither is a convenience, but one is cheaper to lose.
-                head_base = head_base[:-1]
-                continue
-            # LAST RESORT: one header line that still will not fit. Returning the
-            # text measured as too long let `wrap_untrusted` slice it and take
-            # the notice with it -- 5 elements and no warning at all, which is
-            # the very failure the header drop above was added to prevent. So
-            # make room for the notice explicitly and compose what is returned.
-            note = _notice(0, len(plain))
-            keep = MAX_BLOCK_CHARS - len(note) - 1
-            head_base = [head_base[0][:keep]] if keep > 0 else []
-            text = "\n".join(head_base + ([note] if note else []))
-            break
-        return wrap_untrusted("screen", text, limit=MAX_BLOCK_CHARS)
+        lines = [" | ".join(header)] + _summary_lines(elements)
+        return _fit_block(content, elements, lines)
     except Exception:  # pragma: no cover - defensive
         logger.exception("mobile.perception.to_prompt_block failed")
         return ""
+
+
+def _summary_lines(elements: list[dict]) -> list[str]:
+    """The ``fields`` and ``controls`` summary lines, each only when non-empty."""
+    lines: list[str] = []
+    # The two summaries a chat screen needed and did not have: which element
+    # takes typing, and which controls can be tapped and what each is
+    # called. Without them the model read three identical unlabelled Views
+    # and tapped Voice mode as Send.
+    fields = [element for element in elements if element.get("editable")]
+    controls = [
+        element
+        for element in elements
+        if element.get("clickable") and element.get("label")
+    ]
+    # Computed over ALL elements, not per summary: a field and a control
+    # whose abbreviations collide are as confusing as two controls, and the
+    # stricter input costs nothing.
+    summary_labels = _summary_labels(elements)
+    if fields:
+        lines.append(
+            "fields (type into these): "
+            + "; ".join(
+                _eid(element)
+                + " "
+                + (
+                    summary_labels.get(id(element))
+                    or str(element.get("label") or "")
+                    or "(unlabelled)"
+                )
+                for element in fields[:10]
+            )
+        )
+    if controls:
+        lines.append(
+            "controls (tap these): "
+            + "; ".join(
+                _eid(element)
+                + " "
+                + (summary_labels.get(id(element)) or str(element.get("label") or ""))
+                + (" [" + str(element.get("role")) + "]" if element.get("role") else "")
+                for element in controls[:20]
+            )
+        )
+    return lines
+
+
+def _fit_block(content: dict, elements: list[dict], head: list[str]) -> str:
+    """The wrapped packet: *head*, then the notice and as many element lines as fit."""
+    # BEFORE the element lines, because `wrap_untrusted` caps the block at
+    # :data:`MAX_BLOCK_CHARS` and a 225-element packet runs past it -- so a
+    # notice appended at the END was cut off on exactly the packets that
+    # dropped the most, which are the only ones it exists for. Measured
+    # while writing the fixture that grades it. It also reads better here: a
+    # planner learns the screen is incomplete before it reads 225 rows
+    # rather than after.
+    #
+    # WHAT ACTUALLY HAPPENED, not what the old single budget would have done.
+    # "Only the first MAX_ELEMENTS are shown" became false in both
+    # directions once the packet gained headroom: it denied elements it was
+    # rendering on a screen that dropped nothing, and it understated a
+    # 224-element loss as 150. And `truncated` alone cannot say WHICH side of
+    # the panel was thinned, which is the difference between "ask for a
+    # scroll" and "plan against this screen as if it were complete".
+    drops = (
+        int(_count(content.get("dropped_inside_panel"))),
+        int(_count(content.get("dropped_outside_panel"))),
+        int(_count(content.get("dropped_unclassified"))),
+    )
+    # THE BLOCK OWNS ITS OWN SIZE, so the count in the notice is true by
+    # construction rather than by hoping nothing downstream trims it: the
+    # lines are trimmed in `_trim_to_fit`, to what the budget can actually
+    # carry, and the notice reports what was emitted.
+    #
+    # BOUNDED BEFORE THE LOOP. The loop re-joins the body each iteration, so
+    # it is quadratic in the number of lines: measured 0.001s at 225
+    # elements and 50s at 60000, which a stored packet can carry even though
+    # `prune` cannot produce it. No live packet exceeds this bound, so the
+    # cut costs nothing that was going to be rendered anyway.
+    bound = MAX_ELEMENTS + MAX_PACKET_HEADROOM
+    rendered = render_lines(elements)[:bound]
+    # The SAME elements with no references, for the branch that cannot
+    # afford the legend. Built once; the loop chooses between them.
+    plain = [element_line(element) for element in elements][:bound]
+    text = _trim_to_fit(list(head), rendered, plain, content, drops)
+    return wrap_untrusted("screen", text, limit=MAX_BLOCK_CHARS)
+
+
+# THE BLOCK OWNS ITS OWN SIZE. There are TWO truncations: the element budget in
+# `prune`, and `wrap_untrusted`'s character cap. A notice derived from the
+# packet knows only the first. Round 8f moved the notice ABOVE the element
+# lines so the cap would stop cutting the notice -- and the cap then cut the
+# LINES while the notice went on claiming them. Measured: 225 claimed, 181
+# present, and 45 on-panel elements absent while the notice said 20 were lost
+# on screen, which understates the tester's own loss worse than the message
+# that was replaced. So the lines are trimmed HERE, and the cap can no longer
+# cut an element line, so `wrap_untrusted` cannot make the notice false.
+#
+# A FIXED POINT, because the artifact must be measured AFTER the notice is
+# written. The previous version reserved a guessed number of characters for the
+# notice and trimmed against it -- and the notice grew past the guess at
+# three-digit counts, so `wrap_untrusted` cut an element line after the count
+# had already been printed. The cut landed mid-`at[...]`, which hands the
+# planner a rectangle in the SHRINKING direction: worse than the false count it
+# was meant to prevent.
+#
+# So: compose the whole block, measure it, drop the LAST element line, and
+# recompose -- until it fits. Terminates because `shown` strictly shrinks. The
+# header is dropped only as a last resort, and the notice is never what goes: a
+# notice the cap cuts off is not a notice.
+#
+# REFERENCES ARE A PAIR: the `@id` notation and the legend that explains it
+# travel together or neither travels. The first version decided the legend ONCE,
+# from the full `rendered` list, and inserted it at head index 1 -- above both
+# summaries. Two things followed, and an adversarial review measured both.
+# Above the summaries, the head-drop path ate `controls`, then `fields`, then
+# every element line before it touched the legend: 11 element lines with the
+# legend suppressed, 0 with it present, on the same packet. And decided from
+# `rendered` rather than from what survives, it was emitted for references the
+# tail trim had already removed, and omitted while 7 surviving lines still
+# carried `text=@e0`.
+#
+# So the choice is made INSIDE the loop, from `shown`, and the pair degrades in
+# the order that costs the tester least. An unexplained `@e0` is worse than the
+# bytes it saves, but so is throwing the notation away: measured, dropping the
+# references to keep the paragraph left ONE element line where the referenced
+# form fit eleven, because a plain line is three times longer. So the
+# EXPLANATION degrades first (paragraph, then one line), and only if even one
+# line cannot be afforded do the references go -- `plain` is the same elements
+# with none, which is why both lists are carried. (The staged legend choice
+# lives in `_best_fit`.)
+def _trim_to_fit(
+    head_base: list[str],
+    rendered: list[str],
+    plain: list[str],
+    content: dict,
+    drops: tuple,
+) -> str:
+    """Compose the block, dropping header lines until the elements fit."""
+    while True:
+        text, count = _best_fit(head_base, rendered, plain, content, drops)
+        if count >= 0 and (count or len(head_base) <= 1):
+            return text
+        if len(head_base) > 1:
+            # THE FREED ROOM BELONGS TO THE ELEMENTS. Dropping a header line
+            # without restoring them spent 11793 characters on nothing:
+            # measured 0 of 20 elements emitted where 18 fitted, so the
+            # planner got a screen with no actionable element and scrolled
+            # or gave up instead of tapping.
+            #
+            # Controls first, FIELDS only if that was not enough -- the
+            # fields summary is the only thing that says which element takes
+            # typing, and it exists because a model tapped Voice mode as
+            # Send. Neither is a convenience, but one is cheaper to lose.
+            head_base = head_base[:-1]
+            continue
+        return _last_resort_text(head_base, content, drops, len(plain))
+
+
+def _last_resort_text(
+    head_base: list[str], content: dict, drops: tuple, shown: int
+) -> str:
+    """One header line that still will not fit: make room for the notice."""
+    # LAST RESORT: one header line that still will not fit. Returning the
+    # text measured as too long let `wrap_untrusted` slice it and take
+    # the notice with it -- 5 elements and no warning at all, which is
+    # the very failure the header drop above was added to prevent. So
+    # make room for the notice explicitly and compose what is returned.
+    note = _block_notice(content, drops, 0, shown)
+    keep = MAX_BLOCK_CHARS - len(note) - 1
+    head_base = [head_base[0][:keep]] if keep > 0 else []
+    return "\n".join(head_base + ([note] if note else []))
 
 
 # Below this many elements the list is not a screen a model can act on from

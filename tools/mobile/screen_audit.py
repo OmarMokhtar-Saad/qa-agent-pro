@@ -277,6 +277,142 @@ def _target_detail(side: str, floor: int, result: dict) -> str:
     )
 
 
+def _apply_density(result: dict, density_dpi: object) -> None:
+    """Write the device-measured density into ``result`` when it is plausible."""
+    try:
+        dpi = int(density_dpi) if density_dpi else 0
+        measured = dpi > 0 and (
+            DENSITY_BASELINE_DPI // 4 <= dpi <= DENSITY_BASELINE_DPI * 8
+        )
+        scale = dpi / DENSITY_BASELINE_DPI if measured else 0.0
+        measured_floor = (
+            MIN_TOUCH_TARGET_DP * dpi // DENSITY_BASELINE_DPI if measured else 0
+        )
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        dpi, measured, scale, measured_floor = 0, False, 0.0, 0
+    if measured:
+        result["density_dpi"] = dpi
+        result["density_scale"] = scale
+        result["density_source"] = DENSITY_DEVICE
+        result["min_target_px"] = measured_floor
+
+
+def _audit_element(
+    element: dict, floor: int, result: dict, findings: list, by_name: dict
+) -> None:
+    """Append this element's findings and record its spoken name in ``by_name``."""
+    eid = str(element.get("id") or "?")
+    label = str(element.get("label") or "").strip()
+    rid_name = _rid_name(element.get("rid"))
+    _naming_findings(element, eid, label, rid_name, findings)
+    if not _is_interactive(element):
+        # A decorative element without a label is CORRECT. Flagging it is
+        # what makes an audit ignorable.
+        return
+    side = _small_side(element, floor)
+    if side:
+        findings.append(
+            _finding(
+                KIND_SMALL_TARGET,
+                [eid],
+                label or rid_name,
+                _target_detail(side, floor, result),
+            )
+        )
+    spoken = label or rid_name
+    if spoken:
+        key = (" ".join(spoken.lower().split()), str(element.get("role") or ""))
+        by_name.setdefault(key, []).append(eid)
+
+
+def _naming_findings(
+    element: dict, eid: str, label: str, rid_name: str, findings: list
+) -> None:
+    """Append the secret-leak and unnamed input/control findings for one element."""
+    editable = bool(element.get("editable"))
+    clickable = bool(element.get("clickable"))
+    if element.get("secure"):
+        text = str(element.get("text") or "").strip()
+        if text and not _masked(text):
+            findings.append(
+                _finding(
+                    KIND_SECURE_LABEL_LEAK,
+                    [eid],
+                    label,
+                    "this password field's own dump carries "
+                    + str(len(text))
+                    + " characters of unmasked text, so the secret is "
+                    "readable by anything that reads the screen",
+                )
+            )
+    if editable:
+        if not label and not rid_name:
+            findings.append(
+                _finding(
+                    KIND_UNLABELLED_FIELD,
+                    [eid],
+                    "",
+                    "an input with no text, no content-desc and no name "
+                    "in its resource id: a screen reader announces it as "
+                    "an edit box and nothing else",
+                )
+            )
+    elif clickable:
+        if not label and not rid_name:
+            findings.append(
+                _finding(
+                    KIND_UNNAMED_CONTROL,
+                    [eid],
+                    "",
+                    "a tappable control with no text, no content-desc and "
+                    "no name in its resource id: there is nothing for a "
+                    "screen reader to say and no way to work around it",
+                )
+            )
+
+
+def _dropped_count(content: dict) -> int:
+    """THE DROP COUNTS ARE PRUNE'S, not a second derivation of "what was lost".
+
+    `truncated` keeps its own meaning there (the dump offered more than
+    MAX_ELEMENTS) and is reported under that name.
+    """
+    return (
+        perception._count(content.get("dropped_inside_panel"))
+        + perception._count(content.get("dropped_outside_panel"))
+        + perception._count(content.get("dropped_unclassified"))
+    )
+
+
+def _ambiguous_findings(by_name: dict) -> list:
+    """ONE finding per NAME, never per element.
+
+    A list of ten "Delete" rows is one ambiguity, and ten rows of it would
+    spend the whole cap on a single defect.
+    """
+    return [
+        _finding(
+            KIND_AMBIGUOUS_NAME,
+            ids,
+            spoken,
+            str(len(ids)) + " interactive controls answer to this one name, so a "
+            "user navigating by name cannot tell them apart",
+        )
+        for (spoken, _role), ids in by_name.items()
+        if len(ids) > 1
+    ]
+
+
+def _collect_findings(elements: list, floor: int, result: dict) -> list:
+    """Per-element findings first, then the duplicate-name findings."""
+    findings: list = []
+    by_name: dict = {}
+    for element in elements:
+        _audit_element(element, floor, result, findings, by_name)
+    findings.extend(_ambiguous_findings(by_name))
+    return findings
+
+
 def audit(screen: object, density_dpi: object = None) -> dict:
     """Findings for one pruned, annotated screen. Never raises.
 
@@ -307,31 +443,9 @@ def audit(screen: object, density_dpi: object = None) -> dict:
         # locals and are assigned together: a raise between two assignments
         # would otherwise leave a result claiming a measured density while still
         # carrying the default floor.
-        try:
-            dpi = int(density_dpi) if density_dpi else 0
-            measured = dpi > 0 and (
-                DENSITY_BASELINE_DPI // 4 <= dpi <= DENSITY_BASELINE_DPI * 8
-            )
-            scale = dpi / DENSITY_BASELINE_DPI if measured else 0.0
-            measured_floor = (
-                MIN_TOUCH_TARGET_DP * dpi // DENSITY_BASELINE_DPI if measured else 0
-            )
-        except (TypeError, ValueError, OverflowError, ZeroDivisionError):
-            dpi, measured, scale, measured_floor = 0, False, 0.0, 0
-        if measured:
-            result["density_dpi"] = dpi
-            result["density_scale"] = scale
-            result["density_source"] = DENSITY_DEVICE
-            result["min_target_px"] = measured_floor
+        _apply_density(result, density_dpi)
         floor = result["min_target_px"]
-        # THE DROP COUNTS ARE PRUNE'S, not a second derivation of "what was
-        # lost". `truncated` keeps its own meaning there (the dump offered more
-        # than MAX_ELEMENTS) and is reported under that name.
-        dropped = (
-            perception._count(content.get("dropped_inside_panel"))
-            + perception._count(content.get("dropped_outside_panel"))
-            + perception._count(content.get("dropped_unclassified"))
-        )
+        dropped = _dropped_count(content)
         result["dropped"] = dropped
         result["truncated"] = bool(content.get("truncated"))
         result["audited"] = len(elements)
@@ -341,85 +455,7 @@ def audit(screen: object, density_dpi: object = None) -> dict:
         result["auditable"] = True
         result["complete"] = not dropped and not result["truncated"]
 
-        findings: list = []
-        by_name: dict = {}
-        for element in elements:
-            eid = str(element.get("id") or "?")
-            label = str(element.get("label") or "").strip()
-            rid_name = _rid_name(element.get("rid"))
-            editable = bool(element.get("editable"))
-            clickable = bool(element.get("clickable"))
-            if element.get("secure"):
-                text = str(element.get("text") or "").strip()
-                if text and not _masked(text):
-                    findings.append(
-                        _finding(
-                            KIND_SECURE_LABEL_LEAK,
-                            [eid],
-                            label,
-                            "this password field's own dump carries "
-                            + str(len(text))
-                            + " characters of unmasked text, so the secret is "
-                            "readable by anything that reads the screen",
-                        )
-                    )
-            if editable:
-                if not label and not rid_name:
-                    findings.append(
-                        _finding(
-                            KIND_UNLABELLED_FIELD,
-                            [eid],
-                            "",
-                            "an input with no text, no content-desc and no name "
-                            "in its resource id: a screen reader announces it as "
-                            "an edit box and nothing else",
-                        )
-                    )
-            elif clickable:
-                if not label and not rid_name:
-                    findings.append(
-                        _finding(
-                            KIND_UNNAMED_CONTROL,
-                            [eid],
-                            "",
-                            "a tappable control with no text, no content-desc and "
-                            "no name in its resource id: there is nothing for a "
-                            "screen reader to say and no way to work around it",
-                        )
-                    )
-            if not _is_interactive(element):
-                # A decorative element without a label is CORRECT. Flagging it is
-                # what makes an audit ignorable.
-                continue
-            side = _small_side(element, floor)
-            if side:
-                findings.append(
-                    _finding(
-                        KIND_SMALL_TARGET,
-                        [eid],
-                        label or rid_name,
-                        _target_detail(side, floor, result),
-                    )
-                )
-            spoken = label or rid_name
-            if spoken:
-                key = (" ".join(spoken.lower().split()), str(element.get("role") or ""))
-                by_name.setdefault(key, []).append(eid)
-        for (spoken, _role), ids in by_name.items():
-            if len(ids) > 1:
-                # ONE finding per NAME, never per element: a list of ten "Delete"
-                # rows is one ambiguity, and ten rows of it would spend the whole
-                # cap on a single defect.
-                findings.append(
-                    _finding(
-                        KIND_AMBIGUOUS_NAME,
-                        ids,
-                        spoken,
-                        str(len(ids))
-                        + " interactive controls answer to this one name, so a "
-                        "user navigating by name cannot tell them apart",
-                    )
-                )
+        findings = _collect_findings(elements, floor, result)
         result["capped"] = max(0, len(findings) - MAX_FINDINGS)
         result["findings"] = findings[:MAX_FINDINGS]
         result["note"] = _note(result)

@@ -170,27 +170,128 @@ def _cards(rows: list) -> list:
     return cards
 
 
-def compose(screen: object, *, esc: Callable[..., str], app: str = "") -> str:
-    """The phone for one pruned screen, or an honest empty phone."""
-    items = _elements(screen)
-    if not items:
+def _block_markup(blocks: list, esc: Callable[..., str]) -> list:
+    """The markup parts for the blocks, consecutive chips folded into one strip."""
+    parts: list = []
+    run_chips: list = []
+
+    def flush_chips() -> None:
+        if run_chips:
+            parts.append(
+                '<div class="ph-blocks live"><div>'
+                + "".join(
+                    '<span class="ph-chip" dir="auto">' + esc(t, MAX_TEXT) + "</span>"
+                    for t in run_chips
+                )
+                + "</div></div>"
+            )
+            run_chips.clear()
+
+    for block in blocks:
+        if block["kind"] == "chip":
+            run_chips.append(block["lines"][0])
+            continue
+        flush_chips()
+        parts.append(_bubble_or_card_markup(block, esc))
+    flush_chips()
+    return parts
+
+
+def _bubble_or_card_markup(block: dict, esc: Callable[..., str]) -> str:
+    """One non-chip block: a chat bubble, a one-line card or a titled card."""
+    if block["kind"] == "bubble":
+        who = "user" if block["speaker"] == "user" else "sara"
         return (
-            '<div class="phone" dir="auto"><div class="ph-scroll">'
-            '<div class="ph-empty">no element on this screen carried text</div>'
-            "</div></div>"
+            '<div class="ph-msg '
+            + who
+            + '"><div class="ph-bubble" dir="auto">'
+            + esc(" ".join(block["lines"]), 600)
+            + "</div></div>"
         )
-    width = max(box[2] for box, _e in items) or 1
-    height = max(box[3] for box, _e in items) or 1
-    rtl = _rtl([_text(e) for _b, e in items if _text(e)])
+    lines = block["lines"]
+    if len(lines) == 1:
+        return (
+            '<div class="ph-blocks"><div class="ph-card"><div class="ph-row"><div class="ph-rowmain">'
+            '<div class="ph-t" dir="auto">'
+            + esc(lines[0], MAX_TEXT)
+            + "</div></div></div></div></div>"
+        )
+    return (
+        '<div class="ph-blocks"><div class="ph-card"><div class="ph-title" dir="auto">'
+        + esc(lines[0], MAX_TEXT)
+        + "</div>"
+        + "".join(
+            '<div class="ph-opt" dir="auto"><span>'
+            + esc(line, MAX_TEXT)
+            + "</span></div>"
+            for line in lines[1:]
+        )
+        + "</div></div>"
+    )
 
-    top_bar = [(b, e) for b, e in items if b[3] <= height * TOP_BAR_BOTTOM]
-    bottom = [(b, e) for b, e in items if b[1] >= height * COMPOSER_TOP]
-    editable = [(b, e) for b, e in bottom if e.get("editable")]
-    composer_zone = bottom if editable else []
-    used = {id(e) for _b, e in top_bar} | {id(e) for _b, e in composer_zone}
-    content = [(b, e) for b, e in items if id(e) not in used and (b[2] - b[0]) < width]
 
-    # Clickable containers holding text are blocks of their own.
+def _top_bar_markup(top_bar: list, rtl: bool, esc: Callable[..., str]) -> str:
+    """The status strip: the avatar initial, the names and up to four icons."""
+    top_texts = [(b, e) for b, e in top_bar if _text(e)]
+    top_texts.sort(key=lambda item: item[0][0], reverse=rtl)
+    initial = next((e for _b, e in top_texts if len(_text(e)) == 1), None)
+    names = [_text(e) for _b, e in top_texts if e is not initial]
+    icons = [_desc(e) for _b, e in top_bar if _desc(e) and not _text(e)]
+    return (
+        '<div class="ph-top">'
+        + (
+            ('<i class="ph-me">' + esc(_text(initial), 4) + "</i>")
+            if initial is not None
+            else ""
+        )
+        + (
+            '<span class="ph-brand" dir="auto">'
+            + esc(" · ".join(names), 120)
+            + "</span>"
+            if names
+            else ""
+        )
+        + "".join(
+            '<i class="ph-ico'
+            + (" kebab" if index == 0 else "")
+            + '" title="'
+            + esc(label, 80)
+            + '">•</i>'
+            for index, label in enumerate(icons[:4])
+        )
+        + "</div>"
+    )
+
+
+def _composer_markup(composer_zone: list, esc: Callable[..., str]) -> str:
+    """The input bar, or ``""`` when the screen has no composer zone."""
+    if not composer_zone:
+        return ""
+    placeholder = ""
+    for _b, e in composer_zone:
+        if _text(e) and not e.get("editable"):
+            placeholder = _text(e)
+            break
+    side = [
+        _desc(e)
+        for _b, e in composer_zone
+        if _desc(e) and not _text(e) and not e.get("editable")
+    ]
+    mics = [s for s in side if any(w in s.lower() for w in MIC_WORDS)]
+    others = [s for s in side if s not in mics]
+    return (
+        '<div class="ph-input">'
+        + "".join('<i title="' + esc(s, 60) + '">↑</i>' for s in others[:3])
+        + '<span dir="auto">'
+        + esc(placeholder or " ", MAX_TEXT)
+        + "</span>"
+        + "".join('<i class="mic" title="' + esc(s, 60) + '">◉</i>' for s in mics[:3])
+        + "</div>"
+    )
+
+
+def _container_blocks(content: list, rtl: bool, width: int) -> tuple[list, set]:
+    """Blocks for the clickable containers holding text, and the ids they claimed."""
     containers = [
         (b, e)
         for b, e in content
@@ -234,6 +335,30 @@ def compose(screen: object, *, esc: Callable[..., str], app: str = "") -> str:
                 "lines": lines,
             }
         )
+    return blocks, claimed
+
+
+def compose(screen: object, *, esc: Callable[..., str], app: str = "") -> str:
+    """The phone for one pruned screen, or an honest empty phone."""
+    items = _elements(screen)
+    if not items:
+        return (
+            '<div class="phone" dir="auto"><div class="ph-scroll">'
+            '<div class="ph-empty">no element on this screen carried text</div>'
+            "</div></div>"
+        )
+    width = max(box[2] for box, _e in items) or 1
+    height = max(box[3] for box, _e in items) or 1
+    rtl = _rtl([_text(e) for _b, e in items if _text(e)])
+
+    top_bar = [(b, e) for b, e in items if b[3] <= height * TOP_BAR_BOTTOM]
+    bottom = [(b, e) for b, e in items if b[1] >= height * COMPOSER_TOP]
+    editable = [(b, e) for b, e in bottom if e.get("editable")]
+    composer_zone = bottom if editable else []
+    used = {id(e) for _b, e in top_bar} | {id(e) for _b, e in composer_zone}
+    content = [(b, e) for b, e in items if id(e) not in used and (b[2] - b[0]) < width]
+
+    blocks, claimed = _container_blocks(content, rtl, width)
 
     # Free text outside any clickable container: rows -> cards.
     loose = [(b, e) for b, e in content if id(e) not in claimed and _text(e)]
@@ -249,116 +374,9 @@ def compose(screen: object, *, esc: Callable[..., str], app: str = "") -> str:
         )
     blocks.sort(key=lambda block: block["top"])
 
-    # ---- markup --------------------------------------------------------------
-    parts = []
-    run_chips: list = []
-
-    def flush_chips() -> None:
-        if run_chips:
-            parts.append(
-                '<div class="ph-blocks live"><div>'
-                + "".join(
-                    '<span class="ph-chip" dir="auto">' + esc(t, MAX_TEXT) + "</span>"
-                    for t in run_chips
-                )
-                + "</div></div>"
-            )
-            run_chips.clear()
-
-    for block in blocks:
-        if block["kind"] == "chip":
-            run_chips.append(block["lines"][0])
-            continue
-        flush_chips()
-        if block["kind"] == "bubble":
-            who = "user" if block["speaker"] == "user" else "sara"
-            parts.append(
-                '<div class="ph-msg '
-                + who
-                + '"><div class="ph-bubble" dir="auto">'
-                + esc(" ".join(block["lines"]), 600)
-                + "</div></div>"
-            )
-            continue
-        lines = block["lines"]
-        if len(lines) == 1:
-            parts.append(
-                '<div class="ph-blocks"><div class="ph-card"><div class="ph-row"><div class="ph-rowmain">'
-                '<div class="ph-t" dir="auto">'
-                + esc(lines[0], MAX_TEXT)
-                + "</div></div></div></div></div>"
-            )
-        else:
-            parts.append(
-                '<div class="ph-blocks"><div class="ph-card"><div class="ph-title" dir="auto">'
-                + esc(lines[0], MAX_TEXT)
-                + "</div>"
-                + "".join(
-                    '<div class="ph-opt" dir="auto"><span>'
-                    + esc(line, MAX_TEXT)
-                    + "</span></div>"
-                    for line in lines[1:]
-                )
-                + "</div></div>"
-            )
-    flush_chips()
-
-    # ---- chrome --------------------------------------------------------------
-    top_texts = [(b, e) for b, e in top_bar if _text(e)]
-    top_texts.sort(key=lambda item: item[0][0], reverse=rtl)
-    initial = next((e for _b, e in top_texts if len(_text(e)) == 1), None)
-    names = [_text(e) for _b, e in top_texts if e is not initial]
-    icons = [_desc(e) for _b, e in top_bar if _desc(e) and not _text(e)]
-    top = (
-        '<div class="ph-top">'
-        + (
-            ('<i class="ph-me">' + esc(_text(initial), 4) + "</i>")
-            if initial is not None
-            else ""
-        )
-        + (
-            '<span class="ph-brand" dir="auto">'
-            + esc(" · ".join(names), 120)
-            + "</span>"
-            if names
-            else ""
-        )
-        + "".join(
-            '<i class="ph-ico'
-            + (" kebab" if index == 0 else "")
-            + '" title="'
-            + esc(label, 80)
-            + '">•</i>'
-            for index, label in enumerate(icons[:4])
-        )
-        + "</div>"
-    )
-    if composer_zone:
-        placeholder = ""
-        for _b, e in composer_zone:
-            if _text(e) and not e.get("editable"):
-                placeholder = _text(e)
-                break
-        side = [
-            _desc(e)
-            for _b, e in composer_zone
-            if _desc(e) and not _text(e) and not e.get("editable")
-        ]
-        mics = [s for s in side if any(w in s.lower() for w in MIC_WORDS)]
-        others = [s for s in side if s not in mics]
-        composer = (
-            '<div class="ph-input">'
-            + "".join('<i title="' + esc(s, 60) + '">↑</i>' for s in others[:3])
-            + '<span dir="auto">'
-            + esc(placeholder or " ", MAX_TEXT)
-            + "</span>"
-            + "".join(
-                '<i class="mic" title="' + esc(s, 60) + '">◉</i>' for s in mics[:3]
-            )
-            + "</div>"
-        )
-    else:
-        composer = ""
+    parts = _block_markup(blocks, esc)
+    top = _top_bar_markup(top_bar, rtl, esc)
+    composer = _composer_markup(composer_zone, esc)
     body = (
         "".join(parts)
         or '<div class="ph-empty">nothing but chrome on this screen</div>'

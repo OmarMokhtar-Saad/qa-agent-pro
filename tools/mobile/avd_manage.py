@@ -388,6 +388,35 @@ async def _delete(name: str) -> str:
     return "Deleted the AVD `%s`. Nothing else was touched." % single_line(name, 80)
 
 
+def _refusal(what: str, name: str, apply: bool, confirm_destructive: bool) -> str:
+    """The refusal markdown for a change action, or ``""`` when it may run."""
+    if not name:
+        return _WARN + "`emulator=%s` needs `avd=<name>`." % what
+    # A leading dash would reach avdmanager as a flag (`-n --force`). ASCII only,
+    # like the image ids; Android Studio is believed to build no other AVD id.
+    if (
+        name.startswith("-")
+        or not name.isascii()
+        or not sdk_locator.avd_name_is_safe(name)
+    ):
+        return (
+            _WARN
+            + "That is not a safe AVD name (ASCII letters, digits, `.`, `_` and `-`; "
+            "no leading dot or dash). Nothing was run."
+        )
+    if what == "delete" and confirm_destructive is not True:
+        return (
+            _WARN + "Deleting an AVD is permanent. Ask the tester; only after they say "
+            "yes call again with `confirm_destructive=true`. Nothing was deleted."
+        )
+    if apply is not True:
+        return (
+            _WARN + "`emulator=%s` changes this computer, so it needs `apply=true`. "
+            "Nothing was run." % what
+        )
+    return ""
+
+
 async def manage(
     action: str,
     *,
@@ -413,32 +442,9 @@ async def manage(
                 + "Unknown emulator action. Use one of: list, boot, create, delete."
             )
         name = str(avd or "").strip()
-        if not name:
-            return _WARN + "`emulator=%s` needs `avd=<name>`." % what
-        # A leading dash would reach avdmanager as a flag (`-n --force`). ASCII only,
-        # like the image ids; Android Studio is believed to build no other AVD id.
-        if (
-            name.startswith("-")
-            or not name.isascii()
-            or not sdk_locator.avd_name_is_safe(name)
-        ):
-            return (
-                _WARN
-                + "That is not a safe AVD name (ASCII letters, digits, `.`, `_` and `-`; "
-                "no leading dot or dash). Nothing was run."
-            )
-        if what == "delete" and confirm_destructive is not True:
-            return (
-                _WARN
-                + "Deleting an AVD is permanent. Ask the tester; only after they say "
-                "yes call again with `confirm_destructive=true`. Nothing was deleted."
-            )
-        if apply is not True:
-            return (
-                _WARN
-                + "`emulator=%s` changes this computer, so it needs `apply=true`. "
-                "Nothing was run." % what
-            )
+        refusal = _refusal(what, name, apply, confirm_destructive)
+        if refusal:
+            return refusal
         if what == "delete":
             return await _delete(name)
         if what == "boot":

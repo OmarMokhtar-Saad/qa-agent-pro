@@ -446,6 +446,11 @@ def _windows_verdict(deadline: float) -> dict:
             "undetermined": False,
             "method": "IsInRole",
         }
+    return _windows_verdict_group(deadline)
+
+
+def _windows_verdict_group(deadline: float) -> dict:
+    """Windows second step: Administrators-group SID of a non-elevated token."""
     group_budget = _slice(deadline)
     if group_budget <= 0:
         return _budget_spent("probe budget spent before the group check")
@@ -464,6 +469,19 @@ def _windows_verdict(deadline: float) -> dict:
         "undetermined": False,
         "method": "Administrators SID " + ("present" if member else "absent"),
     }
+
+
+def _attemptability_answer(step: dict, verdict: dict) -> str:
+    """The three-valued ``attemptable`` answer for one applicable step."""
+    if not step["needs_admin"]:
+        answer = "yes"
+    elif verdict.get("elevated") or verdict.get("can_elevate"):
+        answer = "yes"
+    elif verdict.get("undetermined"):
+        answer = "unknown"
+    else:
+        answer = "no"
+    return answer
 
 
 def attemptability(verdict: dict) -> list[dict]:
@@ -499,14 +517,7 @@ def attemptability(verdict: dict) -> list[dict]:
         step_os = str(step.get("os") or "")
         if step_os and host_os and step_os != host_os:
             continue
-        if not step["needs_admin"]:
-            answer = "yes"
-        elif verdict.get("elevated") or verdict.get("can_elevate"):
-            answer = "yes"
-        elif verdict.get("undetermined"):
-            answer = "unknown"
-        else:
-            answer = "no"
+        answer = _attemptability_answer(step, verdict)
         rows.append(
             {
                 "step": step["step"],

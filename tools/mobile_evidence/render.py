@@ -280,6 +280,135 @@ def _flatten_case(case: dict) -> dict:
     return out
 
 
+def _read_logcat_slices(run_id: str, files: dict, budget: int) -> tuple[list, list]:
+    """(logcat lines, skipped slice names), reading only while *budget* lasts.
+
+    Slices in case order: a run with many cases must not put every slice in
+    memory at once. What is skipped is NAMED, never silently absent.
+    """
+    logcat_lines: list = []
+    skipped_slices: list = []
+    for tc_id in sorted(k for k in files if k):
+        for name in sorted(files.get(tc_id) or []):
+            if not (name.startswith("logcat-") and name.endswith(".txt")):
+                continue
+            if budget <= 0:
+                skipped_slices.append(str(tc_id) + "/" + str(name))
+                continue
+            read = run_store.read_evidence_text(run_id, tc_id, name)
+            text = read.get("content")
+            if isinstance(text, str) and text.strip():
+                size = len(text.encode("utf-8", errors="replace"))
+                if size > budget:
+                    skipped_slices.append(str(tc_id) + "/" + str(name))
+                    budget = 0
+                    continue
+                budget -= size
+                logcat_lines.extend(text.splitlines())
+    return logcat_lines, skipped_slices
+
+
+def _profile_name(profile: object) -> str:
+    return getattr(profile, "name", "") or getattr(profile, "package", "")
+
+
+def _profile_fields(profile: object) -> dict:
+    return {
+        "profile": _profile_name(profile),
+        "rates": dict(getattr(profile, "rates", None) or {}),
+        "rates_note": str(getattr(profile, "rates_note", "") or ""),
+        "env_by_host": dict(getattr(profile, "env_by_host", None) or {}),
+    }
+
+
+def _evidence_files(
+    run_id: str, manifest: dict, cases: list, profile: object
+) -> tuple[dict | None, dict | None]:
+    """(files, None) when the run can be read, else (None, the ``_none`` refusal)."""
+    package = str(manifest.get("package") or "")
+    if not getattr(settings, "qa_mobile_app_evidence", True):
+        return None, _none(FLAG_OFF_REASON, cases)
+    if profile is None:
+        return None, _none(
+            "no app log captured for "
+            + (package or "(no package)")
+            + ": no profile for this package",
+            cases,
+        )
+    listed = run_store.list_evidence(run_id)
+    files = listed.get("content") if isinstance(listed, dict) else None
+    if listed.get("error") or not isinstance(files, dict):
+        return None, _none(
+            "no app log captured: " + str(listed.get("error") or "no evidence dir"),
+            cases,
+        )
+    return files, None
+
+
+def _read_sources(run_id: str, files: dict) -> tuple[str | None, list, list]:
+    """(ndjson text or None, logcat lines, skipped slice names) within the load budget."""
+    ndjson_text = None
+    budget = int(MAX_LOAD_BYTES)
+    if EVENTS_FILE in (files.get("") or []):
+        read = run_store.read_evidence_text(run_id, None, EVENTS_FILE)
+        if isinstance(read.get("content"), str) and read["content"].strip():
+            ndjson_text = read["content"]
+            budget -= len(ndjson_text.encode("utf-8", errors="replace"))
+    logcat_lines, skipped_slices = _read_logcat_slices(run_id, files, budget)
+    return ndjson_text, logcat_lines, skipped_slices
+
+
+def _build_evidence(
+    profile: object,
+    flat_cases: list,
+    cases: list,
+    ndjson_text: str | None,
+    logcat_lines: list,
+) -> tuple[object | None, dict | None]:
+    """(evidence, None) on success, else (None, the ``_none`` refusal)."""
+    from tools.mobile_evidence import profiles as _profiles
+
+    compiled = _profiles.compile(profile)
+    compiled_content = compiled.get("content") if isinstance(compiled, dict) else None
+    if not isinstance(compiled_content, dict):
+        return None, _none("the profile could not be compiled", cases)
+    built = evidence.build(
+        flat_cases,
+        profile,
+        compiled_content,
+        ndjson=ndjson_text.splitlines() if ndjson_text is not None else None,
+        logcat=logcat_lines or None,
+    )
+    ev = built.get("content") if isinstance(built, dict) else None
+    if built.get("error") or ev is None:
+        return None, _none(
+            "the app log could not be read: " + str(built.get("error") or "unknown"),
+            cases,
+        )
+    return ev, None
+
+
+def _loaded_content(ev: object, manifest: dict, source: str, skipped: list) -> dict:
+    """The evidence-derived part of the loaded content; the caller adds cases and profile."""
+    integrity = ev.integrity()
+    return {
+        "evidence": ev,
+        "report": ev.report,
+        "source": source,
+        "reason": ""
+        if source == "ndjson"
+        else str(
+            manifest.get("events_reason") or "the app's own event log was not pulled"
+        ),
+        "disabled": list(integrity.get("disabledStreams") or []),
+        "integrity": integrity,
+        "by_case": {},
+        "clock_missing": list(integrity.get("clockNotRead") or []),
+        "truncated_load": bool(skipped),
+        "skipped_slices": list(skipped),
+    }
+
+
 def load_run_evidence(
     run_id: str, manifest: dict, cases: list, profile: object
 ) -> dict:
@@ -294,52 +423,10 @@ def load_run_evidence(
     scrub.forget_sensitive()
     try:
         manifest = manifest if isinstance(manifest, dict) else {}
-        package = str(manifest.get("package") or "")
-        if not getattr(settings, "qa_mobile_app_evidence", True):
-            return _none(FLAG_OFF_REASON, cases)
-        if profile is None:
-            return _none(
-                "no app log captured for "
-                + (package or "(no package)")
-                + ": no profile for this package",
-                cases,
-            )
-        listed = run_store.list_evidence(run_id)
-        files = listed.get("content") if isinstance(listed, dict) else None
-        if listed.get("error") or not isinstance(files, dict):
-            return _none(
-                "no app log captured: " + str(listed.get("error") or "no evidence dir"),
-                cases,
-            )
-        ndjson_text = None
-        budget = int(MAX_LOAD_BYTES)
-        skipped_slices: list = []
-        if EVENTS_FILE in (files.get("") or []):
-            read = run_store.read_evidence_text(run_id, None, EVENTS_FILE)
-            if isinstance(read.get("content"), str) and read["content"].strip():
-                ndjson_text = read["content"]
-                budget -= len(ndjson_text.encode("utf-8", errors="replace"))
-        logcat_lines: list = []
-        # Slices in case order, and only while the budget lasts: a run with many
-        # cases must not put every slice in memory at once. What is skipped is
-        # NAMED, never silently absent.
-        for tc_id in sorted(k for k in files if k):
-            for name in sorted(files.get(tc_id) or []):
-                if not (name.startswith("logcat-") and name.endswith(".txt")):
-                    continue
-                if budget <= 0:
-                    skipped_slices.append(str(tc_id) + "/" + str(name))
-                    continue
-                read = run_store.read_evidence_text(run_id, tc_id, name)
-                text = read.get("content")
-                if isinstance(text, str) and text.strip():
-                    size = len(text.encode("utf-8", errors="replace"))
-                    if size > budget:
-                        skipped_slices.append(str(tc_id) + "/" + str(name))
-                        budget = 0
-                        continue
-                    budget -= size
-                    logcat_lines.extend(text.splitlines())
+        files, refusal = _evidence_files(run_id, manifest, cases, profile)
+        if refusal is not None:
+            return refusal
+        ndjson_text, logcat_lines, skipped_slices = _read_sources(run_id, files)
         if ndjson_text is None and not logcat_lines:
             reason = str(manifest.get("events_reason") or "")
             return _none(
@@ -350,61 +437,20 @@ def load_run_evidence(
                     else " -- no slice and no event log on disk"
                 ),
                 cases,
-                {
-                    "profile": getattr(profile, "name", "")
-                    or getattr(profile, "package", "")
-                },
+                {"profile": _profile_name(profile)},
             )
-        from tools.mobile_evidence import profiles as _profiles
-
-        compiled = _profiles.compile(profile)
-        compiled_content = (
-            compiled.get("content") if isinstance(compiled, dict) else None
-        )
-        if not isinstance(compiled_content, dict):
-            return _none("the profile could not be compiled", cases)
         flat_cases = [_flatten_case(c) for c in cases]
-        built = evidence.build(
-            flat_cases,
-            profile,
-            compiled_content,
-            ndjson=ndjson_text.splitlines() if ndjson_text is not None else None,
-            logcat=logcat_lines or None,
+        ev, refusal = _build_evidence(
+            profile, flat_cases, cases, ndjson_text, logcat_lines
         )
-        ev = built.get("content") if isinstance(built, dict) else None
-        if built.get("error") or ev is None:
-            return _none(
-                "the app log could not be read: "
-                + str(built.get("error") or "unknown"),
-                cases,
-            )
-        report = ev.report
-        scrub.learn_sensitive(report)
+        if refusal is not None:
+            return refusal
+        scrub.learn_sensitive(ev.report)
         source = "ndjson" if ndjson_text is not None else "logcat-only"
-        integrity = ev.integrity()
-        content = {
-            "evidence": ev,
-            "report": report,
-            "source": source,
-            "reason": ""
-            if source == "ndjson"
-            else str(
-                manifest.get("events_reason")
-                or "the app's own event log was not pulled"
-            ),
-            "disabled": list(integrity.get("disabledStreams") or []),
-            "integrity": integrity,
-            "profile": getattr(profile, "name", "") or getattr(profile, "package", ""),
-            "rates": dict(getattr(profile, "rates", None) or {}),
-            "rates_note": str(getattr(profile, "rates_note", "") or ""),
-            "env_by_host": dict(getattr(profile, "env_by_host", None) or {}),
-            "cases_by_id": {str(c.get("tc_id") or ""): c for c in cases},
-            "flat_cases": flat_cases,
-            "by_case": {},
-            "clock_missing": list(integrity.get("clockNotRead") or []),
-            "truncated_load": bool(skipped_slices),
-            "skipped_slices": list(skipped_slices),
-        }
+        content = _loaded_content(ev, manifest, source, skipped_slices)
+        content.update(_profile_fields(profile))
+        content["cases_by_id"] = {str(c.get("tc_id") or ""): c for c in cases}
+        content["flat_cases"] = flat_cases
         for c in flat_cases:
             tc_id = str(c.get("tc_id") or "")
             content["by_case"][tc_id] = _case_view(content, c)
@@ -488,67 +534,76 @@ def facts_cells(loaded: object) -> list:
                 "void",
             )
         ]
-    ev = content["evidence"]
-    integrity = content.get("integrity") or {}
-    cells = []
+    cells = [
+        _backend_cell(content.get("integrity") or {}),
+        _model_cell(content["evidence"]),
+        _evidence_cell(content),
+        _clock_cell(content.get("clock_missing") or []),
+    ]
+    return [cell for cell in cells if cell is not None]
+
+
+def _backend_cell(integrity: dict) -> tuple | None:
     env = integrity.get("envFromTraffic") or integrity.get("envClaimed")
-    if env:
-        cells.append(
-            (
-                "backend",
-                ev_esc(env, 40),
-                (
-                    "manifest says "
-                    + ev_esc(integrity.get("envClaimed"), 24)
-                    + " — the traffic is the authority"
-                )
-                if integrity.get("envDisagrees")
-                else "from the traffic"
-                if integrity.get("envFromTraffic")
-                else "as the app's manifest says",
-                "gap" if integrity.get("envDisagrees") else "",
-            )
+    if not env:
+        return None
+    return (
+        "backend",
+        ev_esc(env, 40),
+        (
+            "manifest says "
+            + ev_esc(integrity.get("envClaimed"), 24)
+            + " — the traffic is the authority"
         )
+        if integrity.get("envDisagrees")
+        else "from the traffic"
+        if integrity.get("envFromTraffic")
+        else "as the app's manifest says",
+        "gap" if integrity.get("envDisagrees") else "",
+    )
+
+
+def _model_cell(ev: object) -> tuple | None:
     served = Counter()
     for row in ev.models():
         served[row["model"]] += row["calls"]
-    if served:
-        names = ", ".join(ev_esc(name, 60) for name, _n in served.most_common(3))
-        cells.append(
-            (
-                "model",
-                names,
-                str(sum(served.values()))
-                + " model call"
-                + ("" if sum(served.values()) == 1 else "s"),
-                "",
-            )
-        )
-    source = content.get("source")
-    cells.append(
-        (
-            "evidence",
-            "the app’s own event log" if source == "ndjson" else "logcat slices only",
-            ev_esc(content.get("reason"), 160)
-            if content.get("reason")
-            else "pulled with run-as after the run",
-            "ok" if source == "ndjson" else "gap",
-        )
+    if not served:
+        return None
+    names = ", ".join(ev_esc(name, 60) for name, _n in served.most_common(3))
+    return (
+        "model",
+        names,
+        str(sum(served.values()))
+        + " model call"
+        + ("" if sum(served.values()) == 1 else "s"),
+        "",
     )
-    missing = content.get("clock_missing") or []
-    if missing:
-        cells.append(
-            (
-                "device clock",
-                "not read on "
-                + str(len(missing))
-                + " case"
-                + ("" if len(missing) == 1 else "s"),
-                ev_esc(evidence.NO_CLOCK_NOTE, 160),
-                "gap",
-            )
-        )
-    return cells
+
+
+def _evidence_cell(content: dict) -> tuple:
+    source = content.get("source")
+    return (
+        "evidence",
+        "the app’s own event log" if source == "ndjson" else "logcat slices only",
+        ev_esc(content.get("reason"), 160)
+        if content.get("reason")
+        else "pulled with run-as after the run",
+        "ok" if source == "ndjson" else "gap",
+    )
+
+
+def _clock_cell(missing: list) -> tuple | None:
+    if not missing:
+        return None
+    return (
+        "device clock",
+        "not read on "
+        + str(len(missing))
+        + " case"
+        + ("" if len(missing) == 1 else "s"),
+        ev_esc(evidence.NO_CLOCK_NOTE, 160),
+        "gap",
+    )
 
 
 def overview_tiles(loaded: object) -> list:
@@ -561,7 +616,11 @@ def overview_tiles(loaded: object) -> list:
         ]
     ev = content["evidence"]
     totals = ev.totals()
-    tiles = [
+    return _count_tiles(totals) + [_spend_tile(ev, content, totals)]
+
+
+def _count_tiles(totals: dict) -> list:
+    return [
         _kpi(
             str(totals["llm"]),
             "LLM requests",
@@ -587,6 +646,9 @@ def overview_tiles(loaded: object) -> list:
             key="tokens",
         ),
     ]
+
+
+def _spend_tile(ev: object, content: dict, totals: dict) -> str:
     spend = 0.0
     priced = unpriced = 0
     for row in ev.models():
@@ -608,20 +670,16 @@ def overview_tiles(loaded: object) -> list:
                 + ("" if unpriced == 1 else "s")
                 + " unpriced"
             )
-        tiles.append(
-            _kpi(ev_esc(model.money(spend), 24), "estimated spend", detail, key="cost")
+        return _kpi(
+            ev_esc(model.money(spend), 24), "estimated spend", detail, key="cost"
         )
-    else:
-        tiles.append(
-            _gap_kpi(
-                "estimated spend",
-                "unpriced — no model in this run is in the profile's rates table"
-                if totals["llm"]
-                else "no model call to price",
-                key="cost",
-            )
-        )
-    return tiles
+    return _gap_kpi(
+        "estimated spend",
+        "unpriced — no model in this run is in the profile's rates table"
+        if totals["llm"]
+        else "no model call to price",
+        key="cost",
+    )
 
 
 def _entry_row(b: dict) -> str:
@@ -633,6 +691,61 @@ def _entry_row(b: dict) -> str:
     return _check(cls, _status_label(b), label or verb, verb + " " + url)
 
 
+def _session_meta(rec: dict) -> str:
+    return (
+        '<div class="metabits"><div class="mb"><span class="ml">window</span><span class="mv">'
+        + ev_esc(evidence.stamp(rec.get("from")), 40)
+        + " &rarr; "
+        + ev_esc(evidence.stamp(rec.get("to")), 40)
+        + '</span></div><div class="mb"><span class="ml">turns served</span><span class="mv">'
+        + str(int(rec.get("turns") or 0))
+        + '</span></div><div class="mb"><span class="ml">model calls</span><span class="mv">'
+        + str(int(rec.get("llm") or 0))
+        + '</span></div><div class="mb"><span class="ml">endpoint calls</span><span class="mv">'
+        + str(int(rec.get("bindings") or 0))
+        + "</span></div></div>"
+    )
+
+
+def _session_run_block(rec: dict) -> str:
+    entry = rec.get("entry") or []
+    failed = rec.get("failed") or []
+    rows = "".join(_entry_row(b) for b in entry[:MAX_ROWS])
+    return _sec_block(
+        "App run " + str(rec.get("appRunId") or "?"),
+        _session_meta(rec)
+        + "<h4>Session entry</h4>"
+        + (
+            ('<ul class="checks">' + rows + "</ul>")
+            if rows
+            else _empty("no call outside a case in this app run")
+        ),
+        count=len(entry),
+        note=str(len(entry)) + " entry call(s), " + str(len(failed)) + " failed",
+    )
+
+
+def _ambiguous_block(amb: list) -> str:
+    rows = ""
+    for rec in amb[:MAX_ROWS]:
+        stream = str(rec.get("stream") or "")
+        what = (
+            rec.get("binding")
+            or rec.get("model")
+            or rec.get("tool")
+            or rec.get("text")
+            or rec.get("head")
+            or stream
+        )
+        rows += _check("p-gap", stream, _clip(what, 80), evidence.AMBIGUOUS_NOTE)
+    return _sec_block(
+        "Between two cases",
+        '<ul class="checks">' + rows + "</ul>",
+        count=len(amb),
+        note="attributed to neither card — the device clock was not read for a neighbouring case",
+    )
+
+
 def session_block(loaded: object) -> str:
     """The app outside every case: start-up, sign-in, between-case work, ambiguous turns."""
     content = _content(loaded)
@@ -642,55 +755,11 @@ def session_block(loaded: object) -> str:
     body = ""
     total = 0
     for rec in ev.session():
-        entry = rec.get("entry") or []
-        failed = rec.get("failed") or []
-        total += len(entry)
-        rows = "".join(_entry_row(b) for b in entry[:MAX_ROWS])
-        meta = (
-            '<div class="metabits"><div class="mb"><span class="ml">window</span><span class="mv">'
-            + ev_esc(evidence.stamp(rec.get("from")), 40)
-            + " &rarr; "
-            + ev_esc(evidence.stamp(rec.get("to")), 40)
-            + '</span></div><div class="mb"><span class="ml">turns served</span><span class="mv">'
-            + str(int(rec.get("turns") or 0))
-            + '</span></div><div class="mb"><span class="ml">model calls</span><span class="mv">'
-            + str(int(rec.get("llm") or 0))
-            + '</span></div><div class="mb"><span class="ml">endpoint calls</span><span class="mv">'
-            + str(int(rec.get("bindings") or 0))
-            + "</span></div></div>"
-        )
-        body += _sec_block(
-            "App run " + str(rec.get("appRunId") or "?"),
-            meta
-            + "<h4>Session entry</h4>"
-            + (
-                ('<ul class="checks">' + rows + "</ul>")
-                if rows
-                else _empty("no call outside a case in this app run")
-            ),
-            count=len(entry),
-            note=str(len(entry)) + " entry call(s), " + str(len(failed)) + " failed",
-        )
+        total += len(rec.get("entry") or [])
+        body += _session_run_block(rec)
     amb = ev.ambiguous_records()
     if amb:
-        rows = ""
-        for rec in amb[:MAX_ROWS]:
-            stream = str(rec.get("stream") or "")
-            what = (
-                rec.get("binding")
-                or rec.get("model")
-                or rec.get("tool")
-                or rec.get("text")
-                or rec.get("head")
-                or stream
-            )
-            rows += _check("p-gap", stream, _clip(what, 80), evidence.AMBIGUOUS_NOTE)
-        body += _sec_block(
-            "Between two cases",
-            '<ul class="checks">' + rows + "</ul>",
-            count=len(amb),
-            note="attributed to neither card — the device clock was not read for a neighbouring case",
-        )
+        body += _ambiguous_block(amb)
     if not body:
         body = _empty("every recorded event fell inside a case window")
     return _sec_block(
@@ -707,7 +776,22 @@ def trust_block(loaded: object) -> str:
     if not _has(loaded):
         return ""
     integrity = content.get("integrity") or {}
-    rows = []
+    rows: list = []
+    _add_env_row(rows, integrity)
+    _add_return_rows(rows, integrity)
+    _add_load_rows(rows, content)
+    _add_provenance_rows(rows, content, integrity)
+    _add_join_rows(rows, integrity)
+    return _sec_block(
+        "Can this capture be trusted",
+        '<ul class="checks">' + "".join(rows) + "</ul>",
+        count=len(rows),
+        note="the recorder’s account of itself — none of this is about the app under test",
+    )
+
+
+def _add_env_row(rows: list, integrity: dict) -> None:
+    """Append the manifest-versus-traffic backend row, if either names a backend."""
     if integrity.get("envDisagrees"):
         rows.append(
             _check(
@@ -730,6 +814,10 @@ def trust_block(loaded: object) -> str:
                 str(integrity.get("envFromTraffic") or integrity.get("envClaimed")),
             )
         )
+
+
+def _add_return_rows(rows: list, integrity: dict) -> None:
+    """Append the unanswered-request row and the unparsed-line row."""
     never = integrity.get("neverReturned") or []
     rows.append(
         _check(
@@ -752,6 +840,10 @@ def trust_block(loaded: object) -> str:
             str(malformed),
         )
     )
+
+
+def _add_load_rows(rows: list, content: dict) -> None:
+    """Append the capped-load row and the undescribed-streams row."""
     if content.get("truncated_load"):
         skipped = list(content.get("skipped_slices") or [])
         rows.append(
@@ -779,6 +871,10 @@ def trust_block(loaded: object) -> str:
                 ),
             )
         )
+
+
+def _add_provenance_rows(rows: list, content: dict, integrity: dict) -> None:
+    """Append how turns were bounded, which capture was read, and the clock row."""
     rows.append(
         _check(
             "p-void",
@@ -816,6 +912,10 @@ def trust_block(loaded: object) -> str:
             + evidence.NO_CLOCK_NOTE,
         )
     )
+
+
+def _add_join_rows(rows: list, integrity: dict) -> None:
+    """Append the join-note row and the clipped-windows row."""
     note = integrity.get("joinNote") or ""
     if note:
         rows.append(
@@ -839,12 +939,6 @@ def trust_block(loaded: object) -> str:
                 ),
             )
         )
-    return _sec_block(
-        "Can this capture be trusted",
-        '<ul class="checks">' + "".join(rows) + "</ul>",
-        count=len(rows),
-        note="the recorder’s account of itself — none of this is about the app under test",
-    )
 
 
 def _endpoint_rows(content: dict) -> list:
@@ -883,18 +977,8 @@ def _endpoint_rows(content: dict) -> list:
     return sorted(agg.values(), key=lambda r: (-r["calls"], r["path"]))
 
 
-def apis_section(loaded: object) -> str:
-    content = _content(loaded)
-    if not _has(loaded):
-        return _empty(
-            "no app log captured, so no endpoint is known: "
-            + str(content.get("reason") or "")
-        )
-    rows = _endpoint_rows(content)
-    if not rows:
-        return _empty("the app made no endpoint call inside any case window")
-    hosts = (content.get("integrity") or {}).get("hosts") or []
-    body = "".join(
+def _endpoint_table_row(r: dict) -> str:
+    return (
         '<tr><td class="uc"><span class="cap">'
         + ev_esc(r["verb"], 12)
         + "</span> <code>"
@@ -909,19 +993,35 @@ def apis_section(loaded: object) -> str:
             for label, n in r["statuses"].most_common()
         )
         + "</td></tr>"
-        for r in rows[:MAX_ROWS]
     )
-    hint = (
+
+
+def _hosts_hint(hosts: list) -> str:
+    if not hosts:
+        return ""
+    return (
         '<p class="hint">real wire, host'
         + ("" if len(hosts) == 1 else "s")
         + " "
         + ", ".join(ev_esc(h, 80) for h in hosts)
         + "</p>"
-        if hosts
-        else ""
     )
+
+
+def apis_section(loaded: object) -> str:
+    content = _content(loaded)
+    if not _has(loaded):
+        return _empty(
+            "no app log captured, so no endpoint is known: "
+            + str(content.get("reason") or "")
+        )
+    rows = _endpoint_rows(content)
+    if not rows:
+        return _empty("the app made no endpoint call inside any case window")
+    hosts = (content.get("integrity") or {}).get("hosts") or []
+    body = "".join(_endpoint_table_row(r) for r in rows[:MAX_ROWS])
     return (
-        hint
+        _hosts_hint(hosts)
         + '<div class="tablewrap"><table class="cov"><thead><tr><th scope="col">Endpoint</th>'
         '<th scope="col">Calls</th><th scope="col">Cases</th><th scope="col">Statuses</th></tr></thead><tbody>'
         + body
@@ -1606,36 +1706,16 @@ def _seq_key(rec: dict) -> float | None:
     return float(ts) if isinstance(ts, (int, float)) else None
 
 
-def sequence_items(
-    loaded: object,
-    tc_id: object,
-    trace_rows: list | None = None,
-    step_frames: dict | None = None,
-) -> list:
-    """``[(key, rank, kind, inner_html, clock_label, bar)]`` for ``exchanges.seqlist``.
-    *step_frames* is ``{trace index: frame html}``, built by
-    ``report._seq_frames``. THIS stream is the Run sequence a case with app
-    evidence actually gets -- it REPLACES ``report._seq_rows`` entirely -- so a
-    per-step photograph threaded only into that function would render on no such
-    run at all. The markup is this repository's own (``report._shot_html``), so
-    it is appended OUTSIDE ``_guard``, which exists for the app's text.
-
-    The app's records and the lane's own actions merge on one absolute clock: the
-    records carry the device's epoch ms, an action its host ``at`` corrected by the
-    case's clock offset (the same correction the join applied to the window).
-    """
-    content = _content(loaded)
-    view = _view(loaded, tc_id)
-    if not _has(loaded) or not view:
-        return []
-    case = (content.get("cases_by_id") or {}).get(str(tc_id or "")) or {}
+def _clock_offset(case: dict) -> int:
     offset = _flatten_case(case).get("clock_offset_ms")
-    offset = (
+    return (
         int(offset)
         if isinstance(offset, (int, float)) and not isinstance(offset, bool)
         else 0
     )
-    items: list = []
+
+
+def _longest_step_ms(view: dict) -> float:
     durations = []
     for turn in view["turns"]:
         for stream in ("llm", "bindings", "tools"):
@@ -1643,232 +1723,252 @@ def sequence_items(
                 ms = rec.get("derivedMs")
                 if isinstance(ms, (int, float)):
                     durations.append(float(ms))
-    longest = max(durations) if durations else 0.0
-    multi = len(view["turns"]) > 1
-    for n, turn in enumerate(view["turns"], 1):
-        first_key = None
-        for stream in evidence.STREAMS:
-            for rec in turn.get(stream) or []:
-                key = _seq_key(rec)
-                if key is not None and (first_key is None or key < first_key):
-                    first_key = key
-        if multi and first_key is not None:
-            utt = (turn.get("utterances") or [None])[0]
-            items.append(
-                (
-                    first_key,
-                    exchanges.SEQ_RANK["turn"],
-                    "turn",
-                    _guard(exchanges.seq_turn(n, (utt or {}).get("text") or "")),
-                )
-            )
-        for rec in turn.get("utterances") or []:
+    return max(durations) if durations else 0.0
+
+
+def _turn_opening_items(turn: dict, n: int, multi: bool) -> list:
+    """The turn marker (when the case has several turns), then what the user said."""
+    items: list = []
+    first_key = None
+    for stream in evidence.STREAMS:
+        for rec in turn.get(stream) or []:
             key = _seq_key(rec)
-            if key is not None:
-                items.append(
-                    (
-                        key,
-                        exchanges.SEQ_RANK["user"],
-                        "user",
-                        _guard(exchanges.seq_user(str(rec.get("text") or ""))),
-                    )
-                )
-        for rec in turn.get("llm") or []:
-            key = _seq_key(rec)
-            if key is None:
-                continue
-            x = exchanges.llm_exchange(rec)
-            prompts = "".join(
-                exchanges.codebox(exchanges.body_text(p)) or ""
-                for p in (rec.get("promptMessages") or [])
+            if key is not None and (first_key is None or key < first_key):
+                first_key = key
+    if multi and first_key is not None:
+        utt = (turn.get("utterances") or [None])[0]
+        items.append(
+            (
+                first_key,
+                exchanges.SEQ_RANK["turn"],
+                "turn",
+                _guard(exchanges.seq_turn(n, (utt or {}).get("text") or "")),
             )
-            if prompts:
-                chars = sum(
-                    len(exchanges.body_text(p))
-                    for p in (rec.get("promptMessages") or [])
-                )
-                items.append(
-                    (
-                        key,
-                        exchanges.SEQ_RANK["prompt"],
-                        "prompt",
-                        _guard(
-                            exchanges.seq_prompt(
-                                chars,
-                                prompts,
-                                head="request to " + str(x.get("path") or ""),
-                                meta=str(len(rec.get("promptMessages") or []))
-                                + " msgs",
-                            )
-                        ),
-                    )
-                )
+        )
+    for rec in turn.get("utterances") or []:
+        key = _seq_key(rec)
+        if key is not None:
             items.append(
                 (
                     key,
-                    exchanges.SEQ_RANK["llm"],
-                    "llm",
-                    _guard(exchanges.seq_exchange(x)),
-                    None,
-                    _bar(rec.get("derivedMs"), longest, "llm"),
+                    exchanges.SEQ_RANK["user"],
+                    "user",
+                    _guard(exchanges.seq_user(str(rec.get("text") or ""))),
                 )
             )
-        for rec in turn.get("tools") or []:
-            key = _seq_key(rec)
-            if key is not None:
-                items.append(
-                    (
-                        key,
-                        exchanges.SEQ_RANK["call"],
-                        "call",
-                        _guard(exchanges.seq_exchange(exchanges.tool_exchange(rec))),
-                        None,
-                        _bar(rec.get("derivedMs"), longest, "tool"),
-                    )
-                )
-        for rec in turn.get("bindings") or []:
-            key = _seq_key(rec)
-            if key is not None:
-                items.append(
-                    (
-                        key,
-                        exchanges.SEQ_RANK["api"],
-                        "api",
-                        _guard(exchanges.seq_exchange(exchanges.binding_exchange(rec))),
-                        None,
-                        _bar(rec.get("derivedMs"), longest, "api"),
-                    )
-                )
-        drawn = {
-            (str(b.get("verb") or "").upper(), str(b.get("url") or "").split("?")[0])
-            for b in turn.get("bindings") or []
-        }
-        for rec in turn.get("runlog") or []:
-            key = _seq_key(rec)
-            if key is None:
-                continue
-            if rec.get("lane") == "net" and rec.get("url"):
-                if (
-                    (rec.get("verb") or "").upper(),
-                    str(rec.get("url")).split("?")[0],
-                ) in drawn:
-                    continue
-                items.append(
-                    (
-                        key,
-                        exchanges.SEQ_RANK["net"],
-                        "api",
-                        _guard(exchanges.seq_exchange(exchanges.network_exchange(rec))),
-                    )
-                )
-            else:
-                items.append(
-                    (
-                        key,
-                        exchanges.SEQ_RANK["log"],
-                        str(rec.get("lane") or "log"),
-                        _guard(
-                            exchanges.seq_log(
-                                str(rec.get("lane") or "log"),
-                                str(rec.get("head") or ""),
-                                str(rec.get("body") or ""),
-                                bad=bool(rec.get("bad")),
-                            )
-                        ),
-                    )
-                )
-        for rec in turn.get("flowStates") or []:
-            key = _seq_key(rec)
-            if key is None:
-                continue
-            bits = " · ".join(
-                str(k) + "=" + str(v)
-                for k, v in rec.items()
-                if k
-                not in ("seq", "turnId", "appRunId", "tool", "note", "ts", "derivedMs")
+    return items
+
+
+def _llm_items(turn: dict, longest: float) -> list:
+    items: list = []
+    for rec in turn.get("llm") or []:
+        key = _seq_key(rec)
+        if key is None:
+            continue
+        x = exchanges.llm_exchange(rec)
+        prompts = "".join(
+            exchanges.codebox(exchanges.body_text(p)) or ""
+            for p in (rec.get("promptMessages") or [])
+        )
+        if prompts:
+            chars = sum(
+                len(exchanges.body_text(p)) for p in (rec.get("promptMessages") or [])
             )
-            head = "flow " + str(rec.get("tool") or "") + ": " + bits
             items.append(
                 (
                     key,
-                    exchanges.SEQ_RANK["flow"],
-                    "flow",
+                    exchanges.SEQ_RANK["prompt"],
+                    "prompt",
                     _guard(
-                        exchanges.seq_flow(
-                            head,
-                            body=(
-                                '<p class="seqfull" dir="auto">'
-                                + ev_esc(rec.get("note"), 400)
-                                + "</p>"
-                            )
-                            if rec.get("note")
-                            else "",
+                        exchanges.seq_prompt(
+                            chars,
+                            prompts,
+                            head="request to " + str(x.get("path") or ""),
+                            meta=str(len(rec.get("promptMessages") or [])) + " msgs",
                         )
                     ),
                 )
             )
-        for rec in turn.get("cards") or []:
+        items.append(
+            (
+                key,
+                exchanges.SEQ_RANK["llm"],
+                "llm",
+                _guard(exchanges.seq_exchange(x)),
+                None,
+                _bar(rec.get("derivedMs"), longest, "llm"),
+            )
+        )
+    return items
+
+
+def _call_items(turn: dict, longest: float) -> list:
+    """The tool calls, then the API bindings."""
+    items: list = []
+    for stream, rank, kind, bar_kind, build in (
+        ("tools", "call", "call", "tool", exchanges.tool_exchange),
+        ("bindings", "api", "api", "api", exchanges.binding_exchange),
+    ):
+        for rec in turn.get(stream) or []:
             key = _seq_key(rec)
             if key is not None:
                 items.append(
                     (
                         key,
-                        exchanges.SEQ_RANK["card"],
-                        "card",
-                        _guard(
-                            exchanges.seq_card(
-                                str(rec.get("kind") or "card"),
-                                bool(rec.get("replaced")),
-                            )
-                        ),
+                        exchanges.SEQ_RANK[rank],
+                        kind,
+                        _guard(exchanges.seq_exchange(build(rec))),
+                        None,
+                        _bar(rec.get("derivedMs"), longest, bar_kind),
                     )
                 )
-        for rec in turn.get("notes") or []:
-            key = _seq_key(rec)
-            if key is not None:
-                items.append(
-                    (
-                        key,
-                        exchanges.SEQ_RANK["log"],
-                        "note",
-                        _guard(exchanges.seq_note(str(rec.get("text") or ""))),
-                    )
-                )
-        for rec in turn.get("errors") or []:
-            key = _seq_key(rec)
-            if key is None or rec.get("kind") in ("binding", "llm", "tool"):
-                continue  # already on their own rows
-            detail = rec.get("detail") or {}
+    return items
+
+
+def _runlog_items(turn: dict) -> list:
+    items: list = []
+    drawn = {
+        (str(b.get("verb") or "").upper(), str(b.get("url") or "").split("?")[0])
+        for b in turn.get("bindings") or []
+    }
+    for rec in turn.get("runlog") or []:
+        key = _seq_key(rec)
+        if key is None:
+            continue
+        if rec.get("lane") == "net" and rec.get("url"):
+            if (
+                (rec.get("verb") or "").upper(),
+                str(rec.get("url")).split("?")[0],
+            ) in drawn:
+                continue
             items.append(
                 (
                     key,
-                    exchanges.SEQ_RANK["agent"],
-                    "agent",
+                    exchanges.SEQ_RANK["net"],
+                    "api",
+                    _guard(exchanges.seq_exchange(exchanges.network_exchange(rec))),
+                )
+            )
+        else:
+            items.append(
+                (
+                    key,
+                    exchanges.SEQ_RANK["log"],
+                    str(rec.get("lane") or "log"),
                     _guard(
                         exchanges.seq_log(
-                            "agent",
-                            str(
-                                detail.get("message") or detail.get("class") or "failed"
-                            ),
-                            bad=True,
+                            str(rec.get("lane") or "log"),
+                            str(rec.get("head") or ""),
+                            str(rec.get("body") or ""),
+                            bad=bool(rec.get("bad")),
                         )
                     ),
                 )
             )
-        for rec in turn.get("answers") or []:
-            key = _seq_key(rec)
-            if key is not None:
-                items.append(
-                    (
-                        key,
-                        exchanges.SEQ_RANK["reply"],
-                        "reply",
-                        _guard(
-                            exchanges.seq_reply(ev_esc(rec.get("text"), MAX_REPLY_TEXT))
-                        ),
+    return items
+
+
+def _flow_items(turn: dict) -> list:
+    items: list = []
+    for rec in turn.get("flowStates") or []:
+        key = _seq_key(rec)
+        if key is None:
+            continue
+        bits = " · ".join(
+            str(k) + "=" + str(v)
+            for k, v in rec.items()
+            if k not in ("seq", "turnId", "appRunId", "tool", "note", "ts", "derivedMs")
+        )
+        head = "flow " + str(rec.get("tool") or "") + ": " + bits
+        items.append(
+            (
+                key,
+                exchanges.SEQ_RANK["flow"],
+                "flow",
+                _guard(
+                    exchanges.seq_flow(
+                        head,
+                        body=(
+                            '<p class="seqfull" dir="auto">'
+                            + ev_esc(rec.get("note"), 400)
+                            + "</p>"
+                        )
+                        if rec.get("note")
+                        else "",
                     )
+                ),
+            )
+        )
+    return items
+
+
+def _agent_items(turn: dict) -> list:
+    """Cards, notes, the agent's own failures and its final answers."""
+    items: list = []
+    for rec in turn.get("cards") or []:
+        key = _seq_key(rec)
+        if key is not None:
+            items.append(
+                (
+                    key,
+                    exchanges.SEQ_RANK["card"],
+                    "card",
+                    _guard(
+                        exchanges.seq_card(
+                            str(rec.get("kind") or "card"), bool(rec.get("replaced"))
+                        )
+                    ),
                 )
-    # The lane's own actions, on the same clock.
+            )
+    for rec in turn.get("notes") or []:
+        key = _seq_key(rec)
+        if key is not None:
+            items.append(
+                (
+                    key,
+                    exchanges.SEQ_RANK["log"],
+                    "note",
+                    _guard(exchanges.seq_note(str(rec.get("text") or ""))),
+                )
+            )
+    for rec in turn.get("errors") or []:
+        key = _seq_key(rec)
+        if key is None or rec.get("kind") in ("binding", "llm", "tool"):
+            continue  # already on their own rows
+        detail = rec.get("detail") or {}
+        items.append(
+            (
+                key,
+                exchanges.SEQ_RANK["agent"],
+                "agent",
+                _guard(
+                    exchanges.seq_log(
+                        "agent",
+                        str(detail.get("message") or detail.get("class") or "failed"),
+                        bad=True,
+                    )
+                ),
+            )
+        )
+    for rec in turn.get("answers") or []:
+        key = _seq_key(rec)
+        if key is not None:
+            items.append(
+                (
+                    key,
+                    exchanges.SEQ_RANK["reply"],
+                    "reply",
+                    _guard(
+                        exchanges.seq_reply(ev_esc(rec.get("text"), MAX_REPLY_TEXT))
+                    ),
+                )
+            )
+    return items
+
+
+def _trace_items(case: dict, offset: int, trace_rows, step_frames) -> list:
+    """The lane's own actions, on the same clock."""
+    items: list = []
     trace = [t for t in (case.get("trace") or [])[:MAX_ROWS] if isinstance(t, dict)]
     rows = list(trace_rows or [])
     for i, entry in enumerate(trace):
@@ -1893,6 +1993,44 @@ def sequence_items(
         )
         frame = (step_frames or {}).get(i) or ""
         items.append((key, exchanges.SEQ_RANK[kind], kind, _guard(inner) + str(frame)))
+    return items
+
+
+def sequence_items(
+    loaded: object,
+    tc_id: object,
+    trace_rows: list | None = None,
+    step_frames: dict | None = None,
+) -> list:
+    """``[(key, rank, kind, inner_html, clock_label, bar)]`` for ``exchanges.seqlist``.
+    *step_frames* is ``{trace index: frame html}``, built by
+    ``report._seq_frames``. THIS stream is the Run sequence a case with app
+    evidence actually gets -- it REPLACES ``report._seq_rows`` entirely -- so a
+    per-step photograph threaded only into that function would render on no such
+    run at all. The markup is this repository's own (``report._shot_html``), so
+    it is appended OUTSIDE ``_guard``, which exists for the app's text.
+
+    The app's records and the lane's own actions merge on one absolute clock: the
+    records carry the device's epoch ms, an action its host ``at`` corrected by the
+    case's clock offset (the same correction the join applied to the window).
+    """
+    content = _content(loaded)
+    view = _view(loaded, tc_id)
+    if not _has(loaded) or not view:
+        return []
+    case = (content.get("cases_by_id") or {}).get(str(tc_id or "")) or {}
+    offset = _clock_offset(case)
+    items: list = []
+    longest = _longest_step_ms(view)
+    multi = len(view["turns"]) > 1
+    for n, turn in enumerate(view["turns"], 1):
+        items += _turn_opening_items(turn, n, multi)
+        items += _llm_items(turn, longest)
+        items += _call_items(turn, longest)
+        items += _runlog_items(turn)
+        items += _flow_items(turn)
+        items += _agent_items(turn)
+    items += _trace_items(case, offset, trace_rows, step_frames)
     return items
 
 

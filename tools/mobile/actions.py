@@ -47,6 +47,7 @@ from typing import Annotated, Literal, Optional, Union
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from tools.device_manager import valid_package_name
+from tools.mobile import knowledge_limits
 from tools.mobile.fill_label import FILL_MAX_LABEL_CHARS
 
 logger = logging.getLogger(__name__)
@@ -724,6 +725,10 @@ class Script(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     actions: list[Action] = Field(min_length=1, max_length=MAX_ACTIONS)
+    #: Optional host feedback on applied app notes; validated by knowledge_feedback.
+    knowledge_feedback: list[dict] = Field(
+        default_factory=list, max_length=knowledge_limits.MAX_FEEDBACK_ITEMS
+    )
 
     @model_validator(mode="after")
     def waits_fit_one_submit(self) -> "Script":
@@ -1022,8 +1027,6 @@ def is_credential_action(action: object) -> bool:
     camel case and match whole words with the same code. ``perception`` imports
     nothing from here, so the direction is safe.
     """
-    from tools.mobile import perception
-
     if isinstance(action, BaseModel):
         try:
             payload = action.model_dump(mode="json")
@@ -1039,9 +1042,14 @@ def is_credential_action(action: object) -> bool:
     # clear anyway. Inconsistent rather than unsafe, and the scope is the fix.
     if str(payload.get("op") or "") not in VALUE_BEARING_OPS:
         return False
+    return _surface_reads_as_credential(_value_surface(payload))
+
+
+def _value_surface(payload: dict) -> list:
+    """Every name an action's typed-into field can be read by."""
     target = payload.get("target")
     target = target if isinstance(target, dict) else {}
-    surface = [
+    return [
         payload.get("field"),
         payload.get("label"),
         target.get("rid"),
@@ -1049,6 +1057,12 @@ def is_credential_action(action: object) -> bool:
         target.get("id"),
         target.get("label"),
     ]
+
+
+def _surface_reads_as_credential(surface: list) -> bool:
+    """True when the names are unreadable to this server or match a credential term."""
+    from tools.mobile import perception
+
     # THE WHOLE SURFACE, and this reverses a narrowing that lasted one round.
     #
     # It was narrowed to `field` alone because applying it to a target's label
@@ -1302,66 +1316,56 @@ def resolve_target(target: object, pruned: object) -> dict:
         found = candidates_for(target, pruned)
         if not found:
             return {"error": None, "content": _miss()}
-        supplied = tuple(name for name in SELECTORS if name in found)
-        matched = {name: group for name, (_how, group) in found.items() if group}
-        missed = tuple(name for name in supplied if name not in matched)
-        if not matched:
-            ours_missed = tuple(name for name in missed if name in OURS)
-            return {
-                "error": None,
-                "content": _miss(
-                    stale=bool(ours_missed),
-                    supplied=supplied,
-                    stale_selectors=missed,
-                ),
-            }
-        if missed:
-            return {
-                "error": None,
-                "content": _miss(stale=True, supplied=supplied, stale_selectors=missed),
-            }
-
-        # Elements satisfying EVERY supplied selector. Compared by the ASSIGNED
-        # id (see `_identity`): the content seed omits `clickable`, so a
-        # clickable wrapper and its non-clickable child are one bucket to it,
-        # and a target could be answered by an element only ONE of its
-        # selectors matched.
-        agreed_ids: set | None = None
-        for group in matched.values():
-            group_ids = {_identity(element) for element in group}
-            agreed_ids = group_ids if agreed_ids is None else (agreed_ids & group_ids)
-        if not agreed_ids:
-            return {
-                "error": None,
-                "content": _miss(conflict=True, supplied=supplied),
-            }
-
-        order = {name: index for index, name in enumerate(SELECTORS)}
-        narrowest = min(matched, key=lambda name: (len(matched[name]), order[name]))
-        agreed = [e for e in matched[narrowest] if _identity(e) in agreed_ids]
-        # THEIR clickable preference: the tap target is the wrapper, and the
-        # element carrying the word is often its non-clickable child.
-        tappable = [e for e in agreed if e.get("clickable")]
-
-        # THEIR ambiguity rule, applied to what SURVIVED the cross-check rather
-        # than to the role's own matches -- which is their own "ambiguity falls
-        # through" intent, generalised: any other selector may narrow it, and
-        # only a role still ambiguous at the end is a miss.
-        if "role" in matched and len(tappable) > 1:
-            return {
-                "error": None,
-                "content": _miss(supplied=supplied, candidates=len(tappable)),
-            }
-
-        chosen = (tappable or agreed)[0]
-        preferred = min(matched, key=lambda name: order[name])
-        return {
-            "error": None,
-            "content": _hit(chosen, found[preferred][0], len(matched[preferred])),
-        }
+        return {"error": None, "content": _resolve_found(found)}
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.actions.resolve_target failed")
         return {"error": str(exc), "content": None}
+
+
+def _resolve_found(found: dict) -> dict:
+    """The ``content`` for a target whose selectors produced *found* candidates."""
+    supplied = tuple(name for name in SELECTORS if name in found)
+    matched = {name: group for name, (_how, group) in found.items() if group}
+    missed = tuple(name for name in supplied if name not in matched)
+    if not matched:
+        ours_missed = tuple(name for name in missed if name in OURS)
+        return _miss(stale=bool(ours_missed), supplied=supplied, stale_selectors=missed)
+    if missed:
+        return _miss(stale=True, supplied=supplied, stale_selectors=missed)
+    return _pick_agreed(found, matched, supplied)
+
+
+def _pick_agreed(found: dict, matched: dict, supplied: tuple) -> dict:
+    """Intersect the selectors' matches and choose the element, or say why none."""
+    # Elements satisfying EVERY supplied selector. Compared by the ASSIGNED
+    # id (see `_identity`): the content seed omits `clickable`, so a
+    # clickable wrapper and its non-clickable child are one bucket to it,
+    # and a target could be answered by an element only ONE of its
+    # selectors matched.
+    agreed_ids: set | None = None
+    for group in matched.values():
+        group_ids = {_identity(element) for element in group}
+        agreed_ids = group_ids if agreed_ids is None else (agreed_ids & group_ids)
+    if not agreed_ids:
+        return _miss(conflict=True, supplied=supplied)
+
+    order = {name: index for index, name in enumerate(SELECTORS)}
+    narrowest = min(matched, key=lambda name: (len(matched[name]), order[name]))
+    agreed = [e for e in matched[narrowest] if _identity(e) in agreed_ids]
+    # THEIR clickable preference: the tap target is the wrapper, and the
+    # element carrying the word is often its non-clickable child.
+    tappable = [e for e in agreed if e.get("clickable")]
+
+    # THEIR ambiguity rule, applied to what SURVIVED the cross-check rather
+    # than to the role's own matches -- which is their own "ambiguity falls
+    # through" intent, generalised: any other selector may narrow it, and
+    # only a role still ambiguous at the end is a miss.
+    if "role" in matched and len(tappable) > 1:
+        return _miss(supplied=supplied, candidates=len(tappable))
+
+    chosen = (tappable or agreed)[0]
+    preferred = min(matched, key=lambda name: order[name])
+    return _hit(chosen, found[preferred][0], len(matched[preferred]))
 
 
 def _identity(element: object) -> str:
@@ -1468,84 +1472,101 @@ def describe_vocabulary() -> dict:
             "matching when that element moves. It can never match a DIFFERENT "
             "element, but being handed back still costs you a turn."
         ),
-        "notes": [
-            "tap/type/clear/scroll/press act on a target; back/home/launch take none.",
-            "clear_app_data takes no target and no package -- it wipes THIS "
-            "run's own app's data (pm clear) and relaunches it, judged by the "
-            "destructive guard like every other irreversible action.",
-            "tap_text(text) is the short form of tap: it taps the ONE control carrying that visible text, and REFUSES when more than one control carries it rather than choosing between them. On a screen with the same word on several rows, use tap with a narrower target instead. It takes no target of its own.",
-            "press(key, target) taps the field to focus it and then sends that "
-            "key; key is one of "
-            + ", ".join(sorted(PRESS_KEYS))
-            + ". `enter` is the keyboard's ACTION key and WHAT IT SUBMITS IS "
-            "DECIDED BY THE APP, not by the field you name -- so a press is "
-            "judged against every element on the screen, ordinary text and "
-            "widget names included (a message reading 'did you transfer it?' "
-            "counts, and so does a control whose class or resource id contains "
-            "one of these words), and "
-            "on a screen holding anything irreversible (confirm, pay, delete, "
-            "...) it is handed to the tester. On such a screen tap the button "
-            "you mean instead; that is judged by its own label.",
-            "type carries secret=true ONLY for a value the tester supplied; never "
-            "invent a credential and never put one in a plan.",
-            "Every wait waits FOR something and comes back the moment it "
-            "happens: wait_until_text(text) until that text is on the screen, "
-            "wait_until_gone(text) until it is not (a spinner, 'Loading'), "
-            "wait_until_changed until the screen is a different screen, "
-            "wait_until_idle until two reads in a row are the same. Each takes "
-            "max_s (default "
-            + str(WAIT_UNTIL_DEFAULT_S)
-            + ", at most "
-            + str(WAIT_UNTIL_MAX_S)
-            + "), which is only the bound on a condition that never comes, and "
-            "each stops early and names what appeared instead when a dialog, a "
-            "call, another app or an error text takes the screen. There is no "
-            "fixed wait: the older wait takes until_text, until_rid (an element "
-            "by its resource id: present, or gone with until_gone=true) or ms (<= "
-            + str(MAX_WAIT_MS)
-            + "), and wait ms now runs as wait_until_changed bounded by that ms. "
-            "Never sleep in a shell (sleep, Start-Sleep, timeout) between "
-            "calls: the phone is not watched while you do. assert kinds are "
-            + ", ".join(ASSERT_KINDS)
-            + ". text_present/text_absent take the string to look for in "
-            "`text` OR in `target.text` -- either is accepted, and `text` "
-            "wins if you send both. assert visual takes a `note` (what to "
-            "judge) and must be the LAST action: the replay stops there and "
-            "your next reply carries the screenshot, so judge it and send done "
-            "or the next script. Use it only for what the element list cannot "
-            "say (layout, colour, an image, a chart).",
-            "To check that the app REPLIED, use assert new_text (optionally with "
-            "contains): it passes only when text appeared that was not on the "
-            "previous screen. screen_changed is WEAK -- any navigation "
-            "satisfies it -- so it is never evidence that an answer arrived.",
-            "One submit replays for at most "
-            + str(SUBMIT_BUDGET_MS)
-            + " ms of device time and the waits in one script may total at most "
-            + str(MAX_TOTAL_WAIT_MS)
-            + " ms. Over the wait total the script is REFUSED; over the submit "
-            "budget the replay stops before the next action and hands you the "
-            "screen, so plan short scripts rather than one long one. What spends "
-            "that budget is the SCREEN RE-READ after every action that can "
-            "change the screen, not the tap itself -- so a script is bounded by "
-            "device time long before it is bounded by the action count above.",
-            "ask_tester(prompt, field) stops the replay and asks the tester for "
-            "that one field. The value is typed and never stored.",
-            "end with done(verdict, reason); verdict is one of "
-            + ", ".join(VERDICTS)
-            + ".",
-            "Never send two selectors that point at different elements -- an "
-            "`id` and a `text`, a `rid` and a `text`, any pair: the action is "
-            "handed back rather than guessed, and so is a target one of whose "
-            "selectors matches nothing while another matches. Never reuse an "
-            "`id` for an action you plan AFTER a "
-            "`type` in the same script: typing opens the keyboard and re-lays "
-            "out the screen, so every id from the previous screen goes stale "
-            "at once. `rid` and the on-screen text survive that; ids do not.",
-            "Plan from the screen you were given. If an element you need is not "
-            "on it, stop the script there -- the server hands you the next "
-            "screen and you continue. Do not guess coordinates.",
-        ],
+        "notes": _action_notes() + _wait_notes() + _budget_notes(),
     }
+
+
+def _action_notes() -> list[str]:
+    """The vocabulary notes on targets, tapping, pressing and typing."""
+    return [
+        "tap/type/clear/scroll/press act on a target; back/home/launch take none.",
+        "clear_app_data takes no target and no package -- it wipes THIS "
+        "run's own app's data (pm clear) and relaunches it, judged by the "
+        "destructive guard like every other irreversible action.",
+        "tap_text(text) is the short form of tap: it taps the ONE control carrying that visible text, and REFUSES when more than one control carries it rather than choosing between them. On a screen with the same word on several rows, use tap with a narrower target instead. It takes no target of its own.",
+        "press(key, target) taps the field to focus it and then sends that "
+        "key; key is one of "
+        + ", ".join(sorted(PRESS_KEYS))
+        + ". `enter` is the keyboard's ACTION key and WHAT IT SUBMITS IS "
+        "DECIDED BY THE APP, not by the field you name -- so a press is "
+        "judged against every element on the screen, ordinary text and "
+        "widget names included (a message reading 'did you transfer it?' "
+        "counts, and so does a control whose class or resource id contains "
+        "one of these words), and "
+        "on a screen holding anything irreversible (confirm, pay, delete, "
+        "...) it is handed to the tester. On such a screen tap the button "
+        "you mean instead; that is judged by its own label.",
+        "type carries secret=true ONLY for a value the tester supplied; never "
+        "invent a credential and never put one in a plan.",
+    ]
+
+
+def _wait_notes() -> list[str]:
+    """The vocabulary notes on waits and asserts."""
+    return [
+        "Every wait waits FOR something and comes back the moment it "
+        "happens: wait_until_text(text) until that text is on the screen, "
+        "wait_until_gone(text) until it is not (a spinner, 'Loading'), "
+        "wait_until_changed until the screen is a different screen, "
+        "wait_until_idle until two reads in a row are the same. Each takes "
+        "max_s (default "
+        + str(WAIT_UNTIL_DEFAULT_S)
+        + ", at most "
+        + str(WAIT_UNTIL_MAX_S)
+        + "), which is only the bound on a condition that never comes, and "
+        "each stops early and names what appeared instead when a dialog, a "
+        "call, another app or an error text takes the screen. There is no "
+        "fixed wait: the older wait takes until_text, until_rid (an element "
+        "by its resource id: present, or gone with until_gone=true) or ms (<= "
+        + str(MAX_WAIT_MS)
+        + "), and wait ms now runs as wait_until_changed bounded by that ms. "
+        "Never sleep in a shell (sleep, Start-Sleep, timeout) between "
+        "calls: the phone is not watched while you do. assert kinds are "
+        + ", ".join(ASSERT_KINDS)
+        + ". text_present/text_absent take the string to look for in "
+        "`text` OR in `target.text` -- either is accepted, and `text` "
+        "wins if you send both. assert visual takes a `note` (what to "
+        "judge) and must be the LAST action: the replay stops there and "
+        "your next reply carries the screenshot, so judge it and send done "
+        "or the next script. Use it only for what the element list cannot "
+        "say (layout, colour, an image, a chart).",
+        "To check that the app REPLIED, use assert new_text (optionally with "
+        "contains): it passes only when text appeared that was not on the "
+        "previous screen. screen_changed is WEAK -- any navigation "
+        "satisfies it -- so it is never evidence that an answer arrived.",
+    ]
+
+
+def _budget_notes() -> list[str]:
+    """The vocabulary notes on the device-time budget, ask_tester, done and ids."""
+    return [
+        "One submit replays for at most "
+        + str(SUBMIT_BUDGET_MS)
+        + " ms of device time and the waits in one script may total at most "
+        + str(MAX_TOTAL_WAIT_MS)
+        + " ms. Over the wait total the script is REFUSED; over the submit "
+        "budget the replay stops before the next action and hands you the "
+        "screen, so plan short scripts rather than one long one. What spends "
+        "that budget is the SCREEN RE-READ after every action that can "
+        "change the screen, not the tap itself -- so a script is bounded by "
+        "device time long before it is bounded by the action count above.",
+        "ask_tester(prompt, field) stops the replay and asks the tester for "
+        "that one field. The value is typed and never stored.",
+        "end with done(verdict, reason); verdict is one of "
+        + ", ".join(VERDICTS)
+        + ".",
+        "Never send two selectors that point at different elements -- an "
+        "`id` and a `text`, a `rid` and a `text`, any pair: the action is "
+        "handed back rather than guessed, and so is a target one of whose "
+        "selectors matches nothing while another matches. Never reuse an "
+        "`id` for an action you plan AFTER a "
+        "`type` in the same script: typing opens the keyboard and re-lays "
+        "out the screen, so every id from the previous screen goes stale "
+        "at once. `rid` and the on-screen text survive that; ids do not.",
+        "Plan from the screen you were given. If an element you need is not "
+        "on it, stop the script there -- the server hands you the next "
+        "screen and you continue. Do not guess coordinates.",
+    ]
 
 
 def response_schema() -> dict:

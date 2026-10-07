@@ -139,11 +139,7 @@ async def _run_argv(
             proc.communicate(input=stdin_data), timeout=timeout
         )
     except asyncio.TimeoutError:
-        proc.kill()
-        try:
-            await asyncio.wait_for(proc.communicate(), timeout=1)
-        except Exception:
-            pass
+        await _kill_and_reap(proc)
         logger.warning(
             "mobile.adb: command timed out after %ss: %s",
             timeout,
@@ -152,28 +148,34 @@ async def _run_argv(
         raise
     except asyncio.CancelledError:
         # An outer `wait_for`/task cancellation must still kill the child --
-        # otherwise a cancelled adb call leaves the process running. The
-        # reap below is bounded the same way the timeout path is; it must
-        # not block indefinitely on a child that ignores the kill.
-        proc.kill()
-        try:
-            await asyncio.wait_for(proc.communicate(), timeout=1)
-        except Exception:
-            pass
+        # otherwise a cancelled adb call leaves the process running.
+        await _kill_and_reap(proc)
         raise
-    duration = time.monotonic() - started
+    _log_call_duration(time.monotonic() - started, _cmd_for_log(cmd, stdin_data))
+    return int(proc.returncode or 0), stdout or b"", stderr or b""
+
+
+async def _kill_and_reap(proc) -> None:
+    """Kill *proc* and reap it, bounded so a child that ignores the kill cannot
+    block the caller indefinitely."""
+    proc.kill()
+    try:
+        await asyncio.wait_for(proc.communicate(), timeout=1)
+    except Exception:
+        pass
+
+
+def _log_call_duration(duration: float, rendered_cmd: str) -> None:
+    """Warn on a call over the slow-call ceiling, debug-log any other."""
     if duration > SLOW_CALL_CEILING_S:
         logger.warning(
             "mobile.adb: call took %.2fs (over %ss): %s",
             duration,
             SLOW_CALL_CEILING_S,
-            _cmd_for_log(cmd, stdin_data),
+            rendered_cmd,
         )
     else:
-        logger.debug(
-            "mobile.adb: call took %.2fs: %s", duration, _cmd_for_log(cmd, stdin_data)
-        )
-    return int(proc.returncode or 0), stdout or b"", stderr or b""
+        logger.debug("mobile.adb: call took %.2fs: %s", duration, rendered_cmd)
 
 
 async def raw(
@@ -263,15 +265,7 @@ async def devices() -> dict:
     body = result.get("content") or {}
     rc = int(body.get("rc") or 0)
     if rc != 0:
-        detail = (
-            str(body.get("err") or "").strip() or str(body.get("out") or "").strip()
-        )
-        return {
-            "error": "adb devices failed ("
-            + (detail[:200] if detail else "exit " + str(rc))
-            + ").",
-            "content": None,
-        }
+        return _devices_failed(body, rc)
     # ONE PARSER, TWO READERS. This used to re-derive `parts[1] == "device"`
     # beside the identical line in `device_manager._list_android`, and both
     # dropped an `unauthorized` phone in silence. The classification now happens
@@ -281,25 +275,40 @@ async def devices() -> dict:
     # reported to the tester by `qa_list_devices`, which is where a person reads.
     rows = parse_adb_devices(str((result["content"] or {}).get("out") or ""))
     if rows.dropped_lines:
-        # THE SAME REFUSAL SHAPE AS A NON-ZERO rc, for the same reason. A
-        # truncated list cannot answer "which serials can I drive?": the one
-        # the caller wants may be a line that was never read, and every caller
-        # here spawns, adopts or reports on the answer -- `find_running` would
-        # start a SECOND emulator over the tester's own (D1, 2026-09-03). All
-        # four callers already branch on `error`, so the safe direction needs
-        # no second sentinel.
-        return {
-            "error": (
-                "adb listed more transports than this server reads ("
-                + str(rows.dropped_lines)
-                + " line(s) past the limit were not parsed), so it cannot say "
-                "which devices are connected. Unplug what you are not using, "
-                "or run `adb kill-server`, then try again."
-            ),
-            "content": None,
-        }
+        return _devices_truncated(rows.dropped_lines)
     serials = [str(row["serial"]) for row in rows if row.get("usable")]
     return {"error": None, "content": serials}
+
+
+def _devices_failed(body: dict, rc: int) -> dict:
+    """The refusal for ``adb devices`` exiting non-zero, quoting adb's words."""
+    detail = str(body.get("err") or "").strip() or str(body.get("out") or "").strip()
+    return {
+        "error": "adb devices failed ("
+        + (detail[:200] if detail else "exit " + str(rc))
+        + ").",
+        "content": None,
+    }
+
+
+def _devices_truncated(dropped_lines: int) -> dict:
+    """THE SAME REFUSAL SHAPE AS A NON-ZERO rc, for the same reason. A
+    truncated list cannot answer "which serials can I drive?": the one the
+    caller wants may be a line that was never read, and every caller here
+    spawns, adopts or reports on the answer -- `find_running` would start a
+    SECOND emulator over the tester's own (D1, 2026-09-03). All four callers
+    already branch on `error`, so the safe direction needs no second sentinel.
+    """
+    return {
+        "error": (
+            "adb listed more transports than this server reads ("
+            + str(dropped_lines)
+            + " line(s) past the limit were not parsed), so it cannot say "
+            "which devices are connected. Unplug what you are not using, "
+            "or run `adb kill-server`, then try again."
+        ),
+        "content": None,
+    }
 
 
 async def shell(
@@ -775,23 +784,33 @@ async def launch(serial: str, package: str) -> dict:
         }
     component = await resolve_launcher(serial, package)
     if component:
-        started = await shell(
-            serial, ["am", "start", "-n", component], timeout=LAUNCH_START_TIMEOUT_S
-        )
-        body = started.get("content") or {}
-        text = str(body.get("out") or "") + str(body.get("err") or "")
-        if started.get("error") or "Error" in text:
-            return {
-                "error": (
-                    "Could not start "
-                    + component
-                    + ": "
-                    + (str(started.get("error") or text).strip()[:300] or "no reply")
-                ),
-                "content": None,
-            }
-        await _wait_foreground(serial, str(package))
-        return started
+        return await _launch_component(serial, str(package), component)
+    return await _launch_monkey(serial, str(package))
+
+
+async def _launch_component(serial: str, package: str, component: str) -> dict:
+    """``am start -n <component>``, then wait (bounded) for the app's window."""
+    started = await shell(
+        serial, ["am", "start", "-n", component], timeout=LAUNCH_START_TIMEOUT_S
+    )
+    body = started.get("content") or {}
+    text = str(body.get("out") or "") + str(body.get("err") or "")
+    if started.get("error") or "Error" in text:
+        return {
+            "error": (
+                "Could not start "
+                + component
+                + ": "
+                + (str(started.get("error") or text).strip()[:300] or "no reply")
+            ),
+            "content": None,
+        }
+    await _wait_foreground(serial, package)
+    return started
+
+
+async def _launch_monkey(serial: str, package: str) -> dict:
+    """The fallback launch for a device with no resolvable launcher component."""
     monkeyed = await shell(
         serial,
         [
@@ -963,6 +982,42 @@ async def display_density(serial: str) -> dict:
     return {"error": None, "content": dpi}
 
 
+def _cache_lookup(cache: dict, key: str, now: float) -> tuple[bool, object]:
+    """``(True, value)`` when *key* holds an unexpired entry, else ``(False, None)``.
+
+    A cached ``None`` is a real answer (a failed probe is cached too), which is
+    why the hit is a separate flag.
+    """
+    cached = cache.get(key)
+    if cached is not None and now < cached[0]:
+        return True, cached[1]
+    return False, None
+
+
+def _wm_lines(result: dict) -> list[str]:
+    """Stripped, lower-cased stdout lines of a ``wm`` call; none on an error."""
+    if result.get("error"):
+        return []
+    text = str((result.get("content") or {}).get("out") or "")
+    return [line.strip().lower() for line in text.splitlines()]
+
+
+# NOTES for `display_size`'s guards (kept here so the function stays short).
+#
+# The ceiling is ONE clause over the longer edge, not two comparisons joined by
+# `or`. A two-clause version can be written halfway -- drop the height half and
+# a tall absurd panel walks through -- and it would collide with the zero-guard
+# in the clause ratchet's locator, which matches on the names a condition
+# mentions. `max` cannot be half-applied. The regex bounds the digit COUNT, not
+# the value: 9999999x9999999 parses as a plausible panel, so it is refused with
+# `continue`, meaning "no answer", which every consumer already handles; the
+# dump's own bounds stay the authority for targeting either way.
+#
+# An override REPLACES the physical size and is what is being drawn to, so it
+# wins on its own merit rather than by being printed second. AOSP prints
+# physical first, but "the last line wins" would silently take the wrong one on
+# a build that does not -- and a report scaled to the panel while the device
+# draws an override is at the wrong scale for the whole run.
 async def display_size(serial: str) -> dict:
     """The device's NATURAL display size as ``[w, h]``, or ``None`` content.
 
@@ -983,56 +1038,35 @@ async def display_size(serial: str) -> dict:
     """
     key = str(serial or "")
     now = time.monotonic()
-    cached = _DISPLAY_CACHE.get(key)
-    if cached is not None and now < cached[0]:
-        return {"error": None, "content": cached[1]}
-    result = await shell(key, ["wm", "size"])
+    hit, cached = _cache_lookup(_DISPLAY_CACHE, key, now)
+    if hit:
+        return {"error": None, "content": cached}
     size = None
     overridden = False
-    if not result.get("error"):
-        text = str((result.get("content") or {}).get("out") or "")
-        for line in text.splitlines():
-            lowered = line.strip().lower()
-            override = lowered.startswith("override size:")
-            if not override and not lowered.startswith("physical size:"):
-                continue
-            match = _DISPLAY_RE.search(lowered)
-            if not match:
-                continue
-            width, height = int(match.group(1)), int(match.group(2))
-            if width <= 0 or height <= 0:
-                continue
-            # ONE clause over the longer edge, not two comparisons joined by
-            # `or`. A two-clause version is a clause that can be written
-            # halfway -- drop the height half and a tall absurd panel walks
-            # through -- and it would also collide with the zero-guard above in
-            # the clause ratchet's locator, which matches on the names a
-            # condition mentions. `max` cannot be half-applied.
-            longest_edge = max(width, height)
-            if longest_edge > MAX_DISPLAY_EDGE_PX:
-                # The regex bounds the digit COUNT, not the value: seven digits
-                # each means 9999999x9999999 parses as a plausible panel. Refuse
-                # it here rather than let it through as a coordinate space --
-                # `continue` means "no answer", which every consumer already
-                # handles, and the dump's own bounds stay the authority for
-                # targeting either way.
-                logger.debug(
-                    "refusing an implausible display size %dx%d from %s",
-                    width,
-                    height,
-                    serial,
-                )
-                continue
-            if overridden and not override:
-                # An override REPLACES the physical size and is what is being
-                # drawn to, so it wins on its own merit rather than by being
-                # printed second. AOSP prints physical first, but "the last line
-                # wins" would silently take the wrong one on a build that does
-                # not -- and a report scaled to the panel while the device draws
-                # an override is at the wrong scale for the whole run.
-                continue
-            size = [width, height]
-            overridden = overridden or override
+    for lowered in _wm_lines(await shell(key, ["wm", "size"])):
+        override = lowered.startswith("override size:")
+        if not override and not lowered.startswith("physical size:"):
+            continue
+        match = _DISPLAY_RE.search(lowered)
+        if not match:
+            continue
+        width, height = int(match.group(1)), int(match.group(2))
+        if width <= 0 or height <= 0:
+            continue
+        # See the NOTES above this function for the ceiling and the precedence.
+        longest_edge = max(width, height)
+        if longest_edge > MAX_DISPLAY_EDGE_PX:
+            logger.debug(
+                "refusing an implausible display size %dx%d from %s",
+                width,
+                height,
+                serial,
+            )
+            continue
+        if overridden and not override:
+            continue
+        size = [width, height]
+        overridden = overridden or override
     _DISPLAY_CACHE[key] = (now + DISPLAY_CACHE_TTL_S, size)
     return {"error": None, "content": size}
 
@@ -1080,6 +1114,60 @@ def clear_dump_provider(serial: str) -> None:
     _DUMP_PROVIDERS.pop(str(serial), None)
 
 
+async def _provider_dump(serial: str, provider) -> str | None:
+    """The fast provider's XML when it is clean, capped and ``<``-led, else
+    ``None`` (including when the provider raises) so the caller falls through
+    to uiautomator."""
+    try:
+        fast = await provider(serial) or {}
+        fast_xml = str(fast.get("content") or "")
+        if (
+            not fast.get("error")
+            and fast_xml.lstrip().startswith("<")
+            and len(fast_xml.encode("utf-8", errors="replace")) <= MAX_DUMP_BYTES
+        ):
+            return fast_xml
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "mobile.adb: dump provider failed; using uiautomator", exc_info=True
+        )
+    return None
+
+
+def _dump_no_xml(said: str) -> dict:
+    """The refusal for a dump that did not produce XML; *said* is the device's
+    own (collapsed, capped) output, possibly empty."""
+    if said:
+        # The device SPOKE, so its words LEAD. `cat: ...: No such file` means
+        # the dumper never wrote a file, and a reply that opens with "a secure
+        # window blocks the dump" sends the tester's model to change screens
+        # when the cause is elsewhere -- it reads the first sentence. The
+        # secure window is named after, as one cause.
+        return {
+            "error": (
+                "The device said: "
+                + said
+                + " -- uiautomator produced no XML for this screen. If "
+                "those words name a missing dump file, the dumper did not "
+                "run; a secure window (a password field or a payment "
+                "sheet) is one cause, and moving past it or using a screen "
+                "that allows accessibility is the fix."
+            ),
+            "content": None,
+        }
+    # Nothing came back at all. There are no device words to lead with, so the
+    # likeliest cause is all this branch has to offer.
+    return {
+        "error": (
+            "uiautomator returned no XML for this screen and the device "
+            "said nothing. A secure window (a password field or a payment "
+            "sheet) blocks the dump; move past it or use a screen that "
+            "allows accessibility."
+        ),
+        "content": None,
+    }
+
+
 async def uiautomator_dump(serial: str, *, use_provider: bool = True) -> dict:
     """The current screen's uiautomator XML, as a string.
 
@@ -1099,19 +1187,9 @@ async def uiautomator_dump(serial: str, *, use_provider: bool = True) -> dict:
     """
     provider = _DUMP_PROVIDERS.get(str(serial)) if use_provider else None
     if provider is not None:
-        try:
-            fast = await provider(serial) or {}
-            fast_xml = str(fast.get("content") or "")
-            if (
-                not fast.get("error")
-                and fast_xml.lstrip().startswith("<")
-                and len(fast_xml.encode("utf-8", errors="replace")) <= MAX_DUMP_BYTES
-            ):
-                return {"error": None, "content": fast_xml}
-        except Exception:
-            logging.getLogger(__name__).debug(
-                "mobile.adb: dump provider failed; using uiautomator", exc_info=True
-            )
+        fast_xml = await _provider_dump(serial, provider)
+        if fast_xml is not None:
+            return {"error": None, "content": fast_xml}
     read = await shell(serial, [_DUMP_COMMAND], timeout=DUMP_TIMEOUT_S)
     if read.get("error"):
         if read.get("timed_out"):
@@ -1123,36 +1201,7 @@ async def uiautomator_dump(serial: str, *, use_provider: bool = True) -> dict:
         return read
     xml = str((read["content"] or {}).get("out") or "")
     if not xml.lstrip().startswith("<"):
-        said = " ".join(xml.split())[:200]
-        if said:
-            # The device SPOKE, so its words LEAD. `cat: ...: No such file`
-            # means the dumper never wrote a file, and a reply that opens with
-            # "a secure window blocks the dump" sends the tester's model to
-            # change screens when the cause is elsewhere -- it reads the first
-            # sentence. The secure window is named after, as one cause.
-            return {
-                "error": (
-                    "The device said: "
-                    + said
-                    + " -- uiautomator produced no XML for this screen. If "
-                    "those words name a missing dump file, the dumper did not "
-                    "run; a secure window (a password field or a payment "
-                    "sheet) is one cause, and moving past it or using a screen "
-                    "that allows accessibility is the fix."
-                ),
-                "content": None,
-            }
-        # Nothing came back at all. There are no device words to lead with, so
-        # the likeliest cause is all this branch has to offer.
-        return {
-            "error": (
-                "uiautomator returned no XML for this screen and the device "
-                "said nothing. A secure window (a password field or a payment "
-                "sheet) blocks the dump; move past it or use a screen that "
-                "allows accessibility."
-            ),
-            "content": None,
-        }
+        return _dump_no_xml(" ".join(xml.split())[:200])
     if len(xml.encode("utf-8", errors="replace")) > MAX_DUMP_BYTES:
         return {
             "error": (
@@ -1168,29 +1217,19 @@ async def uiautomator_dump(serial: str, *, use_provider: bool = True) -> dict:
 async def screencap(serial: str, *, timeout_s: float | None = None) -> dict:
     """The current screen as PNG BYTES: ``{"error", "content": bytes|None}``.
 
-    Never raises, exactly like every other function in this module, and a
-    failure is never a partial image: no adb, a timeout, a non-zero exit, an
-    over-cap payload and a body that is not a PNG all come back with
-    ``content: None`` and a stated error, so the caller can carry on with the
-    dump alone. A missing picture must degrade the packet, never lose the turn.
+    Never raises, and a failure is never a partial image: no adb, a timeout, a
+    non-zero exit, an over-cap payload and a body that is not a PNG all come
+    back with ``content: None`` and a stated error, so the caller can carry on
+    with the dump alone.
 
     **It calls :func:`_run_argv` DIRECTLY, and that is forced rather than
-    chosen.** ``raw`` returns ``out.decode(errors="replace")``, so a PNG routed
-    through ``raw`` / ``_device`` / ``shell`` comes back as replacement
-    characters and can never be re-encoded -- the bytes are gone by the time
-    this function would see them. ``_run_argv`` is still the module's SINGLE
-    subprocess seam, so the test recorder in ``tests/mobile/conftest.py``
-    records this call like any other; what is skipped is only the decoding
-    layer. The serial validation ``_device`` would have done is done here, with
-    the same ``_valid_device_id`` and the same wording, so nothing is lost by
-    going round it.
-
-    ``exec-out`` rather than ``shell`` for the reason :func:`run_as_cat` gives:
-    ``shell`` is a pty and mangles the bytes.
-
-    The timeout is the module DEFAULT rather than a new constant: a screencap is
-    one short device call, and ``DEFAULT_TIMEOUT_S`` already carries the CEILINGS
-    row stating exactly the constraint that applies to it.
+    chosen.** ``raw`` decodes stdout with ``errors="replace"``, so a PNG routed
+    through ``raw`` / ``_device`` / ``shell`` could never be re-encoded.
+    ``_run_argv`` is still the module's SINGLE subprocess seam. The serial check
+    ``_device`` would have done is done here with the same wording.
+    ``exec-out`` rather than ``shell`` for the reason :func:`run_as_cat` gives.
+    The timeout is the module DEFAULT, whose CEILINGS row already states the
+    constraint that applies.
     """
     if not _valid_device_id(serial):
         return {
@@ -1213,21 +1252,32 @@ async def screencap(serial: str, *, timeout_s: float | None = None) -> dict:
             "content": None,
         }
     except asyncio.TimeoutError:
-        # A TIMEOUT, said as one (fix round 3, item 3). The Air run's final
-        # screencap timed out after 30 s and the call was logged `ok`: this
-        # branch returned the same shape as a refusal. `timed_out` is the
-        # same additive field `raw` sets, and the mark reaches `_tracked`.
-        from tools import tool_status
-
-        tool_status.mark_timed_out("screencap")
-        return {
-            "error": ("screencap did not answer within " + str(int(wait_s)) + "s."),
-            "timed_out": True,
-            "content": None,
-        }
+        return _screencap_timed_out(wait_s)
     except Exception as exc:
         logger.exception("mobile.adb.screencap failed")
         return {"error": str(exc), "content": None}
+    return _screencap_verdict(rc, out, err)
+
+
+def _screencap_timed_out(wait_s: float) -> dict:
+    """A TIMEOUT, said as one (fix round 3, item 3). The Air run's final
+    screencap timed out after 30 s and the call was logged `ok`: this branch
+    returned the same shape as a refusal. `timed_out` is the same additive field
+    `raw` sets, and the mark reaches `_tracked`.
+    """
+    from tools import tool_status
+
+    tool_status.mark_timed_out("screencap")
+    return {
+        "error": ("screencap did not answer within " + str(int(wait_s)) + "s."),
+        "timed_out": True,
+        "content": None,
+    }
+
+
+def _screencap_verdict(rc: int, out: bytes, err: bytes) -> dict:
+    """Turn a finished ``screencap -p`` into the result dict: a refusal for a
+    non-zero exit, an over-cap body or a body that is not a PNG."""
     if rc != 0:
         # The device's own words, like `uiautomator_dump` quotes `cat`'s. A
         # non-zero exit is checked BEFORE the magic below so a refusal is

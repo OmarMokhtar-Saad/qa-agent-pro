@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from tools.models import TestCase
@@ -263,6 +264,28 @@ def _section_id_match(line: str) -> re.Match[str] | None:
     return _SECTION_ID_RE.match(line)
 
 
+def _absorb_wrap(lines: list[str], index: int, line: str) -> tuple[str, int, bool]:
+    """Merge ``line`` with the continuation lines that follow it.
+
+    Returns ``(merged, consumed, closed)``: the joined text, how many following
+    lines were absorbed, and whether the joined row ends in a pipe.
+    """
+    merged = line
+    consumed = 0
+    closed = False
+    while consumed < _MAX_WRAP_ABSORB and index + 1 + consumed < len(lines):
+        nxt = lines[index + 1 + consumed].rstrip()
+        # A "**DF01**"-style marker starts a new table; never absorb it.
+        if _section_id_match(nxt) or not nxt.strip():
+            break
+        merged = merged + " " + nxt.lstrip()
+        consumed += 1
+        if merged.rstrip().endswith("|"):
+            closed = True
+            break
+    return merged, consumed, closed
+
+
 def _join_wrapped_rows(description: str) -> list[str]:
     """Lines of the description with wrapped table rows re-joined.
 
@@ -313,19 +336,7 @@ def _join_wrapped_rows(description: str) -> list[str]:
                 out.append(line)
                 index += 1
                 continue
-            merged = line
-            consumed = 0
-            closed = False
-            while consumed < _MAX_WRAP_ABSORB and index + 1 + consumed < len(lines):
-                nxt = lines[index + 1 + consumed].rstrip()
-                # A "**DF01**"-style marker starts a new table; never absorb it.
-                if _section_id_match(nxt) or not nxt.strip():
-                    break
-                merged = merged + " " + nxt.lstrip()
-                consumed += 1
-                if merged.rstrip().endswith("|"):
-                    closed = True
-                    break
+            merged, consumed, closed = _absorb_wrap(lines, index, line)
             if closed:
                 out.append(merged)
                 index += 1 + consumed
@@ -518,6 +529,20 @@ def _strip_placeholder_brackets(text: str) -> str:
     return (text or "").strip().strip("<>").strip()
 
 
+def _data_field_row(cells: list[str]) -> tuple[str, str, str] | None:
+    """The (ar, en, kind) triple of a data row; None for blank or header rows."""
+    meaningful = [c for c in cells if c]
+    if not meaningful:
+        return None
+    head = meaningful[0].lower()
+    if head.startswith("content") or head in {"type", "bottom sheet"}:
+        return None  # header row / spanning title
+    ar = cells[0] if len(cells) > 0 else ""
+    en = cells[1] if len(cells) > 1 else ""
+    kind = cells[2] if len(cells) > 2 else ""
+    return (ar, en, kind)
+
+
 def parse_data_field_tables(description: str) -> list[DataFieldTable]:
     """Every DF table in the description, in order of appearance.
 
@@ -548,27 +573,58 @@ def parse_data_field_tables(description: str) -> list[DataFieldTable]:
                 raw_id = _WS_RE.sub("", section.group("id")).upper()
                 current_id = raw_id if raw_id.startswith("DF") else None
                 continue
-            cells = _split_row(line)
-            if not cells:
+            if current_id is None or len(rows) >= _MAX_ROWS_PER_TABLE:
                 continue
-            if current_id is None:
-                continue
-            if len(rows) >= _MAX_ROWS_PER_TABLE:
-                continue
-            meaningful = [c for c in cells if c]
-            if not meaningful:
-                continue
-            head = meaningful[0].lower()
-            if head.startswith("content") or head in {"type", "bottom sheet"}:
-                continue  # header row / spanning title
-            ar = cells[0] if len(cells) > 0 else ""
-            en = cells[1] if len(cells) > 1 else ""
-            kind = cells[2] if len(cells) > 2 else ""
-            rows.append((ar, en, kind))
+            row = _data_field_row(_split_row(line))
+            if row is not None:
+                rows.append(row)
         flush()
     except Exception:
         logger.exception("parse_data_field_tables failed - returning what was parsed")
     return tables
+
+
+def _add_use_case_units(
+    description: str, add: Callable[[str, str, str | None], None]
+) -> None:
+    """Feed every use-case-table row to ``add``, one call per atomic unit."""
+    for label, value in _uc_rows(description):
+        kind = _label_kind(label)
+        if not kind or not value:
+            continue
+        if kind in {"basic_flow", "alternative_flow"}:
+            for step in _split_flow(value):
+                add(kind, step, None)
+        elif kind == "business_rule":
+            for _declared, body in _split_rules(value):
+                add(kind, body, None)
+        else:
+            add(kind, value, None)
+
+
+def _add_data_field_units(
+    description: str, add: Callable[[str, str, str | None], None]
+) -> None:
+    """Feed every data-field table row to ``add`` with its ``DFnn-n`` id."""
+    # A ticket may reuse a table id for two different screens (TICKET-5645
+    # labels both the confirmation dialog and the success screen DF02). That
+    # is reported by source_ambiguity_issues; here the SECOND occurrence is
+    # suffixed so every unit id stays unique and therefore citable.
+    seen_tables: dict[str, int] = {}
+    for table in parse_data_field_tables(description):
+        seen_tables[table.table_id] = seen_tables.get(table.table_id, 0) + 1
+        occurrence = seen_tables[table.table_id]
+        table_key = table.table_id
+        if occurrence > 1:
+            # Numeric, not chr(ord('a') + n): past the 26th occurrence that
+            # produced ids like "DF02|-1", and a pipe inside a unit id
+            # corrupts any pipe-delimited rendering of the traceability matrix.
+            table_key = f"{table.table_id}#{occurrence}"
+        for index, (ar, en, kind_label) in enumerate(table.rows, 1):
+            text = " / ".join(p for p in (en, ar) if p)
+            if kind_label:
+                text = f"{text} [{kind_label}]"
+            add("data_field", text, f"{table_key}-{index}")
 
 
 def parse_requirement_units(
@@ -616,38 +672,8 @@ def parse_requirement_units(
                 )
             )
 
-        for label, value in _uc_rows(description):
-            kind = _label_kind(label)
-            if not kind or not value:
-                continue
-            if kind in {"basic_flow", "alternative_flow"}:
-                for step in _split_flow(value):
-                    add(kind, step)
-            elif kind == "business_rule":
-                for _declared, body in _split_rules(value):
-                    add(kind, body)
-            else:
-                add(kind, value)
-
-        # A ticket may reuse a table id for two different screens (TICKET-5645
-        # labels both the confirmation dialog and the success screen DF02). That
-        # is reported by source_ambiguity_issues; here the SECOND occurrence is
-        # suffixed so every unit id stays unique and therefore citable.
-        seen_tables: dict[str, int] = {}
-        for table in parse_data_field_tables(description):
-            seen_tables[table.table_id] = seen_tables.get(table.table_id, 0) + 1
-            occurrence = seen_tables[table.table_id]
-            table_key = table.table_id
-            if occurrence > 1:
-                # Numeric, not chr(ord('a') + n): past the 26th occurrence that
-                # produced ids like "DF02|-1", and a pipe inside a unit id
-                # corrupts any pipe-delimited rendering of the traceability matrix.
-                table_key = f"{table.table_id}#{occurrence}"
-            for index, (ar, en, kind_label) in enumerate(table.rows, 1):
-                text = " / ".join(p for p in (en, ar) if p)
-                if kind_label:
-                    text = f"{text} [{kind_label}]"
-                add("data_field", text, explicit_id=f"{table_key}-{index}")
+        _add_use_case_units(description, add)
+        _add_data_field_units(description, add)
     except Exception:
         logger.exception("parse_requirement_units failed - returning what was parsed")
     return units
@@ -660,6 +686,48 @@ def assignable_unit_ids(units: list[RequirementUnit]) -> set[str]:
     except Exception:
         logger.exception("assignable_unit_ids failed - returning empty set")
         return set()
+
+
+def _duplicate_rule_issues(description: str) -> list[str]:
+    """One issue per business-rule id declared more than once."""
+    declared: list[str] = []
+    for label, value in _uc_rows(description):
+        if _label_kind(label) == "business_rule":
+            declared.extend(d for d, _ in _split_rules(value) if d)
+    return [
+        f"Business rule id {rule_id} is declared {declared.count(rule_id)} times "
+        f"for different rules - renumber them so each rule is citable."
+        for rule_id in sorted({d for d in declared if declared.count(d) > 1})
+    ]
+
+
+def _duplicate_table_issues(tables: list[DataFieldTable]) -> list[str]:
+    """One issue per data-field table id used more than once."""
+    table_ids = [t.table_id for t in tables]
+    return [
+        f"Data-field table id {table_id} is used {table_ids.count(table_id)} times "
+        f"for different screens - give each table its own id."
+        for table_id in sorted({t for t in table_ids if table_ids.count(t) > 1})
+    ]
+
+
+def _conflicting_label_issues(table: DataFieldTable) -> list[str]:
+    """Issues for rows of one table sharing an English label but not the Arabic."""
+    by_en: dict[str, list[str]] = {}
+    for ar, en, _kind in table.rows:
+        key = _strip_placeholder_brackets(en).lower()
+        if key:
+            by_en.setdefault(key, []).append(_strip_placeholder_brackets(ar))
+    issues: list[str] = []
+    for en_label, ar_labels in sorted(by_en.items()):
+        if len(ar_labels) > 1 and len({a for a in ar_labels if a}) > 1:
+            issues.append(
+                f"{table.table_id}: the English label "
+                f'"{en_label}" is used for {len(ar_labels)} different rows '
+                f"({', '.join(a for a in ar_labels if a)}) - one of the "
+                f"English strings is wrong."
+            )
+    return issues
 
 
 def source_ambiguity_issues(description: str) -> list[str]:
@@ -686,38 +754,11 @@ def source_ambiguity_issues(description: str) -> list[str]:
         if not description or not description.strip():
             return []
 
-        declared: list[str] = []
-        for label, value in _uc_rows(description):
-            if _label_kind(label) == "business_rule":
-                declared.extend(d for d, _ in _split_rules(value) if d)
-        for rule_id in sorted({d for d in declared if declared.count(d) > 1}):
-            issues.append(
-                f"Business rule id {rule_id} is declared {declared.count(rule_id)} times "
-                f"for different rules - renumber them so each rule is citable."
-            )
-
+        issues.extend(_duplicate_rule_issues(description))
         tables = parse_data_field_tables(description)
-        table_ids = [t.table_id for t in tables]
-        for table_id in sorted({t for t in table_ids if table_ids.count(t) > 1}):
-            issues.append(
-                f"Data-field table id {table_id} is used {table_ids.count(table_id)} times "
-                f"for different screens - give each table its own id."
-            )
-
+        issues.extend(_duplicate_table_issues(tables))
         for table in tables:
-            by_en: dict[str, list[str]] = {}
-            for ar, en, _kind in table.rows:
-                key = _strip_placeholder_brackets(en).lower()
-                if key:
-                    by_en.setdefault(key, []).append(_strip_placeholder_brackets(ar))
-            for en_label, ar_labels in sorted(by_en.items()):
-                if len(ar_labels) > 1 and len({a for a in ar_labels if a}) > 1:
-                    issues.append(
-                        f"{table.table_id}: the English label "
-                        f'"{en_label}" is used for {len(ar_labels)} different rows '
-                        f"({', '.join(a for a in ar_labels if a)}) - one of the "
-                        f"English strings is wrong."
-                    )
+            issues.extend(_conflicting_label_issues(table))
     except Exception:
         logger.exception("source_ambiguity_issues failed - returning what was found")
     return issues
@@ -815,6 +856,37 @@ def _normalize_label(text: str) -> str:
     return _WS_RE.sub(" ", (text or "").strip().strip("<>").strip().lower())
 
 
+def _unknown_enum_hits(items: list, allowed: set[str]) -> list[tuple[str, str]]:
+    """(field, value) for each test-data item selecting an undefined option."""
+    hits: list[tuple[str, str]] = []
+    for item in items:
+        field = (getattr(item, "field", "") or "").lower()
+        if not any(hint in field for hint in _ENUM_FIELD_HINTS):
+            continue
+        if any(frag in field for frag in _NON_LABEL_FIELD_FRAGMENTS):
+            continue
+        value = getattr(item, "example_value", "") or ""
+        normalized = _normalize_label(value)
+        if not normalized or normalized in allowed:
+            continue
+        # A bare number/short token is a count or a selector, never an
+        # option label the ticket was supposed to define.
+        if len(normalized) < 4 or not re.search(r"[a-z؀-ۿ]", normalized):
+            continue
+        if normalized[0].isdigit():
+            continue  # "2 checkboxes" is a count, not a label
+        # A generic instruction ("first listed reason",
+        # "first_checkbox_reason") points at whatever the build shows
+        # rather than claiming a specific label. Underscores are folded
+        # to spaces first: `\bfirst\b` does not match "first_checkbox"
+        # because `_` is itself a word character.
+        spaced = normalized.replace("_", " ").replace("-", " ")
+        if _GENERIC_POINTER_RE.search(spaced):
+            continue
+        hits.append((field, value))
+    return hits
+
+
 def find_unknown_enum_values(
     cases: list[TestCase],
     enum_values: dict[str, set[str]],
@@ -854,31 +926,11 @@ def find_unknown_enum_values(
                 continue
             if allow_free_text and _FREE_TEXT_EVIDENCE_RE.search(_case_text(tc)):
                 continue
-            for item in items:
-                field = (getattr(item, "field", "") or "").lower()
-                if not any(hint in field for hint in _ENUM_FIELD_HINTS):
-                    continue
-                if any(frag in field for frag in _NON_LABEL_FIELD_FRAGMENTS):
-                    continue
-                value = getattr(item, "example_value", "") or ""
-                normalized = _normalize_label(value)
-                if not normalized or normalized in allowed:
-                    continue
-                # A bare number/short token is a count or a selector, never an
-                # option label the ticket was supposed to define.
-                if len(normalized) < 4 or not re.search(r"[a-z؀-ۿ]", normalized):
-                    continue
-                if normalized[0].isdigit():
-                    continue  # "2 checkboxes" is a count, not a label
-                # A generic instruction ("first listed reason",
-                # "first_checkbox_reason") points at whatever the build shows
-                # rather than claiming a specific label. Underscores are folded
-                # to spaces first: `\bfirst\b` does not match "first_checkbox"
-                # because `_` is itself a word character.
-                spaced = normalized.replace("_", " ").replace("-", " ")
-                if _GENERIC_POINTER_RE.search(spaced):
-                    continue
-                out.append((getattr(tc, "tc_id", "") or "", field, value))
+            tc_id = getattr(tc, "tc_id", "") or ""
+            out.extend(
+                (tc_id, field, value)
+                for field, value in _unknown_enum_hits(items, allowed)
+            )
     except Exception:
         logger.exception("find_unknown_enum_values failed - returning what was found")
     return out

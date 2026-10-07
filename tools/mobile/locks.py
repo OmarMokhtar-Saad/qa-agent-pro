@@ -368,6 +368,103 @@ def _probe_free(name: str) -> bool:
                 pass
 
 
+def _holder_result(held: bool, pid: int, owner: str, age: float, mine: bool) -> dict:
+    """The ``holder`` envelope: one shape for every branch."""
+    return {
+        "error": None,
+        "content": {
+            "held": held,
+            "pid": pid,
+            "owner": owner,
+            "age": age,
+            "held_too_long": age > HELD_TOO_LONG_S,
+            "mine": mine,
+        },
+    }
+
+
+_ACQUIRED_REASONS = frozenset({"already_held", "acquired"})
+
+
+def _acquire_result(
+    reason: str, label: str, holder_name: str, *, same_process: bool
+) -> dict:
+    """The ``acquire`` envelope. ``acquired`` and ``reentrant`` follow from *reason*."""
+    return {
+        "error": None,
+        "content": {
+            "acquired": reason in _ACQUIRED_REASONS,
+            "owner": label,
+            "holder": holder_name,
+            "reentrant": reason == "already_held",
+            "same_process": same_process,
+            "reason": reason,
+        },
+    }
+
+
+def _contended_result(key: str, label: str, moment: float) -> dict:
+    """Refusal after the kernel said another process holds *key*; disclose a wedge."""
+    body = _read(key) or {}
+    age = _body_age(body, moment)
+    if age > HELD_TOO_LONG_S:
+        logger.critical(
+            "mobile.locks: %s has been held by pid %s for %.0fs. "
+            "Nothing here will break it -- a lock broken under a "
+            "live holder is two holders. If that process is wedged, "
+            "a human has to look.",
+            key,
+            body.get("pid"),
+            age,
+        )
+    return _acquire_result(
+        "held_by_another_process",
+        label,
+        str(body.get("owner") or ""),
+        same_process=False,
+    )
+
+
+def _acquire_in_process(mine: _Held, label: str, lease: str) -> dict:
+    """The answer when this process already holds the lock."""
+    if mine.owner == label:
+        # ADOPT the caller's lease. A same-owner acquire means this
+        # caller has just proved, through `session.claim`, that it
+        # holds the run's lease -- so it becomes the authority for
+        # releasing this lock, and the previous chat's writer stops
+        # being able to. That is the whole point of recording it.
+        if lease:
+            mine.lease = str(lease)
+        # Reentrant: no syscall, no write. This is what makes the
+        # submit path free once the packet path has taken the lock.
+        return _acquire_result("already_held", label, label, same_process=True)
+    return _acquire_result("held_in_this_process", label, mine.owner, same_process=True)
+
+
+def _acquire_file(key: str, label: str, lease: str, moment: float) -> dict:
+    """Take the kernel lock on *key*'s file; caller holds ``_MUTEX``."""
+    paths.ensure_tree()
+    target = lock_path(key)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(target, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        _lock_fd(fd)
+    except LockUnsupported:
+        os.close(fd)
+        logger.warning(
+            "mobile.locks: no file-locking facility on %s; refusing the "
+            "lock rather than admitting two holders",
+            os.name,
+        )
+        return _acquire_result("no_lock_facility", label, "", same_process=False)
+    except (BlockingIOError, OSError):
+        os.close(fd)
+        return _contended_result(key, label, moment)
+    _HELD[key] = _Held(fd=fd, owner=label, since=moment, lease=str(lease or ""))
+    _stamp(key, fd, label, moment)
+    return _acquire_result("acquired", label, label, same_process=False)
+
+
 def holder(name: str = EMULATOR_LOCK, *, now: float | None = None) -> dict:
     """``{held, pid, owner, age, held_too_long, mine}`` without taking anything.
 
@@ -384,18 +481,9 @@ def holder(name: str = EMULATOR_LOCK, *, now: float | None = None) -> dict:
         with _MUTEX:
             mine = _HELD.get(str(name))
             if mine is not None:
-                age = moment - mine.since
-                return {
-                    "error": None,
-                    "content": {
-                        "held": True,
-                        "pid": os.getpid(),
-                        "owner": mine.owner,
-                        "age": age,
-                        "held_too_long": age > HELD_TOO_LONG_S,
-                        "mine": True,
-                    },
-                }
+                return _holder_result(
+                    True, os.getpid(), mine.owner, moment - mine.since, True
+                )
         # THE FILE IS IMMORTAL, so its existence proves nothing and its body
         # proves only that somebody once stamped it. Whether the lock is held
         # RIGHT NOW is a question only the kernel can answer, so ask it: a
@@ -407,29 +495,14 @@ def holder(name: str = EMULATOR_LOCK, *, now: float | None = None) -> dict:
         body = _read(name) or {}
         free = _probe_free(name)
         if free:
-            return {
-                "error": None,
-                "content": {
-                    "held": False,
-                    "pid": 0,
-                    "owner": "",
-                    "age": 0.0,
-                    "held_too_long": False,
-                    "mine": False,
-                },
-            }
-        age = _body_age(body, moment)
-        return {
-            "error": None,
-            "content": {
-                "held": True,
-                "pid": int(body.get("pid") or 0),
-                "owner": str(body.get("owner") or ""),
-                "age": age,
-                "held_too_long": age > HELD_TOO_LONG_S,
-                "mine": False,
-            },
-        }
+            return _holder_result(False, 0, "", 0.0, False)
+        return _holder_result(
+            True,
+            int(body.get("pid") or 0),
+            str(body.get("owner") or ""),
+            _body_age(body, moment),
+            False,
+        )
     except Exception as exc:
         logger.exception("mobile.locks.holder failed")
         return {"error": str(exc), "content": None}
@@ -467,103 +540,59 @@ def acquire(
         with _MUTEX:
             mine = _HELD.get(key)
             if mine is not None:
-                if mine.owner == label:
-                    # ADOPT the caller's lease. A same-owner acquire means this
-                    # caller has just proved, through `session.claim`, that it
-                    # holds the run's lease -- so it becomes the authority for
-                    # releasing this lock, and the previous chat's writer stops
-                    # being able to. That is the whole point of recording it.
-                    if lease:
-                        mine.lease = str(lease)
-                    # Reentrant: no syscall, no write. This is what makes the
-                    # submit path free once the packet path has taken the lock.
-                    return {
-                        "error": None,
-                        "content": {
-                            "acquired": True,
-                            "owner": label,
-                            "holder": label,
-                            "reentrant": True,
-                            "same_process": True,
-                            "reason": "already_held",
-                        },
-                    }
-                return {
-                    "error": None,
-                    "content": {
-                        "acquired": False,
-                        "owner": label,
-                        "holder": mine.owner,
-                        "reentrant": False,
-                        "same_process": True,
-                        "reason": "held_in_this_process",
-                    },
-                }
-            paths.ensure_tree()
-            target = lock_path(key)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(target, os.O_CREAT | os.O_RDWR, 0o600)
-            try:
-                _lock_fd(fd)
-            except LockUnsupported:
-                os.close(fd)
-                logger.warning(
-                    "mobile.locks: no file-locking facility on %s; refusing the "
-                    "lock rather than admitting two holders",
-                    os.name,
-                )
-                return {
-                    "error": None,
-                    "content": {
-                        "acquired": False,
-                        "owner": label,
-                        "holder": "",
-                        "reentrant": False,
-                        "same_process": False,
-                        "reason": "no_lock_facility",
-                    },
-                }
-            except (BlockingIOError, OSError):
-                os.close(fd)
-                body = _read(key) or {}
-                age = _body_age(body, moment)
-                if age > HELD_TOO_LONG_S:
-                    logger.critical(
-                        "mobile.locks: %s has been held by pid %s for %.0fs. "
-                        "Nothing here will break it -- a lock broken under a "
-                        "live holder is two holders. If that process is wedged, "
-                        "a human has to look.",
-                        key,
-                        body.get("pid"),
-                        age,
-                    )
-                return {
-                    "error": None,
-                    "content": {
-                        "acquired": False,
-                        "owner": label,
-                        "holder": str(body.get("owner") or ""),
-                        "reentrant": False,
-                        "same_process": False,
-                        "reason": "held_by_another_process",
-                    },
-                }
-            _HELD[key] = _Held(fd=fd, owner=label, since=moment, lease=str(lease or ""))
-            _stamp(key, fd, label, moment)
-            return {
-                "error": None,
-                "content": {
-                    "acquired": True,
-                    "owner": label,
-                    "holder": label,
-                    "reentrant": False,
-                    "same_process": False,
-                    "reason": "acquired",
-                },
-            }
+                return _acquire_in_process(mine, label, lease)
+            return _acquire_file(key, label, lease, moment)
     except Exception as exc:
         logger.exception("mobile.locks.acquire failed")
         return {"error": str(exc), "content": None}
+
+
+def _release_refusal(
+    mine: _Held, owner: str, lease: str, as_holder: bool, force: bool
+) -> str | None:
+    """Why *mine* may not be released by this caller, or ``None`` when it may."""
+    if force:
+        return None
+    if mine.owner != str(owner or "").strip():
+        return "held by " + mine.owner
+    if not as_holder and str(lease or "") != mine.lease:
+        # RIGHT RUN, WRONG LEASE. A heartbeat writer from a chat that
+        # was displaced beats on until it notices, and when it does it
+        # must not give away the device the CURRENT holder of the same
+        # run is driving. A caller that presents no lease is a handler
+        # that has just claimed the run, and is trusted.
+        #
+        # NOTE THE MISSING `and mine.lease`. With it, a lock recorded
+        # with no lease was releasable by ANY writer for that run id --
+        # unreachable today only because every takeover route happens to
+        # adopt a lease, which is exactly the "unreachable by
+        # construction" argument that already failed twice here (the
+        # reaper, and the per-process placeholder). Without it, a writer
+        # can only release a lock whose lease authority was actually
+        # recorded, so recording it is load-bearing rather than
+        # decorative.
+        #
+        # The reason distinguishes the two cases, because a log
+        # line a future debugger reads should not say "a newer
+        # lease" when in fact NO lease was ever recorded.
+        if mine.lease:
+            return "held under a different lease for " + mine.owner
+        return "held with no recorded lease authority for " + mine.owner
+    return None
+
+
+def _drop_held(key: str, mine: _Held) -> None:
+    """Unlock and close the fd, and ALWAYS forget the entry."""
+    try:
+        _unlock_fd(mine.fd)
+        os.close(mine.fd)
+    except OSError:
+        # An fd already closed underneath us is still released. Popping
+        # it is the never-raise contract AND the fd-leak guard: the
+        # entry must go on EVERY path, including this one.
+        logger.info("mobile.locks: fd for %s was already gone", key)
+    finally:
+        _HELD.pop(key, None)
 
 
 def release(
@@ -604,60 +633,23 @@ def release(
                     "error": None,
                     "content": {"released": False, "reason": "not held"},
                 }
-            if not force and mine.owner != str(owner or "").strip():
-                return {
-                    "error": None,
-                    "content": {
-                        "released": False,
-                        "reason": "held by " + mine.owner,
-                    },
-                }
-            if not force and not as_holder and str(lease or "") != mine.lease:
-                # RIGHT RUN, WRONG LEASE. A heartbeat writer from a chat that
-                # was displaced beats on until it notices, and when it does it
-                # must not give away the device the CURRENT holder of the same
-                # run is driving. A caller that presents no lease is a handler
-                # that has just claimed the run, and is trusted.
-                #
-                # NOTE THE MISSING `and mine.lease`. With it, a lock recorded
-                # with no lease was releasable by ANY writer for that run id --
-                # unreachable today only because every takeover route happens to
-                # adopt a lease, which is exactly the "unreachable by
-                # construction" argument that already failed twice here (the
-                # reaper, and the per-process placeholder). Without it, a writer
-                # can only release a lock whose lease authority was actually
-                # recorded, so recording it is load-bearing rather than
-                # decorative.
-                return {
-                    "error": None,
-                    "content": {
-                        "released": False,
-                        # The reason distinguishes the two cases, because a log
-                        # line a future debugger reads should not say "a newer
-                        # lease" when in fact NO lease was ever recorded.
-                        "reason": (
-                            "held under a different lease for " + mine.owner
-                            if mine.lease
-                            else "held with no recorded lease authority for "
-                            + mine.owner
-                        ),
-                    },
-                }
-            try:
-                _unlock_fd(mine.fd)
-                os.close(mine.fd)
-            except OSError:
-                # An fd already closed underneath us is still released. Popping
-                # it is the never-raise contract AND the fd-leak guard: the
-                # entry must go on EVERY path, including this one.
-                logger.info("mobile.locks: fd for %s was already gone", key)
-            finally:
-                _HELD.pop(key, None)
+            reason = _release_refusal(mine, owner, lease, as_holder, force)
+            if reason is not None:
+                return {"error": None, "content": {"released": False, "reason": reason}}
+            _drop_held(key, mine)
             # NO unlink. The file is immortal -- see the module docstring.
             return {"error": None, "content": {"released": True, "reason": ""}}
     except Exception as exc:
         logger.exception("mobile.locks.release failed")
         return {"error": str(exc), "content": None}
+
+
+def _relabel_refusal(reason: str, holder_label: str) -> dict:
+    """The ``relabel`` refusal envelope."""
+    return {
+        "error": None,
+        "content": {"relabelled": False, "reason": reason, "holder": holder_label},
+    }
 
 
 def relabel(name: str = EMULATOR_LOCK, *, from_owner: str, to_owner: str) -> dict:
@@ -685,27 +677,13 @@ def relabel(name: str = EMULATOR_LOCK, *, from_owner: str, to_owner: str) -> dic
         with _MUTEX:
             mine = _HELD.get(key)
             if mine is None:
-                return {
-                    "error": None,
-                    "content": {
-                        "relabelled": False,
-                        "reason": "not held",
-                        "holder": "",
-                    },
-                }
+                return _relabel_refusal("not held", "")
             if mine.owner != old:
                 # `holder` is the real current OWNER LABEL, not prose. A caller
                 # rendering this refusal needs a label it can put in a
                 # `run_id=` instruction; handing it the reason string produced
                 # `run_id="held by mrun-..."`, which cannot work.
-                return {
-                    "error": None,
-                    "content": {
-                        "relabelled": False,
-                        "reason": "held by " + mine.owner,
-                        "holder": mine.owner,
-                    },
-                }
+                return _relabel_refusal("held by " + mine.owner, mine.owner)
             mine.owner = new
             _stamp(key, mine.fd, new, mine.since)
             return {"error": None, "content": {"relabelled": True, "reason": ""}}
@@ -765,6 +743,19 @@ def names_held_by(owner: object) -> list[str]:
         return sorted(name for name, held in _HELD.items() if held.owner == label)
 
 
+def _unknown_device_row(serial: str, error: str) -> dict:
+    """A ``device_holders`` row for a device whose state is unknown."""
+    return {
+        "serial": serial,
+        "held": False,
+        "pid": 0,
+        "owner": "",
+        "age": 0.0,
+        "held_too_long": False,
+        "error": error,
+    }
+
+
 def device_holders(serials: object, *, now: float | None = None) -> list[dict]:
     """``[{serial, held, owner, age, held_too_long, error}]``, one row per device.
 
@@ -780,31 +771,15 @@ def device_holders(serials: object, *, now: float | None = None) -> list[dict]:
         text = str(serial or "")
         name = device_lock_name(text)
         if not name:
-            rows.append(
-                {
-                    "serial": text,
-                    "held": False,
-                    "pid": 0,
-                    "owner": "",
-                    "age": 0.0,
-                    "held_too_long": False,
-                    "error": "that is not a device serial",
-                }
-            )
+            rows.append(_unknown_device_row(text, "that is not a device serial"))
             continue
         probed = holder(name, now=now) or {}
         body = probed.get("content")
         if probed.get("error") or body is None:
             rows.append(
-                {
-                    "serial": text,
-                    "held": False,
-                    "pid": 0,
-                    "owner": "",
-                    "age": 0.0,
-                    "held_too_long": False,
-                    "error": str(probed.get("error") or "the lock could not be read"),
-                }
+                _unknown_device_row(
+                    text, str(probed.get("error") or "the lock could not be read")
+                )
             )
             continue
         rows.append(

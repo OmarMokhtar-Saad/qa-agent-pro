@@ -669,6 +669,33 @@ def _write_bytes(target: Path, data: bytes) -> None:
     os.replace(tmp, target)
 
 
+def _shot_refusal(
+    run_id: str, ident: str, data: object, directory: Path, target: Path
+) -> str | None:
+    """Why :func:`write_shot` must not store this frame, or ``None`` to store it."""
+    if not _RUN_ID_RE.match(ident):
+        return (
+            "Refusing "
+            + repr(ident[:40])
+            + " as an observation id; ask observation_key for one."
+        )
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        # "There is no picture" and "here is a picture of nothing" are
+        # different answers, and only the first is true of empty bytes.
+        return "No image bytes to store."
+    if not target.exists():
+        kept = len(list(directory.glob("*.png"))) if directory.is_dir() else 0
+        if kept >= MAX_RUN_SHOTS:
+            logger.warning(
+                "mobile.run_store: run %s already keeps %d screen frames; "
+                "this one is not stored",
+                run_id,
+                kept,
+            )
+            return "This run already keeps its limit of frames."
+    return None
+
+
 def write_shot(run_id: str, obs_id: str, data: object) -> dict:
     """Store the PNG of ONE OBSERVATION. Never raises.
 
@@ -698,34 +725,11 @@ def write_shot(run_id: str, obs_id: str, data: object) -> dict:
         if not valid_run_id(run_id):
             return {"error": "Invalid run id.", "content": None}
         ident = str(obs_id or "")
-        if not _RUN_ID_RE.match(ident):
-            return {
-                "error": (
-                    "Refusing "
-                    + repr(ident[:40])
-                    + " as an observation id; ask observation_key for one."
-                ),
-                "content": None,
-            }
-        if not isinstance(data, (bytes, bytearray)) or not data:
-            # "There is no picture" and "here is a picture of nothing" are
-            # different answers, and only the first is true of empty bytes.
-            return {"error": "No image bytes to store.", "content": None}
         directory = run_path(run_id) / SHOTS_DIR
         target = directory / (ident + ".png")
-        if not target.exists():
-            kept = len(list(directory.glob("*.png"))) if directory.is_dir() else 0
-            if kept >= MAX_RUN_SHOTS:
-                logger.warning(
-                    "mobile.run_store: run %s already keeps %d screen frames; "
-                    "this one is not stored",
-                    run_id,
-                    kept,
-                )
-                return {
-                    "error": "This run already keeps its limit of frames.",
-                    "content": None,
-                }
+        refusal = _shot_refusal(run_id, ident, data, directory, target)
+        if refusal:
+            return {"error": refusal, "content": None}
         payload = bytes(data)
         _write_bytes(target, payload)
         return {
@@ -804,6 +808,34 @@ def _run_age(root: Path, manifest: dict, now: float) -> float:
     return float(now) - max(finite)
 
 
+def _keep_reason(child: Path, moment: float, keep_s: float) -> str | None:
+    """Why :func:`gc_stale_runs` must keep this run, or ``None`` to collect it."""
+    manifest = _read_json(child / MANIFEST_FILE)
+    if not isinstance(manifest, dict) or not manifest:
+        return "no_manifest"
+    lease = _read_json(child / LEASE_FILE)
+    heartbeat = float(lease.get("heartbeat") or 0) if isinstance(lease, dict) else 0.0
+    if heartbeat and (moment - heartbeat) <= LEASE_STALE_S:
+        return "lease_live"
+    age = _run_age(child, manifest, moment)
+    if not math.isfinite(age):
+        # A SECOND LAYER, deliberately, and not redundant with the
+        # filter in `_run_age`. Every check below is a COMPARISON, and
+        # every comparison against NaN is False -- so a non-finite age
+        # falls through all of them to the `rmtree`. That is the one
+        # value where this function's default is to DELETE, which is
+        # exactly backwards for a collector whose four keep-reasons all
+        # exist because losing a resumable run costs a tester their
+        # evidence. `_run_age` should never produce this now; if it ever
+        # does again, the run survives and says so instead of vanishing.
+        return "unreadable_age"
+    if age < 0:
+        return "clock_skew"
+    if age <= float(keep_s):
+        return "fresh"
+    return None
+
+
 def gc_stale_runs(*, now: float | None = None, keep_s: float = STALE_RUN_S) -> dict:
     """Delete run directories older than *keep_s*. Never raises.
 
@@ -841,35 +873,9 @@ def gc_stale_runs(*, now: float | None = None, keep_s: float = STALE_RUN_S) -> d
             if not child.is_dir() or not valid_run_id(child.name):
                 continue
             considered += 1
-            manifest = _read_json(child / MANIFEST_FILE)
-            if not isinstance(manifest, dict) or not manifest:
-                kept.append({"run_id": child.name, "reason": "no_manifest"})
-                continue
-            lease = _read_json(child / LEASE_FILE)
-            heartbeat = (
-                float(lease.get("heartbeat") or 0) if isinstance(lease, dict) else 0.0
-            )
-            if heartbeat and (moment - heartbeat) <= LEASE_STALE_S:
-                kept.append({"run_id": child.name, "reason": "lease_live"})
-                continue
-            age = _run_age(child, manifest, moment)
-            if not math.isfinite(age):
-                # A SECOND LAYER, deliberately, and not redundant with the
-                # filter in `_run_age`. Every check below is a COMPARISON, and
-                # every comparison against NaN is False -- so a non-finite age
-                # falls through all of them to the `rmtree`. That is the one
-                # value where this function's default is to DELETE, which is
-                # exactly backwards for a collector whose four keep-reasons all
-                # exist because losing a resumable run costs a tester their
-                # evidence. `_run_age` should never produce this now; if it ever
-                # does again, the run survives and says so instead of vanishing.
-                kept.append({"run_id": child.name, "reason": "unreadable_age"})
-                continue
-            if age < 0:
-                kept.append({"run_id": child.name, "reason": "clock_skew"})
-                continue
-            if age <= float(keep_s):
-                kept.append({"run_id": child.name, "reason": "fresh"})
+            reason = _keep_reason(child, moment, keep_s)
+            if reason:
+                kept.append({"run_id": child.name, "reason": reason})
                 continue
             shutil.rmtree(child, ignore_errors=True)
             removed.append(child.name)
@@ -972,6 +978,27 @@ def _has_verdict(case: object) -> bool:
     return str(body.get("verdict") or "").strip().lower() in DONE_VERDICTS
 
 
+def _expected_verdicts(body: dict, lane: str, total: int) -> int:
+    """How many records were ever MEANT to earn a verdict; see :func:`verdict_coverage`."""
+    if lane == "explore":
+        # LOCAL import, and not a cycle: `explore_runner` imports this module at
+        # module scope, so the edge must not be repaid at import time -- but by
+        # the time this function is CALLED both modules are fully loaded, and
+        # nothing in `explore_runner`'s module body calls back here.
+        #
+        # `display_stop`, not `stop_reason`: this is a RENDER path (the page and
+        # the status reply), and a coverage count that raised on a junk manifest
+        # would take the whole page with it.
+        from tools.mobile import explore_runner
+
+        return 1 if explore_runner.display_stop(body) else 0
+    try:
+        planned = int(body.get("total") or 0)
+    except (TypeError, ValueError, OverflowError):
+        planned = 0
+    return max(planned, total)
+
+
 def verdict_coverage(cases: object, manifest: object = None) -> dict:
     """``{"lane", "total", "with_verdict", "expected", "complete"}``.
 
@@ -1006,29 +1033,7 @@ def verdict_coverage(cases: object, manifest: object = None) -> dict:
     total = len(items)
     with_verdict = sum(1 for case in items if _has_verdict(case))
     lane = str(body.get("lane") or "suite")
-    if lane == "explore":
-        # The two `explore` locals that used to stand here are GONE, not left
-        # behind: this replacement removed their last reader, and a local whose
-        # last reader is removed goes in the same op -- `ruff` selects F in
-        # pyproject, so F841 would fail the implement gate.
-        #
-        # LOCAL import, and not a cycle: `explore_runner` imports this module at
-        # module scope, so the edge must not be repaid at import time -- but by
-        # the time this function is CALLED both modules are fully loaded, and
-        # nothing in `explore_runner`'s module body calls back here.
-        #
-        # `display_stop`, not `stop_reason`: this is a RENDER path (the page and
-        # the status reply), and a coverage count that raised on a junk manifest
-        # would take the whole page with it.
-        from tools.mobile import explore_runner
-
-        expected = 1 if explore_runner.display_stop(body) else 0
-    else:
-        try:
-            planned = int(body.get("total") or 0)
-        except (TypeError, ValueError, OverflowError):
-            planned = 0
-        expected = max(planned, total)
+    expected = _expected_verdicts(body, lane, total)
     return {
         "lane": lane,
         "total": total,
@@ -1261,6 +1266,72 @@ def clear_screen(run_id: str) -> dict:
         return {"error": str(exc), "content": None}
 
 
+def _lease_answer(acquired: bool, holder: str, taken_from: str, reason: str) -> dict:
+    """The ``acquire_lease`` reply envelope."""
+    return {
+        "error": None,
+        "content": {
+            "acquired": acquired,
+            "holder": holder,
+            "taken_over_from": taken_from,
+            "reason": reason,
+        },
+    }
+
+
+def _lease_decision(
+    current: dict | None, session_id: str, moment: float, force: bool
+) -> tuple[str, str]:
+    """``(reason, taken_over_from)``; ``held_by_other`` carries the holder instead."""
+    holder = str((current or {}).get("session_id") or "")
+    heartbeat = float((current or {}).get("heartbeat") or 0)
+    if current and holder and holder != session_id:
+        stale = (moment - heartbeat) > LEASE_STALE_S
+        if not (stale or force):
+            return "held_by_other", holder
+        return ("stale" if stale else "forced"), holder
+    if current and holder == session_id:
+        return "refresh", str(current.get("taken_over_from") or "")
+    return "new", ""
+
+
+def _lease_input_error(run_id: str, session_id: object) -> str | None:
+    """Why :func:`acquire_lease` refuses these ids, or ``None``."""
+    if not valid_run_id(run_id):
+        return "Invalid run id."
+    if not (isinstance(session_id, str) and _SESSION_RE.match(session_id)):
+        return "Refusing " + repr(str(session_id)[:40]) + " as a session id."
+    return None
+
+
+def _swap_lease(
+    run_id: str,
+    session_id: str,
+    moment: float,
+    current: dict | None,
+    decision: tuple[str, str],
+) -> str:
+    """Write the lease, re-read it, and return the session now on disk.
+
+    Compare-after-swap. See :func:`acquire_lease`: this narrows the read-decide-
+    write race rather than closing it, and saying so is the point -- a
+    caller told `acquired=True` for a lease somebody else now holds would
+    go on producing packets for a device it does not own.
+    """
+    reason, taken_from = decision
+    payload = {
+        "session_id": session_id,
+        "heartbeat": moment,
+        "acquired": moment
+        if reason != "refresh"
+        else (current or {}).get("acquired", moment),
+        "taken_over_from": taken_from,
+    }
+    _write_json(_lease_path(run_id), payload)
+    confirmed = _read_json(_lease_path(run_id))
+    return str((confirmed or {}).get("session_id") or "")
+
+
 def acquire_lease(
     run_id: str,
     session_id: str,
@@ -1294,71 +1365,19 @@ def acquire_lease(
     reach yet, and Phase 3 is where the lock/lease pairing gets its owner.
     """
     try:
-        if not valid_run_id(run_id):
-            return {"error": "Invalid run id.", "content": None}
-        if not (isinstance(session_id, str) and _SESSION_RE.match(session_id)):
-            return {
-                "error": "Refusing " + repr(str(session_id)[:40]) + " as a session id.",
-                "content": None,
-            }
+        refusal = _lease_input_error(run_id, session_id)
+        if refusal:
+            return {"error": refusal, "content": None}
         moment = _now(now)
         current = _read_json(_lease_path(run_id))
         current = current if isinstance(current, dict) else None
-        holder = str((current or {}).get("session_id") or "")
-        heartbeat = float((current or {}).get("heartbeat") or 0)
-        taken_from = ""
-        reason = "new"
-        if current and holder and holder != session_id:
-            stale = (moment - heartbeat) > LEASE_STALE_S
-            if not (stale or force):
-                return {
-                    "error": None,
-                    "content": {
-                        "acquired": False,
-                        "holder": holder,
-                        "taken_over_from": "",
-                        "reason": "held_by_other",
-                    },
-                }
-            taken_from = holder
-            reason = "stale" if stale else "forced"
-        elif current and holder == session_id:
-            reason = "refresh"
-            taken_from = str(current.get("taken_over_from") or "")
-        payload = {
-            "session_id": session_id,
-            "heartbeat": moment,
-            "acquired": moment
-            if reason != "refresh"
-            else current.get("acquired", moment),
-            "taken_over_from": taken_from,
-        }
-        _write_json(_lease_path(run_id), payload)
-        # Compare-after-swap. See the docstring: this narrows the read-decide-
-        # write race rather than closing it, and saying so is the point -- a
-        # caller told `acquired=True` for a lease somebody else now holds would
-        # go on producing packets for a device it does not own.
-        confirmed = _read_json(_lease_path(run_id))
-        winner = str((confirmed or {}).get("session_id") or "")
+        reason, taken_from = _lease_decision(current, session_id, moment, force)
+        if reason == "held_by_other":
+            return _lease_answer(False, taken_from, "", reason)
+        winner = _swap_lease(run_id, session_id, moment, current, (reason, taken_from))
         if winner and winner != session_id:
-            return {
-                "error": None,
-                "content": {
-                    "acquired": False,
-                    "holder": winner,
-                    "taken_over_from": "",
-                    "reason": "lost_race",
-                },
-            }
-        return {
-            "error": None,
-            "content": {
-                "acquired": True,
-                "holder": session_id,
-                "taken_over_from": taken_from,
-                "reason": reason,
-            },
-        }
+            return _lease_answer(False, winner, "", "lost_race")
+        return _lease_answer(True, session_id, taken_from, reason)
     except Exception as exc:
         logger.exception("mobile.run_store.acquire_lease failed")
         return {"error": str(exc), "content": None}

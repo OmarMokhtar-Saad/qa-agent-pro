@@ -214,12 +214,29 @@ def _generate_with_cryptography() -> None:
     "already generated", so a crash between the two writes must leave the pair
     INCOMPLETE rather than a certificate with no key behind it.
     """
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.x509.oid import NameOID
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+    cert = _self_signed_root(key)
+    _write_secret(
+        key_path(),
+        key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        ),
+        0o600,
+    )
+    _write_secret(cert_path(), cert.public_bytes(serialization.Encoding.PEM), 0o644)
+
+
+def _self_signed_root(key):
+    """The self-signed CA certificate for ``key`` (SHA-256, cert-sign only)."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.x509.oid import NameOID
+
     name = x509.Name(
         [
             x509.NameAttribute(NameOID.COMMON_NAME, "qa-agents API capture"),
@@ -252,16 +269,7 @@ def _generate_with_cryptography() -> None:
         )
         .sign(key, hashes.SHA256())
     )
-    _write_secret(
-        key_path(),
-        key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
-        ),
-        0o600,
-    )
-    _write_secret(cert_path(), cert.public_bytes(serialization.Encoding.PEM), 0o644)
+    return cert
 
 
 def _read_meta() -> dict:
@@ -273,6 +281,47 @@ def _read_meta() -> dict:
     except Exception:
         logger.warning("mobile_capture.ca: %s is unreadable", meta_path())
         return {}
+
+
+def _existing_ca_reply() -> dict | None:
+    """The ``created: False`` reply for a readable CA on disk, else ``None``."""
+    if not (cert_path().is_file() and key_path().is_file()):
+        return None
+    got = fingerprint()
+    if got["error"]:
+        logger.warning(
+            "mobile_capture.ca: the CA on disk is unusable (%s) -- regenerating",
+            got["error"],
+        )
+        return None
+    return {
+        "error": None,
+        "content": {
+            "path": str(cert_path()),
+            "key_path": str(key_path()),
+            "fingerprint": got["content"]["fingerprint"],
+            "created": False,
+            "backend": _read_meta().get("backend"),
+        },
+    }
+
+
+def _write_meta(fp: str) -> None:
+    _write_secret(
+        meta_path(),
+        json.dumps(
+            {
+                "backend": BACKEND_CRYPTOGRAPHY,
+                "fingerprint": fp,
+                "created_ms": int(
+                    datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000
+                ),
+            },
+            indent=2,
+            sort_keys=True,
+        ).encode("utf-8"),
+        0o600,
+    )
 
 
 def ensure_ca() -> dict:
@@ -290,23 +339,9 @@ def ensure_ca() -> dict:
         tree = paths.ensure_tree()
         if tree["error"]:
             return {"error": tree["error"], "content": None}
-        if cert_path().is_file() and key_path().is_file():
-            got = fingerprint()
-            if not got["error"]:
-                return {
-                    "error": None,
-                    "content": {
-                        "path": str(cert_path()),
-                        "key_path": str(key_path()),
-                        "fingerprint": got["content"]["fingerprint"],
-                        "created": False,
-                        "backend": _read_meta().get("backend"),
-                    },
-                }
-            logger.warning(
-                "mobile_capture.ca: the CA on disk is unusable (%s) -- regenerating",
-                got["error"],
-            )
+        existing = _existing_ca_reply()
+        if existing is not None:
+            return existing
         chosen = _ca_backend()["content"]
         if chosen["backend"] != BACKEND_CRYPTOGRAPHY:
             return {"error": chosen["reason"] or REASON_NO_CA_BACKEND, "content": None}
@@ -314,21 +349,7 @@ def ensure_ca() -> dict:
         got = fingerprint()
         if got["error"]:
             return {"error": got["error"], "content": None}
-        _write_secret(
-            meta_path(),
-            json.dumps(
-                {
-                    "backend": BACKEND_CRYPTOGRAPHY,
-                    "fingerprint": got["content"]["fingerprint"],
-                    "created_ms": int(
-                        datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000
-                    ),
-                },
-                indent=2,
-                sort_keys=True,
-            ).encode("utf-8"),
-            0o600,
-        )
+        _write_meta(got["content"]["fingerprint"])
         return {
             "error": None,
             "content": {

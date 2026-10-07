@@ -23,10 +23,11 @@ Three rules it holds, each pinned by a test:
 from __future__ import annotations
 
 import logging
+from types import ModuleType
 
 from tools.mobile import actions as actions_mod
 from tools.mobile import charter as charter_mod
-from tools.mobile import perception, render, run_store, screen_audit
+from tools.mobile import knowledge_inject, perception, render, run_store, screen_audit
 from tools.untrusted import _GUARD, wrap_untrusted
 
 logger = logging.getLogger(__name__)
@@ -161,7 +162,7 @@ _EXPLORE_INSTRUCTION = (
 
 
 def _packet_base(run_id: str, tc_id: str = "") -> dict:
-    return {
+    packet = {
         "run_id": str(run_id or ""),
         "tc_id": str(tc_id or ""),
         "system_prompt": _SYSTEM_PROMPT,
@@ -169,9 +170,15 @@ def _packet_base(run_id: str, tc_id: str = "") -> dict:
         "vocabulary": actions_mod.describe_vocabulary(),
         "response_schema": actions_mod.response_schema(),
     }
+    # Saved knowledge about the app: the key is ABSENT when there is none, so a
+    # run without knowledge builds the same packet as before.
+    known = knowledge_inject.stable_block(run_id)
+    if known:
+        packet["app_knowledge"] = known
+    return packet
 
 
-def _screen_block(screen: object) -> str:
+def _screen_block(screen: object, run_id: str = "") -> str:
     """The pruned screen as a wrapped prompt block. Never the raw XML.
 
     The accessibility audit rides ALONGSIDE it, in its own wrapper, because the
@@ -194,7 +201,8 @@ def _screen_block(screen: object) -> str:
     # I3: the update-flow hint rides on the screen block for App Tester under
     # either package id, and is "" (the old bytes) for every other app.
     hint = render.app_tester_hint(body.get("package"))
-    return "\n".join(part for part in (block, wrapped, hint) if part)
+    rules = knowledge_inject.screen_rules(run_id, screen) if run_id else ""
+    return "\n".join(part for part in (block, wrapped, hint, rules) if part)
 
 
 def _case_block(view: object) -> str:
@@ -274,7 +282,7 @@ def build_case_job(
                 # attaches the screenshot only when it names a reason.
                 "screen_unusable": perception.dump_unusable(screen),
                 "case_block": _case_block(view),
-                "screen_block": _screen_block(screen),
+                "screen_block": _screen_block(screen, run_id),
                 "instruction": _CASE_INSTRUCTION,
                 "escapes_used": int(escapes or 0),
                 "escapes_left": max(0, 3 - int(escapes or 0)),
@@ -327,7 +335,7 @@ def build_escape_job(
                 "observation_id": _observation_key(screen),
                 "screen_unusable": perception.dump_unusable(screen),
                 "case_block": _case_block(view),
-                "screen_block": _screen_block(screen),
+                "screen_block": _screen_block(screen, run_id),
                 "trace": _trace_block(trace),
                 "stopped_because": str(reason or "")[:600],
                 "instruction": _ESCAPE_INSTRUCTION,
@@ -517,78 +525,98 @@ def build_explore_turn(
                 "turns_left": int(left.get("turns") or 0),
                 "seconds_left": int(left.get("seconds") or 0),
                 "extensions_left": max(0, 1 - int(body.get("extensions_used") or 0)),
-                "guard_destructive": bool(
-                    body.get("guard", True)
-                ),  # THE CHARTER'S THREE STEERING FIELDS. They ride the state
-                # this packet is already built from (``state["charter"]``), so
-                # no signature moves. ``depth`` decides what the packet ASKS
-                # THE MODEL TO ATTEMPT -- one server-owned sentence, not a
-                # tactics catalogue -- and the scope lines are WRAPPED, like
-                # ``goal`` above, because they are tester-authored text
-                # reaching a model.
-                "depth": charter_mod.normalize(body.get("charter"))["depth"],
-                "attempt": charter_mod.depth_directive(body.get("charter")),
-                "scope": wrap_untrusted(
-                    "scope",
-                    charter_mod.scope_sentence(body.get("charter")),
-                    limit=1200,
-                ),
-                # READ, never re-derived. ``explore_runner.next_turn`` is the
-                # ONE writer of this verdict, computed once from the screen it
-                # has just pruned; deriving it again here would be two
-                # conditions over one question, and mirrored conditions drift.
-                #
-                # TWO KEYS ONLY: ``state`` and ``note`` are SERVER-authored
-                # constants. ``matched`` is the tester's own charter line --
-                # the same provenance as ``scope`` above, which is wrapped --
-                # so it does NOT ride the packet as a bare string. The choice
-                # is to KEEP IT ON THE STATE rather than wrap it here: it is
-                # already recorded in ``off_charter`` where the tester and a
-                # resume read it, the model does not need to be told WHICH of
-                # the lines it was already shown matched in order to leave the
-                # screen, and one wrapped value is cheaper than two. One class
-                # of string, one route: tester text reaching a model is
-                # wrapped, or it does not go.
-                "scope_verdict": {
-                    "state": str((body.get("scope_verdict") or {}).get("state") or ""),
-                    "note": str((body.get("scope_verdict") or {}).get("note") or ""),
-                },
-                "screen_block": _screen_block(screen),
+                "guard_destructive": bool(body.get("guard", True)),
+                **_explore_steering(body),
+                "scope_verdict": _explore_scope_verdict(body),
+                "screen_block": _screen_block(screen, run_id),
                 "instruction": _EXPLORE_INSTRUCTION,
-                # The turn fields come from `actions.TURN_FIELD_SCHEMA`, the
-                # same table `decode_reply` splits on. They were literals here,
-                # and v1.79.0 shipped a release in which this packet advertised
-                # `finding` while the transport refused it -- one source is
-                # what stops the two drifting again.
-                "response_schema": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["actions"],
-                    "properties": dict(
-                        {
-                            "actions": actions_mod.response_schema()
-                            .get("properties", {})
-                            .get("actions", {"type": "array"})
-                        },
-                        **actions_mod.TURN_FIELD_SCHEMA,
-                    ),
-                },
-                "worker_instructions": (
-                    "Spend turns, not actions: one script that finishes a whole "
-                    "round costs one turn, and four scripts that each do one "
-                    "step of it cost four. "
-                    "Record anything a tester would want to know in `finding`, "
-                    "one sentence, even when the turn went fine. "
-                    "Set `sub_goal` to the one step you are on now. When the "
-                    "goal moves on to ANOTHER app and that app is on screen, "
-                    "set `app` to its package name once."
-                ),
+                "response_schema": _explore_response_schema(),
+                "worker_instructions": _explore_worker_instructions(),
             }
         )
         return packet
     except Exception:  # pragma: no cover - defensive
         logger.warning("build_explore_turn failed", exc_info=True)
         return {}
+
+
+def _explore_steering(body: dict) -> dict:
+    """THE CHARTER'S THREE STEERING FIELDS. They ride the state
+    this packet is already built from (``state["charter"]``), so
+    no signature moves. ``depth`` decides what the packet ASKS
+    THE MODEL TO ATTEMPT -- one server-owned sentence, not a
+    tactics catalogue -- and the scope lines are WRAPPED, like
+    ``goal``, because they are tester-authored text
+    reaching a model.
+    """
+    return {
+        "depth": charter_mod.normalize(body.get("charter"))["depth"],
+        "attempt": charter_mod.depth_directive(body.get("charter")),
+        "scope": wrap_untrusted(
+            "scope",
+            charter_mod.scope_sentence(body.get("charter")),
+            limit=1200,
+        ),
+    }
+
+
+def _explore_scope_verdict(body: dict) -> dict:
+    """READ, never re-derived. ``explore_runner.next_turn`` is the
+    ONE writer of this verdict, computed once from the screen it
+    has just pruned; deriving it again here would be two
+    conditions over one question, and mirrored conditions drift.
+
+    TWO KEYS ONLY: ``state`` and ``note`` are SERVER-authored
+    constants. ``matched`` is the tester's own charter line --
+    the same provenance as ``scope``, which is wrapped --
+    so it does NOT ride the packet as a bare string. The choice
+    is to KEEP IT ON THE STATE rather than wrap it here: it is
+    already recorded in ``off_charter`` where the tester and a
+    resume read it, the model does not need to be told WHICH of
+    the lines it was already shown matched in order to leave the
+    screen, and one wrapped value is cheaper than two. One class
+    of string, one route: tester text reaching a model is
+    wrapped, or it does not go.
+    """
+    return {
+        "state": str((body.get("scope_verdict") or {}).get("state") or ""),
+        "note": str((body.get("scope_verdict") or {}).get("note") or ""),
+    }
+
+
+def _explore_response_schema() -> dict:
+    """The turn fields come from `actions.TURN_FIELD_SCHEMA`, the
+    same table `decode_reply` splits on. They were literals here,
+    and v1.79.0 shipped a release in which this packet advertised
+    `finding` while the transport refused it -- one source is
+    what stops the two drifting again.
+    """
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["actions"],
+        "properties": dict(
+            {
+                "actions": actions_mod.response_schema()
+                .get("properties", {})
+                .get("actions", {"type": "array"})
+            },
+            **actions_mod.TURN_FIELD_SCHEMA,
+        ),
+    }
+
+
+def _explore_worker_instructions() -> str:
+    return (
+        "Spend turns, not actions: one script that finishes a whole "
+        "round costs one turn, and four scripts that each do one "
+        "step of it cost four. "
+        "Record anything a tester would want to know in `finding`, "
+        "one sentence, even when the turn went fine. "
+        "Set `sub_goal` to the one step you are on now. When the "
+        "goal moves on to ANOTHER app and that app is on screen, "
+        "set `app` to its package name once."
+    )
 
 
 #: The FIRST packet of an explore run. A packet KIND on the existing return
@@ -644,78 +672,88 @@ def build_charter_intake(
             {
                 "kind": CHARTER_INTAKE_KIND,
                 "package": str(package or "")[:200],
-                "questions": [
-                    {
-                        "field": str(question["field"]),
-                        "ask": str(question["ask"]),
-                        "options": list(question["options"]),
-                        "default": charter_mod.defaults()[question["field"]],
-                    }
-                    for question in asks
-                ],
+                "questions": _intake_questions(charter_mod, asks),
                 "defaults": charter_mod.defaults(),
-                "unasked_fields_take_their_default": [
-                    field
-                    for field in charter_mod.defaults()
-                    if field not in charter_mod.ASKABLE
-                ],
-                "instruction": (
-                    "Put these questions to the TESTER in your own words, in "
-                    "one message, and ask no others -- the server owns the "
-                    "question set so that two runs of the same exploration "
-                    "are comparable. Then call `qa_mobile_test` again with "
-                    "`charter` set to a JSON object using these exact field "
-                    "names. Anything the tester does not answer takes the "
-                    "default shown, and the report NAMES every default that "
-                    "was used, so leaving a field out is a recorded choice "
-                    "rather than a silent one."
-                ),
-                "never_do": (
-                    "Never put a password, an OTP or any personal VALUE "
-                    "in this charter, in any field: the charter is written "
-                    "into the run's report on disk, and it has no field for "
-                    "a secret. When the app asks for one during the run, the "
-                    "packet asks the tester for that field by name and the "
-                    "value is typed straight to the device -- it never "
-                    "passes through you, a packet, the report or the run "
-                    "store."
-                ),
-                "response_schema": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["goal"],
-                    "properties": {
-                        "goal": {"type": "string"},
-                        "depth": {"enum": list(charter_mod.DEPTHS)},
-                        "scope": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "include": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                },
-                                "exclude": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                },
-                            },
-                        },
-                        "destructive": {"enum": list(charter_mod.DESTRUCTIVE)},
-                        "budget": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "steps": {"type": "integer"},
-                                "minutes": {"type": "integer"},
-                            },
-                        },
-                        "stop_on": {"enum": list(charter_mod.STOP_ON)},
-                    },
-                },
+                "unasked_fields_take_their_default": _unasked_fields(charter_mod),
+                **_intake_texts(),
+                "response_schema": _intake_response_schema(charter_mod),
             }
         )
         return packet
     except Exception:  # pragma: no cover - defensive
         logger.warning("build_charter_intake failed", exc_info=True)
         return {}
+
+
+def _intake_questions(charter_mod: ModuleType, asks: list) -> list[dict]:
+    return [
+        {
+            "field": str(question["field"]),
+            "ask": str(question["ask"]),
+            "options": list(question["options"]),
+            "default": charter_mod.defaults()[question["field"]],
+        }
+        for question in asks
+    ]
+
+
+def _unasked_fields(charter_mod: ModuleType) -> list:
+    return [
+        field for field in charter_mod.defaults() if field not in charter_mod.ASKABLE
+    ]
+
+
+def _intake_texts() -> dict:
+    return {
+        "instruction": (
+            "Put these questions to the TESTER in your own words, in "
+            "one message, and ask no others -- the server owns the "
+            "question set so that two runs of the same exploration "
+            "are comparable. Then call `qa_mobile_test` again with "
+            "`charter` set to a JSON object using these exact field "
+            "names. Anything the tester does not answer takes the "
+            "default shown, and the report NAMES every default that "
+            "was used, so leaving a field out is a recorded choice "
+            "rather than a silent one."
+        ),
+        "never_do": (
+            "Never put a password, an OTP or any personal VALUE "
+            "in this charter, in any field: the charter is written "
+            "into the run's report on disk, and it has no field for "
+            "a secret. When the app asks for one during the run, the "
+            "packet asks the tester for that field by name and the "
+            "value is typed straight to the device -- it never "
+            "passes through you, a packet, the report or the run "
+            "store."
+        ),
+    }
+
+
+def _intake_response_schema(charter_mod: ModuleType) -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["goal"],
+        "properties": {
+            "goal": {"type": "string"},
+            "depth": {"enum": list(charter_mod.DEPTHS)},
+            "scope": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "include": {"type": "array", "items": {"type": "string"}},
+                    "exclude": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+            "destructive": {"enum": list(charter_mod.DESTRUCTIVE)},
+            "budget": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "steps": {"type": "integer"},
+                    "minutes": {"type": "integer"},
+                },
+            },
+            "stop_on": {"enum": list(charter_mod.STOP_ON)},
+        },
+    }

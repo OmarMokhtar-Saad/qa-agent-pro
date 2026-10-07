@@ -144,20 +144,7 @@ def ownership(target: Path | None = None) -> dict:
     try:
         root = Path(target) if target is not None else cache_root()
         if platform_info.is_windows():
-            return {
-                "error": None,
-                "content": {
-                    "ok": True,
-                    "checked": False,
-                    "detail": (
-                        "Ownership is not checked on Windows: a POSIX owner id "
-                        "carries no meaning there. The cache at "
-                        + str(root)
-                        + " sits under the user profile, whose ACL restricts it."
-                    ),
-                    "fix": "",
-                },
-            }
+            return _ownership_windows(root)
         probe = root
         for _ in range(8):
             if probe.exists():
@@ -178,27 +165,7 @@ def ownership(target: Path | None = None) -> dict:
                     "fix": "",
                 },
             }
-        return {
-            "error": None,
-            "content": {
-                "ok": False,
-                "checked": True,
-                "detail": (
-                    "The mobile cache path "
-                    + str(probe)
-                    + " is owned by uid "
-                    + str(owner)
-                    + ", not by you (uid "
-                    + str(mine)
-                    + "), so nothing was downloaded, installed or created there."
-                ),
-                "fix": (
-                    "Take ownership of that directory, or point the lane at a "
-                    "path you own with QA_MOBILE_CACHE_DIR in .env and restart "
-                    "the MCP server."
-                ),
-            },
-        }
+        return _ownership_refused(probe, owner, mine)
     except Exception as exc:
         logger.warning("mobile.paths: could not read cache ownership: %s", exc)
         return {
@@ -216,6 +183,49 @@ def ownership(target: Path | None = None) -> dict:
                 ),
             },
         }
+
+
+def _ownership_windows(root: Path) -> dict:
+    """The reply for Windows, where the ownership check does not run."""
+    return {
+        "error": None,
+        "content": {
+            "ok": True,
+            "checked": False,
+            "detail": (
+                "Ownership is not checked on Windows: a POSIX owner id "
+                "carries no meaning there. The cache at "
+                + str(root)
+                + " sits under the user profile, whose ACL restricts it."
+            ),
+            "fix": "",
+        },
+    }
+
+
+def _ownership_refused(probe: Path, owner: int, mine: int) -> dict:
+    """The reply when the cache path is owned by somebody else."""
+    return {
+        "error": None,
+        "content": {
+            "ok": False,
+            "checked": True,
+            "detail": (
+                "The mobile cache path "
+                + str(probe)
+                + " is owned by uid "
+                + str(owner)
+                + ", not by you (uid "
+                + str(mine)
+                + "), so nothing was downloaded, installed or created there."
+            ),
+            "fix": (
+                "Take ownership of that directory, or point the lane at a "
+                "path you own with QA_MOBILE_CACHE_DIR in .env and restart "
+                "the MCP server."
+            ),
+        },
+    }
 
 
 def free_bytes(target: Path | None = None) -> int:

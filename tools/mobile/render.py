@@ -879,6 +879,133 @@ def _final_lines(final: object) -> list[str]:
     ]
 
 
+def _status_head_lines(body: dict) -> list[str]:
+    """The identity rows of a status block, capture and final verdict included."""
+    lines = [
+        "## Mobile run `" + _field(body.get("run_id"), "?") + "`",
+        "",
+        # 'unknown', not '?': a question mark here reads as a rendering
+        # artifact, and a tester cannot tell an odd state from a state the
+        # server could not read. The two lines below already spell theirs
+        # out, so this keeps the block consistent.
+        "- state: **" + _field(body.get("state"), "unknown") + "**",
+        "- lane: " + _field(body.get("lane"), "unknown"),
+        "- app: `" + _field(body.get("package"), "(none)") + "`",
+        "- device: " + _field(body.get("serial"), "(not attached)"),
+    ]
+    capture = body.get("capture")
+    if isinstance(capture, dict) and capture:
+        lines.append(capture_line(capture))
+    lines.extend(_final_lines(body.get("final")))
+    return lines
+
+
+def _status_stopped_lines(body: dict) -> list[str]:
+    """The restart instruction for a stopped explore run, or ``[]``.
+
+    LEADS the block, on purpose, and that ordering is the whole point: a
+    forward action below the fold is one a model does not act on.
+    Observed -- a model that met a stopped run and got only a status
+    dropped to 41 raw `adb` shell calls, bypassing the destructive guard,
+    the IME, evidence capture and the step record, and then presented an
+    earlier run's report as the report of that work.
+
+    IT ASSERTS EXACTLY WHAT THE PRODUCER ESTABLISHED and nothing wider.
+    `explore_runner.stop_reason` -- reaching here as `explore_stop` via
+    `session.resolve` -- establishes THAT the run stopped and names it in
+    its own words, so the restart instruction is sound and the reason is
+    quoted rather than interpreted. A previous version added a cause
+    ("its budget is spent"), which an executing review found false for a
+    `goal_reached` run stopped at turn 4 of 30. There is deliberately no
+    per-reason prose and no table to keep in step with the producer.
+    """
+    stopped = _field(body.get("explore_stop"))
+    if not stopped:
+        return []
+    return [
+        "**This run has stopped — `"
+        + stopped
+        + "`.** It cannot be continued: call `qa_mobile_test` to start "
+        "a NEW run.",
+        "",
+    ]
+
+
+def _status_counter_lines(body: dict, coverage_line: str) -> list[str]:
+    """The progress counter row(s): turns for an explore run, cases otherwise."""
+    explore = body.get("explore")
+    explore = explore if isinstance(explore, dict) else {}
+    total = _count(body.get("total"))
+    if str(body.get("lane") or "") == "explore":
+        # The counter line below is SUITE vocabulary: it describes a PLAN,
+        # and an exploratory run has none -- its turns are not planned
+        # cases. Printing it here is how one reply said "0 done, 3
+        # remaining of 3" three lines above a list of three finished turns:
+        # a verdict-derived count beside a status-derived one. This lane
+        # gets the counter it actually has, plus the one coverage sentence.
+        lines = [
+            "- turns: "
+            + str(_count(explore.get("turn")))
+            + " replayed of a "
+            + str(_count(explore.get("turns_budget")))
+            + "-turn budget"
+        ]
+        if coverage_line:
+            lines.append("- " + _field(coverage_line))
+        return lines
+    if total:
+        return [
+            "- cases: "
+            + str(int(body.get("done") or 0))
+            + " done, "
+            + str(len(body.get("failed") or []))
+            + " failed, "
+            + str(max(0, total - int(body.get("done") or 0)))
+            + " remaining of "
+            + str(total)
+        ]
+    return []
+
+
+def _status_abandoned_lines(body: dict) -> list[str]:
+    """The pick-it-back-up instruction for an abandoned run, or ``[]``.
+
+    Deliberately NOT the takeover wording: no other chat holds this
+    run, so "taken over" would send a tester looking for a session
+    that does not exist. What they need is the one call that picks
+    it back up, spelled out.
+    """
+    if str(body.get("state") or "") != "abandoned":
+        return []
+    return [
+        "",
+        "**Nothing has driven this run for "
+        + str(int(float(body.get("lease_age") or 0)))
+        + "s, so it looks abandoned.** Its finished cases are safe on "
+        "disk. To pick it up, call `qa_mobile_test` with "
+        '`run_id="' + _field(body.get("run_id"), "?") + '"` and '
+        "`continue_run=true`.",
+    ]
+
+
+def _status_explore_line(body: dict) -> list[str]:
+    """The ``exploring:`` row for a run with an explore record, or ``[]``."""
+    explore = body.get("explore")
+    if not (isinstance(explore, dict) and explore):
+        return []
+    return [
+        "- exploring: turn "
+        + str(int(explore.get("turn") or 0))
+        + " of "
+        + str(int(explore.get("turns_budget") or 0))
+        + (
+            " — stopped: " + _field(body.get("explore_stop"))
+            if body.get("explore_stop")
+            else ""
+        )
+    ]
+
+
 def status_block(resolved: object, coverage_line: str = "") -> str:
     """What ``qa_mobile_status`` prints: where the run is, from disk only.
 
@@ -889,106 +1016,14 @@ def status_block(resolved: object, coverage_line: str = "") -> str:
     """
     try:
         body = resolved if isinstance(resolved, dict) else {}
-        lines = [
-            "## Mobile run `" + _field(body.get("run_id"), "?") + "`",
-            "",
-            # 'unknown', not '?': a question mark here reads as a rendering
-            # artifact, and a tester cannot tell an odd state from a state the
-            # server could not read. The two lines below already spell theirs
-            # out, so this keeps the block consistent.
-            "- state: **" + _field(body.get("state"), "unknown") + "**",
-            "- lane: " + _field(body.get("lane"), "unknown"),
-            "- app: `" + _field(body.get("package"), "(none)") + "`",
-            "- device: " + _field(body.get("serial"), "(not attached)"),
-        ]
-        capture = body.get("capture")
-        if isinstance(capture, dict) and capture:
-            lines.append(capture_line(capture))
-        lines.extend(_final_lines(body.get("final")))
-        # LEADS the block, on purpose, and that ordering is the whole point: a
-        # forward action below the fold is one a model does not act on.
-        # Observed -- a model that met a stopped run and got only a status
-        # dropped to 41 raw `adb` shell calls, bypassing the destructive guard,
-        # the IME, evidence capture and the step record, and then presented an
-        # earlier run's report as the report of that work.
-        #
-        # IT ASSERTS EXACTLY WHAT THE PRODUCER ESTABLISHED and nothing wider.
-        # `explore_runner.stop_reason` -- reaching here as `explore_stop` via
-        # `session.resolve` -- establishes THAT the run stopped and names it in
-        # its own words, so the restart instruction is sound and the reason is
-        # quoted rather than interpreted. A previous version added a cause
-        # ("its budget is spent"), which an executing review found false for a
-        # `goal_reached` run stopped at turn 4 of 30. There is deliberately no
-        # per-reason prose and no table to keep in step with the producer.
-        stopped = _field(body.get("explore_stop"))
-        if stopped:
-            lines[2:2] = [
-                "**This run has stopped — `"
-                + stopped
-                + "`.** It cannot be continued: call `qa_mobile_test` to start "
-                "a NEW run.",
-                "",
-            ]
-        explore = body.get("explore")
-        explore = explore if isinstance(explore, dict) else {}
-        total = _count(body.get("total"))
-        if str(body.get("lane") or "") == "explore":
-            # The counter line below is SUITE vocabulary: it describes a PLAN,
-            # and an exploratory run has none -- its turns are not planned
-            # cases. Printing it here is how one reply said "0 done, 3
-            # remaining of 3" three lines above a list of three finished turns:
-            # a verdict-derived count beside a status-derived one. This lane
-            # gets the counter it actually has, plus the one coverage sentence.
-            lines.append(
-                "- turns: "
-                + str(_count(explore.get("turn")))
-                + " replayed of a "
-                + str(_count(explore.get("turns_budget")))
-                + "-turn budget"
-            )
-            if coverage_line:
-                lines.append("- " + _field(coverage_line))
-        elif total:
-            lines.append(
-                "- cases: "
-                + str(int(body.get("done") or 0))
-                + " done, "
-                + str(len(body.get("failed") or []))
-                + " failed, "
-                + str(max(0, total - int(body.get("done") or 0)))
-                + " remaining of "
-                + str(total)
-            )
+        lines = _status_head_lines(body)
+        lines[2:2] = _status_stopped_lines(body)
+        lines.extend(_status_counter_lines(body, coverage_line))
         holder = str(body.get("holder") or "")
         if holder:
             lines.append("- lease: held by session `" + holder[:40] + "`")
-        if str(body.get("state") or "") == "abandoned":
-            # Deliberately NOT the takeover wording: no other chat holds this
-            # run, so "taken over" would send a tester looking for a session
-            # that does not exist. What they need is the one call that picks
-            # it back up, spelled out.
-            lines += [
-                "",
-                "**Nothing has driven this run for "
-                + str(int(float(body.get("lease_age") or 0)))
-                + "s, so it looks abandoned.** Its finished cases are safe on "
-                "disk. To pick it up, call `qa_mobile_test` with "
-                '`run_id="' + _field(body.get("run_id"), "?") + '"` and '
-                "`continue_run=true`.",
-            ]
-        explore = body.get("explore")
-        if isinstance(explore, dict) and explore:
-            lines.append(
-                "- exploring: turn "
-                + str(int(explore.get("turn") or 0))
-                + " of "
-                + str(int(explore.get("turns_budget") or 0))
-                + (
-                    " — stopped: " + _field(body.get("explore_stop"))
-                    if body.get("explore_stop")
-                    else ""
-                )
-            )
+        lines += _status_abandoned_lines(body)
+        lines += _status_explore_line(body)
         return "\n".join(lines)
     except Exception:  # pragma: no cover - defensive
         return "## Mobile run\n\n- state: **unknown**"

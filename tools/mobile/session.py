@@ -300,35 +300,9 @@ def claim(run_id: str, session_token: str = "", *, force: bool = False) -> dict:
     duplicated "am I still the holder?" test is how the two drift.
     """
     try:
-        # EXISTENCE FIRST. acquire_lease mkdir -p's the run directory, so
-        # claiming before checking let any well-formed id mint a run in the
-        # shared state root -- and the reply then said the run did not exist
-        # while its lease sat on disk. The check lives here rather than in the
-        # handlers for the reason the docstring above already gives: two copies
-        # of one test is how the two handlers drift.
-        on_disk = run_store.read_manifest(run_id).get("content") or {}
-        if not on_disk:
-            return {
-                "error": (
-                    "No run `" + str(run_id)[:64] + "` on this machine. "
-                    "Nothing was created. `qa_mobile_status` lists the runs "
-                    "this install knows about."
-                ),
-                "content": None,
-            }
-        stopped = run_finalize.stop_text(on_disk)
-        if stopped:
-            # A run ended by qa_mobile_stop or the idle release takes no more
-            # steps: its verdict is recorded, and a later step would restart
-            # the heartbeat and retake the device under a run that says it ended.
-            return {
-                "error": (
-                    "Run `" + str(run_id)[:64] + "` has ended (" + stopped[:40] + ") "
-                    "and takes no more steps. `qa_mobile_status` shows its result; "
-                    "start a new run to test again."
-                ),
-                "content": None,
-            }
+        refusal = _claim_refusal(run_id)
+        if refusal:
+            return refusal
         token = str(session_token or "").strip()
         fresh = not token
         if fresh:
@@ -341,44 +315,87 @@ def claim(run_id: str, session_token: str = "", *, force: bool = False) -> dict:
             # The displaced holder's exit. Returning HELD here would let this
             # chat keep producing packets for an emulator another chat is
             # driving, which is the whole failure the lease exists to stop.
-            return {
-                "error": None,
-                "content": {
-                    "session_token": token,
-                    "state": STATE_TAKEN_OVER,
-                    "holder": str(body.get("holder") or ""),
-                    "taken_over_from": "",
-                },
-            }
+            return _claim_reply(token, STATE_TAKEN_OVER, str(body.get("holder") or ""))
         status = run_store.touch_lease(run_id, token)
         state = str((status.get("content") or {}).get("state") or run_store.HELD)
         if state == run_store.TAKEN_OVER:
-            return {
-                "error": None,
-                "content": {
-                    "session_token": token,
-                    "state": STATE_TAKEN_OVER,
-                    "holder": str((status.get("content") or {}).get("holder") or ""),
-                    "taken_over_from": "",
-                },
-            }
-        return {
-            "error": None,
-            "content": {
-                "session_token": token,
-                "state": run_store.HELD,
-                "holder": token,
-                "taken_over_from": str(body.get("taken_over_from") or ""),
-            },
-        }
+            holder = str((status.get("content") or {}).get("holder") or "")
+            return _claim_reply(token, STATE_TAKEN_OVER, holder)
+        return _claim_reply(
+            token,
+            run_store.HELD,
+            token,
+            str(body.get("taken_over_from") or ""),
+        )
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.session.claim failed")
         return {"error": str(exc), "content": None}
 
 
+def _claim_reply(
+    token: str, state: str, holder: str, taken_over_from: str = ""
+) -> dict:
+    """The ``claim`` success envelope."""
+    return {
+        "error": None,
+        "content": {
+            "session_token": token,
+            "state": state,
+            "holder": holder,
+            "taken_over_from": taken_over_from,
+        },
+    }
+
+
+def _claim_refusal(run_id: str) -> dict | None:
+    """The error reply when ``run_id`` cannot be claimed (absent or ended), else None."""
+    # EXISTENCE FIRST. acquire_lease mkdir -p's the run directory, so
+    # claiming before checking let any well-formed id mint a run in the
+    # shared state root -- and the reply then said the run did not exist
+    # while its lease sat on disk. The check lives in claim rather than in the
+    # handlers: two copies of one test is how the two handlers drift.
+    on_disk = run_store.read_manifest(run_id).get("content") or {}
+    if not on_disk:
+        return {
+            "error": (
+                "No run `" + str(run_id)[:64] + "` on this machine. "
+                "Nothing was created. `qa_mobile_status` lists the runs "
+                "this install knows about."
+            ),
+            "content": None,
+        }
+    stopped = run_finalize.stop_text(on_disk)
+    if stopped:
+        # A run ended by qa_mobile_stop or the idle release takes no more
+        # steps: its verdict is recorded, and a later step would restart
+        # the heartbeat and retake the device under a run that says it ended.
+        return {
+            "error": (
+                "Run `" + str(run_id)[:64] + "` has ended (" + stopped[:40] + ") "
+                "and takes no more steps. `qa_mobile_status` shows its result; "
+                "start a new run to test again."
+            ),
+            "content": None,
+        }
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Device
 # ---------------------------------------------------------------------------
+
+
+def _no_avd_refusal() -> dict:
+    """The refusal ``ensure_device`` hands back when no AVD is named."""
+    return {
+        "error": (
+            "No emulator (AVD) is named. Call `qa_mobile_test` again with "
+            "`avd` set to one of the AVDs in Android Studio's Device "
+            "Manager. `emulator=list` shows them and `emulator=create` "
+            "makes one from an installed system image."
+        ),
+        "content": None,
+    }
 
 
 async def ensure_device(
@@ -409,87 +426,75 @@ async def ensure_device(
         if serial:
             # A tester-chosen (or already-adopted) device: never probe for
             # the hardcoded AVD and never spawn a second emulator under it.
-            waited = await emulator.wait_boot(serial, timeout=budget, tunable=False)
-            if waited.get("error"):
-                return {
-                    "error": None,
-                    "content": {
-                        "state": STATE_BOOTING,
-                        "serial": serial,
-                        # 1200, not 400: wait_boot's message may carry the
-                        # virtualization note, which is 295 chars on top of a
-                        # ~173-char timeout line. At 400 every delivery of that
-                        # note was cut mid-parenthesis and lost the half that
-                        # says WHERE to enable it -- a producer composing a
-                        # message no consumer delivers whole.
-                        "detail": str(waited["error"])[:1200],
-                    },
-                }
-            return {
-                "error": None,
-                "content": {"state": "ready", "serial": serial, "detail": ""},
-            }
+            return await _wait_device_ready(serial, budget)
         if not name:
             # No house AVD to fall back on: auto-provisioning is retired
             # (docs/RETIRED_CAPABILITIES.md -> 6) and the handler resolves the
             # tester's own AVD before it gets here. Refuse rather than spawn
             # `emulator -avd ""`.
-            return {
-                "error": (
-                    "No emulator (AVD) is named. Call `qa_mobile_test` again with "
-                    "`avd` set to one of the AVDs in Android Studio's Device "
-                    "Manager. `emulator=list` shows them and `emulator=create` "
-                    "makes one from an installed system image."
-                ),
-                "content": None,
-            }
+            return _no_avd_refusal()
         running = await emulator.find_running(name)
         if running.get("error"):
             return running
         serial = str((running.get("content") or {}).get("serial") or "")
         if serial:
-            waited = await emulator.wait_boot(serial, timeout=budget, tunable=False)
-            if waited.get("error"):
-                return {
-                    "error": None,
-                    "content": {
-                        "state": STATE_BOOTING,
-                        "serial": serial,
-                        # Same 1200 as the sibling above, same reason.
-                        "detail": str(waited["error"])[:1200],
-                    },
-                }
-            return {
-                "error": None,
-                "content": {"state": "ready", "serial": serial, "detail": ""},
-            }
-        # Only this branch spawns, so only this branch can set the locale from
-        # the first frame. A device we ADOPTED (either branch above) is handled
-        # by `apply_locale`, which reads back rather than assuming.
-        # B5: if the emulator this server spawned last time already DIED, say so in
-        # its own words instead of spawning over it and reporting "booting" again.
-        gone = emulator.exit_report(name)
-        if gone:
-            return {"error": gone["error"], "content": None}
-        started = await emulator.start(name, locale=str(locale or ""))
-        if started.get("error"):
-            return started
+            return await _wait_device_ready(serial, budget)
+        return await _spawn_device(name, locale)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("mobile.session.ensure_device failed")
+        return {"error": str(exc), "content": None}
+
+
+async def _wait_device_ready(serial: str, budget: int) -> dict:
+    """Wait for ``serial`` to boot: ``ready``, or a ``booting`` pointer on timeout."""
+    waited = await emulator.wait_boot(serial, timeout=budget, tunable=False)
+    if waited.get("error"):
         return {
             "error": None,
             "content": {
                 "state": STATE_BOOTING,
-                "serial": "",
-                "detail": (
-                    name
-                    + " was started (pid "
-                    + str((started.get("content") or {}).get("pid") or 0)
-                    + "). A cold emulator takes a minute or two."
-                ),
+                "serial": serial,
+                # 1200, not 400: wait_boot's message may carry the
+                # virtualization note, which is 295 chars on top of a
+                # ~173-char timeout line. At 400 every delivery of that
+                # note was cut mid-parenthesis and lost the half that
+                # says WHERE to enable it -- a producer composing a
+                # message no consumer delivers whole.
+                "detail": str(waited["error"])[:1200],
             },
         }
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("mobile.session.ensure_device failed")
-        return {"error": str(exc), "content": None}
+    return {
+        "error": None,
+        "content": {"state": "ready", "serial": serial, "detail": ""},
+    }
+
+
+async def _spawn_device(name: str, locale: str) -> dict:
+    """Start the AVD ``name`` detached and hand back a ``booting`` pointer."""
+    # Only this path spawns, so only this path can set the locale from
+    # the first frame. A device we ADOPTED is handled by `apply_locale`,
+    # which reads back rather than assuming.
+    # B5: if the emulator this server spawned last time already DIED, say so in
+    # its own words instead of spawning over it and reporting "booting" again.
+    gone = emulator.exit_report(name)
+    if gone:
+        return {"error": gone["error"], "content": None}
+    started = await emulator.start(name, locale=str(locale or ""))
+    if started.get("error"):
+        return started
+    return {
+        "error": None,
+        "content": {
+            "state": STATE_BOOTING,
+            "serial": "",
+            "detail": (
+                name
+                + " was started (pid "
+                + str((started.get("content") or {}).get("pid") or 0)
+                + "). A cold emulator takes a minute or two."
+            ),
+        },
+    }
 
 
 async def device_alive(serial: str) -> dict:
@@ -546,68 +551,64 @@ async def ensure_run_device(run_id: str, *, budget: Budget | None = None) -> dic
                 "content": None,
             }
         serial = str(manifest.get("serial") or "")
-        avd = str(manifest.get("avd") or "")
         alive = (await device_alive(serial)).get("content") or {}
         if alive.get("alive"):
-            return {
-                "error": None,
-                "content": {
-                    "state": "ready",
-                    "serial": serial,
-                    "detail": "",
-                    "rebooted": False,
-                },
-            }
-        # The device is gone and must be booted again -- but only from an AVD
-        # that still exists. Spawning a missing one "succeeds" (the launcher is
-        # detached) and then times out as a boot, which tells the tester to wait
-        # for something that will never come up. A failed listing (no SDK)
-        # falls through to the spawn, whose own error says what is missing.
-        listed = await emulator.list_avds()
-        if not listed.get("error") and avd not in (listed.get("content") or []):
-            return {
-                "error": None,
-                "content": {
-                    "state": STATE_NO_AVD,
-                    "serial": "",
-                    "avd": avd,
-                    "detail": "",
-                    "rebooted": False,
-                },
-            }
-        span = int(budget.remaining()) if budget is not None else DEVICE_WAIT_BUDGET_S
-        ready = await ensure_device(
-            avd=avd, budget_s=max(1, min(DEVICE_WAIT_BUDGET_S, span))
-        )
-        if ready.get("error"):
-            return ready
-        state = ready.get("content") or {}
-        if str(state.get("state") or "") != "ready":
-            return {
-                "error": None,
-                "content": {
-                    "state": STATE_BOOTING,
-                    "serial": str(state.get("serial") or ""),
-                    "detail": str(state.get("detail") or ""),
-                    "rebooted": False,
-                },
-            }
-        fresh = str(state.get("serial") or "")
-        if fresh and fresh != serial:
-            manifest["serial"] = fresh
-            run_store.write_manifest(run_id, manifest)
-        return {
-            "error": None,
-            "content": {
-                "state": "ready",
-                "serial": fresh or serial,
-                "detail": "",
-                "rebooted": True,
-            },
-        }
+            return _run_device_reply("ready", serial)
+        return await _reboot_run_device(run_id, manifest, budget)
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.session.ensure_run_device failed")
         return {"error": str(exc), "content": None}
+
+
+def _run_device_reply(
+    state: str, serial: str, detail: str = "", *, rebooted: bool = False
+) -> dict:
+    """The reply shape ``ensure_run_device`` returns."""
+    return {
+        "error": None,
+        "content": {
+            "state": state,
+            "serial": serial,
+            "detail": detail,
+            "rebooted": rebooted,
+        },
+    }
+
+
+async def _reboot_run_device(
+    run_id: str, manifest: dict, budget: Budget | None
+) -> dict:
+    """Boot the run's AVD again (the serial is gone) and write back a new serial."""
+    serial = str(manifest.get("serial") or "")
+    avd = str(manifest.get("avd") or "")
+    # The device is gone and must be booted again -- but only from an AVD
+    # that still exists. Spawning a missing one "succeeds" (the launcher is
+    # detached) and then times out as a boot, which tells the tester to wait
+    # for something that will never come up. A failed listing (no SDK)
+    # falls through to the spawn, whose own error says what is missing.
+    listed = await emulator.list_avds()
+    if not listed.get("error") and avd not in (listed.get("content") or []):
+        reply = _run_device_reply(STATE_NO_AVD, "")
+        reply["content"]["avd"] = avd
+        return reply
+    span = int(budget.remaining()) if budget is not None else DEVICE_WAIT_BUDGET_S
+    ready = await ensure_device(
+        avd=avd, budget_s=max(1, min(DEVICE_WAIT_BUDGET_S, span))
+    )
+    if ready.get("error"):
+        return ready
+    state = ready.get("content") or {}
+    if str(state.get("state") or "") != "ready":
+        return _run_device_reply(
+            STATE_BOOTING,
+            str(state.get("serial") or ""),
+            str(state.get("detail") or ""),
+        )
+    fresh = str(state.get("serial") or "")
+    if fresh and fresh != serial:
+        manifest["serial"] = fresh
+        run_store.write_manifest(run_id, manifest)
+    return _run_device_reply("ready", fresh or serial, rebooted=True)
 
 
 def _install_state_path() -> Path:
@@ -706,57 +707,12 @@ def start_install(serial: str, apk_path: str, package: str) -> dict:
     has to bring its own consent; nothing here asks for it.
     """
     try:
-        if not valid_package_name(package):
-            return {
-                "error": (
-                    "Refusing " + repr(str(package)[:60]) + " as a package name."
-                ),
-                "content": None,
-            }
-        if not _valid_device_id(serial):
-            return {
-                "error": "Refusing " + repr(str(serial)[:40]) + " as a device id.",
-                "content": None,
-            }
         path = Path(str(apk_path or "")).expanduser()
-        if path.suffix.lower() != ".apk" or not path.is_file():
-            return {
-                "error": (
-                    "No .apk file at "
-                    + str(path)[:200]
-                    + ". Give the full path to the file, and nothing is installed."
-                ),
-                "content": None,
-            }
-        problem = adb.apk_problem(path)
-        if problem:
-            return {
-                "error": (
-                    "Not installing "
-                    + str(path)[:200]
-                    + ": "
-                    + problem
-                    + ". Nothing was installed."
-                ),
-                "content": None,
-            }
+        refusal = _install_refusal(serial, package, path)
+        if refusal:
+            return refusal
         paths.ensure_tree()
-        command = [
-            adb.resolve_adb(),
-            "-s",
-            str(serial),
-            "install",
-            "-r",
-            "-g",
-            str(path),
-        ]
-        kwargs = {
-            "stdin": subprocess.DEVNULL,
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
-        }
-        kwargs.update(platform_info.detach_kwargs())
-        proc = subprocess.Popen(command, **kwargs)  # noqa: S603 - argv, no shell
+        proc = _spawn_install(serial, path)
         payload = {
             "package": str(package),
             "serial": str(serial),
@@ -769,6 +725,54 @@ def start_install(serial: str, apk_path: str, package: str) -> dict:
     except Exception as exc:
         logger.exception("mobile.session.start_install failed")
         return {"error": str(exc), "content": None}
+
+
+def _install_refusal(serial: str, package: str, path: Path) -> dict | None:
+    """The error reply for an install that must not start, else None."""
+    if not valid_package_name(package):
+        return {
+            "error": "Refusing " + repr(str(package)[:60]) + " as a package name.",
+            "content": None,
+        }
+    if not _valid_device_id(serial):
+        return {
+            "error": "Refusing " + repr(str(serial)[:40]) + " as a device id.",
+            "content": None,
+        }
+    if path.suffix.lower() != ".apk" or not path.is_file():
+        return {
+            "error": (
+                "No .apk file at "
+                + str(path)[:200]
+                + ". Give the full path to the file, and nothing is installed."
+            ),
+            "content": None,
+        }
+    problem = adb.apk_problem(path)
+    if problem:
+        return {
+            "error": (
+                "Not installing "
+                + str(path)[:200]
+                + ": "
+                + problem
+                + ". Nothing was installed."
+            ),
+            "content": None,
+        }
+    return None
+
+
+def _spawn_install(serial: str, path: Path) -> object:
+    """Start ``adb install -r -g`` detached and return the process."""
+    command = [adb.resolve_adb(), "-s", str(serial), "install", "-r", "-g", str(path)]
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    kwargs.update(platform_info.detach_kwargs())
+    return subprocess.Popen(command, **kwargs)  # noqa: S603 - argv, no shell
 
 
 async def install_state(serial: str, package: str) -> dict:
@@ -809,44 +813,47 @@ async def install_state(serial: str, package: str) -> dict:
         listed = await adb.installed_packages(serial)
         probed = not listed.get("error")
         names = list(listed.get("content") or [])
-        installed = bool(probed and str(package) in names)
-        pending = bool(
-            probed
-            and not installed
-            and record.get("package") == str(package)
-            and str(record.get("serial") or "") == str(serial)
-            and _install_is_recent(record, time.time())
-        )
-        # FUZZY MATCH, FROM THE SAME PROBE. `installed_packages` already listed
-        # every package id on the device to answer `installed` above -- this
-        # reuses that ONE round trip rather than spending a second adb call to
-        # answer "did the caller guess the wrong id". A tester (or the model
-        # on their behalf) names an app, not a bundle id, and a wrong guess
-        # used to dead-end in "not installed" with no way forward short of a
-        # manual `adb shell pm list packages`. The cap of 5 is a LOCAL bound
-        # (not a module constant): a hint in an error message, not a listing,
-        # so it does not need the CEILINGS governance a shared cap would.
-        suggestions: list[str] = []
-        if probed and not installed and names:
-            import difflib
-
-            suggestions = difflib.get_close_matches(
-                str(package), names, n=5, cutoff=0.4
-            )
-        return {
-            "error": None,
-            "content": {
-                "probed": bool(probed),
-                "installed": installed,
-                "pending": pending,
-                "apk": str(record.get("apk") or ""),
-                "started": _started_seconds(record),
-                "suggestions": suggestions,
-            },
-        }
+        content = _install_state_content(record, probed, names, serial, package)
+        return {"error": None, "content": content}
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.session.install_state failed")
         return {"error": str(exc), "content": None}
+
+
+def _install_state_content(
+    record: dict, probed: bool, names: list, serial: str, package: str
+) -> dict:
+    """The ``install_state`` answer, derived from one probe and the record."""
+    installed = bool(probed and str(package) in names)
+    pending = bool(
+        probed
+        and not installed
+        and record.get("package") == str(package)
+        and str(record.get("serial") or "") == str(serial)
+        and _install_is_recent(record, time.time())
+    )
+    # FUZZY MATCH, FROM THE SAME PROBE. `installed_packages` already listed
+    # every package id on the device to answer `installed` above -- this
+    # reuses that ONE round trip rather than spending a second adb call to
+    # answer "did the caller guess the wrong id". A tester (or the model
+    # on their behalf) names an app, not a bundle id, and a wrong guess
+    # used to dead-end in "not installed" with no way forward short of a
+    # manual `adb shell pm list packages`. The cap of 5 is a LOCAL bound
+    # (not a module constant): a hint in an error message, not a listing,
+    # so it does not need the CEILINGS governance a shared cap would.
+    suggestions: list[str] = []
+    if probed and not installed and names:
+        import difflib
+
+        suggestions = difflib.get_close_matches(str(package), names, n=5, cutoff=0.4)
+    return {
+        "probed": bool(probed),
+        "installed": installed,
+        "pending": pending,
+        "apk": str(record.get("apk") or ""),
+        "started": _started_seconds(record),
+        "suggestions": suggestions,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -949,48 +956,139 @@ def find_resumable_run(signature: str, limit: int = 60) -> dict | None:
         if not wanted:
             return None
         for row in (list_runs(limit) or {}).get("content") or []:
-            manifest = row.get("manifest") or {}
-            # THE KEPT SIGNATURE, and only that one.
-            #
-            # There was a second comparison here against `source_signature` --
-            # the cases the tester supplied before the filters -- so that a
-            # re-run of failures could recognise its own earlier run. Round 3
-            # showed it had to be conditioned on "that run was started with no
-            # filter", because otherwise a tester who ran five cases filtered
-            # to two and then started the whole suite was told the earlier run
-            # was "running the same cases": it was running two of five, and
-            # accepting the offer finishes with three never executed and a
-            # report that looks complete.
-            #
-            # And with that condition the clause is DEAD, which mutation then
-            # proved: a run started with no filter has the two signatures EQUAL
-            # by construction, so the kept comparison has already matched
-            # whenever the source one could. An unkillable guard is not a
-            # guard, so it is gone and `source_signature` stays on the manifest
-            # as the record of what was asked for.
-            if wanted != str(manifest.get("case_signature") or ""):
-                continue
-            # NO package argument at all. There was a package comparison here
-            # and mutation proved it unreachable -- `case_signature` is seeded
-            # WITH the package, so a signature match already implies it -- and
-            # round 2 then pointed out that keeping the PARAMETER after
-            # deleting its use is a trap for a caller who passes a package that
-            # did not build the signature. The binding is in the signature, and
-            # `test_a_different_package_gives_a_different_signature` pins it.
-            run_id = str(row.get("run_id") or "")
-            resolved = (resolve(run_id) or {}).get("content") or {}
-            if not resolved or resolved.get("finished"):
-                continue
-            return {
-                "run_id": run_id,
-                "state": str(resolved.get("state") or ""),
-                "done": int(resolved.get("done") or 0),
-                "total": int(resolved.get("total") or 0),
-            }
+            offer = _resumable_offer(row, wanted)
+            if offer:
+                return offer
         return None
     except Exception:  # pragma: no cover - defensive
         logger.exception("mobile.session.find_resumable_run failed")
         return None
+
+
+def _resumable_offer(row: dict, wanted: str) -> dict | None:
+    """The offer for one listed run when it matches *wanted* and is unfinished."""
+    manifest = row.get("manifest") or {}
+    # THE KEPT SIGNATURE, and only that one.
+    #
+    # There was a second comparison here against `source_signature` --
+    # the cases the tester supplied before the filters -- so that a
+    # re-run of failures could recognise its own earlier run. Round 3
+    # showed it had to be conditioned on "that run was started with no
+    # filter", because otherwise a tester who ran five cases filtered
+    # to two and then started the whole suite was told the earlier run
+    # was "running the same cases": it was running two of five, and
+    # accepting the offer finishes with three never executed and a
+    # report that looks complete.
+    #
+    # And with that condition the clause is DEAD, which mutation then
+    # proved: a run started with no filter has the two signatures EQUAL
+    # by construction, so the kept comparison has already matched
+    # whenever the source one could. An unkillable guard is not a
+    # guard, so it is gone and `source_signature` stays on the manifest
+    # as the record of what was asked for.
+    if wanted != str(manifest.get("case_signature") or ""):
+        return None
+    # NO package argument at all. There was a package comparison here
+    # and mutation proved it unreachable -- `case_signature` is seeded
+    # WITH the package, so a signature match already implies it -- and
+    # round 2 then pointed out that keeping the PARAMETER after
+    # deleting its use is a trap for a caller who passes a package that
+    # did not build the signature. The binding is in the signature, and
+    # `test_a_different_package_gives_a_different_signature` pins it.
+    run_id = str(row.get("run_id") or "")
+    resolved = (resolve(run_id) or {}).get("content") or {}
+    if not resolved or resolved.get("finished"):
+        return None
+    return {
+        "run_id": run_id,
+        "state": str(resolved.get("state") or ""),
+        "done": int(resolved.get("done") or 0),
+        "total": int(resolved.get("total") or 0),
+    }
+
+
+def _no_case_survived(ordered: dict) -> dict:
+    """The refusal for a filter set that dropped every case."""
+    applied = ", ".join((ordered.get("content") or {}).get("applied") or []) or "none"
+    return {
+        "error": (
+            f"No case survived the filters, so no run was created (applied: {applied})."
+        ),
+        "content": None,
+    }
+
+
+def _run_records(
+    device: object, locale: object, capture: object, reset_app: object
+) -> dict:
+    """The four environment records both lanes put on a new run's manifest."""
+    return {
+        # WHAT LANGUAGE THIS RAN IN, on the manifest for the same reason
+        # `device` is: a finished run must still say so after the device
+        # is gone, and two readers asking the device again could get two
+        # answers.
+        "locale": locale_record(locale),
+        # WHAT HARDWARE THIS RAN ON, recorded once at planning time.
+        # On the manifest rather than re-read per status call because a
+        # finished run must still say what it ran on after the device is
+        # unplugged, and because two readers asking the device again
+        # could get two answers.
+        "device": device_record(device),
+        # WHAT TIER THIS RUN'S API CAPTURE REACHED, recorded once at
+        # planning time for the same reason `locale`/`device` are: a
+        # finished run must still say so after the proxy is torn down.
+        "capture": capture_record(capture),
+        "reset_app": reset_app_record(reset_app),
+    }
+
+
+def _suite_manifest(
+    cases: object, kept: list, package: str, serial: str, source: str
+) -> dict:
+    """The suite lane's own manifest keys (identity, signatures, kept cases)."""
+    return {
+        "lane": LANE_SUITE,
+        "package": str(package or ""),
+        "serial": str(serial or ""),
+        "source": str(source or ""),
+        "case_signature": case_signature(package, kept),
+        # The cases the TESTER supplied, before the filters -- the
+        # RECORD of what was asked for, and nothing more.
+        #
+        # It was added so a re-run of failures could recognise its own
+        # earlier run, and `find_resumable_run` no longer reads it: that
+        # match had to be conditioned on "started with no filter", and
+        # with that condition it was dead. The flow survives anyway,
+        # because a run's manifest stores the KEPT cases, so a second
+        # re-run hashes those and matches `case_signature`.
+        "source_signature": case_signature(package, cases),
+        "cases": _case_dumps(kept),
+    }
+
+
+def _explore_manifest(state: dict, package: str, serial: str, avd: str) -> dict:
+    """The exploratory lane's own manifest keys."""
+    return {
+        "lane": LANE_EXPLORE,
+        "package": str(package or ""),
+        "serial": str(serial or ""),
+        "avd": str(avd or ""),
+        # A SNAPSHOT of the PRODUCER's answer, not of a setting.
+        # sdk_locator.avd_system_image() is the one function that says which
+        # image this lane runs: it reads image.sysdir.1 out of the AVD's own
+        # config.ini, so it reports what the device on disk actually boots.
+        # Reading qa_mobile_system_image_tag here would be a SECOND derivation
+        # -- and since the tester brings their own AVD, no setting decides it.
+        # "" when the AVD cannot be resolved, which the report renders as "not
+        # recorded" rather than inventing today's answer for a finished run.
+        "system_image": str(
+            (sdk_locator.avd_system_image(avd) or {}).get("content") or ""
+        ),
+        "order": [],
+        "total": 0,
+        "cases": [],
+        "explore": state,
+    }
 
 
 def plan_suite_run(
@@ -1013,57 +1111,16 @@ def plan_suite_run(
             return ordered
         kept = list((ordered.get("content") or {}).get("cases") or [])
         if not kept:
-            return {
-                "error": (
-                    "No case survived the filters, so no run was created "
-                    "(applied: "
-                    + (
-                        ", ".join((ordered.get("content") or {}).get("applied") or [])
-                        or "none"
-                    )
-                    + ")."
-                ),
-                "content": None,
-            }
+            return _no_case_survived(ordered)
         run_id = mint_run_id()
         planned = scheduler.plan_run(
             run_id,
             kept,
             None,
             manifest_extra={
-                "lane": LANE_SUITE,
-                "package": str(package or ""),
-                "serial": str(serial or ""),
-                # WHAT LANGUAGE THIS RAN IN, on the manifest for the same reason
-                # `device` is: a finished run must still say so after the device
-                # is gone, and two readers asking the device again could get two
-                # answers.
-                "locale": locale_record(locale),
-                # WHAT HARDWARE THIS RAN ON, recorded once at planning time.
-                # On the manifest rather than re-read per status call because a
-                # finished run must still say what it ran on after the device is
-                # unplugged, and because two readers asking the device again
-                # could get two answers.
-                "device": device_record(device),
+                **_suite_manifest(cases, kept, package, serial, source),
+                **_run_records(device, locale, capture, reset_app),
                 "avd": str(avd or ""),
-                # WHAT TIER THIS RUN'S API CAPTURE REACHED, recorded once at
-                # planning time for the same reason `locale`/`device` are: a
-                # finished run must still say so after the proxy is torn down.
-                "capture": capture_record(capture),
-                "reset_app": reset_app_record(reset_app),
-                "source": str(source or ""),
-                "case_signature": case_signature(package, kept),
-                # The cases the TESTER supplied, before the filters -- the
-                # RECORD of what was asked for, and nothing more.
-                #
-                # It was added so a re-run of failures could recognise its own
-                # earlier run, and `find_resumable_run` no longer reads it: that
-                # match had to be conditioned on "started with no filter", and
-                # with that condition it was dead. The flow survives anyway,
-                # because a run's manifest stores the KEPT cases, so a second
-                # re-run hashes those and matches `case_signature`.
-                "source_signature": case_signature(package, cases),
-                "cases": _case_dumps(kept),
             },
         )
         if planned.get("error"):
@@ -1111,29 +1168,8 @@ def plan_explore_run(
         created = run_store.create_run(
             run_id,
             {
-                "lane": LANE_EXPLORE,
-                "package": str(package or ""),
-                "serial": str(serial or ""),
-                "device": device_record(device),
-                "locale": locale_record(locale),
-                "capture": capture_record(capture),
-                "reset_app": reset_app_record(reset_app),
-                "avd": str(avd or ""),
-                # A SNAPSHOT of the PRODUCER's answer, not of a setting.
-                # sdk_locator.avd_system_image() is the one function that says which
-                # image this lane runs: it reads image.sysdir.1 out of the AVD's own
-                # config.ini, so it reports what the device on disk actually boots.
-                # Reading qa_mobile_system_image_tag here would be a SECOND derivation
-                # -- and since the tester brings their own AVD, no setting decides it.
-                # "" when the AVD cannot be resolved, which the report renders as "not
-                # recorded" rather than inventing today's answer for a finished run.
-                "system_image": str(
-                    (sdk_locator.avd_system_image(avd) or {}).get("content") or ""
-                ),
-                "order": [],
-                "total": 0,
-                "cases": [],
-                "explore": state,
+                **_explore_manifest(state, package, serial, avd),
+                **_run_records(device, locale, capture, reset_app),
             },
         )
         if created.get("error"):
@@ -1257,7 +1293,94 @@ def context_for(resolved: object) -> executor.Context:
         # ``submit``) already go through -- so the value cannot reach the
         # executor by one path and not the other.
         asserts_expected=str(body.get("lane") or "") != LANE_EXPLORE,
+        # Per-app knowledge: the run's id and lane. ``begin_run`` reads the env
+        # and app version from the run's manifest.
+        run_id=str(body.get("run_id") or "") or None,
+        lane=str(body.get("lane") or "") or None,
     )
+
+
+def _lane_progress(run_id: str, manifest: dict, explore: dict) -> tuple[str, dict, str]:
+    """``(state, scheduler point, explore stop)`` before the heartbeat check."""
+    # PUBLISHED, not just branched on. This value already decided `state`
+    # here while `report._is_partial` derived the same fact from the weaker
+    # `explore["stop"]` and disagreed with it on the very same manifest.
+    # Handing it out means every consumer reads the one producer.
+    if str(manifest.get("lane") or "") == LANE_EXPLORE:
+        explore_stop = explore_runner.stop_reason(explore)
+        return (STATE_REPORT if explore_stop else STATE_RUNNING), {}, explore_stop
+    point = (scheduler.next_case(run_id) or {}).get("content") or {}
+    if point.get("finished") or run_finalize.stop_text(manifest):
+        return STATE_REPORT, point, ""
+    if point.get("gate"):
+        return STATE_GATE, point, ""
+    return STATE_RUNNING, point, ""
+
+
+def _lease_age(lease: dict) -> float:
+    """The lease's heartbeat age; a non-finite one reads as ZERO."""
+    # A non-finite age reads as ZERO, i.e. "just refreshed", which is the
+    # SAFE direction here: it leaves the run alone rather than declaring
+    # somebody else's live session abandoned. Left unguarded, a NaN makes
+    # the comparison in `_is_abandoned` False and the run could never be
+    # reclaimed at all, because every comparison against NaN is False.
+    age = float(lease.get("age") or 0.0)
+    return age if math.isfinite(age) else 0.0
+
+
+def _is_abandoned(state: str, lease: dict, lease_age: float) -> bool:
+    """An unfinished run whose heartbeat stopped."""
+    # D7 (2026-09-03): an unfinished run whose heartbeat stopped. Two runs
+    # from the audit -- mrun-20260903-103316-b09ee4 (TC-003 stuck in
+    # "planning", TC-004 never started) and ...103359-5b01fc -- still held
+    # a lease, had no report, and `qa_mobile_status` reported them as
+    # plain "running", so a tester had no way to tell a run that was
+    # thinking from one nothing was driving. The lease's own heartbeat age
+    # is the signal; STALE is the same threshold a takeover uses, so the
+    # state and the takeover rule cannot drift apart.
+    return (
+        state not in (STATE_REPORT, STATE_GATE)
+        and str(lease.get("state") or run_store.NONE) != run_store.NONE
+        and lease_age > run_store.LEASE_STALE_S
+    )
+
+
+def _resolve_body(run_id: str, manifest: dict, lease: dict) -> dict:
+    """The ``content`` of a resolved run, from its manifest and lease."""
+    explore = manifest.get("explore")
+    explore = explore if isinstance(explore, dict) else {}
+    state, point, explore_stop = _lane_progress(run_id, manifest, explore)
+    lease_age = _lease_age(lease)
+    if _is_abandoned(state, lease, lease_age):
+        state = STATE_ABANDONED
+    is_explore = str(manifest.get("lane") or "") == LANE_EXPLORE
+    return {
+        "run_id": str(run_id),
+        "state": state,
+        "lane": str(manifest.get("lane") or LANE_SUITE),
+        "package": str(manifest.get("package") or ""),
+        "serial": str(manifest.get("serial") or ""),
+        "device": device_record(manifest.get("device")),
+        "avd": str(manifest.get("avd") or ""),
+        "source": str(manifest.get("source") or ""),
+        "total": int(manifest.get("total") or 0),
+        "done": int(point.get("done") or 0),
+        "failed": list(point.get("failed") or []),
+        "next_tc_id": str(point.get("tc_id") or ""),
+        "gate": bool(point.get("gate")),
+        # The explore lane has no scheduler and therefore no `point`,
+        # so this key was False for the whole life of every exploratory
+        # run -- which is why a stopped run's summary was headed
+        # "Mobile run progress" and its report offered "ask again later
+        # for the rest". Its producer is `stop_reason`.
+        "finished": bool(explore_stop) if is_explore else bool(point.get("finished")),
+        "explore_stop": explore_stop,
+        "final": run_finalize.recorded(manifest),
+        "explore": explore,
+        "holder": str(lease.get("holder") or ""),
+        "lease_state": str(lease.get("state") or run_store.NONE),
+        "lease_age": lease_age,
+    }
 
 
 def resolve(run_id: str, session_token: str = "") -> dict:
@@ -1287,79 +1410,7 @@ def resolve(run_id: str, session_token: str = "") -> dict:
         lease = (run_store.lease_status(run_id, str(session_token or "-")) or {}).get(
             "content"
         ) or {}
-        explore = manifest.get("explore")
-        explore = explore if isinstance(explore, dict) else {}
-        point: dict = {}
-        state = STATE_RUNNING
-        is_explore = str(manifest.get("lane") or "") == LANE_EXPLORE
-        # PUBLISHED, not just branched on. This value already decided `state`
-        # here while `report._is_partial` derived the same fact from the weaker
-        # `explore["stop"]` and disagreed with it on the very same manifest.
-        # Handing it out means every consumer reads the one producer.
-        explore_stop = ""
-        if is_explore:
-            explore_stop = explore_runner.stop_reason(explore)
-            state = STATE_REPORT if explore_stop else STATE_RUNNING
-        else:
-            point = (scheduler.next_case(run_id) or {}).get("content") or {}
-            if point.get("finished") or run_finalize.stop_text(manifest):
-                state = STATE_REPORT
-            elif point.get("gate"):
-                state = STATE_GATE
-        # D7 (2026-09-03): an unfinished run whose heartbeat stopped. Two runs
-        # from the audit -- mrun-20260903-103316-b09ee4 (TC-003 stuck in
-        # "planning", TC-004 never started) and ...103359-5b01fc -- still held
-        # a lease, had no report, and `qa_mobile_status` reported them as
-        # plain "running", so a tester had no way to tell a run that was
-        # thinking from one nothing was driving. The lease's own heartbeat age
-        # is the signal; STALE is the same threshold a takeover uses, so the
-        # state and the takeover rule cannot drift apart.
-        # A non-finite age reads as ZERO, i.e. "just refreshed", which is the
-        # SAFE direction here: it leaves the run alone rather than declaring
-        # somebody else's live session abandoned. Left unguarded, a NaN makes
-        # the comparison below False and the run could never be reclaimed at
-        # all, because every comparison against NaN is False.
-        lease_age = float(lease.get("age") or 0.0)
-        if not math.isfinite(lease_age):
-            lease_age = 0.0
-        if (
-            state not in (STATE_REPORT, STATE_GATE)
-            and str(lease.get("state") or run_store.NONE) != run_store.NONE
-            and lease_age > run_store.LEASE_STALE_S
-        ):
-            state = STATE_ABANDONED
-        return {
-            "error": None,
-            "content": {
-                "run_id": str(run_id),
-                "state": state,
-                "lane": str(manifest.get("lane") or LANE_SUITE),
-                "package": str(manifest.get("package") or ""),
-                "serial": str(manifest.get("serial") or ""),
-                "device": device_record(manifest.get("device")),
-                "avd": str(manifest.get("avd") or ""),
-                "source": str(manifest.get("source") or ""),
-                "total": int(manifest.get("total") or 0),
-                "done": int(point.get("done") or 0),
-                "failed": list(point.get("failed") or []),
-                "next_tc_id": str(point.get("tc_id") or ""),
-                "gate": bool(point.get("gate")),
-                # The explore lane has no scheduler and therefore no `point`,
-                # so this key was False for the whole life of every exploratory
-                # run -- which is why a stopped run's summary was headed
-                # "Mobile run progress" and its report offered "ask again later
-                # for the rest". Its producer is `stop_reason`.
-                "finished": bool(explore_stop)
-                if is_explore
-                else bool(point.get("finished")),
-                "explore_stop": explore_stop,
-                "final": run_finalize.recorded(manifest),
-                "explore": explore,
-                "holder": str(lease.get("holder") or ""),
-                "lease_state": str(lease.get("state") or run_store.NONE),
-                "lease_age": lease_age,
-            },
-        }
+        return {"error": None, "content": _resolve_body(run_id, manifest, lease)}
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.session.resolve failed")
         return {"error": str(exc), "content": None}
@@ -1626,6 +1677,17 @@ def release_device_lock(
     names = locks.names_held_by(label)
     if not names:
         return {"error": None, "content": {"released": False, "reason": "not held"}}
+    released, refusal = _release_names(names, label, lease, as_holder, force)
+    return {
+        "error": None,
+        "content": {"released": released, "reason": "" if released else refusal},
+    }
+
+
+def _release_names(
+    names: list, label: str, lease: str, as_holder: bool, force: bool
+) -> tuple[bool, str]:
+    """Release every lock *label* holds; ``(any released, first refusal reason)``."""
     # BY OWNER, NOT BY NAME. The caller does not always know the serial -- the
     # displaced branches know only that they lost the run -- and asking them to
     # derive one would be a second producer of "which device is this run on".
@@ -1649,10 +1711,7 @@ def release_device_lock(
             released = True
         elif not refusal:
             refusal = str(body.get("reason") or "")
-    return {
-        "error": None,
-        "content": {"released": released, "reason": "" if released else refusal},
-    }
+    return released, refusal
 
 
 async def finish_device(owner: str, **release_kwargs) -> dict:
@@ -1695,19 +1754,34 @@ async def finish_device(owner: str, **release_kwargs) -> dict:
     still calls a one-keyword function, which is what every existing caller and
     every existing test double expects.
     """
+    restores = await _restore_run_state(str(owner))
+    stale = await _sweep_stale_state(str(owner))
+    released = release_device_lock(str(owner), **release_kwargs)
+    return _finish_device_reply(released, restores, stale)
+
+
+async def _restore_run_state(owner: str) -> tuple[dict, dict, dict]:
+    """Disarm, then restore keyboard, animations and a11y: ``(ime, anim, a11y)``."""
     from tools.mobile import a11y, animations, ime, ime_session
 
     # DISARM first (G4): the nonce is forgotten even when the device is gone.
     try:
-        await ime.disarm(serial_of(str(owner)) or "")
+        await ime.disarm(serial_of(owner) or "")
     except Exception:
         logger.debug("mobile.session.finish_device: disarm skipped", exc_info=True)
-    restored = await ime_session.restore(str(owner))
+    restored = await ime_session.restore(owner)
     # The run's animation scales go back too, on the same chokepoint and for the
     # same reason: every teardown path reaches this function.
-    anim = await animations.restore(str(owner))
+    anim = await animations.restore(owner)
     # The a11y service goes off and the tester's accessibility settings come back.
-    a11y_restored = await a11y.restore(str(owner))
+    a11y_restored = await a11y.restore(owner)
+    return restored, anim, a11y_restored
+
+
+async def _sweep_stale_state(owner: str) -> tuple[dict, dict, dict]:
+    """Restore what earlier crashed runs left: ``(ime, animations, a11y)``."""
+    from tools.mobile import a11y, animations, ime_session
+
     a11y_stale = {}
     anim_stale = {}
     # AND ANY KEYBOARD AN EARLIER RUN CRASHED OUT OF. Done here as well as at
@@ -1733,7 +1807,13 @@ async def finish_device(owner: str, **release_kwargs) -> dict:
             ).get("content") or {}
     except Exception:
         logger.debug("mobile.session.finish_device: stale sweep skipped", exc_info=True)
-    released = release_device_lock(str(owner), **release_kwargs)
+    return swept, anim_stale, a11y_stale
+
+
+def _finish_device_reply(released: dict, restores: tuple, stale: tuple) -> dict:
+    """The ``finish_device`` envelope from the release result and both restores."""
+    restored, anim, a11y_restored = restores
+    swept, anim_stale, a11y_stale = stale
     return {
         "error": None,
         "content": {
@@ -1876,64 +1956,49 @@ async def apply_locale(
     a run is about to be started on the strength of it.
     """
     try:
-        wanted = str(requested or "").strip()
-        seen = await adb.runtime_locale(serial)
-        if seen.get("error"):
-            return {
-                "error": None,
-                "content": _locale_body(
-                    wanted, "", "", LOCALE_FROM_DEVICE, str(seen["error"])[:200]
-                ),
-            }
-        actual = str(seen.get("content") or "")
-        if not wanted:
-            return {
-                "error": None,
-                "content": _locale_body("", actual, "", LOCALE_FROM_DEVICE, ""),
-            }
-        source = (
-            LOCALE_FROM_BOOT
-            if str(booted_with or "").strip() == wanted
-            else LOCALE_FROM_SETPROP
-        )
-        if _same_language(actual, wanted):
-            persisted = await adb.persisted_locale(serial)
-            return {
-                "error": None,
-                "content": _locale_body(
-                    wanted,
-                    actual,
-                    (
-                        ""
-                        if persisted.get("error")
-                        else str(persisted.get("content") or "")
-                    ),
-                    source,
-                    "",
-                ),
-            }
-        changed = await adb.set_locale(serial, wanted)
-        if changed.get("error"):
-            return {
-                "error": None,
-                "content": _locale_body(
-                    wanted, actual, "", source, str(changed["error"])[:200]
-                ),
-            }
-        body = changed.get("content") or {}
-        return {
-            "error": None,
-            "content": _locale_body(
-                wanted,
-                str(body.get("runtime") or ""),
-                str(body.get("persisted") or ""),
-                source,
-                "",
-            ),
-        }
+        content = await _locale_content(serial, requested, booted_with)
+        return {"error": None, "content": content}
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.session.apply_locale failed")
         return {"error": str(exc), "content": None}
+
+
+async def _locale_content(serial: str, requested: str, booted_with: str) -> dict:
+    """The language record for one ``apply_locale`` call (may raise)."""
+    wanted = str(requested or "").strip()
+    seen = await adb.runtime_locale(serial)
+    if seen.get("error"):
+        return _locale_body(
+            wanted, "", "", LOCALE_FROM_DEVICE, str(seen["error"])[:200]
+        )
+    actual = str(seen.get("content") or "")
+    if not wanted:
+        return _locale_body("", actual, "", LOCALE_FROM_DEVICE, "")
+    source = (
+        LOCALE_FROM_BOOT
+        if str(booted_with or "").strip() == wanted
+        else LOCALE_FROM_SETPROP
+    )
+    if _same_language(actual, wanted):
+        persisted = await adb.persisted_locale(serial)
+        saved = "" if persisted.get("error") else str(persisted.get("content") or "")
+        return _locale_body(wanted, actual, saved, source, "")
+    return await _locale_changed(serial, wanted, actual, source)
+
+
+async def _locale_changed(serial: str, wanted: str, actual: str, source: str) -> dict:
+    """Write *wanted* to the device and report what it says afterwards."""
+    changed = await adb.set_locale(serial, wanted)
+    if changed.get("error"):
+        return _locale_body(wanted, actual, "", source, str(changed["error"])[:200])
+    body = changed.get("content") or {}
+    return _locale_body(
+        wanted,
+        str(body.get("runtime") or ""),
+        str(body.get("persisted") or ""),
+        source,
+        "",
+    )
 
 
 def locale_phrase(resolved: object) -> str:
@@ -2133,117 +2198,146 @@ async def next_packet(
         body = resolved["content"] or {}
         ctx = context_for(body)
         if str(body.get("lane")) == LANE_EXPLORE:
-            state = body.get("explore") or {}
-            if budget is not None and _in_reserve(budget):
-                # Checked BEFORE the turn, never during: a turn dumps the screen
-                # and writes state, and abandoning one half-done is worse than
-                # answering with a pointer. The reserved tail is spent on ONE
-                # best-effort capture instead of returning bare -- see
-                # _final_packet.
-                # Always attempt the capture: _final_packet self-guards with
-                # asyncio.wait_for(..., timeout=max(0.0, remaining())), so an
-                # already-expired budget degrades to None on its own instead
-                # of skipping the attempt outright.
-                return _busy(body, "", packet=await _final_packet(ctx, budget))
-            turn = await explore_runner.next_turn(run_id, state, ctx)
-            if turn.get("error"):
-                return turn
-            content = turn.get("content") or {}
-            running = str(content.get("status") or "") == explore_runner.RUNNING
-            if running:
-                # WHEN THIS TURN BEGAN, in the same unit the suite lane uses for
-                # a case. The checkpoint is written when the turn ENDS, so
-                # without this the only instant it knows is the end and its
-                # evidence window collapses to the pad around it.
-                began = dict(content.get("state") or {})
-                began["turn_started"] = time.time()
-                content["state"] = began
-            # The wire, for this turn. Started HERE, at the packet build, for
-            # the same reason the suite lane starts it before its launch: the
-            # capture has to cover what the turn is about to do. A stopped
-            # session, a physical device or a flag that is off all land as a
-            # record which SAYS so, and none of them can block a turn.
-            # The budget is re-read HERE and not only before the turn: the
-            # capture adds two device round trips AFTER the only earlier check,
-            # and on a slow emulator that is what pushes the packet build past
-            # the client's timeout. Losing the capture costs a section that
-            # says why; losing the call costs the turn.
-            if running and not (budget is not None and budget.expired()):
-                content["state"] = await _explore_begin_network(
-                    run_id, content.get("state"), ctx
-                )
-            elif not running:
-                # The session has STOPPED. Any capture a previous packet build
-                # started is now never going to be read, so it is stopped and
-                # its file deleted here rather than left recording the tester's
-                # device until something else displaces it.
-                content["state"] = await _explore_abort_network(
-                    run_id, content.get("state"), ctx
-                )
-            _persist_explore(run_id, content.get("state"))
-            return {
-                "error": None,
-                "content": {
-                    "state": STATE_RUNNING if running else STATE_REPORT,
-                    "packet": content.get("packet"),
-                    "tc_id": "",
-                    "status": str(content.get("status") or ""),
-                    "resolved": body,
-                },
-            }
-        if body.get("finished"):
-            await _finish_evidence(run_id, body)
-            return {
-                "error": None,
-                "content": {
-                    "state": STATE_REPORT,
-                    "packet": None,
-                    "tc_id": "",
-                    "resolved": body,
-                },
-            }
-        if body.get("gate") and not past_gate:
-            return {
-                "error": None,
-                "content": {
-                    "state": STATE_GATE,
-                    "packet": None,
-                    "tc_id": str(body.get("next_tc_id") or ""),
-                    "resolved": body,
-                },
-            }
-        loaded = load_case(run_id, str(body.get("next_tc_id") or ""))
-        if loaded.get("error"):
-            return loaded
-        if budget is not None and _in_reserve(budget):
-            # start_case force-stops the app, relaunches it and dumps the screen.
-            # With the budget gone that work would land after the client has
-            # already given up on the call, so nothing is started at all. The
-            # reserved tail is spent on ONE best-effort capture instead -- see
-            # _final_packet.
-            # Always attempt the capture -- see the matching comment in the
-            # explore-lane busy branch above.
-            return _busy(
-                body,
-                str(body.get("next_tc_id") or ""),
-                packet=await _final_packet(ctx, budget),
-            )
-        started = await case_runner.start_case(run_id, loaded["content"], ctx)
-        if started.get("error"):
-            return started
-        content = started.get("content") or {}
-        return {
-            "error": None,
-            "content": {
-                "state": STATE_RUNNING,
-                "packet": content.get("packet"),
-                "tc_id": str(content.get("tc_id") or ""),
-                "resolved": body,
-            },
-        }
+            return await _next_explore_packet(run_id, body, ctx, budget)
+        return await _next_suite_packet(run_id, body, ctx, past_gate, budget)
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.session.next_packet failed")
         return {"error": str(exc), "content": None}
+
+
+async def _next_explore_packet(
+    run_id: str, body: dict, ctx: executor.Context, budget: Budget | None
+) -> dict:
+    """The explore lane's next packet (one turn), or its busy/report answer."""
+    state = body.get("explore") or {}
+    if budget is not None and _in_reserve(budget):
+        # Checked BEFORE the turn, never during: a turn dumps the screen
+        # and writes state, and abandoning one half-done is worse than
+        # answering with a pointer. The reserved tail is spent on ONE
+        # best-effort capture instead of returning bare -- see
+        # _final_packet.
+        # Always attempt the capture: _final_packet self-guards with
+        # asyncio.wait_for(..., timeout=max(0.0, remaining())), so an
+        # already-expired budget degrades to None on its own instead
+        # of skipping the attempt outright.
+        return _busy(body, "", packet=await _final_packet(ctx, budget))
+    turn = await explore_runner.next_turn(run_id, state, ctx)
+    if turn.get("error"):
+        return turn
+    content = turn.get("content") or {}
+    running = str(content.get("status") or "") == explore_runner.RUNNING
+    if running:
+        # WHEN THIS TURN BEGAN, in the same unit the suite lane uses for
+        # a case. The checkpoint is written when the turn ENDS, so
+        # without this the only instant it knows is the end and its
+        # evidence window collapses to the pad around it.
+        began = dict(content.get("state") or {})
+        began["turn_started"] = time.time()
+        content["state"] = began
+    content["state"] = await _explore_turn_network(
+        run_id, content, ctx, running=running, budget=budget
+    )
+    _persist_explore(run_id, content.get("state"))
+    return {
+        "error": None,
+        "content": {
+            "state": STATE_RUNNING if running else STATE_REPORT,
+            "packet": content.get("packet"),
+            "tc_id": "",
+            "status": str(content.get("status") or ""),
+            "resolved": body,
+        },
+    }
+
+
+async def _explore_turn_network(
+    run_id: str,
+    content: dict,
+    ctx: executor.Context,
+    *,
+    running: bool,
+    budget: Budget | None,
+) -> object:
+    """The turn's state after starting (or, once stopped, aborting) its capture."""
+    # The wire, for this turn. Started HERE, at the packet build, for
+    # the same reason the suite lane starts it before its launch: the
+    # capture has to cover what the turn is about to do. A stopped
+    # session, a physical device or a flag that is off all land as a
+    # record which SAYS so, and none of them can block a turn.
+    # The budget is re-read HERE and not only before the turn: the
+    # capture adds two device round trips AFTER the only earlier check,
+    # and on a slow emulator that is what pushes the packet build past
+    # the client's timeout. Losing the capture costs a section that
+    # says why; losing the call costs the turn.
+    if running and not (budget is not None and budget.expired()):
+        return await _explore_begin_network(run_id, content.get("state"), ctx)
+    if not running:
+        # The session has STOPPED. Any capture a previous packet build
+        # started is now never going to be read, so it is stopped and
+        # its file deleted here rather than left recording the tester's
+        # device until something else displaces it.
+        return await _explore_abort_network(run_id, content.get("state"), ctx)
+    return content.get("state")
+
+
+async def _next_suite_packet(
+    run_id: str,
+    body: dict,
+    ctx: executor.Context,
+    past_gate: bool,
+    budget: Budget | None,
+) -> dict:
+    """The suite lane's next packet: report, gate, busy or a started case."""
+    if body.get("finished"):
+        await _finish_evidence(run_id, body)
+        return {
+            "error": None,
+            "content": {
+                "state": STATE_REPORT,
+                "packet": None,
+                "tc_id": "",
+                "resolved": body,
+            },
+        }
+    if body.get("gate") and not past_gate:
+        return {
+            "error": None,
+            "content": {
+                "state": STATE_GATE,
+                "packet": None,
+                "tc_id": str(body.get("next_tc_id") or ""),
+                "resolved": body,
+            },
+        }
+    loaded = load_case(run_id, str(body.get("next_tc_id") or ""))
+    if loaded.get("error"):
+        return loaded
+    if budget is not None and _in_reserve(budget):
+        # start_case force-stops the app, relaunches it and dumps the screen.
+        # With the budget gone that work would land after the client has
+        # already given up on the call, so nothing is started at all. The
+        # reserved tail is spent on ONE best-effort capture instead -- see
+        # _final_packet.
+        # Always attempt the capture -- see the matching comment in the
+        # explore-lane busy branch above.
+        return _busy(
+            body,
+            str(body.get("next_tc_id") or ""),
+            packet=await _final_packet(ctx, budget),
+        )
+    started = await case_runner.start_case(run_id, loaded["content"], ctx)
+    if started.get("error"):
+        return started
+    content = started.get("content") or {}
+    return {
+        "error": None,
+        "content": {
+            "state": STATE_RUNNING,
+            "packet": content.get("packet"),
+            "tc_id": str(content.get("tc_id") or ""),
+            "resolved": body,
+        },
+    }
 
 
 async def _finish_evidence(run_id: str, resolved: object) -> None:
@@ -2592,57 +2686,78 @@ def _checkpoint_explore_turn(
     tc_id = explore_turn_tc_id(turn)
     goal = " ".join(str(body.get("goal") or "").split())[:200] or "no goal recorded"
     now = time.time()
-    # The window this case's evidence is joined on is ``[started, updated]``.
-    # ``started`` is when the PACKET was built, not when this record is written,
-    # or the window is the pad around a single instant at the end of the turn
-    # and everything the app did during it falls outside.
-    began = body.get("turn_started")
-    if not isinstance(began, (int, float)) or isinstance(began, bool) or began <= 0:
-        began = now
+    began = _turn_began(body, now)
     written = {
         "tc_id": tc_id,
         "title": (EXPLORE_TITLE_PREFIX + str(turn) + " \u2014 " + goal)[:250],
-        "verdict": str(verdict or ""),
-        "status": str(result.get("status") or ""),
-        "reason": str(result.get("reason") or "")[:1200],
-        "trace": list(result.get("trace") or []),
+        **_explore_result_fields(result, verdict),
         "escapes": 0,
-        # Same fingerprint shape `case_runner._checkpoint` writes, from the
-        # SAME per-submit `result` this turn's own replay returned -- so an
-        # explore-lane confirm binds to the op THIS run's last turn stopped
-        # on, exactly like the scripted lane's `_consume_confirm`. Not
-        # carried forward from a prior turn's checkpoint, for the same
-        # reason `case_runner._checkpoint` does not carry it forward either.
-        "guard_stop": {
-            "term": str(result.get("guard_term") or "")[:80],
-            "op": str(result.get("guard_op") or "")[:40],
-            "node": str(result.get("guard_node") or "")[
-                : executor.MAX_GUARD_NODE_CHARS
-            ],
-        },
+        "guard_stop": _explore_guard_stop(result),
         "finding": " ".join(str(finding or "").split())[:600],
         "started": min(began, now),
         "updated": now,
-        # Shaped like `case_runner._evidence_record`'s output so the report's
-        # evidence join reads a record rather than a missing key.
-        "evidence": {
-            "profile": None,
-            "clock_offset_ms": None,
-            "pid": None,
-            "skipped": "an exploratory turn takes no app-log slice",
-            "slices": 0,
-            "slices_written": [],
-            # The app LOG is not captured for an exploratory turn; the WIRE is.
-            # Two different questions, so two keys and two answers -- the
-            # skipped line above is about the log alone.
-            "network": case_runner.network_record(network),
-        },
+        "evidence": _explore_turn_evidence(network),
     }
     try:
         run_store.write_case(run_id, tc_id, written)
     except Exception:  # pragma: no cover - defensive
         logger.warning("mobile.session: could not checkpoint an explore turn")
     return written
+
+
+def _turn_began(body: dict, now: float) -> float:
+    """When this turn's packet was built, or *now* when the record has no start."""
+    # The window this case's evidence is joined on is ``[started, updated]``.
+    # ``started`` is when the PACKET was built, not when this record is written,
+    # or the window is the pad around a single instant at the end of the turn
+    # and everything the app did during it falls outside.
+    began = body.get("turn_started")
+    if not isinstance(began, (int, float)) or isinstance(began, bool) or began <= 0:
+        return now
+    return began
+
+
+def _explore_result_fields(result: dict, verdict: str) -> dict:
+    """The verdict, status, reason and trace of one turn's replay result."""
+    return {
+        "verdict": str(verdict or ""),
+        "status": str(result.get("status") or ""),
+        "reason": str(result.get("reason") or "")[:1200],
+        "trace": list(result.get("trace") or []),
+    }
+
+
+def _explore_guard_stop(result: dict) -> dict:
+    """The guard fingerprint a later explore-lane confirm binds to."""
+    # Same fingerprint shape `case_runner._checkpoint` writes, from the
+    # SAME per-submit `result` this turn's own replay returned -- so an
+    # explore-lane confirm binds to the op THIS run's last turn stopped
+    # on, exactly like the scripted lane's `_consume_confirm`. Not
+    # carried forward from a prior turn's checkpoint, for the same
+    # reason `case_runner._checkpoint` does not carry it forward either.
+    return {
+        "term": str(result.get("guard_term") or "")[:80],
+        "op": str(result.get("guard_op") or "")[:40],
+        "node": str(result.get("guard_node") or "")[: executor.MAX_GUARD_NODE_CHARS],
+    }
+
+
+def _explore_turn_evidence(network: object) -> dict:
+    """An evidence record shaped like ``case_runner._evidence_record``'s output."""
+    # Shaped like `case_runner._evidence_record`'s output so the report's
+    # evidence join reads a record rather than a missing key.
+    return {
+        "profile": None,
+        "clock_offset_ms": None,
+        "pid": None,
+        "skipped": "an exploratory turn takes no app-log slice",
+        "slices": 0,
+        "slices_written": [],
+        # The app LOG is not captured for an exploratory turn; the WIRE is.
+        # Two different questions, so two keys and two answers -- the
+        # skipped line above is about the log alone.
+        "network": case_runner.network_record(network),
+    }
 
 
 async def _explore_begin_network(
@@ -2874,17 +2989,7 @@ async def submit(
         lock_reaper.touch_activity(run_id)
         body = resolved["content"] or {}
         ctx = context_for(body)
-        if budget is not None:
-            # Caps THIS submit's replay so PACKET_RESERVE_S is still there for
-            # next_packet afterward -- without this, a slow action can spend
-            # the whole call budget on the replay and next_packet's busy
-            # reply is left with nothing to build a packet from. Never above
-            # SUBMIT_BUDGET_S: that constant is unchanged and still the
-            # ceiling.
-            ctx.budget_s = max(
-                1.0,
-                min(executor.SUBMIT_BUDGET_S, budget.remaining() - PACKET_RESERVE_S),
-            )
+        _cap_submit_budget(ctx, budget)
         field = str(tester_input_field or "").strip()[:80]
         try:
             merged_inputs = _merge_tester_inputs(
@@ -2892,21 +2997,7 @@ async def submit(
             )
         except ValueError as exc:
             return {"error": str(exc), "content": None}
-        # HELD FOR THE RUN (fix round 3, item 1). On the Air run the tester
-        # gave the login fields once and was asked again on five of eight
-        # turns, because a value lived on the Context for ONE call. It is now
-        # held in process memory by `held_inputs` -- never on disk, and never
-        # in this module, which keeps no state in memory -- and every later
-        # submit of the same run carries it, so `ask_tester` finds it already
-        # supplied. A value given on THIS call wins over a held one. The hold
-        # is dropped when the SUBMIT ITSELF reaches the report (both lanes,
-        # below); any other way a run ends relies on the sliding TTL.
-        from tools.mobile import held_inputs
-
-        held_inputs.remember(run_id, merged_inputs)
-        carried = held_inputs.recall(run_id)
-        if carried or merged_inputs:
-            ctx.tester_inputs = dict(carried, **dict(merged_inputs or {}))
+        _hold_tester_inputs(run_id, ctx, merged_inputs)
         ctx.confirm_destructive = bool(confirm_destructive)
         # S10 saved route (PROVISIONAL): empty unless the wrapper is replaying a route.
         ctx.route_expect = (
@@ -2915,52 +3006,108 @@ async def submit(
             else ()
         )
         if str(body.get("lane")) == LANE_EXPLORE:
-            explored = await _submit_explore(run_id, raw_script, ctx, body)
-            content = explored.get("content") if isinstance(explored, dict) else None
-            if isinstance(content, dict) and content.get("state") == STATE_REPORT:
-                held_inputs.forget(run_id)
-            return explored
-        # Scoped to THIS tc_id, not a run-wide scan -- see `_prior_guard_stop`.
-        ctx.prior_guard_stop = _prior_guard_stop(run_id, tc_id)
-        loaded = load_case(run_id, tc_id)
-        if loaded.get("error"):
-            return loaded
-        result = await case_runner.submit_case(
-            run_id, loaded["content"], ctx, raw_script
-        )
-        if result.get("error"):
-            return result
-        content = dict(result.get("content") or {})
-        follow = (scheduler.next_case(run_id) or {}).get("content") or {}
-        state = (
-            STATE_RUNNING
-            if content.get("packet")
-            else (
-                STATE_REPORT
-                if follow.get("finished")
-                else STATE_GATE
-                if follow.get("gate")
-                else STATE_RUNNING
-            )
-        )
-        if state == STATE_REPORT:
-            await _finish_evidence(run_id, body)
-            held_inputs.forget(run_id)
-        return {
-            "error": None,
-            "content": {
-                "state": state,
-                "case": content,
-                "packet": content.get("packet"),
-                "next": follow,
-                "field": field,
-                "resolved": body,
-                "notice": _single_action_notice(raw_script),
-            },
-        }
+            return await _submit_explore_held(run_id, raw_script, ctx, body)
+        return await _submit_suite(run_id, tc_id, raw_script, ctx, body, field)
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.session.submit failed")
         return {"error": str(exc), "content": None}
+
+
+def _cap_submit_budget(ctx: executor.Context, budget: object) -> None:
+    """Cap this submit's replay budget so ``PACKET_RESERVE_S`` is left over."""
+    if budget is None:
+        return
+    # Caps THIS submit's replay so PACKET_RESERVE_S is still there for
+    # next_packet afterward -- without this, a slow action can spend
+    # the whole call budget on the replay and next_packet's busy
+    # reply is left with nothing to build a packet from. Never above
+    # SUBMIT_BUDGET_S: that constant is unchanged and still the
+    # ceiling.
+    ctx.budget_s = max(
+        1.0,
+        min(executor.SUBMIT_BUDGET_S, budget.remaining() - PACKET_RESERVE_S),
+    )
+
+
+def _hold_tester_inputs(run_id: str, ctx: executor.Context, merged: object) -> None:
+    """Remember this call's inputs for the run and put every held one on *ctx*."""
+    # HELD FOR THE RUN (fix round 3, item 1). On the Air run the tester
+    # gave the login fields once and was asked again on five of eight
+    # turns, because a value lived on the Context for ONE call. It is now
+    # held in process memory by `held_inputs` -- never on disk, and never
+    # in this module, which keeps no state in memory -- and every later
+    # submit of the same run carries it, so `ask_tester` finds it already
+    # supplied. A value given on THIS call wins over a held one. The hold
+    # is dropped when the SUBMIT ITSELF reaches the report (both lanes,
+    # below); any other way a run ends relies on the sliding TTL.
+    from tools.mobile import held_inputs
+
+    held_inputs.remember(run_id, merged)
+    carried = held_inputs.recall(run_id)
+    if carried or merged:
+        ctx.tester_inputs = dict(carried, **dict(merged or {}))
+
+
+async def _submit_explore_held(
+    run_id: str, raw_script: object, ctx: executor.Context, body: dict
+) -> dict:
+    """Submit on the explore lane; drop the held inputs once it reports."""
+    from tools.mobile import held_inputs
+
+    explored = await _submit_explore(run_id, raw_script, ctx, body)
+    content = explored.get("content") if isinstance(explored, dict) else None
+    if isinstance(content, dict) and content.get("state") == STATE_REPORT:
+        held_inputs.forget(run_id)
+    return explored
+
+
+async def _submit_suite(
+    run_id: str,
+    tc_id: str,
+    raw_script: object,
+    ctx: executor.Context,
+    body: dict,
+    field: str,
+) -> dict:
+    """Replay one suite-lane answer and build the verdict plus next-step reply."""
+    from tools.mobile import held_inputs
+
+    # Scoped to THIS tc_id, not a run-wide scan -- see `_prior_guard_stop`.
+    ctx.prior_guard_stop = _prior_guard_stop(run_id, tc_id)
+    loaded = load_case(run_id, tc_id)
+    if loaded.get("error"):
+        return loaded
+    result = await case_runner.submit_case(run_id, loaded["content"], ctx, raw_script)
+    if result.get("error"):
+        return result
+    content = dict(result.get("content") or {})
+    follow = (scheduler.next_case(run_id) or {}).get("content") or {}
+    state = (
+        STATE_RUNNING
+        if content.get("packet")
+        else (
+            STATE_REPORT
+            if follow.get("finished")
+            else STATE_GATE
+            if follow.get("gate")
+            else STATE_RUNNING
+        )
+    )
+    if state == STATE_REPORT:
+        await _finish_evidence(run_id, body)
+        held_inputs.forget(run_id)
+    return {
+        "error": None,
+        "content": {
+            "state": state,
+            "case": content,
+            "packet": content.get("packet"),
+            "next": follow,
+            "field": field,
+            "resolved": body,
+            "notice": _single_action_notice(raw_script),
+        },
+    }
 
 
 def _explore_needs_model(reason: str, resolved: dict) -> dict:

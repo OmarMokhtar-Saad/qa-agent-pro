@@ -430,38 +430,43 @@ def _manifest_binding_ok(new_tree: Path) -> bool:
                 return False
             # Legacy unsigned, manifest-less release: preserve current behavior.
             return True
-        mismatched = verify_integrity(new_tree)
-        if mismatched:
-            logger.warning(
-                "ABORTING: release tree does not match its %s (%d file(s) differ, "
-                "e.g. %s) -- refusing to install unverified bytes.",
-                _MANIFEST_NAME,
-                len(mismatched),
-                mismatched[:5],
-            )
-            return False
-        listed = set(load_manifest(new_tree).keys())
-        unlisted = [
-            rel
-            for rel in _swap_candidate_files(new_tree)
-            if rel not in listed and rel not in _MANIFEST_UNLISTED_OK
-        ]
-        if unlisted:
-            logger.warning(
-                "ABORTING: release tree carries %d file(s) absent from %s "
-                "(e.g. %s) -- refusing to install unlisted code.",
-                len(unlisted),
-                _MANIFEST_NAME,
-                unlisted[:5],
-            )
-            return False
-        return True
+        return _tree_matches_manifest(new_tree)
     except Exception:
         logger.warning(
             "manifest-binding check failed -- refusing the swap (fail-closed).",
             exc_info=True,
         )
         return False
+
+
+def _tree_matches_manifest(new_tree: Path) -> bool:
+    """True when every listed file matches and no swap file is unlisted."""
+    mismatched = verify_integrity(new_tree)
+    if mismatched:
+        logger.warning(
+            "ABORTING: release tree does not match its %s (%d file(s) differ, "
+            "e.g. %s) -- refusing to install unverified bytes.",
+            _MANIFEST_NAME,
+            len(mismatched),
+            mismatched[:5],
+        )
+        return False
+    listed = set(load_manifest(new_tree).keys())
+    unlisted = [
+        rel
+        for rel in _swap_candidate_files(new_tree)
+        if rel not in listed and rel not in _MANIFEST_UNLISTED_OK
+    ]
+    if unlisted:
+        logger.warning(
+            "ABORTING: release tree carries %d file(s) absent from %s "
+            "(e.g. %s) -- refusing to install unlisted code.",
+            len(unlisted),
+            _MANIFEST_NAME,
+            unlisted[:5],
+        )
+        return False
+    return True
 
 
 def _check_embedded_pubkey() -> None:
@@ -956,6 +961,105 @@ def _held_too_long(lock_path: Path) -> float:
         return 0.0
 
 
+def _open_lock_fd(lock_path: Path, install_dir: Path) -> Optional[int]:
+    """Open (creating) the lock file; ``None`` after a warning if that fails.
+
+    A descriptor opened before a later step fails is closed here, so the
+    caller never holds one it was not handed."""
+    fd = None
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        # The region msvcrt will lock has to exist, and an empty file has
+        # no byte 0. Written BEFORE the lock and overwritten after it, so
+        # the identity in the file is always the winner's.
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b"\0")
+    except OSError as exc:
+        logger.warning(
+            "tools.updater: could not open an update lock in %s (%s); "
+            "skipping this pass.",
+            install_dir,
+            exc,
+        )
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        return None
+    return fd
+
+
+def _log_lock_contention(lock_path: Path, install_dir: Path) -> None:
+    """Report that another process holds the lock (a critical line if wedged)."""
+    held = _held_too_long(lock_path)
+    if held > HELD_TOO_LONG_S:
+        # NOT a force-release: breaking a lock whose holder may be
+        # mid-swap is the concurrent overlay this exists to prevent,
+        # and "is the holder wedged" is the same liveness question the
+        # file has already proved it cannot answer. So this reports,
+        # and a human decides.
+        logger.critical(
+            "tools.updater: the update lock in %s has been held for "
+            "%.0fs (%s). This install has stopped updating; check "
+            "whether that process is wedged.",
+            install_dir,
+            held,
+            _lock_holder_note(lock_path),
+        )
+    else:
+        logger.info(
+            "tools.updater: another process is applying an update to "
+            "%s (%s); skipping this pass.",
+            install_dir,
+            _lock_holder_note(lock_path),
+        )
+
+
+def _stamp_lock(fd: int) -> None:
+    """Ours. Record who we are, for the log line in some OTHER process --
+    never for a decision here."""
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        stamp = str(os.getpid()) + ":" + secrets.token_hex(8) + " " + str(time.time())
+        os.write(fd, stamp.encode("utf-8"))
+    except OSError:
+        logger.debug("tools.updater: could not stamp the update lock")
+
+
+def _warn_lock_is_dir(lock_path: Path) -> None:
+    logger.warning(
+        "tools.updater: %s is a DIRECTORY, so no update can take the lock. "
+        "Remove it to let updates resume.",
+        lock_path,
+    )
+
+
+def _try_os_lock(fd: int) -> Optional[bool]:
+    """``_os_lock`` result, or ``None`` (warned) where locking is unsupported."""
+    try:
+        return _os_lock(fd)
+    except LockUnsupported as exc:  # pragma: no cover - unreachable on CPython
+        # FAIL CLOSED. A skipped update costs one poll interval; a
+        # concurrent overlay corrupts the install tree.
+        logger.warning(
+            "tools.updater: no OS file locking on this platform (%s), so an "
+            "update cannot be serialised; skipping this pass.",
+            exc,
+        )
+        return None
+
+
+def _release_lock_fd(fd: int, locked: bool) -> None:
+    if locked:
+        _os_unlock(fd)
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
 @contextlib.contextmanager
 def _update_lock(install_dir: Path):
     """Serialise ``apply_update`` ACROSS PROCESSES with an OS lock.
@@ -977,95 +1081,27 @@ def _update_lock(install_dir: Path):
     """
     lock_path = install_dir / _UPDATE_LOCK_FILE
     if lock_path.is_dir():
-        logger.warning(
-            "tools.updater: %s is a DIRECTORY, so no update can take the lock. "
-            "Remove it to let updates resume.",
-            lock_path,
-        )
+        _warn_lock_is_dir(lock_path)
         yield False
         return
     fd = None
     locked = False
     try:
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-            # The region msvcrt will lock has to exist, and an empty file has
-            # no byte 0. Written BEFORE the lock and overwritten after it, so
-            # the identity in the file is always the winner's.
-            if os.fstat(fd).st_size == 0:
-                os.write(fd, b"\0")
-        except OSError as exc:
-            logger.warning(
-                "tools.updater: could not open an update lock in %s (%s); "
-                "skipping this pass.",
-                install_dir,
-                exc,
-            )
+        fd = _open_lock_fd(lock_path, install_dir)
+        if fd is None:
             yield False
             return
-        try:
-            locked = _os_lock(fd)
-        except LockUnsupported as exc:  # pragma: no cover - unreachable on CPython
-            # FAIL CLOSED. A skipped update costs one poll interval; a
-            # concurrent overlay corrupts the install tree.
-            logger.warning(
-                "tools.updater: no OS file locking on this platform (%s), so an "
-                "update cannot be serialised; skipping this pass.",
-                exc,
-            )
-            yield False
-            return
+        locked = _try_os_lock(fd)
         if not locked:
-            held = _held_too_long(lock_path)
-            if held > HELD_TOO_LONG_S:
-                # NOT a force-release: breaking a lock whose holder may be
-                # mid-swap is the concurrent overlay this exists to prevent,
-                # and "is the holder wedged" is the same liveness question the
-                # file has already proved it cannot answer. So this reports,
-                # and a human decides.
-                logger.critical(
-                    "tools.updater: the update lock in %s has been held for "
-                    "%.0fs (%s). This install has stopped updating; check "
-                    "whether that process is wedged.",
-                    install_dir,
-                    held,
-                    _lock_holder_note(lock_path),
-                )
-            else:
-                logger.info(
-                    "tools.updater: another process is applying an update to "
-                    "%s (%s); skipping this pass.",
-                    install_dir,
-                    _lock_holder_note(lock_path),
-                )
+            if locked is not None:
+                _log_lock_contention(lock_path, install_dir)
             yield False
             return
-        # Ours. Record who we are, for the log line above in some OTHER
-        # process -- never for a decision here.
-        try:
-            os.lseek(fd, 0, os.SEEK_SET)
-            os.ftruncate(fd, 0)
-            os.write(
-                fd,
-                (
-                    str(os.getpid())
-                    + ":"
-                    + secrets.token_hex(8)
-                    + " "
-                    + str(time.time())
-                ).encode("utf-8"),
-            )
-        except OSError:
-            logger.debug("tools.updater: could not stamp the update lock")
+        _stamp_lock(fd)
         yield True
     finally:
         if fd is not None:
-            if locked:
-                _os_unlock(fd)
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            _release_lock_fd(fd, bool(locked))
 
 
 def apply_update_locked(
@@ -1090,6 +1126,102 @@ def apply_update_locked(
         return apply_update(new_tree, install_dir, version=version)
 
 
+def _plan_release_files(new_tree: Path) -> list:
+    """(source, relative posix path) for every file the swap may install."""
+    plan = []
+    for src in sorted(new_tree.rglob("*")):
+        if not src.is_file():
+            continue
+        rel = src.relative_to(new_tree).as_posix()
+        if _is_protected(rel) or _is_derived_artifact(rel):
+            continue
+        plan.append((src, rel))
+    return plan
+
+
+def _prune_files(
+    prunable: list, install_dir: Path, backup_dir: Path, pruned: list
+) -> None:
+    """Back up and delete each prunable file, appending to *pruned* in place
+    (so a rollback sees partial progress). One un-deletable orphan is logged
+    and skipped."""
+    for rel in prunable:
+        dest = install_dir / rel
+        try:
+            bdest = backup_dir / rel
+            bdest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(dest, bdest)
+            _make_writable(dest)
+            dest.unlink()
+        except OSError as exc:
+            logger.warning("Could not prune %s (%s).", rel, exc)
+            continue
+        pruned.append(rel)
+
+
+def _overlay_files(
+    plan: list,
+    install_dir: Path,
+    backup_dir: Path,
+    overwritten: list,
+    created: list,
+) -> None:
+    """Copy each planned file into the install, backing up replaced ones and
+    recording into *overwritten* / *created* in place (for rollback)."""
+    for src, rel in plan:
+        dest = install_dir / rel
+        if dest.exists():
+            bdest = backup_dir / rel
+            bdest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(dest, bdest)
+            overwritten.append(rel)
+        else:
+            created.append(rel)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _make_writable(dest)
+        shutil.copy2(src, dest)
+        if rel.endswith(".sh"):
+            # RETAINED, and not redundant now that _safe_extract_zip
+            # restores modes. That restore can only replay bits the archive
+            # CARRIED: a zip built on Windows has create_system != 3 and no
+            # POSIX bits at all, so `external_attr >> 16` is 0 and there is
+            # nothing to put back. This suffix rule is the only thing
+            # covering that case, and without it a shell script would land
+            # non-executable for the window between this copy and the later
+            # lock_files() pass (which only runs after _pip_install() /
+            # migrate_env() finish) -- long enough for a client's spawn
+            # attempt to hit EACCES.
+            st_mode = os.stat(dest).st_mode
+            os.chmod(dest, st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _prunable_for_tree(
+    new_tree: Path, plan: list, old_manifest: dict, install_dir: Path
+) -> list:
+    """The paths to prune, but ONLY against a release tree with its own manifest.
+
+    `new_rels` is the evidence that decides what gets DELETED, so an
+    incomplete or mis-rooted `new_tree` does not merely under-copy, it
+    over-deletes: every path in the old manifest that the tree happens
+    not to contain satisfies all three of _prunable's conditions.
+    _manifest_binding_ok has exactly ONE permissive branch -- a tree with
+    no MANIFEST.sha256, waved through to "preserve current behavior" --
+    and that permission was written when the current behaviour was a pure
+    OVERLAY, which is non-destructive by construction. Prune changes what
+    it grants, so it does not inherit it. Note the two hazards coincide:
+    download_and_extract picks its root by counting DIRECTORIES only, so
+    a mis-rooted tree also has no manifest at its root and is caught here."""
+    if not (new_tree / _MANIFEST_NAME).is_file():
+        logger.warning(
+            "Release tree has no %s -- skipping the prune pass (the copy "
+            "still runs). Nothing is deleted on an unvalidated tree.",
+            _MANIFEST_NAME,
+        )
+        return []
+    new_rels = {rel for _src, rel in plan}
+    return _prunable(old_manifest, new_rels, install_dir, load_removed_paths(new_tree))
+
+
 def apply_update(new_tree: Path, install_dir: Path, version: str = "update") -> Path:
     """Swap the new release tree into the install, skipping every protected
     path. PRUNES files a previous release installed that this one dropped (see
@@ -1106,84 +1238,15 @@ def apply_update(new_tree: Path, install_dir: Path, version: str = "update") -> 
     # only record of what this updater put on disk.
     old_manifest = load_manifest(install_dir)
     try:
-        plan = []
-        for src in sorted(new_tree.rglob("*")):
-            if not src.is_file():
-                continue
-            rel = src.relative_to(new_tree).as_posix()
-            if _is_protected(rel) or _is_derived_artifact(rel):
-                continue
-            plan.append((src, rel))
+        plan = _plan_release_files(new_tree)
         # PRUNE FIRST, so a failure anywhere in the copy below rolls the
         # deletions back along with everything else -- a half-swapped install
         # must not also be missing modules. Each deletion is individually
         # guarded: one un-deletable orphan is logged and skipped, never allowed
         # to fail an otherwise good update.
-        #
-        # ...but ONLY against a release tree that carries its own manifest.
-        # `new_rels` is the evidence that decides what gets DELETED, so an
-        # incomplete or mis-rooted `new_tree` does not merely under-copy, it
-        # over-deletes: every path in the old manifest that the tree happens
-        # not to contain satisfies all three of _prunable's conditions.
-        # _manifest_binding_ok has exactly ONE permissive branch -- a tree with
-        # no MANIFEST.sha256, waved through to "preserve current behavior" --
-        # and that permission was written when the current behaviour was a pure
-        # OVERLAY, which is non-destructive by construction. Prune changes what
-        # it grants, so it does not inherit it. Note the two hazards coincide:
-        # download_and_extract picks its root by counting DIRECTORIES only, so
-        # a mis-rooted tree also has no manifest at its root and is caught here.
-        new_rels = {rel for _src, rel in plan}
-        if not (new_tree / _MANIFEST_NAME).is_file():
-            logger.warning(
-                "Release tree has no %s -- skipping the prune pass (the copy "
-                "still runs). Nothing is deleted on an unvalidated tree.",
-                _MANIFEST_NAME,
-            )
-            prunable: list = []
-        else:
-            prunable = _prunable(
-                old_manifest,
-                new_rels,
-                install_dir,
-                load_removed_paths(new_tree),
-            )
-        for rel in prunable:
-            dest = install_dir / rel
-            try:
-                bdest = backup_dir / rel
-                bdest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(dest, bdest)
-                _make_writable(dest)
-                dest.unlink()
-            except OSError as exc:
-                logger.warning("Could not prune %s (%s).", rel, exc)
-                continue
-            pruned.append(rel)
-        for src, rel in plan:
-            dest = install_dir / rel
-            if dest.exists():
-                bdest = backup_dir / rel
-                bdest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(dest, bdest)
-                overwritten.append(rel)
-            else:
-                created.append(rel)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            _make_writable(dest)
-            shutil.copy2(src, dest)
-            if rel.endswith(".sh"):
-                # RETAINED, and not redundant now that _safe_extract_zip
-                # restores modes. That restore can only replay bits the archive
-                # CARRIED: a zip built on Windows has create_system != 3 and no
-                # POSIX bits at all, so `external_attr >> 16` is 0 and there is
-                # nothing to put back. This suffix rule is the only thing
-                # covering that case, and without it a shell script would land
-                # non-executable for the window between this copy and the later
-                # lock_files() pass (which only runs after _pip_install() /
-                # migrate_env() finish) -- long enough for a client's spawn
-                # attempt to hit EACCES.
-                st_mode = os.stat(dest).st_mode
-                os.chmod(dest, st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        prunable = _prunable_for_tree(new_tree, plan, old_manifest, install_dir)
+        _prune_files(prunable, install_dir, backup_dir, pruned)
+        _overlay_files(plan, install_dir, backup_dir, overwritten, created)
         logger.info(
             "Applied update: %d file(s) (%d new, %d replaced, %d pruned). Backup at %s",
             len(created) + len(overwritten),
@@ -1340,6 +1403,199 @@ def _manifest_heal_deferred(
     return 0 <= time.time() - at < MANIFEST_HEAL_RETRY_INTERVAL_S
 
 
+def _heal_from_release(
+    install_dir: Path,
+    remote: str,
+    download_url: Optional[str],
+    token: str,
+    timeout: float,
+) -> str:
+    """Re-download the matching release and swap it in. Returns the status:
+    ``"healed" | "heal-skipped" | "heal-aborted"``."""
+    _write_heal_marker(install_dir, remote, "attempted")
+    with tempfile.TemporaryDirectory(prefix="qa-heal-") as tmp:
+        new_tree = download_and_extract(download_url, token, timeout, Path(tmp))
+        if not (
+            _signature_gate_ok(
+                new_tree,
+                require=settings.qa_update_require_signature,
+                context="self-heal",
+            )
+            and _manifest_binding_ok(new_tree)
+        ):
+            logger.warning(
+                "Self-heal aborted: release signature/manifest not "
+                "trusted; leaving current files in place."
+            )
+            return "heal-aborted"
+        healed_backup = apply_update_locked(
+            new_tree,
+            install_dir,
+            version="heal-" + str(remote).lstrip("vV"),
+        )
+        if healed_backup is None:
+            return "heal-skipped"
+        _write_heal_marker(install_dir, remote, _healed_outcome(install_dir))
+        return "healed"
+
+
+def _lock_and_heal(
+    install_dir: Path,
+    remote: str,
+    local: Optional[str],
+    download_url: Optional[str],
+) -> str:
+    """Integrity pass for an up-to-date install: heal from the matching
+    release when files drifted, then re-lock. Returns the status string."""
+    status = "up-to-date"
+    token = (settings.github_token or "").strip()
+    timeout = settings.qa_update_timeout
+    # integrity_problems, not verify_integrity: a deleted or emptied
+    # MANIFEST.sha256 must heal (same release, same signature and
+    # binding gates) rather than read as a clean tree.
+    mismatched = integrity_problems(install_dir)
+    # Heal only when the latest release matches the installed version —
+    # that zipball is the exact tree the local MANIFEST.sha256 describes.
+    same_release = (
+        bool(download_url)
+        and _parse_version(remote or "") is not None
+        and _parse_version(remote or "") == _parse_version(local or "")
+    )
+    if same_release and _manifest_heal_deferred(install_dir, mismatched, remote):
+        logger.info(
+            "Manifest heal for %s deferred: already tried within %d h.",
+            remote,
+            MANIFEST_HEAL_RETRY_INTERVAL_S // 3600,
+        )
+        mismatched = []
+    if mismatched and same_release:
+        logger.warning(
+            "Integrity check: %d locally modified file(s) %s — healing from release %s.",
+            len(mismatched),
+            mismatched[:5],
+            remote,
+        )
+        status = _heal_from_release(install_dir, remote, download_url, token, timeout)
+    elif mismatched:
+        logger.warning(
+            "Integrity check: %d modified file(s) but no release zipball matching "
+            "local version %s — cannot heal.",
+            len(mismatched),
+            local,
+        )
+    _relock_and_log(install_dir)
+    return status
+
+
+def _relock_and_log(install_dir: Path) -> None:
+    locked = lock_files(install_dir)
+    # ops-5 (issue 5): only announce real work. A no-op pass logs at
+    # DEBUG, so "Code lock: N file(s)" now means N files ACTUALLY drifted
+    # and were re-locked -- worth noticing -- instead of appearing every
+    # 15 minutes and training the reader to ignore it.
+    if locked:
+        logger.info("Code lock: %d file(s) re-locked read-only.", locked)
+    else:
+        logger.debug("Code lock: all files already read-only.")
+
+
+def _download_verify_apply(
+    download_url: str, remote: object, install_dir: Path, token: str, timeout: float
+) -> Optional[str]:
+    """Download, gate and swap a release in. ``None`` means it was applied;
+    otherwise the status string ``run_update_check`` must return."""
+    with tempfile.TemporaryDirectory(prefix="qa-update-") as tmp:
+        new_tree = download_and_extract(download_url, token, timeout, Path(tmp))
+        if not _signature_gate_ok(
+            new_tree,
+            require=settings.qa_update_require_signature,
+            context="update",
+        ):
+            return "error"
+        # C1: a passed gate only proves the manifest's signature; bind
+        # that manifest to the actual tree bytes before trusting the swap.
+        if not _manifest_binding_ok(new_tree):
+            return "error"
+        applied = apply_update_locked(
+            new_tree, install_dir, version=str(remote).lstrip("vV")
+        )
+        if applied is None:
+            return "update-skipped"
+    return None
+
+
+def _http_error_status(exc: httpx.HTTPStatusError) -> str:
+    """Status for an HTTP failure: an exhausted GitHub quota is not a failure
+    to reach GitHub, but a non-quota 403/401/404 stays a plain ``"error"``."""
+    detail = _rate_limit_detail(exc)
+    if detail is None:
+        logger.warning(
+            "Startup update check failed (%s) — starting current version.",
+            exc,
+        )
+        return "error"
+    logger.warning(
+        "Startup update check hit the GitHub API rate limit (%s) — "
+        "auto-update is BLIND until it resets, not broken, and this "
+        "server is starting the version already on disk. Set GITHUB_TOKEN "
+        "in .env to raise the limit from 60 to 5000 requests/hour.",
+        detail,
+    )
+    return "rate-limited"
+
+
+def _update_to_newer(
+    install_dir: Path,
+    remote: object,
+    local: Optional[str],
+    download_url: Optional[str],
+    lock: bool,
+) -> str:
+    """Install a release newer than the local one; returns the status string."""
+    if not download_url:
+        logger.warning(
+            "Release %s has no downloadable archive - skipping update.",
+            remote,
+        )
+        return "error"
+    logger.info("Newer release %s available (local=%s) — updating.", remote, local)
+    token = (settings.github_token or "").strip()
+    refused = _download_verify_apply(
+        download_url, remote, install_dir, token, settings.qa_update_timeout
+    )
+    if refused is not None:
+        return refused
+    _pip_install(install_dir)
+    migrate_env(install_dir)
+    if lock:
+        lock_files(install_dir)
+    logger.info("Update to %s complete.", remote)
+    return "updated"
+
+
+def _check_release(install_dir: Path, repo: str, lock: bool) -> str:
+    """Fetch the latest release and update, heal or report up-to-date."""
+    token = (settings.github_token or "").strip()
+    local = _local_version(install_dir)
+    release = fetch_latest_release(repo, token, settings.qa_update_timeout)
+    if not release or not release.get("tag_name"):
+        logger.warning("No release found for %s — starting current version.", repo)
+        return "error"
+    remote = release["tag_name"]
+    zipball = release.get("zipball_url")
+    # Prefer the uploaded release ASSET over the auto-generated source
+    # zipball so GitHub's per-asset download_count tracks version adoption;
+    # fall back to the zipball when no asset was attached.
+    download_url = release.get("asset_url") or zipball
+    if is_newer(remote, local):
+        return _update_to_newer(install_dir, remote, local, download_url, lock)
+    status = "up-to-date"
+    if lock:
+        status = _lock_and_heal(install_dir, remote, local, download_url)
+    logger.info("Up to date (local=%s, latest=%s).", local, remote)
+    return status
+
+
 def run_update_check(
     install_dir: Optional[Path] = None,
     *,
@@ -1373,154 +1629,18 @@ def run_update_check(
                 "An update check was forced but no repo is configured (QA_UPDATE_REPO empty) — skipping update."
             )
             return "no-repo"
-        token = (settings.github_token or "").strip()
-        timeout = settings.qa_update_timeout
         # QA_CODE_LOCK_ENABLED was DELETED on 2026-08-13 and hardcoded OFF for a
         # developer checkout; lock_override still wins, which is how the
         # distribution launcher (lock_override=True) keeps the lock working.
         lock = False if lock_override is None else lock_override
-        local = _local_version(install_dir)
-        release = fetch_latest_release(repo, token, timeout)
-        if not release or not release.get("tag_name"):
-            logger.warning("No release found for %s — starting current version.", repo)
-            return "error"
-        remote = release["tag_name"]
-        zipball = release.get("zipball_url")
-        # Prefer the uploaded release ASSET over the auto-generated source
-        # zipball so GitHub's per-asset download_count tracks version adoption;
-        # fall back to the zipball when no asset was attached.
-        download_url = release.get("asset_url") or zipball
-        if is_newer(remote, local):
-            if not download_url:
-                logger.warning(
-                    "Release %s has no downloadable archive - skipping update.",
-                    remote,
-                )
-                return "error"
-            logger.info(
-                "Newer release %s available (local=%s) — updating.", remote, local
-            )
-            with tempfile.TemporaryDirectory(prefix="qa-update-") as tmp:
-                new_tree = download_and_extract(download_url, token, timeout, Path(tmp))
-                if not _signature_gate_ok(
-                    new_tree,
-                    require=settings.qa_update_require_signature,
-                    context="update",
-                ):
-                    return "error"
-                # C1: a passed gate only proves the manifest's signature; bind
-                # that manifest to the actual tree bytes before trusting the swap.
-                if not _manifest_binding_ok(new_tree):
-                    return "error"
-                if (
-                    apply_update_locked(
-                        new_tree, install_dir, version=str(remote).lstrip("vV")
-                    )
-                    is None
-                ):
-                    return "update-skipped"
-            _pip_install(install_dir)
-            migrate_env(install_dir)
-            if lock:
-                lock_files(install_dir)
-            logger.info("Update to %s complete.", remote)
-            return "updated"
-        status = "up-to-date"
-        if lock:
-            # integrity_problems, not verify_integrity: a deleted or emptied
-            # MANIFEST.sha256 must heal (same release, same signature and
-            # binding gates) rather than read as a clean tree.
-            mismatched = integrity_problems(install_dir)
-            # Heal only when the latest release matches the installed version —
-            # that zipball is the exact tree the local MANIFEST.sha256 describes.
-            same_release = (
-                bool(download_url)
-                and _parse_version(remote or "") is not None
-                and _parse_version(remote or "") == _parse_version(local or "")
-            )
-            if same_release and _manifest_heal_deferred(
-                install_dir, mismatched, remote
-            ):
-                logger.info(
-                    "Manifest heal for %s deferred: already tried within %d h.",
-                    remote,
-                    MANIFEST_HEAL_RETRY_INTERVAL_S // 3600,
-                )
-                mismatched = []
-            if mismatched and same_release:
-                logger.warning(
-                    "Integrity check: %d locally modified file(s) %s — healing from release %s.",
-                    len(mismatched),
-                    mismatched[:5],
-                    remote,
-                )
-                _write_heal_marker(install_dir, remote, "attempted")
-                with tempfile.TemporaryDirectory(prefix="qa-heal-") as tmp:
-                    new_tree = download_and_extract(
-                        download_url, token, timeout, Path(tmp)
-                    )
-                    if _signature_gate_ok(
-                        new_tree,
-                        require=settings.qa_update_require_signature,
-                        context="self-heal",
-                    ) and _manifest_binding_ok(new_tree):
-                        healed_backup = apply_update_locked(
-                            new_tree,
-                            install_dir,
-                            version="heal-" + str(remote).lstrip("vV"),
-                        )
-                        status = (
-                            "healed" if healed_backup is not None else "heal-skipped"
-                        )
-                        if healed_backup is not None:
-                            _write_heal_marker(
-                                install_dir, remote, _healed_outcome(install_dir)
-                            )
-                    else:
-                        logger.warning(
-                            "Self-heal aborted: release signature/manifest not "
-                            "trusted; leaving current files in place."
-                        )
-                        status = "heal-aborted"
-            elif mismatched:
-                logger.warning(
-                    "Integrity check: %d modified file(s) but no release zipball matching "
-                    "local version %s — cannot heal.",
-                    len(mismatched),
-                    local,
-                )
-            locked = lock_files(install_dir)
-            # ops-5 (issue 5): only announce real work. A no-op pass logs at
-            # DEBUG, so "Code lock: N file(s)" now means N files ACTUALLY drifted
-            # and were re-locked -- worth noticing -- instead of appearing every
-            # 15 minutes and training the reader to ignore it.
-            if locked:
-                logger.info("Code lock: %d file(s) re-locked read-only.", locked)
-            else:
-                logger.debug("Code lock: all files already read-only.")
-        logger.info("Up to date (local=%s, latest=%s).", local, remote)
-        return status
+        return _check_release(install_dir, repo, lock)
     except httpx.HTTPStatusError as exc:
         # Ahead of the blanket clause below ON PURPOSE: an exhausted GitHub
         # quota is not a failure to reach GitHub. Both directions matter --
         # a non-quota 403/401/404 falls through to the generic message and
         # "error", which is what keeps this branch from becoming "every HTTP
         # error is a rate limit".
-        detail = _rate_limit_detail(exc)
-        if detail is None:
-            logger.warning(
-                "Startup update check failed (%s) — starting current version.",
-                exc,
-            )
-            return "error"
-        logger.warning(
-            "Startup update check hit the GitHub API rate limit (%s) — "
-            "auto-update is BLIND until it resets, not broken, and this "
-            "server is starting the version already on disk. Set GITHUB_TOKEN "
-            "in .env to raise the limit from 60 to 5000 requests/hour.",
-            detail,
-        )
-        return "rate-limited"
+        return _http_error_status(exc)
     except Exception as exc:
         logger.warning(
             "Startup update check failed (%s) — starting current version.", exc

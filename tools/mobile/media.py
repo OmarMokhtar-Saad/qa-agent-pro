@@ -390,32 +390,9 @@ async def finish_step(
             CLIP, state, tc_id=str(tc_id), seq=seq, screen_id=str(screen_id or "")
         )
         if state == OK:
-            closed = await _stop_recorder(serial, held)
             name = "clip-" + _safe(tc_id) + "-" + str(seq) + ".mp4"
             target = directory / name
-            pulled = await adb.pull(serial, str(held.get("remote") or ""), str(target))
-            await adb.shell(
-                serial, ["rm", "-f", str(held.get("remote") or "")], MAX_STOP_WAIT_S
-            )
-            size = target.stat().st_size if target.is_file() else 0
-            # A PULL THAT RAN AND FAILED IS NOT AN `error`. ``adb.raw`` sets
-            # ``error`` only when adb could not be RUN at all (spawn failure,
-            # timeout); a missing remote file comes back error=None with a
-            # NON-ZERO rc and an empty stdout -- the same distinction
-            # ``adb.devices`` had to learn. Reading ``error`` alone would leave
-            # the size check as the only thing that noticed, which is one fact
-            # answered in two places.
-            body = pulled.get("content") or {}
-            rc = int(body.get("rc") or 0) if isinstance(body, dict) else 0
-            if pulled.get("error") or rc or not size:
-                clipped["state"] = PULL_FAILED
-            elif size > MAX_CLIP_BYTES:
-                target.unlink(missing_ok=True)
-                clipped["state"] = PULL_FAILED
-            else:
-                clipped["state"] = OK if closed else TRUNCATED
-                clipped["file"] = name
-                clipped["bytes"] = int(size)
+            await _finish_step_pull(serial, held, target, clipped)
         elif held.get("proc") is not None:
             await _stop_recorder(serial, held)
             await adb.shell(
@@ -431,17 +408,55 @@ async def finish_step(
             screen_id=str(screen_id or ""),
         )
         if state != WITHHELD and screen_id:
-            shot = await adb.screencap(serial)
-            data = shot.get("content") if not shot.get("error") else None
-            if isinstance(data, (bytes, bytearray)) and data:
-                name = "frame-" + _safe(screen_id) + ".png"
-                (directory / name).write_bytes(bytes(data))
-                framed["state"] = OK
-                framed["file"] = name
-            else:
-                framed["state"] = REFUSED
+            await _finish_step_frame(serial, directory, screen_id, framed)
         records.append(framed)
     except Exception as exc:
         logger.warning("mobile.media.finish_step failed: %s", exc)
     remember(run_id, tc_id, records)
     return {"error": None, "content": records}
+
+
+async def _finish_step_pull(
+    serial: str, held: dict, target: Path, clipped: dict
+) -> None:
+    """Stop the recorder, pull the clip to *target* and set the clip record's state."""
+    name = target.name
+    closed = await _stop_recorder(serial, held)
+    pulled = await adb.pull(serial, str(held.get("remote") or ""), str(target))
+    await adb.shell(
+        serial, ["rm", "-f", str(held.get("remote") or "")], MAX_STOP_WAIT_S
+    )
+    size = target.stat().st_size if target.is_file() else 0
+    # A PULL THAT RAN AND FAILED IS NOT AN `error`. ``adb.raw`` sets
+    # ``error`` only when adb could not be RUN at all (spawn failure,
+    # timeout); a missing remote file comes back error=None with a
+    # NON-ZERO rc and an empty stdout -- the same distinction
+    # ``adb.devices`` had to learn. Reading ``error`` alone would leave
+    # the size check as the only thing that noticed, which is one fact
+    # answered in two places.
+    body = pulled.get("content") or {}
+    rc = int(body.get("rc") or 0) if isinstance(body, dict) else 0
+    if pulled.get("error") or rc or not size:
+        clipped["state"] = PULL_FAILED
+    elif size > MAX_CLIP_BYTES:
+        target.unlink(missing_ok=True)
+        clipped["state"] = PULL_FAILED
+    else:
+        clipped["state"] = OK if closed else TRUNCATED
+        clipped["file"] = name
+        clipped["bytes"] = int(size)
+
+
+async def _finish_step_frame(
+    serial: str, directory: Path, screen_id: str, framed: dict
+) -> None:
+    """Capture one frame into *directory* and set the frame record's state."""
+    shot = await adb.screencap(serial)
+    data = shot.get("content") if not shot.get("error") else None
+    if isinstance(data, (bytes, bytearray)) and data:
+        name = "frame-" + _safe(screen_id) + ".png"
+        (directory / name).write_bytes(bytes(data))
+        framed["state"] = OK
+        framed["file"] = name
+    else:
+        framed["state"] = REFUSED

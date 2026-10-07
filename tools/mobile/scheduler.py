@@ -42,6 +42,32 @@ def _as_list(value: object) -> list[str]:
     return [str(part).strip() for part in value if str(part).strip()]
 
 
+def _drop_reason(
+    case: object,
+    ids: set[str],
+    priorities: set[str],
+    categories: set[str],
+    failed: tuple[str, set[str]],
+) -> tuple[str, str | None]:
+    """``(tc_id, why)``: *why* names the first filter excluding *case*, else None."""
+    if isinstance(case, dict):
+        tc_id = _norm(case.get("tc_id"))
+    else:
+        tc_id = _norm(getattr(case, "tc_id", ""))
+    priority = _priority_of(case)
+    category = _norm(getattr(case, "category", "") or "")
+    failed_run, failed_ids = failed
+    if ids and tc_id not in ids:
+        return tc_id, "not in ids"
+    if priorities and _norm(priority) not in priorities:
+        return tc_id, "priority " + priority
+    if categories and category not in categories:
+        return tc_id, "category " + category
+    if failed_run and tc_id not in failed_ids:
+        return tc_id, "did not fail in " + failed_run
+    return tc_id, None
+
+
 def apply_filters(cases: object, filters: object = None) -> dict:
     """Filter *cases*. ``{"error", "content": {"cases", "dropped", "applied"}}``.
 
@@ -61,34 +87,25 @@ def apply_filters(cases: object, filters: object = None) -> dict:
             point = (run_store.resume_point(failed_run) or {}).get("content") or {}
             failed_ids = {_norm(v) for v in (point.get("failed") or [])}
             applied.append("failed_last_run=" + failed_run)
-        if ids:
-            applied.append("ids")
-        if priorities:
-            applied.append("priority")
-        if categories:
-            applied.append("category")
+        applied.extend(
+            name
+            for name, active in (
+                ("ids", ids),
+                ("priority", priorities),
+                ("category", categories),
+            )
+            if active
+        )
 
         kept, dropped = [], []
         for case in items:
-            if isinstance(case, dict):
-                tc_id = _norm(case.get("tc_id"))
+            tc_id, why = _drop_reason(
+                case, ids, priorities, categories, (failed_run, failed_ids)
+            )
+            if why is None:
+                kept.append(case)
             else:
-                tc_id = _norm(getattr(case, "tc_id", ""))
-            priority = _priority_of(case)
-            category = _norm(getattr(case, "category", "") or "")
-            if ids and tc_id not in ids:
-                dropped.append({"tc_id": tc_id, "why": "not in ids"})
-                continue
-            if priorities and _norm(priority) not in priorities:
-                dropped.append({"tc_id": tc_id, "why": "priority " + priority})
-                continue
-            if categories and category not in categories:
-                dropped.append({"tc_id": tc_id, "why": "category " + category})
-                continue
-            if failed_run and tc_id not in failed_ids:
-                dropped.append({"tc_id": tc_id, "why": "did not fail in " + failed_run})
-                continue
-            kept.append(case)
+                dropped.append({"tc_id": tc_id, "why": why})
         return {
             "error": None,
             "content": {
@@ -142,6 +159,31 @@ def order_cases(cases: object, filters: object = None) -> dict:
         return {"error": str(exc), "content": None}
 
 
+def _run_manifest(
+    run_id: str, order: list[str], body: dict, manifest_extra: object
+) -> dict:
+    """The manifest ``plan_run`` stores: caller extras plus the run's ORDER."""
+    manifest = dict(manifest_extra if isinstance(manifest_extra, dict) else {})
+    manifest.update(
+        {
+            "run_id": run_id,
+            "order": order,
+            "total": len(order),
+            "filters": body.get("applied") or [],
+            "planned": time.time(),
+            # The same producer the explore lane reads -- see session.py. Both
+            # callers carry it or the field does not exist, and an absent key reads
+            # as absent on the page rather than as today's setting. The AVD comes
+            # from manifest_extra, which the suite lane fills before this update.
+            "system_image": str(
+                (sdk_locator.avd_system_image(manifest.get("avd")) or {}).get("content")
+                or ""
+            ),
+        }
+    )
+    return manifest
+
+
 def plan_run(
     run_id: str,
     cases: object,
@@ -171,26 +213,7 @@ def plan_run(
                 "content": None,
             }
         order = [str(getattr(case, "tc_id", "") or "") for case in kept]
-        manifest = dict(manifest_extra if isinstance(manifest_extra, dict) else {})
-        manifest.update(
-            {
-                "run_id": run_id,
-                "order": order,
-                "total": len(order),
-                "filters": body.get("applied") or [],
-                "planned": time.time(),
-                # The same producer the explore lane reads -- see session.py. Both
-                # callers carry it or the field does not exist, and an absent key reads
-                # as absent on the page rather than as today's setting. The AVD comes
-                # from manifest_extra, which the suite lane fills before this update.
-                "system_image": str(
-                    (sdk_locator.avd_system_image(manifest.get("avd")) or {}).get(
-                        "content"
-                    )
-                    or ""
-                ),
-            }
-        )
+        manifest = _run_manifest(run_id, order, body, manifest_extra)
         created = run_store.create_run(run_id, manifest)
         if created.get("error"):
             return created

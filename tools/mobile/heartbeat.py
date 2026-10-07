@@ -225,25 +225,9 @@ def start(
         if not token:
             return {"error": NO_TOKEN, "content": None}
         name = str(run_id)
-        with _LOCK:
-            existing = _WRITERS.get(name)
-            if existing is not None and existing.thread.is_alive():
-                return {
-                    "error": None,
-                    "content": {
-                        "started": False,
-                        "run_id": name,
-                        "interval_s": existing.interval_s,
-                        "reason": "already_running",
-                    },
-                }
-            writer = _Writer(
-                name,
-                token,
-                max(0.01, float(interval_s or INTERVAL_S)),
-                max(0, int(max_beats or 0)),
-            )
-            _WRITERS[name] = writer
+        running, writer = _start_register(name, token, interval_s, max_beats)
+        if running is not None:
+            return running
         writer.thread.start()
         return {
             "error": None,
@@ -257,6 +241,30 @@ def start(
     except Exception as exc:
         logger.exception("mobile.heartbeat.start failed")
         return {"error": str(exc), "content": None}
+
+
+def _start_register(name, token, interval_s, max_beats):
+    """Register a new writer, or return the already_running reply."""
+    with _LOCK:
+        existing = _WRITERS.get(name)
+        if existing is not None and existing.thread.is_alive():
+            return {
+                "error": None,
+                "content": {
+                    "started": False,
+                    "run_id": name,
+                    "interval_s": existing.interval_s,
+                    "reason": "already_running",
+                },
+            }, None
+        writer = _Writer(
+            name,
+            token,
+            max(0.01, float(interval_s or INTERVAL_S)),
+            max(0, int(max_beats or 0)),
+        )
+        _WRITERS[name] = writer
+    return None, writer
 
 
 def stop(run_id: str, *, join_timeout: float = 2.0) -> dict:

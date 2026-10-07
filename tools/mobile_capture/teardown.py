@@ -161,6 +161,23 @@ def is_crash_residue(body: dict) -> bool:
     return not _pid_alive(pid)
 
 
+def _busy_result(serial: str, holder: str, reason: str) -> dict:
+    logger.info(
+        "mobile_capture.teardown: %s is locked by %s -- refusing to clear "
+        "it from here (%s)",
+        serial,
+        holder,
+        reason or "no reason given",
+    )
+    return {
+        "cleared": False,
+        "read_back": "",
+        "dangling": True,
+        "busy": True,
+        "holder": holder,
+    }
+
+
 async def clear(serial: str, *, owner: str = "", reason: str = "") -> dict:
     """Set ``http_proxy`` to ``:0``, remove the reverse, kill the marker's pid,
     delete the marker, and READ THE SETTING BACK. The result is the read-back,
@@ -187,20 +204,7 @@ async def clear(serial: str, *, owner: str = "", reason: str = "") -> dict:
     acquired = ((took or {}).get("content") or {}).get("acquired")
     if not acquired:
         holder = str(((took or {}).get("content") or {}).get("holder") or "")
-        logger.info(
-            "mobile_capture.teardown: %s is locked by %s -- refusing to clear "
-            "it from here (%s)",
-            serial,
-            holder,
-            reason or "no reason given",
-        )
-        return {
-            "cleared": False,
-            "read_back": "",
-            "dangling": True,
-            "busy": True,
-            "holder": holder,
-        }
+        return _busy_result(serial, holder, reason)
     try:
         marker = _read_marker(serial) or {}
         pid = int(marker.get("pid") or 0)
@@ -210,68 +214,76 @@ async def clear(serial: str, *, owner: str = "", reason: str = "") -> dict:
             # the process that was proxying it.
             kill_process(pid)
 
-        put = await adb.global_setting_put(
-            serial, HTTP_PROXY_SETTING, HTTP_PROXY_OFF, timeout=CLEAR_TIMEOUT_S
-        )
-        port = int(marker.get("port") or 0)
-        if port:
-            await adb.reverse_remove(
-                serial, "tcp:" + str(port), timeout=CLEAR_TIMEOUT_S
-            )
-        read = await adb.global_setting_get(
-            serial, HTTP_PROXY_SETTING, timeout=CLEAR_TIMEOUT_S
-        )
-
-        if put.get("error") or read.get("error"):
-            # The device could not be reached (or another adb failure). The
-            # marker stays -- deleting it here would tell the next reap
-            # there is nothing to check, which is exactly the "we guessed it
-            # was clear" failure this function exists not to have.
-            logger.warning(
-                "mobile_capture.teardown: could not confirm %s cleared (%s) "
-                "-- leaving its marker for the next reap",
-                serial,
-                reason or "no reason given",
-            )
-            return {
-                "cleared": False,
-                "read_back": "",
-                "dangling": True,
-                "busy": False,
-            }
-
-        read_back = str(read.get("content") or "")
-        cleared = read_back == HTTP_PROXY_OFF
-        if cleared:
-            _delete_marker(serial)
-        else:
-            # adb answered on both calls, but the device itself still
-            # reports a proxy set -- the write did not take (or something
-            # else re-set it after). Reporting `cleared: True` here would be
-            # the exact failure this module exists not to have: the caller
-            # believes the device is safe while it is still routed at a
-            # port whose process this call already killed. The marker stays
-            # so the next reap can still find it, the same reason it stays
-            # on an outright adb failure below.
-            logger.warning(
-                "mobile_capture.teardown: %s read back %r after clearing "
-                "(expected %r) -- leaving its marker for the next reap",
-                serial,
-                read_back,
-                HTTP_PROXY_OFF,
-            )
-        return {
-            "cleared": cleared,
-            "read_back": read_back,
-            "dangling": not cleared,
-            "busy": False,
-        }
+        put, read = await _clear_device(serial, marker)
+        return _clear_verdict(serial, reason, put, read)
     finally:
         if not owner:
             # We minted the label ourselves; give it back. A caller that
             # passed its OWN owner keeps its lock -- releasing here would
             # take the run's lease out from under it.
             session.release_device_lock(label, as_holder=True)
+
+
+async def _clear_device(serial: str, marker: dict) -> tuple[dict, dict]:
+    """Put the proxy off, drop the reverse, read the setting back."""
+    put = await adb.global_setting_put(
+        serial, HTTP_PROXY_SETTING, HTTP_PROXY_OFF, timeout=CLEAR_TIMEOUT_S
+    )
+    port = int(marker.get("port") or 0)
+    if port:
+        await adb.reverse_remove(serial, "tcp:" + str(port), timeout=CLEAR_TIMEOUT_S)
+    read = await adb.global_setting_get(
+        serial, HTTP_PROXY_SETTING, timeout=CLEAR_TIMEOUT_S
+    )
+    return put, read
+
+
+def _clear_verdict(serial: str, reason: str, put: dict, read: dict) -> dict:
+    """Judge the read-back, keep or delete the marker, build the reply."""
+    if put.get("error") or read.get("error"):
+        # The device could not be reached (or another adb failure). The
+        # marker stays -- deleting it here would tell the next reap
+        # there is nothing to check, which is exactly the "we guessed it
+        # was clear" failure this function exists not to have.
+        logger.warning(
+            "mobile_capture.teardown: could not confirm %s cleared (%s) "
+            "-- leaving its marker for the next reap",
+            serial,
+            reason or "no reason given",
+        )
+        return {
+            "cleared": False,
+            "read_back": "",
+            "dangling": True,
+            "busy": False,
+        }
+
+    read_back = str(read.get("content") or "")
+    cleared = read_back == HTTP_PROXY_OFF
+    if cleared:
+        _delete_marker(serial)
+    else:
+        # adb answered on both calls, but the device itself still
+        # reports a proxy set -- the write did not take (or something
+        # else re-set it after). Reporting `cleared: True` here would be
+        # the exact failure this module exists not to have: the caller
+        # believes the device is safe while it is still routed at a
+        # port whose process this call already killed. The marker stays
+        # so the next reap can still find it, the same reason it stays
+        # on an outright adb failure below.
+        logger.warning(
+            "mobile_capture.teardown: %s read back %r after clearing "
+            "(expected %r) -- leaving its marker for the next reap",
+            serial,
+            read_back,
+            HTTP_PROXY_OFF,
+        )
+    return {
+        "cleared": cleared,
+        "read_back": read_back,
+        "dangling": not cleared,
+        "busy": False,
+    }
 
 
 async def reap(*, owner: str = "", serial_hint: str = "") -> dict:

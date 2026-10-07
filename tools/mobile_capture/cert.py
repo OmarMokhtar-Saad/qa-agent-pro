@@ -201,24 +201,215 @@ async def _stage_for_manual_install(serial: str, btype: str) -> dict:
             "staged_at": remote,
             "installed": False,
             "trusted": False,
-            "detail": (
-                "This device reports a '"
-                + (btype or "unknown")
-                + "' build, which refuses `adb root`, so the SYSTEM "
-                "certificate store cannot be reached. The certificate has "
-                "been copied to "
-                + remote
-                + " instead. To finish, on the device: Settings -> Security "
-                "-> Encryption & credentials -> Install a certificate -> CA "
-                "certificate -> Install anyway, then pick qa-agents-ca.crt. "
-                "Be warned this lands in the USER store, and an app built "
-                "for Android 7 or later ignores that store unless the app "
-                "itself opted in -- so for most apps this will change "
-                "nothing, and HTTPS bodies will stay unreadable. Nothing is "
-                "trusted until you complete those steps."
-            ),
+            "detail": _manual_install_detail(btype, remote),
         },
     }
+
+
+def _manual_install_detail(btype: str, remote: str) -> str:
+    """The honest manual-install steps and odds for a non-rootable build."""
+    return (
+        "This device reports a '"
+        + (btype or "unknown")
+        + "' build, which refuses `adb root`, so the SYSTEM "
+        "certificate store cannot be reached. The certificate has "
+        "been copied to "
+        + remote
+        + " instead. To finish, on the device: Settings -> Security "
+        "-> Encryption & credentials -> Install a certificate -> CA "
+        "certificate -> Install anyway, then pick qa-agents-ca.crt. "
+        "Be warned this lands in the USER store, and an app built "
+        "for Android 7 or later ignores that store unless the app "
+        "itself opted in -- so for most apps this will change "
+        "nothing, and HTTPS bodies will stay unreadable. Nothing is "
+        "trusted until you complete those steps."
+    )
+
+
+def _ca_identity() -> tuple[dict | None, str, str]:
+    """(refusal, fingerprint, android hash filename) of the root CA."""
+    made = ca.ensure_ca()
+    if made.get("error"):
+        return {"error": REASON_NO_CA, "content": {"detail": made["error"]}}, "", ""
+    fingerprint = str((made.get("content") or {}).get("fingerprint") or "")
+
+    hashed = ca.android_hashed_name()
+    if hashed.get("error"):
+        return {"error": REASON_NO_CA, "content": {"detail": hashed["error"]}}, "", ""
+    leaf = str(hashed["content"]["filename"])
+    if not _HASH_NAME_RE.match(leaf):
+        refusal = {
+            "error": REASON_NO_CA,
+            "content": {"detail": "unexpected hash filename shape"},
+        }
+        return refusal, "", ""
+    return None, fingerprint, leaf
+
+
+async def _root_device(serial: str) -> dict | None:
+    """Run ``adb root``; the refusal when the device will not root, else None."""
+    rooted = await adb.raw(["-s", serial, "root"], timeout=DEVICE_CALL_TIMEOUT_S)
+    if rooted.get("error"):
+        return {
+            "error": REASON_DEVICE_UNREACHABLE,
+            "content": {"detail": rooted["error"]},
+        }
+    root_body = rooted.get("content") or {}
+    if _rc(root_body) != 0:
+        return {
+            "error": REASON_PRODUCTION_BUILD,
+            "content": {
+                "detail": (
+                    "adb root was refused: "
+                    + str(root_body.get("err") or "").strip()[:200]
+                    + ". A Google Play (`google_apis_playstore`) "
+                    "image cannot root: create an AVD with a "
+                    "`google_apis` image in Android Studio's Device "
+                    "Manager to enable decryption."
+                )
+            },
+        }
+    return None
+
+
+async def _pick_route(serial: str, facts: dict) -> tuple[dict | None, str, str]:
+    """(refusal, device directory, route) chosen from the device API level."""
+    api_raw = str((facts.get("content") or {}).get("api") or "")
+    try:
+        api = int(api_raw)
+    except (TypeError, ValueError, OverflowError):
+        api = None
+    if api is None:
+        refusal = {
+            "error": REASON_API_UNKNOWN,
+            "content": {"detail": "could not read ro.build.version.sdk"},
+        }
+        return refusal, "", ""
+
+    if api >= API_LEVEL_FOR_DATA_ROUTE:
+        return None, DATA_CACERTS_DIR, ROUTE_DATA
+    remounted = await adb.raw(["-s", serial, "remount"], timeout=DEVICE_CALL_TIMEOUT_S)
+    if remounted.get("error"):
+        refusal = {
+            "error": REASON_DEVICE_UNREACHABLE,
+            "content": {"detail": remounted["error"]},
+        }
+        return refusal, "", ""
+    if _rc(remounted.get("content") or {}) != 0:
+        refusal = {
+            "error": REASON_REMOUNT_FAILED,
+            "content": {
+                "detail": (
+                    "`adb remount` failed -- this device's "
+                    "/system is not writable, most likely "
+                    "because it was not started with "
+                    "`-writable-system`. No certificate was "
+                    "installed."
+                )
+            },
+        }
+        return refusal, "", ""
+    return None, SYSTEM_CACERTS_DIR, ROUTE_SYSTEM
+
+
+def _push_failed(detail: str) -> dict:
+    return {"error": REASON_PUSH_FAILED, "content": {"detail": detail}}
+
+
+async def _push_pem(serial: str, device_dir: str, leaf: str) -> tuple[dict | None, str]:
+    """Write the PEM to the device and confirm it landed: (refusal, path)."""
+    pem = ca.read_pem()
+    if pem.get("error"):
+        return {"error": REASON_NO_CA, "content": {"detail": pem["error"]}}, ""
+    pem_bytes = pem["content"]["pem"].encode("utf-8")
+    device_path = device_dir + "/" + leaf
+
+    mk = await adb.shell(
+        serial, ["mkdir", "-p", device_dir], timeout=DEVICE_CALL_TIMEOUT_S
+    )
+    if mk.get("error") or _rc(mk.get("content") or {}) != 0:
+        return _push_failed(mk.get("error") or "mkdir failed"), device_path
+
+    write = await adb.shell(
+        serial,
+        ["sh", "-c", "cat > " + device_path],
+        timeout=DEVICE_CALL_TIMEOUT_S,
+        stdin_data=pem_bytes,
+    )
+    if write.get("error") or _rc(write.get("content") or {}) != 0:
+        detail = (
+            write.get("error")
+            or str((write.get("content") or {}).get("err") or "")[:200]
+        )
+        return _push_failed(detail), device_path
+
+    chmod = await adb.shell(
+        serial, ["chmod", "644", device_path], timeout=DEVICE_CALL_TIMEOUT_S
+    )
+    if chmod.get("error") or _rc(chmod.get("content") or {}) != 0:
+        return _push_failed("chmod failed on the device"), device_path
+
+    verify = await adb.shell(serial, ["ls", device_path], timeout=DEVICE_CALL_TIMEOUT_S)
+    vbody = (verify.get("content") or {}) if not verify.get("error") else {}
+    if not (_rc(vbody) == 0 and device_path in str(vbody.get("out") or "")):
+        refusal = {
+            "error": REASON_VERIFY_FAILED,
+            "content": {
+                "detail": (
+                    "the certificate could not be confirmed on the "
+                    "device after writing it"
+                )
+            },
+        }
+        return refusal, device_path
+    return None, device_path
+
+
+async def _install_checked(serial: str) -> dict:
+    """The install ladder once the lock, ``apply`` and the flag are settled."""
+    refusal, fingerprint, leaf = _ca_identity()
+    if refusal:
+        return refusal
+
+    facts = await adb.device_facts(serial)
+    if facts.get("error"):
+        return {
+            "error": REASON_DEVICE_UNREACHABLE,
+            "content": {"detail": facts["error"]},
+        }
+
+    build_type = await adb.getprop(serial, "ro.build.type")
+    if build_type.get("error"):
+        return {
+            "error": REASON_DEVICE_UNREACHABLE,
+            "content": {"detail": build_type["error"]},
+        }
+    btype = str(build_type.get("content") or "").strip().lower()
+    if btype not in _ROOTABLE_BUILD_TYPES:
+        return await _stage_for_manual_install(serial, btype)
+
+    refusal = await _root_device(serial)
+    if refusal:
+        return refusal
+
+    refusal, device_dir, route = await _pick_route(serial, facts)
+    if refusal:
+        return refusal
+
+    refusal, device_path = await _push_pem(serial, device_dir, leaf)
+    if refusal:
+        return refusal
+
+    marker = {
+        "serial": serial,
+        "route": route,
+        "device_path": device_path,
+        "fingerprint": fingerprint,
+        "hash": leaf,
+        "installed_ms": int(time.time() * 1000),
+    }
+    _write_marker(serial, marker)
+    return {"error": None, "content": marker}
 
 
 async def install(serial: str, *, apply: bool = False, owner: str = "") -> dict:
@@ -246,170 +437,7 @@ async def install(serial: str, *, apply: bool = False, owner: str = "") -> dict:
                 return {"error": REASON_NO_APPLY, "content": None}
             if not settings.qa_mobile_https_capture_enabled:
                 return {"error": REASON_FLAG_OFF, "content": None}
-
-            made = ca.ensure_ca()
-            if made.get("error"):
-                return {"error": REASON_NO_CA, "content": {"detail": made["error"]}}
-            fingerprint = str((made.get("content") or {}).get("fingerprint") or "")
-
-            hashed = ca.android_hashed_name()
-            if hashed.get("error"):
-                return {"error": REASON_NO_CA, "content": {"detail": hashed["error"]}}
-            leaf = str(hashed["content"]["filename"])
-            if not _HASH_NAME_RE.match(leaf):
-                return {
-                    "error": REASON_NO_CA,
-                    "content": {"detail": "unexpected hash filename shape"},
-                }
-
-            facts = await adb.device_facts(serial)
-            if facts.get("error"):
-                return {
-                    "error": REASON_DEVICE_UNREACHABLE,
-                    "content": {"detail": facts["error"]},
-                }
-
-            build_type = await adb.getprop(serial, "ro.build.type")
-            if build_type.get("error"):
-                return {
-                    "error": REASON_DEVICE_UNREACHABLE,
-                    "content": {"detail": build_type["error"]},
-                }
-            btype = str(build_type.get("content") or "").strip().lower()
-            if btype not in _ROOTABLE_BUILD_TYPES:
-                return await _stage_for_manual_install(serial, btype)
-
-            rooted = await adb.raw(
-                ["-s", serial, "root"], timeout=DEVICE_CALL_TIMEOUT_S
-            )
-            if rooted.get("error"):
-                return {
-                    "error": REASON_DEVICE_UNREACHABLE,
-                    "content": {"detail": rooted["error"]},
-                }
-            root_body = rooted.get("content") or {}
-            if _rc(root_body) != 0:
-                return {
-                    "error": REASON_PRODUCTION_BUILD,
-                    "content": {
-                        "detail": (
-                            "adb root was refused: "
-                            + str(root_body.get("err") or "").strip()[:200]
-                            + ". A Google Play (`google_apis_playstore`) "
-                            "image cannot root: create an AVD with a "
-                            "`google_apis` image in Android Studio's Device "
-                            "Manager to enable decryption."
-                        )
-                    },
-                }
-
-            api_raw = str((facts.get("content") or {}).get("api") or "")
-            try:
-                api = int(api_raw)
-            except (TypeError, ValueError, OverflowError):
-                api = None
-            if api is None:
-                return {
-                    "error": REASON_API_UNKNOWN,
-                    "content": {"detail": "could not read ro.build.version.sdk"},
-                }
-
-            if api >= API_LEVEL_FOR_DATA_ROUTE:
-                device_dir = DATA_CACERTS_DIR
-                route = ROUTE_DATA
-            else:
-                remounted = await adb.raw(
-                    ["-s", serial, "remount"], timeout=DEVICE_CALL_TIMEOUT_S
-                )
-                if remounted.get("error"):
-                    return {
-                        "error": REASON_DEVICE_UNREACHABLE,
-                        "content": {"detail": remounted["error"]},
-                    }
-                rbody = remounted.get("content") or {}
-                if _rc(rbody) != 0:
-                    return {
-                        "error": REASON_REMOUNT_FAILED,
-                        "content": {
-                            "detail": (
-                                "`adb remount` failed -- this device's "
-                                "/system is not writable, most likely "
-                                "because it was not started with "
-                                "`-writable-system`. No certificate was "
-                                "installed."
-                            )
-                        },
-                    }
-                device_dir = SYSTEM_CACERTS_DIR
-                route = ROUTE_SYSTEM
-
-            pem = ca.read_pem()
-            if pem.get("error"):
-                return {"error": REASON_NO_CA, "content": {"detail": pem["error"]}}
-            pem_bytes = pem["content"]["pem"].encode("utf-8")
-            device_path = device_dir + "/" + leaf
-
-            mk = await adb.shell(
-                serial, ["mkdir", "-p", device_dir], timeout=DEVICE_CALL_TIMEOUT_S
-            )
-            if mk.get("error") or _rc(mk.get("content") or {}) != 0:
-                return {
-                    "error": REASON_PUSH_FAILED,
-                    "content": {"detail": mk.get("error") or "mkdir failed"},
-                }
-
-            write = await adb.shell(
-                serial,
-                ["sh", "-c", "cat > " + device_path],
-                timeout=DEVICE_CALL_TIMEOUT_S,
-                stdin_data=pem_bytes,
-            )
-            if write.get("error") or _rc(write.get("content") or {}) != 0:
-                return {
-                    "error": REASON_PUSH_FAILED,
-                    "content": {
-                        "detail": (
-                            write.get("error")
-                            or str((write.get("content") or {}).get("err") or "")[:200]
-                        )
-                    },
-                }
-
-            chmod = await adb.shell(
-                serial, ["chmod", "644", device_path], timeout=DEVICE_CALL_TIMEOUT_S
-            )
-            if chmod.get("error") or _rc(chmod.get("content") or {}) != 0:
-                return {
-                    "error": REASON_PUSH_FAILED,
-                    "content": {"detail": "chmod failed on the device"},
-                }
-
-            verify = await adb.shell(
-                serial, ["ls", device_path], timeout=DEVICE_CALL_TIMEOUT_S
-            )
-            vbody = (verify.get("content") or {}) if not verify.get("error") else {}
-            present = _rc(vbody) == 0 and device_path in str(vbody.get("out") or "")
-            if not present:
-                return {
-                    "error": REASON_VERIFY_FAILED,
-                    "content": {
-                        "detail": (
-                            "the certificate could not be confirmed on the "
-                            "device after writing it"
-                        )
-                    },
-                }
-
-            marker = {
-                "serial": serial,
-                "route": route,
-                "device_path": device_path,
-                "fingerprint": fingerprint,
-                "hash": leaf,
-                "installed_ms": int(time.time() * 1000),
-            }
-            _write_marker(serial, marker)
-            return {"error": None, "content": marker}
+            return await _install_checked(serial)
         finally:
             if minted:
                 session.release_device_lock(label, as_holder=True)
@@ -452,6 +480,55 @@ def status(serial: str) -> dict:
         }
 
 
+async def _make_writable(serial: str, route: str) -> bool:
+    """Root + remount for a system-store route; other routes need neither."""
+    if route != ROUTE_SYSTEM:
+        return True
+    rooted = await adb.raw(["-s", serial, "root"], timeout=DEVICE_CALL_TIMEOUT_S)
+    if rooted.get("error") or _rc(rooted.get("content") or {}) != 0:
+        return False
+    remounted = await adb.raw(["-s", serial, "remount"], timeout=DEVICE_CALL_TIMEOUT_S)
+    return not remounted.get("error") and _rc(remounted.get("content") or {}) == 0
+
+
+async def _remove_from_device(serial: str, marker: dict) -> tuple[bool, str]:
+    """``(device_removed, detail)`` after trying to ``rm`` the marked file."""
+    device_path = str(marker.get("device_path") or "")
+    route = str(marker.get("route") or "")
+    reachable = await _make_writable(serial, route)
+    if not (reachable and device_path):
+        return False, "could not reach the device to remove the certificate"
+    rm = await adb.shell(
+        serial, ["rm", "-f", device_path], timeout=DEVICE_CALL_TIMEOUT_S
+    )
+    if not rm.get("error") and _rc(rm.get("content") or {}) == 0:
+        return True, ""
+    return False, str(rm.get("error") or (rm.get("content") or {}).get("err") or "")[
+        :200
+    ]
+
+
+async def _remove_recorded(serial: str) -> dict:
+    """Remove what the local marker records, then forget the device."""
+    marker = _read_marker(serial)
+    device_removed = False
+    if marker:
+        device_removed, detail = await _remove_from_device(serial, marker)
+        _clear_marker(serial)
+    else:
+        detail = "no local record of an installed certificate on this device"
+
+    ledger.forget(serial)
+    return {
+        "error": None,
+        "content": {
+            "device_removed": device_removed,
+            "had_marker": bool(marker),
+            "detail": detail,
+        },
+    }
+
+
 async def remove(serial: str, *, apply: bool = False, owner: str = "") -> dict:
     """Take the certificate off *serial* AND forget it in the ledger.
 
@@ -475,61 +552,7 @@ async def remove(serial: str, *, apply: bool = False, owner: str = "") -> dict:
         try:
             if not apply:
                 return {"error": REASON_NO_APPLY, "content": None}
-
-            marker = _read_marker(serial)
-            device_removed = False
-            detail = ""
-            if marker:
-                device_path = str(marker.get("device_path") or "")
-                route = str(marker.get("route") or "")
-                reachable = True
-                if route == ROUTE_SYSTEM:
-                    rooted = await adb.raw(
-                        ["-s", serial, "root"], timeout=DEVICE_CALL_TIMEOUT_S
-                    )
-                    reachable = (
-                        not rooted.get("error")
-                        and _rc(rooted.get("content") or {}) == 0
-                    )
-                    if reachable:
-                        remounted = await adb.raw(
-                            ["-s", serial, "remount"],
-                            timeout=DEVICE_CALL_TIMEOUT_S,
-                        )
-                        reachable = (
-                            not remounted.get("error")
-                            and _rc(remounted.get("content") or {}) == 0
-                        )
-                if reachable and device_path:
-                    rm = await adb.shell(
-                        serial,
-                        ["rm", "-f", device_path],
-                        timeout=DEVICE_CALL_TIMEOUT_S,
-                    )
-                    device_removed = (
-                        not rm.get("error") and _rc(rm.get("content") or {}) == 0
-                    )
-                    if not device_removed:
-                        detail = str(
-                            rm.get("error")
-                            or (rm.get("content") or {}).get("err")
-                            or ""
-                        )[:200]
-                else:
-                    detail = "could not reach the device to remove the certificate"
-                _clear_marker(serial)
-            else:
-                detail = "no local record of an installed certificate on this device"
-
-            ledger.forget(serial)
-            return {
-                "error": None,
-                "content": {
-                    "device_removed": device_removed,
-                    "had_marker": bool(marker),
-                    "detail": detail,
-                },
-            }
+            return await _remove_recorded(serial)
         finally:
             if minted:
                 session.release_device_lock(label, as_holder=True)

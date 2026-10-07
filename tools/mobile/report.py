@@ -779,29 +779,40 @@ def _device_size(screen: object) -> tuple:
     documented behaviour and it is pinned by test rather than changed here.
     """
     body = screen if isinstance(screen, dict) else {}
-    # In priority order, and derived ONCE: the display if the producer knew it,
-    # then the frame it filtered with, then the walk. Two sources, one set of
-    # clauses -- checking them twice is how a second copy drifts from the first.
+    # Priority order, one set of clauses: display, then filter frame, then the walk.
     for key in ("root_bounds", "frame_bounds"):
-        rect = _bounds_of({"bounds": body.get(key)})
-        if (
-            rect is not None
-            and rect[0] >= 0
-            and rect[1] >= 0
-            and 0 < rect[2] <= MAX_DEVICE_EXTENT
-            and 0 < rect[3] <= MAX_DEVICE_EXTENT
-        ):
-            # Each clause is reachable on its own, which is what makes it a
-            # guard rather than decoration. `_bounds_of` SORTS, so
-            # `rect[2] >= rect[0]` always holds -- but with the origin only
-            # required to be non-negative, `[0,0,0,2400]` still reaches and
-            # fails `rect[2] > 0`, and `[0,0,1080,0]` still reaches and fails
-            # `rect[3] > 0`. A negative origin fails the first two and never
-            # reaches either.
-            return rect[2], rect[3]
+        size = _stored_extent(body.get(key))
+        if size is not None:
+            return size
+    return _elements_extent(body.get("elements"))
+
+
+def _stored_extent(value: object) -> tuple | None:
+    """``(right, bottom)`` of a stored rectangle, or None when it is unusable."""
+    rect = _bounds_of({"bounds": value})
+    if (
+        rect is not None
+        and rect[0] >= 0
+        and rect[1] >= 0
+        and 0 < rect[2] <= MAX_DEVICE_EXTENT
+        and 0 < rect[3] <= MAX_DEVICE_EXTENT
+    ):
+        # Each clause is reachable on its own, which is what makes it a
+        # guard rather than decoration. `_bounds_of` SORTS, so
+        # `rect[2] >= rect[0]` always holds -- but with the origin only
+        # required to be non-negative, `[0,0,0,2400]` still reaches and
+        # fails `rect[2] > 0`, and `[0,0,1080,0]` still reaches and fails
+        # `rect[3] > 0`. A negative origin fails the first two and never
+        # reaches either.
+        return rect[2], rect[3]
+    return None
+
+
+def _elements_extent(elements: object) -> tuple:
+    """The lowest-right corner over the elements: the last-resort device size."""
     width = 0
     height = 0
-    for element in body.get("elements") or []:
+    for element in elements or []:
         box = _bounds_of(element)
         if box is None:
             continue
@@ -894,6 +905,25 @@ def scale_bounds(box: object, dev_w: int, dev_h: int) -> tuple | None:
         return None
 
 
+def _rect_of(element: object, placed: tuple) -> dict:
+    """One drawn wireframe rectangle: scaled box, label and interaction kind."""
+    holder = element if isinstance(element, dict) else {}
+    label = _text(holder.get("text") or holder.get("desc") or holder.get("rid"), 40)
+    kind = "plain"
+    if holder.get("clickable"):
+        kind = "tap"
+    elif holder.get("editable"):
+        kind = "edit"
+    return {
+        "x": placed[0],
+        "y": placed[1],
+        "w": placed[2],
+        "h": placed[3],
+        "label": label,
+        "kind": kind,
+    }
+
+
 def wireframe(screen: object) -> dict:
     """``{"rects", "device", "scaled", "clipped", "outside"}`` for one pruned
     screen. ``clipped`` counts elements drawn as the sliver that fits the
@@ -905,6 +935,27 @@ def wireframe(screen: object) -> dict:
     """
     body = screen if isinstance(screen, dict) else {}
     dev_w, dev_h = _device_size(body)
+    rects, clipped, outside = _place_elements(body.get("elements"), dev_w, dev_h)
+    # `scaled` is a claim about the PICTURE, not about the geometry that went
+    # into it: this function's contract is that a False draws a labelled empty
+    # frame rather than a plausible-looking wrong one. A screen whose elements
+    # all lie outside the display -- reachable since the visibility frame was
+    # widened past it -- scales every one of them to nothing and would otherwise
+    # return an empty frame claiming to be a real one.
+    frame_w, frame_h = _frame_box(dev_w, dev_h)
+    return {
+        "rects": rects,
+        "device": [dev_w, dev_h],
+        "scaled": bool(rects),
+        "clipped": clipped,
+        "outside": outside,
+        "frame_w": frame_w,
+        "frame_h": frame_h,
+    }
+
+
+def _place_elements(elements: object, dev_w: int, dev_h: int) -> tuple:
+    """``(rects, clipped, outside)`` for the elements scaled onto the frame."""
     # No zero-device check HERE: `scale_bounds` refuses a zero device for every
     # box and the loop then produces no rects, which is the same frame the
     # removed early return built by hand. Two checks for one condition was a
@@ -912,7 +963,7 @@ def wireframe(screen: object) -> dict:
     rects = []
     clipped = 0
     outside = 0
-    for element in list(body.get("elements") or [])[:MAX_RECTS]:
+    for element in list(elements or [])[:MAX_RECTS]:
         box = _bounds_of(element)
         if box is None:
             continue
@@ -934,39 +985,8 @@ def wireframe(screen: object) -> dict:
             continue
         if past_edge:
             clipped += 1
-        holder = element if isinstance(element, dict) else {}
-        label = _text(holder.get("text") or holder.get("desc") or holder.get("rid"), 40)
-        kind = "plain"
-        if holder.get("clickable"):
-            kind = "tap"
-        elif holder.get("editable"):
-            kind = "edit"
-        rects.append(
-            {
-                "x": placed[0],
-                "y": placed[1],
-                "w": placed[2],
-                "h": placed[3],
-                "label": label,
-                "kind": kind,
-            }
-        )
-    # `scaled` is a claim about the PICTURE, not about the geometry that went
-    # into it: this function's contract is that a False draws a labelled empty
-    # frame rather than a plausible-looking wrong one. A screen whose elements
-    # all lie outside the display -- reachable since the visibility frame was
-    # widened past it -- scales every one of them to nothing and would otherwise
-    # return an empty frame claiming to be a real one.
-    frame_w, frame_h = _frame_box(dev_w, dev_h)
-    return {
-        "rects": rects,
-        "device": [dev_w, dev_h],
-        "scaled": bool(rects),
-        "clipped": clipped,
-        "outside": outside,
-        "frame_w": frame_w,
-        "frame_h": frame_h,
-    }
+        rects.append(_rect_of(element, placed))
+    return rects, clipped, outside
 
 
 # ── numbers ────────────────────────────────────────────────────────────────────
@@ -1480,6 +1500,28 @@ def _geometry_note(frame: dict) -> str:
     return '<p class="wirenote geom">' + "; ".join(parts) + "</p>"
 
 
+def _element_map_fold(screen_id: object, screens: object) -> str:
+    """The folded element-rectangle wireframe shown under the phone."""
+    return (
+        '<details class="sec"><summary><span class="chev" aria-hidden="true"></span>'
+        'Element map<span class="mt">the same screen as its element rectangles</span></summary>'
+        '<div class="secbody"><div class="phone wire"><div class="ph-scroll">'
+        + _frame_html(screen_id, screens)
+        + "</div></div>"
+        + _WIRE_LEGEND
+        + "</div></details>"
+    )
+
+
+def _empty_phone(verdict: str) -> str:
+    """An empty handset that says why no look is drawn."""
+    return (
+        '<div class="phone" dir="auto"><div class="ph-scroll"><div class="ph-empty">'
+        + esc(AMBIGUOUS_LOOK if verdict == LOOK_AMBIGUOUS else NOT_CAPTURED)
+        + "</div></div></div>"
+    )
+
+
 def _phone_html(
     title: str, sub: str, screen_id: object, screens: object, app: str
 ) -> str:
@@ -1504,15 +1546,7 @@ def _phone_html(
         # unknowable, and a photograph hung above that sentence would contradict
         # it with the one kind of evidence a tester cannot argue with.
         drawn = _shot_html(ident) + screen_phone.compose(screen, esc=esc, app=app)
-        fold = (
-            '<details class="sec"><summary><span class="chev" aria-hidden="true"></span>'
-            'Element map<span class="mt">the same screen as its element rectangles</span></summary>'
-            '<div class="secbody"><div class="phone wire"><div class="ph-scroll">'
-            + _frame_html(screen_id, screens)
-            + "</div></div>"
-            + _WIRE_LEGEND
-            + "</div></details>"
-        )
+        fold = _element_map_fold(screen_id, screens)
     else:
         # THE PICTURE GETS THE SAME ANSWER AS THE FOLD BENEATH IT. Until this
         # change the fold said the look was unknowable while the phone above it
@@ -1521,11 +1555,7 @@ def _phone_html(
         # only `_frame_html`, which is the fold. `ph-empty` is an existing rule
         # in ``report_shell.html`` -- no new class name is introduced, because a
         # class with no rule renders unstyled with nothing failing.
-        drawn = (
-            '<div class="phone" dir="auto"><div class="ph-scroll"><div class="ph-empty">'
-            + esc(AMBIGUOUS_LOOK if verdict == LOOK_AMBIGUOUS else NOT_CAPTURED)
-            + "</div></div></div>"
-        )
+        drawn = _empty_phone(verdict)
         fold = ""
     return (
         '<div class="phone-col" data-look="'
@@ -1658,17 +1688,12 @@ CLIP_SCALE_NOTE = (
 def _video_html(tc_id: object, media_map: object) -> str:
     """Every clip of this case, in order, or the named reason for each gap.
 
-    **The class is ``stepclip``, not ``clip``, and the name was checked before
-    it was chosen.** ``.clip`` is ALREADY taken in ``report_shell.html``: it is
-    the code-block truncation bar (and ``.clip.lazy`` beside it, which the
-    shell's own JS selects by name), and ``tools/mobile_evidence/exchanges.py``
-    emits ``<div class="clip">truncated ...</div>`` onto THIS SAME PAGE. A
-    second ``.clip`` rule added below the first in the cascade would have
-    repainted every one of those notes black and full-width. One name, one
-    meaning, every consumer -- and the consumer here was another module's
-    markup, which is why the check is a grep of the shell and not a memory of
-    it. ``tests/mobile/test_mobile_report_css_binding.py`` asserts every class
-    name this change introduces was UNSTYLED before it landed.
+    **The class is ``stepclip``, not ``clip``.** ``.clip`` is ALREADY taken in
+    ``report_shell.html`` (the code-block truncation bar, which the shell's JS
+    selects by name) and ``tools/mobile_evidence/exchanges.py`` emits it onto
+    THIS SAME PAGE; a second ``.clip`` rule would repaint those notes.
+    ``tests/mobile/test_mobile_report_css_binding.py`` asserts every class
+    name introduced here was UNSTYLED before it landed.
     """
     book = media_map if isinstance(media_map, dict) else {}
     rows = (book.get("clips") or {}).get(_media_key(tc_id)) or []
@@ -1689,12 +1714,9 @@ def _video_html(tc_id: object, media_map: object) -> str:
             # NEVER an empty <video>: a player with no source reads as a broken
             # report, and the reason is the only thing worth showing here.
             body = ""
-        # TWO notes, never one. The first says how this step's recording went;
-        # the second says what every recording on this page IS. Collapsing them
-        # would let a clean clip's caption read as if the downscale were a
-        # failure, and a failed clip's caption claim a downscaled file exists.
-        # The scale note is emitted ONLY where a clip actually plays: a step
-        # with no file was not downscaled, it was not recorded.
+        # TWO notes, never one: how this step's recording went, and what every
+        # recording here IS. The scale note shows ONLY where a clip plays: a
+        # step with no file was not downscaled, it was not recorded.
         scale = (
             '<p class="stepclipnote">' + esc(CLIP_SCALE_NOTE, 300) + "</p>"
             if srcpath
@@ -1777,20 +1799,7 @@ def _action_line(action: object) -> str:
     body = action if isinstance(action, dict) else {}
     if not body:
         return _text(action, 80)
-    target = body.get("target")
-    target = target if isinstance(target, dict) else {}
-    # `rid` first, then what was on screen, and the short `id` LAST -- the same
-    # order `actions.resolve_target` uses, and for the reader's sake rather
-    # than the resolver's: an id is a content hash, so a step table that put it
-    # first read `tap -> e9f3a1b2` where the model had also given a resource id
-    # a tester could recognise.
-    hint = _text(
-        target.get("rid")
-        or target.get("text")
-        or target.get("desc")
-        or target.get("id"),
-        60,
-    )
+    hint = _action_hint(body.get("target"))
     extra = _text(body.get("kind") or body.get("field") or body.get("dir"), 40)
     parts = [_text(body.get("op"), 24) or "?"]
     if hint:
@@ -1801,6 +1810,23 @@ def _action_line(action: object) -> str:
     if typed:
         parts.append("\u201c" + typed + "\u201d")
     return " ".join(parts)
+
+
+def _action_hint(target: object) -> str:
+    """The target's label for a trace line: ``""`` when it has none."""
+    target = target if isinstance(target, dict) else {}
+    # `rid` first, then what was on screen, and the short `id` LAST -- the same
+    # order `actions.resolve_target` uses, and for the reader's sake rather
+    # than the resolver's: an id is a content hash, so a step table that put it
+    # first read `tap -> e9f3a1b2` where the model had also given a resource id
+    # a tester could recognise.
+    return _text(
+        target.get("rid")
+        or target.get("text")
+        or target.get("desc")
+        or target.get("id"),
+        60,
+    )
 
 
 def _typed_literal(body: dict) -> str:
@@ -1814,62 +1840,80 @@ def _typed_literal(body: dict) -> str:
 
 def _trace_rows(trace: object) -> list:
     """The step table's rows, each re-redacted before anything is rendered."""
-    rows = []
-    for entry in list(trace or [])[:MAX_ROWS]:
-        if not isinstance(entry, dict):
+    return [
+        _trace_row(entry)
+        for entry in list(trace or [])[:MAX_ROWS]
+        if isinstance(entry, dict)
+    ]
+
+
+def _trace_row(entry: dict) -> dict:
+    """One step-table row from one trace entry, re-redacted first.
+
+    The ``run_store.redact`` call below is STILL NOT canary-provable, because
+    MUTATION SAID SO: deleting it kept every test green, since `_action_line`
+    masks on the `secret` marker and on CREDENTIAL_TERMS ITSELF. The structural
+    control is the one that holds; this call is kept as depth for the day a
+    field IS rendered that only key-based redaction covers. A security comment
+    that overstates its own line gets a control trusted for what it does not do.
+    """
+    safe = run_store.redact(entry)
+    safe = safe if isinstance(safe, dict) else {}
+    action = safe.get("action")
+    action = action if isinstance(action, dict) else {}
+    # Derived ONCE. The id that names a screen and the key that names a LOOK
+    # at that screen must come from the same normalisation: a truncation on
+    # one side and none on the other is two derivations of one id, which is
+    # a defect the neighbouring plan for this file has already shipped.
+    before_id = _text(safe.get("before_screen_id"), 40)
+    after_id = _text(safe.get("after_screen_id"), 40)
+    return {
+        "index": _text(safe.get("index"), 8),
+        "op": _text(action.get("op"), 24) or "?",
+        "action": _action_line(safe.get("action")),
+        "plain": _plain_action(action),
+        "act": action,
+        "target_id": _text(
+            (action.get("target") or {}).get("id")
+            if isinstance(action.get("target"), dict)
+            else "",
+            40,
+        ),
+        "outcome": _text(safe.get("outcome"), 40) or "-",
+        "ms": _ms(safe.get("ms")),
+        "detail": _text(safe.get("detail"), MAX_TEXT),
+        "notes_applied": _notes_applied(safe.get("knowledge")),
+        "before": before_id,
+        "after": after_id,
+        # WHICH screen each end was, above; WHAT was on it, here. Two
+        # questions, two names, and the key is minted by the STORE's own
+        # producer so this reader cannot ask for a key the writer would
+        # not have written. An observation id is 25 characters -- a
+        # 12-hex screen id, a dash and 12 more -- so it survives the
+        # 40-character `_text` a frame applies to it, with no room for
+        # two observations to collide on a shared prefix.
+        "before_obs": _obs_key(before_id, safe.get("before_screen_hash")),
+        "after_obs": _obs_key(after_id, safe.get("after_screen_hash")),
+    }
+
+
+def _notes_applied(raw: object) -> str:
+    """``Notes applied: #3 wait confirmed (1200 ms); ...`` from a trace entry's
+    ``knowledge`` list, or ``""`` when no saved note touched the step."""
+    parts = []
+    for item in (raw if isinstance(raw, list) else [])[:6]:
+        if not isinstance(item, dict):
             continue
-        # STILL NOT canary-provable, and this comment says so because MUTATION
-        # SAID SO -- not because anyone reasoned about it. The claim written
-        # here first was that rendering a typed literal had made this line
-        # load-bearing. Deleting it and running the suite kept every test
-        # green, because `_action_line` masks on the `secret` marker and on
-        # CREDENTIAL_TERMS ITSELF, before this ever mattered. The structural
-        # control is still the one that holds.
-        #
-        # It is kept as depth for the day a field IS rendered that only
-        # key-based redaction covers, and the honest note is the point: a
-        # security comment that overstates its own line is how a control gets
-        # trusted for something it does not do.
-        safe = run_store.redact(entry)
-        safe = safe if isinstance(safe, dict) else {}
-        action = safe.get("action")
-        action = action if isinstance(action, dict) else {}
-        # Derived ONCE. The id that names a screen and the key that names a LOOK
-        # at that screen must come from the same normalisation: a truncation on
-        # one side and none on the other is two derivations of one id, which is
-        # a defect the neighbouring plan for this file has already shipped.
-        before_id = _text(safe.get("before_screen_id"), 40)
-        after_id = _text(safe.get("after_screen_id"), 40)
-        rows.append(
-            {
-                "index": _text(safe.get("index"), 8),
-                "op": _text(action.get("op"), 24) or "?",
-                "action": _action_line(safe.get("action")),
-                "plain": _plain_action(action),
-                "act": action,
-                "target_id": _text(
-                    (action.get("target") or {}).get("id")
-                    if isinstance(action.get("target"), dict)
-                    else "",
-                    40,
-                ),
-                "outcome": _text(safe.get("outcome"), 40) or "-",
-                "ms": _ms(safe.get("ms")),
-                "detail": _text(safe.get("detail"), MAX_TEXT),
-                "before": before_id,
-                "after": after_id,
-                # WHICH screen each end was, above; WHAT was on it, here. Two
-                # questions, two names, and the key is minted by the STORE's own
-                # producer so this reader cannot ask for a key the writer would
-                # not have written. An observation id is 25 characters -- a
-                # 12-hex screen id, a dash and 12 more -- so it survives the
-                # 40-character `_text` a frame applies to it, with no room for
-                # two observations to collide on a shared prefix.
-                "before_obs": _obs_key(before_id, safe.get("before_screen_hash")),
-                "after_obs": _obs_key(after_id, safe.get("after_screen_hash")),
-            }
+        parts.append(
+            "#%s %s %s%s"
+            % (
+                _text(item.get("note_id"), 12),
+                _text(item.get("kind"), 12),
+                _text(item.get("outcome"), 20).replace("_", " "),
+                " (%s ms)" % _text(item.get("ms"), 10) if item.get("ms") else "",
+            )
         )
-    return rows
+    return ("Notes applied: " + "; ".join(parts)) if parts else ""
 
 
 def _obs_key(ident: object, screen_hash: object) -> str:
@@ -2685,14 +2729,19 @@ def _facts_strip(
     return '<div class="runstrip" aria-label="Run facts">' + cells + "</div>"
 
 
-def _segbar(counts: dict) -> str:
-    total = sum(int(n) for n in counts.values()) or 1
+def _tile_order(counts: dict) -> list:
+    """``(name, count)`` pairs: the known tiles first, then any other verdict."""
     ordered = [(name, int(counts.get(name) or 0)) for name in TILES]
     ordered += [
         (name, int(n)) for name, n in sorted(counts.items()) if name not in TILES
     ]
+    return ordered
+
+
+def _segbar(counts: dict) -> str:
+    total = sum(int(n) for n in counts.values()) or 1
     segs, legend = [], []
-    for name, n in ordered:
+    for name, n in _tile_order(counts):
         if not n:
             continue
         sw, seg, _pill_cls, label = _tone(name)
@@ -3581,6 +3630,7 @@ JOURNEY_ID = "journey"
 CASES_ID = "cases"
 DIAG_ID = "diagnostics"
 ABOUT_ID = "about"
+KNOWLEDGE_ID = "knowledge"
 
 #: This build's picture book: where the report's media and the run's shots
 #: live, the derivatives made so far, how many images were emitted (the first
@@ -3602,6 +3652,7 @@ OUTCOME_WORDS = {
     "left_app": "left the app",
     "route_mismatch": "screen not as saved",
     "supplied": "tester answered",
+    "knowledge_avoid": "stopped by a saved note",
     "-": "not run",
 }
 
@@ -3894,6 +3945,30 @@ def _same_gap(one: tuple, two: tuple) -> bool:
     return one[2] == two[2] and one[2] != LOOK_EXACT
 
 
+def _step_pics(row: dict, library: object, app: str, after_look: tuple) -> str:
+    """The Before and After pictures of one step, or one shared note for both."""
+    before = row.get("before_obs") or row.get("before")
+    after = row.get("after_obs") or row.get("after")
+    target = row.get("target_id") if row.get("op") in TARGET_OPS else ""
+    if after_look:
+        return (_look_pic(before, library, "Before", app, target) if before else "") + (
+            _look_pic(after_look[0], library, "After", app, note=after_look[1])
+        )
+    if before and (
+        before == after
+        or (
+            after
+            and _same_gap(_resolve_look(before, library), _resolve_look(after, library))
+        )
+    ):
+        # Neither end has a picture and both miss it for the same reason: one
+        # note for the pair, not the same sentence twice side by side.
+        return _look_pic(before, library, "Before and after", app, target)
+    return (_look_pic(before, library, "Before", app, target) if before else "") + (
+        _look_pic(after, library, "After", app) if after else ""
+    )
+
+
 def _step_html(
     tc_slug: str,
     index: int,
@@ -3911,28 +3986,9 @@ def _step_html(
     """
     outcome = str(row.get("outcome") or "-")
     word = OUTCOME_WORDS.get(outcome.lower(), outcome.replace("_", " "))
-    before = row.get("before_obs") or row.get("before")
-    after = row.get("after_obs") or row.get("after")
-    target = row.get("target_id") if row.get("op") in TARGET_OPS else ""
-    if after_look:
-        pics = (_look_pic(before, library, "Before", app, target) if before else "") + (
-            _look_pic(after_look[0], library, "After", app, note=after_look[1])
-        )
-    elif before and (
-        before == after
-        or (
-            after
-            and _same_gap(_resolve_look(before, library), _resolve_look(after, library))
-        )
-    ):
-        # Neither end has a picture and both miss it for the same reason: one
-        # note for the pair, not the same sentence twice side by side.
-        pics = _look_pic(before, library, "Before and after", app, target)
-    else:
-        pics = (_look_pic(before, library, "Before", app, target) if before else "") + (
-            _look_pic(after, library, "After", app) if after else ""
-        )
+    pics = _step_pics(row, library, app, after_look)
     detail = str(row.get("detail") or "")
+    applied = str(row.get("notes_applied") or "")
     return (
         '<li class="step" id="step-'
         + tc_slug
@@ -3945,10 +4001,10 @@ def _step_html(
         + "</p>"
         + _outcome_pill(word)
         + "</div>"
-        + (
-            ('<p class="stepnote" dir="auto">' + esc(detail, 300) + "</p>")
-            if detail
-            else ""
+        + "".join(
+            '<p class="stepnote" dir="auto">' + esc(line, 300) + "</p>"
+            for line in (detail, applied)
+            if line
         )
         + (('<div class="steppics">' + pics + "</div>") if pics else "")
         + "</li>"
@@ -4117,6 +4173,16 @@ def _turn_html(
     )
 
 
+def _goal_meta(facts: list) -> list:
+    """The turn count, step count and summed wall time shown on a goal's head."""
+    steps = sum(len(f["rows"]) for f in facts)
+    walls = [f["wall"] for f in facts if f["wall"] is not None]
+    meta = [_count(len(facts), "turn"), _count(steps, "step")]
+    if walls:
+        meta.append(fmt_ms(sum(walls)))
+    return meta
+
+
 def _journey_html(
     groups: list,
     facts_by_id: dict,
@@ -4137,11 +4203,7 @@ def _journey_html(
         ]
         if not facts:
             continue
-        steps = sum(len(f["rows"]) for f in facts)
-        walls = [f["wall"] for f in facts if f["wall"] is not None]
-        meta = [_count(len(facts), "turn"), _count(steps, "step")]
-        if walls:
-            meta.append(fmt_ms(sum(walls)))
+        meta = _goal_meta(facts)
         film = "".join(
             _thumb_html(
                 order[f["tc_id"]], f, _turn_frame(f["tc_id"], cases_by_id), library
@@ -4198,13 +4260,9 @@ def _issues_html(facts: list, kinds: dict) -> str:
 
 def _results_html(groups: list, scripted: list, tally_: dict, total: int) -> str:
     """The header's result lines, inside the totals the selfcheck compares."""
-    ordered = [(name, int(tally_.get(name) or 0)) for name in TILES]
-    ordered += [
-        (name, int(c)) for name, c in sorted(tally_.items()) if name not in TILES
-    ]
     attrs = "".join(
         " data-" + name.replace("_", "-") + '="' + str(int(count)) + '"'
-        for name, count in ordered
+        for name, count in _tile_order(tally_)
     )
     lines = []
     for group in groups:
@@ -4621,6 +4679,7 @@ def _document_body(
         "".join(
             _sechead(sid, title, label, "", body) for sid, title, label, body in present
         )
+        + _knowledge_html(run_id)
         + '<div id="'
         + END_ID
         + '" data-cards="'
@@ -4677,6 +4736,22 @@ def _document_body(
         + body
         + "\n</body></html>\n"
     )
+
+
+def _knowledge_html(run_id: str) -> str:
+    """The per-app knowledge section, ``""`` when nothing was learned. Never raises."""
+    try:
+        from tools.mobile import knowledge_report
+
+        body = knowledge_report.render_section(
+            knowledge_report.knowledge_section(run_id)
+        )
+        if not body:
+            return ""
+        return _sechead(KNOWLEDGE_ID, "App knowledge", "what this run learned", "", body)
+    except Exception:
+        logger.exception("knowledge section failed")
+        return ""
 
 
 def _write_page(target: Path, page: str) -> dict:

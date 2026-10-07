@@ -272,6 +272,27 @@ def _lines_of(source) -> Iterable[str]:
 # ── input adapters: both produce the same list of event dicts ──────────────────
 
 
+def _ndjson_event(rec: dict, run_id, run_index: int) -> dict:
+    """One structured record as the event dict every stream reads."""
+    return {
+        "appRunId": run_id,
+        "cont": False,
+        "runIndex": run_index,
+        "seq": rec.get("seq"),
+        "ts": rec.get("ts"),
+        "monoNanos": rec.get("monoNanos"),
+        "durationMs": rec.get("durationMs"),
+        "level": rec.get("level"),
+        "category": rec.get("category"),
+        "msg": rec.get("msg", "") or "",
+        "fields": rec.get("fields") or {},
+        "sessionId": rec.get("sessionId"),
+        "connectionId": rec.get("connectionId"),
+        "turnId": rec.get("turnId"),
+        "spanId": rec.get("spanId"),
+    }
+
+
 def read_ndjson(source):
     """The primary input. A manifest line opens each app run, then one event per line.
 
@@ -305,25 +326,7 @@ def read_ndjson(source):
         if isinstance(kind, str) and kind.endswith(".session.checkpoint"):
             checkpoints.append(dict(rec, appRunId=run_id, runIndex=run_index))
             continue
-        events.append(
-            {
-                "appRunId": run_id,
-                "cont": False,
-                "runIndex": run_index,
-                "seq": rec.get("seq"),
-                "ts": rec.get("ts"),
-                "monoNanos": rec.get("monoNanos"),
-                "durationMs": rec.get("durationMs"),
-                "level": rec.get("level"),
-                "category": rec.get("category"),
-                "msg": rec.get("msg", "") or "",
-                "fields": rec.get("fields") or {},
-                "sessionId": rec.get("sessionId"),
-                "connectionId": rec.get("connectionId"),
-                "turnId": rec.get("turnId"),
-                "spanId": rec.get("spanId"),
-            }
-        )
+        events.append(_ndjson_event(rec, run_id, run_index))
     events.sort(key=lambda e: (e["runIndex"], e["seq"] is None, e["seq"] or 0))
     return manifests, events, malformed, checkpoints
 
@@ -1407,21 +1410,8 @@ def turn_of_seq(parsed, seq, app_run=None):
     return None
 
 
-def attribute_turns(parsed):
-    """Turn boundaries from the SDK's own turn-start marker, when it stamped no turnId.
-
-    One app run at a time: ``seq`` restarts per run. Everything between one marker and the
-    next belongs to that turn; everything before a run's first marker is start-up and
-    stays unattributed. A capture with real turn ids is left exactly as it is.
-    """
-    if parsed.get("turns") or not parsed.get("utterances"):
-        return parsed
-    by_run: dict = {}
-    for u in parsed["utterances"]:
-        by_run.setdefault(u.get("appRunId"), []).append(u)
-    order = {
-        r.get("appRunId"): r.get("runIndex") for r in (parsed.get("appRuns") or [])
-    }
+def _turn_bounds(by_run: dict):
+    """Per app run the (start, end, turnId) bounds, and the fresh turn record of each."""
     bounds_by_run, turns = {}, {}
     for run, utts in by_run.items():
         utts.sort(key=lambda u: u.get("seq") or 0)
@@ -1444,18 +1434,27 @@ def attribute_turns(parsed):
                 "errors": 0,
             }
         bounds_by_run[run] = bounds
+    return bounds_by_run, turns
 
-    def turn_of(run, seq):
-        if seq is None:
-            return None
-        for start, end, tid in bounds_by_run.get(run) or ():
-            if seq >= start and (end is None or seq <= end):
-                return tid
+
+def _bounded_turn(bounds_by_run: dict, run, seq):
+    """The turn id whose bounds hold ``seq`` in ``run``, or None."""
+    if seq is None:
         return None
+    for start, end, tid in bounds_by_run.get(run) or ():
+        if seq >= start and (end is None or seq <= end):
+            return tid
+    return None
 
-    def run_of(x):
-        return x.get("appRunId") or (x.get("detail") or {}).get("appRunId")
 
+def _run_of(x: dict):
+    return x.get("appRunId") or (x.get("detail") or {}).get("appRunId")
+
+
+def _stamp_turn_ids(
+    parsed: dict, by_run: dict, bounds_by_run: dict, turns: dict
+) -> None:
+    """Write ``turnId`` on every stream item and keep each turn's counts and last seq."""
     counted = {"llm": "llm", "bindings": "bindings", "tools": "tools"}
     for key in (
         "llm",
@@ -1468,7 +1467,7 @@ def attribute_turns(parsed):
         "runlog",
     ):
         for x in parsed.get(key) or []:
-            tid = turn_of(run_of(x), x.get("seq"))
+            tid = _bounded_turn(bounds_by_run, _run_of(x), x.get("seq"))
             x["turnId"] = tid
             if tid:
                 t = turns[tid]
@@ -1477,12 +1476,31 @@ def attribute_turns(parsed):
                     t[counted[key]] += 1
     for utts in by_run.values():
         for u in utts:
-            u["turnId"] = turn_of(u.get("appRunId"), u.get("seq"))
+            u["turnId"] = _bounded_turn(bounds_by_run, u.get("appRunId"), u.get("seq"))
     for err in parsed.get("errors") or []:
-        tid = turn_of(run_of(err), err.get("seq"))
+        tid = _bounded_turn(bounds_by_run, _run_of(err), err.get("seq"))
         err["turnId"] = tid
         if tid:
             turns[tid]["errors"] += 1
+
+
+def attribute_turns(parsed):
+    """Turn boundaries from the SDK's own turn-start marker, when it stamped no turnId.
+
+    One app run at a time: ``seq`` restarts per run. Everything between one marker and the
+    next belongs to that turn; everything before a run's first marker is start-up and
+    stays unattributed. A capture with real turn ids is left exactly as it is.
+    """
+    if parsed.get("turns") or not parsed.get("utterances"):
+        return parsed
+    by_run: dict = {}
+    for u in parsed["utterances"]:
+        by_run.setdefault(u.get("appRunId"), []).append(u)
+    order = {
+        r.get("appRunId"): r.get("runIndex") for r in (parsed.get("appRuns") or [])
+    }
+    bounds_by_run, turns = _turn_bounds(by_run)
+    _stamp_turn_ids(parsed, by_run, bounds_by_run, turns)
     parsed["turns"] = sorted(
         turns.values(),
         key=lambda t: (
@@ -1562,6 +1580,64 @@ def _wall_millis(stamp: str, year: int):
     return int(when.timestamp() * 1000)
 
 
+def _logcat_rows(logcat_lines, tag: str) -> list:
+    """The (ts, msg, level) of every logcat line carrying the SDK's tag."""
+    rows = []
+    for raw in _lines_of(logcat_lines):
+        m = logcat_line(raw.rstrip("\n"))
+        if m and (not tag or m.group("tag").strip() == tag):
+            rows.append((m.group("ts"), m.group("msg"), m.group("level")))
+    return rows
+
+
+def _clock_offset(rows, events, year: int, profile, compiled):
+    """The modal quarter-hour offset between logcat's wall clock and the event clock.
+
+    Messages that occur exactly once on both sides anchor a delta; ``None`` when no
+    message anchors one.
+    """
+    seen = collections.Counter(
+        _runlog_text(e.get("msg") or "", profile, compiled)
+        for e in events
+        if e.get("ts")
+    )
+    stamped = {}
+    for event in events:
+        text = _runlog_text(event.get("msg") or "", profile, compiled)
+        if event.get("ts") and seen[text] == 1:
+            stamped[text] = event["ts"]
+    votes: collections.Counter = collections.Counter()
+    for stamp, msg, _level in rows:
+        anchor = stamped.get(_runlog_text(msg, profile, compiled))
+        wall = _wall_millis(stamp, year)
+        if anchor is not None and wall is not None and isinstance(anchor, (int, float)):
+            votes[round((wall - anchor) / 900000.0)] += 1
+    if not votes:
+        return None
+    return votes.most_common(1)[0][0] * 900000
+
+
+def _network_event(anchor: dict, when, level, text: str) -> dict:
+    """One spliced network line, placed just after ``anchor`` and inheriting its turn."""
+    return {
+        "appRunId": anchor["appRunId"],
+        "runIndex": anchor["runIndex"],
+        "cont": False,
+        "seq": (anchor["seq"] or 0) + 0.5,
+        "ts": when,
+        "monoNanos": None,
+        "durationMs": None,
+        "level": level,
+        "category": None,
+        "msg": text,
+        "fields": {},
+        "sessionId": anchor.get("sessionId"),
+        "connectionId": anchor.get("connectionId"),
+        "turnId": anchor.get("turnId"),
+        "spanId": anchor.get("spanId"),
+    }
+
+
 def merge_logcat_network(events, logcat_lines, profile, compiled) -> int:
     """Splice logcat's network-line stream into the structured events, in place.
 
@@ -1575,33 +1651,13 @@ def merge_logcat_network(events, logcat_lines, profile, compiled) -> int:
     if net is None:
         return 0
     tag = str(getattr(profile, "logcat_tag", "") or "")
-    rows = []
-    for raw in _lines_of(logcat_lines):
-        m = logcat_line(raw.rstrip("\n"))
-        if m and (not tag or m.group("tag").strip() == tag):
-            rows.append((m.group("ts"), m.group("msg"), m.group("level")))
+    rows = _logcat_rows(logcat_lines, tag)
     if not rows:
         return 0
-    seen = collections.Counter(
-        _runlog_text(e.get("msg") or "", profile, compiled)
-        for e in events
-        if e.get("ts")
-    )
-    stamped = {}
-    for event in events:
-        text = _runlog_text(event.get("msg") or "", profile, compiled)
-        if event.get("ts") and seen[text] == 1:
-            stamped[text] = event["ts"]
     year = datetime.datetime.now().year
-    votes: collections.Counter = collections.Counter()
-    for stamp, msg, _level in rows:
-        anchor = stamped.get(_runlog_text(msg, profile, compiled))
-        wall = _wall_millis(stamp, year)
-        if anchor is not None and wall is not None and isinstance(anchor, (int, float)):
-            votes[round((wall - anchor) / 900000.0)] += 1
-    if not votes:
+    offset = _clock_offset(rows, events, year, profile, compiled)
+    if offset is None:
         return 0
-    offset = votes.most_common(1)[0][0] * 900000
     ordered = [e for e in events if isinstance(e.get("ts"), (int, float))]
     if not ordered:
         return 0
@@ -1618,31 +1674,68 @@ def merge_logcat_network(events, logcat_lines, profile, compiled) -> int:
         when = wall - offset
         index = bisect.bisect_right(clocks, when) - 1
         anchor = ordered[index] if index >= 0 else ordered[0]
-        events.append(
-            {
-                "appRunId": anchor["appRunId"],
-                "runIndex": anchor["runIndex"],
-                "cont": False,
-                "seq": (anchor["seq"] or 0) + 0.5,
-                "ts": when,
-                "monoNanos": None,
-                "durationMs": None,
-                "level": level,
-                "category": None,
-                "msg": text,
-                "fields": {},
-                "sessionId": anchor.get("sessionId"),
-                "connectionId": anchor.get("connectionId"),
-                "turnId": anchor.get("turnId"),
-                "spanId": anchor.get("spanId"),
-            }
-        )
+        events.append(_network_event(anchor, when, level, text))
         merged += 1
     events.sort(key=lambda e: (e["runIndex"], e["seq"] is None, e["seq"] or 0))
     return merged
 
 
 # ── the whole report for one capture ───────────────────────────────────────────
+
+
+_LOGCAT_FALLBACK_GAP = {
+    "id": "logcatFallback",
+    "what": "seq ordering, monotonic durations, and the turn correlation chain",
+    "why": "this capture was parsed from logcat; those fields exist only in "
+    "the structured event log, which was not captured.",
+}
+
+
+def _logcat_prompts(logcat, profile, parsed) -> list:
+    """The system prompts of a logcat-only capture, each tied to its turn."""
+    prompts = [
+        {"text": t, "complete": ok, "seq": seq}
+        for t, ok, seq in system_prompts(logcat, profile)
+    ]
+    for p in prompts:
+        p["turnId"] = turn_of_seq(parsed, p["seq"])
+    return prompts
+
+
+def _report_counts(parsed: dict, events: list) -> dict:
+    """The headline counts of one parsed capture."""
+    return {
+        "events": len(events),
+        "appRuns": len(parsed["appRuns"]),
+        "turns": len(parsed["turns"]),
+        "llmCalls": len(parsed["llm"]),
+        "bindingCalls": len(parsed["bindings"]),
+        "toolCalls": len(parsed["tools"]),
+        "notes": len(parsed["notes"]),
+        "errors": len(parsed["errors"]),
+        "narrated": len(parsed["runlog"]),
+    }
+
+
+def _parsed_sections(parsed: dict) -> dict:
+    """The parsed streams the report passes through unchanged."""
+    keys = (
+        "turns",
+        "utterances",
+        "answers",
+        "flowStates",
+        "cards",
+        "appRuns",
+        "llm",
+        "bindings",
+        "tools",
+        "notes",
+        "errors",
+        "runlog",
+        "unresolvedBindings",
+        "configs",
+    )
+    return {key: parsed[key] for key in keys}
 
 
 def build(profile, compiled, *, ndjson=None, logcat=None) -> dict:
@@ -1669,25 +1762,13 @@ def build(profile, compiled, *, ndjson=None, logcat=None) -> dict:
             source = "logcat"
             manifests, events, malformed, checkpoints = read_logcat(logcat, profile)
             parsed = attribute_turns(parse(events, None, profile, compiled))
-            prompts = [
-                {"text": t, "complete": ok, "seq": seq}
-                for t, ok, seq in system_prompts(logcat, profile)
-            ]
-            for p in prompts:
-                p["turnId"] = turn_of_seq(parsed, p["seq"])
+            prompts = _logcat_prompts(logcat, profile, parsed)
         manifest = manifests[-1] if manifests else None
         effective_env, hosts = env_from_traffic(parsed["bindings"], profile)
         claimed_env = (manifest or {}).get("env")
         gaps = list(GAPS)
         if source == "logcat":
-            gaps.append(
-                {
-                    "id": "logcatFallback",
-                    "what": "seq ordering, monotonic durations, and the turn correlation chain",
-                    "why": "this capture was parsed from logcat; those fields exist only in "
-                    "the structured event log, which was not captured.",
-                }
-            )
+            gaps.append(dict(_LOGCAT_FALLBACK_GAP))
         report = {
             "schema": SCHEMA,
             "run": {
@@ -1707,33 +1788,10 @@ def build(profile, compiled, *, ndjson=None, logcat=None) -> dict:
             },
             "manifest": manifest,
             "manifests": manifests,
-            "counts": {
-                "events": len(events),
-                "appRuns": len(parsed["appRuns"]),
-                "turns": len(parsed["turns"]),
-                "llmCalls": len(parsed["llm"]),
-                "bindingCalls": len(parsed["bindings"]),
-                "toolCalls": len(parsed["tools"]),
-                "notes": len(parsed["notes"]),
-                "errors": len(parsed["errors"]),
-                "narrated": len(parsed["runlog"]),
-            },
+            "counts": _report_counts(parsed, events),
             "tokens": totals(parsed),
             "systemPrompts": prompts,
-            "turns": parsed["turns"],
-            "utterances": parsed["utterances"],
-            "answers": parsed["answers"],
-            "flowStates": parsed["flowStates"],
-            "cards": parsed["cards"],
-            "appRuns": parsed["appRuns"],
-            "llm": parsed["llm"],
-            "bindings": parsed["bindings"],
-            "tools": parsed["tools"],
-            "notes": parsed["notes"],
-            "errors": parsed["errors"],
-            "runlog": parsed["runlog"],
-            "unresolvedBindings": parsed["unresolvedBindings"],
-            "configs": parsed["configs"],
+            **_parsed_sections(parsed),
             "checkpoints": checkpoints,
             "clock": parsed.get("clock") or {},
             "gaps": gaps,

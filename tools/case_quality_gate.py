@@ -135,53 +135,7 @@ def scan_suite(cases) -> QualityGateResult:
     first_by_title: dict = {}
     try:
         for case in rows:
-            result.scanned_cases += 1
-            tc_id = _text(case, "tc_id") or "(no id)"
-            category = _text(case, "category") or "(uncategorised)"
-            title_key = normalize(_text(case, "title"))
-            if title_key:
-                first = first_by_title.get(title_key)
-                if first is None:
-                    first_by_title[title_key] = tc_id
-                else:
-                    findings.append(
-                        QualityFinding(
-                            DUPLICATE_TITLE,
-                            tc_id,
-                            category,
-                            "same title as " + first,
-                        )
-                    )
-                    if len(findings) >= _MAX_FINDINGS:
-                        raise _Enough()
-            try:
-                steps = list(getattr(case, "steps", None) or [])
-            except Exception:
-                steps = []
-            for index, step in enumerate(steps, 1):
-                data = _text(step, "test_data")
-                if data and data.casefold() in PLACEHOLDER_TEST_DATA:
-                    findings.append(
-                        QualityFinding(
-                            EMPTY_TEST_DATA,
-                            tc_id,
-                            category,
-                            "step " + str(index) + " has no usable test_data",
-                        )
-                    )
-                action = normalize(_text(step, "action"))
-                expected = normalize(_text(step, "expected_result"))
-                if action and expected and action == expected:
-                    findings.append(
-                        QualityFinding(
-                            RESTATED_EXPECTED,
-                            tc_id,
-                            category,
-                            "step " + str(index) + " restates its action verbatim",
-                        )
-                    )
-                if len(findings) >= _MAX_FINDINGS:
-                    raise _Enough()
+            _scan_suite_case(case, result, findings, first_by_title)
     except _Enough:
         logger.info("case quality gate: stopped at the %d-finding cap", _MAX_FINDINGS)
     except Exception:
@@ -194,6 +148,59 @@ def scan_suite(cases) -> QualityGateResult:
             result.per_category.get(finding.category, 0) + 1
         )
     return result
+
+
+def _scan_suite_case(
+    case, result: QualityGateResult, findings: list, first_by_title: dict
+) -> None:
+    """Scan one case; appends to ``findings``, may raise ``_Enough`` at the cap."""
+    result.scanned_cases += 1
+    tc_id = _text(case, "tc_id") or "(no id)"
+    category = _text(case, "category") or "(uncategorised)"
+    title_key = normalize(_text(case, "title"))
+    if title_key:
+        first = first_by_title.get(title_key)
+        if first is None:
+            first_by_title[title_key] = tc_id
+        else:
+            findings.append(
+                QualityFinding(
+                    DUPLICATE_TITLE,
+                    tc_id,
+                    category,
+                    "same title as " + first,
+                )
+            )
+            if len(findings) >= _MAX_FINDINGS:
+                raise _Enough()
+    try:
+        steps = list(getattr(case, "steps", None) or [])
+    except Exception:
+        steps = []
+    for index, step in enumerate(steps, 1):
+        data = _text(step, "test_data")
+        if data and data.casefold() in PLACEHOLDER_TEST_DATA:
+            findings.append(
+                QualityFinding(
+                    EMPTY_TEST_DATA,
+                    tc_id,
+                    category,
+                    "step " + str(index) + " has no usable test_data",
+                )
+            )
+        action = normalize(_text(step, "action"))
+        expected = normalize(_text(step, "expected_result"))
+        if action and expected and action == expected:
+            findings.append(
+                QualityFinding(
+                    RESTATED_EXPECTED,
+                    tc_id,
+                    category,
+                    "step " + str(index) + " restates its action verbatim",
+                )
+            )
+        if len(findings) >= _MAX_FINDINGS:
+            raise _Enough()
 
 
 def gate_detail(result: QualityGateResult, limit: int = _MAX_EXAMPLES) -> str:

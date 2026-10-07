@@ -172,14 +172,6 @@ async def fetch_url_content(url: str, jira_content: object = None) -> dict:
     Deliberately there is NO HTML-scrape fallback for a Jira host: an anonymous
     Jira Cloud page is an empty SPA shell, and generating from it fabricated
     test cases. Refusing is the safe behaviour.
-
-    2026-08-31: that promise only covered URLs that name an ISSUE. A board,
-    backlog, dashboard or Confluence URL on the same host is not
-    ``looks_like_jira_url``, so it fell through to :func:`_fetch_generic`, which
-    scraped the shell and returned its ``<title>`` -- "Jira" -- as the page
-    content. A live run turned that one word into eight categories of test cases
-    with no disclosure. Such a URL now refuses with
-    ``jira_page_without_issue: True``.
     """
     try:
         hostname, _resolved_ip, block_error = await _validate_public_url(url)
@@ -191,28 +183,44 @@ async def fetch_url_content(url: str, jira_content: object = None) -> dict:
                 return normalize_issue_payload(jira_content, source_url=url)
             return jira_mcp_required_result(url)
 
-        if is_jira_host(url) and "/wiki/" not in (urlparse(url).path or ""):
-            # A Jira HOST carrying no issue key: a board, backlog, dashboard or
-            # the site root. Scraping it yields the SPA shell's <title>, which a
-            # caller cannot tell apart from real requirements -- so this is a
-            # refusal, not a degraded fetch.
-            #
-            # Confluence (`/wiki/...`) is deliberately EXEMPT: looks_like_jira_url
-            # already documents that a Confluence page must fall through to the
-            # SSRF-hardened generic fetcher, and a published space really does
-            # serve readable HTML. Only the Jira APP pages fabricate.
-            return {
-                "error": jira_page_without_issue_message(url),
-                "content": None,
-                "needs_jira_mcp": False,
-                "jira_page_without_issue": True,
-                "source_url": url,
-            }
+        if (refusal := _non_issue_jira_page_result(url)) is not None:
+            return refusal
 
         return await _fetch_generic(url)
 
     except Exception as exc:
         return {"error": str(exc), "content": None}
+
+
+def _non_issue_jira_page_result(url: str) -> dict | None:
+    """Refuse a Jira HOST URL that names no issue; ``None`` means carry on.
+
+    2026-08-31: the "no scrape of a Jira host" promise only covered URLs that
+    name an ISSUE. A board, backlog, dashboard or Confluence URL on the same
+    host is not ``looks_like_jira_url``, so it fell through to
+    :func:`_fetch_generic`, which scraped the shell and returned its
+    ``<title>`` -- "Jira" -- as the page content. A live run turned that one
+    word into eight categories of test cases with no disclosure. Such a URL now
+    refuses with ``jira_page_without_issue: True``.
+    """
+    if is_jira_host(url) and "/wiki/" not in (urlparse(url).path or ""):
+        # A Jira HOST carrying no issue key: a board, backlog, dashboard or
+        # the site root. Scraping it yields the SPA shell's <title>, which a
+        # caller cannot tell apart from real requirements -- so this is a
+        # refusal, not a degraded fetch.
+        #
+        # Confluence (`/wiki/...`) is deliberately EXEMPT: looks_like_jira_url
+        # already documents that a Confluence page must fall through to the
+        # SSRF-hardened generic fetcher, and a published space really does
+        # serve readable HTML. Only the Jira APP pages fabricate.
+        return {
+            "error": jira_page_without_issue_message(url),
+            "content": None,
+            "needs_jira_mcp": False,
+            "jira_page_without_issue": True,
+            "source_url": url,
+        }
+    return None
 
 
 _LOGIN_PATHS = ("/login", "/signin", "/auth", "id.atlassian.com", "accounts.google.com")
@@ -316,6 +324,39 @@ class _HopResult:
     truncated: bool = False
 
 
+async def _read_bounded_body(resp) -> tuple[str, bool]:
+    """Read and decode the streamed body; return ``(text, truncated)``.
+
+    2026-08-30 (audit E1b): the body is read under a HARD byte budget
+    while streaming, instead of being fully buffered by `resp.text` and
+    sliced to _MAX_RAW_HTML_CHARS afterwards. The slice never bounded
+    the ALLOCATION -- an attacker-controlled page (or a redirect chain
+    ending at one) could make this process hold the whole response in
+    memory before a single character was discarded. A declared
+    over-budget content-length is logged, not trusted; the read stops
+    at the budget either way, since the header is attacker-controlled
+    too. Everything is still read BEFORE the client closes, so no live
+    response and no half-open socket escapes (NB-001).
+    """
+    chunks: list[bytes] = []
+    total = 0
+    truncated = False
+    async for chunk in resp.aiter_bytes():
+        if total + len(chunk) >= _MAX_BODY_BYTES:
+            chunks.append(chunk[: max(_MAX_BODY_BYTES - total, 0)])
+            total = _MAX_BODY_BYTES
+            truncated = True
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    raw = b"".join(chunks)
+    try:
+        text = raw.decode(resp.encoding or "utf-8", errors="replace")
+    except (LookupError, TypeError):
+        text = raw.decode("utf-8", errors="replace")
+    return text, truncated
+
+
 async def _fetch_one_hop(url: str) -> _HopResult:
     """Validate + IP-pin a single request, then return a detached _HopResult.
 
@@ -335,16 +376,6 @@ async def _fetch_one_hop(url: str) -> _HopResult:
         async with client.stream(
             "GET", url, headers={"User-Agent": "Mozilla/5.0 QA-Agents/1.0"}
         ) as resp:
-            # 2026-08-30 (audit E1b): the body is read under a HARD byte budget
-            # while streaming, instead of being fully buffered by `resp.text` and
-            # sliced to _MAX_RAW_HTML_CHARS afterwards. The slice never bounded
-            # the ALLOCATION -- an attacker-controlled page (or a redirect chain
-            # ending at one) could make this process hold the whole response in
-            # memory before a single character was discarded. A declared
-            # over-budget content-length is logged, not trusted; the read stops
-            # at the budget either way, since the header is attacker-controlled
-            # too. Everything is still read BEFORE the client closes, so no live
-            # response and no half-open socket escapes (NB-001).
             headers = dict(resp.headers)
             if resp.status_code in _REDIRECT_STATUSES and "location" in headers:
                 # A redirect's body is never parsed by any caller; do not read it.
@@ -359,22 +390,9 @@ async def _fetch_one_hop(url: str) -> _HopResult:
                     declared,
                     _MAX_BODY_BYTES,
                 )
-            chunks: list[bytes] = []
-            total = 0
-            truncated = False
-            async for chunk in resp.aiter_bytes():
-                if total + len(chunk) >= _MAX_BODY_BYTES:
-                    chunks.append(chunk[: max(_MAX_BODY_BYTES - total, 0)])
-                    total = _MAX_BODY_BYTES
-                    truncated = True
-                    break
-                chunks.append(chunk)
-                total += len(chunk)
-            raw = b"".join(chunks)
-            try:
-                text = raw.decode(resp.encoding or "utf-8", errors="replace")
-            except (LookupError, TypeError):
-                text = raw.decode("utf-8", errors="replace")
+            # Everything is still read BEFORE the client closes, so no live
+            # response and no half-open socket escapes (NB-001).
+            text, truncated = await _read_bounded_body(resp)
             return _HopResult(
                 status_code=resp.status_code,
                 headers=headers,
@@ -417,120 +435,145 @@ async def _fetch_generic(url: str) -> dict:
     retarget the connection after the check passed (DNS rebinding).
     """
     try:
-        resp = None
-        final_url = url
-        for attempt in range(_RETRY_MAX + 1):
-            try:
-                resp, final_url = await _follow_redirects_with_pinning(url)
-            except _SSRFBlocked as blocked:
-                logger.warning("Generic fetch blocked for %s: %s", url, blocked.args[0])
-                return {"error": blocked.args[0], "content": None}
-            except httpx.TransportError as exc:
-                logger.warning(
-                    "Generic fetch transport error (attempt %d/%d) for %s: %s",
-                    attempt + 1,
-                    _RETRY_MAX + 1,
-                    url,
-                    exc,
-                )
-                if attempt < _RETRY_MAX:
-                    await asyncio.sleep(_RETRY_DELAYS[attempt])
-                    continue
-                return {
-                    "error": "Could not reach the server after several attempts — please try again.",
-                    "content": None,
-                }
-            if resp.status_code >= 500 and attempt < _RETRY_MAX:
-                logger.warning(
-                    "Generic fetch HTTP %d (attempt %d/%d) for %s — retrying",
-                    resp.status_code,
-                    attempt + 1,
-                    _RETRY_MAX + 1,
-                    url,
-                )
+        fetched = await _fetch_with_retries(url)
+        if isinstance(fetched, dict):
+            return fetched
+        resp, final_url = fetched
+
+        if (refusal := _http_refusal(resp, final_url)) is not None:
+            return refusal
+
+        return _page_result(url, resp)
+    except Exception as exc:
+        return {"error": str(exc), "content": None}
+
+
+async def _fetch_with_retries(url: str) -> tuple[_HopResult, str] | dict:
+    """Run the retrying redirect-following fetch for *url*.
+
+    Returns the ``(response, final_url)`` pair to carry on with, or an error
+    dict to return as-is (the caller tells them apart with ``isinstance(r, dict)``).
+    """
+    resp = None
+    final_url = url
+    for attempt in range(_RETRY_MAX + 1):
+        try:
+            resp, final_url = await _follow_redirects_with_pinning(url)
+        except _SSRFBlocked as blocked:
+            logger.warning("Generic fetch blocked for %s: %s", url, blocked.args[0])
+            return {"error": blocked.args[0], "content": None}
+        except httpx.TransportError as exc:
+            logger.warning(
+                "Generic fetch transport error (attempt %d/%d) for %s: %s",
+                attempt + 1,
+                _RETRY_MAX + 1,
+                url,
+                exc,
+            )
+            if attempt < _RETRY_MAX:
                 await asyncio.sleep(_RETRY_DELAYS[attempt])
                 continue
-            break
-
-        if resp is None:
-            return {"error": "No response after retries", "content": None}
-
-        if resp.status_code in (401, 403):
             return {
-                "error": f"HTTP {resp.status_code}: page requires authentication",
+                "error": "Could not reach the server after several attempts — please try again.",
                 "content": None,
             }
-
-        if resp.status_code >= 400:
-            return {
-                "error": f"HTTP {resp.status_code}: request failed",
-                "content": None,
-            }
-
-        if any(p in final_url for p in _LOGIN_PATHS):
-            return {
-                "error": "Redirected to login page — page requires authentication",
-                "content": None,
-            }
-
-        soup = BeautifulSoup(resp.text, "lxml")
-        for tag in soup(["script", "style"]):
-            tag.decompose()
-
-        title_tag = soup.find("title")
-        title_text = title_tag.get_text(strip=True) if title_tag else ""
-
-        main = soup.find("main") or soup.find("article") or soup.find("body")
-        body_text = (
-            main.get_text(separator="\n", strip=True)
-            if main
-            else soup.get_text(separator="\n", strip=True)
-        )
-
-        # A JS-only SPA shell (e.g. a React/Vue app like SauceDemo) may serve a
-        # short "enable JavaScript" message that is OVER _MIN_READABLE_CHARS, so
-        # detect it independently of the readable-text gate and flag spa_shell so
-        # tools/ui_extractor.py can escalate to a Tier-2 browser render.
-        if _looks_like_js_rendered(resp.text, body_text):
-            logger.info(
-                "Detected JS-rendered SPA shell for %s — flagging spa_shell for "
-                "browser-render escalation",
+        if resp.status_code >= 500 and attempt < _RETRY_MAX:
+            logger.warning(
+                "Generic fetch HTTP %d (attempt %d/%d) for %s — retrying",
+                resp.status_code,
+                attempt + 1,
+                _RETRY_MAX + 1,
                 url,
             )
-            return {
-                "title": title_text,
-                "description": "",
-                "acceptance_criteria": "",
-                "raw_text": body_text[:5000],
-                "raw_html": resp.text[:_MAX_RAW_HTML_CHARS],
-                "content": "",
-                "spa_shell": True,
-                "error": None,
-            }
+            await asyncio.sleep(_RETRY_DELAYS[attempt])
+            continue
+        break
 
-        # Otherwise a 200 with no readable text means an auth wall or a genuinely
-        # broken/empty page — refuse rather than return empty content the
-        # generator would fabricate cases from.
-        if len(body_text.strip()) < _MIN_READABLE_CHARS:
-            return {
-                "error": (
-                    "Could not extract readable content from the page — it likely "
-                    "requires authentication or is rendered with JavaScript (e.g. a "
-                    "Jira or other single-page app). Please paste the ticket text and "
-                    "I'll generate test cases from it."
-                ),
-                "content": None,
-            }
+    if resp is None:
+        return {"error": "No response after retries", "content": None}
+    return resp, final_url
 
+
+def _http_refusal(resp: _HopResult, final_url: str) -> dict | None:
+    """Refuse an auth wall, an HTTP error or a login redirect; ``None`` means carry on."""
+    if resp.status_code in (401, 403):
+        return {
+            "error": f"HTTP {resp.status_code}: page requires authentication",
+            "content": None,
+        }
+
+    if resp.status_code >= 400:
+        return {
+            "error": f"HTTP {resp.status_code}: request failed",
+            "content": None,
+        }
+
+    if any(p in final_url for p in _LOGIN_PATHS):
+        return {
+            "error": "Redirected to login page — page requires authentication",
+            "content": None,
+        }
+    return None
+
+
+def _page_result(url: str, resp: _HopResult) -> dict:
+    """Extract the readable page content from a good response into the result dict."""
+    soup = BeautifulSoup(resp.text, "lxml")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+
+    title_tag = soup.find("title")
+    title_text = title_tag.get_text(strip=True) if title_tag else ""
+
+    main = soup.find("main") or soup.find("article") or soup.find("body")
+    body_text = (
+        main.get_text(separator="\n", strip=True)
+        if main
+        else soup.get_text(separator="\n", strip=True)
+    )
+
+    # A JS-only SPA shell (e.g. a React/Vue app like SauceDemo) may serve a
+    # short "enable JavaScript" message that is OVER _MIN_READABLE_CHARS, so
+    # detect it independently of the readable-text gate and flag spa_shell so
+    # tools/ui_extractor.py can escalate to a Tier-2 browser render.
+    if _looks_like_js_rendered(resp.text, body_text):
+        logger.info(
+            "Detected JS-rendered SPA shell for %s — flagging spa_shell for "
+            "browser-render escalation",
+            url,
+        )
         return {
             "title": title_text,
-            "description": body_text[:3000],
+            "description": "",
             "acceptance_criteria": "",
             "raw_text": body_text[:5000],
             "raw_html": resp.text[:_MAX_RAW_HTML_CHARS],
-            "content": body_text[:5000],
-            "spa_shell": False,
+            "content": "",
+            "spa_shell": True,
             "error": None,
         }
-    except Exception as exc:
-        return {"error": str(exc), "content": None}
+
+    # Otherwise a 200 with no readable text means an auth wall or a genuinely
+    # broken/empty page — refuse rather than return empty content the
+    # generator would fabricate cases from.
+    if len(body_text.strip()) < _MIN_READABLE_CHARS:
+        return {
+            "error": (
+                "Could not extract readable content from the page — it likely "
+                "requires authentication or is rendered with JavaScript (e.g. a "
+                "Jira or other single-page app). Please paste the ticket text and "
+                "I'll generate test cases from it."
+            ),
+            "content": None,
+        }
+
+    return {
+        "title": title_text,
+        "description": body_text[:3000],
+        "acceptance_criteria": "",
+        "raw_text": body_text[:5000],
+        "raw_html": resp.text[:_MAX_RAW_HTML_CHARS],
+        "content": body_text[:5000],
+        "spa_shell": False,
+        "error": None,
+    }

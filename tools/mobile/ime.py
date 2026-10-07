@@ -79,6 +79,19 @@ _IME_REFUSAL_RE = re.compile(
 )
 
 
+def _manifest_actions(module: object, package: str) -> dict:
+    """The broadcast action names, each defaulting to ``<package>.<NAME>``."""
+    return {
+        "input": str(getattr(module, "ACTION_INPUT", package + ".INPUT")),
+        "clear": str(getattr(module, "ACTION_CLEAR", package + ".CLEAR")),
+        "query": str(getattr(module, "ACTION_QUERY", package + ".QUERY")),
+        # Batch 4b: only the new APK answers these; 1.0.0 ignores them.
+        "arm": str(getattr(module, "ACTION_ARM", package + ".ARM")),
+        "disarm": str(getattr(module, "ACTION_DISARM", package + ".DISARM")),
+        "dump": str(getattr(module, "ACTION_DUMP", package + ".DUMP")),
+    }
+
+
 def manifest() -> dict:
     """The pinned IME identity, or a refusal naming the missing pin.
 
@@ -119,15 +132,7 @@ def manifest() -> dict:
             "ime_id": package + "/" + service,
             "url": url,
             "sha256": sha,
-            "actions": {
-                "input": str(getattr(module, "ACTION_INPUT", package + ".INPUT")),
-                "clear": str(getattr(module, "ACTION_CLEAR", package + ".CLEAR")),
-                "query": str(getattr(module, "ACTION_QUERY", package + ".QUERY")),
-                # Batch 4b: only the new APK answers these; 1.0.0 ignores them.
-                "arm": str(getattr(module, "ACTION_ARM", package + ".ARM")),
-                "disarm": str(getattr(module, "ACTION_DISARM", package + ".DISARM")),
-                "dump": str(getattr(module, "ACTION_DUMP", package + ".DUMP")),
-            },
+            "actions": _manifest_actions(module, package),
         },
     }
 
@@ -658,6 +663,43 @@ async def send(serial: str, action: str) -> dict:
     return await _broadcast(serial, action)
 
 
+def _decode_field_text(payload: str) -> str:
+    """The base64 ``t:`` payload as text, or ``""`` when it does not decode."""
+    try:
+        return base64.b64decode(payload or "", validate=True).decode(
+            "utf-8", errors="replace"
+        )
+    except Exception:
+        return ""
+
+
+def _reply_fields(data: str) -> dict:
+    """The ``;``-separated ``k:value`` parts of a reply, with defaults."""
+    fields: dict = {
+        "field": "",
+        "visible": False,
+        "text": "",
+        "refusal": "",
+        "protocol": 0,
+        "dump": "",
+    }
+    for part in data.split(";"):
+        part = part.strip()
+        if part.startswith("t:"):
+            fields["text"] = _decode_field_text(part[2:])
+        elif part.startswith("f:"):
+            fields["field"] = part[2:]
+        elif part.startswith("k:"):
+            fields["visible"] = part[2:].strip() == "1"
+        elif part.startswith("e:"):
+            fields["refusal"] = part[2:].strip()[:40]
+        elif part.startswith("p:"):
+            fields["protocol"] = int(part[2:]) if part[2:].strip().isdigit() else 0
+        elif part.startswith("x:"):
+            fields["dump"] = part[2:].strip()
+    return fields
+
+
 def _parse_reply(text: str, reveal_text: bool = True) -> dict:
     """``{result, field, ime_visible, text}`` from a broadcast reply.
 
@@ -677,43 +719,17 @@ def _parse_reply(text: str, reveal_text: bool = True) -> dict:
     result = int(result_match.group(1)) if result_match else -1
     data_match = _DATA_RE.search(text or "")
     data = data_match.group(1) if data_match else ""
-    field = ""
-    visible = False
-    field_text = ""
-    refusal = ""
-    protocol = 0
-    dump = ""
-    for part in str(data).split(";"):
-        part = part.strip()
-        if part.startswith("t:"):
-            try:
-                field_text = base64.b64decode(part[2:] or "", validate=True).decode(
-                    "utf-8", errors="replace"
-                )
-            except Exception:
-                field_text = ""
-        elif part.startswith("f:"):
-            field = part[2:]
-        elif part.startswith("k:"):
-            visible = part[2:].strip() == "1"
-        elif part.startswith("e:"):
-            refusal = part[2:].strip()[:40]
-        elif part.startswith("p:"):
-            protocol = int(part[2:]) if part[2:].strip().isdigit() else 0
-        elif part.startswith("x:"):
-            dump = part[2:].strip()
+    parts = _reply_fields(str(data))
+    field_text = parts["text"]
     reply = {
         "result": result,
-        "field": field,
-        "ime_visible": visible,
+        "field": parts["field"],
+        "ime_visible": parts["visible"],
     }
     # Present only when non-empty, so a legacy reply keeps its exact shape.
-    if refusal:
-        reply["refusal"] = refusal
-    if protocol:
-        reply["protocol"] = protocol
-    if dump:
-        reply["dump"] = dump
+    for key in ("refusal", "protocol", "dump"):
+        if parts[key]:
+            reply[key] = parts[key]
     if reveal_text:
         reply["text"] = field_text
     else:
@@ -858,6 +874,25 @@ def _could_be_transform(after: str, value: str) -> bool:
     return stripped == _SEPARATORS.sub("", value).casefold()
 
 
+def _secret_landed_verdict(before: int, after: int, value: str) -> str:
+    """The ``landed`` verdict for a secret field, from LENGTHS only."""
+    if after - before == len(value):
+        return LANDED_YES
+    # EMPTY after the commit is the one shape no commit leaves behind,
+    # whatever the field held before -- asked before the changed/unchanged
+    # split, which read a field emptied by a failed commit as ``unknown``.
+    if after == 0:
+        return LANDED_NO
+    if after != before:
+        return LANDED_UNKNOWN
+    # Unchanged length, and only the length is knowable here. A
+    # replace-on-focus of a field that already held something this long,
+    # and a capped field that kept a truncation of what was sent, are both
+    # indistinguishable from nothing happening. An EMPTY field is the one
+    # shape no commit can leave behind, so it is all that is left of ``no``.
+    return LANDED_NO if after == 0 else LANDED_UNKNOWN
+
+
 def _landed_verdict(before, after, value: str, secret: bool) -> str:
     """Did *value* land in the field? ``yes`` / ``no`` / ``unknown``.
 
@@ -897,21 +932,7 @@ def _landed_verdict(before, after, value: str, secret: bool) -> str:
     if before is None or after is None or not value:
         return LANDED_UNKNOWN
     if secret:
-        if int(after) - int(before) == len(value):
-            return LANDED_YES
-        # EMPTY after the commit is the one shape no commit leaves behind,
-        # whatever the field held before -- asked before the changed/unchanged
-        # split, which read a field emptied by a failed commit as ``unknown``.
-        if int(after) == 0:
-            return LANDED_NO
-        if int(after) != int(before):
-            return LANDED_UNKNOWN
-        # Unchanged length, and only the length is knowable here. A
-        # replace-on-focus of a field that already held something this long,
-        # and a capped field that kept a truncation of what was sent, are both
-        # indistinguishable from nothing happening. An EMPTY field is the one
-        # shape no commit can leave behind, so it is all that is left of ``no``.
-        return LANDED_NO if int(after) == 0 else LANDED_UNKNOWN
+        return _secret_landed_verdict(int(before), int(after), value)
     if not str(after):
         return LANDED_NO
     if value in str(after):
@@ -968,62 +989,77 @@ async def type_text(
     """
     try:
         value = "" if text is None else str(text)
-        if len(value) > MAX_TEXT_CHARS:
-            return {
-                "error": (
-                    "Refusing to type "
-                    + str(len(value))
-                    + " characters; the limit is "
-                    + str(MAX_TEXT_CHARS)
-                    + "."
-                ),
-                "content": None,
-            }
+        too_long = _length_refusal(value)
+        if too_long:
+            return too_long
         resolved = manifest()
         if resolved.get("error"):
             return resolved
         actions = (resolved["content"] or {})["actions"]
-        # `receiver_known`: the caller (executor.replay, via keyboard_up) has
-        # already had the receiver answer once this run, so no per-type QUERY.
-        # Encoded BEFORE any broadcast, so an encoding failure is reported as
-        # itself rather than hidden behind a device round trip.
-        payload = base64.b64encode(value.encode("utf-8")).decode("ascii")
-        if not receiver_known:
-            refused = await _focused_field(serial, actions)
-            if refused:
-                return {"error": refused, "content": None}
-        # BEFORE the commit, because the verdict is a DIFFERENCE. A snapshot
-        # taken only afterwards cannot tell a field that accepted the text
-        # from one that already held it.
-        before = await _field_snapshot(serial, actions, secret)
-        sent = await _broadcast(serial, str(actions["input"]), payload)
-        if sent.get("error"):
-            return sent
-        refused = await _undelivered(serial, actions, sent)
-        if refused:
-            return {"error": refused, "content": None}
-        after = await _field_snapshot(serial, actions, secret)
-        landed = _landed_verdict(before, after, value, secret)
-        logger.info(
-            "mobile.ime: typed %d character(s)%s, landed=%s",
-            len(value),
-            " (secret)" if secret else "",
-            landed,
-        )
-        return {
-            "error": None,
-            # ``typed`` is what the HOST SENT. ``landed`` is what the DEVICE
-            # ACCEPTED. Two questions, two names -- reporting only the first is
-            # how a run passed having typed nothing.
-            "content": {
-                "typed": len(value),
-                "secret": bool(secret),
-                "landed": landed,
-            },
-        }
+        return await _commit_and_verify(serial, actions, value, secret, receiver_known)
     except Exception as exc:
         logger.exception("mobile.ime.type_text failed")
         return {"error": str(exc), "content": None}
+
+
+def _length_refusal(value: str) -> dict | None:
+    """The refusal for a *value* over ``MAX_TEXT_CHARS``, else ``None``."""
+    if len(value) <= MAX_TEXT_CHARS:
+        return None
+    return {
+        "error": (
+            "Refusing to type "
+            + str(len(value))
+            + " characters; the limit is "
+            + str(MAX_TEXT_CHARS)
+            + "."
+        ),
+        "content": None,
+    }
+
+
+async def _commit_and_verify(
+    serial: str, actions: dict, value: str, secret: bool, receiver_known: bool
+) -> dict:
+    """Send *value* to the keyboard and report what the field made of it."""
+    # `receiver_known`: the caller (executor.replay, via keyboard_up) has
+    # already had the receiver answer once this run, so no per-type QUERY.
+    # Encoded BEFORE any broadcast, so an encoding failure is reported as
+    # itself rather than hidden behind a device round trip.
+    payload = base64.b64encode(value.encode("utf-8")).decode("ascii")
+    if not receiver_known:
+        refused = await _focused_field(serial, actions)
+        if refused:
+            return {"error": refused, "content": None}
+    # BEFORE the commit, because the verdict is a DIFFERENCE. A snapshot
+    # taken only afterwards cannot tell a field that accepted the text
+    # from one that already held it.
+    before = await _field_snapshot(serial, actions, secret)
+    sent = await _broadcast(serial, str(actions["input"]), payload)
+    if sent.get("error"):
+        return sent
+    refused = await _undelivered(serial, actions, sent)
+    if refused:
+        return {"error": refused, "content": None}
+    after = await _field_snapshot(serial, actions, secret)
+    landed = _landed_verdict(before, after, value, secret)
+    logger.info(
+        "mobile.ime: typed %d character(s)%s, landed=%s",
+        len(value),
+        " (secret)" if secret else "",
+        landed,
+    )
+    return {
+        "error": None,
+        # ``typed`` is what the HOST SENT. ``landed`` is what the DEVICE
+        # ACCEPTED. Two questions, two names -- reporting only the first is
+        # how a run passed having typed nothing.
+        "content": {
+            "typed": len(value),
+            "secret": bool(secret),
+            "landed": landed,
+        },
+    }
 
 
 def fallback_notice(reason: str, serial: str = "") -> str:
@@ -1072,6 +1108,24 @@ def fallback_notice(reason: str, serial: str = "") -> str:
 _INPUT_UNSAFE_RE = re.compile(r"[^\x20-\x7e]|%")
 
 
+def _unsafe_input_refusal(value: str) -> dict | None:
+    """The refusal for text ``input text`` cannot carry, else ``None``."""
+    if not _INPUT_UNSAFE_RE.search(value):
+        return None
+    return {
+        "error": (
+            "The fallback typing path (`adb shell input text`) types printable "
+            "ASCII only and cannot type `%`, so this text was not typed. Install "
+            "the QA keyboard to type it (see the note about the QA keyboard)."
+        ),
+        "content": None,
+        # A refusal the model can route around (different text, or ask the
+        # tester), like the password refusal: NOT a device error that
+        # ends the case.
+        "needs_model": True,
+    }
+
+
 async def type_via_input(
     serial: str, text: str, secret: bool = False, receiver_known: bool = True
 ) -> dict:
@@ -1086,28 +1140,9 @@ async def type_via_input(
     """
     try:
         value = "" if text is None else str(text)
-        if len(value) > MAX_TEXT_CHARS:
-            return {
-                "error": "Refusing to type "
-                + str(len(value))
-                + " characters; the limit is "
-                + str(MAX_TEXT_CHARS)
-                + ".",
-                "content": None,
-            }
-        if _INPUT_UNSAFE_RE.search(value):
-            return {
-                "error": (
-                    "The fallback typing path (`adb shell input text`) types printable "
-                    "ASCII only and cannot type `%`, so this text was not typed. Install "
-                    "the QA keyboard to type it (see the note about the QA keyboard)."
-                ),
-                "content": None,
-                # A refusal the model can route around (different text, or ask the
-                # tester), like the password refusal: NOT a device error that
-                # ends the case.
-                "needs_model": True,
-            }
+        refused = _length_refusal(value) or _unsafe_input_refusal(value)
+        if refused:
+            return refused
         quoted = "'" + value.replace(" ", "%s").replace("'", "'\\''") + "'"
         sent = await adb.shell(
             serial, [], stdin_data=("input text " + quoted + "\n").encode("ascii")
@@ -1186,45 +1221,53 @@ async def arm(serial: str, fresh: bool = False) -> dict:
             return resolved
         actions = (resolved["content"] or {})["actions"]
         held = ime_nonce.get(serial)
-        if held and not fresh:
-            asked = await _send(serial, str(actions["query"]), "", held)
-            if not asked.get("error") and _reply_code(asked) in (0, 1):
-                return {
-                    "error": None,
-                    "content": {"armed": True, "protocol": ime_nonce.protocol(serial)},
-                }
+        if held and not fresh and await _still_ours(serial, actions, held):
+            return {
+                "error": None,
+                "content": {"armed": True, "protocol": ime_nonce.protocol(serial)},
+            }
         ime_nonce.forget(serial)
         nonce = ime_nonce.new_nonce()
         sent = await _send(serial, str(actions["arm"]), "", nonce)
         if sent.get("error"):
             return sent
-        reply = reply_of(sent)
-        code = int(reply.get("result", -1))
-        if (
-            code == ime_nonce.REPLY_OK
-            and int(reply.get("protocol", 0)) >= ime_nonce.PROTOCOL_NONCE
-        ):
-            ime_nonce.hold(serial, nonce)
-            ime_nonce.set_protocol(serial, int(reply["protocol"]))
-            return {
-                "error": None,
-                "content": {"armed": True, "protocol": int(reply["protocol"])},
-            }
-        if code == ime_nonce.REPLY_ALREADY_ARMED:
-            return {"error": ALREADY_ARMED, "content": None}
-        if code == 0:
-            ime_nonce.set_protocol(serial, ime_nonce.PROTOCOL_LEGACY)
-            return {
-                "error": None,
-                "content": {"armed": False, "protocol": ime_nonce.PROTOCOL_LEGACY},
-            }
-        return {
-            "error": UNEXPECTED_ARM_REPLY + " (result " + str(code) + ").",
-            "content": None,
-        }
+        return _arm_outcome(serial, nonce, reply_of(sent))
     except Exception as exc:
         logger.exception("mobile.ime.arm failed")
         return {"error": str(exc), "content": None}
+
+
+async def _still_ours(serial: str, actions: dict, held: str) -> bool:
+    """Does one nonce-bearing QUERY show the keyboard still armed for *held*?"""
+    asked = await _send(serial, str(actions["query"]), "", held)
+    return not asked.get("error") and _reply_code(asked) in (0, 1)
+
+
+def _arm_outcome(serial: str, nonce: str, reply: dict) -> dict:
+    """Interpret an ARM reply, holding the nonce when the keyboard armed."""
+    code = int(reply.get("result", -1))
+    if (
+        code == ime_nonce.REPLY_OK
+        and int(reply.get("protocol", 0)) >= ime_nonce.PROTOCOL_NONCE
+    ):
+        ime_nonce.hold(serial, nonce)
+        ime_nonce.set_protocol(serial, int(reply["protocol"]))
+        return {
+            "error": None,
+            "content": {"armed": True, "protocol": int(reply["protocol"])},
+        }
+    if code == ime_nonce.REPLY_ALREADY_ARMED:
+        return {"error": ALREADY_ARMED, "content": None}
+    if code == 0:
+        ime_nonce.set_protocol(serial, ime_nonce.PROTOCOL_LEGACY)
+        return {
+            "error": None,
+            "content": {"armed": False, "protocol": ime_nonce.PROTOCOL_LEGACY},
+        }
+    return {
+        "error": UNEXPECTED_ARM_REPLY + " (result " + str(code) + ").",
+        "content": None,
+    }
 
 
 async def disarm(serial: str) -> dict:

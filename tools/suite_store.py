@@ -241,25 +241,31 @@ def _save_suite_sync(
                 ).fetchone()
                 if row:
                     target_id = row[0]
-            # Replace the suite's cases wholesale so a re-save is idempotent.
-            conn.execute("DELETE FROM cases WHERE suite_id = ?", (target_id,))
-            conn.executemany(
-                "INSERT INTO cases (suite_id, stable_id, payload_json, version, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                [
-                    (
-                        target_id,
-                        tc.stable_id,
-                        tc.model_dump_json(),
-                        1,
-                        now,
-                    )
-                    for tc in suite.test_cases
-                ],
-            )
+            _insert_case_rows(conn, target_id, suite, now)
         return target_id
     finally:
         conn.close()
+
+
+def _insert_case_rows(
+    conn: sqlite3.Connection, target_id: str, suite: TestSuite, now: float
+) -> None:
+    # Replace the suite's cases wholesale so a re-save is idempotent.
+    conn.execute("DELETE FROM cases WHERE suite_id = ?", (target_id,))
+    conn.executemany(
+        "INSERT INTO cases (suite_id, stable_id, payload_json, version, updated_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [
+            (
+                target_id,
+                tc.stable_id,
+                tc.model_dump_json(),
+                1,
+                now,
+            )
+            for tc in suite.test_cases
+        ],
+    )
 
 
 def _load_suite_sync(suite_id: str) -> TestSuite | None:
@@ -274,6 +280,10 @@ def _load_suite_sync(suite_id: str) -> TestSuite | None:
         ).fetchall()
     finally:
         conn.close()
+    return _suite_from_rows(suite_id, case_rows)
+
+
+def _suite_from_rows(suite_id: str, case_rows: list) -> TestSuite | None:
     if not case_rows:
         return None
     cases = []

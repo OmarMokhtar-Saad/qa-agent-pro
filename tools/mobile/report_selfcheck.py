@@ -312,6 +312,39 @@ def _pin_script(page: "_Page") -> dict:
     )
 
 
+def _stray_images(images: list, prefix: str, folder: Path | None) -> list:
+    """The ``src`` of every image that is neither the shot placeholder nor stored media.
+
+    # IDENTITY, not absence: see the note on EXTERNAL. TWO conditions, because
+    # "starts with ../" alone would admit "../../../etc" and every other escape
+    # out of the run folder -- a rule that passes on anything shaped vaguely
+    # right is the shape this repository keeps paying for. The prefix is the
+    # emitter's own constant, and the climb must be EXACTLY one.
+    #
+    # The one other home an image has is the report's own media folder -- a
+    # frame or a resized copy of one -- held to the media rule: inside
+    # it, with no climb at all. And THERE: frames used to travel inline, so a
+    # path under media/ that nothing wrote is the regression to catch, and a
+    # well-formed src that points at nothing passes every shape test.
+    """
+
+    def _stored(src: str) -> bool:
+        return folder is None or (folder / src).is_file()
+
+    return [
+        str(src)[:60]
+        for src in images
+        if not (
+            (str(src).startswith(SHOT_SRC) and str(src).count("..") == 1)
+            or (
+                str(src).startswith(prefix)
+                and ".." not in str(src)
+                and _stored(str(src))
+            )
+        )
+    ]
+
+
 def _pin_links(page: "_Page", text: str, folder: Path | None = None) -> dict:
     """The page fetches NOTHING, images are inline, clips point INSIDE the folder.
 
@@ -329,35 +362,9 @@ def _pin_links(page: "_Page", text: str, folder: Path | None = None) -> dict:
     # EVERY link is a stray now. The shell used to carry three typeface links and this
     # filter existed to allow exactly those; they were deleted because a report is read
     # offline from a folder, so there is no longer a legitimate href on this page.
-    strays = [str(href)[:60] for href in page.links]
-    # IDENTITY, not absence: see the note on EXTERNAL. TWO conditions, because
-    # "starts with ../" alone would admit "../../../etc" and every other escape
-    # out of the run folder -- a rule that passes on anything shaped vaguely
-    # right is the shape this repository keeps paying for. The prefix is the
-    # emitter's own constant, and the climb must be EXACTLY one.
-    #
-    # The one other home an image has is the report's own media folder -- a
-    # frame or a resized copy of one -- held to the media rule below: inside
-    # it, with no climb at all. And THERE: frames used to travel inline, so a
-    # path under media/ that nothing wrote is the regression to catch, and a
-    # well-formed src that points at nothing passes every shape test.
     prefix = str(report.MEDIA_DIR) + "/"
-
-    def _stored(src: str) -> bool:
-        return folder is None or (folder / src).is_file()
-
-    strays += [
-        str(src)[:60]
-        for src in page.images
-        if not (
-            (str(src).startswith(SHOT_SRC) and str(src).count("..") == 1)
-            or (
-                str(src).startswith(prefix)
-                and ".." not in str(src)
-                and _stored(str(src))
-            )
-        )
-    ]
+    strays = [str(href)[:60] for href in page.links]
+    strays += _stray_images(page.images, prefix, folder)
     found = [needle for needle in EXTERNAL if needle in text]
     offfolder = [
         tag + "@" + (str(src)[:60] or "(empty)")
@@ -437,6 +444,37 @@ def _pin_capture_tier(manifest: dict) -> dict:
     )
 
 
+def _all_pins(run_id: str, page: "_Page", text: str, size: int) -> list:
+    """Every pin, in report order, against the parsed *page* and the store."""
+    cases = [
+        case
+        for case in (run_store.list_cases(run_id) or {}).get("content") or []
+        if isinstance(case, dict)
+    ]
+    store_ids = [str(case.get("tc_id") or "") for case in cases]
+    manifest = (run_store.read_manifest(run_id) or {}).get("content")
+    manifest = manifest if isinstance(manifest, dict) else {}
+    store_tally = report.tally(cases)
+    return [
+        _pin_cases(page.cards, store_ids),
+        _pin_totals(page.summary, store_tally, len(cases)),
+        _pin_card_count(page.cards, page.summary),
+        _pin_terminator(page.end, page.cards),
+        _pin_absent(PIN_NO_MARKERS, text, FORBIDDEN_MARKERS),
+        _pin_absent(PIN_NO_XML, text, RAW_XML),
+        _pin_script(page),
+        _pin_links(page, text, report.report_path(run_id).parent),
+        _pin_absent(PIN_NO_SECRET, text, SECRET_TOKENS),
+        _pin(
+            PIN_SIZE,
+            size <= report.MAX_PAGE_BYTES,
+            str(size) + " bytes of " + str(report.MAX_PAGE_BYTES),
+        ),
+        _pin_crashes(page.crashes, cases),
+        _pin_capture_tier(manifest),
+    ]
+
+
 def check(run_id: str, html_path: str = "") -> dict:
     """Every pin against the page for *run_id*. Never raises.
 
@@ -456,36 +494,10 @@ def check(run_id: str, html_path: str = "") -> dict:
             return {"error": "No report file at " + target[:200], "content": None}
         text = path.read_text(encoding="utf-8", errors="replace")
         size = len(text.encode("utf-8", errors="replace"))
-        cases = [
-            case
-            for case in (run_store.list_cases(run_id) or {}).get("content") or []
-            if isinstance(case, dict)
-        ]
-        store_ids = [str(case.get("tc_id") or "") for case in cases]
-        manifest = (run_store.read_manifest(run_id) or {}).get("content")
-        manifest = manifest if isinstance(manifest, dict) else {}
-        store_tally = report.tally(cases)
         page = _Page()
         page.feed(text)
         page.close()
-        pins = [
-            _pin_cases(page.cards, store_ids),
-            _pin_totals(page.summary, store_tally, len(cases)),
-            _pin_card_count(page.cards, page.summary),
-            _pin_terminator(page.end, page.cards),
-            _pin_absent(PIN_NO_MARKERS, text, FORBIDDEN_MARKERS),
-            _pin_absent(PIN_NO_XML, text, RAW_XML),
-            _pin_script(page),
-            _pin_links(page, text, report.report_path(run_id).parent),
-            _pin_absent(PIN_NO_SECRET, text, SECRET_TOKENS),
-            _pin(
-                PIN_SIZE,
-                size <= report.MAX_PAGE_BYTES,
-                str(size) + " bytes of " + str(report.MAX_PAGE_BYTES),
-            ),
-            _pin_crashes(page.crashes, cases),
-            _pin_capture_tier(manifest),
-        ]
+        pins = _all_pins(run_id, page, text, size)
         return {
             "error": None,
             "content": {

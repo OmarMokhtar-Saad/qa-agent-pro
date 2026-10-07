@@ -155,37 +155,15 @@ async def extract_ui_elements(url: str, prefetched: dict | None = None) -> dict:
                 url,
                 spa_shell,
             )
-            rendered = await render_page(url)
-            if rendered.get("error"):
-                render_error = rendered["error"]
-                logger.warning(
-                    "ui_extractor: Tier 2 browser render unavailable/failed for %s: %s",
-                    url,
-                    rendered["error"],
-                )
-            else:
-                rendered_html = rendered.get("html") or ""
-                if rendered_html:
-                    rendered_elements = _parse_ui_elements(rendered_html)
-                    if not _looks_empty(rendered_elements):
-                        ui_elements = rendered_elements
-                        extraction_method = "js_rendered"
-                        if rendered.get("title"):
-                            page_title = rendered["title"]
-
-            if _looks_empty(ui_elements):
-                screenshot = (
-                    rendered.get("screenshot") if not rendered.get("error") else None
-                )
-                if screenshot:
-                    # Host-mode boomerang: make NO server-side vision call. The raw
-                    # screenshot rides to the host's OWN multimodal model as MCP
-                    # image content; ui_elements stays empty, which is the same
-                    # outcome cli/cursor already reached here.
-                    deferred_screenshot = screenshot
-                    extraction_method = "vision_deferred"
-                else:
-                    extraction_method = "unavailable"
+            (
+                ui_elements,
+                page_title,
+                extraction_method,
+                render_error,
+                deferred_screenshot,
+            ) = await _escalate_to_tier2(
+                url, ui_elements, page_title, extraction_method
+            )
 
         content_summary = _build_content_summary(page_title, ui_elements)
         if not content_summary:
@@ -217,6 +195,48 @@ async def extract_ui_elements(url: str, prefetched: dict | None = None) -> dict:
     except Exception as exc:
         logger.exception("ui_extractor: unexpected error for %s", url)
         return {"error": str(exc), "content": None}
+
+
+async def _escalate_to_tier2(
+    url: str, ui_elements: dict, page_title: str, extraction_method: str
+) -> tuple[dict, str, str, str | None, bytes | None]:
+    """Render *url* in a browser and fold the result into the Tier 1 outcome.
+
+    Returns (ui_elements, page_title, extraction_method, render_error,
+    deferred_screenshot).
+    """
+    render_error: str | None = None
+    deferred_screenshot: bytes | None = None
+    rendered = await render_page(url)
+    if rendered.get("error"):
+        render_error = rendered["error"]
+        logger.warning(
+            "ui_extractor: Tier 2 browser render unavailable/failed for %s: %s",
+            url,
+            rendered["error"],
+        )
+    else:
+        rendered_html = rendered.get("html") or ""
+        if rendered_html:
+            rendered_elements = _parse_ui_elements(rendered_html)
+            if not _looks_empty(rendered_elements):
+                ui_elements = rendered_elements
+                extraction_method = "js_rendered"
+                if rendered.get("title"):
+                    page_title = rendered["title"]
+
+    if _looks_empty(ui_elements):
+        screenshot = rendered.get("screenshot") if not rendered.get("error") else None
+        if screenshot:
+            # Host-mode boomerang: make NO server-side vision call. The raw
+            # screenshot rides to the host's OWN multimodal model as MCP
+            # image content; ui_elements stays empty, which is the same
+            # outcome cli/cursor already reached here.
+            deferred_screenshot = screenshot
+            extraction_method = "vision_deferred"
+        else:
+            extraction_method = "unavailable"
+    return ui_elements, page_title, extraction_method, render_error, deferred_screenshot
 
 
 def _looks_empty(ui_elements: dict) -> bool:

@@ -505,83 +505,128 @@ def substitute_placeholders(
         per_case_keys: dict[str, set[str]] = {}
         out: list[TestCase] = []
         for tc in cases:
-            used: set[str] = set()
-            local_unresolved: set[str] = set()
-            data = tc.model_dump()
-            touched = False
-            for fname in ("title", "preconditions", "postconditions", "module"):
-                value = data.get(fname)
-                if isinstance(value, str) and PLACEHOLDER_RE.search(value):
-                    data[fname] = _clamp(
-                        _sub_text(value, table, used, local_unresolved), fname
-                    )
-                    touched = True
-            for step in data.get("steps") or []:
-                for fname in ("action", "test_data", "expected_result"):
-                    value = step.get(fname)
-                    if isinstance(value, str) and PLACEHOLDER_RE.search(value):
-                        step[fname] = _sub_text(value, table, used, local_unresolved)
-                        touched = True
+            case, used, local_unresolved, rebuilt = _substitute_case(tc, table)
             unresolved |= local_unresolved
-            if not touched:
-                out.append(tc)
-                continue
+            out.append(case)
             report["substitutions"] += len(used)
-            try:
-                rebuilt = TestCase.model_validate(data)
-            except Exception:
-                logger.warning(
-                    "bilingual substitution produced an invalid case (%s) - keeping "
-                    "the original; the residual-token sweep will neutralise any "
-                    "token left in it",
-                    getattr(tc, "tc_id", "?"),
-                    exc_info=True,
-                )
-                out.append(tc)
-                continue
-            out.append(rebuilt)
-            if used:
-                report["cases_touched"].append(rebuilt.tc_id)
-                per_case_keys[rebuilt.tc_id] = used
+            if rebuilt and used:
+                report["cases_touched"].append(case.tc_id)
+                per_case_keys[case.tc_id] = used
 
-        holder: dict[str, set[str]] = {}
-        langs: dict[str, set[str]] = {}
-        for tc_id, keys in per_case_keys.items():
-            for entry in keys:
-                lang, key = entry.split(":", 1)
-                holder.setdefault(key, set()).add(tc_id)
-                langs.setdefault(key, set()).add(lang)
-        covered = set(holder)
-        report["covered_keys"] = sorted(covered)
-        report["missing_keys"] = sorted(
-            k for k in (normalize_key(p.key) for p in pairs) if k and k not in covered
-        )
-        report["partial_keys"] = sorted(k for k, ls in langs.items() if len(ls) < 2)
-        report["split_keys"] = sorted(k for k, ids in holder.items() if len(ids) > 1)
-        report["unresolved"] = sorted(unresolved)
-        # PROTECTION LIST, not a nice-to-have. Two bilingual cases differ only by
-        # which documented message they quote; a similarity scorer could still
-        # score that pair above the 0.9 dedup threshold even AFTER substitution,
-        # were the disabled dedup seam revived, so ordering substitution before
-        # dedup is necessary but not sufficient. stable_id is derived from
-        # (title, steps) and the only later mutation before dedup is the sweep's
-        # model_copy, which does NOT re-run that validator -- so these ids still
-        # match at the dedup call site.
-        report["protected_stable_ids"] = sorted(
-            {
-                sid
-                for sid in (
-                    (tc.stable_id or "") for tc in out if tc.tc_id in per_case_keys
-                )
-                if sid
-            }
-        )
-        report["placeholders_seen"] = bool(per_case_keys or unresolved)
-        report["baked_keys"] = detect_baked_literals(out, pairs, covered)
+        _fill_coverage_report(report, per_case_keys, unresolved, out, pairs)
         return out, report
     except Exception:
         logger.exception("substitute_placeholders failed - cases returned unchanged")
         return list(cases), report
+
+
+def _substitute_case(
+    tc: TestCase, table: dict
+) -> tuple[TestCase, set[str], set[str], bool]:
+    """Substitute one case. Returns ``(case, used, unresolved, rebuilt)``;
+    ``rebuilt`` is False when the case was untouched or re-validation failed
+    (the original is kept)."""
+    used: set[str] = set()
+    local_unresolved: set[str] = set()
+    data = tc.model_dump()
+    touched = False
+    for fname in ("title", "preconditions", "postconditions", "module"):
+        value = data.get(fname)
+        if isinstance(value, str) and PLACEHOLDER_RE.search(value):
+            data[fname] = _clamp(_sub_text(value, table, used, local_unresolved), fname)
+            touched = True
+    for step in data.get("steps") or []:
+        for fname in ("action", "test_data", "expected_result"):
+            value = step.get(fname)
+            if isinstance(value, str) and PLACEHOLDER_RE.search(value):
+                step[fname] = _sub_text(value, table, used, local_unresolved)
+                touched = True
+    if not touched:
+        return tc, used, local_unresolved, False
+    try:
+        return TestCase.model_validate(data), used, local_unresolved, True
+    except Exception:
+        logger.warning(
+            "bilingual substitution produced an invalid case (%s) - keeping "
+            "the original; the residual-token sweep will neutralise any "
+            "token left in it",
+            getattr(tc, "tc_id", "?"),
+            exc_info=True,
+        )
+        return tc, used, local_unresolved, False
+
+
+def _fill_coverage_report(
+    report: dict,
+    per_case_keys: dict[str, set[str]],
+    unresolved: set[str],
+    out: list[TestCase],
+    pairs: list[LanguagePair],
+) -> None:
+    """Derive the key-coverage fields of ``report`` from what was substituted."""
+    holder: dict[str, set[str]] = {}
+    langs: dict[str, set[str]] = {}
+    for tc_id, keys in per_case_keys.items():
+        for entry in keys:
+            lang, key = entry.split(":", 1)
+            holder.setdefault(key, set()).add(tc_id)
+            langs.setdefault(key, set()).add(lang)
+    covered = set(holder)
+    report["covered_keys"] = sorted(covered)
+    report["missing_keys"] = sorted(
+        k for k in (normalize_key(p.key) for p in pairs) if k and k not in covered
+    )
+    report["partial_keys"] = sorted(k for k, ls in langs.items() if len(ls) < 2)
+    report["split_keys"] = sorted(k for k, ids in holder.items() if len(ids) > 1)
+    report["unresolved"] = sorted(unresolved)
+    # PROTECTION LIST, not a nice-to-have. Two bilingual cases differ only by
+    # which documented message they quote; a similarity scorer could still
+    # score that pair above the 0.9 dedup threshold even AFTER substitution,
+    # were the disabled dedup seam revived, so ordering substitution before
+    # dedup is necessary but not sufficient. stable_id is derived from
+    # (title, steps) and the only later mutation before dedup is the sweep's
+    # model_copy, which does NOT re-run that validator -- so these ids still
+    # match at the dedup call site.
+    report["protected_stable_ids"] = sorted(
+        {
+            sid
+            for sid in ((tc.stable_id or "") for tc in out if tc.tc_id in per_case_keys)
+            if sid
+        }
+    )
+    report["placeholders_seen"] = bool(per_case_keys or unresolved)
+    report["baked_keys"] = detect_baked_literals(out, pairs, covered)
+
+
+def _step_sweep_update(step) -> dict:
+    """The cleaned step fields, empty when the step carries no residual token."""
+    s_update: dict = {}
+    for fname in ("action", "test_data", "expected_result"):
+        value = getattr(step, fname, None)
+        if isinstance(value, str) and RESIDUAL_TOKEN_RE.search(value):
+            s_update[fname] = RESIDUAL_TOKEN_RE.sub(UNRESOLVED_TEXT, value)
+    return s_update
+
+
+def _case_sweep_update(tc: TestCase) -> dict:
+    """The model_copy update that neutralises residual tokens; empty when clean."""
+    update: dict = {}
+    for fname in ("title", "preconditions", "postconditions", "module"):
+        value = getattr(tc, fname, None)
+        if isinstance(value, str) and RESIDUAL_TOKEN_RE.search(value):
+            update[fname] = _clamp(RESIDUAL_TOKEN_RE.sub(UNRESOLVED_TEXT, value), fname)
+    new_steps = []
+    steps_dirty = False
+    for step in getattr(tc, "steps", None) or []:
+        s_update = _step_sweep_update(step)
+        if s_update:
+            steps_dirty = True
+            new_steps.append(step.model_copy(update=s_update))
+        else:
+            new_steps.append(step)
+    if steps_dirty:
+        update["steps"] = new_steps
+    return update
 
 
 def sweep_residual_placeholders(
@@ -606,28 +651,7 @@ def sweep_residual_placeholders(
         out: list[TestCase] = []
         dirty: list[str] = []
         for tc in cases:
-            update: dict = {}
-            for fname in ("title", "preconditions", "postconditions", "module"):
-                value = getattr(tc, fname, None)
-                if isinstance(value, str) and RESIDUAL_TOKEN_RE.search(value):
-                    update[fname] = _clamp(
-                        RESIDUAL_TOKEN_RE.sub(UNRESOLVED_TEXT, value), fname
-                    )
-            new_steps = []
-            steps_dirty = False
-            for step in getattr(tc, "steps", None) or []:
-                s_update: dict = {}
-                for fname in ("action", "test_data", "expected_result"):
-                    value = getattr(step, fname, None)
-                    if isinstance(value, str) and RESIDUAL_TOKEN_RE.search(value):
-                        s_update[fname] = RESIDUAL_TOKEN_RE.sub(UNRESOLVED_TEXT, value)
-                if s_update:
-                    steps_dirty = True
-                    new_steps.append(step.model_copy(update=s_update))
-                else:
-                    new_steps.append(step)
-            if steps_dirty:
-                update["steps"] = new_steps
+            update = _case_sweep_update(tc)
             if update:
                 dirty.append(tc.tc_id)
                 out.append(tc.model_copy(update=update))
@@ -686,6 +710,54 @@ def detect_baked_literals(
 # --- Templated manual (native-speaker) validation case ------------------------
 
 
+def _manual_validation_steps(keys: str, more: str) -> list[TestStep]:
+    """The three fixed steps of the native-speaker validation case."""
+    return [
+        TestStep(
+            step_number=1,
+            action=(
+                "Switch the application locale to Arabic (Settings > Language > "
+                "Arabic) and open every screen that shows a documented message: "
+                f"{keys}{more}."
+            ),
+            test_data=None,
+            expected_result=(
+                "Every documented Arabic string is rendered, right-aligned and "
+                "fully visible (no truncation, no clipped diacritics) and is not "
+                "replaced by its English fallback."
+            ),
+        ),
+        TestStep(
+            step_number=2,
+            action=(
+                "Have a NATIVE ARABIC SPEAKER read each rendered Arabic message "
+                "and compare it word for word against the wording documented on "
+                "the ticket."
+            ),
+            test_data=None,
+            expected_result=(
+                "Each Arabic message matches the documented wording, is "
+                "grammatically correct and reads naturally against its English "
+                "counterpart. Any mismatch is raised as a defect on the ticket."
+            ),
+        ),
+        TestStep(
+            step_number=3,
+            action=(
+                "With the locale still Arabic, check numbers, dates, currency "
+                "amounts and mixed-direction lines (a Latin product code inside "
+                "an Arabic sentence)."
+            ),
+            test_data=None,
+            expected_result=(
+                "Numerals, dates and currency read in the correct order and "
+                "mixed-direction lines are not visually reordered, split or "
+                "mirrored."
+            ),
+        ),
+    ]
+
+
 def build_manual_validation_case(
     pairs: list[LanguagePair], tc_id: str = "TC-999"
 ) -> TestCase | None:
@@ -705,50 +777,7 @@ def build_manual_validation_case(
             return None
         keys = ", ".join(p.key for p in pairs[:30])
         more = " and the remaining documented keys" if len(pairs) > 30 else ""
-        steps = [
-            TestStep(
-                step_number=1,
-                action=(
-                    "Switch the application locale to Arabic (Settings > Language > "
-                    "Arabic) and open every screen that shows a documented message: "
-                    f"{keys}{more}."
-                ),
-                test_data=None,
-                expected_result=(
-                    "Every documented Arabic string is rendered, right-aligned and "
-                    "fully visible (no truncation, no clipped diacritics) and is not "
-                    "replaced by its English fallback."
-                ),
-            ),
-            TestStep(
-                step_number=2,
-                action=(
-                    "Have a NATIVE ARABIC SPEAKER read each rendered Arabic message "
-                    "and compare it word for word against the wording documented on "
-                    "the ticket."
-                ),
-                test_data=None,
-                expected_result=(
-                    "Each Arabic message matches the documented wording, is "
-                    "grammatically correct and reads naturally against its English "
-                    "counterpart. Any mismatch is raised as a defect on the ticket."
-                ),
-            ),
-            TestStep(
-                step_number=3,
-                action=(
-                    "With the locale still Arabic, check numbers, dates, currency "
-                    "amounts and mixed-direction lines (a Latin product code inside "
-                    "an Arabic sentence)."
-                ),
-                test_data=None,
-                expected_result=(
-                    "Numerals, dates and currency read in the correct order and "
-                    "mixed-direction lines are not visually reordered, split or "
-                    "mirrored."
-                ),
-            ),
-        ]
+        steps = _manual_validation_steps(keys, more)
         return TestCase(
             tc_id=tc_id,
             module="Localization (EN/AR)",

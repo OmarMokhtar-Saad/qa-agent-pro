@@ -583,6 +583,16 @@ def _expected_polarity(tc: TestCase) -> str | None:
         return None
 
 
+def _ids_sharing_subject(
+    mine: list[tuple[str, frozenset[str]]],
+    theirs: list[tuple[str, frozenset[str]]],
+) -> list[str]:
+    """Sorted tc_ids in *mine* whose subject overlaps any subject in *theirs*."""
+    return sorted(
+        {tc_id for tc_id, subj in mine if any(subj & other for _o, other in theirs)}
+    )
+
+
 def find_contradictory_state_assumptions(
     cases: list[TestCase],
 ) -> list[tuple[str, list[str], list[str]]]:
@@ -617,20 +627,8 @@ def find_contradictory_state_assumptions(
         for state in sorted(set(available) & set(blocked)):
             # Only a shared subject makes this a contradiction rather than two
             # unrelated assertions that happen to seed the same status.
-            yes = sorted(
-                {
-                    tc_id
-                    for tc_id, subj in available[state]
-                    if any(subj & other for _o, other in blocked[state])
-                }
-            )
-            no = sorted(
-                {
-                    tc_id
-                    for tc_id, subj in blocked[state]
-                    if any(subj & other for _o, other in available[state])
-                }
-            )
+            yes = _ids_sharing_subject(available[state], blocked[state])
+            no = _ids_sharing_subject(blocked[state], available[state])
             if yes and no:
                 out.append((state, yes, no))
     except Exception:
@@ -808,40 +806,236 @@ def _bound_advisory_block(lines: list[str], order: list[tuple[str, int]]) -> str
         # dropping whole bullets if even the floor does not fit. Uniform across
         # bullets rather than largest-first: the largest bullet is not the least
         # important one, and per-bullet favouritism is the framing F14 faulted.
-        for row_cap in _ROW_CAP_LADDER:
-            trimmed = [_trim_bullet_rows(b, row_cap) for b in bullets]
-            body = "\n".join(header + [ln for b in trimmed for ln in b])
-            if len(body) <= _BLOCK_CAP:
-                # Never let trimming make the block longer than leaving it alone.
-                return body if len(body) < len(joined) else joined
-            bullets = trimmed
-        keep = list(range(len(bullets)))
-        dropped: list[int] = []
-        for idx in sorted(
-            (i for i, (_n, p) in enumerate(order) if p),
-            key=lambda i: (order[i][1], i),
-        ):
-            body = "\n".join(
-                header + [ln for j in keep if j != idx for ln in bullets[j]]
-            )
-            reserve = len(
-                _advisory_omission_marker([order[j][0] for j in dropped + [idx]])
-            )
-            keep.remove(idx)
-            dropped.append(idx)
-            if len(body) + reserve <= _BLOCK_CAP:
-                break
-        if not dropped:
+        fitted, bullets = _shrink_rows_to_fit(header, bullets, joined)
+        if fitted is not None:
+            return fitted
+        out = _drop_bullets_to_fit(header, bullets, order)
+        if out is None:
             return joined
-        out = "\n".join(
-            header + [ln for j in keep for ln in bullets[j]]
-        ) + _advisory_omission_marker([order[j][0] for j in sorted(dropped)])
         # Dropping may never make the block LONGER than leaving it alone -- the
         # same net-loss rule mcp_handlers.assemble_finalize_reply enforces.
         return out if len(out) < len(joined) else joined
     except Exception:
         logger.exception("advisory block budget failed - returning it unbounded")
         return "\n".join(lines)
+
+
+def _shrink_rows_to_fit(
+    header: list[str], bullets: list[list[str]], joined: str
+) -> tuple[str | None, list[list[str]]]:
+    """Shrink every bullet's rows down the cap ladder until the block fits.
+
+    Returns (block, bullets): block is None when even the floor does not fit,
+    and bullets is then the most-trimmed set.
+    """
+    for row_cap in _ROW_CAP_LADDER:
+        trimmed = [_trim_bullet_rows(b, row_cap) for b in bullets]
+        body = "\n".join(header + [ln for b in trimmed for ln in b])
+        if len(body) <= _BLOCK_CAP:
+            # Never let trimming make the block longer than leaving it alone.
+            return (body if len(body) < len(joined) else joined), trimmed
+        bullets = trimmed
+    return None, bullets
+
+
+def _drop_bullets_to_fit(
+    header: list[str], bullets: list[list[str]], order: list[tuple[str, int]]
+) -> str | None:
+    """Drop whole bullets, lowest priority first, until the block fits.
+
+    Returns the block with a named omission marker, or None when no droppable
+    bullet existed.
+    """
+    keep = list(range(len(bullets)))
+    dropped: list[int] = []
+    for idx in sorted(
+        (i for i, (_n, p) in enumerate(order) if p),
+        key=lambda i: (order[i][1], i),
+    ):
+        body = "\n".join(header + [ln for j in keep if j != idx for ln in bullets[j]])
+        reserve = len(_advisory_omission_marker([order[j][0] for j in dropped + [idx]]))
+        keep.remove(idx)
+        dropped.append(idx)
+        if len(body) + reserve <= _BLOCK_CAP:
+            break
+    if not dropped:
+        return None
+    return "\n".join(
+        header + [ln for j in keep for ln in bullets[j]]
+    ) + _advisory_omission_marker([order[j][0] for j in sorted(dropped)])
+
+
+def _add_oracle_bullet(lines: list[str], order: list[tuple[str, int]], oracles) -> None:
+    order.append(("soft oracles", _ADV_P_UNJUDGEABLE))
+    by_case: dict[str, list[int]] = defaultdict(list)
+    for tc_id, step_number, _ in oracles:
+        by_case[tc_id].append(step_number)
+    lines.append(
+        f"- **{len(by_case)} case(s) have an expected result that accepts more "
+        "than one outcome**, so the step cannot fail and cannot detect a "
+        "defect. Where the ticket genuinely does not specify the outcome, "
+        "convert the case to an exploratory charter that records the actual "
+        "behaviour instead of asserting one:"
+    )
+    for tc_id in sorted(by_case)[:_MAX_REPORTED]:
+        steps = ", ".join(str(n) for n in sorted(by_case[tc_id]))
+        lines.append(f"  - {tc_id} (step {steps})")
+    if len(by_case) > _MAX_REPORTED:
+        lines.append(f"  - ... and {len(by_case) - _MAX_REPORTED} more")
+
+
+def _add_conditional_bullet(
+    lines: list[str], order: list[tuple[str, int]], conditional
+) -> None:
+    order.append(("conditional actions", _ADV_P_UNEXECUTABLE))
+    # Its own bullet, not merged into the oracle list: a soft oracle
+    # means the tester runs the step and cannot fail it, a conditional
+    # action means the tester cannot tell whether to run it at all, and
+    # one count would misdescribe both. Same block, because a fourth
+    # heading costs reply budget for advice of the same class.
+    by_action: dict[str, list[int]] = defaultdict(list)
+    for tc_id, step_number, _ in conditional:
+        by_action[tc_id].append(step_number)
+    lines.append(
+        f"- **{len(by_action)} case(s) have an action the tester "
+        'cannot execute as written** — it is conditional ("if '
+        'visible", "if available"), so whether the step is performed '
+        "at all depends on what the build happens to show, and a Pass "
+        "is indistinguishable from a skip. Name the entry point the "
+        "case means, or split the conditional branch into its own case:"
+    )
+    for tc_id in sorted(by_action)[:_MAX_REPORTED]:
+        numbers = ", ".join(str(n) for n in sorted(by_action[tc_id]))
+        lines.append(f"  - {tc_id} (step {numbers})")
+    if len(by_action) > _MAX_REPORTED:
+        lines.append(f"  - ... and {len(by_action) - _MAX_REPORTED} more")
+
+
+def _add_conflict_bullet(
+    lines: list[str], order: list[tuple[str, int]], conflicts
+) -> None:
+    order.append(("contradictory state assumptions", _ADV_P_CROSS_CASE))
+    lines.append(
+        "- **Contradictory state assumptions** — the same seeded state is "
+        "treated as both allowing and blocking the action. The ticket does "
+        "not resolve this; confirm the rule before executing either side:"
+    )
+    for state, avail, block in conflicts[:_MAX_REPORTED]:
+        lines.append(
+            f"  - `{state}`: allowed by {', '.join(avail)} / "
+            f"blocked by {', '.join(block)}"
+        )
+
+
+def _add_ungrounded_bullet(
+    lines: list[str], order: list[tuple[str, int]], ungrounded
+) -> None:
+    # PROTECTED. This bullet says the case asserts copy the product never
+    # promised -- a false oracle a tester files a bug against. It is also
+    # the grounding/trust signal, and the bullet whose silent absence
+    # made the original bound vacuous; it must never be the one dropped.
+    order.append(("invented UI strings", 0))
+    # A FOURTH bullet in this block rather than a heading of its
+    # own, for the reason recorded above the conditional-action
+    # bullet: this is the same class of advice -- "this assertion
+    # cannot do its job" -- and a second heading costs finalize-
+    # reply budget that F03 already measured as scarce.
+    #
+    # Grouped by the invented STRING, not by tc_id like the two
+    # bullets above, because the string IS the defect: suite
+    # b8b8ed00 repeats one invented 'Transfer scheduled' across
+    # all 96 of its cases, and grouping by case would spend twenty
+    # lines of the reply saying the same thing twenty times.
+    by_span: dict[str, set[str]] = defaultdict(set)
+    for tc_id, _step_number, span in ungrounded:
+        by_span[span].add(tc_id)
+    lines.append(
+        f"- **{len(by_span)} exact UI string(s) are asserted that "
+        "the source never promises** — the tester compares "
+        "the product against copy nobody wrote, so any wording "
+        "difference reads as a defect. Assert what the message "
+        'MUST SAY ("an error that names the field and the limit it '
+        'broke") instead '
+        "of its exact text, or get the real copy into the ticket:"
+    )
+    for span in sorted(by_span)[:_MAX_REPORTED]:
+        shown = span if len(span) <= 60 else span[:57] + "..."
+        ids = sorted(by_span[span])
+        where = ids[0] if len(ids) == 1 else f"{ids[0]} +{len(ids) - 1} more"
+        lines.append(f"  - '{shown}' ({where})")
+    if len(by_span) > _MAX_REPORTED:
+        lines.append(f"  - ... and {len(by_span) - _MAX_REPORTED} more")
+
+
+def _add_bounds_bullet(lines: list[str], order: list[tuple[str, int]], bounds) -> None:
+    # PROTECTED, same class as the bullet above: the case asserts that a
+    # documented-legal value is rejected, so it fails against correct
+    # software. Wrong, not thin.
+    order.append(("bound contradictions", 0))
+    # A FIFTH bullet, same block, for the reason recorded above the
+    # conditional-action bullet: same class of advice ("this case
+    # cannot pass against correct software"), and a heading of its own
+    # costs finalize-reply budget F03 already measured as scarce.
+    lines.append(
+        f"- **{len(bounds)} case(s) contradict a numeric bound the "
+        "source states** — the value the step enters is legal under "
+        "the range the source gives for that field yet the step asserts "
+        "it is rejected (or the reverse), so the case fails against "
+        "correct software. Check the value, and check it is on the "
+        "field the range actually belongs to:"
+    )
+    for finding in bounds[:_MAX_REPORTED]:
+        side = "inside" if finding.kind == "legal-rejected" else "outside"
+        verdict = (
+            "the step expects it to be rejected"
+            if finding.kind == "legal-rejected"
+            else "the step expects it to be accepted"
+        )
+        lines.append(
+            f"  - {finding.tc_id} (step {finding.step_number}): "
+            f"{_amount(finding.value)} is {side} the "
+            f"{_amount(finding.low)}–{_amount(finding.high)} the source "
+            f"states for the {finding.subject}, but {verdict}"
+        )
+    if len(bounds) > _MAX_REPORTED:
+        lines.append(f"  - ... and {len(bounds) - _MAX_REPORTED} more")
+
+
+def _add_classes_bullet(
+    lines: list[str], order: list[tuple[str, int]], classes
+) -> None:
+    order.append(("missing coverage classes", _ADV_P_SUGGESTION))
+    # A SIXTH bullet, same block, same reasoning as the ones
+    # above: same class of advice, and a heading of its own
+    # costs finalize-reply budget F03 measured as scarce.
+    #
+    # Each line reports QUALIFYING against MENTIONED, because
+    # the two numbers say different things and only the pair
+    # is actionable: '3 mention, 0 test it' means the subject
+    # is covered on the happy path and untested on the failure
+    # path, which is the single most common shape of this gap.
+    lines.append(
+        f"- **{len(classes)} test class(es) an experienced "
+        "tester would expect are missing or thin.** Each line "
+        "gives how many cases actually exercise the class "
+        "against how many merely mention its subject:"
+    )
+    for finding in classes[:_MAX_REPORTED]:
+        got = len(finding.qualifying)
+        seen = len(finding.subject_hits)
+        tail = (
+            " - the source does not specify the outcome, so "
+            "cover it as an exploratory charter that RECORDS "
+            "the behaviour, never as an asserted result"
+            if finding.unspecified
+            else ""
+        )
+        lines.append(
+            f"  - {finding.label}: {got} of {finding.floor} "
+            f"case(s), from {seen} that mention the subject{tail}"
+        )
+    if len(classes) > _MAX_REPORTED:
+        lines.append(f"  - ... and {len(classes) - _MAX_REPORTED} more")
 
 
 def consistency_warning_section(
@@ -879,158 +1073,17 @@ def consistency_warning_section(
         # rather than missing, and so can never be the ones that yield.
         order: list[tuple[str, int]] = []
         if oracles:
-            order.append(("soft oracles", _ADV_P_UNJUDGEABLE))
-            by_case: dict[str, list[int]] = defaultdict(list)
-            for tc_id, step_number, _ in oracles:
-                by_case[tc_id].append(step_number)
-            lines.append(
-                f"- **{len(by_case)} case(s) have an expected result that accepts more "
-                "than one outcome**, so the step cannot fail and cannot detect a "
-                "defect. Where the ticket genuinely does not specify the outcome, "
-                "convert the case to an exploratory charter that records the actual "
-                "behaviour instead of asserting one:"
-            )
-            for tc_id in sorted(by_case)[:_MAX_REPORTED]:
-                steps = ", ".join(str(n) for n in sorted(by_case[tc_id]))
-                lines.append(f"  - {tc_id} (step {steps})")
-            if len(by_case) > _MAX_REPORTED:
-                lines.append(f"  - ... and {len(by_case) - _MAX_REPORTED} more")
+            _add_oracle_bullet(lines, order, oracles)
         if conditional:
-            order.append(("conditional actions", _ADV_P_UNEXECUTABLE))
-            # Its own bullet, not merged into the oracle list: a soft oracle
-            # means the tester runs the step and cannot fail it, a conditional
-            # action means the tester cannot tell whether to run it at all, and
-            # one count would misdescribe both. Same block, because a fourth
-            # heading costs reply budget for advice of the same class.
-            by_action: dict[str, list[int]] = defaultdict(list)
-            for tc_id, step_number, _ in conditional:
-                by_action[tc_id].append(step_number)
-            lines.append(
-                f"- **{len(by_action)} case(s) have an action the tester "
-                'cannot execute as written** \u2014 it is conditional ("if '
-                'visible", "if available"), so whether the step is performed '
-                "at all depends on what the build happens to show, and a Pass "
-                "is indistinguishable from a skip. Name the entry point the "
-                "case means, or split the conditional branch into its own case:"
-            )
-            for tc_id in sorted(by_action)[:_MAX_REPORTED]:
-                numbers = ", ".join(str(n) for n in sorted(by_action[tc_id]))
-                lines.append(f"  - {tc_id} (step {numbers})")
-            if len(by_action) > _MAX_REPORTED:
-                lines.append(f"  - ... and {len(by_action) - _MAX_REPORTED} more")
+            _add_conditional_bullet(lines, order, conditional)
         if conflicts:
-            order.append(("contradictory state assumptions", _ADV_P_CROSS_CASE))
-            lines.append(
-                "- **Contradictory state assumptions** — the same seeded state is "
-                "treated as both allowing and blocking the action. The ticket does "
-                "not resolve this; confirm the rule before executing either side:"
-            )
-            for state, avail, block in conflicts[:_MAX_REPORTED]:
-                lines.append(
-                    f"  - `{state}`: allowed by {', '.join(avail)} / "
-                    f"blocked by {', '.join(block)}"
-                )
+            _add_conflict_bullet(lines, order, conflicts)
         if ungrounded:
-            # PROTECTED. This bullet says the case asserts copy the product never
-            # promised -- a false oracle a tester files a bug against. It is also
-            # the grounding/trust signal, and the bullet whose silent absence
-            # made the original bound vacuous; it must never be the one dropped.
-            order.append(("invented UI strings", 0))
-            # A FOURTH bullet in this block rather than a heading of its
-            # own, for the reason recorded above the conditional-action
-            # bullet: this is the same class of advice -- "this assertion
-            # cannot do its job" -- and a second heading costs finalize-
-            # reply budget that F03 already measured as scarce.
-            #
-            # Grouped by the invented STRING, not by tc_id like the two
-            # bullets above, because the string IS the defect: suite
-            # b8b8ed00 repeats one invented 'Transfer scheduled' across
-            # all 96 of its cases, and grouping by case would spend twenty
-            # lines of the reply saying the same thing twenty times.
-            by_span: dict[str, set[str]] = defaultdict(set)
-            for tc_id, _step_number, span in ungrounded:
-                by_span[span].add(tc_id)
-            lines.append(
-                f"- **{len(by_span)} exact UI string(s) are asserted that "
-                "the source never promises** \u2014 the tester compares "
-                "the product against copy nobody wrote, so any wording "
-                "difference reads as a defect. Assert what the message "
-                'MUST SAY ("an error that names the field and the limit it '
-                'broke") instead '
-                "of its exact text, or get the real copy into the ticket:"
-            )
-            for span in sorted(by_span)[:_MAX_REPORTED]:
-                shown = span if len(span) <= 60 else span[:57] + "..."
-                ids = sorted(by_span[span])
-                where = ids[0] if len(ids) == 1 else f"{ids[0]} +{len(ids) - 1} more"
-                lines.append(f"  - '{shown}' ({where})")
-            if len(by_span) > _MAX_REPORTED:
-                lines.append(f"  - ... and {len(by_span) - _MAX_REPORTED} more")
+            _add_ungrounded_bullet(lines, order, ungrounded)
         if bounds:
-            # PROTECTED, same class as the bullet above: the case asserts that a
-            # documented-legal value is rejected, so it fails against correct
-            # software. Wrong, not thin.
-            order.append(("bound contradictions", 0))
-            # A FIFTH bullet, same block, for the reason recorded above the
-            # conditional-action bullet: same class of advice ("this case
-            # cannot pass against correct software"), and a heading of its own
-            # costs finalize-reply budget F03 already measured as scarce.
-            lines.append(
-                f"- **{len(bounds)} case(s) contradict a numeric bound the "
-                "source states** \u2014 the value the step enters is legal under "
-                "the range the source gives for that field yet the step asserts "
-                "it is rejected (or the reverse), so the case fails against "
-                "correct software. Check the value, and check it is on the "
-                "field the range actually belongs to:"
-            )
-            for finding in bounds[:_MAX_REPORTED]:
-                side = "inside" if finding.kind == "legal-rejected" else "outside"
-                verdict = (
-                    "the step expects it to be rejected"
-                    if finding.kind == "legal-rejected"
-                    else "the step expects it to be accepted"
-                )
-                lines.append(
-                    f"  - {finding.tc_id} (step {finding.step_number}): "
-                    f"{_amount(finding.value)} is {side} the "
-                    f"{_amount(finding.low)}\u2013{_amount(finding.high)} the source "
-                    f"states for the {finding.subject}, but {verdict}"
-                )
-            if len(bounds) > _MAX_REPORTED:
-                lines.append(f"  - ... and {len(bounds) - _MAX_REPORTED} more")
+            _add_bounds_bullet(lines, order, bounds)
         if classes:
-            order.append(("missing coverage classes", _ADV_P_SUGGESTION))
-            # A SIXTH bullet, same block, same reasoning as the ones
-            # above: same class of advice, and a heading of its own
-            # costs finalize-reply budget F03 measured as scarce.
-            #
-            # Each line reports QUALIFYING against MENTIONED, because
-            # the two numbers say different things and only the pair
-            # is actionable: '3 mention, 0 test it' means the subject
-            # is covered on the happy path and untested on the failure
-            # path, which is the single most common shape of this gap.
-            lines.append(
-                f"- **{len(classes)} test class(es) an experienced "
-                "tester would expect are missing or thin.** Each line "
-                "gives how many cases actually exercise the class "
-                "against how many merely mention its subject:"
-            )
-            for finding in classes[:_MAX_REPORTED]:
-                got = len(finding.qualifying)
-                seen = len(finding.subject_hits)
-                tail = (
-                    " - the source does not specify the outcome, so "
-                    "cover it as an exploratory charter that RECORDS "
-                    "the behaviour, never as an asserted result"
-                    if finding.unspecified
-                    else ""
-                )
-                lines.append(
-                    f"  - {finding.label}: {got} of {finding.floor} "
-                    f"case(s), from {seen} that mention the subject{tail}"
-                )
-            if len(classes) > _MAX_REPORTED:
-                lines.append(f"  - ... and {len(classes) - _MAX_REPORTED} more")
+            _add_classes_bullet(lines, order, classes)
         return _bound_advisory_block(lines, order)
     except Exception:
         logger.exception("consistency_warning_section failed - returning empty string")

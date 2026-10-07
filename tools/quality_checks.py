@@ -1242,85 +1242,123 @@ def quality_warning_section(cases: list[TestCase], max_examples: int = 10) -> st
             return ""
 
         lines = ["\n\n## Data Quality Notes\n"]
-        if vague:
-            lines.append(
-                f"- {len(vague)} step(s) may use vague phrasing instead of a literal "
-                "value — please review before executing:"
-            )
-            for tc_id, step_number, action in vague[:max_examples]:
-                lines.append(f"  - {tc_id} step {step_number}: {action[:120]}")
-        if placeholder:
-            lines.append(
-                f"- {len(placeholder)} step(s) have placeholder test data instead of "
-                "a concrete example value:"
-            )
-            for tc_id, step_number, test_data in placeholder[:max_examples]:
-                lines.append(f"  - {tc_id} step {step_number}: {test_data}")
-        if vague_expected:
-            lines.append(
-                f"- {len(vague_expected)} step(s) have a vague expected result "
-                '(e.g. "appropriate error message") instead of the concrete outcome '
-                "to verify:"
-            )
-            for tc_id, step_number, expected in vague_expected[:max_examples]:
-                lines.append(f"  - {tc_id} step {step_number}: {expected[:120]}")
+        lines += _vague_lines(vague, max_examples)
+        lines += _placeholder_lines(placeholder, max_examples)
+        lines += _vague_expected_lines(vague_expected, max_examples)
         if empty_data_flagged:
-            pct = round(100 * len(empty_test_data) / total_cases)
-            threshold_pct = round(100 * EMPTY_DATA_WARN_RATIO)
-            # COUNTS ONLY, never an id list: this section is where the finalize
-            # reply's _SUMMARY_CAP truncation lands (live repro 2026-08-15).
-            # It leads with the RATIO judgement rather than the raw missing
-            # count so that it does not restate data_notes_section's "N of M
-            # case(s) declare a data plan; K declare none" line -- that is a
-            # DISCLOSURE of a contractually legal shape, this is the advisory
-            # that the shape has taken over the suite. Additive, not a second
-            # rendering of the same number.
-            #
-            # AND IT IS BUDGETED (reviewer F1, 2026-08-21, MEASURED not
-            # estimated). The suite shape that TRIPS this advisory is also the
-            # shape whose Test Data enumeration has almost nothing left to
-            # enumerate, so the section does not shrink enough to pay for a
-            # long bullet: a first draft ran 380 chars and pushed the finalize
-            # reply to 4229 against mcp_handlers._SUMMARY_CAP = 4000,
-            # truncating the grounding/scope advisories and the
-            # REVIEW_REQUIRED tail that print after it. One line, ~134 chars at
-            # a 96-case suite. If it must grow, shorten something else here --
-            # do not raise the cap.
-            # tests/test_finalize_reply_cap.py measures the tripped shape.
-            lines.append(
-                # F13 (2026-08-30): "no test data plan" named no field, and the
-                # export's Test Data column -- which renders STEP-level
-                # test_data and is routinely FULL on a suite that trips this --
-                # made the same tester read a 100%-missing warning beside a
-                # populated column. Both are true; they measure different
-                # fields. "case-level" is six characters and says which. The
-                # remediation is unchanged, and so is the budget this bullet is
-                # measured against: a longer explanation was written, measured
-                # at +56 chars, and pushed the finalize reply past
-                # _SUMMARY_CAP -- cutting this advisory AND the duplicate
-                # prescreen's CONTRADICTED headline. Do not re-add it here; the
-                # place for the long version is the workbook.
-                f"- {pct}% of {total_cases} case(s) have no case-level "
-                f"test_data (threshold {threshold_pct}%; {len(empty_data)} "
-                "also lack preconditions) — add a test_data entry per field "
-                "the case uses."
-            )
-        if unanchored:
-            # The ids go to the log, not the reply: see FINDABILITY_MAX_LOGGED.
-            logger.info(
-                "findability: %d of %d case(s) open mid-screen (first step names no screen): %s",
-                len(unanchored),
-                total_cases,
-                ", ".join(tc_id for tc_id, _ in unanchored[:FINDABILITY_MAX_LOGGED]),
-            )
-            lines.append(
-                f"- {len(unanchored)} of {total_cases} case(s) open mid-screen "
-                "(first step names no screen)."
-            )
+            lines.append(_empty_data_line(empty_test_data, empty_data, total_cases))
+        lines += _unanchored_lines(unanchored, total_cases)
         return "\n".join(lines)
     except Exception:
         logger.exception("quality_warning_section failed — returning empty string")
         return ""
+
+
+def _vague_lines(vague: list[tuple[str, int, str]], max_examples: int) -> list[str]:
+    """The vague-phrasing bullet and its examples; empty when nothing is vague."""
+    lines: list[str] = []
+    if vague:
+        lines.append(
+            f"- {len(vague)} step(s) may use vague phrasing instead of a literal "
+            "value — please review before executing:"
+        )
+        for tc_id, step_number, action in vague[:max_examples]:
+            lines.append(f"  - {tc_id} step {step_number}: {action[:120]}")
+    return lines
+
+
+def _placeholder_lines(
+    placeholder: list[tuple[str, int, str]], max_examples: int
+) -> list[str]:
+    """The placeholder-test-data bullet and its examples."""
+    lines: list[str] = []
+    if placeholder:
+        lines.append(
+            f"- {len(placeholder)} step(s) have placeholder test data instead of "
+            "a concrete example value:"
+        )
+        for tc_id, step_number, test_data in placeholder[:max_examples]:
+            lines.append(f"  - {tc_id} step {step_number}: {test_data}")
+    return lines
+
+
+def _vague_expected_lines(
+    vague_expected: list[tuple[str, int, str]], max_examples: int
+) -> list[str]:
+    """The vague-expected-result bullet and its examples."""
+    lines: list[str] = []
+    if vague_expected:
+        lines.append(
+            f"- {len(vague_expected)} step(s) have a vague expected result "
+            '(e.g. "appropriate error message") instead of the concrete outcome '
+            "to verify:"
+        )
+        for tc_id, step_number, expected in vague_expected[:max_examples]:
+            lines.append(f"  - {tc_id} step {step_number}: {expected[:120]}")
+    return lines
+
+
+def _empty_data_line(
+    empty_test_data: list[str], empty_data: list[str], total_cases: int
+) -> str:
+    """The one-line empty-test_data advisory."""
+    pct = round(100 * len(empty_test_data) / total_cases)
+    threshold_pct = round(100 * EMPTY_DATA_WARN_RATIO)
+    # COUNTS ONLY, never an id list: this section is where the finalize
+    # reply's _SUMMARY_CAP truncation lands (live repro 2026-08-15).
+    # It leads with the RATIO judgement rather than the raw missing
+    # count so that it does not restate data_notes_section's "N of M
+    # case(s) declare a data plan; K declare none" line -- that is a
+    # DISCLOSURE of a contractually legal shape, this is the advisory
+    # that the shape has taken over the suite. Additive, not a second
+    # rendering of the same number.
+    #
+    # AND IT IS BUDGETED (reviewer F1, 2026-08-21, MEASURED not
+    # estimated). The suite shape that TRIPS this advisory is also the
+    # shape whose Test Data enumeration has almost nothing left to
+    # enumerate, so the section does not shrink enough to pay for a
+    # long bullet: a first draft ran 380 chars and pushed the finalize
+    # reply to 4229 against mcp_handlers._SUMMARY_CAP = 4000,
+    # truncating the grounding/scope advisories and the
+    # REVIEW_REQUIRED tail that print after it. One line, ~134 chars at
+    # a 96-case suite. If it must grow, shorten something else here --
+    # do not raise the cap.
+    # tests/test_finalize_reply_cap.py measures the tripped shape.
+    return (
+        # F13 (2026-08-30): "no test data plan" named no field, and the
+        # export's Test Data column -- which renders STEP-level
+        # test_data and is routinely FULL on a suite that trips this --
+        # made the same tester read a 100%-missing warning beside a
+        # populated column. Both are true; they measure different
+        # fields. "case-level" is six characters and says which. The
+        # remediation is unchanged, and so is the budget this bullet is
+        # measured against: a longer explanation was written, measured
+        # at +56 chars, and pushed the finalize reply past
+        # _SUMMARY_CAP -- cutting this advisory AND the duplicate
+        # prescreen's CONTRADICTED headline. Do not re-add it here; the
+        # place for the long version is the workbook.
+        f"- {pct}% of {total_cases} case(s) have no case-level "
+        f"test_data (threshold {threshold_pct}%; {len(empty_data)} "
+        "also lack preconditions) — add a test_data entry per field "
+        "the case uses."
+    )
+
+
+def _unanchored_lines(unanchored: list[tuple[str, str]], total_cases: int) -> list[str]:
+    """The mid-screen bullet; logs the ids, empty when none are unanchored."""
+    if not unanchored:
+        return []
+    # The ids go to the log, not the reply: see FINDABILITY_MAX_LOGGED.
+    logger.info(
+        "findability: %d of %d case(s) open mid-screen (first step names no screen): %s",
+        len(unanchored),
+        total_cases,
+        ", ".join(tc_id for tc_id, _ in unanchored[:FINDABILITY_MAX_LOGGED]),
+    )
+    return [
+        f"- {len(unanchored)} of {total_cases} case(s) open mid-screen "
+        "(first step names no screen)."
+    ]
 
 
 def resolve_chained_refs_to_stable(cases: list[TestCase]) -> list[TestCase]:
@@ -1467,10 +1505,19 @@ def _qualifier_prefix_merges(counts: dict[str, int]) -> dict[str, str]:
     large share of real suites (``str.casefold()`` is a no-op for Arabic, which
     the first pass silently depends on).
     """
+    bare_by_key = _bare_label_by_key(counts)
+    tails, known_qualifiers = _separator_tails(counts)
+    _add_separatorless_tails(counts, tails, known_qualifiers)
+    return _merges_from_tails(tails, bare_by_key)
 
-    def _norm(label: object) -> str:
-        return " ".join(str(label or "").split())
 
+def _norm_label(label: object) -> str:
+    """The label with runs of whitespace collapsed to single spaces."""
+    return " ".join(str(label or "").split())
+
+
+def _bare_label_by_key(counts: dict[str, int]) -> dict[str, str]:
+    """Casefolded key -> the majority spelling among the labels sharing it."""
     # Keyed CASEFOLDED, and the winner within a key is the spelling used by the
     # MOST cases. 2026-08-03: this lookup used to be exact-text, which silently
     # defeated the whole rule the first time a real suite disagreed on case. The
@@ -1482,11 +1529,17 @@ def _qualifier_prefix_merges(counts: dict[str, int]) -> dict[str, str]:
     # casing pass already does, so the two passes cannot disagree on the winner.
     bare_by_key: dict[str, str] = {}
     for label in counts:
-        key = _norm(label).casefold()
+        key = _norm_label(label).casefold()
         cur = bare_by_key.get(key)
         if cur is None or counts.get(label, 0) > counts.get(cur, 0):
             bare_by_key[key] = label
+    return bare_by_key
 
+
+def _separator_tails(
+    counts: dict[str, int],
+) -> tuple[dict[str, dict[str, frozenset]], set]:
+    """Tail key -> {qualified label: removed head tokens}, plus every qualifier token."""
     # Qualifier tokens seen in SEPARATOR-qualified labels, e.g. "Client Store - X"
     # contributes {client, store}. Used only to decide whether a SEPARATOR-LESS
     # label is a product-qualified variant; see the guard below.
@@ -1495,7 +1548,7 @@ def _qualifier_prefix_merges(counts: dict[str, int]) -> dict[str, str]:
     # The removed tokens are what tell one product family from rival qualifiers.
     tails: dict[str, dict[str, frozenset]] = {}
     for label in counts:
-        norm = _norm(label)
+        norm = _norm_label(label)
         for sep in _MODULE_SEPARATORS:
             token = f" {sep} "
             idx = norm.find(token)
@@ -1507,7 +1560,15 @@ def _qualifier_prefix_merges(counts: dict[str, int]) -> dict[str, str]:
                     tails.setdefault(tail.casefold(), {})[label] = toks
                     known_qualifiers.update(toks)
                 idx = norm.find(token, idx + 1)
+    return tails, known_qualifiers
 
+
+def _add_separatorless_tails(
+    counts: dict[str, int],
+    tails: dict[str, dict[str, frozenset]],
+    known_qualifiers: set,
+) -> None:
+    """Add the product-qualified separator-less labels to `tails` in place."""
     # A SEPARATOR-LESS label can still be a product-qualified variant:
     # "Client Cancel Order" is "Cancel Order" with a product name glued on. But
     # plain suffix containment is exactly the dangerous rule -- "Order" is a suffix
@@ -1517,7 +1578,7 @@ def _qualifier_prefix_merges(counts: dict[str, int]) -> dict[str, str]:
     # "Client" qualifies via "Client Store - ...", so it is allowed; "Cancel"
     # never appears as a qualifier, so "Order" <- "Cancel Order" stays refused.
     for label in counts:
-        norm = _norm(label)
+        norm = _norm_label(label)
         toks = norm.split()
         for cut in range(1, len(toks)):
             prefix = toks[:cut]
@@ -1530,6 +1591,11 @@ def _qualifier_prefix_merges(counts: dict[str, int]) -> dict[str, str]:
                 t.casefold() for t in prefix
             )
 
+
+def _merges_from_tails(
+    tails: dict[str, dict[str, frozenset]], bare_by_key: dict[str, str]
+) -> dict[str, str]:
+    """{qualified label: bare label} for every tail the two guards let through."""
     merges: dict[str, str] = {}
     for tail_key, qualified in tails.items():
         target = bare_by_key.get(tail_key)
@@ -1594,57 +1660,78 @@ def normalize_module_names(
             return cases
         # Majority casing per key group: the single spelling used by the most
         # cases in that group wins over any minority variant sharing the key.
-        canonical: dict[str, str] = {}
-        if needs_case_pass:
-            for key, members in buckets.items():
-                counts: dict[str, int] = {}
-                for tc in members:
-                    counts[tc.module] = counts.get(tc.module, 0) + 1
-                canonical[key] = max(counts.items(), key=lambda kv: kv[1])[0]
-        changed = 0
-        out: list[TestCase] = []
-        for tc in cases:
-            key = " ".join((tc.module or "").split()).casefold()
-            target = canonical.get(key, tc.module)
-            if target != tc.module:
-                changed += 1
-                out.append(tc.model_copy(update={"module": target}))
-            else:
-                out.append(tc)
-        if changed:
-            logger.info(
-                "normalize_module_names: canonicalized %d case(s) across %d "
-                "module name variant(s)",
-                changed,
-                sum(
-                    1
-                    for members in buckets.values()
-                    if len({tc.module for tc in members}) > 1
-                ),
-            )
+        canonical = _majority_spellings(buckets) if needs_case_pass else {}
+        out = _apply_canonical_modules(cases, canonical, buckets)
         if merge_qualifier_prefixes:
-            label_counts: dict[str, int] = {}
-            for tc in out:
-                label_counts[tc.module] = label_counts.get(tc.module, 0) + 1
-            merges = _qualifier_prefix_merges(label_counts)
-            if merges:
-                out = [
-                    (
-                        tc.model_copy(update={"module": merges[tc.module]})
-                        if tc.module in merges
-                        else tc
-                    )
-                    for tc in out
-                ]
-                logger.info(
-                    "normalize_module_names: merged %d qualifier-prefixed label(s): %s",
-                    len(merges),
-                    "; ".join(f"{k!r} -> {v!r}" for k, v in sorted(merges.items())),
-                )
+            out = _merge_qualifier_labels(out)
         return out
     except Exception:
         logger.exception("normalize_module_names failed — returning cases unchanged")
         return cases
+
+
+def _majority_spellings(buckets: dict[str, list[TestCase]]) -> dict[str, str]:
+    """Key -> the module spelling used by the most cases in that key group."""
+    canonical: dict[str, str] = {}
+    for key, members in buckets.items():
+        counts: dict[str, int] = {}
+        for tc in members:
+            counts[tc.module] = counts.get(tc.module, 0) + 1
+        canonical[key] = max(counts.items(), key=lambda kv: kv[1])[0]
+    return canonical
+
+
+def _apply_canonical_modules(
+    cases: list[TestCase],
+    canonical: dict[str, str],
+    buckets: dict[str, list[TestCase]],
+) -> list[TestCase]:
+    """Rewrite each case's module to its canonical spelling and log the count."""
+    changed = 0
+    out: list[TestCase] = []
+    for tc in cases:
+        key = " ".join((tc.module or "").split()).casefold()
+        target = canonical.get(key, tc.module)
+        if target != tc.module:
+            changed += 1
+            out.append(tc.model_copy(update={"module": target}))
+        else:
+            out.append(tc)
+    if changed:
+        logger.info(
+            "normalize_module_names: canonicalized %d case(s) across %d "
+            "module name variant(s)",
+            changed,
+            sum(
+                1
+                for members in buckets.values()
+                if len({tc.module for tc in members}) > 1
+            ),
+        )
+    return out
+
+
+def _merge_qualifier_labels(out: list[TestCase]) -> list[TestCase]:
+    """Fold qualifier-prefixed module labels onto the bare label they qualify."""
+    label_counts: dict[str, int] = {}
+    for tc in out:
+        label_counts[tc.module] = label_counts.get(tc.module, 0) + 1
+    merges = _qualifier_prefix_merges(label_counts)
+    if merges:
+        out = [
+            (
+                tc.model_copy(update={"module": merges[tc.module]})
+                if tc.module in merges
+                else tc
+            )
+            for tc in out
+        ]
+        logger.info(
+            "normalize_module_names: merged %d qualifier-prefixed label(s): %s",
+            len(merges),
+            "; ".join(f"{k!r} -> {v!r}" for k, v in sorted(merges.items())),
+        )
+    return out
 
 
 def data_notes_section(cases: list[TestCase]) -> str:
@@ -1690,76 +1777,90 @@ def data_notes_section(cases: list[TestCase]) -> str:
     Never raises.
     """
     try:
-        rows: list[str] = []
-        total = 0
-        missing = 0
-        missing_ids: list[str] = []
-        for tc in cases:
-            total += 1
-            if not getattr(tc, "test_data", None):
-                missing += 1
-                missing_ids.append(str(getattr(tc, "tc_id", "") or "?"))
-                continue
-            fields = ", ".join(f"{it.field}={it.strategy}" for it in tc.test_data)
-            rows.append(f"- {tc.tc_id}: {fields}")
-        # Bounded gap line: counts always, plus the affected ids while they are
-        # a MINORITY of the suite (see the module constants above for why the
-        # ids were added and why the ratio gate is not optional). Rendered
-        # AHEAD of the enumeration so an intra-section cut can never eat it.
-        gap = ""
-        if missing and total >= EMPTY_DATA_MIN_CASES:
-            named = ""
-            if missing < total * EMPTY_DATA_WARN_RATIO:
-                shown_ids = [
-                    str(i)[:DATA_GAP_MAX_ID_CHARS]
-                    for i in missing_ids[:DATA_GAP_MAX_IDS]
-                ]
-                extra = missing - len(shown_ids)
-                tail = f" (+{extra} more)" if extra > 0 else ""
-                named = f": {', '.join(shown_ids)}{tail}"
-            gap = (
-                f"{total - missing} of {total} case(s) declare a data plan; "
-                f"{missing} declare none (blank Test Data column){named}.\n"
-            )
-        if not rows:
-            # Nothing to enumerate. Stay silent unless the gap line has something
-            # to say, so an empty or sub-floor suite still renders nothing at all.
-            return f"\n\n## Test Data\n{gap}".rstrip() if gap else ""
-        header = (
-            "\n\n## Test Data\n"
-            f"{gap}"
-            "Each case below declares what data it needs and how to source it "
-            "(see the **Test Data** column in the exported file):\n"
-        )
-        # DATA_GAP_ROW_COST fewer enumerated rows when the gap line renders -- it
-        # was ONE until TICKET-5138 (2026-08-21) made the line name ids -- so the
-        # disclosure is still paid for out of THIS section's budget instead of
-        # out of the shared _SUMMARY_CAP. The dropped rows are not lost: they
-        # roll into the overflow count, and the full plan is in the exported
-        # file either way. The trade is deliberate on content as well as on
-        # arithmetic: an enumerated row describes a case whose plan is ALREADY
-        # in the exported Test Data column, whereas a named missing id is
-        # actionable nowhere else.
-        #
-        # THE OVERFLOW CONDITION IS LOAD-BEARING. Charging the cost when the
-        # enumeration fits today CREATES an "... and N more" line that was
-        # absent, which costs ~87 chars to save ~150 of rows and can end up NET
-        # POSITIVE -- measured at +42 on the 87-of-96 fixture in
-        # tests/test_finalize_reply_cap.py, i.e. 4025 against a 4000 cap. So the
-        # rows are only ever taken from an enumeration that already overflows,
-        # where each dropped row is a pure saving. Never let this become an
-        # unconditional `if gap`.
-        limit = DATA_NOTES_MAX_CASES
-        if gap and len(rows) > DATA_NOTES_MAX_CASES:
-            limit = max(1, DATA_NOTES_MAX_CASES - DATA_GAP_ROW_COST)
-        shown = rows[:limit]
-        overflow = len(rows) - len(shown)
-        if overflow:
-            shown.append(
-                f"- … and {overflow} more case(s) — the full plan is in the "
-                "Test Data column of the exported file."
-            )
-        return header + "\n".join(shown)
+        rows, missing_ids, total = _data_note_rows(cases)
+        gap = _data_gap_line(total, missing_ids)
+        return _data_notes_text(rows, gap)
     except Exception:
         logger.exception("test_data_notes_section failed — returning empty string")
         return ""
+
+
+def _data_note_rows(cases: list[TestCase]) -> tuple[list[str], list[str], int]:
+    """The enumerated plan rows, the ids declaring no plan, and the case total."""
+    rows: list[str] = []
+    total = 0
+    missing_ids: list[str] = []
+    for tc in cases:
+        total += 1
+        if not getattr(tc, "test_data", None):
+            missing_ids.append(str(getattr(tc, "tc_id", "") or "?"))
+            continue
+        fields = ", ".join(f"{it.field}={it.strategy}" for it in tc.test_data)
+        rows.append(f"- {tc.tc_id}: {fields}")
+    return rows, missing_ids, total
+
+
+def _data_gap_line(total: int, missing_ids: list[str]) -> str:
+    """The bounded disclosure line for cases with no plan; '' when none applies."""
+    missing = len(missing_ids)
+    # Bounded gap line: counts always, plus the affected ids while they are
+    # a MINORITY of the suite (see the module constants above for why the
+    # ids were added and why the ratio gate is not optional). Rendered
+    # AHEAD of the enumeration so an intra-section cut can never eat it.
+    if not (missing and total >= EMPTY_DATA_MIN_CASES):
+        return ""
+    named = ""
+    if missing < total * EMPTY_DATA_WARN_RATIO:
+        shown_ids = [
+            str(i)[:DATA_GAP_MAX_ID_CHARS] for i in missing_ids[:DATA_GAP_MAX_IDS]
+        ]
+        extra = missing - len(shown_ids)
+        tail = f" (+{extra} more)" if extra > 0 else ""
+        named = f": {', '.join(shown_ids)}{tail}"
+    return (
+        f"{total - missing} of {total} case(s) declare a data plan; "
+        f"{missing} declare none (blank Test Data column){named}.\n"
+    )
+
+
+def _data_notes_text(rows: list[str], gap: str) -> str:
+    """Assemble the '## Test Data' block from the plan rows and the gap line."""
+    if not rows:
+        # Nothing to enumerate. Stay silent unless the gap line has something
+        # to say, so an empty or sub-floor suite still renders nothing at all.
+        return f"\n\n## Test Data\n{gap}".rstrip() if gap else ""
+    header = (
+        "\n\n## Test Data\n"
+        f"{gap}"
+        "Each case below declares what data it needs and how to source it "
+        "(see the **Test Data** column in the exported file):\n"
+    )
+    # DATA_GAP_ROW_COST fewer enumerated rows when the gap line renders -- it
+    # was ONE until TICKET-5138 (2026-08-21) made the line name ids -- so the
+    # disclosure is still paid for out of THIS section's budget instead of
+    # out of the shared _SUMMARY_CAP. The dropped rows are not lost: they
+    # roll into the overflow count, and the full plan is in the exported
+    # file either way. The trade is deliberate on content as well as on
+    # arithmetic: an enumerated row describes a case whose plan is ALREADY
+    # in the exported Test Data column, whereas a named missing id is
+    # actionable nowhere else.
+    #
+    # THE OVERFLOW CONDITION IS LOAD-BEARING. Charging the cost when the
+    # enumeration fits today CREATES an "... and N more" line that was
+    # absent, which costs ~87 chars to save ~150 of rows and can end up NET
+    # POSITIVE -- measured at +42 on the 87-of-96 fixture in
+    # tests/test_finalize_reply_cap.py, i.e. 4025 against a 4000 cap. So the
+    # rows are only ever taken from an enumeration that already overflows,
+    # where each dropped row is a pure saving. Never let this become an
+    # unconditional `if gap`.
+    limit = DATA_NOTES_MAX_CASES
+    if gap and len(rows) > DATA_NOTES_MAX_CASES:
+        limit = max(1, DATA_NOTES_MAX_CASES - DATA_GAP_ROW_COST)
+    shown = rows[:limit]
+    overflow = len(rows) - len(shown)
+    if overflow:
+        shown.append(
+            f"- … and {overflow} more case(s) — the full plan is in the "
+            "Test Data column of the exported file."
+        )
+    return header + "\n".join(shown)

@@ -228,40 +228,13 @@ async def restore_stale(serial: str, *, skip_run_id: str = "") -> dict:
     acting on its own.
     """
     try:
-        from tools.mobile import locks as mobile_locks
-
         found = stale_records(serial, skip_run_id=skip_run_id)
         if not found:
-            return {
-                "error": None,
-                "content": {
-                    "restored": False,
-                    "detail": "no earlier run left a keyboard selected on this device",
-                    "previous": "",
-                    "runs": [],
-                },
-            }
-        # THREE CONDITIONS, ALL REQUIRED, ALL FAILING CLOSED. This changes a
-        # device belonging to somebody else's run, so the bar is not "looks
-        # idle" but "is provably not in use".
-        #
-        # (a) THE PROBE ANSWERED. No row, or a row carrying an error, is not
-        #     evidence of an idle device.
-        # (b) THE DEVICE IS FREE OR OURS. Asking only "is it held" was the
-        #     defect a review caught: both call sites run while THIS run holds
-        #     the lock -- `_mobile_hand_off` takes it and then sweeps,
-        #     `finish_device` sweeps before releasing -- so the hold the guard
-        #     tripped over was its own and the sweep could never fire.
-        #     Measured before the fix: held=True, owner=our own run id.
-        # (c) EVERY WRITER IS PROVABLY GONE. A lock can be free while its
-        #     writer lives, so this is the condition that actually protects a
-        #     live run; (b) is the weaker check, not the only one.
-        rows = mobile_locks.device_holders([str(serial)]) or []
-        row = rows[0] if rows else {}
-        mine = str(skip_run_id or "")
-        held_by_another = bool(row.get("held")) and str(row.get("owner") or "") != mine
-        undead = [r["run_id"] for r in found if not pid_is_provably_dead(r.get("pid"))]
-        if not rows or row.get("error") or held_by_another or undead:
+            return _sweep_result(
+                False, "no earlier run left a keyboard selected on this device", []
+            )
+        undead = _unconfirmed_holders(serial, skip_run_id, found)
+        if undead is not None:
             # ONE refusal for all three, deliberately: they are the same answer
             # to the tester -- something may still be using this device, so
             # nothing was touched -- and three differently-worded refusals for
@@ -269,90 +242,134 @@ async def restore_stale(serial: str, *, skip_run_id: str = "") -> dict:
             # things. `undead` includes every record written before the pid
             # field existed, which is correct and self-healing: no pid is not
             # evidence of a dead run, and the next run writes one.
-            return {
-                "error": None,
-                "content": {
-                    "restored": False,
-                    "detail": (
-                        "a previous run's keyboard record exists but its holder "
-                        "could not be confirmed dead, so the device was left "
-                        "alone"
-                    ),
-                    "previous": "",
-                    "runs": undead or [r["run_id"] for r in found],
-                },
-            }
-        # OLDEST first: the earliest record holds the keyboard the tester
-        # actually chose. A later crashed run may have recorded OUR keyboard as
-        # its previous, and restoring that would hand back the thing being
-        # undone.
-        found.sort(key=lambda r: float(r.get("selected_at") or 0.0))
-        previous = ""
-        for record in found:
-            candidate = str(record.get("previous") or "")
-            if candidate and not record.get("was_ours"):
-                previous = candidate
-                break
-        if not previous:
-            # NOTHING TO GO BACK TO, so these records are spent: every candidate
-            # names our own keyboard. Cleared, because keeping them would make
-            # every later sweep re-report a crash nobody can act on -- and
-            # unlike the failure below, there is no information here to lose.
-            for record in found:
-                clear_record(str(record.get("run_id") or ""))
-            return {
-                "error": None,
-                "content": {
-                    "restored": False,
-                    "detail": (
-                        "an earlier run left a record naming no keyboard to go "
-                        "back to, so nothing was changed"
-                    ),
-                    "previous": "",
-                    "runs": [r["run_id"] for r in found],
-                },
-            }
-        # RESTORE FIRST, CLEAR ONLY ON SUCCESS. The first version cleared here,
-        # before the restore, and a review caught what that costs: a device that
-        # dropped off adb for the second the `ime set` takes left no record, so
-        # no later run could retry -- the fix deleted, on its own failure path,
-        # the one thing it was built to read.
-        result = await ime.restore_previous(str(serial), previous)
-        if result.get("error"):
-            return {
-                "error": None,
-                "content": {
-                    "restored": False,
-                    # KEPT, so the next run can try again, and SAID, because the
-                    # tester is the only one who can fix it in Settings if no
-                    # next run comes.
-                    "detail": (
-                        "could not give back the keyboard an earlier run left "
-                        "selected (" + str(result["error"])[:160] + "). It will "
-                        "be tried again next time."
-                    ),
-                    "previous": previous,
-                    "runs": [r["run_id"] for r in found],
-                },
-            }
-        for record in found:
-            clear_record(str(record.get("run_id") or ""))
-        return {
-            "error": None,
-            "content": {
-                "restored": True,
-                "detail": (
-                    "restored the keyboard a crashed run left selected ("
-                    + ime.display_id(previous)
-                    + ")"
-                ),
-                "previous": previous,
-                "runs": [r["run_id"] for r in found],
-            },
-        }
+            return _sweep_result(
+                False,
+                "a previous run's keyboard record exists but its holder "
+                "could not be confirmed dead, so the device was left alone",
+                undead or [r["run_id"] for r in found],
+            )
+        return await _restore_found(serial, found)
     except Exception as exc:
         logger.exception("mobile.ime_session.restore_stale failed")
         return {"error": str(exc), "content": None}
+
+
+def _sweep_result(restored: bool, detail: str, runs: list, previous: str = "") -> dict:
+    """The ``restore_stale`` result body."""
+    return {
+        "error": None,
+        "content": {
+            "restored": restored,
+            "detail": detail,
+            "previous": previous,
+            "runs": runs,
+        },
+    }
+
+
+def _unconfirmed_holders(serial: str, skip_run_id: str, found: list) -> list | None:
+    """``None`` when the device is provably idle; else the run ids not proven dead.
+
+    An empty list still means "refuse": the probe itself gave no clear answer.
+    """
+    from tools.mobile import locks as mobile_locks
+
+    # THREE CONDITIONS, ALL REQUIRED, ALL FAILING CLOSED. This changes a
+    # device belonging to somebody else's run, so the bar is not "looks
+    # idle" but "is provably not in use".
+    #
+    # (a) THE PROBE ANSWERED. No row, or a row carrying an error, is not
+    #     evidence of an idle device.
+    # (b) THE DEVICE IS FREE OR OURS. Asking only "is it held" was the
+    #     defect a review caught: both call sites run while THIS run holds
+    #     the lock -- `_mobile_hand_off` takes it and then sweeps,
+    #     `finish_device` sweeps before releasing -- so the hold the guard
+    #     tripped over was its own and the sweep could never fire.
+    #     Measured before the fix: held=True, owner=our own run id.
+    # (c) EVERY WRITER IS PROVABLY GONE. A lock can be free while its
+    #     writer lives, so this is the condition that actually protects a
+    #     live run; (b) is the weaker check, not the only one.
+    rows = mobile_locks.device_holders([str(serial)]) or []
+    row = rows[0] if rows else {}
+    mine = str(skip_run_id or "")
+    held_by_another = bool(row.get("held")) and str(row.get("owner") or "") != mine
+    undead = [r["run_id"] for r in found if not pid_is_provably_dead(r.get("pid"))]
+    if not rows or row.get("error") or held_by_another or undead:
+        return undead
+    return None
+
+
+def _earliest_previous(found: list) -> str:
+    """The keyboard to give back: the oldest record's, never our own."""
+    # OLDEST first: the earliest record holds the keyboard the tester
+    # actually chose. A later crashed run may have recorded OUR keyboard as
+    # its previous, and restoring that would hand back the thing being
+    # undone.
+    found.sort(key=lambda r: float(r.get("selected_at") or 0.0))
+    for record in found:
+        candidate = str(record.get("previous") or "")
+        if candidate and not record.get("was_ours"):
+            return candidate
+    return ""
+
+
+def _clear_all(found: list) -> None:
+    for record in found:
+        clear_record(str(record.get("run_id") or ""))
+
+
+async def _restore_found(serial: str, found: list) -> dict:
+    """Give back the keyboard named by *found*, clearing records only on success."""
+    previous = _earliest_previous(found)
+    runs = [r["run_id"] for r in found]
+    if not previous:
+        # NOTHING TO GO BACK TO, so these records are spent: every candidate
+        # names our own keyboard. Cleared, because keeping them would make
+        # every later sweep re-report a crash nobody can act on -- and
+        # unlike the failure below, there is no information here to lose.
+        _clear_all(found)
+        return _sweep_result(
+            False,
+            "an earlier run left a record naming no keyboard to go "
+            "back to, so nothing was changed",
+            runs,
+        )
+    # RESTORE FIRST, CLEAR ONLY ON SUCCESS. The first version cleared here,
+    # before the restore, and a review caught what that costs: a device that
+    # dropped off adb for the second the `ime set` takes left no record, so
+    # no later run could retry -- the fix deleted, on its own failure path,
+    # the one thing it was built to read.
+    result = await ime.restore_previous(str(serial), previous)
+    if result.get("error"):
+        # KEPT, so the next run can try again, and SAID, because the
+        # tester is the only one who can fix it in Settings if no
+        # next run comes.
+        return _sweep_result(
+            False,
+            "could not give back the keyboard an earlier run left "
+            "selected (" + str(result["error"])[:160] + "). It will "
+            "be tried again next time.",
+            runs,
+            previous,
+        )
+    _clear_all(found)
+    return _sweep_result(
+        True,
+        "restored the keyboard a crashed run left selected ("
+        + ime.display_id(previous)
+        + ")",
+        runs,
+        previous,
+    )
+
+
+async def _pinned_state(serial: str, installed: bool) -> bool | None:
+    """True/False for an installed package's build pin; None when not installed."""
+    # Only an installed package has a build to compare; None is never a match.
+    if not installed:
+        return None
+    verdict = await ime.verify_pinned(serial)
+    return (verdict.get("content") or {}).get("pinned")
 
 
 async def state(serial: str) -> dict:
@@ -374,11 +391,7 @@ async def state(serial: str) -> dict:
             return current
         now = str(current.get("content") or "")
         installed = bool((present.get("content") or {}).get("installed"))
-        # Only an installed package has a build to compare; None is never a match.
-        pinned = None
-        if installed:
-            verdict = await ime.verify_pinned(serial)
-            pinned = (verdict.get("content") or {}).get("pinned")
+        pinned = await _pinned_state(serial, installed)
         return {
             "error": None,
             "content": {
@@ -518,107 +531,130 @@ async def _ensure_ready(serial: str, run_id: str) -> dict:
             }
 
         # REMEMBER FIRST. Everything below this line changes the device.
-        if not read_record(run_id):
-            remembered = await ime.remember_previous(serial)
-            if remembered.get("error"):
-                return remembered
-            kept = remembered.get("content") or {}
-            written = write_record(
-                run_id,
-                {
-                    "serial": str(serial),
-                    "previous": str(kept.get("previous") or ""),
-                    "was_ours": bool(kept.get("was_ours")),
-                    "selected_at": time.time(),
-                    # WHO to prove gone before anyone undoes this. Without it a
-                    # later sweep can only ask whether the device lock is free,
-                    # and a lock can be free while its writer is alive between
-                    # two calls. A record carrying no pid is never swept.
-                    "pid": os.getpid(),
-                },
-            )
-            if written.get("error"):
-                # A record we could not write is a restore we could not perform,
-                # so this refuses rather than displacing a keyboard it has no way
-                # to give back.
-                return {
-                    "error": (
-                        "Refusing to select the QA input method: its record could "
-                        "not be written, so the keyboard you have now could not be "
-                        "restored afterwards (" + str(written["error"])[:120] + ")."
-                    ),
-                    "content": None,
-                }
+        refused = await _remember_keyboard(serial, run_id)
+        if refused:
+            return refused
 
         if not body.get("installed") or body.get("pinned") is False:
             installed = await ime.install(serial)
             if installed.get("error"):
                 return installed
-        settled: dict = {}
-        last_failure_text = ""
-        reached_poll = False
-        for attempt in range(1, IME_SELECT_MAX_ATTEMPTS + 1):
-            enabled = await ime.enable(serial)
-            if enabled.get("error"):
-                last_failure_text = str(enabled.get("error") or "")
-                if attempt < IME_SELECT_MAX_ATTEMPTS:
-                    await _await_listed(serial)
-                continue
-            chosen = await ime.select(serial)
-            if chosen.get("error"):
-                last_failure_text = str(chosen.get("error") or "")
-                if attempt < IME_SELECT_MAX_ATTEMPTS:
-                    await _await_listed(serial)
-                continue
-
-            last_failure_text = ""
-            reached_poll = True
-            for poll in range(IME_POLL_MAX_ATTEMPTS):
-                after = await state(serial)
-                if after.get("error"):
-                    return after
-                settled = after.get("content") or {}
-                if settled.get("selected"):
-                    return {
-                        "error": None,
-                        "content": {
-                            "ready": True,
-                            "changed": True,
-                            "detail": "selected the QA input method",
-                        },
-                    }
-                if poll < IME_POLL_MAX_ATTEMPTS - 1:
-                    await _sleep(IME_POLL_INTERVAL_S)
-            if attempt < IME_SELECT_MAX_ATTEMPTS:
-                await _await_listed(serial)
-
-        if not reached_poll:
-            after = await state(serial)
-            if after.get("error"):
-                return after
-            settled = after.get("content") or {}
-
-        detail = wrap_untrusted(
-            "device_ime_state",
-            str(settled.get("current") or "no keyboard")[:120]
-            + (
-                "; last attempt failed: " + last_failure_text[:200]
-                if last_failure_text
-                else ""
-            ),
-        )
-        return {
-            "error": (
-                "The QA input method was installed and enabled but did not "
-                "become the active keyboard; typing would go to "
-                + detail
-                + ". Nothing was typed."
-            ),
-            "content": None,
-        }
+        return await _select_ours(serial)
     except Exception as exc:
         logger.exception("mobile.ime_session.ensure_ready failed")
         return {"error": str(exc), "content": None}
+
+
+async def _remember_keyboard(serial: str, run_id: str) -> dict | None:
+    """Record the tester's keyboard once per run; an error result, else ``None``."""
+    if read_record(run_id):
+        return None
+    remembered = await ime.remember_previous(serial)
+    if remembered.get("error"):
+        return remembered
+    kept = remembered.get("content") or {}
+    written = write_record(
+        run_id,
+        {
+            "serial": str(serial),
+            "previous": str(kept.get("previous") or ""),
+            "was_ours": bool(kept.get("was_ours")),
+            "selected_at": time.time(),
+            # WHO to prove gone before anyone undoes this. Without it a
+            # later sweep can only ask whether the device lock is free,
+            # and a lock can be free while its writer is alive between
+            # two calls. A record carrying no pid is never swept.
+            "pid": os.getpid(),
+        },
+    )
+    if written.get("error"):
+        # A record we could not write is a restore we could not perform,
+        # so this refuses rather than displacing a keyboard it has no way
+        # to give back.
+        return {
+            "error": (
+                "Refusing to select the QA input method: its record could "
+                "not be written, so the keyboard you have now could not be "
+                "restored afterwards (" + str(written["error"])[:120] + ")."
+            ),
+            "content": None,
+        }
+    return None
+
+
+async def _enable_and_select(serial: str) -> str:
+    """Enable then select our keyboard; the failure text, or ``""`` on success."""
+    enabled = await ime.enable(serial)
+    if enabled.get("error"):
+        return str(enabled.get("error") or "")
+    chosen = await ime.select(serial)
+    if chosen.get("error"):
+        return str(chosen.get("error") or "")
+    return ""
+
+
+async def _poll_selected(serial: str) -> tuple[dict | None, dict]:
+    """Poll until our keyboard is active: ``(result_or_None, last_settled_state)``."""
+    settled: dict = {}
+    for poll in range(IME_POLL_MAX_ATTEMPTS):
+        after = await state(serial)
+        if after.get("error"):
+            return after, settled
+        settled = after.get("content") or {}
+        if settled.get("selected"):
+            done = {
+                "error": None,
+                "content": {
+                    "ready": True,
+                    "changed": True,
+                    "detail": "selected the QA input method",
+                },
+            }
+            return done, settled
+        if poll < IME_POLL_MAX_ATTEMPTS - 1:
+            await _sleep(IME_POLL_INTERVAL_S)
+    return None, settled
+
+
+async def _select_ours(serial: str) -> dict:
+    """Select our keyboard with bounded retries; the error result if it never sticks."""
+    settled: dict = {}
+    last_failure_text = ""
+    reached_poll = False
+    for attempt in range(1, IME_SELECT_MAX_ATTEMPTS + 1):
+        last_failure_text = await _enable_and_select(serial)
+        if not last_failure_text:
+            reached_poll = True
+            early, settled = await _poll_selected(serial)
+            if early:
+                return early
+        if attempt < IME_SELECT_MAX_ATTEMPTS:
+            await _await_listed(serial)
+
+    if not reached_poll:
+        after = await state(serial)
+        if after.get("error"):
+            return after
+        settled = after.get("content") or {}
+
+    detail = wrap_untrusted(
+        "device_ime_state",
+        str(settled.get("current") or "no keyboard")[:120]
+        + (
+            "; last attempt failed: " + last_failure_text[:200]
+            if last_failure_text
+            else ""
+        ),
+    )
+    return {
+        "error": (
+            "The QA input method was installed and enabled but did not "
+            "become the active keyboard; typing would go to "
+            + detail
+            + ". Nothing was typed."
+        ),
+        "content": None,
+    }
 
 
 async def restore(run_id: str) -> dict:

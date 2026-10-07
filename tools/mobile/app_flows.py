@@ -156,6 +156,58 @@ def _screen_strings(step: dict) -> list:
     return [str(value) for value in out if value]
 
 
+def _check_step(index: int, step: object, params: list) -> tuple[dict, str]:
+    """``(clean_step, "")`` for a replayable step, else ``({}, problem)``."""
+    if not isinstance(step, dict):
+        return {}, "step %d is not an object" % index
+    op = str(step.get("op") or "")
+    if op not in ALLOWED_OPS:
+        why = _REFUSED_WHY.get(op, "it is not a replayable UI action")
+        return {}, "step %d: `%s` cannot be saved in a flow (%s)" % (
+            index,
+            op[:30],
+            why,
+        )
+    clean = copy.deepcopy(step)
+    target = clean.get("target")
+    if isinstance(target, dict):
+        target.pop("id", None)
+        if not any(
+            str(target.get(key) or "").strip()
+            for key in ("text", "rid", "role", "label")
+        ):
+            return {}, (
+                "step %d: its target is a positional id only, which does not survive a replay"
+                % index
+            )
+    if op in ("type", "fill"):
+        problem = _check_typed(index, clean, params)
+        if problem:
+            return {}, problem
+    for value in _screen_strings(clean):
+        why = app_knowledge.secret_reason(value)
+        if why:
+            return {}, "step %d is not saved: %s" % (index, why)
+    return clean, ""
+
+
+def _template_payload(raw: object) -> tuple:
+    """The script's action list and no problem, or None and the refusal text."""
+    payload = raw
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return None, "the script is not valid JSON"
+    if isinstance(payload, dict):
+        payload = payload.get("actions")
+    if not isinstance(payload, list) or not payload:
+        return None, "a flow needs a non-empty `actions` list"
+    if len(payload) > actions.MAX_MODEL_ACTIONS:
+        return None, "a flow holds at most %d steps" % actions.MAX_MODEL_ACTIONS
+    return payload, None
+
+
 def template_from_script(raw: object) -> dict:
     """A validated template ``{'params', 'steps'}`` from a script (JSON text, list or dict).
 
@@ -164,53 +216,15 @@ def template_from_script(raw: object) -> dict:
     scrub would refuse. The caller's data is never mutated.
     """
     try:
-        payload = raw
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except ValueError:
-                return _err("the script is not valid JSON")
-        if isinstance(payload, dict):
-            payload = payload.get("actions")
-        if not isinstance(payload, list) or not payload:
-            return _err("a flow needs a non-empty `actions` list")
-        if len(payload) > actions.MAX_MODEL_ACTIONS:
-            return _err("a flow holds at most %d steps" % actions.MAX_MODEL_ACTIONS)
+        payload, problem = _template_payload(raw)
+        if problem:
+            return _err(problem)
         steps: list = []
         params: list = []
         for index, step in enumerate(payload, 1):
-            if not isinstance(step, dict):
-                return _err("step %d is not an object" % index)
-            op = str(step.get("op") or "")
-            if op not in ALLOWED_OPS:
-                return _err(
-                    "step %d: `%s` cannot be saved in a flow (%s)"
-                    % (
-                        index,
-                        op[:30],
-                        _REFUSED_WHY.get(op, "it is not a replayable UI action"),
-                    )
-                )
-            clean = copy.deepcopy(step)
-            target = clean.get("target")
-            if isinstance(target, dict):
-                target.pop("id", None)
-                if not any(
-                    str(target.get(key) or "").strip()
-                    for key in ("text", "rid", "role", "label")
-                ):
-                    return _err(
-                        "step %d: its target is a positional id only, which does not survive a replay"
-                        % index
-                    )
-            if op in ("type", "fill"):
-                problem = _check_typed(index, clean, params)
-                if problem:
-                    return _err(problem)
-            for value in _screen_strings(clean):
-                why = app_knowledge.secret_reason(value)
-                if why:
-                    return _err("step %d is not saved: %s" % (index, why))
+            clean, problem = _check_step(index, step, params)
+            if problem:
+                return _err(problem)
             steps.append(clean)
         if len(params) > MAX_PARAMS_PER_FLOW:
             return _err("a flow takes at most %d parameters" % MAX_PARAMS_PER_FLOW)

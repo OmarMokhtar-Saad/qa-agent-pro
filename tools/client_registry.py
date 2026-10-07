@@ -177,54 +177,83 @@ def register_entry(
 
     fd = _lock(config_path)
     try:
-        cfg: dict = {}
-        original: str | None = None
-        if config_path.is_file():
-            try:
-                original = config_path.read_text(encoding="utf-8")
-                stripped = original.strip()
-                cfg = json.loads(stripped) if stripped else {}
-            except (OSError, ValueError) as exc:
-                # Never clobber something we cannot parse.
-                return ERROR, f"existing config is not readable JSON ({exc})"
-            if not isinstance(cfg, dict):
-                return ERROR, "existing config root is not a JSON object"
-
-        servers = cfg.get("mcpServers")
-        if servers is None:
-            servers = {}
-            cfg["mcpServers"] = servers
-        if not isinstance(servers, dict):
-            return ERROR, "existing mcpServers is not a JSON object"
-
-        existing = servers.get(server_name)
-        if existing is not None:
-            if insert_only:
-                return PRESENT, "already registered; left untouched"
-            if existing == desired:
-                return PRESENT, "already registered with this command"
-            status = UPDATED
-        else:
-            status = ADDED
-
-        servers[server_name] = desired
-        payload = json.dumps(cfg, indent=2) + "\n"
-        if original is not None and payload == original:
-            return PRESENT, "already up to date"
-
-        # .bak ONLY now that a real write is about to happen.
-        if original is not None:
-            try:
-                _atomic_write(Path(str(config_path) + ".bak"), original)
-            except Exception:
-                logger.debug("could not write a .bak", exc_info=True)
-        _atomic_write(config_path, payload)
-        return status, str(config_path)
+        return _register_locked(config_path, server_name, desired, insert_only)
     except Exception as exc:
         logger.debug("register_entry failed for %s", config_path, exc_info=True)
         return ERROR, str(exc)
     finally:
         _unlock(fd)
+
+
+def _register_locked(
+    config_path: Path, server_name: str, desired: dict, insert_only: bool
+) -> tuple[str, str]:
+    """The read-merge-write of ``register_entry``, run while the lock is held."""
+    cfg, original, failure = _read_config(config_path)
+    if failure is None:
+        status, failure = _place_entry(cfg, server_name, desired, insert_only)
+    if failure is not None:
+        return failure
+    payload = json.dumps(cfg, indent=2) + "\n"
+    if original is not None and payload == original:
+        return PRESENT, "already up to date"
+
+    # .bak ONLY now that a real write is about to happen.
+    if original is not None:
+        try:
+            _atomic_write(Path(str(config_path) + ".bak"), original)
+        except Exception:
+            logger.debug("could not write a .bak", exc_info=True)
+    _atomic_write(config_path, payload)
+    return status, str(config_path)
+
+
+def _read_config(
+    config_path: Path,
+) -> tuple[dict, str | None, tuple[str, str] | None]:
+    """(cfg, original text, failure): ``failure`` is a ready (status, detail) or None."""
+    cfg: dict = {}
+    original: str | None = None
+    if config_path.is_file():
+        try:
+            original = config_path.read_text(encoding="utf-8")
+            stripped = original.strip()
+            cfg = json.loads(stripped) if stripped else {}
+        except (OSError, ValueError) as exc:
+            # Never clobber something we cannot parse.
+            return (
+                cfg,
+                original,
+                (ERROR, f"existing config is not readable JSON ({exc})"),
+            )
+        if not isinstance(cfg, dict):
+            return cfg, original, (ERROR, "existing config root is not a JSON object")
+    return cfg, original, None
+
+
+def _place_entry(
+    cfg: dict, server_name: str, desired: dict, insert_only: bool
+) -> tuple[str, tuple[str, str] | None]:
+    """Set ``desired`` in ``cfg``: (status, failure); ``failure`` is an early (status, detail)."""
+    servers = cfg.get("mcpServers")
+    if servers is None:
+        servers = {}
+        cfg["mcpServers"] = servers
+    if not isinstance(servers, dict):
+        return "", (ERROR, "existing mcpServers is not a JSON object")
+
+    existing = servers.get(server_name)
+    if existing is not None:
+        if insert_only:
+            return "", (PRESENT, "already registered; left untouched")
+        if existing == desired:
+            return "", (PRESENT, "already registered with this command")
+        status = UPDATED
+    else:
+        status = ADDED
+
+    servers[server_name] = desired
+    return status, None
 
 
 def register_client(
@@ -312,40 +341,7 @@ def discover_registrations(
     seen_paths: set = set()
 
     def _scan(path: Path, scope: str, base: object = None) -> None:
-        try:
-            rp = path.resolve()
-            if rp in seen_paths or not path.is_file():
-                return
-            seen_paths.add(rp)
-            data = json.loads(path.read_text(encoding="utf-8") or "{}")
-            servers = (data or {}).get("mcpServers") or {}
-            if not isinstance(servers, dict):
-                return
-            for name, entry in servers.items():
-                if not _looks_like_qa_server(str(name)):
-                    continue
-                cmd = ""
-                if isinstance(entry, dict):
-                    cmd = str(entry.get("command") or entry.get("url") or "")
-                    args = entry.get("args")
-                    if isinstance(args, list) and args:
-                        cmd = (cmd + " " + " ".join(str(a) for a in args)).strip()
-                out.append(
-                    {
-                        "scope": scope,
-                        "name": str(name),
-                        "command": cmd,
-                        "config": str(path),
-                        # A relative path in a PROJECT config is workspace-relative,
-                        # not config-relative -- `${workspaceFolder}` means the
-                        # workspace ROOT. Resolving against the config's own folder
-                        # made `.cursor/mcp.json` look like a third install living in
-                        # `<root>/.cursor`. Carry the correct base with the row.
-                        "base": str(base or path.parent),
-                    }
-                )
-        except Exception:
-            logger.debug("could not scan %s for MCP registrations", path, exc_info=True)
+        _scan_registrations(path, scope, base, seen_paths, out)
 
     _scan(home / ".claude.json", "user")
     for _label, cfg, _need in default_targets(home):
@@ -354,6 +350,46 @@ def discover_registrations(
         for rel in _PROJECT_CONFIG_RELPATHS:
             _scan(Path(root) / rel, "project", base=Path(root))
     return out
+
+
+def _scan_registrations(
+    path: Path, scope: str, base: object, seen_paths: set, out: list[dict]
+) -> None:
+    """Append the qa-server registrations of one config file to ``out``."""
+    try:
+        rp = path.resolve()
+        if rp in seen_paths or not path.is_file():
+            return
+        seen_paths.add(rp)
+        data = json.loads(path.read_text(encoding="utf-8") or "{}")
+        servers = (data or {}).get("mcpServers") or {}
+        if not isinstance(servers, dict):
+            return
+        for name, entry in servers.items():
+            if not _looks_like_qa_server(str(name)):
+                continue
+            cmd = ""
+            if isinstance(entry, dict):
+                cmd = str(entry.get("command") or entry.get("url") or "")
+                args = entry.get("args")
+                if isinstance(args, list) and args:
+                    cmd = (cmd + " " + " ".join(str(a) for a in args)).strip()
+            out.append(
+                {
+                    "scope": scope,
+                    "name": str(name),
+                    "command": cmd,
+                    "config": str(path),
+                    # A relative path in a PROJECT config is workspace-relative,
+                    # not config-relative -- `${workspaceFolder}` means the
+                    # workspace ROOT. Resolving against the config's own folder
+                    # made `.cursor/mcp.json` look like a third install living in
+                    # `<root>/.cursor`. Carry the correct base with the row.
+                    "base": str(base or path.parent),
+                }
+            )
+    except Exception:
+        logger.debug("could not scan %s for MCP registrations", path, exc_info=True)
 
 
 def install_target(command: str, base: str | Path) -> str:

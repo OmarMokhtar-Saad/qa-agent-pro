@@ -212,51 +212,61 @@ def parse_bounds(grounding_text: str) -> list[_Bound]:
     bounds: list[_Bound] = []
     try:
         flattened = " ".join((grounding_text or "").split())
-        for clause in re.split(r"[.;]", flattened):
-            match = _RANGE_RE.search(clause)
-            if not match:
-                continue
-            low, high = _number(match.group(1)), _number(match.group(2))
-            if low >= high:
-                continue
-            ordered = _ordered_tokens(clause[: match.start()])
-            subject = set(ordered)
-            if not subject:
-                continue
-            increment = _INCREMENT_RE.search(clause)
-            bounds.append(
-                _Bound(
-                    low=low,
-                    high=high,
-                    increment=_number(increment.group(1)) if increment else None,
-                    subject=frozenset(subject),
-                    distinctive=frozenset(subject),
-                    order=tuple(ordered),
-                )
-            )
-        # A token two ranges share cannot tell them apart, so it is removed
-        # from both. What is left ({monthly, spending, cap} against
-        # {per-transaction, transaction, limit}) is what binding runs on.
-        resolved: list[_Bound] = []
-        for index, bound in enumerate(bounds):
-            others: set[str] = set()
-            for other_index, other in enumerate(bounds):
-                if other_index != index:
-                    others |= other.subject
-            resolved.append(
-                _Bound(
-                    low=bound.low,
-                    high=bound.high,
-                    increment=bound.increment,
-                    subject=bound.subject,
-                    distinctive=frozenset(bound.subject - others),
-                    order=bound.order,
-                )
-            )
-        return resolved
+        _parse_bounds_clauses(flattened, bounds)
+        return _parse_bounds_resolve(bounds)
     except Exception:
         logger.exception("parse_bounds failed - returning what was parsed")
         return []
+
+
+def _parse_bounds_clauses(flattened: str, bounds: list[_Bound]) -> None:
+    """Append one raw bound for each clause of ``flattened`` that states a range."""
+    for clause in re.split(r"[.;]", flattened):
+        match = _RANGE_RE.search(clause)
+        if not match:
+            continue
+        low, high = _number(match.group(1)), _number(match.group(2))
+        if low >= high:
+            continue
+        ordered = _ordered_tokens(clause[: match.start()])
+        subject = set(ordered)
+        if not subject:
+            continue
+        increment = _INCREMENT_RE.search(clause)
+        bounds.append(
+            _Bound(
+                low=low,
+                high=high,
+                increment=_number(increment.group(1)) if increment else None,
+                subject=frozenset(subject),
+                distinctive=frozenset(subject),
+                order=tuple(ordered),
+            )
+        )
+
+
+def _parse_bounds_resolve(bounds: list[_Bound]) -> list[_Bound]:
+    """Strip from each bound the subject tokens that another bound also has."""
+    # A token two ranges share cannot tell them apart, so it is removed
+    # from both. What is left ({monthly, spending, cap} against
+    # {per-transaction, transaction, limit}) is what binding runs on.
+    resolved: list[_Bound] = []
+    for index, bound in enumerate(bounds):
+        others: set[str] = set()
+        for other_index, other in enumerate(bounds):
+            if other_index != index:
+                others |= other.subject
+        resolved.append(
+            _Bound(
+                low=bound.low,
+                high=bound.high,
+                increment=bound.increment,
+                subject=bound.subject,
+                distinctive=frozenset(bound.subject - others),
+                order=bound.order,
+            )
+        )
+    return resolved
 
 
 def entered_value(action: str) -> float | None:
@@ -311,42 +321,49 @@ def find_bound_contradictions(
         if not bounds:
             return []
         for case in cases or []:
-            case_tokens = _tokens(getattr(case, "title", "") or "")
-            for datum in getattr(case, "test_data", None) or []:
-                case_tokens |= _tokens(str(getattr(datum, "field", "") or ""))
-            for step in getattr(case, "steps", None) or []:
-                action = getattr(step, "action", "") or ""
-                expected = getattr(step, "expected_result", "") or ""
-                value = entered_value(action)
-                if value is None:
-                    continue
-                bound = _bind(case_tokens | _tokens(action), bounds)
-                if bound is None:
-                    continue
-                legal = bound.is_legal(value)
-                rejected = bool(_REJECT_RE.search(expected))
-                accepted = bool(_ACCEPT_RE.search(expected))
-                if rejected == accepted:
-                    # Both readings, or neither -- the expected result does not
-                    # commit to an outcome, so there is nothing to contradict.
-                    continue
-                if legal and rejected:
-                    kind = "legal-rejected"
-                elif not legal and accepted:
-                    kind = "illegal-accepted"
-                else:
-                    continue
-                findings.append(
-                    BoundFinding(
-                        tc_id=getattr(case, "tc_id", "") or "",
-                        step_number=int(getattr(step, "step_number", 0) or 0),
-                        value=value,
-                        subject=bound.label,
-                        low=bound.low,
-                        high=bound.high,
-                        kind=kind,
-                    )
-                )
+            _find_bound_contradictions_case(case, bounds, findings)
     except Exception:
         logger.exception("find_bound_contradictions failed - returning what was found")
     return findings
+
+
+def _find_bound_contradictions_case(
+    case: TestCase, bounds: list[_Bound], findings: list[BoundFinding]
+) -> None:
+    """Append to ``findings`` each step of ``case`` that contradicts a bound."""
+    case_tokens = _tokens(getattr(case, "title", "") or "")
+    for datum in getattr(case, "test_data", None) or []:
+        case_tokens |= _tokens(str(getattr(datum, "field", "") or ""))
+    for step in getattr(case, "steps", None) or []:
+        action = getattr(step, "action", "") or ""
+        expected = getattr(step, "expected_result", "") or ""
+        value = entered_value(action)
+        if value is None:
+            continue
+        bound = _bind(case_tokens | _tokens(action), bounds)
+        if bound is None:
+            continue
+        legal = bound.is_legal(value)
+        rejected = bool(_REJECT_RE.search(expected))
+        accepted = bool(_ACCEPT_RE.search(expected))
+        if rejected == accepted:
+            # Both readings, or neither -- the expected result does not
+            # commit to an outcome, so there is nothing to contradict.
+            continue
+        if legal and rejected:
+            kind = "legal-rejected"
+        elif not legal and accepted:
+            kind = "illegal-accepted"
+        else:
+            continue
+        findings.append(
+            BoundFinding(
+                tc_id=getattr(case, "tc_id", "") or "",
+                step_number=int(getattr(step, "step_number", 0) or 0),
+                value=value,
+                subject=bound.label,
+                low=bound.low,
+                high=bound.high,
+                kind=kind,
+            )
+        )

@@ -49,6 +49,8 @@ from tools.mobile import (
     dump_latency,
     fill_label,
     ime,
+    knowledge_hooks,
+    knowledge_limits,
     latency_scale,
     launch_guard,
     perception,
@@ -381,6 +383,18 @@ class Context:
     # a direct ``Context(...)`` test may preset it. Never written by a guard
     # except through ``_apply_knowledge``.
     knowledge: dict | None = None
+    # Per-app knowledge run facts (contract 1.4/1.6): the run's id and lane, the
+    # installed app version, the run env, the bounded in-memory event buffer the
+    # hook plugs fill, and the cached RunFacts. All optional.
+    run_id: str | None = None
+    lane: str | None = None
+    app_version: str = ""
+    env: dict = dataclasses.field(default_factory=dict)
+    kbuf: list = dataclasses.field(default_factory=list)
+    run_facts: object = None
+    # The steps still to run, current step first; set before each ``pre_step``
+    # so the shortcut plug can match the model's upcoming steps.
+    script_ahead: list = dataclasses.field(default_factory=list)
     # Non-empty when the QA keyboard could not be set up and typing goes through
     # `adb shell input text` instead (R1d). Holds the reason. Set by the replay
     # itself or by the case runner; empty (the default) is the normal path.
@@ -552,47 +566,55 @@ def _contained_text(element: dict, screen: object) -> list[str]:
     """
     if not isinstance(screen, dict):
         return []
-    box = element.get("bounds")
-    if not (isinstance(box, (list, tuple)) and len(box) == 4):
+    outer = _int_box(element.get("bounds"))
+    if outer is None:
         return []
+    out: list[str] = []
+    for other in screen.get("elements") or []:
+        if _is_contained_child(element, other, outer):
+            for key in ("text", "desc"):
+                value = str(other.get(key) or "")
+                if value:
+                    out.append(value)
+    return out
+
+
+def _int_box(box: object) -> tuple[int, int, int, int] | None:
+    """Four integer bounds, or None when *box* is not a usable rectangle."""
+    if not (isinstance(box, (list, tuple)) and len(box) == 4):
+        return None
     try:
         x1, y1, x2, y2 = (int(v) for v in box)
     except (TypeError, ValueError, OverflowError):
-        return []
-    own_area = (x2 - x1) * (y2 - y1)
-    out: list[str] = []
-    for other in screen.get("elements") or []:
-        if not isinstance(other, dict) or other is element:
-            continue
-        if other.get("id") and other.get("id") == element.get("id"):
-            continue
-        inner = other.get("bounds")
-        if not (isinstance(inner, (list, tuple)) and len(inner) == 4):
-            continue
-        try:
-            a1, b1, a2, b2 = (int(v) for v in inner)
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if a1 < x1 or b1 < y1 or a2 > x2 or b2 > y2:
-            continue
-        # STRICTLY LARGER is skipped; EQUAL is a child.
-        #
-        # This was `>=`, and the reason it was wrong is that it was doing a job
-        # already done: the two checks above exclude an element from being its
-        # own child, by identity and by id. What `>=` actually excluded was an
-        # ordinary `match_parent` x `match_parent` label inside a clickable
-        # wrapper -- the commonest button shape on Android -- so a transfer
-        # CTA whose child said "Send money" was judged on
-        # 'com.bank.app:id/cta Frame Layout' and tapped through unguarded.
-        # Confirmed live by a review that ran it, and unpinned in BOTH
-        # directions: flipping the operator left 1697 tests green.
-        if (a2 - a1) * (b2 - b1) > own_area:
-            continue
-        for key in ("text", "desc"):
-            value = str(other.get(key) or "")
-            if value:
-                out.append(value)
-    return out
+        return None
+    return x1, y1, x2, y2
+
+
+def _is_contained_child(element: dict, other: object, outer: tuple) -> bool:
+    """True when *other* is drawn inside *outer* and is not *element* itself."""
+    if not isinstance(other, dict) or other is element:
+        return False
+    if other.get("id") and other.get("id") == element.get("id"):
+        return False
+    inner = _int_box(other.get("bounds"))
+    if inner is None:
+        return False
+    x1, y1, x2, y2 = outer
+    a1, b1, a2, b2 = inner
+    if a1 < x1 or b1 < y1 or a2 > x2 or b2 > y2:
+        return False
+    # STRICTLY LARGER is skipped; EQUAL is a child.
+    #
+    # This was `>=`, and the reason it was wrong is that it was doing a job
+    # already done: the two checks above exclude an element from being its
+    # own child, by identity and by id. What `>=` actually excluded was an
+    # ordinary `match_parent` x `match_parent` label inside a clickable
+    # wrapper -- the commonest button shape on Android -- so a transfer
+    # CTA whose child said "Send money" was judged on
+    # 'com.bank.app:id/cta Frame Layout' and tapped through unguarded.
+    # Confirmed live by a review that ran it, and unpinned in BOTH
+    # directions: flipping the operator left 1697 tests green.
+    return (a2 - a1) * (b2 - b1) <= (x2 - x1) * (y2 - y1)
 
 
 #: The ``guard_term`` a ``press`` gets on a screen the packet does not carry in
@@ -781,6 +803,32 @@ def guard_detail(hit: str, screen: object, expected: object) -> str:
     return _control_detail(hit)
 
 
+# Notes on screen_hit's branches (kept here so the function stays short).
+#
+# THE FIDELITY QUESTION, and ONLY it. `judged` PRESENT selects the first branch
+# and returns; ABSENT leaves everything after it byte-for-byte what it was. It
+# is a parameter rather than a second function on purpose: the ratchet
+# (test_screen_hit_is_the_only_screen_level_producer) reads the producers out
+# of this module and a new one would be ungraded.
+#
+# DELEGATED, never re-derived. `providers_base.is_untrusted` is THE one answer
+# to "may the guard judge what it read here", and it carries its own non-dict
+# check, so spelling the lookup again would be the same answer derived twice
+# from the same input -- mirrored conditions drift. ABSENT or UNKNOWN is NOT
+# untrusted -- only `degraded` and `blind` are; a guard stop is terminal for a
+# scripted case, so refusing on absence would stop every checkpoint written
+# before the seam existed. That rule lives in `providers_base`, once.
+#
+# TRUNCATION IS ONE WAY THE PACKET CAN FAIL TO CARRY THE SCREEN, NOT THE ONLY
+# ONE. `prune` takes its root bounds from the first node carrying them and
+# drops everything outside; on a multi-window dump whose systemui window sorts
+# first, the app's whole window is dropped and `truncated` stays False.
+# Measured: one element kept (a clock), and the press guard cleared a screen
+# holding "Confirm payment" that it had never seen. So a screen whose dominant
+# package is not the app under test cannot be vouched for. An EMPTY
+# `expected_package` means the caller did not say which app it is driving, and
+# a refusal invented on no evidence would be its own defect -- so that case
+# keeps today's answer.
 def screen_hit(
     screen: object, expected_package: str = "", judged: object = None
 ) -> str:
@@ -803,21 +851,8 @@ def screen_hit(
     text belongs to other elements, which are judged on their own turn. Never
     raises.
     """
-    # THE FIDELITY QUESTION, and ONLY it. `judged` PRESENT selects this branch
-    # and returns; ABSENT leaves everything below byte-for-byte what it was.
-    # It is a parameter rather than a second function on purpose: the ratchet
-    # (test_screen_hit_is_the_only_screen_level_producer) reads the producers
-    # out of this module and a new one would be ungraded.
+    # Notes on each branch: the comment block above this function.
     if judged is not None:
-        # DELEGATED, never re-derived. `providers_base.is_untrusted` is THE
-        # one answer to "may the guard judge what it read here", and it
-        # carries its own non-dict check, so spelling the lookup again here
-        # would be the same answer derived twice from the same input --
-        # mirrored conditions drift, and the two would agree only by
-        # coincidence. ABSENT or UNKNOWN is NOT untrusted -- only `degraded`
-        # and `blind` are; a guard stop is terminal for a scripted case, so
-        # refusing on absence would stop every checkpoint written before the
-        # seam existed. That rule lives in `providers_base`, once.
         if providers_base.is_untrusted(judged):
             return SCREEN_CONTROL_NOT_READ
         return ""
@@ -825,17 +860,6 @@ def screen_hit(
         return ""
     if screen.get("truncated"):
         return SCREEN_NOT_FULLY_SEEN
-    # TRUNCATION IS ONE WAY THE PACKET CAN FAIL TO CARRY THE SCREEN, NOT THE
-    # ONLY ONE. `prune` takes its root bounds from the first node carrying
-    # them and drops everything outside; on a multi-window dump whose systemui
-    # window sorts first, the app's whole window is dropped and `truncated`
-    # stays False. Measured: one element kept (a clock), and the press guard
-    # cleared a screen holding "Confirm payment" that it had never seen.
-    #
-    # So a screen whose dominant package is not the app under test cannot be
-    # vouched for. An EMPTY `expected_package` means the caller did not say
-    # which app it is driving, and a refusal invented on no evidence would be
-    # its own defect -- so that case keeps today's answer.
     seen = str(screen.get("package") or "")
     if expected_package and seen and seen != str(expected_package):
         return SCREEN_NOT_THE_APP
@@ -2170,10 +2194,14 @@ def _load_knowledge(ctx: Context) -> None:
     ctx.knowledge = _read_knowledge(str(getattr(ctx, "package", "") or ""))
 
 
-def _read_knowledge(package: str) -> dict:
+def _read_knowledge(package: str, facts: object = None) -> dict:
     """*package*'s guards plus empty tallies. Touches no Context, so a worker
     thread still running after its awaiting task was cancelled cannot set
-    ``ctx.knowledge`` behind ``_flush_knowledge``'s back. Never raises."""
+    ``ctx.knowledge`` behind ``_flush_knowledge``'s back. Never raises.
+
+    Env-scoped guards are filtered here against ``facts.env``: a match is
+    stamped ``_env_ok`` (so ``candidates`` applies it), a mismatch goes to
+    ``skipped_env``. ``snap`` holds the plugs' read-only snapshot."""
     guards: list = []
     try:
         if package:
@@ -2182,13 +2210,67 @@ def _read_knowledge(package: str) -> dict:
                 guards = list(loaded.get("content") or [])
     except Exception:
         logger.exception("mobile app knowledge: load failed; continuing without notes")
+    guards, skipped = _split_env(guards, getattr(facts, "env", None))
     return {
         "package": package,
         "guards": guards,
         "counts": {},
         "events": [],
         "spent_ms": 0,
+        "skipped_env": skipped,
+        "snap": _read_snapshot(package, facts),
     }
+
+
+def _split_env(guards: list, env: object) -> tuple[list, list]:
+    """Keep guards with no env condition or a matching one (stamped ``_env_ok``);
+    the rest are skipped. An empty run env fails closed."""
+    from tools.mobile import knowledge_run
+
+    kept: list = []
+    skipped: list = []
+    for guard in guards:
+        want = (guard.get("when") or {}).get("env")
+        if not want:
+            kept.append(guard)
+        elif knowledge_run.env_matches(want, env):
+            kept.append(dict(guard, _env_ok=True))
+        else:
+            skipped.append(guard)
+    return kept, skipped
+
+
+def _read_snapshot(package: str, facts: object) -> dict:
+    """The plugs' merged read-only snapshot; ``{}`` without facts or an existing
+    store (nothing is created). One connection, closed here. Never raises."""
+    if facts is None or not package:
+        return {}
+    try:
+        path = app_knowledge.db_path(package)
+        if path is None or not path.exists():
+            return {}
+        conn = app_knowledge._connect(path, write=False)
+        try:
+            return knowledge_hooks.snapshots(conn, facts)
+        finally:
+            conn.close()
+    except Exception:
+        logger.exception("mobile app knowledge: snapshot failed")
+        return {}
+
+
+def _flush_kbuf(ctx: Context) -> None:
+    """Hand ``ctx.kbuf`` to the plugs' ``flush`` in ONE batched call, then empty
+    it. Never raises."""
+    events = list(getattr(ctx, "kbuf", None) or [])
+    if not events:
+        return
+    try:
+        knowledge_hooks.flush_kbuf(ctx, events)
+    except Exception:
+        logger.exception("mobile app knowledge: kbuf flush failed")
+    finally:
+        ctx.kbuf = []
 
 
 def _flush_knowledge(ctx: Context) -> None:
@@ -2200,8 +2282,10 @@ def _flush_knowledge(ctx: Context) -> None:
     between two replays is seen by the second one."""
     know = getattr(ctx, "knowledge", None)
     ctx.knowledge = None
+    _flush_kbuf(ctx)
     if not isinstance(know, dict):
         return
+    know.pop("snap", None)
     try:
         if know.get("counts") or know.get("events"):
             app_knowledge.flush_counters(
@@ -2281,97 +2365,130 @@ async def _apply_knowledge(
         )
         if not matched:
             return screen, None
-        probe = ""
-        if any((g.get("when") or {}).get("activity") for g in matched):
-            began = time.monotonic()
-            probe = await _focus_probe(ctx.serial, min(2.0, max(0.0, deadline - began)))
-            know["spent_ms"] = int(know.get("spent_ms") or 0) + int(
-                max(0.0, time.monotonic() - began) * 1000
-            )
-        live = [g for g in matched if app_knowledge.activity_ok(g, probe)]
+        live = await _live_guards(ctx, know, matched, deadline)
+        # An avoid note refuses an ACTION. A read-only assert or a poll wait
+        # changes nothing, so it is never refused.
+        if op not in NON_ACTUATING_OPS and op not in actions_mod.WAIT_OPS:
+            refusal = _avoid_refusal(know, live, op, entry)
+            if refusal is not None:
+                return screen, refusal
         fired: list[dict] = []
-        for guard in live:
-            if guard.get("kind") != "avoid":
-                continue
-            know["events"].append(
-                {"note_id": guard.get("id"), "event": "avoided", "detail": op}
-            )
-            fired.append(
-                {
-                    "note_id": guard.get("id"),
-                    "kind": "avoid",
-                    "outcome": "avoided",
-                    "ms": 0,
-                }
-            )
-            entry["knowledge"] = fired
-            return screen, (
-                "A saved note for this app says not to do this here (note #%s). "
-                "Do something else, or ask the tester. %s"
-                % (guard.get("id"), app_knowledge.echo(guard))
-            )
         for guard in live:
             if guard.get("kind") != "wait":
                 continue
-            then = guard.get("then") or {}
-            budget = min(
-                int(then.get("ms") or app_knowledge.DEFAULT_GUARD_WAIT_MS),
-                actions_mod.MAX_WAIT_MS,
-                actions_mod.MAX_TOTAL_WAIT_MS
-                - actions_mod.total_wait_ms(items)
-                - int(know.get("spent_ms") or 0),
-                int((deadline - time.monotonic()) * 1000),
-            )
+            budget = _guard_wait_budget(guard, know, items, deadline)
             if budget <= 0:
                 continue
-            began = time.monotonic()
-            ctx.wait_interruption = ""
-            if then.get("until_rid"):
-                satisfied, screen, _late = await _wait_until_element(
-                    ctx,
-                    screen,
-                    str(then["until_rid"]),
-                    str(then.get("until_rid_text") or ""),
-                    bool(then.get("until_gone")),
-                    budget,
-                )
-            else:
-                satisfied, screen, _late = await _wait_until_text(
-                    ctx, screen, str(then.get("until_text") or ""), budget
-                )
-            spent = int(max(0.0, time.monotonic() - began) * 1000)
-            know["spent_ms"] = int(know.get("spent_ms") or 0) + spent
-            interrupted, ctx.wait_interruption = ctx.wait_interruption, ""
-            # An interruption says nothing about the note, so it is logged
-            # but tallied neither way.
-            if satisfied:
-                outcome = "confirmed"
-            elif interrupted:
-                outcome = "interrupted"
-            else:
-                outcome = "contradicted"
-            if outcome != "interrupted":
-                tally = know["counts"].setdefault(
-                    guard.get("id"), {"confirmed": 0, "contradicted": 0}
-                )
-                tally[outcome] += 1
-            know["events"].append(
-                {"note_id": guard.get("id"), "event": outcome, "detail": op}
+            screen, outcome, spent = await _run_wait_guard(
+                ctx, know, guard, screen, budget
             )
-            fired.append(
-                {
-                    "note_id": guard.get("id"),
-                    "kind": "wait",
-                    "outcome": outcome,
-                    "ms": spent,
-                }
-            )
+            _tally_wait(know, guard, outcome, op)
+            fired.append(_fired_note(guard, "wait", outcome, spent))
         if fired:
             entry["knowledge"] = fired
         return screen, None
     except Exception:
         logger.exception("mobile app knowledge: guard failed; continuing without notes")
         return screen, None
+
+
+def _fired_note(guard: dict, kind: str, outcome: str, spent: int) -> dict:
+    return {"note_id": guard.get("id"), "kind": kind, "outcome": outcome, "ms": spent}
+
+
+async def _live_guards(
+    ctx: Context, know: dict, matched: list, deadline: float
+) -> list:
+    """The matched guards whose activity condition holds on the live focus."""
+    probe = ""
+    if any((g.get("when") or {}).get("activity") for g in matched):
+        began = time.monotonic()
+        probe = await _focus_probe(ctx.serial, min(2.0, max(0.0, deadline - began)))
+        know["spent_ms"] = int(know.get("spent_ms") or 0) + int(
+            max(0.0, time.monotonic() - began) * 1000
+        )
+    return [g for g in matched if app_knowledge.activity_ok(g, probe)]
+
+
+def _avoid_refusal(know: dict, live: list, op: str, entry: dict) -> str | None:
+    """The refusal text for the first live ``avoid`` note, logging it on *entry*."""
+    for guard in live:
+        if guard.get("kind") != "avoid":
+            continue
+        know["events"].append(
+            {"note_id": guard.get("id"), "event": "avoided", "detail": op}
+        )
+        entry["knowledge"] = [_fired_note(guard, "avoid", "avoided", 0)]
+        return (
+            "A saved note for this app says not to do this here (note #%s). "
+            "Do something else, skip this step or mark it blocked, or ask the "
+            "tester. If the note is wrong, retire it with "
+            'qa_mobile_notes(action="retire", note_id=%s). %s'
+            % (guard.get("id"), guard.get("id"), app_knowledge.echo(guard))
+        )
+    return None
+
+
+def _guard_wait_budget(guard: dict, know: dict, items: list, deadline: float) -> int:
+    """Ms a ``wait`` note may poll: the smallest of every cap that applies."""
+    then = guard.get("then") or {}
+    return min(
+        int(then.get("ms") or app_knowledge.DEFAULT_GUARD_WAIT_MS),
+        actions_mod.MAX_WAIT_MS,
+        actions_mod.MAX_TOTAL_WAIT_MS
+        - actions_mod.total_wait_ms(items)
+        - int(know.get("spent_ms") or 0),
+        int((deadline - time.monotonic()) * 1000),
+    )
+
+
+async def _run_wait_guard(
+    ctx: Context, know: dict, guard: dict, screen: object, budget: int
+) -> tuple[object, str, int]:
+    """Poll for what a ``wait`` note names: ``(screen, outcome, spent_ms)``."""
+    then = guard.get("then") or {}
+    began = time.monotonic()
+    ctx.wait_interruption = ""
+    if then.get("until_rid"):
+        already = _screen_has_element(
+            screen, str(then["until_rid"]), str(then.get("until_rid_text") or "")
+        ) != bool(then.get("until_gone"))
+    else:
+        already = _screen_has(screen, str(then.get("until_text") or ""))
+    if already:
+        # The screen already shows what the note waits for: nothing was
+        # waited on, so it neither confirms nor contradicts the note.
+        return screen, "already_met", 0
+    if then.get("until_rid"):
+        satisfied, screen, _late = await _wait_until_element(
+            ctx,
+            screen,
+            str(then["until_rid"]),
+            str(then.get("until_rid_text") or ""),
+            bool(then.get("until_gone")),
+            budget,
+        )
+    else:
+        satisfied, screen, _late = await _wait_until_text(
+            ctx, screen, str(then.get("until_text") or ""), budget
+        )
+    spent = int(max(0.0, time.monotonic() - began) * 1000)
+    know["spent_ms"] = int(know.get("spent_ms") or 0) + spent
+    interrupted, ctx.wait_interruption = ctx.wait_interruption, ""
+    if satisfied:
+        return screen, "confirmed", spent
+    return screen, "interrupted" if interrupted else "contradicted", spent
+
+
+def _tally_wait(know: dict, guard: dict, outcome: str, op: str) -> None:
+    """Log a wait outcome; an interruption says nothing about the note, so it
+    or an already-met condition is logged but tallied neither way."""
+    if outcome not in ("interrupted", "already_met"):
+        tally = know["counts"].setdefault(
+            guard.get("id"), {"confirmed": 0, "contradicted": 0}
+        )
+        tally[outcome] += 1
+    know["events"].append({"note_id": guard.get("id"), "event": outcome, "detail": op})
 
 
 async def _focus_probe(serial: str, budget: float) -> str:
@@ -2969,64 +3086,73 @@ async def keyboard_up(serial: str) -> dict:
     try:
         remembered = await ime.remember_previous(serial)
         if remembered.get("error"):
-            return {
-                "error": "QA keyboard not set up: reading the current keyboard "
-                "failed: " + str(remembered["error"]),
-                "content": None,
-            }
+            return _keyboard_failure(
+                "reading the current keyboard failed: " + str(remembered["error"])
+            )
         previous = str((remembered.get("content") or {}).get("previous") or "")
-        present = await ime.installed(serial)
-        if present.get("error"):
-            return {
-                "error": "QA keyboard not set up: checking whether it is "
-                "installed failed: " + str(present["error"]),
-                "content": None,
-            }
-        missing = not (present.get("content") or {}).get("installed")
-        if missing or await ime.is_foreign_build(serial):
-            put = await ime.install(serial)
-            if put.get("error"):
-                return {
-                    "error": "QA keyboard not set up: installing it failed: "
-                    + str(put["error"]),
-                    "content": None,
-                }
-        enabled = await ime.enable(serial)
-        if enabled.get("error"):
-            return {
-                "error": "QA keyboard not set up: enabling it failed: "
-                + str(enabled["error"]),
-                "content": None,
-            }
-        ours = str(((ime.manifest() or {}).get("content") or {}).get("ime_id") or "")
-        current = await step_timing.timed("ime_check", ime.current_ime(serial))
-        if current.get("error") or not ime.same_component(current.get("content"), ours):
-            chosen = await ime.select(serial)
-            if chosen.get("error"):
-                return {
-                    "error": "QA keyboard not set up: selecting it failed: "
-                    + str(chosen["error"]),
-                    "content": {"previous": previous},
-                }
-        # G4: arm before the receiver check. A refused or unexpected ARM stops the
-        # keyboard here, which `replay` turns into the usual typing fallback and notice.
-        armed = await ime.arm(serial)
-        if armed.get("error"):
-            return {
-                "error": "QA keyboard not set up: " + str(armed["error"]),
-                "content": {"previous": previous},
-            }
-        probed = await ime.probe(serial)
-        if probed.get("error") or not (probed.get("content") or {}).get("ok"):
-            return {
-                "error": "QA keyboard not set up: it does not answer its status "
-                "query: " + str(probed.get("error") or "no result= in the reply"),
-                "content": {"previous": previous},
-            }
-        return {"error": None, "content": {"previous": previous}}
+        failed = await _keyboard_install(serial)
+        if failed is None:
+            failed = await _keyboard_select(serial, previous)
+        if failed is None:
+            failed = await _keyboard_arm_and_probe(serial, previous)
+        return failed or {"error": None, "content": {"previous": previous}}
     except Exception as exc:
         logger.exception("mobile.executor.keyboard_up failed")
         return {"error": "QA keyboard not set up: " + str(exc), "content": None}
+
+
+def _keyboard_failure(reason: str, previous: str | None = None) -> dict:
+    """The ``keyboard_up`` error shape; ``previous`` rides along once known."""
+    content = None if previous is None else {"previous": previous}
+    return {"error": "QA keyboard not set up: " + reason, "content": content}
+
+
+async def _keyboard_install(serial: str) -> dict | None:
+    """Install (when missing or a foreign build) and enable ours; a failure or None."""
+    present = await ime.installed(serial)
+    if present.get("error"):
+        return _keyboard_failure(
+            "checking whether it is installed failed: " + str(present["error"])
+        )
+    missing = not (present.get("content") or {}).get("installed")
+    if missing or await ime.is_foreign_build(serial):
+        put = await ime.install(serial)
+        if put.get("error"):
+            return _keyboard_failure("installing it failed: " + str(put["error"]))
+    enabled = await ime.enable(serial)
+    if enabled.get("error"):
+        return _keyboard_failure("enabling it failed: " + str(enabled["error"]))
+    return None
+
+
+async def _keyboard_select(serial: str, previous: str) -> dict | None:
+    """Select ours unless it is already the current keyboard; a failure or None."""
+    ours = str(((ime.manifest() or {}).get("content") or {}).get("ime_id") or "")
+    current = await step_timing.timed("ime_check", ime.current_ime(serial))
+    if current.get("error") or not ime.same_component(current.get("content"), ours):
+        chosen = await ime.select(serial)
+        if chosen.get("error"):
+            return _keyboard_failure(
+                "selecting it failed: " + str(chosen["error"]), previous
+            )
+    return None
+
+
+async def _keyboard_arm_and_probe(serial: str, previous: str) -> dict | None:
+    """G4: arm before the receiver check. A refused or unexpected ARM stops the
+    keyboard here, which `replay` turns into the usual typing fallback and notice.
+    """
+    armed = await ime.arm(serial)
+    if armed.get("error"):
+        return _keyboard_failure(str(armed["error"]), previous)
+    probed = await ime.probe(serial)
+    if probed.get("error") or not (probed.get("content") or {}).get("ok"):
+        return _keyboard_failure(
+            "it does not answer its status query: "
+            + str(probed.get("error") or "no result= in the reply"),
+            previous,
+        )
+    return None
 
 
 async def keyboard_down(serial: str, previous: str) -> dict:
@@ -3050,6 +3176,24 @@ async def keyboard_down(serial: str, previous: str) -> dict:
         }
 
 
+async def _begin_knowledge_run(ctx: Context) -> object:
+    """Run facts for this replay (version, env), cached per run; ``None`` on any
+    failure. Copies the version and env onto the Context."""
+    if not getattr(ctx, "run_id", None):
+        return None
+    try:
+        from tools.mobile import knowledge_run
+
+        facts = await knowledge_run.begin_run(ctx)
+        ctx.run_facts = facts
+        ctx.app_version = facts.app_version
+        ctx.env = dict(facts.env)
+        return facts
+    except Exception:
+        logger.exception("mobile app knowledge: begin_run failed")
+        return None
+
+
 async def replay(script: object, ctx: Context) -> dict:
     """Execute *script*; the contract is :func:`_replay_keyboard`'s.
 
@@ -3064,7 +3208,9 @@ async def replay(script: object, ctx: Context) -> dict:
         # happens here, on the loop, so a cancelled load never assigns.
         if getattr(ctx, "knowledge", None) is None:
             package = str(getattr(ctx, "package", "") or "")
-            ctx.knowledge = await asyncio.to_thread(_read_knowledge, package)
+            facts = await _begin_knowledge_run(ctx)
+            args = (package,) if facts is None else (package, facts)
+            ctx.knowledge = await asyncio.to_thread(_read_knowledge, *args)
         return await _replay_keyboard(script, ctx)
     finally:
         await asyncio.to_thread(_flush_knowledge, ctx)
@@ -3124,6 +3270,31 @@ class _ReplayRun:
     ctx: Context
     items: list
     trace: list[dict]
+
+
+def _record_script_feedback(ctx: Context, script: object, screen: object) -> None:
+    """``Script.knowledge_feedback`` into ``ctx.kbuf`` (in memory, step index 0).
+    Never raises."""
+    items = list(getattr(script, "knowledge_feedback", None) or [])
+    if not items:
+        return
+    try:
+        from tools.mobile import knowledge_feedback
+
+        knowledge_feedback.record(ctx, items, screen, 0)
+    except Exception:
+        logger.exception("mobile app knowledge: script feedback failed")
+
+
+async def _replay_open(
+    ctx: Context, script: object, screen: object, trace: list
+) -> tuple[object, dict | None]:
+    """``_replay_first_screen``, then the script's feedback is recorded before any
+    step can stop the run, so it is kept even when no step is dispatched."""
+    items = list(getattr(script, "actions", None) or [])
+    screen, reply = await _replay_first_screen(ctx, items, screen, trace)
+    _record_script_feedback(ctx, script, screen)
+    return screen, reply
 
 
 async def _replay_first_screen(
@@ -3277,6 +3448,141 @@ def _ask_tester_step(
     _stamp_after(entry, screen)
     _append(run.trace, entry)
     return None
+
+
+class _StepCursor:
+    """Iterates ``(index, action)`` over a list that knowledge plugs may splice
+    into mid-run. ``insert`` places steps at the cursor and re-enters there, so
+    inserted steps meet the same guards as scripted ones."""
+
+    def __init__(self, items: list) -> None:
+        self.items = items
+        self.pos = 0
+        self.budget = knowledge_limits.PRECONDITION_STEPS * 4
+
+    def __iter__(self) -> "_StepCursor":
+        return self
+
+    def __next__(self) -> tuple[int, object]:
+        if self.pos >= len(self.items):
+            raise StopIteration
+        self.pos += 1
+        return self.pos - 1, self.items[self.pos - 1]
+
+    def insert(
+        self, index: int, steps: object, route_locked: bool, consume: int = 0
+    ) -> bool:
+        """Splice *steps* before ``index``, replacing the next *consume* scripted
+        steps (a shortcut stands in for them); ``False`` (nothing inserted) when
+        the run is route-locked, the steps are empty or the per-run budget is spent."""
+        new = [st for st in list(steps or []) if st is not None]
+        if route_locked or not new or len(new) > self.budget:
+            return False
+        self.budget -= len(new)
+        self.items[index : index + max(0, consume)] = new
+        self.pos = index
+        return True
+
+
+def _stamp_screen_key(ctx: Context, entry: dict, screen: object) -> None:
+    """In-memory ``screen_key`` + ``activity`` for the knowledge learner."""
+    try:
+        from tools.mobile import screen_key
+
+        activity = str(getattr(ctx, "activity", "") or "")
+        entry["screen_key"] = screen_key.screen_key(
+            screen, str(getattr(ctx, "package", "") or ""), activity
+        ).key
+        entry["activity"] = activity
+    except Exception:
+        logger.exception("mobile app knowledge: screen key failed")
+
+
+def _stamp_after_key(ctx: Context, entry: dict, screen: object) -> None:
+    try:
+        from tools.mobile import screen_key
+
+        entry["after_screen_key"] = screen_key.screen_key(
+            screen,
+            str(getattr(ctx, "package", "") or ""),
+            str(getattr(ctx, "activity", "") or ""),
+        ).key
+    except Exception:
+        logger.exception("mobile app knowledge: after screen key failed")
+
+
+def _mark_refused(ctx: Context, fired: object) -> None:
+    """An ``insert_steps`` the cursor refused (budget spent, route-locked): the
+    plug's ``*_fired`` event for that item is marked ``refused`` so it is never
+    counted as having run."""
+    item = (fired or {}).get("item") if isinstance(fired, dict) else None
+    for ev in reversed(getattr(ctx, "kbuf", None) or []):
+        if isinstance(ev, dict) and ev.get("item") == item and str(ev.get("kind", "")).endswith("_fired"):
+            ev["refused"] = True
+            return
+
+
+async def _knowledge_pre(
+    run: _ReplayRun,
+    cursor: _StepCursor,
+    step: tuple[int, object, dict],
+    screen: object,
+    deadline: float,
+) -> tuple[dict | None, bool]:
+    """``pre_step`` then the adaptive wait, once each: ``(reply, inserted)``.
+    ``reply`` ends the replay (a refuse or stop directive); ``inserted`` means
+    steps were spliced in and the loop must re-enter at the same index."""
+    ctx, (index, action, entry) = run.ctx, step
+    ctx.script_ahead = list(cursor.items[index:])
+    directive = await knowledge_hooks.pre_step(ctx, entry, action, screen)
+    if directive.kind in ("refuse", "stop"):
+        why = directive.reason or "stopped by app knowledge"
+        return _knowledge_stop(run, index, entry, screen, why), False
+    if directive.kind == "insert_steps":
+        consume = int((directive.fired or {}).get("consume") or 0)
+        inserted = cursor.insert(
+            index, directive.steps, bool(ctx.route_expect), consume
+        )
+        if not inserted:
+            _mark_refused(ctx, directive.fired)
+        return None, inserted
+    ms = knowledge_hooks.step_wait(ctx, action, screen)
+    left = int((deadline - time.monotonic()) * 1000)
+    ms = min(ms, int(actions_mod.MAX_WAIT_MS), left)
+    if ms > 0:
+        await asyncio.sleep(ms / 1000.0)
+    return None, False
+
+
+def _knowledge_post(
+    run: _ReplayRun, entry: dict, before: object, after: object
+) -> None:
+    """After a step: stamp ``after_screen_key``, then ``post_step`` (in memory)."""
+    _stamp_after_key(run.ctx, entry, after)
+    knowledge_hooks.post_step(run.ctx, entry, before, after)
+
+
+async def _knowledge_target(
+    run: _ReplayRun, entry: dict, action: object, screen: object, found: tuple
+) -> tuple[object, object]:
+    """``resolve_target`` once on ``found = (element, reply)``. A
+    ``replace_target`` directive sets the element and clears the reply (the plug
+    found what the default could not); a miss the default already committed to
+    the trace is taken back, so the step is recorded once, by its real outcome."""
+    element, reply = found
+    got = await knowledge_hooks.resolve_target(run.ctx, action, screen, element)
+    if got.kind != "replace_target" or got.target is None:
+        return element, reply
+    if reply is not None:
+        if run.trace and run.trace[-1] is entry:
+            run.trace.pop()
+        for key in ("outcome", "detail", "after_screen_id", "after_screen_hash"):
+            entry.pop(key, None)
+        # ``_append`` popped ``_started``; restore it so the final ``ms`` covers
+        # the whole step, not just the miss.
+        if "ms" in entry:
+            entry["_started"] = time.monotonic() - int(entry.pop("ms")) / 1000.0
+    return got.target, None
 
 
 def _knowledge_stop(
@@ -3940,7 +4246,7 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
     screen = ctx.screen if isinstance(ctx.screen, dict) else None
     try:
         items = list(getattr(script, "actions", None) or [])
-        screen, reply = await _replay_first_screen(ctx, items, screen, trace)
+        screen, reply = await _replay_open(ctx, script, screen, trace)
         if reply is not None:
             return reply
         run = _ReplayRun(ctx, items, trace)
@@ -3950,7 +4256,7 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
         #: ``None`` until one has run, which is the honest answer ``new_text``
         #: gives when a script asserts a reply before sending anything.
         baseline_texts: set | None = None
-        for index, action in enumerate(items):
+        for index, action in (cursor := _StepCursor(items)):
             # NEVER on index 0. A budget that can stop the first action makes no
             # progress at all, and each stop costs one of three escapes, so a
             # short budget would turn every case into `blocked` without ever
@@ -3961,6 +4267,7 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
             entry = _entry(
                 index, action, _screen_id(screen), started, _screen_hash(screen)
             )
+            _stamp_screen_key(ctx, entry, screen)
             op = str(getattr(action, "op", "") or "")
             # S10 saved route (PROVISIONAL): the live screen must be the one this step was
             # saved from. Checked BEFORE the guard and before anything is actuated.
@@ -3990,10 +4297,20 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
             )
             if note_stop is not None:
                 return _knowledge_stop(run, index, entry, screen, note_stop)
+            reply, inserted = await _knowledge_pre(
+                run, cursor, (index, action, entry), screen, deadline
+            )
+            if reply is not None:
+                return reply
+            if inserted:
+                continue
 
             # --- target resolution -------------------------------------------
             element, scroll_missed, reply = _resolve_element(
                 run, op, action, entry, screen
+            )
+            element, reply = await _knowledge_target(
+                run, entry, action, screen, (element, reply)
             )
             if reply is not None:
                 return reply
@@ -4095,7 +4412,9 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
 
             # --- asserts, waits and device ops --------------------------------
             step = _Step(op, action, entry, element, scroll_missed)
+            before = screen
             screen, reply = await _dispatch_op(run, step, screen, baseline_texts)
+            _knowledge_post(run, entry, before, screen)
             if reply is not None:
                 return reply
 

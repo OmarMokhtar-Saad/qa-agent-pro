@@ -141,6 +141,24 @@ def _param_names(op: dict, path_item: dict) -> list:
     return names
 
 
+def _endpoint_line(method: str, path: str, op: dict, path_item: dict) -> str:
+    """One summary line for a single operation."""
+    line = f"- {method.upper()} {path}"
+    label = str(op.get("summary") or op.get("operationId") or "").strip()
+    if label:
+        line += f" — {label[:100]}"
+    params = _param_names(op, path_item)
+    if params:
+        line += "; params: " + ", ".join(params[:8])
+    body = op.get("requestBody")
+    if isinstance(body, dict):
+        line += "; has request body" + ("*" if body.get("required") else "")
+    responses = op.get("responses")
+    if isinstance(responses, dict) and responses:
+        line += "; responses: " + ", ".join(sorted(str(c) for c in responses)[:8])
+    return line
+
+
 def summarize_openapi(spec: dict) -> str:
     """Condense a parsed spec into a bounded plain-text endpoint summary."""
     info = spec.get("info") if isinstance(spec.get("info"), dict) else {}
@@ -151,6 +169,16 @@ def summarize_openapi(spec: dict) -> str:
     desc = str(info.get("description") or "").strip()
     if desc:
         lines.append(desc[:500])
+    lines.extend(_servers_lines(spec))
+    lines.extend(_auth_lines(spec))
+    lines.append("")
+    lines.append("Endpoints (* = required param):")
+    lines.extend(_endpoint_lines(spec))
+    return "\n".join(lines)[:_MAX_CHARS]
+
+
+def _servers_lines(spec: dict) -> list[str]:
+    """The ``Servers:`` summary line (at most 5 urls), or []."""
     servers = spec.get("servers") or []
     if isinstance(servers, list) and servers:
         urls = [
@@ -159,7 +187,12 @@ def summarize_openapi(spec: dict) -> str:
             if isinstance(s, dict) and s.get("url")
         ]
         if urls:
-            lines.append("Servers: " + ", ".join(urls))
+            return ["Servers: " + ", ".join(urls)]
+    return []
+
+
+def _auth_lines(spec: dict) -> list[str]:
+    """The ``Auth:`` summary line (at most 6 schemes), or []."""
     schemes = {}
     components = spec.get("components")
     if isinstance(components, dict) and isinstance(
@@ -175,9 +208,13 @@ def summarize_openapi(spec: dict) -> str:
             if isinstance(scheme, dict)
         ]
         if auth:
-            lines.append("Auth: " + ", ".join(auth))
-    lines.append("")
-    lines.append("Endpoints (* = required param):")
+            return ["Auth: " + ", ".join(auth)]
+    return []
+
+
+def _endpoint_lines(spec: dict) -> list[str]:
+    """Endpoint lines up to _MAX_ENDPOINTS, plus a truncation note."""
+    lines: list[str] = []
     shown = 0
     total = 0
     for path in sorted(spec.get("paths") or {}):
@@ -192,25 +229,10 @@ def summarize_openapi(spec: dict) -> str:
             if shown >= _MAX_ENDPOINTS:
                 continue
             shown += 1
-            line = f"- {method.upper()} {path}"
-            label = str(op.get("summary") or op.get("operationId") or "").strip()
-            if label:
-                line += f" — {label[:100]}"
-            params = _param_names(op, path_item)
-            if params:
-                line += "; params: " + ", ".join(params[:8])
-            body = op.get("requestBody")
-            if isinstance(body, dict):
-                line += "; has request body" + ("*" if body.get("required") else "")
-            responses = op.get("responses")
-            if isinstance(responses, dict) and responses:
-                line += "; responses: " + ", ".join(
-                    sorted(str(c) for c in responses)[:8]
-                )
-            lines.append(line)
+            lines.append(_endpoint_line(method, path, op, path_item))
     if total > shown:
         lines.append(f"... and {total - shown} more endpoints (truncated).")
-    return "\n".join(lines)[:_MAX_CHARS]
+    return lines
 
 
 async def fetch_openapi_document(url: str, *, max_chars: int | None = None) -> dict:

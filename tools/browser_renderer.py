@@ -136,6 +136,66 @@ async def _public_host_error(url: str) -> str | None:
 _PLAYWRIGHT_MISSING = False  # latched True after the first failed import
 
 
+async def _merge_iframe_html(page, html: str, url: str) -> str:
+    """Append each reachable child frame's HTML to ``html``.
+
+    page.content() serializes ONLY the main frame, so a form embedded in an
+    <iframe> (payment widgets, SSO, embedded signup) would be invisible to the
+    BeautifulSoup extractors. Cross-origin or detached frames may refuse
+    .content() — skip them individually. Never raises.
+    """
+    try:
+        child_frames = list(page.frames)[1:]  # [0] is the main frame
+        frame_htmls: list[str] = []
+        for fr in child_frames[:_MAX_FRAMES]:
+            try:
+                fhtml = await fr.content()
+            except Exception:
+                continue
+            if fhtml:
+                frame_htmls.append(fhtml)
+        if frame_htmls:
+            logger.info(
+                "render_page: merged %d iframe document(s) for %s",
+                len(frame_htmls),
+                url,
+            )
+            html = (html or "") + "".join(
+                f"\n<!-- iframe-content -->\n{fh}" for fh in frame_htmls
+            )
+    except Exception:
+        logger.debug(
+            "render_page: iframe content collection skipped for %s",
+            url,
+            exc_info=True,
+        )
+    return html
+
+
+async def _capture_screenshot(page, url: str, playwright_error: type) -> bytes | None:
+    """PNG screenshot of ``page``, or None when capture fails (non-fatal)."""
+    try:
+        return await page.screenshot(type="png")
+    except playwright_error:
+        logger.warning(
+            "render_page: screenshot capture failed for %s (non-fatal)",
+            url,
+        )
+        return None
+
+
+async def _accessibility_snapshot(page, url: str) -> dict | None:
+    """Accessibility tree of ``page``, or None when unavailable."""
+    try:
+        return await page.accessibility.snapshot()
+    except Exception:
+        logger.debug(
+            "render_page: accessibility snapshot unavailable for %s",
+            url,
+        )
+        return None
+
+
 async def render_page(url: str, capture_screenshot: bool = True) -> dict:
     """Render `url` in headless Chromium and return the fully rendered HTML.
 
@@ -253,56 +313,15 @@ async def render_page(url: str, capture_screenshot: bool = True) -> dict:
                 html = await page.content()
                 title = await page.title()
 
-                # Also pull HTML from child frames (iframes). page.content()
-                # serializes ONLY the main frame, so a form embedded in an
-                # <iframe> (payment widgets, SSO, embedded signup) would be
-                # invisible to the BeautifulSoup extractors. Append each reachable
-                # frame's HTML so those fields are captured too. Cross-origin or
-                # detached frames may refuse .content() — skip them individually.
-                try:
-                    child_frames = list(page.frames)[1:]  # [0] is the main frame
-                    frame_htmls: list[str] = []
-                    for fr in child_frames[:_MAX_FRAMES]:
-                        try:
-                            fhtml = await fr.content()
-                        except Exception:
-                            continue
-                        if fhtml:
-                            frame_htmls.append(fhtml)
-                    if frame_htmls:
-                        logger.info(
-                            "render_page: merged %d iframe document(s) for %s",
-                            len(frame_htmls),
-                            url,
-                        )
-                        html = (html or "") + "".join(
-                            f"\n<!-- iframe-content -->\n{fh}" for fh in frame_htmls
-                        )
-                except Exception:
-                    logger.debug(
-                        "render_page: iframe content collection skipped for %s",
-                        url,
-                        exc_info=True,
-                    )
+                html = await _merge_iframe_html(page, html, url)
 
                 screenshot_bytes = None
                 if capture_screenshot:
-                    try:
-                        screenshot_bytes = await page.screenshot(type="png")
-                    except PlaywrightError:
-                        logger.warning(
-                            "render_page: screenshot capture failed for %s (non-fatal)",
-                            url,
-                        )
-
-                accessibility = None
-                try:
-                    accessibility = await page.accessibility.snapshot()
-                except Exception:
-                    logger.debug(
-                        "render_page: accessibility snapshot unavailable for %s",
-                        url,
+                    screenshot_bytes = await _capture_screenshot(
+                        page, url, PlaywrightError
                     )
+
+                accessibility = await _accessibility_snapshot(page, url)
 
                 return {
                     "error": None,

@@ -75,6 +75,7 @@ from __future__ import annotations
 import io
 import logging
 import struct
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -255,47 +256,85 @@ def filename_for(run_id: object = "", tc_id: object = "") -> str:
         return "screen.png"
 
 
+# Why `_resized` behaves as it does (kept here so the function stays short).
+#
+# NEVER RAISES, never returns nothing: the INPUT comes back unchanged whenever
+# this cannot do better -- Pillow absent, bytes that are not a decodable image,
+# an image already inside the bound, or any failure at all. A full-size picture
+# is worth strictly more than no picture, and the job is bytes, not verdicts.
+#
+# TOO MANY PIXELS TO DECODE is one of those "cannot do better" cases, refused
+# BEFORE ``load()`` rather than after: the size is in the header, the cost is
+# in the decode, and the whole point is not to pay it. See MAX_DECODE_PIXELS.
+#
+# RESAMPLING IS LANCZOS ONLY FOR CONTINUOUS-TONE MODES. Measured on Pillow
+# 12.3.0: a ``P`` (palette) or ``1`` (bilevel) image resized with
+# ``Image.LANCZOS`` comes back byte-identical to the same resize with
+# ``Image.NEAREST`` -- Pillow downgrades silently and raises nothing. That
+# matters because the legibility case for a 768 long edge ASSUMES LANCZOS ran;
+# where it did not, the floor's argument does not hold. It is documented rather
+# than fixed because ``adb.screencap -p`` does not produce those modes, and a
+# conversion would be an unreachable branch -- which this module already
+# refuses to add, for the reason stated at the end of `_resized`.
+#
+# STILL PNG. JPEG would buy transport bytes we are not short of -- the model's
+# cost depends on the dimensions, not on the file size -- and its ringing lands
+# on exactly the canvas-drawn screens where the picture is the only
+# description of the screen there is.
+#
+# THE BYTES CAN GROW, and that is accepted rather than guarded. What this buys
+# is TOKENS, which are a function of the dimensions alone, so a 354x768
+# attachment costs the same whatever it weighs. LANCZOS resampling of a fine
+# repeating pattern -- a transparency checkerboard, a QR code, a dense chart --
+# rings, turning a cheap two-colour image into continuous tone that PNG cannot
+# pack: measured at +233% on an 8px checkerboard and +64% on this module's own
+# test fixture, against -58% to -95% on ordinary app screens. Returning the
+# original whenever it is the smaller of the two would be the wrong trade by a
+# factor of four: 1513 tokens against 363. The growth is bounded and cannot
+# reach the transport: the worst case at this long edge is about 3.6MB against
+# ``adb.MAX_SCREENSHOT_BYTES`` of 8MB, and an input capable of producing it was
+# already refused at that cap.
+def _downscaled_png(image: Any, pil_image: Any) -> bytes | None:
+    """PNG bytes of the open *image* shrunk to the long-edge bound, or None.
+
+    ``None`` means "send the original": too many pixels to decode, or already
+    inside the bound.
+    """
+    # SIZE BEFORE LOAD. `Image.open` reads only the header, so the dimensions
+    # are known before a single pixel is decoded -- which is the one moment this
+    # can be refused cheaply. `load()` below is the decode, and its cost is PIXELS.
+    width, height = image.size
+    if width * height > MAX_DECODE_PIXELS:
+        logger.warning(
+            "mobile.screenshot: %dx%d is above MAX_DECODE_PIXELS, so "
+            "this screen is attached at full size rather than decoded.",
+            width,
+            height,
+        )
+        return None
+    image.load()
+    longest = max(image.size)
+    if longest <= MAX_LONG_EDGE_PX:
+        # Already inside the bound. Returned UNTOUCHED rather than re-encoded: a
+        # round trip through the encoder cannot make this picture cheaper and
+        # can only lose pixels off it.
+        return None
+    scale = MAX_LONG_EDGE_PX / float(longest)
+    size = (
+        max(1, int(round(image.width * scale))),
+        max(1, int(round(image.height * scale))),
+    )
+    smaller = image.resize(size, pil_image.LANCZOS)
+    buffer = io.BytesIO()
+    smaller.save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
+
+
 def _resized(data: bytes) -> bytes:
     """*data* scaled so its long edge is at most :data:`MAX_LONG_EDGE_PX`.
 
-    Never raises, and never returns nothing: the INPUT comes back unchanged
-    whenever this cannot do better -- Pillow absent, bytes that are not a
-    decodable image, an image already inside the bound, or any failure at all.
-    A full-size picture is worth strictly more than no picture, and this
-    function's job is bytes, not verdicts.
-
-    TOO MANY PIXELS TO DECODE is one of those "cannot do better" cases, and it
-    is refused BEFORE ``load()`` rather than after: the size is in the header,
-    the cost is in the decode, and the whole point is not to pay it. See
-    :data:`MAX_DECODE_PIXELS`.
-
-    RESAMPLING IS LANCZOS ONLY FOR CONTINUOUS-TONE MODES. Measured on Pillow
-    12.3.0: a ``P`` (palette) or ``1`` (bilevel) image resized with
-    ``Image.LANCZOS`` comes back byte-identical to the same resize with
-    ``Image.NEAREST`` -- Pillow downgrades silently and raises nothing. That
-    matters because the legibility case for a 768 long edge ASSUMES LANCZOS ran;
-    where it did not, the floor's argument does not hold. It is documented
-    rather than fixed because ``adb.screencap -p`` does not produce those modes,
-    and a conversion here would be an unreachable branch -- which this module
-    already refuses to add, for the reason stated at the end of this function.
-
-    STILL PNG. JPEG would buy transport bytes we are not short of -- the model's
-    cost depends on the dimensions above, not on the file size -- and its
-    ringing lands on exactly the canvas-drawn screens where the picture is the
-    only description of the screen there is.
-
-    THE BYTES CAN GROW, and that is accepted rather than guarded. What this
-    function buys is TOKENS, which are a function of the dimensions alone, so a
-    354x768 attachment costs the same whatever it weighs. LANCZOS resampling of
-    a fine repeating pattern -- a transparency checkerboard, a QR code, a dense
-    chart -- rings, turning a cheap two-colour image into continuous tone that
-    PNG cannot pack: measured at +233% on an 8px checkerboard and +64% on this
-    module's own test fixture, against -58% to -95% on ordinary app screens.
-    Returning the original whenever it is the smaller of the two would be the
-    wrong trade by a factor of four: 1513 tokens against 363. The growth is
-    bounded and cannot reach the transport: the worst case at this long edge is
-    about 3.6MB against ``adb.MAX_SCREENSHOT_BYTES`` of 8MB, and an input
-    capable of producing it was already refused at that cap.
+    The input comes back unchanged whenever this cannot do better; see the
+    comment block above.
     """
     try:
         from PIL import Image
@@ -309,35 +348,7 @@ def _resized(data: bytes) -> bytes:
         return data
     try:
         with Image.open(io.BytesIO(data)) as image:
-            # SIZE BEFORE LOAD. `Image.open` reads only the header, so the
-            # dimensions are known before a single pixel is decoded -- which is
-            # the one moment this can be refused cheaply. `load()` below is the
-            # decode, and its cost is PIXELS.
-            width, height = image.size
-            if width * height > MAX_DECODE_PIXELS:
-                logger.warning(
-                    "mobile.screenshot: %dx%d is above MAX_DECODE_PIXELS, so "
-                    "this screen is attached at full size rather than decoded.",
-                    width,
-                    height,
-                )
-                return data
-            image.load()
-            longest = max(image.size)
-            if longest <= MAX_LONG_EDGE_PX:
-                # Already inside the bound. Returned UNTOUCHED rather than
-                # re-encoded: a round trip through the encoder cannot make this
-                # picture cheaper and can only lose pixels off it.
-                return data
-            scale = MAX_LONG_EDGE_PX / float(longest)
-            size = (
-                max(1, int(round(image.width * scale))),
-                max(1, int(round(image.height * scale))),
-            )
-            smaller = image.resize(size, Image.LANCZOS)
-            buffer = io.BytesIO()
-            smaller.save(buffer, format="PNG", optimize=True)
-        out = buffer.getvalue()
+            out = _downscaled_png(image, Image)
     except Exception:  # never-raise: a picture is not a verdict
         logger.exception("mobile.screenshot resize failed")
         return data
@@ -345,7 +356,7 @@ def _resized(data: bytes) -> bytes:
     # that arm was unreachable and its mutant survived -- an unkillable branch
     # reads as defence while grading nothing. Every real failure path above
     # returns `data` explicitly.
-    return out
+    return data if out is None else out
 
 
 def to_spec(data: object, *, run_id: object = "", tc_id: object = "") -> dict | None:
