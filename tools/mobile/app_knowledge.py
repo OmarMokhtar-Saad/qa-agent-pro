@@ -474,7 +474,9 @@ def _validate(text: object, kind: object, when: object, then: object) -> tuple |
     return _validate_by_kind(text, kind, clean_when, then)
 
 
-def _validate_by_kind(text: str, kind: str, clean_when: dict, then: dict) -> tuple | str:
+def _validate_by_kind(
+    text: str, kind: str, clean_when: dict, then: dict
+) -> tuple | str:
     """The kind-specific part of ``_validate``."""
     if kind == "fact":
         if then:
@@ -696,49 +698,69 @@ def add_note(
         if isinstance(clean, str):
             return _err(clean)
         text, when, then = clean
-        blob = "\n".join([text] + _leaf_strings(when) + _leaf_strings(then))
-        reason = _secret_reason(blob, secrets, source_run)
+        reason = _plaintext_refusal(text, when, then, secrets, source_run)
         if reason:
-            return _err(
-                "%s. Notes are stored in plain text on this machine: describe "
-                "the screen or the timing, never a password, a code or a "
-                "personal number" % reason
-            )
-        scope = str(kind) + "|" + json.dumps(when, sort_keys=True)
-        now = time.time()
-        with closing(_connect(path, write=True)) as conn, conn:
-            # Take the write lock BEFORE the scope/count reads: legacy
-            # sqlite3 isolation opens a transaction only at the first write,
-            # so two runs could both pass the cap check.
-            conn.execute("BEGIN IMMEDIATE")
-            old = [
-                r["id"]
-                for r in conn.execute(
-                    "SELECT id FROM notes WHERE scope_key = ? AND status = 'active'",
-                    (scope,),
-                )
-            ]
-            full = _cap_error(conn, len(old))
-            if full:
-                return _err(full)
-            values = (
-                kind,
-                text,
-                json.dumps(when, sort_keys=True),
-                json.dumps(then, sort_keys=True),
-                scope,
-                str(app_version or "")[:64],
-                str(source_run or "")[:64],
-                old[0] if old else None,
-                now,
-            )
-            new_id = _insert_note(conn, values, old)
-            _add_event(conn, new_id, "added", kind, source_run)
-        return _ok(
-            {"id": new_id, "kind": kind, "text": text, "when": when, "superseded": old}
-        )
+            return _err(reason)
+        return _write_note(path, (kind, text, when, then), (app_version, source_run))
     except Exception as exc:
         return _fail("add_note", exc)
+
+
+def _plaintext_refusal(
+    text: str, when: object, then: object, secrets: object, source_run: object
+) -> str:
+    """The refusal text when the note holds a secret, else ``""``."""
+    blob = "\n".join([text] + _leaf_strings(when) + _leaf_strings(then))
+    reason = _secret_reason(blob, secrets, source_run)
+    if not reason:
+        return ""
+    return (
+        "%s. Notes are stored in plain text on this machine: describe "
+        "the screen or the timing, never a password, a code or a "
+        "personal number" % reason
+    )
+
+
+def _write_note(path: Path, note: tuple, meta: tuple) -> dict:
+    """Store a validated *note* ``(kind, text, when, then)``.
+
+    *meta* is ``(app_version, source_run)``. A same-scope active note is
+    marked superseded, never deleted."""
+    kind, text, when, then = note
+    app_version, source_run = meta
+    scope = str(kind) + "|" + json.dumps(when, sort_keys=True)
+    now = time.time()
+    with closing(_connect(path, write=True)) as conn, conn:
+        # Take the write lock BEFORE the scope/count reads: legacy
+        # sqlite3 isolation opens a transaction only at the first write,
+        # so two runs could both pass the cap check.
+        conn.execute("BEGIN IMMEDIATE")
+        old = [
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM notes WHERE scope_key = ? AND status = 'active'",
+                (scope,),
+            )
+        ]
+        full = _cap_error(conn, len(old))
+        if full:
+            return _err(full)
+        values = (
+            kind,
+            text,
+            json.dumps(when, sort_keys=True),
+            json.dumps(then, sort_keys=True),
+            scope,
+            str(app_version or "")[:64],
+            str(source_run or "")[:64],
+            old[0] if old else None,
+            now,
+        )
+        new_id = _insert_note(conn, values, old)
+        _add_event(conn, new_id, "added", kind, source_run)
+    return _ok(
+        {"id": new_id, "kind": kind, "text": text, "when": when, "superseded": old}
+    )
 
 
 def _read_notes(package: object, where: str) -> tuple:

@@ -341,20 +341,26 @@ def build_escape_job(
                 "instruction": _ESCAPE_INSTRUCTION,
                 "escapes_used": int(escapes or 0),
                 "escapes_left": max(0, 3 - int(escapes or 0)),
-                "worker_instructions": (
-                    "One JSON object, key `actions`. If this case cannot be "
-                    "completed from here, say so with done(verdict='blocked', "
-                    "reason=...) rather than retrying the same action. "
-                    + _RECOVERY_NOTE
-                    + (_LAST_ESCAPE_NOTE if max(0, 3 - int(escapes or 0)) <= 1 else "")
-                    + _BUDGET_NOTE
-                ),
+                "worker_instructions": _escape_worker_instructions(escapes),
             }
         )
         return packet
     except Exception:  # pragma: no cover - defensive
         logger.warning("build_escape_job failed", exc_info=True)
         return {}
+
+
+def _escape_worker_instructions(escapes: int) -> str:
+    """The worker text of an escape packet; the last escape gets its extra note."""
+    last = max(0, 3 - int(escapes or 0)) <= 1
+    return (
+        "One JSON object, key `actions`. If this case cannot be "
+        "completed from here, say so with done(verdict='blocked', "
+        "reason=...) rather than retrying the same action. "
+        + _RECOVERY_NOTE
+        + (_LAST_ESCAPE_NOTE if last else "")
+        + _BUDGET_NOTE
+    )
 
 
 #: The fail-safe ask for a sentinel no consumer registered. A NAMED constant so
@@ -655,34 +661,39 @@ def build_charter_intake(
     header and ``tools/mobile/ime.py``.
     """
     try:
-        from tools.mobile import charter as charter_mod
-
-        # THE RAW CHARTER, NOT A NORMALISED ONE. ``normalize`` fills every
-        # field, so ``questions_for(normalize({}))`` returns ONE question
-        # (``goal``) where ``questions_for({})`` returns FIVE -- measured. This
-        # line held the normalised form, so a tester with no charter was asked
-        # ONE question and depth, scope, destructive and budget were silently
-        # defaulted. Same defect as judging the normalised charter in
-        # ``defaults_used`` (M2d), at a SECOND CONSUMER: the function was
-        # graded, the WIRING was not. Graded at this seam by M1c /
-        # ``test_an_empty_intake_asks_all_five_questions_through_the_builder``.
-        asks = charter_mod.questions_for(charter)
-        packet = _packet_base(run_id)
-        packet.update(
-            {
-                "kind": CHARTER_INTAKE_KIND,
-                "package": str(package or "")[:200],
-                "questions": _intake_questions(charter_mod, asks),
-                "defaults": charter_mod.defaults(),
-                "unasked_fields_take_their_default": _unasked_fields(charter_mod),
-                **_intake_texts(),
-                "response_schema": _intake_response_schema(charter_mod),
-            }
-        )
-        return packet
+        return _charter_intake_packet(run_id, package, charter)
     except Exception:  # pragma: no cover - defensive
         logger.warning("build_charter_intake failed", exc_info=True)
         return {}
+
+
+def _charter_intake_packet(run_id: str, package: str, charter: object) -> dict:
+    """The intake packet itself; ``build_charter_intake`` guards it."""
+    from tools.mobile import charter as charter_mod
+
+    # THE RAW CHARTER, NOT A NORMALISED ONE. ``normalize`` fills every
+    # field, so ``questions_for(normalize({}))`` returns ONE question
+    # (``goal``) where ``questions_for({})`` returns FIVE -- measured. This
+    # line held the normalised form, so a tester with no charter was asked
+    # ONE question and depth, scope, destructive and budget were silently
+    # defaulted. Same defect as judging the normalised charter in
+    # ``defaults_used`` (M2d), at a SECOND CONSUMER: the function was
+    # graded, the WIRING was not. Graded at this seam by M1c /
+    # ``test_an_empty_intake_asks_all_five_questions_through_the_builder``.
+    asks = charter_mod.questions_for(charter)
+    packet = _packet_base(run_id)
+    packet.update(
+        {
+            "kind": CHARTER_INTAKE_KIND,
+            "package": str(package or "")[:200],
+            "questions": _intake_questions(charter_mod, asks),
+            "defaults": charter_mod.defaults(),
+            "unasked_fields_take_their_default": _unasked_fields(charter_mod),
+            **_intake_texts(),
+            "response_schema": _intake_response_schema(charter_mod),
+        }
+    )
+    return packet
 
 
 def _intake_questions(charter_mod: ModuleType, asks: list) -> list[dict]:

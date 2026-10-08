@@ -25,7 +25,9 @@ def looks_destructive(text: object) -> bool:
     try:
         from tools.mobile import executor
 
-        return executor.is_destructive(str(text or "").replace("_", " ").replace(".", " ").replace("/", " "))
+        return executor.is_destructive(
+            str(text or "").replace("_", " ").replace(".", " ").replace("/", " ")
+        )
     except Exception:
         logger.exception("knowledge popups: destructive check failed")
         return True
@@ -36,7 +38,9 @@ _SIGNATURE_CLIP = 240
 
 
 def _anchors(conn, key: str) -> list:
-    found = knowledge_db.rows(conn, "screens", "screen_key = ? AND invalid_at IS NULL", (key,), 1)
+    found = knowledge_db.rows(
+        conn, "screens", "screen_key = ? AND invalid_at IS NULL", (key,), 1
+    )
     try:
         got = json.loads(found[0].get("anchors_json") or "[]") if found else []
     except ValueError:
@@ -60,9 +64,15 @@ def find(steps: object) -> list:
         x = cur.get("after_screen_key")
         if not x or x == cur.get("screen_key") or nxt.get("screen_key") != x:
             continue
-        if nxt.get("op") != "tap" or nxt.get("outcome") != "ok" or not nxt.get("target_rid"):
+        if (
+            nxt.get("op") != "tap"
+            or nxt.get("outcome") != "ok"
+            or not nxt.get("target_rid")
+        ):
             continue
-        if nxt.get("after_screen_key") != cur.get("screen_key") or str(x).startswith("sk1d:"):
+        if nxt.get("after_screen_key") != cur.get("screen_key") or str(x).startswith(
+            "sk1d:"
+        ):
             continue
         slot = (x, str(nxt.get("activity") or ""), nxt["target_rid"])
         found[slot] = found.get(slot, 0) + 1
@@ -77,23 +87,38 @@ def _stored_rid(row: dict) -> object:
     return got.get("rid") if isinstance(got, dict) else None
 
 
+def _credit(conn, run_id: str, row: dict, sig: str, count: int) -> int:
+    """Count one more sighting on an existing row, once per run."""
+    try:
+        runs = json.loads(row.get("runs_json") or "[]")
+    except ValueError:
+        runs = []
+    if run_id and run_id in runs:
+        return 0
+    got = knowledge_db.upsert_counter(
+        conn,
+        "popups",
+        {"signature": sig},
+        {"times_seen": count, "runs_seen": 1},
+        run_id=run_id,
+        why="popup seen",
+    )
+    return 1 if got else 0
+
+
 def _upsert(conn, run_id: str, popup: tuple) -> int:
     key, activity, rid, count = popup
     sig = signature(activity, _anchors(conn, key), rid)
-    found = knowledge_db.rows(conn, "popups", "signature = ? AND invalid_at IS NULL", (sig,), 1)
-    squat = bool(found) and found[0].get("trust") == "imported" and _stored_rid(found[0]) != rid
+    found = knowledge_db.rows(
+        conn, "popups", "signature = ? AND invalid_at IS NULL", (sig,), 1
+    )
+    squat = (
+        bool(found)
+        and found[0].get("trust") == "imported"
+        and _stored_rid(found[0]) != rid
+    )
     if found and not squat:
-        try:
-            runs = json.loads(found[0].get("runs_json") or "[]")
-        except ValueError:
-            runs = []
-        if run_id and run_id in runs:
-            return 0
-        got = knowledge_db.upsert_counter(
-            conn, "popups", {"signature": sig}, {"times_seen": count, "runs_seen": 1},
-            run_id=run_id, why="popup seen",
-        )
-        return 1 if got else 0
+        return _credit(conn, run_id, found[0], sig, count)
     dismiss = {"op": "tap", "rid": rid, "screen_key": key, "activity": activity}
     values = {
         "signature": sig,
@@ -106,10 +131,21 @@ def _upsert(conn, run_id: str, popup: tuple) -> int:
         # An import never earns local credit for a dismiss this install did not
         # observe: a fresh local row takes its place.
         got = knowledge_db.supersede(
-            conn, "popups", found[0]["id"], values, run_id=run_id, why="imported popup, other dismiss"
+            conn,
+            "popups",
+            found[0]["id"],
+            values,
+            run_id=run_id,
+            why="imported popup, other dismiss",
         )
         return 1 if got else 0
-    return 1 if knowledge_db.insert(conn, "popups", values, run_id=run_id, why="popup candidate") else 0
+    return (
+        1
+        if knowledge_db.insert(
+            conn, "popups", values, run_id=run_id, why="popup candidate"
+        )
+        else 0
+    )
 
 
 def run(conn, lc) -> StageResult:

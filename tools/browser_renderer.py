@@ -196,6 +196,103 @@ async def _accessibility_snapshot(page, url: str) -> dict | None:
         return None
 
 
+def _playwright_missing_result() -> dict:
+    """Failure result for an environment without Playwright."""
+    return {
+        "error": (
+            "Browser rendering is not available (Playwright is not "
+            "installed). Install it with `pip install -e '.[browser]'` and "
+            "run `playwright install chromium`."
+        ),
+        **_UNAVAILABLE_RESULT,
+    }
+
+
+async def _navigate(page, url: str, playwright_error: type) -> dict | None:
+    """Load ``url``; return a failure result on navigation error, else None."""
+    try:
+        # domcontentloaded (not networkidle): a page that holds
+        # telemetry/analytics sockets open (e.g. SauceDemo) never
+        # reaches "networkidle", so that wait_until would burn the
+        # whole nav timeout and fail even though the page rendered
+        # fine. We wait for a real DOM instead, then settle for SPA
+        # hydration afterwards.
+        await page.goto(url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+    except playwright_error as exc:
+        logger.warning("render_page: navigation failed for %s: %s", url, exc)
+        return {
+            "error": f"Browser navigation failed: {exc}",
+            **_UNAVAILABLE_RESULT,
+        }
+    return None
+
+
+async def _redirect_failure(final_url: str, url: str) -> dict | None:
+    """SSRF guard: failure result when the post-redirect URL is blocked."""
+    # A page that redirected to a private/internal address must be discarded.
+    redirect_block = await _public_host_error(final_url)
+    if not redirect_block:
+        return None
+    logger.warning(
+        "render_page: %s redirected to blocked target %s — %s",
+        url,
+        final_url,
+        redirect_block,
+    )
+    return {
+        "error": f"Blocked after redirect: {redirect_block}",
+        **_UNAVAILABLE_RESULT,
+    }
+
+
+async def _settle_hydration(page, url: str, playwright_error: type) -> None:
+    """Wait, non-fatally, for the DOM to contain an interactive element."""
+    # domcontentloaded fires before a client-side framework paints. On timeout
+    # (e.g. a canvas-only UI) we fall through and scrape the current DOM;
+    # Tier 3 vision can still take over.
+    try:
+        await page.wait_for_function(
+            "() => document.querySelector("
+            "'input, button, select, textarea, a, [role]') !== null",
+            timeout=_HYDRATE_TIMEOUT_MS,
+        )
+    except playwright_error:
+        logger.debug(
+            "render_page: hydration wait timed out for %s — scraping current DOM",
+            url,
+        )
+
+
+async def _render_in_page(
+    page, url: str, capture_screenshot: bool, playwright_error: type
+) -> dict:
+    """Navigate, guard the redirect, settle and scrape ``page``."""
+    failure = await _navigate(page, url, playwright_error)
+    if failure:
+        return failure
+    final_url = page.url
+    failure = await _redirect_failure(final_url, url)
+    if failure:
+        return failure
+    await _settle_hydration(page, url, playwright_error)
+
+    html = await page.content()
+    title = await page.title()
+    html = await _merge_iframe_html(page, html, url)
+    screenshot_bytes = None
+    if capture_screenshot:
+        screenshot_bytes = await _capture_screenshot(page, url, playwright_error)
+    accessibility = await _accessibility_snapshot(page, url)
+    return {
+        "error": None,
+        "html": (html or "")[:_MAX_HTML_CHARS],
+        "title": title or "",
+        "screenshot": screenshot_bytes,
+        "accessibility": accessibility,
+        "final_url": final_url,
+    }
+
+
 async def render_page(url: str, capture_screenshot: bool = True) -> dict:
     """Render `url` in headless Chromium and return the fully rendered HTML.
 
@@ -214,14 +311,7 @@ async def render_page(url: str, capture_screenshot: bool = True) -> dict:
     global _PLAYWRIGHT_MISSING
     if _PLAYWRIGHT_MISSING:
         logger.debug("render_page: playwright known missing — skipping render")
-        return {
-            "error": (
-                "Browser rendering is not available (Playwright is not "
-                "installed). Install it with `pip install -e '.[browser]'` and "
-                "run `playwright install chromium`."
-            ),
-            **_UNAVAILABLE_RESULT,
-        }
+        return _playwright_missing_result()
     hostname, validated_ip, block_reason = await _validate_public_host(url)
     if block_reason:
         logger.warning("render_page: refusing to render %s — %s", url, block_reason)
@@ -237,14 +327,7 @@ async def render_page(url: str, capture_screenshot: bool = True) -> dict:
             "extra (`pip install -e '.[browser]'` then `playwright install "
             "chromium`) to enable JS-rendered SPA support."
         )
-        return {
-            "error": (
-                "Browser rendering is not available (Playwright is not "
-                "installed). Install it with `pip install -e '.[browser]'` and "
-                "run `playwright install chromium`."
-            ),
-            **_UNAVAILABLE_RESULT,
-        }
+        return _playwright_missing_result()
 
     try:
         async with async_playwright() as pw:
@@ -256,81 +339,9 @@ async def render_page(url: str, capture_screenshot: bool = True) -> dict:
             )
             browser = await pw.chromium.launch(headless=True, args=[resolver_arg])
             try:
-                page = await browser.new_page()
-                try:
-                    # domcontentloaded (not networkidle): a page that holds
-                    # telemetry/analytics sockets open (e.g. SauceDemo) never
-                    # reaches "networkidle", so that wait_until would burn the
-                    # whole nav timeout and fail even though the page rendered
-                    # fine. We wait for a real DOM instead, then settle for SPA
-                    # hydration below.
-                    await page.goto(
-                        url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
-                    )
-                except PlaywrightError as exc:
-                    logger.warning(
-                        "render_page: navigation failed for %s: %s", url, exc
-                    )
-                    return {
-                        "error": f"Browser navigation failed: {exc}",
-                        **_UNAVAILABLE_RESULT,
-                    }
-
-                # SSRF guard: re-check the post-redirect final URL. A page that
-                # redirected to a private/internal address must be discarded.
-                final_url = page.url
-                redirect_block = await _public_host_error(final_url)
-                if redirect_block:
-                    logger.warning(
-                        "render_page: %s redirected to blocked target %s — %s",
-                        url,
-                        final_url,
-                        redirect_block,
-                    )
-                    return {
-                        "error": f"Blocked after redirect: {redirect_block}",
-                        **_UNAVAILABLE_RESULT,
-                    }
-
-                # SPA hydration settle: domcontentloaded fires before a
-                # client-side framework paints, so wait — non-fatally — for the
-                # DOM to actually contain an interactive element before we
-                # scrape it. On timeout (e.g. a canvas-only UI) we fall through
-                # and scrape the current DOM; Tier 3 vision can still take over.
-                try:
-                    await page.wait_for_function(
-                        "() => document.querySelector("
-                        "'input, button, select, textarea, a, [role]') !== null",
-                        timeout=_HYDRATE_TIMEOUT_MS,
-                    )
-                except PlaywrightError:
-                    logger.debug(
-                        "render_page: hydration wait timed out for %s — "
-                        "scraping current DOM",
-                        url,
-                    )
-
-                html = await page.content()
-                title = await page.title()
-
-                html = await _merge_iframe_html(page, html, url)
-
-                screenshot_bytes = None
-                if capture_screenshot:
-                    screenshot_bytes = await _capture_screenshot(
-                        page, url, PlaywrightError
-                    )
-
-                accessibility = await _accessibility_snapshot(page, url)
-
-                return {
-                    "error": None,
-                    "html": (html or "")[:_MAX_HTML_CHARS],
-                    "title": title or "",
-                    "screenshot": screenshot_bytes,
-                    "accessibility": accessibility,
-                    "final_url": final_url,
-                }
+                return await _render_in_page(
+                    await browser.new_page(), url, capture_screenshot, PlaywrightError
+                )
             finally:
                 await browser.close()
     except Exception as exc:

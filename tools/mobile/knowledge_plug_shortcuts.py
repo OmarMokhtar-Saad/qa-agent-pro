@@ -72,7 +72,11 @@ def _fail(ctx: object, item: str, why: str) -> None:
 def _try(ctx: object, row: dict, screen: object, ahead: list) -> Directive:
     item = "shortcuts:%s" % row.get("id")
     steps = row.get("steps") or []
-    if not steps or _count(ctx, "shortcut_fired", item) or _count(ctx, "shortcut_fail", item):
+    if (
+        not steps
+        or _count(ctx, "shortcut_fired", item)
+        or _count(ctx, "shortcut_fail", item)
+    ):
         return knowledge_hooks.NONE
     if len(ahead) < len(steps):
         # Fewer scripted steps left than the shortcut stands in for: it would
@@ -100,7 +104,8 @@ def _try(ctx: object, row: dict, screen: object, ahead: list) -> Directive:
         return knowledge_hooks.NONE
     expect = [list(op_rid(p)) for p in parsed]
     knowledge_hooks.kbuf_add(
-        ctx, {"kind": "shortcut_fired", "item": item, "left": len(parsed), "expect": expect}
+        ctx,
+        {"kind": "shortcut_fired", "item": item, "left": len(parsed), "expect": expect},
     )
     return Directive(
         kind="insert_steps",
@@ -145,7 +150,9 @@ def post_step(ctx, entry, before, after) -> None:
         ev = live[-1]
         expect = ev.get("expect") or []
         at = len(expect) - int(ev["left"])
-        if not 0 <= at < len(expect) or list(op_rid(entry.get("action") or {})) != list(expect[at]):
+        if not 0 <= at < len(expect) or list(op_rid(entry.get("action") or {})) != list(
+            expect[at]
+        ):
             return
         if entry.get("outcome") != "ok":
             ev.update(kind="shortcut_fail", why="steps", left=0)
@@ -168,7 +175,9 @@ def snapshot(conn, facts) -> dict:
 
     out = []
     where = "status = 'active' AND invalid_at IS NULL AND start_key != ''"
-    for row in knowledge_db.rows(conn, "shortcuts", where, (), knowledge_limits.SNAPSHOT_MAX_ROWS):
+    for row in knowledge_db.rows(
+        conn, "shortcuts", where, (), knowledge_limits.SNAPSHOT_MAX_ROWS
+    ):
         out.append(
             {
                 "id": row["id"],
@@ -186,7 +195,9 @@ def _row_of(conn, item: object) -> dict | None:
     parsed = knowledge_db.parse_item_id(item)
     if parsed is None or parsed[0] != "shortcuts":
         return None
-    found = knowledge_db.rows(conn, "shortcuts", "id = ? AND invalid_at IS NULL", (parsed[1],), 1)
+    found = knowledge_db.rows(
+        conn, "shortcuts", "id = ? AND invalid_at IS NULL", (parsed[1],), 1
+    )
     return found[0] if found else None
 
 
@@ -198,19 +209,40 @@ def _apply(conn, run_id: str, ev: dict) -> None:
         if ev.get("refused") or int(ev.get("left") or 0) > 0:
             return  # never ran to the end: not inserted, or the run stopped
         knowledge_db.upsert_counter(
-            conn, "shortcuts", {"name": row["name"]}, {"success": 1}, run_id=run_id, why="shortcut fired"
+            conn,
+            "shortcuts",
+            {"name": row["name"]},
+            {"success": 1},
+            run_id=run_id,
+            why="shortcut fired",
         )
         return
     knowledge_db.upsert_counter(
-        conn, "shortcuts", {"name": row["name"]}, {"fail": 1}, run_id=run_id, why="shortcut " + str(ev.get("why", ""))[:40]
+        conn,
+        "shortcuts",
+        {"name": row["name"]},
+        {"fail": 1},
+        run_id=run_id,
+        why="shortcut " + str(ev.get("why", ""))[:40],
     )
     if int(row.get("fail") or 0) + 1 >= knowledge_limits.STALE_AFTER_FAILS:
-        knowledge_db.set_status(conn, "shortcuts", row["id"], "stale", run_id=run_id, why="shortcut failed repeatedly")
+        knowledge_db.set_status(
+            conn,
+            "shortcuts",
+            row["id"],
+            "stale",
+            run_id=run_id,
+            why="shortcut failed repeatedly",
+        )
 
 
 def flush(package: str, run_id: str, events: list) -> None:
     """Persist this run's shortcut fired/fail events (one connection, batched)."""
-    mine = [e for e in events or [] if isinstance(e, dict) and e.get("kind") in ("shortcut_fired", "shortcut_fail")]
+    mine = [
+        e
+        for e in events or []
+        if isinstance(e, dict) and e.get("kind") in ("shortcut_fired", "shortcut_fail")
+    ]
     if not mine:
         return
     conn = knowledge_db.open_rw(package)

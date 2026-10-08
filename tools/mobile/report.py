@@ -77,7 +77,9 @@ import os
 import re
 import time
 from collections import Counter
+from collections.abc import Callable
 from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 
 from tools.mobile import actions as actions_mod
@@ -1398,13 +1400,7 @@ def _frame_html(screen_id: object, screens: object) -> str:
             + "</p></div>"
         )
     if verdict == LOOK_UNCAPTURED:
-        return (
-            '<div class="frame missing" data-screen="'
-            + esc(ident, 40)
-            + '"><p class="wirenote">'
-            + esc(NOT_CAPTURED)
-            + "</p></div>"
-        )
+        return _missing_frame(ident, NOT_CAPTURED)
     if verdict == LOOK_AMBIGUOUS:
         # THE INVARIANT, DECIDED IN `_resolve_look` AND HONOURED HERE.
         #
@@ -1427,15 +1423,24 @@ def _frame_html(screen_id: object, screens: object) -> str:
         # ambiguous -- the bare id and that single observation are the same
         # bytes -- so a settings walk and every single-look screen render as
         # they always did. That is what keeps this a guard and not a regression.
-        return (
-            '<div class="frame missing" data-screen="'
-            + esc(ident, 40)
-            + '"><p class="wirenote">'
-            + esc(AMBIGUOUS_LOOK)
-            + "</p></div>"
-        )
-    frame = wireframe(screen)
-    rects = "".join(
+        return _missing_frame(ident, AMBIGUOUS_LOOK)
+    return _drawn_frame(ident, wireframe(screen))
+
+
+def _missing_frame(ident: str, note: str) -> str:
+    """An empty frame for *ident* carrying *note* as its reason."""
+    return (
+        '<div class="frame missing" data-screen="'
+        + esc(ident, 40)
+        + '"><p class="wirenote">'
+        + esc(note)
+        + "</p></div>"
+    )
+
+
+def _rect_html(rect: dict) -> str:
+    """One element rectangle of the wireframe."""
+    return (
         '<div class="rect '
         + esc(rect["kind"], 12)
         + '" style="left:'
@@ -1451,8 +1456,12 @@ def _frame_html(screen_id: object, screens: object) -> str:
         + '" dir="auto">'
         + esc(rect["label"], 40)
         + "</div>"
-        for rect in frame["rects"]
     )
+
+
+def _drawn_frame(ident: str, frame: dict) -> str:
+    """The wireframe of one stored screen: its rectangles and geometry note."""
+    rects = "".join(_rect_html(rect) for rect in frame["rects"])
     return (
         '<div class="frame" style="width:'
         + str(int(frame["frame_w"]))
@@ -1986,81 +1995,106 @@ def _seq_rows(rows: list, screens: object = None, app: str = "") -> str:
     for row in rows:
         kind = OP_KIND.get(row["op"].lower(), "step")
         label = "0.0s" if clock == 0 else "+%.1fs" % (clock / 1000.0)
-        bar = ""
-        if row["ms"] is not None and longest:
-            bar = (
-                '<span class="seqbar k-tool" title="'
-                + str(int(row["ms"]))
-                + " ms of the "
-                + str(int(longest))
-                + ' ms longest step in this case"><i style="width:%.1f%%"></i></span>'
-                % max(3.0, min(100.0, row["ms"] / float(longest) * 100.0))
+        out.append(
+            _seq_item(
+                kind,
+                label,
+                _seq_head(row),
+                _seq_bar(row, longest),
+                _seq_detail(row, screens, app),
             )
-        head = (
-            '<span class="seqk">'
-            + esc(row["op"], 24)
-            + '</span><span class="seqtx" dir="auto">'
-            + esc(row["action"], 160)
-            + "</span>"
-            + (
-                ('<span class="mt">' + esc(fmt_ms(row["ms"]), 16) + "</span>")
-                if row["ms"] is not None
-                else ""
-            )
-            + _outcome_pill(row["outcome"])
         )
-        detail = ""
-        if row["detail"]:
-            detail = '<p class="seqfull" dir="auto">' + esc(row["detail"]) + "</p>"
-        if row["before"] or row["after"]:
-            detail += (
-                '<div class="chipnote"><i>screen</i>'
-                + (esc(row["before"], 40) or "—")
-                + " → "
-                + (esc(row["after"], 40) or "—")
-                + "</div>"
-            )
-        if row["after"] and _changed(row):
-            detail += (
-                '<div class="phonewide">'
-                + _phone_html(
-                    "Screen after",
-                    "what this action left on screen",
-                    row["after_obs"] or row["after"],
-                    screens,
-                    app,
-                )
-                + "</div>"
-            )
-        if detail:
-            out.append(
-                '<li class="seq is-'
-                + kind
-                + '"><details class="seqfold"><summary><span class="chev" aria-hidden="true"></span>'
-                '<span class="seqt">'
-                + label
-                + '</span><div class="seqmain">'
-                + head
-                + "</div>"
-                + bar
-                + '</summary><div class="seqdetail">'
-                + detail
-                + "</div></details></li>"
-            )
-        else:
-            out.append(
-                '<li class="seq is-'
-                + kind
-                + '"><span class="chev ghost" aria-hidden="true"></span><span class="seqt">'
-                + label
-                + '</span><div class="seqmain">'
-                + head
-                + "</div>"
-                + bar
-                + "</li>"
-            )
         clock += row["ms"] or 0
     return '<ul class="seqlist">' + "".join(out) + "</ul>"
+
+
+def _seq_bar(row: dict, longest: int) -> str:
+    """The step's duration bar against the longest step, or '' without a time."""
+    if row["ms"] is None or not longest:
+        return ""
+    return (
+        '<span class="seqbar k-tool" title="'
+        + str(int(row["ms"]))
+        + " ms of the "
+        + str(int(longest))
+        + ' ms longest step in this case"><i style="width:%.1f%%"></i></span>'
+        % max(3.0, min(100.0, row["ms"] / float(longest) * 100.0))
+    )
+
+
+def _seq_head(row: dict) -> str:
+    """The step's operation, action text, time and outcome pill."""
+    return (
+        '<span class="seqk">'
+        + esc(row["op"], 24)
+        + '</span><span class="seqtx" dir="auto">'
+        + esc(row["action"], 160)
+        + "</span>"
+        + (
+            ('<span class="mt">' + esc(fmt_ms(row["ms"]), 16) + "</span>")
+            if row["ms"] is not None
+            else ""
+        )
+        + _outcome_pill(row["outcome"])
+    )
+
+
+def _seq_detail(row: dict, screens: object, app: str) -> str:
+    """The folded detail of a step: full text, screen change, new screen frame."""
+    detail = ""
+    if row["detail"]:
+        detail = '<p class="seqfull" dir="auto">' + esc(row["detail"]) + "</p>"
+    if row["before"] or row["after"]:
+        detail += (
+            '<div class="chipnote"><i>screen</i>'
+            + (esc(row["before"], 40) or "—")
+            + " → "
+            + (esc(row["after"], 40) or "—")
+            + "</div>"
+        )
+    if row["after"] and _changed(row):
+        detail += (
+            '<div class="phonewide">'
+            + _phone_html(
+                "Screen after",
+                "what this action left on screen",
+                row["after_obs"] or row["after"],
+                screens,
+                app,
+            )
+            + "</div>"
+        )
+    return detail
+
+
+def _seq_item(kind: str, label: str, head: str, bar: str, detail: str) -> str:
+    """One sequence list item: a fold when there is detail, else a plain row."""
+    if detail:
+        return (
+            '<li class="seq is-'
+            + kind
+            + '"><details class="seqfold"><summary><span class="chev" aria-hidden="true"></span>'
+            '<span class="seqt">'
+            + label
+            + '</span><div class="seqmain">'
+            + head
+            + "</div>"
+            + bar
+            + '</summary><div class="seqdetail">'
+            + detail
+            + "</div></details></li>"
+        )
+    return (
+        '<li class="seq is-'
+        + kind
+        + '"><span class="chev ghost" aria-hidden="true"></span><span class="seqt">'
+        + label
+        + '</span><div class="seqmain">'
+        + head
+        + "</div>"
+        + bar
+        + "</li>"
+    )
 
 
 # ── one case ───────────────────────────────────────────────────────────────────
@@ -2126,8 +2160,37 @@ def _case_facts(case: object, manifest: dict, run_id: str = "") -> dict:
     safe = safe if isinstance(safe, dict) else {}
     tc_id = _text(safe.get("tc_id"), 40)
     rows = _trace_rows(safe.get("trace"))
-    planned = _planned_case(manifest, tc_id)
+    facts = _case_record(safe, tc_id, run_id)
+    facts.update(_case_planning(safe, rows))
+    facts.update(_case_screens(safe, rows))
+    facts.update(_case_planned(_planned_case(manifest, tc_id), rows))
+    return facts
+
+
+def _case_screens(safe: dict, rows: list) -> dict:
+    """The screens a case started on, ended on and passed through."""
     first_before = rows[0]["before"] if rows else _text(safe.get("screen_id"), 40)
+    last_after, last_obs, last_look = _last_looks(rows)
+    last_substituted = bool(last_look) and last_look != last_obs
+    # The observation each end WAS, kept beside the id each end IS. A card that
+    # keys its frame on the id alone draws the last look at that screen, which
+    # on a conversation is somebody else's turn.
+    first_obs = rows[0]["before_obs"] if rows else ""
+    screens_seen = {row["before"] for row in rows} | {row["after"] for row in rows}
+    screens_seen.discard("")
+    return {
+        "first": first_before,
+        "last": last_after,
+        "first_obs": first_obs,
+        "last_obs": last_obs,
+        "last_look": last_look,
+        "last_substituted": last_substituted,
+        "screens": len(screens_seen),
+    }
+
+
+def _last_looks(rows: list) -> tuple:
+    """``(last_after, last_obs, last_look)`` scanned from the end of *rows*."""
     last_after = ""
     last_obs = ""
     for row in reversed(rows):
@@ -2169,25 +2232,15 @@ def _case_facts(case: object, manifest: dict, run_id: str = "") -> dict:
     # turn of this one -- but a reader reconciling the card against the trace
     # should know which row they are looking at.
     #
-    # Substituted means an EARLIER look at the right screen, so the caption must
-    # say so rather than claim it is the end state. A record written before
-    # observations existed substitutes nothing and keeps its old caption.
-    last_substituted = bool(last_look) and last_look != last_obs
-    # The observation each end WAS, kept beside the id each end IS. A card that
-    # keys its frame on the id alone draws the last look at that screen, which
-    # on a conversation is somebody else's turn.
-    first_obs = rows[0]["before_obs"] if rows else ""
-    screens_seen = {row["before"] for row in rows} | {row["after"] for row in rows}
-    screens_seen.discard("")
-    try:
-        escapes = int(safe.get("escapes") or 0)
-    except (TypeError, ValueError, OverflowError):
-        escapes = 0
-    try:
-        free_stops = max(0, int(safe.get("free_stops") or 0))
-    except (TypeError, ValueError, OverflowError):
-        free_stops = 0
-    wall = _case_wall(rows)
+    # Substituted (``last_look != last_obs``) means an EARLIER look at the right
+    # screen, so the caption must say so rather than claim it is the end state. A
+    # record written before observations existed substitutes nothing and keeps
+    # its old caption.
+    return last_after, last_obs, last_look
+
+
+def _case_record(safe: dict, tc_id: str, run_id: str) -> dict:
+    """The identity, verdict and evidence a case checkpoint carries."""
     return {
         "tc_id": tc_id,
         "slug": _slug(tc_id),
@@ -2209,6 +2262,20 @@ def _case_facts(case: object, manifest: dict, run_id: str = "") -> dict:
         "status": _text(safe.get("status"), 40),
         "reason": _text(safe.get("reason"), 400),
         "finding": _text(safe.get("finding"), 200),
+    }
+
+
+def _case_planning(safe: dict, rows: list) -> dict:
+    """The case's escape, uncharged-stop and planning-turn counts."""
+    try:
+        escapes = int(safe.get("escapes") or 0)
+    except (TypeError, ValueError, OverflowError):
+        escapes = 0
+    try:
+        free_stops = max(0, int(safe.get("free_stops") or 0))
+    except (TypeError, ValueError, OverflowError):
+        free_stops = 0
+    return {
         "escapes": max(0, escapes),
         "free_stops": free_stops,
         # Planning turns by the tester's own chat model: the first plan, every
@@ -2224,13 +2291,13 @@ def _case_facts(case: object, manifest: dict, run_id: str = "") -> dict:
         "plans": (1 + max(0, escapes) + free_stops) if rows else 0,
         "updated": safe.get("updated"),
         "rows": rows,
-        "first": first_before,
-        "last": last_after,
-        "first_obs": first_obs,
-        "last_obs": last_obs,
-        "last_look": last_look,
-        "last_substituted": last_substituted,
-        "screens": len(screens_seen),
+    }
+
+
+def _case_planned(planned: dict, rows: list) -> dict:
+    """What the suite planned for the case, and how long it took."""
+    wall = _case_wall(rows)
+    return {
         "wall": wall,
         "lat": _lat_bucket(wall),
         "module": _text(planned.get("module"), 60) or "(unfiled)",
@@ -2445,28 +2512,48 @@ def _card_html(
     _sw, _seg, pill_cls, label = _tone(verdict)
     rows = facts["rows"]
     first_action = rows[0]["action"] if rows else ""
-    snippet = ""
-    if first_action or facts["reason"]:
-        snippet = (
-            '<span class="csnip">'
-            + (
-                ('<q dir="auto">' + esc(first_action, 64) + "</q>")
-                if first_action
-                else ""
-            )
-            + (
-                '<span class="arr" aria-hidden="true">→</span>'
-                if first_action and facts["reason"]
-                else ""
-            )
-            + (
-                ('<q class="sara" dir="auto">' + esc(facts["reason"], 64) + "</q>")
-                if facts["reason"]
-                else ""
-            )
-            + "</span>"
+    snippet = _card_snippet(first_action, facts["reason"])
+    bits = _card_bits(facts, pill_cls, label, loaded)
+    attrs = _card_attrs(facts, loaded)
+    expected = (
+        esc(facts["expected"], 600)
+        if facts["expected"]
+        else "the suite states no expected result for this case"
+    )
+    head = _card_head(facts, (pill_cls, label), snippet, attrs, "".join(bits))
+    return (
+        head
+        + _card_body(
+            facts,
+            expected,
+            _card_steps(facts, screens, app),
+            _card_tech(facts, screens, loaded),
+            media_map,
         )
-    bits = [_pill(pill_cls, label), MSEP, _metric(len(rows), "steps")]
+        + "</div>\n</details>"
+    )
+
+
+def _card_snippet(first_action: str, reason: str) -> str:
+    """The summary line: the first action, an arrow, the stated reason."""
+    if not (first_action or reason):
+        return ""
+    return (
+        '<span class="csnip">'
+        + (('<q dir="auto">' + esc(first_action, 64) + "</q>") if first_action else "")
+        + (
+            '<span class="arr" aria-hidden="true">→</span>'
+            if first_action and reason
+            else ""
+        )
+        + (('<q class="sara" dir="auto">' + esc(reason, 64) + "</q>") if reason else "")
+        + "</span>"
+    )
+
+
+def _card_bits(facts: dict, pill_cls: str, label: str, loaded: dict | None) -> list:
+    """The summary metrics: verdict pill, step, wall, turn and screen counts."""
+    bits = [_pill(pill_cls, label), MSEP, _metric(len(facts["rows"]), "steps")]
     if facts["wall"] is not None:
         bits += [MSEP, _metric(fmt_ms(facts["wall"]), "wall")]
     bits += [
@@ -2478,12 +2565,12 @@ def _card_html(
     if loaded:
         # The app's side of the same case: LLM / API / tool counts, tokens, cost.
         bits += ev_render.card_metrics(loaded, facts["tc_id"])
-    attrs = _card_attrs(facts, loaded)
-    expected = (
-        esc(facts["expected"], 600)
-        if facts["expected"]
-        else "the suite states no expected result for this case"
-    )
+    return bits
+
+
+def _card_steps(facts: dict, screens: object, app: str) -> str:
+    """The case's step list, or the honest note that none was replayed."""
+    rows = facts["rows"]
     # THE SAME STEP LIST AS A JOURNEY TURN. Each step shows the screen before
     # and after it, resolved through `_look_pic`, so the ambiguous-look and
     # not-captured notes stand in place of a picture exactly as they do there.
@@ -2530,10 +2617,15 @@ def _card_html(
                 else ""
             )
         )
-    tech = _card_tech(facts, screens, loaded)
+    return steps
+
+
+def _card_head(facts: dict, tone: tuple, snippet: str, attrs: str, bits: str) -> str:
+    """The card's opening tag and its summary row."""
+    pill_cls, label = tone
     return (
         '\n<details class="case rail-'
-        + RAIL.get(verdict, "none")
+        + RAIL.get(facts["verdict"], "none")
         + '" id="case-'
         + esc(facts["slug"], 40)
         + '" '
@@ -2555,8 +2647,17 @@ def _card_html(
         + '</span>\n    <a class="plink" href="#case-'
         + esc(facts["slug"], 40)
         + '" title="Copy a link to this record">#</a>\n    <div class="smetrics">'
-        + "".join(bits)
-        + '</div>\n  </summary>\n  <div class="cbody"><p class="cexp"><b>Expected</b> — '
+        + bits
+        + "</div>\n  </summary>"
+    )
+
+
+def _card_body(
+    facts: dict, expected: str, steps: str, tech: str, media_map: object
+) -> str:
+    """The card's body: expected result, strips, steps, end state, tech fold."""
+    return (
+        '\n  <div class="cbody"><p class="cexp"><b>Expected</b> — '
         + expected
         + "</p>"
         + _vstrip(facts)
@@ -2566,7 +2667,6 @@ def _card_html(
         + '<details class="tech"><summary>Technical detail</summary>'
         + tech
         + "</details>"
-        + "</div>\n</details>"
     )
 
 
@@ -2659,9 +2759,31 @@ def _facts_strip(
     loaded: dict | None = None,
     coverage: dict | None = None,
 ) -> str:
-    holder = _text(lease.get("session_id"), 40)
-    displaced = _text(lease.get("taken_over_from"), 40)
-    items = [
+    items = _run_cells(run_id, manifest, partial, coverage)
+    locale_cell = _locale_cell(manifest)
+    if locale_cell:
+        items.append(locale_cell)
+    if loaded:
+        items.extend(ev_render.facts_cells(loaded))
+    items.extend(_lease_cells(lease))
+    cells = "".join(
+        '<div class="rf"><span class="rfl">'
+        + label
+        + '</span><span class="rfv">'
+        + (('<i class="sw ' + tone + '"></i>') if tone else "")
+        + value
+        + (("<small>" + sub + "</small>") if sub else "")
+        + "</span></div>"
+        for label, value, sub, tone in items
+    )
+    return '<div class="runstrip" aria-label="Run facts">' + cells + "</div>"
+
+
+def _run_cells(
+    run_id: str, manifest: dict, partial: bool, coverage: dict | None
+) -> list:
+    """The five always-present cells of the run facts strip."""
+    return [
         (
             "device",
             esc(manifest.get("serial") or "(not attached)", 40),
@@ -2693,11 +2815,13 @@ def _facts_strip(
             "gap" if (partial or not (coverage or {}).get("complete")) else "ok",
         ),
     ]
-    locale_cell = _locale_cell(manifest)
-    if locale_cell:
-        items.append(locale_cell)
-    if loaded:
-        items.extend(ev_render.facts_cells(loaded))
+
+
+def _lease_cells(lease: dict) -> list:
+    """The lease holder and takeover cells, each only when the lease names one."""
+    holder = _text(lease.get("session_id"), 40)
+    displaced = _text(lease.get("taken_over_from"), 40)
+    items: list = []
     if holder:
         items.append(
             (
@@ -2716,17 +2840,7 @@ def _facts_strip(
                 "",
             )
         )
-    cells = "".join(
-        '<div class="rf"><span class="rfl">'
-        + label
-        + '</span><span class="rfv">'
-        + (('<i class="sw ' + tone + '"></i>') if tone else "")
-        + value
-        + (("<small>" + sub + "</small>") if sub else "")
-        + "</span></div>"
-        for label, value, sub, tone in items
-    )
-    return '<div class="runstrip" aria-label="Run facts">' + cells + "</div>"
+    return items
 
 
 def _tile_order(counts: dict) -> list:
@@ -2787,6 +2901,99 @@ def _segbar(counts: dict) -> str:
     )
 
 
+def _perf_tile(values: list, title: str, noun: str, why: str) -> str:
+    """One KPI tile: the median, the spread and the count of ``values``."""
+    return _kpi(
+        esc(fmt_ms(_percentile(values, 0.5)), 16),
+        title,
+        '<span class="kstat">usually '
+        + esc(fmt_ms(_percentile(values, 0.5)), 16)
+        + ", between "
+        + esc(fmt_ms(min(values)), 16)
+        + " and "
+        + esc(fmt_ms(max(values)), 16)
+        + '</span><span class="kstat">across '
+        + str(len(values))
+        + noun
+        + why,
+    )
+
+
+def _perf_tiles(step_ms: list, walls: list) -> list:
+    tiles = [
+        _perf_tile(
+            step_ms,
+            "How long an action took",
+            " actions</span>",
+            '<details class="kwhy"><summary>what this means</summary><p>measured by the replay '
+            "clock around one action — the tap or the wait itself, not the model's planning turn, "
+            "which happens in the tester's own chat</p></details>",
+        ),
+    ]
+    if walls:
+        tiles.append(
+            _perf_tile(
+                [w for _f, w in walls],
+                "How long a case took",
+                " cases</span>",
+                '<details class="kwhy"><summary>what this means</summary><p>the sum of that case\'s '
+                "measured actions, a FLOOR rather than the whole truth: the turns the model spent "
+                "planning between actions are nobody's measurement here</p></details>",
+            )
+        )
+    return tiles
+
+
+def _perf_run_rows(walls: list) -> str:
+    top = max(w for _f, w in walls) or 1
+    ordered = sorted(walls, key=lambda pair: -pair[1])
+    return "".join(
+        '<li class="runrow"><button type="button" data-jump-case="'
+        + esc(f["slug"], 40)
+        + '"><span class="rname"><b>'
+        + esc(f["tc_id"], 40)
+        + "</b>"
+        + (esc(f["title"], 80) or "(untitled case)")
+        + '</span><span class="rval">'
+        + esc(fmt_ms(w), 16)
+        + '</span><span class="rtrack"><i class="sw-lat-'
+        + (f["lat"] or "fast")
+        + '" style="width:%.1f%%"></i></span></button></li>'
+        % max(1.0, w / float(top) * 100.0)
+        for f, w in ordered
+    )
+
+
+def _perf_legend(walls: list) -> str:
+    buckets = Counter(f["lat"] for f, _w in walls)
+    return "".join(
+        '<li><button type="button" data-jump-group="lat" data-jump-value="'
+        + key
+        + '"><i class="sw sw-lat-'
+        + key
+        + '"></i><b>'
+        + str(buckets.get(key, 0))
+        + "</b>"
+        + label
+        + "</button></li>"
+        for key, label, _ceiling in LAT_BUCKETS
+    )
+
+
+def _perf_figure(walls: list) -> str:
+    return (
+        '<figure class="hist"><figcaption><b>How long a case took</b><span>'
+        + str(len(walls))
+        + " case"
+        + ("" if len(walls) == 1 else "s")
+        + ', each one shown · click one to open it</span></figcaption><ul class="runs">'
+        + _perf_run_rows(walls)
+        + '</ul><ul class="seglegend">'
+        + _perf_legend(walls)
+        + "</ul></figure>"
+    )
+
+
 def _perf(facts: list, loaded: dict | None = None) -> str:
     step_ms = [row["ms"] for f in facts for row in f["rows"] if row["ms"] is not None]
     walls = [(f, f["wall"]) for f in facts if f["wall"] is not None]
@@ -2795,87 +3002,8 @@ def _perf(facts: list, loaded: dict | None = None) -> str:
             '<p class="empty-note big">Nothing here carried a measured duration yet — the tiles '
             "and the figure appear once an action has been replayed.</p>"
         ) + (ev_render.perf_extra(loaded) if loaded else "")
-    tiles = [
-        _kpi(
-            esc(fmt_ms(_percentile(step_ms, 0.5)), 16),
-            "How long an action took",
-            '<span class="kstat">usually '
-            + esc(fmt_ms(_percentile(step_ms, 0.5)), 16)
-            + ", between "
-            + esc(fmt_ms(min(step_ms)), 16)
-            + " and "
-            + esc(fmt_ms(max(step_ms)), 16)
-            + '</span><span class="kstat">across '
-            + str(len(step_ms))
-            + " actions</span>"
-            '<details class="kwhy"><summary>what this means</summary><p>measured by the replay '
-            "clock around one action — the tap or the wait itself, not the model's planning turn, "
-            "which happens in the tester's own chat</p></details>",
-        ),
-    ]
-    if walls:
-        wall_values = [w for _f, w in walls]
-        tiles.append(
-            _kpi(
-                esc(fmt_ms(_percentile(wall_values, 0.5)), 16),
-                "How long a case took",
-                '<span class="kstat">usually '
-                + esc(fmt_ms(_percentile(wall_values, 0.5)), 16)
-                + ", between "
-                + esc(fmt_ms(min(wall_values)), 16)
-                + " and "
-                + esc(fmt_ms(max(wall_values)), 16)
-                + '</span><span class="kstat">across '
-                + str(len(wall_values))
-                + " cases</span>"
-                '<details class="kwhy"><summary>what this means</summary><p>the sum of that case\'s '
-                "measured actions, a FLOOR rather than the whole truth: the turns the model spent "
-                "planning between actions are nobody's measurement here</p></details>",
-            )
-        )
-    figure = ""
-    if walls:
-        top = max(w for _f, w in walls) or 1
-        ordered = sorted(walls, key=lambda pair: -pair[1])
-        items = "".join(
-            '<li class="runrow"><button type="button" data-jump-case="'
-            + esc(f["slug"], 40)
-            + '"><span class="rname"><b>'
-            + esc(f["tc_id"], 40)
-            + "</b>"
-            + (esc(f["title"], 80) or "(untitled case)")
-            + '</span><span class="rval">'
-            + esc(fmt_ms(w), 16)
-            + '</span><span class="rtrack"><i class="sw-lat-'
-            + (f["lat"] or "fast")
-            + '" style="width:%.1f%%"></i></span></button></li>'
-            % max(1.0, w / float(top) * 100.0)
-            for f, w in ordered
-        )
-        buckets = Counter(f["lat"] for f, _w in walls)
-        legend = "".join(
-            '<li><button type="button" data-jump-group="lat" data-jump-value="'
-            + key
-            + '"><i class="sw sw-lat-'
-            + key
-            + '"></i><b>'
-            + str(buckets.get(key, 0))
-            + "</b>"
-            + label
-            + "</button></li>"
-            for key, label, _ceiling in LAT_BUCKETS
-        )
-        figure = (
-            '<figure class="hist"><figcaption><b>How long a case took</b><span>'
-            + str(len(walls))
-            + " case"
-            + ("" if len(walls) == 1 else "s")
-            + ', each one shown · click one to open it</span></figcaption><ul class="runs">'
-            + items
-            + '</ul><ul class="seglegend">'
-            + legend
-            + "</ul></figure>"
-        )
+    tiles = _perf_tiles(step_ms, walls)
+    figure = _perf_figure(walls) if walls else ""
     return (
         '<p class="hint">Every action the server replays is timed on its own clock, so these are '
         "real elapsed times — for the action alone. The model's planning between actions runs in "
@@ -2888,7 +3016,7 @@ def _perf(facts: list, loaded: dict | None = None) -> str:
     )
 
 
-def _toolbar(facts: list, loaded: dict | None = None) -> str:
+def _toolbar_groups(facts: list) -> list:
     verdicts = Counter(f["verdict"] for f in facts)
     modules = Counter(f["module"] for f in facts)
     priorities = Counter(f["priority"] for f in facts)
@@ -2931,8 +3059,10 @@ def _toolbar(facts: list, loaded: dict | None = None) -> str:
             ),
         ),
     ]
-    if loaded:
-        groups += ev_render.toolbar_groups(loaded, facts)
+    return groups
+
+
+def _toolbar_sorts(loaded: dict | None) -> str:
     sorts = (
         ("order", "case order"),
         ("steps", "actions, most first"),
@@ -2940,9 +3070,16 @@ def _toolbar(facts: list, loaded: dict | None = None) -> str:
         ("plans", "LLM turns, most first"),
         ("escapes", "escape-hatch turns, most first"),
     ) + (tuple(ev_render.extra_sorts(loaded)) if loaded else ())
-    opts = "".join(
+    return "".join(
         '<option value="' + k + '">' + label + "</option>" for k, label in sorts
     )
+
+
+def _toolbar(facts: list, loaded: dict | None = None) -> str:
+    groups = _toolbar_groups(facts)
+    if loaded:
+        groups += ev_render.toolbar_groups(loaded, facts)
+    opts = _toolbar_sorts(loaded)
     fgs = "".join(_filter_group(label, chips) for label, chips in groups)
     total = str(len(facts))
     return (
@@ -3036,6 +3173,76 @@ def _fill(template: str, slots: dict) -> str:
     return _SLOT.sub(one, template)
 
 
+def _replayed_turns(explore: dict, turns: int) -> int:
+    try:
+        replayed = max(0, int(turns or 0))
+    except (TypeError, ValueError, OverflowError):
+        replayed = 0
+    # The CARD count under-counts turns: a turn whose script failed to parse
+    # returns before it is checkpointed (``session._submit_explore``), while
+    # ``explore_runner.next_turn`` had already incremented and persisted the
+    # turn number -- so mrun-20260907-174354-758700 replayed 19 turns, wrote 17
+    # cards, and this lede said "17 turns" with no silent turns at all.
+    # The manifest's own counter is taken when it is LARGER; a smaller value
+    # (an older build that never wrote one, a manifest not yet persisted) would
+    # under-count in the other direction, and the lede must never claim fewer
+    # turns than there are cards on the page.
+    try:
+        recorded = max(0, int(explore.get("turn") or 0))
+    except (TypeError, ValueError, OverflowError):
+        recorded = 0
+    return max(replayed, recorded)
+
+
+def _spoken_turns(notes: list) -> set:
+    # Counted by DISTINCT turn, never by row. A turn resubmitted with a finding
+    # appends a second row while leaving ONE checkpoint, so a row count read
+    # "2 findings over 1 turn" and drove the silent count negative into its own
+    # clamp -- which hid the miscount instead of reporting it.
+    spoke = set()
+    for note in notes:
+        try:
+            spoke.add(int(note.get("turn") or 0))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return spoke
+
+
+def _findings_lede(
+    explore: dict, spoken: int, replayed: int, stop: str, terms: str
+) -> str:
+    silent = max(0, replayed - spoken)
+    return (
+        "Goal: "
+        + (esc(explore.get("goal"), 400) or "(not recorded)")
+        + ". "
+        + str(spoken)
+        + " finding"
+        + ("" if spoken == 1 else "s")
+        + " recorded over "
+        + str(replayed)
+        + " turn"
+        + ("" if replayed == 1 else "s")
+        + (
+            ", and "
+            + str(silent)
+            + " turn"
+            + ("" if silent == 1 else "s")
+            + " recorded none — every turn is asked for one, so those are "
+            "gaps in the evidence rather than turns with nothing to report"
+            if silent
+            else ""
+        )
+        + ". "
+        + (
+            "This session ended: " + esc(stop, 40) + "."
+            if stop
+            else "This session has NOT ended, so this list is incomplete."
+        )
+        + ((" " + esc(terms, 800)) if terms else "")
+    )
+
+
 def _findings_section(manifest: dict, turns: int) -> str:
     """What an exploratory run FOUND. ``""`` for any other lane.
 
@@ -3067,36 +3274,8 @@ def _findings_section(manifest: dict, turns: int) -> str:
     notes = [
         note for note in list(explore.get("findings") or []) if isinstance(note, dict)
     ]
-    try:
-        replayed = max(0, int(turns or 0))
-    except (TypeError, ValueError, OverflowError):
-        replayed = 0
-    # The CARD count under-counts turns: a turn whose script failed to parse
-    # returns before it is checkpointed (``session._submit_explore``), while
-    # ``explore_runner.next_turn`` had already incremented and persisted the
-    # turn number -- so mrun-20260907-174354-758700 replayed 19 turns, wrote 17
-    # cards, and this lede said "17 turns" with no silent turns at all.
-    # The manifest's own counter is taken when it is LARGER; a smaller value
-    # (an older build that never wrote one, a manifest not yet persisted) would
-    # under-count in the other direction, and the lede must never claim fewer
-    # turns than there are cards on the page.
-    try:
-        recorded = max(0, int(explore.get("turn") or 0))
-    except (TypeError, ValueError, OverflowError):
-        recorded = 0
-    if recorded > replayed:
-        replayed = recorded
-    # Counted by DISTINCT turn, never by row. A turn resubmitted with a finding
-    # appends a second row while leaving ONE checkpoint, so a row count read
-    # "2 findings over 1 turn" and drove the silent count negative into its own
-    # clamp -- which hid the miscount instead of reporting it.
-    spoke = set()
-    for note in notes:
-        try:
-            spoke.add(int(note.get("turn") or 0))
-        except (TypeError, ValueError, OverflowError):
-            continue
-    silent = max(0, replayed - len(spoke))
+    replayed = _replayed_turns(explore, turns)
+    spoke = _spoken_turns(notes)
     stop = _text(explore_stop(body), 40)
     # The run's TERMS, including every default the tester did not set: a
     # silent default is a run whose terms nobody can reconstruct afterwards.
@@ -3104,35 +3283,19 @@ def _findings_section(manifest: dict, turns: int) -> str:
     # returns "" for a run with no charter -- every run recorded before step 4
     # -- so those pages render exactly as they did.
     terms = charter_mod.describe_terms(explore.get("charter"))
-    lede = (
-        "Goal: "
-        + (esc(explore.get("goal"), 400) or "(not recorded)")
-        + ". "
-        + str(len(spoke))
-        + " finding"
-        + ("" if len(spoke) == 1 else "s")
-        + " recorded over "
-        + str(replayed)
-        + " turn"
-        + ("" if replayed == 1 else "s")
-        + (
-            ", and "
-            + str(silent)
-            + " turn"
-            + ("" if silent == 1 else "s")
-            + " recorded none \u2014 every turn is asked for one, so those are "
-            "gaps in the evidence rather than turns with nothing to report"
-            if silent
-            else ""
-        )
-        + ". "
-        + (
-            "This session ended: " + esc(stop, 40) + "."
-            if stop
-            else "This session has NOT ended, so this list is incomplete."
-        )
-        + ((" " + esc(terms, 800)) if terms else "")
+    lede = _findings_lede(explore, len(spoke), replayed, stop, terms)
+    return _sechead(
+        "findings",
+        "What exploring found",
+        "one line per turn",
+        lede,
+        _findings_table(notes),
+        level=3,
     )
+
+
+def _findings_table(notes: list) -> str:
+    """The one-row-per-turn findings table, or the empty note."""
     rows = "".join(
         '<tr><td class="num">'
         + esc(note.get("turn"), 8)
@@ -3141,16 +3304,13 @@ def _findings_section(manifest: dict, turns: int) -> str:
         + "</td></tr>"
         for note in notes
     )
-    table = (
+    return (
         '<div class="tablewrap"><table class="cov"><thead><tr>'
         '<th scope="col" class="num">Turn</th>'
         '<th scope="col">What the turn reported</th>'
         "</tr></thead><tbody>" + rows + "</tbody></table></div>"
         if rows
         else '<p class="empty-note big">No turn recorded a finding.</p>'
-    )
-    return _sechead(
-        "findings", "What exploring found", "one line per turn", lede, table, level=3
     )
 
 
@@ -3193,61 +3353,39 @@ def _a11y_rows(screen_id: str, result: dict) -> str:
     return "".join(out)
 
 
-def _a11y_section(screens: object) -> str:
-    """What the run's own screens say about whether the app is USABLE.
+def _a11y_screen_row(screen_id: str, result: object, counts: Counter) -> str:
+    """One screen's table rows, tallying what it adds into ``counts``."""
+    if not isinstance(result, dict) or not result.get("present"):
+        counts["unaudited"] += 1
+        return (
+            '<tr><td class="num">'
+            + esc(screen_id, 40)
+            + '</td><td class="cap">not audited</td><td dir="auto">'
+            + "this screen was stored before the accessibility audit existed, "
+            "so no finding here is evidence about it" + "</td></tr>"
+        )
+    if result.get("auditable"):
+        counts["audited"] += 1
+        if not result.get("complete"):
+            counts["partial"] += 1
+        if result.get("density_source") != screen_audit.DENSITY_DEVICE:
+            counts["assumed"] += 1
+    else:
+        counts["unauditable"] += 1
+    counts["total"] += len(
+        [f for f in (result.get("findings") or []) if isinstance(f, dict)]
+    )
+    return _a11y_rows(screen_id, result)
 
-    The findings come from ``screen_audit``, which ``perception.prune`` runs over
-    every screen this lane ever pruned -- one producer, and this section reads the
-    stored answer rather than deriving a second one.
 
-    THREE outcomes that must never render alike, which is the whole point of the
-    section: a screen with findings, a screen that was audited and had none, and a
-    screen with no accessibility nodes AT ALL (a canvas app), where an empty list
-    means nothing was looked at. A screen stored by a build older than the audit
-    is a fourth: it carries no result, and this says so rather than counting it
-    clean.
-
-    Every interpolated value goes through :func:`esc` -- the labels are device
-    text -- and only class names ``report_shell.html`` already styles are used.
-    A finding NEVER touches a verdict: nothing here is read by
-    ``_case_facts``, and the verdict producers do not import this module.
-    """
-    library = screens if isinstance(screens, dict) else {}
-    audited = 0
-    unauditable = 0
-    unaudited = 0
-    partial = 0
-    assumed = 0
-    total = 0
-    rows = []
-    for screen_id in sorted(str(key) for key in library.keys()):
-        screen = library.get(screen_id)
-        if not isinstance(screen, dict):
-            continue
-        result = screen.get("accessibility")
-        if not isinstance(result, dict) or not result.get("present"):
-            unaudited += 1
-            rows.append(
-                '<tr><td class="num">'
-                + esc(screen_id, 40)
-                + '</td><td class="cap">not audited</td><td dir="auto">'
-                + "this screen was stored before the accessibility audit existed, "
-                "so no finding here is evidence about it" + "</td></tr>"
-            )
-            continue
-        if result.get("auditable"):
-            audited += 1
-            if not result.get("complete"):
-                partial += 1
-            if result.get("density_source") != screen_audit.DENSITY_DEVICE:
-                assumed += 1
-        else:
-            unauditable += 1
-        total += len([f for f in (result.get("findings") or []) if isinstance(f, dict)])
-        rows.append(_a11y_rows(screen_id, result))
-    if not rows:
-        return ""
-    lede = (
+def _a11y_lede(counts: Counter) -> str:
+    total = counts["total"]
+    audited = counts["audited"]
+    unauditable = counts["unauditable"]
+    partial = counts["partial"]
+    unaudited = counts["unaudited"]
+    assumed = counts["assumed"]
+    return (
         str(total)
         + " finding"
         + ("" if total == 1 else "s")
@@ -3289,6 +3427,38 @@ def _a11y_section(screens: object) -> str:
         )
         + " Colour contrast, jank and start-up time are NOT checked here."
     )
+
+
+def _a11y_section(screens: object) -> str:
+    """What the run's own screens say about whether the app is USABLE.
+
+    The findings come from ``screen_audit``, which ``perception.prune`` runs over
+    every screen this lane ever pruned -- one producer, and this section reads the
+    stored answer rather than deriving a second one.
+
+    THREE outcomes that must never render alike, which is the whole point of the
+    section: a screen with findings, a screen that was audited and had none, and a
+    screen with no accessibility nodes AT ALL (a canvas app), where an empty list
+    means nothing was looked at. A screen stored by a build older than the audit
+    is a fourth: it carries no result, and this says so rather than counting it
+    clean.
+
+    Every interpolated value goes through :func:`esc` -- the labels are device
+    text -- and only class names ``report_shell.html`` already styles are used.
+    A finding NEVER touches a verdict: nothing here is read by
+    ``_case_facts``, and the verdict producers do not import this module.
+    """
+    library = screens if isinstance(screens, dict) else {}
+    counts = Counter()
+    rows = []
+    for screen_id in sorted(str(key) for key in library.keys()):
+        screen = library.get(screen_id)
+        if not isinstance(screen, dict):
+            continue
+        rows.append(_a11y_screen_row(screen_id, screen.get("accessibility"), counts))
+    if not rows:
+        return ""
+    lede = _a11y_lede(counts)
     table = (
         '<div class="tablewrap"><table class="cov"><thead><tr>'
         '<th scope="col" class="num">Screen</th>'
@@ -3418,30 +3588,41 @@ def _env_section(manifest: dict, loaded: dict | None = None) -> str:
     already owns. The system image comes from the manifest SNAPSHOT and from nowhere else.
     """
     book = manifest if isinstance(manifest, dict) else {}
-    rows = []
-
-    def row(label, value, sub=""):
-        rows.append(
-            '<div class="envrow"><span class="rfl">'
-            + esc(label, 60)
-            + '</span><span class="rfv">'
-            + value
-            + ("<small>" + esc(sub, 300) + "</small>" if sub else "")
-            + "</span></div>"
-        )
-
     image = str(book.get("system_image") or "")
-    row(
-        "System image",
-        esc(image, 120)
-        if image
-        else '<span class="cap none">' + esc(SYSTEM_IMAGE_ABSENT, 300) + "</span>",
-        "snapshotted at run creation from sdk_locator.avd_system_image(); HTTPS body "
-        "decryption is only possible on a rootable image"
-        if image
-        else "",
+    rows = [
+        _env_row(
+            "System image",
+            esc(image, 120)
+            if image
+            else '<span class="cap none">' + esc(SYSTEM_IMAGE_ABSENT, 300) + "</span>",
+            "snapshotted at run creation from sdk_locator.avd_system_image(); HTTPS body "
+            "decryption is only possible on a rootable image"
+            if image
+            else "",
+        ),
+        _env_row("Device", esc(_device_sub(book), 120)),
+        _env_host_row(),
+        _env_row(
+            "Rendered",
+            esc(_short_stamp(time.time()), 40),
+            "when this page was BUILT, which is not when the run happened",
+        ),
+    ]
+    return '<div class="runstrip">' + "".join(rows) + "</div>"
+
+
+def _env_row(label: str, value: str, sub: str = "") -> str:
+    return (
+        '<div class="envrow"><span class="rfl">'
+        + esc(label, 60)
+        + '</span><span class="rfv">'
+        + value
+        + ("<small>" + esc(sub, 300) + "</small>" if sub else "")
+        + "</span></div>"
     )
-    row("Device", esc(_device_sub(book), 120))
+
+
+def _env_host_row() -> str:
     # platform_info has NO `host_os`, and `raw_platform()` returns sys.platform
     # ("darwin"), which is NOT a SUPPORT key -- its own docstring says it is for
     # REPORTING the host, never for branching. So the host is NAMED from
@@ -3454,17 +3635,11 @@ def _env_section(manifest: dict, loaded: dict | None = None) -> str:
         if platform_info.is_macos()
         else (platform_info.WINDOWS if platform_info.is_windows() else "")
     )
-    row(
+    return _env_row(
         "Host platform",
         esc(platform_info.raw_platform() or "(unknown)", 60),
         platform_info.support_statement(host),
     )
-    row(
-        "Rendered",
-        esc(_short_stamp(time.time()), 40),
-        "when this page was BUILT, which is not when the run happened",
-    )
-    return '<div class="runstrip">' + "".join(rows) + "</div>"
 
 
 #: The run's last known moment, DERIVED, and labelled as derived everywhere it is shown.
@@ -3923,33 +4098,7 @@ def _look_pic(
         ('<span class="picsub">' + esc(note, 80) + "</span>") if note else ""
     )
     if screen is not None and verdict == LOOK_EXACT:
-        filename = str(((_SHOTS.get() or {}).get("frames") or {}).get(ident) or "")
-        book = _IMAGES.get()
-        if filename and book is not None:
-            return (
-                head
-                + '<div class="picbox">'
-                + _img_html(
-                    "../" + run_store.SHOTS_DIR,
-                    filename,
-                    book["shots_dir"] / filename,
-                    caption + ": the screen as the device drew it",
-                    STEP_SIZES,
-                )
-                + _tap_overlay(target_id, screen)
-                + "</div><figcaption>"
-                + label
-                + "</figcaption></figure>"
-            )
-        return (
-            head
-            + '<div class="picdraw">'
-            + screen_phone.compose(screen, esc=esc, app=app)
-            + "</div><figcaption>"
-            + label
-            + " · drawn from the element list, no picture stored"
-            + "</figcaption></figure>"
-        )
+        return head + _exact_pic_body((ident, screen), caption, app, target_id, label)
     gap = AMBIGUOUS_LOOK if verdict == LOOK_AMBIGUOUS else NOT_CAPTURED
     return (
         head
@@ -3957,6 +4106,41 @@ def _look_pic(
         + esc(gap, 300)
         + "</p><figcaption>"
         + label
+        + "</figcaption></figure>"
+    )
+
+
+def _exact_pic_body(
+    look: tuple, caption: str, app: str, target_id: str, label: str
+) -> str:
+    """The stored picture with its tap overlay, else the drawing of the screen.
+
+    ``look`` is ``(ident, screen)`` as `_resolve_look` returned them.
+    """
+    ident, screen = look
+    filename = str(((_SHOTS.get() or {}).get("frames") or {}).get(ident) or "")
+    book = _IMAGES.get()
+    if filename and book is not None:
+        return (
+            '<div class="picbox">'
+            + _img_html(
+                "../" + run_store.SHOTS_DIR,
+                filename,
+                book["shots_dir"] / filename,
+                caption + ": the screen as the device drew it",
+                STEP_SIZES,
+            )
+            + _tap_overlay(target_id, screen)
+            + "</div><figcaption>"
+            + label
+            + "</figcaption></figure>"
+        )
+    return (
+        '<div class="picdraw">'
+        + screen_phone.compose(screen, esc=esc, app=app)
+        + "</div><figcaption>"
+        + label
+        + " · drawn from the element list, no picture stored"
         + "</figcaption></figure>"
     )
 
@@ -4122,6 +4306,47 @@ def _count(n: int, one: str, many: str = "") -> str:
     return str(int(n)) + " " + (one if int(n) == 1 else (many or one + "s"))
 
 
+def _turn_tech_rows(f: dict) -> str:
+    """The ``dt``/``dd`` pairs of a turn's technical detail; empty values drop."""
+    tech = [
+        ("Case", f["tc_id"]),
+        ("Status", f["status"] or "(none)"),
+        ("Why it ended", f["reason"]),
+    ]
+    return "".join(
+        "<dt>" + esc(k, 40) + '</dt><dd dir="auto">' + esc(v, 400) + "</dd>"
+        for k, v in tech
+        if v
+    )
+
+
+def _turn_extra(f: dict, loaded: dict | None) -> str:
+    """Crash, log, network and capture blocks that close a turn's detail."""
+    return (
+        _crash_block(f.get("crash"))
+        + (ev_render.turns_table(loaded, f["tc_id"]) if _app_logged(loaded) else "")
+        + ev_render.case_network(f.get("network"))
+        + ev_render.case_capture(f.get("capture"))
+    )
+
+
+def _turn_clips(f: dict, media_map: object) -> str:
+    """The recordings stored for a turn's case."""
+    return "".join(
+        _clip_html(rec)
+        for rec in ((media_map or {}).get("clips") or {}).get(_media_key(f["tc_id"]))
+        or []
+    )
+
+
+def _turn_meta(f: dict) -> str:
+    """``"3 steps · 1.2 s"``: the step count and, when known, the wall time."""
+    meta = [_count(len(f["rows"]), "step")]
+    if f["wall"] is not None:
+        meta.append(fmt_ms(f["wall"]))
+    return " · ".join(meta)
+
+
 def _turn_html(
     n: int,
     f: dict,
@@ -4132,36 +4357,14 @@ def _turn_html(
     loaded: dict | None,
 ) -> str:
     verdict = f["verdict"]
-    word = _unify_verdict(verdict)
-    pill = _result_pill(word) if verdict in DONE_VERDICTS else ""
-    rows = f["rows"]
+    pill = _result_pill(_unify_verdict(verdict)) if verdict in DONE_VERDICTS else ""
     steps = "".join(
-        _step_html(f["slug"], i, row, library, app) for i, row in enumerate(rows)
+        _step_html(f["slug"], i, row, library, app) for i, row in enumerate(f["rows"])
     )
-    clips = "".join(
-        _clip_html(rec)
-        for rec in ((media_map or {}).get("clips") or {}).get(_media_key(f["tc_id"]))
-        or []
-    )
-    meta = [_count(len(rows), "step")]
-    if f["wall"] is not None:
-        meta.append(fmt_ms(f["wall"]))
-    tech = [
-        ("Case", f["tc_id"]),
-        ("Status", f["status"] or "(none)"),
-        ("Why it ended", f["reason"]),
-    ]
-    tech_rows = "".join(
-        "<dt>" + esc(k, 40) + '</dt><dd dir="auto">' + esc(v, 400) + "</dd>"
-        for k, v in tech
-        if v
-    )
-    extra = (
-        _crash_block(f.get("crash"))
-        + (ev_render.turns_table(loaded, f["tc_id"]) if _app_logged(loaded) else "")
-        + ev_render.case_network(f.get("network"))
-        + ev_render.case_capture(f.get("capture"))
-    )
+    clips = _turn_clips(f, media_map)
+    meta = _turn_meta(f)
+    tech_rows = _turn_tech_rows(f)
+    extra = _turn_extra(f, loaded)
     return (
         '<article class="turn" id="turn-'
         + f["slug"]
@@ -4178,7 +4381,7 @@ def _turn_html(
         + "</h4>"
         + pill
         + '<span class="turnmeta">'
-        + esc(" · ".join(meta), 60)
+        + esc(meta, 60)
         + "</span></header>"
         + clips
         + (
@@ -4548,87 +4751,86 @@ def _about_html() -> str:
     )
 
 
-def _document_body(
-    *,
-    run_id: str,
-    manifest: dict,
-    cases: list,
-    screens: object,
-    lease: dict,
-    tally: dict,
-    observations: object = None,
-    partial: bool,
-    coverage: dict | None = None,
-) -> str:
-    # run_id is this branch's addition (the capture reader needs it to find the
-    # per-case flows); media_map is main's. Both are required: dropping either
-    # silently disables one lane's evidence.
-    facts = [_case_facts(case, manifest, run_id) for case in cases]
-    # The run's pixels, joined ONCE and handed to every section that shows one.
-    media_map = _media_map(cases)
-    # TWO libraries, joined once. ``screens`` answers which screens the run
-    # visited and stays the accessibility audit's input -- one row per screen,
-    # not one per look at it. ``library`` adds every stored OBSERVATION and is
-    # what a FRAME resolves against, so a four-turn conversation draws four
-    # pictures instead of one. Merged rather than passed as a pair because the
-    # keys do not collide IN PRACTICE: `perception._screen_id` emits twelve hex
-    # characters and an observation id is that id plus a dash and up to twelve
-    # more, so no screen id has the shape of an observation key.
-    #
-    # NOT an invariant the code enforces, and the comment used to claim it was.
-    # `run_store._RUN_ID_RE` accepts up to 64 characters of [A-Za-z0-9._-], so a
-    # STORED screen id of "aabbccdd0011-000000000000" is admissible and would
-    # collide, with the observation silently winning this `update`. Nothing
-    # produces such an id today; if something ever does, the fix is two
-    # dictionaries rather than a longer comment. Stated because an invariant
-    # asserted in prose and unenforced in code is how a reader stops checking.
-    library = _merged_library(screens, observations)
-    # Defaulted rather than required, so a caller that has not computed it still
-    # gets THE producer's answer and never a locally invented one.
-    coverage = (
-        coverage if isinstance(coverage, dict) else verdict_coverage(cases, manifest)
-    )
-    app = _app_label(manifest)
-    # The app's side of the run (plan P3): read ONCE, joined to the cases, and
-    # handed to every section. Never raises; a run without a capture, or a
-    # package without a profile, renders every evidence fragment as a stated gap.
-    loaded = ev_render.load_run_evidence(
+@dataclass(frozen=True)
+class _Run:
+    """What every section of one page is built from, read ONCE."""
+
+    run_id: str
+    manifest: dict
+    cases: list
+    facts: list
+    library: dict
+    loaded: dict | None
+    coverage: dict
+
+
+def _coverage_of(coverage: object, cases: list, manifest: dict) -> dict:
+    """Defaulted rather than required, so a caller that has not computed it still
+    gets THE producer's answer and never a locally invented one.
+    """
+    return coverage if isinstance(coverage, dict) else verdict_coverage(cases, manifest)
+
+
+def _load_evidence(run_id: str, manifest: dict, cases: list) -> dict | None:
+    """The app's side of the run (plan P3): read ONCE, joined to the cases, and
+    handed to every section. Never raises; a run without a capture, or a
+    package without a profile, renders every evidence fragment as a stated gap.
+    """
+    return ev_render.load_run_evidence(
         run_id, manifest, cases, ev_profiles.profile_for(manifest.get("package"))
     )
-    # A run is goals, turns and steps. An exploratory case is a TURN, drawn in
-    # the journey of the goal it drove at; every other case is a scripted case,
-    # drawn in the case list. One map says which, so no case is drawn twice.
-    #
-    # `findings` is built by `_logs_section` and only there: building it twice
-    # is how this page once emitted id="findings" twice -- see
-    # test_no_id_is_emitted_twice_on_the_rendered_page.
-    kinds = {
+
+
+def _split_cases(run: _Run) -> tuple:
+    """``(kinds, turns, scripted)``: the turn facts by ``tc_id`` and the rest."""
+    kinds = _case_kinds(run.cases, run.manifest)
+    facts_by_id = {f["tc_id"]: f for f in run.facts}
+    turns = {
+        tc: facts_by_id[tc]
+        for tc, kind in kinds.items()
+        if kind == "turn" and tc in facts_by_id
+    }
+    scripted = [f for f in run.facts if kinds.get(f["tc_id"]) != "turn"]
+    return kinds, turns, scripted
+
+
+def _case_kinds(cases: list, manifest: dict) -> dict:
+    """``tc_id`` -> ``"turn"`` or ``"case"``.
+
+    A run is goals, turns and steps. An exploratory case is a TURN, drawn in
+    the journey of the goal it drove at; every other case is a scripted case,
+    drawn in the case list. One map says which, so no case is drawn twice.
+
+    `findings` is built by `_logs_section` and only there: building it twice
+    is how this page once emitted id="findings" twice -- see
+    test_no_id_is_emitted_twice_on_the_rendered_page.
+    """
+    return {
         _text(c.get("tc_id"), 40): (
             "turn" if _case_type(c, manifest) == EXPLORATORY else "case"
         )
         for c in cases
         if isinstance(c, dict)
     }
-    facts_by_id = {f["tc_id"]: f for f in facts}
-    cases_by_id = {_media_key(c.get("tc_id")): c for c in cases if isinstance(c, dict)}
-    turns = {
-        tc: facts_by_id[tc]
-        for tc, kind in kinds.items()
-        if kind == "turn" and tc in facts_by_id
-    }
-    scripted = [f for f in facts if kinds.get(f["tc_id"]) != "turn"]
-    groups = _derive_goals(cases, manifest)
-    issues = _issues_html(facts, kinds)
-    journey = _journey_html(
-        groups, turns, cases_by_id, manifest, library, app, media_map, loaded
-    )
-    cases_body = (
-        _cases_html(scripted, library, app, loaded, coverage, observations, media_map)
-        if scripted
+
+
+def _evidence_html(loaded: dict | None) -> str:
+    """The app's own capture, summarised: its tiles, the session it came from,
+    and the trust checks -- including why nothing was read (the flag is off,
+    the load hit its byte cap). The old overview carried these.
+    """
+    tiles = "".join(ev_render.overview_tiles(loaded)) if loaded else ""
+    return (
+        (('<div class="kpis run">' + tiles + "</div>") if tiles else "")
+        + (ev_render.session_block(loaded) + ev_render.trust_block(loaded))
+        if loaded
         else ""
     )
-    a11y = _a11y_section(screens)
-    network = (
+
+
+def _network_html(facts: list, loaded: dict | None, cases: list, manifest: dict) -> str:
+    """The network, API and capture sections plus the perf block, when any apply."""
+    return (
         ev_render.apis_section(loaded)
         + ev_render.network_section(cases)
         + ev_render.capture_section(cases, manifest)
@@ -4636,28 +4838,26 @@ def _document_body(
         if _has_network(facts, loaded)
         else ""
     )
-    # The app's own capture, summarised: its tiles, the session it came from,
-    # and the trust checks -- including why nothing was read (the flag is off,
-    # the load hit its byte cap). The old overview carried these.
-    tiles = "".join(ev_render.overview_tiles(loaded)) if loaded else ""
-    evidence = (
-        (('<div class="kpis run">' + tiles + "</div>") if tiles else "")
-        + (ev_render.session_block(loaded) + ev_render.trust_block(loaded))
-        if loaded
-        else ""
-    )
-    # Built after the journey and the case list: every image note those
-    # pictures raised is in the book by now.
-    notes = "".join(
+
+
+def _image_notes_html() -> str:
+    """Every image note the pictures raised; build it after the journey and the
+    case list, so all of them are in the book by now.
+    """
+    return "".join(
         "<li>" + esc(note, 300) + "</li>"
         for note in list((_IMAGES.get() or {}).get("notes") or [])
     )
-    diagnostics = (
+
+
+def _diag_head(capture: str, notes: str, evidence: str, network: str) -> str:
+    """The first four diagnostics parts."""
+    return (
         _diag_part(
             "screen-capture",
             "Screen capture",
             "what the element reader kept and dropped",
-            _capture_table(library),
+            capture,
         )
         + _diag_part(
             "images",
@@ -4669,29 +4869,21 @@ def _document_body(
             "evidence", "App evidence", "what the app's own capture holds", evidence
         )
         + _diag_part("network", "Network", "the app's own calls", network)
-        + _diag_part(
-            "logs", "Logs and findings", "", _logs_section(manifest, facts, len(facts))
-        )
-        + _diag_part("diag-a11y", "Accessibility", "", a11y)
-        + _timings_part(manifest)
-        + _diag_part(
-            "env",
-            "Environment",
-            "what this run ran on",
-            _facts_strip(run_id, manifest, lease, partial, loaded, coverage)
-            + _env_section(manifest, loaded),
-        )
     )
-    parts = [
-        (ISSUES_ID, "Issues", "what failed or was blocked", issues),
-        (JOURNEY_ID, "Journey", "what the explorer did, turn by turn", journey),
-        (CASES_ID, "Scripted cases", "every planned case and how it ended", cases_body),
-        (DIAG_ID, "Diagnostics", "technical detail, collapsed", diagnostics),
-        (ABOUT_ID, "About this report", "how to read it", _about_html()),
-    ]
-    # The nav is built from what was emitted and only from it, so it can never
-    # offer a section this page does not have.
-    present = [part for part in parts if part[3]]
+
+
+def _diag_tail(logs: str, a11y: str, timings: str, env: str) -> str:
+    """The last diagnostics parts: logs, accessibility, timings, environment."""
+    return (
+        _diag_part("logs", "Logs and findings", "", logs)
+        + _diag_part("diag-a11y", "Accessibility", "", a11y)
+        + timings
+        + _diag_part("env", "Environment", "what this run ran on", env)
+    )
+
+
+def _nav_and_sections(present: list, run_id: str, n_cases: int) -> tuple:
+    """The nav links and the section markup of the parts that were emitted."""
     nav = "".join(
         '<a href="#' + sid + '" data-nav="' + sid + '">' + esc(title, 40) + "</a>"
         for sid, title, _label, _body in present
@@ -4704,45 +4896,38 @@ def _document_body(
         + '<div id="'
         + END_ID
         + '" data-cards="'
-        + str(len(cases))
+        + str(n_cases)
         + '"></div>'
     )
-    build = _build_label(manifest)
-    digest = hashlib.sha1(
+    return nav, sections
+
+
+def _source_digest(run_id: str, manifest: dict, n_cases: int) -> str:
+    """The short stamp that ties a page to the run it was built from."""
+    return hashlib.sha1(
         (
-            str(run_id)
-            + ":"
-            + str(manifest.get("created") or "")
-            + ":"
-            + str(len(cases))
+            str(run_id) + ":" + str(manifest.get("created") or "") + ":" + str(n_cases)
         ).encode("utf-8")
     ).hexdigest()[:12]
+
+
+def _title_html(app: str, build: str) -> str:
+    """The page title: the app name and, when known, its build."""
+    return (
+        '<span dir="auto">'
+        + esc(app, 80)
+        + "</span>"
+        + ((' <span class="build">' + esc(build, 40) + "</span>") if build else "")
+    )
+
+
+def _fill_page(make_slots: Callable[[], dict]) -> str:
+    """Fill the shell, prune its stylesheet to what the page uses, and wrap it.
+
+    The slots are built INSIDE the guard, so a slot that raises still releases.
+    """
     try:
-        body = _fill(
-            SHELL,
-            {
-                "DOC_TITLE": esc(app + " · mobile run " + str(run_id), 160),
-                "BRAND": "Mobile run",
-                "BRAND_SUB": "QA Agents",
-                "NAV": nav,
-                "EYEBROW": "Mobile run " + esc(run_id, 80),
-                "TITLE": '<span dir="auto">'
-                + esc(app, 80)
-                + "</span>"
-                + (
-                    (' <span class="build">' + esc(build, 40) + "</span>")
-                    if build
-                    else ""
-                ),
-                "META": _meta_html(manifest, cases, partial, coverage),
-                "RESULTS": _results_html(groups, scripted, tally, len(facts)),
-                "SECTIONS": sections,
-                "FOOTER_META": _footer_html(run_id, manifest),
-                "SOURCE_STAMP": esc(str(run_id) + ":" + digest, 80),
-                # Never used by this lane: nothing here is big enough to park.
-                "STORES": "",
-            },
-        )
+        body = _fill(SHELL, make_slots())
     finally:
         # The learned-value net stays armed only while the page is being built --
         # and not a moment longer when the build raises.
@@ -4759,6 +4944,126 @@ def _document_body(
     )
 
 
+def _diagnostics_html(run: _Run, screens: object, lease: dict, partial: bool) -> str:
+    """The collapsed diagnostics. Built after the journey and the case list, so
+    every image note those pictures raised is in the book by now.
+    """
+    a11y = _a11y_section(screens)
+    head = _diag_head(
+        _capture_table(run.library),
+        _image_notes_html(),
+        _evidence_html(run.loaded),
+        _network_html(run.facts, run.loaded, run.cases, run.manifest),
+    )
+    env = _facts_strip(
+        run.run_id, run.manifest, lease, partial, run.loaded, run.coverage
+    ) + _env_section(run.manifest, run.loaded)
+    return head + _diag_tail(
+        _logs_section(run.manifest, run.facts, len(run.facts)),
+        a11y,
+        _timings_part(run.manifest),
+        env,
+    )
+
+
+def _present_parts(
+    issues: str, journey: str, cases_body: str, diagnostics: str
+) -> list:
+    """The top-level parts that were emitted. The nav is built from these and
+    only from these, so it can never offer a section this page does not have.
+    """
+    parts = [
+        (ISSUES_ID, "Issues", "what failed or was blocked", issues),
+        (JOURNEY_ID, "Journey", "what the explorer did, turn by turn", journey),
+        (CASES_ID, "Scripted cases", "every planned case and how it ended", cases_body),
+        (DIAG_ID, "Diagnostics", "technical detail, collapsed", diagnostics),
+        (ABOUT_ID, "About this report", "how to read it", _about_html()),
+    ]
+    return [part for part in parts if part[3]]
+
+
+def _page_slots(run: _Run, app: str, present: list, partial: bool) -> dict:
+    """The shell slots but ``RESULTS``, which the caller owns."""
+    nav, sections = _nav_and_sections(present, run.run_id, len(run.cases))
+    build = _build_label(run.manifest)
+    digest = _source_digest(run.run_id, run.manifest, len(run.cases))
+    return {
+        "DOC_TITLE": esc(app + " · mobile run " + str(run.run_id), 160),
+        "BRAND": "Mobile run",
+        "BRAND_SUB": "QA Agents",
+        "NAV": nav,
+        "EYEBROW": "Mobile run " + esc(run.run_id, 80),
+        "TITLE": _title_html(app, build),
+        "META": _meta_html(run.manifest, run.cases, partial, run.coverage),
+        "SECTIONS": sections,
+        "FOOTER_META": _footer_html(run.run_id, run.manifest),
+        "SOURCE_STAMP": esc(str(run.run_id) + ":" + digest, 80),
+        # Never used by this lane: nothing here is big enough to park.
+        "STORES": "",
+    }
+
+
+# `_document_body` joins TWO libraries, once. ``screens`` answers which screens
+# the run visited and stays the accessibility audit's input -- one row per
+# screen, not one per look at it. ``library`` adds every stored OBSERVATION and
+# is what a FRAME resolves against, so a four-turn conversation draws four
+# pictures instead of one. Merged rather than passed as a pair because the
+# keys do not collide IN PRACTICE: `perception._screen_id` emits twelve hex
+# characters and an observation id is that id plus a dash and up to twelve
+# more, so no screen id has the shape of an observation key.
+#
+# NOT an invariant the code enforces, and the comment used to claim it was.
+# `run_store._RUN_ID_RE` accepts up to 64 characters of [A-Za-z0-9._-], so a
+# STORED screen id of "aabbccdd0011-000000000000" is admissible and would
+# collide, with the observation silently winning this `update`. Nothing
+# produces such an id today; if something ever does, the fix is two
+# dictionaries rather than a longer comment. Stated because an invariant
+# asserted in prose and unenforced in code is how a reader stops checking.
+#
+# run_id is this branch's addition (the capture reader needs it to find the
+# per-case flows); media_map is main's. Both are required: dropping either
+# silently disables one lane's evidence.
+def _document_body(
+    *,
+    run_id: str,
+    manifest: dict,
+    cases: list,
+    screens: object,
+    lease: dict,
+    tally: dict,
+    observations: object = None,
+    partial: bool,
+    coverage: dict | None = None,
+) -> str:
+    facts = [_case_facts(case, manifest, run_id) for case in cases]
+    media_map = _media_map(cases)
+    library = _merged_library(screens, observations)
+    coverage = _coverage_of(coverage, cases, manifest)
+    app = _app_label(manifest)
+    loaded = _load_evidence(run_id, manifest, cases)
+    run = _Run(run_id, manifest, cases, facts, library, loaded, coverage)
+    kinds, turns, scripted = _split_cases(run)
+    groups = _derive_goals(cases, manifest)
+    issues = _issues_html(facts, kinds)
+    cases_by_id = {_media_key(c.get("tc_id")): c for c in cases if isinstance(c, dict)}
+    journey = _journey_html(
+        groups, turns, cases_by_id, manifest, library, app, media_map, loaded
+    )
+    cases_body = (
+        _cases_html(scripted, library, app, loaded, coverage, observations, media_map)
+        if scripted
+        else ""
+    )
+    diagnostics = _diagnostics_html(run, screens, lease, partial)
+    present = _present_parts(issues, journey, cases_body, diagnostics)
+    return _fill_page(
+        lambda: {
+            **_page_slots(run, app, present, partial),
+            "RESULTS": _results_html(groups, scripted, tally, len(facts)),
+        }
+    )
+
+
 def _knowledge_html(run_id: str) -> str:
     """The per-app knowledge section, ``""`` when nothing was learned. Never raises."""
     try:
@@ -4769,7 +5074,9 @@ def _knowledge_html(run_id: str) -> str:
         )
         if not body:
             return ""
-        return _sechead(KNOWLEDGE_ID, "App knowledge", "what this run learned", "", body)
+        return _sechead(
+            KNOWLEDGE_ID, "App knowledge", "what this run learned", "", body
+        )
     except Exception:
         logger.exception("knowledge section failed")
         return ""
@@ -4844,6 +5151,56 @@ def _is_partial(manifest: dict, cases: list, tally: dict) -> bool:
     return bool(not cases or done < max(planned, len(cases)))
 
 
+def _render_run(run_id: str, manifest: dict) -> dict:
+    """Read the run's files, build the page, write it; the ``render`` result."""
+    cases = [
+        case
+        for case in (run_store.list_cases(run_id) or {}).get("content") or []
+        if isinstance(case, dict)
+    ]
+    screens = (run_store.list_screens(run_id) or {}).get("content") or {}
+    # The evidence library, read beside the dedup library and never
+    # instead of it: the audit wants one row per screen, a frame wants
+    # the look the step actually took.
+    observations = (run_store.list_observations(run_id) or {}).get("content") or {}
+    lease = (run_store.read_lease(run_id) or {}).get("content") or {}
+    lease = lease if isinstance(lease, dict) else {}
+    # NOT `tally = tally(cases)`: that binds `tally` as a local for the
+    # WHOLE function body, so the call on the right resolves to an unbound
+    # local and EVERY invocation raises UnboundLocalError -- which this
+    # function's own `except Exception` then reports as a handled error,
+    # so the module looks alive and returns nothing. Found by EXECUTING.
+    counts = tally(cases)
+    partial = _is_partial(manifest, cases, counts)
+    coverage = verdict_coverage(cases, manifest)
+    page = _document(
+        run_id=str(run_id),
+        manifest=manifest,
+        cases=cases,
+        screens=screens,
+        observations=observations,
+        lease=lease,
+        tally=counts,
+        partial=partial,
+        coverage=coverage,
+    )
+    target = report_path(str(run_id))
+    written = _write_page(target, page)
+    if written.get("error"):
+        return written
+    return {
+        "error": None,
+        "content": {
+            "path": str(target),
+            "partial": partial,
+            "verdict_coverage": coverage,
+            "cards": len(cases),
+            "totals": counts,
+            "bytes": len(page.encode("utf-8")),
+        },
+    }
+
+
 def render(run_id: str) -> dict:
     """Write ``runs/<run_id>/report/index.html`` and its ``media/`` beside it.
 
@@ -4871,52 +5228,7 @@ def render(run_id: str) -> dict:
                 ),
                 "content": None,
             }
-        cases = [
-            case
-            for case in (run_store.list_cases(run_id) or {}).get("content") or []
-            if isinstance(case, dict)
-        ]
-        screens = (run_store.list_screens(run_id) or {}).get("content") or {}
-        # The evidence library, read beside the dedup library and never
-        # instead of it: the audit wants one row per screen, a frame wants
-        # the look the step actually took.
-        observations = (run_store.list_observations(run_id) or {}).get("content") or {}
-        lease = (run_store.read_lease(run_id) or {}).get("content") or {}
-        lease = lease if isinstance(lease, dict) else {}
-        # NOT `tally = tally(cases)`: that binds `tally` as a local for the
-        # WHOLE function body, so the call on the right resolves to an unbound
-        # local and EVERY invocation raises UnboundLocalError -- which this
-        # function's own `except Exception` then reports as a handled error,
-        # so the module looks alive and returns nothing. Found by EXECUTING.
-        counts = tally(cases)
-        partial = _is_partial(manifest, cases, counts)
-        coverage = verdict_coverage(cases, manifest)
-        page = _document(
-            run_id=str(run_id),
-            manifest=manifest,
-            cases=cases,
-            screens=screens,
-            observations=observations,
-            lease=lease,
-            tally=counts,
-            partial=partial,
-            coverage=coverage,
-        )
-        target = report_path(str(run_id))
-        written = _write_page(target, page)
-        if written.get("error"):
-            return written
-        return {
-            "error": None,
-            "content": {
-                "path": str(target),
-                "partial": partial,
-                "verdict_coverage": coverage,
-                "cards": len(cases),
-                "totals": counts,
-                "bytes": len(page.encode("utf-8")),
-            },
-        }
+        return _render_run(run_id, manifest)
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.report.render failed")
         return {"error": str(exc), "content": None}

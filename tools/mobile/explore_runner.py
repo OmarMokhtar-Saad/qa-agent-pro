@@ -325,6 +325,24 @@ def _record_scope(body: dict, screen: dict) -> None:
         )
 
 
+def _committed_turn(body: dict) -> int:
+    """The highest COMMITTED turn number in *body*, with legacy fallbacks."""
+    # An ABSENT key is a state written before this ledger existed and is read
+    # as fully committed. A CORRUPT key falls back to the same place, never
+    # to 0: a live run at turn 7 restarted at TC-001 would have
+    # ``run_store.write_case`` overwrite the cards it already wrote. If
+    # ``turn`` is junk too this raises and ``next_turn``'s handler answers
+    # with an error -- the same answer ``stop_reason`` above already gives for
+    # that state, which is why there is no third fallback here.
+    committed = body.get("committed_turn")
+    if committed is None:
+        committed = body.get("turn")
+    try:
+        return int(committed or 0)
+    except (TypeError, ValueError, OverflowError):
+        return int(body.get("turn") or 0)
+
+
 def _allocate_turn(body: dict) -> None:
     """Commit the previous turn and hand out the PROVISIONAL next turn number."""
     # A turn number is consumed by a replay HAVING HAPPENED, not by a packet
@@ -364,23 +382,25 @@ def _allocate_turn(body: dict) -> None:
     # bumped value on the next build and drift one higher on every re-issue
     # of a legacy run's packet. Writing the same value again is idempotent;
     # not writing it is a numbering leak.
-    #
-    # An ABSENT key is a state written before this ledger existed and is read
-    # as fully committed. A CORRUPT key falls back to the same place, never
-    # to 0: a live run at turn 7 restarted at TC-001 would have
-    # ``run_store.write_case`` overwrite the cards it already wrote. If
-    # ``turn`` is junk too this raises and ``next_turn``'s handler answers
-    # with an error -- the same answer ``stop_reason`` above already gives for
-    # that state, which is why there is no third fallback here.
-    committed = body.get("committed_turn")
-    if committed is None:
-        committed = body.get("turn")
-    try:
-        committed = int(committed or 0)
-    except (TypeError, ValueError, OverflowError):
-        committed = int(body.get("turn") or 0)
+    committed = _committed_turn(body)
     body["committed_turn"] = committed
     body["turn"] = committed + 1
+
+
+def _turn_result(
+    status: str, body: dict, screen: dict | None, packet: object, left: dict
+) -> dict:
+    """The ``next_turn`` success envelope for *status*."""
+    return {
+        "error": None,
+        "content": {
+            "status": status,
+            "state": body,
+            "screen": screen,
+            "packet": packet,
+            "remaining": left,
+        },
+    }
 
 
 async def next_turn(
@@ -396,16 +416,7 @@ async def next_turn(
         stop = stop_reason(body, now=now)
         if stop:
             body["stop"] = stop
-            return {
-                "error": None,
-                "content": {
-                    "status": stop,
-                    "state": body,
-                    "screen": None,
-                    "packet": None,
-                    "remaining": remaining(body, now=now),
-                },
-            }
+            return _turn_result(stop, body, None, None, remaining(body, now=now))
 
         pruned = await _observe_screen(ctx)
         if pruned.get("error"):
@@ -424,16 +435,7 @@ async def next_turn(
         packet = mobile_run.build_explore_turn(
             body, screen, run_id=run_id, remaining=left
         )
-        return {
-            "error": None,
-            "content": {
-                "status": RUNNING,
-                "state": body,
-                "screen": screen,
-                "packet": packet,
-                "remaining": left,
-            },
-        }
+        return _turn_result(RUNNING, body, screen, packet, left)
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.explore_runner.next_turn failed")
         return {"error": str(exc), "content": None}
@@ -625,6 +627,28 @@ def _early_stop(body: dict, reply: dict, finding: str, notice: str) -> dict | No
     return None
 
 
+def _record_finding(body: dict, reply: dict) -> tuple[str, str]:
+    """Store the reply's finding in *body*; return ``(finding, notice)``.
+
+    ``notice`` is the no-finding nudge, empty when a finding was recorded.
+    """
+    finding = " ".join(str(reply.get("finding") or "").split())[:600]
+    if finding:
+        findings = list(body.get("findings") or [])
+        findings.append({"turn": int(body.get("turn") or 0), "note": finding})
+        body["findings"] = findings[:MAX_TURNS]
+        return finding, ""
+    # Disclosed, never refused -- see NO_FINDING_NOTICE. An extension
+    # verdict overwrites this later, on purpose: that one is about the
+    # budget, which matters more than a nudge.
+    notice = finding_nag.reminder(
+        int(body.get("turn") or 0),
+        int(body.get("turns_budget") or MAX_TURNS),
+        final=bool(reply.get("goal_reached")),
+    )
+    return finding, notice
+
+
 def apply_turn_result(state: object, raw: object, *, now: float | None = None) -> dict:
     """Fold a turn reply into the state: goal, a finding, or an extension.
 
@@ -635,22 +659,7 @@ def apply_turn_result(state: object, raw: object, *, now: float | None = None) -
     try:
         body = dict(state if isinstance(state, dict) else {})
         reply = raw if isinstance(raw, dict) else {}
-        notice = ""
-
-        finding = " ".join(str(reply.get("finding") or "").split())[:600]
-        if finding:
-            findings = list(body.get("findings") or [])
-            findings.append({"turn": int(body.get("turn") or 0), "note": finding})
-            body["findings"] = findings[:MAX_TURNS]
-        else:
-            # Disclosed, never refused -- see NO_FINDING_NOTICE. An extension
-            # verdict overwrites this below, on purpose: that one is about the
-            # budget, which matters more than a nudge.
-            notice = finding_nag.reminder(
-                int(body.get("turn") or 0),
-                int(body.get("turns_budget") or MAX_TURNS),
-                final=bool(reply.get("goal_reached")),
-            )
+        finding, notice = _record_finding(body, reply)
 
         # THE STEP IT IS ON NOW (fix round 3, item 1). The full goal goes to a
         # chat once per run; this short line rides every packet after it. A

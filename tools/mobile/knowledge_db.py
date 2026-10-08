@@ -167,7 +167,9 @@ def _finish(conn, owns: bool, ok: bool) -> None:
 
 def _refuse(conn, table: str, run_id: str, why: object, reason: str) -> None:
     try:
-        _event(conn, "refused", (table, None), (run_id, "%s (%s)" % (reason, why), None))
+        _event(
+            conn, "refused", (table, None), (run_id, "%s (%s)" % (reason, why), None)
+        )
         # A bulk import logs one refusal per row: keep only the newest.
         conn.execute(
             "DELETE FROM events WHERE id IN (SELECT id FROM events WHERE event = 'refused'"
@@ -189,7 +191,9 @@ def _row(table: str, cols: list, values: dict, run_id: str) -> dict:
         "runs_json": json.dumps([run_id] if run_id else []),
     }
     row = {k: v for k, v in defaults.items() if k in cols}
-    row.update({k: _dump(v) for k, v in values.items() if k in cols and k not in _NO_WRITE})
+    row.update(
+        {k: _dump(v) for k, v in values.items() if k in cols and k not in _NO_WRITE}
+    )
     return row
 
 
@@ -213,7 +217,8 @@ def _insert_row(conn, table: str, values: dict, run_id: str) -> tuple:
         return None, "cap: %s is full" % table
     names = list(row)
     cur = conn.execute(
-        "INSERT INTO %s (%s) VALUES (%s)" % (table, ", ".join(names), ", ".join("?" * len(names))),
+        "INSERT INTO %s (%s) VALUES (%s)"
+        % (table, ", ".join(names), ", ".join("?" * len(names))),
         [row[n] for n in names],
     )
     return cur.lastrowid, ""
@@ -261,7 +266,8 @@ def _open_row(conn, table: str, key: dict):
         return None
     where = " AND ".join("%s = ?" % k for k in key)
     return conn.execute(
-        "SELECT * FROM %s WHERE %s AND invalid_at IS NULL ORDER BY id DESC LIMIT 1" % (table, where),
+        "SELECT * FROM %s WHERE %s AND invalid_at IS NULL ORDER BY id DESC LIMIT 1"
+        % (table, where),
         [_dump(v) for v in key.values()],
     ).fetchone()
 
@@ -283,9 +289,12 @@ def upsert_counter(conn, table: str, key: dict, deltas: dict, **ctx):
         run_id = str(ctx.pop("run_id", "") or "")
         why = ctx.pop("why", "")
         cols = set(knowledge_schema.table_columns(conn, table))
-        deltas = {k: v for k, v in (deltas or {}).items() if k in cols and k not in _NO_WRITE}
+        deltas = {
+            k: v for k, v in (deltas or {}).items() if k in cols and k not in _NO_WRITE
+        }
         if table not in knowledge_schema.LEARNED_TABLES or not all(
-            isinstance(v, (int, float)) and not isinstance(v, bool) for v in deltas.values()
+            isinstance(v, (int, float)) and not isinstance(v, bool)
+            for v in deltas.values()
         ):
             _finish(conn, owns, True)
             return None
@@ -299,7 +308,10 @@ def upsert_counter(conn, table: str, key: dict, deltas: dict, **ctx):
             sets.append("runs_json = ?")
             args.append(_bump_runs(old["runs_json"], run_id))
         if sets:
-            conn.execute("UPDATE %s SET %s WHERE id = ?" % (table, ", ".join(sets)), args + [old["id"]])
+            conn.execute(
+                "UPDATE %s SET %s WHERE id = ?" % (table, ", ".join(sets)),
+                args + [old["id"]],
+            )
         _event(conn, "counter", (table, old["id"]), (run_id, why, before))
         _finish(conn, owns, True)
         return old["id"]
@@ -326,10 +338,14 @@ def supersede(conn, table: str, old_id: int, new_values: dict, **ctx):
         conn.execute("SAVEPOINT ak_supersede")
         now = time.time()
         conn.execute(
-            "UPDATE %s SET status = 'superseded', invalid_at = ? WHERE id = ?" % table, (now, old_id)
+            "UPDATE %s SET status = 'superseded', invalid_at = ? WHERE id = ?" % table,
+            (now, old_id),
         )
         new_id, reason = _insert_row(
-            conn, table, {**dict(new_values or {}), "supersedes": old_id, "valid_from": now}, run_id
+            conn,
+            table,
+            {**dict(new_values or {}), "supersedes": old_id, "valid_from": now},
+            run_id,
         )
         if new_id is None:
             conn.execute("ROLLBACK TO ak_supersede")
@@ -337,7 +353,13 @@ def supersede(conn, table: str, old_id: int, new_values: dict, **ctx):
             _refuse(conn, table, run_id, why, reason)
             _finish(conn, owns, True)
             return None
-        before = {"old": {"id": old_id, "status": old["status"], "invalid_at": old["invalid_at"]}}
+        before = {
+            "old": {
+                "id": old_id,
+                "status": old["status"],
+                "invalid_at": old["invalid_at"],
+            }
+        }
         _event(conn, "supersede", (table, new_id), (run_id, why, before))
         conn.execute("RELEASE ak_supersede")
         _finish(conn, owns, True)
@@ -357,13 +379,19 @@ def set_status(conn, table: str, row_id: int, status: str, **cols) -> bool:
         if status not in STATUSES or table not in knowledge_schema.LEARNED_TABLES:
             return False
         have = set(knowledge_schema.table_columns(conn, table))
-        extra = {k: _dump(v) for k, v in cols.items() if k in have and k not in _NO_WRITE | {"status"}}
+        extra = {
+            k: _dump(v)
+            for k, v in cols.items()
+            if k in have and k not in _NO_WRITE | {"status"}
+        }
         reason = _secret(extra, run_id)
         if reason:
             _refuse(conn, table, run_id, why, "secret " + reason)
             _finish(conn, owns, True)
             return False
-        old = conn.execute("SELECT * FROM %s WHERE id = ?" % table, (row_id,)).fetchone()
+        old = conn.execute(
+            "SELECT * FROM %s WHERE id = ?" % table, (row_id,)
+        ).fetchone()
         if old is None:
             return False
         new = {"status": status, **extra}
@@ -371,7 +399,10 @@ def set_status(conn, table: str, row_id: int, status: str, **cols) -> bool:
             new["invalid_at"] = time.time()
         before = {c: old[c] for c in new}
         sets = ", ".join("%s = ?" % c for c in new)
-        conn.execute("UPDATE %s SET %s WHERE id = ?" % (table, sets), list(new.values()) + [row_id])
+        conn.execute(
+            "UPDATE %s SET %s WHERE id = ?" % (table, sets),
+            list(new.values()) + [row_id],
+        )
         _event(conn, "status", (table, row_id), (run_id, why, before))
         _finish(conn, owns, True)
         return True
@@ -381,7 +412,9 @@ def set_status(conn, table: str, row_id: int, status: str, **cols) -> bool:
         return False
 
 
-def rows(conn, table: str, where: str = "", args: object = (), limit: int = 100) -> list:
+def rows(
+    conn, table: str, where: str = "", args: object = (), limit: int = 100
+) -> list:
     """Rows of *table* as dicts, newest first. *where* is a constant SQL fragment
     with ``?`` placeholders (never caller text); *args* are bound. Bounded."""
     try:
@@ -406,9 +439,7 @@ def rows(conn, table: str, where: str = "", args: object = (), limit: int = 100)
 
 _ROWS_CLOSED = "status IN ('superseded', 'retired')"
 #: Runs the learner is done with: learned, skipped, or failed with no tries left.
-_RUNS_CLOSED = (
-    "learn_state IN ('learned', 'skipped') OR (learn_state = 'failed' AND learn_tries >= 3)"
-)
+_RUNS_CLOSED = "learn_state IN ('learned', 'skipped') OR (learn_state = 'failed' AND learn_tries >= 3)"
 
 
 def _drop_closed(conn, table: str, rule: tuple, cutoff: float) -> int:
@@ -467,7 +498,9 @@ def compact(conn, table: str) -> int:
     owns = _owns(conn)
     try:
         cutoff = time.time() - knowledge_limits.RETENTION_DAYS * 86400
-        conn.execute("DELETE FROM events WHERE table_name = ? AND ts < ?", (table, cutoff))
+        conn.execute(
+            "DELETE FROM events WHERE table_name = ? AND ts < ?", (table, cutoff)
+        )
         if table == "notes" or table not in knowledge_limits.MAX_ROWS:
             _finish(conn, owns, True)
             return 0

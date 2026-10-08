@@ -38,7 +38,9 @@ def _package(run_id: str) -> str:
     from tools.mobile import run_store
 
     manifest = (run_store.read_manifest(run_id) or {}).get("content")
-    return str((manifest or {}).get("package") or "") if isinstance(manifest, dict) else ""
+    return (
+        str((manifest or {}).get("package") or "") if isinstance(manifest, dict) else ""
+    )
 
 
 def _summary(package: str, run_id: str) -> dict:
@@ -80,11 +82,11 @@ def knowledge_section(run_id: object) -> dict:
                 module = importlib.import_module("tools.mobile." + name)
                 key = _PROVIDER_KEY[name]
                 items = [_item(i) for i in module.build(package, rid, summary) or []]
-                section[key] = [i for i in items if i][:limits.LIST_PAGE_ROWS]
+                section[key] = [i for i in items if i][: limits.LIST_PAGE_ROWS]
                 guards = getattr(module, "guards", None)
                 if guards:
                     got = [_item(i) for i in guards(rid) or []]
-                    section["guards"] = [i for i in got if i][:limits.LIST_PAGE_ROWS]
+                    section["guards"] = [i for i in got if i][: limits.LIST_PAGE_ROWS]
             except Exception:
                 logger.exception("report provider %s failed", name)
         try:
@@ -93,7 +95,9 @@ def knowledge_section(run_id: object) -> dict:
             pass
         skipped = summary.get("skipped")
         if isinstance(skipped, list):
-            section["skipped"] = [str(s)[:_TEXT] for s in skipped[:limits.LIST_PAGE_ROWS]]
+            section["skipped"] = [
+                str(s)[:_TEXT] for s in skipped[: limits.LIST_PAGE_ROWS]
+            ]
     except Exception:
         logger.exception("knowledge_section failed")
         return _empty()
@@ -111,7 +115,13 @@ def _list(heading: str, items: list, esc) -> str:
         if item.get("action_hint"):
             line += " (" + esc(item["action_hint"], _TEXT) + ")"
         rows.append("<li>" + line + "</li>")
-    return '<p class="elab">' + esc(heading, 60) + '</p><ul class="plain">' + "".join(rows) + "</ul>"
+    return (
+        '<p class="elab">'
+        + esc(heading, 60)
+        + '</p><ul class="plain">'
+        + "".join(rows)
+        + "</ul>"
+    )
 
 
 def render_section(section: object) -> str:
@@ -131,7 +141,11 @@ def render_section(section: object) -> str:
         except (TypeError, ValueError, OverflowError):
             recheck = 0
         if recheck > 0:
-            parts.append('<p class="elab">' + esc("%d note(s) need a re-check" % recheck, 80) + "</p>")
+            parts.append(
+                '<p class="elab">'
+                + esc("%d note(s) need a re-check" % recheck, 80)
+                + "</p>"
+            )
         inner = "".join(p for p in parts if p)
         return '<div class="card">' + inner + "</div>" if inner else ""
     except Exception:

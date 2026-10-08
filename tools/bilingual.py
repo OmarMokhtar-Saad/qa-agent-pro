@@ -218,30 +218,38 @@ def _pair_from_cells(cells: list[str]) -> tuple[str, str, str] | None:
     """(key, en, ar) from a table row, or None when the row is not a pair row."""
     if len(cells) < 2 or all(_SEP_CELL_RE.match(c) for c in cells):
         return None
-    key = ""
-    key_idx = -1
+    key, key_idx = _find_key_cell(cells)
+    ar_idx = next(
+        (i for i, c in enumerate(cells) if i != key_idx and _AR_CHAR_RE.search(c)),
+        -1,
+    )
+    if ar_idx < 0:
+        return None
+    en_idx = _find_en_cell(cells, (key_idx, ar_idx))
+    if en_idx < 0:
+        return None
+    return key, _clean_value(cells[en_idx]), _clean_value(cells[ar_idx])
+
+
+def _find_key_cell(cells: list[str]) -> tuple[str, int]:
+    """(normalized key, cell index) of the first cell holding a key; ("", -1) if none."""
     for i, cell in enumerate(cells):
         m = _KEY_RE.search(cell)
         if m:
-            key, key_idx = normalize_key(m.group(1)), i
-            break
-    ar_idx = -1
-    for i, cell in enumerate(cells):
-        if i != key_idx and _AR_CHAR_RE.search(cell):
-            ar_idx = i
-            break
-    if ar_idx < 0:
-        return None
+            return normalize_key(m.group(1)), i
+    return "", -1
+
+
+def _find_en_cell(cells: list[str], skip: tuple[int, int]) -> int:
+    """Index of the cell with the most Latin letters outside ``skip``; -1 if none."""
     en_idx, best = -1, 0
     for i, cell in enumerate(cells):
-        if i in (key_idx, ar_idx):
+        if i in skip:
             continue
         n = len(_LATIN_RE.findall(cell))
         if n > best:
             best, en_idx = n, i
-    if en_idx < 0:
-        return None
-    return key, _clean_value(cells[en_idx]), _clean_value(cells[ar_idx])
+    return en_idx
 
 
 def _pair_from_line(line: str) -> tuple[str, str, str] | None:
@@ -826,55 +834,58 @@ def bilingual_warning_section(pairs: list[LanguagePair], report: dict) -> str:
             "validation_ case in this suite is the MANUAL half and must be executed "
             "by an Arabic speaker.",
         ]
-        flagged = False
-        missing = report.get("missing_keys") or []
-        if missing:
-            flagged = True
-            lines.append(
-                "- **No test case covers these keys:** "
-                + ", ".join(missing[:20])
-                + (" ..." if len(missing) > 20 else "")
-            )
-        partial = report.get("partial_keys") or []
-        if partial:
-            flagged = True
-            lines.append(
-                "- **Only ONE language was quoted (the pair is incomplete):** "
-                + ", ".join(partial[:20])
-            )
-        split = report.get("split_keys") or []
-        if split:
-            flagged = True
-            lines.append(
-                "- **EN and AR landed in DIFFERENT test cases (should be one case, "
-                "two steps):** " + ", ".join(split[:20])
-            )
-        baked = report.get("baked_keys") or []
-        if baked:
-            flagged = True
-            lines.append(
-                "- **The model typed the string itself instead of using the "
-                "placeholder - re-check it character by character against the "
-                "ticket:** " + ", ".join(baked[:20])
-            )
-        unresolved = report.get("unresolved") or []
-        if unresolved:
-            flagged = True
-            lines.append(
-                "- **Placeholders referenced a key the ticket does not document:** "
-                + ", ".join(unresolved[:20])
-            )
-        residual = report.get("residual_tokens") or []
-        if residual:
-            flagged = True
-            lines.append(
-                "- **Unresolved placeholder tokens were neutralised in these cases - "
-                "they now read the 'not documented' text instead of a message:** "
-                + ", ".join(residual[:20])
-            )
-        if not flagged:
+        findings = _warning_findings(report)
+        lines.extend(findings)
+        if not findings:
             lines.append("- All documented pairs are covered in a single case each.")
         return "\n".join(lines)
     except Exception:
         logger.exception("bilingual_warning_section failed - returning ''")
         return ""
+
+
+# (report key, bullet text, True when the list gets a " ..." overflow marker)
+_WARNING_SPECS: tuple[tuple[str, str, bool], ...] = (
+    ("missing_keys", "- **No test case covers these keys:** ", True),
+    (
+        "partial_keys",
+        "- **Only ONE language was quoted (the pair is incomplete):** ",
+        False,
+    ),
+    (
+        "split_keys",
+        "- **EN and AR landed in DIFFERENT test cases (should be one case, "
+        "two steps):** ",
+        False,
+    ),
+    (
+        "baked_keys",
+        "- **The model typed the string itself instead of using the "
+        "placeholder - re-check it character by character against the "
+        "ticket:** ",
+        False,
+    ),
+    (
+        "unresolved",
+        "- **Placeholders referenced a key the ticket does not document:** ",
+        False,
+    ),
+    (
+        "residual_tokens",
+        "- **Unresolved placeholder tokens were neutralised in these cases - "
+        "they now read the 'not documented' text instead of a message:** ",
+        False,
+    ),
+)
+
+
+def _warning_findings(report: dict) -> list[str]:
+    """One bullet per non-empty problem list in the coverage report."""
+    findings: list[str] = []
+    for report_key, text, marks_overflow in _WARNING_SPECS:
+        keys = report.get(report_key) or []
+        if not keys:
+            continue
+        overflow = " ..." if marks_overflow and len(keys) > 20 else ""
+        findings.append(text + ", ".join(keys[:20]) + overflow)
+    return findings

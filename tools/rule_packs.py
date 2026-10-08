@@ -192,23 +192,7 @@ def build_rule_packs(
     try:
         blob = "\n".join(t for t in (jira_text or "", feature_text or "") if t)
         if result.bilingual_on:
-            result.pairs = extract_language_pairs(blob)
-            for pair, text in zip(
-                result.pairs, bilingual_checklist_lines(result.pairs)
-            ):
-                result.lines.append(
-                    RulePackLine(
-                        line_id=f"RP-I18N-{pair.key}",
-                        text=text,
-                        origin="bilingual",
-                        subsystem="i18n",
-                        ears_pattern=_EARS_EVENT,
-                        source=_SOURCE_DOCUMENTED,
-                    )
-                )
-            logger.info(
-                "bilingual rule pack: %d EN/AR pair(s) documented", len(result.pairs)
-            )
+            _run_bilingual_pack(result, blob)
         if result.standing_on:
             result.triggers = detect_triggers(
                 feature_text=feature_text,
@@ -217,30 +201,50 @@ def build_rule_packs(
                 openapi_text=openapi_text,
                 images_present=images_present,
             )
-            for line_id, text, subsystem in standing_checklist_lines(result.triggers):
-                result.lines.append(
-                    RulePackLine(
-                        line_id=f"RP-{line_id}",
-                        text=text,
-                        origin=(
-                            "standing_api" if subsystem == "backend" else "standing_ui"
-                        ),
-                        subsystem=subsystem,
-                        ears_pattern=_EARS_UBIQUITOUS,
-                        source=_SOURCE_IMPLIED,
-                    )
-                )
-            logger.info(
-                "standing rule pack: api=%s (weak_only=%s) ui=%s spec=%s lines=%d",
-                result.triggers.api,
-                result.triggers.api_weak_only,
-                result.triggers.ui,
-                result.triggers.has_spec,
-                len(result.lines),
-            )
+            _add_standing_lines(result)
     except Exception:
         logger.exception("build_rule_packs failed - rule packs are inert this run")
     return result
+
+
+def _run_bilingual_pack(result: RulePackResult, blob: str) -> None:
+    """Extract the EN/AR pairs from ``blob`` and add their mandated lines."""
+    result.pairs = extract_language_pairs(blob)
+    for pair, text in zip(result.pairs, bilingual_checklist_lines(result.pairs)):
+        result.lines.append(
+            RulePackLine(
+                line_id=f"RP-I18N-{pair.key}",
+                text=text,
+                origin="bilingual",
+                subsystem="i18n",
+                ears_pattern=_EARS_EVENT,
+                source=_SOURCE_DOCUMENTED,
+            )
+        )
+    logger.info("bilingual rule pack: %d EN/AR pair(s) documented", len(result.pairs))
+
+
+def _add_standing_lines(result: RulePackResult) -> None:
+    """Add the standing API/UI lines for ``result.triggers``."""
+    for line_id, text, subsystem in standing_checklist_lines(result.triggers):
+        result.lines.append(
+            RulePackLine(
+                line_id=f"RP-{line_id}",
+                text=text,
+                origin="standing_api" if subsystem == "backend" else "standing_ui",
+                subsystem=subsystem,
+                ears_pattern=_EARS_UBIQUITOUS,
+                source=_SOURCE_IMPLIED,
+            )
+        )
+    logger.info(
+        "standing rule pack: api=%s (weak_only=%s) ui=%s spec=%s lines=%d",
+        result.triggers.api,
+        result.triggers.api_weak_only,
+        result.triggers.ui,
+        result.triggers.has_spec,
+        len(result.lines),
+    )
 
 
 # --- Batch 2 composition ------------------------------------------------------

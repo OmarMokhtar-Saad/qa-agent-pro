@@ -207,7 +207,10 @@ def learn_run(package: str, run_id: str) -> dict:
         conn = knowledge_db.open_rw(package)
         if conn is None:
             return {"state": "failed", "error": "no knowledge store"}
-        conn.execute("INSERT OR IGNORE INTO runs (run_id, started) VALUES (?, ?)", (run_id, time.time()))
+        conn.execute(
+            "INSERT OR IGNORE INTO runs (run_id, started) VALUES (?, ?)",
+            (run_id, time.time()),
+        )
         conn.commit()
         row = _run_row(conn, run_id)
         if row.get("learn_state") in ("learned", "skipped"):

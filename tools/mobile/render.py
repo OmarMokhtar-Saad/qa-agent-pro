@@ -181,6 +181,20 @@ def source_for_label(label: str) -> str:
     return ""
 
 
+def _unmatched_head(text: str) -> str:
+    """The first sentence of the unmatched-source note: number or other answer."""
+    if text.isdigit():
+        return (
+            "> **That reply was a number, and a number no longer selects an "
+            "option.** Your question UI may relabel and reorder the list, so a "
+            "position named whichever lane happened to be shown there."
+        )
+    return (
+        "> **That reply was not one of the option keys.** An option is "
+        "identified by the key printed beside it, and nothing else."
+    )
+
+
 def _unmatched_source_note(answer: object) -> str:
     """The explanation for a ``source`` that matched no option key. Never raises.
 
@@ -218,19 +232,9 @@ def _unmatched_source_note(answer: object) -> str:
         return ""
     if not text:
         return ""
-    if text.isdigit():
-        head = (
-            "> **That reply was a number, and a number no longer selects an "
-            "option.** Your question UI may relabel and reorder the list, so a "
-            "position named whichever lane happened to be shown there."
-        )
-    else:
-        head = (
-            "> **That reply was not one of the option keys.** An option is "
-            "identified by the key printed beside it, and nothing else."
-        )
     return (
-        head + " Nothing was started. Ask the user again and send `source` set to "
+        _unmatched_head(text)
+        + " Nothing was started. Ask the user again and send `source` set to "
         "the KEY of the option they choose, exactly as printed below.\n\n"
     )
 
@@ -1383,29 +1387,9 @@ def device_busy_block(refusal: object) -> str:
     the most contended step has already run. A tester with two devices is
     serialised across both; that is a known cost, not a bug.
     """
-    from tools.mobile import run_store
-
     body = refusal if isinstance(refusal, dict) else {}
-    who = str(body.get("holder") or "").strip()
+    who = _holder_label(body)
     same = bool(body.get("same_process"))
-    # `holder` IS AN OWNER LABEL, NEVER PROSE. A caller once passed a refusal
-    # REASON here ("held by mrun-...") and this block dutifully told the tester
-    # to call `qa_mobile_test` with `run_id="held by mrun-..."` -- an
-    # instruction that cannot work. Rather than trusting every present and
-    # future call site to pass the right thing, the takeover branch is entered
-    # only for a label that IS a run id; anything else falls to the generic
-    # line, which asks for nothing the tester cannot do.
-    if (
-        who
-        and not who.startswith("provisioning:")
-        and not run_store.looks_like_a_run_id(who)
-    ):
-        # THE GRAMMAR, not `valid_run_id`. That one asks whether a string is
-        # safe as a path segment and says yes to every single-token status
-        # string in this lane -- `handoff_failed`, `already_held`, `not_held` --
-        # so it would have let one of them through as something a tester was
-        # told to pass back. Two different questions, two predicates.
-        who = ""
     if str(body.get("reason") or "") == "no_lock_facility":
         return (
             "## The mobile lane cannot guarantee one run at a time here\n\n"
@@ -1415,32 +1399,78 @@ def device_busy_block(refusal: object) -> str:
             "happen as recorded. Refusing is the safe answer; nothing was "
             "started."
         )
-    # THE HOLDER'S OWN STATE, asked once, of the producer that answers the
-    # tester's `qa_mobile_status`. Only meaningful for a label that IS a run id,
-    # which the sanitisation above has already established.
-    finished = False
-    if who and not who.startswith("provisioning:"):
-        try:
-            from tools.mobile import session
+    lines = [
+        "## Another run is using the device\n",
+        _holder_paragraph(who, same, _holder_finished(who)),
+        _ONE_LOCK_NOTE,
+    ]
+    return "\n".join(lines)
 
-            resolved = session.resolve(who)
-            if not resolved.get("error"):
-                state = str((resolved.get("content") or {}).get("state") or "")
-                finished = state == session.STATE_REPORT
-        except Exception:  # pragma: no cover - a refusal may not fail to render
-            finished = False
 
-    lines = ["## Another run is using the device\n"]
+def _holder_label(body: dict) -> str:
+    """The refusal's ``holder`` if it is a run id or a provisioning label, else ``""``."""
+    from tools.mobile import run_store
+
+    who = str(body.get("holder") or "").strip()
+    # `holder` IS AN OWNER LABEL, NEVER PROSE. A caller once passed a refusal
+    # REASON here ("held by mrun-...") and this block dutifully told the tester
+    # to call `qa_mobile_test` with `run_id="held by mrun-..."` -- an
+    # instruction that cannot work. Rather than trusting every present and
+    # future call site to pass the right thing, the takeover branch is entered
+    # only for a label that IS a run id; anything else falls to the generic
+    # line, which asks for nothing the tester cannot do.
+    # THE GRAMMAR, not `valid_run_id`. That one asks whether a string is safe as
+    # a path segment and says yes to every single-token status string in this
+    # lane -- `handoff_failed`, `already_held`, `not_held` -- so it would have
+    # let one of them through as something a tester was told to pass back.
+    if (
+        who
+        and not who.startswith("provisioning:")
+        and not run_store.looks_like_a_run_id(who)
+    ):
+        return ""
+    return who
+
+
+def _holder_finished(who: str) -> bool:
+    """Whether the holder run has reached its report. Never raises.
+
+    THE HOLDER'S OWN STATE, asked once, of the producer that answers the
+    tester's `qa_mobile_status`. Only meaningful for a label that IS a run id.
+    """
+    if not who or who.startswith("provisioning:"):
+        return False
+    try:
+        from tools.mobile import session
+
+        resolved = session.resolve(who)
+        if resolved.get("error"):
+            return False
+        state = str((resolved.get("content") or {}).get("state") or "")
+        return state == session.STATE_REPORT
+    except Exception:  # pragma: no cover - a refusal may not fail to render
+        return False
+
+
+_ONE_LOCK_NOTE = (
+    "\nOne lock covers the whole lane, not one per device: the device is "
+    "chosen and booted before any serial exists, so there is nothing to key "
+    "a per-device lock on at the moment it matters most."
+)
+
+
+def _holder_paragraph(who: str, same: bool, finished: bool) -> str:
+    """The paragraph that says who holds the device and what the tester can do."""
     if who.startswith("provisioning:"):
-        lines.append(
+        return (
             "A run is being set up on this device right now"
             + (" in this same server" if same else " by another chat")
             + " — the device is being picked, booted or the app installed. "
             "That step finishes within the call that started it, so call "
             "`qa_mobile_test` again in a moment."
         )
-    elif who and finished:
-        lines.append(
+    if who and finished:
+        return (
             "Run `" + who + "` still holds it, but that run has FINISHED — "
             "nothing is driving it. It cannot be taken over, because there is "
             "nothing left to continue; the chat that ran it hands the device "
@@ -1450,8 +1480,8 @@ def device_busy_block(refusal: object) -> str:
             "2. **See what it did** — `qa_mobile_status` with "
             '`run_id="' + who + '"`, and `report_now=true` for its HTML report.'
         )
-    elif who:
-        lines.append(
+    if who:
+        return (
             "Run `" + who + "` holds it. Two options, and nothing here will "
             "break its hold:\n\n"
             "1. **Take that run over** — call `qa_mobile_test` with "
@@ -1461,15 +1491,8 @@ def device_busy_block(refusal: object) -> str:
             "2. **Wait for it to finish** — `qa_mobile_status` with that run id "
             "shows where it is."
         )
-    else:
-        lines.append(
-            "Another process on this machine holds it. `qa_mobile_status` lists "
-            "the runs this install knows about; taking one over with "
-            "`qa_mobile_test run_id=...` is what releases the device."
-        )
-    lines.append(
-        "\nOne lock covers the whole lane, not one per device: the device is "
-        "chosen and booted before any serial exists, so there is nothing to key "
-        "a per-device lock on at the moment it matters most."
+    return (
+        "Another process on this machine holds it. `qa_mobile_status` lists "
+        "the runs this install knows about; taking one over with "
+        "`qa_mobile_test run_id=...` is what releases the device."
     )
-    return "\n".join(lines)

@@ -244,6 +244,64 @@ def _append_privileges_row(rows: list) -> None:
         rows.append(Row("host_privileges", "undetermined", str(exc)))
 
 
+def _mobile_sdk_row(located: dict) -> Row:
+    root = str(located.get("sdk_root") or "")
+    missing = list(located.get("missing") or [])
+    return Row(
+        "mobile_sdk",
+        "ok" if root and not missing else ("warn" if root else "fail"),
+        ("Android SDK at " + root if root else "No Android SDK found.")
+        + (" Missing: " + ", ".join(missing) if missing else ""),
+        ""
+        if root and not missing
+        else "Android Studio's SDK Manager installs these; the desktop "
+        "wizard never writes into the SDK itself.",
+        tool_path=root,
+    )
+
+
+def _adb_row(located: dict, resolved_adb: str) -> Row:
+    adb_path = str((located.get("tools") or {}).get("adb") or "")
+    return Row(
+        "adb",
+        "ok" if adb_path else "fail",
+        "adb at " + resolved_adb if adb_path else "No adb in the located SDK.",
+        ""
+        if adb_path
+        else "Install Platform-Tools from Android Studio's SDK Manager; "
+        "neither this server nor a desktop client installs it.",
+        tool_path=resolved_adb,
+    )
+
+
+def _sdk_tool_row(tool: str, located: dict) -> Row:
+    tool_path = str((located.get("tools") or {}).get(tool) or "")
+    return Row(
+        "sdk_tool:" + tool,
+        "ok" if tool_path else "fail",
+        tool + " at " + tool_path
+        if tool_path
+        else "No " + tool + " in the located SDK.",
+        ""
+        if tool_path
+        else "Install it from Android Studio's SDK Manager; neither "
+        "this server nor a desktop client writes into the SDK.",
+        tool_path=tool_path,
+    )
+
+
+def _append_mobile_sdk_off_rows(rows: list) -> None:
+    detail = "The mobile modules are not present in this edition."
+    rows.append(Row("mobile_sdk", "off", detail))
+    rows.append(Row("adb", "off", detail))
+    # The SAME component set as the located branch. A consumer that saw these
+    # rows on one machine and nothing on another could not tell an edition
+    # without the mobile modules from a backend too old to report them, and
+    # would round the second one to "not installed".
+    for tool in SDK_TOOL_ROWS:
+        rows.append(Row("sdk_tool:" + tool, "off", detail))
+
+
 def _append_mobile_sdk_rows(rows: list) -> None:
     """Append the ``mobile_sdk``, ``adb`` and ``sdk_tool:*`` rows."""
     try:
@@ -251,81 +309,15 @@ def _append_mobile_sdk_rows(rows: list) -> None:
         from tools.mobile import sdk_locator
 
         located = (sdk_locator.locate_sdk() or {}).get("content") or {}
-        root = str(located.get("sdk_root") or "")
-        missing = list(located.get("missing") or [])
-        rows.append(
-            Row(
-                "mobile_sdk",
-                "ok" if root and not missing else ("warn" if root else "fail"),
-                ("Android SDK at " + root if root else "No Android SDK found.")
-                + (" Missing: " + ", ".join(missing) if missing else ""),
-                ""
-                if root and not missing
-                else "Android Studio's SDK Manager installs these; the desktop "
-                "wizard never writes into the SDK itself.",
-                tool_path=root,
-            )
-        )
-        adb_path = str((located.get("tools") or {}).get("adb") or "")
+        rows.append(_mobile_sdk_row(located))
         # The one shared resolver the mobile lane itself calls (tools.mobile.
         # adb.resolve_adb / device_manager._adb_binary), so the doctor can
         # never diverge from what a run actually drives -- audit item 6.
-        resolved_adb = mobile_adb.resolve_adb()
-        rows.append(
-            Row(
-                "adb",
-                "ok" if adb_path else "fail",
-                "adb at " + resolved_adb if adb_path else "No adb in the located SDK.",
-                ""
-                if adb_path
-                else "Install Platform-Tools from Android Studio's SDK Manager; "
-                "neither this server nor a desktop client installs it.",
-                tool_path=resolved_adb,
-            )
-        )
+        rows.append(_adb_row(located, mobile_adb.resolve_adb()))
         for tool in SDK_TOOL_ROWS:
-            tool_path = str((located.get("tools") or {}).get(tool) or "")
-            rows.append(
-                Row(
-                    "sdk_tool:" + tool,
-                    "ok" if tool_path else "fail",
-                    tool + " at " + tool_path
-                    if tool_path
-                    else "No " + tool + " in the located SDK.",
-                    ""
-                    if tool_path
-                    else "Install it from Android Studio's SDK Manager; neither "
-                    "this server nor a desktop client writes into the SDK.",
-                    tool_path=tool_path,
-                )
-            )
+            rows.append(_sdk_tool_row(tool, located))
     except Exception:
-        rows.append(
-            Row(
-                "mobile_sdk",
-                "off",
-                "The mobile modules are not present in this edition.",
-            )
-        )
-        rows.append(
-            Row(
-                "adb",
-                "off",
-                "The mobile modules are not present in this edition.",
-            )
-        )
-        # The SAME component set as the branch above. A consumer that saw these
-        # rows on one machine and nothing on another could not tell an edition
-        # without the mobile modules from a backend too old to report them, and
-        # would round the second one to "not installed".
-        for tool in SDK_TOOL_ROWS:
-            rows.append(
-                Row(
-                    "sdk_tool:" + tool,
-                    "off",
-                    "The mobile modules are not present in this edition.",
-                )
-            )
+        _append_mobile_sdk_off_rows(rows)
 
 
 def _append_mobile_ime_row(rows: list) -> None:
@@ -392,6 +384,14 @@ def _system_image_items() -> list:
         return [
             Row(component, "off", "The mobile modules are not present in this edition.")
         ]
+    booted = _probe_booted(asyncio, emulator, component)
+    if isinstance(booted, Row):
+        return [booted]
+    return _booted_image_items(booted, component, sdk_locator)
+
+
+def _probe_booted(asyncio, emulator, component: str) -> "list | Row":
+    """The booted emulators, or the one ``Row`` that says why there are none."""
     try:
         listed = asyncio.run(
             asyncio.wait_for(
@@ -399,31 +399,25 @@ def _system_image_items() -> list:
             )
         )
     except Exception:
-        return [
-            Row(
-                component,
-                "undetermined",
-                "The emulator probe did not finish, so the image is unknown.",
-            )
-        ]
+        return Row(
+            component,
+            "undetermined",
+            "The emulator probe did not finish, so the image is unknown.",
+        )
     if listed.get("error"):
-        return [
-            Row(
-                component,
-                "undetermined",
-                "The emulator probe failed, so the image is unknown.",
-            )
-        ]
+        return Row(
+            component,
+            "undetermined",
+            "The emulator probe failed, so the image is unknown.",
+        )
     booted = [item for item in (listed.get("content") or []) if isinstance(item, dict)]
     if not booted:
-        return [
-            Row(
-                component,
-                "off",
-                "No emulator is booted, so its system image is unknown.",
-            )
-        ]
-    return _booted_image_items(booted, component, sdk_locator)
+        return Row(
+            component,
+            "off",
+            "No emulator is booted, so its system image is unknown.",
+        )
+    return booted
 
 
 def _booted_image_items(booted: list, component: str, sdk_locator) -> list:
@@ -498,11 +492,9 @@ def _client_row(label: str, config_path, by_config: dict, mine: str) -> Row:
     )
 
 
-def _claude_code_row(home, by_config: dict, mine: str) -> Row:
-    """The Claude Code row, detected read-only (it is not in ``default_targets``)."""
+def _claude_code_config(home):
+    """The path of ``~/.claude.json`` under ``home`` (or the real home)."""
     from pathlib import Path as _Path
-
-    from tools import client_registry
 
     # Claude Code is NOT in `default_targets` -- it is registered through
     # `claude mcp add` rather than by editing a file this server knows the
@@ -512,9 +504,14 @@ def _claude_code_row(home, by_config: dict, mine: str) -> Row:
     # installed, and `~/.claude.json` is the config `discover_registrations`
     # already scans. Detection only -- the WRITE is the desktop app's, with
     # a backup beside the file.
-    code_config = (
-        _Path(home) / ".claude.json" if home else _Path.home() / ".claude.json"
-    )
+    return _Path(home) / ".claude.json" if home else _Path.home() / ".claude.json"
+
+
+def _claude_code_row(home, by_config: dict, mine: str) -> Row:
+    """The Claude Code row, detected read-only (it is not in ``default_targets``)."""
+    from tools import client_registry
+
+    code_config = _claude_code_config(home)
     code_present = bool(shutil.which("claude")) or code_config.is_file()
     if not code_present:
         return Row("Claude Code", "off", "Not installed on this machine.", "", "")

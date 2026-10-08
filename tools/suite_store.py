@@ -197,30 +197,8 @@ def _save_suite_sync(
     conn = _connect()
     try:
         with conn:  # transaction
-            # ONE atomic statement, deliberately NOT a SELECT-then-INSERT-or-
-            # UPDATE: each save_suite call runs on its OWN connection in its own
-            # thread, so a read-then-branch is a TOCTOU race -- two finalizes for
-            # the same prep (exactly what the retry-during-the-save-folder-dialog
-            # scenario produces) could both observe "no row yet" and both insert,
-            # which is the bug this is here to prevent. The partial UNIQUE index
-            # created in _ensure_columns is what the conflict resolves against;
-            # SQLite serialises the two writers and the loser takes the DO UPDATE
-            # branch, keeping the ORIGINAL row's id (`excluded.id` is never
-            # assigned) and its prep_id.
-            #
-            # `INSERT OR REPLACE` is retained for the id-conflict case so a save
-            # that carries NO prep_id behaves byte-identically to before this fix.
-            conn.execute(
-                "INSERT OR REPLACE INTO suites "
-                "(id, feature_text, source_url, created_at, created_by, prep_id, "
-                "provenance_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(prep_id) WHERE prep_id IS NOT NULL DO UPDATE SET "
-                "feature_text = excluded.feature_text, "
-                "source_url = excluded.source_url, "
-                "created_at = excluded.created_at, "
-                "created_by = excluded.created_by, "
-                "provenance_json = excluded.provenance_json",
+            _upsert_suite_row(
+                conn,
                 (
                     suite.suite_id,
                     feature_text or "",
@@ -231,20 +209,54 @@ def _save_suite_sync(
                     provenance_json,
                 ),
             )
-            target_id = suite.suite_id
-            if prep_id:
-                # Which row survived. Safe to read: this connection already holds
-                # the write lock taken by the statement above, so no other
-                # finalize can interleave between the write and this lookup.
-                row = conn.execute(
-                    "SELECT id FROM suites WHERE prep_id = ? LIMIT 1", (prep_id,)
-                ).fetchone()
-                if row:
-                    target_id = row[0]
+            target_id = _surviving_suite_id(conn, suite.suite_id, prep_id)
             _insert_case_rows(conn, target_id, suite, now)
         return target_id
     finally:
         conn.close()
+
+
+def _upsert_suite_row(conn: sqlite3.Connection, params: tuple) -> None:
+    # ONE atomic statement, deliberately NOT a SELECT-then-INSERT-or-
+    # UPDATE: each save_suite call runs on its OWN connection in its own
+    # thread, so a read-then-branch is a TOCTOU race -- two finalizes for
+    # the same prep (exactly what the retry-during-the-save-folder-dialog
+    # scenario produces) could both observe "no row yet" and both insert,
+    # which is the bug this is here to prevent. The partial UNIQUE index
+    # created in _ensure_columns is what the conflict resolves against;
+    # SQLite serialises the two writers and the loser takes the DO UPDATE
+    # branch, keeping the ORIGINAL row's id (`excluded.id` is never
+    # assigned) and its prep_id.
+    #
+    # `INSERT OR REPLACE` is retained for the id-conflict case so a save
+    # that carries NO prep_id behaves byte-identically to before this fix.
+    conn.execute(
+        "INSERT OR REPLACE INTO suites "
+        "(id, feature_text, source_url, created_at, created_by, prep_id, "
+        "provenance_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(prep_id) WHERE prep_id IS NOT NULL DO UPDATE SET "
+        "feature_text = excluded.feature_text, "
+        "source_url = excluded.source_url, "
+        "created_at = excluded.created_at, "
+        "created_by = excluded.created_by, "
+        "provenance_json = excluded.provenance_json",
+        params,
+    )
+
+
+def _surviving_suite_id(
+    conn: sqlite3.Connection, suite_id: str, prep_id: str | None
+) -> str:
+    if not prep_id:
+        return suite_id
+    # Which row survived. Safe to read: this connection already holds
+    # the write lock taken by the upsert, so no other finalize can
+    # interleave between the write and this lookup.
+    row = conn.execute(
+        "SELECT id FROM suites WHERE prep_id = ? LIMIT 1", (prep_id,)
+    ).fetchone()
+    return row[0] if row else suite_id
 
 
 def _insert_case_rows(
@@ -283,51 +295,65 @@ def _load_suite_sync(suite_id: str) -> TestSuite | None:
     return _suite_from_rows(suite_id, case_rows)
 
 
+def _load_case_row(
+    payload: str, suite_id: str
+) -> tuple[TestCase | None, Exception | None]:
+    """(case or None, the strict-parse error or None).
+
+    The error is returned even when the lenient retry recovers the case, so the
+    caller keeps the first REAL reason.
+    """
+    try:
+        return TestCase.model_validate_json(payload), None
+    except Exception as exc:
+        first_err = exc
+    # Forward compatibility: a row written by a NEWER build can carry fields
+    # this one does not know, and TestCase sets extra="forbid". Drop only the
+    # unknown keys and retry -- never guess at a value, never mutate a known
+    # one. Additive drift only; a narrowed constraint still fails.
+    known = set(TestCase.model_fields)
+    try:
+        raw = json.loads(payload)
+        if not isinstance(raw, dict):
+            raise ValueError("case payload is not an object")
+        dropped = sorted(k for k in raw if k not in known)
+        if not dropped:
+            raise ValueError("no unknown keys to drop")
+        case = TestCase.model_validate({k: v for k, v in raw.items() if k in known})
+    except Exception:
+        return None, first_err
+    logger.warning(
+        "suite_store: case in suite %s carried unknown field(s) %s -- "
+        "dropped them to load it (payload written by a newer build?)",
+        suite_id,
+        ", ".join(dropped),
+    )
+    return case, first_err
+
+
 def _suite_from_rows(suite_id: str, case_rows: list) -> TestSuite | None:
     if not case_rows:
         return None
     cases = []
     skipped = 0
     first_err = None
-    known = set(TestCase.model_fields)
     for r in case_rows:
-        try:
-            cases.append(TestCase.model_validate_json(r[0]))
+        case, err = _load_case_row(r[0], suite_id)
+        # Keep the REAL reason: the retry raises a synthetic error.
+        first_err = first_err or err
+        if case is not None:
+            cases.append(case)
             continue
-        except Exception as exc:
-            # Keep the REAL reason: the retry below raises a synthetic error.
-            first_err = first_err or exc
-        # Forward compatibility: a row written by a NEWER build can carry fields
-        # this one does not know, and TestCase sets extra="forbid". Drop only the
-        # unknown keys and retry -- never guess at a value, never mutate a known
-        # one. Additive drift only; a narrowed constraint still fails below.
-        try:
-            raw = json.loads(r[0])
-            if not isinstance(raw, dict):
-                raise ValueError("case payload is not an object")
-            dropped = sorted(k for k in raw if k not in known)
-            if not dropped:
-                raise ValueError("no unknown keys to drop")
-            cases.append(
-                TestCase.model_validate({k: v for k, v in raw.items() if k in known})
-            )
+        skipped += 1
+        # At most a few lines: a wholly corrupt 64-case suite must not
+        # emit 64 tracebacks, and the SYNTHETIC retry error is not the
+        # interesting one -- first_err is.
+        if skipped <= 3:
             logger.warning(
-                "suite_store: case in suite %s carried unknown field(s) %s -- "
-                "dropped them to load it (payload written by a newer build?)",
+                "suite_store: case in suite %s could not be loaded: %r",
                 suite_id,
-                ", ".join(dropped),
+                first_err,
             )
-        except Exception:
-            skipped += 1
-            # At most a few lines: a wholly corrupt 64-case suite must not
-            # emit 64 tracebacks, and the SYNTHETIC retry error is not the
-            # interesting one -- first_err is.
-            if skipped <= 3:
-                logger.warning(
-                    "suite_store: case in suite %s could not be loaded: %r",
-                    suite_id,
-                    first_err,
-                )
     if skipped:
         logger.warning(
             "suite_store: %d case(s) in suite %s could not be loaded and are "

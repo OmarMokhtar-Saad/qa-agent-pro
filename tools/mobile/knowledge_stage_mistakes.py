@@ -91,7 +91,9 @@ def _fix_of(steps: list, i: int, sig: str) -> dict | None:
             moved = later.get("after_screen_key") not in ("", later.get("screen_key"))
             if moved and later.get("target_rid") != rec.get("target_rid"):
                 return later
-        elif later.get("op") == rec.get("op") and later.get("target_rid") == rec.get("target_rid"):
+        elif later.get("op") == rec.get("op") and later.get("target_rid") == rec.get(
+            "target_rid"
+        ):
             return later
     return None
 
@@ -106,7 +108,9 @@ def find_hits(steps: list) -> list:
         here = (sig, rec.get("screen_key"), rec.get("target_rid"))
         if sig and here != last:
             prev = steps[i - 1] if i else None
-            hits.append({"sig": sig, "rec": rec, "prev": prev, "fix": _fix_of(steps, i, sig)})
+            hits.append(
+                {"sig": sig, "rec": rec, "prev": prev, "fix": _fix_of(steps, i, sig)}
+            )
         last = here if sig else ("", "", "")
     return hits
 
@@ -137,16 +141,41 @@ def _credit(conn, hit: dict, run_id: str) -> int:
         "bad_pattern": hit["sig"],
     }
     tester = hit["sig"] == "tester_correction"
-    old = _find(conn, "mistakes", "screen_key = ? AND element_fp = ? AND bad_pattern = ?", tuple(key.values()))
+    old = _find(
+        conn,
+        "mistakes",
+        "screen_key = ? AND element_fp = ? AND bad_pattern = ?",
+        tuple(key.values()),
+    )
     if old is None:
         symptom, fix = texts(hit)
         extra = {"trust": "tester", "status": "active"} if tester else {}
-        values = {**key, "symptom": symptom, "fix": fix, "count": 1, "runs_seen": 1, **extra}
-        return int(knowledge_db.insert(conn, "mistakes", values, run_id=run_id, why="mistake") is not None)
+        values = {
+            **key,
+            "symptom": symptom,
+            "fix": fix,
+            "count": 1,
+            "runs_seen": 1,
+            **extra,
+        }
+        return int(
+            knowledge_db.insert(conn, "mistakes", values, run_id=run_id, why="mistake")
+            is not None
+        )
     deltas = {"count": 1, "runs_seen": 0 if run_id in _runs(old) else 1}
-    row_id = knowledge_db.upsert_counter(conn, "mistakes", key, deltas, run_id=run_id, why="mistake")
+    row_id = knowledge_db.upsert_counter(
+        conn, "mistakes", key, deltas, run_id=run_id, why="mistake"
+    )
     if row_id is not None and tester and old["status"] != "active":
-        knowledge_db.set_status(conn, "mistakes", row_id, "active", trust="tester", run_id=run_id, why="mistake tester")
+        knowledge_db.set_status(
+            conn,
+            "mistakes",
+            row_id,
+            "active",
+            trust="tester",
+            run_id=run_id,
+            why="mistake tester",
+        )
     return int(row_id is not None)
 
 
@@ -170,14 +199,21 @@ def learned_bindings(steps: list) -> dict:
     clash: set = set()
     for rec in steps:
         field, rid = str(rec.get("text_field") or ""), str(rec.get("target_rid") or "")
-        if rec.get("op") != "type" or rec.get("landed") is not True or not (field and rid):
+        if (
+            rec.get("op") != "type"
+            or rec.get("landed") is not True
+            or not (field and rid)
+        ):
             continue
         if _degraded(str(rec.get("screen_key") or "")) or not _ok(rec):
             continue
         slot = (rec["screen_key"], rid)
         if slot in out and out[slot][0] != field:
             clash.add(slot)
-        out[slot] = (field, bool(rec.get("tester_correction")) or out.get(slot, ("", False))[1])
+        out[slot] = (
+            field,
+            bool(rec.get("tester_correction")) or out.get(slot, ("", False))[1],
+        )
     return {slot: val for slot, val in out.items() if slot not in clash}
 
 
@@ -191,17 +227,37 @@ def _promote(conn, row_id: int, tester: bool, run_id: str) -> None:
         return
     if tester or _distinct(row) >= knowledge_limits.MISTAKE_ACTIVE_RUNS:
         cols = {"trust": "tester"} if tester else {}
-        knowledge_db.set_status(conn, "elements", row_id, "active", run_id=run_id, why="binding confirmed", **cols)
+        knowledge_db.set_status(
+            conn,
+            "elements",
+            row_id,
+            "active",
+            run_id=run_id,
+            why="binding confirmed",
+            **cols,
+        )
 
 
 def _contradict(conn, old: dict, run_id: str) -> None:
     """A different field landed where an ACTIVE binding says otherwise."""
     knowledge_db.upsert_counter(
-        conn, "elements", {"fp_hash": old["fp_hash"]}, {"contradicted": 1}, run_id=run_id, why="binding conflict"
+        conn,
+        "elements",
+        {"fp_hash": old["fp_hash"]},
+        {"contradicted": 1},
+        run_id=run_id,
+        why="binding conflict",
     )
     hot = int(old["contradicted"] or 0) + 1
     if hot >= knowledge_limits.CONTRADICT_FLOOR and hot > int(old["confirmed"] or 0):
-        knowledge_db.set_status(conn, "elements", old["id"], "stale", run_id=run_id, why="binding contradicted")
+        knowledge_db.set_status(
+            conn,
+            "elements",
+            old["id"],
+            "stale",
+            run_id=run_id,
+            why="binding contradicted",
+        )
 
 
 def _bind(conn, slot: tuple, val: tuple, run_id: str) -> int:
@@ -210,18 +266,39 @@ def _bind(conn, slot: tuple, val: tuple, run_id: str) -> int:
     fp, digest = _binding_fp(rid, key)
     old = _find(conn, "elements", "fp_hash = ?", (digest,))
     if old is None:
-        values = {"screen_key": key, "fp_json": fp, "fp_hash": digest, "bound_field": field, "locators_json": "[]"}
-        row_id = knowledge_db.insert(conn, "elements", values, run_id=run_id, why="binding")
+        values = {
+            "screen_key": key,
+            "fp_json": fp,
+            "fp_hash": digest,
+            "bound_field": field,
+            "locators_json": "[]",
+        }
+        row_id = knowledge_db.insert(
+            conn, "elements", values, run_id=run_id, why="binding"
+        )
     elif old["bound_field"] == field:
         row_id = knowledge_db.upsert_counter(
-            conn, "elements", {"fp_hash": digest}, {"confirmed": 1}, run_id=run_id, why="binding"
+            conn,
+            "elements",
+            {"fp_hash": digest},
+            {"confirmed": 1},
+            run_id=run_id,
+            why="binding",
         )
     elif old["status"] == "active":
         _contradict(conn, old, run_id)
         return 0
     else:
-        values = {"screen_key": key, "fp_json": fp, "fp_hash": digest, "bound_field": field, "locators_json": "[]"}
-        row_id = knowledge_db.supersede(conn, "elements", old["id"], values, run_id=run_id, why="binding changed")
+        values = {
+            "screen_key": key,
+            "fp_json": fp,
+            "fp_hash": digest,
+            "bound_field": field,
+            "locators_json": "[]",
+        }
+        row_id = knowledge_db.supersede(
+            conn, "elements", old["id"], values, run_id=run_id, why="binding changed"
+        )
     if row_id is not None:
         _promote(conn, row_id, tester, run_id)
     return int(row_id is not None)
@@ -229,7 +306,9 @@ def _bind(conn, slot: tuple, val: tuple, run_id: str) -> int:
 
 def run(conn, lc) -> StageResult:
     """Never raises past the pipeline; one transaction per call (the pipeline's)."""
-    steps = [s for s in (lc.steps or []) if not _degraded(str(s.get("screen_key") or ""))]
+    steps = [
+        s for s in (lc.steps or []) if not _degraded(str(s.get("screen_key") or ""))
+    ]
     result = StageResult("mistakes")
     for hit in find_hits(steps):
         result.wrote += _credit(conn, hit, lc.run_id)

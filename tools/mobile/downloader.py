@@ -435,6 +435,48 @@ def _hash_mismatch(part: Path, name: str, want: str, actual: str) -> dict:
     }
 
 
+def _file_name(url: object) -> str:
+    return (urlsplit(str(url)).path or "").rsplit("/", 1)[-1] or ("the requested file")
+
+
+def _progress_base(phase: str, url: object) -> dict:
+    """The progress fields that stay constant for the whole download."""
+    return {
+        "phase": phase,
+        "message": "downloading " + _file_name(url),
+        "error": None,
+        "pid": os.getpid(),
+    }
+
+
+def _disk_refusal(payload_bytes: int, dest_path: Path) -> str:
+    """Return the refusal text when the disk is too full, else ``""``."""
+    disk = (check_disk(payload_bytes, dest_path.parent) or {}).get("content") or {}
+    if not disk.get("ok", False) and required_bytes(payload_bytes) > 0:
+        return str(disk.get("detail") or "insufficient disk space")
+    return ""
+
+
+def _fetch_and_install(
+    url: str,
+    dest_path: Path,
+    want: str,
+    progress_path: str | Path | None,
+    base: dict,
+) -> dict:
+    """Resume into ``<dest>.part``, verify the hash, then move it into place."""
+    part = dest_path.with_name(dest_path.name + ".part")
+    start = part.stat().st_size if part.is_file() else 0
+    off_https = _fetch_part(url, part, start, progress_path, base)
+    if off_https:
+        return {"error": off_https, "content": None}
+    actual = digest_file(part)
+    if actual != want:
+        return _hash_mismatch(part, _file_name(url), want, actual)
+    os.replace(part, dest_path)
+    return _delivered(dest_path, cached=False)
+
+
 def download(
     url: str,
     dest: str | Path,
@@ -458,36 +500,16 @@ def download(
         refusal = _download_refusal(url, sha256)
         if refusal:
             return {"error": refusal, "content": None}
-        name = (urlsplit(str(url)).path or "").rsplit("/", 1)[-1] or (
-            "the requested file"
-        )
         want = str(sha256).strip().lower()
         dest_path = Path(dest)
         if dest_path.is_file() and digest_file(dest_path) == want:
             return _delivered(dest_path, cached=True)
-        disk = (check_disk(payload_bytes, dest_path.parent) or {}).get("content") or {}
-        if not disk.get("ok", False) and required_bytes(payload_bytes) > 0:
-            return {
-                "error": str(disk.get("detail") or "insufficient disk space"),
-                "content": None,
-            }
+        disk_refusal = _disk_refusal(payload_bytes, dest_path)
+        if disk_refusal:
+            return {"error": disk_refusal, "content": None}
         dest_path.parent.mkdir(parents=True, exist_ok=True)
-        part = dest_path.with_name(dest_path.name + ".part")
-        start = part.stat().st_size if part.is_file() else 0
-        base = {
-            "phase": phase,
-            "message": "downloading " + name,
-            "error": None,
-            "pid": os.getpid(),
-        }
-        off_https = _fetch_part(str(url), part, start, progress_path, base)
-        if off_https:
-            return {"error": off_https, "content": None}
-        actual = digest_file(part)
-        if actual != want:
-            return _hash_mismatch(part, name, want, actual)
-        os.replace(part, dest_path)
-        return _delivered(dest_path, cached=False)
+        base = _progress_base(phase, url)
+        return _fetch_and_install(str(url), dest_path, want, progress_path, base)
     except RedirectRefused as exc:
         # Ahead of the ValueError clause below on purpose: a refused hop is a
         # decision this module made, and the tester must read it as a refusal

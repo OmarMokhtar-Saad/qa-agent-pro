@@ -1513,7 +1513,10 @@ class HostJob:
     spec: dict
 
 
-def _job_index_entry(job_id, stage, order, blocking, return_field, payload_key) -> dict:
+def _job_index_entry(payload_key, fields) -> dict:
+    """Index entry for ``payload_key``; ``fields`` is
+    ``(job_id, stage, order, blocking, return_field)``."""
+    job_id, stage, order, blocking, return_field = fields
     return {
         "job_id": str(job_id),
         "stage": str(stage),
@@ -1532,7 +1535,7 @@ def _legacy_job_index(out: dict, instr0: str) -> tuple[list, str]:
     for key, meta in _LEGACY_JOB_KEYS.items():
         if isinstance(out.get(key), dict):
             jid, stage, order, blocking, ret, marker, clause = meta
-            index.append(_job_index_entry(jid, stage, order, blocking, ret, key))
+            index.append(_job_index_entry(key, (jid, stage, order, blocking, ret)))
             if clause and marker and marker not in instr0:
                 clauses += clause
     return index, clauses
@@ -1572,12 +1575,8 @@ def attach_jobs(payload: dict, jobs=()) -> dict:
             out[j.payload_key] = dict(j.spec)
             index.append(
                 _job_index_entry(
-                    j.job_id,
-                    j.stage,
-                    j.order,
-                    j.blocking,
-                    j.return_field,
                     j.payload_key,
+                    (j.job_id, j.stage, j.order, j.blocking, j.return_field),
                 )
             )
         if not index:
@@ -1908,7 +1907,7 @@ def _ambiguity_unverified_block(notes: list) -> str:
     """The block for a submission with no readable ``ambiguity_result``."""
     out = [
         "> ⚠️  **The ticket's testability was never verified.** "
-        "The TICKET-7154 requirement pre-pass runs in your chat, not on "
+        "The requirement pre-pass runs in your chat, not on "
         "this server -- and this submission came back with no readable "
         "`ambiguity_result`, so there is no evidence it ran at all. "
         # F7 (2026-08-15): say that the step was declared BLOCKING and
@@ -3580,35 +3579,40 @@ _COLLISION_CLAUSE = (
 )
 
 
+def _ambiguity_job_spec() -> dict:
+    """A fresh ``ambiguity_job`` payload entry (task, instructions, schema)."""
+    return {
+        "task": "classify_requirements_before_generating",
+        "instructions": (
+            "Classify the ticket in user_context BEFORE generating cases. "
+            "Return JSON: severity, issues, questions (<=3), testable_surface. "
+            "If severity is high (or no-UI with no URL), stop and ask the user; "
+            "otherwise continue to generate."
+        ),
+        "response_schema": {
+            "type": "object",
+            "properties": {
+                "severity": {
+                    "type": "string",
+                    "enum": ["none", "low", "medium", "high"],
+                },
+                "issues": {"type": "array", "items": {"type": "string"}},
+                "questions": {"type": "array", "items": {"type": "string"}},
+                "testable_surface": {
+                    "type": "string",
+                    "enum": ["ui", "api", "backend", "docs", "none", "unclear"],
+                },
+            },
+            "required": ["severity", "issues", "questions", "testable_surface"],
+        },
+    }
+
+
 def attach_ambiguity_job(payload: dict) -> dict:
     """Add ambiguity_job + step-0 instructions for host-side preflight. Never raises."""
     out = dict(payload or {})
     try:
-        out["ambiguity_job"] = {
-            "task": "classify_requirements_before_generating",
-            "instructions": (
-                "Classify the ticket in user_context BEFORE generating cases. "
-                "Return JSON: severity, issues, questions (<=3), testable_surface. "
-                "If severity is high (or no-UI with no URL), stop and ask the user; "
-                "otherwise continue to generate."
-            ),
-            "response_schema": {
-                "type": "object",
-                "properties": {
-                    "severity": {
-                        "type": "string",
-                        "enum": ["none", "low", "medium", "high"],
-                    },
-                    "issues": {"type": "array", "items": {"type": "string"}},
-                    "questions": {"type": "array", "items": {"type": "string"}},
-                    "testable_surface": {
-                        "type": "string",
-                        "enum": ["ui", "api", "backend", "docs", "none", "unclear"],
-                    },
-                },
-                "required": ["severity", "issues", "questions", "testable_surface"],
-            },
-        }
+        out["ambiguity_job"] = _ambiguity_job_spec()
         # DETECT AND REPORT ONLY. This does not resolve the collision, does not
         # block generation, and does not touch `host_ambiguity_severity` -- the
         # host self-reports that, and the server does not classify. It puts the
@@ -3658,25 +3662,40 @@ def _bounded_json_spans(raw: str, *, budget: int):
             raise PrepParseError("submitted JSON exceeded the scan budget")
         ch = raw[i]
         if in_string:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_string = False
+            in_string, escaped = _string_scan_state(ch, escaped)
         elif ch == '"':
             in_string = True
-        elif ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            if depth > 0:
-                depth -= 1
-                if depth == 0 and start >= 0:
-                    yield raw[start : i + 1]
-                    start = -1
+        elif ch in "{}":
+            depth, start, span = _brace_scan_step(raw, i, depth, start)
+            if span is not None:
+                yield span
         i += 1
+
+
+def _string_scan_state(ch: str, escaped: bool) -> tuple[bool, bool]:
+    """One character inside a JSON string: return ``(in_string, escaped)``."""
+    if escaped:
+        return True, False
+    if ch == "\\":
+        return True, True
+    return ch != '"', False
+
+
+def _brace_scan_step(
+    raw: str, i: int, depth: int, start: int
+) -> tuple[int, int, str | None]:
+    """Apply the brace at ``raw[i]``: return ``(depth, start, closed_span)``.
+
+    ``closed_span`` is the top-level object just completed, else ``None``.
+    """
+    if raw[i] == "{":
+        return depth + 1, (i if depth == 0 else start), None
+    if depth == 0:
+        return depth, start, None
+    depth -= 1
+    if depth == 0 and start >= 0:
+        return 0, -1, raw[start : i + 1]
+    return depth, start, None
 
 
 def _pop_sidecar_fields(data) -> tuple[dict, object, dict]:
@@ -4129,9 +4148,7 @@ def _check_submitted_object(text_or_obj, enforce_size_cap: bool) -> None:
     if cap and enforce_size_cap:
         try:
             size = len(
-                json.dumps(text_or_obj, ensure_ascii=False).encode(
-                    "utf-8", "ignore"
-                )
+                json.dumps(text_or_obj, ensure_ascii=False).encode("utf-8", "ignore")
             )
         except (TypeError, ValueError, RecursionError) as exc:
             raise PrepParseError(
@@ -4224,15 +4241,24 @@ def parse_host_suite(text_or_obj, *, enforce_size_cap: bool = True) -> ParsedSub
             f"{type(text_or_obj).__name__}"
         )
 
+    _check_text_size_cap(text_or_obj, enforce_size_cap)
+    return _parse_suite_text(text_or_obj)
+
+
+def _check_text_size_cap(text: str, enforce_size_cap: bool) -> None:
+    """Raise PrepParseError when ``text`` exceeds ``qa_prep_max_bytes``."""
     max_bytes = int(getattr(settings, "qa_prep_max_bytes", 0) or 0)
     if (
         enforce_size_cap
         and max_bytes
-        and len(text_or_obj.encode("utf-8", "ignore")) > max_bytes
+        and len(text.encode("utf-8", "ignore")) > max_bytes
     ):
         raise PrepParseError(f"submitted JSON exceeds the {max_bytes}-byte cap")
 
-    stripped = _strip_json_fence(text_or_obj.strip())
+
+def _parse_suite_text(text: str) -> ParsedSubmission:
+    """Fence-strip, depth-check and validate the largest suite object in ``text``."""
+    stripped = _strip_json_fence(text.strip())
 
     if _text_nesting_depth(stripped) > _MAX_JSON_DEPTH:
         raise PrepParseError(

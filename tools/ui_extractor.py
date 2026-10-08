@@ -78,10 +78,7 @@ async def extract_ui_elements(url: str, prefetched: dict | None = None) -> dict:
     Never raises.
     """
     try:
-        if isinstance(prefetched, dict) and not prefetched.get("error"):
-            fetch_result = prefetched
-        else:
-            fetch_result = await fetch_url_content(url)
+        fetch_result = await _fetch_or_reuse(url, prefetched)
         if fetch_result.get("error"):
             logger.warning(
                 "ui_extractor: fetch_url_content failed for %s: %s",
@@ -104,97 +101,118 @@ async def extract_ui_elements(url: str, prefetched: dict | None = None) -> dict:
                 "ui_extractor: no HTML content returned for %s -- returning text fallback",
                 url,
             )
-            return {
-                "ui_elements": {},
-                "page_title": page_title,
-                "content": fetch_result.get("description") or "",
-                "extraction_method": "none",
-                "render_error": None,
-                "error": None,
-            }
+            return _result(
+                {}, page_title, fetch_result.get("description") or "", "none", None
+            )
 
-        ui_elements = _parse_ui_elements(raw_html) if raw_html else {}
-        extraction_method = "static_html"
-        # Carries the Tier 2 render failure reason (Playwright missing, nav
-        # timeout, ...) up to the caller so a "no elements" outcome can be
-        # explained specifically instead of with a single generic message.
-        render_error: str | None = None
-        # Raw Tier 3 screenshot, kept ONLY when defer_vision suppressed the
-        # server-side vision call, so the caller can forward it to the host.
-        deferred_screenshot: bytes | None = None
-
-        # Tier 2 renders a page's HTML, so it can only help when HTML was
-        # actually fetched. A Jira REST result carries the ticket's TEXT and no
-        # HTML at all (raw_text is used as the raw_html fallback above), so
-        # _parse_ui_elements is always empty and _looks_empty escalated EVERY
-        # Jira URL to a headless-Chromium render of an auth-walled issue/board
-        # page. Measured on a real board URL: 15.2s to "extract" 2 headings and
-        # 0 fields/buttons from the Atlassian shell -- which _looks_empty then
-        # ACCEPTED, overwriting page_title with the board's title instead of the
-        # ticket summary. Gating on raw_html fixes this and every future
-        # text-only source; _fetch_generic returns raw_html on both of its 200
-        # paths, so no real web page loses Tier 2.
-        # spa_shell stays an INDEPENDENT trigger: the fetcher setting it means
-        # "this is a JS-only shell, re-render it", and that must hold even when
-        # no HTML came back. Only the _looks_empty heuristic is gated on having
-        # HTML -- that is the branch a text-only source wrongly satisfied.
-        has_html = bool(fetch_result.get("raw_html"))
-        skip_tier2 = not spa_shell and not has_html
-        if skip_tier2:
-            # No HTML was ever parsed, so "static_html" would misreport the
-            # module contract; "none" is the documented value for that.
-            extraction_method = "none"
-            logger.debug(
-                "ui_extractor: %s returned no HTML (text-only source) -- "
-                "skipping the Tier 2 browser render",
-                url,
-            )
-        if not skip_tier2 and (spa_shell or _looks_empty(ui_elements)):
-            logger.info(
-                "ui_extractor: escalating to Tier 2 browser render for %s (spa_shell=%s)",
-                url,
-                spa_shell,
-            )
-            (
-                ui_elements,
-                page_title,
-                extraction_method,
-                render_error,
-                deferred_screenshot,
-            ) = await _escalate_to_tier2(
-                url, ui_elements, page_title, extraction_method
-            )
+        (
+            ui_elements,
+            page_title,
+            extraction_method,
+            render_error,
+            deferred_screenshot,
+        ) = await _run_tiers(url, fetch_result, raw_html, page_title, spa_shell)
 
         content_summary = _build_content_summary(page_title, ui_elements)
         if not content_summary:
             content_summary = fetch_result.get("description") or ""
 
-        logger.info(
-            "ui_extractor: extracted %d headings, %d fields, %d buttons, %d links "
-            "from %s (method=%s)",
-            len(ui_elements.get("headings") or []),
-            len(ui_elements.get("form_fields") or []),
-            len(ui_elements.get("buttons") or []),
-            len(ui_elements.get("navigation_links") or []),
-            url,
+        _log_extraction_counts(url, ui_elements, extraction_method)
+        return _result(
+            ui_elements,
+            page_title,
+            content_summary,
             extraction_method,
+            render_error,
+            deferred_screenshot,
         )
-        out = {
-            "ui_elements": ui_elements,
-            "page_title": page_title,
-            "content": content_summary,
-            "extraction_method": extraction_method,
-            "render_error": render_error,
-            "error": None,
-        }
-        if deferred_screenshot is not None:
-            # Key ABSENT unless the vision call was actually deferred, so a
-            # flag-OFF result dict stays key-identical to today's.
-            out["vision_screenshot"] = deferred_screenshot
-        return out
     except Exception as exc:
         logger.exception("ui_extractor: unexpected error for %s", url)
         return {"error": str(exc), "content": None}
+
+
+async def _run_tiers(
+    url: str, fetch_result: dict, raw_html: str, page_title: str, spa_shell: bool
+) -> tuple[dict, str, str, str | None, bytes | None]:
+    """Tier 1 parse, then Tier 2 when warranted.
+
+    Returns (ui_elements, page_title, extraction_method, render_error,
+    deferred_screenshot).
+    """
+    ui_elements = _parse_ui_elements(raw_html) if raw_html else {}
+    # Tier 2 renders a page's HTML, so it can only help when HTML was
+    # actually fetched. A Jira REST result carries the ticket's TEXT and no
+    # HTML at all (raw_text is used as the raw_html fallback), so
+    # _parse_ui_elements is always empty and _looks_empty escalated EVERY
+    # Jira URL to a headless-Chromium render of an auth-walled issue/board
+    # page (15.2s measured, and the board title overwrote the ticket summary).
+    # Gating on raw_html fixes this and every future text-only source;
+    # _fetch_generic returns raw_html on both of its 200 paths, so no real web
+    # page loses Tier 2.
+    # spa_shell stays an INDEPENDENT trigger: the fetcher setting it means
+    # "this is a JS-only shell, re-render it", and that must hold even when
+    # no HTML came back. Only the _looks_empty heuristic is gated on having
+    # HTML -- that is the branch a text-only source wrongly satisfied.
+    has_html = bool(fetch_result.get("raw_html"))
+    if not spa_shell and not has_html:
+        # No HTML was ever parsed, so "static_html" would misreport the
+        # module contract; "none" is the documented value for that.
+        logger.debug(
+            "ui_extractor: %s returned no HTML (text-only source) -- "
+            "skipping the Tier 2 browser render",
+            url,
+        )
+        return ui_elements, page_title, "none", None, None
+    if spa_shell or _looks_empty(ui_elements):
+        logger.info(
+            "ui_extractor: escalating to Tier 2 browser render for %s (spa_shell=%s)",
+            url,
+            spa_shell,
+        )
+        return await _escalate_to_tier2(url, ui_elements, page_title, "static_html")
+    return ui_elements, page_title, "static_html", None, None
+
+
+async def _fetch_or_reuse(url: str, prefetched: dict | None) -> dict:
+    """Reuse a clean *prefetched* result, else fetch the URL."""
+    if isinstance(prefetched, dict) and not prefetched.get("error"):
+        return prefetched
+    return await fetch_url_content(url)
+
+
+def _log_extraction_counts(url: str, ui_elements: dict, extraction_method: str) -> None:
+    logger.info(
+        "ui_extractor: extracted %d headings, %d fields, %d buttons, %d links "
+        "from %s (method=%s)",
+        len(ui_elements.get("headings") or []),
+        len(ui_elements.get("form_fields") or []),
+        len(ui_elements.get("buttons") or []),
+        len(ui_elements.get("navigation_links") or []),
+        url,
+        extraction_method,
+    )
+
+
+def _result(
+    ui_elements: dict,
+    page_title: str,
+    content: str,
+    extraction_method: str,
+    render_error: str | None,
+    deferred_screenshot: bytes | None = None,
+) -> dict:
+    """Success dict; ``vision_screenshot`` is ABSENT unless one was deferred."""
+    out = {
+        "ui_elements": ui_elements,
+        "page_title": page_title,
+        "content": content,
+        "extraction_method": extraction_method,
+        "render_error": render_error,
+        "error": None,
+    }
+    if deferred_screenshot is not None:
+        out["vision_screenshot"] = deferred_screenshot
+    return out
 
 
 async def _escalate_to_tier2(
@@ -374,32 +392,17 @@ def _extract_form_fields(
     try:
         fields: list[dict] = []
         for tag in soup.find_all(["input", "select", "textarea"]):
-            tag_type = tag.name
-            input_type = tag.get("type", "text") if tag_type == "input" else tag_type
+            input_type = _field_input_type(tag)
             # Skip hidden and submit/button inputs -- they're captured elsewhere
             if input_type in ("hidden", "submit", "button", "image", "reset"):
                 continue
-            name = tag.get("name") or tag.get("id") or ""
-            placeholder = tag.get("placeholder") or ""
-            required = tag.has_attr("required")
-            # Try to find an associated <label> via `for` attribute or wrapping element
-            label_text = ""
-            tag_id = tag.get("id")
-            if tag_id:
-                label_el = soup.find("label", attrs={"for": tag_id})
-                if label_el:
-                    label_text = label_el.get_text(strip=True)
-            if not label_text:
-                parent_label = tag.find_parent("label")
-                if parent_label:
-                    label_text = parent_label.get_text(strip=True)
             fields.append(
                 {
-                    "name": name,
+                    "name": tag.get("name") or tag.get("id") or "",
                     "type": input_type,
-                    "placeholder": placeholder,
-                    "required": required,
-                    "label": label_text,
+                    "placeholder": tag.get("placeholder") or "",
+                    "required": tag.has_attr("required"),
+                    "label": _field_label(soup, tag),
                     # Non-None only when the field is inside a pop-up/modal that
                     # must be opened first (names the trigger control).
                     "modal_trigger": _field_modal_trigger(
@@ -411,6 +414,26 @@ def _extract_form_fields(
     except Exception:
         logger.exception("ui_extractor._extract_form_fields failed")
         return []
+
+
+def _field_input_type(tag) -> str:
+    """The ``type`` of an input, or the tag name for select/textarea."""
+    return tag.get("type", "text") if tag.name == "input" else tag.name
+
+
+def _field_label(soup: BeautifulSoup, tag) -> str:
+    """Label text via the `for` attribute, else a wrapping <label>, else ""."""
+    tag_id = tag.get("id")
+    if tag_id:
+        label_el = soup.find("label", attrs={"for": tag_id})
+        if label_el:
+            text = label_el.get_text(strip=True)
+            if text:
+                return text
+    parent_label = tag.find_parent("label")
+    if parent_label:
+        return parent_label.get_text(strip=True)
+    return ""
 
 
 def _extract_buttons(soup: BeautifulSoup) -> list[dict]:

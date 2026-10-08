@@ -125,7 +125,9 @@ def screen_key(screen: object, package: str = "", activity: str = "") -> ScreenK
         package = str(package or body.get("package") or "")
         activity = str(activity or body.get("activity") or "")
         raw = body.get("elements")
-        elements = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+        elements = (
+            [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+        )
         anchors = _anchors(elements, package)
         title = _title(elements)
         if len(anchors) < 2:

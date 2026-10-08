@@ -1,6 +1,6 @@
 [project]
 name = "qa-agent-pro"
-version = "1.107.4"
+version = "1.107.5"
 requires-python = ">=3.10"
 dependencies = [
     "pyyaml>=6.0",  # contracts + OpenAPI specs are YAML (api_test agent)
@@ -77,6 +77,11 @@ include = ["agents*", "tools*", "config*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+# Unknown marks are errors and a strict xfail that passes fails the run, so an
+# acceptance test cannot linger once its feature exists. Set here, not in
+# addopts, for the reason given below.
+strict_markers = true
+xfail_strict = true
 # Pydantic models named Test* (TestCase, TestSuite, ...) are not test classes.
 python_classes = ["Test*Case", "*Tests", "*TestCase"]
 filterwarnings = ["ignore::pytest.PytestCollectionWarning"]
@@ -92,6 +97,9 @@ filterwarnings = ["ignore::pytest.PytestCollectionWarning"]
 # outside that directory.
 markers = [
     "live: drives a running MCP server through a real chat model; costs model calls. Needs QA_LIVE_SWEEP=1.",
+    "story: a Hermes story test (acceptance or integration); see tests/conftest.py --story-progress.",
+    "acceptance: a story acceptance test written before the feature; xfail(strict=True) until it exists.",
+    "integration: a story integration test across the pieces a story touched.",
     "dispatch_guard_bare: opts a test OUT of conftest.py's autouse dispatch-guard entry, so tools.dispatch_guard.require_dispatched reflects reality for it (needed by tests driving a real mcp_server._tracked() dispatch or stdio handshake).",
 ]
 
@@ -104,8 +112,8 @@ target-version = "py310"
 #
 # It was ALSO never gated in practice: every session verifies with
 # `ruff check tools/ agents/ config/ tests/ mcp_server.py llm.py scripts/`, which
-# passes, while CI runs the repo-wide `ruff check .` / `ruff format --check .`
-# (.github/workflows/ci.yml:38 and :41). Those two disagreed, so CI was red on
+# passes, while the then-CI ran the repo-wide `ruff check .` / `ruff format --check .`
+# (CI is gone; the Hermes card DoD and merge gate run them now). Those two disagreed, so CI was red on
 # main while every local check was green: 104 lint findings and 49 unformatted
 # files at 4208e90, ALL of them under .claude/. Measured across commits, the
 # format step was green at 75d2635 and broke at 688e870 when the finding
@@ -115,7 +123,7 @@ target-version = "py310"
 # 56 of the 104 findings are F821 (undefined name) in deliberately partial
 # fragments, so formatting could not have fixed them -- the scope was the bug,
 # not the formatting. Excluding here makes the repo-wide command mean exactly
-# what the scoped one already meant, so CI now gates the product and nothing else.
+# what the scoped one already meant, so the gate checks the product and nothing else.
 # `.tmp/` is scratch from live validation runs -- the TICKET-9311 generation
 # scripts and their outputs. Kept on disk as run evidence, never shipped, and
 # not this project's code to keep formatted. It is gitignored as well, but that

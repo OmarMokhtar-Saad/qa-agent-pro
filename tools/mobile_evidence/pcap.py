@@ -101,6 +101,12 @@ _LINKTYPE_ETHERNET = 1
 _LINKTYPE_RAW = 101
 _LINKTYPE_RAW4 = 228
 _LINKTYPE_RAW6 = 229
+_SUPPORTED_LINKTYPES = (
+    _LINKTYPE_ETHERNET,
+    _LINKTYPE_RAW,
+    _LINKTYPE_RAW4,
+    _LINKTYPE_RAW6,
+)
 
 _ETH_IPV4 = 0x0800
 _ETH_IPV6 = 0x86DD
@@ -561,54 +567,29 @@ def _dns_rows(conv: dict, base: dict) -> list:
 def _flow_row(conv: dict, base: dict) -> dict:
     """The single row of a non-DNS flow, named by the best evidence it has."""
     server = conv["server"]
-    row = dict(base)
     if conv["sni"]:
-        row.update(
-            {
-                "host": conv["sni"],
-                "port": server[1],
-                "proto": PROTO_TLS,
-                "source": SOURCE_SNI,
-            }
-        )
+        naming = _naming(conv["sni"], server[1], PROTO_TLS, SOURCE_SNI)
     elif conv["http_host"]:
         # KEYED ON THE HOST, not on a list of request lines. It was `elif
         # conv["targets"]`, and dropping the request target would have made
         # this branch unreachable -- every plaintext row would have fallen
         # through to ip-only and the feature would have silently stopped
         # naming hosts it had correctly parsed.
-        row.update(
-            {
-                "host": conv["http_host"],
-                "port": server[1],
-                "proto": PROTO_HTTP,
-                "source": SOURCE_HTTP,
-            }
-        )
+        naming = _naming(conv["http_host"], server[1], PROTO_HTTP, SOURCE_HTTP)
     elif server is not None:
-        row.update(
-            {
-                "host": server[0],
-                "port": server[1],
-                "proto": conv["transport"],
-                "source": SOURCE_IP,
-            }
-        )
+        naming = _naming(server[0], server[1], conv["transport"], SOURCE_IP)
     else:
         # NOTHING in this flow identified a client, so neither end is the
         # server. Said, not guessed -- and with no local port, so the owner
         # attribution can only report it unsampled.
-        row.update(
-            {
-                "host": conv["ends"],
-                "port": None,
-                "proto": conv["transport"],
-                "source": SOURCE_IP,
-                "local_ports": [],
-                "undetermined": True,
-            }
-        )
-    return row
+        naming = _naming(conv["ends"], None, conv["transport"], SOURCE_IP)
+        naming.update({"local_ports": [], "undetermined": True})
+    return {**base, **naming}
+
+
+def _naming(host: object, port: object, proto: str, source: str) -> dict:
+    """The row fields that name a flow's far end."""
+    return {"host": host, "port": port, "proto": proto, "source": source}
 
 
 def _rows(flows: dict) -> list:
@@ -741,15 +722,16 @@ def parse(data: object) -> dict:
         }
     prefix, nanos = head
     linktype = struct.unpack(prefix + "I", raw[20:24])[0]
-    supported = linktype in (
-        _LINKTYPE_ETHERNET,
-        _LINKTYPE_RAW,
-        _LINKTYPE_RAW4,
-        _LINKTYPE_RAW6,
-    )
+    supported = linktype in _SUPPORTED_LINKTYPES
     flows, counts, cut = _read_records(raw, prefix, nanos, linktype, supported)
+    return _parse_result(flows, counts, truncated or cut, linktype, supported)
+
+
+def _parse_result(
+    flows: dict, counts: tuple, truncated: bool, linktype: int, supported: bool
+) -> dict:
+    """The successful parse envelope for the flows read."""
     packets, total, unparsed, dropped_flows = counts
-    truncated = truncated or cut
     notes = _parse_notes(supported, linktype, truncated, dropped_flows)
     return {
         "error": None,

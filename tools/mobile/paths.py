@@ -145,44 +145,60 @@ def ownership(target: Path | None = None) -> dict:
         root = Path(target) if target is not None else cache_root()
         if platform_info.is_windows():
             return _ownership_windows(root)
-        probe = root
-        for _ in range(8):
-            if probe.exists():
-                break
-            parent = probe.parent
-            if parent == probe:
-                break
-            probe = parent
+        probe = _existing_ancestor(root)
         owner = int(os.stat(str(probe)).st_uid)
         mine = int(os.getuid())
         if owner == mine:
-            return {
-                "error": None,
-                "content": {
-                    "ok": True,
-                    "checked": True,
-                    "detail": str(probe) + " is owned by uid " + str(mine),
-                    "fix": "",
-                },
-            }
+            return _ownership_ok(probe, mine)
         return _ownership_refused(probe, owner, mine)
     except Exception as exc:
         logger.warning("mobile.paths: could not read cache ownership: %s", exc)
-        return {
-            "error": None,
-            "content": {
-                "ok": False,
-                "checked": False,
-                "detail": (
-                    "The owner of the mobile cache path could not be determined "
-                    "(" + str(exc)[:120] + "), so it is treated as NOT ours."
-                ),
-                "fix": (
-                    "Check that the path in QA_MOBILE_CACHE_DIR exists and is "
-                    "readable, or unset it to use ~/.qa-agents/mobile."
-                ),
-            },
-        }
+        return _ownership_unknown(exc)
+
+
+def _existing_ancestor(root: Path) -> Path:
+    """The nearest existing path at or above *root* (at most 8 levels up)."""
+    probe = root
+    for _ in range(8):
+        if probe.exists():
+            break
+        parent = probe.parent
+        if parent == probe:
+            break
+        probe = parent
+    return probe
+
+
+def _ownership_ok(probe: Path, mine: int) -> dict:
+    """The reply when the cache path is owned by the current user."""
+    return {
+        "error": None,
+        "content": {
+            "ok": True,
+            "checked": True,
+            "detail": str(probe) + " is owned by uid " + str(mine),
+            "fix": "",
+        },
+    }
+
+
+def _ownership_unknown(exc: Exception) -> dict:
+    """The reply when the owner could not be read: treated as NOT ours."""
+    return {
+        "error": None,
+        "content": {
+            "ok": False,
+            "checked": False,
+            "detail": (
+                "The owner of the mobile cache path could not be determined "
+                "(" + str(exc)[:120] + "), so it is treated as NOT ours."
+            ),
+            "fix": (
+                "Check that the path in QA_MOBILE_CACHE_DIR exists and is "
+                "readable, or unset it to use ~/.qa-agents/mobile."
+            ),
+        },
+    }
 
 
 def _ownership_windows(root: Path) -> dict:

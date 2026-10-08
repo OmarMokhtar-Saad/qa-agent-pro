@@ -155,7 +155,8 @@ def _create_indexes(conn: sqlite3.Connection) -> None:
         )
     for table in ("notes", "lessons", "elements", "timings", "mistakes"):
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS ix_%s_screen ON %s (screen_key, status)" % (table, table)
+            "CREATE INDEX IF NOT EXISTS ix_%s_screen ON %s (screen_key, status)"
+            % (table, table)
         )
     conn.execute("CREATE INDEX IF NOT EXISTS ix_edges_from ON edges (from_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS ix_events_run ON events (run_id)")
@@ -207,12 +208,15 @@ def _restore(conn: sqlite3.Connection, table: str, row_id: int, before: dict) ->
         return False
     sets = ", ".join("%s = ?" % k for k, _ in items)
     conn.execute(
-        "UPDATE %s SET %s WHERE id = ?" % (table, sets), [v for _, v in items] + [row_id]
+        "UPDATE %s SET %s WHERE id = ?" % (table, sets),
+        [v for _, v in items] + [row_id],
     )
     return True
 
 
-def _undo_one(conn: sqlite3.Connection, kind: str, table: str, row_id: int, raw: str) -> bool:
+def _undo_one(
+    conn: sqlite3.Connection, kind: str, table: str, row_id: int, raw: str
+) -> bool:
     """Undo one event. ``kind`` is the event name written by knowledge_db."""
     before = _load(raw)
     if kind == "insert":

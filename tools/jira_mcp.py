@@ -345,6 +345,45 @@ def _strip_urls(text: str) -> str:
 _KEYLESS_MAX_CHARS = 60
 
 
+def _inline_card_text(attrs: dict) -> str:
+    """Issue key of an inlineCard, else its host-stripped path, else ""."""
+    url = attrs.get("url")
+    if not isinstance(url, str) or not url:
+        return ""
+    key = issue_key_from_url(url)
+    if key:
+        return key
+    # Fallback: the path only, never the host and never the scheme.
+    try:
+        path = (urlparse(url).path or "").strip("/")
+    except ValueError:
+        return ""
+    path = path[:_KEYLESS_MAX_CHARS]
+    if not path or "://" in path or path.lower().startswith("http"):
+        return ""
+    return path
+
+
+def _mention_status_text(node_type: str, attrs: dict) -> str:
+    """Text of a mention or status node, without a leading "@"."""
+    text = attrs.get("text")
+    if not isinstance(text, str):
+        return ""
+    text = text.strip()
+    if node_type == "mention" and text.startswith("@"):
+        text = text[1:].strip()
+    return text[:_KEYLESS_MAX_CHARS]
+
+
+def _date_node_text(attrs: dict) -> str:
+    """YYYY-MM-DD of a date node's millisecond timestamp, else ""."""
+    stamp = attrs.get("timestamp")
+    if not isinstance(stamp, (str, int, float)):
+        return ""
+    seconds = int(str(stamp).strip()) / 1000.0
+    return datetime.fromtimestamp(seconds, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
 def _keyless_node_text(node: dict) -> str:
     """Readable text for an ADF node that has `attrs` but no `content`.
 
@@ -357,35 +396,11 @@ def _keyless_node_text(node: dict) -> str:
         if not isinstance(attrs, dict):
             return ""
         if node_type == "inlineCard":
-            url = attrs.get("url")
-            if not isinstance(url, str) or not url:
-                return ""
-            key = issue_key_from_url(url)
-            if key:
-                return key
-            # Fallback: the path only, never the host and never the scheme.
-            try:
-                path = (urlparse(url).path or "").strip("/")
-            except ValueError:
-                return ""
-            path = path[:_KEYLESS_MAX_CHARS]
-            if not path or "://" in path or path.lower().startswith("http"):
-                return ""
-            return path
+            return _inline_card_text(attrs)
         if node_type in ("mention", "status"):
-            text = attrs.get("text")
-            if not isinstance(text, str):
-                return ""
-            text = text.strip()
-            if node_type == "mention" and text.startswith("@"):
-                text = text[1:].strip()
-            return text[:_KEYLESS_MAX_CHARS]
+            return _mention_status_text(node_type, attrs)
         if node_type == "date":
-            stamp = attrs.get("timestamp")
-            if not isinstance(stamp, (str, int, float)):
-                return ""
-            seconds = int(str(stamp).strip()) / 1000.0
-            return datetime.fromtimestamp(seconds, tz=timezone.utc).strftime("%Y-%m-%d")
+            return _date_node_text(attrs)
     except Exception:
         logger.debug("_keyless_node_text failed - dropping the node", exc_info=True)
     return ""
@@ -3164,7 +3179,7 @@ def build_fetch_directive(url: str, issue_key: str = "") -> str:
         want_comments = bool(settings.jira_fetch_comments)
         want_parent = bool(settings.jira_fetch_parent)
         # An EMPTY JIRA_AC_FIELD is a legitimate configuration -- a project may
-        # simply have no Acceptance Criteria field (verified on the live TICKET
+        # simply have no Acceptance Criteria field (verified on a live
         # project: 21 fields on its Story type, none of them AC), in which case
         # criteria come from description parsing plus AC_JOB. Asking for it
         # anyway produced `...,comment,`.` -- a trailing comma and an empty field

@@ -776,37 +776,42 @@ def guard_detail(hit: str, screen: object, expected: object) -> str:
         if handler is not None:
             return handler(screen if isinstance(screen, dict) else {}, expected)
         if not hit or destructive_hit(hit) != hit:
-            # NOT "is it a known sentinel" -- that question cannot be asked
-            # honestly here, because registration now DEFINES the sentinel set,
-            # so the answer is yes exactly when a handler was found above.
-            # The question that survives is the one GUARD_DETAIL actually
-            # claims: is this a CONTROL? A term the lexicon does not match is
-            # not one, whatever it is called, so the control wording would be
-            # false and the generic screen sentence is what is true.
-            #
-            # IDENTITY, not containment. `not destructive_hit(hit)` was the
-            # first form and a review broke it in one line: a stop phrased "the
-            # app was reset between actions" CONTAINS the lexicon token "reset",
-            # so it read as a control and got the control wording. What arrives
-            # here from the guard is the lexicon TERM itself (see the call site
-            # -- `hit = destructive_hit(label)`), so a genuine term is its own
-            # match and a sentence that merely mentions one is not.
-            # This is the runtime half of the producer check in the ratchet: a
-            # screen-level stop nobody registered fails safe HERE even if it
-            # reached a shipped build.
-            # ERROR, not warning: a guard quietly degrading to a generic
-            # sentence is the exact failure mode this whole chain is about, and
-            # a warning in a replay log is a line nobody reads.
-            logger.error(
-                "mobile.executor: guard term %r is neither a registered screen "
-                "stop nor a lexicon match",
-                hit,
-            )
-            return GUARD_DETAIL_SCREEN_GENERIC
+            return _unrecognised_guard_term(hit)
     except Exception:  # pragma: no cover - defensive; the guard must not crash
         logger.error("mobile.executor.guard_detail failed", exc_info=True)
         return GUARD_DETAIL_SCREEN_GENERIC
     return _control_detail(hit)
+
+
+def _unrecognised_guard_term(hit: str) -> str:
+    """Log a guard term that is neither a screen stop nor a lexicon match."""
+    # NOT "is it a known sentinel" -- that question cannot be asked
+    # honestly here, because registration now DEFINES the sentinel set,
+    # so the answer is yes exactly when a handler was found above.
+    # The question that survives is the one GUARD_DETAIL actually
+    # claims: is this a CONTROL? A term the lexicon does not match is
+    # not one, whatever it is called, so the control wording would be
+    # false and the generic screen sentence is what is true.
+    #
+    # IDENTITY, not containment. `not destructive_hit(hit)` was the
+    # first form and a review broke it in one line: a stop phrased "the
+    # app was reset between actions" CONTAINS the lexicon token "reset",
+    # so it read as a control and got the control wording. What arrives
+    # here from the guard is the lexicon TERM itself (see the call site
+    # -- `hit = destructive_hit(label)`), so a genuine term is its own
+    # match and a sentence that merely mentions one is not.
+    # This is the runtime half of the producer check in the ratchet: a
+    # screen-level stop nobody registered fails safe HERE even if it
+    # reached a shipped build.
+    # ERROR, not warning: a guard quietly degrading to a generic
+    # sentence is the exact failure mode this whole chain is about, and
+    # a warning in a replay log is a line nobody reads.
+    logger.error(
+        "mobile.executor: guard term %r is neither a registered screen "
+        "stop nor a lexicon match",
+        hit,
+    )
+    return GUARD_DETAIL_SCREEN_GENERIC
 
 
 # Notes on screen_hit's branches (kept here so the function stays short).
@@ -1129,6 +1134,21 @@ async def resolve_activity(ctx: object) -> str:
         return known
     if getattr(ctx, "_activity_probed", False):
         return ""
+    serial = _serial_for_activity(ctx)
+    probed = await adb.current_activity(serial)
+    found = str(probed.get("content") or "")
+    try:
+        ctx._activity_probed = True
+        if found:
+            ctx.activity = found
+    except Exception:
+        # A frozen or slotted context must not fail a dump over a cache write.
+        return found
+    return found
+
+
+def _serial_for_activity(ctx: object) -> str:
+    """The context's serial, warning when it has none."""
     serial = str(getattr(ctx, "serial", "") or "")
     if not serial:
         # Not a refusal -- an empty activity is a NORMAL answer here and a
@@ -1140,16 +1160,7 @@ async def resolve_activity(ctx: object) -> str:
             "mobile.executor.resolve_activity: no serial on the context; "
             "screen ids will be hashed without an activity"
         )
-    probed = await adb.current_activity(serial)
-    found = str(probed.get("content") or "")
-    try:
-        ctx._activity_probed = True
-        if found:
-            ctx.activity = found
-    except Exception:
-        # A frozen or slotted context must not fail a dump over a cache write.
-        return found
-    return found
+    return serial
 
 
 #: The wall clock, bound at import. Tests replace `executor.time` with a fake
@@ -1955,27 +1966,50 @@ async def _settle(
     *mark_no_change* is False for ``wait``: ``no_change`` exists to tell a model
     "your tap did nothing", and a wait that changes nothing is the normal case.
     """
-    before_id = str(entry.get("before_screen_id") or "")
-    before_hash = str(entry.get("before_screen_hash") or "")
     if redump:
-        dumped = await _dump(ctx)
-        if dumped.get("error"):
-            entry["outcome"] = "dump_failed"
-            entry["detail"] = str(dumped["error"])[:400]
-            _append(trace, entry)
-            return screen, _result(
-                STATUS_ERROR, trace, screen, "", entry["detail"], index
-            )
-        screen = dumped.get("content")
+        screen, stop = await _settle_redump(ctx, entry, screen, trace, index)
+        if stop is not None:
+            return screen, stop
     # A registered dialog handler answers a known interruption BEFORE the screen
     # is stamped, so the entry records the screen the replay actually continues
     # on. No handler registered: this returns the screen untouched.
     screen = await _answer_dialogs(ctx, entry, screen, op, extra_expected)
-    # BOTH halves, through the one producer. This site used to write the hash
-    # alone and re-derive the id inline for the comparison below -- so it was
-    # simultaneously the only site stamping a look AND a second derivation of
-    # the id. One call answers both.
+    # BOTH halves (hash and id), through the one producer, never re-derived.
     _stamp_after(entry, screen)
+    screen, unchanged = await _settle_unchanged(
+        ctx, entry, screen, (redump, mark_no_change), op
+    )
+    if unchanged:
+        entry["outcome"] = "no_change"
+    kind, foreign = _cut_of(ctx, screen, op, extra_expected)
+    if kind:
+        return screen, _cut_stop(ctx, entry, screen, trace, (index, kind, foreign))
+    return screen, None
+
+
+async def _settle_redump(
+    ctx: Context, entry: dict, screen: object, trace: list[dict], index: int
+) -> tuple:
+    """``_settle``'s re-dump half: ``(screen, stop)``, ``stop`` set on a failed dump."""
+    dumped = await _dump(ctx)
+    if dumped.get("error"):
+        entry["outcome"] = "dump_failed"
+        entry["detail"] = str(dumped["error"])[:400]
+        _append(trace, entry)
+        return screen, _result(STATUS_ERROR, trace, screen, "", entry["detail"], index)
+    return dumped.get("content"), None
+
+
+async def _settle_unchanged(
+    ctx: Context, entry: dict, screen: object, flags: tuple, op: str
+) -> tuple:
+    """``(screen, unchanged)``: did the action change nothing, after auto-settle.
+
+    *flags* is ``(redump, mark_no_change)``.
+    """
+    redump, mark_no_change = flags
+    before_id = str(entry.get("before_screen_id") or "")
+    before_hash = str(entry.get("before_screen_hash") or "")
     unchanged = mark_no_change and _unchanged(
         before_hash,
         entry["after_screen_hash"],
@@ -1994,26 +2028,26 @@ async def _settle(
             before_id,
             entry["after_screen_id"],
         )
-    if unchanged:
-        entry["outcome"] = "no_change"
+    return screen, unchanged
 
-    # The app is not where the script thinks it is. Recorded on the ACTION that
-    # took it there, and the replay stops: every target after this one would
-    # miss against a screen that belongs to somebody else, which is how one
-    # mistaken tap spent a case's three escapes and reported `blocked` without
-    # ever mentioning that the app had been left.
-    kind, foreign = _cut_of(ctx, screen, op, extra_expected)
-    if kind:
-        entry["outcome"] = "left_app"
-        if kind == "system_dialog":
-            entry["outcome"] = "system_dialog"
-        entry["detail"] = _cut_detail(kind, foreign, ctx, entry)
-        _stamp_after(entry, screen)
-        _append(trace, entry)
-        return screen, _result(
-            STATUS_NEEDS_MODEL, trace, screen, "", entry["detail"], index
-        )
-    return screen, None
+
+def _cut_stop(
+    ctx: Context, entry: dict, screen: object, trace: list[dict], cut: tuple
+) -> dict:
+    """The replay result for an app that is not where the script thinks it is.
+
+    *cut* is ``(index, kind, foreign)``. Recorded on the ACTION that took it
+    there, and the replay stops: every target after this one would miss against
+    a screen that belongs to somebody else, which is how one mistaken tap spent
+    a case's three escapes and reported `blocked` without ever mentioning that
+    the app had been left.
+    """
+    index, kind, foreign = cut
+    entry["outcome"] = "system_dialog" if kind == "system_dialog" else "left_app"
+    entry["detail"] = _cut_detail(kind, foreign, ctx, entry)
+    _stamp_after(entry, screen)
+    _append(trace, entry)
+    return _result(STATUS_NEEDS_MODEL, trace, screen, "", entry["detail"], index)
 
 
 async def _wait_until_text(
@@ -2378,20 +2412,13 @@ async def _apply_knowledge(
     """
     try:
         know = getattr(ctx, "knowledge", None)
-        if op == "wait" or not isinstance(know, dict) or not know.get("guards"):
-            return screen, None
-        matched = app_knowledge.candidates(
-            know["guards"], op, _action_rids(action, screen)
-        )
+        matched = _matched_notes(know, action, op, screen)
         if not matched:
             return screen, None
         live = await _live_guards(ctx, know, matched, deadline)
-        # An avoid note refuses an ACTION. A read-only assert or a poll wait
-        # changes nothing, so it is never refused.
-        if op not in NON_ACTUATING_OPS and op not in actions_mod.WAIT_OPS:
-            refusal = _avoid_refusal(know, live, op, entry)
-            if refusal is not None:
-                return screen, refusal
+        refusal = _knowledge_refusal(know, live, op, entry)
+        if refusal is not None:
+            return screen, refusal
         fired: list[dict] = []
         for guard in live:
             if guard.get("kind") != "wait":
@@ -2410,6 +2437,22 @@ async def _apply_knowledge(
     except Exception:
         logger.exception("mobile app knowledge: guard failed; continuing without notes")
         return screen, None
+
+
+def _matched_notes(know: object, action: object, op: str, screen: object) -> list:
+    """The saved guard notes that match this action, or ``[]`` when none apply."""
+    if op == "wait" or not isinstance(know, dict) or not know.get("guards"):
+        return []
+    return app_knowledge.candidates(know["guards"], op, _action_rids(action, screen))
+
+
+def _knowledge_refusal(know: dict, live: list, op: str, entry: dict) -> str | None:
+    """The avoid-note refusal for *op*, or ``None``."""
+    # An avoid note refuses an ACTION. A read-only assert or a poll wait
+    # changes nothing, so it is never refused.
+    if op in NON_ACTUATING_OPS or op in actions_mod.WAIT_OPS:
+        return None
+    return _avoid_refusal(know, live, op, entry)
 
 
 def _fired_note(guard: dict, kind: str, outcome: str, spent: int) -> dict:
@@ -2529,48 +2572,50 @@ async def _focus_probe(serial: str, budget: float) -> str:
     return str((probed or {}).get("content") or "")
 
 
+# Notes on _wait_until_changed (kept here so the function stays short).
+#
+# A wait exists because the planner expects the screen to become something
+# else; sleeping through the whole ``ms`` after it already has is the cheapest
+# thing this lane was getting wrong -- observed on run mrun-20260908-061316-
+# a41b2a, where fixed sleeps sat between every action.
+#
+# NO FIXED SLEEP (S17, owner decision). There is no floor below which the wait
+# is slept instead of polled, and nothing is slept after the last poll: an
+# unchanged screen ends the wait at its bound, a changed one at the poll that
+# sees it. Each poll's dump is cut at the deadline (``_dump(ctx,
+# deadline=...)``), so even a dump slower than its p90 cannot carry the wait
+# past the ms it was given.
+#
+# It does not decide the screen the model SEES on a change. The caller still
+# settles with ``redump=True`` after an early return, so an intermediate screen
+# -- a spinner replacing a button IS a change -- is re-read before it is handed
+# over.
+#
+# WHICH IDENTITY, and why it is the hash. ``_screen_id`` is package + activity
+# + the top three texts, and ``perception._screen_id`` says so: it is
+# deliberately coarse because the report dedupes on it. A chat reply is
+# appended at the BOTTOM, so the top three texts never move and the id is
+# byte-identical -- which made this loop blind to the one event it exists to
+# catch. ``_settle`` was moved to the hash for the same reason.
+#
+# ``reusable`` is True in ONE case only: the screen never changed and the wait
+# ended on a poll whose dump SUCCEEDED, so that dump is the post-wait screen and
+# the caller's settle skips its own (``redump=not reusable``). Every early
+# return is ``reusable=False``. That screen can be up to one :data:`WAIT_POLL_S`
+# old: a poll whose sleep reached the deadline dumps nothing, so the last
+# successful read stands for the post-wait screen.
+#
+# FOCUS FIRST. Each iteration asks ``adb.current_activity`` -- bounded by the
+# time left -- before paying for a dump. A focused window different from the one
+# PROBED when the wait started (never ``ctx.activity``, which is memoised per
+# replay) is a change, returned at once and never reusable. An empty answer on
+# either side is unknown, never a change.
 async def _wait_until_changed(
     ctx: Context, screen: object, ms: int
 ) -> tuple[object, bool, bool]:
     """Poll until the screen is no longer the one we started on, or *ms* runs out.
 
-    Returns ``(latest_screen, changed, reusable)``. A wait exists because the
-    planner expects the screen to become something else; sleeping through the
-    whole ``ms`` after it already has is the cheapest thing this lane was
-    getting wrong -- observed on run mrun-20260908-061316-a41b2a, where fixed
-    sleeps sat between every action.
-
-    NO FIXED SLEEP (S17, owner decision). There is no floor below which the
-    wait is slept instead of polled, and nothing is slept after the last poll:
-    an unchanged screen ends the wait at its bound, a changed one at the poll
-    that sees it. Each poll's dump is cut at the deadline
-    (``_dump(ctx, deadline=...)``), so even a dump slower than its p90 cannot
-    carry the wait past the ms it was given.
-
-    It does not decide the screen the model SEES on a change. The caller still
-    settles with ``redump=True`` after an early return, so an intermediate
-    screen -- a spinner replacing a button IS a change -- is re-read before it
-    is handed over.
-
-    WHICH IDENTITY, and why it is the hash. ``_screen_id`` is package +
-    activity + the top three texts, and ``perception._screen_id`` says so: it
-    is deliberately coarse because the report dedupes on it. A chat reply is
-    appended at the BOTTOM, so the top three texts never move and the id is
-    byte-identical -- which made this loop blind to the one event it exists to
-    catch. ``_settle`` was moved to the hash for the same reason.
-
-    ``reusable`` is True in ONE case only: the screen never changed and the
-    wait ended on a poll whose dump SUCCEEDED, so that dump is the post-wait
-    screen and the caller's settle skips its own (``redump=not reusable``).
-    Every early return is ``reusable=False``. That screen can be up to one
-    :data:`WAIT_POLL_S` old: a poll whose sleep reached the deadline dumps
-    nothing, so the last successful read stands for the post-wait screen.
-
-    FOCUS FIRST. Each iteration asks ``adb.current_activity`` -- bounded by
-    the time left -- before paying for a dump. A focused window different
-    from the one PROBED when the wait started (never ``ctx.activity``, which
-    is memoised per replay) is a change, returned at once and never
-    reusable. An empty answer on either side is unknown, never a change.
+    Returns ``(latest_screen, changed, reusable)``; see the notes above.
     """
     before = _screen_hash(screen)
     deadline = time.monotonic() + latency_scale.scale_timeout(
@@ -2754,57 +2799,45 @@ def _on_screen_box(element: dict, display: object) -> tuple[int, int, int, int]:
     return x1, y1, x2, y2
 
 
+def _centred_swipe(direction: str, points: tuple, box: tuple) -> tuple:
+    """The swipe for *direction* centred in *box*, its half-extent the table's
+    (*points*) clipped to the box minus :data:`_SWIPE_INSET`."""
+    x1, y1, x2, y2 = box
+    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+    if direction in ("up", "down"):
+        half = min(
+            abs(points[1] - points[3]) // 2, max(0, (y2 - y1) // 2 - _SWIPE_INSET)
+        )
+        if direction == "up":
+            return (cx, cy + half, cx, cy - half)
+        return (cx, cy - half, cx, cy + half)
+    half = min(abs(points[0] - points[2]) // 2, max(0, (x2 - x1) // 2 - _SWIPE_INSET))
+    if direction == "left":
+        return (cx + half, cy, cx - half, cy)
+    return (cx - half, cy, cx + half, cy)
+
+
 def _swipe_points(
     direction: str, element: object, display: object = None
 ) -> tuple | None:
     """The swipe ``_perform`` issues for *direction*, confined to *element*.
 
     A target-less pan uses the :data:`_SWIPE` table as it is. A TARGETED swipe
-    is centred on the element on BOTH axes and its extent is clipped to the
-    element's bounds minus :data:`_SWIPE_INSET`, so the whole gesture happens
-    on the node the action named. The shipped code shifted the table by the
-    element's X only: ``scroll left`` naming a row at y 700-800 swiped along
-    y=1000, never touched the row, and crossed a "Slide to confirm payment"
-    control the guard had judged nothing about. A short element gets a short
-    swipe rather than one that leaves it.
+    is centred on the element on BOTH axes and clipped to the element's bounds
+    minus :data:`_SWIPE_INSET`, so the whole gesture happens on the node the
+    action named (shifting by X only once swiped past the named row and across
+    controls the guard never judged). A short element gets a short swipe.
 
-    THE INVARIANT, stated once and checked LAST: the gesture returned moves at
-    least :data:`_MIN_SWIPE_PX` along its axis, or ``None`` is returned. It is
-    checked after every adjustment because the order was the defect twice: a
-    ``half <= 0`` refusal placed BEFORE a ``>= 0`` clamp let a mostly off-screen
-    element clamp both ends onto the screen edge and ship ``input swipe 0 950
-    0 950 300`` -- a press -- with the refusal green. So the swipe is computed
-    from the element's ON-SCREEN part and the post-condition is on the final
-    tuple.
+    THE INVARIANT, checked LAST on the final tuple: the gesture moves at least
+    :data:`_MIN_SWIPE_PX` along its axis, or ``None`` is returned. Checking
+    before a clamp once let a mostly off-screen element ship a press.
 
-    "On-screen part" is FOUR clamps when the caller knows the display, and two
-    when it does not.
-
-    It used to be two, justified like this: "the far edges are left alone
-    because ``perception.prune`` drops a node lying entirely outside the root
-    bounds, so an element that survives into a packet has its far edges inside
-    the window already." The premise is true and the conclusion does not
-    follow. ``prune`` drops a node lying ENTIRELY outside; a node lying PARTLY
-    outside survives with its far edges untouched. Measured on a 1080x2400
-    display with a row at ``[900,700][3000,800]``: the row survives pruning,
-    ``scroll left`` returns ``(2300,750)->(1600,750)``, both x past the right
-    edge, ``adb._coord`` accepts them because ``_SWIPE_MAX`` is 20000 and not a
-    display bound, and the device silently ignores the gesture while the step
-    reports success. A no-op that reports success is worse than a refusal.
-
-    That inference was already wrong before the display work; what changed is
-    how often it is reached. The visibility frame is now the display widened to
-    cover everything the dump lays out, so the off-screen filter no longer drops
-    anything at a positive coordinate -- a partly-visible row is the NORMAL
-    case now, not the odd one.
-
-    *display* is the packet's own ``root_bounds``, passed by the caller so the
-    guard and the device read one number: ``adb.display_size`` expires per
-    serial, so two reads on one gesture can disagree, and a guard judging a
-    different rectangle from the one the finger uses is the bug this function's
-    history is made of. When it is absent or unusable the far clamps are
-    SKIPPED rather than guessed -- a stale or missing size must never shrink a
-    real gesture out of existence.
+    The element's ON-SCREEN part (:func:`_on_screen_box`) is FOUR clamps when
+    *display* is known, two when not. *display* is the packet's own
+    ``root_bounds``, so the guard and the device read one number; absent or
+    unusable, the far clamps are SKIPPED rather than guessed. A partly-visible
+    row is the NORMAL case: its far edges can lie past the display, and a
+    gesture there is silently ignored while the step reports success.
 
     Returns ``None`` for an unknown direction, and for an element whose
     on-screen part is too small to swipe on; ``_perform`` tells the two apart
@@ -2821,23 +2854,7 @@ def _swipe_points(
     x1, y1, x2, y2 = _on_screen_box(element, display)
     if x2 <= x1 or y2 <= y1:
         return None
-    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-    if direction in ("up", "down"):
-        half = min(
-            abs(points[1] - points[3]) // 2, max(0, (y2 - y1) // 2 - _SWIPE_INSET)
-        )
-        if direction == "up":
-            swipe = (cx, cy + half, cx, cy - half)
-        else:
-            swipe = (cx, cy - half, cx, cy + half)
-    else:
-        half = min(
-            abs(points[0] - points[2]) // 2, max(0, (x2 - x1) // 2 - _SWIPE_INSET)
-        )
-        if direction == "left":
-            swipe = (cx + half, cy, cx - half, cy)
-        else:
-            swipe = (cx - half, cy, cx + half, cy)
+    swipe = _centred_swipe(direction, points, (x1, y1, x2, y2))
     # The post-condition, on the FINAL tuple: a gesture that moves less than
     # touch slop is delivered as a click on the element the script asked to
     # scroll. Handed back instead, so the model names the list.
@@ -3543,7 +3560,11 @@ def _mark_refused(ctx: Context, fired: object) -> None:
     counted as having run."""
     item = (fired or {}).get("item") if isinstance(fired, dict) else None
     for ev in reversed(getattr(ctx, "kbuf", None) or []):
-        if isinstance(ev, dict) and ev.get("item") == item and str(ev.get("kind", "")).endswith("_fired"):
+        if (
+            isinstance(ev, dict)
+            and ev.get("item") == item
+            and str(ev.get("kind", "")).endswith("_fired")
+        ):
             ev["refused"] = True
             return
 
@@ -4272,7 +4293,7 @@ def _before_texts(op: str, screen: object, previous: set | None) -> set | None:
     return baseline_texts
 
 
-# --- _guard_stop: why the destructive guard is shaped this way ---------------
+# --- _guard_stop: why the destructive guard is shaped this way
 #
 # DENY BY DEFAULT, and judge the node the action ACTUATES, not the node it
 # NAMES. Both halves were learned by shipping the failure.
@@ -4304,39 +4325,45 @@ def _before_texts(op: str, screen: object, previous: set | None) -> set | None:
 # a guard stop is terminal for a scripted case, so the pan stays unjudged and
 # the decision is pinned in both directions by tests/mobile.
 #
-# Press branch: the key fires the FORM's IME action and no dump names the control
-# that action reaches (uiautomator emits no imeOptions), so the scope is every
-# element the packet carries, and a packet that does not carry the whole screen
-# cannot clear it. Measured: `tap {"text": "Confirm payment"}` was refused while
-# `press enter {"rid": amount}` on the same form sent KEYCODE_ENTER. The judged-
-# node probe runs LAST, only with a node in hand, so `judged=None` never reaches
-# the fidelity branch. `confirmed` is a flag, not `hit = ""`: the sentinel ratchet
-# requires `hit` be bound ONLY by destructive_hit/screen_hit. The replies use
-# EXPLICIT keywords, never a dict splat: guard_term's provenance must be
-# traceable by reading the call. guard_refused is an explicit marker, not a
-# comparison against the detail PROSE, which the tester reads and may reword.
-
-
+# The `press` branch: the key fires the FORM's IME action, and no dump names
+# the control that action reaches (uiautomator emits no imeOptions). The
+# actuated node is unknown BY CONSTRUCTION, so the scope is every element the
+# packet carries -- and a packet that does not carry the whole screen cannot
+# clear it. Measured before this line existed: `tap {"text": "Confirm
+# payment"}` was refused while `press enter {"rid": amount}` on the same form
+# sent KEYCODE_ENTER.
+#
+# The judged-node branch runs LAST, and only with a node in hand: a path that
+# has a term today keeps it, and `judged=None` can never reach the fidelity
+# branch, so nothing else about this guard moves.
+#
+# The refused reply: EXPLICIT KEYWORDS, never a dict splat. The sentinel
+# ratchet forbids ``**kwargs`` into this sink because ``guard_term``'s
+# provenance must be traceable by reading the call, and it is right: a splat
+# hides which keys reach the payload. ``guard_refused`` is an EXPLICIT marker
+# rather than a comparison against the detail PROSE -- a reader that matches
+# on wording breaks the moment the wording is improved, and the wording is the
+# part the tester actually reads.
 def _guard_stop(
     run: _ReplayRun, step: _Step, screen: object, index: int
 ) -> dict | None:
-    """The reply that ends the replay at the destructive guard, else ``None``.
-
-    Deny by default; judges the node the action ACTUATES. See the comment above.
-    """
+    """The reply that ends the replay at the guard, else ``None`` (why: above)."""
     ctx, trace, op, entry = run.ctx, run.trace, step.op, step.entry
     if not ctx.guard_destructive or op in NON_ACTUATING_OPS:
         return None
     label, judged_node = _guard_label(op, step.action, step.element, screen)
     hit = destructive_hit(label)
-    if not hit and op == "press":
+    if not hit and op == "press":  # IME action: see the `press` branch above
         hit = screen_hit(screen, ctx.package)
-    if not hit and judged_node is not None:
+    if not hit and judged_node is not None:  # LAST: see the judged-node branch
         hit = screen_hit(screen, "", judged=judged_node)
+    # A flag, not `hit = ""`: the sentinel ratchet requires
+    # `hit` be bound ONLY by destructive_hit/screen_hit.
     confirmed = bool(hit) and _consume_confirm(ctx, hit, screen, op, entry, label)
     if not hit or confirmed:
         return None
     if _record_guard_stop(run, op, hit, entry, screen):
+        # EXPLICIT KEYWORDS, never a dict splat: see the refused reply above.
         return {
             "error": None,
             "content": _result(
@@ -4419,71 +4446,95 @@ async def _replay_steps(script: object, ctx: Context) -> dict:
         if reply is not None:
             return reply
         run = _ReplayRun(ctx, items, trace)
-
-        deadline = time.monotonic() + _budget_seconds(ctx)
-        #: The screen content as it was before the last screen-changing action.
-        #: ``None`` until one has run, which is the honest answer ``new_text``
-        #: gives when a script asserts a reply before sending anything.
-        baseline_texts: set | None = None
+        state = _ReplayState(screen, time.monotonic() + _budget_seconds(ctx))
         for index, action in (cursor := _StepCursor(items)):
-            # NEVER on index 0. A budget that can stop the first action makes no
-            # progress at all, and each stop costs one of three escapes, so a
-            # short budget would turn every case into `blocked` without ever
-            # touching the device.
-            if index and time.monotonic() >= deadline:
-                return _budget_stop(run, index, screen)
-            started = time.monotonic()
-            entry = _entry(
-                index, action, _screen_id(screen), started, _screen_hash(screen)
-            )
-            _stamp_screen_key(ctx, entry, screen)
-            op = str(getattr(action, "op", "") or "")
-            # S10 saved route (PROVISIONAL): the live screen must be the one this step was
-            # saved from. Checked BEFORE the guard and before anything is actuated.
-            expected_id = _route_expected(ctx, index, len(items))
-            if expected_id and expected_id != _screen_id(screen):
-                return _route_mismatch_stop(run, index, entry, screen)
-            # The BEFORE set for ``assert new_text``, captured for every op that
-            # can change the screen -- ``wait`` included, which is the whole
-            # point: the reply a case is waiting for arrives during the wait.
-            baseline_texts = _before_texts(op, screen, baseline_texts)
-
-            # --- terminal ops -------------------------------------------------
-            if op == "done":
-                return _done_stop(run, action, index, entry, screen)
-            if op == "ask_tester":
-                reply = _ask_tester_step(run, action, index, entry, screen)
-                if reply is not None:
-                    return reply
-                continue
-
-            # Saved app notes, BEFORE the target resolves. A wait note polls
-            # (bounded); an avoid note refuses. The destructive guard below
-            # still runs and still outranks both.
-            screen, reply, inserted = await _knowledge_before(
-                run, cursor, (index, action, entry), screen, deadline
-            )
-            if reply is not None:
-                return reply
-            if inserted:
-                continue
-
-            # --- target resolution, then the destructive guard ----------------
-            step, reply = await _target_step(run, (index, action, entry), op, screen)
+            reply = await _replay_one(run, cursor, (index, action), state)
             if reply is not None:
                 return reply
 
-            # --- asserts, waits and device ops --------------------------------
-            before = screen
-            screen, reply = await _dispatch_op(run, step, screen, baseline_texts)
-            _knowledge_post(run, entry, before, screen)
-            if reply is not None:
-                return reply
-
-        return _end_of_script(run, screen)
+        return _end_of_script(run, state.screen)
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.executor.replay failed")
         return {"error": str(exc), "content": None}
+
+
+@dataclasses.dataclass
+class _ReplayState:
+    """What changes from one step to the next: the live screen, the budget
+    deadline and the screen content before the last screen-changing action.
+
+    ``baseline_texts`` is ``None`` until one has run, which is the honest answer
+    ``new_text`` gives when a script asserts a reply before sending anything."""
+
+    screen: dict | None
+    deadline: float
+    baseline_texts: set | None = None
+
+
+def _step_prelude(
+    run: _ReplayRun, state: _ReplayState, index: int, action: object
+) -> tuple[dict | None, dict | None]:
+    """The entry for step *index*, or the reply that stops the script before it.
+
+    Checks the saved route (S10, PROVISIONAL): the live screen must be the one
+    this step was saved from, BEFORE the guard and before anything is actuated.
+    Then captures the BEFORE set for ``assert new_text`` for every op that can
+    change the screen -- ``wait`` included, because the reply a case is waiting
+    for arrives during the wait."""
+    screen = state.screen
+    started = time.monotonic()
+    entry = _entry(index, action, _screen_id(screen), started, _screen_hash(screen))
+    _stamp_screen_key(run.ctx, entry, screen)
+    op = str(getattr(action, "op", "") or "")
+    expected_id = _route_expected(run.ctx, index, len(run.items))
+    if expected_id and expected_id != _screen_id(screen):
+        return entry, _route_mismatch_stop(run, index, entry, screen)
+    state.baseline_texts = _before_texts(op, screen, state.baseline_texts)
+    return entry, None
+
+
+async def _replay_one(
+    run: _ReplayRun, cursor: _StepCursor, item: tuple, state: _ReplayState
+) -> dict | None:
+    """One step of the replay; the reply that ends the script, else ``None``."""
+    index, action = item
+    # NEVER on index 0. A budget that can stop the first action makes no
+    # progress at all, and each stop costs one of three escapes, so a short
+    # budget would turn every case into `blocked` without ever touching the
+    # device.
+    if index and time.monotonic() >= state.deadline:
+        return _budget_stop(run, index, state.screen)
+    entry, reply = _step_prelude(run, state, index, action)
+    if reply is not None:
+        return reply
+    op = str(getattr(action, "op", "") or "")
+    # --- terminal ops -------------------------------------------------
+    if op == "done":
+        return _done_stop(run, action, index, entry, state.screen)
+    if op == "ask_tester":
+        return _ask_tester_step(run, action, index, entry, state.screen)
+
+    # Saved app notes, BEFORE the target resolves. A wait note polls
+    # (bounded); an avoid note refuses. The destructive guard below
+    # still runs and still outranks both.
+    state.screen, reply, inserted = await _knowledge_before(
+        run, cursor, (index, action, entry), state.screen, state.deadline
+    )
+    if reply is not None or inserted:
+        return reply
+
+    # --- target resolution, then the destructive guard ----------------
+    step, reply = await _target_step(run, (index, action, entry), op, state.screen)
+    if reply is not None:
+        return reply
+
+    # --- asserts, waits and device ops --------------------------------
+    before = state.screen
+    state.screen, reply = await _dispatch_op(
+        run, step, state.screen, state.baseline_texts
+    )
+    _knowledge_post(run, entry, before, state.screen)
+    return reply
 
 
 def _no_done_reason(ended_verified: bool, summary: str, asserts_expected: bool) -> str:
@@ -4754,67 +4805,85 @@ def _evaluate_assert(
             "still on this screen: " if found else "absent, as expected: "
         ) + repr(text[:120])
     if kind == "element":
-        resolved = actions_mod.resolve_target(getattr(action, "target", None), screen)
-        body = (resolved or {}).get("content") or {}
-        element = body.get("element")
-        if element is None and (body.get("stale") or body.get("conflict")):
-            # "The element is absent" and "the target could not be read on this
-            # screen" are different answers, and an assert must not quietly
-            # turn the second into the first -- that would report the app as
-            # wrong when the PLAN was stale.
-            return False, missing_element_detail(body)
-        return bool(element), (
-            "the element is on this screen"
-            if element
-            else "the element is not on this screen"
-        )
+        return _assert_element(action, screen)
     if kind == "new_text":
-        if baseline is None:
-            return False, (
-                "no earlier screen to compare against: nothing in this script "
-                "has changed the screen yet, so there is no 'before' to diff"
-            )
-        contains = " ".join(str(getattr(action, "contains", "") or "").split())
-        # TWO things are subtracted before anything counts as a reply, and both
-        # came from a review that ran the code rather than read it.
-        #
-        # 1. What this script TYPED. A chat composer echoes your question into
-        #    the thread, so `[type, tap send, assert new_text]` passed on an app
-        #    that never answered -- on the most ordinary screen there is.
-        # 2. Furniture that only CHANGED. A clock going 10:42 -> 10:43 is a new
-        #    string and is not new content. Recognised without a threshold: an
-        #    added string whose digits normalise onto a string that was there
-        #    before is a mutation of what was already on screen.
-        added = sorted(_texts(screen) - set(baseline))
-        typed = _typed_by_script(trace)
-        added = [item for item in added if item not in typed]
-        before_shapes = {
-            _digit_shape(item) for item in set(baseline) if _is_furniture(item)
-        }
-        # ONE condition, not two. The bound belongs on the BASELINE side -- only
-        # a string that was already furniture can be furniture that ticked -- and
-        # a second copy of it on the added side decided nothing, which mutation
-        # proved by deleting it and changing no result. A guard nothing can kill
-        # is not a guard.
-        added = [item for item in added if _digit_shape(item) not in before_shapes]
-        if contains:
-            added = [item for item in added if contains.lower() in item.lower()]
-        if added:
-            return True, (
-                "a new reply appeared: "
-                + repr(added[0][:160])
-                + (
-                    (" (and " + str(len(added) - 1) + " more)")
-                    if len(added) > 1
-                    else ""
-                )
-            )
-        return False, (
-            "no new text appeared on this screen since the last action"
-            + ((" containing " + repr(contains[:60])) if contains else "")
-        )
+        return _assert_new_text(action, screen, trace, baseline)
+    return _assert_screen_changed(screen, trace)
 
-    # screen_changed
+
+def _assert_element(action: object, screen: object) -> tuple[bool, str]:
+    """``assert element``: is the named target on this screen."""
+    resolved = actions_mod.resolve_target(getattr(action, "target", None), screen)
+    body = (resolved or {}).get("content") or {}
+    element = body.get("element")
+    if element is None and (body.get("stale") or body.get("conflict")):
+        # "The element is absent" and "the target could not be read on this
+        # screen" are different answers, and an assert must not quietly
+        # turn the second into the first -- that would report the app as
+        # wrong when the PLAN was stale.
+        return False, missing_element_detail(body)
+    return bool(element), (
+        "the element is on this screen"
+        if element
+        else "the element is not on this screen"
+    )
+
+
+def _new_text_added(screen: object, trace: list[dict], baseline: object) -> list:
+    """The strings on *screen* that count as a reply since *baseline*.
+
+    TWO things are subtracted before anything counts as a reply, and both
+    came from a review that ran the code rather than read it.
+
+    1. What this script TYPED. A chat composer echoes your question into
+       the thread, so `[type, tap send, assert new_text]` passed on an app
+       that never answered -- on the most ordinary screen there is.
+    2. Furniture that only CHANGED. A clock going 10:42 -> 10:43 is a new
+       string and is not new content. Recognised without a threshold: an
+       added string whose digits normalise onto a string that was there
+       before is a mutation of what was already on screen.
+    """
+    added = sorted(_texts(screen) - set(baseline))
+    typed = _typed_by_script(trace)
+    added = [item for item in added if item not in typed]
+    before_shapes = {
+        _digit_shape(item) for item in set(baseline) if _is_furniture(item)
+    }
+    # ONE condition, not two. The bound belongs on the BASELINE side -- only
+    # a string that was already furniture can be furniture that ticked -- and
+    # a second copy of it on the added side decided nothing, which mutation
+    # proved by deleting it and changing no result. A guard nothing can kill
+    # is not a guard.
+    return [item for item in added if _digit_shape(item) not in before_shapes]
+
+
+def _assert_new_text(
+    action: object, screen: object, trace: list[dict], baseline: object
+) -> tuple[bool, str]:
+    """``assert new_text``: a reply appeared since *baseline*."""
+    if baseline is None:
+        return False, (
+            "no earlier screen to compare against: nothing in this script "
+            "has changed the screen yet, so there is no 'before' to diff"
+        )
+    contains = " ".join(str(getattr(action, "contains", "") or "").split())
+    added = _new_text_added(screen, trace, baseline)
+    if contains:
+        added = [item for item in added if contains.lower() in item.lower()]
+    if added:
+        return True, (
+            "a new reply appeared: "
+            + repr(added[0][:160])
+            + ((" (and " + str(len(added) - 1) + " more)") if len(added) > 1 else "")
+        )
+    return False, (
+        "no new text appeared on this screen since the last action"
+        + ((" containing " + repr(contains[:60])) if contains else "")
+    )
+
+
+def _assert_screen_changed(screen: object, trace: list[dict]) -> tuple[bool, str]:
+    """``assert screen_changed`` (weak: compares ids, see ``_evaluate_assert``)."""
     seen = [
         entry.get("before_screen_id")
         for entry in trace
@@ -4862,6 +4931,21 @@ def _brought_to_front(
     )
 
 
+#: Ops that are one system key press, and the keycode each sends.
+_SYSTEM_KEY_OPS = {"back": "KEYCODE_BACK", "home": "KEYCODE_HOME"}
+
+
+async def _tap_op(element: object, serial: str) -> dict:
+    """``tap`` / ``tap_text``: tap the centre of the chosen element."""
+    # ONE device path for both. `tap_text` differs only in how its element
+    # was chosen; once chosen a tap is a tap, and a second `adb.tap` call
+    # site would be a second place for the bounds check to drift.
+    center = _center(element) if isinstance(element, dict) else None
+    if not center:
+        return {"error": "That element has no usable bounds.", "content": None}
+    return await adb.tap(serial, center[0], center[1])
+
+
 async def _perform(
     op: str,
     action: object,
@@ -4873,10 +4957,8 @@ async def _perform(
     serial = ctx.serial
     # Any device op can change the screen, so a carried read is stale from here.
     _drop_carried(serial)
-    if op == "back":
-        return await adb.keyevent(serial, "KEYCODE_BACK")
-    if op == "home":
-        return await adb.keyevent(serial, "KEYCODE_HOME")
+    if op in _SYSTEM_KEY_OPS:
+        return await adb.keyevent(serial, _SYSTEM_KEY_OPS[op])
     if op == "launch":
         return await _launch_op(action, ctx)
     if op == "clear_app_data":
@@ -4890,13 +4972,7 @@ async def _perform(
     if op == "scroll":
         return await _scroll_op(action, element, display, serial)
     if op in ("tap", "tap_text"):
-        # ONE device path for both. `tap_text` differs only in how its element
-        # was chosen; once chosen a tap is a tap, and a second `adb.tap` call
-        # site would be a second place for the bounds check to drift.
-        center = _center(element) if isinstance(element, dict) else None
-        if not center:
-            return {"error": "That element has no usable bounds.", "content": None}
-        return await adb.tap(serial, center[0], center[1])
+        return await _tap_op(element, serial)
     if op == "press":
         return await _press_op(action, element, serial)
     if op in ("type", "fill", "clear"):
@@ -5114,11 +5190,8 @@ def _judge_landed(result: object, field: str) -> dict:
       never passes silently.
     """
     if not isinstance(result, dict):
-        # Unreachable: `ime.type_text` returns a dict on every path including
-        # its `except`. A FIXED string rather than `str(result)`, because this
-        # is the only line here that could interpolate an unconstrained object
-        # into a message a tester reads -- and the day the contract changes is
-        # the day that object might be a field's contents.
+        # Unreachable: `ime.type_text` returns a dict on every path. A FIXED
+        # string, never `str(result)`: that object might be a field's contents.
         return {"error": "The keyboard returned an unusable reply.", "content": None}
     if result.get("error"):
         return result
@@ -5143,13 +5216,18 @@ def _judge_landed(result: object, field: str) -> dict:
             ),
             "content": None,
         }
+    return _unconfirmed_type_reply(bool(content.get("secret")), typed, field)
+
+
+def _unconfirmed_type_reply(secret: bool, typed: object, field: str) -> dict:
+    """The ``needs_model`` reply for a type the keyboard could not confirm."""
     # TWO recoveries, because the two modes can be asked for different things.
     # Telling the model to check that "the field shows the value" is the right
     # instruction for ordinary text and exactly the wrong one for a
     # credential: the field is masked, so it cannot be done, and asking for it
     # points a model at a plaintext password on a screen capture -- undoing at
     # the prose layer what the length-only comparison protects in the code.
-    if content.get("secret"):
+    if secret:
         recovery = (
             " and the keyboard could not confirm it landed. Look at the "
             "screenshot: the field is masked, so check that it is non-empty "

@@ -1387,111 +1387,124 @@ def perf_extra(loaded: object) -> str:
     )
     endpoints = ev.endpoints()
     if endpoints:
-        rows = ""
-        for r in sorted(
-            endpoints, key=lambda r: -(model.pct(sorted(r["samples"]), 0.5) or 0)
-        ):
-            ordered = sorted(r["samples"])
-            p50, p95, worst = (
-                model.pct(ordered, 0.5),
-                model.pct(ordered, 0.95),
-                (ordered[-1] if ordered else None),
-            )
-            rows += (
-                '<tr tabindex="0" data-spath="'
-                + ev_esc(r["path"], 160)
-                + '" data-scalls="'
-                + str(r["calls"])
-                + '" data-sp50="'
-                + (str(p50) if p50 is not None else "-1")
-                + '" data-sp95="'
-                + (str(p95) if p95 is not None else "-1")
-                + '" data-sworst="'
-                + (str(worst) if worst is not None else "-1")
-                + '" data-serr="'
-                + str(r["errors"])
-                + '"><td class="uc"><span class="cap">'
-                + ev_esc(r["verb"], 12)
-                + "</span> <code>"
-                + ev_esc(r["path"], 160)
-                + '</code></td><td class="num">'
-                + str(r["calls"])
-                + '</td><td class="num">'
-                + ev_esc(_fmt(p50), 16)
-                + '</td><td class="num">'
-                + ev_esc(_fmt(p95), 16)
-                + '</td><td class="num">'
-                + ev_esc(_fmt(worst), 16)
-                + '</td><td class="num">'
-                + (str(r["errors"]) if r["errors"] else '<span class="mt">none</span>')
-                + "</td></tr>"
-            )
-        out += _sec_block(
-            "Which backend calls were slow",
-            '<p class="hint">Sort any column. Typical is the middle time; slower runs is the time 19 calls in 20 came in under (p50 and p95).</p>'
-            '<div class="tablewrap"><table class="cov sortable" id="perfendpoints"><thead><tr>'
-            '<th scope="col" data-sort="path">Endpoint</th><th scope="col" data-sort="calls" class="num">Calls</th>'
-            '<th scope="col" data-sort="p50" class="num">Typical</th><th scope="col" data-sort="p95" class="num">Slower runs</th>'
-            '<th scope="col" data-sort="worst" class="num">Slowest</th><th scope="col" data-sort="err" class="num">Errors</th>'
-            "</tr></thead><tbody>" + rows + "</tbody></table></div>",
-            note="every endpoint the run reached, slowest first",
-        )
+        out += _perf_endpoints_block(endpoints)
     models = ev.models()
     if models:
-        top = max((model.pct(sorted(m["samples"]), 0.5) or 0) for m in models) or 1.0
-        items = ""
-        buckets: Counter = Counter()
-        for m in sorted(models, key=lambda m: -m["calls"]):
-            p50 = model.pct(sorted(m["samples"]), 0.5)
-            usd = model.price(m["model"], m["in"], m["out"], content.get("rates"))
-            bucket = model.lat_bucket(p50) or "fast"
-            buckets[bucket] += 1
-            items += (
-                '<li class="runrow"><span class="rstatic"><span class="rname"><b></b><code>'
-                + ev_esc(m["model"], 80)
-                + '</code><span class="rmeta">'
-                + str(m["calls"])
-                + " calls · "
-                + format(int(m["in"]), ",")
-                + " tokens in, "
-                + format(int(m["out"]), ",")
-                + " out"
-                + (
-                    (" · " + ev_esc(model.money(usd), 24))
-                    if usd is not None
-                    else " · unpriced"
-                )
-                + '</span></span><span class="rval">'
-                + ev_esc(_fmt(p50), 16)
-                + '</span><span class="rtrack"><i class="sw-lat-'
-                + bucket
-                + '" style="width:%.1f%%"></i></span></span></li>'
-                % (max(1.0, (p50 or 0) / float(top) * 100.0))
-            )
-        legend = "".join(
-            '<li><span class="legkey"><i class="sw sw-lat-'
-            + key
-            + '"></i><b>'
-            + str(buckets.get(key, 0))
-            + "</b>"
-            + label
-            + "</span></li>"
-            for key, label, _c in model.LAT_BUCKETS
-        )
-        out += (
-            '<figure class="hist"><figcaption><b>Which models were used</b><span>'
-            + str(len(models))
-            + " model"
-            + ("" if len(models) == 1 else "s")
-            + " · "
-            + str(sum(m["calls"] for m in models))
-            + ' calls · busiest first</span></figcaption><ul class="runs">'
-            + items
-            + '</ul><ul class="seglegend">'
-            + legend
-            + "</ul></figure>"
-        )
+        out += _perf_models_figure(models, content.get("rates"))
     return out
+
+
+def _perf_endpoint_row(r: dict) -> str:
+    ordered = sorted(r["samples"])
+    p50, p95, worst = (
+        model.pct(ordered, 0.5),
+        model.pct(ordered, 0.95),
+        (ordered[-1] if ordered else None),
+    )
+    return (
+        '<tr tabindex="0" data-spath="'
+        + ev_esc(r["path"], 160)
+        + '" data-scalls="'
+        + str(r["calls"])
+        + '" data-sp50="'
+        + (str(p50) if p50 is not None else "-1")
+        + '" data-sp95="'
+        + (str(p95) if p95 is not None else "-1")
+        + '" data-sworst="'
+        + (str(worst) if worst is not None else "-1")
+        + '" data-serr="'
+        + str(r["errors"])
+        + '"><td class="uc"><span class="cap">'
+        + ev_esc(r["verb"], 12)
+        + "</span> <code>"
+        + ev_esc(r["path"], 160)
+        + '</code></td><td class="num">'
+        + str(r["calls"])
+        + '</td><td class="num">'
+        + ev_esc(_fmt(p50), 16)
+        + '</td><td class="num">'
+        + ev_esc(_fmt(p95), 16)
+        + '</td><td class="num">'
+        + ev_esc(_fmt(worst), 16)
+        + '</td><td class="num">'
+        + (str(r["errors"]) if r["errors"] else '<span class="mt">none</span>')
+        + "</td></tr>"
+    )
+
+
+def _perf_endpoints_block(endpoints: list) -> str:
+    rows = "".join(
+        _perf_endpoint_row(r)
+        for r in sorted(
+            endpoints, key=lambda r: -(model.pct(sorted(r["samples"]), 0.5) or 0)
+        )
+    )
+    return _sec_block(
+        "Which backend calls were slow",
+        '<p class="hint">Sort any column. Typical is the middle time; slower runs is the time 19 calls in 20 came in under (p50 and p95).</p>'
+        '<div class="tablewrap"><table class="cov sortable" id="perfendpoints"><thead><tr>'
+        '<th scope="col" data-sort="path">Endpoint</th><th scope="col" data-sort="calls" class="num">Calls</th>'
+        '<th scope="col" data-sort="p50" class="num">Typical</th><th scope="col" data-sort="p95" class="num">Slower runs</th>'
+        '<th scope="col" data-sort="worst" class="num">Slowest</th><th scope="col" data-sort="err" class="num">Errors</th>'
+        "</tr></thead><tbody>" + rows + "</tbody></table></div>",
+        note="every endpoint the run reached, slowest first",
+    )
+
+
+def _perf_model_row(m: dict, bucket: str, usd: object, p50: object, top: float) -> str:
+    return (
+        '<li class="runrow"><span class="rstatic"><span class="rname"><b></b><code>'
+        + ev_esc(m["model"], 80)
+        + '</code><span class="rmeta">'
+        + str(m["calls"])
+        + " calls · "
+        + format(int(m["in"]), ",")
+        + " tokens in, "
+        + format(int(m["out"]), ",")
+        + " out"
+        + ((" · " + ev_esc(model.money(usd), 24)) if usd is not None else " · unpriced")
+        + '</span></span><span class="rval">'
+        + ev_esc(_fmt(p50), 16)
+        + '</span><span class="rtrack"><i class="sw-lat-'
+        + bucket
+        + '" style="width:%.1f%%"></i></span></span></li>'
+        % (max(1.0, (p50 or 0) / float(top) * 100.0))
+    )
+
+
+def _perf_models_figure(models: list, rates: object) -> str:
+    top = max((model.pct(sorted(m["samples"]), 0.5) or 0) for m in models) or 1.0
+    items = ""
+    buckets: Counter = Counter()
+    for m in sorted(models, key=lambda m: -m["calls"]):
+        p50 = model.pct(sorted(m["samples"]), 0.5)
+        usd = model.price(m["model"], m["in"], m["out"], rates)
+        bucket = model.lat_bucket(p50) or "fast"
+        buckets[bucket] += 1
+        items += _perf_model_row(m, bucket, usd, p50, top)
+    legend = "".join(
+        '<li><span class="legkey"><i class="sw sw-lat-'
+        + key
+        + '"></i><b>'
+        + str(buckets.get(key, 0))
+        + "</b>"
+        + label
+        + "</span></li>"
+        for key, label, _c in model.LAT_BUCKETS
+    )
+    return (
+        '<figure class="hist"><figcaption><b>Which models were used</b><span>'
+        + str(len(models))
+        + " model"
+        + ("" if len(models) == 1 else "s")
+        + " · "
+        + str(sum(m["calls"] for m in models))
+        + ' calls · busiest first</span></figcaption><ul class="runs">'
+        + items
+        + '</ul><ul class="seglegend">'
+        + legend
+        + "</ul></figure>"
+    )
 
 
 # ── the toolbar and the card ───────────────────────────────────────────────────
@@ -1629,6 +1642,32 @@ def _turn_rows(view: dict, report: dict) -> list:
     return rows
 
 
+def _turn_table_row(
+    n: int, said: object, reply_ms: object, outcome: str, answer: object
+) -> str:
+    return (
+        '<tr><td class="n">'
+        + str(n)
+        + '</td><td class="said" dir="auto">'
+        + (
+            ("<q>" + ev_esc(_clip(said), 80) + "</q>")
+            if said
+            else '<span class="mt">no utterance logged</span>'
+        )
+        + '</td><td class="num">'
+        + ev_esc(_fmt(reply_ms) if reply_ms is not None else "—", 16)
+        + '</td><td class="outc">'
+        + outcome
+        + '</td><td class="said" dir="auto">'
+        + (
+            ("<q>" + ev_esc(_clip(answer), 80) + "</q>")
+            if answer
+            else '<span class="mt">no reply text</span>'
+        )
+        + "</td></tr>"
+    )
+
+
 def turns_table(loaded: object, tc_id: object) -> str:
     content = _content(loaded)
     if not _has(loaded):
@@ -1646,29 +1685,7 @@ def turns_table(loaded: object, tc_id: object) -> str:
             _empty("no app turn fell inside this case's window"),
             note="nothing the app logged was attributed to this case",
         )
-    rows = ""
-    for n, said, reply_ms, outcome, answer in _turn_rows(view, content["report"]):
-        rows += (
-            '<tr><td class="n">'
-            + str(n)
-            + '</td><td class="said" dir="auto">'
-            + (
-                ("<q>" + ev_esc(_clip(said), 80) + "</q>")
-                if said
-                else '<span class="mt">no utterance logged</span>'
-            )
-            + '</td><td class="num">'
-            + ev_esc(_fmt(reply_ms) if reply_ms is not None else "—", 16)
-            + '</td><td class="outc">'
-            + outcome
-            + '</td><td class="said" dir="auto">'
-            + (
-                ("<q>" + ev_esc(_clip(answer), 80) + "</q>")
-                if answer
-                else '<span class="mt">no reply text</span>'
-            )
-            + "</td></tr>"
-        )
+    rows = "".join(_turn_table_row(*row) for row in _turn_rows(view, content["report"]))
     table = (
         '<div class="tablewrap"><table class="cov turns"><thead><tr><th scope="col">#</th>'
         '<th scope="col">The app heard</th><th scope="col" class="num">Reply in</th>'
@@ -1904,6 +1921,15 @@ def _flow_items(turn: dict) -> list:
 
 def _agent_items(turn: dict) -> list:
     """Cards, notes, the agent's own failures and its final answers."""
+    return (
+        _card_items(turn)
+        + _note_items(turn)
+        + _agent_error_items(turn)
+        + _answer_items(turn)
+    )
+
+
+def _card_items(turn: dict) -> list:
     items: list = []
     for rec in turn.get("cards") or []:
         key = _seq_key(rec)
@@ -1920,6 +1946,11 @@ def _agent_items(turn: dict) -> list:
                     ),
                 )
             )
+    return items
+
+
+def _note_items(turn: dict) -> list:
+    items: list = []
     for rec in turn.get("notes") or []:
         key = _seq_key(rec)
         if key is not None:
@@ -1931,6 +1962,11 @@ def _agent_items(turn: dict) -> list:
                     _guard(exchanges.seq_note(str(rec.get("text") or ""))),
                 )
             )
+    return items
+
+
+def _agent_error_items(turn: dict) -> list:
+    items: list = []
     for rec in turn.get("errors") or []:
         key = _seq_key(rec)
         if key is None or rec.get("kind") in ("binding", "llm", "tool"):
@@ -1950,6 +1986,11 @@ def _agent_items(turn: dict) -> list:
                 ),
             )
         )
+    return items
+
+
+def _answer_items(turn: dict) -> list:
+    items: list = []
     for rec in turn.get("answers") or []:
         key = _seq_key(rec)
         if key is not None:
@@ -2145,6 +2186,21 @@ def case_capture(record: object) -> str:
     )
 
 
+def _capture_flow_total(cases: object) -> int:
+    """Calls observed across every case's capture record."""
+    flow_total = 0
+    for case in cases or ():
+        if not isinstance(case, dict):
+            continue
+        record = (case.get("evidence") or {}).get("capture")
+        if isinstance(record, dict):
+            try:
+                flow_total += max(0, int(record.get("flow_count") or 0))
+            except (TypeError, ValueError, OverflowError):
+                pass
+    return flow_total
+
+
 def capture_section(cases: object, manifest: object) -> str:
     """The run-level API-capture section (T7.2): the tier this run reached
     and, when it is not decrypted, the reason BY NAME -- and the
@@ -2159,16 +2215,7 @@ def capture_section(cases: object, manifest: object) -> str:
     tier = tier if tier in capture_ladder.TIERS else capture_ladder.TIER_NONE
     reason = capture.get("reason")
     message = capture.get("message")
-    flow_total = 0
-    for case in cases or ():
-        if not isinstance(case, dict):
-            continue
-        record = (case.get("evidence") or {}).get("capture")
-        if isinstance(record, dict):
-            try:
-                flow_total += max(0, int(record.get("flow_count") or 0))
-            except (TypeError, ValueError, OverflowError):
-                pass
+    flow_total = _capture_flow_total(cases)
     lines = [
         '<p class="captier">Capture reached tier: <b>'
         + ev_esc(CAPTURE_TIER_LABELS.get(tier, tier), 40)

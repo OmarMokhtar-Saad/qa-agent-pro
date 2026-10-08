@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.107.4] - 2026-10-07
+## [1.107.5] - 2026-10-08
 
 ### Added
 
@@ -27,9 +27,9 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Anonymous, opt-out usage analytics (telemetry). See the README
   'Telemetry & privacy' section; disable with DO_NOT_TRACK=1.
 
-### Fixed
+### Changed
 
-- A destructive-action stop on a camelCase id such as btnLogOut no
-  longer puts an invisible control character in the stopped element's
-  name sent to your chat client, and confirming a stop recorded before
-  v1.107.3 releases it again instead of refusing it as a different control.
+- Internal restructure: long functions in the MCP server, the mobile
+  executor, report and downloader, and the API and Jira tools are split
+  into smaller helpers. No change in behavior is intended.
+- The shipped files no longer carry internal work-ticket references.

@@ -84,7 +84,9 @@ def seed_shortcuts_from_routes(package: str, conn: object, run_id: str = "") -> 
             "start_key": "",
             "end_key": "",
         }
-        if knowledge_db.insert(conn, "shortcuts", values, run_id=run_id, why="route seed"):
+        if knowledge_db.insert(
+            conn, "shortcuts", values, run_id=run_id, why="route seed"
+        ):
             added += 1
     return added
 
@@ -99,9 +101,14 @@ def _find_run(recs: list, steps: list) -> tuple[str, str]:
             continue
         if any(r.get("outcome") != "ok" for r in window):
             continue
-        if any(a.get("after_screen_key") != b.get("screen_key") for a, b in zip(window, window[1:], strict=False)):
+        if any(
+            a.get("after_screen_key") != b.get("screen_key")
+            for a, b in zip(window, window[1:], strict=False)
+        ):
             continue
-        return str(window[0]["screen_key"]), str(window[-1].get("after_screen_key") or "")
+        return str(window[0]["screen_key"]), str(
+            window[-1].get("after_screen_key") or ""
+        )
     return "", ""
 
 
@@ -109,7 +116,11 @@ def activate_seeds(conn: object, package: str, recs: list, run_id: str = "") -> 
     """Activate seeds whose route this run replayed. Returns seeds activated."""
     done = 0
     pending = knowledge_db.rows(
-        conn, "shortcuts", "origin LIKE 'route:%' AND status = 'candidate' AND start_key = '' AND invalid_at IS NULL", (), 50
+        conn,
+        "shortcuts",
+        "origin LIKE 'route:%' AND status = 'candidate' AND start_key = '' AND invalid_at IS NULL",
+        (),
+        50,
     )
     for row in pending:
         try:
@@ -117,7 +128,10 @@ def activate_seeds(conn: object, package: str, recs: list, run_id: str = "") -> 
         except ValueError:
             continue
         if not isinstance(steps, list) or not all(
-            isinstance(s, dict) and isinstance(s.get("op"), str) and isinstance(s.get("rid"), str) for s in steps
+            isinstance(s, dict)
+            and isinstance(s.get("op"), str)
+            and isinstance(s.get("rid"), str)
+            for s in steps
         ):
             continue
         start, end = _find_run(recs, steps) if steps else ("", "")
@@ -125,8 +139,15 @@ def activate_seeds(conn: object, package: str, recs: list, run_id: str = "") -> 
             continue
         pre = {"screen_key": start, "rids": [steps[0]["rid"]]}
         if knowledge_db.set_status(
-            conn, "shortcuts", row["id"], "active", run_id=run_id, why="route replayed",
-            start_key=start, end_key=end, precondition_json=json.dumps(pre),
+            conn,
+            "shortcuts",
+            row["id"],
+            "active",
+            run_id=run_id,
+            why="route replayed",
+            start_key=start,
+            end_key=end,
+            precondition_json=json.dumps(pre),
         ):
             done += 1
     return done

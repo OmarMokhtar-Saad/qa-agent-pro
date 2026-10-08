@@ -930,6 +930,42 @@ def _summarise(checks: list[dict], resolved_serial: str, needs_typing: bool) -> 
     }
 
 
+async def _run_steps(
+    checks: list[dict], target_package: str, serial: str, early: dict
+) -> str:
+    """Run every step in order, appending to *checks*; return the resolved serial.
+
+    *early* is filled with the started probe tasks so the caller can cancel
+    any task no step reached.
+    """
+    # 1. virtualization -----------------------------------------------
+    # (Computed at step 4a, once the serial is known, and inserted at
+    # position 0 so the row order is unchanged: a physical handset has no
+    # use for the emulator-accelerator answer.)
+    serials = await _step_adb_responds(checks)
+    _step_adb_first_on_path(checks)
+    resolved_serial = await _step_emulator_booted(checks, serials, serial)
+    _step_virtualization(checks, resolved_serial)
+
+    # THE READ-ONLY DEVICE PROBES, STARTED TOGETHER (S13). Steps 4b-9 each
+    # made one adb round trip and waited for it before the next began, so a
+    # slow resolver (the DNS ping has its own multi-second budget) held up
+    # four probes that do not depend on it. Each step still awaits ITS task
+    # at its own place, inside its own try, so the row order and every
+    # step's failure handling are exactly what the serial version produced;
+    # a step that finds no task makes the call itself.
+    early.update(_start_early_probes(resolved_serial, target_package))
+
+    await _step_device_dns(checks, resolved_serial, early)
+    await _step_package_installed(checks, target_package, resolved_serial, early)
+    pinned = _step_ime_pinned(checks)
+    await _step_ime_probes(checks, pinned, resolved_serial, early)
+    _step_free_disk(checks)
+    _step_cache_ownership(checks)
+    _step_host_privileges(checks)
+    return resolved_serial
+
+
 async def check(
     target_package: str = "", serial: str = "", needs_typing: bool = False
 ) -> dict:
@@ -941,35 +977,11 @@ async def check(
     not an error condition.
     """
     checks: list[dict] = []
-    resolved_serial = str(serial or "")
     early: dict = {}
     try:
-        # 1. virtualization -----------------------------------------------
-        # (Computed at step 4a, once the serial is known, and inserted at
-        # position 0 so the row order is unchanged: a physical handset has no
-        # use for the emulator-accelerator answer.)
-
-        serials = await _step_adb_responds(checks)
-        _step_adb_first_on_path(checks)
-        resolved_serial = await _step_emulator_booted(checks, serials, resolved_serial)
-        _step_virtualization(checks, resolved_serial)
-
-        # THE READ-ONLY DEVICE PROBES, STARTED TOGETHER (S13). Steps 4b-9 each
-        # made one adb round trip and waited for it before the next began, so a
-        # slow resolver (the DNS ping has its own multi-second budget) held up
-        # four probes that do not depend on it. Each step still awaits ITS task
-        # at its own place, inside its own try, so the row order and every
-        # step's failure handling are exactly what the serial version produced;
-        # a step that finds no task makes the call itself.
-        early = _start_early_probes(resolved_serial, target_package)
-
-        await _step_device_dns(checks, resolved_serial, early)
-        await _step_package_installed(checks, target_package, resolved_serial, early)
-        pinned = _step_ime_pinned(checks)
-        await _step_ime_probes(checks, pinned, resolved_serial, early)
-        _step_free_disk(checks)
-        _step_cache_ownership(checks)
-        _step_host_privileges(checks)
+        resolved_serial = await _run_steps(
+            checks, target_package, str(serial or ""), early
+        )
         return {
             "error": None,
             "content": _summarise(checks, resolved_serial, needs_typing),

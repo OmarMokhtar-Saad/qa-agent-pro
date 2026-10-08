@@ -87,7 +87,11 @@ def secret_refusal(steps: list) -> str:
 
     for step in steps:
         if step["op"] == "type":
-            probe = {"op": "type", "target": {"rid": step["rid"]}, "field": step.get("field", "")}
+            probe = {
+                "op": "type",
+                "target": {"rid": step["rid"]},
+                "field": step.get("field", ""),
+            }
             if actions.is_credential_action(probe):
                 return "credential field"
     return app_knowledge.secret_reason(json.dumps(steps), (), "")
@@ -109,7 +113,9 @@ def candidates(steps: object) -> tuple[list, int]:
                 if secret_refusal(shaped):
                     refused += 1
                     continue
-                digest = hashlib.sha1(json.dumps([start, end, shaped], sort_keys=True).encode()).hexdigest()
+                digest = hashlib.sha1(
+                    json.dumps([start, end, shaped], sort_keys=True).encode()
+                ).hexdigest()
                 seen.setdefault("mined-" + digest[:12], (start, end, shaped, args))
                 if len(seen) >= MAX_WINDOWS:
                     break
@@ -133,7 +139,9 @@ def _make_room(conn, run_id: str) -> None:
         " AND origin = 'mined' ORDER BY id ASC LIMIT 1"
     ).fetchone()
     if row is not None:
-        knowledge_db.set_status(conn, "shortcuts", row["id"], "retired", run_id=run_id, why="shortcut cap")
+        knowledge_db.set_status(
+            conn, "shortcuts", row["id"], "retired", run_id=run_id, why="shortcut cap"
+        )
 
 
 def _insert(conn, run_id: str, cand: tuple) -> int:
@@ -149,7 +157,13 @@ def _insert(conn, run_id: str, cand: tuple) -> int:
         "start_key": start,
         "end_key": end,
     }
-    return 1 if knowledge_db.insert(conn, "shortcuts", values, run_id=run_id, why="shortcut mined") else 0
+    return (
+        1
+        if knowledge_db.insert(
+            conn, "shortcuts", values, run_id=run_id, why="shortcut mined"
+        )
+        else 0
+    )
 
 
 def _mine(conn, lc) -> tuple[int, int, int]:
@@ -157,14 +171,24 @@ def _mine(conn, lc) -> tuple[int, int, int]:
     found, refused = candidates(lc.steps)
     wrote, ready, fresh = 0, 0, 0
     for cand in found:
-        have = knowledge_db.rows(conn, "shortcuts", "name = ? AND invalid_at IS NULL", (cand[0],), 1)
+        have = knowledge_db.rows(
+            conn, "shortcuts", "name = ? AND invalid_at IS NULL", (cand[0],), 1
+        )
         if have:
             if lc.run_id not in _runs(have[0]):
                 got = knowledge_db.upsert_counter(
-                    conn, "shortcuts", {"name": cand[0]}, {}, run_id=lc.run_id, why="shortcut seen"
+                    conn,
+                    "shortcuts",
+                    {"name": cand[0]},
+                    {},
+                    run_id=lc.run_id,
+                    why="shortcut seen",
                 )
                 wrote += 1 if got else 0
-            if have[0]["status"] == "candidate" and len(_runs(have[0])) + 1 >= knowledge_limits.SHORTCUT_MIN_RUNS:
+            if (
+                have[0]["status"] == "candidate"
+                and len(_runs(have[0])) + 1 >= knowledge_limits.SHORTCUT_MIN_RUNS
+            ):
                 ready += 1
         elif fresh < NEW_PER_RUN:
             fresh += 1
@@ -175,7 +199,9 @@ def _mine(conn, lc) -> tuple[int, int, int]:
 def run(conn, lc) -> StageResult:
     notes: list = []
     wrote, ready, refused = _mine(conn, lc)
-    wrote += knowledge_routes_bridge.seed_shortcuts_from_routes(lc.package, conn, lc.run_id)
+    wrote += knowledge_routes_bridge.seed_shortcuts_from_routes(
+        lc.package, conn, lc.run_id
+    )
     woke = knowledge_routes_bridge.activate_seeds(conn, lc.package, lc.steps, lc.run_id)
     wrote += woke
     if ready:

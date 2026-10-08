@@ -590,6 +590,143 @@ def script_types(script: object) -> bool:
     return False
 
 
+def _fold_queue(raw_script: object, queued_in: list) -> tuple[object, str | None]:
+    """Fold the queued actions into the submission: ``(script, refusal)``.
+
+    ``refusal`` is ``None`` when the fold succeeded (or nothing was queued).
+    """
+    if not queued_in:
+        return raw_script, None
+    decoded = actions_mod.decode_reply(raw_script)
+    combined = actions_mod.combine_queued_actions(
+        queued_in, list(decoded.get("actions") or [])
+    )
+    if not combined.get("ok"):
+        note_refusal(combined.get("reason"))
+        return raw_script, str(combined.get("reason") or "")
+    return {"actions": combined["actions"]}, None
+
+
+def _parse_submission(raw_script: object, folded: bool) -> dict:
+    """Validate the script; a folded queue was already held to both caps by the
+    combine, so only a bare submission is held to the model cap here."""
+    parsed = actions_mod.parse_script(
+        raw_script,
+        max_actions=(
+            actions_mod.MAX_ACTIONS if folded else actions_mod.MAX_MODEL_ACTIONS
+        ),
+    )
+    if parsed.get("error"):
+        note_refusal(parsed["error"])
+    return parsed
+
+
+def _refused_script(
+    run_id: str, tc_id: str, view: dict, reason: str, queued_in: list
+) -> dict:
+    """The needs-model checkpoint for a script refused before any replay.
+
+    A refused script is NOT an escape: nothing was replayed, so the planner
+    gets the same screen back and one of its escapes is not spent on our own
+    validation.
+    """
+    return {
+        "error": None,
+        "content": _checkpoint(
+            run_id,
+            tc_id,
+            view,
+            verdict="",
+            status=NEEDS_MODEL,
+            reason=reason,
+            trace=[],
+            escapes=escapes_used(run_id, tc_id),
+            packet=None,
+            queued_actions=queued_in,
+        ),
+    }
+
+
+async def _ready_keyboard(script: object, ctx: executor.Context, run_id: str) -> None:
+    """THE KEYBOARD, BEFORE ANYTHING IS TYPED.
+
+    `ime_session.ensure_ready` is idempotent, so a run whose every case types
+    pays for this once; a run that never types never calls it and never
+    displaces the tester's keyboard. A refusal ends the case by NAME rather
+    than replaying into a keyboard that is not listening -- which is the
+    silence this whole change exists to end: ADBKeyBoard's receiver never
+    registers on API 35, so a tester's own script typed into nothing and
+    reported success.
+    """
+    if not script_types(script):
+        return
+    ready = await ime_session.ensure_ready(ctx.serial, run_id)
+    if ready.get("error"):
+        # R1d: NO early return. The case runs with typing over stdin; the
+        # replay attaches the fallback notice (why, and the exact fix) to
+        # the result. The failure is memoised per run by ensure_ready.
+        ctx.typing_fallback = str(ready["error"])[:400]
+
+
+async def _replay_recorded(
+    run_id: str, tc_id: str, script: object, ctx: executor.Context
+) -> tuple[dict, object]:
+    """Replay the script with the screen recorder running: ``(replayed, clip)``.
+
+    The pixels of this step. Started BEFORE the replay and stopped after it, so
+    the clip covers exactly what the planner's script did. Never branches the
+    run: a refused recorder returns a handle carrying the reason, and the
+    verdict path cannot see the difference. `script` is a validated
+    `actions.Script` MODEL, not a list -- `media.withholds` reads `.actions` off
+    it for that reason.
+    """
+    clip = (await media.start_clip(run_id, tc_id, script, ctx.serial)).get("content")
+    fallback_before = str(getattr(ctx, "typing_fallback", "") or "")
+    replayed = await executor.replay(script, ctx)
+    fallback_after = str(getattr(ctx, "typing_fallback", "") or "")
+    if fallback_after and not fallback_before:
+        # R1d: the keyboard was ready but would not come up inside the replay.
+        # Memoise it so the next typing case does not retry the install.
+        ime_session.write_fallback(run_id, fallback_after)
+    if replayed.get("error"):
+        # THE LEAK THIS PATH WOULD OTHERWISE BE. The caller returns BEFORE
+        # `finish_step`, so the recorder started above would outlive the step
+        # -- and the next step's device-global `pkill -INT screenrecord` would
+        # then close the WRONG recording. `abandon` stops it and deletes the
+        # file without storing a record: a step with no result has nowhere to
+        # show a picture or a reason.
+        await media.abandon(ctx.serial, clip)
+    return replayed, clip
+
+
+async def _close_step_evidence(
+    step: "_Step", clip: object, ctx: executor.Context
+) -> dict:
+    """Stop the recorder and slice the app evidence; returns the case's crash."""
+    # Outside any `if`: a step that changed nothing still started a
+    # recorder, and a recorder nobody stops is a device process that
+    # outlives the run. This writes the media records onto the case, and
+    # `_checkpoint` rebuilds that body whole -- which is why it
+    # carries `media` forward explicitly.
+    await step_timing.timed(
+        "evidence",
+        media.finish_step(
+            step.run_id,
+            step.tc_id,
+            ctx.serial,
+            clip,
+            str((step.new_screen or {}).get("screen_id") or ""),
+        ),
+    )
+    # App evidence (plan D5): ONE slice per replay, after the trace is
+    # final and before the checkpoint that carries the record forward.
+    # The refused-script path never reaches here: nothing ran, so
+    # there is nothing to slice.
+    return await step_timing.timed(
+        "evidence", _slice_evidence(step.run_id, step.tc_id, ctx)
+    )
+
+
 async def submit_case(
     run_id: str,
     case: object,
@@ -616,121 +753,22 @@ async def submit_case(
             prior_checkpoint if isinstance(prior_checkpoint, dict) else {}
         )
         queued_in = list(prior_checkpoint.get("queued_actions") or [])
-        if queued_in:
-            decoded = actions_mod.decode_reply(raw_script)
-            combined = actions_mod.combine_queued_actions(
-                queued_in, list(decoded.get("actions") or [])
-            )
-            if not combined.get("ok"):
-                note_refusal(combined.get("reason"))
-                return {
-                    "error": None,
-                    "content": _checkpoint(
-                        run_id,
-                        tc_id,
-                        view,
-                        verdict="",
-                        status=NEEDS_MODEL,
-                        reason=str(combined.get("reason") or ""),
-                        trace=[],
-                        escapes=escapes_used(run_id, tc_id),
-                        packet=None,
-                        queued_actions=queued_in,
-                    ),
-                }
-            raw_script = {"actions": combined["actions"]}
+        raw_script, fold_refusal = _fold_queue(raw_script, queued_in)
+        if fold_refusal is not None:
+            return _refused_script(run_id, tc_id, view, fold_refusal, queued_in)
 
-        # A folded queue was already held to both caps by the combine, so only
-        # a bare submission is held to the model cap here.
-        parsed = actions_mod.parse_script(
-            raw_script,
-            max_actions=(
-                actions_mod.MAX_ACTIONS if queued_in else actions_mod.MAX_MODEL_ACTIONS
-            ),
-        )
+        parsed = _parse_submission(raw_script, bool(queued_in))
         if parsed.get("error"):
-            note_refusal(parsed["error"])
-            # A refused script is NOT an escape: nothing was replayed, so the
-            # planner gets the same screen back and one of its escapes is not
-            # spent on our own validation.
-            return {
-                "error": None,
-                "content": _checkpoint(
-                    run_id,
-                    tc_id,
-                    view,
-                    verdict="",
-                    status=NEEDS_MODEL,
-                    reason=str(parsed["error"]),
-                    trace=[],
-                    escapes=escapes_used(run_id, tc_id),
-                    packet=None,
-                    queued_actions=queued_in,
-                ),
-            }
+            return _refused_script(run_id, tc_id, view, str(parsed["error"]), queued_in)
 
-        # THE KEYBOARD, BEFORE ANYTHING IS TYPED. `ime_session.ensure_ready` is
-        # idempotent, so a run whose every case types pays for this once; a run
-        # that never types never calls it and never displaces the tester's
-        # keyboard. A refusal ends the case by NAME rather than replaying into a
-        # keyboard that is not listening -- which is the silence this whole
-        # change exists to end: ADBKeyBoard's receiver never registers on API
-        # 35, so a tester's own script typed into nothing and reported success.
-        if script_types(parsed["content"]):
-            ready = await ime_session.ensure_ready(ctx.serial, run_id)
-            if ready.get("error"):
-                # R1d: NO early return. The case runs with typing over stdin; the
-                # replay attaches the fallback notice (why, and the exact fix) to
-                # the result. The failure is memoised per run by ensure_ready.
-                ctx.typing_fallback = str(ready["error"])[:400]
+        await _ready_keyboard(parsed["content"], ctx, run_id)
 
         ctx.screen = screen if isinstance(screen, dict) else None
-        # The pixels of this step. Started BEFORE the replay and stopped after
-        # it, so the clip covers exactly what the planner's script did. Never
-        # branches the run: a refused recorder returns a handle carrying the
-        # reason, and the verdict path below cannot see the difference.
-        # `parsed["content"]` is a validated `actions.Script` MODEL, not a list
-        # -- `media.withholds` reads `.actions` off it for that reason.
-        clip = (
-            await media.start_clip(run_id, tc_id, parsed["content"], ctx.serial)
-        ).get("content")
-        fallback_before = str(getattr(ctx, "typing_fallback", "") or "")
-        replayed = await executor.replay(parsed["content"], ctx)
-        fallback_after = str(getattr(ctx, "typing_fallback", "") or "")
-        if fallback_after and not fallback_before:
-            # R1d: the keyboard was ready but would not come up inside the replay.
-            # Memoise it so the next typing case does not retry the install.
-            ime_session.write_fallback(run_id, fallback_after)
+        replayed, clip = await _replay_recorded(run_id, tc_id, parsed["content"], ctx)
         if replayed.get("error"):
-            # THE LEAK THIS PATH WOULD OTHERWISE BE. This returns BEFORE the
-            # `finish_step` below, so the recorder started two lines up would
-            # outlive the step -- and the next step's device-global
-            # `pkill -INT screenrecord` would then close the WRONG recording.
-            # `abandon` stops it and deletes the file without storing a record:
-            # a step with no result has nowhere to show a picture or a reason.
-            await media.abandon(ctx.serial, clip)
             return replayed
         step = _read_step(run_id, tc_id, replayed)
-        # Outside any `if`: a step that changed nothing still started a
-        # recorder, and a recorder nobody stops is a device process that
-        # outlives the run. This writes the media records onto the case, and
-        # `_checkpoint` rebuilds that body whole -- which is why it
-        # carries `media` forward explicitly.
-        await step_timing.timed(
-            "evidence",
-            media.finish_step(
-                run_id,
-                tc_id,
-                ctx.serial,
-                clip,
-                str((step.new_screen or {}).get("screen_id") or ""),
-            ),
-        )
-        # App evidence (plan D5): ONE slice per replay, after the trace is
-        # final and before the checkpoint that carries the record forward.
-        # The refused-script path never reaches here: nothing ran, so
-        # there is nothing to slice.
-        crash = await step_timing.timed("evidence", _slice_evidence(run_id, tc_id, ctx))
+        crash = await _close_step_evidence(step, clip, ctx)
         return _outcome_checkpoint(step, view, crash)
 
     except Exception as exc:  # pragma: no cover - defensive
@@ -1003,6 +1041,23 @@ def _checkpoint(
         # ACCUMULATED, not replaced -- see `merge_traces`.
         "trace": merge_traces(prior.get("trace"), trace),
         "escapes": int(escapes),
+        "started": prior.get("started") or now,
+        "updated": now,
+        "evidence": _evidence_record(prior.get("evidence")),
+        **_carried_fields(prior, uncharged, guard_stop, queued_actions),
+    }
+    written = run_store.write_case(run_id, tc_id, body)
+    payload = dict(body)
+    payload["packet"] = packet
+    payload["checkpoint_error"] = written.get("error")
+    return payload
+
+
+def _carried_fields(
+    prior: dict, uncharged: object, guard_stop: object, queued_actions: object
+) -> dict:
+    """The checkpoint fields that are carried, cleared or taken from the call."""
+    return {
         # ONE carry-forward for both reasons. Every terminal checkpoint
         # replaces this body whole, so a count this call did not compute must
         # survive -- and `_prior_uncharged` guards the read on BOTH sides,
@@ -1025,9 +1080,6 @@ def _checkpoint(
         "queued_actions": (
             list(queued_actions) if isinstance(queued_actions, list) else []
         ),
-        "started": prior.get("started") or now,
-        "updated": now,
-        "evidence": _evidence_record(prior.get("evidence")),
         # CARRY-FORWARD, same reason as `started` and `evidence`: this body
         # REPLACES the case whole, and `media.remember` wrote its records onto
         # the case moments ago, on this same submit. Without this line the
@@ -1038,11 +1090,6 @@ def _checkpoint(
             item for item in list(prior.get("media") or []) if isinstance(item, dict)
         ],
     }
-    written = run_store.write_case(run_id, tc_id, body)
-    payload = dict(body)
-    payload["packet"] = packet
-    payload["checkpoint_error"] = written.get("error")
-    return payload
 
 
 def _prior_uncharged(prior: object) -> dict:
@@ -1214,6 +1261,27 @@ def capture_record(source: object) -> dict:
     }
 
 
+def _record_slice(evidence: dict, sliced: object) -> None:
+    """Append one log slice to the evidence record and merge its crash in."""
+    content = sliced.get("content") if isinstance(sliced, dict) else None
+    content = content if isinstance(content, dict) else {}
+    evidence["slices"] += 1
+    this_crash = content.get("crash")
+    this_crash = this_crash if isinstance(this_crash, dict) else {}
+    evidence["slices_written"].append(
+        {
+            "index": evidence["slices"] - 1,
+            "path": str(content.get("path") or ""),
+            "lines": content.get("lines"),
+            "truncated": bool(content.get("truncated")),
+            "skipped": content.get("skipped")
+            or (sliced.get("error") if isinstance(sliced, dict) else None),
+            "crash": this_crash,
+        }
+    )
+    evidence["crash"] = _merge_crash(evidence.get("crash"), this_crash)
+
+
 async def _slice_evidence(run_id: str, tc_id: str, ctx: executor.Context) -> dict:
     """Take this replay's logcat slice, record it, and return the case's crash.
 
@@ -1249,52 +1317,48 @@ async def _slice_evidence(run_id: str, tc_id: str, ctx: executor.Context) -> dic
             begin=evidence,
             tester_inputs=ctx.tester_inputs,
         )
-        content = sliced.get("content") if isinstance(sliced, dict) else None
-        content = content if isinstance(content, dict) else {}
-        evidence["slices"] += 1
-        this_crash = content.get("crash")
-        this_crash = this_crash if isinstance(this_crash, dict) else {}
-        evidence["slices_written"].append(
-            {
-                "index": evidence["slices"] - 1,
-                "path": str(content.get("path") or ""),
-                "lines": content.get("lines"),
-                "truncated": bool(content.get("truncated")),
-                "skipped": content.get("skipped")
-                or (sliced.get("error") if isinstance(sliced, dict) else None),
-                "crash": this_crash,
-            }
-        )
-        evidence["crash"] = _merge_crash(evidence.get("crash"), this_crash)
-        # The wire is stopped, parsed and attributed at the SAME checkpoint the
-        # log slice is taken, and spliced in beside it. Nothing branches on the
-        # result: an evidence fault can no more change a verdict here than a
-        # failed slice can, which is why this sits after the crash merge and
-        # before the write rather than anywhere a return could skip it.
-        evidence["network"] = network_record(
-            await capture.finish_network(
-                ctx.serial,
-                ctx.package,
-                run_id,
-                tc_id,
-                max(0, evidence["slices"] - 1),
-                evidence.get("network"),
-            )
-        )
-        # Same checkpoint, same discipline, the API-capture lane's own
-        # dimension: never branched on, an evidence fault here can no more
-        # change a verdict than a failed log slice can.
-        evidence["capture"] = capture_record(
-            api_flows.finish_case(run_id, tc_id, tester_inputs=ctx.tester_inputs)
-        )
-        # NEVER write a document read before an await. A checkpoint may have
-        # landed while the device was being read; the fresh copy carries its
-        # verdict and trace, and only the evidence record is spliced in.
-        fresh = (run_store.read_case(run_id, tc_id) or {}).get("content")
-        fresh = fresh if isinstance(fresh, dict) else prior
-        fresh["evidence"] = evidence
-        run_store.write_case(run_id, tc_id, fresh)
+        _record_slice(evidence, sliced)
+        await _finish_wire(evidence, run_id, tc_id, ctx)
+        _splice_evidence(run_id, tc_id, evidence, prior)
         return _merge_crash(evidence.get("crash"), None)
     except Exception:  # never-raise: evidence is not a verdict
         logger.exception("mobile.case_runner._slice_evidence failed")
         return {}
+
+
+async def _finish_wire(
+    evidence: dict, run_id: str, tc_id: str, ctx: executor.Context
+) -> None:
+    """Stop the network capture and the API-capture lane into the record."""
+    # The wire is stopped, parsed and attributed at the SAME checkpoint the
+    # log slice is taken, and spliced in beside it. Nothing branches on the
+    # result: an evidence fault can no more change a verdict here than a
+    # failed slice can, which is why this runs after the crash merge and
+    # before the write rather than anywhere a return could skip it.
+    evidence["network"] = network_record(
+        await capture.finish_network(
+            ctx.serial,
+            ctx.package,
+            run_id,
+            tc_id,
+            max(0, evidence["slices"] - 1),
+            evidence.get("network"),
+        )
+    )
+    # Same checkpoint, same discipline, the API-capture lane's own
+    # dimension: never branched on, an evidence fault here can no more
+    # change a verdict than a failed log slice can.
+    evidence["capture"] = capture_record(
+        api_flows.finish_case(run_id, tc_id, tester_inputs=ctx.tester_inputs)
+    )
+
+
+def _splice_evidence(run_id: str, tc_id: str, evidence: dict, prior: dict) -> None:
+    """Write the evidence record onto a FRESH read of the case."""
+    # NEVER write a document read before an await. A checkpoint may have
+    # landed while the device was being read; the fresh copy carries its
+    # verdict and trace, and only the evidence record is spliced in.
+    fresh = (run_store.read_case(run_id, tc_id) or {}).get("content")
+    fresh = fresh if isinstance(fresh, dict) else prior
+    fresh["evidence"] = evidence
+    run_store.write_case(run_id, tc_id, fresh)

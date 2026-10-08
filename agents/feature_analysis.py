@@ -358,6 +358,20 @@ def _task_meta(
     }
 
 
+def _coerce_field(name: str, value: object) -> str | list[str] | None:
+    """One host-submitted field coerced to its type; ``None`` when nothing usable."""
+    if name in _STR_FIELDS:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
+    if isinstance(value, str):
+        value = [value]
+    if isinstance(value, (list, tuple)):
+        items = [str(i).strip() for i in value if str(i).strip()]
+        return items or None
+    return None
+
+
 def finalize_feature_report(payload: object) -> tuple[FeatureAnalysisReport, bool]:
     """``(report, usable)`` from an UNTRUSTED host submission. Never raises.
 
@@ -376,17 +390,9 @@ def finalize_feature_report(payload: object) -> tuple[FeatureAnalysisReport, boo
     for name in FeatureAnalysisReport.model_fields:
         if name not in payload:
             continue
-        value = payload[name]
-        if name in _STR_FIELDS:
-            if isinstance(value, str) and value.strip():
-                data[name] = value.strip()
-            continue
-        if isinstance(value, str):
-            value = [value]
-        if isinstance(value, (list, tuple)):
-            items = [str(i).strip() for i in value if str(i).strip()]
-            if items:
-                data[name] = items
+        coerced = _coerce_field(name, payload[name])
+        if coerced:
+            data[name] = coerced
     if not data:
         return FeatureAnalysisReport(), False
     try:

@@ -286,6 +286,31 @@ def _absorb_wrap(lines: list[str], index: int, line: str) -> tuple[str, int, boo
     return merged, consumed, closed
 
 
+def _join_step(lines: list[str], index: int) -> tuple[str, int]:
+    """The line to emit for ``lines[index]`` and the index of the next line."""
+    line = lines[index].rstrip()
+    stripped = line.strip()
+    if not (stripped.startswith("|") and not stripped.endswith("|")):
+        return line, index + 1
+    # Only a LONE OPENING CELL is a wrapped row. A line with two or
+    # more cells is a complete record written without a trailing pipe,
+    # and treating it as unterminated is what collapsed whole
+    # descriptions. The real Jira wrapping looks like
+    #     | < خطأ في معلومات الطلب>
+    #      | <Incorrect order information > | Checkbox |
+    # so the fragment has ONE cell and its continuation legitimately
+    # looks like a complete row -- which means the continuation cannot be
+    # rejected for looking complete, only the fragment can be rejected
+    # for looking complete.
+    if len(_split_row(line)) != 1:
+        return line, index + 1
+    merged, consumed, closed = _absorb_wrap(lines, index, line)
+    if closed:
+        return merged, index + 1 + consumed
+    # Leave it alone -- _split_row tolerates the missing pipe.
+    return line, index + 1
+
+
 def _join_wrapped_rows(description: str) -> list[str]:
     """Lines of the description with wrapped table rows re-joined.
 
@@ -316,34 +341,8 @@ def _join_wrapped_rows(description: str) -> list[str]:
         lines = (description or "").splitlines()[:_MAX_SOURCE_LINES]
         index = 0
         while index < len(lines):
-            line = lines[index].rstrip()
-            stripped = line.strip()
-            if not (stripped.startswith("|") and not stripped.endswith("|")):
-                out.append(line)
-                index += 1
-                continue
-            # Only a LONE OPENING CELL is a wrapped row. A line with two or
-            # more cells is a complete record written without a trailing pipe,
-            # and treating it as unterminated is what collapsed whole
-            # descriptions. The real Jira wrapping looks like
-            #     | < خطأ في معلومات الطلب>
-            #      | <Incorrect order information > | Checkbox |
-            # so the fragment has ONE cell and its continuation legitimately
-            # looks like a complete row -- which means the continuation cannot be
-            # rejected for looking complete, only the fragment can be rejected
-            # for looking complete.
-            if len(_split_row(line)) != 1:
-                out.append(line)
-                index += 1
-                continue
-            merged, consumed, closed = _absorb_wrap(lines, index, line)
-            if closed:
-                out.append(merged)
-                index += 1 + consumed
-            else:
-                # Leave it alone -- _split_row tolerates the missing pipe.
-                out.append(line)
-                index += 1
+            emitted, index = _join_step(lines, index)
+            out.append(emitted)
     except Exception:
         logger.exception("_join_wrapped_rows failed - using raw lines")
         return (description or "").splitlines()[:_MAX_SOURCE_LINES]

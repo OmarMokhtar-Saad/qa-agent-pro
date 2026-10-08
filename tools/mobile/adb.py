@@ -1041,34 +1041,48 @@ async def display_size(serial: str) -> dict:
     hit, cached = _cache_lookup(_DISPLAY_CACHE, key, now)
     if hit:
         return {"error": None, "content": cached}
-    size = None
-    overridden = False
-    for lowered in _wm_lines(await shell(key, ["wm", "size"])):
-        override = lowered.startswith("override size:")
-        if not override and not lowered.startswith("physical size:"):
-            continue
-        match = _DISPLAY_RE.search(lowered)
-        if not match:
-            continue
-        width, height = int(match.group(1)), int(match.group(2))
-        if width <= 0 or height <= 0:
-            continue
-        # See the NOTES above this function for the ceiling and the precedence.
-        longest_edge = max(width, height)
-        if longest_edge > MAX_DISPLAY_EDGE_PX:
-            logger.debug(
-                "refusing an implausible display size %dx%d from %s",
-                width,
-                height,
-                serial,
-            )
-            continue
-        if overridden and not override:
-            continue
-        size = [width, height]
-        overridden = overridden or override
+    size = _pick_display_size(_wm_lines(await shell(key, ["wm", "size"])), serial)
     _DISPLAY_CACHE[key] = (now + DISPLAY_CACHE_TTL_S, size)
     return {"error": None, "content": size}
+
+
+def _wm_size_candidate(lowered: str, serial: str) -> tuple[list[int], bool] | None:
+    """``([w, h], is_override)`` for one ``wm size`` line, or ``None`` to skip it."""
+    override = lowered.startswith("override size:")
+    if not override and not lowered.startswith("physical size:"):
+        return None
+    match = _DISPLAY_RE.search(lowered)
+    if not match:
+        return None
+    width, height = int(match.group(1)), int(match.group(2))
+    if width <= 0 or height <= 0:
+        return None
+    # See the NOTES above `display_size` for the ceiling and the precedence.
+    if max(width, height) > MAX_DISPLAY_EDGE_PX:
+        logger.debug(
+            "refusing an implausible display size %dx%d from %s",
+            width,
+            height,
+            serial,
+        )
+        return None
+    return [width, height], override
+
+
+def _pick_display_size(lines: list[str], serial: str) -> list[int] | None:
+    """The size the ``wm size`` lines agree on; an override beats a physical line."""
+    size = None
+    overridden = False
+    for lowered in lines:
+        candidate = _wm_size_candidate(lowered, serial)
+        if candidate is None:
+            continue
+        found, override = candidate
+        if overridden and not override:
+            continue
+        size = found
+        overridden = overridden or override
+    return size
 
 
 #: ONE device shell command, not two adb round trips.
@@ -1362,6 +1376,11 @@ async def screencap_raw(serial: str, *, timeout_s: float | None = None) -> dict:
     except Exception as exc:
         logger.exception("mobile.adb.screencap_raw failed")
         return {"error": str(exc), "content": None}
+    return _screencap_raw_verdict(rc, out, err)
+
+
+def _screencap_raw_verdict(rc: int, out: bytes, err: bytes) -> dict:
+    """The answer for a finished raw ``screencap``: the frame, or why not."""
     if rc != 0:
         said = " ".join(err.decode(errors="replace").split())[:200]
         return {
@@ -1829,14 +1848,9 @@ async def emu(serial: str, *args: object) -> dict:
     derivation of one question, and mirrored conditions drift.
     """
     words = [str(word) for word in args]
-    if not words:
-        return {"error": "Refusing an empty emulator console command.", "content": None}
-    for word in words:
-        if not _EMU_WORD_RE.match(word):
-            return {
-                "error": "Refusing emulator console argument " + repr(word[:40]) + ".",
-                "content": None,
-            }
+    refusal = _emu_words_refusal(words)
+    if refusal is not None:
+        return {"error": refusal, "content": None}
     facts = await device_facts(serial)
     kind = str(((facts or {}).get("content") or {}).get("kind") or "")
     if kind != "emulator":
@@ -1849,6 +1863,21 @@ async def emu(serial: str, *args: object) -> dict:
     stderr = str(body.get("err") or "").strip()
     if stderr:
         joined = joined + "\n" + stderr
+    return _emu_reply(words, joined)
+
+
+def _emu_words_refusal(words: list[str]) -> str | None:
+    """Why the console command line is refused, or ``None`` when it is fine."""
+    if not words:
+        return "Refusing an empty emulator console command."
+    for word in words:
+        if not _EMU_WORD_RE.match(word):
+            return "Refusing emulator console argument " + repr(word[:40]) + "."
+    return None
+
+
+def _emu_reply(words: list[str], joined: str) -> dict:
+    """Read the console's verdict from its TEXT (the exit code is always zero)."""
     text, truncated = _capped(joined, MAX_DUMP_BYTES)
     if truncated:
         return {

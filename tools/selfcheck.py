@@ -624,31 +624,53 @@ class _ScanTally:
     model_tokens: set = field(default_factory=set)
 
 
-def _scan_surface(tally: _ScanTally, surface: str, text: str) -> None:
-    findings = tally.findings
+def _scan_flags(tally: _ScanTally, surface: str, text: str) -> None:
     for token in sorted(set(_TOKEN.findall(text))):
         if token.endswith("_"):  # a prefix reference, never a field name
             continue
         tally.flag_tokens.add(token)
         if token not in tally.live:
-            findings.append(Finding("dead_flag", surface, token))
+            tally.findings.append(Finding("dead_flag", surface, token))
+
+
+def _scan_modules(tally: _ScanTally, surface: str, text: str) -> None:
     for rel in sorted(set(_MODULE.findall(text))):
         tally.module_tokens.add(rel)
         if not _module_exists(tally.root, rel):
-            findings.append(Finding("dead_module", surface, rel))
+            tally.findings.append(Finding("dead_module", surface, rel))
+
+
+def _scan_llm_symbols(tally: _ScanTally, surface: str, text: str) -> None:
     for symbol in sorted(set(_LLM_SYMBOL.findall(text))):
         if symbol not in tally.llm_symbols:
-            findings.append(Finding("absent_llm_symbol", surface, f"llm.{symbol}"))
-    for hit in sorted({m.group(0) for m in _MODEL.finditer(text)}):
-        tally.model_tokens.add(hit)
-        findings.append(Finding("model_reference", surface, hit))
-    for hit in sorted({m.group(0) for m in _SERVER_MODEL_CLAIM.finditer(text)}):
-        tally.model_tokens.add(hit)
-        findings.append(Finding("server_model_claim", surface, hit))
+            tally.findings.append(
+                Finding("absent_llm_symbol", surface, f"llm.{symbol}")
+            )
+
+
+def _scan_model_claims(tally: _ScanTally, surface: str, text: str) -> None:
+    for kind, pattern in (
+        ("model_reference", _MODEL),
+        ("server_model_claim", _SERVER_MODEL_CLAIM),
+    ):
+        for hit in sorted({m.group(0) for m in pattern.finditer(text)}):
+            tally.model_tokens.add(hit)
+            tally.findings.append(Finding(kind, surface, hit))
+
+
+def _scan_tools(tally: _ScanTally, surface: str, text: str) -> None:
     for name in sorted(set(_TOOL.findall(text))):
         tally.tool_mentions.add(name)
         if name not in tally.registered:
-            findings.append(Finding("unregistered_tool", surface, name))
+            tally.findings.append(Finding("unregistered_tool", surface, name))
+
+
+def _scan_surface(tally: _ScanTally, surface: str, text: str) -> None:
+    _scan_flags(tally, surface, text)
+    _scan_modules(tally, surface, text)
+    _scan_llm_symbols(tally, surface, text)
+    _scan_model_claims(tally, surface, text)
+    _scan_tools(tally, surface, text)
 
 
 def scan(

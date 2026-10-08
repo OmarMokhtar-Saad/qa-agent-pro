@@ -924,6 +924,27 @@ def build_server():
     from fastmcp import Context, FastMCP
     from mcp.types import ContentBlock, ToolAnnotations
 
+    mcp, editions = _new_fastmcp(FastMCP)
+    _install_rejection_log(mcp)
+
+    _register_core_tools(mcp, Context, ContentBlock)
+    _register_suite_tools(mcp, Context, ToolAnnotations)
+    _register_mobile_tools(mcp, Context, ContentBlock)
+    _register_full_edition_tools(mcp, Context)
+    _register_full_edition_submit_tools(mcp, Context)
+    _register_corpus_and_device_tools(mcp, Context, ContentBlock)
+    _register_machine_tools(mcp, Context)
+    _register_feature_analysis_tools(mcp, Context, ContentBlock)
+    _register_prompts(mcp, **editions)
+
+    return mcp
+
+
+def _new_fastmcp(fastmcp_cls):
+    """Build the bare FastMCP server; return it with the three edition gates.
+
+    The gates come back as the keyword arguments ``_register_prompts`` takes.
+    """
     # The two edition gates, read here so the GUIDANCE text is built from the
     # same expressions the registration gates below use. (Those gates still
     # call `_test_cases_only()` inline at their own sites; this is a second
@@ -943,33 +964,16 @@ def build_server():
     # holds nothing but a call to this.
     edition_mobile = mcp_handlers._mobile_lane_enabled()
 
-    mcp = FastMCP(
+    editions = {
+        "test_cases_only": edition_test_cases_only,
+        "api_tests": edition_api_tests,
+        "mobile": edition_mobile,
+    }
+    mcp = fastmcp_cls(
         SERVER_NAME,
-        instructions=guidance.server_instructions(
-            test_cases_only=edition_test_cases_only,
-            api_tests=edition_api_tests,
-            mobile=edition_mobile,
-        )
-        + _reload_notice(),
+        instructions=guidance.server_instructions(**editions) + _reload_notice(),
     )
-    _install_rejection_log(mcp)
-
-    _register_core_tools(mcp, Context, ContentBlock)
-    _register_suite_tools(mcp, Context, ToolAnnotations)
-    _register_mobile_tools(mcp, Context, ContentBlock)
-    _register_full_edition_tools(mcp, Context)
-    _register_full_edition_submit_tools(mcp, Context)
-    _register_corpus_and_device_tools(mcp, Context, ContentBlock)
-    _register_machine_tools(mcp, Context)
-    _register_feature_analysis_tools(mcp, Context, ContentBlock)
-    _register_prompts(
-        mcp,
-        test_cases_only=edition_test_cases_only,
-        api_tests=edition_api_tests,
-        mobile=edition_mobile,
-    )
-
-    return mcp
+    return mcp, editions
 
 
 _DUP_REPLY_PREFIX = (
@@ -1258,299 +1262,332 @@ def _register_mobile_tools(mcp, Context, ContentBlock) -> None:
     # v1.77.0 registered none of these three tools while its own README
     # promised all three. Do not re-add it here or in the predicate.
     if mcp_handlers._mobile_lane_enabled():
+        _register_mobile_device_tools(mcp, Context)
+        _register_mobile_test_tool(mcp, Context, ContentBlock)
+        _register_mobile_submit_step_tool(mcp, Context, ContentBlock)
+        _register_mobile_status_tools(mcp, Context)
+        _register_mobile_knowledge_tools(mcp, Context)
+        _register_mobile_flows_tool(mcp, Context)
+        _register_mobile_capture_setup_tool(mcp, Context)
 
-        @mcp.tool()
-        async def qa_mobile_stop(ctx: Context, target: str = "") -> str:
-            """Stop ONE mobile run and free its device. `target`: run id or device serial. Do not guess a run or device: ask the user."""
-            return await _tracked(
-                "qa_mobile_stop",
-                ctx,
-                mcp_handlers.handle_mobile_stop(target, **_make_elicitors(ctx)),
-            )
 
-        @mcp.tool()
-        async def qa_app_info(
-            ctx: Context, app: str = "", package: str = "", device_id: str = ""
-        ) -> str:
-            """Read an installed app's version on a device. Touches nothing. Do not guess an app, package or device: ask the user."""
-            return await _tracked(
-                "qa_app_info",
-                ctx,
-                mcp_handlers.handle_app_info(
-                    app, package, device_id, **_make_elicitors(ctx)
-                ),
-            )
+def _register_mobile_device_tools(mcp, Context) -> None:
+    """Register qa_mobile_stop, qa_app_info and qa_update_app (mobile lane)."""
 
-        @mcp.tool()
-        async def qa_update_app(
-            ctx: Context,
-            app: str = "",
-            package: str = "",
-            device_id: str = "",
-            source: str = "",
-        ) -> str:
-            """Update an app on a device from an install `source`; a downgrade asks before uninstalling. Do not guess an app, package, device or source: ask the user."""
-            return await _tracked(
-                "qa_update_app",
-                ctx,
-                mcp_handlers.handle_update_app(
-                    app, package, device_id, source, **_make_elicitors(ctx)
-                ),
-            )
+    @mcp.tool()
+    async def qa_mobile_stop(ctx: Context, target: str = "") -> str:
+        """Stop ONE mobile run and free its device. `target`: run id or device serial. Do not guess a run or device: ask the user."""
+        return await _tracked(
+            "qa_mobile_stop",
+            ctx,
+            mcp_handlers.handle_mobile_stop(target, **_make_elicitors(ctx)),
+        )
 
-        @mcp.tool()
-        async def qa_mobile_test(
-            ctx: Context,
-            source: str = "",
-            suite_id: str = "",
-            goal: str = "",
-            cases: str = "",
-            app: str = "",
-            package: str = "",
-            run_id: str = "",
-            session_token: str = "",
-            apply: bool = False,
-            continue_run: bool = False,
-            serial: str = "",
-            device_id: str = "",
-            avd: str = "",
-            new_run: bool = False,
-            locale: str = "",
-            capture: str = "",
-            capture_ack: bool = False,
-            reset_app: bool = False,
-            charter: str = "",
-            note: str = "",
-            env: str = "",
-            screenshot: bool = False,
-            emulator: str = "",
-            system_image: str = "",
-            confirm_destructive: bool = False,
-        ) -> list[ContentBlock]:
-            """Drive an Android device: ad-hoc steps (goal=...), cases, exploration.
+    @mcp.tool()
+    async def qa_app_info(
+        ctx: Context, app: str = "", package: str = "", device_id: str = ""
+    ) -> str:
+        """Read an installed app's version on a device. Touches nothing. Do not guess an app, package or device: ask the user."""
+        return await _tracked(
+            "qa_app_info",
+            ctx,
+            mcp_handlers.handle_app_info(
+                app, package, device_id, **_make_elicitors(ctx)
+            ),
+        )
 
-            ANY Android device action goes through this tool. Do NOT use raw adb or shell: this tool owns the destructive guard, run folder and evidence.
+    @mcp.tool()
+    async def qa_update_app(
+        ctx: Context,
+        app: str = "",
+        package: str = "",
+        device_id: str = "",
+        source: str = "",
+    ) -> str:
+        """Update an app on a device from an install `source`; a downgrade asks before uninstalling. Do not guess an app, package, device or source: ask the user."""
+        return await _tracked(
+            "qa_update_app",
+            ctx,
+            mcp_handlers.handle_update_app(
+                app, package, device_id, source, **_make_elicitors(ctx)
+            ),
+        )
 
-            Call with NO arguments to start. Install/download/launch needs apply=true. run_id continues a run in ANY chat. ONE packet at a time; answer each with qa_submit_mobile_step. Install key in `source`, its value in `app` (or `package`); `device_id`: an adb serial; `avd`: one to boot; `charter`: JSON, no secrets; `locale`, `reset_app=true` need apply=true; new_run=true only if the tester asks. `note`: JSON {"text","kind":wait|avoid,"when":{"op","rid"},"then":{"until_text|rid","ms"}} for THIS app; no secrets.
 
-            Never report a screen state, field value or login outcome that was not read from a qa_* observation. If the server cannot type or act, stop and report the blocker by name. Do not fall back to raw adb input, and do not claim a result. Relay a finished run's verdict block word for word. Ask, never guess, the app, package, device or source."""
-            from mcp.types import TextContent
+def _register_mobile_test_tool(mcp, Context, ContentBlock) -> None:
+    """Register qa_mobile_test (mobile lane)."""
 
-            text, specs = await _tracked(
-                "qa_mobile_test",
-                ctx,
-                mcp_handlers.handle_mobile_test_content(
-                    source,
-                    suite_id,
-                    goal,
-                    cases,
-                    app,
-                    package,
-                    run_id,
-                    session_token,
-                    apply,
-                    continue_run,
-                    serial=_device_ref(device_id, serial),
-                    avd=avd,
-                    new_run=new_run,
-                    locale=locale,
-                    capture=capture,
-                    capture_ack=capture_ack,
-                    reset_app=reset_app,
-                    charter=charter,
-                    note=note,
-                    env=env,
-                    screenshot=screenshot,
-                    emulator=emulator,
-                    system_image=system_image,
-                    confirm_destructive=confirm_destructive,
-                    **_make_elicitors(ctx),
-                    progress=_make_progress(ctx),
-                ),
-            )
-            # The qa_capture_screens shape, deliberately identical: one text
-            # block plus one image block per captured screen, with that
-            # helper's NEVER-silent text fallback when the fastmcp Image API is
-            # unavailable. A packet with no picture yields the text block alone
-            # and SAYS so in its own `screen_image` note -- the reply never
-            # implies an image that is not there.
-            return [
-                TextContent(type="text", text=text),
-                *_image_content_blocks(specs),
-            ]
+    @mcp.tool()
+    async def qa_mobile_test(
+        ctx: Context,
+        source: str = "",
+        suite_id: str = "",
+        goal: str = "",
+        cases: str = "",
+        app: str = "",
+        package: str = "",
+        run_id: str = "",
+        session_token: str = "",
+        apply: bool = False,
+        continue_run: bool = False,
+        serial: str = "",
+        device_id: str = "",
+        avd: str = "",
+        new_run: bool = False,
+        locale: str = "",
+        capture: str = "",
+        capture_ack: bool = False,
+        reset_app: bool = False,
+        charter: str = "",
+        note: str = "",
+        env: str = "",
+        screenshot: bool = False,
+        emulator: str = "",
+        system_image: str = "",
+        confirm_destructive: bool = False,
+    ) -> list[ContentBlock]:
+        """Drive an Android device: ad-hoc steps (goal=...), cases, exploration.
 
-        @mcp.tool()
-        @_with_script_doc
-        async def qa_submit_mobile_step(
-            run_id: str,
-            ctx: Context,
-            tc_id: str = "",
-            script: str = "",
-            tester_input: str = "",
-            tester_input_field: str = "",
-            session_token: str = "",
-            confirm_destructive: bool = False,
-            tester_inputs: str = "",
-            note: str = "",
-            env: str = "",
-            screenshot: bool = False,
-            flow: str = "",
-            flow_params: str = "",
-            save_flow: str = "",
-            route: str = "",
-            save_route: str = "",
-            finding: str = "",
-        ) -> list[ContentBlock]:
-            """Submit the action script YOU planned for a mobile packet.
+        ANY Android device action goes through this tool. Do NOT use raw adb or shell: this tool owns the destructive guard, run folder and evidence.
 
-            The reply is the verdict plus the NEXT packet. For a credential, ask the TESTER for that field and pass it as tester_input with tester_input_field (several: tester_inputs='{"login_password": "...", "login_otp": "..."}'); it is typed into the app and stored nowhere. Pass confirm_destructive=true only after the TESTER confirms a guard stop.
+        Call with NO arguments to start. Install/download/launch needs apply=true. run_id continues a run in ANY chat. ONE packet at a time; answer each with qa_submit_mobile_step. Install key in `source`, its value in `app` (or `package`); `device_id`: an adb serial; `avd`: one to boot; `charter`: JSON, no secrets; `locale`, `reset_app=true` need apply=true; new_run=true only if the tester asks. `note`: JSON {"text","kind":wait|avoid,"when":{"op","rid"},"then":{"until_text|rid","ms"}} for THIS app; no secrets.
 
-            `note`: as on `qa_mobile_test`. Never report a screen state, field value or login outcome that was not read from a qa_* observation. If the server cannot type or act, stop and report the blocker by name. Do not fall back to raw adb input, and do not claim a result. `finding`: explore runs only, one observation per turn."""
-            from mcp.types import TextContent
+        Never report a screen state, field value or login outcome that was not read from a qa_* observation. If the server cannot type or act, stop and report the blocker by name. Do not fall back to raw adb input, and do not claim a result. Relay a finished run's verdict block word for word. Ask, never guess, the app, package, device or source."""
+        from mcp.types import TextContent
 
-            text, specs = await _tracked(
-                "qa_submit_mobile_step",
-                ctx,
-                mcp_handlers.handle_submit_mobile_step_content(
-                    run_id,
-                    tc_id,
-                    script,
-                    tester_input,
-                    tester_input_field,
-                    session_token,
-                    confirm_destructive=confirm_destructive,
-                    tester_inputs=tester_inputs,
-                    note=note,
-                    env=env,
-                    screenshot=screenshot,
-                    flow=flow,
-                    flow_params=flow_params,
-                    save_flow=save_flow,
-                    route=route,
-                    save_route=save_route,
-                    finding=finding,
-                    progress=_make_progress(ctx),
-                ),
-            )
-            # Same shape as qa_mobile_test above and as qa_capture_screens.
-            return [
-                TextContent(type="text", text=text),
-                *_image_content_blocks(specs),
-            ]
+        text, specs = await _tracked(
+            "qa_mobile_test",
+            ctx,
+            mcp_handlers.handle_mobile_test_content(
+                source,
+                suite_id,
+                goal,
+                cases,
+                app,
+                package,
+                run_id,
+                session_token,
+                apply,
+                continue_run,
+                serial=_device_ref(device_id, serial),
+                avd=avd,
+                new_run=new_run,
+                locale=locale,
+                capture=capture,
+                capture_ack=capture_ack,
+                reset_app=reset_app,
+                charter=charter,
+                note=note,
+                env=env,
+                screenshot=screenshot,
+                emulator=emulator,
+                system_image=system_image,
+                confirm_destructive=confirm_destructive,
+                **_make_elicitors(ctx),
+                progress=_make_progress(ctx),
+            ),
+        )
+        # The qa_capture_screens shape, deliberately identical: one text
+        # block plus one image block per captured screen, with that
+        # helper's NEVER-silent text fallback when the fastmcp Image API is
+        # unavailable. A packet with no picture yields the text block alone
+        # and SAYS so in its own `screen_image` note -- the reply never
+        # implies an image that is not there.
+        return [
+            TextContent(type="text", text=text),
+            *_image_content_blocks(specs),
+        ]
 
-        @mcp.tool()
-        async def qa_mobile_status(
-            ctx: Context,
-            run_id: str = "",
-            session_token: str = "",
-            report_now: bool = False,
-        ) -> str:
-            """Where a mobile run stands, read from disk. Touches no device. Device actions go through `qa_mobile_test` (goal=... for ad-hoc steps), never raw adb.
 
-            Emulator, lease holder, cases done/failed/remaining. Call after anything outliving a tool call (big install, cold boot). No run_id lists runs; report_now=true writes the HTML report and returns its path."""
-            return await _tracked(
-                "qa_mobile_status",
-                ctx,
-                mcp_handlers.handle_mobile_status(
-                    run_id, session_token, report_now, progress=_make_progress(ctx)
-                ),
-            )
+def _register_mobile_submit_step_tool(mcp, Context, ContentBlock) -> None:
+    """Register qa_submit_mobile_step (mobile lane)."""
 
-        # Inside the mobile-lane gate, deliberately: a network watch drives the
-        # emulator console and samples the device's socket table, so it lives
-        # or dies with `_mobile_lane_enabled()` exactly like the three tools
-        # beside it. No flag: like the rest of the lane it runs wherever the
-        # modules are on disk.
-        @mcp.tool()
-        async def qa_network_watch(
-            ctx: Context,
-            action: str = "status",
-            serial: str = "",
-            package: str = "",
-            apply: bool = False,
-            device_id: str = "",
-        ) -> str:
-            """Watch what an emulator puts on the wire, passively, root-free. `device_id`: adb serial (alias `serial`). `action="start"` needs `apply=true`; `"stop"` (REVERTS) never does; `"status"`. Hosts come from TLS ClientHello and DNS; **paths and query strings are not visible and never guessed**. The pcap is parsed and DELETED; only the summary returns."""
-            return await _tracked_noted(
-                "qa_network_watch",
-                ctx,
-                mcp_handlers.handle_network_watch(
-                    action, _device_ref(device_id, serial), package, apply
-                ),
-            )
+    @mcp.tool()
+    @_with_script_doc
+    async def qa_submit_mobile_step(
+        run_id: str,
+        ctx: Context,
+        tc_id: str = "",
+        script: str = "",
+        tester_input: str = "",
+        tester_input_field: str = "",
+        session_token: str = "",
+        confirm_destructive: bool = False,
+        tester_inputs: str = "",
+        note: str = "",
+        env: str = "",
+        screenshot: bool = False,
+        flow: str = "",
+        flow_params: str = "",
+        save_flow: str = "",
+        route: str = "",
+        save_route: str = "",
+        finding: str = "",
+    ) -> list[ContentBlock]:
+        """Submit the action script YOU planned for a mobile packet.
 
-        @mcp.tool()
-        async def qa_mobile_notes(
-            ctx: Context,
-            action: str = "list",
-            package: str = "",
-            run_id: str = "",
-            note_id: int = 0,
-            reason: str = "",
-        ) -> str:
-            """List or retire (`note_id`, kept in history) ONE app's saved notes, by `package` or `run_id`."""
-            return await _tracked(
-                "qa_mobile_notes",
-                ctx,
-                mcp_handlers.handle_mobile_notes(
-                    action, package, run_id, note_id, reason
-                ),
-            )
+        The reply is the verdict plus the NEXT packet. For a credential, ask the TESTER for that field and pass it as tester_input with tester_input_field (several: tester_inputs='{"login_password": "...", "login_otp": "..."}'); it is typed into the app and stored nowhere. Pass confirm_destructive=true only after the TESTER confirms a guard stop.
 
-        @mcp.tool()
-        async def qa_mobile_knowledge(
-            ctx: Context,
-            action: str = "list",
-            package: str = "",
-            item_id: str = "",
-            data: dict | None = None,
-        ) -> str:
-            """ONE app's learned knowledge: list/show/confirm/reject/edit/export/import. data: table,page,run_id"""
-            return await _tracked(
-                "qa_mobile_knowledge",
-                ctx,
-                mcp_handlers.handle_mobile_knowledge(
-                    action,
-                    package,
-                    item_id,
-                    str((data or {}).get("run_id") or ""),
-                    data,
-                ),
-            )
+        `note`: as on `qa_mobile_test`. Never report a screen state, field value or login outcome that was not read from a qa_* observation. If the server cannot type or act, stop and report the blocker by name. Do not fall back to raw adb input, and do not claim a result. `finding`: explore runs only, one observation per turn."""
+        from mcp.types import TextContent
 
-        @mcp.tool()
-        async def qa_mobile_flows(
-            ctx: Context,
-            action: str = "list",
-            package: str = "",
-            run_id: str = "",
-            name: str = "",
-            kind: str = "flow",
-        ) -> str:
-            """List, show or delete one app's saved flows."""
-            return await _tracked(
-                "qa_mobile_flows",
-                ctx,
-                mcp_handlers.handle_mobile_flows(action, package, run_id, name, kind),
-            )
+        text, specs = await _tracked(
+            "qa_submit_mobile_step",
+            ctx,
+            mcp_handlers.handle_submit_mobile_step_content(
+                run_id,
+                tc_id,
+                script,
+                tester_input,
+                tester_input_field,
+                session_token,
+                confirm_destructive=confirm_destructive,
+                tester_inputs=tester_inputs,
+                note=note,
+                env=env,
+                screenshot=screenshot,
+                flow=flow,
+                flow_params=flow_params,
+                save_flow=save_flow,
+                route=route,
+                save_route=save_route,
+                finding=finding,
+                progress=_make_progress(ctx),
+            ),
+        )
+        # Same shape as qa_mobile_test above and as qa_capture_screens.
+        return [
+            TextContent(type="text", text=text),
+            *_image_content_blocks(specs),
+        ]
 
-        @mcp.tool()
-        async def qa_setup_capture(
-            ctx: Context,
-            serial: str = "",
-            action: str = "prepare",
-            apply: bool = False,
-            capture_ack: bool = False,
-            device_id: str = "",
-        ) -> str:
-            """Prepare, check or remove API capture on a device AHEAD of a run. `device_id` is the adb serial (`serial` is an alias). `action="prepare"` installs the qa-agents proxy certificate and proves decryption; `"status"` reads the device's trust from disk; `"remove"` clears the live proxy. prepare and remove need `apply=true`."""
-            return await _tracked_noted(
-                "qa_setup_capture",
-                ctx,
-                mcp_handlers.handle_setup_capture(
-                    _device_ref(device_id, serial), action, apply, capture_ack
-                ),
-            )
+
+def _register_mobile_status_tools(mcp, Context) -> None:
+    """Register qa_mobile_status and qa_network_watch (mobile lane)."""
+
+    @mcp.tool()
+    async def qa_mobile_status(
+        ctx: Context,
+        run_id: str = "",
+        session_token: str = "",
+        report_now: bool = False,
+    ) -> str:
+        """Where a mobile run stands, read from disk. Touches no device. Device actions go through `qa_mobile_test` (goal=... for ad-hoc steps), never raw adb.
+
+        Emulator, lease holder, cases done/failed/remaining. Call after anything outliving a tool call (big install, cold boot). No run_id lists runs; report_now=true writes the HTML report and returns its path."""
+        return await _tracked(
+            "qa_mobile_status",
+            ctx,
+            mcp_handlers.handle_mobile_status(
+                run_id, session_token, report_now, progress=_make_progress(ctx)
+            ),
+        )
+
+    # Registered under the mobile-lane gate, deliberately: a network watch
+    # drives the emulator console and samples the device's socket table, so
+    # it lives or dies with `_mobile_lane_enabled()` exactly like the three
+    # tools beside it. No flag: like the rest of the lane it runs wherever
+    # the modules are on disk.
+    @mcp.tool()
+    async def qa_network_watch(
+        ctx: Context,
+        action: str = "status",
+        serial: str = "",
+        package: str = "",
+        apply: bool = False,
+        device_id: str = "",
+    ) -> str:
+        """Watch what an emulator puts on the wire, passively, root-free. `device_id`: adb serial (alias `serial`). `action="start"` needs `apply=true`; `"stop"` (REVERTS) never does; `"status"`. Hosts come from TLS ClientHello and DNS; **paths and query strings are not visible and never guessed**. The pcap is parsed and DELETED; only the summary returns."""
+        return await _tracked_noted(
+            "qa_network_watch",
+            ctx,
+            mcp_handlers.handle_network_watch(
+                action, _device_ref(device_id, serial), package, apply
+            ),
+        )
+
+
+def _register_mobile_knowledge_tools(mcp, Context) -> None:
+    """Register qa_mobile_notes and qa_mobile_knowledge (mobile lane)."""
+
+    @mcp.tool()
+    async def qa_mobile_notes(
+        ctx: Context,
+        action: str = "list",
+        package: str = "",
+        run_id: str = "",
+        note_id: int = 0,
+        reason: str = "",
+    ) -> str:
+        """List or retire (`note_id`, kept in history) ONE app's saved notes, by `package` or `run_id`."""
+        return await _tracked(
+            "qa_mobile_notes",
+            ctx,
+            mcp_handlers.handle_mobile_notes(action, package, run_id, note_id, reason),
+        )
+
+    @mcp.tool()
+    async def qa_mobile_knowledge(
+        ctx: Context,
+        action: str = "list",
+        package: str = "",
+        item_id: str = "",
+        data: dict | None = None,
+    ) -> str:
+        """ONE app's learned knowledge: list/show/confirm/reject/edit/export/import. data: table,page,run_id"""
+        return await _tracked(
+            "qa_mobile_knowledge",
+            ctx,
+            mcp_handlers.handle_mobile_knowledge(
+                action,
+                package,
+                item_id,
+                str((data or {}).get("run_id") or ""),
+                data,
+            ),
+        )
+
+
+def _register_mobile_flows_tool(mcp, Context) -> None:
+    """Register qa_mobile_flows (mobile lane)."""
+
+    @mcp.tool()
+    async def qa_mobile_flows(
+        ctx: Context,
+        action: str = "list",
+        package: str = "",
+        run_id: str = "",
+        name: str = "",
+        kind: str = "flow",
+    ) -> str:
+        """List, show or delete one app's saved flows."""
+        return await _tracked(
+            "qa_mobile_flows",
+            ctx,
+            mcp_handlers.handle_mobile_flows(action, package, run_id, name, kind),
+        )
+
+
+def _register_mobile_capture_setup_tool(mcp, Context) -> None:
+    """Register qa_setup_capture (mobile lane)."""
+
+    @mcp.tool()
+    async def qa_setup_capture(
+        ctx: Context,
+        serial: str = "",
+        action: str = "prepare",
+        apply: bool = False,
+        capture_ack: bool = False,
+        device_id: str = "",
+    ) -> str:
+        """Prepare, check or remove API capture on a device AHEAD of a run. `device_id` is the adb serial (`serial` is an alias). `action="prepare"` installs the qa-agents proxy certificate and proves decryption; `"status"` reads the device's trust from disk; `"remove"` clears the live proxy. prepare and remove need `apply=true`."""
+        return await _tracked_noted(
+            "qa_setup_capture",
+            ctx,
+            mcp_handlers.handle_setup_capture(
+                _device_ref(device_id, serial), action, apply, capture_ack
+            ),
+        )
 
 
 def _register_full_edition_tools(mcp, Context) -> None:
@@ -1586,118 +1623,137 @@ def _register_full_edition_tools(mcp, Context) -> None:
 def _register_full_edition_submit_tools(mcp, Context) -> None:
     """Register the bug-report and exploratory submit tools (full edition only)."""
     if not mcp_handlers._test_cases_only():
-
-        @mcp.tool()
-        async def qa_submit_bug_report(task_id: str, report: str, ctx: Context) -> str:
-            """Submit the bug report YOU wrote for a task opened by qa_bug_report: pass the task_id and the full markdown as `report`, written exactly as the envelope's system_prompt specifies. The server validates the required sections, saves it to the corpus, and either returns the finished report or asks you to re-emit it against a NEW task id."""
-            return await _tracked(
-                "qa_submit_bug_report",
-                ctx,
-                mcp_handlers.handle_submit_bug_report(
-                    task_id, report, progress=_make_progress(ctx)
-                ),
-            )
-
+        _register_submit_bug_report_tool(mcp, Context)
         if settings.qa_testrail_push_enabled or settings.qa_xray_push_enabled:
-
-            @mcp.tool()
-            async def qa_push_suite(
-                suite_id: str,
-                target: str,
-                project_id: int = 0,
-                section_name: str = "",
-                apply: bool = False,
-                ctx: Context = None,
-            ) -> str:
-                """Push a stored test suite into TestRail or Xray. target="testrail" (needs the numeric project_id from the TestRail URL) or "xray". Defaults to a PREVIEW that sends nothing. A real push needs apply=true AND the target's kill-switch flag enabled in .env. Nothing here can delete the cases afterwards."""
-                return await _tracked(
-                    "qa_push_suite",
-                    ctx,
-                    mcp_handlers.handle_push_suite(
-                        suite_id,
-                        target,
-                        project_id=project_id,
-                        section_name=section_name,
-                        apply=apply,
-                        progress=_make_progress(ctx),
-                    ),
-                )
-
+            _register_push_suite_tool(mcp, Context)
         if settings.qa_api_test_enabled:
+            _register_api_intake_tools(mcp, Context)
+            _register_api_suite_tools(mcp, Context)
+        _register_submit_explore_step_tool(mcp, Context)
 
-            @mcp.tool()
-            async def qa_api_project(
-                create: str = "", use: str = "", ctx: Context = None
-            ) -> str:
-                """Create a new API test project, or continue an existing one. Every API flow starts here. With NO arguments it returns the choice plus registered projects: ask the tester in plain chat. create="<name>" fetches the public template, renames it, makes ONE local commit (nothing pushed) and proves it compiles. use="<name or path>" continues an existing project. Then call qa_prepare_api_tests."""
-                return await _tracked_noted(
-                    "qa_api_project",
-                    ctx,
-                    mcp_handlers.handle_api_project(
-                        create, use, progress=_make_progress(ctx)
-                    ),
-                )
 
-            @mcp.tool()
-            async def qa_prepare_api_tests(
-                input: str = "",
-                intake_id: str = "",
-                confirmed: bool = False,
-                project: str = "",
-                ctx: Context = None,
-            ) -> str:
-                """Start (or continue) an API endpoint test intake. Chat-only: no model call. Paste a contract template, curl command, OpenAPI URL/JSON or prose. Returns an intake card (questions to ask) or, once complete and confirmed=true, a task envelope YOU answer, then call qa_submit_api_tests with the task_id and your cases. project="<name>" scopes the endpoint registry; pass it once, on the first call."""
-                return await _tracked_noted(
-                    "qa_prepare_api_tests",
-                    ctx,
-                    mcp_handlers.handle_prepare_api_tests(
-                        input,
-                        intake_id,
-                        confirmed,
-                        project,
-                        progress=_make_progress(ctx),
-                    ),
-                )
+def _register_submit_bug_report_tool(mcp, Context) -> None:
+    """Register qa_submit_bug_report (the caller holds the edition gate)."""
 
-            @mcp.tool()
-            async def qa_submit_api_tests(
-                task_id: str, suite: str, ctx: Context
-            ) -> str:
-                """Submit the API test cases YOU generated for a qa_prepare_api_tests task: the task_id and your JSON {"cases": [...]}. The server grounds every assertion against the confirmed contract (dropping hallucinated fields, refusing cases that cannot fail) and returns the suite + a suite_id for qa_write_api_test."""
-                return await _tracked(
-                    "qa_submit_api_tests",
-                    ctx,
-                    mcp_handlers.handle_submit_api_tests(
-                        task_id, suite, progress=_make_progress(ctx)
-                    ),
-                )
+    @mcp.tool()
+    async def qa_submit_bug_report(task_id: str, report: str, ctx: Context) -> str:
+        """Submit the bug report YOU wrote for a task opened by qa_bug_report: pass the task_id and the full markdown as `report`, written exactly as the envelope's system_prompt specifies. The server validates the required sections, saves it to the corpus, and either returns the finished report or asks you to re-emit it against a NEW task id."""
+        return await _tracked(
+            "qa_submit_bug_report",
+            ctx,
+            mcp_handlers.handle_submit_bug_report(
+                task_id, report, progress=_make_progress(ctx)
+            ),
+        )
 
-            @mcp.tool()
-            async def qa_write_api_test(
-                suite_id: str,
-                apply: bool = False,
-                project: str = "",
-                ctx: Context = None,
-            ) -> str:
-                """Render + (dry-run or) write the Java tests for a finalized suite. apply=false (default) returns the branch, target paths and Java source, writing nothing. apply=true writes via the framework repo's ops pipeline, only when QA_API_FRAMEWORK_WRITE_ENABLED is on and QA_API_FRAMEWORK_WRITE_DRY_RUN is off. Never main, never push. project="<name>" targets a qa_api_project project; omit it for QA_API_FRAMEWORK_PATH."""
-                return await _tracked_noted(
-                    "qa_write_api_test",
-                    ctx,
-                    mcp_handlers.handle_write_api_test(
-                        suite_id, apply, project, progress=_make_progress(ctx)
-                    ),
-                )
 
-        @mcp.tool()
-        async def qa_submit_explore_step(task_id: str, step: str, ctx: Context) -> str:
-            """Submit the coaching step YOU wrote for a task opened by qa_explore_step. Include the trailing <meta>area: …; phase: …</meta> line the system_prompt asks for: the server parses it to track coverage, then strips it."""
-            return await _tracked(
-                "qa_submit_explore_step",
-                ctx,
-                mcp_handlers.handle_submit_explore_step(
-                    task_id, step, progress=_make_progress(ctx)
-                ),
-            )
+def _register_push_suite_tool(mcp, Context) -> None:
+    """Register qa_push_suite (the caller holds the push-flag gate)."""
+
+    @mcp.tool()
+    async def qa_push_suite(
+        suite_id: str,
+        target: str,
+        project_id: int = 0,
+        section_name: str = "",
+        apply: bool = False,
+        ctx: Context = None,
+    ) -> str:
+        """Push a stored test suite into TestRail or Xray. target="testrail" (needs the numeric project_id from the TestRail URL) or "xray". Defaults to a PREVIEW that sends nothing. A real push needs apply=true AND the target's kill-switch flag enabled in .env. Nothing here can delete the cases afterwards."""
+        return await _tracked(
+            "qa_push_suite",
+            ctx,
+            mcp_handlers.handle_push_suite(
+                suite_id,
+                target,
+                project_id=project_id,
+                section_name=section_name,
+                apply=apply,
+                progress=_make_progress(ctx),
+            ),
+        )
+
+
+def _register_api_intake_tools(mcp, Context) -> None:
+    """Register qa_api_project and qa_prepare_api_tests (API flag gate held by the caller)."""
+
+    @mcp.tool()
+    async def qa_api_project(
+        create: str = "", use: str = "", ctx: Context = None
+    ) -> str:
+        """Create a new API test project, or continue an existing one. Every API flow starts here. With NO arguments it returns the choice plus registered projects: ask the tester in plain chat. create="<name>" fetches the public template, renames it, makes ONE local commit (nothing pushed) and proves it compiles. use="<name or path>" continues an existing project. Then call qa_prepare_api_tests."""
+        return await _tracked_noted(
+            "qa_api_project",
+            ctx,
+            mcp_handlers.handle_api_project(create, use, progress=_make_progress(ctx)),
+        )
+
+    @mcp.tool()
+    async def qa_prepare_api_tests(
+        input: str = "",
+        intake_id: str = "",
+        confirmed: bool = False,
+        project: str = "",
+        ctx: Context = None,
+    ) -> str:
+        """Start (or continue) an API endpoint test intake. Chat-only: no model call. Paste a contract template, curl command, OpenAPI URL/JSON or prose. Returns an intake card (questions to ask) or, once complete and confirmed=true, a task envelope YOU answer, then call qa_submit_api_tests with the task_id and your cases. project="<name>" scopes the endpoint registry; pass it once, on the first call."""
+        return await _tracked_noted(
+            "qa_prepare_api_tests",
+            ctx,
+            mcp_handlers.handle_prepare_api_tests(
+                input,
+                intake_id,
+                confirmed,
+                project,
+                progress=_make_progress(ctx),
+            ),
+        )
+
+
+def _register_api_suite_tools(mcp, Context) -> None:
+    """Register qa_submit_api_tests and qa_write_api_test (API flag gate held by the caller)."""
+
+    @mcp.tool()
+    async def qa_submit_api_tests(task_id: str, suite: str, ctx: Context) -> str:
+        """Submit the API test cases YOU generated for a qa_prepare_api_tests task: the task_id and your JSON {"cases": [...]}. The server grounds every assertion against the confirmed contract (dropping hallucinated fields, refusing cases that cannot fail) and returns the suite + a suite_id for qa_write_api_test."""
+        return await _tracked(
+            "qa_submit_api_tests",
+            ctx,
+            mcp_handlers.handle_submit_api_tests(
+                task_id, suite, progress=_make_progress(ctx)
+            ),
+        )
+
+    @mcp.tool()
+    async def qa_write_api_test(
+        suite_id: str,
+        apply: bool = False,
+        project: str = "",
+        ctx: Context = None,
+    ) -> str:
+        """Render + (dry-run or) write the Java tests for a finalized suite. apply=false (default) returns the branch, target paths and Java source, writing nothing. apply=true writes via the framework repo's ops pipeline, only when QA_API_FRAMEWORK_WRITE_ENABLED is on and QA_API_FRAMEWORK_WRITE_DRY_RUN is off. Never main, never push. project="<name>" targets a qa_api_project project; omit it for QA_API_FRAMEWORK_PATH."""
+        return await _tracked_noted(
+            "qa_write_api_test",
+            ctx,
+            mcp_handlers.handle_write_api_test(
+                suite_id, apply, project, progress=_make_progress(ctx)
+            ),
+        )
+
+
+def _register_submit_explore_step_tool(mcp, Context) -> None:
+    """Register qa_submit_explore_step (the caller holds the edition gate)."""
+
+    @mcp.tool()
+    async def qa_submit_explore_step(task_id: str, step: str, ctx: Context) -> str:
+        """Submit the coaching step YOU wrote for a task opened by qa_explore_step. Include the trailing <meta>area: …; phase: …</meta> line the system_prompt asks for: the server parses it to track coverage, then strips it."""
+        return await _tracked(
+            "qa_submit_explore_step",
+            ctx,
+            mcp_handlers.handle_submit_explore_step(
+                task_id, step, progress=_make_progress(ctx)
+            ),
+        )
 
 
 def _register_corpus_and_device_tools(mcp, Context, ContentBlock) -> None:
@@ -1738,6 +1794,13 @@ def _register_corpus_and_device_tools(mcp, Context, ContentBlock) -> None:
             ),
         )
 
+    _register_device_list_tools(mcp, Context)
+    _register_capture_screens_tool(mcp, Context, ContentBlock)
+
+
+def _register_device_list_tools(mcp, Context) -> None:
+    """Register qa_list_devices and qa_mirror_hold."""
+
     @mcp.tool()
     async def qa_list_devices(ctx: Context) -> str:
         """List attached Android/iOS devices, emulators, and simulators."""
@@ -1755,6 +1818,10 @@ def _register_corpus_and_device_tools(mcp, Context, ContentBlock) -> None:
             return mcp_handlers.handle_mirror_hold(serial, action)
 
         return await _tracked("qa_mirror_hold", ctx, _hold())
+
+
+def _register_capture_screens_tool(mcp, Context, ContentBlock) -> None:
+    """Register qa_capture_screens (every edition)."""
 
     # Registered UNCONDITIONALLY (not inside the full-edition block below):
     # tools/device_manager IS shipped in the test-cases-only edition, capturing
@@ -1810,18 +1877,29 @@ def _register_machine_tools(mcp, Context) -> None:
     # release note. Device capture is unaffected -- qa_capture_screens and
     # qa_list_devices are registered above and still live.
     if not mcp_handlers._test_cases_only():
+        _register_wizard_tool(mcp, Context)
+    _register_doctor_tools(mcp, Context)
+    _register_machine_report_tools(mcp, Context)
 
-        @mcp.tool()
-        async def qa_wizard(ctx: Context) -> str:
-            """Guided entry point: pick a workflow (Test cases / Bug report / Exploratory); it walks you END-TO-END, asking where the feature comes from (description / Jira ticket / mobile screens / Jira + mobile), and returns the suite. Feature Analysis: `qa_feature_analysis`. No parameters; without MCP elicitation, a markdown menu."""
-            return await _tracked(
-                "qa_wizard",
-                ctx,
-                mcp_handlers.handle_wizard(
-                    **_make_elicitors(ctx),
-                    progress=_make_progress(ctx),
-                ),
-            )
+
+def _register_wizard_tool(mcp, Context) -> None:
+    """Register qa_wizard (full edition only; the caller holds the gate)."""
+
+    @mcp.tool()
+    async def qa_wizard(ctx: Context) -> str:
+        """Guided entry point: pick a workflow (Test cases / Bug report / Exploratory); it walks you END-TO-END, asking where the feature comes from (description / Jira ticket / mobile screens / Jira + mobile), and returns the suite. Feature Analysis: `qa_feature_analysis`. No parameters; without MCP elicitation, a markdown menu."""
+        return await _tracked(
+            "qa_wizard",
+            ctx,
+            mcp_handlers.handle_wizard(
+                **_make_elicitors(ctx),
+                progress=_make_progress(ctx),
+            ),
+        )
+
+
+def _register_doctor_tools(mcp, Context) -> None:
+    """Register qa-doctor and qa_host_check (every edition)."""
 
     @mcp.tool(name="qa-doctor")
     async def qa_doctor(ctx: Context, fix: bool = False) -> str:
@@ -1855,6 +1933,10 @@ def _register_machine_tools(mcp, Context) -> None:
             ctx,
             mcp_handlers.handle_host_check(refresh=bool(refresh)),
         )
+
+
+def _register_machine_report_tools(mcp, Context) -> None:
+    """Register qa_machine_report and the selfcheck tool (every edition)."""
 
     # ALL editions, NO flag. It makes no outbound call, needs no per-install
     # credential, is not an experiment, and there is no install where "do not

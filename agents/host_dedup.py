@@ -1208,14 +1208,12 @@ def build_duplicate_section(
     Bounded by CHARACTERS (``_MAX_DUP_SECTION_CHARS``), not by group count, so the
     section cannot grow to tens of KB. Truncation never hides a deletion: whenever
     the group list is cut AND cases were removed, every removed tc_id is listed
-    (itself bounded, because the proportional cap bounds how many there can be).
-    Pure and synchronous. Never raises.
+    (itself bounded by the proportional cap). Pure and synchronous. Never raises.
     """
     try:
-        groups = list(groups or [])
-        notes = list(notes or [])
-        removed = list(removed or [])
-        agreements = list(agreements or [])
+        groups, notes, removed, agreements = (
+            list(seq or []) for seq in (groups, notes, removed, agreements)
+        )
         if not groups and not notes and not removed:
             return ""
         lines: list = []

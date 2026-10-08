@@ -596,8 +596,9 @@ def _quarter_turned(rotation: object) -> bool:
         return False
 
 
-def _display_rect(tree: object, display: object, rotation: object) -> tuple:
-    """``(display, frame, axes)`` -- the screen, the region an element may
+# The full contract of `_display_rect`, kept beside it and attached as its
+# ``__doc__`` below so the function body stays within the length limit.
+_DISPLAY_RECT_DOC = """``(display, frame, axes)`` -- the screen, the region an element may
     occupy, and what is known of the screen PER AXIS.
 
     **These are two answers, not one, and conflating them is what this function
@@ -683,6 +684,9 @@ def _display_rect(tree: object, display: object, rotation: object) -> tuple:
     display lose a clamp it should have had. *frame* is ``None`` only when no
     positive-area node has a positive right or bottom edge.
     """
+
+
+def _display_rect(tree: object, display: object, rotation: object) -> tuple:
     try:
         laid_out = list(tree.iter("node"))
         windows = [child for child in tree if getattr(child, "tag", None) == "node"]
@@ -702,7 +706,12 @@ def _display_rect(tree: object, display: object, rotation: object) -> tuple:
     # row dragged out to its own far edge would silently turn that clamp
     # into a no-op and send a gesture the device ignores.
     panel_right, panel_bottom = _extent(windows)
+    width, height = _panel_dims(display, rotation, (panel_right, panel_bottom))
+    return _rects_and_axes(width, height, right, bottom)
 
+
+def _panel_dims(display: object, rotation: object, window_extent: tuple) -> tuple:
+    """``(width, height)`` of the panel: the device's answer, else the windows'."""
     size = _display_size(display)
 
     if size is not None:
@@ -731,8 +740,12 @@ def _display_rect(tree: object, display: object, rotation: object) -> tuple:
         # confidently wrong one, and neither is reached at all when the device
         # answers `wm size` -- which it did on every device this has been run
         # against.
-        width, height = panel_right, panel_bottom
+        width, height = window_extent
+    return width, height
 
+
+def _rects_and_axes(width: int, height: int, right: int, bottom: int) -> tuple:
+    """``(panel, frame, axes)`` from the panel size and the all-node extent."""
     # The FRAME is derived whether or not the panel is known, and is returned
     # even when the panel is not. `prune` takes the first positive-area node as
     # its visibility filter when the frame is None, and that node being mistaken
@@ -769,6 +782,9 @@ def _display_rect(tree: object, display: object, rotation: object) -> tuple:
     # safeguard and grades as nothing, the defect `ed7b1ecf` deleted from
     # `label_of` in this same file.
     return panel, (0, 0, frame_right, frame_bottom), (width, height)
+
+
+_display_rect.__doc__ = _DISPLAY_RECT_DOC
 
 
 def _dominant_package(elements: object) -> str:
@@ -1077,65 +1093,65 @@ def _system_dialog_package(elements: list, package: str) -> str:
     return ""
 
 
+# OFF-PANEL CROWDING MAY NEVER DELETE AN ON-PANEL CONTROL.
+#
+# The frame is the display WIDENED to cover everything the dump
+# lays out, which is what stops a stale device size deleting the
+# tester's screen. But widening admits off-display elements into the same
+# `MAX_ELEMENTS` budget in DOCUMENT order, so an adjacent pager page or
+# an incoming activity laid out one screen width away could fill the cap
+# and evict the control the tester is looking at. Measured: 150 rows of
+# an incoming activity listed first, and `Delete account` gone from the
+# packet, with a CORRECT display.
+#
+# Promoting what intersects the panel fixed that and broke its mirror
+# image. Measured the other way: a tablet dump under a STALE phone size
+# -- the case the widening above exists for -- classified `Delete
+# account` at document index 0 as off-display and evicted it, while both
+# the correct display and the dump-derived fallback kept it.
+#
+# The two cannot be told apart from here. A panel narrower than the dump
+# extent is either a stale panel (keep the extra) or an app drawing
+# off-screen (drop it), and the geometry is identical in kind -- rounds 3
+# and 4 already made that trade in both directions.
+#
+# FOUR passes at spending one budget between the two classes each fixed
+# the previous pass's worst case and created a new one further out:
+# document order lost the visible control behind a full cap of off-panel
+# rows; promotion lost the control a STALE panel misclassified;
+# reserving half the budget for document order lost 25 visible controls
+# behind 75 off-panel ones; reinstating that reserve lost 35 at 130.
+# Each was measured, and the pattern is the point -- at a fixed cap,
+# "every on-panel element survives" and "every element the dump listed
+# first survives" are JOINTLY UNSATISFIABLE. That is a counting fact and
+# no ordering rule repeals it.
+#
+# So the fix leaves the ordering axis: the packet's TOTAL grew by
+# :data:`MAX_PACKET_HEADROOM`, the inside class keeps its own cap, the
+# outside class takes what the total leaves, and the walk preserves
+# DOCUMENT order. The headroom is spent only when the dump disagrees
+# with the panel, so an ordinary screen is capped exactly as it was.
+#
+# When something IS dropped, `dropped_inside_panel` /
+# `dropped_outside_panel` say which side of the panel it was on, because
+# a screen thinned without saying so is one the model plans against
+# believing it is complete.
+#
+# The properties that hold over ANY dump, which are the ones worth
+# grading: off-panel crowding never removes an on-panel element, and no
+# dump loses more elements than it loses without any of this.
+# UNCHANGED MEANING, deliberately: "the dump offered more than
+# `MAX_ELEMENTS`". `screen_hit` refuses a press on a truncated packet --
+# a CLAUDE.md hard rule, because the control a key reaches is not in the
+# dump at all -- so redefining this flag as "something was dropped"
+# would relax a destructive guard as a side effect of a budget change,
+# on a lane that reaches real installs. The new counts below carry the
+# better information without touching what this gates.
 def _cap_and_label(elements: list, selected: tuple) -> tuple[list, bool, tuple]:
     """``(elements, truncated, (inside, outside, unclassified))`` after the cap.
 
     Also assigns ids and labels the survivors.
     """
-    # OFF-PANEL CROWDING MAY NEVER DELETE AN ON-PANEL CONTROL.
-    #
-    # The frame is the display WIDENED to cover everything the dump
-    # lays out, which is what stops a stale device size deleting the
-    # tester's screen. But widening admits off-display elements into the same
-    # `MAX_ELEMENTS` budget in DOCUMENT order, so an adjacent pager page or
-    # an incoming activity laid out one screen width away could fill the cap
-    # and evict the control the tester is looking at. Measured: 150 rows of
-    # an incoming activity listed first, and `Delete account` gone from the
-    # packet, with a CORRECT display.
-    #
-    # Promoting what intersects the panel fixed that and broke its mirror
-    # image. Measured the other way: a tablet dump under a STALE phone size
-    # -- the case the widening above exists for -- classified `Delete
-    # account` at document index 0 as off-display and evicted it, while both
-    # the correct display and the dump-derived fallback kept it.
-    #
-    # The two cannot be told apart from here. A panel narrower than the dump
-    # extent is either a stale panel (keep the extra) or an app drawing
-    # off-screen (drop it), and the geometry is identical in kind -- rounds 3
-    # and 4 already made that trade in both directions.
-    #
-    # FOUR passes at spending one budget between the two classes each fixed
-    # the previous pass's worst case and created a new one further out:
-    # document order lost the visible control behind a full cap of off-panel
-    # rows; promotion lost the control a STALE panel misclassified;
-    # reserving half the budget for document order lost 25 visible controls
-    # behind 75 off-panel ones; reinstating that reserve lost 35 at 130.
-    # Each was measured, and the pattern is the point -- at a fixed cap,
-    # "every on-panel element survives" and "every element the dump listed
-    # first survives" are JOINTLY UNSATISFIABLE. That is a counting fact and
-    # no ordering rule repeals it.
-    #
-    # So the fix leaves the ordering axis: the packet's TOTAL grew by
-    # :data:`MAX_PACKET_HEADROOM`, the inside class keeps its own cap, the
-    # outside class takes what the total leaves, and the walk preserves
-    # DOCUMENT order. The headroom is spent only when the dump disagrees
-    # with the panel, so an ordinary screen is capped exactly as it was.
-    #
-    # When something IS dropped, `dropped_inside_panel` /
-    # `dropped_outside_panel` say which side of the panel it was on, because
-    # a screen thinned without saying so is one the model plans against
-    # believing it is complete.
-    #
-    # The properties that hold over ANY dump, which are the ones worth
-    # grading: off-panel crowding never removes an on-panel element, and no
-    # dump loses more elements than it loses without any of this.
-    # UNCHANGED MEANING, deliberately: "the dump offered more than
-    # `MAX_ELEMENTS`". `screen_hit` refuses a press on a truncated packet --
-    # a CLAUDE.md hard rule, because the control a key reaches is not in the
-    # dump at all -- so redefining this flag as "something was dropped"
-    # would relax a destructive guard as a side effect of a budget change,
-    # on a lane that reaches real installs. The new counts below carry the
-    # better information without touching what this gates.
     truncated = len(elements) > MAX_ELEMENTS
     elements, inside, outside, unclassified = _cap_elements(elements, selected)
     _assign_ids(elements)
@@ -1151,7 +1167,6 @@ def _geometry_fields(
     selected: tuple, frame: tuple, panel_axes: tuple, drops: tuple
 ) -> dict:
     """The display, frame, per-class drop counts and per-axis panel of a screen."""
-    dropped_inside, dropped_outside, dropped_unclassified = drops
     return {
         # The DISPLAY. Stored because the tallest element bottom is NOT
         # the viewport: a scroll container reports its CONTENT height, and
@@ -1174,6 +1189,14 @@ def _geometry_fields(
         # a node's box under a name that promises the frame, which is the
         # one-name-two-meanings defect this key exists to end.
         "frame_bounds": list(frame) if frame else [],
+        **_panel_fields(drops, panel_axes),
+    }
+
+
+def _panel_fields(drops: tuple, panel_axes: tuple) -> dict:
+    """Per-class drop counts and the per-axis panel of a screen."""
+    dropped_inside, dropped_outside, dropped_unclassified = drops
+    return {
         # WHICH class lost elements, because "truncated" alone cannot say
         # whether the tester's own screen was thinned or an adjacent pager
         # page was. A model told only that something was cut plans against a
@@ -1202,6 +1225,44 @@ def _geometry_fields(
         # out above the display. Two consumers, two values, one meaning each.
         "panel_axes": list(panel_axes),
     }
+
+
+def _screen_content(
+    elements: list, texts: list[str], package: str, activity: str, extras: dict
+) -> dict:
+    """The screen packet: identity fields, then *extras* (geometry, truncation)."""
+    # The SCREEN hash and every ELEMENT id come from the same per-element
+    # seed, so "did this screen change" and "is this the same element"
+    # cannot answer from two different notions of identity.
+    seed = "\x1f".join(element_seed(element) for element in elements)
+    package = _dominant_package(elements) or package
+    # ANY element's, not the dominant one's: an overlay is smaller than the
+    # window it covers by definition, so these are two different questions
+    # about one dump and each needs its own answer.
+    dialog = _system_dialog_package(elements, package)
+    for element in elements:
+        element.pop("package", None)
+    return {
+        "screen_id": _screen_id(package, _clean(activity), texts),
+        "elements": elements,
+        "hash": hashlib.sha256(seed.encode("utf-8", errors="replace")).hexdigest()[:16],
+        "package": package,
+        "dialog_package": dialog,
+        "activity": _clean(activity),
+        **extras,
+    }
+
+
+def _audit(content: dict, density: object) -> object:
+    """THE AUDIT, over the screen ``prune`` just produced and nothing else."""
+    # One producer: the packet, the report and the run's stored screen
+    # all read this key rather than each deriving an answer of their own.
+    # Imported HERE rather than at module scope because `screen_audit`
+    # imports this module for its one tokeniser; by the time a prune runs,
+    # this module is fully loaded, so the cycle cannot bite.
+    from tools.mobile import screen_audit
+
+    return screen_audit.audit(content, density)
 
 
 def prune(
@@ -1235,40 +1296,18 @@ def prune(
         elements, texts, package, considered = _collect_elements(root, frame)
 
         elements, truncated, drops = _cap_and_label(elements, selected)
-
-        # The SCREEN hash and every ELEMENT id come from the same per-element
-        # seed, so "did this screen change" and "is this the same element"
-        # cannot answer from two different notions of identity.
-        seed = "\x1f".join(element_seed(element) for element in elements)
-        package = _dominant_package(elements) or package
-        # ANY element's, not the dominant one's: an overlay is smaller than the
-        # window it covers by definition, so these are two different questions
-        # about one dump and each needs its own answer.
-        dialog = _system_dialog_package(elements, package)
-        for element in elements:
-            element.pop("package", None)
-        content = {
-            "screen_id": _screen_id(package, _clean(activity), texts),
-            "elements": elements,
-            "hash": hashlib.sha256(seed.encode("utf-8", errors="replace")).hexdigest()[
-                :16
-            ],
-            "package": package,
-            "dialog_package": dialog,
-            "activity": _clean(activity),
-            **_geometry_fields(selected, frame, panel_axes, drops),
-            "truncated": truncated,
-            "considered": considered,
-        }
-        # THE AUDIT, over the screen this function just produced and nothing
-        # else. One producer: the packet, the report and the run's stored screen
-        # all read this key rather than each deriving an answer of their own.
-        # Imported HERE rather than at module scope because `screen_audit`
-        # imports this module for its one tokeniser; by the time a prune runs,
-        # this module is fully loaded, so the cycle cannot bite.
-        from tools.mobile import screen_audit
-
-        content["accessibility"] = screen_audit.audit(content, density)
+        content = _screen_content(
+            elements,
+            texts,
+            package,
+            activity,
+            {
+                **_geometry_fields(selected, frame, panel_axes, drops),
+                "truncated": truncated,
+                "considered": considered,
+            },
+        )
+        content["accessibility"] = _audit(content, density)
         return {"error": None, "content": content}
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.perception.prune failed")

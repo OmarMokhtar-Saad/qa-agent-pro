@@ -243,6 +243,25 @@ def secret_fields(template: dict) -> list:
     )
 
 
+def _params_problem(template: dict, params: dict) -> str:
+    """Why *params* do not fit the template's declared parameters, or ``''``."""
+    declared = list(template.get("params") or [])
+    missing = [p for p in declared if p not in params]
+    extra = sorted(str(k)[:40] for k in params if k not in declared)
+    if missing or extra:
+        return "flow parameters do not match: missing %s, unknown %s" % (
+            missing or "none",
+            extra or "none",
+        )
+    for key, value in params.items():
+        if not isinstance(value, str) or len(value) > actions.MAX_TEXT_CHARS:
+            return "parameter `%s` must be text of at most %d characters" % (
+                str(key)[:40],
+                actions.MAX_TEXT_CHARS,
+            )
+    return ""
+
+
 def expand(template: dict, params: object, supplied: object) -> dict:
     """The script JSON to replay: placeholders filled, then parsed again as the final gate.
 
@@ -254,20 +273,9 @@ def expand(template: dict, params: object, supplied: object) -> dict:
             params = {}
         if not isinstance(params, dict):
             return _err("`flow_params` must be a JSON object")
-        declared = list(template.get("params") or [])
-        missing = [p for p in declared if p not in params]
-        extra = sorted(str(k)[:40] for k in params if k not in declared)
-        if missing or extra:
-            return _err(
-                "flow parameters do not match: missing %s, unknown %s"
-                % (missing or "none", extra or "none")
-            )
-        for key, value in params.items():
-            if not isinstance(value, str) or len(value) > actions.MAX_TEXT_CHARS:
-                return _err(
-                    "parameter `%s` must be text of at most %d characters"
-                    % (str(key)[:40], actions.MAX_TEXT_CHARS)
-                )
+        problem = _params_problem(template, params)
+        if problem:
+            return _err(problem)
         absent = [f for f in secret_fields(template) if f not in set(supplied or ())]
         if absent:
             return _err(

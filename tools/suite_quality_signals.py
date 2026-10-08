@@ -147,6 +147,68 @@ def dedup_self_report_contradiction(
         return False
 
 
+def _refs_advisory(cases, staged_text):
+    refs = unverified_external_references(cases, staged_text)
+    if not refs:
+        return None
+    return (
+        "Unstaged ticket references",
+        "These cases reference ticket key(s) not found in the "
+        f"staged ticket text: {', '.join(refs)}.",
+    )
+
+
+def _conditional_advisory(cases):
+    cond_ids = conditional_steps(cases)
+    if not cond_ids:
+        return None
+    return (
+        "Conditional / unexecutable steps",
+        "These case(s) have a step whose action reads as an "
+        "if/when branch rather than a single deterministic "
+        f"action: {', '.join(cond_ids)}.",
+    )
+
+
+def _concentration_advisory(cases):
+    ac = ac_concentration(cases)
+    if not ac:
+        return None
+    rid, ratio = ac
+    return (
+        "Acceptance-criterion concentration",
+        f"`{rid}` backs {ratio:.0%} of this suite -- coverage may "
+        "be concentrated on one requirement rather than spread "
+        "across the ticket.",
+    )
+
+
+def _precondition_advisory(cases):
+    precond = precondition_repetition(cases)
+    if not precond:
+        return None
+    text, ratio = precond
+    return (
+        "Precondition repetition",
+        f"{ratio:.0%} of this suite shares the identical "
+        f"precondition text ({text[:80]!r}) -- may indicate "
+        "copy-paste rather than per-case tailoring.",
+    )
+
+
+def _dedup_advisory(host_claimed_no_duplicates, server_duplicate_groups):
+    if not dedup_self_report_contradiction(
+        host_claimed_no_duplicates, server_duplicate_groups
+    ):
+        return None
+    return (
+        "Dedup self-report contradiction",
+        "The submitting host reported NO duplicate cases, but "
+        "the server's own lexical prescreen found candidate "
+        "duplicate group(s) -- the two disagree.",
+    )
+
+
 def compute_suite_quality_advisories(
     cases,
     *,
@@ -162,58 +224,14 @@ def compute_suite_quality_advisories(
     ``cases`` argument. Warn-only -- never refuses, never raises."""
     out: list[tuple[str, str]] = []
     try:
-        refs = unverified_external_references(cases, staged_text)
-        if refs:
-            out.append(
-                (
-                    "Unstaged ticket references",
-                    "These cases reference ticket key(s) not found in the "
-                    f"staged ticket text: {', '.join(refs)}.",
-                )
-            )
-        cond_ids = conditional_steps(cases)
-        if cond_ids:
-            out.append(
-                (
-                    "Conditional / unexecutable steps",
-                    "These case(s) have a step whose action reads as an "
-                    "if/when branch rather than a single deterministic "
-                    f"action: {', '.join(cond_ids)}.",
-                )
-            )
-        ac = ac_concentration(cases)
-        if ac:
-            rid, ratio = ac
-            out.append(
-                (
-                    "Acceptance-criterion concentration",
-                    f"`{rid}` backs {ratio:.0%} of this suite -- coverage may "
-                    "be concentrated on one requirement rather than spread "
-                    "across the ticket.",
-                )
-            )
-        precond = precondition_repetition(cases)
-        if precond:
-            text, ratio = precond
-            out.append(
-                (
-                    "Precondition repetition",
-                    f"{ratio:.0%} of this suite shares the identical "
-                    f"precondition text ({text[:80]!r}) -- may indicate "
-                    "copy-paste rather than per-case tailoring.",
-                )
-            )
-        if dedup_self_report_contradiction(
-            host_claimed_no_duplicates, server_duplicate_groups
-        ):
-            out.append(
-                (
-                    "Dedup self-report contradiction",
-                    "The submitting host reported NO duplicate cases, but "
-                    "the server's own lexical prescreen found candidate "
-                    "duplicate group(s) -- the two disagree.",
-                )
-            )
+        found = (
+            _refs_advisory(cases, staged_text),
+            _conditional_advisory(cases),
+            _concentration_advisory(cases),
+            _precondition_advisory(cases),
+            _dedup_advisory(host_claimed_no_duplicates, server_duplicate_groups),
+        )
+        out.extend(a for a in found if a)
     except Exception:
         logger.debug("compute_suite_quality_advisories failed", exc_info=True)
     return out

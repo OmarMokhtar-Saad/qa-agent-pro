@@ -1027,6 +1027,25 @@ def rejection_notice(charter: object) -> str:
     return _rejected_clause(charter)
 
 
+# describe_terms notes (kept beside the function, out of its body):
+# :func:`normalize` is the strip point, so a charter that reached
+# persistence carries the SERVER's verdict and never a host-supplied list.
+# READ OFF ``charter``, THE ARGUMENT AS GIVEN -- never off ``terms``.
+# :func:`normalize` is NOT idempotent on its own output (see its
+# docstring): re-normalising strips ``DEFAULTS_KEY`` and re-derives it
+# against a fully filled body, so ``defaults_used(terms)`` is ALWAYS [] and
+# the disclosure clause silently disappears. That is mutant M11, and it is
+# named here because this line's correctness otherwise rests on an accident
+# of call order that no reader could be expected to preserve.
+# REFUSE BY NAME, AHEAD OF EVERY CLIPPABLE CLAUSE. A coercer that replaces
+# an out-of-enum answer with the default REDUCES what was asked for, and
+# the invariant is that such a site refuses by name in the same reply. Read
+# off ``charter``, the argument as given, for the M11 reason: re-normalising
+# strips the recorded verdict. The clause is BOUNDED -- at most five
+# entries, each value trimmed to 40 characters -- because one unbounded
+# clause ahead of a disclosure defeats the whole ordering. See
+# :func:`_rejected_clause`, the same loop extracted so `rejection_notice`
+# can surface it before this run has a finished report.
 def describe_terms(charter: object) -> str:
     """The run's TERMS as one plain sentence, defaults NAMED. ONE producer.
 
@@ -1065,35 +1084,31 @@ def describe_terms(charter: object) -> str:
     if not isinstance(charter, dict) or not charter:
         return ""
     terms = normalize(charter)
+    return (
+        _rejected_clause(charter)
+        + _defaults_clause(defaults_used(charter))
+        + _stop_clauses(terms)
+        + _budget_clause(terms)
+        + _charter_clause(terms)
+    )
+
+
+def _defaults_clause(assumed: list) -> str:
+    """Which defaults the server assumed; ``""`` when none."""
+    if not assumed:
+        return ""
+    return (
+        "The tester did not set "
+        + ", ".join(assumed)
+        + ", so the server used its own default for "
+        + ("each" if len(assumed) > 1 else "it")
+        + ". "
+    )
+
+
+def _stop_clauses(terms: dict) -> str:
+    """The undetected-stop and guard-refusal disclosures."""
     said = ""
-    # :func:`normalize` is the strip point, so a charter that reached
-    # persistence carries the SERVER's verdict and never a host-supplied list.
-    # READ OFF ``charter``, THE ARGUMENT AS GIVEN -- never off ``terms``.
-    # :func:`normalize` is NOT idempotent on its own output (see its
-    # docstring): re-normalising strips ``DEFAULTS_KEY`` and re-derives it
-    # against a fully filled body, so ``defaults_used(terms)`` is ALWAYS [] and
-    # the disclosure clause silently disappears. That is mutant M11, and it is
-    # named here because this line's correctness otherwise rests on an accident
-    # of call order that no reader could be expected to preserve.
-    # REFUSE BY NAME, AHEAD OF EVERY CLIPPABLE CLAUSE. A coercer that replaces
-    # an out-of-enum answer with the default REDUCES what was asked for, and
-    # the invariant is that such a site refuses by name in the same reply. Read
-    # off ``charter``, the argument as given, for the M11 reason: re-normalising
-    # strips the recorded verdict. The clause is BOUNDED -- at most five
-    # entries, each value trimmed to 40 characters -- because one unbounded
-    # clause ahead of a disclosure defeats the whole ordering. See
-    # :func:`_rejected_clause`, the same loop extracted so `rejection_notice`
-    # can surface it before this run has a finished report.
-    said += _rejected_clause(charter)
-    assumed = defaults_used(charter)
-    if assumed:
-        said += (
-            "The tester did not set "
-            + ", ".join(assumed)
-            + ", so the server used its own default for "
-            + ("each" if len(assumed) > 1 else "it")
-            + ". "
-        )
     if terms["stop_on"] not in WIRED_STOPS:
         said += (
             terms["stop_on"] + " is recorded but not yet detected, so this run "
@@ -1105,6 +1120,11 @@ def describe_terms(charter: object) -> str:
             "does: a stopped action ends this run by name rather than pausing "
             "for the tester. "
         )
+    return said
+
+
+def _budget_clause(terms: dict) -> str:
+    """The budget sentence: what was asked, what clamped, what stops the run."""
     budget = terms["budget"]
     spend = (
         (
@@ -1150,7 +1170,11 @@ def describe_terms(charter: object) -> str:
         # minutes-only, both, neither) built BEFORE this rule, because
         # fixture diversity and not mutation count is what grades it.
         spend += ", clamped to the lane's ceiling of " + " and ".join(clamped)
-    said += "Budget " + spend + "; stopping on " + terms["stop_on"] + ". "
+    return "Budget " + spend + "; stopping on " + terms["stop_on"] + ". "
+
+
+def _charter_clause(terms: dict) -> str:
+    """The closing clause: depth, destructive policy and scope."""
     # THE DISCLOSURE THESE THREE FIELDS USED TO CARRY IS GONE, because the gap
     # it described is gone: the turn packet carries the depth directive and
     # the scope lines, and the destructive policy decides what happens after a
@@ -1158,7 +1182,7 @@ def describe_terms(charter: object) -> str:
     # defect as one that preceded the fix, so it was retired in the SAME
     # commit that wired them. What is still genuinely unwired keeps its own
     # sentence -- see the ``coverage_plateau`` clause above, untouched.
-    said += (
+    return (
         "Charter: depth "
         + terms["depth"]
         + " -- the turn packet asks for that work by name; destructive "
@@ -1175,4 +1199,3 @@ def describe_terms(charter: object) -> str:
         "stops the run on one. A resume reads these back and explores under "
         "them."
     )
-    return said

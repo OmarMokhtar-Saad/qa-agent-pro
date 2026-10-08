@@ -60,51 +60,57 @@ def generate_test_case_csv(suite: TestSuite, output_path: str | None = None) -> 
         writer = csv.writer(fh)
         writer.writerow(_HEADERS)
         for tc in suite.test_cases:
-            steps_text = sanitize_cell(
-                "\n".join(f"{s.step_number}. {s.action}" for s in tc.steps)
-            )
-            expected_text = sanitize_cell(
-                "\n".join(f"{s.step_number}. {s.expected_result}" for s in tc.steps)
-            )
-            data_lines = [
-                f"Step {s.step_number}: {s.test_data}" for s in tc.steps if s.test_data
-            ]
-            # Case-level data-provisioning plan: appended after the per-step
-            # lines; a case with none is byte-identical to before.
-            data_lines.extend(format_test_data_lines(tc.test_data))
-            test_data_text = sanitize_cell("\n".join(data_lines))
-            writer.writerow(
-                [
-                    tc.tc_id,
-                    sanitize_cell(tc.module),
-                    sanitize_cell(tc.title),
-                    tc.priority.value,
-                    tc.type.value,
-                    sanitize_cell(tc.preconditions or ""),
-                    steps_text,
-                    test_data_text,
-                    expected_text,
-                    "Not Run",
-                    "",
-                    # sanitize_cell is defence-in-depth, not a necessity: the
-                    # value is normalised to one of 8 canonical names before it
-                    # gets here, but TestCase.category itself accepts any
-                    # <=60-char string, so a future path could bypass that.
-                    sanitize_cell(getattr(tc, "category", None) or ""),
-                    # F06: the acceptance criterion this case verifies.
-                    # "(untraced)" rather than a blank, for the reason
-                    # xlsx_generator._requirement_cell gives.
-                    sanitize_cell(
-                        display_requirement_id(tc.requirement_id) or "(untraced)"
-                    ),
-                    # An unscored suite writes an EMPTY cell, not "0" -- the
-                    # xlsx writes write_blank for the same reason.
-                    _risk_score_cell(tc) if _risk_score_cell(tc) is not None else "",
-                ]
-            )
+            writer.writerow(_case_row(tc))
 
     logger.info("CSV written: %s (%d test cases)", output_path, len(suite.test_cases))
     return output_path
+
+
+def _test_data_text(tc) -> str:
+    """The Test Data cell: per-step lines, then the case-level plan."""
+    data_lines = [
+        f"Step {s.step_number}: {s.test_data}" for s in tc.steps if s.test_data
+    ]
+    # Case-level data-provisioning plan: appended after the per-step
+    # lines; a case with none is byte-identical to before.
+    data_lines.extend(format_test_data_lines(tc.test_data))
+    return sanitize_cell("\n".join(data_lines))
+
+
+def _case_row(tc) -> list:
+    """One CSV row for a test case, in _HEADERS order."""
+    steps_text = sanitize_cell(
+        "\n".join(f"{s.step_number}. {s.action}" for s in tc.steps)
+    )
+    expected_text = sanitize_cell(
+        "\n".join(f"{s.step_number}. {s.expected_result}" for s in tc.steps)
+    )
+    risk = _risk_score_cell(tc)
+    return [
+        tc.tc_id,
+        sanitize_cell(tc.module),
+        sanitize_cell(tc.title),
+        tc.priority.value,
+        tc.type.value,
+        sanitize_cell(tc.preconditions or ""),
+        steps_text,
+        _test_data_text(tc),
+        expected_text,
+        "Not Run",
+        "",
+        # sanitize_cell is defence-in-depth, not a necessity: the
+        # value is normalised to one of 8 canonical names before it
+        # gets here, but TestCase.category itself accepts any
+        # <=60-char string, so a future path could bypass that.
+        sanitize_cell(getattr(tc, "category", None) or ""),
+        # F06: the acceptance criterion this case verifies.
+        # "(untraced)" rather than a blank, for the reason
+        # xlsx_generator._requirement_cell gives.
+        sanitize_cell(display_requirement_id(tc.requirement_id) or "(untraced)"),
+        # An unscored suite writes an EMPTY cell, not "0" -- the
+        # xlsx writes write_blank for the same reason.
+        risk if risk is not None else "",
+    ]
 
 
 def cleanup_temp_files(max_age_seconds: int = 3600) -> int:

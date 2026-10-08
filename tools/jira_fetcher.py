@@ -516,9 +516,9 @@ def _http_refusal(resp: _HopResult, final_url: str) -> dict | None:
     return None
 
 
-def _page_result(url: str, resp: _HopResult) -> dict:
-    """Extract the readable page content from a good response into the result dict."""
-    soup = BeautifulSoup(resp.text, "lxml")
+def _extract_title_and_text(html: str) -> tuple[str, str]:
+    """Return (title, readable body text) of an HTML page."""
+    soup = BeautifulSoup(html, "lxml")
     for tag in soup(["script", "style"]):
         tag.decompose()
 
@@ -531,6 +531,25 @@ def _page_result(url: str, resp: _HopResult) -> dict:
         if main
         else soup.get_text(separator="\n", strip=True)
     )
+    return title_text, body_text
+
+
+def _unreadable_page_result() -> dict:
+    """The refusal for a 200 page with no readable text."""
+    return {
+        "error": (
+            "Could not extract readable content from the page — it likely "
+            "requires authentication or is rendered with JavaScript (e.g. a "
+            "Jira or other single-page app). Please paste the ticket text and "
+            "I'll generate test cases from it."
+        ),
+        "content": None,
+    }
+
+
+def _page_result(url: str, resp: _HopResult) -> dict:
+    """Extract the readable page content from a good response into the result dict."""
+    title_text, body_text = _extract_title_and_text(resp.text)
 
     # A JS-only SPA shell (e.g. a React/Vue app like SauceDemo) may serve a
     # short "enable JavaScript" message that is OVER _MIN_READABLE_CHARS, so
@@ -557,15 +576,7 @@ def _page_result(url: str, resp: _HopResult) -> dict:
     # broken/empty page — refuse rather than return empty content the
     # generator would fabricate cases from.
     if len(body_text.strip()) < _MIN_READABLE_CHARS:
-        return {
-            "error": (
-                "Could not extract readable content from the page — it likely "
-                "requires authentication or is rendered with JavaScript (e.g. a "
-                "Jira or other single-page app). Please paste the ticket text and "
-                "I'll generate test cases from it."
-            ),
-            "content": None,
-        }
+        return _unreadable_page_result()
 
     return {
         "title": title_text,

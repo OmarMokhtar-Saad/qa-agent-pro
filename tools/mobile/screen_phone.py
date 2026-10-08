@@ -338,6 +338,32 @@ def _container_blocks(content: list, rtl: bool, width: int) -> tuple[list, set]:
     return blocks, claimed
 
 
+def _split_zones(items: list, width: int, height: int) -> tuple[list, list, list]:
+    """The top bar, the composer zone and the content between them."""
+    top_bar = [(b, e) for b, e in items if b[3] <= height * TOP_BAR_BOTTOM]
+    bottom = [(b, e) for b, e in items if b[1] >= height * COMPOSER_TOP]
+    editable = [(b, e) for b, e in bottom if e.get("editable")]
+    composer_zone = bottom if editable else []
+    used = {id(e) for _b, e in top_bar} | {id(e) for _b, e in composer_zone}
+    content = [(b, e) for b, e in items if id(e) not in used and (b[2] - b[0]) < width]
+    return top_bar, composer_zone, content
+
+
+def _loose_card_blocks(content: list, claimed: set, rtl: bool) -> list:
+    """Free text outside any clickable container: rows -> cards."""
+    loose = [(b, e) for b, e in content if id(e) not in claimed and _text(e)]
+    return [
+        {
+            "top": card["top"],
+            "bottom": card["bottom"],
+            "kind": "card",
+            "speaker": "",
+            "lines": card["rows"],
+        }
+        for card in _cards(_rows(loose, rtl))
+    ]
+
+
 def compose(screen: object, *, esc: Callable[..., str], app: str = "") -> str:
     """The phone for one pruned screen, or an honest empty phone."""
     items = _elements(screen)
@@ -351,27 +377,9 @@ def compose(screen: object, *, esc: Callable[..., str], app: str = "") -> str:
     height = max(box[3] for box, _e in items) or 1
     rtl = _rtl([_text(e) for _b, e in items if _text(e)])
 
-    top_bar = [(b, e) for b, e in items if b[3] <= height * TOP_BAR_BOTTOM]
-    bottom = [(b, e) for b, e in items if b[1] >= height * COMPOSER_TOP]
-    editable = [(b, e) for b, e in bottom if e.get("editable")]
-    composer_zone = bottom if editable else []
-    used = {id(e) for _b, e in top_bar} | {id(e) for _b, e in composer_zone}
-    content = [(b, e) for b, e in items if id(e) not in used and (b[2] - b[0]) < width]
-
+    top_bar, composer_zone, content = _split_zones(items, width, height)
     blocks, claimed = _container_blocks(content, rtl, width)
-
-    # Free text outside any clickable container: rows -> cards.
-    loose = [(b, e) for b, e in content if id(e) not in claimed and _text(e)]
-    for card in _cards(_rows(loose, rtl)):
-        blocks.append(
-            {
-                "top": card["top"],
-                "bottom": card["bottom"],
-                "kind": "card",
-                "speaker": "",
-                "lines": card["rows"],
-            }
-        )
+    blocks.extend(_loose_card_blocks(content, claimed, rtl))
     blocks.sort(key=lambda block: block["top"])
 
     parts = _block_markup(blocks, esc)

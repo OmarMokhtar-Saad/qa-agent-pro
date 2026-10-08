@@ -48,42 +48,46 @@ async def prepare(serial: str, *, owner: str = "", apply_: bool = False) -> dict
     an exception a caller has to separately handle.
     """
     from tools.mobile import session
-    from tools.mobile_capture import cert, ladder, proxy
+    from tools.mobile_capture import ladder
 
     serial = str(serial or "")
     minted = not str(owner or "").strip()
     label = str(owner or "").strip() or session.new_provisioning_owner()
 
     try:
-        held = (session.take_device_lock(label, serial=serial) or {}).get(
-            "content"
-        ) or {}
-        if not held.get("acquired"):
-            return _none_reply(serial, label, proxy.REASON_DEVICE_BUSY)
-        if not apply_:
-            return _none_reply(serial, label, ladder.REASON_NO_APPLY)
-
-        fingerprint, prior_tier = _ca_fingerprint_and_prior(serial)
-
-        installed = await cert.install(serial, apply=apply_, owner=label)
-        if installed.get("error"):
-            if installed["error"] in (proxy.REASON_DEVICE_BUSY, ladder.REASON_FLAG_OFF):
-                return _none_reply(serial, label, installed["error"], fingerprint)
-            return _none_reply(
-                serial, label, ladder.REASON_CERT_NOT_TRUSTED, fingerprint
-            )
-
-        if not _mitmdump_binary(apply_):
-            return _none_reply(serial, label, ladder.REASON_NO_MITMDUMP, fingerprint)
-
-        run = await _start_and_probe(serial, label)
-        return _decide_reply(serial, label, fingerprint, prior_tier, run)
+        return await _prepare_locked(serial, label, apply_)
     except Exception:
         logger.exception("mobile_capture.prepare failed")
         return _none_reply(serial, label, ladder.REASON_DEVICE_GONE)
     finally:
         if minted:
             session.release_device_lock(label, as_holder=True)
+
+
+async def _prepare_locked(serial: str, label: str, apply_: bool) -> dict:
+    """Take the device lock, install the CA, start and probe the proxy, decide."""
+    from tools.mobile import session
+    from tools.mobile_capture import cert, ladder, proxy
+
+    held = (session.take_device_lock(label, serial=serial) or {}).get("content") or {}
+    if not held.get("acquired"):
+        return _none_reply(serial, label, proxy.REASON_DEVICE_BUSY)
+    if not apply_:
+        return _none_reply(serial, label, ladder.REASON_NO_APPLY)
+
+    fingerprint, prior_tier = _ca_fingerprint_and_prior(serial)
+
+    installed = await cert.install(serial, apply=apply_, owner=label)
+    if installed.get("error"):
+        if installed["error"] in (proxy.REASON_DEVICE_BUSY, ladder.REASON_FLAG_OFF):
+            return _none_reply(serial, label, installed["error"], fingerprint)
+        return _none_reply(serial, label, ladder.REASON_CERT_NOT_TRUSTED, fingerprint)
+
+    if not _mitmdump_binary(apply_):
+        return _none_reply(serial, label, ladder.REASON_NO_MITMDUMP, fingerprint)
+
+    run = await _start_and_probe(serial, label)
+    return _decide_reply(serial, label, fingerprint, prior_tier, run)
 
 
 def _none_reply(serial: str, label: str, reason: str, fingerprint: str = "") -> dict:

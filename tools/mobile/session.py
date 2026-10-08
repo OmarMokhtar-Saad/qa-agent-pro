@@ -2290,25 +2290,9 @@ async def _next_suite_packet(
     """The suite lane's next packet: report, gate, busy or a started case."""
     if body.get("finished"):
         await _finish_evidence(run_id, body)
-        return {
-            "error": None,
-            "content": {
-                "state": STATE_REPORT,
-                "packet": None,
-                "tc_id": "",
-                "resolved": body,
-            },
-        }
+        return _suite_reply(STATE_REPORT, body, None, "")
     if body.get("gate") and not past_gate:
-        return {
-            "error": None,
-            "content": {
-                "state": STATE_GATE,
-                "packet": None,
-                "tc_id": str(body.get("next_tc_id") or ""),
-                "resolved": body,
-            },
-        }
+        return _suite_reply(STATE_GATE, body, None, str(body.get("next_tc_id") or ""))
     loaded = load_case(run_id, str(body.get("next_tc_id") or ""))
     if loaded.get("error"):
         return loaded
@@ -2329,12 +2313,19 @@ async def _next_suite_packet(
     if started.get("error"):
         return started
     content = started.get("content") or {}
+    return _suite_reply(
+        STATE_RUNNING, body, content.get("packet"), str(content.get("tc_id") or "")
+    )
+
+
+def _suite_reply(state: str, body: dict, packet: object, tc_id: str) -> dict:
+    """The suite lane's next-packet reply shape."""
     return {
         "error": None,
         "content": {
-            "state": STATE_RUNNING,
-            "packet": content.get("packet"),
-            "tc_id": str(content.get("tc_id") or ""),
+            "state": state,
+            "packet": packet,
+            "tc_id": tc_id,
             "resolved": body,
         },
     }
@@ -3000,17 +2991,20 @@ async def submit(
         _hold_tester_inputs(run_id, ctx, merged_inputs)
         ctx.confirm_destructive = bool(confirm_destructive)
         # S10 saved route (PROVISIONAL): empty unless the wrapper is replaying a route.
-        ctx.route_expect = (
-            tuple(str(item) for item in route_expect)
-            if isinstance(route_expect, (list, tuple))
-            else ()
-        )
+        ctx.route_expect = _route_expect_tuple(route_expect)
         if str(body.get("lane")) == LANE_EXPLORE:
             return await _submit_explore_held(run_id, raw_script, ctx, body)
         return await _submit_suite(run_id, tc_id, raw_script, ctx, body, field)
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.session.submit failed")
         return {"error": str(exc), "content": None}
+
+
+def _route_expect_tuple(route_expect: object) -> tuple[str, ...]:
+    """The expected route as a tuple of strings; empty for anything else."""
+    if isinstance(route_expect, (list, tuple)):
+        return tuple(str(item) for item in route_expect)
+    return ()
 
 
 def _cap_submit_budget(ctx: executor.Context, budget: object) -> None:
@@ -3141,17 +3135,17 @@ def _noted_outcome(run_id: str, replayed: dict) -> dict:
     return outcome
 
 
-async def _submit_explore(
-    run_id: str, raw: object, ctx: executor.Context, resolved: dict
-) -> dict:
-    """One exploratory turn: replay the actions, then fold the reply."""
+def _parse_explore_submission(
+    raw: object, resolved: dict
+) -> tuple[dict, dict, dict | None]:
+    """Decode and parse the model's reply: (payload, parsed script, refusal)."""
     from tools.mobile import actions as actions_mod
 
     # DECODED, not type-tested. `qa_submit_mobile_step` declares `script: str`,
     # so this used to be `{}` on every real client path: the whole JSON string
     # went to `parse_script`, `Script`'s `extra="forbid"` refused the advertised
     # `finding` key, and nothing replayed -- and when a model retried with a
-    # bare actions array, `apply_turn_result` below got `{}` and never read the
+    # bare actions array, `apply_turn_result` got `{}` and never read the
     # finding. Two failures, one cause, and no test saw either because every
     # test passed a dict into this helper.
     payload = actions_mod.decode_reply(raw)
@@ -3164,7 +3158,8 @@ async def _submit_explore(
             queued_in, list(payload.get("actions") or [])
         )
         if not combined.get("ok"):
-            return _explore_needs_model(str(combined.get("reason") or ""), resolved)
+            refusal = _explore_needs_model(str(combined.get("reason") or ""), resolved)
+            return payload, {}, refusal
         payload["actions"] = combined["actions"]
     # A folded queue was already held to both caps by the combine, so only a
     # bare submission is held to the model cap here.
@@ -3175,7 +3170,95 @@ async def _submit_explore(
         ),
     )
     if parsed.get("error"):
-        return _explore_needs_model(parsed["error"], resolved)
+        return payload, parsed, _explore_needs_model(parsed["error"], resolved)
+    return payload, parsed, None
+
+
+def _arm_explore_guards(run_id: str, ctx: executor.Context, resolved: dict) -> None:
+    """Set the run-wide evidence and guard policy the executor reads."""
+    # Run-wide evidence, read from the checkpoints this run already wrote and
+    # passed in EXPLICITLY. See ``_explore_prior_verified``.
+    ctx.prior_turn_blocked = _explore_prior_turn_blocked(run_id)
+    ctx.prior_verified = _explore_prior_verified(run_id)
+    # WHAT HAPPENS AFTER A GUARD HIT, from this run's own charter. The guard
+    # itself is unchanged and no value here lets an action through it:
+    # ``charter.guard_policy`` maps ``destructive: none`` to REFUSE, and the
+    # executor then ENDS the attempt by name instead of pausing for the
+    # tester. An explicit input, set beside ``prior_verified`` for the same
+    # reason -- the executor knows nothing about runs or charters.
+    ctx.guard_refuses = (
+        charter_mod.guard_policy(
+            ((resolved.get("explore") or {}).get("charter") or {}).get("destructive")
+        )
+        == charter_mod.REFUSE
+    )
+    # THIS turn's own id, computed BEFORE the replay. The exact-match
+    # lookup alone no longer suffices here: `explore_runner.next_packet`
+    # bumps `state["turn"]` on EVERY call, so a confirm submitted after the
+    # scheduler already advanced past this turn names a `tc_id` no case was
+    # ever checkpointed under. See `_prior_guard_stop_explore`.
+    ctx.prior_guard_stop = _prior_guard_stop_explore(
+        run_id, explore_turn_case_id(resolved.get("explore"))
+    )
+
+
+def _turn_verdict(outcome: dict) -> str:
+    """The verdict of a turn whose ``done()`` judged the goal, else ""."""
+    # Only a turn whose ``done()`` judged the goal writes a verdict; every
+    # other turn keeps "" plus its status, because an exploratory turn has no
+    # expected result to be judged against. It lands in the ordinary
+    # ``verdict`` field, exactly as the suite lane writes it, so
+    # ``run_store.DONE_VERDICTS`` and every reader of it work unchanged.
+    #
+    # The condition is STATED, not inferred from the producer:
+    # ``executor.replay``'s no-done exit returns ``unverified`` too, so reading
+    # the field alone recorded a turn that merely acted as one that had reached
+    # a verdict.
+    ended = any(
+        str((entry.get("action") or {}).get("op") or "") == "done"
+        for entry in list(outcome.get("trace") or [])
+        if isinstance(entry, dict)
+    )
+    return str(outcome.get("verdict") or "") if ended else ""
+
+
+def _explore_turn_case(checkpoint: dict, outcome: dict, verdict: str) -> dict:
+    """The ``case`` block of the chat reply for one replayed turn."""
+    return {
+        "tc_id": checkpoint["tc_id"],
+        "title": checkpoint["title"],
+        "status": str(outcome.get("status") or ""),
+        "verdict": verdict,
+        "reason": str(outcome.get("reason") or ""),
+        "trace": list(outcome.get("trace") or []),
+    }
+
+
+def _explore_turn_reply(
+    case: dict, notice: str, resolved: dict, *, stopped: bool
+) -> dict:
+    """The chat reply for one folded exploratory turn."""
+    return {
+        "error": None,
+        "content": {
+            "state": STATE_REPORT if stopped else STATE_RUNNING,
+            "case": case,
+            "packet": None,
+            "next": {},
+            "notice": notice,
+            "field": "",
+            "resolved": resolved,
+        },
+    }
+
+
+async def _submit_explore(
+    run_id: str, raw: object, ctx: executor.Context, resolved: dict
+) -> dict:
+    """One exploratory turn: replay the actions, then fold the reply."""
+    payload, parsed, refusal = _parse_explore_submission(raw, resolved)
+    if refusal is not None:
+        return refusal
     # HAND-OVER TO THE TARGET APP (fix round 3, item 1). A multi-app goal
     # (App Tester -> the app under test) moves into a second app, and every guard that
     # asks "is this the app under test" reads `ctx.package` -- which stayed
@@ -3192,31 +3275,26 @@ async def _submit_explore(
         resolved["explore"] = dict(resolved.get("explore") or {}, app=handed)
         ctx.package = handed
         ctx.activity = ""
-    # Run-wide evidence, read from the checkpoints this run already wrote and
-    # passed in EXPLICITLY. See ``_explore_prior_verified``.
-    ctx.prior_turn_blocked = _explore_prior_turn_blocked(run_id)
-    ctx.prior_verified = _explore_prior_verified(
-        run_id
-    )  # WHAT HAPPENS AFTER A GUARD HIT, from this run's own charter. The guard
-    # itself is unchanged and no value here lets an action through it:
-    # ``charter.guard_policy`` maps ``destructive: none`` to REFUSE, and the
-    # executor then ENDS the attempt by name instead of pausing for the
-    # tester. An explicit input, set beside ``prior_verified`` for the same
-    # reason -- the executor knows nothing about runs or charters.
-    ctx.guard_refuses = (
-        charter_mod.guard_policy(
-            ((resolved.get("explore") or {}).get("charter") or {}).get("destructive")
-        )
-        == charter_mod.REFUSE
-    )
-    # THIS turn's own id, computed BEFORE the replay below. The exact-match
-    # lookup alone no longer suffices here: `explore_runner.next_packet`
-    # bumps `state["turn"]` on EVERY call, so a confirm submitted after the
-    # scheduler already advanced past this turn names a `tc_id` no case was
-    # ever checkpointed under. See `_prior_guard_stop_explore`.
-    ctx.prior_guard_stop = _prior_guard_stop_explore(
-        run_id, explore_turn_case_id(resolved.get("explore"))
-    )
+    _arm_explore_guards(run_id, ctx, resolved)
+    replay = await _replay_explore_turn(run_id, ctx, resolved, payload, parsed)
+    if isinstance(replay, dict):
+        return replay
+    return await _commit_explore_turn(run_id, ctx, resolved, payload, replay)
+
+
+@dataclass(frozen=True)
+class _ReplayedTurn:
+    """What a replayed exploratory turn hands to its commit step."""
+
+    outcome: dict
+    clip: object
+    clip_tc_id: str
+
+
+async def _replay_explore_turn(
+    run_id: str, ctx: executor.Context, resolved: dict, payload: dict, parsed: dict
+) -> _ReplayedTurn | dict:
+    """Start the clip and replay the actions; a replay error is returned as is."""
     # THE RECORDER, on the lane that shipped without one. `case_runner` has
     # started a clip around ITS replay since v1.87.0; this is the other replay
     # site and it had none, so every exploratory run -- which is the lane the
@@ -3246,7 +3324,18 @@ async def _submit_explore(
             await _explore_abort_network(run_id, resolved.get("explore") or {}, ctx),
         )
         return replayed
-    outcome = _noted_outcome(run_id, replayed)
+    return _ReplayedTurn(_noted_outcome(run_id, replayed), clip, clip_tc_id)
+
+
+async def _commit_explore_turn(
+    run_id: str,
+    ctx: executor.Context,
+    resolved: dict,
+    payload: dict,
+    replay: _ReplayedTurn,
+) -> dict:
+    """Fold the replayed turn into the explore state, checkpoint it and reply."""
+    outcome, clip, clip_tc_id = replay.outcome, replay.clip, replay.clip_tc_id
     folded = explore_runner.apply_turn_result(resolved.get("explore") or {}, payload)
     if folded.get("error"):
         return folded
@@ -3263,32 +3352,9 @@ async def _submit_explore(
     # and is the same on a resubmit.
     before = resolved.get("explore") or {}
     finding = _latest_finding(turn.get("state"))
-    # ONE producer for this turn's verdict, computed once from the replay and
-    # read by BOTH consumers below -- the DISK record and the CHAT reply. They
-    # are two artifacts with two lifetimes, so they stay two sites; what was
-    # wrong is that each was its own producer, writing "" unconditionally.
-    #
-    # Only a turn whose ``done()`` judged the goal writes a verdict; every
-    # other turn keeps "" plus its status, because an exploratory turn has no
-    # expected result to be judged against. It lands in the ordinary
-    # ``verdict`` field, exactly as the suite lane writes it, so
-    # ``run_store.DONE_VERDICTS`` and every reader of it work unchanged and no
-    # verdict reaches the report by a second route.
-    #
-    # The condition is STATED, not inferred from the producer. The premise this
-    # line used to rest on -- "the executor returns a verdict only from a
-    # ``done`` op" -- is false: ``executor.replay``'s no-done exit returns
-    # ``unverified`` too, so reading the field alone recorded a turn that
-    # merely acted as one that had reached a verdict. ``unverified`` IS in
-    # ``DONE_VERDICTS``, so that would have made D1's coverage count true and
-    # meaningless in the same breath -- every turn "with a verdict", none of
-    # them judged.
-    ended = any(
-        str((entry.get("action") or {}).get("op") or "") == "done"
-        for entry in list(outcome.get("trace") or [])
-        if isinstance(entry, dict)
-    )
-    verdict = str(outcome.get("verdict") or "") if ended else ""
+    # ONE producer for this turn's verdict, read by BOTH consumers below --
+    # the DISK record and the CHAT reply.
+    verdict = _turn_verdict(outcome)
     # The turn HAS been replayed, so its capture is complete. Stopped before the
     # checkpoint, because the checkpoint is what carries the record to the report.
     net = await _explore_finish_network(run_id, before, ctx)
@@ -3309,6 +3375,43 @@ async def _submit_explore(
         clip,
         str((outcome.get("screen") or {}).get("screen_id") or ""),
     )
+    return await _settle_explore_turn(run_id, resolved, turn, outcome, checkpoint)
+
+
+async def _settle_explore_turn(
+    run_id: str, resolved: dict, turn: dict, outcome: dict, checkpoint: dict
+) -> dict:
+    """Persist the committed explore state, close the run if over, and reply."""
+    before = resolved.get("explore") or {}
+    finding = _latest_finding(turn.get("state"))
+    verdict = _turn_verdict(outcome)
+    committed_state, refused = _committed_explore_state(turn, outcome)
+    _persist_explore(
+        run_id,
+        committed_state,
+        planned=_explore_planned_case(checkpoint["tc_id"], before, finding),
+    )
+    # ONE derivation of "has this run stopped", read by BOTH consumers below.
+    # The two used to be two copies of the same condition, and a refusal must
+    # move both or the chat reply invites a next turn the run will not give.
+    stopped = refused or str(turn.get("status") or "") != explore_runner.RUNNING
+    if stopped:
+        await _finish_evidence(run_id, resolved)
+    notice = (
+        explore_runner.GUARD_REFUSED_NOTICE
+        if refused
+        else str(turn.get("notice") or "")
+    )
+    return _explore_turn_reply(
+        _explore_turn_case(checkpoint, outcome, verdict),
+        notice,
+        resolved,
+        stopped=stopped,
+    )
+
+
+def _committed_explore_state(turn: dict, outcome: dict) -> tuple[dict, bool]:
+    """The explore state to persist for a replayed turn, and whether it refused."""
     # The replay HAPPENED, so the number this turn was handed is now earned.
     # This is the only writer that ADVANCES ``committed_turn`` to a number the
     # ladder has not already earned, and it
@@ -3347,45 +3450,23 @@ async def _submit_explore(
     refused = bool(outcome.get("guard_refused"))
     if refused:
         committed_state["stop"] = explore_runner.STOP_GUARD_REFUSED
-    _persist_explore(
-        run_id,
-        committed_state,
-        planned=_explore_planned_case(checkpoint["tc_id"], before, finding),
-    )
-    # ONE derivation of "has this run stopped", read by BOTH consumers below.
-    # The two used to be two copies of the same condition, and a refusal must
-    # move both or the chat reply invites a next turn the run will not give.
-    stopped = refused or str(turn.get("status") or "") != explore_runner.RUNNING
-    if stopped:
-        await _finish_evidence(run_id, resolved)
-    return {
-        "error": None,
-        "content": {
-            "state": STATE_REPORT if stopped else STATE_RUNNING,
-            "case": {
-                "tc_id": checkpoint["tc_id"],
-                "title": checkpoint["title"],
-                "status": str(outcome.get("status") or ""),
-                "verdict": verdict,
-                "reason": str(outcome.get("reason") or ""),
-                "trace": list(outcome.get("trace") or []),
-            },
-            "packet": None,
-            "next": {},
-            "notice": (
-                explore_runner.GUARD_REFUSED_NOTICE
-                if refused
-                else str(turn.get("notice") or "")
-            ),
-            "field": "",
-            "resolved": resolved,
-        },
-    }
+    return committed_state, refused
 
 
 # ---------------------------------------------------------------------------
 # Audit
 # ---------------------------------------------------------------------------
+
+
+def _masked_field_entries(fields: list[str] | None) -> list[dict]:
+    """Marked, value-free entries for the tester field NAMES, capped."""
+    names = [str(name)[:80] for name in fields or [] if str(name or "").strip()][
+        :MOBILE_MAX_TESTER_INPUTS
+    ]
+    return [
+        {"secret": True, "field": name, "value": run_store.SECRET_MASK}
+        for name in names
+    ]
 
 
 def audit_detail(
@@ -3426,15 +3507,9 @@ def audit_detail(
                 "field": str(field)[:80],
                 "value": run_store.SECRET_MASK,
             }
-        if fields:
-            names = [str(name)[:80] for name in fields if str(name or "").strip()][
-                :MOBILE_MAX_TESTER_INPUTS
-            ]
-            if names:
-                detail["tester_fields"] = [
-                    {"secret": True, "field": name, "value": run_store.SECRET_MASK}
-                    for name in names
-                ]
+        masked = _masked_field_entries(fields)
+        if masked:
+            detail["tester_fields"] = masked
         return run_store.redact(detail)
     except Exception:  # pragma: no cover - defensive
         logger.warning("mobile.session.audit_detail failed", exc_info=True)

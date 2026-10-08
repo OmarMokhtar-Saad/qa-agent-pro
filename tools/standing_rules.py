@@ -321,18 +321,22 @@ def assumed_label(source_ref: str, has_spec: bool, bilingual: bool = False) -> s
         return ASSUMED_EN.format(ref="the source ticket")
 
 
+def _api_contract_source(has_spec: bool) -> str:
+    """Where the API checklist lines say field names and codes come from."""
+    if has_spec:
+        return "the linked OpenAPI/Swagger spec"
+    return (
+        "standard REST convention (ASSUMED - the ticket documents no "
+        "contract, so the case title must start with the literal marker "
+        + ASSUMED_MARKER
+        + ")"
+    )
+
+
 def _checklist_section(triggers: Triggers) -> list[tuple[str, str, str]]:
     """The API checklist lines (SR-API-1..4) for a fired API trigger."""
+    source = _api_contract_source(triggers.has_spec)
     out: list[tuple[str, str, str]] = []
-    if triggers.has_spec:
-        source = "the linked OpenAPI/Swagger spec"
-    else:
-        source = (
-            "standard REST convention (ASSUMED - the ticket documents no "
-            "contract, so the case title must start with the literal marker "
-            + ASSUMED_MARKER
-            + ")"
-        )
     out.append(
         (
             "SR-API-1",
@@ -411,13 +415,10 @@ def standing_checklist_lines(triggers: Triggers) -> list[tuple[str, str, str]]:
     return out
 
 
-def _prompt_block_lines(
-    triggers: Triggers, lines: list[tuple[str, str, str]], checklist_mode: bool
-) -> str:
-    """The head + checklist bullets + tail of the standing-rules prompt clause."""
-    body = "\n".join(f"- [{lid}] {text}" for lid, text, _sub in lines)
+def _prompt_block_head(checklist_mode: bool) -> str:
+    """The opening of the standing-rules prompt clause."""
     if checklist_mode:
-        head = (
+        return (
             "\n\n## STANDING RULES (mandatory)\n"
             "The ticket content triggered the rules below. They are ALREADY on "
             "the Atomic Requirements Checklist as lines whose ids start with "
@@ -426,13 +427,16 @@ def _prompt_block_lines(
             "every other checklist line, so your `requirement_id` tag is "
             "advisory:\n"
         )
-    else:
-        head = (
-            "\n\n## STANDING RULES (mandatory)\n"
-            "The ticket content triggered the rules below. Produce at least one "
-            "dedicated test case for each bullet that falls in your category's "
-            "scope:\n"
-        )
+    return (
+        "\n\n## STANDING RULES (mandatory)\n"
+        "The ticket content triggered the rules below. Produce at least one "
+        "dedicated test case for each bullet that falls in your category's "
+        "scope:\n"
+    )
+
+
+def _prompt_block_tail(triggers: Triggers) -> str:
+    """The API-contract and open-question notes closing the prompt clause."""
     tail = ""
     if triggers.api and not triggers.has_spec:
         tail = (
@@ -463,7 +467,15 @@ def _prompt_block_lines(
             "conservative reading and start its title with the literal marker "
             f"{CLARIFY_MARKER}.\n"
         )
-    return head + body + tail
+    return tail
+
+
+def _prompt_block_lines(
+    triggers: Triggers, lines: list[tuple[str, str, str]], checklist_mode: bool
+) -> str:
+    """The head + checklist bullets + tail of the standing-rules prompt clause."""
+    body = "\n".join(f"- [{lid}] {text}" for lid, text, _sub in lines)
+    return _prompt_block_head(checklist_mode) + body + _prompt_block_tail(triggers)
 
 
 def format_standing_prompt_block(
@@ -532,46 +544,69 @@ def annotate_assumed_cases(
     return notes
 
 
+def _api_warning_rows(triggers: Triggers, source_ref: str) -> list[str]:
+    """The advisory rows for a fired API trigger."""
+    src = (
+        "the linked OpenAPI/Swagger spec"
+        if triggers.has_spec
+        else "standard REST convention"
+    )
+    lines = [
+        "- **API rules fired** (matched: "
+        + ", ".join(triggers.api_evidence[:5] or ["an OpenAPI spec"])
+        + ") - status-code, request-design and response-structure cases are "
+        f"mandatory and were written against {src}."
+    ]
+    if triggers.api_weak_only:
+        lines.append(
+            "  - ⚠️ **The trigger was CIRCUMSTANTIAL.** No word like "
+            '"API", "endpoint" or "status code" appears on this ticket; the '
+            "rules fired on "
+            + ", ".join(f"`{e}`" for e in triggers.api_evidence[:5])
+            + ". If this story has no backend surface, ignore the "
+            "API cases -- they are advisory."
+        )
+    if not triggers.has_spec:
+        lines.append(
+            "  - No contract is documented on the ticket. Cases marked "
+            f"`{ASSUMED_MARKER}` carry this note in the Excel **Notes** "
+            f"column: _{assumed_label(source_ref, False)}_"
+        )
+    if triggers.spec_hint:
+        lines.append(
+            "  - A spec URL appears in the ticket text "
+            f"(`{triggers.spec_hint}`). Spec ingestion is always on, so "
+            "if the API cases were not written from the contract the "
+            "URL was not recognised as an OpenAPI/Swagger link, or the "
+            "fetch failed."
+        )
+    return lines
+
+
+def _question_warning_rows(open_questions: list[str]) -> list[str]:
+    """The advisory rows listing unresolved ticket questions."""
+    lines = [
+        "- **Unresolved questions found in the ticket / comments - these were "
+        "NOT answered by the generator:**"
+    ]
+    for q in open_questions[:5]:
+        # UNTRUSTED, attacker-writable ticket/comment prose. safe_display
+        # strips the markdown structure it could otherwise forge inside
+        # this section, and the quotes make the provenance obvious.
+        safe = safe_display(q)
+        if safe:
+            lines.append(f'  - "{safe}"')
+    lines.append(f"  Resolve them before executing any case marked `{CLARIFY_MARKER}`.")
+    return lines
+
+
 def _warning_rows(
     triggers: Triggers, notes: dict[str, str], source_ref: str
 ) -> list[str]:
     """The advisory bullet rows under the standing-rules heading."""
     lines: list[str] = []
     if triggers.api:
-        src = (
-            "the linked OpenAPI/Swagger spec"
-            if triggers.has_spec
-            else "standard REST convention"
-        )
-        lines.append(
-            "- **API rules fired** (matched: "
-            + ", ".join(triggers.api_evidence[:5] or ["an OpenAPI spec"])
-            + ") - status-code, request-design and response-structure cases are "
-            f"mandatory and were written against {src}."
-        )
-        if triggers.api_weak_only:
-            lines.append(
-                "  - ⚠️ **The trigger was CIRCUMSTANTIAL.** No word like "
-                '"API", "endpoint" or "status code" appears on this ticket; the '
-                "rules fired on "
-                + ", ".join(f"`{e}`" for e in triggers.api_evidence[:5])
-                + ". If this story has no backend surface, ignore the "
-                "API cases -- they are advisory."
-            )
-        if not triggers.has_spec:
-            lines.append(
-                "  - No contract is documented on the ticket. Cases marked "
-                f"`{ASSUMED_MARKER}` carry this note in the Excel **Notes** "
-                f"column: _{assumed_label(source_ref, False)}_"
-            )
-        if triggers.spec_hint:
-            lines.append(
-                "  - A spec URL appears in the ticket text "
-                f"(`{triggers.spec_hint}`). Spec ingestion is always on, so "
-                "if the API cases were not written from the contract the "
-                "URL was not recognised as an OpenAPI/Swagger link, or the "
-                "fetch failed."
-            )
+        lines.extend(_api_warning_rows(triggers, source_ref))
     if triggers.ui:
         lines.append(
             "- **User-facing screen detected** - a baseline UI build-quality case "
@@ -579,20 +614,7 @@ def _warning_rows(
             "interactive states, smallest supported width)."
         )
     if triggers.open_questions:
-        lines.append(
-            "- **Unresolved questions found in the ticket / comments - these were "
-            "NOT answered by the generator:**"
-        )
-        for q in triggers.open_questions[:5]:
-            # UNTRUSTED, attacker-writable ticket/comment prose. safe_display
-            # strips the markdown structure it could otherwise forge inside
-            # this section, and the quotes make the provenance obvious.
-            safe = safe_display(q)
-            if safe:
-                lines.append(f'  - "{safe}"')
-        lines.append(
-            f"  Resolve them before executing any case marked `{CLARIFY_MARKER}`."
-        )
+        lines.extend(_question_warning_rows(triggers.open_questions))
     if notes:
         lines.append(
             "- Cases carrying an assumption / clarification note: "

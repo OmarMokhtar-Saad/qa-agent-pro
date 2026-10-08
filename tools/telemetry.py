@@ -312,6 +312,28 @@ def pop_tool_properties() -> dict:
         return {}
 
 
+def _scrub_frame_paths(frame: dict, root: str) -> None:
+    """Make a stack frame's ``abs_path`` / ``filename`` install-relative or a bare name."""
+    for key in ("abs_path", "filename"):
+        path = frame.get(key)
+        if not isinstance(path, str):
+            continue
+        if path.startswith(root):
+            frame[key] = path[len(root) :].lstrip("/\\")
+        else:
+            frame[key] = os.path.basename(path)
+
+
+def _scrub_exception_entry(entry: dict, root: str) -> None:
+    """Force the entry's ``value`` to its type name and scrub every frame path."""
+    if entry.get("type"):
+        entry["value"] = str(entry["type"])
+    frames = (entry.get("stacktrace") or {}).get("frames") or []
+    for frame in frames:
+        if isinstance(frame, dict):
+            _scrub_frame_paths(frame, root)
+
+
 def _scrub_event_paths(event):
     """posthog ``before_send`` hook for the dist client: strip absolute paths
     from crash stack frames (they can leak the user's OS username) and force
@@ -327,22 +349,8 @@ def _scrub_event_paths(event):
             return event
         root = str(_INSTALL_DIR)
         for entry in exc_list:
-            if not isinstance(entry, dict):
-                continue
-            if entry.get("type"):
-                entry["value"] = str(entry["type"])
-            frames = (entry.get("stacktrace") or {}).get("frames") or []
-            for frame in frames:
-                if not isinstance(frame, dict):
-                    continue
-                for key in ("abs_path", "filename"):
-                    path = frame.get(key)
-                    if not isinstance(path, str):
-                        continue
-                    if path.startswith(root):
-                        frame[key] = path[len(root) :].lstrip("/\\")
-                    else:
-                        frame[key] = os.path.basename(path)
+            if isinstance(entry, dict):
+                _scrub_exception_entry(entry, root)
         return event
     except Exception:
         logger.debug(

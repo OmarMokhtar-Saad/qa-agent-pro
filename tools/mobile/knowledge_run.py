@@ -217,7 +217,11 @@ async def begin_run(ctx: object) -> RunFacts:
                 str(getattr(ctx, "serial", "") or ""), package
             )
         facts = RunFacts(
-            run_id, package, str(name), str(code), dict(env),
+            run_id,
+            package,
+            str(name),
+            str(code),
+            dict(env),
             str(getattr(ctx, "lane", "") or ""),
         )
         if run_id and package:
@@ -303,9 +307,7 @@ def pending_runs(package: str, *, exclude=(), limit: int | None = None) -> list[
         ).fetchall()
         now = time.time()
         out = [
-            r[0]
-            for r in rows
-            if r[0] not in skip and _finished(r[0], r[1] or 0.0, now)
+            r[0] for r in rows if r[0] not in skip and _finished(r[0], r[1] or 0.0, now)
         ]
         return out[: max(0, cap)]
     except Exception:

@@ -226,37 +226,37 @@ async def start(serial: str, *, run_id: str) -> dict:
         # it back is the exact leak this phase exists to prevent, applied to
         # the lock instead of the proxy setting.
         newly_acquired = not content.get("reentrant")
-        succeeded = False
+        reply = {"error": REASON_PROXY_START_FAILED, "content": None}
         try:
-            await teardown.reap(owner=str(run_id), serial_hint=serial)
-
-            capped = _cap_refusal(serial)
-            if capped is not None:
-                return capped
-
-            port = _free_port()
-            proc = _start_spawn(run_id, port)
-            if not _wait_port_open(port, START_TIMEOUT_S):
-                # The leaked-process class: a spawn that never binds must not
-                # be left running, and must never have the proxy setting
-                # applied.
-                teardown.kill_process(proc.pid)
-                return {"error": REASON_PROXY_START_FAILED, "content": None}
-
-            reply = await _start_apply(serial, run_id, port, proc)
-            succeeded = reply["error"] is None
+            reply = await _start_locked(serial, run_id)
             return reply
         finally:
-            # The LOCK invariant, mirrored from the proxy-setting invariant
-            # above. A caller who did not hold this lock before calling us
-            # does not keep holding it after a failure; a caller who already
-            # held it keeps its own lifecycle unaffected, since this call
-            # never released anything it did not itself acquire.
-            if newly_acquired and not succeeded:
+            # The LOCK invariant: release only a lock this call took, and only
+            # when no live proxy is handed off (also on an exception).
+            if newly_acquired and reply["error"] is not None:
                 session.release_device_lock(str(run_id), as_holder=True)
     except Exception as exc:
         logger.exception("mobile_capture.proxy.start failed")
         return {"error": str(exc), "content": None}
+
+
+async def _start_locked(serial: str, run_id: str) -> dict:
+    """Reap residue, check the cap, spawn and apply, with the device lock held."""
+    await teardown.reap(owner=str(run_id), serial_hint=serial)
+
+    capped = _cap_refusal(serial)
+    if capped is not None:
+        return capped
+
+    port = _free_port()
+    proc = _start_spawn(run_id, port)
+    if not _wait_port_open(port, START_TIMEOUT_S):
+        # The leaked-process class: a spawn that never binds must not be left
+        # running, and must never have the proxy setting applied.
+        teardown.kill_process(proc.pid)
+        return {"error": REASON_PROXY_START_FAILED, "content": None}
+
+    return await _start_apply(serial, run_id, port, proc)
 
 
 def _start_spawn(run_id: str, port: int):

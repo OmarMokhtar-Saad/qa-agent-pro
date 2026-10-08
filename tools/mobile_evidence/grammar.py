@@ -1749,6 +1749,27 @@ def _parsed_sections(parsed: dict) -> dict:
     return {key: parsed[key] for key in keys}
 
 
+def _run_section(source: str, parsed: dict, malformed, manifest, profile) -> dict:
+    """The ``run`` block of the report: source, environment claims and traffic hosts."""
+    effective_env, hosts = env_from_traffic(parsed["bindings"], profile)
+    claimed_env = (manifest or {}).get("env")
+    return {
+        "source": source,
+        "mergedNetworkLines": parsed.get("mergedNetworkLines") or 0,
+        "malformedLines": malformed,
+        "turnsFromNarration": bool(parsed.get("turnsFromNarration")),
+        "appRuns": len(parsed["appRuns"]),
+        "env": effective_env or claimed_env,
+        "envClaimed": claimed_env,
+        "envFromTraffic": effective_env,
+        "envDisagrees": bool(
+            effective_env and claimed_env and effective_env != claimed_env
+        ),
+        "hosts": hosts,
+        "disabled": parsed.get("disabled") or [],
+    }
+
+
 def build(profile, compiled, *, ndjson=None, logcat=None) -> dict:
     """Parse one capture into the report dict every downstream reader consumes.
 
@@ -1775,28 +1796,12 @@ def build(profile, compiled, *, ndjson=None, logcat=None) -> dict:
             parsed = attribute_turns(parse(events, None, profile, compiled))
             prompts = _logcat_prompts(logcat, profile, parsed)
         manifest = manifests[-1] if manifests else None
-        effective_env, hosts = env_from_traffic(parsed["bindings"], profile)
-        claimed_env = (manifest or {}).get("env")
         gaps = list(GAPS)
         if source == "logcat":
             gaps.append(dict(_LOGCAT_FALLBACK_GAP))
         report = {
             "schema": SCHEMA,
-            "run": {
-                "source": source,
-                "mergedNetworkLines": parsed.get("mergedNetworkLines") or 0,
-                "malformedLines": malformed,
-                "turnsFromNarration": bool(parsed.get("turnsFromNarration")),
-                "appRuns": len(parsed["appRuns"]),
-                "env": effective_env or claimed_env,
-                "envClaimed": claimed_env,
-                "envFromTraffic": effective_env,
-                "envDisagrees": bool(
-                    effective_env and claimed_env and effective_env != claimed_env
-                ),
-                "hosts": hosts,
-                "disabled": parsed.get("disabled") or [],
-            },
+            "run": _run_section(source, parsed, malformed, manifest, profile),
             "manifest": manifest,
             "manifests": manifests,
             "counts": _report_counts(parsed, events),

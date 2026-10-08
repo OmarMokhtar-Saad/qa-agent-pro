@@ -133,35 +133,37 @@ def _explain_validation(exc: Exception) -> str:
     step_index = next((int(p) for p in location if isinstance(p, int)), -1)
     label, column = _FIELD_LABELS.get(field, (field or "value", ""))
     where = "step " + str(step_index + 1) + "'s " if step_index >= 0 else ""
+    detail = _problem_detail(problem, where + label)
+    if column:
+        detail += " (column: " + column + ")"
+    return detail
+
+
+def _problem_detail(problem: dict, subject: str) -> str:
+    """The sentence for one pydantic error kind, about *subject*."""
     context = problem.get("ctx") or {}
     kind = str(problem.get("type") or "")
     if kind == "string_too_short":
-        detail = (
-            where
-            + label
+        return (
+            subject
             + " needs at least "
             + str(context.get("min_length"))
             + " characters"
         )
-    elif kind == "string_too_long":
-        detail = (
-            where
-            + label
+    if kind == "string_too_long":
+        return (
+            subject
             + " is longer than "
             + str(context.get("max_length"))
             + " characters"
         )
-    elif kind == "string_pattern_mismatch":
-        detail = where + label + " is not in the expected format"
-    elif kind == "missing":
-        detail = where + label + " is missing"
-    elif kind == "too_short":
-        detail = where + label + " has no entries"
-    else:
-        detail = where + label + ": " + str(problem.get("msg") or "")[:120]
-    if column:
-        detail += " (column: " + column + ")"
-    return detail
+    if kind == "string_pattern_mismatch":
+        return subject + " is not in the expected format"
+    if kind == "missing":
+        return subject + " is missing"
+    if kind == "too_short":
+        return subject + " has no entries"
+    return subject + ": " + str(problem.get("msg") or "")[:120]
 
 
 def _maybe_path(text: str) -> "pathlib.Path | None":
@@ -299,6 +301,25 @@ def _expected_for(index: int, expected: list[str], total: int) -> str:
     return UNCOVERED_STEP_NOTE
 
 
+def _outcome(
+    case: object = None, reject: dict | None = None, renumbered: bool = False
+) -> dict:
+    return {"case": case, "reject": reject, "renumbered": renumbered}
+
+
+def _rejected(row_number: int, why: str, title: str) -> dict:
+    return _outcome(reject={"row": row_number, "why": why, "title": title[:80]})
+
+
+def _resolve_tc_id(raw_id: str, fallback_index: int) -> tuple[str, bool]:
+    """The normalised ``TC-nnn`` id and whether it differs from what was written."""
+    digits = re.sub(r"\D", "", raw_id)
+    if digits and 1 <= len(digits) <= 6:
+        tc_id = "TC-" + digits.zfill(3)
+        return tc_id, tc_id != raw_id.strip().upper()
+    return "TC-" + str(fallback_index).zfill(3), True
+
+
 def _row_to_case(
     row: list[str], mapping: dict[str, int], row_number: int, fallback_index: int
 ) -> dict:
@@ -311,59 +332,27 @@ def _row_to_case(
         return _clean(row[index])
 
     title = cell("title")
-    steps_text = cell("steps")
-    expected_text = cell("expected")
-
     if not any(cell(name) for name in COLUMN_ALIASES):
-        return {"case": None, "reject": None, "renumbered": False}
+        return _outcome()
     if not title:
-        return {
-            "case": None,
-            "reject": {"row": row_number, "why": "no title", "title": ""},
-            "renumbered": False,
-        }
-    steps = _split_numbered(steps_text)
+        return _rejected(row_number, "no title", "")
+    steps = _split_numbered(cell("steps"))
     if not steps:
-        return {
-            "case": None,
-            "reject": {"row": row_number, "why": "no steps", "title": title[:80]},
-            "renumbered": False,
-        }
-    expected = _split_numbered(expected_text)
+        return _rejected(row_number, "no steps", title)
+    expected = _split_numbered(cell("expected"))
     if not expected:
-        return {
-            "case": None,
-            "reject": {
-                "row": row_number,
-                "why": "no expected result",
-                "title": title[:80],
-            },
-            "renumbered": False,
-        }
+        return _rejected(row_number, "no expected result", title)
 
-    raw_id = cell("tc_id")
-    digits = re.sub(r"\D", "", raw_id)
-    renumbered = False
-    if digits and 1 <= len(digits) <= 6:
-        tc_id = "TC-" + digits.zfill(3)
-        renumbered = tc_id != raw_id.strip().upper()
-    else:
-        tc_id = "TC-" + str(fallback_index).zfill(3)
-        renumbered = True
-
+    tc_id, renumbered = _resolve_tc_id(cell("tc_id"), fallback_index)
     module = cell("module") or "Imported cases"
-    priority = PRIORITY_LOOKUP.get(cell("priority").lower(), Priority.MEDIUM)
-    test_type = TYPE_LOOKUP.get(cell("type").lower(), TestType.FUNCTIONAL)
-    preconditions = cell("preconditions") or None
-
     try:
         built = TestCase(
             tc_id=tc_id,
             module=module[:100] if len(module) >= 2 else "Imported cases",
             title=title[:250],
-            priority=priority,
-            type=test_type,
-            preconditions=preconditions,
+            priority=PRIORITY_LOOKUP.get(cell("priority").lower(), Priority.MEDIUM),
+            type=TYPE_LOOKUP.get(cell("type").lower(), TestType.FUNCTIONAL),
+            preconditions=cell("preconditions") or None,
             steps=[
                 TestStep(
                     step_number=number,
@@ -374,16 +363,40 @@ def _row_to_case(
             ],
         )
     except Exception as exc:
-        return {
-            "case": None,
-            "reject": {
-                "row": row_number,
-                "why": _explain_validation(exc),
-                "title": title[:80],
-            },
-            "renumbered": False,
-        }
-    return {"case": built, "reject": None, "renumbered": renumbered}
+        return _rejected(row_number, _explain_validation(exc), title)
+    return _outcome(case=built, renumbered=renumbered)
+
+
+def _convert_rows(
+    rows: list[list[str]], mapping: dict[str, int], first_data_row: int
+) -> tuple[list, list, list]:
+    """Data rows -> (cases, rejected, renumbered tc_ids)."""
+    cases, rejected, renumbered = [], [], []
+    for offset, row in enumerate(rows[1 : MAX_ROWS + 1]):
+        outcome = _row_to_case(row, mapping, first_data_row + offset, len(cases) + 1)
+        if outcome["case"] is not None:
+            cases.append(outcome["case"])
+            if outcome["renumbered"]:
+                renumbered.append(outcome["case"].tc_id)
+        elif outcome["reject"] is not None:
+            rejected.append(outcome["reject"])
+    return cases, rejected, renumbered
+
+
+def _no_cases_message(rejected: list[dict]) -> str:
+    base = "No row in this table produced a usable test case."
+    if not rejected:
+        return base
+    return (
+        base
+        + " "
+        + str(len(rejected))
+        + " row(s) were rejected; the first was row "
+        + str(rejected[0]["row"])
+        + " ("
+        + rejected[0]["why"]
+        + ")."
+    )
 
 
 def _assemble(rows: list[list[str]], first_data_row: int) -> dict:
@@ -401,30 +414,9 @@ def _assemble(rows: list[list[str]], first_data_row: int) -> dict:
             ),
             "content": None,
         }
-    cases, rejected, renumbered = [], [], []
-    for offset, row in enumerate(rows[1 : MAX_ROWS + 1]):
-        outcome = _row_to_case(row, mapping, first_data_row + offset, len(cases) + 1)
-        if outcome["case"] is not None:
-            cases.append(outcome["case"])
-            if outcome["renumbered"]:
-                renumbered.append(outcome["case"].tc_id)
-        elif outcome["reject"] is not None:
-            rejected.append(outcome["reject"])
+    cases, rejected, renumbered = _convert_rows(rows, mapping, first_data_row)
     if not cases:
-        return {
-            "error": (
-                "No row in this table produced a usable test case. "
-                + str(len(rejected))
-                + " row(s) were rejected; the first was row "
-                + str(rejected[0]["row"])
-                + " ("
-                + rejected[0]["why"]
-                + ")."
-                if rejected
-                else "No row in this table produced a usable test case."
-            ),
-            "content": None,
-        }
+        return {"error": _no_cases_message(rejected), "content": None}
     truncated = len(rows) - 1 > MAX_ROWS
     return {
         "error": None,
@@ -729,9 +721,7 @@ def _cell_value(cell: ElementTree.Element, shared: list[str]) -> str:
             value = child.text or ""
         elif name == "is":
             value = "".join(
-                node.text or ""
-                for node in child.iter()
-                if _strip_ns(node.tag) == "t"
+                node.text or "" for node in child.iter() if _strip_ns(node.tag) == "t"
             )
     if kind == "s":
         try:

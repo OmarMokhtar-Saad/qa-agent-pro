@@ -836,6 +836,28 @@ def _keep_reason(child: Path, moment: float, keep_s: float) -> str | None:
     return None
 
 
+def _sweep_runs(
+    root: Path, moment: float, keep_s: float
+) -> tuple[list[str], list[dict], int]:
+    """Delete every collectable run under *root*; ``(removed, kept, considered)``."""
+    removed: list[str] = []
+    kept: list[dict] = []
+    considered = 0
+    if not root.is_dir():
+        return removed, kept, considered
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or not valid_run_id(child.name):
+            continue
+        considered += 1
+        reason = _keep_reason(child, moment, keep_s)
+        if reason:
+            kept.append({"run_id": child.name, "reason": reason})
+            continue
+        shutil.rmtree(child, ignore_errors=True)
+        removed.append(child.name)
+    return removed, kept, considered
+
+
 def gc_stale_runs(*, now: float | None = None, keep_s: float = STALE_RUN_S) -> dict:
     """Delete run directories older than *keep_s*. Never raises.
 
@@ -860,25 +882,7 @@ def gc_stale_runs(*, now: float | None = None, keep_s: float = STALE_RUN_S) -> d
     """
     try:
         moment = _now(now)
-        root = paths.sub("runs")
-        removed: list[str] = []
-        kept: list[dict] = []
-        considered = 0
-        if not root.is_dir():
-            return {
-                "error": None,
-                "content": {"removed": removed, "kept": kept, "considered": 0},
-            }
-        for child in sorted(root.iterdir()):
-            if not child.is_dir() or not valid_run_id(child.name):
-                continue
-            considered += 1
-            reason = _keep_reason(child, moment, keep_s)
-            if reason:
-                kept.append({"run_id": child.name, "reason": reason})
-                continue
-            shutil.rmtree(child, ignore_errors=True)
-            removed.append(child.name)
+        removed, kept, considered = _sweep_runs(paths.sub("runs"), moment, keep_s)
         if removed:
             logger.info("mobile.run_store: collected %d stale run(s)", len(removed))
         return {
