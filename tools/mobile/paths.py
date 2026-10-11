@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -78,6 +79,10 @@ def cache_root() -> Path:
     return Path.home().joinpath(*DEFAULT_ROOT_PARTS)
 
 
+#: What may become a ``runs/<id>`` path segment (also ``run_store.valid_run_id``).
+RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
 def sub(name: str) -> Path:
     """Path of a cache sub-directory. Creates nothing."""
     return cache_root() / str(name)
@@ -89,8 +94,15 @@ def state_file(name: str) -> Path:
 
 
 def run_dir(run_id: str) -> Path:
-    """Path of one run's directory in ``runs/``."""
-    return sub("runs") / str(run_id)
+    """Path of one run's directory in ``runs/``.
+
+    *run_id* becomes a path segment, so one that could leave ``runs/`` (``..``,
+    a separator, an empty string) is refused with ``ValueError``.
+    """
+    segment = str(run_id)
+    if not RUN_ID_RE.match(segment):
+        raise ValueError(f"not a usable run id: {segment!r}")
+    return sub("runs") / segment
 
 
 def ensure_tree() -> dict:

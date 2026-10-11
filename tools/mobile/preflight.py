@@ -31,6 +31,20 @@ from tools.mobile import (
 
 logger = logging.getLogger(__name__)
 
+#: What a probe step can raise: a process, file or socket failure, a timeout,
+#: or a malformed answer from adb/emulator tooling. A step that raises one of
+#: these becomes a failing row; any other error is a bug and propagates to
+#: ``check``'s catch-all.
+_STEP_ERRORS = (
+    OSError,
+    RuntimeError,
+    ValueError,
+    LookupError,
+    TypeError,
+    AttributeError,
+    asyncio.TimeoutError,
+)
+
 
 #: Check names, in report order. Also the set the tests assert against, so a
 #: check that silently stops being emitted fails the suite.
@@ -310,7 +324,7 @@ async def _step_adb_responds(checks: list[dict]) -> list[str]:
                     "adb reports " + str(len(serials)) + " device(s)",
                 )
             )
-    except Exception as exc:
+    except _STEP_ERRORS as exc:
         checks.append(_failed("adb_responds", exc))
     return serials
 
@@ -342,7 +356,7 @@ def _step_adb_first_on_path(checks: list[dict]) -> None:
                 ),
             )
         )
-    except Exception as exc:
+    except _STEP_ERRORS as exc:
         checks.append(_failed("adb_first_on_path", exc))
 
 
@@ -432,7 +446,7 @@ async def _step_emulator_booted(
                     ),
                 )
             )
-    except Exception as exc:
+    except _STEP_ERRORS as exc:
         checks.append(_failed("emulator_booted", exc))
     return resolved_serial
 
@@ -458,7 +472,7 @@ def _step_virtualization(checks: list[dict], resolved_serial: str) -> None:
             if virt.get("undetermined"):
                 virt_record["blocking"] = False
             checks.insert(0, virt_record)
-    except Exception as exc:
+    except _STEP_ERRORS as exc:
         checks.insert(0, _failed("virtualization", exc))
 
 
@@ -579,7 +593,7 @@ async def _step_device_dns(
             )
         else:
             checks.append(await _dns_failure_record(resolved_serial, overran))
-    except Exception as exc:
+    except _STEP_ERRORS as exc:
         checks.append(_failed("device_dns", exc))
 
 
@@ -615,7 +629,7 @@ async def _step_package_installed(
                 ),
             )
         )
-    except Exception as exc:
+    except _STEP_ERRORS as exc:
         checks.append(_failed("package_installed", exc))
 
 
@@ -661,7 +675,7 @@ def _step_ime_pinned(checks: list[dict]) -> bool:
                 str(status.get("fix") or ""),
             )
         )
-    except Exception as exc:
+    except _STEP_ERRORS as exc:
         checks.append(_failed("ime_pinned", exc))
     return pinned
 
@@ -708,7 +722,7 @@ async def _step_ime_installed(
                 ),
             )
         )
-    except Exception as exc:
+    except _STEP_ERRORS as exc:
         checks.append(_failed("ime_installed", exc))
 
 
@@ -750,7 +764,7 @@ async def _step_ime_selected(
                 ),
             )
         )
-    except Exception as exc:
+    except _STEP_ERRORS as exc:
         checks.append(_failed("ime_selected", exc))
 
 
@@ -787,7 +801,7 @@ async def _step_ime_oracle(
                 ),
             )
         )
-    except Exception as exc:
+    except _STEP_ERRORS as exc:
         checks.append(_failed("ime_oracle", exc))
 
 
@@ -839,7 +853,7 @@ def _step_free_disk(checks: list[dict]) -> None:
                 ),
             )
         )
-    except Exception as exc:
+    except _STEP_ERRORS as exc:
         checks.append(_failed("free_disk", exc))
 
 
@@ -869,7 +883,7 @@ def _step_cache_ownership(checks: list[dict]) -> None:
                 str(owned.get("fix") or ""),
             )
         )
-    except Exception as exc:
+    except _STEP_ERRORS as exc:
         checks.append(_failed("cache_ownership", exc))
 
 
@@ -901,7 +915,7 @@ def _step_host_privileges(checks: list[dict]) -> None:
                 "list and the official download references.",
             )
         )
-    except Exception as exc:
+    except _STEP_ERRORS as exc:
         checks.append(_failed("host_privileges", exc))
 
 

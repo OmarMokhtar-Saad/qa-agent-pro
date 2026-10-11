@@ -1,6 +1,6 @@
 [project]
 name = "qa-agent-pro"
-version = "1.107.5"
+version = "1.108.0"
 requires-python = ">=3.10"
 dependencies = [
     "pyyaml>=6.0",  # contracts + OpenAPI specs are YAML (api_test agent)
@@ -72,7 +72,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["agents*", "tools*", "config*"]
+include = ["agents*", "tools*", "config*", "handlers*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -133,12 +133,13 @@ target-version = "py310"
 extend-exclude = [".claude", ".tmp"]
 
 # The release gate refuses when its own code changed since the last wrapper
-# release (AGENTS.md, Quality gates), and a reformat is such a change. These two
+# release (AGENTS.md, Quality gates), and a reformat is such a change. These
 # are therefore left exactly as released and kept out of `ruff format --check .`;
 # `ruff check .` still lints them. Drop an entry when that file is next changed
-# on purpose and format it in the same commit.
+# on purpose and format it in the same commit. scripts/dist_build holds the
+# build templates, which must stay byte-verbatim.
 [tool.ruff.format]
-exclude = ["scripts/release.py", "scripts/build_dist.py"]
+exclude = ["scripts/release.py", "scripts/build_dist.py", "scripts/dist_build"]
 
 # mypy had NO configuration at all, so `mypy .` -- the lint_cmd the pre-push
 # hook runs -- walked into the ops executor's own backups/ directories, found

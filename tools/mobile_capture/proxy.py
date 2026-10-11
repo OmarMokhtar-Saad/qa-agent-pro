@@ -1,7 +1,7 @@
 """Spawn/stop the qa-agents-owned ``mitmdump``, and the device's ``http_proxy``.
 
 **Concurrency (T3.2a).** Every entry point runs under the lane's EXISTING
-per-serial device lock, ``tools.mobile.session.take_device_lock`` -- no new
+per-serial device lock, ``tools.mobile.device_lock.take_device_lock`` -- no new
 lock is invented, because a second serialisation primitive for the same
 device is two answers to one question. Acquisition is idempotent for the same
 owner in the same process (that function's own docstring), so the run path,
@@ -40,7 +40,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from tools.mobile import adb, session
+from tools.mobile import adb, device_lock
 from tools.mobile_capture import paths, teardown
 
 logger = logging.getLogger(__name__)
@@ -209,7 +209,7 @@ async def start(serial: str, *, run_id: str) -> dict:
     """
     try:
         serial = str(serial)
-        took = session.take_device_lock(str(run_id), serial=serial)
+        took = device_lock.take_device_lock(str(run_id), serial=serial)
         content = (took or {}).get("content") or {}
         if not content.get("acquired"):
             return {
@@ -234,7 +234,7 @@ async def start(serial: str, *, run_id: str) -> dict:
             # The LOCK invariant: release only a lock this call took, and only
             # when no live proxy is handed off (also on an exception).
             if newly_acquired and reply["error"] is not None:
-                session.release_device_lock(str(run_id), as_holder=True)
+                device_lock.release_device_lock(str(run_id), as_holder=True)
     except Exception as exc:
         logger.exception("mobile_capture.proxy.start failed")
         return {"error": str(exc), "content": None}

@@ -1,8 +1,8 @@
 """Host-mode duplicate detection: the shortlist prescreen and the host-reviewed
 ``duplicate_groups`` validation, screen, apply and reply section.
 
-Moved verbatim out of ``agents/host_mode.py`` (clean-code audit part 05);
-``host_mode`` re-exports every public name, so existing callers are unchanged.
+Moved verbatim out of the former ``host_mode`` module (clean-code audit part 05);
+callers import every public name from this module.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import difflib
 import logging
 import re
+from dataclasses import dataclass
 
 from config.settings import settings
 from tools.rtm import normalize_ac_id
@@ -81,6 +82,19 @@ _DUP_PRIORITY_RANK = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
 _DUP_WS_RE = re.compile(r"[^a-z0-9]+")
 
 
+# What reading untrusted host-authored shapes can raise; fail-soft helpers catch
+# exactly these instead of a blind ``Exception``.
+_UNTRUSTED_ERRORS = (
+    AttributeError,
+    TypeError,
+    ValueError,
+    IndexError,
+    KeyError,
+    OverflowError,
+    RecursionError,
+)
+
+
 def _dup_text(tc) -> str:
     """Normalised comparison text for the ADVISORY agreement label: title + FIRST
     step action, lower-cased with every non-alphanumeric run collapsed to one space.
@@ -94,7 +108,7 @@ def _dup_text(tc) -> str:
         steps = getattr(tc, "steps", None) or []
         action = (getattr(steps[0], "action", "") or "") if steps else ""
         return _DUP_WS_RE.sub(" ", f"{title} {action}".lower()).strip()[:600]
-    except Exception:
+    except _UNTRUSTED_ERRORS:
         return ""
 
 
@@ -111,7 +125,7 @@ def _dup_text_ratio(a, b) -> float:
         if not ta or not tb:
             return 0.0
         return difflib.SequenceMatcher(None, ta, tb).ratio()
-    except Exception:
+    except _UNTRUSTED_ERRORS:
         return 0.0
 
 
@@ -178,7 +192,7 @@ def _dup_title_tokens(case: object) -> frozenset:
             return frozenset()
         title = str(case.get("title") or "")[:_DUP_SHORTLIST_TITLE_SCAN]
         return frozenset(_DUP_SHORTLIST_TOKEN_RE.findall(title.lower()))
-    except Exception:
+    except _UNTRUSTED_ERRORS:
         return frozenset()
 
 
@@ -187,7 +201,7 @@ def _shortlist_safe(text: object, cap: int) -> str:
     backticks and newlines (backtick-span breakout) and cap the length."""
     try:
         return str(text or "").replace("`", "").replace("\n", " ").strip()[:cap]
-    except Exception:  # pragma: no cover
+    except _UNTRUSTED_ERRORS:  # pragma: no cover
         return ""
 
 
@@ -317,7 +331,7 @@ def _is_boundary_contrast(tokens_a: frozenset, tokens_b: frozenset) -> bool:
         if not diff:
             return False
         return all(t in _DUP_DISCRIMINATORS for t in diff)
-    except Exception:  # pragma: no cover - a filter never breaks the prescreen
+    except _UNTRUSTED_ERRORS:  # pragma: no cover - a filter never breaks the prescreen
         return False
 
 
@@ -406,7 +420,7 @@ def build_dup_shortlist_counted(merged_cases: list) -> tuple[list, int]:
         pairs = _shortlist_pairs(_shortlist_entries(merged_cases))
         pairs.sort(key=lambda p: (-p["ratio"], p["id_a"], p["id_b"]))
         return pairs[:_DUP_SHORTLIST_MAX_PAIRS], len(pairs)
-    except Exception:
+    except Exception:  # noqa: BLE001 - public boundary; tests pin that nothing escapes
         logger.debug("build_dup_shortlist_counted failed", exc_info=True)
         return [], 0
 
@@ -466,7 +480,7 @@ def build_dup_shortlist_section(pairs: list) -> str:
             )
         lines.append("")
         return "\n".join(lines) + "\n"
-    except Exception:
+    except _UNTRUSTED_ERRORS:
         logger.debug("build_dup_shortlist_section failed", exc_info=True)
         return ""
 
@@ -494,7 +508,7 @@ def dup_shortlist_cases_json(cases: list) -> list:
                 tid, title = getattr(c, "tc_id", ""), getattr(c, "title", "")
             if tid:
                 out.append({"tc_id": str(tid), "title": str(title or "")})
-    except Exception:
+    except Exception:  # noqa: BLE001 - public boundary; tests pin that nothing escapes
         logger.debug("dup_shortlist_cases_json failed", exc_info=True)
     return out
 
@@ -609,7 +623,7 @@ def build_dup_contradiction_pairs(pairs: list) -> str:
             )
         lines.append("")
         return "\n".join(lines) + "\n"
-    except Exception:
+    except Exception:  # noqa: BLE001 - public boundary; tests pin that nothing escapes
         logger.debug("build_dup_contradiction_pairs failed", exc_info=True)
         return ""
 
@@ -787,7 +801,7 @@ def _extract_duplicate_groups(raw, valid_ids) -> tuple[list, list]:
             ]
         groups = _walk_duplicate_groups(raw, valid_ids, notes)
         return groups, notes[:_MAX_DUP_NOTES]
-    except Exception:
+    except Exception:  # noqa: BLE001 - hostile iterables may raise anything
         logger.warning(
             "could not read duplicate_groups -- ignoring the field", exc_info=True
         )
@@ -853,7 +867,7 @@ def dup_agreements(cases: list, groups: list) -> list:
     try:
         for members in groups or []:
             out.append(_group_agreement(cases or [], members or []))
-    except Exception:
+    except _UNTRUSTED_ERRORS:
         logger.warning("dup_agreements failed -- omitting the labels", exc_info=True)
         return [0.0 for _ in (groups or [])]
     return out
@@ -942,7 +956,7 @@ def screen_duplicate_groups(cases: list, groups: list) -> tuple[list, list]:
         if removable > limit:
             return [], [_removal_refusal(removable, len(cases), limit)]
         return screened, refusals
-    except Exception:
+    except _UNTRUSTED_ERRORS:
         logger.warning(
             "screen_duplicate_groups failed -- honouring no group", exc_info=True
         )
@@ -1035,7 +1049,7 @@ def apply_duplicate_groups(cases: list, groups: list) -> tuple[list, list, list]
         removed = [(cases[i].tc_id, drop[i]) for i in sorted(drop)]
         _log_removed(len(removed), len(cases))
         return kept, removed, notes
-    except Exception:
+    except _UNTRUSTED_ERRORS:
         logger.warning(
             "apply_duplicate_groups failed -- keeping every case", exc_info=True
         )
@@ -1180,15 +1194,35 @@ def _dup_notes_lines(notes: list) -> list:
     return lines
 
 
+@dataclass(frozen=True)
+class DupReviewOutcome:
+    """What the dedup pass did, as ``build_duplicate_section`` reports it."""
+
+    removed: list | None = None
+    applied: bool = False
+    notes: list | None = None
+    agreements: list | None = None
+
+
+def _resolve_outcome(
+    outcome: DupReviewOutcome | None, fields: dict
+) -> DupReviewOutcome:
+    """The outcome object, built from the keywords ``removed``/``applied``/``notes``/
+    ``agreements`` when none was passed (an unknown keyword is a TypeError, as it
+    was for the old keyword-only signature)."""
+    if outcome is None:
+        return DupReviewOutcome(**fields)
+    if fields:
+        raise TypeError("pass either outcome or keyword fields, not both")
+    return outcome
+
+
 def build_duplicate_section(
     groups: list,
     submitted_cases: list,
     final_cases: list,
-    *,
-    removed: list | None = None,
-    applied: bool = False,
-    notes: list | None = None,
-    agreements: list | None = None,
+    outcome: DupReviewOutcome | None = None,
+    **fields: object,
 ) -> str:
     """The bounded, deterministic "duplicate review" block prepended to the submit
     reply, AHEAD of the variable-length generated summary (the same ordering rule
@@ -1210,22 +1244,24 @@ def build_duplicate_section(
     the group list is cut AND cases were removed, every removed tc_id is listed
     (itself bounded by the proportional cap). Pure and synchronous. Never raises.
     """
+    outcome = _resolve_outcome(outcome, fields)
     try:
         groups, notes, removed, agreements = (
-            list(seq or []) for seq in (groups, notes, removed, agreements)
+            list(seq or [])
+            for seq in (groups, outcome.notes, outcome.removed, outcome.agreements)
         )
         if not groups and not notes and not removed:
             return ""
         lines: list = []
         if groups or removed:
-            render_member = _member_renderer(submitted_cases, final_cases, removed)
+            render = _member_renderer(submitted_cases, final_cases, removed)
             lines += _dup_review_lines(
-                groups, removed, applied, agreements, render_member
+                groups, removed, outcome.applied, agreements, render
             )
         if notes:
             lines += _dup_notes_lines(notes)
         return "\n".join(lines) + "\n"
-    except Exception:
+    except _UNTRUSTED_ERRORS:
         logger.warning(
             "build_duplicate_section failed -- omitting the section", exc_info=True
         )

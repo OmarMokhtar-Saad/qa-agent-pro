@@ -23,9 +23,9 @@ logger = logging.getLogger(__name__)
 def looks_destructive(text: object) -> bool:
     """True when the executor's destructive lexicon matches *text* (an rid or label)."""
     try:
-        from tools.mobile import executor
+        from tools.mobile.replay.guard import is_destructive
 
-        return executor.is_destructive(
+        return is_destructive(
             str(text or "").replace("_", " ").replace(".", " ").replace("/", " ")
         )
     except Exception:

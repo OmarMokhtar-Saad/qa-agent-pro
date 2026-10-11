@@ -4,7 +4,7 @@ One SQLite file per package at ``<cache>/apps/<package>/knowledge.db`` (tables
 ``meta``, ``notes``, ``events``). It is local to this machine and never
 uploaded. This module owns validation, secret refusal, the caps, supersede and
 the counters. Callers: the ``note`` parameter and ``qa_mobile_notes`` (through
-``tools/mcp_handlers.py``) and the executor's guard.
+``handlers/``) and the executor's guard.
 
 No public function raises: each returns ``{"error": ..., "content": ...}``.
 A note is text the host model reads back, so it is only ever echoed through

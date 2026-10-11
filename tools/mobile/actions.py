@@ -69,7 +69,7 @@ MAX_WAIT_MS = 10000
 #: checkpoint write and the packet render inside the window.
 #:
 #: It lives HERE, next to the vocabulary, and not in ``executor``, because the
-#: packet quotes it to the model and ``agents/mobile_run`` may not import the
+#: packet quotes it to the model and ``tools/mobile/run_packets`` may not import the
 #: executor. ``executor.SUBMIT_BUDGET_S`` is derived from this one value.
 SUBMIT_BUDGET_MS = 40000
 
@@ -497,6 +497,10 @@ class OpenUrlAction(_Base):
         scheme = self.url.split(":", 1)[0].strip().lower()
         if scheme not in URL_SCHEMES:
             raise ValueError("url scheme must be one of " + ", ".join(URL_SCHEMES))
+        from tools.mobile.adb import SAFE_URL_RE  # lazy: adb imports this module
+
+        if not SAFE_URL_RE.fullmatch(self.url):
+            raise ValueError("url contains whitespace or unsafe characters")
         return self
 
 

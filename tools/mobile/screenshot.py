@@ -36,10 +36,10 @@ standing between a chat transport and a reply no client will render. Three caps,
 three constraints, a CEILINGS row each.
 
 **Why a module of its own**, rather than beside the packet builders:
-``agents/mobile_run.py`` builds PACKETS -- dicts the model answers -- and knows
+``tools/mobile/run_packets.py`` builds PACKETS -- dicts the model answers -- and knows
 nothing about MCP content types; ``tools/mobile/render.py`` renders markdown a
 tester reads. An image spec is neither, and it has exactly one consumer
-(``tools/mcp_handlers``), so putting it in either of those would put a transport
+(``handlers``), so putting it in either of those would put a transport
 artifact inside a builder with no other reason to know the transport exists. It
 is also small and importable without the composition root, which is what makes
 the note text below assertable on its own.

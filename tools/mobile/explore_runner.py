@@ -17,20 +17,30 @@ from __future__ import annotations
 
 import logging
 import re
-import time
 
-from tools.mobile import adb, executor, finding_nag, run_store
+from tools.mobile import adb, finding_nag, run_store
 from tools.mobile import charter as charter_mod
+from tools.mobile.explore_stop import (
+    DEADLINE_S,
+    MAX_GOAL_CHARS,
+    MAX_TURNS,
+    STOP_DEADLINE,  # noqa: F401
+    STOP_FINDING,
+    STOP_GOAL,
+    STOP_GUARD_REFUSED,  # noqa: F401
+    STOP_TURNS,  # noqa: F401
+    _now,
+    display_stop,  # noqa: F401
+    stop_reason,
+)  # identity re-exports (P3 shim rule); unused ones carry noqa
 from tools.mobile.providers import composite
+from tools.mobile.replay.dump import dump_raw, resolve_activity
 
 logger = logging.getLogger(__name__)
 
-MAX_TURNS = 30
-DEADLINE_S = 20 * 60
 MAX_EXTENSIONS = 1
 EXTENSION_TURNS = 15
 EXTENSION_S = 10 * 60
-MAX_GOAL_CHARS = 600
 MAX_WATCH_ITEMS = 10
 #: Fix round 3, item 1: the step of a multi-app goal the model is on now. It
 #: rides every packet in place of the full goal, so it is short by design.
@@ -66,19 +76,6 @@ HANDOVER_REFUSED_PREFIXES = (
 HANDOVER_REFUSED_WORDS = ("launcher", "packageinstaller", "permissioncontroller")
 _PACKAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$")
 
-STOP_GOAL = "goal_reached"
-STOP_TURNS = "turn_budget_exhausted"
-STOP_DEADLINE = "deadline_reached"  #: The charter's ``stop_on: first_finding``. A fifth stop, and the only one
-#: step 4 wires: ``coverage_plateau`` is persisted and reported and behaves as
-#: ``budget``, because nothing detects a plateau yet -- nothing grades a
-#: plateau stop, follow-up.
-STOP_FINDING = "first_finding"
-#: The charter's ``destructive`` REFUSE, recorded as a stop. A refused run is
-#: OVER: ``session._submit_explore`` writes this the moment the executor
-#: reports a refusal, so ``stop_reason`` -- which returns any non-empty
-#: ``state["stop"]`` -- and every page under it say the run stopped, rather
-#: than leaving a terminal refusal looking like a turn the tester can answer.
-STOP_GUARD_REFUSED = "guard_refused"
 
 #: What the tester is TOLD when that happens, in the SAME reply. The lane's
 #: rule: a site that refuses says so BY NAME and leaves no success-shaped
@@ -157,10 +154,6 @@ EXTENSION_NOT_GRANTED_CONTINUE = (
 )
 
 
-def _now(value: float | None) -> float:
-    return time.time() if value is None else float(value)
-
-
 def new_state(
     goal: object,
     watch_for: object = (),
@@ -209,63 +202,6 @@ def new_state(
     }
 
 
-def stop_reason(state: object, *, now: float | None = None) -> str:
-    """Why this session must stop, or ``""``. Checked BEFORE each turn.
-
-    THE STRICT ONE, and its strictness is load-bearing. It coerces ``turn``,
-    ``turns_budget`` and ``deadline``, and a state whose numbers are junk makes
-    it RAISE. That raise is the containment gate: ``session.resolve`` calls this
-    at the first statement of every entry point, its own handler turns the
-    ValueError into ``{"error": ...}``, and so a corrupt state is refused before
-    ``next_packet``, ``submit`` or ``qa_mobile_status`` can reach a device.
-    ``test_l11_...`` and ``test_l12_...`` in
-    ``tests/mobile/test_mobile_explore_turn_ledger.py`` pin exactly that -- L12
-    states that the replay and the commit line are never reached.
-
-    So DO NOT make this total. A render must never fail to draw a page because a
-    field on disk is junk, and a gate must refuse exactly then: that is two
-    contracts, and two contracts need two names over one core.
-    :func:`display_stop` is the other name.
-    """
-    body = state if isinstance(state, dict) else {}
-    if str(body.get("stop") or ""):
-        return str(body["stop"])
-    if int(body.get("turn") or 0) >= int(body.get("turns_budget") or MAX_TURNS):
-        return STOP_TURNS
-    if _now(now) >= float(body.get("deadline") or 0):
-        return STOP_DEADLINE
-    return ""
-
-
-def display_stop(manifest: object, *, now: float | None = None) -> str:
-    """Why the run this MANIFEST describes has stopped, or ``""``. TOTAL.
-
-    THE RENDER CONTRACT, and the counterpart to :func:`stop_reason`'s strict
-    one. Same core -- it calls ``stop_reason`` -- with two differences that are
-    the contract:
-
-    * it takes the MANIFEST and does the lane check itself, so a consumer cannot
-      get "is this an explore run, and did it stop" half right;
-    * it NEVER raises. A state whose numbers will not coerce reads as NOT
-      stopped, which is the answer the page gave before any of this existed. The
-      alternative is measured and worse: ``report._is_partial`` calls this, and
-      ``report.render``'s outer ``except`` turns any raise into NO PAGE AT ALL.
-
-    Its callers are a page and a coverage count. The GATE keeps ``stop_reason``.
-    """
-    body = manifest if isinstance(manifest, dict) else {}
-    if str(body.get("lane") or "") != "explore":
-        return ""
-    explore = body.get("explore")
-    try:
-        return stop_reason(explore if isinstance(explore, dict) else {}, now=now)
-    except (TypeError, ValueError, OverflowError):
-        logger.warning(
-            "mobile.explore_runner: unreadable explore state, displaying as running"
-        )
-        return ""
-
-
 def remaining(state: object, *, now: float | None = None) -> dict:
     body = state if isinstance(state, dict) else {}
     turns = max(
@@ -277,7 +213,7 @@ def remaining(state: object, *, now: float | None = None) -> dict:
 
 async def _observe_screen(ctx: object) -> dict:
     """Dump and prune the foreground screen: the pruned result, or an error dict."""
-    dumped = await executor.dump_raw(getattr(ctx, "serial", ""))
+    dumped = await dump_raw(getattr(ctx, "serial", ""))
     if dumped.get("error"):
         return dumped
     sized = await adb.display_size(getattr(ctx, "serial", ""))
@@ -286,7 +222,7 @@ async def _observe_screen(ctx: object) -> dict:
     return composite.observe(
         dumped.get("content"),
         # ONE producer, shared with the replay: see resolve_activity.
-        await executor.resolve_activity(ctx),
+        await resolve_activity(ctx),
         display=sized.get("content"),
         density=dpi.get("content"),
     )
@@ -430,7 +366,7 @@ async def next_turn(
         _allocate_turn(body)
         left = remaining(body, now=now)
 
-        from agents import mobile_run
+        from tools.mobile import run_packets as mobile_run
 
         packet = mobile_run.build_explore_turn(
             body, screen, run_id=run_id, remaining=left

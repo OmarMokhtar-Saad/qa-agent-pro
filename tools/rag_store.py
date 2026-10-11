@@ -487,7 +487,7 @@ async def add_to_corpus(entry_type: str, content: str, metadata: dict) -> dict:
         # entry meant 65 lines on a single submit, and because all logging goes to
         # stderr Cursor renders every one of them as `[error]`, burying real
         # errors. The aggregate "RAG: persisted N test case(s) to corpus" line in
-        # tools/mcp_handlers._persist_suite_to_corpus carries the operational fact.
+        # handlers._persist_suite_to_corpus carries the operational fact.
         logger.debug("rag_store: added %s entry %s to %s", entry_type, entry_id, path)
         return {"error": None, "content": {"id": entry_id}}
     except Exception as exc:
@@ -510,7 +510,7 @@ async def replace_source_entries(
     ``keep_ids`` is the set of entry ids the caller has JUST written for this
     source; they are spared and everything else under the same key goes. Called
     with no keep_ids it removes every entry for the source, which is why
-    tools/mcp_handlers._persist_suite_to_corpus calls it only AFTER a successful
+    handlers._persist_suite_to_corpus calls it only AFTER a successful
     write and only with the fresh ids: an empty or wholly-unserializable suite
     must never delete the previous good one.
 

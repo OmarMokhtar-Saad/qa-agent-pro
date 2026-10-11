@@ -9,10 +9,10 @@ the pinned identity of the QA input method APK. Phase 1 added the platform layer
 (paths, platform_info, sdk_locator, downloader, adb, emulator, ime,
 preflight, run_store, locks) and Phase 2 the execution engine (perception,
 actions, executor, case_runner, explore_runner, importers, scheduler), whose
-prompt builders live in ``agents/mobile_run.py``. Phase 3 added the MCP surface
+prompt builders live in ``tools/mobile/run_packets.py``. Phase 3 added the MCP surface
 (``session`` -- the state machine and all of its on-disk state -- and
 ``render``, every tester-facing string), reached through
-``tools/mcp_handlers.py``'s three ``qa_mobile_*`` handlers. Phase 4 added the
+``handlers/``'s three ``qa_mobile_*`` handlers. Phase 4 added the
 report -- ``report`` (the standalone HTML document, built from one run's own
 files and nothing else), ``report_selfcheck`` (its CLI gate) and
 ``open_report`` -- plus the per-run screen library in ``run_store`` that gives

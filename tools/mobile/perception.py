@@ -37,7 +37,15 @@ import logging
 import re
 from xml.etree import ElementTree
 
-from tools.untrusted import _GUARD, wrap_untrusted
+from tools.safe_parse import XML_DECL_RE, has_xml_decl, parse_xml
+from tools.untrusted import (
+    _GUARD,
+    MAX_GUARD_SENTINEL_CHARS,
+    NEUTRALIZED,
+    derive_guard_sentinel,
+    guard_markers,
+    wrap_untrusted,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -132,14 +140,10 @@ EDITABLE_CLASS_HINTS = (
     "TextInputEditText",
 )
 
-_DECL_RE = re.compile(r"<!\s*(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
+_DECL_RE = XML_DECL_RE
 _BOUNDS_RE = re.compile(r"\[(-?\d{1,7}),(-?\d{1,7})\]\[(-?\d{1,7}),(-?\d{1,7})\]")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _WS_RE = re.compile(r"[ \t]{2,}")
-
-# A derived marker must never be longer than this, so a pathological guard
-# cannot turn every screen into one giant redaction.
-MAX_GUARD_SENTINEL_CHARS = 60
 
 # The largest display dimension accepted from the device. `adb.display_size`
 # parses it out of `wm size`, which is device output rather than something this
@@ -167,11 +171,7 @@ def _guard_sentinel() -> str:
     ``test_the_guard_sentinel_is_derived_from_the_live_guard_not_copied``
     asserts that property, so a divergence fails CI instead of failing quietly.
     """
-    text = str(_GUARD or "").strip()
-    head, separator, _rest = text.partition(":")
-    if separator and 0 < len(head) <= MAX_GUARD_SENTINEL_CHARS:
-        return head + separator
-    return text[:MAX_GUARD_SENTINEL_CHARS]
+    return derive_guard_sentinel(_GUARD, MAX_GUARD_SENTINEL_CHARS)
 
 
 GUARD_SENTINEL = _guard_sentinel()
@@ -189,15 +189,7 @@ GUARD_SENTINEL = _guard_sentinel()
 # resolves and no assert matches, with no refusal to explain it. The
 # pathological-LONG case was already handled by MAX_GUARD_SENTINEL_CHARS; this
 # is the other end of the same edit.
-GUARD_MARKERS = tuple(
-    marker
-    for marker in (
-        "untrusted_content",
-        GUARD_SENTINEL,
-    )
-    if marker
-)
-NEUTRALIZED = "[neutralized]"
+GUARD_MARKERS = guard_markers(GUARD_SENTINEL)
 
 # Refusal texts. Constants so the tests assert on the module's own words rather
 # than on a copy, and so the reason a dump was refused is stable enough for a
@@ -1076,12 +1068,12 @@ def _parse_dump(xml: object) -> tuple[ElementTree.Element | None, str]:
         return None, NOT_XML_REFUSAL
     if len(xml.encode("utf-8", errors="replace")) > MAX_DUMP_BYTES:
         return None, OVERSIZE_REFUSAL
-    if _DECL_RE.search(xml):
+    if has_xml_decl(xml):
         return None, DOCTYPE_REFUSAL
-    try:
-        return ElementTree.fromstring(xml), ""
-    except ElementTree.ParseError:
+    root = parse_xml(xml)
+    if root is None:
         return None, NOT_XML_REFUSAL
+    return root, ""
 
 
 def _system_dialog_package(elements: list, package: str) -> str:

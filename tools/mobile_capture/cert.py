@@ -43,7 +43,7 @@ real device without root refuses at the identical ``ro.build.type`` check.
 Every public function returns ``{"error", "content"}`` and never raises.
 Every device-touching call needs ``apply=True``; ``apply=False`` (or a
 caller that never sets it) touches nothing. Runs under the lane's own
-per-serial device lock (``tools.mobile.session.take_device_lock``), the same
+per-serial device lock (``tools.mobile.device_lock.take_device_lock``), the same
 primitive ``proxy.start`` uses -- no second lock is invented.
 
 **Never a source of TIER_DECRYPTED.** A successful ``install()`` proves the
@@ -64,7 +64,7 @@ import time
 from pathlib import Path
 
 from config.settings import settings
-from tools.mobile import adb, session
+from tools.mobile import adb, device_lock
 from tools.mobile_capture import ca, ledger, paths, proxy
 
 logger = logging.getLogger(__name__)
@@ -422,9 +422,9 @@ async def install(serial: str, *, apply: bool = False, owner: str = "") -> dict:
     """
     serial = str(serial or "")
     minted = not str(owner or "").strip()
-    label = str(owner or "").strip() or session.new_provisioning_owner()
+    label = str(owner or "").strip() or device_lock.new_provisioning_owner()
     try:
-        took = (session.take_device_lock(label, serial=serial) or {}).get(
+        took = (device_lock.take_device_lock(label, serial=serial) or {}).get(
             "content"
         ) or {}
         if not took.get("acquired"):
@@ -440,7 +440,7 @@ async def install(serial: str, *, apply: bool = False, owner: str = "") -> dict:
             return await _install_checked(serial)
         finally:
             if minted:
-                session.release_device_lock(label, as_holder=True)
+                device_lock.release_device_lock(label, as_holder=True)
     except Exception:
         logger.exception("mobile_capture.cert.install failed")
         return {"error": REASON_DEVICE_UNREACHABLE, "content": None}
@@ -539,9 +539,9 @@ async def remove(serial: str, *, apply: bool = False, owner: str = "") -> dict:
     """
     serial = str(serial or "")
     minted = not str(owner or "").strip()
-    label = str(owner or "").strip() or session.new_provisioning_owner()
+    label = str(owner or "").strip() or device_lock.new_provisioning_owner()
     try:
-        took = (session.take_device_lock(label, serial=serial) or {}).get(
+        took = (device_lock.take_device_lock(label, serial=serial) or {}).get(
             "content"
         ) or {}
         if not took.get("acquired"):
@@ -555,7 +555,7 @@ async def remove(serial: str, *, apply: bool = False, owner: str = "") -> dict:
             return await _remove_recorded(serial)
         finally:
             if minted:
-                session.release_device_lock(label, as_holder=True)
+                device_lock.release_device_lock(label, as_holder=True)
     except Exception:
         logger.exception("mobile_capture.cert.remove failed")
         ledger.forget(serial)

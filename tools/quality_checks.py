@@ -181,7 +181,7 @@ EMPTY_DATA_MIN_CASES = 5
 
 # Cap on the per-case enumeration in data_notes_section. One line per case is a
 # flood on a real run — 96 cases meant 96 lines, which pushed the finalize reply
-# past the 4000-char cap in tools/mcp_handlers.shape_generation_result and
+# past the 4000-char cap in handlers.shape_generation_result and
 # truncated everything after this section (live repro 2026-08-15). Same failure
 # shape as the checklist NOT-COVERED flood suppressed in tools/rtm.py. The full
 # plan still ships in the Test Data column of the exported file. Module
@@ -901,7 +901,7 @@ def _url_names_a_destination(text: str) -> bool:
 # a style one.
 #
 # WHAT BOUNDS THIS LINE. The reply is not bounded by one fixed number.
-# tools/mcp_handlers caps the WHOLE submit reply at _REPLY_CAP and gives
+# handlers caps the WHOLE submit reply at _REPLY_CAP and gives
 # `summary` -- the block this line lives in -- a COMPUTED allowance:
 #
 #   summary_budget(sections, header_len)
@@ -1761,7 +1761,7 @@ def data_notes_section(cases: list[TestCase]) -> str:
     At most DATA_GAP_MAX_IDS ids are named, each clipped to
     DATA_GAP_MAX_ID_CHARS, followed by "(+N more)" -- so the line is bounded at
     ~190 chars at ANY suite size. The finalize reply is capped
-    (tools/mcp_handlers._SUMMARY_CAP = 4000) and this section is followed by
+    (handlers._SUMMARY_CAP = 4000) and this section is followed by
     the anchoring / scope / grounding advisories, which are what a truncation
     actually cuts -- so the ids are paid for out of this section's own
     enumeration budget, and ONLY where that payment is real (see `limit`).

@@ -188,7 +188,7 @@ class Settings(BaseSettings):
     #
     # 2026-08-30 (audit finding 8 follow-up): `qa_classifier_model` was the
     # THIRTEENTH field of that P2-I set, held back at the time because
-    # `tools/mcp_handlers.py` still read it twice to label which model the
+    # `handlers/` still read it twice to label which model the
     # ambiguity gate would name. Both reads went with the server-side ambiguity
     # gate in P2-J (2026-08-16), so it named a model nothing could call. It is
     # DELETED here together with `qa_max_chat_images` / `qa_max_chat_image_bytes`
@@ -273,12 +273,12 @@ class Settings(BaseSettings):
     # It changed what the host was ASKED to do and spent the tester's tokens on
     # one judgement per case for a precision nobody had measured, which is what
     # made it an experiment rather than an advisory. tools/grounding_verdicts.py
-    # and agents.host_mode.build_grounding_section are RETAINED with every bound
+    # and agents.host_grounding.build_grounding_section are RETAINED with every bound
     # they carry (ids matched against the suite's own, verdicts enum-gated, notes
     # capped, a 40% proportional ceiling, cases MOVED rather than deleted), so a
     # submission that carries verdicts anyway is still handled safely. What is
     # gone is only the INSTRUCTION that asks for them; the seam is
-    # agents.host_mode.grounding_review_enabled(). See docs/FEATURE_FLAGS.md.
+    # agents.host_grounding.grounding_review_enabled(). See docs/FEATURE_FLAGS.md.
     # Parent-story context (JIRA_FETCH_PARENT). Default **OFF** since
     # 2026-09-25 (Air onboarding test) -- this REVERSES the "deliberate
     # exception to the defaults-OFF rule" this comment used to record: a
@@ -420,7 +420,7 @@ class Settings(BaseSettings):
     # (`true`), NOT this field's code default (`False`) -- the same divergence,
     # and the same reasoning, batch 6 recorded for QA_SWAGGER_ENABLED. Testers
     # can always list attached Android/iOS devices, pick one, and capture
-    # screens; tools/mcp_handlers._mobile_capture() returns the True constant.
+    # screens; handlers._mobile_capture() returns the True constant.
     # qa_capture_screens makes NO server-side vision call (the screens ride to
     # the tester's own chat model as MCP image content), so that path needs no
     # credential. CORRECTED 2026-08-30 (audit finding 8): this comment used to
@@ -536,7 +536,7 @@ class Settings(BaseSettings):
     # feature hardcoded ON -- the flag policy's "promote to default ON,
     # flag deleted" outcome for an experiment. The seams are
     # mcp_server._feature_analysis_enabled and
-    # tools.mcp_handlers._feature_analysis_enabled. The test-cases-only
+    # handlers._common._feature_analysis_enabled. The test-cases-only
     # EDITION gate is unchanged and still outranks them, so the public
     # distribution registers neither tool.
 
@@ -1032,11 +1032,11 @@ class Settings(BaseSettings):
     # Jira/comment text that host mode deliberately places in the host's own
     # context. So this path is DESTRUCTIVE + attacker-influenced and is bounded by
     # the two deterministic server-side screens below, in addition to defaulting
-    # OFF and to the NB-016 rescue mirrored in agents/host_mode.py.
+    # OFF and to the NB-016 rescue mirrored in agents/host_*.py.
     qa_host_dedup_apply: bool = False
     # Caps on the UNTRUSTED field's SHAPE: how many groups are considered and how
     # many cases one group may name. Never-raise-coerced as positive ints and
-    # additionally hard-capped in agents/host_mode.py, whose constant wins when it
+    # additionally hard-capped in agents/host_*.py, whose constant wins when it
     # is smaller. NB these are shape caps, not a safety bound: 50 x 12 = 550
     # removable ids, so they do NOT stop a disjoint partition of the suite. The two
     # ratios below are the actual bound.
@@ -1045,7 +1045,7 @@ class Settings(BaseSettings):
     # SAFETY BOUND (the one that actually bounds the destructive path). Max share of
     # the SUBMITTED cases one host review may remove; above it the WHOLE review is
     # refused (nothing removed) and the refusal is reported verbatim. An operator may
-    # LOWER this; the module ceiling (0.40) in agents/host_mode.py wins, so it can
+    # LOWER this; the module ceiling (0.40) in agents/host_*.py wins, so it can
     # never be raised. Deliberately CORPUS-INDEPENDENT: it needs no calibration, so
     # it is a guarantee rather than a tuned guess. The second bound is a module
     # constant with no .env knob at all (_DUP_MAX_APPLY_GROUP_SIZE = 4: more than 4
@@ -1056,7 +1056,7 @@ class Settings(BaseSettings):
     # reply. It gates nothing, because it cannot: MEASURED 2026-07-29, the
     # motivating cross-category duplicate scores 0.29 while two unrelated cases score
     # 0.28-0.34 and two cases that must NOT be merged score 0.95, so no threshold
-    # separates the classes (see agents/host_mode.dup_agreements for the full table).
+    # separates the classes (see agents/host_dedup.dup_agreements for the full table).
     # Shipping an uncalibrated number as a security bound would look like a
     # guarantee and not be one.
     qa_host_dedup_low_text_ratio: float = 0.5
@@ -1078,7 +1078,7 @@ class Settings(BaseSettings):
     # the parent + ONE full qa_submit_suite -- which keeps the dedup/coverage
     # review (it needs the merged suite's global tc_ids) but is lost wholesale if
     # the chat dies before that single call, exactly how the first live run died.
-    # The seam is agents.host_mode._parallel_fanout_on().
+    # The seam is agents.host_orchestration._parallel_fanout_on().
     # See docs/FEATURE_FLAGS.md.
 
     # --- Volume floor + duplicate-prepare guard: flags DELETED 2026-08-12 -
@@ -1157,7 +1157,7 @@ class Settings(BaseSettings):
     # advertises no elicitation capability, so ctx.elicit raises there, the
     # callback reports UNAVAILABLE and the caller falls back to the markdown
     # menu exactly as it did with the flag off. mcp_server._elicit_enabled() and
-    # tools/mcp_handlers._elicit_enabled() return the True constant; every
+    # handlers._elicit_enabled() return the True constant; every
     # dialog stays bounded by the existing per-call elicitation budget. See
     # docs/FEATURE_FLAGS.md.
 

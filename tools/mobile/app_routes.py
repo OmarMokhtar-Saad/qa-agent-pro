@@ -4,8 +4,8 @@ PROVISIONAL (owner has not confirmed): a screen's fingerprint is its ``screen_id
 
 A route is a flow TEMPLATE (``app_flows``: steps and labels, never a typed value) plus the
 ``screen_id`` each step must START on and the ``screen_id`` the last step must END on, both read
-from the trace of the clean run that saved it. Replay is ONE script through ``session.submit``
-and ``executor.replay`` with ``Context.route_expect`` set: the executor compares the live screen
+from the trace of the clean run that saved it. Replay is ONE script through ``session_submit.submit``
+and ``replay.replay.replay`` with ``Context.route_expect`` set: the executor compares the live screen
 with the saved one before every step and a mismatch stops with nothing tapped; the wrapper then
 checks the end screen. This module adds no way to act on the device and never calls a model.
 Every public function returns an error/content dict (or a plain value) and never raises.

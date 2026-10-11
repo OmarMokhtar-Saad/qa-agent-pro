@@ -371,7 +371,7 @@ class TestSuite(BaseModel):
     # QA_ATOMIC_CHECKLIST_ENABLED was deleted and the behaviour hardcoded ON.
     # A PrivateAttr so it is EXCLUDED from the JSON schema used as an LLM
     # response_model (it must never pollute generation) and from serialization.
-    # tools.xlsx_generator and tools.mcp_handlers read it via getattr.
+    # tools.xlsx_generator and handlers read it via getattr.
     _checklist_artifacts: Optional[dict] = PrivateAttr(default=None)
 
     # {tc_id: note} for the XLSX Notes column — the Batch 3
@@ -393,7 +393,7 @@ class TestSuite(BaseModel):
     # Rows for the "Generation Notes" sheet: what this run could NOT do, or did
     # short of what was asked -- an under-generated category, an absent
     # requirements checklist, a preflight that left no evidence it ran. A list
-    # of (finding, detail) pairs, attached by tools.mcp_handlers just before the
+    # of (finding, detail) pairs, attached by handlers just before the
     # export.
     #
     # WHY IT EXISTS (2026-08-15, F5/F6/F7): each of these was already disclosed

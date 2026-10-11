@@ -48,7 +48,7 @@ pipeline is byte-identical to today.
 DELETED. It had been behaviourally unreachable since 2026-08-14 -- every call
 site sat under ``result.atomicity_on``, which ``build_rule_packs`` sets from
 ``atomicity_rules_enabled()``, the ``False`` constant. The seam and the
-``RulePackResult.atomicity_on`` FIELD are retained: ``agents/host_mode.py``
+``RulePackResult.atomicity_on`` FIELD are retained: ``agents/host_*.py``
 serialises that field into the prep envelope, so removing it would be a
 prep-format change. What is gone is the split-rule instruction and the two
 bundling detectors; reviving them is a fresh implementation, not a flag flip.
@@ -150,7 +150,7 @@ def atomicity_rules_enabled() -> bool:
     CODE -- ``tools/atomicity.py`` was deleted, because a pack whose every call
     site is unreachable is dead code that only looks revivable. It is retained
     because ``RulePackResult.atomicity_on`` is part of the serialised prep
-    envelope (``agents/host_mode.py``) and because a True here must still not
+    envelope (``agents/host_*.py``) and because a True here must still not
     make the pack claim to run.
     """
     return False

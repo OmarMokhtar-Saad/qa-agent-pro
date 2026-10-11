@@ -48,7 +48,7 @@ def _api_key() -> str:
     """Resolve the PostHog key: explicit env override, else the baked default."""
     try:
         return (settings.posthog_api_key or _DEFAULT_POSTHOG_KEY or "").strip()
-    except Exception:
+    except Exception:  # noqa: BLE001 - never-raise: settings must not break telemetry
         return (_DEFAULT_POSTHOG_KEY or "").strip()
 
 
@@ -84,7 +84,7 @@ def startup_notice() -> None:
             logger.info(
                 "telemetry: on - anonymous usage metrics; opt out with DO_NOT_TRACK=1"
             )
-    except Exception:
+    except Exception:  # noqa: BLE001 - never-raise contract
         logger.debug("telemetry startup notice failed", exc_info=True)
 
 
@@ -115,7 +115,7 @@ def _machine_id() -> str:
         import machineid
 
         return str(machineid.hashed_id(_MACHINE_ID_APP))
-    except Exception:
+    except Exception:  # noqa: BLE001 - optional third-party package, any failure -> ''
         return ""
 
 
@@ -143,7 +143,7 @@ def _distinct_id() -> str:
     """Person key: the configured email when set, else the install UUID."""
     try:
         email = (settings.qa_user_email or "").strip()
-    except Exception:
+    except Exception:  # noqa: BLE001 - never-raise: settings must not break telemetry
         email = ""
     return email or _install_id()
 
@@ -165,7 +165,7 @@ def _base_properties(client_name: str = "", client_version: str = "") -> dict:
         props["mcp_client_version"] = client_version
     try:
         email = (settings.qa_user_email or "").strip()
-    except Exception:
+    except Exception:  # noqa: BLE001 - never-raise: settings must not break telemetry
         email = ""
     if email:
         props["$set"] = {"email": email}
@@ -190,7 +190,7 @@ def _post(payload: dict) -> None:
             timeout=_TIMEOUT_S,
             headers={"Content-Type": "application/json"},
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 - never-raise: a failed send is dropped
         logger.debug("telemetry: capture POST failed", exc_info=True)
 
 
@@ -198,7 +198,7 @@ def _dispatch(payload: dict) -> None:
     """Send on a daemon thread so a slow network never delays a tool."""
     try:
         threading.Thread(target=_post, args=(payload,), daemon=True).start()
-    except Exception:
+    except Exception:  # noqa: BLE001 - never-raise contract
         logger.debug("telemetry: could not dispatch event", exc_info=True)
 
 
@@ -207,7 +207,7 @@ def _capture(event: str, properties: dict) -> None:
         return
     try:
         _dispatch(_build_payload(event, _distinct_id(), properties))
-    except Exception:
+    except Exception:  # noqa: BLE001 - never-raise contract
         logger.debug("telemetry: capture failed", exc_info=True)
 
 
@@ -216,7 +216,7 @@ def server_start(client_name: str = "", client_version: str = "") -> None:
     _capture("server_start", _base_properties(client_name, client_version))
 
 
-def tool_called(
+def tool_called(  # noqa: PLR0913 - keyword-only public API with many callers
     tool: str,
     *,
     duration_ms: int = 0,
@@ -275,7 +275,7 @@ def start_tool_trace(tool: str) -> str:
     try:
         _ai_trace_id_var.set(trace_id)
         _tool_props_var.set({})
-    except Exception:
+    except Exception:  # noqa: BLE001 - never-raise contract
         logger.debug("telemetry: start_tool_trace failed", exc_info=True)
     return trace_id
 
@@ -284,7 +284,7 @@ def current_trace_id() -> str:
     """The in-flight tool's ``$ai_trace_id`` ('' outside a tool call). Never raises."""
     try:
         return _ai_trace_id_var.get()
-    except Exception:
+    except Exception:  # noqa: BLE001 - never-raise contract
         return ""
 
 
@@ -298,7 +298,7 @@ def add_tool_properties(**props) -> None:
         for key, value in props.items():
             if value is not None:
                 bag[key] = value
-    except Exception:
+    except Exception:  # noqa: BLE001 - never-raise contract
         logger.debug("telemetry: add_tool_properties failed", exc_info=True)
 
 
@@ -308,7 +308,7 @@ def pop_tool_properties() -> dict:
         bag = _tool_props_var.get()
         _tool_props_var.set(None)
         return dict(bag) if bag else {}
-    except Exception:
+    except Exception:  # noqa: BLE001 - never-raise contract
         return {}
 
 
@@ -352,7 +352,7 @@ def _scrub_event_paths(event):
             if isinstance(entry, dict):
                 _scrub_exception_entry(entry, root)
         return event
-    except Exception:
+    except Exception:  # noqa: BLE001 - fail-closed: drop the event, never raise
         logger.debug(
             "telemetry: before_send scrub failed - dropping event", exc_info=True
         )
@@ -381,7 +381,7 @@ def _dist_sdk_client():
         )
         atexit.register(_safe_flush, client)
         _dist_sdk_cached = client
-    except Exception:
+    except Exception:  # noqa: BLE001 - optional SDK: any init failure -> bare HTTP
         logger.debug(
             "telemetry: dist posthog SDK unavailable -- bare-HTTP error events only",
             exc_info=True,
@@ -402,11 +402,11 @@ def _scrubbed_exception(exc: BaseException) -> BaseException:
         cls = type(exc)
         try:
             scrubbed: BaseException = cls(cls.__name__)
-        except Exception:
+        except Exception:  # noqa: BLE001 - arbitrary exception constructors
             scrubbed = Exception(cls.__name__)
         scrubbed.__traceback__ = getattr(exc, "__traceback__", None)
         return scrubbed
-    except Exception:
+    except (TypeError, AttributeError):
         return exc
 
 
@@ -448,11 +448,11 @@ def capture_error_dist(
             )
         else:
             _dispatch(_build_payload("tool_error", _distinct_id(), props))
-    except Exception:
+    except Exception:  # noqa: BLE001 - never-raise contract
         logger.debug("telemetry: capture_error_dist failed", exc_info=True)
 
 
-def capture_ai_generation(
+def capture_ai_generation(  # noqa: PLR0913 - keyword-only public API with many callers
     *,
     model: str = "",
     provider: str = "",
@@ -493,7 +493,7 @@ def capture_ai_generation(
         if tid:
             props["$ai_trace_id"] = tid
         _capture("$ai_generation", props)
-    except Exception:
+    except Exception:  # noqa: BLE001 - never-raise contract
         logger.debug("telemetry: capture_ai_generation failed", exc_info=True)
 
 
@@ -501,5 +501,5 @@ def _safe_flush(client: object) -> None:
     """Flush a posthog client, swallowing any error (never raises)."""
     try:
         client.flush()
-    except Exception:
+    except Exception:  # noqa: BLE001 - never-raise: runs at interpreter exit
         logger.debug("analytics: flush failed", exc_info=True)

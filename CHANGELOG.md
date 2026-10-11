@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.107.5] - 2026-10-08
+## [1.108.0] - 2026-10-11
 
 ### Added
 
@@ -29,7 +29,31 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Internal restructure: long functions in the MCP server, the mobile
-  executor, report and downloader, and the API and Jira tools are split
-  into smaller helpers. No change in behavior is intended.
-- The shipped files no longer carry internal work-ticket references.
+- Internal restructure: the MCP tool handlers now live in their own
+  `handlers/` package and the shared tools are split along clean layer
+  boundaries. Tool names, arguments and replies are unchanged.
+- Swagger/OpenAPI documents above 32 million characters are refused
+  before parsing, and parsing no longer blocks the server.
+
+### Fixed
+
+- `.env` self-heal fixes `KEY = value` lines, writes atomically, and keeps
+  one backup with the `.env`'s own permissions instead of a new one every
+  run.
+- Closing a host task twice no longer runs it twice; local stores close
+  their database on setup errors and wait on a busy database.
+- Timed-out or cancelled device commands now stop their whole process
+  group instead of leaving adb/xcrun children running.
+- A device lock that fails to move to a new owner no longer leaves locks
+  split between two owners.
+
+### Security
+
+- Mobile `open_url` accepts only plain URL characters, so a URL can no
+  longer inject device-shell arguments or redirects.
+- The Jira payload size cap can no longer be bypassed; device
+  UI XML with DOCTYPE/ENTITY is refused; imported suites must stay inside
+  the chosen folder and not follow symlinks.
+- Spreadsheet exports neutralise more formula-injection prefixes; exports
+  refuse the install folder and hidden folders; untrusted-content
+  markers resist more spoofing variants.

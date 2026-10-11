@@ -24,21 +24,14 @@ uses for the pcap lane's record, applied here to this lane's.
 from __future__ import annotations
 
 from tools.mobile_capture import probe
-
-#: The tier vocabulary. A caller branches on these by NAME.
-TIER_NONE = "none"
-TIER_PROXIED = "proxied"
-TIER_DECRYPTED = "decrypted"
-TIER_TLS_FAILURE = "tls_failure"
-TIER_INCONCLUSIVE = "inconclusive"
-TIERS = frozenset(
-    {
-        TIER_NONE,
-        TIER_PROXIED,
-        TIER_DECRYPTED,
-        TIER_TLS_FAILURE,
-        TIER_INCONCLUSIVE,
-    }
+from tools.mobile_shared.capture_tiers import (  # noqa: F401  re-exports: tier names keep their old home
+    REASON_PINNED,
+    TIER_DECRYPTED,
+    TIER_INCONCLUSIVE,
+    TIER_NONE,
+    TIER_PROXIED,
+    TIER_TLS_FAILURE,
+    TIERS,
 )
 
 #: The refusal vocabulary. Every code below has exactly one sentence in
@@ -48,7 +41,6 @@ REASON_NO_CONSENT = "no_consent"
 REASON_NO_APPLY = "no_apply"
 REASON_NO_MITMDUMP = "no_mitmdump"
 REASON_CERT_NOT_TRUSTED = "cert_not_trusted"
-REASON_PINNED = "pinned"
 REASON_TLS_FAILURE = "tls_failure"
 REASON_PROXY_START_FAILED = "proxy_start_failed"
 REASON_DEVICE_GONE = "device_gone"

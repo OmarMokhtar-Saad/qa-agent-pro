@@ -13,7 +13,7 @@ which is exactly what the test suite does (``mitmproxy`` is not a project
 dependency; see T2.4).
 
 **It does NO redaction.** Redaction is qa-agents' job, at WRITE time
-(``tools/mobile_capture/flows.py``), applying ``tools/mobile_evidence/scrub``'s
+(``tools/mobile_capture/flows.py``), applying ``tools/mobile_shared/scrub``'s
 nets under an armed, per-task :class:`contextvars.ContextVar` scope this
 process never sees. Splitting redaction into this file would put the pattern
 set in a process qa-agents cannot unit-test in-process.

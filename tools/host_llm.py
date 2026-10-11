@@ -1,6 +1,6 @@
 """tools/host_llm.py -- generic host ("boomerang") broker for server-side LLM calls.
 
-``agents/host_mode.py`` boomerangs test-case generation by SPLITTING one logical
+``agents/host_*.py`` boomerangs test-case generation by SPLITTING one logical
 operation into two stateless MCP tool calls (``qa_prepare_test_cases`` -> the host
 model generates in its own chat turn -> ``qa_submit_suite``), with state persisted
 in ``tools/prep_store.py``. That split is not a style choice: while a tool call is
@@ -47,7 +47,7 @@ that from ``qa-doctor`` and a one-time startup WARNING -- never from
 behaviour. Phases 2-6 shrink ``UNMIGRATED_PATHS`` as each row migrates.
 
 Note for readers coming from the plan brief: MCP *elicitation* (``ctx.elicit``,
-used by the wizard pickers in ``tools/mcp_handlers.py``) asks the *human* for
+used by the wizard pickers in ``handlers/``) asks the *human* for
 primitive structured input. It cannot ask the client's *model* to generate and is
 not an LLM substitute.
 
@@ -59,10 +59,10 @@ and NEVER raises.
 
 from __future__ import annotations
 
-import json
 import logging
 
 from tools import prep_store
+from tools.safe_parse import loads_json
 from tools.untrusted import wrap_untrusted
 
 logger = logging.getLogger(__name__)
@@ -224,7 +224,7 @@ UNMIGRATED_PATHS: tuple[tuple[str, str], ...] = (
     #   coverage-gap prose (suppressed by advisory_gaps=False, now disclosed by the
     #   same block) and the whole-suite markdown fallback, which is unreachable on
     #   a host submit -- all_cases there is provably non-empty, since
-    #   TestSuite.test_cases carries min_length=1, host_mode._validate_suite raises
+    #   TestSuite.test_cases carries min_length=1, host_submission._validate_suite raises
     #   when nothing valid remains, apply_duplicate_groups returns every case when
     #   the kept set would be empty, and filter_unanchored_cases never empties. The
     #   id is deliberately NOT split in two: LEDGER_IDS is the constant 24-member
@@ -285,7 +285,7 @@ UNMIGRATED_PATHS: tuple[tuple[str, str], ...] = (
     # master-plan Phase 6 gates on.
     #
     #   R4 built the programme's ONLY genuinely new fold: CHECKLIST_JOB
-    #   (agents/host_mode.py, mechanism A, stage step_zero, order 30, return
+    #   (agents/host_*.py, mechanism A, stage step_zero, order 30, return
     #   field `checklist_items`), shipped behind QA_HOST_CHECKLIST_REVIEW_ENABLED
     #   AND-ed with QA_ATOMIC_CHECKLIST_ENABLED, which was default-OFF at the
     #   time and was DELETED on 2026-08-14, the checklist becoming
@@ -300,10 +300,10 @@ UNMIGRATED_PATHS: tuple[tuple[str, str], ...] = (
     #   TWO cross-phase gates had to be widened in the same op, because both
     #   are AND-ed with "the prep produced checklist items" -- which is False
     #   at prepare time once the decomposition is boomeranged:
-    #     * tools/mcp_handlers._nli_suppress (Phase 3b, since DELETED along
+    #     * handlers._nli_suppress (Phase 3b, since DELETED along
     #       with the two NLI ask_json calls in tools/rtm.py it guarded -- both
     #       gone since P2-G1).
-    #     * agents/host_mode._coverage_instruction -- HISTORICAL, this widen no
+    #     * the former host_mode facade's _coverage_instruction -- HISTORICAL, this widen no
     #       longer exists. Un-widened it would have made the whole
     #       QA_HOST_COVERAGE_REVIEW_ENABLED clause vanish from the payload,
     #       deleting the host analog that 3b's row named as the replacement
@@ -326,7 +326,7 @@ UNMIGRATED_PATHS: tuple[tuple[str, str], ...] = (
     # maestro_exporter.translate left this tuple in the Phase-5d ops file that
     # flipped its ledger row to `disabled (disclosed)` -- NOT `migrated`, and not
     # because a fold was hard: the path has had no production caller since the
-    # Chainlit UI was retired (tools/mcp_handlers.py calls
+    # Chainlit UI was retired (handlers/ calls
     # generate_maestro_flows(suite) with no translations map), so building a
     # boomerang for it would have been new tester-facing capability disguised as
     # a migration. It stays in LEDGER_IDS and is scope-tagged, so
@@ -584,7 +584,7 @@ def _unknown_ids_note(unknown: tuple[str, ...]) -> str:
 # It deliberately prints NO ledger id and NO literal
 # QA_SERVER_LLM_ALLOW=<ids> recipe. This branch renders on EVERY
 # retired install, and this module's standing discipline (shared
-# with the per-mode items in tools/mcp_handlers.py) is that an id
+# with the per-mode items in handlers/) is that an id
 # is named only where THAT install actually loses the capability --
 # naming one otherwise promises a loss the operator does not
 # suffer. A dry-run web install and an install with both Maestro
@@ -925,10 +925,7 @@ async def open_task(
 
 def _loads(text: str) -> dict | None:
     """json.loads restricted to objects. Returns None on anything else."""
-    try:
-        obj = json.loads((text or "").strip())
-    except Exception:
-        return None
+    obj = loads_json(text, dict_only=True, strip_both=True, swallow_all=True)
     return obj if isinstance(obj, dict) else None
 
 
@@ -983,6 +980,30 @@ def _closed_content(
     }
 
 
+async def _load_open_task(
+    tid: str, raw: str, expect_kind: str
+) -> tuple[dict | None, dict | None]:
+    """Validate *tid* against the store: ``(record, None)`` or ``(None, rejection)``."""
+    if len(raw or "") > _MAX_RAW_CHARS:
+        return None, {
+            "error": f"submission exceeds {_MAX_RAW_CHARS} characters",
+            "content": None,
+        }
+    loaded = await prep_store.load_prep(tid)
+    record = loaded.get("content")
+    if loaded.get("error") or not isinstance(record, dict):
+        return None, {"error": "unknown or expired task_id", "content": None}
+    if record.get(_MARKER) != _SCHEMA_VERSION:
+        return None, {"error": "unknown or expired task_id", "content": None}
+    kind = str(record.get("kind") or "")
+    if expect_kind and kind != str(expect_kind):
+        return None, {
+            "error": f"task_id belongs to a {kind!r} task, not {str(expect_kind)!r}",
+            "content": None,
+        }
+    return record, None
+
+
 async def close_task(task_id: str, raw: str, *, expect_kind: str = "") -> dict:
     """Validate a host submission against an open task and consume the task id.
 
@@ -1002,29 +1023,20 @@ async def close_task(task_id: str, raw: str, *, expect_kind: str = "") -> dict:
         tid = str(task_id or "")
         if not tid:
             return {"error": "task_id is required", "content": None}
-        if len(raw or "") > _MAX_RAW_CHARS:
-            return {
-                "error": f"submission exceeds {_MAX_RAW_CHARS} characters",
-                "content": None,
-            }
-        loaded = await prep_store.load_prep(tid)
-        record = loaded.get("content")
-        if loaded.get("error") or not isinstance(record, dict):
-            return {"error": "unknown or expired task_id", "content": None}
-        if record.get(_MARKER) != _SCHEMA_VERSION:
-            return {"error": "unknown or expired task_id", "content": None}
+        record, rejection = await _load_open_task(tid, raw, expect_kind)
+        if rejection is not None:
+            return rejection
         kind = str(record.get("kind") or "")
-        if expect_kind and kind != str(expect_kind):
-            return {
-                "error": (
-                    f"task_id belongs to a {kind!r} task, not {str(expect_kind)!r}"
-                ),
-                "content": None,
-            }
         return_field = str(record.get("return_field") or "")
         parsed = _extract_json(raw) if return_field else None
         payload = _cap(parsed) if isinstance(parsed, dict) else None
-        await prep_store.delete_prep(tid)
+        # The DELETE is the atomic claim: load_prep above is only a read, so two
+        # concurrent closes can both pass validation. Only the one whose DELETE
+        # removed the row may proceed; the other is refused like a stale id.
+        claim = await prep_store.delete_prep(tid)
+        claimed = claim.get("content") if isinstance(claim, dict) else None
+        if isinstance(claimed, dict) and claimed.get("deleted") is False:
+            return {"error": "unknown or expired task_id", "content": None}
         logger.info("host_llm: closed %s task %s", kind or "generic", tid)
         return {
             "error": None,

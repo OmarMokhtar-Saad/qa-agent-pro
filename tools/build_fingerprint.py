@@ -42,18 +42,37 @@ logger = logging.getLogger(__name__)
 # The install root: this file is <root>/tools/build_fingerprint.py.
 _ROOT = Path(__file__).resolve().parent.parent
 
-# Sorted so the hash never depends on the literal's order here.
+# Sorted so the hash never depends on the literal's order here. An entry that
+# is a DIRECTORY (handlers, a package since refactor P2) stands for
+# every *.py file under it, so a new module of the split is tracked without
+# editing this list.
 _TRACKED: tuple[str, ...] = (
-    "agents/host_mode.py",
+    "agents/host_prep_serde.py",
+    "agents/host_submission.py",
+    "agents/host_grounding.py",
+    "agents/host_jobs.py",
+    "agents/host_ac.py",
+    "agents/host_checklist.py",
+    "agents/host_image.py",
+    "agents/host_orchestration.py",
+    "agents/host_category_jobs.py",
     "agents/test_scenario_agent.py",
     "tools/atomic_checklist.py",
     "tools/jira_mcp.py",
-    "tools/mcp_handlers.py",
+    "handlers",
     "tools/prep_store.py",
     "tools/rtm.py",
 )
 
 _CACHED: str | None = None
+
+
+def _expand(rel: str) -> list[str]:
+    """``rel`` itself, or every ``*.py`` under it (posix, sorted) when it is a package dir."""
+    root = _ROOT / rel
+    if root.is_dir():
+        return sorted(p.relative_to(_ROOT).as_posix() for p in root.rglob("*.py"))
+    return [rel]
 
 
 def _hash_file(path: Path) -> str:
@@ -86,7 +105,7 @@ def code_fingerprint() -> str:
         return _CACHED
     try:
         digest = hashlib.sha256()
-        for rel in sorted(_TRACKED):
+        for rel in sorted({f for entry in _TRACKED for f in _expand(entry)}):
             digest.update(rel.encode("utf-8"))
             digest.update(b"\0")
             digest.update(_hash_file(_ROOT / rel).encode("ascii"))

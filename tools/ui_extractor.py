@@ -18,7 +18,7 @@ JavaScript single-page apps (React/Vue/Angular, e.g. SauceDemo):
             caller passed defer_vision=True from a constant, so the call had
             been unreachable since 2026-08-12; the screenshot is returned
             under ``vision_screenshot`` and handed to the tester's OWN
-            multimodal model through agents/host_mode.IMAGE_JOB instead.
+            multimodal model through agents/host_image.IMAGE_JOB instead.
             Ledger row `ui_extractor.describe_via_vision`.
 
 Contract:
@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 # The Tier-3 ask_vision call, its _VISION_SYSTEM_PROMPT and the ledger id
 # `ui_extractor.describe_via_vision` were DELETED on 2026-08-16 (P2-F1).
-# extract_ui_elements itself is LIVE -- tools/mcp_handlers._ground_and_gate
+# extract_ui_elements itself is LIVE -- handlers._ground_and_gate
 # reaches it from qa_prepare_test_cases -- but its vision fallback was not:
 # the only production caller passed defer_vision=True, derived from the
 # hardcoded "host" generation mode, so the deferral branch is the only one
@@ -62,10 +62,8 @@ async def extract_ui_elements(url: str, prefetched: dict | None = None) -> dict:
       extraction_method (str) -- which tier produced the result
       error       (None) -- always None on success
 
-    When *prefetched* is a non-None, error-free result from a prior
-    ``fetch_url_content(url)`` call, it is reused instead of fetching the URL a
-    second time (B-008/D-3). A None or error-bearing *prefetched* falls back to
-    the normal internal fetch, so behaviour is identical when it is not supplied.
+    A non-None, error-free *prefetched* result (B-008/D-3) is reused instead of
+    fetching the URL a second time; see ``_fetch_or_reuse``.
 
     When Tier 2 renders a page whose HTML still yields no elements, the
     screenshot is returned under ``vision_screenshot`` (raw bytes) with
@@ -74,8 +72,7 @@ async def extract_ui_elements(url: str, prefetched: dict | None = None) -> dict:
     stays empty on that branch. The ``vision_screenshot`` key is ABSENT (not
     None) unless a screenshot was actually produced.
 
-    On any failure returns {"error": str, "content": None}.
-    Never raises.
+    On any failure returns {"error": str, "content": None}. Never raises.
     """
     try:
         fetch_result = await _fetch_or_reuse(url, prefetched)
@@ -86,49 +83,53 @@ async def extract_ui_elements(url: str, prefetched: dict | None = None) -> dict:
                 fetch_result["error"],
             )
             return {"error": fetch_result["error"], "content": None}
-
-        raw_html = (
-            fetch_result.get("raw_html")
-            or fetch_result.get("raw_text")
-            or fetch_result.get("content")
-            or ""
-        )
-        page_title = fetch_result.get("title") or ""
-        spa_shell = bool(fetch_result.get("spa_shell"))
-
-        if not raw_html and not spa_shell:
-            logger.warning(
-                "ui_extractor: no HTML content returned for %s -- returning text fallback",
-                url,
-            )
-            return _result(
-                {}, page_title, fetch_result.get("description") or "", "none", None
-            )
-
-        (
-            ui_elements,
-            page_title,
-            extraction_method,
-            render_error,
-            deferred_screenshot,
-        ) = await _run_tiers(url, fetch_result, raw_html, page_title, spa_shell)
-
-        content_summary = _build_content_summary(page_title, ui_elements)
-        if not content_summary:
-            content_summary = fetch_result.get("description") or ""
-
-        _log_extraction_counts(url, ui_elements, extraction_method)
-        return _result(
-            ui_elements,
-            page_title,
-            content_summary,
-            extraction_method,
-            render_error,
-            deferred_screenshot,
-        )
+        return await _extract_from_fetch(url, fetch_result)
     except Exception as exc:
         logger.exception("ui_extractor: unexpected error for %s", url)
         return {"error": str(exc), "content": None}
+
+
+async def _extract_from_fetch(url: str, fetch_result: dict) -> dict:
+    """Build the success dict from a clean fetch result."""
+    raw_html = (
+        fetch_result.get("raw_html")
+        or fetch_result.get("raw_text")
+        or fetch_result.get("content")
+        or ""
+    )
+    page_title = fetch_result.get("title") or ""
+    spa_shell = bool(fetch_result.get("spa_shell"))
+
+    if not raw_html and not spa_shell:
+        logger.warning(
+            "ui_extractor: no HTML content returned for %s -- returning text fallback",
+            url,
+        )
+        return _result(
+            {}, page_title, fetch_result.get("description") or "", "none", None
+        )
+
+    (
+        ui_elements,
+        page_title,
+        extraction_method,
+        render_error,
+        deferred_screenshot,
+    ) = await _run_tiers(url, fetch_result, raw_html, page_title, spa_shell)
+
+    content_summary = _build_content_summary(page_title, ui_elements)
+    if not content_summary:
+        content_summary = fetch_result.get("description") or ""
+
+    _log_extraction_counts(url, ui_elements, extraction_method)
+    return _result(
+        ui_elements,
+        page_title,
+        content_summary,
+        extraction_method,
+        render_error,
+        deferred_screenshot,
+    )
 
 
 async def _run_tiers(
@@ -174,7 +175,11 @@ async def _run_tiers(
 
 
 async def _fetch_or_reuse(url: str, prefetched: dict | None) -> dict:
-    """Reuse a clean *prefetched* result, else fetch the URL."""
+    """Reuse a clean *prefetched* result, else fetch the URL.
+
+    A non-None, error-free result of a prior ``fetch_url_content(url)`` is
+    reused (B-008/D-3); None or an error-bearing one falls back to the fetch.
+    """
     if isinstance(prefetched, dict) and not prefetched.get("error"):
         return prefetched
     return await fetch_url_content(url)

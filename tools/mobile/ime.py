@@ -908,7 +908,7 @@ def _landed_verdict(before, after, value: str, secret: bool) -> str:
 
     **A COMMIT CAN REPLACE, NOT ONLY APPEND.** `QaImeService` calls
     `commitText`, which overwrites the current SELECTION, and
-    `executor._perform` taps the field to focus it immediately before typing --
+    `replay.device_ops._perform` taps the field to focus it immediately before typing --
     the gesture that triggers `selectAllOnFocus`. So "the field did not change"
     does NOT imply "nothing happened": re-typing a value the field already
     held is a correct type with an unchanged field. Containment is therefore
@@ -1022,7 +1022,7 @@ async def _commit_and_verify(
     serial: str, actions: dict, value: str, secret: bool, receiver_known: bool
 ) -> dict:
     """Send *value* to the keyboard and report what the field made of it."""
-    # `receiver_known`: the caller (executor.replay, via keyboard_up) has
+    # `receiver_known`: the caller (replay.replay.replay, via keyboard_up) has
     # already had the receiver answer once this run, so no per-type QUERY.
     # Encoded BEFORE any broadcast, so an encoding failure is reported as
     # itself rather than hidden behind a device round trip.

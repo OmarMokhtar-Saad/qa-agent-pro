@@ -16,10 +16,16 @@ import logging
 import os
 import platform
 import shutil
-import subprocess
+import subprocess  # noqa: F401  (patched by tests)
 import sys
+from typing import cast
 
 from tools import host_privileges
+from tools.process_runner import (  # noqa: F401  (re-exported; tests read them here)
+    CREATE_NO_WINDOW,
+    no_window_kwargs,
+    run,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +156,6 @@ POWERSHELL_TIMEOUT_S = 60
 # branch under test.
 DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
-CREATE_NO_WINDOW = 0x08000000
 
 # --- THE PLATFORM-SUPPORT TABLE: ONE PRODUCER --------------------------------
 #
@@ -302,24 +307,24 @@ def _run_sync(
     so a probe failure degrades into a preflight line with a fix rather than an
     exception on the MCP boundary.
     """
-    try:
-        proc = subprocess.run(  # noqa: S603 - argv list, no shell
-            cmd,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-            **no_window_kwargs(),
-            **({} if stdin_text is None else {"input": stdin_text.encode()}),
-        )
-    except FileNotFoundError:
+    r = run(
+        cmd,
+        timeout=timeout,
+        no_window=True,
+        input=None if stdin_text is None else stdin_text.encode(),
+        rc_coerce="int_or_zero",
+    )
+    if r.not_found:
         return 127, "", "not found: " + (cmd[0] if cmd else "")
-    except subprocess.TimeoutExpired:
+    if r.timed_out:
         return 124, "", "timed out after " + str(timeout) + "s"
-    except OSError as exc:
-        return 126, "", _os_error_detail(cmd, exc)
-    out = (proc.stdout or b"").decode(errors="replace")
-    err = (proc.stderr or b"").decode(errors="replace")
-    return int(proc.returncode or 0), out, err
+    if isinstance(r.exc, OSError):
+        return 126, "", _os_error_detail(cmd, r.exc)
+    if r.exc is not None:
+        raise r.exc
+    out = (r.stdout or b"").decode(errors="replace")
+    err = (r.stderr or b"").decode(errors="replace")
+    return cast(int, r.rc), out, err
 
 
 def normalize_arch(machine: str) -> str:
@@ -357,24 +362,6 @@ def detach_kwargs() -> dict:
             | CREATE_NO_WINDOW
         }
     return {"start_new_session": True}
-
-
-def no_window_kwargs() -> dict:
-    """``Popen`` keywords that keep a SYNCHRONOUS child's console hidden.
-
-    ``detach_kwargs`` already carries ``CREATE_NO_WINDOW`` for the three
-    detached spawns, but every SYNCHRONOUS child -- the virtualization probe,
-    ``sdkmanager``, ``avdmanager`` and every one of the dozens of ``adb`` calls a
-    single case makes -- had no creation flags at all, so on Windows each one
-    flashes a console window in the tester's face.
-
-    An empty dict on POSIX rather than ``creationflags=0``: POSIX
-    ``subprocess`` tolerates the zero, but ``asyncio.create_subprocess_exec``
-    does not accept the keyword at all there, and ``adb`` is an async caller.
-    """
-    if is_windows():
-        return {"creationflags": CREATE_NO_WINDOW}
-    return {}
 
 
 def powershell_command(script: str) -> list[str]:

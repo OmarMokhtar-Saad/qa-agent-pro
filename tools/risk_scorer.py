@@ -155,7 +155,7 @@ def score_and_sort(cases: list[TestCase]) -> tuple[list[TestCase], str]:
 # The chat-only overlay (the host `risk_scores` field), its 0-100 -> tier-label
 # mapper and the three tier cut-offs are gone with the RISK_JOB cluster they
 # served. The overlay was reached only when `host_risk_scores is not None`,
-# which was provably never: `tools/mcp_handlers` set `_risk_job = False` as a
+# which was provably never: `handlers` set `_risk_job = False` as a
 # hardcoded literal, that local was the ONLY writer of `meta["host_risk_job"]`,
 # and the submit keyed the extraction off that stamp. The SERVER-side half
 # (`score_with_llm`, its response models, its prompt and its seam) went one

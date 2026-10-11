@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Every acceptance-criterion description reaches a model, by TWO routes that share
 # this one string: ``format_ac_prompt_block`` below joins them into the category
-# ``system_prompt``, and ``agents.host_mode._prepared_ac_entries`` copies the SAME
+# ``system_prompt``, and ``agents.host_orchestration._prepared_ac_entries`` copies the SAME
 # values into every job packet's ``acceptance_criteria`` field. The text is
 # Jira-sourced, so it is attacker-influenced.
 #
@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # The containment lives in ``__post_init__`` rather than in the prompt builder on
 # purpose. ``description`` has three readers -- the prompt block, the job packet
 # field and the RTM matcher -- and a criterion is constructed at four sites across
-# two modules (here, and three in ``agents.host_mode``). Sanitizing the value is
+# two modules (here, and three in ``agents.host_*``). Sanitizing the value is
 # the only single place that covers the class; a guard in one builder leaves the
 # packet field, which was the route that actually carried the payload end to end.
 _AC_DESCRIPTION_LIMIT = 1200
@@ -138,21 +138,21 @@ class AcceptanceCriterion:
 #
 # It was dead. Its only caller was agents/test_scenario_agent._run_gen_acs,
 # which ran only under `synthesize_acs=True`; the one live caller of
-# _prepare_generation (tools/mcp_handlers.handle_prepare_test_cases) passed
+# _prepare_generation (handlers.handle_prepare_test_cases) passed
 # synthesize_acs=not _host_ac, and `_host_ac` derives from
 # llm.resolve_generation_mode() == "host" -- a constant since 2026-08-12. The
 # legacy routes that still reached it, graph.py and evals/, were deleted in
 # P2-A and P2-B.
 #
 # There is NO capability loss: the criteria are derived by the tester's OWN
-# model as agents/host_mode.AC_JOB, and _prepare_generation still appends
+# model as agents/host_ac.AC_JOB, and _prepare_generation still appends
 # _HOST_AC_JOB_DIRECTIVE to rtm_hint to ask for them. parse_acceptance_criteria,
 # rtm_trace and the rest of this module are LIVE and untouched.
 
 
 # ``normalize_ac_id`` MOVED to tools/models.py on 2026-08-19 (F06) and is
 # re-exported by the import above, so `from tools.rtm import normalize_ac_id`
-# still resolves for tools/ac_anchor.py, agents/host_mode.py,
+# still resolves for tools/ac_anchor.py, agents/host_*.py,
 # agents/test_scenario_agent.py and tests/test_rtm.py -- none of them changed.
 # It moved because its sibling ``display_requirement_id`` is needed by all five
 # exporters on every row, and importing THIS module for it would have pulled

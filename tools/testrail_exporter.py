@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import csv
 import logging
-import tempfile
-import time
-from pathlib import Path
+import tempfile  # noqa: F401  # tests patch tools.<module>.tempfile.gettempdir
 
 from tools.cell_sanitizer import sanitize_cell
+from tools.export_common import resolve_output_path
 from tools.models import (
     TestSuite,
     display_requirement_id,
     format_test_data_lines,
 )
-from tools.secure_temp import SUBDIR_NAME, make_secure_temp_path
+from tools.secure_temp import (
+    cleanup_temp_files as _sweep_temp_files,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,12 +42,7 @@ def generate_testrail_csv(suite: TestSuite, output_path: str | None = None) -> s
 
     Raises OSError or ValueError on genuine file I/O errors.
     """
-    if output_path is None:
-        output_path = make_secure_temp_path(
-            prefix="qa_test_cases_", suffix="_testrail.csv"
-        )
-
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    output_path = resolve_output_path(output_path, "_testrail.csv")
 
     # The optional "Test Data" column is added ONLY when at least one case carries a
     # data-provisioning plan. With none, both the header and every row are
@@ -113,24 +109,9 @@ def cleanup_temp_files(max_age_seconds: int = 3600) -> int:
     /tmp root, where a same-named file could belong to an unrelated user. The glob
     (``*_testrail.csv``) is specific to this exporter's output.
     """
-    base = Path(tempfile.gettempdir()) / SUBDIR_NAME
-    if not base.is_dir():
-        return 0
-    now = time.time()
-    deleted = 0
-    for path in base.glob("qa_test_cases_*_testrail.csv"):
-        try:
-            age = now - path.stat().st_mtime
-            if age > max_age_seconds:
-                path.unlink(missing_ok=True)
-                deleted += 1
-                logger.info(
-                    "Cleaned up stale TestRail CSV temp file: %s (age %.0fs)",
-                    path,
-                    age,
-                )
-        except OSError:
-            logger.warning("Could not check/delete temp file: %s", path)
-    if deleted:
-        logger.info("TestRail CSV cleanup: removed %d stale file(s)", deleted)
-    return deleted
+    return _sweep_temp_files(
+        max_age_seconds=max_age_seconds,
+        pattern="qa_test_cases_*_testrail.csv",
+        label="TestRail CSV",
+        log=logger,
+    )

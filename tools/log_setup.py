@@ -44,7 +44,9 @@ from __future__ import annotations
 import logging
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger("qa_agents.log_setup")
 
@@ -93,19 +95,16 @@ def _env_file_values() -> dict[str, str]:
             if not name.startswith("QA_LOG_"):
                 continue
             _env_cache[name] = value.split("#")[0].strip().strip("\"'")
-    except Exception:
+    except OSError:
         logger.debug("could not read .env for the log settings", exc_info=True)
     return _env_cache
 
 
 def _setting(name: str) -> str:
-    try:
-        value = os.environ.get(name)
-        if value is not None and str(value).strip():
-            return str(value).strip()
-        return _env_file_values().get(name, "")
-    except Exception:  # pragma: no cover - defensive
-        return ""
+    value = os.environ.get(name)
+    if value is not None and value.strip():
+        return value.strip()
+    return _env_file_values().get(name, "")
 
 
 def _bool_setting(name: str, default: bool) -> bool:
@@ -121,7 +120,7 @@ def _int_setting(name: str, default: int, minimum: int) -> int:
     try:
         raw = _setting(name)
         return max(minimum, int(float(raw))) if raw else default
-    except Exception:
+    except (ValueError, OverflowError):
         logger.debug("unusable %s -- using %s", name, default, exc_info=True)
         return default
 
@@ -130,7 +129,7 @@ def _float_setting(name: str, default: float, minimum: float) -> float:
     try:
         raw = _setting(name)
         return max(minimum, float(raw)) if raw else default
-    except Exception:
+    except (ValueError, OverflowError):
         logger.debug("unusable %s -- using %s", name, default, exc_info=True)
         return default
 
@@ -168,7 +167,7 @@ def set_client(name: object, log_dir: str | Path | None = None) -> str:
                 resolved,
                 process_log_path(log_dir) if log_dir else f"pid {os.getpid()}",
             )
-    except Exception:
+    except (OSError, TypeError, ValueError):
         logger.debug("could not record the MCP client name", exc_info=True)
         _client["name"] = UNKNOWN_CLIENT
     return _client["name"]
@@ -176,10 +175,7 @@ def set_client(name: object, log_dir: str | Path | None = None) -> str:
 
 def current_client() -> str:
     """The client tag for this process (``unknown`` before the handshake)."""
-    try:
-        return _client.get("name") or UNKNOWN_CLIENT
-    except Exception:  # pragma: no cover - a dict read cannot realistically fail
-        return UNKNOWN_CLIENT
+    return _client.get("name") or UNKNOWN_CLIENT
 
 
 class ProcessContextFilter(logging.Filter):
@@ -188,10 +184,7 @@ class ProcessContextFilter(logging.Filter):
     The pid needs no filter: ``process`` is a standard LogRecord attribute."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            record.qa_client = current_client()
-        except Exception:  # pragma: no cover - defensive
-            record.qa_client = UNKNOWN_CLIENT
+        record.qa_client = current_client()
         return True
 
 
@@ -211,7 +204,7 @@ def _pid_from_name(name: str, prefix: str) -> int | None:
     try:
         stem = name[len(prefix) + 1 :].split(".", 1)[0]
         return int(stem)
-    except Exception:
+    except (ValueError, OverflowError):
         return None
 
 
@@ -228,10 +221,7 @@ def _off_posix() -> bool:
     """Is this a non-POSIX platform? Read through ONE helper (review W5) so a
     test can exercise the Windows branch by patching THIS module, instead of
     monkeypatching the stdlib's ``os.name`` process-wide. Never raises."""
-    try:
-        return os.name != "posix"
-    except Exception:  # pragma: no cover - defensive
-        return True
+    return os.name != "posix"
 
 
 def _pid_is_alive(pid: int | None) -> bool:
@@ -259,7 +249,7 @@ def _pid_is_alive(pid: int | None) -> bool:
         return False
     except PermissionError:
         return True  # it exists, it is just owned by another user
-    except Exception:
+    except (OSError, OverflowError, TypeError, ValueError, AttributeError):
         return True  # no os.kill, a silly pid, anything: keep the file
 
 
@@ -301,15 +291,22 @@ def _delete_stale(
     return removed
 
 
+@dataclass(frozen=True)
+class SweepOptions:
+    """The optional knobs of ``sweep_old_logs``; ``None`` means the module default."""
+
+    keep: int | None = None
+    days: float | None = None
+    now: float | None = None
+    skip: str | Path | None = None
+    enabled: bool | None = None
+
+
 def sweep_old_logs(
     log_dir: str | Path,
     *,
     prefix: str = DEFAULT_PREFIX,
-    keep: int | None = None,
-    days: float | None = None,
-    now: float | None = None,
-    skip: str | Path | None = None,
-    enabled: bool | None = None,
+    **options: Any,
 ) -> list[str]:
     """Delete this prefix's stale per-process files; return the names removed.
 
@@ -326,20 +323,31 @@ def sweep_old_logs(
     * the legacy SHARED ``qa-agents.log`` / ``launcher.log`` cannot match the glob
       (``<prefix>-*``), so pre-existing evidence is left exactly where it is.
     """
+    opts = SweepOptions(**options)  # an unknown keyword is a TypeError, as before
     removed: list[str] = []
     try:
-        if not (RETENTION_ENABLED if enabled is None else enabled):
+        if not (RETENTION_ENABLED if opts.enabled is None else opts.enabled):
             return removed
-        keep_n = RETENTION_MAX_FILES if keep is None else int(keep)
-        max_age = RETENTION_DAYS if days is None else float(days)
-        now_ts = time.time() if now is None else float(now)
+        keep_n = RETENTION_MAX_FILES if opts.keep is None else int(opts.keep)
+        max_age = RETENTION_DAYS if opts.days is None else float(opts.days)
+        now_ts = time.time() if opts.now is None else float(opts.now)
         cutoff = now_ts - max_age * 86400.0
-        active = Path(skip).name if skip else ""
+        active = Path(opts.skip).name if opts.skip else ""
         entries = _sweep_candidates(Path(log_dir), prefix, active, now_ts)
         removed.extend(_delete_stale(entries, keep_n, cutoff))
-    except Exception:
+    except (OSError, TypeError, ValueError, OverflowError):
         logger.debug("the log retention sweep failed", exc_info=True)
     return removed
+
+
+@dataclass(frozen=True)
+class FileLoggingOptions:
+    """The optional knobs of ``configure_file_logging``; ``None`` means the default."""
+
+    max_bytes: int | None = None
+    backup_count: int | None = None
+    pid: int | None = None
+    target: logging.Logger | None = None
 
 
 def configure_file_logging(
@@ -347,10 +355,7 @@ def configure_file_logging(
     *,
     prefix: str = DEFAULT_PREFIX,
     level: int = logging.INFO,
-    max_bytes: int | None = None,
-    backup_count: int | None = None,
-    pid: int | None = None,
-    target: logging.Logger | None = None,
+    **options: Any,
 ) -> logging.Handler | None:
     """Attach this process's OWN rotating file handler and sweep old files.
 
@@ -365,18 +370,21 @@ def configure_file_logging(
     not share one record stream."""
     from logging.handlers import RotatingFileHandler
 
+    opts = FileLoggingOptions(**options)  # an unknown keyword is a TypeError
     try:
         directory = Path(log_dir)
         directory.mkdir(parents=True, exist_ok=True)
-        path = process_log_path(directory, prefix=prefix, pid=pid)
-        owner = target if target is not None else logging.getLogger()
+        path = process_log_path(directory, prefix=prefix, pid=opts.pid)
+        owner = opts.target if opts.target is not None else logging.getLogger()
         for existing in list(owner.handlers):
             if getattr(existing, "qa_log_path", "") == str(path):
                 return existing
         handler = RotatingFileHandler(
             str(path),
-            maxBytes=MAX_BYTES if max_bytes is None else int(max_bytes),
-            backupCount=BACKUP_COUNT if backup_count is None else int(backup_count),
+            maxBytes=MAX_BYTES if opts.max_bytes is None else int(opts.max_bytes),
+            backupCount=(
+                BACKUP_COUNT if opts.backup_count is None else int(opts.backup_count)
+            ),
             encoding="utf-8",
         )
         handler.setLevel(level)
@@ -386,6 +394,6 @@ def configure_file_logging(
         owner.addHandler(handler)
         sweep_old_logs(directory, prefix=prefix, skip=path)
         return handler
-    except Exception:
+    except (OSError, TypeError, ValueError):
         logger.debug("could not open a per-process log file", exc_info=True)
         return None

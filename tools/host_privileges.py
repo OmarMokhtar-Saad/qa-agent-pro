@@ -48,9 +48,12 @@ from __future__ import annotations
 import logging
 import os
 import platform
-import subprocess
+import subprocess  # noqa: F401  (patched by tests)
 import sys
 import time
+from typing import cast
+
+from tools.process_runner import run
 
 logger = logging.getLogger(__name__)
 
@@ -303,16 +306,12 @@ def _run(argv: list[str], timeout: float = PROBE_TIMEOUT_S) -> tuple[int, str, s
     non-zero rc, which is evidence.
     """
     try:
-        done = subprocess.run(
-            list(argv),
-            capture_output=True,
-            timeout=max(0.1, float(timeout)),
-            shell=False,
-            check=False,
-        )
-        out = (done.stdout or b"").decode("utf-8", "replace")
-        err = (done.stderr or b"").decode("utf-8", "replace")
-        return int(done.returncode), out, err
+        r = run(list(argv), timeout=max(0.1, float(timeout)), shell=False)
+        if r.exc is not None:
+            raise r.exc
+        out = (r.stdout or b"").decode("utf-8", "replace")
+        err = (r.stderr or b"").decode("utf-8", "replace")
+        return cast(int, r.rc), out, err
     except Exception as exc:
         logger.debug("host_privileges probe could not run %s: %s", argv[:1], exc)
         return -1, "", str(exc)

@@ -183,7 +183,7 @@ SETUP_CHECK_TOOL = "qa-doctor"
 SETUP_CHECK_MAX_RETRIES = 2
 SETUP_CHECK_TIMEOUT_S = 25.0
 # Fragments of the child's 'a reload was scheduled' reply
-# (tools/mcp_handlers._reloading_message). Two ASCII-only pieces on
+# (handlers._reloading_message). Two ASCII-only pieces on
 # purpose: the real sentence joins them with an em dash, which JSON
 # encoders emit as an escape sequence, so a single literal spanning
 # it would silently stop matching.

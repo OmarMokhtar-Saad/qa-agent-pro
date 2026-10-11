@@ -117,13 +117,14 @@ def _run_is_finished(run_id: str, session_token: str = "") -> bool:
     that is the failure the whole lease mechanism exists to prevent.
     """
     try:
-        from tools.mobile import session
+        from tools.mobile.session_core import STATE_REPORT
+        from tools.mobile.session_runs import resolve
 
-        resolved = session.resolve(str(run_id), str(session_token or ""))
+        resolved = resolve(str(run_id), str(session_token or ""))
         if resolved.get("error"):
             return False
         body = resolved.get("content") or {}
-        return str(body.get("state") or "") == session.STATE_REPORT
+        return str(body.get("state") or "") == STATE_REPORT
     except Exception:  # pragma: no cover - defensive
         logger.warning("mobile.heartbeat: could not read the state of %s", run_id)
         return False

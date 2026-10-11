@@ -218,8 +218,8 @@ def compute_suite_quality_advisories(
 ) -> list[tuple[str, str]]:
     """Aggregate every signal above into ``(title, detail)`` tuples, the exact
     shape the Generation Notes extension point already takes
-    (``tools/mcp_handlers.py``'s ``_gen_notes.append((title, detail))``, see
-    ``agents.host_mode.ambiguity_notes_gen_note`` for a sibling of this same
+    (``handlers/``'s ``_gen_notes.append((title, detail))``, see
+    ``agents.host_jobs.ambiguity_notes_gen_note`` for a sibling of this same
     shape). [] when nothing is worth flagging, including for a None/garbage
     ``cases`` argument. Warn-only -- never refuses, never raises."""
     out: list[tuple[str, str]] = []

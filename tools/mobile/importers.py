@@ -28,11 +28,14 @@ import io
 import logging
 import pathlib
 import re
+import tempfile
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
 
 from tools.models import Priority, TestCase, TestStep, TestType
+from tools.safe_parse import XML_DECL_RE
+from tools.untrusted import single_line, strip_spoof_tags
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +48,7 @@ MAX_STEPS = 40
 MAX_ZIP_MEMBERS = 200
 MAX_UNCOMPRESSED_BYTES = 32 * 1024 * 1024
 
-_DECL_RE = re.compile(r"<!\s*(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
+_DECL_RE = XML_DECL_RE
 _STEP_SPLIT_RE = re.compile(r"(?m)^\s*(\d{1,3})\s*[.)\-:]\s+")
 _BIDI_RE = re.compile("[‎‏‪-‮⁦-⁩]")
 _CELL_REF_RE = re.compile(r"^([A-Z]{1,3})(\d{1,7})$")
@@ -163,7 +166,53 @@ def _problem_detail(problem: dict, subject: str) -> str:
         return subject + " is missing"
     if kind == "too_short":
         return subject + " has no entries"
-    return subject + ": " + str(problem.get("msg") or "")[:120]
+    return subject + ": " + single_line(problem.get("msg") or "", 120)
+
+
+_SOURCE_SUFFIXES = (".csv", ".xlsx", ".md", ".markdown", ".txt")
+
+
+def _source_roots() -> list[Path]:
+    """Where a tester's own case file may live: their home and the temp dir."""
+    roots = [Path(tempfile.gettempdir())]
+    try:
+        roots.append(Path.home())
+    except (RuntimeError, KeyError):  # pragma: no cover - no home directory
+        pass
+    resolved = []
+    for root in roots:
+        try:
+            resolved.append(root.resolve())
+        except OSError:  # pragma: no cover - defensive
+            continue
+    return resolved
+
+
+def vet_source_path(path: Path) -> None:
+    """Raise ``PermissionError`` unless *path* is a case file we may read.
+
+    ``cases`` reaches here from an MCP argument, so a path is untrusted: it must
+    be a plain (non-symlink) .csv/.xlsx/.md/.txt file under the user's home or
+    the temp dir, and not inside a dot-directory (``~/.ssh``, ``~/.aws``).
+    """
+    if path.suffix.lower() not in _SOURCE_SUFFIXES:
+        raise PermissionError(
+            "Cannot import "
+            + path.name
+            + ": give a .csv, .xlsx, .md or .txt path, or paste a markdown table"
+        )
+    if path.is_symlink():
+        raise PermissionError("a symbolic link cannot be imported")
+    resolved = path.resolve()
+    for root in _source_roots():
+        if resolved.is_relative_to(root):
+            if any(part.startswith(".") for part in resolved.relative_to(root).parts):
+                break
+            return
+    raise PermissionError(
+        "that file is outside the folders cases can be imported from "
+        "(your home folder or the temp folder)"
+    )
 
 
 def _maybe_path(text: str) -> "pathlib.Path | None":
@@ -185,9 +234,13 @@ def _maybe_path(text: str) -> "pathlib.Path | None":
         return None
     try:
         resolved = pathlib.Path(candidate).expanduser()
-        return resolved if resolved.is_file() else None
+        is_file = resolved.is_file()
     except (OSError, ValueError):
         return None
+    if not is_file:
+        return None
+    vet_source_path(resolved)
+    return resolved
 
 
 def _clean_document(text: object) -> str:
@@ -308,7 +361,9 @@ def _outcome(
 
 
 def _rejected(row_number: int, why: str, title: str) -> dict:
-    return _outcome(reject={"row": row_number, "why": why, "title": title[:80]})
+    # The title is a raw cell, echoed to the host model: short and neutralised.
+    shown = strip_spoof_tags(single_line(title, 60))
+    return _outcome(reject={"row": row_number, "why": why, "title": shown})
 
 
 def _resolve_tc_id(raw_id: str, fallback_index: int) -> tuple[str, bool]:
@@ -602,6 +657,7 @@ def from_xlsx(source: object) -> dict:
                 "error": "There is no file at " + str(path) + ".",
                 "content": None,
             }
+        vet_source_path(path)
         if path.stat().st_size > MAX_BYTES:
             return {"error": _too_big(path.name), "content": None}
         with zipfile.ZipFile(path) as archive:
@@ -623,7 +679,7 @@ def from_xlsx(source: object) -> dict:
             "error": "That file is not a readable .xlsx workbook.",
             "content": None,
         }
-    except OSError as exc:
+    except OSError as exc:  # includes the PermissionError from vet_source_path
         return {"error": "Could not read that workbook: " + str(exc), "content": None}
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.importers.from_xlsx failed")
@@ -732,29 +788,31 @@ def _cell_value(cell: ElementTree.Element, shared: list[str]) -> str:
 
 
 def _sheet_rows(sheet_xml: str, shared: list[str]) -> dict:
+    """Rows of the sheet, read as a stream and stopped past ``MAX_ROWS``."""
+    rows: list[list[str]] = []
     try:
-        root = ElementTree.fromstring(sheet_xml)
+        stream = io.BytesIO(sheet_xml.encode("utf-8"))
+        for _event, row in ElementTree.iterparse(stream, events=("end",)):
+            if _strip_ns(row.tag) != "row":
+                continue
+            cells: dict[int, str] = {}
+            for cell in row:
+                if _strip_ns(cell.tag) != "c":
+                    continue
+                column = _column_index(cell.get("r") or "")
+                if column < 0:
+                    column = len(cells)
+                cells[column] = _clean(_cell_value(cell, shared))
+            row.clear()
+            if not cells:
+                rows.append([])
+                continue  # blank rows never trigger the cap
+            width = max(cells) + 1
+            rows.append([cells.get(index, "") for index in range(width)])
+            if len(rows) > MAX_ROWS + 1:
+                break
     except ElementTree.ParseError:
         return {"error": "That worksheet is not valid XML.", "content": None}
-    rows: list[list[str]] = []
-    for row in root.iter():
-        if _strip_ns(row.tag) != "row":
-            continue
-        cells: dict[int, str] = {}
-        for cell in row:
-            if _strip_ns(cell.tag) != "c":
-                continue
-            column = _column_index(cell.get("r") or "")
-            if column < 0:
-                column = len(cells)
-            cells[column] = _clean(_cell_value(cell, shared))
-        if not cells:
-            rows.append([])
-            continue
-        width = max(cells) + 1
-        rows.append([cells.get(index, "") for index in range(width)])
-        if len(rows) > MAX_ROWS + 1:
-            break
     return {"error": None, "content": rows}
 
 
@@ -817,7 +875,11 @@ def render_rejections(content: object) -> str:
             "- row "
             + str(item.get("row"))
             + ": "
-            + str(item.get("why") or "")
-            + (" -- " + str(item.get("title")) if str(item.get("title") or "") else "")
+            + single_line(item.get("why") or "", 160)
+            + (
+                " -- " + single_line(item.get("title"), 60)
+                if str(item.get("title") or "")
+                else ""
+            )
         )
     return "\n".join(lines)

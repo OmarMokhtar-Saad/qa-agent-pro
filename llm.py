@@ -72,7 +72,7 @@ def resolve_generation_mode() -> str:
     Since 2026-08-16 there is not even a backend to route to: dead-code deletion
     P2-G2c removed all three. The function is RETAINED, with its
     'server'|'host' contract unchanged, because callers exist
-    (tools/mcp_handlers.py) and the 'server' value stays meaningful to them --
+    (handlers/) and the 'server' value stays meaningful to them --
     they branch on it to decide what to disclose. It simply never returns it.
     Never raises.
     """

@@ -8,7 +8,7 @@ timed-out question for a client, every later question for that client returns
 again. ``mcp_handlers._ELICIT_GATE_STRIKES`` (two strikes, process wide) is NOT
 changed: this is a stricter rule that only the mobile lane uses.
 
-This module imports nothing from ``tools.mcp_handlers``: the host injects the
+This module imports nothing from ``handlers``: the host injects the
 elicit function and the client key.
 """
 

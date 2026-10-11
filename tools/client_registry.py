@@ -53,7 +53,7 @@ SERVER_NAME = "qa-agent-pro"
 
 # This module's own directory is tools/, so its grandparent is the server's
 # install root -- computed locally rather than imported from
-# tools.mcp_handlers, per this module's stdlib-only/imports-no-project-module
+# handlers, per this module's stdlib-only/imports-no-project-module
 # house rule above.
 _SERVER_ROOT = Path(__file__).resolve().parent.parent
 
@@ -79,6 +79,18 @@ SKIPPED = "skipped"
 ERROR = "error"
 
 
+# What the "never raises" helpers below can actually meet: file-system and JSON
+# errors, malformed config shapes, and ``Path.resolve`` symlink loops.
+_RECOVERABLE = (
+    OSError,
+    ValueError,
+    TypeError,
+    KeyError,
+    AttributeError,
+    RuntimeError,
+)
+
+
 def _lock(path: Path):
     """Advisory exclusive lock on a sidecar file. Returns an fd, or None.
 
@@ -93,7 +105,7 @@ def _lock(path: Path):
         fd = os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
         return fd
-    except Exception:
+    except (ImportError, OSError, ValueError):
         logger.debug("could not acquire an MCP-config lock; proceeding", exc_info=True)
         return None
 
@@ -105,12 +117,12 @@ def _unlock(fd) -> None:
         import fcntl
 
         fcntl.flock(fd, fcntl.LOCK_UN)
-    except Exception:
+    except (ImportError, OSError, ValueError):
         logger.debug("could not release the MCP-config lock", exc_info=True)
     finally:
         try:
             os.close(fd)
-        except Exception:
+        except OSError:
             logger.debug("could not close the MCP-config lock fd", exc_info=True)
 
 
@@ -178,7 +190,7 @@ def register_entry(
     fd = _lock(config_path)
     try:
         return _register_locked(config_path, server_name, desired, insert_only)
-    except Exception as exc:
+    except _RECOVERABLE as exc:
         logger.debug("register_entry failed for %s", config_path, exc_info=True)
         return ERROR, str(exc)
     finally:
@@ -202,7 +214,7 @@ def _register_locked(
     if original is not None:
         try:
             _atomic_write(Path(str(config_path) + ".bak"), original)
-        except Exception:
+        except OSError:
             logger.debug("could not write a .bak", exc_info=True)
     _atomic_write(config_path, payload)
     return status, str(config_path)
@@ -388,7 +400,7 @@ def _scan_registrations(
                     "base": str(base or path.parent),
                 }
             )
-    except Exception:
+    except _RECOVERABLE:
         logger.debug("could not scan %s for MCP registrations", path, exc_info=True)
 
 
@@ -426,7 +438,7 @@ def install_target(command: str, base: str | Path) -> str:
         if not p.is_absolute():
             p = Path(base) / p
         return str(p.resolve().parent)
-    except Exception:
+    except _RECOVERABLE:
         logger.debug("install_target failed for %r", command, exc_info=True)
         return str(command or "")
 
@@ -470,7 +482,7 @@ def split_server_warning(
             "under another. A project-scope entry only exists while that folder is "
             "open, so this is easy to hit without having changed anything."
         )
-    except Exception:
+    except _RECOVERABLE:
         logger.debug("split_server_warning failed", exc_info=True)
         return ""
 
@@ -482,7 +494,7 @@ def workspace_contains_server_warning(
     """One advisory line when the tester's OPEN WORKSPACE contains this
     server's own source tree.
 
-    A workspace that contains ``tools/mcp_handlers.py`` lets an agent import
+    A workspace that contains ``handlers/`` lets an agent import
     that module directly, or spawn its own stdio copy of this server inside
     its own environment, bypassing the registered tool surface and its
     dispatch guard entirely -- exactly how the 2026-09-25 Cursor audit
@@ -493,15 +505,15 @@ def workspace_contains_server_warning(
         root = Path(server_root) if server_root is not None else _SERVER_ROOT
         try:
             root = root.resolve()
-        except Exception:
+        except (OSError, RuntimeError):
             pass
-        marker = root / "tools" / "mcp_handlers.py"
+        marker = root / "handlers" / "__init__.py"
         if not marker.is_file():
             return ""
         for raw in workspace_roots or []:
             try:
                 candidate = Path(raw).resolve()
-            except Exception:
+            except (OSError, RuntimeError, TypeError, ValueError):
                 continue
             same = candidate == root
             root_inside_candidate = root != candidate and root_is_relative(
@@ -514,14 +526,14 @@ def workspace_contains_server_warning(
                 return (
                     "**Your open workspace contains this MCP server's own source "
                     f"tree** (`{root}`). An agent running in this workspace can "
-                    "import `tools/mcp_handlers.py` directly or start its own copy "
+                    "import `handlers/` directly or start its own copy "
                     "of this server, bypassing the registered tool surface and its "
                     "dispatch guard entirely. Point your editor at a dedicated "
                     "workspace instead, e.g. `~/qa-onboarding-ws`, and keep this "
                     "install's checkout closed while you run QA sessions."
                 )
         return ""
-    except Exception:
+    except _RECOVERABLE:
         logger.debug("workspace_contains_server_warning failed", exc_info=True)
         return ""
 
@@ -552,7 +564,7 @@ def register_all(
             status, detail = register_client(
                 path, start_command, insert_only=insert_only, require_dir=need
             )
-        except Exception as exc:  # pragma: no cover - register_client never raises
+        except _RECOVERABLE as exc:  # pragma: no cover - register_client never raises
             status, detail = ERROR, str(exc)
         results.append((label, status, detail))
     return results
@@ -603,7 +615,7 @@ def register_atlassian(
                 insert_only=insert_only,
                 require_dir=need,
             )
-        except Exception as exc:  # pragma: no cover - register_entry never raises
+        except _RECOVERABLE as exc:  # pragma: no cover - register_entry never raises
             status, detail = ERROR, str(exc)
         results.append((label, status, detail))
     return results

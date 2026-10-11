@@ -163,14 +163,8 @@ def _scan_suite_case(
         if first is None:
             first_by_title[title_key] = tc_id
         else:
-            findings.append(
-                QualityFinding(
-                    DUPLICATE_TITLE,
-                    tc_id,
-                    category,
-                    "same title as " + first,
-                )
-            )
+            detail = "same title as " + first
+            findings.append(QualityFinding(DUPLICATE_TITLE, tc_id, category, detail))
             if len(findings) >= _MAX_FINDINGS:
                 raise _Enough()
     try:
@@ -178,29 +172,22 @@ def _scan_suite_case(
     except Exception:
         steps = []
     for index, step in enumerate(steps, 1):
-        data = _text(step, "test_data")
-        if data and data.casefold() in PLACEHOLDER_TEST_DATA:
-            findings.append(
-                QualityFinding(
-                    EMPTY_TEST_DATA,
-                    tc_id,
-                    category,
-                    "step " + str(index) + " has no usable test_data",
-                )
-            )
-        action = normalize(_text(step, "action"))
-        expected = normalize(_text(step, "expected_result"))
-        if action and expected and action == expected:
-            findings.append(
-                QualityFinding(
-                    RESTATED_EXPECTED,
-                    tc_id,
-                    category,
-                    "step " + str(index) + " restates its action verbatim",
-                )
-            )
+        _scan_step(step, index, tc_id, category, findings)
         if len(findings) >= _MAX_FINDINGS:
             raise _Enough()
+
+
+def _scan_step(step, index: int, tc_id: str, category: str, findings: list) -> None:
+    """Scan one step for placeholder test data and an action restated as its result."""
+    data = _text(step, "test_data")
+    if data and data.casefold() in PLACEHOLDER_TEST_DATA:
+        detail = "step " + str(index) + " has no usable test_data"
+        findings.append(QualityFinding(EMPTY_TEST_DATA, tc_id, category, detail))
+    action = normalize(_text(step, "action"))
+    expected = normalize(_text(step, "expected_result"))
+    if action and expected and action == expected:
+        detail = "step " + str(index) + " restates its action verbatim"
+        findings.append(QualityFinding(RESTATED_EXPECTED, tc_id, category, detail))
 
 
 def gate_detail(result: QualityGateResult, limit: int = _MAX_EXAMPLES) -> str:

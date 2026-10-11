@@ -20,7 +20,7 @@ Two rules this module exists to keep:
    how a seventh source becomes unreachable while the text still claims six, and
    that half of the old rule was never the problem.
 2. **A packet is rendered, never rebuilt.** ``packet_block`` embeds the dict
-   ``agents/mobile_run`` produced and adds nothing to it. The pruned screen is
+   ``tools/mobile/run_packets`` produced and adds nothing to it. The pruned screen is
    already the only screen representation in there; the raw uiautomator XML has
    no route into this file.
 """
@@ -641,7 +641,7 @@ def without_goal(packet: object) -> dict:
 def packet_block(packet: object, *, session_token: str = "") -> str:
     """The packet as a fenced JSON block plus the no-echo instruction.
 
-    The packet is embedded exactly as ``agents/mobile_run`` built it. Nothing is
+    The packet is embedded exactly as ``tools/mobile/run_packets`` built it. Nothing is
     added to it here -- in particular no screen, no dump and no path -- so the
     compactness property is a property of that builder and this renderer
     together, and a test can assert it over the rendered reply.
@@ -834,7 +834,7 @@ def gate_block(point: object) -> str:
     )
 
 
-# Every value below comes off DISK, and session.py persists model-supplied
+# Every value below comes off DISK, and session_runs.py builds and run_store writes model-supplied
 # goal/package/serial into that manifest. A run resumes in any chat from its id,
 # so text planted by one chat is read by another chat's model: this is a
 # cross-chat injection channel, not merely display text.
@@ -1121,7 +1121,7 @@ def _typed_field_tally(rows: list[dict]) -> str:
     """ "N typed fields verified, M failed", naming each failed field.
 
     Read from each case's own trace: a ``type`` whose outcome is ``ok`` landed
-    (``executor._judge_landed`` made every other verdict a failure), and one
+    (``replay.device_ops._judge_landed`` made every other verdict a failure), and one
     that came back ``device_error`` or ``refused`` did not. Empty when the run
     typed nothing, so a run that never touched a field is not told about one.
     """
@@ -1441,13 +1441,14 @@ def _holder_finished(who: str) -> bool:
     if not who or who.startswith("provisioning:"):
         return False
     try:
-        from tools.mobile import session
+        from tools.mobile.session_core import STATE_REPORT
+        from tools.mobile.session_runs import resolve
 
-        resolved = session.resolve(who)
+        resolved = resolve(who)
         if resolved.get("error"):
             return False
         state = str((resolved.get("content") or {}).get("state") or "")
-        return state == session.STATE_REPORT
+        return state == STATE_REPORT
     except Exception:  # pragma: no cover - a refusal may not fail to render
         return False
 

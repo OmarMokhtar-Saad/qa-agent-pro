@@ -36,6 +36,7 @@ import uuid
 from pathlib import Path
 
 from config.settings import settings
+from tools import sqlite_store
 from tools.install_paths import resolve_data_path
 
 logger = logging.getLogger(__name__)
@@ -211,19 +212,25 @@ def _connect() -> sqlite3.Connection:
     never-raise contract still holds via the callers' error dicts).
     """
     path = _db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=_BUSY_TIMEOUT_S)
+    conn = sqlite_store.connect(
+        path,
+        timeout=_BUSY_TIMEOUT_S,
+        wal=True,
+        busy_timeout_ms=int(_BUSY_TIMEOUT_S * 1000),
+        pragmas_best_effort=True,
+        foreign_keys=True,
+        logger=logger,
+        log_label="prep_store",
+    )
     try:
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute(f"PRAGMA busy_timeout = {int(_BUSY_TIMEOUT_S * 1000)}")
-    except sqlite3.Error:
-        logger.debug("prep_store: WAL/busy_timeout pragmas unavailable", exc_info=True)
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.executescript(_SCHEMA)
-    # Best-effort migration for DBs created before touched_at existed.
-    # Probe-first and non-fatal: readers re-probe and degrade to the
-    # fixed TTL rather than ever selecting a missing column.
-    _ensure_touched_at(conn)
+        conn.executescript(_SCHEMA)
+        # Best-effort migration for DBs created before touched_at existed.
+        # Probe-first and non-fatal: readers re-probe and degrade to the
+        # fixed TTL rather than ever selecting a missing column.
+        _ensure_touched_at(conn)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
@@ -319,11 +326,13 @@ def _load_prep_sync(prep_id: str) -> dict | None:
         return None
 
 
-def _delete_prep_sync(prep_id: str) -> None:
+def _delete_prep_sync(prep_id: str) -> bool:
+    """Delete the prep; True only when THIS call removed a row (atomic claim)."""
     conn = _connect()
     try:
         with conn:  # transaction
-            conn.execute("DELETE FROM preps WHERE id = ?", (prep_id,))
+            cur = conn.execute("DELETE FROM preps WHERE id = ?", (prep_id,))
+            return cur.rowcount > 0
     finally:
         conn.close()
 
@@ -549,9 +558,12 @@ async def load_prep(prep_id: str) -> dict:
 async def delete_prep(prep_id: str) -> dict:
     """Delete a prep record (and its submissions, via cascade) once finalized."""
     try:
+        deleted = False
         if prep_id:
-            await asyncio.to_thread(_delete_prep_sync, prep_id)
-        return {"error": None, "content": {"prep_id": prep_id}}
+            deleted = await asyncio.to_thread(_delete_prep_sync, prep_id)
+        # ``deleted`` is False when another caller already removed the row, so a
+        # one-shot consumer (host_llm.close_task) can refuse a concurrent second close.
+        return {"error": None, "content": {"prep_id": prep_id, "deleted": deleted}}
     except Exception as exc:
         logger.exception("prep_store.delete_prep failed")
         return {"error": str(exc), "content": None}
@@ -706,7 +718,7 @@ def _clean_strings(raw: object, limit: int, item_len: int | None = None) -> list
 
 
 def _image_state(meta: dict) -> dict:
-    """The IMAGE state of an open prep (2026-08-09), so tools/mcp_handlers.py
+    """The IMAGE state of an open prep (2026-08-09), so handlers/
     can carry its screens forward into a re-prepare -- or refuse and NAME them
     -- instead of silently generating ungrounded. IDS AND COUNTS ONLY: image
     bytes are never persisted here. Every field is coerced defensively: this

@@ -66,7 +66,7 @@ ZERO findings, so on a clean ticket this detector adds NOTHING to the payload an
 leaves ``instructions`` byte-identical.
 
 The similarity measure is the F08 title-token Jaccard idiom
-(``agents/host_mode.build_dup_shortlist``), read in the opposite direction: F08
+(``agents/host_dedup.build_dup_shortlist``), read in the opposite direction: F08
 flags a HIGH overlap between two cases, this flags a ZERO overlap between two
 bindings. The tokeniser is re-declared here rather than imported because
 ``tools/`` must not import ``agents/`` -- that edge is what lets an agent be

@@ -21,13 +21,14 @@ on a timer without a tester wondering what a refresh just changed.
 Imports of the producers are LAZY, inside each builder, for the reason
 ``tools/flag_registry.py`` states about itself: importing this module must cost
 nothing. None of those producers imports the composition root
-(``tools/mcp_handlers.py``), and this module does not import it either: the
+(``handlers/``), and this module does not import it either: the
 edition facts only the composition root knows arrive INJECTED, as the
 ``edition_probe`` callable ``handle_machine_report`` hands to ``collect``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shutil
 from dataclasses import asdict, dataclass
@@ -163,6 +164,20 @@ def local_version() -> str | None:
     return _local_version(install_dir())
 
 
+#: What a probe of this machine can raise: a missing module, a bad shape, a
+#: failed OS call, or a timeout. Anything else is a bug and should surface.
+_PROBE_ERRORS = (
+    ImportError,
+    AttributeError,
+    KeyError,
+    TypeError,
+    ValueError,
+    RuntimeError,
+    OSError,
+    asyncio.TimeoutError,
+)
+
+
 def backend_info(edition_probe: Callable[[], dict] | None = None) -> dict:
     """Version AND edition in one call -- what a client needs to decide whether
     the backend it found is one it can talk to.
@@ -173,12 +188,12 @@ def backend_info(edition_probe: Callable[[], dict] | None = None) -> dict:
     try:
         version = str(local_version() or "unknown")
         root = str(install_dir())
-    except Exception as exc:  # never raises: a client polls this
+    except _PROBE_ERRORS as exc:  # never raises: a client polls this
         logger.info("machine_report: version unavailable: %s", exc)
     edition = {}
     try:
         edition = edition_probe() if edition_probe else {}
-    except Exception as exc:
+    except _PROBE_ERRORS as exc:
         logger.info("machine_report: edition unavailable: %s", exc)
     return {"version": version, "install_dir": root, "edition": edition}
 
@@ -195,7 +210,7 @@ def _append_version_row(rows: list) -> None:
                 "" if version else "Reinstall, or re-run the launcher.",
             )
         )
-    except Exception as exc:
+    except _PROBE_ERRORS as exc:
         rows.append(
             Row(
                 "backend_version",
@@ -240,7 +255,7 @@ def _append_privileges_row(rows: list) -> None:
                 else "Admin-free steps only on this account.",
             )
         )
-    except Exception as exc:
+    except _PROBE_ERRORS as exc:
         rows.append(Row("host_privileges", "undetermined", str(exc)))
 
 
@@ -316,7 +331,7 @@ def _append_mobile_sdk_rows(rows: list) -> None:
         rows.append(_adb_row(located, mobile_adb.resolve_adb()))
         for tool in SDK_TOOL_ROWS:
             rows.append(_sdk_tool_row(tool, located))
-    except Exception:
+    except _PROBE_ERRORS:
         _append_mobile_sdk_off_rows(rows)
 
 
@@ -335,7 +350,7 @@ def _append_mobile_ime_row(rows: list) -> None:
                 "" if ok else str(pinned.get("fix") or ""),
             )
         )
-    except Exception:
+    except _PROBE_ERRORS:
         # `off`, not `undetermined`: on a build with no mobile modules the
         # keyboard is not an open question, it is absent by construction.
         rows.append(
@@ -377,10 +392,8 @@ def _system_image_items() -> list:
     """
     component = "mobile_system_image"
     try:
-        import asyncio
-
         from tools.mobile import emulator, sdk_locator
-    except Exception:
+    except ImportError:
         return [
             Row(component, "off", "The mobile modules are not present in this edition.")
         ]
@@ -398,7 +411,7 @@ def _probe_booted(asyncio, emulator, component: str) -> "list | Row":
                 emulator.list_running(), timeout=SYSTEM_IMAGE_PROBE_TIMEOUT_S
             )
         )
-    except Exception:
+    except _PROBE_ERRORS:
         return Row(
             component,
             "undetermined",
@@ -573,7 +586,7 @@ def client_rows(home=None) -> list:
         found = []
         try:
             found = list(client_registry.discover_registrations(home) or [])
-        except Exception as exc:
+        except _PROBE_ERRORS as exc:
             logger.info("machine_report: discovery failed: %s", exc)
         mine = str(install_dir())
         by_config = {}
@@ -584,7 +597,7 @@ def client_rows(home=None) -> list:
         for label, config_path, _dir in client_registry.default_targets(home):
             rows.append(_client_row(label, _Path(config_path), by_config, mine))
         rows.append(_claude_code_row(home, by_config, mine))
-    except Exception as exc:
+    except _PROBE_ERRORS as exc:
         rows.append(Row("mcp_clients", "undetermined", str(exc)))
     return _rows(rows)
 

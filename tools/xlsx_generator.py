@@ -4,23 +4,37 @@ from __future__ import annotations
 
 import logging
 import math
-import tempfile
-import time
-from pathlib import Path
+import tempfile  # noqa: F401  # tests patch tools.<module>.tempfile.gettempdir
 from typing import NamedTuple
 
 import xlsxwriter
 
 from tools.bilingual import bidi_isolate, is_rtl_cell
 from tools.cell_sanitizer import sanitize_cell
+from tools.export_common import resolve_output_path
 from tools.models import (
     TestSuite,
     display_requirement_id,
     format_test_data_lines,
 )
-from tools.secure_temp import SUBDIR_NAME, make_secure_temp_path
+from tools.secure_temp import (
+    cleanup_temp_files as _sweep_temp_files,
+)
 
 logger = logging.getLogger(__name__)
+
+# What a cell renderer can raise on a malformed case: bad value types or a
+# missing attribute (``OverflowError`` covers ``int(inf)``).
+_CELL_ERRORS = (ValueError, TypeError, AttributeError, OverflowError)
+# What a sheet writer can raise: the above, plus bad rows or xlsxwriter itself
+# refusing the sheet (duplicate name, closed workbook, bad range).
+_SHEET_ERRORS = (
+    *_CELL_ERRORS,
+    LookupError,
+    ImportError,
+    OSError,
+    xlsxwriter.exceptions.XlsxWriterException,
+)
 
 # One row per test case — steps and expected results joined with newlines.
 # Risk Score / Risk Label / Risk Rationale / Stable ID are intentionally NOT
@@ -117,7 +131,7 @@ def _prepare(text: str) -> str:
     suite. Never raises."""
     try:
         return bidi_isolate(sanitize_cell(text or ""))
-    except Exception:  # pragma: no cover - defensive
+    except _CELL_ERRORS:  # pragma: no cover - defensive
         logger.debug("cell preparation failed", exc_info=True)
         return sanitize_cell(text or "")
 
@@ -176,7 +190,7 @@ def _risk_score_cell(tc: object) -> int | None:
             return None
         score = getattr(tc, "risk_score", None)
         return int(score) if score is not None else None
-    except Exception:  # pragma: no cover - defensive
+    except _CELL_ERRORS:  # pragma: no cover - defensive
         logger.debug("risk score cell rendering failed -- left blank", exc_info=True)
         return None
 
@@ -198,17 +212,14 @@ def _requirement_cell(tc: object) -> str:
         return (
             display_requirement_id(getattr(tc, "requirement_id", "")) or _UNTRACED_LABEL
         )
-    except Exception:  # pragma: no cover - defensive
+    except _CELL_ERRORS:  # pragma: no cover - defensive
         logger.debug("requirement cell rendering failed", exc_info=True)
         return _UNTRACED_LABEL
 
 
 def generate_test_case_xlsx(suite: TestSuite, output_path: str | None = None) -> str:
     """Write suite to an XLSX file and return the file path."""
-    if output_path is None:
-        output_path = make_secure_temp_path(prefix="qa_test_cases_", suffix=".xlsx")
-
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    output_path = resolve_output_path(output_path, ".xlsx")
 
     workbook = xlsxwriter.Workbook(output_path, {"strings_to_formulas": False})
     try:
@@ -226,26 +237,14 @@ def generate_test_case_xlsx(suite: TestSuite, output_path: str | None = None) ->
 
 def cleanup_temp_files(max_age_seconds: int = 3600) -> int:
     """Delete qa_test_cases_*.xlsx temp files older than max_age_seconds. Returns count deleted."""
-    tmp_dir = Path(tempfile.gettempdir())
-    now = time.time()
-    deleted = 0
-    # Sweep both the secure export subdir (new location) and the tempdir root
-    # (legacy pre-QW-18 files) so nothing is orphaned.
-    for base in (tmp_dir / SUBDIR_NAME, tmp_dir):
-        for path in base.glob("qa_test_cases_*.xlsx"):
-            try:
-                age = now - path.stat().st_mtime
-                if age > max_age_seconds:
-                    path.unlink(missing_ok=True)
-                    deleted += 1
-                    logger.info(
-                        "Cleaned up stale XLSX temp file: %s (age %.0fs)", path, age
-                    )
-            except OSError:
-                logger.warning("Could not check/delete temp file: %s", path)
-    if deleted:
-        logger.info("XLSX cleanup: removed %d stale file(s)", deleted)
-    return deleted
+    return _sweep_temp_files(
+        max_age_seconds=max_age_seconds,
+        pattern="qa_test_cases_*.xlsx",
+        label="XLSX",
+        sweep_tmp_root=True,
+        require_subdir=False,
+        log=logger,
+    )
 
 
 def _sheet_formats(
@@ -305,11 +304,11 @@ def _write_checklist_sheets(workbook: xlsxwriter.Workbook, suite: TestSuite) -> 
                 ws.set_column(0, 0, 14)
                 ws.set_column(1, max(1, len(rows[0]) - 1), 42)
                 _write_grid(ws, rows, header_fmt, cell_fmt)
-            except Exception:
+            except _SHEET_ERRORS:
                 logger.warning(
                     "Failed writing the %s sheet — skipping it", name, exc_info=True
                 )
-    except Exception:
+    except _SHEET_ERRORS:
         logger.warning("checklist-sheet generation failed — skipping", exc_info=True)
 
 
@@ -351,7 +350,7 @@ def _write_rtm_sheet(workbook: xlsxwriter.Workbook, suite: TestSuite) -> None:
         ws.set_column(3, 3, 42)
         ws.set_column(4, 4, 14)
         _write_grid(ws, rows, header_fmt, cell_fmt)
-    except Exception:
+    except _SHEET_ERRORS:
         logger.warning(
             "Failed writing the Requirements Traceability sheet - skipping it",
             exc_info=True,
@@ -394,7 +393,7 @@ def _write_generation_notes_sheet(
                 finding, detail = "Note", row
             ws.write(r, 0, sanitize_cell(str(finding)), cell_fmt)
             ws.write(r, 1, sanitize_cell(str(detail)), cell_fmt)
-    except Exception:
+    except _SHEET_ERRORS:
         logger.warning(
             "Failed writing the Generation Notes sheet - skipping it",
             exc_info=True,
@@ -423,7 +422,7 @@ def _write_assumed_sheet(workbook: xlsxwriter.Workbook, suite: TestSuite) -> Non
         ws.set_column(0, 1, 14)
         ws.set_column(2, max(2, len(rows[0]) - 1), 42)
         _write_grid(ws, rows, header_fmt, cell_fmt)
-    except Exception:
+    except _SHEET_ERRORS:
         logger.warning(
             "Failed writing the Assumed Requirements sheet - skipping it",
             exc_info=True,

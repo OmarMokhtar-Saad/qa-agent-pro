@@ -72,6 +72,18 @@ from tools.xlsx_generator import generate_test_case_xlsx
 
 logger = logging.getLogger(__name__)
 
+# What a best-effort step (status callback, private-attr attach, log line,
+# disclosure text) can raise; anything else is a real bug and must surface.
+_BEST_EFFORT_ERRORS = (
+    AttributeError,
+    KeyError,
+    LookupError,
+    OSError,
+    RuntimeError,
+    TypeError,
+    ValueError,
+)
+
 
 async def _emit_status(
     on_status: Callable[[str], Awaitable[None]] | None, message: str
@@ -84,7 +96,7 @@ async def _emit_status(
         return
     try:
         await on_status(message)
-    except Exception:
+    except _BEST_EFFORT_ERRORS:
         logger.debug("on_status callback failed for %r", message, exc_info=True)
 
 
@@ -202,7 +214,7 @@ def effective_categories() -> list[tuple[str, str, str]]:
 # _finalize_generation; P2-E3 deleted that branch and analyze_feature with it, so
 # this copy governed nothing. The two that matter are untouched and still gate
 # TOOL REGISTRATION: mcp_server._feature_analysis_enabled and
-# tools.mcp_handlers._feature_analysis_enabled. qa_feature_analysis and
+# handlers._common._feature_analysis_enabled. qa_feature_analysis and
 # qa_submit_feature_analysis are unaffected -- they are chat-only, and
 # agents/feature_analysis.py keeps everything they use
 # (build_feature_analysis_prompt, finalize_feature_report,
@@ -218,7 +230,7 @@ def checklist_remediation_enabled() -> bool:
     2026-08-16 (dead-code deletion P2-E1): the bounded critic/regeneration loop
     this seam used to switch -- ``_remediate_gaps`` and the critic pair -- was
     DELETED, so inside THIS module the seam now governs nothing. Its own
-    HOST-side reader (tools/mcp_handlers' GAP ROUND block) was deleted too, so
+    HOST-side reader (handlers' GAP ROUND block) was deleted too, so
     this function has no remaining reader; retained for revival rather than
     deleted outright.
     """
@@ -420,7 +432,7 @@ For each distinct data field the test needs, add ONE object with:
 """
 
 # The rules the host-mode category jobs inject into a FRESH prompt
-# (agents/host_mode.py). Until 2026-08-16 this was a SPLIT: a
+# (agents/host_*.py). Until 2026-08-16 this was a SPLIT: a
 # _QUALITY_RETRY_PREAMBLE that ACCUSED the model of prior bad output, correct
 # only on a genuine re-ask, plus the body below. P2-E2 deleted the server-side
 # retry/repair ladder that was the preamble's only consumer, so only the body
@@ -580,11 +592,11 @@ def _strip_html(text: str) -> str:
 # _describe_ticket_images made one llm.ask_vision call per ticket image so
 # the description could reach the text-only generation prompt, under ledger
 # id `test_scenario_agent.jira_images`. It was dead: the only caller of
-# _prepare_generation (tools/mcp_handlers.handle_prepare_test_cases) passes
+# _prepare_generation (handlers.handle_prepare_test_cases) passes
 # describe_images_server_side=False as a LITERAL, and the legacy routes that
 # still reached it -- graph.py and evals/ -- were deleted in P2-A and P2-B.
 # The raw bytes ride to the tester's OWN multimodal model through
-# agents/host_mode.IMAGE_JOB, which is strictly better: this call was api
+# agents/host_image.IMAGE_JOB, which is strictly better: this call was api
 # backend only and returned nothing at all on cli/cursor. The ledger id
 # stays in tools/host_llm.LEDGER_IDS -- that frozenset never shrinks.
 
@@ -715,7 +727,7 @@ def _case_count_bounds(
     # a real suite. Length and this signal score cannot separate the two, so
     # tuning the COUNT here trades a documented over-generation for an
     # undocumented under-generation. What was fixed instead is the missing
-    # caveat: host_mode._thin_source adds a do-not-invent clause to
+    # caveat: host_category_jobs._thin_source adds a do-not-invent clause to
     # worker_instructions for exactly this shape. A count-level fix needs a
     # signal that reads whether the text names a SURFACE, which this one does
     # not.
@@ -913,7 +925,7 @@ def _url_host(url: str) -> str:
 
 def _is_jira_ticket_url(url: str) -> bool:
     """True for an Atlassian/Jira issue-tracker SOURCE URL (mirrors the host
-    detection in tools/mcp_handlers._jira_config_hint).
+    detection in handlers._jira_config_hint).
 
     Such a URL documents requirements; it is NOT the application under test and
     must never become a navigation target (TICKET-7154). NOTE: only Atlassian/Jira
@@ -1069,11 +1081,11 @@ def _build_parent_scope_directive(target_title: str) -> str:
 # EACH of the 8 to derive its OWN AC-001..AC-00N list, and the merged suite then
 # carries colliding ids meaning different things per category -- which
 # extract_host_acs' id reassignment would silently re-point again. So derivation
-# lives ONLY in the parent-facing job spec (agents.host_mode.AC_JOB); this half
+# lives ONLY in the parent-facing job spec (agents.host_ac.AC_JOB); this half
 # says the list is SUPPLIED, forbids deriving or renumbering, and forbids
 # inventing an id when no list arrived (null is correct there, a fabricated id is
 # not). Divergence is still DETECTED deterministically at submit -- see the
-# unknown-id line in host_mode.build_host_ac_section.
+# unknown-id line in host_ac.build_host_ac_section.
 _HOST_AC_JOB_DIRECTIVE = (
     "\n\n## Acceptance Criteria (SUPPLIED to you -- populate requirement_id)\n"
     "This ticket carries no acceptance criteria of its own. ONE list of derived "
@@ -1141,7 +1153,7 @@ def _source_acs(
     Returns ``(acs, source_acs, need_acs, host_ac_job)``. ``source_acs`` holds
     only REAL, source-parsed criteria (empty when the host must derive them),
     the one ground truth the AC-anchoring check may anchor against. When no
-    criteria exist the HOST derives them (``agents.host_mode.AC_JOB``); there is
+    criteria exist the HOST derives them (``agents.host_ac.AC_JOB``); there is
     no server-side synthesis, so ``host_ac_job`` always equals ``need_acs``.
     """
     acs: list[AcceptanceCriterion] = []
@@ -1528,8 +1540,8 @@ def _prepared_generation(**live: Any) -> PreparedGeneration:
 
     * checklist_items / checklist_presented_ids / checklist_audit stay empty for
       the whole of prepare: the atomic checklist is derived by the tester's OWN
-      model (agents.host_mode.CHECKLIST_JOB) and arrives on the SUBMISSION, where
-      tools/mcp_handlers.py validates it (and runs the granularity audit) and
+      model (agents.host_checklist.CHECKLIST_JOB) and arrives on the SUBMISSION, where
+      handlers/ validates it (and runs the granularity audit) and
       sets prepared.checklist_items. The fields stay so nothing reads them by
       ABSENCE; mcp_handlers reads checklist_presented_ids back on the submit side.
     * jira_image_text / attached_image_text / image_notice are always "": the
@@ -1649,7 +1661,7 @@ def _host_suppression_section(
             "`test_scenario_agent.rewrite_vague` and "
             "`test_scenario_agent.markdown`."
         )
-    except Exception:  # pragma: no cover - defensive; disclosure must never break
+    except _BEST_EFFORT_ERRORS:  # pragma: no cover - disclosure must never break
         logger.debug("_host_suppression_section failed", exc_info=True)
         return ""
 
@@ -1784,7 +1796,7 @@ def _checklist_section(suite, checklist_items, checklist_audit) -> str:
             "items": checklist_to_dicts(checklist_items),
             "audit": checklist_audit,
         }
-    except Exception:
+    except _BEST_EFFORT_ERRORS:
         logger.debug("attaching checklist artifacts failed", exc_info=True)
     return section
 
@@ -1800,7 +1812,7 @@ def _rule_pack_report(suite, renumbered, rule_packs, rule_pack_ctx) -> str:
     if rule_pack_notes_map:
         try:
             suite._rule_pack_notes = rule_pack_notes_map
-        except Exception:
+        except _BEST_EFFORT_ERRORS:
             logger.debug("attaching rule-pack notes failed", exc_info=True)
     rule_pack_ctx["notes"] = rule_pack_notes_map
     return rule_pack_section(
@@ -2048,7 +2060,7 @@ def _log_finalize_funnel(suite, renumbered, quality_section: str) -> None:
                 - {""}
             ),
         )
-    except Exception:
+    except _BEST_EFFORT_ERRORS:
         logger.debug("finalize summary log failed", exc_info=True)
 
 
@@ -2104,7 +2116,7 @@ def _dedupe_and_log(all_cases: list[TestCase]) -> list[TestCase]:
 
 def _rtm_headline(acs: list, source_acs: list, suite: TestSuite) -> str:
     # 2026-08-03: `acs` may be MODEL-DERIVED rather than read from the ticket.
-    # tools/mcp_handlers sets prepared.acs from the host's AC_JOB when the
+    # handlers sets prepared.acs from the host's AC_JOB when the
     # ticket carried none, and deliberately leaves source_acs empty, so the two
     # fields together ARE the provenance -- no extra plumbing needed. Without
     # this the headline line claimed "6/6 acceptance criteria traced, all
@@ -2134,7 +2146,7 @@ def _attach_rtm_data(
         suite._rtm_artifacts = {
             "rows": rtm_rows(acs, renumbered, derived=bool(acs) and not source_acs)
         }
-    except Exception:  # pragma: no cover - rtm_trace never raises
+    except _BEST_EFFORT_ERRORS:  # pragma: no cover - rtm_trace never raises
         logger.debug("could not attach _rtm_trace", exc_info=True)
 
 
@@ -2151,7 +2163,7 @@ def _attach_rtm_data(
 # THIS CALL IS THE SECOND OF TWO, and it does not close the finding on its own
 # (review round 2, C1). A chained ref crosses TWO renumbers, and each needs its
 # own carrier:
-#   1. the MERGE, `tools/mcp_handlers._merge_category_rows`, which flattens the
+#   1. the MERGE, `handlers._merge_category_rows`, which flattens the
 #      per-category submissions into one TC-0001..N sequence. That is handled
 #      THERE, by `_remap_chained_from`, per CATEGORY ROW -- the only place a
 #      host-written tc_id is unambiguous, since every category numbers from
@@ -2335,22 +2347,32 @@ def _summary_head(
 # a short summary (counts + gaps) without the per-case tables.
 # single_screen left this signature on 2026-08-16: P2-E1 deleted the remediation
 # block that was its only reader here -- _prepare_generation keeps its own copy.
+@dataclass(frozen=True)
+class _FinalizeOptions:
+    """Keyword options of ``_finalize_generation`` (an unknown name raises)."""
+
+    on_progress: Callable[[int], Awaitable[None]] | None = None
+    on_status: Callable[[str], Awaitable[None]] | None = None
+    defer_files: bool = False
+    on_suite_ready: Callable[[TestSuite], None] | None = None
+    on_report_ready: Callable[[str], None] | None = None
+    ui_content: dict | None = None
+
+
 async def _finalize_generation(
     prepared: PreparedGeneration,
     all_cases: list[TestCase],
     category_results: list[CategoryResult],
-    *,
-    on_progress: Callable[[int], Awaitable[None]] | None = None,
-    on_status: Callable[[str], Awaitable[None]] | None = None,
-    defer_files: bool = False,
-    on_suite_ready: Callable[[TestSuite], None] | None = None,
-    on_report_ready: Callable[[str], None] | None = None,
-    ui_content: dict | None = None,
+    **options: Any,
 ) -> tuple[str, str, str, str, str]:
     """Finalize a generated suite: dedupe, score, renumber, report, export.
 
+    Keyword options are those of ``_FinalizeOptions``.
     Returns (summary, xlsx, csv, testrail, status); phase notes sit above the helpers.
     """
+    opts = _FinalizeOptions(**options)
+    on_status, on_progress = opts.on_status, opts.on_progress
+    defer_files, on_suite_ready = opts.defer_files, opts.on_suite_ready
     all_cases = _dedupe_for_finalize(all_cases, prepared.source_acs)
     await _emit_status(on_status, "📊 Scoring by risk and finalizing the test suite…")
     scored, risk_section, rule_pack_ctx, out_of_scope_ids = _score_and_scope(

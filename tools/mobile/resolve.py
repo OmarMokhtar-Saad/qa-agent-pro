@@ -12,7 +12,7 @@ install source decides through :func:`resolve_or_ask`. The rule is the owner's
   production flavour when a qa and a master flavour are installed too.
 
 The question travels through an injected :data:`AskCb` (the host builds it from
-MCP elicitation), so this module imports nothing from ``tools.mcp_handlers``.
+MCP elicitation), so this module imports nothing from ``handlers``.
 When the callback is missing, declined or raising, the caller gets the
 unresolved :class:`Resolution` back and shows :meth:`Resolution.menu` instead.
 """

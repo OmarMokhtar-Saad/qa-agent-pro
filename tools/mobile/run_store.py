@@ -81,7 +81,7 @@ import shutil
 import time
 from pathlib import Path
 
-from tools.mobile import paths
+from tools.mobile import explore_stop, paths
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +175,7 @@ MAX_RUN_OBSERVATIONS = 400
 #: resume is not a cap.
 MAX_RUN_SHOTS = 400
 
-_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_RUN_ID_RE = paths.RUN_ID_RE
 _TC_ID_RE = re.compile(r"^TC-\d{3,6}$")
 _SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
@@ -985,17 +985,10 @@ def _has_verdict(case: object) -> bool:
 def _expected_verdicts(body: dict, lane: str, total: int) -> int:
     """How many records were ever MEANT to earn a verdict; see :func:`verdict_coverage`."""
     if lane == "explore":
-        # LOCAL import, and not a cycle: `explore_runner` imports this module at
-        # module scope, so the edge must not be repaid at import time -- but by
-        # the time this function is CALLED both modules are fully loaded, and
-        # nothing in `explore_runner`'s module body calls back here.
-        #
         # `display_stop`, not `stop_reason`: this is a RENDER path (the page and
         # the status reply), and a coverage count that raised on a junk manifest
         # would take the whole page with it.
-        from tools.mobile import explore_runner
-
-        return 1 if explore_runner.display_stop(body) else 0
+        return 1 if explore_stop.display_stop(body) else 0
     try:
         planned = int(body.get("total") or 0)
     except (TypeError, ValueError, OverflowError):
@@ -1023,7 +1016,7 @@ def verdict_coverage(cases: object, manifest: object = None) -> dict:
     * the EXPLORE lane earns ONE verdict for the whole run, on the turn that
       judges the goal. A turn has no expected result, so counting 17
       exploratory turns as 17 missing verdicts reports a gap that does not
-      exist. ``expected`` is 1 once ``explore_runner.display_stop`` calls the
+      exist. ``expected`` is 1 once ``explore_stop.display_stop`` calls the
       run stopped, and 0 before that. NOT ``explore.stop``, which is one of that
       producer's three clauses: a run stopped by its deadline or its turn budget
       never sets the field, so this counted it as still running and the page

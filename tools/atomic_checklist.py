@@ -5,8 +5,8 @@ Pass 1 of the checklist pipeline USED to live here as
 ticket into an UNBOUNDED, EARS-shaped, source-tagged flat checklist. It was
 DELETED on 2026-08-16 (dead-code deletion P2-F2) -- see the tombstone below
 the response models. The decomposition now runs on the TESTER'S OWN model as
-agents/host_mode.CHECKLIST_JOB (stage step_zero) and arrives back on the
-submission, where tools/mcp_handlers.py validates its shape and sets
+agents/host_checklist.CHECKLIST_JOB (stage step_zero) and arrives back on the
+submission, where handlers/ validates its shape and sets
 ``prepared.checklist_items``. What this module still does is CONSUME that
 checklist:
 
@@ -18,7 +18,7 @@ checklist:
 
 ``checklist_enabled()`` is LIVE and load-bearing -- a True constant since
 2026-08-14, when QA_ATOMIC_CHECKLIST_ENABLED was DELETED and the behaviour
-hardcoded ON. tools/mcp_handlers.py reads it at call time to decide whether
+hardcoded ON. handlers/ reads it at call time to decide whether
 CHECKLIST_JOB ships to the host. tests/conftest.py pins it False suite-wide.
 
 TRUNCATION IS NEVER SILENT. ``format_checklist_prompt_block`` returns BOTH the
@@ -42,7 +42,7 @@ resolved comments deterministically in Python and injected its own fenced,
 provenanced AMENDMENTS block into the generation prompt; dead-code deletion
 batch D5 deleted that module on 2026-08-15. CHECKLIST_JOB's prompt inherits
 the same rule, and the host's reply is treated as UNTRUSTED and shape-capped
-by agents/host_mode.py before any item reaches a report.
+by agents/host_*.py before any item reaches a report.
 
 PROVENANCE IS A READING AID, NOT A SECURITY CONTROL. ``source`` is SELF-REPORTED
 by the same model call that reads the ticket. ``normalize_source`` folds anything
@@ -301,7 +301,7 @@ class ChecklistItem(BaseModel):
 #
 # The EARS shape, the atomicity rule, the worked example and the source-tag
 # allowlist that _DECOMPOSE_SYSTEM taught are NOT lost -- they are the
-# instruction text of agents/host_mode.CHECKLIST_JOB, which asks the tester's
+# instruction text of agents/host_checklist.CHECKLIST_JOB, which asks the tester's
 # own model for the same decomposition. ``normalize_source`` and
 # ``EARS_PATTERNS`` are LIVE and are what validate the host's reply.
 
@@ -363,14 +363,14 @@ def checklist_enabled() -> bool:
 #
 # It was dead. Its only caller was agents/test_scenario_agent._run_checklist,
 # which ran only under `decompose_checklist=True`; the one live caller of
-# _prepare_generation (tools/mcp_handlers.handle_prepare_test_cases) passed
+# _prepare_generation (handlers.handle_prepare_test_cases) passed
 # decompose_checklist=not _checklist_job, and `_checklist_job` is True on
 # every install (checklist_enabled() is a True constant and the mode is "host"
 # by constant). graph.py and evals/, the last routes that reached it, were
 # deleted in P2-A and P2-B.
 #
-# There is NO capability loss: the decomposition is agents/host_mode.CHECKLIST_JOB
-# on the tester's own model, and tools/mcp_handlers.py sets the validated result
+# There is NO capability loss: the decomposition is agents/host_checklist.CHECKLIST_JOB
+# on the tester's own model, and handlers/ sets the validated result
 # onto prepared.checklist_items at submit. checklist_enabled() above STAYS --
 # it is live and gates whether that job ships.
 

@@ -7,7 +7,7 @@ the feature is on (unconditional since 2026-08-14, batch 8c).
 
 House rules honoured: this module imports no routing or handler layer (the
 ``router.py`` the rule used to name was deleted in P2-A, 2026-08-15; what the
-rule protects now is that ``agents/`` never imports ``tools/mcp_handlers.py``,
+rule protects now is that ``agents/`` never imports ``handlers/``,
 so an agent can be exercised without the MCP transport); secrets come from
 ``.env`` via config.settings only; no
 bare ``print()`` -- logging only. Never raises to its caller: ``analyze_feature``
@@ -313,14 +313,12 @@ async def prepare_feature_analysis(
     dict; never raises.
     """
     try:
-        system, user = build_feature_analysis_prompt(
-            feature_text,
-            jira_text,
-            screenshot_descriptions,
+        system, user = _round_prompt(
+            (feature_text, jira_text, screenshot_descriptions),
             ui_content,
-            list(acs or []),
-            reminder=_RESUBMIT_REMINDER if int(round_no) > 1 else "",
-            screens_attached=int(screens or 0),
+            acs,
+            screens,
+            round_no,
         )
         return await open_task(
             "feature_analysis",
@@ -340,6 +338,26 @@ async def prepare_feature_analysis(
     except Exception as exc:
         logger.exception("prepare_feature_analysis failed")
         return {"error": str(exc), "content": None}
+
+
+def _round_prompt(
+    texts: tuple[str, str, str],
+    ui_content: dict | None,
+    acs: list | None,
+    screens: int,
+    round_no: int,
+) -> tuple[str, str]:
+    """The (system, user) prompt for this round; a resubmit adds the reminder."""
+    feature_text, jira_text, screenshot_descriptions = texts
+    return build_feature_analysis_prompt(
+        feature_text,
+        jira_text,
+        screenshot_descriptions,
+        ui_content,
+        list(acs or []),
+        reminder=_RESUBMIT_REMINDER if int(round_no) > 1 else "",
+        screens_attached=int(screens or 0),
+    )
 
 
 def _task_meta(

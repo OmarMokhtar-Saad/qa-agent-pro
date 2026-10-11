@@ -47,6 +47,7 @@ Never raises: every public function returns ``{"error", "content"}``.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
@@ -441,6 +442,17 @@ def _acquire_in_process(mine: _Held, label: str, lease: str) -> dict:
     return _acquire_result("held_in_this_process", label, mine.owner, same_process=True)
 
 
+#: errnos a non-blocking exclusive lock reports when another holder has it
+#: (``flock`` -> EWOULDBLOCK/EAGAIN, ``msvcrt.locking`` -> EACCES/EDEADLK).
+_CONTENTION_ERRNOS = frozenset(
+    {errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES, errno.EDEADLK}
+)
+
+
+def _is_contention(exc: OSError) -> bool:
+    return isinstance(exc, BlockingIOError) or exc.errno in _CONTENTION_ERRNOS
+
+
 def _acquire_file(key: str, label: str, lease: str, moment: float) -> dict:
     """Take the kernel lock on *key*'s file; caller holds ``_MUTEX``."""
     paths.ensure_tree()
@@ -457,8 +469,13 @@ def _acquire_file(key: str, label: str, lease: str, moment: float) -> dict:
             os.name,
         )
         return _acquire_result("no_lock_facility", label, "", same_process=False)
-    except (BlockingIOError, OSError):
+    except OSError as exc:
         os.close(fd)
+        if not _is_contention(exc):
+            # ENOLCK, EBADF, EIO...: the lock facility is broken, which is not
+            # "someone else is using the device". Let `acquire` log it and
+            # answer with an error rather than a misleading busy refusal.
+            raise
         return _contended_result(key, label, moment)
     _HELD[key] = _Held(fd=fd, owner=label, since=moment, lease=str(lease or ""))
     _stamp(key, fd, label, moment)

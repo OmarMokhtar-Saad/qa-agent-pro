@@ -127,7 +127,7 @@ def _list(heading: str, items: list, esc) -> str:
 def render_section(section: object) -> str:
     try:
         body = section if isinstance(section, dict) else {}
-        from tools.mobile.report import esc
+        from tools.mobile.report_text import esc
 
         parts = [
             _list("learned this run", body.get("learned") or [], esc),

@@ -50,6 +50,7 @@ from urllib.parse import parse_qs, urlparse
 
 import llm
 from config.settings import settings
+from tools.untrusted import single_line, strip_spoof_tags
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +135,11 @@ def _tool_prefix() -> str:
     """
     try:
         value = str(getattr(settings, "qa_jira_mcp_tool_prefix", "") or "").strip()
-    except Exception:  # pragma: no cover - settings is lenient by contract
+    except (
+        AttributeError,
+        TypeError,
+        ValueError,
+    ):  # pragma: no cover - settings is lenient
         value = ""
     return value or "mcp__atlassian__"
 
@@ -209,7 +214,11 @@ def issue_url_for_key(key: object) -> str:
         return ""
     try:
         base = str(settings.jira_base_url or "").strip().rstrip("/")
-    except Exception:  # pragma: no cover - settings is lenient by contract
+    except (
+        AttributeError,
+        TypeError,
+        ValueError,
+    ):  # pragma: no cover - settings is lenient
         base = ""
     if not base.lower().startswith(("http://", "https://")):
         return ""
@@ -217,7 +226,7 @@ def issue_url_for_key(key: object) -> str:
         parsed = urlparse(base)
         if parsed.username or parsed.password or "@" in (parsed.netloc or ""):
             return ""
-    except Exception:  # pragma: no cover - urlparse on an http(s) string
+    except ValueError:  # pragma: no cover - urlparse on an http(s) string
         return ""
     return f"{base}/browse/{valid}"
 
@@ -235,7 +244,7 @@ def selected_issue_key(url: str) -> str:
                 key = _valid_issue_key(value)
                 if key:
                     return key
-    except Exception:
+    except (ValueError, TypeError, AttributeError):
         logger.debug("selected_issue_key: parse failed", exc_info=True)
     return ""
 
@@ -284,11 +293,16 @@ def is_jira_host(url: str) -> bool:
         return False
     if not host:
         return False
-    if "atlassian.net" in host or host.startswith("jira.") or ".jira." in host:
+    if (
+        host == "atlassian.net"
+        or host.endswith(".atlassian.net")
+        or host.startswith("jira.")
+        or ".jira." in host
+    ):
         return True
     try:
         configured = (urlparse(settings.jira_base_url or "").hostname or "").lower()
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         configured = ""
     return bool(configured) and host == configured
 
@@ -557,7 +571,7 @@ def _workspace_config_paths(
     for root in workspace_roots or []:
         try:
             paths.append(Path(root).joinpath(*parts))
-        except Exception:
+        except (TypeError, ValueError):
             logger.debug("ignoring unusable workspace root %r", root, exc_info=True)
     return paths
 
@@ -3175,7 +3189,10 @@ def build_fetch_directive(url: str, issue_key: str = "") -> str:
         prefix = _tool_prefix()
         token = secrets.token_urlsafe(16)
         key = _valid_issue_key(issue_key) or issue_key_from_url(url)
-        target = f"`{key}`" if key else f"the issue at {url}"
+        # The URL is caller-supplied text going into a directive the host model
+        # reads as trusted: one line, no backticks, no spoofed delimiter tags.
+        shown_url = strip_spoof_tags(single_line(url, 300))
+        target = f"`{key}`" if key else f"the issue at `{shown_url}`"
         want_comments = bool(settings.jira_fetch_comments)
         want_parent = bool(settings.jira_fetch_parent)
         # An EMPTY JIRA_AC_FIELD is a legitimate configuration -- a project may
@@ -3241,17 +3258,22 @@ def _load_payload(raw: object) -> tuple[dict, str]:
     over _MAX_PAYLOAD_BYTES before parsing.
     """
     try:
+        too_large = (
+            "That Jira payload is too large to accept "
+            f"(over {_MAX_PAYLOAD_BYTES // 1000} KB). Re-fetch the issue "
+            "requesting only the fields listed in the directive."
+        )
         if isinstance(raw, dict):
+            # A parsed dict skipped the cap a JSON string gets; size it the same.
+            size = len(json.dumps(raw, default=str).encode("utf-8", "ignore"))
+            if size > _MAX_PAYLOAD_BYTES:
+                return {}, too_large
             return raw, ""
         text = str(raw or "").strip()
         if not text:
             return {}, "empty"
         if len(text.encode("utf-8", "ignore")) > _MAX_PAYLOAD_BYTES:
-            return {}, (
-                "That Jira payload is too large to accept "
-                f"(over {_MAX_PAYLOAD_BYTES // 1000} KB). Re-fetch the issue "
-                "requesting only the fields listed in the directive."
-            )
+            return {}, too_large
         if text.startswith("```"):
             text = text.split("\n", 1)[-1]
             if text.rstrip().endswith("```"):

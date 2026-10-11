@@ -1,7 +1,7 @@
 """One place that builds ``adb`` argv, and the only place that can feed it stdin.
 
-Every device identifier is re-validated with ``device_manager._valid_device_id``
-and every package name with ``device_manager.valid_package_name`` before it
+Every device identifier is re-validated with ``device_ids._valid_device_id``
+and every package name with ``device_ids.valid_package_name`` before it
 reaches a subprocess, so a client-controlled string can never smuggle an extra
 argument. There is no shell anywhere in this module.
 
@@ -20,17 +20,21 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shlex
 import time
+from collections.abc import Callable
 from pathlib import Path
 
-from tools.device_manager import (
+from tools.device_ids import (
+    SYSTEM_PACKAGE_PREFIXES,
     _valid_device_id,
-    invalidate_discovery_cache,
     parse_adb_devices,
+    parse_pm_packages,
     valid_package_name,
 )
 from tools.mobile import platform_info, sdk_locator
 from tools.mobile.install_errors import parse_failure
+from tools.process_runner import arun
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +95,12 @@ KEYEVENT_RE = re.compile(r"^(?:[0-9]{1,3}|KEYCODE_[A-Z0-9_]{1,40})$")
 #: how the Play Store (and therefore Firebase App Tester) is opened.
 ALLOWED_URL_SCHEMES = ("https", "http", "market")
 
+#: The only characters a URL handed to ``open_url`` may contain: no whitespace
+#: of any kind and nothing the device shell reads as syntax (quotes, < > \ ( )
+#: * { } ; & | $ and backtick). An allowlist, because ``am start -d`` text goes
+#: through the device's ``sh`` and a blacklist always misses one.
+SAFE_URL_RE = re.compile(r"^[A-Za-z0-9._~:/?#=%+@,-]{1,2000}$")
+
 _SWIPE_MAX = 20000
 
 
@@ -126,43 +136,30 @@ async def _run_argv(
     """
     # A single case makes dozens of adb calls. Without the no-window flag each
     # one flashes a console window on Windows, which reads as a broken editor.
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
+    clock: list[float] = []
+    r = await arun(
+        cmd,
+        timeout=timeout,
         stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        **platform_info.no_window_kwargs(),
+        communicate_input=True,
+        stdin_data=stdin_data,
+        no_window=True,
+        kill_drain=True,
+        kill_on_cancel=True,
+        ignore_kill_error=False,
+        on_drain_error=None,
+        on_spawned=lambda: clock.append(time.monotonic()),
     )
-    started = time.monotonic()
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input=stdin_data), timeout=timeout
-        )
-    except asyncio.TimeoutError:
-        await _kill_and_reap(proc)
+    if r.timed_out:
         logger.warning(
             "mobile.adb: command timed out after %ss: %s",
             timeout,
             _cmd_for_log(cmd, stdin_data),
         )
-        raise
-    except asyncio.CancelledError:
-        # An outer `wait_for`/task cancellation must still kill the child --
-        # otherwise a cancelled adb call leaves the process running.
-        await _kill_and_reap(proc)
-        raise
-    _log_call_duration(time.monotonic() - started, _cmd_for_log(cmd, stdin_data))
-    return int(proc.returncode or 0), stdout or b"", stderr or b""
-
-
-async def _kill_and_reap(proc) -> None:
-    """Kill *proc* and reap it, bounded so a child that ignores the kill cannot
-    block the caller indefinitely."""
-    proc.kill()
-    try:
-        await asyncio.wait_for(proc.communicate(), timeout=1)
-    except Exception:
-        pass
+    if r.exc is not None:
+        raise r.exc
+    _log_call_duration(time.monotonic() - clock[0], _cmd_for_log(cmd, stdin_data))
+    return int(r.rc or 0), r.stdout or b"", r.stderr or b""
 
 
 def _log_call_duration(duration: float, rendered_cmd: str) -> None:
@@ -228,6 +225,27 @@ _DEVICE_GONE_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Callbacks run when adb reports a device gone, keyed by the callable itself so
+#: re-subscribing the same one is idempotent while distinct closures that share
+#: a qualname (``<locals>``, ``<lambda>``) no longer replace each other. ``tools.device_manager`` subscribes its
+#: ``invalidate_discovery_cache`` at import. NOTE: ``importlib.reload`` of this
+#: module rebinds the dict to an empty one; reload device_manager afterwards to
+#: re-subscribe.
+_device_gone_listeners: dict[Callable[[], None], Callable[[], None]] = {}
+
+
+def on_device_gone(cb: Callable[[], None]) -> None:
+    """Register *cb* to run when adb reports the selected device gone."""
+    _device_gone_listeners[cb] = cb
+
+
+def _notify_device_gone() -> None:
+    for cb in list(_device_gone_listeners.values()):
+        try:
+            cb()
+        except Exception:
+            logger.exception("mobile.adb device-gone listener failed")
+
 
 async def _device(
     serial: str,
@@ -247,7 +265,7 @@ async def _device(
         and body.get("rc")
         and _DEVICE_GONE_RE.search(str(body.get("err") or "")[:2000])
     ):
-        invalidate_discovery_cache()
+        _notify_device_gone()
     return result
 
 
@@ -664,14 +682,10 @@ async def installed_packages(serial: str) -> dict:
             + ").",
             "content": None,
         }
-    out: list[str] = []
-    for line in str(body.get("out") or "").splitlines():
-        line = line.strip()
-        if line.startswith("package:"):
-            candidate = line[len("package:") :].strip()
-            if valid_package_name(candidate):
-                out.append(candidate)
-    return {"error": None, "content": sorted(set(out))}
+    return {
+        "error": None,
+        "content": sorted(set(parse_pm_packages(str(body.get("out") or "")))),
+    }
 
 
 #: A resolved launcher component, ``<package>/<class>``. The class may be
@@ -844,12 +858,8 @@ async def clear_app_data(serial: str, package: str) -> dict:
     ``android.*``) is refused too, because looking like a valid package is not
     the same question as being an app this lane may wipe.
     """
-    from tools import device_manager
-
     name = str(package or "")
-    if not valid_package_name(name) or name.startswith(
-        device_manager.SYSTEM_PACKAGE_PREFIXES
-    ):
+    if not valid_package_name(name) or name.startswith(SYSTEM_PACKAGE_PREFIXES):
         return {
             "error": "Refusing to clear data for " + repr(name[:60]),
             "content": None,
@@ -1545,13 +1555,16 @@ async def open_url(serial: str, url: str) -> dict:
             ),
             "content": None,
         }
-    if any(ch in text for ch in (" ", "\n", "\r", "'", '"', "`", "$", ";", "&", "|")):
+    if not SAFE_URL_RE.fullmatch(text):
         return {
-            "error": "Refusing to open a URL containing shell-significant characters.",
+            "error": "Refusing to open a URL containing unsafe characters.",
             "content": None,
         }
+    # adb joins argv with spaces and the device's sh re-parses it, so the URL
+    # is quoted as one word (`?` and `#` are shell syntax there).
     return await shell(
-        serial, ["am", "start", "-a", "android.intent.action.VIEW", "-d", text]
+        serial,
+        ["am", "start", "-a", "android.intent.action.VIEW", "-d", shlex.quote(text)],
     )
 
 

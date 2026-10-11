@@ -13,6 +13,9 @@ commented out.
 from __future__ import annotations
 
 import logging
+import os
+import re
+import tempfile
 import time
 from pathlib import Path
 
@@ -66,8 +69,19 @@ def _scan(raw: str) -> tuple[list[str], list[tuple[str, str, str, str]]]:
         superseded, new_value, reason = HEAL_RULES[key]
         if value.lower() not in superseded or value == new_value:
             continue
-        # Preserve the original indentation/spacing style of the line.
-        lines[idx] = line.replace(f"={value}", f"={new_value}", 1)
+        # Preserve the original indentation/spacing style of the line. Match the
+        # KEY and the value as the operator typed them ("KEY = v" included); a
+        # plain "=value" replace silently missed spaced assignments.
+        new_line = re.sub(
+            rf"^(\s*{re.escape(key)}\s*=\s*){re.escape(value)}",
+            lambda m: m.group(1) + new_value,
+            line,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        if new_line == line:
+            continue  # could not rewrite it -- do not report it as healed
+        lines[idx] = new_line
         changed.append((key, value, new_value, reason))
     return lines, changed
 
@@ -103,6 +117,26 @@ def find_superseded(install_dir: Path) -> dict:
         return result
 
 
+def _write_backup_and_replace(
+    env: Path, backup: Path, raw: str, new_text: str, mode: int
+) -> None:
+    """Write the backup of *raw*, then atomically replace *env* with *new_text*."""
+    # Backup carries the .env's own mode (it holds the same secrets).
+    bfd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    with os.fdopen(bfd, "w", encoding="utf-8") as fh:
+        fh.write(raw)
+    # Atomic replace: a crash mid-write must not leave a truncated .env.
+    tfd, tmp = tempfile.mkstemp(dir=str(env.parent), prefix=".env.tmp-")
+    try:
+        with os.fdopen(tfd, "w", encoding="utf-8") as fh:
+            fh.write(new_text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, env)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 def heal_env(install_dir: Path) -> dict:
     """Rewrite superseded default values in ``install_dir/.env``.
 
@@ -122,9 +156,15 @@ def heal_env(install_dir: Path) -> dict:
 
         stamp = time.strftime("%Y%m%d-%H%M%S")
         backup = env.with_name(f".env.bak-{stamp}")
-        backup.write_text(raw, encoding="utf-8")
         trailing = "\n" if raw.endswith("\n") else ""
-        env.write_text("\n".join(lines) + trailing, encoding="utf-8")
+        new_text = "\n".join(lines) + trailing
+        if new_text == raw:
+            return result
+        try:
+            mode = env.stat().st_mode & 0o777
+        except OSError:
+            mode = 0o600
+        _write_backup_and_replace(env, backup, raw, new_text, mode)
         result["changed"] = changed
         result["backup"] = str(backup)
         logger.info(

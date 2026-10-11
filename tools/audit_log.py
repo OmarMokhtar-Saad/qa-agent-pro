@@ -22,6 +22,7 @@ import sqlite3
 import time
 
 from config.settings import settings
+from tools import sqlite_store
 from tools.install_paths import resolve_data_path
 
 logger = logging.getLogger(__name__)
@@ -44,9 +45,20 @@ def _connect() -> sqlite3.Connection:
     # Install-root anchored -- see tools/install_paths. A cwd-relative audit log
     # split the trail across databases, so "what happened" needed archaeology.
     path = resolve_data_path(settings.qa_audit_log_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path))
-    conn.executescript(_SCHEMA)
+    conn = sqlite_store.connect(
+        path,
+        timeout=5.0,
+        wal=True,
+        busy_timeout_ms=5000,
+        pragmas_best_effort=True,
+        logger=logging.getLogger(__name__),
+        log_label="audit_log",
+    )
+    try:
+        conn.executescript(_SCHEMA)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 

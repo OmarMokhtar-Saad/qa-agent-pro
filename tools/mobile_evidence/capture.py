@@ -45,7 +45,8 @@ import time
 
 from config.settings import settings
 from tools.mobile import adb, run_store
-from tools.mobile_evidence import crash_detector, netattr, pcap, profiles, scrub
+from tools.mobile_evidence import crash_detector, netattr, pcap, profiles
+from tools.mobile_shared import scrub
 
 logger = logging.getLogger(__name__)
 

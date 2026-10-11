@@ -293,6 +293,24 @@ async def _render_in_page(
     }
 
 
+async def _launch_and_render(
+    pw, resolver_rules: str, url: str, capture_screenshot: bool, playwright_error: type
+) -> dict:
+    """Launch Chromium with DNS pinned to the validated IP and render ``url``.
+
+    Pinning stops Chromium re-resolving the hostname to a private/internal
+    address after the SSRF check passed (DNS-rebinding bypass — NB-002).
+    """
+    resolver_arg = f"--host-resolver-rules={resolver_rules}"
+    browser = await pw.chromium.launch(headless=True, args=[resolver_arg])
+    try:
+        return await _render_in_page(
+            await browser.new_page(), url, capture_screenshot, playwright_error
+        )
+    finally:
+        await browser.close()
+
+
 async def render_page(url: str, capture_screenshot: bool = True) -> dict:
     """Render `url` in headless Chromium and return the fully rendered HTML.
 
@@ -331,19 +349,13 @@ async def render_page(url: str, capture_screenshot: bool = True) -> dict:
 
     try:
         async with async_playwright() as pw:
-            # Pin Chromium's DNS to the IP the SSRF guard already validated so it
-            # cannot re-resolve `hostname` to a private/internal address after
-            # the check passed (DNS-rebinding / SSRF bypass — NB-002).
-            resolver_arg = (
-                f"--host-resolver-rules={_host_resolver_rules(hostname, validated_ip)}"
+            return await _launch_and_render(
+                pw,
+                _host_resolver_rules(hostname, validated_ip),
+                url,
+                capture_screenshot,
+                PlaywrightError,
             )
-            browser = await pw.chromium.launch(headless=True, args=[resolver_arg])
-            try:
-                return await _render_in_page(
-                    await browser.new_page(), url, capture_screenshot, PlaywrightError
-                )
-            finally:
-                await browser.close()
     except Exception as exc:
         logger.exception("render_page: unexpected browser error for %s", url)
         return {"error": f"Browser rendering failed: {exc}", **_UNAVAILABLE_RESULT}

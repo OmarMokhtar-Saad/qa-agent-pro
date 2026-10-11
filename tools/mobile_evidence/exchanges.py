@@ -30,7 +30,7 @@ import collections
 import json
 import re
 
-from tools.mobile_evidence.scrub import (
+from tools.mobile_shared.scrub import (
     SENSITIVE_KEY_RE,
     e,
     mask_value,

@@ -10,7 +10,8 @@ fold-and-cap, so this is not a second rule. The caller's dict is never mutated.
 
 from __future__ import annotations
 
-from tools.mobile import actions, session
+from tools.mobile import actions
+from tools.mobile.session_core import LANE_EXPLORE
 
 
 def merge_finding(
@@ -24,7 +25,7 @@ def merge_finding(
     """
     merged = dict(payload) if isinstance(payload, dict) else {}
     text = actions.script_finding({"finding": finding})
-    if lane != session.LANE_EXPLORE:
+    if lane != LANE_EXPLORE:
         if not text:
             return merged, None
         shown = repr(str(lane)[:20])

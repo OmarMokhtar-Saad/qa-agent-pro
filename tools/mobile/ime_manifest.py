@@ -40,7 +40,8 @@ IME_ASSET_URL = (
 #: against the asset itself and against its published .sha256 sidecar.
 IME_SHA256 = "0d8abda1677bb56311212c86e5de1d1990572134abab37807cc273410125db51"
 
-#: The three broadcasts QaImeService registers at runtime (QaImeService.kt:218).
+#: The text-field broadcasts QaImeService registers in onCreate (QaImeService.kt:72-113; it also
+#: registers ARM/DISARM/DUMP, which this module does not state).
 #: `ime.manifest()` defaults these from IME_PACKAGE; they are stated rather than
 #: inferred so a future package rename cannot silently change the wire protocol.
 ACTION_INPUT = "io.qaagents.ime.INPUT"

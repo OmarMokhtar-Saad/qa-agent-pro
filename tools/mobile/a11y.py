@@ -26,7 +26,14 @@ import re
 import time
 import zlib
 
-from tools.mobile import adb, ime, ime_nonce, ime_session, perception, run_store
+from tools.mobile import (
+    adb,
+    ime,
+    ime_nonce,
+    ime_session,
+    perception,
+    run_records,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,34 +81,19 @@ def component() -> str:
 
 
 def _record_path(run_id: str):
-    return run_store.run_path(str(run_id)) / RECORD_FILE
+    return run_records.record_path(run_id, RECORD_FILE)
 
 
 def read_record(run_id: str) -> dict:
-    try:
-        body = run_store._read_json(_record_path(run_id))
-    except Exception:
-        logger.exception("mobile.a11y.read_record failed")
-        return {}
-    return body if isinstance(body, dict) else {}
+    return run_records.read_record(_record_path, run_id, logger, "mobile.a11y")
 
 
 def write_record(run_id: str, body: dict) -> dict:
-    try:
-        run_store._write_json(_record_path(run_id), dict(body or {}))
-        return {"error": None, "content": dict(body or {})}
-    except Exception as exc:
-        logger.exception("mobile.a11y.write_record failed")
-        return {"error": str(exc), "content": None}
+    return run_records.write_record(_record_path, run_id, body, logger, "mobile.a11y")
 
 
 def clear_record(run_id: str) -> None:
-    try:
-        target = _record_path(run_id)
-        if target.is_file():
-            target.unlink()
-    except Exception:
-        logger.exception("mobile.a11y.clear_record failed")
+    run_records.clear_record(_record_path, run_id, logger, "mobile.a11y")
 
 
 async def _sh(serial: str, command: str) -> dict:
@@ -349,9 +341,9 @@ async def _verify_parity(serial: str, run_id: str) -> dict:
     if connected.get("error"):
         await restore(run_id)
         return connected
-    from tools.mobile import executor  # lazy: executor's import graph is wide
+    from tools.mobile.replay.dump import dump_raw
 
-    slow = await executor.dump_raw(serial, use_provider=False)
+    slow = await dump_raw(serial, use_provider=False)
     checked = (
         slow
         if slow.get("error")
@@ -458,22 +450,14 @@ async def restore(run_id: str) -> dict:
 
 def stale_records(serial: str, *, skip_run_id: str = "") -> list:
     """Records from OTHER runs that still claim to have changed *serial*."""
-    out: list = []
-    try:
-        wanted = str(serial or "")
-        if not wanted:
-            return out
-        listed = run_store.list_runs(ime_session.IME_STALE_SCAN_RUNS, gc=False) or {}
-        for row in listed.get("content") or []:
-            run_id = str((row or {}).get("run_id") or "")
-            if not run_id or run_id == str(skip_run_id or ""):
-                continue
-            record = read_record(run_id)
-            if record and str(record.get("serial") or "") == wanted:
-                out.append({"run_id": run_id, **record})
-    except Exception:
-        logger.exception("mobile.a11y.stale_records failed")
-    return out
+    return run_records.stale_records(
+        serial,
+        skip_run_id,
+        ime_session.IME_STALE_SCAN_RUNS,
+        read_record,
+        logger,
+        "mobile.a11y",
+    )
 
 
 async def restore_stale(serial: str, *, skip_run_id: str = "") -> dict:

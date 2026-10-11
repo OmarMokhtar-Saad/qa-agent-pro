@@ -29,15 +29,15 @@ from collections import Counter
 
 from config.settings import settings
 from tools.mobile import run_store
-from tools.mobile_capture import ladder as capture_ladder
 from tools.mobile_evidence import (
     evidence,
     exchanges,
     model,
     netattr,
     pcap,
-    scrub,
 )
+from tools.mobile_shared import capture_tiers, scrub
+from tools.untrusted import GUARD_MARKERS, NEUTRALIZED
 
 logger = logging.getLogger(__name__)
 
@@ -76,12 +76,10 @@ SERIES = (
 
 
 def _neutralize(text: str) -> str:
-    from tools.mobile import perception
-
     out = text
-    for marker in perception.GUARD_MARKERS:
+    for marker in GUARD_MARKERS:
         if marker and marker in out:
-            out = out.replace(marker, perception.NEUTRALIZED)
+            out = out.replace(marker, NEUTRALIZED)
     return out
 
 
@@ -2093,11 +2091,11 @@ CAPTURE_LIMITS_NOTE = (
 #: ``tools.mobile_capture.ladder`` produces -- never a second spelling
 #: drifting from the first.
 CAPTURE_TIER_LABELS = {
-    capture_ladder.TIER_NONE: "not attempted",
-    capture_ladder.TIER_PROXIED: "proxied, not decrypted",
-    capture_ladder.TIER_DECRYPTED: "decrypted",
-    capture_ladder.TIER_TLS_FAILURE: "TLS failed",
-    capture_ladder.TIER_INCONCLUSIVE: "inconclusive",
+    capture_tiers.TIER_NONE: "not attempted",
+    capture_tiers.TIER_PROXIED: "proxied, not decrypted",
+    capture_tiers.TIER_DECRYPTED: "decrypted",
+    capture_tiers.TIER_TLS_FAILURE: "TLS failed",
+    capture_tiers.TIER_INCONCLUSIVE: "inconclusive",
 }
 
 
@@ -2212,7 +2210,7 @@ def capture_section(cases: object, manifest: object) -> str:
     body = manifest if isinstance(manifest, dict) else {}
     capture = body.get("capture") if isinstance(body.get("capture"), dict) else {}
     tier = capture.get("tier")
-    tier = tier if tier in capture_ladder.TIERS else capture_ladder.TIER_NONE
+    tier = tier if tier in capture_tiers.TIERS else capture_tiers.TIER_NONE
     reason = capture.get("reason")
     message = capture.get("message")
     flow_total = _capture_flow_total(cases)
@@ -2223,7 +2221,7 @@ def capture_section(cases: object, manifest: object) -> str:
         + str(flow_total)
         + ".</p>"
     ]
-    if tier != capture_ladder.TIER_DECRYPTED:
+    if tier != capture_tiers.TIER_DECRYPTED:
         lines.append(
             '<p class="capreason">Not decrypted -- reason: <b>'
             + ev_esc(reason or "unknown", 40)
@@ -2231,7 +2229,7 @@ def capture_section(cases: object, manifest: object) -> str:
             + ev_esc(message or "No further detail was recorded.", 300)
             + "</p>"
         )
-    if reason == capture_ladder.REASON_PINNED:
+    if reason == capture_tiers.REASON_PINNED:
         lines.append(
             '<p class="cappin">A request failure shown below on this run may '
             "be capture's own doing, not the app's: the app pins its own "

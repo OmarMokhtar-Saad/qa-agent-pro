@@ -32,7 +32,7 @@ property is graded only once its mutant has been RUN.
   is typed here rather than left as prose in a packet.
 * **``destructive`` decides whether a guard hit PAUSES the run or REFUSES it,
   and NOTHING else.** :func:`guard_policy` is that whole decision. It does not
-  widen the destructive lexicon, ``tools/mobile/executor.py`` does not import
+  widen the destructive lexicon, ``tools/mobile/replay`` does not import
   this module, and the guard -- including the per-element fidelity sentinel
   added by step 3 -- is UNCHANGED. A future reader will assume otherwise, so it
   is said here: there is no value of ``destructive`` that lets an action
@@ -62,7 +62,7 @@ Whatever it builds must not re-open what ``tools/mobile/ime.py`` guarantees:
 the lane types credential VALUES through the IME on stdin with an EMPTY argv
 (``type_text`` -> ``adb.shell(serial, [], stdin_data=...)``) precisely so a
 value never reaches argv, a packet, a trace or the run store, and
-``agents/mobile_run.build_tester_request`` carries a field NAME and a prompt
+``tools/mobile/run_packets.build_tester_request`` carries a field NAME and a prompt
 and has no way to carry a value.
 
 No model call, no device, no file and no network: this module is data and
@@ -80,6 +80,8 @@ from __future__ import annotations
 
 import json
 import logging
+
+from tools.mobile import explore_stop
 
 logger = logging.getLogger(__name__)
 
@@ -638,11 +640,8 @@ def _coerced_terms(body: dict) -> dict:
     """The schema fields of an already schema-stripped *body*, each coerced."""
     terms = defaults()
     # The goal's length bound belongs to the explore state, which is the thing
-    # that stores it; imported HERE rather than at module scope so this module
-    # stays importable from ``explore_runner`` without a cycle.
-    from tools.mobile import explore_runner
-
-    terms["goal"] = _one_line(body.get("goal"), explore_runner.MAX_GOAL_CHARS)
+    # that stores it.
+    terms["goal"] = _one_line(body.get("goal"), explore_stop.MAX_GOAL_CHARS)
     terms["depth"] = _choice(body.get("depth"), DEPTHS, "both")
     scope = body.get("scope")
     scope = scope if isinstance(scope, dict) else {}
@@ -732,7 +731,7 @@ def questions_for(charter: object) -> tuple:
     function returns FIVE questions for ``{}`` and ONE for ``normalize({})``,
     because normalisation fills every field and four of the five then read as
     ANSWERED. Its only production caller,
-    ``agents.mobile_run.build_charter_intake``, passed the normalised charter,
+    ``tools.mobile.run_packets.build_charter_intake``, passed the normalised charter,
     so a tester with no charter was asked ONE question and the other four were
     silently defaulted -- the absence of the feature wearing the feature's
     name. The function itself was graded (M2d) and the WIRING was not; the
@@ -1147,11 +1146,9 @@ def _budget_clause(terms: dict) -> str:
     # just had. M6/M6b grade the clamp in ISOLATION, which is exactly why the
     # sentence stayed wrong. Both numbers are rendered: either alone is the
     # worse artifact.
-    from tools.mobile import explore_runner
-
     asked_steps, asked_seconds = budget_cap(terms)
     ran_steps, ran_seconds = budget_for(
-        terms, explore_runner.MAX_TURNS, explore_runner.DEADLINE_S
+        terms, explore_stop.MAX_TURNS, explore_stop.DEADLINE_S
     )
     clamped = []
     if asked_steps and ran_steps < asked_steps:

@@ -13,11 +13,11 @@ the pcap lane's clock-window discipline already avoids
 (``tools.mobile_evidence.capture.CLOCK_NOT_READ`` / ``clock_offset_ms``).
 
 **Redaction happens HERE, at write time, never in the addon.** The pattern
-set is exactly ``tools.mobile_evidence.scrub``'s: :data:`scrub.SECRET_HEADERS`,
+set is exactly ``tools.mobile_shared.scrub``'s: :data:`scrub.SECRET_HEADERS`,
 :data:`scrub.SENSITIVE_KEY_RE`, :data:`scrub.MIN_SENSITIVE_LEN`, and the
 tester's own typed values, armed for the duration of ONE case's redaction
 through :func:`scrub.armed_scope` -- the per-TASK isolation that replaced the
-old module-global arming (see ``tools/mobile_evidence/scrub.py``'s module
+old module-global arming (see ``tools/mobile_shared/scrub.py``'s module
 docstring and ``tests/mobile_evidence/test_scrub_isolation.py``). No pattern
 is duplicated: this module never reimplements a mask, it only calls scrub's.
 
@@ -35,7 +35,7 @@ from pathlib import Path
 
 from tools.mobile import run_store
 from tools.mobile_capture import paths
-from tools.mobile_evidence import scrub
+from tools.mobile_shared import scrub
 
 logger = logging.getLogger(__name__)
 
@@ -276,7 +276,7 @@ def finish_case(run_id: str, tc_id: str, *, tester_inputs: object = None) -> dic
     raw file. ``{"error", "content": {"flow_count", "flows", "truncated_by_count"}}``.
 
     Armed with the tester's typed values for the DURATION of this call only,
-    in THIS task -- :func:`tools.mobile_evidence.scrub.armed_scope`, never
+    in THIS task -- :func:`tools.mobile_shared.scrub.armed_scope`, never
     the module-global arming the render path still uses. An evidence fault
     here can no more change a verdict than a failed log slice can; callers
     must never branch on the result beyond recording it.

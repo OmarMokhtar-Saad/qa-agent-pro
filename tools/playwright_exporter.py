@@ -15,12 +15,13 @@ from __future__ import annotations
 import keyword
 import logging
 import re
-import tempfile
-import time
-from pathlib import Path
+import tempfile  # noqa: F401  # tests patch tools.<module>.tempfile.gettempdir
 
+from tools.export_common import resolve_output_path, write_text_export
 from tools.models import TestCase, TestSuite, display_requirement_id
-from tools.secure_temp import SUBDIR_NAME, make_secure_temp_path
+from tools.secure_temp import (
+    cleanup_temp_files as _sweep_temp_files,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,16 +104,13 @@ def generate_playwright_script(suite: TestSuite, output_path: str | None = None)
 
     Raises OSError only on genuine file I/O errors (callers wrap in try/except).
     """
-    if output_path is None:
-        output_path = make_secure_temp_path(prefix="qa_test_cases_", suffix=".py")
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    output_path = resolve_output_path(output_path, ".py")
 
     used: set[str] = set()
     blocks = [_test_block(tc, _slug(tc.title, used)) for tc in suite.test_cases]
     content = _HEADER + "\n\n" + "\n\n\n".join(blocks) + "\n"
 
-    with open(output_path, "w", encoding="utf-8") as fh:
-        fh.write(content)
+    write_text_export(output_path, content)
 
     logger.info(
         "Playwright skeleton written: %s (%d tests)",
@@ -129,24 +127,9 @@ def cleanup_temp_files(max_age_seconds: int = 3600) -> int:
     /tmp root for ``qa_test_cases_*.py`` risked deleting an unrelated user's file
     that happened to match the pattern.
     """
-    base = Path(tempfile.gettempdir()) / SUBDIR_NAME
-    if not base.is_dir():
-        return 0
-    now = time.time()
-    deleted = 0
-    for path in base.glob("qa_test_cases_*.py"):
-        try:
-            age = now - path.stat().st_mtime
-            if age > max_age_seconds:
-                path.unlink(missing_ok=True)
-                deleted += 1
-                logger.info(
-                    "Cleaned up stale Playwright temp file: %s (age %.0fs)",
-                    path,
-                    age,
-                )
-        except OSError:
-            logger.warning("Could not check/delete temp file: %s", path)
-    if deleted:
-        logger.info("Playwright cleanup: removed %d stale file(s)", deleted)
-    return deleted
+    return _sweep_temp_files(
+        max_age_seconds=max_age_seconds,
+        pattern="qa_test_cases_*.py",
+        label="Playwright",
+        log=logger,
+    )

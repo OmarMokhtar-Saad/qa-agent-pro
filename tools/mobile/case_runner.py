@@ -21,16 +21,17 @@ import time
 from typing import NamedTuple
 
 from tools.mobile import actions as actions_mod
-from tools.mobile import (
-    adb,
-    executor,
-    ime_session,
-    media,
-    run_store,
-    run_verdict,
-    step_timing,
-)
+from tools.mobile import adb, ime_session, media, run_store, run_verdict, step_timing
 from tools.mobile.providers import composite
+from tools.mobile.replay.context import (
+    STATUS_DONE,
+    STATUS_ERROR,
+    STATUS_NEEDS_TESTER,
+    Context,
+)
+from tools.mobile.replay.dump import dump_raw, resolve_activity
+from tools.mobile.replay.guard import MAX_GUARD_NODE_CHARS
+from tools.mobile.replay.replay import replay
 from tools.mobile_capture import flows as api_flows
 from tools.mobile_evidence import capture, crash_detector
 
@@ -363,7 +364,7 @@ def free_stops_used(run_id: str, tc_id: str) -> int:
         return 0
 
 
-async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
+async def start_case(run_id: str, case: object, ctx: Context) -> dict:
     """Clean-launch the app, dump the first screen, build the planning packet.
 
     ``{"error", "content": {"tc_id", "screen", "packet", "escapes"}}``.
@@ -394,7 +395,7 @@ async def start_case(run_id: str, case: object, ctx: executor.Context) -> dict:
         return {"error": str(exc), "content": None}
 
 
-def _start_refusal(tc_id: object, ctx: executor.Context) -> dict | None:
+def _start_refusal(tc_id: object, ctx: Context) -> dict | None:
     """The error payload for a case that must not start, or None."""
     if not run_store.valid_tc_id(tc_id):
         return {
@@ -413,7 +414,7 @@ def _start_refusal(tc_id: object, ctx: executor.Context) -> dict | None:
     return None
 
 
-async def _begin_evidence(run_id: str, tc_id: str, ctx: executor.Context) -> dict:
+async def _begin_evidence(run_id: str, tc_id: str, ctx: Context) -> dict:
     """Open the per-case evidence lanes, between the force-stop and the launch.
 
     None of them can block the case or change a verdict: a lane that is off,
@@ -446,18 +447,18 @@ class _Settle(NamedTuple):
     in_front: bool
 
 
-async def _observe_settle(ctx: executor.Context) -> _Settle:
+async def _observe_settle(ctx: Context) -> _Settle:
     """One dump pruned WITHOUT an activity (``in_front`` is not decided here).
 
     THE SETTLE PRUNE passes NO activity on purpose: it answers ONE question --
     "is the app in front yet?" -- inside a loop that exists BECAUSE the answer
-    is often no. `executor.resolve_activity` MEMOISES what it probes, so
+    is often no. `replay.dump.resolve_activity` MEMOISES what it probes, so
     probing from in here would freeze whatever held focus mid-launch (the
     launcher, an IME, a permission dialog) onto the context. The identity is
     resolved once, after the loop. The density is a DEVICE fact like the size,
     so the accessibility audit measures 48dp against THIS device.
     """
-    dumped = await executor.dump_raw(ctx.serial)
+    dumped = await dump_raw(ctx.serial)
     if dumped.get("error"):
         return _Settle(dumped, dumped, {}, {}, {}, False)
     sized = await adb.display_size(ctx.serial)
@@ -473,7 +474,7 @@ async def _observe_settle(ctx: executor.Context) -> _Settle:
     return _Settle(None, dumped, sized, dpi, pruned.get("content") or {}, False)
 
 
-async def _wait_for_foreground(ctx: executor.Context) -> _Settle:
+async def _wait_for_foreground(ctx: Context) -> _Settle:
     """WAIT FOR THE APP TO BE IN FRONT; ``error`` is set when it never was.
 
     `adb.launch` returns when the intent is delivered, not when the app is
@@ -503,17 +504,17 @@ async def _wait_for_foreground(ctx: executor.Context) -> _Settle:
         await _sleep(FOREGROUND_POLL_S)
 
 
-async def _settled_screen(ctx: executor.Context, settle: _Settle) -> dict:
+async def _settled_screen(ctx: Context, settle: _Settle) -> dict:
     """THE IDENTITY, resolved once, and ONLY when the app was in front.
 
-    ONE producer, shared with the replay -- see `executor.resolve_activity`.
+    ONE producer, shared with the replay -- see `replay.dump.resolve_activity`.
     The dump is re-pruned rather than re-fetched. Not resolving is the SAFE
     answer: the other exit is a dump that named no package, where the focused
     window may still be what the launch was moving away from, and
     `resolve_activity` memoises. A failure to resolve or re-prune leaves the
     settle screen standing -- never no screen at all.
     """
-    activity = await executor.resolve_activity(ctx) if settle.in_front else ""
+    activity = await resolve_activity(ctx) if settle.in_front else ""
     if not activity:
         return settle.screen
     settled = composite.observe(
@@ -536,7 +537,7 @@ def _write_planning(
     # not read: a lost wireframe beats a lost verdict.
     run_store.write_screen(run_id, screen)
 
-    from agents import mobile_run
+    from tools.mobile import run_packets as mobile_run
 
     used = escapes_used(run_id, tc_id)
     packet = mobile_run.build_case_job(
@@ -647,7 +648,7 @@ def _refused_script(
     }
 
 
-async def _ready_keyboard(script: object, ctx: executor.Context, run_id: str) -> None:
+async def _ready_keyboard(script: object, ctx: Context, run_id: str) -> None:
     """THE KEYBOARD, BEFORE ANYTHING IS TYPED.
 
     `ime_session.ensure_ready` is idempotent, so a run whose every case types
@@ -669,7 +670,7 @@ async def _ready_keyboard(script: object, ctx: executor.Context, run_id: str) ->
 
 
 async def _replay_recorded(
-    run_id: str, tc_id: str, script: object, ctx: executor.Context
+    run_id: str, tc_id: str, script: object, ctx: Context
 ) -> tuple[dict, object]:
     """Replay the script with the screen recorder running: ``(replayed, clip)``.
 
@@ -682,7 +683,7 @@ async def _replay_recorded(
     """
     clip = (await media.start_clip(run_id, tc_id, script, ctx.serial)).get("content")
     fallback_before = str(getattr(ctx, "typing_fallback", "") or "")
-    replayed = await executor.replay(script, ctx)
+    replayed = await replay(script, ctx)
     fallback_after = str(getattr(ctx, "typing_fallback", "") or "")
     if fallback_after and not fallback_before:
         # R1d: the keyboard was ready but would not come up inside the replay.
@@ -699,9 +700,7 @@ async def _replay_recorded(
     return replayed, clip
 
 
-async def _close_step_evidence(
-    step: "_Step", clip: object, ctx: executor.Context
-) -> dict:
+async def _close_step_evidence(step: "_Step", clip: object, ctx: Context) -> dict:
     """Stop the recorder and slice the app evidence; returns the case's crash."""
     # Outside any `if`: a step that changed nothing still started a
     # recorder, and a recorder nobody stops is a device process that
@@ -730,7 +729,7 @@ async def _close_step_evidence(
 async def submit_case(
     run_id: str,
     case: object,
-    ctx: executor.Context,
+    ctx: Context,
     raw_script: object,
     *,
     screen: dict | None = None,
@@ -803,7 +802,7 @@ def _outcome_checkpoint(step: _Step, view: dict, crash: object) -> dict:
     result = step.result
     status = str(result.get("status") or "")
     reason = str(result.get("reason") or "")
-    if status == executor.STATUS_DONE:
+    if status == STATUS_DONE:
         # A model-declared `pass` over a case whose app DIED is a false pass,
         # and the lane captured the proof and then never read it. The
         # override happens here and nowhere else: this is already the one
@@ -814,18 +813,18 @@ def _outcome_checkpoint(step: _Step, view: dict, crash: object) -> dict:
             step,
             view,
             verdict=verdict,
-            status=executor.STATUS_DONE,
+            status=STATUS_DONE,
             reason=done_reason,
             packet=None,
         )
-    if status == executor.STATUS_NEEDS_TESTER:
+    if status == STATUS_NEEDS_TESTER:
         return _tester_payload(step, view)
-    if status == executor.STATUS_ERROR:
+    if status == STATUS_ERROR:
         return _step_payload(
             step,
             view,
             verdict=VERDICT_BLOCKED,
-            status=executor.STATUS_ERROR,
+            status=STATUS_ERROR,
             reason=reason,
             packet=None,
         )
@@ -834,7 +833,7 @@ def _outcome_checkpoint(step: _Step, view: dict, crash: object) -> dict:
 
 def _tester_payload(step: _Step, view: dict) -> dict:
     """The needs_tester outcome: a credential request and the guard that stopped."""
-    from agents import mobile_run
+    from tools.mobile import run_packets as mobile_run
 
     result = step.result
     reason = str(result.get("reason") or "")
@@ -855,9 +854,7 @@ def _tester_payload(step: _Step, view: dict) -> dict:
         guard_stop={
             "term": str(result.get("guard_term") or "")[:80],
             "op": str(result.get("guard_op") or "")[:40],
-            "node": str(result.get("guard_node") or "")[
-                : executor.MAX_GUARD_NODE_CHARS
-            ],
+            "node": str(result.get("guard_node") or "")[:MAX_GUARD_NODE_CHARS],
         },
     )
 
@@ -933,7 +930,7 @@ def _ask_model_payload(
     step: _Step, view: dict, used: int, uncharged: dict, reason_key: str
 ) -> dict:
     """Hand the model the escape-hatch job for a stop that is still allowed."""
-    from agents import mobile_run
+    from tools.mobile import run_packets as mobile_run
 
     result = step.result
     reason = str(result.get("reason") or "")
@@ -1144,7 +1141,7 @@ def _uncharged_count(raw: object) -> int | None:
 
 
 async def _abandon(
-    run_id: str, tc_id: str, ctx: executor.Context, evidence: dict, result: dict
+    run_id: str, tc_id: str, ctx: Context, evidence: dict, result: dict
 ) -> dict:
     """Stop the case's network capture and hand *result* back UNCHANGED.
 
@@ -1282,7 +1279,7 @@ def _record_slice(evidence: dict, sliced: object) -> None:
     evidence["crash"] = _merge_crash(evidence.get("crash"), this_crash)
 
 
-async def _slice_evidence(run_id: str, tc_id: str, ctx: executor.Context) -> dict:
+async def _slice_evidence(run_id: str, tc_id: str, ctx: Context) -> dict:
     """Take this replay's logcat slice, record it, and return the case's crash.
 
     Reads the record ``start_case`` left, asks ``capture`` for the slice --
@@ -1326,9 +1323,7 @@ async def _slice_evidence(run_id: str, tc_id: str, ctx: executor.Context) -> dic
         return {}
 
 
-async def _finish_wire(
-    evidence: dict, run_id: str, tc_id: str, ctx: executor.Context
-) -> None:
+async def _finish_wire(evidence: dict, run_id: str, tc_id: str, ctx: Context) -> None:
     """Stop the network capture and the API-capture lane into the record."""
     # The wire is stopped, parsed and attributed at the SAME checkpoint the
     # log slice is taken, and spliced in beside it. Nothing branches on the

@@ -18,13 +18,14 @@ Follows the same never-raise / tempfile / cleanup contract as csv_exporter.py.
 from __future__ import annotations
 
 import logging
-import tempfile
-import time
+import tempfile  # noqa: F401  # tests patch tools.<module>.tempfile.gettempdir
 from collections import OrderedDict
-from pathlib import Path
 
+from tools.export_common import resolve_output_path, write_text_export
 from tools.models import TestCase, TestSuite, display_requirement_id
-from tools.secure_temp import SUBDIR_NAME, make_secure_temp_path
+from tools.secure_temp import (
+    cleanup_temp_files as _sweep_temp_files,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,9 +107,7 @@ def generate_feature_file(suite: TestSuite, output_path: str | None = None) -> s
     Raises OSError only on genuine file I/O errors (matches csv_exporter);
     callers in app.py wrap export generation in try/except.
     """
-    if output_path is None:
-        output_path = make_secure_temp_path(prefix="qa_test_cases_", suffix=".feature")
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    output_path = resolve_output_path(output_path, ".feature")
 
     # Group scenarios by module -> one Feature per module, order preserved.
     by_module: "OrderedDict[str, list[TestCase]]" = OrderedDict()
@@ -124,8 +123,7 @@ def generate_feature_file(suite: TestSuite, output_path: str | None = None) -> s
         blocks.append("\n".join(block).rstrip() + "\n")
 
     content = "\n\n".join(blocks).rstrip() + "\n"
-    with open(output_path, "w", encoding="utf-8") as fh:
-        fh.write(content)
+    write_text_export(output_path, content)
 
     logger.info(
         "Gherkin written: %s (%d scenarios, %d features)",
@@ -138,21 +136,11 @@ def generate_feature_file(suite: TestSuite, output_path: str | None = None) -> s
 
 def cleanup_temp_files(max_age_seconds: int = 3600) -> int:
     """Delete qa_test_cases_*.feature temp files older than max_age_seconds."""
-    tmp_dir = Path(tempfile.gettempdir())
-    now = time.time()
-    deleted = 0
-    for base in (tmp_dir / SUBDIR_NAME, tmp_dir):
-        for path in base.glob("qa_test_cases_*.feature"):
-            try:
-                age = now - path.stat().st_mtime
-                if age > max_age_seconds:
-                    path.unlink(missing_ok=True)
-                    deleted += 1
-                    logger.info(
-                        "Cleaned up stale Gherkin temp file: %s (age %.0fs)", path, age
-                    )
-            except OSError:
-                logger.warning("Could not check/delete temp file: %s", path)
-    if deleted:
-        logger.info("Gherkin cleanup: removed %d stale file(s)", deleted)
-    return deleted
+    return _sweep_temp_files(
+        max_age_seconds=max_age_seconds,
+        pattern="qa_test_cases_*.feature",
+        label="Gherkin",
+        sweep_tmp_root=True,
+        require_subdir=False,
+        log=logger,
+    )

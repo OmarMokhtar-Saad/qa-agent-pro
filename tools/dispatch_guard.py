@@ -68,5 +68,5 @@ def require_dispatched(tool_name: str) -> None:
         raise DispatchGuardRefusal(
             f"{tool_name} was called without going through the MCP dispatch "
             "path (mcp_server._tracked). Call the qa_* tool through your MCP "
-            "client instead of importing tools.mcp_handlers directly."
+            "client instead of importing handlers directly."
         )

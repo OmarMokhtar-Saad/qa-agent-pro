@@ -1,4 +1,4 @@
-"""Prompt builders for the mobile lane, in the ``agents/host_mode.py`` style.
+"""Prompt builders for the mobile lane, in the ``agents/host_*.py`` style.
 
 No model runs on this server, so every decision a mobile run needs -- what to
 tap, whether the goal was reached, what to do with a screen the plan did not
@@ -8,7 +8,7 @@ touches no device, opens no file and makes no network call.
 
 Three rules it holds, each pinned by a test:
 
-* **Nothing here imports ``tools/mcp_handlers.py``.** That edge is what lets a
+* **Nothing here imports ``handlers/``.** That edge is what lets a
   packet be built and asserted on without the MCP transport.
 * **The RAW dump never enters a packet.** Packets carry ``perception``'s pruned
   screen block, already neutralised and length-capped. A packet containing
@@ -31,6 +31,10 @@ from tools.mobile import knowledge_inject, perception, render, run_store, screen
 from tools.untrusted import _GUARD, wrap_untrusted
 
 logger = logging.getLogger(__name__)
+
+#: What a packet builder can hit on a malformed view, screen or trace: a missing
+#: attribute or key, a wrong type or value. Anything else is a real bug and surfaces.
+_PACKET_ERRORS = (AttributeError, KeyError, IndexError, TypeError, ValueError, OSError)
 
 MAX_TRACE_ENTRIES = 40
 MAX_CASE_STEPS = 40
@@ -263,7 +267,9 @@ def _observation_key(screen: object) -> str:
     """
     try:
         return run_store.observation_id(screen)
-    except Exception:  # pragma: no cover - the store never raises; a packet may not
+    except (
+        _PACKET_ERRORS
+    ):  # pragma: no cover - the store never raises; a packet may not
         logger.warning("mobile_run._observation_key failed", exc_info=True)
         return ""
 
@@ -294,7 +300,7 @@ def build_case_job(
             }
         )
         return packet
-    except Exception:  # pragma: no cover - defensive
+    except _PACKET_ERRORS:  # pragma: no cover - defensive
         logger.warning("build_case_job failed", exc_info=True)
         return {}
 
@@ -320,15 +326,18 @@ def build_escape_job(
     view: object,
     screen: object,
     trace: object,
-    *,
-    run_id: str,
-    tc_id: str,
-    escapes: int,
-    reason: str = "",
+    **ctx: str | int,
 ) -> dict:
-    """The escape-hatch packet: the trace, the NEW screen, continue from here."""
+    """The escape-hatch packet: the trace, the NEW screen, continue from here.
+
+    Keyword-only ``ctx``: ``run_id`` and ``tc_id`` (str), ``escapes`` (int) are
+    required; ``reason`` (str) is optional.
+    """
     try:
-        packet = _packet_base(run_id, tc_id)
+        run_id = str(ctx["run_id"])
+        escapes = int(ctx["escapes"])
+        reason = str(ctx.get("reason", ""))
+        packet = _packet_base(run_id, str(ctx["tc_id"]))
         packet.update(
             {
                 "kind": "escape",
@@ -345,7 +354,7 @@ def build_escape_job(
             }
         )
         return packet
-    except Exception:  # pragma: no cover - defensive
+    except _PACKET_ERRORS:  # pragma: no cover - defensive
         logger.warning("build_escape_job failed", exc_info=True)
         return {}
 
@@ -376,7 +385,7 @@ GUARD_ASK_SCREEN_GENERIC = (
 )
 
 
-def screen_asks(executor_mod) -> dict:
+def screen_asks(guard_mod) -> dict:
     """Sentinel -> what the MODEL is told, for every screen-level stop.
 
     A REGISTRY, matching ``executor.screen_stop_details`` at the other
@@ -389,7 +398,7 @@ def screen_asks(executor_mod) -> dict:
     ratchet grades this dict against :func:`executor.screen_sentinels`.
     """
     return {
-        executor_mod.SCREEN_NOT_THE_APP: (
+        guard_mod.SCREEN_NOT_THE_APP: (
             "The replay stopped before a press: the screen in front is not the "
             "app under test, so what that press would submit cannot be judged. "
             "Nothing was touched. Re-sending the same press stops here again -- "
@@ -397,7 +406,7 @@ def screen_asks(executor_mod) -> dict:
             "front of it, and then carry on in the same script. The stop's "
             "`detail` names both packages."
         ),
-        executor_mod.SCREEN_NOT_FULLY_SEEN: (
+        guard_mod.SCREEN_NOT_FULLY_SEEN: (
             "The replay stopped before a press: this screen has more elements "
             "than one packet carries, so what that press would submit cannot "
             "be judged. Nothing was touched. Re-sending the same press stops "
@@ -405,7 +414,7 @@ def screen_asks(executor_mod) -> dict:
             "which is judged by its own label. Ask the tester only if you "
             "cannot tell which control that is."
         ),
-        executor_mod.SCREEN_CONTROL_NOT_READ: (
+        guard_mod.SCREEN_CONTROL_NOT_READ: (
             "The replay stopped before acting: the element under that touch was "
             "not read in full -- the app does not expose its text to the "
             "accessibility layer this lane reads, so what the action would "
@@ -433,7 +442,7 @@ def _guard_ask(guard_term: str) -> str:
 
     NO COUNT IN THIS DOCSTRING, deliberately. It said "two stops" while three
     reached here: ``SCREEN_NOT_THE_APP`` was added at the producer
-    (``executor.screen_hit``) and wired into only one of that value's two
+    (``replay.guard.screen_hit``) and wired into only one of that value's two
     consumers, and this one fell through to the control wording -- telling the
     model a non-existent control had been hit and to re-send a script that
     re-stops. The ratchet that now fails at authoring time instead is
@@ -444,12 +453,12 @@ def _guard_ask(guard_term: str) -> str:
     and a module-level import would put an agent's import at the top of a file
     the executor's own callers import.
     """
-    from tools.mobile import executor as executor_mod
+    from tools.mobile.replay import guard as guard_mod
 
-    said = screen_asks(executor_mod).get(guard_term)
+    said = screen_asks(guard_mod).get(guard_term)
     if said is not None:
         return said
-    if not guard_term or executor_mod.destructive_hit(guard_term) != guard_term:
+    if not guard_term or guard_mod.destructive_hit(guard_term) != guard_term:
         # A term this module has no words for, and one the lexicon does not
         # match either -- so it is not a control, and the fallback's two
         # claims would both be false. True and unhelpful beats false and
@@ -498,7 +507,7 @@ def build_tester_request(
                 "and do not repeat the value back in your own message."
             ),
         }
-    except Exception:  # pragma: no cover - defensive
+    except _PACKET_ERRORS:  # pragma: no cover - defensive
         logger.warning("build_tester_request failed", exc_info=True)
         return {}
 
@@ -541,7 +550,7 @@ def build_explore_turn(
             }
         )
         return packet
-    except Exception:  # pragma: no cover - defensive
+    except _PACKET_ERRORS:  # pragma: no cover - defensive
         logger.warning("build_explore_turn failed", exc_info=True)
         return {}
 
@@ -662,7 +671,7 @@ def build_charter_intake(
     """
     try:
         return _charter_intake_packet(run_id, package, charter)
-    except Exception:  # pragma: no cover - defensive
+    except _PACKET_ERRORS:  # pragma: no cover - defensive
         logger.warning("build_charter_intake failed", exc_info=True)
         return {}
 

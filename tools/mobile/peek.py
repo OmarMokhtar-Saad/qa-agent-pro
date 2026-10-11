@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import logging
 
-from tools.mobile import adb, executor, perception
+from tools.mobile import adb, perception
 from tools.mobile.providers import composite
+from tools.mobile.replay.context import Context
+from tools.mobile.replay.dump import dump_raw, resolve_activity
 from tools.untrusted import wrap_untrusted
 
 logger = logging.getLogger(__name__)
@@ -33,7 +35,7 @@ _FALLBACK = "Call `qa_capture_screens` without `peek` for a screenshot."
 async def peek(serial: str) -> str:
     """The current screen of *serial* as markdown. Never raises."""
     try:
-        raw = await executor.dump_raw(serial)
+        raw = await dump_raw(serial)
         if raw.get("error"):
             return (
                 "\u26a0\ufe0f Could not read the screen. Check the device is unlocked "
@@ -42,7 +44,7 @@ async def peek(serial: str) -> str:
             )
         sized = await adb.display_size(serial)
         dpi = await adb.display_density(serial)
-        activity = await executor.resolve_activity(executor.Context(serial=serial))
+        activity = await resolve_activity(Context(serial=serial))
         screen = composite.observe(
             raw.get("content"),
             activity,

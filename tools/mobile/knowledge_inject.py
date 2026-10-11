@@ -1,5 +1,5 @@
 """What the tester's model is told about the app (contract 1.7). ``agents/``
-imports ONLY this module, never ``tools/mcp_handlers.py``.
+imports ONLY this module, never ``handlers/``.
 
 Two entry points, both sync, no I/O, never raising, ``""`` when nothing applies:
 

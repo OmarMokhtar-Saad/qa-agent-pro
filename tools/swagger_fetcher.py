@@ -2,7 +2,7 @@
 
 ``QA_SWAGGER_ENABLED`` was DELETED on 2026-08-13 (flag-surface reduction,
 batch 6) and the behaviour hardcoded ON -- the value the distribution ``.env``
-template always shipped. ``tools.mcp_handlers`` now reaches this module
+template always shipped. ``handlers`` now reaches this module
 whenever :func:`looks_like_openapi_url` recognises a pasted URL.
 
 Fetches an OpenAPI (Swagger) specification from a pasted URL and condenses it
@@ -22,6 +22,7 @@ House rules honored:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from urllib.parse import urlparse
@@ -35,6 +36,9 @@ logger = logging.getLogger("qa_agents.swagger_fetcher")
 # Bounds keeping the grounding block prompt-sized even for huge specs.
 _MAX_ENDPOINTS = 80
 _MAX_CHARS = 12000
+# Absolute backstop even for the uncapped (grounding) caller: nothing legitimate is
+# this large (GitHub's spec is ~9 MB), and yaml.safe_load on more is a CPU/memory sink.
+_HARD_MAX_CHARS = 32_000_000
 _HTTP_METHODS = ("get", "post", "put", "patch", "delete", "head", "options")
 
 # URL substrings that mark a likely OpenAPI/Swagger document.
@@ -235,6 +239,21 @@ def _endpoint_lines(spec: dict) -> list[str]:
     return lines
 
 
+def _oversize_error(text: str, max_chars: int | None) -> str:
+    """The refusal message when *text* breaks the caller's or the hard cap, else ''."""
+    if max_chars is not None and text and len(text) > max_chars:
+        return (
+            f"spec document is larger than {max_chars} characters "
+            "- paste the single endpoint instead"
+        )
+    if text and len(text) > _HARD_MAX_CHARS:
+        return (
+            f"spec document is larger than {_HARD_MAX_CHARS} characters"
+            " - refusing to parse it"
+        )
+    return ""
+
+
 async def fetch_openapi_document(url: str, *, max_chars: int | None = None) -> dict:
     """Fetch + parse an OpenAPI spec URL into the PARSED DICT. NEVER raises.
 
@@ -265,15 +284,11 @@ async def fetch_openapi_document(url: str, *, max_chars: int | None = None) -> d
                 "spec": None,
             }
         text = hop.text
-        if max_chars is not None and text and len(text) > max_chars:
-            return {
-                "error": (
-                    f"spec document is larger than {max_chars} characters "
-                    "- paste the single endpoint instead"
-                ),
-                "spec": None,
-            }
-        spec = _parse_spec(text)
+        too_large = _oversize_error(text, max_chars)
+        if too_large:
+            return {"error": too_large, "spec": None}
+        # json/yaml parsing of a multi-MB spec is CPU-bound: keep it off the loop.
+        spec = await asyncio.to_thread(_parse_spec, text)
         if spec is None:
             return {
                 "error": "URL did not return a parseable OpenAPI/Swagger document",

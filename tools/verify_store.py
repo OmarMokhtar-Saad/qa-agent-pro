@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from config.settings import settings
+from tools import sqlite_store
 from tools.install_paths import resolve_data_path
 
 logger = logging.getLogger(__name__)
@@ -80,21 +81,25 @@ def _db_path() -> Path:
 
 def _connect() -> sqlite3.Connection:
     path = _db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=_BUSY_TIMEOUT_S)
+    conn = sqlite_store.connect(
+        path,
+        timeout=_BUSY_TIMEOUT_S,
+        wal=True,
+        busy_timeout_ms=int(_BUSY_TIMEOUT_S * 1000),
+        pragmas_best_effort=True,
+        logger=logger,
+        log_label="verify_store",
+    )
     try:
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute(f"PRAGMA busy_timeout = {int(_BUSY_TIMEOUT_S * 1000)}")
-    except sqlite3.Error:
-        logger.debug(
-            "verify_store: WAL/busy_timeout pragmas unavailable", exc_info=True
-        )
-    conn.executescript(_SCHEMA)
-    for statement in _MIGRATIONS:
-        try:
-            conn.execute(statement)
-        except sqlite3.OperationalError:
-            pass  # Already applied - the column exists.
+        conn.executescript(_SCHEMA)
+        for statement in _MIGRATIONS:
+            try:
+                conn.execute(statement)
+            except sqlite3.OperationalError:
+                pass  # Already applied - the column exists.
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 

@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 
 from config.settings import settings
+from tools import sqlite_store
 from tools.install_paths import resolve_data_path
 from tools.models import TestCase, TestSuite
 
@@ -165,18 +166,30 @@ def _drop_retired_tables(conn: sqlite3.Connection) -> None:
 def _connect() -> sqlite3.Connection:
     """Open the DB (creating parent dirs + schema). Caller must close."""
     path = _db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path))
-    # Enforce declared FOREIGN KEY ... ON DELETE CASCADE (NB-019). SQLite defaults
-    # this OFF per-connection, so the schema's cascade is inert without it — a
-    # future suite-delete path would otherwise leave orphaned `cases` rows.
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.executescript(_SCHEMA)
-    _ensure_columns(conn)
-    # AFTER _ensure_columns on purpose: the prep_id migration is the one
-    # that changes behaviour if it fails, so nothing this function does
-    # can be what stopped it.
-    _drop_retired_tables(conn)
+    # foreign_keys=True enforces declared FOREIGN KEY ... ON DELETE CASCADE
+    # (NB-019). SQLite defaults this OFF per-connection, so the schema's cascade
+    # is inert without it — a future suite-delete path would otherwise leave
+    # orphaned `cases` rows.
+    conn = sqlite_store.connect(
+        path,
+        timeout=5.0,
+        wal=True,
+        busy_timeout_ms=5000,
+        pragmas_best_effort=True,
+        foreign_keys=True,
+        logger=logging.getLogger(__name__),
+        log_label="suite_store",
+    )
+    try:
+        conn.executescript(_SCHEMA)
+        _ensure_columns(conn)
+        # AFTER _ensure_columns on purpose: the prep_id migration is the one
+        # that changes behaviour if it fails, so nothing this function does
+        # can be what stopped it.
+        _drop_retired_tables(conn)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 

@@ -1,6 +1,6 @@
 """The ``uiautomator dump`` tree source: the fallback every device supports.
 
-It wraps the executor's guarded dump (``executor.dump_raw``) in the
+It wraps the executor's guarded dump (``replay.dump.dump_raw``) in the
 stream-0 :class:`~tools.mobile.tree_source.TreeSource` interface and registers
 at priority 100, so it is tried after any faster source the tester opted in to.
 
@@ -22,9 +22,9 @@ from tools.mobile.tree_source import TreeResult
 async def _guarded_dump(serial: str) -> dict:
     # Late import: executor imports most of the package. dump_raw is the
     # single-flight guard every raw dump outside the executor must take.
-    from tools.mobile import executor  # noqa: PLC0415
+    from tools.mobile.replay.dump import dump_raw
 
-    return await executor.dump_raw(serial)
+    return await dump_raw(serial)
 
 
 class DumpTreeSource:

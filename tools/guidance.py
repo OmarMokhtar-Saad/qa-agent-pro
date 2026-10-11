@@ -4,7 +4,7 @@ Prompts, as pure text.
 Every tester-facing workflow this server implements is a HANDSHAKE -- prepare,
 then submit -- because no model runs here: the calling agent's own chat model
 does every generative step. That contract lives in the tool descriptions and in
-the payloads ``agents/host_mode.py`` builds, which means a client only learns it
+the payloads ``agents/host_*.py`` builds, which means a client only learns it
 AFTER it has already called a tool, and only for the tool it happened to call.
 Two things fix that at the protocol level, and this module is the text for both:
 
@@ -26,7 +26,7 @@ Two rules this module exists to keep:
    with each reply shape*, and stops there.
 2. **It is EDITION-AWARE by parameter, not by import.** Both entry points take
    the gates as booleans, so this module imports nothing internal -- no
-   ``config.settings``, no ``tools.mcp_handlers`` -- and the caller
+   ``config.settings``, no ``handlers`` -- and the caller
    (``mcp_server.build_server``) resolves each gate exactly once, from the same
    expression that decides whether the tool is registered at all. Guidance
    naming a tool the tester's edition does not have is worse than no guidance:
@@ -132,9 +132,9 @@ def server_instructions(
 ) -> str:
     """The ``instructions=`` block for this edition.
 
-    ``test_cases_only`` mirrors ``tools.mcp_handlers._test_cases_only()``,
+    ``test_cases_only`` mirrors ``handlers._common._test_cases_only()``,
     ``api_tests`` mirrors ``settings.qa_api_test_enabled`` and ``mobile``
-    mirrors ``tools.mcp_handlers._mobile_lane_enabled()`` -- the caller passes
+    mirrors ``handlers._common._mobile_lane_enabled()`` -- the caller passes
     the SAME expressions that gate registration, so a tool can never be named
     here and absent there.
 

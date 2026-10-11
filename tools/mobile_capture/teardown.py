@@ -21,7 +21,7 @@ process dies -- there is no third state.
 
 **Concurrency (T3.2a).** Every entry point here -- :func:`clear` included --
 runs under the lane's EXISTING per-serial device lock,
-``tools.mobile.session.take_device_lock``. A caller that already holds it for
+``tools.mobile.device_lock.take_device_lock``. A caller that already holds it for
 this serial (``proxy.start``'s own ``run_id``) passes it as *owner* and the
 take is a free re-entry; a caller with no lock of its own mints a throwaway
 label, takes the lock, and releases it itself -- so a second, unrelated
@@ -48,7 +48,7 @@ import signal
 import time
 from pathlib import Path
 
-from tools.mobile import adb, session
+from tools.mobile import adb, device_lock
 from tools.mobile_capture import paths
 
 logger = logging.getLogger(__name__)
@@ -188,7 +188,7 @@ async def clear(serial: str, *, owner: str = "", reason: str = "") -> dict:
     point into capture.** A caller that ALREADY holds it for this serial
     passes its own *owner* (``proxy.start``'s ``run_id``) and the take is a
     free re-entry; a caller with none mints a throwaway
-    :func:`tools.mobile.session.new_provisioning_owner` label, takes the
+    :func:`tools.mobile.device_lock.new_provisioning_owner` label, takes the
     lock, and releases it itself when this call returns -- so a second
     caller (T3.3's sixth exit path) is refused BY NAME rather than clearing a
     marker the first is still using.
@@ -199,8 +199,8 @@ async def clear(serial: str, *, owner: str = "", reason: str = "") -> dict:
     finds to be crash residue.
     """
     serial = str(serial)
-    label = str(owner) if owner else session.new_provisioning_owner()
-    took = session.take_device_lock(label, serial=serial)
+    label = str(owner) if owner else device_lock.new_provisioning_owner()
+    took = device_lock.take_device_lock(label, serial=serial)
     acquired = ((took or {}).get("content") or {}).get("acquired")
     if not acquired:
         holder = str(((took or {}).get("content") or {}).get("holder") or "")
@@ -221,7 +221,7 @@ async def clear(serial: str, *, owner: str = "", reason: str = "") -> dict:
             # We minted the label ourselves; give it back. A caller that
             # passed its OWN owner keeps its lock -- releasing here would
             # take the run's lease out from under it.
-            session.release_device_lock(label, as_holder=True)
+            device_lock.release_device_lock(label, as_holder=True)
 
 
 async def _clear_device(serial: str, marker: dict) -> tuple[dict, dict]:

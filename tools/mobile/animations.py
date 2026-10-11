@@ -24,7 +24,11 @@ import os
 import re
 import time
 
-from tools.mobile import adb, ime_session, run_store
+from tools.mobile import (
+    adb,
+    ime_session,
+    run_records,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,37 +51,24 @@ _SCALE_RE = re.compile(r"\d{1,3}(\.\d{1,6})?")
 
 
 def _record_path(run_id: str):
-    return run_store.run_path(str(run_id)) / RECORD_FILE
+    return run_records.record_path(run_id, RECORD_FILE)
 
 
 def read_record(run_id: str) -> dict:
     """The run's animation record, or ``{}``. Never raises."""
-    try:
-        body = run_store._read_json(_record_path(run_id))
-    except Exception:  # pragma: no cover - _read_json already swallows
-        logger.exception("mobile.animations.read_record failed")
-        return {}
-    return body if isinstance(body, dict) else {}
+    return run_records.read_record(_record_path, run_id, logger, "mobile.animations")
 
 
 def write_record(run_id: str, body: dict) -> dict:
     """Write the run's animation record through run_store's own writer."""
-    try:
-        run_store._write_json(_record_path(run_id), dict(body or {}))
-        return {"error": None, "content": dict(body or {})}
-    except Exception as exc:
-        logger.exception("mobile.animations.write_record failed")
-        return {"error": str(exc), "content": None}
+    return run_records.write_record(
+        _record_path, run_id, body, logger, "mobile.animations"
+    )
 
 
 def clear_record(run_id: str) -> None:
     """Drop the record. A missing file is success: the point is that it is gone."""
-    try:
-        target = _record_path(run_id)
-        if target.is_file():
-            target.unlink()
-    except Exception:
-        logger.exception("mobile.animations.clear_record failed")
+    run_records.clear_record(_record_path, run_id, logger, "mobile.animations")
 
 
 def _is_zero(value: str) -> bool:
@@ -214,23 +205,14 @@ async def restore(run_id: str) -> dict:
 
 def stale_records(serial: str, *, skip_run_id: str = "") -> list:
     """Records from OTHER runs that still claim to have changed *serial*."""
-    out: list = []
-    try:
-        wanted = str(serial or "")
-        if not wanted:
-            return out
-        listed = run_store.list_runs(ime_session.IME_STALE_SCAN_RUNS, gc=False) or {}
-        for row in listed.get("content") or []:
-            run_id = str((row or {}).get("run_id") or "")
-            if not run_id or run_id == str(skip_run_id or ""):
-                continue
-            record = read_record(run_id)
-            if not record or str(record.get("serial") or "") != wanted:
-                continue
-            out.append({"run_id": run_id, **record})
-    except Exception:
-        logger.exception("mobile.animations.stale_records failed")
-    return out
+    return run_records.stale_records(
+        serial,
+        skip_run_id,
+        ime_session.IME_STALE_SCAN_RUNS,
+        read_record,
+        logger,
+        "mobile.animations",
+    )
 
 
 def _stale_outcome(restored: bool, detail: str, runs: list) -> dict:

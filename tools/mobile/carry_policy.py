@@ -4,7 +4,7 @@
 last dumped instead of dumping again. That is only safe when nothing happened
 in between, so the answer is derived from the one fact that proves it: the
 previous turn's trace held ONLY ops that cannot actuate
-(``executor.NON_ACTUATING_OPS``: an assert, ``done``, ``ask_tester``).
+(``replay.guard.NON_ACTUATING_OPS``: an assert, ``done``, ``ask_tester``).
 An empty trace, a missing trace, an unknown run, or any actuating op says no.
 
 The memory is per run id and bounded: at most :data:`MAX_CARRY_RUNS` runs are
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 
-from tools.mobile import executor
+from tools.mobile.replay.guard import NON_ACTUATING_OPS
 
 #: Runs whose last-turn answer is kept for this process; the oldest goes first.
 MAX_CARRY_RUNS = 64
@@ -35,7 +35,7 @@ def trace_is_inert(trace: object) -> bool:
     """True only for a non-empty trace whose every op cannot actuate."""
     if not isinstance(trace, list) or not trace:
         return False
-    return all(_op_of(entry) in executor.NON_ACTUATING_OPS for entry in trace)
+    return all(_op_of(entry) in NON_ACTUATING_OPS for entry in trace)
 
 
 def note(run_id: str, trace: object) -> None:

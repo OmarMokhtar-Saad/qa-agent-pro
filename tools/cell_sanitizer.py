@@ -13,10 +13,35 @@ from __future__ import annotations
 _FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
 
 
+# Characters an importer may skip before deciding a cell is a formula, so
+# NBSP + "=cmd" is still live: NBSP, zero-width, other Unicode spaces, C0 controls.
+_LEADING_SKIP = (
+    "\u00a0\u200b\u200c\u200d\u2060\ufeff\u202f\u205f\u3000 "
+    + "".join(chr(c) for c in range(0x2000, 0x200B))
+    + "".join(
+        chr(c) for c in (*range(0x00, 0x09), 0x0B, 0x0C, *range(0x0E, 0x20), 0x7F)
+    )
+)
+
+
+def _prefix(segment: str) -> str:
+    if not segment:
+        return segment
+    head = segment.lstrip(_LEADING_SKIP)
+    if segment[0] in _FORMULA_TRIGGERS or (head and head[0] in _FORMULA_TRIGGERS):
+        return "'" + segment
+    return segment
+
+
 def _neutralize_line(line: str) -> str:
-    """Prefix a single line with ' when it starts with a formula trigger."""
-    if line and line[0] in _FORMULA_TRIGGERS:
-        return "'" + line
+    """Prefix a line (and each lone-CR sub-line) that starts with a formula trigger.
+
+    A lone \\r starts a new row in Excel, so text after one is a line start too.
+    """
+    line = _prefix(line)
+    if "\r" in line:
+        first, *rest = line.split("\r")
+        line = "\r".join([first, *(_prefix(p) for p in rest)])
     return line
 
 
@@ -43,5 +68,5 @@ def sanitize_cell(value: str) -> str:
     if not text:
         return text
     # Preserve the original newline characters (\n and \r\n both collapse to \n
-    # for our exports, which is fine — we never emit lone \r as data).
+    # for our exports, which is fine; a lone \r is handled in _neutralize_line).
     return "\n".join(_neutralize_line(line) for line in text.split("\n"))

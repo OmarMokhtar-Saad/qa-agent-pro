@@ -44,8 +44,9 @@ masked before anything reaches disk, and this module is called after that), and
 the marker and excerpt are neutralised of prompt-guard markers HERE, because both
 are stored on the case record and rendered into the HTML report -- and neither of
 those paths goes through ``wrap_untrusted``. The markers come from
-``tools/mobile/perception`` rather than being copied, for the reason stated in
-``perception._guard_sentinel``: a copy of a guard phrase drifts silently. The
+``tools/untrusted`` (the same derivation ``perception`` uses) rather than being
+copied, for the reason stated in ``perception._guard_sentinel``: a copy of a
+guard phrase drifts silently. The
 CHAT path, which does reach a model, wraps them: ``tools/mobile/render.crash_note``.
 """
 
@@ -54,7 +55,7 @@ from __future__ import annotations
 import logging
 import re
 
-from tools.mobile.perception import GUARD_MARKERS, NEUTRALIZED
+from tools.untrusted import GUARD_MARKERS, NEUTRALIZED
 
 logger = logging.getLogger(__name__)
 

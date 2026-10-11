@@ -26,6 +26,7 @@ from tools.mobile import adb, tree_source
 from tools.mobile.dialog_handlers import TAP_RID, TAP_TEXT, DialogAction, is_denied
 from tools.mobile.perception import parse_bounds
 from tools.mobile.tree_source import TreeResult, TreeSource
+from tools.safe_parse import parse_xml
 
 log = logging.getLogger(__name__)
 
@@ -45,9 +46,8 @@ def _is_match(node: ElementTree.Element, text: str, rid: str) -> bool:
 def find_center(xml: str, *, text: str = "", rid: str = "") -> Optional[tuple]:
     """Centre ``(x, y)`` of the first node whose text, content-desc (or
     resource-id) equals the argument and whose bounds have an area; else None."""
-    try:
-        root = ElementTree.fromstring(xml or "")
-    except ElementTree.ParseError:
+    root = parse_xml(xml or "", refuse_decl=True)
+    if root is None:
         return None
     for node in root.iter("node"):
         if not _is_match(node, text, rid):
@@ -63,9 +63,9 @@ RawDump = Callable[[str], Awaitable[dict]]
 
 async def _guarded_dump(serial: str) -> dict:
     # Imported late: executor imports most of the package.
-    from tools.mobile import executor  # noqa: PLC0415
+    from tools.mobile.replay.dump import dump_raw
 
-    return await executor.dump_raw(serial)
+    return await dump_raw(serial)
 
 
 class AdbDeviceUi:

@@ -10,6 +10,7 @@ A-001 / B-030).
 from __future__ import annotations
 
 import re
+import unicodedata
 
 # Appended to every generating agent's system prompt alongside at least one
 # wrap_untrusted() call, so the model is told -- once, explicitly -- how to
@@ -28,7 +29,36 @@ _GUARD = (
 # Strip anything that could be mistaken for our own delimiter tags, so
 # untrusted text cannot forge a fake </untrusted_content> boundary (or a fake
 # opening tag) to break out of its wrapper.
-_SPOOF_PATTERN = re.compile(r"</?untrusted_content\b[^>]*>", re.IGNORECASE)
+# Tolerates space inside the tag (`</ untrusted_content>`) and a tag left
+# unclosed at the end of the text; fullwidth lookalikes are folded by NFKC in
+# strip_spoof_tags before this runs.
+_SPOOF_PATTERN = re.compile(
+    r"<\s*/?\s*untrusted_content\b(?:[^>]*>|[^\n]*)", re.IGNORECASE
+)
+
+# A derived guard marker must never be longer than this, so a pathological
+# guard cannot turn every screen into one giant redaction.
+MAX_GUARD_SENTINEL_CHARS = 60
+
+# What screen text is rewritten to when it tried to say a guard marker.
+NEUTRALIZED = "[neutralized]"
+
+
+def derive_guard_sentinel(guard: object, max_chars: int) -> str:
+    """The opening LABEL of *guard*: its prefix through the first colon, else a cut."""
+    text = str(guard or "").strip()
+    head, separator, _rest = text.partition(":")
+    if separator and 0 < len(head) <= max_chars:
+        return head + separator
+    return text[:max_chars]
+
+
+def guard_markers(sentinel: str) -> tuple[str, ...]:
+    """Everything a screen must not be able to say; falsy markers are DROPPED."""
+    return tuple(m for m in ("untrusted_content", sentinel) if m)
+
+
+GUARD_MARKERS = guard_markers(derive_guard_sentinel(_GUARD, MAX_GUARD_SENTINEL_CHARS))
 
 
 def single_line(value: object, limit: int = 120) -> str:
@@ -41,7 +71,7 @@ def single_line(value: object, limit: int = 120) -> str:
 
     Moved here from ``agents.api_test_agent._safe`` on 2026-09-02, because a text
     sanitiser has no business living in an agent: three call sites in
-    ``tools/mcp_handlers`` imported it from there, one of them outside any
+    ``handlers`` imported it from there, one of them outside any
     ``try``.
 
     CORRECTED the same day, after review: the move was first justified by
@@ -89,6 +119,10 @@ def strip_spoof_tags(text: object) -> str:
     cleaned = text if isinstance(text, str) else str(text or "")
     # Until stable: one pass turns `</untrusted_</untrusted_content>content>` into
     # a real closing tag. Every pass removes characters, so this terminates.
+    if not cleaned.isascii():
+        folded = unicodedata.normalize("NFKC", cleaned)
+        if _SPOOF_PATTERN.search(folded):
+            cleaned = folded  # only when a fullwidth lookalike hid a tag
     while _SPOOF_PATTERN.search(cleaned):
         cleaned = _SPOOF_PATTERN.sub("", cleaned)
     return cleaned
