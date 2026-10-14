@@ -1,10 +1,9 @@
-"""App Tester UI: open the listing and select one app by its label (no install)."""
+"""App Tester UI: open the app list and find one app's row by its label (no tap)."""
 
 from __future__ import annotations
 
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Union
 
-from tools.mobile.dialog_handlers import visible_texts
 from tools.mobile.install_source import InstallOutcome, InstallRequest
 from tools.mobile.install_sources.app_tester_ui_consts import (
     APP_TESTER_PACKAGE,
@@ -15,7 +14,7 @@ from tools.mobile.resolve import AskCb
 
 
 class ListedApp(NamedTuple):
-    """What to select: the device, the label and the App Tester id installed."""
+    """What to find: the device, the label and the App Tester id installed."""
 
     serial: str
     label: str
@@ -31,13 +30,14 @@ _LAUNCH_FAILED = InstallOutcome(
 
 
 class _PickMixin:
-    """Select an app's card in the App Tester list."""
+    """Find an app's row in the App Tester list."""
 
-    async def open_listed_app(
+    async def find_listed_app(
         self: _Flow, want: ListedApp, ask: Optional[AskCb] = None
-    ) -> InstallOutcome:
-        """Open App Tester, scroll the whole list, select the card matching the
-        label (asking only when none or several match). Installs nothing."""
+    ) -> Union[str, InstallOutcome]:
+        """Open App Tester, go back to its app list, scroll it, and return the
+        bundle id of the one row matching the label (asking only when several
+        match). Taps no row and installs nothing."""
         ui = self._ui_factory(want.serial)
         if not await ui.launch(want.tester):
             return _LAUNCH_FAILED
@@ -45,5 +45,4 @@ class _PickMixin:
         if shot is None:
             return _LAUNCH_FAILED
         run = _Run(ui, InstallRequest(want.serial, "", want.label), ask, None)
-        opened = await self._open_card(run, visible_texts(shot.xml))
-        return opened or InstallOutcome(True, "", "Selected the app in App Tester.")
+        return await self._pick_row(run, shot.xml)

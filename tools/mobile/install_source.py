@@ -39,6 +39,9 @@ class InstallRequest:
     app_label: str = ""
     release: Optional[Release] = None
     target_version_code: Optional[int] = None
+    #: True: the source's own Update/Download button decides the release (the
+    #: newest); no release is chosen or asked about.
+    latest: bool = False
 
 
 @dataclass(frozen=True)

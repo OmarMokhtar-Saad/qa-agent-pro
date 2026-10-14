@@ -23,12 +23,13 @@ MOBILE_SOURCES: tuple[tuple[str, str], ...] = (
 )
 
 #: How the app under test gets onto the emulator. Every one of these needs
-#: ``apply=true``; the first two are the only ones that write to the device from
-#: here, the middle two hand the tester the emulator's own Play Store UI.
+#: ``apply=true``. ``local_apk`` installs from here and ``app_tester`` taps App
+#: Tester's own Download button and the system installer; ``download_url`` and
+#: ``play_store`` hand the tester the emulator's own UI.
 INSTALL_SOURCES: tuple[tuple[str, str], ...] = (
     ("local_apk", "Install an .apk from a path on this machine"),
     ("download_url", "Open a download link inside the emulator's browser"),
-    ("app_tester", "Open Firebase App Tester through the emulator's Play Store"),
+    ("app_tester", "Install from Firebase App Tester on the device"),
     ("play_store", "Open the Play Store inside the emulator and install from there"),
     (
         "installed_package",

@@ -25,7 +25,7 @@ class _DetailMixin:
     """The app-page steps of the flow."""
 
     async def _detail(self: _Flow, run: _Run, texts) -> Optional[InstallOutcome]:
-        if not (run.release_done or run.tapped):
+        if not (run.release_done or run.tapped or run.request.latest):
             releases = parse_releases(texts)
             if len(releases) > 1:
                 return await self._tap_release(run, releases)

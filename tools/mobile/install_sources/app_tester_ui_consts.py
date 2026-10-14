@@ -16,6 +16,10 @@ APP_TESTER_PACKAGE = "dev.firebase.appdistribution"
 #: a screen dump, so this bounds the search, not the list.
 MAX_LISTING_SCROLLS = 6
 
+#: Back presses (and screen reads after each) made to leave the app page App
+#: Tester reopens on and reach its app list.
+MAX_BACK_TO_LIST = 3
+
 #: Pause between screens while something loads or installs.
 APP_TESTER_POLL_S = 1.0
 
@@ -23,9 +27,8 @@ ACTION_LABELS = ("Update", "Download", "Install")
 OPEN_LABEL = "Open"
 _PROGRESS_STARTS = ("downloading", "installing", "pending", "preparing")
 _VERSION_RE = re.compile(r"\b(\d+(?:\.\d+)*)\s*\((\d+)\)")
-#: Listing lines that are not app names: a card's release count, the list header.
-_RELEASE_COUNT_RE = re.compile(r"^\d+\s+releases?$", re.IGNORECASE)
-_LISTING_HEADERS = ("Test apps",)
+#: The App Tester text of its one-time setup for AAB releases (a tester step).
+AAB_SETUP_LABEL = "Get started"
 
 SleepFn = Callable[[float], Awaitable[None]]
 VersionFn = Callable[[str, str], Awaitable[Optional[AppVersion]]]
@@ -66,13 +69,11 @@ class _Flow(Protocol):
 
     async def _perform(self, ui: DeviceUi, action: Any) -> None: ...
 
-    async def _tester_screen(
-        self, run: _Run, texts: Any
-    ) -> Optional[InstallOutcome]: ...
+    async def _tester_screen(self, run: _Run, xml: str) -> Optional[InstallOutcome]: ...
 
-    async def _open_card(self, run: _Run, texts: Any) -> Optional[InstallOutcome]: ...
+    async def _open_card(self, run: _Run, xml: str) -> Optional[InstallOutcome]: ...
 
-    async def _scan_listing(self, run: _Run, texts: Any) -> tuple: ...
+    async def _pick_row(self, run: _Run, xml: str) -> Any: ...
 
     async def _tap_card(
         self, run: _Run, text: str, scroll_back: bool = False

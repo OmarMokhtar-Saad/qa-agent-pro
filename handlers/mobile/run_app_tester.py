@@ -1,10 +1,12 @@
-"""The ``app_tester`` source of ``qa_mobile_test``: open App Tester, pick the app."""
+"""The ``app_tester`` source of ``qa_mobile_test``: find the app in App Tester, install it."""
 
 from __future__ import annotations
 
+from handlers import _common
 from handlers.mobile.run_request import _AppCall, _mobile_ask
 from tools.mobile import adb as mobile_adb
-from tools.mobile.install_source import InstallOutcome
+from tools.mobile import app_alias
+from tools.mobile.install_source import InstallOutcome, InstallRequest
 from tools.mobile.install_sources.app_tester_ui import AppTesterUiSource
 from tools.mobile.install_sources.app_tester_ui_pick import ListedApp
 from tools.mobile.render_install import (
@@ -13,11 +15,9 @@ from tools.mobile.render_install import (
     APP_TESTER_STORE_PACKAGE,
 )
 
-_SELECTED = (
-    "## Opened in App Tester\n\nSelected the app in the list. Use its Download or "
-    "Update button, finish in the system installer, then call `qa_mobile_test` "
-    "again with the app's `package` name and `source=installed_package`. "
-    "Nothing was downloaded by this server.\n\n"
+_INSTALLING = (
+    "Installing the app through App Tester: its Download button, then the "
+    "system installer."
 )
 
 
@@ -41,18 +41,33 @@ async def _open_tester_store(serial: str) -> str:
     )
 
 
-def _outcome_markdown(outcome: InstallOutcome) -> str:
-    if outcome.ok:
-        return _SELECTED + APP_TESTER_HINT
-    return "⚠️ " + outcome.message
+def _failed(outcome: InstallOutcome) -> str:
+    return "⚠️ " + outcome.message + "\n\n" + APP_TESTER_HINT
+
+
+async def _install_listed(call: _AppCall, want: ListedApp) -> tuple:
+    """Find the app's row, then Download and install it: ``("", package)`` once
+    the installed version is confirmed, else the outcome message."""
+    source = AppTesterUiSource()
+    ask = _mobile_ask(call.choose)
+    bundle = await source.find_listed_app(want, ask)
+    if isinstance(bundle, InstallOutcome):
+        return _failed(bundle), ""
+    await _common.emit(call.progress, _INSTALLING)
+    request = InstallRequest(call.serial, bundle, want.label, latest=True)
+    outcome = await source.install(request, ask)
+    if not outcome.ok:
+        return _failed(outcome), bundle
+    app_alias.remember_alias(call.serial, want.label, bundle)
+    return "", bundle
 
 
 async def app_tester_stage(call: _AppCall, target: str) -> tuple:
-    """Launch the installed App Tester, scan its whole list, select the app named
-    by the hint. Store page only when App Tester itself is missing."""
+    """Launch the installed App Tester, find the app named by the hint in its
+    list, install it (Download + system installer) and continue the run with
+    its package. Store page only when App Tester itself is missing."""
     tester = await installed_tester(call.serial)
     if not tester:
         return await _open_tester_store(call.serial), target
     want = ListedApp(call.serial, call.value or target, tester)
-    outcome = await AppTesterUiSource().open_listed_app(want, _mobile_ask(call.choose))
-    return _outcome_markdown(outcome), target
+    return await _install_listed(call, want)

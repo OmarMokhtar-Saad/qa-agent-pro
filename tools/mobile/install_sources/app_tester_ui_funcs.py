@@ -9,15 +9,15 @@ from tools.mobile.app_info import AppVersion
 from tools.mobile.install_errors import code_from_dialog_text, explain, to_outcome
 from tools.mobile.install_source import InstallOutcome, InstallRequest, Release
 from tools.mobile.install_sources.app_tester_ui_consts import (
-    _LISTING_HEADERS,
     _PROGRESS_STARTS,
-    _RELEASE_COUNT_RE,
     _VERSION_RE,
-    ACTION_LABELS,
     OPEN_LABEL,
 )
 from tools.mobile.resolve import MAX_ASK_OPTIONS, Resolution
 from tools.untrusted import wrap_untrusted
+
+#: Characters of the App Tester row list quoted in a not-found reply.
+MAX_ROWS_SHOWN_CHARS = 1500
 
 
 def parse_releases(texts) -> list:
@@ -95,20 +95,44 @@ def _unresolved_message(got: Resolution) -> str:
     )
 
 
+def _not_on_list() -> InstallOutcome:
+    return InstallOutcome(
+        False,
+        "not_on_list",
+        "App Tester did not reach its app list after going back. Ask the tester "
+        "to open App Tester, sign in if asked, and leave it on the app list.",
+    )
+
+
+def _rows_not_found(label: str, rows) -> InstallOutcome:
+    shown = "\n".join(row.name + " (" + row.bundle + ")" for row in rows)
+    return InstallOutcome(
+        False,
+        "app_not_found",
+        "No app in App Tester has every word of "
+        + repr(label[:80])
+        + " in its name or bundle id.\n"
+        + wrap_untrusted("app tester options", shown, limit=MAX_ROWS_SHOWN_CHARS)
+        + "\nAsk the user which one they mean; do not guess.",
+    )
+
+
+def _aab_setup() -> InstallOutcome:
+    return InstallOutcome(
+        False,
+        "aab_setup_required",
+        "App Tester asks for its one-time setup to download AAB releases (Get "
+        "started). This is the tester's step: ask them to finish it on the "
+        "phone, then call `qa_mobile_test` again. Nothing was installed.",
+    )
+
+
 def _tap_failed(text: str) -> InstallOutcome:
     return InstallOutcome(
         False,
         "tap_failed",
         "Could not tap " + repr(str(text)[:80]) + " on the App Tester screen.",
     )
-
-
-def _is_card_text(text: str) -> bool:
-    if len(text) < 2 or text in ACTION_LABELS or text == OPEN_LABEL:
-        return False
-    if text in _LISTING_HEADERS or _RELEASE_COUNT_RE.match(text):
-        return False
-    return not (valid_package_name(text) or _VERSION_RE.search(text))
 
 
 def _explicit_release(request: InstallRequest, releases: list) -> Optional[str]:

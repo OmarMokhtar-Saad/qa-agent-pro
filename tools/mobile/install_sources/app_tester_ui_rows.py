@@ -1,0 +1,80 @@
+"""App Tester UI: the app list read as rows (display name + bundle id).
+
+A list row is the ``:id/row`` node with ``:id/app_name`` and ``:id/bundle_id``
+children. Only rows are candidates: release notes and other free text on an
+app page never are. Ids are matched by suffix, so any App Tester package id
+reads the same.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import NamedTuple
+from xml.etree import ElementTree
+
+from tools.safe_parse import parse_xml
+
+LIST_RID = ":id/appListRecyclerView"
+ROW_RID = ":id/row"
+AAB_SETUP_RID = ":id/aab_instructions_dialog_container"
+_END = "</hierarchy>"
+_SPLIT_RE = re.compile(r"[\s|.\-_]+")
+
+
+class Row(NamedTuple):
+    """One app in the App Tester list."""
+
+    name: str
+    bundle: str
+
+
+def _rid(node: ElementTree.Element) -> str:
+    return node.get("resource-id") or ""
+
+
+def _child_text(row: ElementTree.Element, suffix: str) -> str:
+    for node in row.iter("node"):
+        if _rid(node).endswith(suffix):
+            return (node.get("text") or "").strip()
+    return ""
+
+
+def _root(xml: str) -> ElementTree.Element | None:
+    """The parsed dump; text after ``</hierarchy>`` (an adb trailer) is cut."""
+    head, end, _ = (xml or "").rpartition(_END)
+    return parse_xml(head + end if end else xml or "", refuse_decl=True)
+
+
+def parse_rows(xml: str) -> list:
+    """The list rows on this screen, top first; rows without a bundle id drop."""
+    root = _root(xml)
+    if root is None:
+        return []
+    rows = (
+        Row(_child_text(node, ":id/app_name"), _child_text(node, ":id/bundle_id"))
+        for node in root.iter("node")
+        if _rid(node).endswith(ROW_RID)
+    )
+    return [row for row in rows if row.bundle]
+
+
+def has_rid(xml: str, suffix: str) -> bool:
+    root = _root(xml)
+    return root is not None and any(_rid(n).endswith(suffix) for n in root.iter())
+
+
+def is_listing(xml: str) -> bool:
+    """True when the screen is the App Tester app list (not an app page)."""
+    return has_rid(xml, LIST_RID)
+
+
+def _words(text: str) -> set:
+    return {word for word in _SPLIT_RE.split(text.casefold()) if word}
+
+
+def matching_rows(label: str, rows) -> list:
+    """Rows whose name and bundle words hold every word of *label*."""
+    want = _words(label)
+    if not want:
+        return []
+    return [row for row in rows if want <= _words(row.name) | _words(row.bundle)]

@@ -14,13 +14,19 @@ from tools.mobile.dialog_handlers import (
 )
 from tools.mobile.install_source import DeviceUi, InstallOutcome
 from tools.mobile.install_sources.app_tester_ui_consts import (
+    AAB_SETUP_LABEL,
     APP_TESTER_PACKAGE,
     APP_TESTER_POLL_S,
     Seen,
     _Flow,
     _Run,
 )
-from tools.mobile.install_sources.app_tester_ui_funcs import _foreign_stop, _in_progress
+from tools.mobile.install_sources.app_tester_ui_funcs import (
+    _aab_setup,
+    _foreign_stop,
+    _in_progress,
+)
+from tools.mobile.install_sources.app_tester_ui_rows import AAB_SETUP_RID, has_rid
 
 
 class _ScreenMixin:
@@ -34,7 +40,7 @@ class _ScreenMixin:
         front = await run.ui.foreground()
         texts = visible_texts(shot.xml)
         if front == APP_TESTER_PACKAGE:
-            return await self._tester_screen(run, texts)
+            return await self._tester_screen(run, shot.xml)
         if front == run.request.package:
             return await self._own_app(run)
         return await self._foreign(run, Seen(front, shot.xml, texts))
@@ -71,10 +77,15 @@ class _ScreenMixin:
             await ui.tap_text(action.value)
         await self._sleep(APP_TESTER_POLL_S)
 
-    async def _tester_screen(self: _Flow, run: _Run, texts) -> Optional[InstallOutcome]:
+    async def _tester_screen(
+        self: _Flow, run: _Run, xml: str
+    ) -> Optional[InstallOutcome]:
+        texts = visible_texts(xml)
         if _in_progress(texts):
             await self._sleep(APP_TESTER_POLL_S)
             return None
         if not run.card_tapped:
-            return await self._open_card(run, texts)
+            return await self._open_card(run, xml)
+        if AAB_SETUP_LABEL in texts or has_rid(xml, AAB_SETUP_RID):
+            return _aab_setup()
         return await self._detail(run, texts)

@@ -5,13 +5,16 @@ API, CLI or credential is involved (owner decision, 2026-10-05). The flow, one
 screen at a time, is bounded by ``MAX_APP_TESTER_STEPS`` steps and
 ``APP_TESTER_FLOW_TIMEOUT_S`` seconds:
 
-1. open App Tester and find the app card: by the package id when the list shows
-   it (scrolling the list at most ``MAX_LISTING_SCROLLS`` times to look), else
-   by its display label (resolve-or-ask:
-   several cards for one label are asked about, never picked);
+1. open App Tester, press back (at most ``MAX_BACK_TO_LIST`` times) until its
+   app list shows -- it reopens on the last app page viewed -- and find the
+   app's list row (scrolling at most ``MAX_LISTING_SCROLLS`` times): by the
+   package id when a row's bundle id is it, else by its label, every word of
+   which must be in the row's name or bundle id. Only list rows are candidates,
+   never release notes; several matching rows are asked about, never picked;
 2. on the app page, choose a release when several are listed (the request's
-   release or target version code decides, otherwise ask) and tap Update /
-   Download / Install ONCE;
+   release or target version code decides; ``latest`` leaves it to the page's
+   own button; otherwise ask) and tap Update / Download / Install ONCE. An AAB
+   one-time setup screen (Get started) stops the flow as the tester's step;
 3. hand every screen of another app (package installer, permission controller)
    to ``dialog_handlers.handle``, which taps only visible controls and never a
    destructive one;
@@ -63,7 +66,7 @@ from tools.mobile.resolve import AskCb, PickOpts, decide, resolve_or_ask  # noqa
 APP_TESTER_FLOW_TIMEOUT_S = 240
 
 #: Loop bound: screens examined before the flow gives up.
-MAX_APP_TESTER_STEPS = 30
+MAX_APP_TESTER_STEPS = 60
 
 
 class AppTesterUiSource(_ScreenMixin, _CardMixin, _DetailMixin, _PickMixin):
@@ -92,7 +95,7 @@ class AppTesterUiSource(_ScreenMixin, _CardMixin, _DetailMixin, _PickMixin):
         if not await run.ui.launch(APP_TESTER_PACKAGE):
             return []
         shot = await run.ui.screen()
-        if shot is None or await self._open_card(run, visible_texts(shot.xml)):
+        if shot is None or await self._open_card(run, shot.xml):
             return []
         detail = await run.ui.screen()
         if detail is None:

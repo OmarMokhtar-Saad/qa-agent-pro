@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.111.1] - 2026-10-14
+## [1.112.0] - 2026-10-15
 
 ### Added
 
@@ -29,11 +29,17 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- The install menu shown when a mobile call names no app now says so,
-  and points a screen-only check at `qa_capture_screens(peek=true)`.
+- `source=app_tester` now installs the app itself: it finds the app in
+  App Tester, taps its Download or Update button, finishes the system
+  installer and continues the run once the new version is installed.
+  The newest release is taken without a second question.
 
 ### Fixed
 
-- The device list no longer offers iOS simulators reported by devicectl
-  or paired iPhones that are not connected; booted simulators are still
-  listed.
+- App Tester no longer opens the wrong app. It goes back to the app list
+  when it reopens on another app's page, and only list rows count: every
+  word of the name you give must match the row's name or package id.
+  Release notes are never read as apps, and several matching apps are
+  asked about.
+- App Tester's one-time setup for AAB releases (Get started) now stops
+  the install and asks you to finish it on the phone.
