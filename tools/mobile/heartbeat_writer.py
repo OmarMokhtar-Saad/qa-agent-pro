@@ -11,7 +11,7 @@ import threading
 from typing import NamedTuple
 
 from tools.mobile import heartbeat_beat as beat
-from tools.mobile import run_store
+from tools.mobile import run_lease_release, run_store
 
 #: One quarter of ``run_store.LEASE_STALE_S``, so THREE consecutive missed beats
 #: are needed before another chat may take the run over. Derived rather than
@@ -87,6 +87,7 @@ class _Writer:
         if beat._run_is_finished(self.run_id, self.session_token):
             self.stop_reason = "run_finished"
             beat._release_device_lock(self.run_id, self.session_token)
+            run_lease_release.mark_released(self.run_id, self.session_token)
             return True
         if self._stop.wait(self.interval_s):
             self.stop_reason = self.stop_reason or "stopped"

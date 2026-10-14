@@ -20,6 +20,7 @@ from tools.mobile import (
     knowledge_hooks,
     knowledge_limits,
     knowledge_stage_popups,
+    kplg_popup_ref,
 )
 from tools.mobile.knowledge_hooks import Directive
 from tools.mobile.kplg_calls import Post, Pre
@@ -76,7 +77,9 @@ def _fired(ctx: Any, item: str) -> int:
 
 def _dismiss_step(rid: str):
 
-    got = actions.parse_script({"actions": [{"op": "tap", "target": {"rid": rid}}]})
+    got = actions.parse_script(
+        {"actions": [{"op": "tap", "target": kplg_popup_ref.target_of(rid)}]}
+    )
     script = got.get("content")
     return list(getattr(script, "actions", None) or [])
 
@@ -85,10 +88,11 @@ def _blocked(call: Pre) -> set:
     """Resource ids on screen when a popup can block the step, else empty."""
 
     op, want = op_rid(call.step)
+    want = want or kplg_popup_ref.step_ref(call.step)
     # Only an op that actuates is blocked by a popup; an assert or a wait is not.
     if op not in actions.MUTATING_OPS or op in actions.WAIT_OPS:
         return set()
-    here = screen_rids(call.screen)
+    here = screen_rids(call.screen) | kplg_popup_ref.screen_refs(call.screen)
     if not want or want in here or want.split("/", 1)[-1] in here:
         return set()
     return here
@@ -157,7 +161,8 @@ def pre_step(ctx, call: Pre) -> Directive:
 def post_step(ctx, call: Post) -> None:
     """Stamp ``entry["popup"]`` on the dismiss tap a popup directive inserted."""
     entry = call.entry
-    _, rid = op_rid((entry or {}).get("action") or {})
+    action = (entry or {}).get("action") or {}
+    rid = op_rid(action)[1] or kplg_popup_ref.step_ref(action)
     for ev in getattr(ctx, "kbuf", None) or []:
         if (
             ev.get("kind") == "popup_fired"

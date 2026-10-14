@@ -48,6 +48,8 @@ class PressAction(_Base):
 
 
 class ScrollAction(_Base):
+    """``dir`` is the way the content moves: "down" reveals what is below."""
+
     op: Literal["scroll"]
     dir: Literal["up", "down", "left", "right"]
     target: Optional[Target] = None

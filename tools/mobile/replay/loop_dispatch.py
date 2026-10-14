@@ -10,10 +10,13 @@ from tools.mobile.replay.device_ops import _perform
 from tools.mobile.replay.elements import _clamp_source
 from tools.mobile.replay.elements_swipe import TouchSpec
 from tools.mobile.replay.guard import _confirmed
+from tools.mobile.replay.loop_field_empty import reconcile_empty_field
 from tools.mobile.replay.loop_settle import Acted, _device_error_stop, _settle_device
+from tools.mobile.replay.screen import _screen_hash
 from tools.mobile.replay.steps_assert import Seen, _assert_step
 from tools.mobile.replay.verdicts import SCROLL_TARGET_MISSED
 from tools.mobile.replay.waits import _changed_wait, _condition_wait, _wait_spec
+from tools.mobile.replay.waits_prior import clear_action, note_action
 from tools.mobile.replay.waits_types import ChangedStep, CondStep
 
 
@@ -27,6 +30,7 @@ async def _wait_step(
     """
     spec = _wait_spec(step.action, run.items)
     if spec[0] != "changed":
+        clear_action(run.ctx)
         return await _condition_wait(
             run, CondStep(step.action, spec, step.entry), screen
         )
@@ -42,7 +46,9 @@ async def _device_step(
     """Run a device op: ``(screen, reply)``, ``reply`` is ``None`` to go on."""
     entry = step.entry
     touch = TouchSpec(step.op, step.action, step.element, _clamp_source(screen))
+    note_action(run.ctx, _screen_hash(screen))
     outcome = await _perform(touch, run.ctx)
+    outcome = await reconcile_empty_field(run, Acted(outcome, entry, screen))
     if outcome.get("error"):
         return screen, _device_error_stop(run, Acted(outcome, entry, screen))
     entry["outcome"] = "ok"

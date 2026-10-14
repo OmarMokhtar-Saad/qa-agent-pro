@@ -89,7 +89,7 @@ def run_age(root: Path, manifest: dict, now: float) -> float:
 def _lease_live(child: Path, moment: float) -> bool:
     lease = run_io.read_json(child / run_consts.LEASE_FILE)
     heartbeat = float(lease.get("heartbeat") or 0) if isinstance(lease, dict) else 0.0
-    if math.isnan(heartbeat):
+    if math.isnan(heartbeat) or (isinstance(lease, dict) and lease.get("released_at")):
         return False
     return bool(heartbeat and (moment - heartbeat) <= run_consts.LEASE_STALE_S)
 

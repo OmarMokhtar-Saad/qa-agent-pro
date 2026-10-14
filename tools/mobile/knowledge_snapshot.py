@@ -27,6 +27,7 @@ SNAPSHOT_KEYS = {
     "elements": dict,
     "popups": list,
     "shortcuts": list,
+    "flows": list,
     "edges": dict,
     "mistakes": dict,
     "lessons": dict,

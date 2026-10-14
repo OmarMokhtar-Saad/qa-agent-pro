@@ -83,9 +83,18 @@ async def _commit_and_verify(job: _TypeJob, value: str) -> dict:
     refused = await _undelivered(job.serial, job.actions, sent)
     if refused:
         return {"error": refused, "content": None}
+    return await _verified_result(job, value, before)
+
+
+async def _verified_result(job: _TypeJob, value: str, before: str | None) -> dict:
+    """Read the field again and build the success envelope."""
     after = await _field_snapshot(job.serial, job.actions, job.secret)
     landed = _landed_verdict(Seen(before, after), value, job.secret)
-    return _typed_result(value, job.secret, landed)
+    result = _typed_result(value, job.secret, landed)
+    # EMPTY after the commit: only the screen can say whether that is a dead
+    # field or an auto-submitting OTP that moved on, so the replay asks it.
+    result["content"]["empty_after"] = after == ""
+    return result
 
 
 def _typed_result(value: str, secret: bool, landed: str) -> dict:

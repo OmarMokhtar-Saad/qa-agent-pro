@@ -37,6 +37,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from tools.mobile.session_explore_ids import EXPLORE_MODULE
+
 
 def _typed_outcomes(rows: list[dict]) -> tuple[int, list[str]]:
     verified = 0
@@ -58,12 +60,20 @@ def _typed_outcomes(rows: list[dict]) -> tuple[int, list[str]]:
     return verified, failed
 
 
+def _is_explore(rows: list[dict]) -> bool:
+    """Whether every row is an explore turn (the Exploration module)."""
+    return bool(rows) and all(r.get("module") == EXPLORE_MODULE for r in rows)
+
+
 def _typed_field_tally(rows: list[dict]) -> str:
     """ "N typed fields verified, M failed", naming each failed field."""
     verified, failed = _typed_outcomes(rows)
     if not verified and not failed:
         return ""
-    line = str(verified) + " typed fields verified, " + str(len(failed)) + " failed"
+    # An explore turn that stumbled is a warning: the run's verdict is the final
+    # done(pass), not every step. A suite case that failed still says "failed".
+    word = "warnings" if _is_explore(rows) else "failed"
+    line = str(verified) + " typed fields verified, " + str(len(failed)) + " " + word
     if failed:
         line += ": " + ", ".join(repr(name[:60]) for name in failed[:12])
         if len(failed) > 12:

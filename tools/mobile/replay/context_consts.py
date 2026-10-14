@@ -51,6 +51,11 @@ WAIT_POLL_S = 0.25
 #: again. Bounded, because a tap that really did nothing must still say so.
 AUTO_SETTLE_MAX_S = 2.0
 
+#: The longest an explore turn waits for the screen to change (S3). The turn
+#: ends and hands the model the screen; a 10s wait for a change that is not
+#: coming only delays that. Scripted runs keep the model's own ``ms``.
+EXPLORE_CHANGED_WAIT_MAX_MS = 3000
+
 #: Screen-changing ops that do NOT auto-settle: a field edit changes one
 #: element in place, and polling for a "change" after it would spend the whole
 #: bound on every keystroke the IME already confirmed.

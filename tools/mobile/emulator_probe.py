@@ -123,3 +123,24 @@ async def list_running() -> dict:
     except Exception as exc:
         logger.exception("mobile.emulator.list_running failed")
         return {"error": str(exc), "content": None}
+
+
+async def list_physical() -> dict:
+    """Every ready non-emulator adb serial (a phone), as ``{"serial", "avd": ""}``.
+
+    Lets the device stage adopt a connected phone instead of booting an
+    emulator beside it. ``error`` is set when adb cannot be asked.
+    """
+    try:
+        listed = await adb.devices()
+        if listed.get("error"):
+            return {"error": str(listed["error"]), "content": None}
+        rows = [
+            {"serial": str(s), "avd": ""}
+            for s in listed.get("content") or []
+            if not str(s).startswith("emulator-")
+        ]
+        return {"error": None, "content": rows}
+    except Exception as exc:
+        logger.exception("mobile.emulator.list_physical failed")
+        return {"error": str(exc), "content": None}

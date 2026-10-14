@@ -6,13 +6,26 @@ import time
 
 from tools.mobile import watch
 from tools.mobile.replay.context import Context, _sleep
-from tools.mobile.replay.context_consts import WAIT_POLL_S
+from tools.mobile.replay.context_consts import (
+    EXPLORE_CHANGED_WAIT_MAX_MS,
+    WAIT_POLL_S,
+)
 from tools.mobile.replay.dump import _dump, _focus_probe
 from tools.mobile.replay.screen import _screen_hash
 from tools.mobile.replay.waits_interrupt import _interruption_of
 from tools.mobile.replay.waits_poll import _wait_deadline
+from tools.mobile.replay.waits_prior import already_changed
 from tools.mobile.replay.waits_spec import _secs
 from tools.mobile.replay.waits_types import AfterWait
+
+
+def _capped_ms(ctx: Context, ms: int) -> int:
+    """*ms*, held to the explore lane's ceiling: a turn waits, then the model decides."""
+    return (
+        min(ms, EXPLORE_CHANGED_WAIT_MAX_MS)
+        if getattr(ctx, "lane", "") == "explore"
+        else ms
+    )
 
 
 async def _focus_moved(serial: str, before_focus: str, deadline: float) -> bool:
@@ -89,10 +102,11 @@ async def _changed_poll(ctx: Context, deadline: float) -> tuple:
 async def _wait_until_changed(ctx: Context, screen: object, ms: int) -> tuple:
     """Poll until the screen is not the one we started on: ``(screen, changed, reusable)``."""
     before = _screen_hash(screen)
-    deadline = _wait_deadline(ctx, ms / 1000.0)
+    if already_changed(ctx, before, screen):
+        return screen, True, True
+    deadline = _wait_deadline(ctx, _capped_ms(ctx, ms) / 1000.0)
     before_focus = await _focus_probe(ctx.serial, deadline - time.monotonic())
-    current = screen
-    fresh = False
+    current, fresh = screen, False
     ticker = watch.Ticker("waiting for the screen to change")
     while time.monotonic() < deadline:
         await ticker.tick()

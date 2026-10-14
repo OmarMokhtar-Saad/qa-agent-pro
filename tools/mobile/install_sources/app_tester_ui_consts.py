@@ -58,6 +58,7 @@ class Seen(NamedTuple):
 # mypy-strict gate catches drift.
 class _Flow(Protocol):
     _sleep: SleepFn
+    _ui_factory: UiFactory
 
     async def _own_app(self, run: _Run) -> Optional[InstallOutcome]: ...
 

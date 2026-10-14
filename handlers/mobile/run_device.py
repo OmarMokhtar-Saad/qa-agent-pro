@@ -30,12 +30,12 @@ async def _mobile_ensure_ready(serial: str, avd: str = "") -> tuple:
 # The label came back from the CLIENT, so the serial in it is not
 # evidence. Only a serial we actually enumerated may be driven.
 async def _device_stage_pick(booted: list, choose: _common.ChooseCb) -> tuple:
-    """Several emulators are running: let the tester pick one, then ready it."""
+    """Several devices are connected: let the tester pick one, then ready it."""
 
     labels = _pick_labels(booted)
     picked = await _elicit.elicit_choice(
         choose,
-        "Several emulators are running. Which one should this run use?",
+        "Several devices are connected. Which one should this run use?",
         labels,
     )
     if picked.status != _common.CHOSEN:
@@ -51,7 +51,7 @@ def _pick_labels(booted: list) -> list:
     return [
         str(item.get("serial") or "")
         + " ("
-        + (str(item.get("avd") or "") or "unknown AVD")
+        + (str(item.get("avd") or "") or "physical device")
         + ")"
         for item in booted
     ]
@@ -61,7 +61,7 @@ def _pick_menu_reply(labels: list) -> str:
     """The numbered menu sent back when the tester did not choose."""
     menu = "\n".join(str(i + 1) + ". " + label for i, label in enumerate(labels))
     return (
-        "## Several emulators are running\n\n"
+        "## Several devices are connected\n\n"
         + menu
         + "\n\nCall `qa_mobile_test` again with `serial` set to the "
         "one you want."
@@ -124,10 +124,21 @@ async def _mobile_device_stage(call: _DeviceCall) -> tuple:
     return await _device_stage_running(call)
 
 
-async def _device_stage_running(call: _DeviceCall) -> tuple:
-    """No serial given: ready the one running emulator, pick, or boot."""
+async def _connected_devices() -> dict:
+    """Running emulators plus connected phones: ``{"error", "content": rows}``."""
 
     running = await emulator.list_running()
+    if running.get("error"):
+        return running
+    # A failed phone probe is not fatal: the emulator probe already reached adb.
+    phones = (await emulator.list_physical()).get("content") or []
+    return {"error": None, "content": (running.get("content") or []) + phones}
+
+
+async def _device_stage_running(call: _DeviceCall) -> tuple:
+    """No serial given: ready the one connected device, pick, or boot."""
+
+    running = await _connected_devices()
     if running.get("error"):
         return "⚠️ " + str(running["error"])[:300], ""
     booted = running.get("content") or []

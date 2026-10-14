@@ -10,8 +10,9 @@ from handlers.mobile.run_install import (
     _local_apk_stage,
 )
 from handlers.mobile.run_request import _AppCall, _mobile_ask
-from tools.mobile import app_stage_pick, resolve_cache, run_store
+from tools.mobile import app_alias, app_stage_pick, resolve_cache, run_store
 from tools.mobile import render as mobile_render
+from tools.mobile.install_source_infer import infer_install_source
 
 
 # Notes for ``_installed_package_target`` (moved out of the body to keep it short):
@@ -53,10 +54,7 @@ def _remember_installed(call: _AppCall, target: str) -> None:
     """Remember *target* as the resolution of the app hint, when there is one."""
 
     if call.value:
-        answer_key = resolve_cache.cache_key(call.serial, call.value)
-        run_store.write_resolved_app(
-            answer_key, run_store.ResolvedApp(target, call.serial, {})
-        )
+        app_alias.remember_alias(call.serial, call.value, target)
 
 
 def _probe_outcome(call: _AppCall, target: str, body: dict) -> tuple | None:
@@ -106,11 +104,26 @@ async def _app_stage_remembered(call: _AppCall) -> tuple[str, str]:
     return menu, target
 
 
+def _inferred_source(call: _AppCall) -> str:
+    """The source named by the app text, or by the goal for the lanes that need no value.
+
+    A link or path found only in the goal is never opened (``call.value`` is), so
+    ``download_url`` and ``local_apk`` are inferred from ``app`` alone.
+    """
+    from_app = infer_install_source(call.value)
+    if from_app:
+        return from_app
+    from_goal = infer_install_source(call.source_text)
+    return "" if from_goal in ("download_url", "local_apk") else from_goal
+
+
 async def _app_stage_install(call: _AppCall, st: tuple, probe: tuple) -> tuple:
     """The install branches once the probe found no finished answer."""
 
     install_source, target = st
     probed, suggestions = probe
+    # An empty source is inferred from the app text; ask only if that is unclear.
+    install_source = install_source or _inferred_source(call)
     if not install_source:
         return mobile_render.install_menu_markdown(target, probed=probed), target
     if not call.apply:
@@ -127,7 +140,6 @@ async def _app_stage_install(call: _AppCall, st: tuple, probe: tuple) -> tuple:
 # A KEY only. This used to try a POSITIONAL lookup first, and the start menu
 # shares this argument, so a start-menu answer of "3" resolved here to
 # `app_tester`.
-# Notes for ``_mobile_app_stage`` (moved out of the body to keep it short):
 #
 #     The resolved package comes back because the ``installed_package`` source
 #     carries it in ``app`` rather than in ``package``: deriving it twice is how

@@ -9,6 +9,7 @@ import logging
 
 from config.settings_guard import never_raise
 from tools import tool_status
+from tools.mobile import step_timing
 from tools.mobile.adb_consts import DUMP_REMOTE_PATH
 from tools.mobile.adb_host import host
 
@@ -58,6 +59,13 @@ def clear_dump_provider(serial: str) -> None:
     _DUMP_PROVIDERS.pop(str(serial), None)
 
 
+#: What the step timing row says served a dump (the manifest ``source``). The
+#: fallback tags say WHY uiautomator was used, so a slow run is explainable.
+SOURCE_A11Y = "qa-ime-a11y"
+SOURCE_NO_PROVIDER = "uiautomator-dump (no a11y)"
+SOURCE_PROVIDER_FAILED = "uiautomator-dump (a11y failed)"
+
+
 async def _provider_dump(serial: str, provider) -> str | None:
     """The fast provider's XML when it is clean, capped and ``<``-led, else
     ``None`` (including when the provider raises) so the caller falls through
@@ -73,6 +81,9 @@ async def _provider_dump(serial: str, provider) -> str | None:
             and len(fast_xml.encode("utf-8", errors="replace")) <= host().MAX_DUMP_BYTES
         ):
             return fast_xml
+        logger.warning(
+            "mobile.adb: a11y dump refused: %s", str(fast.get("error"))[:200]
+        )
     return None
 
 
@@ -118,11 +129,16 @@ def _dump_no_xml(said: str) -> dict:
 async def _fast_dump(serial: str, use_provider: bool) -> dict | None:
     """The provider's reply envelope when it answered cleanly, else ``None``."""
     provider = _DUMP_PROVIDERS.get(str(serial)) if use_provider else None
-    if provider is not None:
-        fast_xml = await _provider_dump(serial, provider)
-        if fast_xml is not None:
-            return {"error": None, "content": fast_xml}
-    return None
+    if provider is None:
+        if use_provider:
+            step_timing.note_source(SOURCE_NO_PROVIDER)
+        return None
+    fast_xml = await _provider_dump(serial, provider)
+    if fast_xml is None:
+        step_timing.note_source(SOURCE_PROVIDER_FAILED)
+        return None
+    step_timing.note_source(SOURCE_A11Y)
+    return {"error": None, "content": fast_xml}
 
 
 def _over_cap() -> dict:

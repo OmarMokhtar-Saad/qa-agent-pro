@@ -119,12 +119,23 @@ async def _a11y_enable_note(serial: str, run_id: str, lines: list) -> None:
 
     with never_raise(logger, "mobile a11y stage: enable skipped", exc_info=True):
         on = await a11y.enable(serial, run_id)
-        if on.get("error"):
+        why = on.get("error") or _a11y_off_reason(on)
+        if why:
             lines.append(
                 "⚠️ Fast screen reading is off for this run ("
-                + str(on["error"])[:200]
+                + str(why)[:200]
                 + "); using uiautomator, which is slower."
             )
+
+
+def _a11y_off_reason(on: dict) -> str:
+    """Why a clean ``enable`` still left the fast dump off, or ``""`` when it is on."""
+    content = on.get("content") or {}
+    if content.get("enabled") is not False:
+        return ""
+    if content.get("reason") == "keyboard_not_armed":
+        return "the QA keyboard is not armed"
+    return "the QA keyboard is an old version"
 
 
 # Notes for ``_mobile_animations_stage`` (moved out of the body to keep it short):

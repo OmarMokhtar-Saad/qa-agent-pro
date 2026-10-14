@@ -7,10 +7,10 @@ import logging
 import tools.mobile.session_device as session_device
 from config.settings_guard import never_raise
 from handlers import _common
+from handlers.mobile.run_app_tester import app_tester_stage
 from handlers.mobile.run_request import _AppCall
 from tools import device_manager as _device_manager
 from tools.mobile import adb as mobile_adb
-from tools.mobile import render as mobile_render
 from tools.mobile import run_store as _run_store
 
 logger = logging.getLogger("tools.mcp_handlers")
@@ -102,36 +102,31 @@ def _store_url(install_source: str, value: str, target: str) -> str:
             if value.startswith("market://")
             else "market://details?id=" + (value or target)
         )
-    if install_source == "app_tester":
-        url = "market://details?id=com.google.android.apps.firebase.appdistribution"
     return url
 
 
-def _store_opened_markdown(install_source: str) -> str:
+def _store_opened_markdown() -> str:
     """The reply once the store page is open on the emulator."""
 
     return (
         "## Opened on the emulator\n\nFinish the install in the emulator's own "
         "UI, then call `qa_mobile_test` again with the app's `package` name and "
         "`source=installed_package`. Nothing was downloaded by this server."
-        + (
-            "\n\n" + mobile_render.app_tester_hint(mobile_render.APP_TESTER_PACKAGES[0])
-            if install_source == "app_tester"
-            else ""
-        )
     )
 
 
 async def _app_stage_open_store(
     call: _AppCall, install_source: str, target: str
 ) -> tuple:
-    """Open the Play Store page (or Firebase App Tester) inside the emulator."""
+    """Open the Play Store page, or drive Firebase App Tester, in the emulator."""
 
+    if install_source == "app_tester":
+        return await app_tester_stage(call, target)
     url = _store_url(install_source, call.value, target)
     opened = await mobile_adb.open_url(call.serial, url)
     if opened.get("error"):
         return "⚠️ " + str(opened["error"])[:300], target
-    return _store_opened_markdown(install_source), target
+    return _store_opened_markdown(), target
 
 
 def _installing_reply(target: str) -> tuple:

@@ -51,6 +51,7 @@ from tools.mobile.emulator_probe import (  # noqa: F401
     find_running,
     list_avds,
     list_avds_sync,
+    list_physical,
     list_running,
 )
 from tools.mobile.emulator_start import (  # noqa: F401

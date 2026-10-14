@@ -32,6 +32,7 @@ def _scroll_lines() -> list:
     return [
         "scroll dir: "
         + "|".join(action_consts.SCROLL_DIRECTIONS)
+        + " (the way the content moves: down shows what is below, up what is above)"
         + ". assert kind: "
         + "|".join(action_consts.ASSERT_KINDS)
         + " (visual must be last). done verdict: "

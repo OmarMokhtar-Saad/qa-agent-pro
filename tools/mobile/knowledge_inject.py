@@ -46,7 +46,7 @@ from tools.untrusted import wrap_untrusted  # noqa: F401
 logger = logging.getLogger(__name__)
 
 #: Modules (under tools.mobile) that call ``register_source`` when imported.
-INJECT_SOURCES: tuple = ()
+INJECT_SOURCES: tuple = ("knowledge_inject_flows",)
 
 SOURCES: dict = {}
 _LOCK = threading.Lock()

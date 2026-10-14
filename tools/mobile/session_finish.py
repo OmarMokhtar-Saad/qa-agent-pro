@@ -16,6 +16,7 @@ from tools.mobile import (
     locks,
     preflight,
     run_finalize,
+    run_lease_release,
     stop_run,
 )
 from tools.mobile.device_lock import (
@@ -134,6 +135,7 @@ async def finish_device(owner: str, **release_kwargs) -> dict:
     restores = await _restore_run_state(str(owner))
     stale = await _sweep_stale_state(str(owner))
     released = release_device_lock(str(owner), DeviceRelease(**release_kwargs))
+    run_lease_release.mark_released(str(owner))
     return _finish_device_reply(released, restores, stale)
 
 

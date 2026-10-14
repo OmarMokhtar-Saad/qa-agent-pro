@@ -16,7 +16,9 @@ REFUSAL that names them.
    on newer releases, ``hint``), and ``perception.prune`` therefore never sees
    it. The layer is omitted rather than stubbed: a branch with no producer is
    dead code that reads as a capability.
-3. ``adjacent`` -- the nearest EDITABLE node below, or to the right of, a
+3. ``contained`` -- an EDITABLE node whose bounds hold the centre of a
+   matching text node (a Material floating label drawn inside its field).
+4. ``adjacent`` -- the nearest EDITABLE node below, or to the right of, a
    non-editable node whose ``text`` or ``desc`` matches.
 
 Matching is tiered ACROSS the layers: EXACT after normalisation (lower-case,
@@ -40,6 +42,7 @@ from typing import Any
 from tools.mobile.fill_label_geom import _rect  # noqa: F401
 from tools.mobile.fill_label_layers import (  # noqa: F401
     LAYER_ADJACENT,
+    LAYER_CONTAINED,
     LAYER_FIELD,
     LAYERS,
     _adjacent_layer,
@@ -50,6 +53,7 @@ from tools.mobile.fill_label_match import (  # noqa: F401
     TIER_EXACT,
     _norm,
 )
+from tools.mobile.fill_label_owner import contained_layer
 from tools.untrusted import single_line, wrap_untrusted
 
 #: The longest label ``fill`` accepts. A LABEL, not a paragraph: it is matched
@@ -65,7 +69,11 @@ FILL_MAX_CANDIDATES_LISTED = 5
 #: longest part and are attacker-influenced, so each is clipped.
 FILL_MAX_CANDIDATE_CHARS = 60
 
-_LAYER_FUNCS = ((LAYER_FIELD, _field_layer), (LAYER_ADJACENT, _adjacent_layer))
+_LAYER_FUNCS = (
+    (LAYER_FIELD, _field_layer),
+    (LAYER_CONTAINED, contained_layer),
+    (LAYER_ADJACENT, _adjacent_layer),
+)
 
 
 def _miss_result() -> dict:

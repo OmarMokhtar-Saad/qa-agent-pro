@@ -30,7 +30,9 @@ PRIORITY = 10
 
 def _typed(step: object) -> tuple:
     """``(field, rid)`` of a non-secret ``type`` step naming both, else ``("", "")``."""
-    if getattr(step, "op", "") != "type" or getattr(step, "secret", False):
+    if getattr(step, "op", "") not in ("type", "fill") or getattr(
+        step, "secret", False
+    ):
         return "", ""
     field = str(getattr(step, "field", "") or "")
     rid = str(getattr(getattr(step, "target", None), "rid", "") or "")

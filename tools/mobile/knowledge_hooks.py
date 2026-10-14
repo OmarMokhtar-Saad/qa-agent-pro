@@ -28,6 +28,7 @@ PLUGS = (
     "knowledge_plug_shortcuts",
     "knowledge_plug_locators",
     "knowledge_plug_timings",
+    "knowledge_plug_flows",
     "knowledge_feedback",
 )
 

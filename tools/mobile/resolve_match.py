@@ -85,6 +85,29 @@ def _exact(pool: tuple, wanted: str) -> list:
     return [c for c in pool if _norm(c.key) == wanted] if wanted else []
 
 
+def _ends_with_last_word(text: str, cand: Candidate) -> bool:
+    """The key or label ENDS with the hint's last word: "shop qa" favours
+    ``com.x.shop.qa`` over ``com.x.shop.qa.staging``."""
+    last = (_words(text) or [""])[-1]
+    return any(
+        (re.findall(r"[a-z0-9]+", _norm(part)) or [""])[-1] == last
+        for part in (cand.key, cand.label)
+    )
+
+
+def _matches(text: str, pool: tuple, opts: PickOpts) -> tuple:
+    """The candidates matching the hint. For a hint of several words, several
+    hits are narrowed to those whose name ends the way the hint does (all of
+    them if none do); a one-word hint keeps every flavour so the tester picks."""
+    if not _norm(text):
+        return pool
+    hits = tuple(c for c in pool if opts.match(text, c))
+    if len(_words(text)) < 2:
+        return hits
+    best = tuple(c for c in hits if _ends_with_last_word(text, c))
+    return best if len(hits) > 1 and best else hits
+
+
 def decide(
     text: str, candidates: Sequence[Candidate], opts: PickOpts = _DEFAULT
 ) -> Resolution:
@@ -96,7 +119,7 @@ def decide(
     exact = _exact(pool, wanted)
     if len(exact) == 1:
         return Resolution(RESOLVED, exact[0].key, (exact[0],), how="exact")
-    hits = tuple(c for c in pool if opts.match(text, c)) if wanted else pool
+    hits = _matches(text, pool, opts)
     if len(hits) == 1:
         return Resolution(RESOLVED, hits[0].key, hits, how="single")
     if hits:

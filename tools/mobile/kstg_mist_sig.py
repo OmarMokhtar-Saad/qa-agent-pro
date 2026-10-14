@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tools.mobile.kstg_mist_detail import detail, join
+
 OK_OUTCOMES = ("ok", "assert_pass", "visual_check", "done")
 TAP_OPS = ("tap", "tap_text", "click", "long_press")
 _OUTCOME_SIGNATURE = {
@@ -34,7 +36,7 @@ def ok(rec: dict) -> bool:
 
 
 def _typed_failed(rec: dict) -> bool:
-    if rec.get("op") != "type":
+    if rec.get("op") not in ("type", "fill"):
         return False
     return rec.get("landed") is False or rec.get("outcome") == "device_error"
 
@@ -66,6 +68,16 @@ def _collision(rec: dict, seen: dict) -> bool:
     return first != field
 
 
+def _same_input(later: dict, rec: dict) -> bool:
+    """The retry: same op on the same element, or the same field on the right one."""
+    if later.get("op") != rec.get("op"):
+        return False
+    field = str(rec.get("text_field") or "")
+    return later.get("target_rid") == rec.get("target_rid") or (
+        bool(field) and later.get("text_field") == field
+    )
+
+
 def _fix_of(steps: list, i: int, sig: str) -> dict | None:
     """The later OK step on the same screen_key that contrasts with the failure."""
     rec = steps[i]
@@ -76,9 +88,7 @@ def _fix_of(steps: list, i: int, sig: str) -> dict | None:
             moved = later.get("after_screen_key") not in ("", later.get("screen_key"))
             if moved and later.get("target_rid") != rec.get("target_rid"):
                 return later
-        elif later.get("op") == rec.get("op") and later.get("target_rid") == rec.get(
-            "target_rid"
-        ):
+        elif _same_input(later, rec):
             return later
     return None
 
@@ -109,4 +119,4 @@ def texts(hit: dict) -> tuple:
     fixed = ""
     if fix is not None:
         fixed = "a later %s on %s worked on this screen" % (fix.get("op"), _name(fix))
-    return symptom[:200], fixed[:200]
+    return symptom[:200], join(fixed, detail(rec, fix))

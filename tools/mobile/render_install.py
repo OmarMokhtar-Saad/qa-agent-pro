@@ -77,6 +77,9 @@ APP_TESTER_PACKAGES = (
     "dev.firebase.appdistribution",
 )
 
+#: The id the Play Store lists App Tester under today (the first one is legacy).
+APP_TESTER_STORE_PACKAGE = APP_TESTER_PACKAGES[1]
+
 #: Static server text, not device text. It says nothing about HOW a build got onto
 #: the device (the install source is not recorded), only how App Tester updates one.
 APP_TESTER_HINT = (

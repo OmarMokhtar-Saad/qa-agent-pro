@@ -15,7 +15,7 @@ import json
 import logging
 from typing import Any
 
-from tools.mobile import knowledge_db, knowledge_limits
+from tools.mobile import knowledge_db, knowledge_limits, kstg_popup_text
 from tools.mobile.knowledge_learn import StageResult
 from tools.mobile.kstg_popup_write import Sighting, store
 from tools.mobile.replay.guard import is_destructive
@@ -84,6 +84,8 @@ def find(steps: Any) -> list:
         slot = _slot(cur, nxt)
         if slot is not None:
             found[slot] = found.get(slot, 0) + 1
+    for slot, count in kstg_popup_text.slots(recs).items():
+        found.setdefault(slot, count)
     return [(k, a, r, n) for (k, a, r), n in sorted(found.items())]
 
 

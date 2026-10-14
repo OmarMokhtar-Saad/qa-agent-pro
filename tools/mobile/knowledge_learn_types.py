@@ -11,6 +11,7 @@ STAGES = (
     "popups",
     "edges",
     "shortcuts",
+    "flows",
     "mistakes",
     "versions",
     "gate",

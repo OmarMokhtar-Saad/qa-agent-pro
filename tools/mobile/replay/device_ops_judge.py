@@ -43,8 +43,18 @@ def _judge_landed(result: object, field: str) -> dict:
         return result
     typed = content.get("typed", 0)
     if landed == ime.LANDED_NO:
-        return _landed_no_reply(typed, field)
+        return _landed_no_with_fallback(content, field)
     return _unconfirmed_type_reply(bool(content.get("secret")), typed, field)
+
+
+def _landed_no_with_fallback(content: dict, field: str) -> dict:
+    """The "did not land" reply; an EMPTY field also carries the unknown reply."""
+    typed = content.get("typed", 0)
+    reply = _landed_no_reply(typed, field)
+    if content.get("empty_after"):
+        secret = bool(content.get("secret"))
+        reply["if_screen_changed"] = _unconfirmed_type_reply(secret, typed, field)
+    return reply
 
 
 def _landed_no_reply(typed: object, field: str) -> dict:

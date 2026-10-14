@@ -35,6 +35,7 @@ from tools.mobile.session_records_locale import (  # noqa: F401
     locale_phrase,
     locale_record,
 )
+from tools.mobile.session_verdict_explore import explore_verdict
 from tools.mobile.verdicts import (
     VERDICT_FAIL,
     VERDICT_PASS,
@@ -138,4 +139,6 @@ def run_verdict(resolved: object, cases: Any) -> str:
         return VERDICT_UNVERIFIED
     if reset.get("requested") and not reset.get("done"):
         return VERDICT_UNVERIFIED
+    if body.get("explore") and explore_verdict(rows):
+        return VERDICT_PASS
     return _verdict_of(rows)

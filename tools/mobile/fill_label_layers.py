@@ -6,10 +6,12 @@ from typing import Any
 
 from tools.mobile.fill_label_geom import _claimed_between, _distance, _Pair, _rect
 from tools.mobile.fill_label_match import _matches, _Query, _strings
+from tools.mobile.fill_label_owner import owning_fields
 
 LAYER_FIELD = "field"
+LAYER_CONTAINED = "contained"
 LAYER_ADJACENT = "adjacent"
-LAYERS = (LAYER_FIELD, LAYER_ADJACENT)
+LAYERS = (LAYER_FIELD, LAYER_CONTAINED, LAYER_ADJACENT)
 
 
 def _field_layer(elements: list, label: str, tier: str) -> list:
@@ -48,7 +50,8 @@ def _adjacent_layer(elements: list, label: str, tier: str) -> list:
     ]
     query = _Query(label, tier)
     labels = [e for e in texts if _matches(e, ("text", "desc"), query)]
-    fields = _boxed_fields(elements)
+    owned = owning_fields(elements)
+    fields = [fb for fb in _boxed_fields(elements) if fb[0] not in owned]
     other_boxes = [_rect(e) for e in texts if e not in labels]
     other_boxes = [box for box in other_boxes if box]
     winners: list = []

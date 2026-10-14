@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from typing import Any, TypedDict, cast
 
-from tools.mobile import knowledge_limits, run_store
+from tools.mobile import knowledge_limits, knowledge_trace_flow, run_store
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,8 @@ class StepRec(TypedDict, total=False):
     index: int
     op: str
     target_rid: str
+    target_text: str
+    flow_action: dict
     text_field: str
     screen_key: str
     after_screen_key: str
@@ -60,6 +62,8 @@ def _head(entry: dict, action: dict) -> StepRec:
         index=_int(entry.get("index")),
         op=_text(action.get("op"), 40),
         target_rid=_rid(action),
+        target_text=knowledge_trace_flow.target_text(action),
+        flow_action=knowledge_trace_flow.flow_action(action),
         text_field=_text(entry.get("text_field") or action.get("field"), 80),
         screen_key=_text(entry.get("screen_key"), 64),
         after_screen_key=_text(entry.get("after_screen_key"), 64),

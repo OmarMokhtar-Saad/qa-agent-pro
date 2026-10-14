@@ -9,11 +9,13 @@ from tools.mobile.replay.elements_geom import (
     _on_screen_box,
 )
 
+#: ``dir`` is the CONTENT direction, like ``scroll_down`` of the device UI:
+#: "down" reveals what is below, so the finger moves UP. Each row is the finger.
 _SWIPE = {
-    "up": (540, 1500, 540, 500),
-    "down": (540, 500, 540, 1500),
-    "left": (900, 1000, 200, 1000),
-    "right": (200, 1000, 900, 1000),
+    "down": (540, 1500, 540, 500),
+    "up": (540, 500, 540, 1500),
+    "right": (900, 1000, 200, 1000),
+    "left": (200, 1000, 900, 1000),
 }
 
 #: How far inside a named element's edge a confined swipe starts and ends, in
@@ -38,11 +40,11 @@ def _centred_swipe(direction: str, points: tuple, box: tuple) -> tuple:
         half = min(
             abs(points[1] - points[3]) // 2, max(0, (y2 - y1) // 2 - _SWIPE_INSET)
         )
-        if direction == "up":
+        if direction == "down":
             return (cx, cy + half, cx, cy - half)
         return (cx, cy - half, cx, cy + half)
     half = min(abs(points[0] - points[2]) // 2, max(0, (x2 - x1) // 2 - _SWIPE_INSET))
-    if direction == "left":
+    if direction == "right":
         return (cx + half, cy, cx - half, cy)
     return (cx - half, cy, cx + half, cy)
 

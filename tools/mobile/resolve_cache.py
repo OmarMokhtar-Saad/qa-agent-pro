@@ -8,6 +8,7 @@ cached -- and an entry whose package is no longer installed is dropped.
 
 from __future__ import annotations
 
+import re
 from typing import Iterable, Optional
 
 #: Answers kept per process; the oldest is dropped first. A run asks a handful
@@ -15,10 +16,14 @@ from typing import Iterable, Optional
 MAX_RUN_ANSWERS = 32
 
 
+def normalise_hint(text: str) -> str:
+    """Lower-case words only: case, spacing and punctuation never split a hint."""
+    return " ".join(re.sub(r"[\W_]+", " ", str(text or "").lower()).split())
+
+
 def cache_key(serial: str, text: str) -> str:
     """``<serial>|<normalised text>``: stable, lower-cased, no secrets."""
-    words = " ".join(str(text or "").lower().split())
-    return (str(serial or "").strip() + "|" + words)[:200]
+    return (str(serial or "").strip() + "|" + normalise_hint(text))[:200]
 
 
 class RunAnswers:

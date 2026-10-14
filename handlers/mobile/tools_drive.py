@@ -45,11 +45,11 @@ def _register_mobile_test_tool(mcp, kit, rt) -> None:
     ) -> list[ContentBlock]:
         """Drive an Android device: ad-hoc steps (goal=...), cases, exploration.
 
-        ANY Android device action goes through this tool. Do NOT use raw adb or shell: this tool owns the destructive guard, run folder and evidence.
+        ANY Android device action goes through this tool. Do NOT use raw adb or shell: it owns the destructive guard, run folder and evidence.
 
-        Call with NO arguments to start. Install/download/launch needs apply=true. run_id continues a run in ANY chat. ONE packet at a time; answer each with qa_submit_mobile_step. Install key in `source`, its value in `app` (or `package`); `device_id`: an adb serial; `avd`: one to boot; `charter`: JSON, no secrets; `locale`, `reset_app=true` need apply=true; new_run=true only if the tester asks. `note`: JSON {"text","kind":wait|avoid,"when":{"op","rid"},"then":{"until_text|rid","ms"}} for THIS app; no secrets.
+        Pass a stated task as `goal` on the FIRST call; call with NO arguments only when there is none. Install/download/launch needs apply=true. run_id continues a run in ANY chat. ONE packet at a time; answer each with qa_submit_mobile_step. Install key in `source`, its value in `app` (or `package`); `device_id`: an adb serial; `avd`: one to boot; `charter`: JSON, no secrets; `locale`, `reset_app=true` need apply=true; new_run=true only if the tester asks. `note`: JSON {"text","kind":wait|avoid,"when":{"op","rid"},"then":{"until_text|rid","ms"}} for THIS app; no secrets.
 
-        Never report a screen state, field value or login outcome that was not read from a qa_* observation. If the server cannot type or act, stop and report the blocker by name. Do not fall back to raw adb input, and do not claim a result. Relay a finished run's verdict block word for word. Ask, never guess, the app, package, device or source."""
+        Never report a screen state, field value or login outcome that was not read from a qa_* observation. If the server cannot type or act, stop and report the blocker by name. Do not fall back to raw adb input, and do not claim a result. Relay a finished run's verdict block word for word. Ask, never guess, the app, package or device; `source` is inferred from the app text, ask only if unclear."""
         # Every parameter except ctx/device_id goes to the handler by name.
         fields = {k: v for k, v in locals().items() if k not in _TEST_UNSENT}
         fields["serial"] = rt._device_ref(device_id, serial)

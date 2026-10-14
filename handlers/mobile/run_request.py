@@ -94,11 +94,17 @@ class _AppCall:
     apply: bool
     progress: _common.ProgressCb = None
     choose: _common.ChooseCb = None
+    goal: str = ""
 
     @property
     def value(self) -> str:
         """The app hint, stripped."""
         return str(self.app or "").strip()
+
+    @property
+    def source_text(self) -> str:
+        """App hint and goal together: what the install source is inferred from."""
+        return (self.value + " " + str(self.goal or "")).strip()
 
     @property
     def typed_package(self) -> str:
@@ -109,5 +115,12 @@ class _AppCall:
 def _app_call(req: _MobileTestRequest, serial: str) -> _AppCall:
     """The app-stage call for one request on one device."""
     return _AppCall(
-        serial, req.package, req.source, req.app, req.apply, req.progress, req.choose
+        serial,
+        req.package,
+        req.source,
+        req.app,
+        req.apply,
+        req.progress,
+        req.choose,
+        req.goal,
     )

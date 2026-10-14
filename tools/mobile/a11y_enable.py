@@ -121,12 +121,16 @@ async def _verify_parity(serial: str, run_id: str) -> dict:
 
 
 def _unsupported(serial: str) -> dict | None:
-    """The silent no-op for a legacy APK (no nonce, protocol < 2), else None."""
-    if ime_nonce.protocol(serial) < ime_nonce.PROTOCOL_NONCE or not ime_nonce.get(
-        serial
-    ):
-        return {"error": None, "content": {"enabled": False, "reason": "legacy"}}
+    """The silent no-op for a legacy APK or an unarmed keyboard, else None."""
+    if ime_nonce.protocol(serial) == 1:
+        return _off("legacy")
+    if not ime_nonce.get(serial):
+        return _off("keyboard_not_armed")
     return None
+
+
+def _off(reason: str) -> dict:
+    return {"error": None, "content": {"enabled": False, "reason": reason}}
 
 
 async def _precheck(serial: str, run_id: str):

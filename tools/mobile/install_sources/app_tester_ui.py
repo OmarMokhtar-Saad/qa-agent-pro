@@ -54,6 +54,7 @@ from tools.mobile.install_sources.app_tester_ui_funcs import (  # noqa: F401
     _refuse_request,
     parse_releases,
 )
+from tools.mobile.install_sources.app_tester_ui_pick import _PickMixin
 from tools.mobile.install_sources.app_tester_ui_screens import _ScreenMixin
 from tools.mobile.resolve import AskCb, PickOpts, decide, resolve_or_ask  # noqa: F401
 
@@ -65,7 +66,7 @@ APP_TESTER_FLOW_TIMEOUT_S = 240
 MAX_APP_TESTER_STEPS = 30
 
 
-class AppTesterUiSource(_ScreenMixin, _CardMixin, _DetailMixin):
+class AppTesterUiSource(_ScreenMixin, _CardMixin, _DetailMixin, _PickMixin):
     """InstallSource ``app_tester``: update or install through the App Tester UI."""
 
     name = "app_tester"
