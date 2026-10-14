@@ -14,6 +14,9 @@ from tools.models import (
     format_test_data_lines,
 )
 from tools.secure_temp import (
+    Sweep,
+)
+from tools.secure_temp import (
     cleanup_temp_files as _sweep_temp_files,
 )
 from tools.xlsx_generator import _risk_score_cell
@@ -75,40 +78,58 @@ def _test_data_text(tc) -> str:
     return sanitize_cell("\n".join(data_lines))
 
 
-def _case_row(tc) -> list:
-    """One CSV row for a test case, in _HEADERS order."""
-    steps_text = sanitize_cell(
-        "\n".join(f"{s.step_number}. {s.action}" for s in tc.steps)
+def _step_text(tc, attr: str) -> str:
+    """A numbered per-step column (action or expected result)."""
+    return sanitize_cell(
+        "\n".join(f"{s.step_number}. {getattr(s, attr)}" for s in tc.steps)
     )
-    expected_text = sanitize_cell(
-        "\n".join(f"{s.step_number}. {s.expected_result}" for s in tc.steps)
-    )
-    risk = _risk_score_cell(tc)
+
+
+def _ident_cells(tc) -> list:
+    """The identity columns: id, module, title, priority, type."""
     return [
         tc.tc_id,
         sanitize_cell(tc.module),
         sanitize_cell(tc.title),
         tc.priority.value,
         tc.type.value,
+    ]
+
+
+def _body_cells(tc) -> list:
+    """The body columns: preconditions, steps, test data, expected, status."""
+    return [
         sanitize_cell(tc.preconditions or ""),
-        steps_text,
+        _step_text(tc, "action"),
         _test_data_text(tc),
-        expected_text,
+        _step_text(tc, "expected_result"),
         "Not Run",
         "",
-        # sanitize_cell is defence-in-depth, not a necessity: the
-        # value is normalised to one of 8 canonical names before it
-        # gets here, but TestCase.category itself accepts any
-        # <=60-char string, so a future path could bypass that.
+    ]
+
+
+# sanitize_cell is defence-in-depth, not a necessity: the
+# value is normalised to one of 8 canonical names before it
+# gets here, but TestCase.category itself accepts any
+# <=60-char string, so a future path could bypass that.
+# F06: the acceptance criterion this case verifies.
+# "(untraced)" rather than a blank, for the reason
+# xlsx_generator._requirement_cell gives.
+# An unscored suite writes an EMPTY cell, not "0" -- the
+# xlsx writes write_blank for the same reason.
+def _trace_cells(tc) -> list:
+    """The trailing columns: category, requirement, risk score."""
+    risk = _risk_score_cell(tc)
+    return [
         sanitize_cell(getattr(tc, "category", None) or ""),
-        # F06: the acceptance criterion this case verifies.
-        # "(untraced)" rather than a blank, for the reason
-        # xlsx_generator._requirement_cell gives.
         sanitize_cell(display_requirement_id(tc.requirement_id) or "(untraced)"),
-        # An unscored suite writes an EMPTY cell, not "0" -- the
-        # xlsx writes write_blank for the same reason.
         risk if risk is not None else "",
     ]
+
+
+def _case_row(tc) -> list:
+    """One CSV row for a test case, in _HEADERS order."""
+    return [*_ident_cells(tc), *_body_cells(tc), *_trace_cells(tc)]
 
 
 def cleanup_temp_files(max_age_seconds: int = 3600) -> int:
@@ -120,9 +141,11 @@ def cleanup_temp_files(max_age_seconds: int = 3600) -> int:
     (``*_testrail.csv``), which testrail_exporter owns.
     """
     return _sweep_temp_files(
-        max_age_seconds=max_age_seconds,
-        pattern="qa_test_cases_*.csv",
-        label="CSV",
-        skip_suffix="_testrail.csv",
-        log=logger,
+        Sweep(
+            max_age_seconds=max_age_seconds,
+            pattern="qa_test_cases_*.csv",
+            label="CSV",
+            skip_suffix="_testrail.csv",
+            log=logger,
+        )
     )

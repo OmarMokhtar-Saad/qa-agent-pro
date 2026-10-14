@@ -53,292 +53,46 @@ CHAT path, which does reach a model, wraps them: ``tools/mobile/render.crash_not
 from __future__ import annotations
 
 import logging
-import re
+import re  # noqa: F401
 
-from tools.untrusted import GUARD_MARKERS, NEUTRALIZED
+from tools.mobile_evidence.crash_const import (  # noqa: F401
+    _CONTROL_RE,
+    _LINE_RE,
+    _TAGS_AM,
+    _TAGS_CRASH,
+    _TAGS_NATIVE,
+    _WS_RE,
+    KIND_ANR,
+    KIND_APP_CRASH,
+    KIND_LABELS,
+    KIND_NATIVE_ABORT,
+    KIND_PROCESS_DEATH,
+    KINDS,
+    MAX_ATTRIBUTION_LINES,
+    MAX_EXCERPT_CHARS,
+    MAX_EXCERPT_LINES,
+    MAX_MARKER_CHARS,
+    MAX_SCAN_BYTES,
+    SERVER_PREFIX,
+)
+from tools.mobile_evidence.crash_match import (  # noqa: F401
+    _attributes,
+    _find_marker,
+    _kind_of,
+    _parse_lines,
+)
+from tools.mobile_evidence.crash_scan import scan  # noqa: F401
+from tools.mobile_evidence.crash_server import (  # noqa: F401
+    crash_of_case,
+    server_reason,
+)
+from tools.mobile_evidence.crash_text import (  # noqa: F401
+    _empty,
+    _excerpt,
+    _missed,
+    _neutralize,
+    _package_re,
+)
+from tools.untrusted import GUARD_MARKERS, NEUTRALIZED  # noqa: F401
 
 logger = logging.getLogger(__name__)
-
-KIND_APP_CRASH = "app_crash"
-KIND_NATIVE_ABORT = "native_abort"
-KIND_ANR = "anr"
-KIND_PROCESS_DEATH = "process_death"
-
-#: Every kind this module can report. Frozen as a tuple so a consumer can branch
-#: on the whole set rather than on a literal it copied.
-KINDS: tuple[str, ...] = (
-    KIND_APP_CRASH,
-    KIND_NATIVE_ABORT,
-    KIND_ANR,
-    KIND_PROCESS_DEATH,
-)
-
-#: How each kind reads to a tester who does not read logcat. ONE producer of the
-#: phrase, so the chat reply, the verdict reason and the report cannot word the
-#: same event three ways.
-KIND_LABELS: dict[str, str] = {
-    KIND_APP_CRASH: "the app threw an unhandled exception and was killed",
-    KIND_NATIVE_ABORT: "the app aborted in native code",
-    KIND_ANR: "the app stopped responding (ANR)",
-    KIND_PROCESS_DEATH: "the app's process died while the case was running",
-}
-
-#: Bytes of one slice this detector will read. It must be able to see everything
-#: ``capture.MAX_SLICE_BYTES`` admits, or a crash inside a legally captured slice
-#: is invisible -- so it is set to the same value rather than lower. Text beyond
-#: it keeps the TAIL, never the head: a crash ENDS the process, so it is at the
-#: end of a slice, and a head-clipping scan would systematically miss the one
-#: event this module exists to find.
-MAX_SCAN_BYTES = 4 * 1024 * 1024
-
-#: Parsed lines after a marker in which the package must be named for the marker
-#: to count. The harmful direction is UPWARD: a wide window attributes ANOTHER
-#: process's death to the app under test, which is a false FAIL -- the failure
-#: mode this module creates and must not manufacture. Four is what the runtime
-#: itself writes: ``FATAL EXCEPTION`` is followed by ``Process:`` within two.
-MAX_ATTRIBUTION_LINES = 4
-
-#: Lines of the excerpt kept as evidence.
-MAX_EXCERPT_LINES = 12
-
-#: Characters of that excerpt -- the second half of the same bound, because a
-#: stack frame line is long. It also bounds what ``render.crash_note`` hands a
-#: model inside its untrusted wrapper.
-MAX_EXCERPT_CHARS = 1200
-
-#: Characters of the ONE line offered as proof. It is quoted in the verdict
-#: REASON, which ``case_runner._checkpoint`` caps at 1200 and
-#: ``render.verdict_line`` clips at 160, so a large value silently pushes the
-#: server's own sentence out of the tester's chat.
-MAX_MARKER_CHARS = 200
-
-#: What the reason says first, so a 160-character clip still carries the
-#: attribution. The server made this call; the model did not.
-SERVER_PREFIX = "Server override:"
-
-_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_WS_RE = re.compile(r"[ \t]{2,}")
-
-#: ``MM-DD HH:MM:SS.mmm  PID  TID L TAG: message`` -- logcat's threadtime format,
-#: which is what ``adb logcat -d`` produces with and without ``-s``. A line that
-#: does not parse cannot carry a marker: clause 2 needs the TAG, and a line with
-#: no tag field has not been shown to come from the system.
-_LINE_RE = re.compile(
-    r"^\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3}\s+\d+\s+\d+\s+"
-    r"([VDIWEFS])\s+([^:]{1,64}?)\s*:\s?(.*)$"
-)
-
-#: (kind, tags that own the marker, marker test, attribution test). ONE table, so
-#: a kind cannot exist with no tag or no attribution rule.
-_TAGS_CRASH = ("androidruntime",)
-_TAGS_NATIVE = ("debug", "libc")
-_TAGS_AM = ("activitymanager",)
-
-
-def _neutralize(value: object) -> str:
-    """One device-sourced string, safe to STORE and to SHOW. Never raises."""
-    try:
-        text = value if isinstance(value, str) else str(value or "")
-    except Exception:  # pragma: no cover - a __str__ that raises
-        return ""
-    text = _CONTROL_RE.sub("", text).replace("\r", " ").replace("\n", " ")
-    for marker in GUARD_MARKERS:
-        if marker and marker.lower() in text.lower():
-            text = re.sub(re.escape(marker), NEUTRALIZED, text, flags=re.IGNORECASE)
-    return _WS_RE.sub(" ", text).strip()
-
-
-def _empty(reason: str, *, lines: int = 0, truncated: bool = False) -> dict:
-    """The not-detected record. Always carries a reason: silence is not evidence."""
-    return {
-        "detected": False,
-        "kind": "",
-        "label": "",
-        "marker": "",
-        "excerpt": "",
-        "package": "",
-        "lines_scanned": int(lines),
-        "truncated": bool(truncated),
-        "reason": str(reason)[:200],
-    }
-
-
-def _package_re(package: str):
-    """A WHOLE-package matcher. ``com.example.app`` must not match
-    ``com.example.app.debug`` -- clause 4, and the reason this is a regex rather
-    than an ``in``."""
-    return re.compile(r"(?<![\w.])" + re.escape(package) + r"(?![\w.])")
-
-
-def _kind_of(tag: str, message: str) -> str:
-    """The kind this line's TAG and text prove, or "". Clause 2 lives here."""
-    low = tag.strip().lower()
-    body = message
-    if low in _TAGS_CRASH and "FATAL EXCEPTION" in body:
-        return KIND_APP_CRASH
-    if low in _TAGS_NATIVE and ("Fatal signal" in body or "tombstone" in body):
-        return KIND_NATIVE_ABORT
-    if low in _TAGS_AM and body.lstrip().startswith("ANR in "):
-        return KIND_ANR
-    if low in _TAGS_AM and (
-        ("has died" in body and body.lstrip().startswith("Process "))
-        or body.lstrip().startswith("Force finishing activity ")
-    ):
-        return KIND_PROCESS_DEATH
-    return ""
-
-
-def _attributes(kind: str, message: str, matcher) -> bool:
-    """Whether THIS line attributes *kind* to the package. Clause 3, same line."""
-    if kind == KIND_APP_CRASH:
-        return bool(message.lstrip().startswith("Process:")) and bool(
-            matcher.search(message)
-        )
-    if kind == KIND_NATIVE_ABORT:
-        return ">>>" in message and bool(matcher.search(message))
-    return bool(matcher.search(message))
-
-
-def _parse_lines(lines: list[str]) -> list[tuple[str, str, str]]:
-    """``(tag, message, raw line)`` per line; an unparseable line has an empty tag."""
-    parsed = []
-    for line in lines:
-        hit = _LINE_RE.match(line)
-        parsed.append((hit.group(2), hit.group(3), line) if hit else ("", "", line))
-    return parsed
-
-
-def _find_marker(parsed: list, matcher) -> tuple[tuple[int, str] | None, str]:
-    """``((index, kind) of the first attributed marker or None, last kind seen)``."""
-    seen_marker = ""
-    for index, (tag, message, _line) in enumerate(parsed):
-        if not tag:
-            continue
-        kind = _kind_of(tag, message)
-        if not kind:
-            continue
-        seen_marker = kind
-        window = parsed[index : index + 1 + MAX_ATTRIBUTION_LINES]
-        if any(_attributes(kind, entry[1], matcher) for entry in window if entry[0]):
-            return (index, kind), seen_marker
-    return None, seen_marker
-
-
-def _excerpt(parsed: list, index: int) -> str:
-    return "\n".join(
-        _neutralize(entry[2]) for entry in parsed[index : index + MAX_EXCERPT_LINES]
-    )[:MAX_EXCERPT_CHARS]
-
-
-def _missed(seen_marker: str, pkg: str, lines: int, truncated: bool) -> dict:
-    """The not-detected record, saying whether another process's marker was seen."""
-    if seen_marker:
-        reason = (
-            "the "
-            + seen_marker
-            + " marker in this slice names another process, not "
-            + pkg[:80]
-            + ", so it is not this case's failure"
-        )
-    else:
-        reason = "no fatal-event marker from the platform is in this slice"
-    return _empty(reason, lines=lines, truncated=truncated)
-
-
-def scan(text: object, package: object) -> dict:
-    """Judge one slice. ``{"detected", "kind", "label", "marker", "excerpt",
-    "package", "lines_scanned", "truncated", "reason"}``. Never raises.
-
-    ``detected`` is True only with a kind AND a marker line AND the package under
-    test attributed to that marker.
-    """
-    try:
-        pkg = str(package or "").strip()
-        if not pkg:
-            return _empty(
-                "no package under test was given, so nothing can be attributed"
-            )
-        try:
-            body = text if isinstance(text, str) else str(text or "")
-        except Exception:  # pragma: no cover - a __str__ that raises
-            return _empty("the slice could not be read as text")
-        if not body.strip():
-            return _empty("the slice is empty, so it proves nothing either way")
-        raw = body.encode("utf-8", errors="replace")
-        truncated = len(raw) > MAX_SCAN_BYTES
-        if truncated:
-            # THE TAIL, not the head. A crash ends the process.
-            body = raw[-MAX_SCAN_BYTES:].decode("utf-8", errors="replace")
-        lines = body.splitlines()
-        matcher = _package_re(pkg)
-        parsed = _parse_lines(lines)
-        found, seen_marker = _find_marker(parsed, matcher)
-        if found is not None:
-            index, kind = found
-            return {
-                "detected": True,
-                "kind": kind,
-                "label": KIND_LABELS.get(kind, "the app under test died"),
-                "marker": _neutralize(parsed[index][2])[:MAX_MARKER_CHARS],
-                "excerpt": _excerpt(parsed, index),
-                "package": pkg[:120],
-                "lines_scanned": len(lines),
-                "truncated": truncated,
-                "reason": "",
-            }
-        return _missed(seen_marker, pkg, len(lines), truncated)
-    except Exception:  # never-raise: a detector that raises is a detector that is off
-        logger.exception("mobile_evidence.crash_detector.scan failed")
-        return _empty("the slice could not be scanned")
-
-
-def crash_of_case(case: object) -> dict:
-    """The crash record on a CASE checkpoint, or ``{}``. Never raises.
-
-    THE one place that knows where a crash lives -- ``case["evidence"]["crash"]``
-    -- and that a record is only a crash when ``detected``. The report and the
-    chat both call this instead of walking the record themselves: two walks are
-    two derivations of the same answer, and mirrored conditions drift.
-    """
-    try:
-        body = case if isinstance(case, dict) else {}
-        evidence = body.get("evidence")
-        evidence = evidence if isinstance(evidence, dict) else {}
-        crash = evidence.get("crash")
-        if isinstance(crash, dict) and crash.get("detected"):
-            return crash
-        return {}
-    except Exception:  # pragma: no cover - defensive
-        logger.exception("mobile_evidence.crash_detector.crash_of_case failed")
-        return {}
-
-
-def server_reason(crash: object, model_reason: object = "") -> str:
-    """THE override reason. One producer, and it never impersonates the model.
-
-    The server's own attribution is the FIRST clause, because
-    ``render.verdict_line`` clips a reason to 160 characters -- a sentence that
-    explains itself after the clip explains nothing. The model's own words are
-    quoted, labelled and LAST, so the tester can see both judgements and whose
-    each one is.
-    """
-    try:
-        body = crash if isinstance(crash, dict) else {}
-        label = str(body.get("label") or "the app under test died")[:120]
-        marker = str(body.get("marker") or "")[:MAX_MARKER_CHARS]
-        mine = str(model_reason or "").strip()[:200]
-        text = (
-            SERVER_PREFIX
-            + " the app under test crashed during this case ("
-            + label
-            + "), so a pass cannot stand. This is the server's call, not your"
-            " own judgement, and the run's own logcat is the proof."
-        )
-        if marker:
-            text += " The line that proves it: " + marker
-        if mine:
-            text += ' The model reported: "' + mine + '"'
-        return text
-    except Exception:  # pragma: no cover - defensive
-        logger.exception("mobile_evidence.crash_detector.server_reason failed")
-        return SERVER_PREFIX + " the app under test crashed during this case."

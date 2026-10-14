@@ -25,97 +25,70 @@ Contract:
   downloaded (``playwright install chromium``), render_page() returns a
   clean error dict instead of crashing the caller -- Tier 1 (httpx) results
   remain usable on their own.
+
+render_page() returns on success:
+  {"error": None, "html": str, "title": str, "screenshot": bytes | None,
+   "accessibility": dict | None, "final_url": str}
+and on failure (blocked URL, Playwright not installed, Chromium not installed,
+navigation timeout, or any other browser error):
+  {"error": str, "html": None, "title": "", "screenshot": None,
+   "accessibility": None, "final_url": None}
 """
 
 from __future__ import annotations
 
-import ipaddress
 import logging
-import socket
-from urllib.parse import urlparse
+from typing import cast
 
-from tools.net_guard import embedded_v4_non_public
+from tools.browser_renderer_host import (  # noqa: F401
+    _host_resolver_rules,
+    _parse_target,
+    pin_public_ip,
+)
+from tools.browser_renderer_page import (  # noqa: F401
+    _HYDRATE_TIMEOUT_MS,
+    _MAX_FRAMES,
+    _MAX_HTML_CHARS,
+    _NAV_TIMEOUT_MS,
+    _UNAVAILABLE_RESULT,
+    _accessibility_snapshot,
+    _capture_screenshot,
+    _merge_iframe_html,
+    _navigate,
+    _settle_hydration,
+)
+from tools.browser_renderer_run import (  # noqa: F401
+    RenderJob,
+    _launch_and_render,
+    _render_in_page,
+)
+from tools.net_guard import embedded_v4_non_public  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
-_NAV_TIMEOUT_MS = 30_000
-# After domcontentloaded fires, give a client-side framework (React/Vue/Angular)
-# a bounded window to actually paint its interactive elements before we scrape.
-# Non-fatal: on timeout we scrape whatever has rendered so far.
-_HYDRATE_TIMEOUT_MS = 8_000
-_MAX_HTML_CHARS = 200_000
-_MAX_FRAMES = 10  # cap child (iframe) documents merged into the rendered HTML
-
-_UNAVAILABLE_RESULT = {
-    "html": None,
-    "title": "",
-    "screenshot": None,
-    "accessibility": None,
-    "final_url": None,
-}
+_PLAYWRIGHT_MISSING = False  # latched True after the first failed import
 
 
-def _host_resolver_rules(hostname: str, validated_ip: str) -> str:
-    """Build a Chromium ``--host-resolver-rules`` value pinning `hostname`
-    (and its :443 form) to the already-validated public IP.
-
-    This forces Chromium to reuse the IP the SSRF guard checked instead of
-    performing its own second DNS lookup, so a DNS-rebinding attacker cannot
-    answer "public" for the guard and "169.254.169.254 / 10.x / 127.0.0.1" for
-    Chromium moments later (NB-002).
-    """
-    return (
-        f"MAP {hostname} {validated_ip},"
-        f"MAP {hostname}:443 {validated_ip}:443,"
-        f"MAP {hostname}:80 {validated_ip}:80,"
-        # Everything else fails to resolve: a redirect or subresource to any
-        # OTHER host cannot be looked up (it would otherwise be resolved
-        # UNpinned, before the post-nav final-URL SSRF re-check runs). The
-        # explicit MAPs above win because Chromium applies the first matching
-        # rule; ``~NOTFOUND`` forces ERR_NAME_NOT_RESOLVED for the rest.
-        "MAP * ~NOTFOUND"
-    )
-
-
-async def _validate_public_host(url: str) -> tuple[str | None, str | None, str | None]:
-    """Validate `url` as a public http(s) target and pin its resolved IP.
-
-    Returns ``(hostname, validated_ip, error)`` — ``error`` is None on success,
-    in which case ``hostname``/``validated_ip`` are set. On failure the error
-    string is set and the other two are None. Mirrors the SSRF/private-address
-    guard in tools/jira_fetcher.py (every resolved address must be global) and
-    additionally hands back the FIRST validated public IP so render_page can
-    pin Chromium's DNS to it (``--host-resolver-rules``), closing the
-    DNS-rebinding window where Chromium re-resolves to a private address after
-    the check passed (NB-002). Never raises.
-    """
+# Validate `url` as a public http(s) target and pin its resolved IP.
+#
+# Returns ``(hostname, validated_ip, error)`` — ``error`` is None on success,
+# in which case ``hostname``/``validated_ip`` are set. On failure the error
+# string is set and the other two are None. Mirrors the SSRF/private-address
+# guard in tools/jira_fetcher.py (every resolved address must be global) and
+# additionally hands back the FIRST validated public IP so render_page can
+# pin Chromium's DNS to it (``--host-resolver-rules``), closing the
+# DNS-rebinding window where Chromium re-resolves to a private address after
+# the check passed (NB-002). Never raises.
+async def validate_public_host(url: str) -> tuple[str | None, str | None, str | None]:
+    """Validate `url` as a public http(s) target and pin its resolved IP."""
     try:
-        import asyncio
-
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            return None, None, f"Blocked: scheme '{parsed.scheme}' not allowed"
-        hostname = parsed.hostname
-        if not hostname:
-            return None, None, "Blocked: invalid hostname"
-        try:
-            loop = asyncio.get_running_loop()
-            infos = await loop.getaddrinfo(hostname, None)
-        except socket.gaierror:
-            return None, None, f"Blocked: could not resolve hostname '{hostname}'"
-        validated_ip: str | None = None
-        for info in infos:
-            addr = ipaddress.ip_address(info[4][0])
-            # Same NAT64 / IPv4-mapped gap as tools/jira_fetcher's guard, and
-            # the same helper closes it -- shared rather than duplicated, so
-            # the two SSRF guards cannot drift apart.
-            if not addr.is_global or embedded_v4_non_public(addr):
-                return None, None, "Blocked: non-public address"
-            if validated_ip is None:
-                validated_ip = info[4][0]
-        if validated_ip is None:
-            return None, None, "Blocked: non-public address"
-        return hostname, validated_ip, None
+        hostname, error = _parse_target(url)
+        if error:
+            return None, None, error
+        ip, error = await pin_public_ip(cast("str", hostname))
+        if error:
+            return None, None, error
+        return hostname, ip, None
     except Exception:
         # Fail closed: any unexpected error inspecting the URL blocks the render.
         logger.exception("_validate_public_host: URL validation failed for %s", url)
@@ -133,69 +106,6 @@ async def _public_host_error(url: str) -> str | None:
     return error
 
 
-_PLAYWRIGHT_MISSING = False  # latched True after the first failed import
-
-
-async def _merge_iframe_html(page, html: str, url: str) -> str:
-    """Append each reachable child frame's HTML to ``html``.
-
-    page.content() serializes ONLY the main frame, so a form embedded in an
-    <iframe> (payment widgets, SSO, embedded signup) would be invisible to the
-    BeautifulSoup extractors. Cross-origin or detached frames may refuse
-    .content() — skip them individually. Never raises.
-    """
-    try:
-        child_frames = list(page.frames)[1:]  # [0] is the main frame
-        frame_htmls: list[str] = []
-        for fr in child_frames[:_MAX_FRAMES]:
-            try:
-                fhtml = await fr.content()
-            except Exception:
-                continue
-            if fhtml:
-                frame_htmls.append(fhtml)
-        if frame_htmls:
-            logger.info(
-                "render_page: merged %d iframe document(s) for %s",
-                len(frame_htmls),
-                url,
-            )
-            html = (html or "") + "".join(
-                f"\n<!-- iframe-content -->\n{fh}" for fh in frame_htmls
-            )
-    except Exception:
-        logger.debug(
-            "render_page: iframe content collection skipped for %s",
-            url,
-            exc_info=True,
-        )
-    return html
-
-
-async def _capture_screenshot(page, url: str, playwright_error: type) -> bytes | None:
-    """PNG screenshot of ``page``, or None when capture fails (non-fatal)."""
-    try:
-        return await page.screenshot(type="png")
-    except playwright_error:
-        logger.warning(
-            "render_page: screenshot capture failed for %s (non-fatal)",
-            url,
-        )
-        return None
-
-
-async def _accessibility_snapshot(page, url: str) -> dict | None:
-    """Accessibility tree of ``page``, or None when unavailable."""
-    try:
-        return await page.accessibility.snapshot()
-    except Exception:
-        logger.debug(
-            "render_page: accessibility snapshot unavailable for %s",
-            url,
-        )
-        return None
-
-
 def _playwright_missing_result() -> dict:
     """Failure result for an environment without Playwright."""
     return {
@@ -206,25 +116,6 @@ def _playwright_missing_result() -> dict:
         ),
         **_UNAVAILABLE_RESULT,
     }
-
-
-async def _navigate(page, url: str, playwright_error: type) -> dict | None:
-    """Load ``url``; return a failure result on navigation error, else None."""
-    try:
-        # domcontentloaded (not networkidle): a page that holds
-        # telemetry/analytics sockets open (e.g. SauceDemo) never
-        # reaches "networkidle", so that wait_until would burn the
-        # whole nav timeout and fail even though the page rendered
-        # fine. We wait for a real DOM instead, then settle for SPA
-        # hydration afterwards.
-        await page.goto(url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
-    except playwright_error as exc:
-        logger.warning("render_page: navigation failed for %s: %s", url, exc)
-        return {
-            "error": f"Browser navigation failed: {exc}",
-            **_UNAVAILABLE_RESULT,
-        }
-    return None
 
 
 async def _redirect_failure(final_url: str, url: str) -> dict | None:
@@ -245,99 +136,17 @@ async def _redirect_failure(final_url: str, url: str) -> dict | None:
     }
 
 
-async def _settle_hydration(page, url: str, playwright_error: type) -> None:
-    """Wait, non-fatally, for the DOM to contain an interactive element."""
-    # domcontentloaded fires before a client-side framework paints. On timeout
-    # (e.g. a canvas-only UI) we fall through and scrape the current DOM;
-    # Tier 3 vision can still take over.
-    try:
-        await page.wait_for_function(
-            "() => document.querySelector("
-            "'input, button, select, textarea, a, [role]') !== null",
-            timeout=_HYDRATE_TIMEOUT_MS,
-        )
-    except playwright_error:
-        logger.debug(
-            "render_page: hydration wait timed out for %s — scraping current DOM",
-            url,
-        )
+def playwright_missing() -> bool:
+    """True once a playwright import failed (the render latch)."""
+    return _PLAYWRIGHT_MISSING
 
 
-async def _render_in_page(
-    page, url: str, capture_screenshot: bool, playwright_error: type
-) -> dict:
-    """Navigate, guard the redirect, settle and scrape ``page``."""
-    failure = await _navigate(page, url, playwright_error)
-    if failure:
-        return failure
-    final_url = page.url
-    failure = await _redirect_failure(final_url, url)
-    if failure:
-        return failure
-    await _settle_hydration(page, url, playwright_error)
-
-    html = await page.content()
-    title = await page.title()
-    html = await _merge_iframe_html(page, html, url)
-    screenshot_bytes = None
-    if capture_screenshot:
-        screenshot_bytes = await _capture_screenshot(page, url, playwright_error)
-    accessibility = await _accessibility_snapshot(page, url)
-    return {
-        "error": None,
-        "html": (html or "")[:_MAX_HTML_CHARS],
-        "title": title or "",
-        "screenshot": screenshot_bytes,
-        "accessibility": accessibility,
-        "final_url": final_url,
-    }
-
-
-async def _launch_and_render(
-    pw, resolver_rules: str, url: str, capture_screenshot: bool, playwright_error: type
-) -> dict:
-    """Launch Chromium with DNS pinned to the validated IP and render ``url``.
-
-    Pinning stops Chromium re-resolving the hostname to a private/internal
-    address after the SSRF check passed (DNS-rebinding bypass — NB-002).
-    """
-    resolver_arg = f"--host-resolver-rules={resolver_rules}"
-    browser = await pw.chromium.launch(headless=True, args=[resolver_arg])
-    try:
-        return await _render_in_page(
-            await browser.new_page(), url, capture_screenshot, playwright_error
-        )
-    finally:
-        await browser.close()
-
-
-async def render_page(url: str, capture_screenshot: bool = True) -> dict:
-    """Render `url` in headless Chromium and return the fully rendered HTML.
-
-    Returns on success:
-      {"error": None, "html": str, "title": str, "screenshot": bytes | None,
-       "accessibility": dict | None, "final_url": str}
-    Returns on failure (blocked URL, Playwright not installed, Chromium not
-    installed, navigation timeout, or any other browser error):
-      {"error": str, "html": None, "title": "", "screenshot": None,
-       "accessibility": None, "final_url": None}
-
-    Never raises.
-    """
-    # SSRF guard: validate the target BEFORE spinning up a browser, and capture
-    # the validated public IP so Chromium's own DNS can be pinned to it.
+def _load_playwright():
+    """``(Error, async_playwright)``, or None (and latch) when not installed."""
     global _PLAYWRIGHT_MISSING
-    if _PLAYWRIGHT_MISSING:
-        logger.debug("render_page: playwright known missing — skipping render")
-        return _playwright_missing_result()
-    hostname, validated_ip, block_reason = await _validate_public_host(url)
-    if block_reason:
-        logger.warning("render_page: refusing to render %s — %s", url, block_reason)
-        return {"error": block_reason, **_UNAVAILABLE_RESULT}
-
     try:
-        from playwright.async_api import Error as PlaywrightError
-        from playwright.async_api import async_playwright
+        # Kept lazy: playwright is heavy and optional (not installed in most venvs).
+        from playwright.async_api import Error, async_playwright
     except ImportError:
         _PLAYWRIGHT_MISSING = True
         logger.warning(
@@ -345,17 +154,43 @@ async def render_page(url: str, capture_screenshot: bool = True) -> dict:
             "extra (`pip install -e '.[browser]'` then `playwright install "
             "chromium`) to enable JS-rendered SPA support."
         )
-        return _playwright_missing_result()
+        return None
+    return Error, async_playwright
 
+
+async def _render_checked(url: str, capture_screenshot: bool, rules: str) -> dict:
+    """Render a validated target; never raises."""
+    loaded = _load_playwright()
+    if loaded is None:
+        return _playwright_missing_result()
+    playwright_error, async_playwright = loaded
+    job = RenderJob(url, capture_screenshot, playwright_error, _redirect_failure)
     try:
         async with async_playwright() as pw:
-            return await _launch_and_render(
-                pw,
-                _host_resolver_rules(hostname, validated_ip),
-                url,
-                capture_screenshot,
-                PlaywrightError,
-            )
+            return await _launch_and_render(pw, rules, job)
     except Exception as exc:
         logger.exception("render_page: unexpected browser error for %s", url)
         return {"error": f"Browser rendering failed: {exc}", **_UNAVAILABLE_RESULT}
+
+
+async def render_page(url: str, capture_screenshot: bool = True) -> dict:
+    """Render `url` in headless Chromium and return the fully rendered HTML.
+
+    Result shape: see the module docstring. Never raises.
+    """
+    # SSRF guard: validate the target BEFORE spinning up a browser, and capture
+    # the validated public IP so Chromium's own DNS can be pinned to it.
+    if playwright_missing():
+        logger.debug("render_page: playwright known missing — skipping render")
+        return _playwright_missing_result()
+    hostname, validated_ip, block_reason = await _validate_public_host(url)
+    if block_reason:
+        logger.warning("render_page: refusing to render %s — %s", url, block_reason)
+        return {"error": block_reason, **_UNAVAILABLE_RESULT}
+    rules = _host_resolver_rules(cast("str", hostname), cast("str", validated_ip))
+    return await _render_checked(url, capture_screenshot, rules)
+
+
+async def _validate_public_host(url: str) -> tuple[str | None, str | None, str | None]:
+    """Legacy name of :func:`validate_public_host` (WX removes it)."""
+    return await validate_public_host(url)

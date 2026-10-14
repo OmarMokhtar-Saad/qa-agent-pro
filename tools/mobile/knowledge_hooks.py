@@ -15,7 +15,8 @@ import inspect
 import logging
 from dataclasses import dataclass, field
 
-from tools.mobile import knowledge_limits
+from tools.mobile import actions, knowledge_limits
+from tools.mobile.kplg_calls import Post, Pre, Resolve
 
 logger = logging.getLogger(__name__)
 
@@ -92,19 +93,19 @@ async def _first(seam: str, *args) -> Directive:
     return NONE
 
 
-async def pre_step(ctx, entry, step, screen) -> Directive:
+async def pre_step(ctx, call: Pre) -> Directive:
     """Popup dismiss, precondition, field-binding refusal, shortcut."""
     try:
-        return await _first("pre_step", ctx, entry, step, screen)
+        return await _first("pre_step", ctx, call)
     except Exception:
         logger.exception("knowledge pre_step failed")
         return NONE
 
 
-async def resolve_target(ctx, step, screen, default) -> Directive:
+async def resolve_target(ctx, call: Resolve) -> Directive:
     """Ranked locator queue, similarity heal, missing@vX."""
     try:
-        return await _first("resolve_target", ctx, step, screen, default)
+        return await _first("resolve_target", ctx, call)
     except Exception:
         logger.exception("knowledge resolve_target failed")
         return NONE
@@ -113,8 +114,6 @@ async def resolve_target(ctx, step, screen, default) -> Directive:
 def step_wait(ctx, step, screen) -> int:
     """Adaptive wait in ms, capped at the executor's MAX_WAIT_MS; 0 = none."""
     try:
-        from tools.mobile import actions
-
         best = 0
         for mod in plugs():
             fn = getattr(mod, "step_wait", None)
@@ -130,7 +129,7 @@ def step_wait(ctx, step, screen) -> int:
         return 0
 
 
-def post_step(ctx, entry, before, after) -> None:
+def post_step(ctx, call: Post) -> None:
     """In-memory only: plugs record into ``ctx.kbuf``; fired events are merged
     into the entry. Never touches the DB."""
     try:
@@ -139,7 +138,7 @@ def post_step(ctx, entry, before, after) -> None:
             if fn is None:
                 continue
             try:
-                fn(ctx, entry, before, after)
+                fn(ctx, call)
             except Exception:
                 logger.exception("knowledge plug %s.post_step failed", mod.__name__)
     except Exception:

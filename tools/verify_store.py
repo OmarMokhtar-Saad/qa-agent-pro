@@ -5,7 +5,7 @@
 away. ``qa-doctor`` then re-guessed from on-disk config on EVERY run and
 re-raised the same "Fix now: verify the connection" item forever -- even one
 minute after a successful probe -- and, because that item was unconditional, it
-pinned the report's headline off "Ready" permanently (see ``_overall_verdict``).
+pinned the report's headline off "Ready" permanently (see ``overall_verdict``).
 
 WHAT IS PERSISTED, exhaustively: whether the probe succeeded, when, and the NAME
 of the probe tool. NOTHING derived from the payload -- no account id, no email,
@@ -30,12 +30,14 @@ import asyncio
 import logging
 import sqlite3
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
-from config.settings import settings
-from tools import sqlite_store
+import llm
+import tools.jira_mcp as jira_mcp
+from config.settings_guard import never_raise
+from tools import settings_port, verify_store_db
 from tools.install_paths import resolve_data_path
+from tools.verify_store_db import Verdict
 
 logger = logging.getLogger(__name__)
 
@@ -63,117 +65,51 @@ CREATE TABLE IF NOT EXISTS atlassian_verifications (
 );
 """
 
-# Databases created before 2026-09-01 predate site_checked. Added here rather
-# than by a migration script: an additive column with a default is the whole
-# change, and a failed ALTER on an already-migrated database is expected, not an
-# error.
-_MIGRATIONS = (
-    "ALTER TABLE atlassian_verifications ADD COLUMN site_checked INTEGER NOT NULL DEFAULT 0",
-)
 
-
-def _db_path() -> Path:
+def db_path() -> Path:
     # Anchored to the install root, not the process cwd -- same reasoning as
     # prep_store: a verdict recorded while one project was open must not be
     # invisible when another is.
-    return resolve_data_path(settings.qa_suite_store_path)
+    return resolve_data_path(settings_port.get().qa_suite_store_path)
 
 
 def _connect() -> sqlite3.Connection:
-    path = _db_path()
-    conn = sqlite_store.connect(
-        path,
-        timeout=_BUSY_TIMEOUT_S,
-        wal=True,
-        busy_timeout_ms=int(_BUSY_TIMEOUT_S * 1000),
-        pragmas_best_effort=True,
-        logger=logger,
-        log_label="verify_store",
-    )
+    return verify_store_db.open_db(_db_path(), _SCHEMA, _BUSY_TIMEOUT_S)
+
+
+def _run(fn, *args):
+    conn = _connect()
     try:
-        conn.executescript(_SCHEMA)
-        for statement in _MIGRATIONS:
-            try:
-                conn.execute(statement)
-            except sqlite3.OperationalError:
-                pass  # Already applied - the column exists.
-    except BaseException:
+        return fn(conn, *args)
+    finally:
         conn.close()
-        raise
-    return conn
 
 
-def _client_key() -> str:
+def client_key() -> str:
     """The calling editor, or "" when the handshake did not name one.
 
-    Imported lazily: this module is itself imported from never-raising guards,
-    so a broken ``llm`` import must degrade to the shared "" row rather than
-    break the store.
+    A failing ``llm`` call degrades to the shared "" row rather than break the store.
     """
-    try:
-        import llm
-
+    with never_raise(logger, "verify_store: host client unavailable", exc_info=True):
         return str(llm.get_host_client() or "")[:64]
-    except Exception:
-        logger.debug("verify_store: host client unavailable", exc_info=True)
-        return ""
+    return ""
 
 
-def _iso(epoch: float) -> str:
-    try:
-        return (
-            datetime.fromtimestamp(float(epoch), tz=timezone.utc)
-            .replace(microsecond=0)
-            .isoformat()
-        )
-    except Exception:
-        return ""
-
-
-def _save_sync(
-    client: str, verified: bool, tool: str, at_epoch: float, site_checked: bool
-) -> None:
-    conn = _connect()
-    try:
-        with conn:
-            conn.execute(
-                "INSERT INTO atlassian_verifications "
-                "(client, verified, at_epoch, tool, site_checked) "
-                "VALUES (?, ?, ?, ?, ?) "
-                "ON CONFLICT(client) DO UPDATE SET "
-                "verified=excluded.verified, at_epoch=excluded.at_epoch, "
-                "tool=excluded.tool, site_checked=excluded.site_checked",
-                (
-                    client,
-                    1 if verified else 0,
-                    float(at_epoch),
-                    str(tool)[:120],
-                    1 if site_checked else 0,
-                ),
-            )
-    finally:
-        conn.close()
-
-
-def _load_sync(client: str) -> dict | None:
-    conn = _connect()
-    try:
-        row = conn.execute(
-            "SELECT verified, at_epoch, tool, site_checked "
-            "FROM atlassian_verifications WHERE client = ?",
-            (client,),
-        ).fetchone()
-    finally:
-        conn.close()
-    if not row:
-        return None
-    return {
-        "verified": bool(row[0]),
-        "at": _iso(row[1]),
-        "tool": str(row[2] or ""),
-        "site_checked": bool(row[3]),
-        "age_s": max(0.0, time.time() - float(row[1])),
-    }
+def _apply_provenance(rec: dict) -> None:
+    rec["fresh"] = rec["age_s"] <= VERDICT_FRESH_S
+    # Provenance is a SECOND, independent freshness axis: a verdict can
+    # be minutes old and still not be evidence, because the probe that
+    # produced it did not ask the question we now ask. Evaluated on READ
+    # like `fresh`, so widening the accepted set re-judges existing rows
+    # rather than stranding them. Defaults False on any failure -- that
+    # re-asks one cheap read-only question, where True would certify
+    # access nobody checked.
+    with never_raise(
+        logger, "verify_store: provenance check skipped", exc_info=True
+    ) as g:
+        rec["current_probe"] = rec["tool"] in jira_mcp.probe_provenance_accepted()
+    if g.failed:
+        rec["current_probe"] = False
 
 
 async def record_verdict(verified: bool, tool: str, site_checked: bool = False) -> dict:
@@ -182,20 +118,20 @@ async def record_verdict(verified: bool, tool: str, site_checked: bool = False) 
     ``site_checked`` is a BOOLEAN: whether the access half was actually checked,
     never WHICH site or what it was called. Never raises.
     """
-    try:
-        client = _client_key()
-        await asyncio.to_thread(
-            _save_sync,
-            client,
-            bool(verified),
-            tool,
-            time.time(),
-            bool(site_checked),
+    with never_raise(
+        logger, "verify_store: recording the verdict failed", exc_info=True
+    ) as g:
+        client = client_key()
+        v = Verdict(
+            client=client,
+            verified=bool(verified),
+            tool=tool,
+            at_epoch=time.time(),
+            site_checked=bool(site_checked),
         )
+        await asyncio.to_thread(_run, verify_store_db.save, v)
         return {"error": None, "content": True}
-    except Exception as exc:
-        logger.debug("verify_store: recording the verdict failed", exc_info=True)
-        return {"error": str(exc), "content": None}
+    return {"error": str(g.exc), "content": None}
 
 
 async def load_verdict() -> dict:
@@ -207,26 +143,17 @@ async def load_verdict() -> dict:
     Staleness is evaluated on READ, never written down, so changing
     ``VERDICT_FRESH_S`` re-judges existing rows instead of stranding them.
     """
-    try:
-        client = _client_key()
-        rec = await asyncio.to_thread(_load_sync, client)
+    with never_raise(
+        logger, "verify_store: loading the verdict failed", exc_info=True
+    ) as g:
+        client = client_key()
+        rec = await asyncio.to_thread(_run, verify_store_db.load_row, client)
         if rec is not None:
-            rec["fresh"] = rec["age_s"] <= VERDICT_FRESH_S
-            # Provenance is a SECOND, independent freshness axis: a verdict can
-            # be minutes old and still not be evidence, because the probe that
-            # produced it did not ask the question we now ask. Evaluated on READ
-            # like `fresh`, so widening the accepted set re-judges existing rows
-            # rather than stranding them. Defaults False on any failure -- that
-            # re-asks one cheap read-only question, where True would certify
-            # access nobody checked.
-            try:
-                from tools.jira_mcp import probe_provenance_accepted
-
-                rec["current_probe"] = rec["tool"] in probe_provenance_accepted()
-            except Exception:
-                logger.debug("verify_store: provenance check skipped", exc_info=True)
-                rec["current_probe"] = False
+            _apply_provenance(rec)
         return {"error": None, "content": rec}
-    except Exception as exc:
-        logger.debug("verify_store: loading the verdict failed", exc_info=True)
-        return {"error": str(exc), "content": None}
+    return {"error": str(g.exc), "content": None}
+
+
+def _db_path() -> Path:
+    """Legacy name of :func:`db_path` (WX removes it)."""
+    return db_path()

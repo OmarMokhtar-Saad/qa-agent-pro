@@ -23,7 +23,7 @@ from tools.mobile.replay.guard import NON_ACTUATING_OPS
 #: Runs whose last-turn answer is kept for this process; the oldest goes first.
 MAX_CARRY_RUNS = 64
 
-_inert: OrderedDict[str, bool] = OrderedDict()
+inert: OrderedDict[str, bool] = OrderedDict()
 
 
 def _op_of(entry: object) -> object:
@@ -41,12 +41,12 @@ def trace_is_inert(trace: object) -> bool:
 def note(run_id: str, trace: object) -> None:
     """Record whether the turn that just ran left the screen untouched."""
     key = str(run_id or "")
-    _inert[key] = trace_is_inert(trace)
-    _inert.move_to_end(key)
-    while len(_inert) > MAX_CARRY_RUNS:
-        _inert.popitem(last=False)
+    inert[key] = trace_is_inert(trace)
+    inert.move_to_end(key)
+    while len(inert) > MAX_CARRY_RUNS:
+        inert.popitem(last=False)
 
 
 def allowed(run_id: str) -> bool:
     """May this run's next call start from the screen already read?"""
-    return _inert.get(str(run_id or ""), False)
+    return inert.get(str(run_id or ""), False)

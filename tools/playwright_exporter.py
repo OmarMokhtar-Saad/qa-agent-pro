@@ -20,6 +20,9 @@ import tempfile  # noqa: F401  # tests patch tools.<module>.tempfile.gettempdir
 from tools.export_common import resolve_output_path, write_text_export
 from tools.models import TestCase, TestSuite, display_requirement_id
 from tools.secure_temp import (
+    Sweep,
+)
+from tools.secure_temp import (
     cleanup_temp_files as _sweep_temp_files,
 )
 
@@ -75,25 +78,37 @@ def _docstring(text: str) -> str:
     return _comment(text).replace("\\", "\\\\").replace('"', "'")
 
 
+# F06: the acceptance criterion this skeleton belongs to. Omitted entirely
+# when the case carries no usable tag -- a comment reading "Requirement:"
+# with nothing after it is worse than no line.
+def _context_comments(tc: TestCase) -> list[str]:
+    lines: list[str] = []
+    requirement = display_requirement_id(getattr(tc, "requirement_id", ""))
+    if requirement:
+        lines.append(f"    # Requirement: {_comment(requirement)}")
+    if tc.preconditions and tc.preconditions.strip():
+        lines.append(f"    # Precondition: {_comment(tc.preconditions)}")
+    return lines
+
+
+def _step_comments(tc: TestCase) -> list[str]:
+    lines: list[str] = []
+    for s in tc.steps:
+        data = f" [data: {_comment(s.test_data)}]" if s.test_data else ""
+        lines.append(f"    # Step {s.step_number}: {_comment(s.action)}{data}")
+        lines.append(f"    #   Expect: {_comment(s.expected_result)}")
+    return lines
+
+
 def _test_block(tc: TestCase, slug: str) -> str:
     lines: list[str] = []
     marker = tc.type.value.lower()
     lines.append(f"@pytest.mark.{re.sub(r'[^a-z0-9_]', '_', marker)}")
     lines.append(f"def test_{slug}(page: Page) -> None:")
     lines.append(f'    """{_docstring(tc.title)} [{tc.tc_id} / {tc.stable_id}]"""')
-    # F06: the acceptance criterion this skeleton belongs to. Omitted entirely
-    # when the case carries no usable tag -- a comment reading "Requirement:"
-    # with nothing after it is worse than no line.
-    requirement = display_requirement_id(getattr(tc, "requirement_id", ""))
-    if requirement:
-        lines.append(f"    # Requirement: {_comment(requirement)}")
-    if tc.preconditions and tc.preconditions.strip():
-        lines.append(f"    # Precondition: {_comment(tc.preconditions)}")
+    lines += _context_comments(tc)
     lines.append("    # TODO: navigate to the feature under test, e.g. page.goto(...)")
-    for s in tc.steps:
-        data = f" [data: {_comment(s.test_data)}]" if s.test_data else ""
-        lines.append(f"    # Step {s.step_number}: {_comment(s.action)}{data}")
-        lines.append(f"    #   Expect: {_comment(s.expected_result)}")
+    lines += _step_comments(tc)
     lines.append("    # TODO: implement the actions above with Playwright and assert")
     lines.append('    pytest.skip("skeleton — implement the steps above")')
     return "\n".join(lines)
@@ -128,8 +143,10 @@ def cleanup_temp_files(max_age_seconds: int = 3600) -> int:
     that happened to match the pattern.
     """
     return _sweep_temp_files(
-        max_age_seconds=max_age_seconds,
-        pattern="qa_test_cases_*.py",
-        label="Playwright",
-        log=logger,
+        Sweep(
+            max_age_seconds=max_age_seconds,
+            pattern="qa_test_cases_*.py",
+            label="Playwright",
+            log=logger,
+        )
     )

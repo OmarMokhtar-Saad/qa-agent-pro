@@ -14,26 +14,27 @@ from tools.mobile import actions
 from tools.mobile.session_core import LANE_EXPLORE
 
 
+def _refusal(lane: object) -> str:
+    return (
+        "A finding is kept only on an explore turn; this run is on the "
+        + repr(str(lane)[:20])
+        + " lane, so it was left out."
+    )
+
+
+# Explore lane: the cleaned finding is set when there is one. Any other lane:
+# the payload comes back unchanged and, when a finding was given, the refusal
+# names the lane. An empty or non-text finding adds nothing and refuses nothing.
 def merge_finding(
     payload: dict, finding: object, *, lane: str
 ) -> tuple[dict, str | None]:
-    """A copy of ``payload`` plus the finding, and a refusal text or None.
-
-    Explore lane: the cleaned finding is set when there is one. Any other lane:
-    the payload comes back unchanged and, when a finding was given, the refusal
-    names the lane. An empty or non-text finding adds nothing and refuses nothing.
-    """
+    """A copy of ``payload`` plus the finding, and a refusal text or None."""
     merged = dict(payload) if isinstance(payload, dict) else {}
     text = actions.script_finding({"finding": finding})
     if lane != LANE_EXPLORE:
         if not text:
             return merged, None
-        shown = repr(str(lane)[:20])
-        return merged, (
-            "A finding is kept only on an explore turn; this run is on the "
-            + shown
-            + " lane, so it was left out."
-        )
+        return merged, _refusal(lane)
     if text:
         merged["finding"] = text
     return merged, None

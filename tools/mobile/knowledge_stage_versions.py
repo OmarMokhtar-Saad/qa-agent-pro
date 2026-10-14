@@ -12,8 +12,8 @@ def _versioned(conn, lc, version: str) -> int:
         done += kv.flag_version(conn, version, lc.run_id)
     else:
         done += kv.reactivate_downgrade(conn, version, lc.run_id)
-    done += kv.restore_confirmed(conn, lc.steps or [], version, lc.run_id)
-    done += kv.apply_missing(conn, lc.steps or [], version, lc.run_id)
+    done += kv.restore_confirmed(conn, lc.steps or [], kv.VerCtx(version, lc.run_id))
+    done += kv.apply_missing(conn, lc.steps or [], kv.VerCtx(version, lc.run_id))
     return done
 
 

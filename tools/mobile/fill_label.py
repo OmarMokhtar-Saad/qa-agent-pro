@@ -35,8 +35,21 @@ this module.
 
 from __future__ import annotations
 
-import re
+from typing import Any
 
+from tools.mobile.fill_label_geom import _rect  # noqa: F401
+from tools.mobile.fill_label_layers import (  # noqa: F401
+    LAYER_ADJACENT,
+    LAYER_FIELD,
+    LAYERS,
+    _adjacent_layer,
+    _field_layer,
+)
+from tools.mobile.fill_label_match import (  # noqa: F401
+    TIER_CONTAINS,
+    TIER_EXACT,
+    _norm,
+)
 from tools.untrusted import single_line, wrap_untrusted
 
 #: The longest label ``fill`` accepts. A LABEL, not a paragraph: it is matched
@@ -52,140 +65,21 @@ FILL_MAX_CANDIDATES_LISTED = 5
 #: longest part and are attacker-influenced, so each is clipped.
 FILL_MAX_CANDIDATE_CHARS = 60
 
-LAYER_FIELD = "field"
-LAYER_ADJACENT = "adjacent"
-LAYERS = (LAYER_FIELD, LAYER_ADJACENT)
-
-TIER_EXACT = "exact"
-TIER_CONTAINS = "contains"
-
-_WORDS = re.compile(r"\w+", re.UNICODE)
-
-
-def _norm(value: object) -> str:
-    return " ".join(str(value or "").split()).casefold()
-
-
-def _words(value: object) -> list[str]:
-    return _WORDS.findall(_norm(value))
-
-
-def _contains(wanted: list[str], have: list[str]) -> bool:
-    size = len(wanted)
-    return bool(size) and any(
-        have[i : i + size] == wanted for i in range(len(have) - size + 1)
-    )
-
-
-def _strings(element: dict, keys: tuple) -> list[str]:
-    return [s for s in (str(element.get(k) or "") for k in keys) if s.strip()]
-
-
-def _matches(element: dict, keys: tuple, label: str, tier: str) -> bool:
-    if tier == TIER_EXACT:
-        return any(_norm(s) == label for s in _strings(element, keys))
-    wanted = _words(label)
-    return any(_contains(wanted, _words(s)) for s in _strings(element, keys))
-
-
-def _rect(element: dict) -> tuple | None:
-    box = element.get("bounds")
-    if not isinstance(box, (list, tuple)) or len(box) != 4:
-        return None
-    try:
-        left, top, right, bottom = (int(v) for v in box)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if right <= left or bottom <= top:
-        return None
-    return left, top, right, bottom
-
-
-def _field_layer(elements: list, label: str, tier: str) -> list:
-    return [
-        e
-        for e in elements
-        if e.get("editable") and _matches(e, ("hint", "text", "desc"), label, tier)
-    ]
-
-
-def _distance(label_box: tuple, field_box: tuple, tol: int) -> int | None:
-    """Pixels from a label to a field below or right of it, else ``None``."""
-    l_left, l_top, l_right, l_bottom = label_box
-    f_left, f_top, f_right, f_bottom = field_box
-    overlaps_rows = f_top < l_bottom and f_bottom > l_top
-    if overlaps_rows and f_left >= l_right - tol:
-        return max(0, f_left - l_right)
-    overlaps_cols = f_left < l_right and f_right > l_left
-    if overlaps_cols and f_top >= l_bottom - tol:
-        return max(0, f_top - l_bottom)
-    return None
-
-
-def _claimed_between(
-    label_box: tuple, field_box: tuple, others: list, tol: int
-) -> bool:
-    """True when another text node sits between a label and a field below it --
-    the field then belongs to THAT text, not to this label."""
-    for box in others:
-        inside_rows = box[1] >= label_box[3] - tol and box[3] <= field_box[1] + tol
-        inside_cols = box[0] < field_box[2] and box[2] > field_box[0]
-        if inside_rows and inside_cols and box != label_box:
-            return True
-    return False
-
-
-def _adjacent_layer(elements: list, label: str, tier: str) -> list:
-    texts = [
-        e for e in elements if not e.get("editable") and _strings(e, ("text", "desc"))
-    ]
-    labels = [e for e in texts if _matches(e, ("text", "desc"), label, tier)]
-    fields = [(e, _rect(e)) for e in elements if e.get("editable")]
-    fields = [(e, box) for e, box in fields if box]
-    other_boxes = [_rect(e) for e in texts if e not in labels]
-    other_boxes = [box for box in other_boxes if box]
-    winners: list = []
-    for node in labels:
-        box = _rect(node)
-        if not box:
-            continue
-        tol = max(4, (box[3] - box[1]) // 4)
-        scored = []
-        for field, f_box in fields:
-            gap = _distance(box, f_box, tol)
-            if gap is None:
-                continue
-            if _claimed_between(box, f_box, other_boxes, tol):
-                continue
-            scored.append((gap, field))
-        if not scored:
-            continue
-        nearest = min(gap for gap, _ in scored)
-        winners.extend(f for gap, f in scored if gap == nearest and f not in winners)
-    return winners
-
-
 _LAYER_FUNCS = ((LAYER_FIELD, _field_layer), (LAYER_ADJACENT, _adjacent_layer))
 
 
-def resolve_fill(label: object, elements: object) -> dict:
-    """``{"element", "layer", "tier", "candidates", "ambiguous"}``. Never raises.
-
-    ``element`` is set only when the first (tier, layer) that matched anything
-    matched exactly one field. ``candidates`` is that pair's full list (empty when
-    nothing matched anywhere); ``ambiguous`` is true when it held more than one.
-    """
-    miss = {
+def _miss_result() -> dict:
+    miss: dict[str, Any] = {
         "element": None,
         "layer": "",
         "tier": "",
         "candidates": [],
         "ambiguous": False,
     }
-    wanted = _norm(label) if isinstance(label, str) else ""
-    if not wanted or not isinstance(elements, (list, tuple)):
-        return miss
-    usable = [e for e in elements if isinstance(e, dict)]
+    return miss
+
+
+def _search(usable: list, wanted: str) -> dict | None:
     # Tier OUTSIDE layer: an exact label anywhere beats a contains hit in an
     # earlier layer, so "Name" never types into a field hinted "Name of your
     # pet" while a visible "Name" label sits above a different field.
@@ -200,7 +94,21 @@ def resolve_fill(label: object, elements: object) -> dict:
                     "candidates": found,
                     "ambiguous": len(found) > 1,
                 }
-    return miss
+    return None
+
+
+def resolve_fill(label: object, elements: object) -> dict:
+    """``{"element", "layer", "tier", "candidates", "ambiguous"}``. Never raises.
+
+    ``element`` is set only when the first (tier, layer) that matched anything
+    matched exactly one field. ``candidates`` is that pair's full list (empty when
+    nothing matched anywhere); ``ambiguous`` is true when it held more than one.
+    """
+    wanted = _norm(label) if isinstance(label, str) else ""
+    if not wanted or not isinstance(elements, (list, tuple)):
+        return _miss_result()
+    usable = [e for e in elements if isinstance(e, dict)]
+    return _search(usable, wanted) or _miss_result()
 
 
 def _describe(element: dict) -> str:
@@ -211,12 +119,7 @@ def _describe(element: dict) -> str:
     return single_line(name + where, FILL_MAX_CANDIDATE_CHARS)
 
 
-def refusal_detail(label: object, picked: dict) -> str:
-    """Why a fill touched nothing, in terms the model can act on."""
-    wanted = single_line(label, FILL_MAX_LABEL_CHARS)
-    found = [c for c in (picked.get("candidates") or []) if isinstance(c, dict)]
-    if len(found) < 2:
-        return "Nothing on this screen is an input field labelled `" + wanted + "`."
+def _many_text(wanted: str, found: list) -> str:
     shown = [_describe(c) for c in found[:FILL_MAX_CANDIDATES_LISTED]]
     more = len(found) - len(shown)
     return (
@@ -232,3 +135,12 @@ def refusal_detail(label: object, picked: dict) -> str:
         + (" (+" + str(more) + " more)" if more > 0 else "")
         + ". Use `type` with a rid or a narrower target to say which one."
     )
+
+
+def refusal_detail(label: object, picked: dict) -> str:
+    """Why a fill touched nothing, in terms the model can act on."""
+    wanted = single_line(label, FILL_MAX_LABEL_CHARS)
+    found = [c for c in (picked.get("candidates") or []) if isinstance(c, dict)]
+    if len(found) < 2:
+        return "Nothing on this screen is an input field labelled `" + wanted + "`."
+    return _many_text(wanted, found)

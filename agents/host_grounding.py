@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
-import dataclasses
 import logging
+
+from agents.host_grounding_parts import (  # noqa: F401
+    RoutedCases,
+    judge_verdicts,
+    render_sections,
+    routed_cases,
+)
+from config.settings_guard import never_raise
 
 logger = logging.getLogger("agents.host_mode")
 
@@ -64,86 +71,52 @@ def _grounding_instruction() -> str:
     purpose, see agents/host_jobs.py), which would place a
     run-this-last instruction first. Never raises.
     """
-    try:
+    # pragma: no cover - the seam never raises
+    with never_raise(logger, "grounding-review seam read failed", exc_info=True):
         if grounding_review_enabled():
             return _HOST_GROUNDING_INSTRUCTION
-    except Exception:  # pragma: no cover - the seam never raises
-        logger.debug("grounding-review seam read failed", exc_info=True)
     return ""
 
 
+# Reviewer-facing markdown for the host's entailment verdicts.
+#
+# Thin adapter over tools.grounding_verdicts: that module owns every bound (id
+# matching, enum gating, note caps, the 40% proportional ceiling, never-empty),
+# this one only renders. Returns "" when no usable verdict came back, so a
+# submission without the field is byte-identical to today. Never raises.
 def build_grounding_section(raw: object, cases: list) -> str:
-    """Reviewer-facing markdown for the host's entailment verdicts.
-
-    Thin adapter over tools.grounding_verdicts: that module owns every bound (id
-    matching, enum gating, note caps, the 40% proportional ceiling, never-empty),
-    this one only renders. Returns "" when no usable verdict came back, so a
-    submission without the field is byte-identical to today. Never raises.
-    """
-    try:
-        from tools.grounding_verdicts import (
-            assumed_requirements_section,
-            parse_verdicts,
-            refusal_section,
-            split_ungrounded,
-            unspecified_section,
-        )
-
-        ids = [getattr(c, "tc_id", "") or "" for c in cases or []]
-        verdicts = parse_verdicts(raw, ids)
-        if not verdicts:
-            return ""
-        routing = split_ungrounded(list(cases or []), verdicts)
-        return (
-            refusal_section(routing)
-            + assumed_requirements_section(routing.routed, verdicts)
-            + unspecified_section(list(cases or []), verdicts)
-        )
-    except Exception:
-        logger.exception("build_grounding_section failed - omitting the section")
-        return ""
+    """Reviewer-facing markdown for the host's entailment verdicts."""
+    with never_raise(
+        logger,
+        "build_grounding_section failed - omitting the section",
+        level=logging.ERROR,
+        exc_info=True,
+    ):
+        found = judge_verdicts(raw, cases)
+        return render_sections(found) if found is not None else ""
+    return ""
 
 
-@dataclasses.dataclass(frozen=True)
-class RoutedCases:
-    """Cases an entailment review moved off the suite, plus their export rows."""
-
-    routed: list
-    rows: list
-
-
+# The routing decision for a submission, or None when nothing should move.
+#
+# Separate from build_grounding_section on purpose: that one renders text, this
+# one is consulted by the submit path to actually remove the cases. Both delegate
+# every bound to tools.grounding_verdicts -- the id matching, the enum gate, the
+# 40% proportional ceiling and the never-empty invariant -- so the reported
+# section and the applied split can never disagree.
+#
+# Returns None when there is no usable verdict, when nothing was judged
+# ungrounded, or when the ceiling refused the batch. Never raises: on any
+# failure nothing is routed, because failing to re-file a case is recoverable
+# and losing one is not.
 def route_ungrounded_cases(raw: object, cases: list) -> RoutedCases | None:
-    """The routing decision for a submission, or None when nothing should move.
-
-    Separate from build_grounding_section on purpose: that one renders text, this
-    one is consulted by the submit path to actually remove the cases. Both delegate
-    every bound to tools.grounding_verdicts -- the id matching, the enum gate, the
-    40% proportional ceiling and the never-empty invariant -- so the reported
-    section and the applied split can never disagree.
-
-    Returns None when there is no usable verdict, when nothing was judged
-    ungrounded, or when the ceiling refused the batch. Never raises: on any
-    failure nothing is routed, because failing to re-file a case is recoverable
-    and losing one is not.
-    """
-    try:
-        from tools.grounding_verdicts import (
-            assumed_requirements_rows,
-            parse_verdicts,
-            split_ungrounded,
-        )
-
-        ids = [getattr(c, "tc_id", "") or "" for c in cases or []]
-        verdicts = parse_verdicts(raw, ids)
-        if not verdicts:
-            return None
-        routing = split_ungrounded(list(cases or []), verdicts)
-        if not routing.routed:
-            return None
-        return RoutedCases(
-            routed=list(routing.routed),
-            rows=assumed_requirements_rows(routing.routed, verdicts),
-        )
-    except Exception:
-        logger.exception("route_ungrounded_cases failed - routing nothing")
-        return None
+    """The routing decision for a submission, or None when nothing should move."""
+    with never_raise(
+        logger,
+        "route_ungrounded_cases failed - routing nothing",
+        level=logging.ERROR,
+        exc_info=True,
+    ):
+        found = judge_verdicts(raw, cases)
+        return routed_cases(found) if found is not None else None
+    return None

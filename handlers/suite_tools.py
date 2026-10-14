@@ -1,20 +1,23 @@
 """MCP registration adapters: suite_tools."""
 
+from typing import Any
+
 from handlers import export, prep_status, submit_category, submit_suite
 
 
-def register_suite_tools(mcp, Context, ToolAnnotations, rt) -> None:
+def register_suite_tools(mcp, kit, rt) -> None:
     """Register the submit, status, job, category and export tools."""
-    _register_submit_suite_tool(mcp, Context, rt)
-    _register_suite_status_tools(mcp, Context, ToolAnnotations, rt)
-    _register_category_and_export_tools(mcp, Context, rt)
+    _register_submit_suite_tool(mcp, kit, rt)
+    _register_suite_status_tools(mcp, kit, rt)
+    _register_category_and_export_tools(mcp, kit, rt)
 
 
-def _register_submit_suite_tool(mcp, Context, rt) -> None:
+def _register_submit_suite_tool(mcp, kit, rt) -> None:
     """Register qa_submit_suite."""
+    Context: Any = kit.context
 
     @mcp.tool()
-    async def qa_submit_suite(
+    async def qa_submit_suite(  # noqa: PLR0913 - MCP tool schema
         ctx: Context,
         prep_id: str = "",
         suite_json: str | dict = "",
@@ -34,18 +37,28 @@ def _register_submit_suite_tool(mcp, Context, rt) -> None:
             submit_suite.handle_submit_suite(
                 prep_id,
                 suite_json,
-                volume_floor_ack=volume_floor_ack,
-                image_relevance_ack=image_relevance_ack,
-                step_assertion_ack=step_assertion_ack,
-                quality_gate_ack=quality_gate_ack,
-                ask_text=rt._make_asker(ctx),
-                progress=rt._make_progress(ctx),
+                submit_suite.SubmitOptions(
+                    volume_floor_ack,
+                    image_relevance_ack,
+                    step_assertion_ack,
+                    quality_gate_ack,
+                    rt._make_asker(ctx),
+                    rt._make_progress(ctx),
+                ),
             ),
         )
 
 
-def _register_suite_status_tools(mcp, Context, ToolAnnotations, rt) -> None:
+def _register_suite_status_tools(mcp, kit, rt) -> None:
     """Register the read-only qa_prep_status and qa_get_category_job."""
+    _register_prep_status_tool(mcp, kit, rt)
+    _register_category_job_tool(mcp, kit, rt)
+
+
+def _register_prep_status_tool(mcp, kit, rt) -> None:
+    """Register qa_prep_status."""
+    Context: Any = kit.context
+    ToolAnnotations: Any = kit.annotations
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def qa_prep_status(ctx: Context, prep_id: str = "") -> str:
@@ -55,6 +68,11 @@ def _register_suite_status_tools(mcp, Context, ToolAnnotations, rt) -> None:
             ctx,
             prep_status.handle_prep_status(prep_id),
         )
+
+
+def _register_category_job_tool(mcp, kit, rt) -> None:
+    Context: Any = kit.context
+    ToolAnnotations: Any = kit.annotations
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     async def qa_get_category_job(
@@ -74,11 +92,20 @@ def _register_suite_status_tools(mcp, Context, ToolAnnotations, rt) -> None:
         return _result
 
 
-def _register_category_and_export_tools(mcp, Context, rt) -> None:
+def _export_options(rt, ctx, **keys: str) -> export.ExportOptions:
+    return export.ExportOptions(
+        **keys,
+        choose=rt._make_chooser(ctx),
+        progress=rt._make_progress(ctx),
+    )
+
+
+def _register_category_and_export_tools(mcp, kit, rt) -> None:
     """Register qa_submit_category and qa_export_suite."""
+    Context: Any = kit.context
 
     @mcp.tool()
-    async def qa_submit_category(
+    async def qa_submit_category(  # noqa: PLR0913 - MCP tool schema
         ctx: Context,
         prep_id: str = "",
         category_name: str = "",
@@ -99,7 +126,7 @@ def _register_category_and_export_tools(mcp, Context, rt) -> None:
         )
 
     @mcp.tool()
-    async def qa_export_suite(
+    async def qa_export_suite(  # noqa: PLR0913 - MCP tool schema
         ctx: Context,
         suite_id: str = "",
         format: str = "",
@@ -113,9 +140,6 @@ def _register_category_and_export_tools(mcp, Context, rt) -> None:
             export.handle_export_suite(
                 suite_id,
                 format,
-                output_dir=output_dir,
-                prep_id=prep_id,
-                choose=rt._make_chooser(ctx),
-                progress=rt._make_progress(ctx),
+                _export_options(rt, ctx, output_dir=output_dir, prep_id=prep_id),
             ),
         )

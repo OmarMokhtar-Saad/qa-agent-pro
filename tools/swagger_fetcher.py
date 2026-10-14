@@ -23,27 +23,46 @@ House rules honored:
 from __future__ import annotations
 
 import asyncio
-import json
+import json  # noqa: F401
 import logging
-from urllib.parse import urlparse
+from typing import (
+    Any,
+    cast,  # noqa: F401
+)
+from urllib.parse import urlparse  # noqa: F401
 
-import yaml
+import yaml  # noqa: F401
 
+from config.settings_guard import never_raise
 from tools.jira_fetcher import _follow_redirects_with_pinning
+from tools.swf_lines import (  # noqa: F401
+    _HTTP_METHODS,
+    _MAX_ENDPOINTS,
+    _endpoint_line,
+    _endpoint_lines,
+    _param_names,
+)
+from tools.swf_spec import (  # noqa: F401
+    _SPEC_SUFFIXES,
+    _URL_HINTS,
+    looks_like_openapi_url,
+)
+from tools.swf_spec import (
+    _parse_spec as parse_spec,
+)
+from tools.swf_summary import (  # noqa: F401
+    _MAX_CHARS,
+    _auth_lines,
+    _servers_lines,
+    summarize_openapi,
+    summary_result,
+)
 
 logger = logging.getLogger("qa_agents.swagger_fetcher")
 
-# Bounds keeping the grounding block prompt-sized even for huge specs.
-_MAX_ENDPOINTS = 80
-_MAX_CHARS = 12000
 # Absolute backstop even for the uncapped (grounding) caller: nothing legitimate is
 # this large (GitHub's spec is ~9 MB), and yaml.safe_load on more is a CPU/memory sink.
-_HARD_MAX_CHARS = 32_000_000
-_HTTP_METHODS = ("get", "post", "put", "patch", "delete", "head", "options")
-
-# URL substrings that mark a likely OpenAPI/Swagger document.
-_URL_HINTS = ("swagger", "openapi", "api-docs", "api_docs")
-_SPEC_SUFFIXES = (".json", ".yaml", ".yml")
+HARD_MAX_CHARS = 32_000_000
 
 # A fetched spec is held IN MEMORY while the API agent parses it. OPT-IN:
 # fetch_openapi_spec passes no cap, so the shipped test-case-grounding caller is
@@ -78,167 +97,6 @@ _SPEC_SUFFIXES = (".json", ".yaml", ".yml")
 _MAX_SPEC_CHARS = 4_000_000
 
 
-def looks_like_openapi_url(url: str) -> bool:
-    """Cheap pre-filter: does this URL plausibly point at an OpenAPI spec?
-
-    Used by app.py to decide whether to try the spec fetch before the generic
-    HTML page fetch. False negatives just fall back to the page path; false
-    positives are caught by the parse step (which then falls back too).
-    """
-    try:
-        parsed = urlparse((url or "").strip().lower())
-    except ValueError:
-        return False
-    if parsed.scheme not in ("http", "https"):
-        return False
-    haystack = parsed.path + "?" + parsed.query
-    if any(hint in haystack for hint in _URL_HINTS):
-        return True
-    return parsed.path.endswith(_SPEC_SUFFIXES)
-
-
-def _parse_spec(text: str) -> dict | None:
-    """Parse JSON-or-YAML text into an OpenAPI/Swagger dict, else ``None``.
-
-    Accepts only mappings carrying an ``openapi``/``swagger`` version marker
-    and a ``paths`` mapping — anything else is "not a spec", never an error.
-    """
-    if not text or not text.strip():
-        return None
-    data = None
-    try:
-        data = json.loads(text)
-    except ValueError:
-        try:
-            data = yaml.safe_load(text)
-        except yaml.YAMLError:
-            return None
-    if not isinstance(data, dict):
-        return None
-    if "openapi" not in data and "swagger" not in data:
-        return None
-    if not isinstance(data.get("paths"), dict):
-        return None
-    return data
-
-
-def _param_names(op: dict, path_item: dict) -> list:
-    """Merged operation + path-level parameter names, required ones marked."""
-    names = []
-    seen = set()
-    for source in (path_item.get("parameters") or [], op.get("parameters") or []):
-        if not isinstance(source, list):
-            continue
-        for p in source:
-            if not isinstance(p, dict) or not p.get("name"):
-                continue
-            key = (p.get("name"), p.get("in"))
-            if key in seen:
-                continue
-            seen.add(key)
-            label = str(p["name"])
-            if p.get("in"):
-                label += f" ({p['in']})"
-            if p.get("required"):
-                label += "*"
-            names.append(label)
-    return names
-
-
-def _endpoint_line(method: str, path: str, op: dict, path_item: dict) -> str:
-    """One summary line for a single operation."""
-    line = f"- {method.upper()} {path}"
-    label = str(op.get("summary") or op.get("operationId") or "").strip()
-    if label:
-        line += f" — {label[:100]}"
-    params = _param_names(op, path_item)
-    if params:
-        line += "; params: " + ", ".join(params[:8])
-    body = op.get("requestBody")
-    if isinstance(body, dict):
-        line += "; has request body" + ("*" if body.get("required") else "")
-    responses = op.get("responses")
-    if isinstance(responses, dict) and responses:
-        line += "; responses: " + ", ".join(sorted(str(c) for c in responses)[:8])
-    return line
-
-
-def summarize_openapi(spec: dict) -> str:
-    """Condense a parsed spec into a bounded plain-text endpoint summary."""
-    info = spec.get("info") if isinstance(spec.get("info"), dict) else {}
-    lines = []
-    title = str(info.get("title") or "Untitled API").strip()
-    version = str(info.get("version") or "").strip()
-    lines.append(f"API: {title}" + (f" (version {version})" if version else ""))
-    desc = str(info.get("description") or "").strip()
-    if desc:
-        lines.append(desc[:500])
-    lines.extend(_servers_lines(spec))
-    lines.extend(_auth_lines(spec))
-    lines.append("")
-    lines.append("Endpoints (* = required param):")
-    lines.extend(_endpoint_lines(spec))
-    return "\n".join(lines)[:_MAX_CHARS]
-
-
-def _servers_lines(spec: dict) -> list[str]:
-    """The ``Servers:`` summary line (at most 5 urls), or []."""
-    servers = spec.get("servers") or []
-    if isinstance(servers, list) and servers:
-        urls = [
-            str(s.get("url"))
-            for s in servers[:5]
-            if isinstance(s, dict) and s.get("url")
-        ]
-        if urls:
-            return ["Servers: " + ", ".join(urls)]
-    return []
-
-
-def _auth_lines(spec: dict) -> list[str]:
-    """The ``Auth:`` summary line (at most 6 schemes), or []."""
-    schemes = {}
-    components = spec.get("components")
-    if isinstance(components, dict) and isinstance(
-        components.get("securitySchemes"), dict
-    ):
-        schemes = components["securitySchemes"]
-    elif isinstance(spec.get("securityDefinitions"), dict):  # Swagger 2.0
-        schemes = spec["securityDefinitions"]
-    if schemes:
-        auth = [
-            f"{name} ({scheme.get('type', '?')})"
-            for name, scheme in list(schemes.items())[:6]
-            if isinstance(scheme, dict)
-        ]
-        if auth:
-            return ["Auth: " + ", ".join(auth)]
-    return []
-
-
-def _endpoint_lines(spec: dict) -> list[str]:
-    """Endpoint lines up to _MAX_ENDPOINTS, plus a truncation note."""
-    lines: list[str] = []
-    shown = 0
-    total = 0
-    for path in sorted(spec.get("paths") or {}):
-        path_item = spec["paths"].get(path)
-        if not isinstance(path_item, dict):
-            continue
-        for method in _HTTP_METHODS:
-            op = path_item.get(method)
-            if not isinstance(op, dict):
-                continue
-            total += 1
-            if shown >= _MAX_ENDPOINTS:
-                continue
-            shown += 1
-            lines.append(_endpoint_line(method, path, op, path_item))
-    if total > shown:
-        lines.append(f"... and {total - shown} more endpoints (truncated).")
-    return lines
-
-
 def _oversize_error(text: str, max_chars: int | None) -> str:
     """The refusal message when *text* breaks the caller's or the hard cap, else ''."""
     if max_chars is not None and text and len(text) > max_chars:
@@ -246,95 +104,97 @@ def _oversize_error(text: str, max_chars: int | None) -> str:
             f"spec document is larger than {max_chars} characters "
             "- paste the single endpoint instead"
         )
-    if text and len(text) > _HARD_MAX_CHARS:
+    if text and len(text) > HARD_MAX_CHARS:
         return (
-            f"spec document is larger than {_HARD_MAX_CHARS} characters"
+            f"spec document is larger than {HARD_MAX_CHARS} characters"
             " - refusing to parse it"
         )
     return ""
 
 
+def _refusal(hop: Any, max_chars: int | None) -> dict | None:
+    """The error dict for an HTTP failure or an oversize body, else None."""
+    if hop.status_code >= 400:
+        return {"error": f"HTTP {hop.status_code} fetching OpenAPI spec", "spec": None}
+    too_large = _oversize_error(hop.text, max_chars)
+    return {"error": too_large, "spec": None} if too_large else None
+
+
+async def follow_redirects_with_pinning(url: str) -> tuple[Any, str]:
+    """Public seam for the pinned fetch; calls the private name at call time."""
+    return await _follow_redirects_with_pinning(url)
+
+
+# Fetch + parse an OpenAPI spec URL into the PARSED DICT. NEVER raises.
+# Returns ``{"error": None, "url": <final url>, "spec": <dict>}`` on success,
+# else ``{"error": <reason>, "spec": None}``.
+#
+# This is the module's SINGLE network call site: :func:`fetch_openapi_spec`
+# (the prose-summary face used by the test-case grounding path) delegates to
+# it, so there is exactly one fetch path and exactly one SSRF stack. That
+# stack -- scheme/DNS/public-IP validation, IP pinning and manual per-hop
+# redirect validation in ``tools.jira_fetcher`` -- is reached through the
+# identical ``_follow_redirects_with_pinning`` call as before: not
+# reimplemented, not parameterised, not bypassed.
+#
+# The API test agent needs the parsed dict, not the prose summary.
+#
+# ``max_chars`` is OPT-IN and defaults to no cap, so the long-standing
+# :func:`fetch_openapi_spec` behaviour is byte-for-byte unchanged. Only the new
+# API-agent caller passes a bound. Capping unconditionally here would silently
+# impose a new refusal on the shipped test-case grounding path.
+async def _document_of(url: str, max_chars: int | None) -> dict:
+    hop, final_url = await follow_redirects_with_pinning(url)
+    refusal = _refusal(hop, max_chars)
+    if refusal:
+        return refusal
+    # json/yaml parsing of a multi-MB spec is CPU-bound: keep it off the loop.
+    spec = await asyncio.to_thread(parse_spec, hop.text)
+    if spec is None:
+        return {
+            "error": "URL did not return a parseable OpenAPI/Swagger document",
+            "spec": None,
+        }
+    return {"error": None, "url": final_url, "spec": spec}
+
+
+async def _summary_of(url: str) -> dict:
+    # The summarising half must stay inside the module's "never raises to
+    # callers" house rule: sorted() over mixed-type YAML path keys raises
+    # TypeError, and the caller is the live test-case grounding path.
+    fetched = await fetch_openapi_document(url)
+    if fetched.get("error"):
+        return {"error": fetched["error"], "summary": None}
+    return summary_result(fetched)
+
+
 async def fetch_openapi_document(url: str, *, max_chars: int | None = None) -> dict:
-    """Fetch + parse an OpenAPI spec URL into the PARSED DICT. NEVER raises.
-
-    Returns ``{"error": None, "url": <final url>, "spec": <dict>}`` on success,
-    else ``{"error": <reason>, "spec": None}``.
-
-    This is the module's SINGLE network call site: :func:`fetch_openapi_spec`
-    (the prose-summary face used by the test-case grounding path) delegates to
-    it, so there is exactly one fetch path and exactly one SSRF stack. That
-    stack -- scheme/DNS/public-IP validation, IP pinning and manual per-hop
-    redirect validation in ``tools.jira_fetcher`` -- is reached through the
-    identical ``_follow_redirects_with_pinning`` call as before: not
-    reimplemented, not parameterised, not bypassed.
-
-    The API test agent needs the parsed dict (``openapi_contract.extract``
-    consumes a spec object, not prose), which the summary face cannot provide.
-
-    ``max_chars`` is OPT-IN and defaults to no cap, so the long-standing
-    :func:`fetch_openapi_spec` behaviour is byte-for-byte unchanged. Only the new
-    API-agent caller passes a bound. Capping unconditionally here would silently
-    impose a new refusal on the shipped test-case grounding path.
-    """
-    try:
-        hop, final_url = await _follow_redirects_with_pinning(url)
-        if hop.status_code >= 400:
-            return {
-                "error": f"HTTP {hop.status_code} fetching OpenAPI spec",
-                "spec": None,
-            }
-        text = hop.text
-        too_large = _oversize_error(text, max_chars)
-        if too_large:
-            return {"error": too_large, "spec": None}
-        # json/yaml parsing of a multi-MB spec is CPU-bound: keep it off the loop.
-        spec = await asyncio.to_thread(_parse_spec, text)
-        if spec is None:
-            return {
-                "error": "URL did not return a parseable OpenAPI/Swagger document",
-                "spec": None,
-            }
-        return {"error": None, "url": final_url, "spec": spec}
-    except Exception as exc:
-        logger.warning("OpenAPI spec fetch failed for %s: %s", url, exc)
-        return {"error": str(exc) or exc.__class__.__name__, "spec": None}
+    with never_raise(
+        logger,
+        "OpenAPI spec fetch failed for %s: %s",
+        url,
+        level=logging.WARNING,
+        with_exc=True,
+    ) as g:
+        return await _document_of(url, max_chars)
+    return {"error": str(g.exc) or g.exc.__class__.__name__, "spec": None}
 
 
 async def fetch_openapi_spec(url: str) -> dict:
-    """Fetch + parse + summarize an OpenAPI spec URL. NEVER raises.
-
-    Returns ``{"error": None, "url", "title", "version", "endpoint_count",
-    "summary"}`` on success, else ``{"error": <reason>, "summary": None}``.
-
-    The public return contract is unchanged; only the fetch+parse half moved
-    into :func:`fetch_openapi_document` so both faces share one network path.
-    No cap is passed, so this face refuses nothing it did not refuse before.
-    """
-    try:
-        fetched = await fetch_openapi_document(url)
-        if fetched.get("error"):
-            return {"error": fetched["error"], "summary": None}
-        spec = fetched["spec"]
-        info = spec.get("info") if isinstance(spec.get("info"), dict) else {}
-        paths = spec.get("paths") or {}
-        endpoint_count = sum(
-            1
-            for item in paths.values()
-            if isinstance(item, dict)
-            for m in _HTTP_METHODS
-            if isinstance(item.get(m), dict)
-        )
-        return {
-            "error": None,
-            "url": fetched["url"],
-            "title": str(info.get("title") or "Untitled API"),
-            "version": str(info.get("version") or ""),
-            "endpoint_count": endpoint_count,
-            "summary": summarize_openapi(spec),
-        }
-    except Exception as exc:
-        # The summarising half must stay inside the module's "never raises to
-        # callers" house rule: sorted() over mixed-type YAML path keys raises
-        # TypeError, and the caller is the live test-case grounding path.
-        logger.warning("OpenAPI spec summarize failed for %s: %s", url, exc)
-        return {"error": str(exc) or exc.__class__.__name__, "summary": None}
+    # Fetch + parse + summarize an OpenAPI spec URL. NEVER raises.
+    #
+    # Returns {"error": None, "url", "title", "version", "endpoint_count",
+    # "summary"} on success, else {"error": <reason>, "summary": None}.
+    #
+    # The public return contract is unchanged; only the fetch+parse half moved
+    # into fetch_openapi_document so both faces share one network path.
+    # No cap is passed, so this face refuses nothing it did not refuse before.
+    with never_raise(
+        logger,
+        "OpenAPI spec summarize failed for %s: %s",
+        url,
+        level=logging.WARNING,
+        with_exc=True,
+    ) as g:
+        return await _summary_of(url)
+    return {"error": str(g.exc) or g.exc.__class__.__name__, "summary": None}

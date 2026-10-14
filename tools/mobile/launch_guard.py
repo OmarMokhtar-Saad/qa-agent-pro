@@ -5,7 +5,7 @@ test, the Firebase App Tester, and the packages the step declared in
 ``expect_apps``. Anything else is refused, and the refusal names the allowed set
 so the model can fix the step instead of guessing.
 
-The package is whitelist-validated (``actions.is_package_id``) before it is
+The package is whitelist-validated (``action_consts.is_package_id``) before it is
 echoed, so the refusal text never carries free-form model or device text.
 The destructive guard is a separate check on the ACTUATED node and still runs.
 """
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from tools.mobile.actions import is_package_id
+from tools.mobile.action_consts import is_package_id
 
 APP_TESTER_PACKAGE = "dev.firebase.appdistribution"
 
@@ -33,6 +33,19 @@ def allowed_packages(target: object, expect_apps: Iterable = ()) -> list[str]:
     return out
 
 
+def _refusal(package: object, listing: str) -> str:
+    if not is_package_id(package):
+        return (
+            "launch refused: package must be an Android package id such as "
+            "com.example.app. Allowed here: " + listing + "."
+        )
+    return (
+        "launch refused: " + str(package) + " is not an app this step may open. "
+        "Allowed: " + listing + ". List it in `expect_apps` when the step really "
+        "moves into it."
+    )
+
+
 def launch_allowed(
     package: object, *, target: object, expect_apps: Iterable = ()
 ) -> tuple[bool, str]:
@@ -43,16 +56,6 @@ def launch_allowed(
     target, so a dropped field cannot launch something unintended.
     """
     allowed = allowed_packages(target, expect_apps)
-    listing = ", ".join(allowed)
-    if not is_package_id(package):
-        return False, (
-            "launch refused: package must be an Android package id such as "
-            "com.example.app. Allowed here: " + listing + "."
-        )
-    if package in allowed:
+    if is_package_id(package) and package in allowed:
         return True, ""
-    return False, (
-        "launch refused: " + str(package) + " is not an app this step may open. "
-        "Allowed: " + listing + ". List it in `expect_apps` when the step really "
-        "moves into it."
-    )
+    return False, _refusal(package, ", ".join(allowed))

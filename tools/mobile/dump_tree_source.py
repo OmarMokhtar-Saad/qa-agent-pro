@@ -16,15 +16,14 @@ import time
 from typing import Optional
 
 from tools.mobile import tree_source
+from tools.mobile.replay import dump as replay_dump
 from tools.mobile.tree_source import TreeResult
 
 
 async def _guarded_dump(serial: str) -> dict:
-    # Late import: executor imports most of the package. dump_raw is the
-    # single-flight guard every raw dump outside the executor must take.
-    from tools.mobile.replay.dump import dump_raw
-
-    return await dump_raw(serial)
+    # dump_raw is the single-flight guard every raw dump outside the
+    # executor must take.
+    return await replay_dump.dump_raw(serial)
 
 
 class DumpTreeSource:

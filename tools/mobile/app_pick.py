@@ -15,7 +15,7 @@ Nothing here guesses: an ambiguous or empty request returns an unresolved
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Optional, Sequence
+from typing import Awaitable, Callable, NamedTuple, Optional, Sequence
 
 from tools.device_manager import valid_package_name
 from tools.mobile import adb
@@ -25,12 +25,21 @@ from tools.mobile.resolve import (
     RESOLVED,
     AskCb,
     Candidate,
+    PickOpts,
     Resolution,
     resolve_or_ask,
 )
 from tools.mobile.resolve_cache import RunAnswers
 
 PackageLister = Callable[[str], Awaitable[dict]]
+
+
+@dataclass(frozen=True)
+class PickPorts:
+    ask: Optional[AskCb] = None
+    packages: Optional[PackageLister] = None
+    answers: Optional[RunAnswers] = None
+    labeler: Optional[LabelLister] = None
 
 
 @dataclass(frozen=True)
@@ -49,33 +58,29 @@ def _unresolved(question: str) -> Resolution:
     return Resolution(NONE, question=question)
 
 
+class _Listed(NamedTuple):
+    packages: list
+    labels: dict
+
+
 async def _resolve_installed(
-    request: PickRequest,
-    installed: Sequence[str],
-    ask: Optional[AskCb],
-    answers: Optional[RunAnswers],
-    labels: Optional[dict] = None,
+    request: PickRequest, listed: _Listed, ports: PickPorts
 ) -> Resolution:
+    answers = ports.answers
     if answers is not None:
-        answers.drop_missing(request.serial, installed)
+        answers.drop_missing(request.serial, listed.packages)
         remembered = answers.get(request.serial, request.app_text)
         if remembered:
             return Resolution(RESOLVED, remembered, how="asked")
-    cands = package_candidates(installed, labels)
-    got = await resolve_or_ask(request.app_text, cands, noun="app", ask=ask)
+    cands = package_candidates(listed.packages, listed.labels)
+    opts = PickOpts(noun="app", ask=ports.ask)
+    got = await resolve_or_ask(request.app_text, cands, opts)
     if answers is not None and got.resolved and got.how == "asked":
         answers.remember(request.serial, request.app_text, got.value)
     return got
 
 
-async def pick_package(
-    request: PickRequest,
-    *,
-    ask: Optional[AskCb] = None,
-    packages: Optional[PackageLister] = None,
-    answers: Optional[RunAnswers] = None,
-    labeler: Optional[LabelLister] = None,
-) -> Resolution:
+def _early(request: PickRequest) -> Optional[Resolution]:
     explicit = request.explicit_package.strip()
     if explicit:
         if not valid_package_name(explicit):
@@ -89,9 +94,19 @@ async def pick_package(
             "No app name was given. Ask the user which app to use; they can name "
             "part of its name."
         )
-    listing = await (packages or adb.installed_packages)(request.serial)
+    return None
+
+
+async def pick_package(
+    request: PickRequest, ports: Optional[PickPorts] = None
+) -> Resolution:
+    early = _early(request)
+    if early is not None:
+        return early
+    use = ports or PickPorts()
+    listing = await (use.packages or adb.installed_packages)(request.serial)
     if listing.get("error"):
         return _unresolved(str(listing["error"]))
     installed = list(listing.get("content") or [])
-    labels = await (labeler or known_labels)(request.serial, installed)
-    return await _resolve_installed(request, installed, ask, answers, labels)
+    labels = await (use.labeler or known_labels)(request.serial, installed)
+    return await _resolve_installed(request, _Listed(installed, labels), use)

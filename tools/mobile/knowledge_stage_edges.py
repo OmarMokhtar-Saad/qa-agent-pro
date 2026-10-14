@@ -12,14 +12,16 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any, NamedTuple
 
 from tools.mobile import knowledge_db, knowledge_limits
 from tools.mobile.knowledge_learn import StageResult
+from tools.mobile.kstg_edge_snap import snapshot  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
 
-def ok_steps(steps: object) -> list:
+def ok_steps(steps: Any) -> list:
     """The steps that ended ``ok`` and carry both screen keys."""
     out = []
     for rec in list(steps or []):
@@ -41,7 +43,7 @@ def percentile(values: list, pct: float) -> int:
     return ordered[min(rank, len(ordered)) - 1]
 
 
-def collect(steps: object) -> dict:
+def collect(steps: Any) -> dict:
     """``{(from, op, target, to): [ms, ...]}`` for one run."""
     found: dict = {}
     for rec in ok_steps(steps):
@@ -86,70 +88,64 @@ def _make_room(conn, run_id: str) -> None:
     ).fetchone()
     if row is not None:
         knowledge_db.set_status(
-            conn, "edges", row["id"], "retired", run_id=run_id, why="edge cap"
+            conn,
+            "edges",
+            knowledge_db.Status(
+                row["id"], "retired", None, run_id=run_id, why="edge cap"
+            ),
         )
 
 
-def _one(conn, run_id: str, key: tuple, times: list) -> int:
-    where = "from_key = ? AND action = ? AND target = ? AND to_key = ? AND invalid_at IS NULL"
-    found = knowledge_db.rows(conn, "edges", where, key, 1)
-    natural = dict(zip(("from_key", "action", "target", "to_key"), key, strict=True))
-    if found:
-        if run_id and run_id in _runs(found[0]):
-            return 0
-        deltas = _blend(found[0], times)
-        got = knowledge_db.upsert_counter(
-            conn, "edges", natural, deltas, run_id=run_id, why="edge seen"
-        )
-        return 1 if got else 0
-    _make_room(conn, run_id)
+class EdgeObs(NamedTuple):
+    run_id: str
+    key: tuple
+    times: list
+
+
+_NATURAL = ("from_key", "action", "target", "to_key")
+
+
+def _seen(conn, obs: EdgeObs, old: dict) -> int:
+    if obs.run_id and obs.run_id in _runs(old):
+        return 0
+    deltas = _blend(old, obs.times)
+    natural = dict(zip(_NATURAL, obs.key, strict=True))
+    got = knowledge_db.upsert_counter(
+        conn,
+        "edges",
+        knowledge_db.Counter(natural, deltas, run_id=obs.run_id, why="edge seen"),
+    )
+    return 1 if got else 0
+
+
+def _learn(conn, obs: EdgeObs) -> int:
+    natural = dict(zip(_NATURAL, obs.key, strict=True))
+    _make_room(conn, obs.run_id)
     values = {
         **natural,
-        "count": len(times),
-        "p50_ms": percentile(times, 50),
-        "p90_ms": percentile(times, 90),
+        "count": len(obs.times),
+        "p50_ms": percentile(obs.times, 50),
+        "p90_ms": percentile(obs.times, 90),
         "status": "active",
         "trust": "learned",
     }
-    return (
-        1
-        if knowledge_db.insert(conn, "edges", values, run_id=run_id, why="edge learned")
-        else 0
-    )
+    write = knowledge_db.Write(values, run_id=obs.run_id, why="edge learned")
+    return 1 if knowledge_db.insert(conn, "edges", write) else 0
+
+
+def _one(conn, obs: EdgeObs) -> int:
+    where = "from_key = ? AND action = ? AND target = ? AND to_key = ? AND invalid_at IS NULL"
+    found = knowledge_db.rows(conn, "edges", knowledge_db.Where(where, obs.key, 1))
+    if found:
+        return _seen(conn, obs, found[0])
+    return _learn(conn, obs)
 
 
 def run(conn, lc) -> StageResult:
     wrote = 0
     seen = collect(lc.steps)
     for key in sorted(seen):
-        wrote += _one(conn, lc.run_id, key, seen[key])
+        wrote += _one(conn, EdgeObs(lc.run_id, key, seen[key]))
     return StageResult(
         "edges", wrote=wrote, notes=["%d edge rows touched" % wrote] if wrote else []
     )
-
-
-def snapshot(conn, facts) -> dict:
-    """Active edges by ``from_key`` (the plugs' read-only snapshot slice)."""
-    out: dict = {}
-    for row in knowledge_db.rows(
-        conn,
-        "edges",
-        "status = 'active' AND invalid_at IS NULL",
-        (),
-        knowledge_limits.SNAPSHOT_MAX_ROWS,
-    ):
-        out.setdefault(row["from_key"], []).append(
-            {
-                k: row[k]
-                for k in (
-                    "id",
-                    "action",
-                    "target",
-                    "to_key",
-                    "count",
-                    "p50_ms",
-                    "p90_ms",
-                )
-            }
-        )
-    return out

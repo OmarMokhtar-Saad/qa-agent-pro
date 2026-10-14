@@ -1,0 +1,79 @@
+"""Stopping and abandoning a recorder: the wall-clock-bounded half of the lane."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from config.settings_guard import never_raise
+from tools.mobile import adb
+from tools.mobile.media_consts import MAX_STOP_WAIT_S
+
+logger = logging.getLogger("tools.mobile.media")
+
+#: This module's OWN handle on ``asyncio.wait_for``.
+#:
+#: The stop's timeout is the fact a test must be able to observe, and the honest
+#: way to observe it is to replace THIS name -- module-local, and restored by
+#: ``monkeypatch`` at the end of the test -- rather than ``asyncio.wait_for``
+#: itself. Patching the stdlib attribute reaches every coroutine that awaits a
+#: timeout anywhere in the same test process, so a spy meant to read one number
+#: silently re-times unrelated code.
+wait_for = asyncio.wait_for
+
+
+async def signal_recorder(serial: str) -> None:
+    """Interrupt every ``screenrecord`` on the device (bounded by the stop window)."""
+    await adb.shell(serial, ["pkill", "-INT", "screenrecord"], MAX_STOP_WAIT_S)
+
+
+# A killed screenrecord leaves an unplayable file, which is why this sends an
+# interrupt on the device FIRST and gives the recorder a window to close its
+# container, rather than killing the adb client outright.
+#
+# But the window is :data:`MAX_STOP_WAIT_S`, not ``adb.DEFAULT_TIMEOUT_S``, and
+# the client IS killed once it expires. A device with no ``pkill``, or one
+# where the interrupt never reaches the recorder, would otherwise block the
+# step for the full adb default -- thirty seconds of a tester's wall clock,
+# every step, for a picture that is already lost.
+#
+# ``pkill -INT screenrecord`` is device-GLOBAL (see the module docstring):
+# there is no pid to target, and the per-device lock is what keeps that from
+# reaching another run.
+async def _stop_recorder(serial: str, handle: dict) -> bool:
+    """Interrupt the recorder so it CLOSES its container, then reap it."""
+    proc = handle.get("proc")
+    if proc is None:
+        return False
+    await signal_recorder(serial)
+    with never_raise():
+        await wait_for(proc.communicate(), timeout=MAX_STOP_WAIT_S)
+        return True
+    with never_raise():
+        proc.kill()
+        await wait_for(proc.communicate(), timeout=MAX_STOP_WAIT_S)
+    return False
+
+
+# The one path where a clip is thrown away rather than named. When
+# ``executor.replay`` returns an ERROR, ``case_runner`` returns it without
+# checkpointing: there is no step result to attach a picture to and no
+# terminal screen to key a frame by, so there is nowhere a state could be
+# shown. What there still IS, though, is a live device process -- and a
+# recorder nobody stops outlives the step, at which point the NEXT step's
+# device-global ``pkill -INT screenrecord`` closes the WRONG recording.
+#
+# Bounded by :data:`MAX_STOP_WAIT_S` like every other stop, and never raises: an
+# error path must not acquire a second way to fail.
+async def abandon(serial: str, handle: object) -> dict:
+    """Stop a recorder and DELETE its file, storing no record at all."""
+    held = handle if isinstance(handle, dict) else {}
+    with never_raise(
+        logger, "mobile.media.abandon failed: %s", level=logging.WARNING, with_exc=True
+    ):
+        if held.get("proc") is not None:
+            await _stop_recorder(serial, held)
+        remote = str(held.get("remote") or "")
+        if remote:
+            await adb.shell(serial, ["rm", "-f", remote], MAX_STOP_WAIT_S)
+    return {"error": None, "content": None}

@@ -20,6 +20,8 @@ from __future__ import annotations
 import contextvars
 import logging
 
+from config.settings_guard import never_raise
+
 logger = logging.getLogger(__name__)
 
 #: Marks kept per call. A poll loop can time out several times in one call;
@@ -33,11 +35,7 @@ _MARKS: contextvars.ContextVar[list | None] = contextvars.ContextVar(
 
 def begin() -> contextvars.Token | None:
     """Open a fresh sink for THIS call. Returns the token :func:`finish` needs."""
-    try:
-        return _MARKS.set([])
-    except Exception:  # pragma: no cover - defensive
-        logger.debug("tool_status.begin failed", exc_info=True)
-        return None
+    return _MARKS.set([])
 
 
 def mark_timed_out(what: str) -> None:
@@ -46,24 +44,23 @@ def mark_timed_out(what: str) -> None:
     A no-op outside a call that opened a sink, so library code may call it
     unconditionally.
     """
-    try:
+    # defensive
+    with never_raise(logger, "tool_status.mark_timed_out failed", exc_info=True):
         sink = _MARKS.get()
         if sink is not None and len(sink) < MAX_MARKS:
             sink.append(str(what or "unknown")[:40])
-    except Exception:  # pragma: no cover - defensive
-        logger.debug("tool_status.mark_timed_out failed", exc_info=True)
 
 
 def finish(token: contextvars.Token | None) -> list[str]:
     """The marks this call collected, and the sink closed. Never raises."""
     try:
         out = list(_MARKS.get() or [])
-    except Exception:  # pragma: no cover - defensive
+    except TypeError:  # pragma: no cover - defensive
         out = []
     if token is not None:
         try:
             _MARKS.reset(token)
-        except Exception:  # pragma: no cover - defensive
+        except (ValueError, RuntimeError):  # pragma: no cover - defensive
             # A token from another context: leave the var alone rather than
             # fail the call. The next begin() replaces it anyway.
             logger.debug("tool_status.finish reset failed", exc_info=True)

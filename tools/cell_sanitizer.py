@@ -45,25 +45,23 @@ def _neutralize_line(line: str) -> str:
     return line
 
 
+# Excel, Google Sheets and TestRail's CSV importer treat a cell (and, in
+# multi-line cells, effectively each line) that begins with =, +, -, @, TAB or
+# CR as a formula. LLM-generated test text is untrusted, and our steps/test-data
+# cells are multi-line ("1. do X\\n2. do Y"). Checking only text[0] left a
+# formula that appears AFTER an embedded newline (e.g. "1. do X\\n=cmd|...")
+# live. We therefore split on newlines and prefix a leading ' on each offending
+# line.
+#
+# The leading single-quote is the accepted OWASP defense for CSV injection; it
+# is invisible in .xlsx (Excel's text marker) and TestRail/Sheets strip it on
+# import in the common flows. It can show as a literal ' in a raw CSV opened as
+# plain text, which is the documented, accepted trade-off for a safe import.
+#
+# Never raises -- non-string input is coerced via str() first.
 def sanitize_cell(value: str) -> str:
     """Neutralize spreadsheet/CSV formula injection at the start of EVERY line
-    within a cell (NB-015).
-
-    Excel, Google Sheets and TestRail's CSV importer treat a cell (and, in
-    multi-line cells, effectively each line) that begins with =, +, -, @, TAB or
-    CR as a formula. LLM-generated test text is untrusted, and our steps/test-data
-    cells are multi-line ("1. do X\\n2. do Y"). Checking only text[0] left a
-    formula that appears AFTER an embedded newline (e.g. "1. do X\\n=cmd|...")
-    live. We therefore split on newlines and prefix a leading ' on each offending
-    line.
-
-    The leading single-quote is the accepted OWASP defense for CSV injection; it
-    is invisible in .xlsx (Excel's text marker) and TestRail/Sheets strip it on
-    import in the common flows. It can show as a literal ' in a raw CSV opened as
-    plain text, which is the documented, accepted trade-off for a safe import.
-
-    Never raises -- non-string input is coerced via str() first.
-    """
+    within a cell (NB-015)."""
     text = value if isinstance(value, str) else str(value)
     if not text:
         return text

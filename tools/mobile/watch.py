@@ -23,8 +23,25 @@ from __future__ import annotations
 
 import contextvars
 import logging
-import re
+import re  # noqa: F401
 import time
+from typing import Any
+
+from config.settings_guard import never_raise
+from tools.mobile.watch_classify import (  # noqa: F401
+    _DISCONNECT_RE,
+    _HTTP_RE,
+    CALL_PACKAGES,
+    ERROR_PHRASES,
+    LOCK_PHRASES,
+    MAX_QUOTE_CHARS,
+    PREFIX,
+    SHADE_PACKAGE,
+    _quote,
+    classify_error,
+    classify_package,
+    classify_texts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,59 +51,6 @@ PROGRESS_EVERY_S = 3.0
 
 #: The longest progress line sent to the host.
 MAX_PROGRESS_CHARS = 160
-
-#: The longest quotation of on-screen text inside an interruption sentence.
-MAX_QUOTE_CHARS = 80
-
-PREFIX = "interrupted: "
-
-#: Packages of the phone app's in-call screens. UNVERIFIED on Samsung/Xiaomi
-#: builds beyond the ones listed; an unlisted dialer is simply not named.
-CALL_PACKAGES = frozenset(
-    {
-        "com.android.incallui",
-        "com.google.android.dialer",
-        "com.android.dialer",
-        "com.samsung.android.incallui",
-    }
-)
-
-#: The notification shade and the lock screen are both drawn by system UI.
-SHADE_PACKAGE = "com.android.systemui"
-
-LOCK_PHRASES = ("swipe up to unlock", "swipe to unlock")
-
-#: adb's own words for a device that went away: ``device offline``,
-#: ``device 'emulator-5554' not found``, ``no devices/emulators found``,
-#: ``device unauthorized``. Anchored on the word DEVICE, so a tool on the
-#: device saying ``uiautomator: not found`` is not read as a disconnect.
-_DISCONNECT_RE = re.compile(
-    r"\bdevice\b[^.\n]{0,80}?\b(?:offline|not found|unauthorized)\b"
-    r"|\bno devices\b|\bdisconnected\b"
-)
-
-#: Lower-case fragments that mean the app or the platform is reporting a
-#: failure. Deliberately narrow: a false interruption costs the model a re-plan
-#: on a screen that was fine.
-ERROR_PHRASES = (
-    "isn't responding",
-    "not responding",
-    "has stopped",
-    "keeps stopping",
-    "internal server error",
-    "something went wrong",
-    "no internet connection",
-    "unable to connect",
-    "network error",
-    "app not installed",
-    "installation failed",
-    "install failed",
-    "couldn't be installed",
-)
-
-#: ``HTTP 500``, ``status: 503``, ``error 404`` -- a status word FIRST, so a bare
-#: "500 items" or a price is not read as a server error.
-_HTTP_RE = re.compile(r"\b(?:http|status|error|code)\s*[:#=-]?\s*([45]\d\d)\b")
 
 _REAL_MONOTONIC = time.monotonic
 
@@ -112,10 +76,8 @@ async def say(message: str) -> None:
     callback = _progress.get()
     if callback is None:
         return
-    try:
+    with never_raise(logger, "mobile.watch: progress callback failed", exc_info=True):
         await callback(str(message)[:MAX_PROGRESS_CHARS])
-    except Exception:
-        logger.debug("mobile.watch: progress callback failed", exc_info=True)
 
 
 class Ticker:
@@ -127,10 +89,10 @@ class Ticker:
     its sequence consumed by progress bookkeeping.
     """
 
-    def __init__(self, what: str, *, every: float | None = None, clock: object = None):
+    def __init__(self, what: str, *, every: float | None = None, clock: Any = None):
         self._what = str(what)
         self._every = PROGRESS_EVERY_S if every is None else float(every)
-        self._clock = clock or _REAL_MONOTONIC
+        self._clock: Any = clock or _REAL_MONOTONIC
         self._start = self._clock()
         self._last = self._start
 
@@ -147,63 +109,3 @@ class Ticker:
             line += " (" + str(detail) + ")"
         await say(line)
         return True
-
-
-def _quote(text: object) -> str:
-    return repr(" ".join(str(text).split())[:MAX_QUOTE_CHARS])
-
-
-def classify_package(package: object, before_package: object) -> str:
-    """Name a call or the shade/lock screen that is NEW in front of the app.
-
-    ``""`` when the package did not change or is not one of the named kinds;
-    the caller decides what a plain app switch is called.
-    """
-    now = str(package or "")
-    before = str(before_package or "")
-    if not now or now == before:
-        return ""
-    if now in CALL_PACKAGES:
-        return (
-            PREFIX
-            + "a phone call is in front of the app ("
-            + now[:MAX_QUOTE_CHARS]
-            + "). Answer or decline it, then continue."
-        )
-    if now == SHADE_PACKAGE:
-        return (
-            PREFIX
-            + "the notification shade or the lock screen is in front of the app. "
-            "Close or unlock it, then continue."
-        )
-    return ""
-
-
-def classify_texts(new_texts: object) -> str:
-    """Name an error, a failed install or a lock screen among texts that are NEW.
-
-    *new_texts* is what the screen shows now and did not show when the wait
-    began. Sorted, so the same screen always yields the same sentence.
-    """
-    if not new_texts:
-        return ""
-    for text in sorted(str(t) for t in new_texts):
-        low = " ".join(text.split()).lower().replace("\u2019", "'")
-        if any(phrase in low for phrase in LOCK_PHRASES):
-            return PREFIX + "the screen is locked. Unlock the phone, then continue."
-        if any(phrase in low for phrase in ERROR_PHRASES) or _HTTP_RE.search(low):
-            return PREFIX + "the screen now shows an error: " + _quote(text)
-    return ""
-
-
-def classify_error(error: object) -> str:
-    """Name a device that stopped answering, from a failed dump's error text."""
-    low = str(error or "").lower()
-    if _DISCONNECT_RE.search(low):
-        return (
-            PREFIX
-            + "the device stopped answering ("
-            + _quote(error)
-            + "). Check the cable and `adb devices`, then retry."
-        )
-    return ""

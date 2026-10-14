@@ -14,6 +14,9 @@ from tools.models import (
     format_test_data_lines,
 )
 from tools.secure_temp import (
+    Sweep,
+)
+from tools.secure_temp import (
     cleanup_temp_files as _sweep_temp_files,
 )
 
@@ -43,29 +46,11 @@ def generate_testrail_csv(suite: TestSuite, output_path: str | None = None) -> s
     Raises OSError or ValueError on genuine file I/O errors.
     """
     output_path = resolve_output_path(output_path, "_testrail.csv")
-
-    # The optional "Test Data" column is added ONLY when at least one case carries a
-    # data-provisioning plan. With none, both the header and every row are
-    # byte-identical to the pre-feature export.
-    has_test_data = any(tc.test_data for tc in suite.test_cases)
-    # F06: TestRail's own requirement-link column, conditional for exactly the
-    # reason "Test Data" is -- with no tagged case the header and every row stay
-    # byte-identical to the pre-feature export.
-    #
-    # DELIBERATE DIVERGENCE from tools/testrail_pusher.py, which sends
-    # `stable_id` in the API `refs` field: a CSV a human imports wants the
-    # acceptance criterion, and changing what the live credentialed pusher sends
-    # is a decision of its own, not a side effect of adding a column here.
-    has_refs = any((tc.requirement_id or "").strip() for tc in suite.test_cases)
-    headers = list(_HEADERS)
-    if has_test_data:
-        headers.append("Test Data")
-    if has_refs:
-        headers.append("References")
+    has_test_data, has_refs = _optional_columns(suite)
 
     with open(output_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
-        writer.writerow(headers)
+        writer.writerow(_headers(has_test_data, has_refs))
         for tc in suite.test_cases:
             writer.writerow(_generate_testrail_csv_row(tc, has_test_data, has_refs))
 
@@ -75,14 +60,61 @@ def generate_testrail_csv(suite: TestSuite, output_path: str | None = None) -> s
     return output_path
 
 
-def _generate_testrail_csv_row(tc, has_test_data: bool, has_refs: bool) -> list:
-    """One CSV row for ``tc``, with the optional columns the header carries."""
+# The optional "Test Data" column is added ONLY when at least one case carries a
+# data-provisioning plan. With none, both the header and every row are
+# byte-identical to the pre-feature export.
+# F06: TestRail's own requirement-link column, conditional for exactly the
+# reason "Test Data" is -- with no tagged case the header and every row stay
+# byte-identical to the pre-feature export.
+#
+# DELIBERATE DIVERGENCE from tools/testrail_pusher.py, which sends
+# `stable_id` in the API `refs` field: a CSV a human imports wants the
+# acceptance criterion, and changing what the live credentialed pusher sends
+# is a decision of its own, not a side effect of adding a column here.
+def _optional_columns(suite: TestSuite) -> tuple[bool, bool]:
+    """Return (has_test_data, has_refs) for the suite."""
+    has_test_data = any(tc.test_data for tc in suite.test_cases)
+    has_refs = any((tc.requirement_id or "").strip() for tc in suite.test_cases)
+    return has_test_data, has_refs
+
+
+def _headers(has_test_data: bool, has_refs: bool) -> list[str]:
+    """Header row: the fixed columns plus the optional ones."""
+    headers = list(_HEADERS)
+    if has_test_data:
+        headers.append("Test Data")
+    if has_refs:
+        headers.append("References")
+    return headers
+
+
+def _step_texts(tc) -> tuple[str, str]:
+    """Sanitized (steps, expected results) cell texts for ``tc``."""
     steps_text = sanitize_cell(
         "\n".join(f"{s.step_number}. {s.action}" for s in tc.steps)
     )
     expected_text = sanitize_cell(
         "\n".join(f"{s.step_number}. {s.expected_result}" for s in tc.steps)
     )
+    return steps_text, expected_text
+
+
+# BLANK for an untraced case, not the "(untraced)" label the
+# xlsx/csv columns use: this file is machine-imported, and a TMS
+# would ingest that literal as a reference string.
+def _optional_cells(tc, has_test_data: bool, has_refs: bool) -> list:
+    """The Test Data cell then the References cell, as the header carries them."""
+    cells = []
+    if has_test_data:
+        cells.append(sanitize_cell("\n".join(format_test_data_lines(tc.test_data))))
+    if has_refs:
+        cells.append(sanitize_cell(display_requirement_id(tc.requirement_id)))
+    return cells
+
+
+def _generate_testrail_csv_row(tc, has_test_data: bool, has_refs: bool) -> list:
+    """One CSV row for ``tc``, with the optional columns the header carries."""
+    steps_text, expected_text = _step_texts(tc)
     row = [
         sanitize_cell(tc.title),
         sanitize_cell(tc.module),
@@ -92,13 +124,7 @@ def _generate_testrail_csv_row(tc, has_test_data: bool, has_refs: bool) -> list:
         steps_text,
         expected_text,
     ]
-    if has_test_data:
-        row.append(sanitize_cell("\n".join(format_test_data_lines(tc.test_data))))
-    if has_refs:
-        # BLANK for an untraced case, not the "(untraced)" label the
-        # xlsx/csv columns use: this file is machine-imported, and a TMS
-        # would ingest that literal as a reference string.
-        row.append(sanitize_cell(display_requirement_id(tc.requirement_id)))
+    row.extend(_optional_cells(tc, has_test_data, has_refs))
     return row
 
 
@@ -110,8 +136,10 @@ def cleanup_temp_files(max_age_seconds: int = 3600) -> int:
     (``*_testrail.csv``) is specific to this exporter's output.
     """
     return _sweep_temp_files(
-        max_age_seconds=max_age_seconds,
-        pattern="qa_test_cases_*_testrail.csv",
-        label="TestRail CSV",
-        log=logger,
+        Sweep(
+            max_age_seconds=max_age_seconds,
+            pattern="qa_test_cases_*_testrail.csv",
+            label="TestRail CSV",
+            log=logger,
+        )
     )

@@ -7,44 +7,50 @@ from __future__ import annotations
 
 import json
 import re
+from typing import NamedTuple
 from xml.etree import ElementTree
 
 XML_DECL_RE = re.compile(r"<!\s*(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
 
 
-def loads_json(
-    text: str,
-    *,
-    container_only: bool = False,
-    dict_only: bool = False,
-    strip_both: bool = False,
-    swallow_all: bool = False,
-) -> object:
+class JsonMode(NamedTuple):
+    """Tolerance flags for ``loads_json`` (always built with keywords)."""
+
+    # lstrip, then require a leading ``{`` or ``[`` (else None); a non-str input
+    # raises AttributeError, as ``str.lstrip`` does.
+    container_only: bool = False
+    # return the value only when it is a dict, else None.
+    dict_only: bool = False
+    # ``(text or "").strip()`` (inside the try) instead of lstrip.
+    strip_both: bool = False
+    # catch Exception; otherwise only (ValueError, TypeError, RecursionError).
+    swallow_all: bool = False
+
+
+_PLAIN = JsonMode()
+_TOLERATED = (ValueError, TypeError, RecursionError)
+
+
+def _json_source(text: str, mode: JsonMode) -> str:
+    if mode.container_only:
+        return text.lstrip()
+    return (text or "").strip() if mode.strip_both else text
+
+
+def loads_json(text: str, mode: JsonMode = _PLAIN) -> object:
     """json.loads with the explicit tolerance flags both callers need.
 
-    container_only: lstrip, then require a leading ``{`` or ``[`` (else None);
-        a non-str input raises AttributeError, as ``str.lstrip`` does.
-    dict_only: return the value only when it is a dict, else None.
-    strip_both: ``(text or "").strip()`` (inside the try) instead of lstrip.
-    swallow_all: catch Exception; otherwise only (ValueError, TypeError,
-        RecursionError).
     Returns None on any failure.
     """
-    if container_only:
-        t = text.lstrip()
-        if t[:1] not in "{[":
-            return None
+    if mode.container_only and text.lstrip()[:1] not in "{[":
+        return None
     try:
-        if not container_only:
-            t = (text or "").strip() if strip_both else text
-        obj = json.loads(t)
+        obj = json.loads(_json_source(text, mode))
     except Exception as exc:
-        if not swallow_all and not isinstance(
-            exc, (ValueError, TypeError, RecursionError)
-        ):
+        if not (mode.swallow_all or isinstance(exc, _TOLERATED)):
             raise
         return None
-    if dict_only:
+    if mode.dict_only:
         return obj if isinstance(obj, dict) else None
     return obj
 

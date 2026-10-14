@@ -21,16 +21,24 @@ Middleware base is not importable, and the caller also guards on
 from __future__ import annotations
 
 import logging
+from typing import Any, cast
+
+from pydantic import ValidationError
+
+from config.settings_guard import never_raise
+
+try:
+    from fastmcp.server.middleware import Middleware
+except ImportError as exc:  # no fastmcp, or one without middleware
+    if (exc.name or "").split(".")[0] != "fastmcp":
+        raise
+    Middleware = cast("Any", None)
 
 logger = logging.getLogger("qa_agents.mcp")
 
 
 def _validation_error(exc: BaseException | None):
     """The pydantic ValidationError in ``exc``'s cause chain, or None."""
-    try:
-        from pydantic import ValidationError
-    except Exception:
-        return None
     seen: set[int] = set()
     current = exc
     while current is not None and id(current) not in seen:
@@ -46,13 +54,12 @@ def error_types(exc: BaseException | None) -> list[str]:
     found = _validation_error(exc)
     if found is None:
         return []
-    try:
+    with never_raise():
         rows = found.errors(
             include_input=False, include_context=False, include_url=False
         )
         return sorted({str(row.get("type") or "unknown") for row in rows})
-    except Exception:
-        return ["unreadable"]
+    return ["unreadable"]
 
 
 def _safe_name(name: object) -> str:
@@ -74,25 +81,26 @@ def log_rejection(tool: object, exc: BaseException) -> bool:
     return True
 
 
+def _note_rejection(context: object, exc: BaseException) -> None:
+    """Log the rejection of the tool call in ``context``; never raises."""
+    # A constant message and NO exc_info: the active exception
+    # chain carries the rejected input.
+    with never_raise(logger, "rejection log failed"):
+        name = getattr(getattr(context, "message", None), "name", "")
+        log_rejection(name, exc)
+
+
 def build_middleware():
     """A FastMCP middleware that logs rejections, or None if unsupported."""
-    try:
-        from fastmcp.server.middleware import Middleware
-    except Exception:
+    if Middleware is None:
         return None
 
     class _RejectionLog(Middleware):
         async def on_call_tool(self, context, call_next):
-            try:
+            with never_raise() as g:
                 return await call_next(context)
-            except Exception as exc:
-                try:
-                    name = getattr(getattr(context, "message", None), "name", "")
-                    log_rejection(name, exc)
-                except Exception:
-                    # A constant message and NO exc_info: the active exception
-                    # chain carries the rejected input.
-                    logger.debug("rejection log failed")
-                raise
+            assert g.exc is not None
+            _note_rejection(context, g.exc)
+            raise g.exc
 
     return _RejectionLog()

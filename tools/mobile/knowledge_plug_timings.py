@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 
-from tools.mobile import knowledge_db, knowledge_limits, screen_key
+from tools.mobile import actions, knowledge_db, knowledge_limits, screen_key
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +40,11 @@ def snapshot(conn, facts) -> dict:
     rows = knowledge_db.rows(
         conn,
         "timings",
-        "status = 'active' AND invalid_at IS NULL AND n >= ? AND wait_ms > 0",
-        (knowledge_limits.MIN_SAMPLES_WAIT,),
-        knowledge_limits.SNAPSHOT_MAX_ROWS,
+        knowledge_db.Where(
+            "status = 'active' AND invalid_at IS NULL AND n >= ? AND wait_ms > 0",
+            (knowledge_limits.MIN_SAMPLES_WAIT,),
+            knowledge_limits.SNAPSHOT_MAX_ROWS,
+        ),
     )
     for row in rows:
         out[(row["screen_key"], row["action"], row["target"])] = int(row["wait_ms"])
@@ -56,7 +58,6 @@ def step_wait(ctx, step, screen) -> int:
         table = snap.get("timings") or {}
         if not table:
             return 0
-        from tools.mobile import actions
 
         op, rid = step_op_rid(step)
         key = screen_key.screen_key(

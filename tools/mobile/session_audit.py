@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
+from config.settings_guard import never_raise
 from tools.mobile import (
     run_store,
 )
@@ -31,68 +33,85 @@ def _masked_field_entries(fields: list[str] | None) -> list[dict]:
     ]
 
 
-def audit_detail(
-    *,
-    run_id: str = "",
-    tc_id: str = "",
-    verdict: str = "",
-    status: str = "",
-    field: str = "",
-    fields: list[str] | None = None,
-    step: str = "",
-    apply: object = None,
-) -> dict:
-    """The ``detail`` dict an audit row may carry. **No value can reach it.**
+@dataclass(frozen=True)
+class AuditFacts:
+    """The value-free facts one audit row may carry (field NAMES only)."""
 
-    ``audit_log.record_event`` writes ``detail`` VERBATIM -- there is no
-    redaction hook anywhere below this point -- and ``run_store.redact`` is
-    mark-based plus a fixed list of credential-NAMED keys. A tester names their
-    own field, so ``{"inputs": {"tenantToken": "..."}}`` would be written in
-    clear. This function therefore has no parameter that could carry a value: it
-    takes the field NAME and emits a MARKED entry, and the marker is what makes
-    the ``redact`` pass below effective rather than incidental.
-    """
-    try:
-        detail: dict = {
-            "run_id": str(run_id or "")[:80],
-            "tc_id": str(tc_id or "")[:16],
-            "verdict": str(verdict or "")[:24],
-            "status": str(status or "")[:32],
+    run_id: str = ""
+    tc_id: str = ""
+    verdict: str = ""
+    status: str = ""
+    field: str = ""
+    fields: list[str] | None = None
+    step: str = ""
+    apply: object = None
+
+
+def _audit_base(facts: AuditFacts) -> dict:
+    """The always-present, length-capped identity keys of an audit detail."""
+    return {
+        "run_id": str(facts.run_id or "")[:80],
+        "tc_id": str(facts.tc_id or "")[:16],
+        "verdict": str(facts.verdict or "")[:24],
+        "status": str(facts.status or "")[:32],
+    }
+
+
+def _audit_extras(detail: dict, facts: AuditFacts) -> None:
+    """Add the optional step/apply/tester_field/tester_fields keys in place."""
+    if facts.step:
+        detail["step"] = str(facts.step)[:48]
+    if facts.apply is not None:
+        detail["apply"] = bool(facts.apply)
+    if facts.field:
+        detail["tester_field"] = {
+            "secret": True,
+            "field": str(facts.field)[:80],
+            "value": run_store.SECRET_MASK,
         }
-        if step:
-            detail["step"] = str(step)[:48]
-        if apply is not None:
-            detail["apply"] = bool(apply)
-        if field:
-            detail["tester_field"] = {
-                "secret": True,
-                "field": str(field)[:80],
-                "value": run_store.SECRET_MASK,
-            }
-        masked = _masked_field_entries(fields)
-        if masked:
-            detail["tester_fields"] = masked
+    masked = _masked_field_entries(facts.fields)
+    if masked:
+        detail["tester_fields"] = masked
+
+
+# The ``detail`` dict an audit row may carry. **No value can reach it.**
+#
+# ``audit_log.record_event`` writes ``detail`` VERBATIM -- there is no
+# redaction hook anywhere below this point -- and ``run_store.redact`` is
+# mark-based plus a fixed list of credential-NAMED keys. A tester names their
+# own field, so ``{"inputs": {"tenantToken": "..."}}`` would be written in
+# clear. This function therefore has no parameter that could carry a value: it
+# takes the field NAME and emits a MARKED entry, and the marker is what makes
+# the ``redact`` pass below effective rather than incidental.
+def audit_detail(facts: AuditFacts) -> dict:
+    """The ``detail`` dict an audit row may carry. No value can reach it."""
+    with never_raise(
+        logger,
+        "mobile.session.audit_detail failed",
+        level=logging.WARNING,
+        exc_info=True,
+    ):
+        detail = _audit_base(facts)
+        _audit_extras(detail, facts)
         return run_store.redact(detail)
-    except Exception:  # pragma: no cover - defensive
-        logger.warning("mobile.session.audit_detail failed", exc_info=True)
-        return {}
+    return {}
 
 
+# Prune a dump. Here so a handler never touches raw XML itself.
+#
+# ``display`` is the device's natural size where the caller has it. Without it
+# `prune` derives the frame from the dump's own windows, which over-estimates
+# rather than under-estimates and so cannot lose the screen -- see
+# `perception._display_frame`.
+#
+# NO PRODUCTION CALLER TODAY, and one thing to know before writing the first
+# one: ``activity`` defaults to ``""``, and a screen pruned without an activity
+# gets a screen_id hashed on two dimensions instead of three -- a DIFFERENT id
+# from the one `executor` stamps on every trace entry. If a screen from here is
+# ever stored in a run, pass ``await executor.resolve_activity(ctx)``, or the
+# report's join silently loses every picture (measured; see
+# ``tests/mobile/test_mobile_screen_id_producer``). This function takes no run
+# id, so that module's class pin cannot see it.
 def screen_of(dump: object, activity: str = "", display: object = None) -> dict:
-    """Prune a dump. Here so a handler never touches raw XML itself.
-
-    ``display`` is the device's natural size where the caller has it. Without it
-    `prune` derives the frame from the dump's own windows, which over-estimates
-    rather than under-estimates and so cannot lose the screen -- see
-    `perception._display_frame`.
-
-    NO PRODUCTION CALLER TODAY, and one thing to know before writing the first
-    one: ``activity`` defaults to ``""``, and a screen pruned without an activity
-    gets a screen_id hashed on two dimensions instead of three -- a DIFFERENT id
-    from the one `executor` stamps on every trace entry. If a screen from here is
-    ever stored in a run, pass ``await executor.resolve_activity(ctx)``, or the
-    report's join silently loses every picture (measured; see
-    ``tests/mobile/test_mobile_screen_id_producer``). This function takes no run
-    id, so that module's class pin cannot see it.
-    """
-    return composite.observe(dump, activity, display=display)
+    """Prune a dump. Here so a handler never touches raw XML itself."""
+    return composite.observe(dump, activity, composite.ScreenView(display))

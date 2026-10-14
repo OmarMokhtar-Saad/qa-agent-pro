@@ -22,7 +22,7 @@ from typing import Awaitable, Callable, Optional
 
 from tools.device_manager import valid_package_name
 from tools.mobile import app_pick
-from tools.mobile.app_pick import PickRequest
+from tools.mobile.app_pick import PickPorts, PickRequest
 from tools.mobile.resolve import ASK, AskCb, Resolution
 from tools.untrusted import wrap_untrusted
 
@@ -44,25 +44,32 @@ class PickOutcome:
     said: str = ""
 
 
-async def pick_installed(
-    serial: str,
-    text: str,
-    ask: Optional[AskCb],
-    *,
-    picker: Optional[Picker] = None,
-) -> PickOutcome:
-    """Resolve ``text`` against the packages installed on ``serial``."""
-    wanted = " ".join(str(text or "").split())
-    if not str(serial or "").strip() or not wanted or valid_package_name(wanted):
-        return PickOutcome()
-    run = picker or app_pick.pick_package
-    try:
-        got = await run(PickRequest(wanted, str(serial)), ask=ask)
-    except LIST_FAILURES:
-        log.warning("app_stage_pick: the device listing failed", exc_info=True)
-        return PickOutcome()
+@dataclass(frozen=True)
+class StageOpts:
+    ask: Optional[AskCb] = None
+    picker: Optional[Picker] = None
+
+
+def _outcome(got: Resolution) -> PickOutcome:
     if got.resolved:
         return PickOutcome(package=str(got.value), said=got.said())
     if got.status == ASK and got.options:
         return PickOutcome(menu=wrap_untrusted("installed apps", got.menu()))
     return PickOutcome()
+
+
+async def pick_installed(
+    serial: str, text: str, opts: Optional[StageOpts] = None
+) -> PickOutcome:
+    """Resolve ``text`` against the packages installed on ``serial``."""
+    use = opts or StageOpts()
+    wanted = " ".join(str(text or "").split())
+    if not str(serial or "").strip() or not wanted or valid_package_name(wanted):
+        return PickOutcome()
+    run = use.picker or app_pick.pick_package
+    try:
+        got = await run(PickRequest(wanted, str(serial)), PickPorts(ask=use.ask))
+    except LIST_FAILURES:
+        log.warning("app_stage_pick: the device listing failed", exc_info=True)
+        return PickOutcome()
+    return _outcome(got)

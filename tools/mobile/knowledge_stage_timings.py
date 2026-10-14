@@ -15,9 +15,11 @@ from __future__ import annotations
 import json
 import logging
 import math
+from typing import NamedTuple
 
-from tools.mobile import knowledge_db, knowledge_limits, run_store
+from tools.mobile import actions, knowledge_db, knowledge_limits, run_store
 from tools.mobile.knowledge_learn import StageResult
+from tools.mobile.kstg_timing_write import Plan, insert_row, update_row
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +39,6 @@ def p90(values: list) -> int:
 
 def wait_for(p90_ms: int, n: int) -> int:
     """The bounded wait for a p90, or 0 while there are too few samples."""
-    from tools.mobile import actions
 
     if n < knowledge_limits.MIN_SAMPLES_WAIT or p90_ms <= 0:
         return 0
@@ -113,37 +114,28 @@ def _values(key: tuple, samples: list, version: str) -> dict:
     }
 
 
-def _store(conn, lc, key: tuple, ms: list) -> bool:
-    found = knowledge_db.rows(conn, "timings", _OPEN, key, 1)
+class Group(NamedTuple):
+    key: tuple
+    ms: list
+
+
+def _vals(lc, old: dict | None, g: Group) -> dict:
+    version = str(getattr(lc.facts, "app_version", "") or "")
+    samples = ((_samples(old.get("samples_json")) if old else []) + g.ms)[
+        -knowledge_limits.SAMPLES_PER_TIMING :
+    ]
+    return _values(g.key, samples, version)
+
+
+def _store(conn, lc, g: Group) -> bool:
+    found = knowledge_db.rows(conn, "timings", knowledge_db.Where(_OPEN, g.key, 1))
     old = found[0] if found else None
     if not _fresh(old, lc.run_id):
         return False
-    version = str(getattr(lc.facts, "app_version", "") or "")
-    samples = ((_samples(old.get("samples_json")) if old else []) + ms)[
-        -knowledge_limits.SAMPLES_PER_TIMING :
-    ]
-    vals = _values(key, samples, version)
-    status = "active" if vals["n"] >= knowledge_limits.MIN_SAMPLES_WAIT else "candidate"
-    why = "timings %s/%s" % (key[1], key[2])
-    if old is None:
-        got = knowledge_db.insert(
-            conn, "timings", {**vals, "status": status}, run_id=lc.run_id, why=why
-        )
-        return got is not None
-    runs = knowledge_db._bump_runs(old.get("runs_json"), lc.run_id)
-    cols = {
-        k: v for k, v in vals.items() if k not in ("screen_key", "action", "target")
-    }
-    return knowledge_db.set_status(
-        conn,
-        "timings",
-        old["id"],
-        status,
-        runs_json=runs,
-        run_id=lc.run_id,
-        why=why,
-        **cols,
-    )
+    why = "timings %s/%s" % (g.key[1], g.key[2])
+    plan = Plan(old, _vals(lc, old, g), why)
+    write = insert_row if old is None else update_row
+    return write(conn, lc.run_id, plan)
 
 
 def run(conn, lc) -> StageResult:
@@ -151,7 +143,7 @@ def run(conn, lc) -> StageResult:
     try:
         groups = collect(list(lc.steps or []), _factor(lc.run_id))
         for key, ms in groups.items():
-            if _store(conn, lc, key, ms):
+            if _store(conn, lc, Group(key, ms)):
                 res.wrote += 1
         if groups:
             res.notes.append("%d timing keys seen" % len(groups))

@@ -21,8 +21,12 @@ import logging
 import tempfile  # noqa: F401  # tests patch tools.<module>.tempfile.gettempdir
 from collections import OrderedDict
 
+from config.settings_guard import never_raise
 from tools.export_common import resolve_output_path, write_text_export
 from tools.models import TestCase, TestSuite, display_requirement_id
+from tools.secure_temp import (
+    Sweep,
+)
 from tools.secure_temp import (
     cleanup_temp_files as _sweep_temp_files,
 )
@@ -56,16 +60,15 @@ _TAG_MAX = 40
 
 def _requirement_tag(tc: TestCase) -> str:
     """``@AC-001`` for a case with a usable requirement tag, else ""."""
-    try:
+    # defensive
+    with never_raise(logger, "requirement tag rendering failed", exc_info=True):
         value = display_requirement_id(getattr(tc, "requirement_id", ""))
         if not value or len(value) > _TAG_MAX:
             return ""
         if not all(ch in _TAG_SAFE for ch in value):
             return ""
         return "@" + value
-    except Exception:  # pragma: no cover - defensive
-        logger.debug("requirement tag rendering failed", exc_info=True)
-        return ""
+    return ""
 
 
 def _scenario_tags(tc: TestCase) -> str:
@@ -78,6 +81,27 @@ def _scenario_tags(tc: TestCase) -> str:
     return "  " + " ".join(tags)
 
 
+# Actions -> When / And (test data appended inline when present)
+def _action_lines(tc: TestCase) -> list[str]:
+    lines: list[str] = []
+    for i, step in enumerate(tc.steps):
+        keyword = "When" if i == 0 else "And"
+        action = _one_line(step.action)
+        if step.test_data and step.test_data.strip():
+            action = f"{action} (with {_one_line(step.test_data)})"
+        lines.append(f"    {keyword} {action}")
+    return lines
+
+
+# Expected results -> Then / And
+def _expected_lines(tc: TestCase) -> list[str]:
+    lines: list[str] = []
+    for i, step in enumerate(tc.steps):
+        keyword = "Then" if i == 0 else "And"
+        lines.append(f"    {keyword} {_one_line(step.expected_result)}")
+    return lines
+
+
 def _scenario_block(tc: TestCase) -> list[str]:
     lines: list[str] = [_scenario_tags(tc)]
     lines.append(f"  Scenario: {_one_line(tc.title)}")
@@ -85,43 +109,33 @@ def _scenario_block(tc: TestCase) -> list[str]:
     if tc.preconditions and tc.preconditions.strip():
         lines.append(f"    Given {_one_line(tc.preconditions)}")
 
-    # Actions -> When / And (test data appended inline when present)
-    for i, step in enumerate(tc.steps):
-        keyword = "When" if i == 0 else "And"
-        action = _one_line(step.action)
-        if step.test_data and step.test_data.strip():
-            action = f"{action} (with {_one_line(step.test_data)})"
-        lines.append(f"    {keyword} {action}")
-
-    # Expected results -> Then / And
-    for i, step in enumerate(tc.steps):
-        keyword = "Then" if i == 0 else "And"
-        lines.append(f"    {keyword} {_one_line(step.expected_result)}")
-
-    return lines
+    return lines + _action_lines(tc) + _expected_lines(tc)
 
 
-def generate_feature_file(suite: TestSuite, output_path: str | None = None) -> str:
-    """Write suite to a .feature file and return its path.
-
-    Raises OSError only on genuine file I/O errors (matches csv_exporter);
-    callers in app.py wrap export generation in try/except.
-    """
-    output_path = resolve_output_path(output_path, ".feature")
-
-    # Group scenarios by module -> one Feature per module, order preserved.
+# Group scenarios by module -> one Feature per module, order preserved.
+def _group_by_module(suite: TestSuite) -> "OrderedDict[str, list[TestCase]]":
     by_module: "OrderedDict[str, list[TestCase]]" = OrderedDict()
     for tc in suite.test_cases:
         by_module.setdefault(tc.module or "Untitled", []).append(tc)
+    return by_module
 
-    blocks: list[str] = []
-    for module, cases in by_module.items():
-        block = [f"Feature: {_one_line(module)}", ""]
-        for tc in cases:
-            block.extend(_scenario_block(tc))
-            block.append("")  # blank line between scenarios
-        blocks.append("\n".join(block).rstrip() + "\n")
 
+def _feature_block(module: str, cases: list[TestCase]) -> str:
+    block = [f"Feature: {_one_line(module)}", ""]
+    for tc in cases:
+        block.extend(_scenario_block(tc))
+        block.append("")  # blank line between scenarios
+    return "\n".join(block).rstrip() + "\n"
+
+
+# Raises OSError only on genuine file I/O errors (matches csv_exporter);
+# callers in app.py wrap export generation in try/except.
+def generate_feature_file(suite: TestSuite, output_path: str | None = None) -> str:
+    """Write suite to a .feature file and return its path."""
+    output_path = resolve_output_path(output_path, ".feature")
+
+    by_module = _group_by_module(suite)
+    blocks = [_feature_block(module, cases) for module, cases in by_module.items()]
     content = "\n\n".join(blocks).rstrip() + "\n"
     write_text_export(output_path, content)
 
@@ -137,10 +151,12 @@ def generate_feature_file(suite: TestSuite, output_path: str | None = None) -> s
 def cleanup_temp_files(max_age_seconds: int = 3600) -> int:
     """Delete qa_test_cases_*.feature temp files older than max_age_seconds."""
     return _sweep_temp_files(
-        max_age_seconds=max_age_seconds,
-        pattern="qa_test_cases_*.feature",
-        label="Gherkin",
-        sweep_tmp_root=True,
-        require_subdir=False,
-        log=logger,
+        Sweep(
+            max_age_seconds=max_age_seconds,
+            pattern="qa_test_cases_*.feature",
+            label="Gherkin",
+            sweep_tmp_root=True,
+            require_subdir=False,
+            log=logger,
+        )
     )

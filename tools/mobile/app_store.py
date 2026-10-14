@@ -13,17 +13,25 @@ this server's own read-modify-write whole.
 
 from __future__ import annotations
 
-import errno
 import json
 import logging
 import os
 import re
-import secrets
-import stat
-import tempfile
+import secrets  # noqa: F401 - tests patch app_store.secrets.token_hex
 import threading
 
+from config.settings_guard import never_raise
 from tools.mobile import app_knowledge, paths
+from tools.mobile.app_store_io import (
+    Job,
+    read_path,
+    read_pinned,
+    write_path,
+    write_pinned,
+)
+from tools.mobile.app_store_io import (
+    err as _err,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,14 +56,10 @@ _PINNED = (
 )
 
 
-def _race_window(stage: str) -> None:
+def race_window(stage: str) -> None:
     """Test seam, a no-op in production: called at ``"validated"`` (the path was accepted,
     nothing opened yet) and ``"opened"`` (the use is about to start), the two instants a
     local process could swap the directory for a symlink."""
-
-
-def _err(message: str) -> dict:
-    return {"error": message, "content": None}
 
 
 def app_dir(package: object):
@@ -81,140 +85,21 @@ def _file(package: object, name: object):
     return directory / str(name)
 
 
-def _open_dir(directory) -> int:
-    """A handle on *directory* itself; a symlink at that name is refused (``OSError``)."""
-    return os.open(str(directory), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-
-
-def _read_capped(dir_fd: int, name: str):
-    """Up to ``MAX_FILE_BYTES + 1`` bytes of the regular file *name*, else ``None``."""
-    try:
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        if exc.errno == errno.ELOOP:
-            return None
-        raise
-    with os.fdopen(fd, "rb") as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-            return None
-        return handle.read(MAX_FILE_BYTES + 1)
-
-
-def _decode(raw) -> dict:
-    if raw is None or len(raw) > MAX_FILE_BYTES:
-        return {}
-    body = json.loads(raw.decode("utf-8"))
-    return body if isinstance(body, dict) else {}
-
-
-def _read_pinned(directory, name: str) -> dict:
-    try:
-        dir_fd = _open_dir(directory)
-    except OSError:
-        return {}
-    try:
-        _race_window("opened")
-        return _decode(_read_capped(dir_fd, name))
-    finally:
-        os.close(dir_fd)
-
-
-def _read_path(target) -> dict:
-    """The check-then-use read, for platforms without handle-relative calls."""
-    if target.is_symlink() or not target.is_file():
-        return {}
-    if target.stat().st_size > MAX_FILE_BYTES:
-        return {}
-    _race_window("opened")
-    body = json.loads(target.read_text(encoding="utf-8"))
-    return body if isinstance(body, dict) else {}
-
-
-def _publish(dir_fd: int, name: str, raw: bytes) -> None:
-    """Temp file, fsync, ``os.replace``: all relative to the checked directory handle."""
-    tmp = "%s.%s.tmp" % (name, secrets.token_hex(8))
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-    fd = os.open(tmp, flags, 0o600, dir_fd=dir_fd)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(raw)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-    except BaseException:
-        try:
-            os.unlink(tmp, dir_fd=dir_fd)
-        except OSError:
-            pass
-        raise
-
-
-def _write_pinned(directory, name: str, raw: bytes) -> dict:
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        dir_fd = _open_dir(directory)
-    except OSError:
-        return _err("the app directory is a symlink or is not a directory")
-    try:
-        _race_window("opened")
-        try:
-            os.fchmod(dir_fd, 0o700)
-        except OSError:
-            pass
-        _publish(dir_fd, name, raw)
-    finally:
-        os.close(dir_fd)
-    return {"error": None, "content": {"bytes": len(raw)}}
-
-
-def _write_path(target, raw: bytes) -> dict:
-    """The check-then-use write, for platforms without handle-relative calls."""
-    directory = target.parent
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if directory.is_symlink():
-        return _err("the app directory is a symlink")
-    try:
-        os.chmod(directory, 0o700)
-    except OSError:
-        pass
-    _race_window("opened")
-    fd, tmp = tempfile.mkstemp(
-        prefix=target.name + ".", suffix=".tmp", dir=str(directory)
-    )
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(raw)
-            handle.flush()
-            os.fsync(handle.fileno())
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp, target)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-    return {"error": None, "content": {"bytes": len(raw)}}
-
-
 def read_json(package: object, name: object) -> dict:
     """The stored object, or ``{}`` for a missing, oversized, corrupt or non-object file."""
-    try:
+    with never_raise(
+        logger,
+        "mobile.app_store.read_json failed",
+        level=logging.WARNING,
+        exc_info=True,
+    ):
         target = _file(package, name)
         if target is None:
             return {}
-        _race_window("validated")
-        if _PINNED:
-            return _read_pinned(target.parent, target.name)
-        return _read_path(target)
-    except Exception:
-        logger.warning("mobile.app_store.read_json failed", exc_info=True)
-        return {}
+        race_window("validated")
+        job = Job(target, MAX_FILE_BYTES, race_window)
+        return read_pinned(job) if _PINNED else read_path(job)
+    return {}
 
 
 def write_json(package: object, name: object, body: object) -> dict:
@@ -230,10 +115,9 @@ def write_json(package: object, name: object, body: object) -> dict:
         raw = json.dumps(body, ensure_ascii=False, sort_keys=True).encode("utf-8")
         if len(raw) > MAX_FILE_BYTES:
             return _err("the stored file would exceed its %d byte cap" % MAX_FILE_BYTES)
-        _race_window("validated")
-        if _PINNED:
-            return _write_pinned(target.parent, target.name, raw)
-        return _write_path(target, raw)
+        race_window("validated")
+        job = Job(target, MAX_FILE_BYTES, race_window)
+        return write_pinned(job, raw) if _PINNED else write_path(job, raw)
     except Exception as exc:
         logger.exception("mobile.app_store.write_json failed")
         return _err("could not write the file (%s)" % type(exc).__name__)

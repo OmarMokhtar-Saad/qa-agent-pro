@@ -67,362 +67,43 @@ from __future__ import annotations
 
 import logging
 
-from tools.mobile import perception
+from tools.mobile.saud_consts import (  # noqa: F401
+    ASSUMED_DENSITY_CAVEAT,
+    ASSUMED_DENSITY_DPI,
+    CLEAN_NOTE,
+    DENSITY_ASSUMED,
+    DENSITY_BASELINE_DPI,
+    DENSITY_DEVICE,
+    KIND_AMBIGUOUS_NAME,
+    KIND_LABELS,
+    KIND_SECURE_LABEL_LEAK,
+    KIND_SMALL_TARGET,
+    KIND_UNLABELLED_FIELD,
+    KIND_UNNAMED_CONTROL,
+    MAX_FINDING_CHARS,
+    MAX_FINDINGS,
+    MIN_TOUCH_TARGET_DP,
+    MIN_TOUCH_TARGET_PX,
+    NO_NODES_NOTE,
+)
+from tools.mobile.saud_density import _empty
+from tools.mobile.saud_elements import _audit_result
+from tools.mobile.saud_names import _rid_name, _unwrap  # noqa: F401
+from tools.mobile.saud_note import _finding_line
 
 logger = logging.getLogger(__name__)
 
-#: An interactive control that a screen-reader user cannot name at all.
-KIND_UNNAMED_CONTROL = "unnamed_control"
-#: An editable field with no accessible name. Split from the control kind on
-#: purpose: the two domains are DISJOINT (editable first, clickable second), so
-#: each clause has screens only it can reject and neither grades the other.
-KIND_UNLABELLED_FIELD = "unlabelled_field"
-#: An interactive target below the platform minimum, in pixels at a stated density.
-KIND_SMALL_TARGET = "small_target"
-#: Two or more interactive controls a user navigating by NAME cannot tell apart.
-KIND_AMBIGUOUS_NAME = "ambiguous_name"
-#: A password field whose dump carries the secret it holds.
-KIND_SECURE_LABEL_LEAK = "secure_label_leak"
 
-KIND_LABELS = {
-    KIND_UNNAMED_CONTROL: "control with no accessible name",
-    KIND_UNLABELLED_FIELD: "input field with no label",
-    KIND_SMALL_TARGET: "touch target below the platform minimum",
-    KIND_AMBIGUOUS_NAME: "controls sharing one accessible name",
-    KIND_SECURE_LABEL_LEAK: "password field exposing its own value",
-}
-
-#: Findings carried out of one screen. The report renders every one into a
-#: self-contained HTML file and the packet quotes the summary to a model.
-MAX_FINDINGS = 40
-#: Characters of any one finding's detail line, on both surfaces. It must be
-#: large enough to carry :data:`ASSUMED_DENSITY_CAVEAT` WHOLE: a cap that clips
-#: the words "this may be a false alarm" off the end of a warning leaves a
-#: confident finding behind, which is worse than no warning at all. Pinned by
-#: ``test_the_assumed_density_caveat_survives_the_character_cap``.
-MAX_FINDING_CHARS = 400
-#: Android's stated minimum touch target, in dp. The harmful direction is
-#: UPWARD: a larger minimum flags targets that are fine.
-MIN_TOUCH_TARGET_DP = 48
-#: The definition of dp: 1dp is one pixel at 160dpi. Not a bound, a unit.
-DENSITY_BASELINE_DPI = 160
-#: The density used ONLY when the device did not answer. See the module
-#: docstring for why 320 and why the fallback wording is not optional.
-ASSUMED_DENSITY_DPI = 320
-#: The dp minimum in pixels at :data:`ASSUMED_DENSITY_DPI` -- the FALLBACK floor
-#: only; a device that answers gets its own floor computed from its own dpi. A
-#: LITERAL, not a computed value: the cap scanner only sees ``NAME = <number>``,
-#: so a derived constant would ship unbounded from above. The relation is pinned
-#: by ``tests/mobile/test_mobile_screen_audit.py``.
-MIN_TOUCH_TARGET_PX = 96
-
-DENSITY_ASSUMED = "assumed"
-DENSITY_DEVICE = "device"
-
-#: The second half of an assumed-density finding, and the reason this module
-#: does not simply print the number. ONE producer for the sentence, so the
-#: packet and the report cannot warn differently -- or one of them not at all.
-ASSUMED_DENSITY_CAVEAT = (
-    " -- the device did not report its density, so this is an ASSUMPTION. On a "
-    "low-density device (160-240dpi) a fully COMPLIANT 48dp control is only "
-    "48-72px and would be flagged here, so confirm this one against the device "
-    "before filing it."
-)
-
-NO_NODES_NOTE = (
-    "This screen exposed no accessibility nodes, so NOTHING was audited -- that "
-    "is not a clean result. A canvas-drawn app (Flutter, React Native, a game, "
-    "a WebView) looks like this; judge it from the screenshot instead."
-)
-CLEAN_NOTE = "Every element this screen carried was audited; no check fired."
-
-#: Resource-id words that name a widget rather than its purpose. A control whose
-#: id reduces to these has no name derivable from it.
-GENERIC_ID_WORDS = frozenset(
-    {
-        "btn",
-        "button",
-        "container",
-        "content",
-        "control",
-        "edit",
-        "field",
-        "frame",
-        "group",
-        "icon",
-        "image",
-        "img",
-        "item",
-        "iv",
-        "layout",
-        "root",
-        "row",
-        "text",
-        "tv",
-        "view",
-        "widget",
-        "wrapper",
-    }
-)
-
-#: Characters an app uses to MASK a password in its own dump. Text made only of
-#: these is a mask, not a leak.
-MASK_CHARS = frozenset("*•·●∙ ")
-
-
-def _empty(present: bool) -> dict:
-    """The shape every return of :func:`audit` has, with nothing found."""
-    return {
-        "present": bool(present),
-        "auditable": False,
-        "complete": False,
-        "audited": 0,
-        "dropped": 0,
-        "truncated": False,
-        "density_dpi": int(ASSUMED_DENSITY_DPI),
-        "density_scale": float(ASSUMED_DENSITY_DPI) / float(DENSITY_BASELINE_DPI),
-        "density_source": DENSITY_ASSUMED,
-        "min_target_px": int(MIN_TOUCH_TARGET_PX),
-        "findings": [],
-        "capped": 0,
-        "note": NO_NODES_NOTE if present else "",
-    }
-
-
-def _unwrap(screen: object) -> dict:
-    body = screen if isinstance(screen, dict) else {}
-    inner = body.get("content")
-    return inner if isinstance(inner, dict) else body
-
-
-def _rid_name(rid: object) -> str:
-    """A name derivable from a resource id, or ``""``.
-
-    ``perception.words`` is the one tokeniser -- deriving the same answer from a
-    second regex here is how two rules drift apart.
-    """
-    tail = str(rid or "").rsplit("/", 1)[-1]
-    tokens = [word for word in perception.words(tail) if word not in GENERIC_ID_WORDS]
-    return " ".join(tokens)
-
-
-def _is_interactive(element: dict) -> bool:
-    return bool(element.get("clickable") or element.get("editable"))
-
-
-def _finding(kind: str, ids: list, name: str, detail: str) -> dict:
-    return {
-        "kind": kind,
-        "ids": [str(value) for value in ids][:12],
-        "name": str(name or "")[:MAX_FINDING_CHARS],
-        "detail": str(detail or "")[:MAX_FINDING_CHARS],
-    }
-
-
-def _masked(text: str) -> bool:
-    stripped = str(text or "").strip()
-    return bool(stripped) and not (set(stripped) - MASK_CHARS)
-
-
-def _small_side(element: dict, floor: int) -> str:
-    box = element.get("bounds") or []
-    if not (isinstance(box, (list, tuple)) and len(box) == 4):
-        return ""
-    try:
-        width = int(box[2]) - int(box[0])
-        height = int(box[3]) - int(box[1])
-    except (TypeError, ValueError, OverflowError):
-        return ""
-    if width <= 0 or height <= 0:
-        return ""
-    if width >= floor and height >= floor:
-        return ""
-    return str(width) + "x" + str(height) + "px"
-
-
-def _target_detail(side: str, floor: int, result: dict) -> str:
-    """The touch-target finding's words. TWO wordings, never one with a caveat.
-
-    A measured density states a fact. An assumed one states an assumption AND
-    its failure direction, because the reader's next action differs: file it, or
-    check the device first. The same rule the screenshot notes follow.
-    """
-    scale = "%.2gx" % float(result.get("density_scale") or 0)
-    head = (
-        "this target is "
-        + side
-        + ", under the "
-        + str(floor)
-        + "px that "
-        + str(MIN_TOUCH_TARGET_DP)
-        + "dp is at "
-    )
-    if result.get("density_source") == DENSITY_DEVICE:
-        return (
-            head
-            + "this device's measured density of "
-            + str(result.get("density_dpi"))
-            + "dpi ("
-            + scale
-            + ")"
-        )
-    return (
-        head
-        + "an assumed "
-        + str(result.get("density_dpi"))
-        + "dpi ("
-        + scale
-        + ")"
-        + ASSUMED_DENSITY_CAVEAT
-    )
-
-
-def _apply_density(result: dict, density_dpi: object) -> None:
-    """Write the device-measured density into ``result`` when it is plausible."""
-    try:
-        dpi = int(density_dpi) if density_dpi else 0
-        measured = dpi > 0 and (
-            DENSITY_BASELINE_DPI // 4 <= dpi <= DENSITY_BASELINE_DPI * 8
-        )
-        scale = dpi / DENSITY_BASELINE_DPI if measured else 0.0
-        measured_floor = (
-            MIN_TOUCH_TARGET_DP * dpi // DENSITY_BASELINE_DPI if measured else 0
-        )
-    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
-        dpi, measured, scale, measured_floor = 0, False, 0.0, 0
-    if measured:
-        result["density_dpi"] = dpi
-        result["density_scale"] = scale
-        result["density_source"] = DENSITY_DEVICE
-        result["min_target_px"] = measured_floor
-
-
-def _audit_element(
-    element: dict, floor: int, result: dict, findings: list, by_name: dict
-) -> None:
-    """Append this element's findings and record its spoken name in ``by_name``."""
-    eid = str(element.get("id") or "?")
-    label = str(element.get("label") or "").strip()
-    rid_name = _rid_name(element.get("rid"))
-    _naming_findings(element, eid, label, rid_name, findings)
-    if not _is_interactive(element):
-        # A decorative element without a label is CORRECT. Flagging it is
-        # what makes an audit ignorable.
-        return
-    side = _small_side(element, floor)
-    if side:
-        findings.append(
-            _finding(
-                KIND_SMALL_TARGET,
-                [eid],
-                label or rid_name,
-                _target_detail(side, floor, result),
-            )
-        )
-    spoken = label or rid_name
-    if spoken:
-        key = (" ".join(spoken.lower().split()), str(element.get("role") or ""))
-        by_name.setdefault(key, []).append(eid)
-
-
-def _naming_findings(
-    element: dict, eid: str, label: str, rid_name: str, findings: list
-) -> None:
-    """Append the secret-leak and unnamed input/control findings for one element."""
-    editable = bool(element.get("editable"))
-    clickable = bool(element.get("clickable"))
-    if element.get("secure"):
-        text = str(element.get("text") or "").strip()
-        if text and not _masked(text):
-            findings.append(
-                _finding(
-                    KIND_SECURE_LABEL_LEAK,
-                    [eid],
-                    label,
-                    "this password field's own dump carries "
-                    + str(len(text))
-                    + " characters of unmasked text, so the secret is "
-                    "readable by anything that reads the screen",
-                )
-            )
-    if editable:
-        if not label and not rid_name:
-            findings.append(
-                _finding(
-                    KIND_UNLABELLED_FIELD,
-                    [eid],
-                    "",
-                    "an input with no text, no content-desc and no name "
-                    "in its resource id: a screen reader announces it as "
-                    "an edit box and nothing else",
-                )
-            )
-    elif clickable:
-        if not label and not rid_name:
-            findings.append(
-                _finding(
-                    KIND_UNNAMED_CONTROL,
-                    [eid],
-                    "",
-                    "a tappable control with no text, no content-desc and "
-                    "no name in its resource id: there is nothing for a "
-                    "screen reader to say and no way to work around it",
-                )
-            )
-
-
-def _dropped_count(content: dict) -> int:
-    """THE DROP COUNTS ARE PRUNE'S, not a second derivation of "what was lost".
-
-    `truncated` keeps its own meaning there (the dump offered more than
-    MAX_ELEMENTS) and is reported under that name.
-    """
-    return (
-        perception._count(content.get("dropped_inside_panel"))
-        + perception._count(content.get("dropped_outside_panel"))
-        + perception._count(content.get("dropped_unclassified"))
-    )
-
-
-def _ambiguous_findings(by_name: dict) -> list:
-    """ONE finding per NAME, never per element.
-
-    A list of ten "Delete" rows is one ambiguity, and ten rows of it would
-    spend the whole cap on a single defect.
-    """
-    return [
-        _finding(
-            KIND_AMBIGUOUS_NAME,
-            ids,
-            spoken,
-            str(len(ids)) + " interactive controls answer to this one name, so a "
-            "user navigating by name cannot tell them apart",
-        )
-        for (spoken, _role), ids in by_name.items()
-        if len(ids) > 1
-    ]
-
-
-def _collect_findings(elements: list, floor: int, result: dict) -> list:
-    """Per-element findings first, then the duplicate-name findings."""
-    findings: list = []
-    by_name: dict = {}
-    for element in elements:
-        _audit_element(element, floor, result, findings, by_name)
-    findings.extend(_ambiguous_findings(by_name))
-    return findings
-
-
+# Findings for one pruned, annotated screen. Never raises.
+#
+# ``density_dpi`` is what ``adb.display_density`` read off the DEVICE. It is
+# DPI, never a scale factor -- the two differ by 160x and would be silently
+# interchangeable if the parameter were called ``density``, which is the
+# one-name-two-meanings defect this package has paid for before. ``None`` (a
+# device that could not answer, or a caller with no device) means the floor is
+# the assumed one and EVERY finding it produces says so.
 def audit(screen: object, density_dpi: object = None) -> dict:
-    """Findings for one pruned, annotated screen. Never raises.
-
-    ``density_dpi`` is what ``adb.display_density`` read off the DEVICE. It is
-    DPI, never a scale factor -- the two differ by 160x and would be silently
-    interchangeable if the parameter were called ``density``, which is the
-    one-name-two-meanings defect this package has paid for before. ``None`` (a
-    device that could not answer, or a caller with no device) means the floor is
-    the assumed one and EVERY finding it produces says so.
-    """
+    """Findings for one pruned, annotated screen. Never raises."""
     try:
         content = _unwrap(screen)
         present = bool(
@@ -432,113 +113,27 @@ def audit(screen: object, density_dpi: object = None) -> dict:
             # No screen at all -- a different answer from a screen with no nodes,
             # and the surfaces render nothing rather than a false reassurance.
             return _empty(False)
-        elements = [e for e in (content.get("elements") or []) if isinstance(e, dict)]
-        result = _empty(True)
-        # ONE coercion of this value, inside the guard that admits it may not be
-        # representable, and everything derived from it computed there too. The
-        # reader already rejects an implausible dpi, but by the time it arrives
-        # here it is a stored packet's worth of trust, and it is a MULTIPLIER on
-        # the floor -- a bad one rescales the check rather than failing it, so
-        # out of range means "the device did not answer". Derived values land in
-        # locals and are assigned together: a raise between two assignments
-        # would otherwise leave a result claiming a measured density while still
-        # carrying the default floor.
-        _apply_density(result, density_dpi)
-        floor = result["min_target_px"]
-        dropped = _dropped_count(content)
-        result["dropped"] = dropped
-        result["truncated"] = bool(content.get("truncated"))
-        result["audited"] = len(elements)
-        if not elements:
-            result["note"] = NO_NODES_NOTE
-            return result
-        result["auditable"] = True
-        result["complete"] = not dropped and not result["truncated"]
-
-        findings = _collect_findings(elements, floor, result)
-        result["capped"] = max(0, len(findings) - MAX_FINDINGS)
-        result["findings"] = findings[:MAX_FINDINGS]
-        result["note"] = _note(result)
-        return result
+        return _audit_result(content, density_dpi)
     except Exception:  # pragma: no cover - defensive
         logger.exception("mobile.screen_audit.audit failed")
         return _empty(False)
 
 
-def _note(result: dict) -> str:
-    """THE sentence every surface prints, composed once.
-
-    Partiality is part of the sentence rather than a caveat a caller may forget:
-    a count of findings over a truncated element set describes some of a screen,
-    and saying so is not optional.
-    """
-    findings = list(result.get("findings") or [])
-    capped = int(result.get("capped") or 0)
-    audited = int(result.get("audited") or 0)
-    dropped = int(result.get("dropped") or 0)
-    if not result.get("auditable"):
-        return NO_NODES_NOTE
-    head = (
-        (
-            str(len(findings))
-            + " accessibility finding"
-            + ("" if len(findings) == 1 else "s")
-            + " over "
-            + str(audited)
-            + " element"
-            + ("" if audited == 1 else "s")
-            + "."
-        )
-        if findings
-        else CLEAN_NOTE
-    )
-    if capped:
-        head += " " + str(capped) + " further finding(s) were not carried."
-    if dropped or result.get("truncated"):
-        head += (
-            " THIS AUDIT IS PARTIAL: "
-            + str(dropped)
-            + " element(s) this screen offered were dropped before it ran"
-            + (
-                " and the screen exceeded the element cap"
-                if result.get("truncated")
-                else ""
-            )
-            + ", so it describes "
-            + str(audited)
-            + " of a larger screen and its silence is not evidence."
-        )
-    return head
-
-
+# The audit as plain lines for a model surface. ``""`` when there is no screen.
+#
+# The CALLER wraps this in ``untrusted.wrap_untrusted`` -- the names quoted
+# here are device text. The report gets the same facts through HTML escaping
+# instead: two surfaces, two mechanisms.
 def summary_text(result: object) -> str:
-    """The audit as plain lines for a model surface. ``""`` when there is no screen.
-
-    The CALLER wraps this in ``untrusted.wrap_untrusted`` -- the names quoted
-    here are device text. The report gets the same facts through HTML escaping
-    instead: two surfaces, two mechanisms.
-    """
+    """The audit as plain lines for a model surface."""
     try:
         body = result if isinstance(result, dict) else {}
         if not body.get("present"):
             return ""
         lines = ["accessibility: " + str(body.get("note") or "")]
         for finding in list(body.get("findings") or [])[:MAX_FINDINGS]:
-            if not isinstance(finding, dict):
-                continue
-            kind = str(finding.get("kind") or "")
-            lines.append(
-                "- "
-                + KIND_LABELS.get(kind, kind)
-                + " ["
-                + ",".join(str(value) for value in (finding.get("ids") or []))
-                + "] "
-                + (
-                    str(finding.get("name") or "")
-                    and ('"' + str(finding["name"]) + '" ')
-                )
-                + str(finding.get("detail") or "")
-            )
+            if isinstance(finding, dict):
+                lines.append(_finding_line(finding))
         lines.append(
             "These are usability findings about the SCREEN. They are not this "
             "case's verdict and must not change it."

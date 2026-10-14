@@ -11,7 +11,7 @@ Never raises. Screen text and typed values never enter a record.
 from __future__ import annotations
 
 import logging
-from typing import TypedDict
+from typing import Any, TypedDict, cast
 
 from tools.mobile import knowledge_limits, run_store
 
@@ -37,7 +37,7 @@ class StepRec(TypedDict, total=False):
     fired: list
 
 
-def _text(value: object, limit: int = 200) -> str:
+def _text(value: Any, limit: int = 200) -> str:
     return str(value or "")[:limit]
 
 
@@ -48,19 +48,14 @@ def _rid(action: dict) -> str:
     return _text(rid)
 
 
-def _int(value: object) -> int:
+def _int(value: Any) -> int:
     try:
         return max(0, int(value or 0))
     except (TypeError, ValueError, OverflowError):
         return 0
 
 
-def step_rec(entry: object) -> StepRec | None:
-    """One trace entry as a ``StepRec``; ``None`` when it was not stamped."""
-    if not isinstance(entry, dict) or not entry.get("screen_key"):
-        return None
-    action = entry.get("action") if isinstance(entry.get("action"), dict) else {}
-    landed = entry.get("landed")
+def _head(entry: dict, action: dict) -> StepRec:
     return StepRec(
         index=_int(entry.get("index")),
         op=_text(action.get("op"), 40),
@@ -70,6 +65,12 @@ def step_rec(entry: object) -> StepRec | None:
         after_screen_key=_text(entry.get("after_screen_key"), 64),
         activity=_text(entry.get("activity"), 200),
         outcome=_text(entry.get("outcome"), 40),
+    )
+
+
+def _tail(entry: dict) -> StepRec:
+    landed = entry.get("landed")
+    return StepRec(
         ms=_int(entry.get("ms")),
         retries=_int(entry.get("retries")),
         landed=landed if isinstance(landed, bool) else None,
@@ -79,6 +80,18 @@ def step_rec(entry: object) -> StepRec | None:
         tester_correction=bool(entry.get("tester_correction")),
         fired=list(entry.get("knowledge") or entry.get("fired") or [])[:10],
     )
+
+
+def step_rec(entry: Any) -> StepRec | None:
+    """One trace entry as a ``StepRec``; ``None`` when it was not stamped."""
+    if not isinstance(entry, dict) or not entry.get("screen_key"):
+        return None
+    action = cast(
+        "dict", entry.get("action") if isinstance(entry.get("action"), dict) else {}
+    )
+    rec = _head(entry, action)
+    rec.update(_tail(entry))
+    return rec
 
 
 def load_steps(run_id: str) -> list[StepRec]:

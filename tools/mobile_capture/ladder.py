@@ -23,7 +23,24 @@ uses for the pcap lane's record, applied here to this lane's.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from tools.mobile_capture import probe
+from tools.mobile_capture.ladder_reasons import (  # noqa: F401  re-exports: the vocabulary moved
+    _REASON_SENTENCES,
+    REASON_CERT_NOT_TRUSTED,
+    REASON_DEVICE_GONE,
+    REASON_FLAG_OFF,
+    REASON_INCONCLUSIVE,
+    REASON_NO_APPLY,
+    REASON_NO_CONSENT,
+    REASON_NO_MITMDUMP,
+    REASON_NOT_OFFERED,
+    REASON_PROXY_START_FAILED,
+    REASON_TLS_FAILURE,
+    REASON_USER_STORE_ONLY,
+    REASONS,
+)
 from tools.mobile_shared.capture_tiers import (  # noqa: F401  re-exports: tier names keep their old home
     REASON_PINNED,
     TIER_DECRYPTED,
@@ -33,89 +50,6 @@ from tools.mobile_shared.capture_tiers import (  # noqa: F401  re-exports: tier 
     TIER_TLS_FAILURE,
     TIERS,
 )
-
-#: The refusal vocabulary. Every code below has exactly one sentence in
-#: ``_REASON_SENTENCES``, proven by ``test_every_reason_code_has_a_sentence_``
-#: ``and_no_two_share_one``.
-REASON_NO_CONSENT = "no_consent"
-REASON_NO_APPLY = "no_apply"
-REASON_NO_MITMDUMP = "no_mitmdump"
-REASON_CERT_NOT_TRUSTED = "cert_not_trusted"
-REASON_TLS_FAILURE = "tls_failure"
-REASON_PROXY_START_FAILED = "proxy_start_failed"
-REASON_DEVICE_GONE = "device_gone"
-REASON_USER_STORE_ONLY = "user_store_only"
-REASON_INCONCLUSIVE = "inconclusive"
-#: The lane kill-switch is unset, so the root CA was not installed. Same
-#: string as ``cert.REASON_FLAG_OFF``, which ``prepare`` passes through.
-REASON_FLAG_OFF = "flag_off"
-
-#: Nobody has been asked about this device yet. NOT the same as
-#: REASON_NO_CONSENT: a decline is an answer, and this is the absence of the
-#: question. Collapsing the two would tell a tester they had refused something
-#: they were never offered.
-REASON_NOT_OFFERED = "not_offered"
-REASONS = frozenset(
-    {
-        REASON_NO_CONSENT,
-        REASON_NO_APPLY,
-        REASON_NO_MITMDUMP,
-        REASON_CERT_NOT_TRUSTED,
-        REASON_PINNED,
-        REASON_TLS_FAILURE,
-        REASON_PROXY_START_FAILED,
-        REASON_DEVICE_GONE,
-        REASON_USER_STORE_ONLY,
-        REASON_INCONCLUSIVE,
-        REASON_NOT_OFFERED,
-        REASON_FLAG_OFF,
-    }
-)
-
-#: One sentence per reason code. THE ONE PRODUCER of the tester-facing
-#: sentence for a refusal -- a rendered sentence can change without any
-#: caller's branch changing, because callers branch on the CODE.
-_REASON_SENTENCES = {
-    REASON_NO_CONSENT: (
-        "The tester declined API capture, so this run continues without it."
-    ),
-    REASON_FLAG_OFF: (
-        "API capture installs a root certificate on the device, which needs "
-        "`QA_MOBILE_HTTPS_CAPTURE_ENABLED=true` in `.env`; nothing was installed."
-    ),
-    REASON_NO_APPLY: (
-        "API capture needs apply=true to install or start anything; nothing "
-        "was touched."
-    ),
-    REASON_NO_MITMDUMP: (
-        "mitmdump is not provisioned yet, so no proxy could be started."
-    ),
-    REASON_CERT_NOT_TRUSTED: (
-        "The device did not accept the qa-agents root certificate."
-    ),
-    REASON_PINNED: (
-        "The app pins its own certificates, so its requests fail once our "
-        "certificate is installed."
-    ),
-    REASON_TLS_FAILURE: (
-        "The proxy could not complete a TLS handshake through the device."
-    ),
-    REASON_PROXY_START_FAILED: (
-        "The qa-agents proxy did not start, so this run continues without capture."
-    ),
-    REASON_DEVICE_GONE: ("The device disconnected before capture could be confirmed."),
-    REASON_USER_STORE_ONLY: (
-        "Only the user certificate store accepted the CA; most apps on this "
-        "device ignore it."
-    ),
-    REASON_INCONCLUSIVE: (
-        "Capture could not be confirmed one way or the other on this run."
-    ),
-    REASON_NOT_OFFERED: (
-        "API capture is not set up on this device. Call again with "
-        'capture="on" to record the app\'s API calls.'
-    ),
-}
 
 
 def refusal(code: object) -> dict:
@@ -132,73 +66,87 @@ def refusal(code: object) -> dict:
     return {"reason": code, "message": sentence}
 
 
-def decide(
-    *,
-    consent: bool,
-    apply_: bool,
-    mitmdump_available: bool,
-    device_gone: bool = False,
-    proxy_started: bool = False,
-    probe_state: str | None = None,
-    pinned: bool = False,
-    user_store_only: bool = False,
-    ledger_prior_tier: str | None = None,
-) -> dict:
+@dataclass(frozen=True)
+class Situation:
+    """What THIS run observed; the one argument of :func:`decide`."""
+
+    consent: bool
+    apply_: bool
+    mitmdump_available: bool
+    device_gone: bool = False
+    proxy_started: bool = False
+    probe_state: str | None = None
+    pinned: bool = False
+    user_store_only: bool = False
+    # Intentionally never read by decide(); see its docstring.
+    ledger_prior_tier: str | None = None
+
+
+def _gate_refusal(s: Situation) -> dict | None:
+    """The first unmet precondition as a no-tier reply, else None."""
+    if not s.consent:
+        return {"tier": TIER_NONE, "reason": REASON_NO_CONSENT}
+    if not s.apply_:
+        return {"tier": TIER_NONE, "reason": REASON_NO_APPLY}
+    if not s.mitmdump_available:
+        return {"tier": TIER_NONE, "reason": REASON_NO_MITMDUMP}
+    if s.device_gone:
+        return {"tier": TIER_NONE, "reason": REASON_DEVICE_GONE}
+    if not s.proxy_started:
+        return {"tier": TIER_NONE, "reason": REASON_PROXY_START_FAILED}
+    return None
+
+
+def _probe_tier(s: Situation) -> dict:
+    """The tier for a run whose proxy started, from the functional probe."""
+    if s.probe_state == probe.DECRYPTED:
+        return {"tier": TIER_DECRYPTED, "reason": None}
+    if s.probe_state == probe.TLS_FAILURE:
+        return {
+            "tier": TIER_TLS_FAILURE,
+            "reason": REASON_PINNED if s.pinned else REASON_TLS_FAILURE,
+        }
+    if s.user_store_only:
+        return {"tier": TIER_PROXIED, "reason": REASON_USER_STORE_ONLY}
+    return {"tier": TIER_PROXIED, "reason": REASON_INCONCLUSIVE}
+
+
+def decide(situation: Situation) -> dict:
     """``{"tier": ..., "reason": ... | None}``. The ONE place a tier is decided.
 
-    ``ledger_prior_tier`` is accepted only so a caller (and this module's own
-    tests) can prove it is INERT for this decision: passing
-    ``TIER_DECRYPTED`` here changes nothing about the result, because this
+    ``Situation.ledger_prior_tier`` is accepted only so a caller (and this
+    module's own tests) can prove it is INERT for this decision: passing
+    ``TIER_DECRYPTED`` there changes nothing about the result, because this
     run's tier comes from ``probe_state`` alone. A structural cert check --
     reading that a certificate is installed, or that the ledger once recorded
     success -- can never produce :data:`TIER_DECRYPTED` through this
     function.
     """
-    del ledger_prior_tier  # intentionally not read; see the docstring above.
-    if not consent:
-        return {"tier": TIER_NONE, "reason": REASON_NO_CONSENT}
-    if not apply_:
-        return {"tier": TIER_NONE, "reason": REASON_NO_APPLY}
-    if not mitmdump_available:
-        return {"tier": TIER_NONE, "reason": REASON_NO_MITMDUMP}
-    if device_gone:
-        return {"tier": TIER_NONE, "reason": REASON_DEVICE_GONE}
-    if not proxy_started:
-        return {"tier": TIER_NONE, "reason": REASON_PROXY_START_FAILED}
-    if probe_state == probe.DECRYPTED:
-        return {"tier": TIER_DECRYPTED, "reason": None}
-    if probe_state == probe.TLS_FAILURE:
-        return {
-            "tier": TIER_TLS_FAILURE,
-            "reason": REASON_PINNED if pinned else REASON_TLS_FAILURE,
-        }
-    if user_store_only:
-        return {"tier": TIER_PROXIED, "reason": REASON_USER_STORE_ONLY}
-    return {"tier": TIER_PROXIED, "reason": REASON_INCONCLUSIVE}
+    return _gate_refusal(situation) or _probe_tier(situation)
 
 
-def record(source: object) -> dict:
-    """The capture record shape. EVERY KEY PRESENT, normalised from a
-    ``decide()`` reply, a checkpoint already on disk, or nothing at all --
-    the ``tools/mobile/case_runner.py::network_record`` precedent, applied to
-    this lane. Never raises: a corrupt or missing value on disk reads as this
-    record's own empty value, not a KeyError inside a checkpoint splice.
-    """
+def _body_of(source: object) -> dict:
+    """The dict a record is read from: ``content`` when present, else *source*."""
     holder = source if isinstance(source, dict) else {}
     body = holder.get("content") if "content" in holder else holder
-    body = body if isinstance(body, dict) else {}
+    return body if isinstance(body, dict) else {}
 
+
+def _flow_count(body: dict) -> int:
+    """``flow_count`` as a non-negative int; a corrupt value reads as 0."""
+    try:
+        return max(0, int(body.get("flow_count") or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _shape(body: dict) -> dict:
+    """Every key of the capture record, normalised from *body*."""
     tier = body.get("tier")
-    tier = tier if tier in TIERS else TIER_NONE
     reason = body.get("reason")
     reason = reason if reason in REASONS else None
-    try:
-        flow_count = max(0, int(body.get("flow_count") or 0))
-    except (TypeError, ValueError, OverflowError):
-        flow_count = 0
-
     return {
-        "tier": tier,
+        "tier": tier if tier in TIERS else TIER_NONE,
         "reason": reason,
         # Carried by the ONE producer so a consumer can branch on it. The
         # renderer read this key before anything emitted it, which is how a
@@ -210,5 +158,15 @@ def record(source: object) -> dict:
         "fingerprint": str(body.get("fingerprint") or ""),
         "run_id": str(body.get("run_id") or ""),
         "started_ms": body.get("started_ms"),
-        "flow_count": flow_count,
+        "flow_count": _flow_count(body),
     }
+
+
+def record(source: object) -> dict:
+    """The capture record shape. EVERY KEY PRESENT, normalised from a
+    ``decide()`` reply, a checkpoint already on disk, or nothing at all --
+    the ``tools/mobile/case_runner.py::network_record`` precedent, applied to
+    this lane. Never raises: a corrupt or missing value on disk reads as this
+    record's own empty value, not a KeyError inside a checkpoint splice.
+    """
+    return _shape(_body_of(source))

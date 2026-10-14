@@ -26,6 +26,8 @@ import logging
 import threading
 import time
 
+from config.settings_guard import never_raise
+
 logger = logging.getLogger(__name__)
 
 #: Runs whose values are held at once. The oldest is dropped first.
@@ -49,9 +51,27 @@ def _prune(now: float) -> None:
         _HELD.pop(run_id, None)
 
 
+def _merge(held: dict[str, str], values: dict) -> dict[str, str]:
+    for name, value in values.items():
+        field = str(name or "").strip()[:80]
+        if not field or value is None:
+            continue
+        if field not in held and len(held) >= MAX_HELD_FIELDS:
+            continue
+        held[field] = str(value)
+    return held
+
+
+def _evict() -> None:
+    while len(_HELD) > MAX_HELD_RUNS:
+        oldest = min(_HELD, key=lambda r: _HELD[r][0])
+        _HELD.pop(oldest, None)
+
+
 def remember(run_id: str, values: object, *, now: float | None = None) -> None:
     """Hold *values* (``field -> value``) for *run_id*. Never raises."""
-    try:
+    # No exc_info: a traceback's locals could carry the value.
+    with never_raise(logger, "held_inputs.remember failed"):
         key = str(run_id or "")
         if not key or not isinstance(values, dict) or not values:
             return
@@ -59,25 +79,13 @@ def remember(run_id: str, values: object, *, now: float | None = None) -> None:
         with _LOCK:
             _prune(stamp)
             held = dict((_HELD.get(key) or (stamp, {}))[1])
-            for name, value in values.items():
-                field = str(name or "").strip()[:80]
-                if not field or value is None:
-                    continue
-                if field not in held and len(held) >= MAX_HELD_FIELDS:
-                    continue
-                held[field] = str(value)
-            _HELD[key] = (stamp, held)
-            while len(_HELD) > MAX_HELD_RUNS:
-                oldest = min(_HELD, key=lambda r: _HELD[r][0])
-                _HELD.pop(oldest, None)
-    except Exception:  # pragma: no cover - defensive
-        # No exc_info: a traceback's locals could carry the value.
-        logger.debug("held_inputs.remember failed")
+            _HELD[key] = (stamp, _merge(held, values))
+            _evict()
 
 
 def recall(run_id: str, *, now: float | None = None) -> dict[str, str]:
     """A COPY of what is held for *run_id*, ``{}`` when nothing is. Never raises."""
-    try:
+    with never_raise():
         stamp = _clock(now)
         with _LOCK:
             _prune(stamp)
@@ -87,8 +95,7 @@ def recall(run_id: str, *, now: float | None = None) -> dict[str, str]:
                 # Sliding: a run still in use keeps its values.
                 _HELD[key] = (stamp, entry[1])
             return dict(entry[1]) if entry else {}
-    except Exception:  # pragma: no cover - defensive
-        return {}
+    return {}
 
 
 def held_fields(run_id: str, *, now: float | None = None) -> list[str]:
@@ -98,11 +105,9 @@ def held_fields(run_id: str, *, now: float | None = None) -> list[str]:
 
 def forget(run_id: str) -> None:
     """Drop everything held for *run_id*. Never raises."""
-    try:
+    with never_raise(logger, "held_inputs.forget failed"):
         with _LOCK:
             _HELD.pop(str(run_id or ""), None)
-    except Exception:  # pragma: no cover - defensive
-        logger.debug("held_inputs.forget failed")
 
 
 def clear() -> None:

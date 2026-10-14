@@ -32,7 +32,7 @@ import urllib.request
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from tools.mobile import adb, tree_optin
+from tools.mobile import adb, tree_optin, tree_source
 from tools.mobile.tree_source import TreeResult
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,9 @@ U2_DEVICE_PORT = 9008
 U2_RPC_PATH = "/jsonrpc/0"
 U2_RPC_METHOD = "dumpWindowHierarchy"
 U2_RPC_PARAMS = [False, 50]
+_RPC_BODY = json.dumps(
+    {"jsonrpc": "2.0", "id": 1, "method": U2_RPC_METHOD, "params": U2_RPC_PARAMS}
+).encode("utf-8")
 U2_APK_NAMES = ("app-uiautomator.apk", "app-uiautomator-test.apk")
 U2_INSTRUMENT = (
     "am",
@@ -78,7 +81,7 @@ FAILURES = (
 Rpc = Callable[[int, float], Awaitable[Optional[str]]]
 
 
-def _assets_dir() -> Optional[Path]:
+def assets_dir() -> Optional[Path]:
     """The directory holding the helper APKs of an INSTALLED uiautomator2, or None."""
     try:
         spec = importlib.util.find_spec("uiautomator2")
@@ -90,7 +93,7 @@ def _assets_dir() -> Optional[Path]:
     return assets if all((assets / n).is_file() for n in U2_APK_NAMES) else None
 
 
-def _pick_port() -> int:
+def pick_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind((LOOPBACK, 0))
         return int(probe.getsockname()[1])
@@ -98,17 +101,9 @@ def _pick_port() -> int:
 
 def _post_rpc(port: int, timeout_s: float) -> Optional[str]:
     """One loopback JSON-RPC call; the hierarchy text or None. Blocking."""
-    body = json.dumps(
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": U2_RPC_METHOD,
-            "params": U2_RPC_PARAMS,
-        }
-    ).encode("utf-8")
     url = "http://" + LOOPBACK + ":" + str(int(port)) + U2_RPC_PATH
     request = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}
+        url, data=_RPC_BODY, headers={"Content-Type": "application/json"}
     )
     with urllib.request.urlopen(request, timeout=timeout_s) as reply:
         raw = reply.read(adb.MAX_DUMP_BYTES + 1)
@@ -132,7 +127,7 @@ class U2TreeSource:
         self._cooldown: dict = {}
 
     async def available(self, serial: str) -> bool:
-        if not tree_optin.is_enabled(serial) or _assets_dir() is None:
+        if not tree_optin.is_enabled(serial) or assets_dir() is None:
             return False
         return time.monotonic() >= self._cooldown.get(serial, 0.0)
 
@@ -165,7 +160,7 @@ class U2TreeSource:
         return port
 
     async def _start(self, serial: str) -> Optional[int]:
-        assets = _assets_dir()
+        assets = assets_dir()
         forward = getattr(adb, "forward", None)
         if assets is None or forward is None:
             return None
@@ -174,9 +169,10 @@ class U2TreeSource:
                 return None
         if (await adb.shell(serial, list(U2_INSTRUMENT))).get("error"):
             return None
-        port = _pick_port()
+        port = pick_port()
         remote = "tcp:" + str(U2_DEVICE_PORT)
-        if (await forward(serial, "tcp:" + str(port), remote)).get("error"):
+        spec = adb.PortSpec(remote=remote, local="tcp:" + str(port))
+        if (await forward(serial, spec)).get("error"):
             return None
         return port
 
@@ -194,6 +190,5 @@ class U2TreeSource:
 def register_u2_source() -> None:
     """Register at priority 10 (tried before the fallback). Selection still
     needs ``tree_optin.allowed``, so registering opts nobody in."""
-    from tools.mobile import tree_source
 
     tree_source.register_tree_source(U2TreeSource(), priority=10)

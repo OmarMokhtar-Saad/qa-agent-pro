@@ -32,292 +32,34 @@ non-``:0`` value below is inside a ``try/finally`` whose ``finally`` reaches
 
 from __future__ import annotations
 
-import json
 import logging
-import os
-import socket
-import subprocess
-import time
-from pathlib import Path
+import os  # noqa: F401  (tests patch proxy.os.chmod)
+import subprocess  # noqa: F401  (tests patch proxy.subprocess.Popen)
 
-from tools.mobile import adb, device_lock
-from tools.mobile_capture import paths, teardown
+from tools.mobile import adb, device_lock  # noqa: F401  (tests patch these)
+from tools.mobile_capture.proxy_proc import (  # noqa: F401
+    ADDON_DIR_ENV,
+    ADDON_PATH,
+    ADDON_RUN_ID_ENV,
+    HTTP_PROXY_SETTING,
+    MAX_LIVE_PROXIES,
+    REASON_DEVICE_BUSY,
+    REASON_PROXY_START_FAILED,
+    REASON_TOO_MANY_PROXIES,
+    START_TIMEOUT_S,
+    _cap_refusal,
+    _free_port,
+    live_markers,
+    read_marker,
+    spawn_proxy,
+    wait_port_open,
+    write_marker,
+)
+from tools.mobile_capture.proxy_start import (  # noqa: F401
+    _start_apply,
+    _start_locked,
+    _start_spawn,
+    start,
+)
 
-logger = logging.getLogger(__name__)
-
-#: How long ONE spawn is waited on before the run continues WITHOUT capture.
-#: See tests/test_bounds_upper.py::CEILINGS.
-START_TIMEOUT_S: int = 20
-
-#: Concurrently PROXIED devices, one ``mitmdump`` each.
-#: See tests/test_bounds_upper.py::CEILINGS.
-MAX_LIVE_PROXIES: int = 2
-
-REASON_DEVICE_BUSY = "device_busy"
-REASON_TOO_MANY_PROXIES = "too_many_proxies"
-REASON_PROXY_START_FAILED = "proxy_start_failed"
-
-#: Loaded by ``mitmdump -s`` as its addon script. Phase 5 (``addon.py``) is
-#: what actually writes flows there; this module only needs the path, fixed
-#: now so that phase does not have to touch this constant.
-ADDON_PATH: Path = Path(__file__).resolve().with_name("addon.py")
-
-HTTP_PROXY_SETTING = "http_proxy"
-
-#: The ONLY channel to the addon's OTHER interpreter (T5.1): it reads these
-#: two names from its own environment, never anything imported from this
-#: tree. Both are set on the ``mitmdump`` child's environment, never on this
-#: process's own -- a leaked env var here would let a later, unrelated call
-#: in THIS process pick up a stale run id.
-# Off the QA_ prefix on purpose -- see the note beside addon.RUN_ID_ENV.
-# These two literals must stay in step with the addon's, which the addon
-# contract test asserts rather than trusting.
-ADDON_RUN_ID_ENV = "MITMCAP_RUN_ID"
-ADDON_DIR_ENV = "MITMCAP_DIR"
-
-
-def _free_port() -> int:
-    """An ephemeral localhost port, free at the instant this returns."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _wait_port_open(port: int, timeout_s: float) -> bool:
-    """Blocking poll for *port* to accept a connection. A thin, patchable seam."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(0.5)
-            try:
-                sock.connect(("127.0.0.1", port))
-                return True
-            except OSError:
-                time.sleep(0.05)
-    return False
-
-
-def _spawn(port: int, ca_dir: Path) -> subprocess.Popen:
-    """The ONE place ``mitmdump`` is spawned. ``Popen``, never ``shell=True``."""
-    return subprocess.Popen(
-        [
-            "mitmdump",
-            "-q",
-            "--listen-host",
-            "127.0.0.1",
-            "--listen-port",
-            str(port),
-            "--set",
-            "confdir=" + str(ca_dir),
-            "-s",
-            str(ADDON_PATH),
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
-def read_marker(serial: str) -> dict | None:
-    """The runtime marker for *serial*, or ``None``. Never raises."""
-    target = paths.proxy_marker(serial)
-    try:
-        if not target.is_file():
-            return None
-        body = json.loads(target.read_text(encoding="utf-8"))
-        return body if isinstance(body, dict) else None
-    except Exception:
-        logger.warning("mobile_capture.proxy: unreadable marker for %s", serial)
-        return None
-
-
-def write_marker(serial: str, body: dict) -> None:
-    """Write the marker atomically. THE ONE PRODUCER of the marker's shape."""
-    target = paths.proxy_marker(serial)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(target.name + ".tmp")
-    tmp.write_text(json.dumps(body, sort_keys=True), encoding="utf-8")
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    os.replace(tmp, target)
-
-
-def live_markers(*, exclude_serial: str = "") -> list[tuple[str, dict]]:
-    """``(serial, marker)`` for every marker that is a genuinely LIVE proxy.
-
-    Excludes crash residue (:func:`tools.mobile_capture.teardown.is_crash_residue`
-    -- the ONE producer of that judgement, not re-derived here) and, optionally,
-    one serial: the cap check below uses this to keep a caller's OWN slot from
-    ever counting against itself.
-    """
-    out: list[tuple[str, dict]] = []
-    root = paths.capture_root()
-    if not root.is_dir():
-        return out
-    for entry in sorted(root.glob("proxy-*.json")):
-        try:
-            body = json.loads(entry.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if not isinstance(body, dict):
-            continue
-        serial = str(body.get("serial") or "")
-        if not serial or serial == str(exclude_serial):
-            continue
-        if not teardown.is_crash_residue(body):
-            out.append((serial, body))
-    return out
-
-
-def _cap_refusal(serial: str) -> dict | None:
-    """``None`` when there is room; a refusal naming every holder otherwise.
-
-    NEVER KILLS. Reaching the cap refuses by name (T3.2b); the only path that
-    ever tears a live proxy down is crash-residue reaping in ``teardown.py``,
-    never this function.
-    """
-    live = live_markers(exclude_serial=serial)
-    if len(live) < MAX_LIVE_PROXIES:
-        return None
-    holders = [{"serial": s, "run_id": str(b.get("run_id") or "")} for s, b in live]
-    return {
-        "error": REASON_TOO_MANY_PROXIES,
-        "content": {"max": MAX_LIVE_PROXIES, "holders": holders},
-    }
-
-
-async def start(serial: str, *, run_id: str) -> dict:
-    """Spawn ``mitmdump`` for *serial* and point it at the device. Never raises.
-
-    Runs under the per-serial device lock (T3.2a): the same *run_id* re-enters
-    for free; a different owner already holding it is refused by name and
-    spawns nothing. Reaps crash residue first ("reap on start"), then checks
-    :data:`MAX_LIVE_PROXIES`, then spawns.
-
-    THE ORDERING INVARIANT: the marker is written before ``http_proxy`` is
-    ever set, and the ``try/finally`` below undoes a partial start through
-    :func:`tools.mobile_capture.teardown.clear` on anything short of full
-    success.
-
-    THE LOCK INVARIANT: a lock this call NEWLY acquired (as opposed to a
-    re-entrant take on a lock the caller already held) is released on every
-    path that returns WITHOUT a live proxy -- never on success, where
-    ownership transfers to the caller's own lifecycle. After a failed
-    ``start``, the device is therefore neither proxied nor locked.
-    """
-    try:
-        serial = str(serial)
-        took = device_lock.take_device_lock(str(run_id), serial=serial)
-        content = (took or {}).get("content") or {}
-        if not content.get("acquired"):
-            return {
-                "error": REASON_DEVICE_BUSY,
-                "content": {"holder": str(content.get("holder") or "")},
-            }
-        # NEWLY acquired vs RE-ENTERED (T3.2a's idempotent-same-owner path,
-        # reported as `reentrant` by `take_device_lock`). A caller who already
-        # held this lock before calling us keeps managing its own lifecycle --
-        # this function must never give away a lock it did not take. A caller
-        # for whom THIS call is what acquired the lock is the one who must
-        # get it back on every path that does not hand off a live proxy: a
-        # function that takes a resource, fails, and returns without giving
-        # it back is the exact leak this phase exists to prevent, applied to
-        # the lock instead of the proxy setting.
-        newly_acquired = not content.get("reentrant")
-        reply = {"error": REASON_PROXY_START_FAILED, "content": None}
-        try:
-            reply = await _start_locked(serial, run_id)
-            return reply
-        finally:
-            # The LOCK invariant: release only a lock this call took, and only
-            # when no live proxy is handed off (also on an exception).
-            if newly_acquired and reply["error"] is not None:
-                device_lock.release_device_lock(str(run_id), as_holder=True)
-    except Exception as exc:
-        logger.exception("mobile_capture.proxy.start failed")
-        return {"error": str(exc), "content": None}
-
-
-async def _start_locked(serial: str, run_id: str) -> dict:
-    """Reap residue, check the cap, spawn and apply, with the device lock held."""
-    await teardown.reap(owner=str(run_id), serial_hint=serial)
-
-    capped = _cap_refusal(serial)
-    if capped is not None:
-        return capped
-
-    port = _free_port()
-    proc = _start_spawn(run_id, port)
-    if not _wait_port_open(port, START_TIMEOUT_S):
-        # The leaked-process class: a spawn that never binds must not be left
-        # running, and must never have the proxy setting applied.
-        teardown.kill_process(proc.pid)
-        return {"error": REASON_PROXY_START_FAILED, "content": None}
-
-    return await _start_apply(serial, run_id, port, proc)
-
-
-def _start_spawn(run_id: str, port: int):
-    """Spawn ``mitmdump`` with the addon's env set only around the spawn call."""
-    # *run_id* and the capture tmp directory reach the addon ONLY
-    # through the CHILD's environment (T5.1): they cannot be new
-    # arguments on `_spawn` itself without breaking every existing
-    # fake that patches `_spawn` with its ORIGINAL two-argument
-    # shape (tests/mobile_capture/test_proxy_start.py and
-    # test_proxy_uncovered_branches.py both do). `_spawn` still
-    # reads `os.environ` un-touched (its own `env=None` default),
-    # so the mutation below is scoped to the single synchronous
-    # statement that calls it -- no `await` sits between the two,
-    # so no other task in this process can observe it, and the
-    # `finally` restores the parent's environment unconditionally.
-    _prev_env = dict(os.environ)
-    try:
-        os.environ[ADDON_RUN_ID_ENV] = paths.safe_name(run_id)
-        os.environ[ADDON_DIR_ENV] = str(paths.tmp_dir())
-        proc = _spawn(port, paths.ca_dir())
-    finally:
-        os.environ.clear()
-        os.environ.update(_prev_env)
-    return proc
-
-
-async def _start_apply(serial: str, run_id: str, port: int, proc) -> dict:
-    """Write the marker, point the device at the proxy, undo it on any failure."""
-    proxy_set = False
-    try:
-        write_marker(
-            serial,
-            {
-                "pid": proc.pid,
-                "port": port,
-                "run_id": str(run_id),
-                "serial": serial,
-                "started_ms": int(time.time() * 1000),
-                "boot_id": teardown.boot_id(),
-            },
-        )
-        rev = await adb.reverse(serial, "tcp:" + str(port), "tcp:" + str(port))
-        if rev.get("error"):
-            return {"error": rev["error"], "content": None}
-        put = await adb.global_setting_put(
-            serial, HTTP_PROXY_SETTING, "127.0.0.1:" + str(port)
-        )
-        if put.get("error"):
-            return {"error": put["error"], "content": None}
-        read = await adb.global_setting_get(serial, HTTP_PROXY_SETTING)
-        if read.get("error"):
-            return {"error": read["error"], "content": None}
-        proxy_set = True
-        return {
-            "error": None,
-            "content": {
-                "port": port,
-                "pid": proc.pid,
-                "http_proxy": str(read.get("content") or ""),
-            },
-        }
-    finally:
-        if not proxy_set:
-            await teardown.clear(serial, owner=str(run_id), reason="start_failed")
+logger = logging.getLogger("tools.mobile_capture.proxy")

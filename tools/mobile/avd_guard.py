@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -55,42 +56,52 @@ def host_load() -> float | None:
         return None
 
 
-def reasons(
-    width: int = 0,
-    height: int = 0,
-    density: int | None = None,
-    load_per_core: float | None = None,
-) -> list[str]:
+class Panel(NamedTuple):
+    """The display and host numbers one ``assess`` call looks at."""
+
+    width: int = 0
+    height: int = 0
+    density: int | None = None
+    load_per_core: float | None = None
+
+
+def _size_reasons(panel: Panel, found: list[str]) -> None:
+    """Append the long-edge and density clauses, in that order."""
+    width, height, density = panel.width, panel.height, panel.density
+    if max(int(width or 0), int(height or 0)) > HEAVY_AVD_MAX_LONG_EDGE_PX:
+        found.append(
+            f"the panel is {int(width)}×{int(height)} "
+            f"(over {HEAVY_AVD_MAX_LONG_EDGE_PX} px on the long edge)"
+        )
+    if density is not None and int(density) > HEAVY_AVD_MAX_DENSITY_DPI:
+        found.append(
+            f"density is {int(density)} dpi (over {HEAVY_AVD_MAX_DENSITY_DPI})"
+        )
+
+
+def _load_clause(load: float) -> str:
+    return (
+        f"this machine's load is {load:.1f} per core "
+        f"(over {HEAVY_HOST_LOAD_PER_CORE_MAX:.1f})"
+    )
+
+
+def reasons(panel: Panel) -> list[str]:
     """Each threshold crossed, as a short clause. Empty when nothing is heavy."""
     found: list[str] = []
+    load_per_core = panel.load_per_core
     try:
-        if max(int(width or 0), int(height or 0)) > HEAVY_AVD_MAX_LONG_EDGE_PX:
-            found.append(
-                f"the panel is {int(width)}×{int(height)} "
-                f"(over {HEAVY_AVD_MAX_LONG_EDGE_PX} px on the long edge)"
-            )
-        if density is not None and int(density) > HEAVY_AVD_MAX_DENSITY_DPI:
-            found.append(
-                f"density is {int(density)} dpi (over {HEAVY_AVD_MAX_DENSITY_DPI})"
-            )
+        _size_reasons(panel, found)
         if load_per_core is not None and load_per_core > HEAVY_HOST_LOAD_PER_CORE_MAX:
-            found.append(
-                f"this machine's load is {load_per_core:.1f} per core "
-                f"(over {HEAVY_HOST_LOAD_PER_CORE_MAX:.1f})"
-            )
+            found.append(_load_clause(load_per_core))
     except (TypeError, ValueError, OverflowError):
         logger.exception("mobile.avd_guard.reasons got a non-number")
     return found
 
 
-def assess(
-    width: int = 0,
-    height: int = 0,
-    density: int | None = None,
-    load_per_core: float | None = None,
-) -> str:
+def assess(panel: Panel) -> str:
     """One warning sentence, or ``""`` when nothing crossed a threshold."""
-    found = reasons(width, height, density, load_per_core)
+    found = reasons(panel)
     if not found:
         return ""
     return "Steps will be slow: " + "; ".join(found) + ". " + LIGHTER_AVD + "."

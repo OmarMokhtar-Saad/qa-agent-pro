@@ -61,48 +61,49 @@ def guard_markers(sentinel: str) -> tuple[str, ...]:
 GUARD_MARKERS = guard_markers(derive_guard_sentinel(_GUARD, MAX_GUARD_SENTINEL_CHARS))
 
 
+# 2026-09-02 review: `\n` and `\r` alone were not "newlines". Python's own
+# str.splitlines treats seven characters as line breaks, and a markdown
+# renderer or a model reading the reply will break on U+2028 / U+2029 too --
+# so a value could still start its own line inside server-authored prose
+# while passing a `"\n" not in reply` assertion. Neutralise every one of
+# them, which is what the twelve call sites already believe this does.
+_LINE_SEPARATORS = (
+    "\n",
+    "\r",
+    "\v",
+    "\f",
+    "\x1c",
+    "\x1d",
+    "\x1e",
+    "\x85",
+    "\u2028",
+    "\u2029",
+)
+
+
+# Server-authored cards and replies are read by the host model as trusted
+# text, so a value containing a code fence or a newline could inject
+# instructions. This is the value-level sibling of ``wrap_untrusted``, which
+# wraps a BLOCK.
+#
+# Moved here from ``agents.api_test_agent._safe`` on 2026-09-02, because a text
+# sanitiser has no business living in an agent: three call sites in
+# ``handlers`` imported it from there, one of them outside any
+# ``try``.
+#
+# CORRECTED the same day, after review: the move was first justified by
+# claiming that import would raise ImportError on a public-distribution
+# install, since the dist does not copy ``agents/api_test_agent.py``. **That
+# was false.** ``qa_push_suite`` is registered inside
+# ``if not mcp_handlers._test_cases_only()``, the dist IS test-cases-only, so
+# the handler never registers there and its function-local import never runs.
+# This is correct placement, not a bug fix, and the ImportError it claimed to
+# prevent was unreachable. Never raises.
 def single_line(value: object, limit: int = 120) -> str:
-    """A single-line, fence-safe rendering of one untrusted VALUE.
-
-    Server-authored cards and replies are read by the host model as trusted
-    text, so a value containing a code fence or a newline could inject
-    instructions. This is the value-level sibling of ``wrap_untrusted``, which
-    wraps a BLOCK.
-
-    Moved here from ``agents.api_test_agent._safe`` on 2026-09-02, because a text
-    sanitiser has no business living in an agent: three call sites in
-    ``handlers`` imported it from there, one of them outside any
-    ``try``.
-
-    CORRECTED the same day, after review: the move was first justified by
-    claiming that import would raise ImportError on a public-distribution
-    install, since the dist does not copy ``agents/api_test_agent.py``. **That
-    was false.** ``qa_push_suite`` is registered inside
-    ``if not mcp_handlers._test_cases_only()``, the dist IS test-cases-only, so
-    the handler never registers there and its function-local import never runs.
-    This is correct placement, not a bug fix, and the ImportError it claimed to
-    prevent was unreachable. Never raises.
-    """
+    """A single-line, fence-safe rendering of one untrusted VALUE; never raises."""
     text = str(value if value is not None else "")
     text = text.replace("`", "'")
-    # 2026-09-02 review: `\n` and `\r` alone were not "newlines". Python's own
-    # str.splitlines treats seven characters as line breaks, and a markdown
-    # renderer or a model reading the reply will break on U+2028 / U+2029 too --
-    # so a value could still start its own line inside server-authored prose
-    # while passing a `"\n" not in reply` assertion. Neutralise every one of
-    # them, which is what the twelve call sites already believe this does.
-    for _sep in (
-        "\n",
-        "\r",
-        "\v",
-        "\f",
-        "\x1c",
-        "\x1d",
-        "\x1e",
-        "\x85",
-        "\u2028",
-        "\u2029",
-    ):
+    for _sep in _LINE_SEPARATORS:
         text = text.replace(_sep, " ")
     return text[:limit] + ("\u2026" if len(text) > limit else "")
 
@@ -134,6 +135,15 @@ def strip_spoof_tags(text: object) -> str:
 _UNSAFE_LABEL_CHARS = re.compile(r"[^a-zA-Z0-9_\-]")
 
 
+def _cap(text: str, limit: int) -> str:
+    """*text* with spoof tags stripped, cut to *limit* and marked when truncated."""
+    cleaned = strip_spoof_tags(text)
+    truncated = cleaned[:limit]
+    if len(cleaned) > limit:
+        truncated += "\n...[truncated]"
+    return truncated
+
+
 def wrap_untrusted(label: str, body: str, limit: int = 4000) -> str:
     """Wrap externally-sourced `body` text in a labeled, escaped, length-capped block.
 
@@ -147,12 +157,7 @@ def wrap_untrusted(label: str, body: str, limit: int = 4000) -> str:
     text = body if isinstance(body, str) else str(body or "")
     if not text.strip():
         return ""
-
-    cleaned = strip_spoof_tags(text)
-    truncated = cleaned[:limit]
-    if len(cleaned) > limit:
-        truncated += "\n...[truncated]"
-
+    truncated = _cap(text, limit)
     safe_label = _UNSAFE_LABEL_CHARS.sub("_", label) or "content"
     return (
         f'<untrusted_content source="{safe_label}">\n{truncated}\n</untrusted_content>'

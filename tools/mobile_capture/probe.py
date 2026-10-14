@@ -93,13 +93,21 @@ def classify(shell_result: object) -> str:
     sets (curl's TLS-specific codes vs. every other non-zero exit); the
     response dimension reads ``out`` only once ``rc == 0``.
     """
-    if not isinstance(shell_result, dict):
+    body = _reachable_body(shell_result)
+    if body is None:
         return INCONCLUSIVE
+    return _state_of(body)
+
+
+def _reachable_body(shell_result: object) -> dict | None:
+    """The reply's content dict, or None when the probe never reached the device."""
+    if not isinstance(shell_result, dict):
+        return None
     if shell_result.get("error"):
         # adb itself could not run the command at all (spawn failure, adb
         # missing, adb-level timeout). The device may be fine; the probe
         # simply never reached it, which says nothing about TLS.
-        return INCONCLUSIVE
+        return None
     body = shell_result.get("content")
     body = body if isinstance(body, dict) else {}
     err = str(body.get("err") or "")
@@ -107,7 +115,12 @@ def classify(shell_result: object) -> str:
         # The device is offline or gone. THE headline case: this must never
         # read as TLS_FAILURE, or a tester is told to fix a certificate that
         # was never reached.
-        return INCONCLUSIVE
+        return None
+    return body
+
+
+def _state_of(body: dict) -> str:
+    """The state for a reachable device's reply: rc first, then the marker."""
     rc = _classify_rc(body)
     if rc is None:
         return INCONCLUSIVE
@@ -119,7 +132,11 @@ def classify(shell_result: object) -> str:
         # says the certificate was rejected, so this is INCONCLUSIVE, not
         # TLS_FAILURE.
         return INCONCLUSIVE
-    out = str(body.get("out") or "")
+    return _marker_state(str(body.get("out") or ""))
+
+
+def _marker_state(out: str) -> str:
+    """DECRYPTED when the marker line is in *out*, else INCONCLUSIVE."""
     marker_line = (MARKER_HEADER + ": " + MARKER_VALUE).lower()
     if marker_line in out.lower():
         return DECRYPTED

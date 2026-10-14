@@ -28,14 +28,14 @@ import logging
 import threading
 
 from tools.mobile import run_store
+from tools.mobile.heartbeat_beat import (  # noqa: F401
+    _release_device_lock,
+    _run_is_finished,
+    beat_once,
+)
+from tools.mobile.heartbeat_writer import INTERVAL_S, Pace, _Writer  # noqa: F401
 
 logger = logging.getLogger(__name__)
-
-#: One quarter of ``run_store.LEASE_STALE_S``, so THREE consecutive missed beats
-#: are needed before another chat may take the run over. Derived rather than
-#: literal: a future change to the staleness window must not silently turn this
-#: into a writer that beats slower than the lease goes stale.
-INTERVAL_S = max(1.0, float(run_store.LEASE_STALE_S) / 4.0)
 
 NO_TOKEN = (
     "A lease heartbeat needs the session token that holds the run; without it "
@@ -46,226 +46,88 @@ _LOCK = threading.Lock()
 _WRITERS: dict = {}
 
 
-def _beat_once(run_id: str, session_token: str) -> bool:
-    """Refresh one heartbeat. ``True`` while the lease is still ours.
+def _ok(name: str, interval_s: float, state: tuple) -> dict:
+    content = {
+        "started": state[0],
+        "run_id": name,
+        "interval_s": interval_s,
+        "reason": state[1],
+    }
+    return {"error": None, "content": content}
 
-    Private on purpose, and the loop's whole decision: the tests drive THIS to
-    check the take-over behaviour without depending on thread scheduling.
-    """
+
+def _refuse(run_id: str, session_token: str) -> dict | None:
+    """The refusal reply for a bad run id or a missing token, else ``None``."""
+    if not run_store.valid_run_id(run_id):
+        return {
+            "error": "Refusing " + repr(str(run_id)[:40]) + " as a run id.",
+            "content": None,
+        }
+    if not str(session_token or "").strip():
+        return {"error": NO_TOKEN, "content": None}
+    return None
+
+
+# Start the heartbeat for *run_id*, held by *session_token*.
+#
+# ``{"error", "content": {"started", "run_id", "interval_s", "reason"}}``.
+# A second call for a run that already has a live writer returns
+# ``started=False, reason="already_running"`` rather than a second writer:
+# two threads refreshing one lease is not twice as safe, it is twice as many
+# things to stop.
+#
+# ``max_beats=0`` beats until stopped; a positive value is a BOUND, which is
+# also what makes the thread terminate deterministically under test instead of
+# a sleep the assertion has to outlast.
+def start(run_id: str, session_token: str, pace: Pace | None = None) -> dict:
+    """Start the heartbeat for *run_id*, held by *session_token*."""
     try:
-        status = run_store.touch_lease(run_id, session_token)
-        if status.get("error"):
-            return False
-        body = status.get("content") or {}
-        return str(body.get("state") or "") == run_store.HELD
-    except Exception:
-        logger.warning("mobile.heartbeat: could not refresh the lease for %s", run_id)
-        return False
-
-
-def _release_device_lock(run_id: str, session_token: str = "") -> None:
-    """Give the emulator back when THIS process loses *run_id*'s lease.
-
-    THE HOLDER RELEASING ITS OWN LOCK, not a reaper. The emulator lock is held
-    by this process under this run's id, and losing the lease is the moment this
-    process learns it is no longer the chat driving the run -- so it is the
-    moment to stop holding the device. Another chat that took the run over gets
-    it on its next attempt, at most one beat interval later.
-
-    Bound to the two stops that mean THIS PROCESS IS DONE DRIVING: ``lease_lost``
-    (another chat took the run) and ``run_finished`` (the run reached its
-    report). Deliberately NOT the other two: ``max_beats`` is a test-only bound
-    and releasing there would drop a live run's lock under test, and
-    ``stop``/``stop_all`` have no production caller (only this package's test
-    teardown), so releasing there would only surprise a test.
-
-    Never raises: a lock that could not be given back is a log line, and process
-    exit gives it back regardless -- the kernel owns liveness.
-    """
-    try:
-        from tools.mobile import locks
-
-        # THE DEVICE THIS RUN ACTUALLY HOLDS, asked of the fd table rather than
-        # named. A fixed name here would release a lock this run never took --
-        # silently, since `release` answers "not held" and nothing branches on
-        # it -- and leave the real device held until the process exited. The
-        # lease is still presented, so a writer whose lease was superseded is
-        # refused exactly as before: this changes WHICH lock is asked, never who
-        # is allowed to release it.
-        for name in locks.names_held_by(str(run_id)):
-            locks.release(name, owner=str(run_id), lease=str(session_token or ""))
-    except Exception:  # pragma: no cover - defensive
-        logger.warning(
-            "mobile.heartbeat: could not release the emulator lock for %s", run_id
-        )
-
-
-def _run_is_finished(run_id: str, session_token: str = "") -> bool:
-    """Has *run_id* reached its terminal state? ``False`` whenever unsure.
-
-    THE SAME PRODUCER the tester's own status reply reads -- ``session.resolve``
-    -- rather than a second derivation here. "Is this run over" answered in two
-    places drifts, and the copy that drifts is the one nobody is looking at.
-
-    Imported inside the call, like ``locks`` in the sibling above: this module is
-    loaded when the server starts and must not drag the session module in behind
-    it.
-
-    FAIL-SAFE IS KEEP BEATING. A writer that cannot tell holds the device it
-    already holds, which is exactly what it did before this existed; releasing on
-    an unreadable answer would hand a LIVE run's emulator to another chat, and
-    that is the failure the whole lease mechanism exists to prevent.
-    """
-    try:
-        from tools.mobile.session_core import STATE_REPORT
-        from tools.mobile.session_runs import resolve
-
-        resolved = resolve(str(run_id), str(session_token or ""))
-        if resolved.get("error"):
-            return False
-        body = resolved.get("content") or {}
-        return str(body.get("state") or "") == STATE_REPORT
-    except Exception:  # pragma: no cover - defensive
-        logger.warning("mobile.heartbeat: could not read the state of %s", run_id)
-        return False
-
-
-class _Writer:
-    """One run's beating thread. Private: nothing outside this module holds one."""
-
-    def __init__(
-        self,
-        run_id: str,
-        session_token: str,
-        interval_s: float,
-        max_beats: int,
-    ) -> None:
-        self.run_id = str(run_id)
-        self.session_token = str(session_token)
-        self.interval_s = float(interval_s)
-        self.max_beats = int(max_beats)
-        self.beats = 0
-        self.stop_reason = ""
-        self._stop = threading.Event()
-        self.thread = threading.Thread(
-            target=self._loop, name="qa-mobile-heartbeat", daemon=True
-        )
-
-    def stop(self) -> None:
-        self._stop.set()
-
-    def _loop(self) -> None:
-        """Beat FIRST, then wait.
-
-        The order is not cosmetic, and it was chosen by RUNNING it: with the
-        wait first, a `start()` immediately followed by `stop()` recorded zero
-        beats -- the stop event won the race -- so the writer had no observable
-        effect and the test asserting one was flaky by construction. Beating
-        first is also the better behaviour: starting a heartbeat refreshes the
-        lease at once rather than one interval later, which is exactly what a
-        chat resuming a run wants.
-        """
-        while True:
-            if not _beat_once(self.run_id, self.session_token):
-                self.stop_reason = "lease_lost"
-                _release_device_lock(self.run_id, self.session_token)
-                break
-            self.beats += 1
-            if self.max_beats and self.beats >= self.max_beats:
-                self.stop_reason = "max_beats"
-                break
-            # THE RUN IS OVER, so stop holding its emulator.
-            #
-            # WHY THE BEAT ABOVE DOES NOT COVER THIS: `_beat_once` answers "is
-            # the lease still mine", and for a run that has reached its report
-            # the answer is yes forever -- so the writer beat on and the device
-            # stayed held until the process exited. Measured: a run that stopped
-            # at `deadline_reached` held the emulator for 35 minutes while every
-            # other chat was refused, and the refusal offered a take-over that a
-            # finished run cannot accept.
-            #
-            # AFTER `max_beats` so a bounded test writer still stops for the
-            # reason its test named, and BEFORE the wait so the device comes
-            # back on the next beat rather than at process exit.
-            if _run_is_finished(self.run_id, self.session_token):
-                self.stop_reason = "run_finished"
-                _release_device_lock(self.run_id, self.session_token)
-                break
-            if self._stop.wait(self.interval_s):
-                self.stop_reason = self.stop_reason or "stopped"
-                break
-        self._stop.set()
-
-
-def start(
-    run_id: str,
-    session_token: str,
-    *,
-    interval_s: float = INTERVAL_S,
-    max_beats: int = 0,
-) -> dict:
-    """Start the heartbeat for *run_id*, held by *session_token*.
-
-    ``{"error", "content": {"started", "run_id", "interval_s", "reason"}}``.
-    A second call for a run that already has a live writer returns
-    ``started=False, reason="already_running"`` rather than a second writer:
-    two threads refreshing one lease is not twice as safe, it is twice as many
-    things to stop.
-
-    ``max_beats=0`` beats until stopped; a positive value is a BOUND, which is
-    also what makes the thread terminate deterministically under test instead of
-    a sleep the assertion has to outlast.
-    """
-    try:
-        if not run_store.valid_run_id(run_id):
-            return {
-                "error": "Refusing " + repr(str(run_id)[:40]) + " as a run id.",
-                "content": None,
-            }
-        token = str(session_token or "").strip()
-        if not token:
-            return {"error": NO_TOKEN, "content": None}
+        refused = _refuse(run_id, session_token)
+        if refused is not None:
+            return refused
         name = str(run_id)
-        running, writer = _start_register(name, token, interval_s, max_beats)
+        running, writer = _start_register(name, str(session_token).strip(), pace)
         if running is not None:
             return running
         writer.thread.start()
-        return {
-            "error": None,
-            "content": {
-                "started": True,
-                "run_id": name,
-                "interval_s": writer.interval_s,
-                "reason": "started",
-            },
-        }
+        return _ok(name, writer.interval_s, (True, "started"))
     except Exception as exc:
         logger.exception("mobile.heartbeat.start failed")
         return {"error": str(exc), "content": None}
 
 
-def _start_register(name, token, interval_s, max_beats):
+def _start_register(name: str, token: str, pace: Pace | None):
     """Register a new writer, or return the already_running reply."""
+    pace = pace or Pace()
     with _LOCK:
         existing = _WRITERS.get(name)
         if existing is not None and existing.thread.is_alive():
-            return {
-                "error": None,
-                "content": {
-                    "started": False,
-                    "run_id": name,
-                    "interval_s": existing.interval_s,
-                    "reason": "already_running",
-                },
-            }, None
-        writer = _Writer(
-            name,
-            token,
-            max(0.01, float(interval_s or INTERVAL_S)),
-            max(0, int(max_beats or 0)),
+            return _ok(name, existing.interval_s, (False, "already_running")), None
+        fixed = Pace(
+            max(0.01, float(pace.interval_s or INTERVAL_S)),
+            max(0, int(pace.max_beats or 0)),
         )
+        writer = _Writer(name, token, fixed)
         _WRITERS[name] = writer
     return None, writer
+
+
+def _stopped_reply(name: str, writer: _Writer | None) -> dict:
+    if writer is None:
+        content = {
+            "stopped": False,
+            "run_id": name,
+            "beats": 0,
+            "reason": "not_running",
+        }
+    else:
+        content = {
+            "stopped": True,
+            "run_id": name,
+            "beats": writer.beats,
+            "reason": writer.stop_reason or "stopped",
+        }
+    return {"error": None, "content": content}
 
 
 def stop(run_id: str, *, join_timeout: float = 2.0) -> dict:
@@ -274,27 +136,10 @@ def stop(run_id: str, *, join_timeout: float = 2.0) -> dict:
         name = str(run_id)
         with _LOCK:
             writer = _WRITERS.pop(name, None)
-        if writer is None:
-            return {
-                "error": None,
-                "content": {
-                    "stopped": False,
-                    "run_id": name,
-                    "beats": 0,
-                    "reason": "not_running",
-                },
-            }
-        writer.stop()
-        writer.thread.join(timeout=max(0.0, float(join_timeout)))
-        return {
-            "error": None,
-            "content": {
-                "stopped": True,
-                "run_id": name,
-                "beats": writer.beats,
-                "reason": writer.stop_reason or "stopped",
-            },
-        }
+        if writer is not None:
+            writer.stop()
+            writer.thread.join(timeout=max(0.0, float(join_timeout)))
+        return _stopped_reply(name, writer)
     except Exception as exc:
         logger.exception("mobile.heartbeat.stop failed")
         return {"error": str(exc), "content": None}

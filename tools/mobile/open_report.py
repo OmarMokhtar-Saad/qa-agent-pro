@@ -26,7 +26,9 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
+from config.settings_guard import never_raise
 from tools.mobile import platform_info
 
 logger = logging.getLogger(__name__)
@@ -34,6 +36,14 @@ logger = logging.getLogger(__name__)
 NO_OPENER = "no file opener on this machine"
 
 WINDOWS = "startfile"
+
+# Fire-and-forget: all three streams on DEVNULL and the child in its own session.
+_DETACHED: dict[str, Any] = {
+    "stdin": subprocess.DEVNULL,
+    "stdout": subprocess.DEVNULL,
+    "stderr": subprocess.DEVNULL,
+    "start_new_session": True,
+}
 
 
 def _opener() -> str:
@@ -61,33 +71,42 @@ def _result(opened: bool, how: str = "", detail: str = "") -> dict:
     }
 
 
+def _target(path: str) -> str:
+    """The report file to open (a folder resolves to its index), or ``""``."""
+    target = str(path or "")
+    # The report is a FOLDER now, so a caller may hand either the folder or
+    # its index. One resolution, here, rather than one in every caller.
+    if target and Path(target).is_dir():
+        target = str(Path(target) / "index.html")
+    return target if target and Path(target).is_file() else ""
+
+
+def _startfile(target: str) -> dict:
+    """The Windows branch: ``os.startfile`` where this platform has it."""
+    starter = getattr(os, "startfile", None)
+    if starter is None:
+        return _result(False, "", NO_OPENER)
+    starter(target)
+    return _result(True, "os.startfile")
+
+
 def open_report(path: str) -> dict:
     """``{"error", "content": {"opened", "how", "detail"}}``. Never raises."""
-    try:
-        target = str(path or "")
-        # The report is a FOLDER now, so a caller may hand either the folder or
-        # its index. One resolution, here, rather than one in every caller.
-        if target and Path(target).is_dir():
-            target = str(Path(target) / "index.html")
-        if not target or not Path(target).is_file():
+    with never_raise(
+        logger,
+        "mobile.open_report: could not open %s: %s",
+        path,
+        level=logging.WARNING,
+        with_exc=True,
+    ) as g:
+        target = _target(path)
+        if not target:
             return _result(False, "", "there is no report file at that path")
         opener = _opener()
         if not opener:
             return _result(False, "", NO_OPENER)
         if opener == WINDOWS:
-            starter = getattr(os, "startfile", None)
-            if starter is None:
-                return _result(False, "", NO_OPENER)
-            starter(target)
-            return _result(True, "os.startfile")
-        subprocess.Popen(
-            [opener, target],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+            return _startfile(target)
+        subprocess.Popen([opener, target], **_DETACHED)
         return _result(True, opener)
-    except Exception as exc:
-        logger.warning("mobile.open_report: could not open %s: %s", path, exc)
-        return _result(False, "", str(exc)[:200])
+    return _result(False, "", str(g.exc)[:200])

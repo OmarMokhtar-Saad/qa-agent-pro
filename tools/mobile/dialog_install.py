@@ -4,7 +4,7 @@ The installer belongs to another app, so a step that installs or updates an app
 used to be cut at the first installer screen. This handler taps the one control
 that moves the install forward. It never taps Uninstall: that control is not in
 its list, the central denylist would refuse it anyway, and
-:class:`~tools.mobile.dialog_defaults.ChoiceHandler` skips any screen that
+:class:`~tools.mobile.dialog_choice.ChoiceHandler` skips any screen that
 mentions an uninstall.
 
 Package ids are the stock Google, AOSP and Samsung installers. A vendor installer
@@ -14,7 +14,7 @@ not listed here is not handled and the executor refuses as before.
 from __future__ import annotations
 
 from tools.mobile import dialog_handlers as dh
-from tools.mobile.dialog_defaults import ChoiceHandler
+from tools.mobile.dialog_choice import ChoiceHandler
 
 INSTALLER_PACKAGES = frozenset(
     {

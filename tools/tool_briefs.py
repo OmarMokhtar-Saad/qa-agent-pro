@@ -14,6 +14,10 @@ This module imports nothing internal, so any layer may import it.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
+from config.settings_guard import never_raise
+
 TOOL_DESCRIPTION_MAX_CHARS = 1200
 TOOL_DESCRIPTIONS_TOTAL_MAX_CHARS = 15000
 
@@ -154,10 +158,9 @@ def append_tool_note(name: str, result: object) -> object:
     if not note or not isinstance(result, str):
         return result
     text = str(result) + "\n\n---\nTool note: " + note.strip()
-    try:
+    with never_raise():
         images = getattr(result, "images", None)
         if images is not None and type(result) is not str:
-            return type(result)(text, images)
+            return cast("Any", type(result))(text, images)
         return text
-    except Exception:
-        return result
+    return result

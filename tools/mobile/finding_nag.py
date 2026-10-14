@@ -9,6 +9,8 @@ where the notice is shown.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 FINDING_REMINDER = (
     "This step recorded no `finding`, so the report has nothing to show for it. "
     "Add one sentence with your final reply, even when everything went fine."
@@ -22,10 +24,16 @@ def should_remind(turn: int, max_turns: int, final: bool = False) -> bool:
     return int(max_turns or 0) > 0 and int(turn or 0) >= int(max_turns)
 
 
-def reminder(
-    turn: int, max_turns: int, *, final: bool = False, finding: object = ""
-) -> str:
+class Turn(NamedTuple):
+    """Where in the run a reply lands, and whether it is the closing one."""
+
+    turn: int
+    max_turns: int
+    final: bool = False
+
+
+def reminder(when: Turn, finding: object = "") -> str:
     """The reminder text, or ``""`` when a finding was given or it is not time."""
     if isinstance(finding, str) and finding.strip():
         return ""
-    return FINDING_REMINDER if should_remind(turn, max_turns, final) else ""
+    return FINDING_REMINDER if should_remind(*when) else ""

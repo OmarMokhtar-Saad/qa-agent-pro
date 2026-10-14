@@ -49,15 +49,24 @@ def _remember_timeout(key: str) -> None:
         del _TIMED_OUT[next(iter(_TIMED_OUT))]
 
 
+def _picked(result: Any, key: str, options: list) -> Optional[str]:
+    if getattr(result, "timed_out", False):
+        _remember_timeout(key)
+        log.info("mobile_elicit: a question timed out; later ones use the menu")
+        return None
+    if getattr(result, "status", "") != STATUS_CHOSEN:
+        return None
+    value = getattr(result, "value", None)
+    return value if value in options else None
+
+
+# The callback returns the option text the tester picked, or None for a
+# decline, a timeout, an unavailable client or a value that is not one of the
+# offered options (so a stray answer can never read as a choice).
 def make_mobile_ask(
     choose: Any, elicit_choice: ElicitFn, *, client_key: Callable[[], str]
 ) -> Optional[AskCb]:
-    """An AskCb over the host chooser, or None when the client cannot elicit.
-
-    The callback returns the option text the tester picked, or None for a
-    decline, a timeout, an unavailable client or a value that is not one of the
-    offered options (so a stray answer can never read as a choice).
-    """
+    """An AskCb over the host chooser, or None when the client cannot elicit."""
     if choose is None:
         return None
 
@@ -66,13 +75,6 @@ def make_mobile_ask(
         if timed_out(key):
             return None
         result = await elicit_choice(choose, question, list(options))
-        if getattr(result, "timed_out", False):
-            _remember_timeout(key)
-            log.info("mobile_elicit: a question timed out; later ones use the menu")
-            return None
-        if getattr(result, "status", "") != STATUS_CHOSEN:
-            return None
-        value = getattr(result, "value", None)
-        return value if value in options else None
+        return _picked(result, key, options)
 
     return ask

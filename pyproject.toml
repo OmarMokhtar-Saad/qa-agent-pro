@@ -1,6 +1,6 @@
 [project]
 name = "qa-agent-pro"
-version = "1.108.0"
+version = "1.109.0"
 requires-python = ">=3.10"
 dependencies = [
     "pyyaml>=6.0",  # contracts + OpenAPI specs are YAML (api_test agent)
@@ -167,12 +167,12 @@ ignore = ["E501"]
 "scripts/*" = ["T201"]
 "tests/*" = ["T201"]
 
-# Clean-code limits (.claude/agents/_shared/CODE_QUALITY_STANDARD.md). These
-# equal ruff's defaults and are written out to pin them. The rules are NOT in
+# Clean-code limits: the Clean Code book's (see AGENTS.md "Quality gates"),
+# stricter than ruff's defaults and CODE_QUALITY_STANDARD.md's max-args 5. The rules are NOT in
 # `select` above: the existing breaches would turn `ruff check .` red. They are
 # enforced as a per-file ratchet by tests/test_code_quality_ratchet.py instead.
 [tool.ruff.lint.mccabe]
 max-complexity = 10
 
 [tool.ruff.lint.pylint]
-max-args = 5
+max-args = 3

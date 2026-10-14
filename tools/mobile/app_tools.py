@@ -22,9 +22,14 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import Optional
+from typing import NamedTuple, Optional
 
-from tools.mobile import adb, app_info, update_app, user_confirm
+from tools.mobile import adb, app_info, update_app, user_confirm  # noqa: F401
+from tools.mobile.app_tools_uninstall import (
+    is_uninstall_question,
+    uninstall_prompt,
+    uninstalled,
+)
 from tools.mobile.resolve import AskCb
 from tools.mobile.update_app import UpdatePorts, UpdateReport, UpdateRequest
 from tools.untrusted import wrap_untrusted
@@ -73,39 +78,15 @@ def _target_code(value: object) -> Optional[int]:
     return code
 
 
-def _is_uninstall_question(report: UpdateReport) -> bool:
-    prefix = update_app.CONFIRM_UNINSTALL + ":"
-    return (
-        report.status == update_app.STATUS_CONFIRM
-        and report.confirm_action.startswith(prefix)
-    )
+class _Env(NamedTuple):
+    ports: UpdatePorts
+    ask: Optional[AskCb]
 
 
-def _question(report: UpdateReport) -> str:
-    return (
-        "Uninstall " + report.package + " from " + report.serial + " so the update "
-        "can install? That deletes all of the app data on the device."
-    )
-
-
-async def _uninstalled(report: UpdateReport) -> bool:
-    """True only when adb removed the app. ``adb.uninstall`` reports ``error``
-    None even on a non-zero exit, so the exit code is read here as well."""
-    got = await adb.uninstall(report.serial, report.package)
-    if got.get("error"):
-        return False
-    body = got.get("content")
-    return not (isinstance(body, dict) and body.get("rc"))
-
-
-async def _resolve_conflict(
-    req: UpdateRequest,
-    ports: UpdatePorts,
-    report: UpdateReport,
-    ask: Optional[AskCb],
-) -> str:
-    """Ask the tester; on a real yes uninstall once and retry once."""
-    consent = await user_confirm.confirm(_question(report), report.confirm_action, ask)
+async def _consented(report: UpdateReport, ask: Optional[AskCb]) -> str:
+    """The stop text when the tester did not agree or adb failed, else ``""``."""
+    question = uninstall_prompt(report)
+    consent = await user_confirm.confirm(question, report.confirm_action, ask)
     if consent is None:
         return _plain(
             "update_app: declined",
@@ -113,16 +94,24 @@ async def _resolve_conflict(
             "the update was not done. Do not uninstall without asking the tester "
             "again.",
         )
-    if not await _uninstalled(report):
+    if not await uninstalled(report):
         return _plain(
             "update_app: failed",
             "The uninstall did not succeed, so the update was not retried. Check "
             "the device and ask the tester how to continue.",
         )
+    return ""
+
+
+async def _resolve_conflict(req: UpdateRequest, report: UpdateReport, env: _Env) -> str:
+    """Ask the tester; on a real yes uninstall once and retry once."""
+    stop = await _consented(report, env.ask)
+    if stop:
+        return stop
     retry = await update_app.update_app(
-        dataclasses.replace(req, package=report.package), ports
+        dataclasses.replace(req, package=report.package), env.ports
     )
-    if _is_uninstall_question(retry):
+    if is_uninstall_question(retry):
         return _plain(
             "update_app: failed",
             "The install still conflicts after the uninstall. Stopped without a "
@@ -146,8 +135,8 @@ async def _run(
         )
     use = ports or update_app.default_ports(ask)
     report = await update_app.update_app(req, use)
-    if _is_uninstall_question(report):
-        return await _resolve_conflict(req, use, report, ask)
+    if is_uninstall_question(report):
+        return await _resolve_conflict(req, report, _Env(use, ask))
     return _render(report)
 
 

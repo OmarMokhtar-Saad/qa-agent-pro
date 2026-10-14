@@ -22,301 +22,58 @@ The report text may carry device or app text; the handler wraps it with
 
 from __future__ import annotations
 
-import asyncio
+import asyncio  # noqa: F401
 import logging
-import time
-from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Optional
+import time  # noqa: F401
+from dataclasses import dataclass, field  # noqa: F401
+from functools import partial
+from typing import Any, Awaitable, Callable, Optional  # noqa: F401
 
-from tools.device_manager import valid_package_name
+from tools.device_manager import valid_package_name  # noqa: F401
 from tools.mobile import (
     app_info,
     app_pick,
     device_pick,
-    install_errors,
+    install_errors,  # noqa: F401
     install_source,
-    run_verdict,
+    install_sources,
+    run_verdict,  # noqa: F401
 )
 from tools.mobile.adb_device_ui import AdbDeviceUi
-from tools.mobile.app_info import AppVersion
+from tools.mobile.app_info import AppVersion  # noqa: F401
 from tools.mobile.app_pick import PickRequest
-from tools.mobile.install_source import InstallOutcome, InstallRequest, InstallSource
-from tools.mobile.resolve import ASK, MAX_ASK_OPTIONS, AskCb, Resolution
-from tools.mobile.run_verdict import OUTCOME_PASS, Verdict
-
-log = logging.getLogger(__name__)
-
-#: Characters of one report message. The host model re-reads it every turn; it
-#: is a verdict plus two version lines, or one question.
-MAX_UPDATE_MESSAGE_CHARS = 800
-
-STATUS_OK = "ok"
-STATUS_ASK = "ask"
-STATUS_CONFIRM = "confirm"
-STATUS_FAILED = "failed"
-STATUS_UNVERIFIED = "unverified"
-
-SOURCE_DEFAULT = "app_tester"
-CONFIRM_UNINSTALL = "uninstall"
-
-#: App Tester outcome codes that are a question for the tester, not a failure.
-ASK_CODES = frozenset({"app_ambiguous", "app_not_found", "release_ambiguous"})
-
-#: What a port may raise. Narrow on purpose: a bug (TypeError, AttributeError)
-#: must surface, and CancelledError is not an Exception so it always propagates.
-PORT_FAILURES = (
-    OSError,
-    RuntimeError,
-    TimeoutError,
-    asyncio.TimeoutError,
-    ValueError,
-    LookupError,
+from tools.mobile.install_source import (  # noqa: F401
+    InstallOutcome,
+    InstallRequest,
+    InstallSource,
+)
+from tools.mobile.resolve import ASK, MAX_ASK_OPTIONS, AskCb, Resolution  # noqa: F401
+from tools.mobile.run_verdict import OUTCOME_PASS, Verdict  # noqa: F401
+from tools.mobile.update_app_run import _Phases, _Run, _verdict  # noqa: F401
+from tools.mobile.update_app_types import (  # noqa: F401
+    ASK_CODES,
+    CONFIRM_UNINSTALL,
+    MAX_UPDATE_MESSAGE_CHARS,
+    PORT_FAILURES,
+    SOURCE_DEFAULT,
+    STATUS_ASK,
+    STATUS_CONFIRM,
+    STATUS_FAILED,
+    STATUS_OK,
+    STATUS_UNVERIFIED,
+    Clock,
+    Landing,
+    UpdatePorts,
+    UpdateReport,
+    UpdateRequest,
+    _clip,
+    _install_label,
+    _status,
+    _summary,
+    _version_line,
 )
 
-Clock = Callable[[], float]
-
-
-@dataclass(frozen=True)
-class UpdateRequest:
-    serial: str = ""
-    app_text: str = ""
-    package: str = ""
-    source: str = SOURCE_DEFAULT
-    app_label: str = ""
-    target_version_code: Optional[int] = None
-
-
-def _install_label(request: UpdateRequest) -> str:
-    """The display name an install source lists the app by: the explicit label,
-    else the tester's own words for the app unless they are a package id."""
-    label = str(request.app_label or "").strip()
-    if label:
-        return label
-    text = str(request.app_text or "").strip()
-    return "" if valid_package_name(text) else text
-
-
-@dataclass(frozen=True)
-class UpdatePorts:
-    """Everything update_app touches, injected so tests need no device."""
-
-    pick_device: Callable[[str], Awaitable[Resolution]]
-    pick_package: Callable[[PickRequest], Awaitable[Resolution]]
-    read_version: Callable[[str, str], Awaitable[Optional[AppVersion]]]
-    get_source: Callable[[str], Optional[InstallSource]]
-    launch: Callable[[str, str], Awaitable[bool]]
-    foreground: Callable[[str], Awaitable[str]]
-    ask: Optional[AskCb] = None
-    clock: Clock = time.monotonic
-
-
-@dataclass(frozen=True)
-class UpdateReport:
-    status: str
-    message: str
-    serial: str = ""
-    package: str = ""
-    before: Optional[AppVersion] = None
-    after: Optional[AppVersion] = None
-    verdict: Optional[Verdict] = None
-    confirm_action: str = ""
-    options: tuple = ()
-    timings_ms: dict = field(default_factory=dict)
-
-    def to_dict(self) -> dict:
-        return {
-            "status": self.status,
-            "message": self.message,
-            "serial": self.serial,
-            "package": self.package,
-            "before": self.before.to_dict() if self.before else None,
-            "after": self.after.to_dict() if self.after else None,
-            "verdict": self.verdict.line() if self.verdict else "",
-            "confirmAction": self.confirm_action,
-            "options": list(self.options),
-            "timingsMs": dict(self.timings_ms),
-        }
-
-
-def _clip(text: object) -> str:
-    return str(text or "").strip()[:MAX_UPDATE_MESSAGE_CHARS]
-
-
-class _Phases:
-    """Milliseconds per phase, from the injected clock."""
-
-    def __init__(self, clock: Clock) -> None:
-        self._clock = clock
-        self.ms: dict = {}
-
-    async def run(self, name: str, work: Awaitable):
-        started = self._clock()
-        try:
-            return await work
-        finally:
-            self.ms[name] = int((self._clock() - started) * 1000)
-
-
-def _status(verdict: Optional[Verdict], launched: bool) -> str:
-    if not launched:
-        return STATUS_FAILED
-    if verdict is None:
-        return STATUS_UNVERIFIED
-    return STATUS_OK if verdict.outcome == OUTCOME_PASS else STATUS_FAILED
-
-
-def _version_line(label: str, version: Optional[AppVersion]) -> str:
-    return label + ": " + (version.line() if version else "not readable") + "."
-
-
-def _summary(
-    package: str,
-    launched: bool,
-    versions: tuple,
-    verdict: Optional[Verdict],
-) -> str:
-    parts = []
-    if not launched:
-        parts.append("Installed, but launching " + package + " failed.")
-    if verdict is None:
-        parts.append(
-            "Could not verify the update: the installed version was unreadable, "
-            "or there was no earlier version or target to compare with."
-        )
-    else:
-        parts.append(verdict.line())
-    parts.append(_version_line("Before", versions[0]))
-    parts.append(_version_line("After", versions[1]))
-    return " ".join(parts)
-
-
-class _Run:
-    """State of one update_app call: the request, the ports, what was resolved."""
-
-    def __init__(self, request: UpdateRequest, ports: UpdatePorts) -> None:
-        self.request = request
-        self.ports = ports
-        self.phases = _Phases(ports.clock)
-        self.serial = ""
-        self.package = ""
-
-    def report(self, status: str, message: str, **extra: object) -> UpdateReport:
-        return UpdateReport(
-            status,
-            _clip(message),
-            self.serial,
-            self.package,
-            timings_ms=dict(self.phases.ms),
-            **extra,
-        )
-
-    def unresolved(self, got: Resolution) -> UpdateReport:
-        if got.status == ASK:
-            shown = tuple(c.display() for c in got.options[:MAX_ASK_OPTIONS])
-            return self.report(STATUS_ASK, got.menu(), options=shown)
-        return self.report(STATUS_FAILED, got.question or "Nothing matched.")
-
-    async def source_problem(
-        self, source: Optional[InstallSource]
-    ) -> Optional[UpdateReport]:
-        name = repr(str(self.request.source)[:40])
-        if source is None:
-            return self.report(
-                STATUS_FAILED, "No install source named " + name + " is registered."
-            )
-        ready = await self.phases.run("source", source.available(self.serial))
-        if ready:
-            return None
-        return self.report(
-            STATUS_FAILED,
-            "The install source " + name + " is not available on " + self.serial + ".",
-        )
-
-    def confirmation(self, outcome: InstallOutcome) -> UpdateReport:
-        if outcome.needs_confirmation != CONFIRM_UNINSTALL:
-            asked = repr(str(outcome.needs_confirmation)[:40])
-            return self.report(
-                STATUS_FAILED,
-                "The install source asked for " + asked + ", which is not "
-                "supported. Nothing was changed.",
-            )
-        action = CONFIRM_UNINSTALL + ":" + self.serial + ":" + self.package
-        why = outcome.message or install_errors.explain(outcome.code).guidance
-        head = (
-            "The tester must agree before "
-            + self.package
-            + " is uninstalled on "
-            + self.serial
-            + " (that deletes its data; nothing is uninstalled "
-            "automatically). "
-        )
-        return self.report(STATUS_CONFIRM, head + why, confirm_action=action)
-
-    def install_stop(self, outcome: InstallOutcome) -> Optional[UpdateReport]:
-        if outcome.needs_confirmation:
-            return self.confirmation(outcome)
-        if outcome.ok:
-            return None
-        if outcome.code in ASK_CODES:
-            fallback = "Ask the user which one they mean; do not guess."
-            return self.report(STATUS_ASK, outcome.message or fallback)
-        why = outcome.message or install_errors.explain(outcome.code).guidance
-        return self.report(STATUS_FAILED, why)
-
-    async def finish(self, before: Optional[AppVersion]) -> UpdateReport:
-        ports, serial, package = self.ports, self.serial, self.package
-        launched = await self.phases.run("launch", ports.launch(serial, package))
-        after = await self.phases.run(
-            "version_after", ports.read_version(serial, package)
-        )
-        shown = await self.phases.run("foreground", ports.foreground(serial))
-        verdict = run_verdict.auto_verify_install(
-            previous_code=before.version_code if before else None,
-            installed_code=after.version_code if after else None,
-            target_code=self.request.target_version_code,
-            foreground_package=shown,
-            package=package,
-        )
-        return self.report(
-            _status(verdict, launched),
-            _summary(package, launched, (before, after), verdict),
-            before=before,
-            after=after,
-            verdict=verdict,
-        )
-
-    async def run(self) -> UpdateReport:
-        request, ports = self.request, self.ports
-        device = await self.phases.run("device", ports.pick_device(request.serial))
-        if not device.resolved:
-            return self.unresolved(device)
-        self.serial = str(device.value)
-        pick = PickRequest(request.app_text, self.serial, request.package)
-        app = await self.phases.run("package", ports.pick_package(pick))
-        if not app.resolved:
-            return self.unresolved(app)
-        self.package = str(app.value)
-        source = ports.get_source(request.source)
-        problem = await self.source_problem(source)
-        if problem is not None:
-            return problem
-        before = await self.phases.run(
-            "version_before", ports.read_version(self.serial, self.package)
-        )
-        install_request = InstallRequest(
-            self.serial,
-            self.package,
-            _install_label(request),
-            None,
-            request.target_version_code,
-        )
-        outcome = await self.phases.run(
-            "install", source.install(install_request, ports.ask)
-        )
-        stop = self.install_stop(outcome)
-        if stop is not None:
-            return stop
-        return await self.finish(before)
+log = logging.getLogger(__name__)
 
 
 async def update_app(request: UpdateRequest, ports: UpdatePorts) -> UpdateReport:
@@ -334,34 +91,36 @@ async def update_app(request: UpdateRequest, ports: UpdatePorts) -> UpdateReport
         )
 
 
+async def _pick_device(requested: str, ask: Optional[AskCb]) -> Resolution:
+    return await device_pick.pick_device(requested, ask=ask)
+
+
+async def _pick_package(request: PickRequest, ask: Optional[AskCb]) -> Resolution:
+    return await app_pick.pick_package(request, app_pick.PickPorts(ask=ask))
+
+
+async def _launch(serial: str, package: str) -> bool:
+    return await AdbDeviceUi(serial).launch(package)
+
+
+async def _foreground(serial: str) -> str:
+    return await AdbDeviceUi(serial).foreground()
+
+
 def default_ports(ask: Optional[AskCb] = None) -> UpdatePorts:
     """Ports over the real adb-backed modules; ``ask`` is the tester question.
 
     Registers the shipped install sources first (idempotent), so ``app_tester``
     resolves without depending on server start-up wiring.
     """
-    from tools.mobile import install_sources
 
     install_sources.register_defaults()
-
-    async def pick_device(requested: str) -> Resolution:
-        return await device_pick.pick_device(requested, ask=ask)
-
-    async def pick_package(request: PickRequest) -> Resolution:
-        return await app_pick.pick_package(request, ask=ask)
-
-    async def launch(serial: str, package: str) -> bool:
-        return await AdbDeviceUi(serial).launch(package)
-
-    async def foreground(serial: str) -> str:
-        return await AdbDeviceUi(serial).foreground()
-
     return UpdatePorts(
-        pick_device,
-        pick_package,
+        partial(_pick_device, ask=ask),
+        partial(_pick_package, ask=ask),
         app_info.read_version,
         install_source.get_source,
-        launch,
-        foreground,
+        _launch,
+        _foreground,
         ask,
     )

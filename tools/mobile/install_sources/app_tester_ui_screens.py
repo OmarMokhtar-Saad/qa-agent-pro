@@ -1,0 +1,80 @@
+"""App Tester UI: the per-screen steps (own app, foreign dialog, tester page)."""
+
+from __future__ import annotations
+
+from typing import Optional
+
+from tools.mobile import dialog_handlers
+from tools.mobile.dialog_handlers import (
+    BACK,
+    TAP_RID,
+    DialogAction,
+    DialogContext,
+    visible_texts,
+)
+from tools.mobile.install_source import DeviceUi, InstallOutcome
+from tools.mobile.install_sources.app_tester_ui_consts import (
+    APP_TESTER_PACKAGE,
+    APP_TESTER_POLL_S,
+    Seen,
+    _Flow,
+    _Run,
+)
+from tools.mobile.install_sources.app_tester_ui_funcs import _foreign_stop, _in_progress
+
+
+class _ScreenMixin:
+    """The screen-level steps of the flow."""
+
+    async def _step(self: _Flow, run: _Run) -> Optional[InstallOutcome]:
+        shot = await run.ui.screen()
+        if shot is None:
+            await self._sleep(APP_TESTER_POLL_S)
+            return None
+        front = await run.ui.foreground()
+        texts = visible_texts(shot.xml)
+        if front == APP_TESTER_PACKAGE:
+            return await self._tester_screen(run, texts)
+        if front == run.request.package:
+            return await self._own_app(run)
+        return await self._foreign(run, Seen(front, shot.xml, texts))
+
+    async def _own_app(self: _Flow, run: _Run) -> Optional[InstallOutcome]:
+        if not run.tapped:
+            return InstallOutcome(
+                False,
+                "unrecognised_screen",
+                "The app itself is in front, not the App Tester. Nothing was tapped.",
+            )
+        await self._sleep(APP_TESTER_POLL_S)
+        return None
+
+    async def _foreign(self: _Flow, run: _Run, seen: Seen) -> Optional[InstallOutcome]:
+        front, xml, texts = seen
+        expected = frozenset({APP_TESTER_PACKAGE, run.request.package})
+        ctx = DialogContext(run.request.serial, front, expected, xml)
+        action = dialog_handlers.handle(ctx)
+        if action is not None:
+            await self._perform(run.ui, action)
+            return None
+        if _in_progress(texts):
+            await self._sleep(APP_TESTER_POLL_S)
+            return None
+        return _foreign_stop(front, texts)
+
+    async def _perform(self: _Flow, ui: DeviceUi, action: DialogAction) -> None:
+        if action.kind == BACK:
+            await ui.press_back()
+        elif action.kind == TAP_RID:
+            await ui.tap_resource_id(action.value)
+        else:
+            await ui.tap_text(action.value)
+        await self._sleep(APP_TESTER_POLL_S)
+
+    async def _tester_screen(self: _Flow, run: _Run, texts) -> Optional[InstallOutcome]:
+        if _in_progress(texts):
+            await self._sleep(APP_TESTER_POLL_S)
+            return None
+        if not run.card_tapped:
+            return await self._open_card(run, texts)
+        return await self._detail(run, texts)

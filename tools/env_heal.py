@@ -13,11 +13,13 @@ commented out.
 from __future__ import annotations
 
 import logging
-import os
+import os  # noqa: F401
 import re
-import tempfile
-import time
+import tempfile  # noqa: F401
+import time  # noqa: F401
 from pathlib import Path
+
+from tools.env_heal_write import commit
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +48,7 @@ HEAL_RULES: dict[str, tuple[tuple[str, ...], str, str]] = {
     # (default false), so "false" is the current default, not a superseded one.
 }
 
-_MAX_ENV_BYTES = 1_000_000
+MAX_ENV_BYTES = 1_000_000
 
 
 def _split(line: str) -> tuple[str, str]:
@@ -56,6 +58,21 @@ def _split(line: str) -> tuple[str, str]:
         return "", ""
     key, _, value = stripped.partition("=")
     return key.strip(), value.strip()
+
+
+def _rewrite(line: str, key: str, edit: tuple[str, str]) -> str:
+    """``line`` with ``edit`` = (value, new_value) applied to ``key``'s value."""
+    value, new_value = edit
+    # Preserve the original indentation/spacing style of the line. Match the
+    # KEY and the value as the operator typed them ("KEY = v" included); a
+    # plain "=value" replace silently missed spaced assignments.
+    return re.sub(
+        rf"^(\s*{re.escape(key)}\s*=\s*){re.escape(value)}",
+        lambda m: m.group(1) + new_value,
+        line,
+        count=1,
+        flags=re.IGNORECASE,
+    )
 
 
 def _scan(raw: str) -> tuple[list[str], list[tuple[str, str, str, str]]]:
@@ -69,16 +86,7 @@ def _scan(raw: str) -> tuple[list[str], list[tuple[str, str, str, str]]]:
         superseded, new_value, reason = HEAL_RULES[key]
         if value.lower() not in superseded or value == new_value:
             continue
-        # Preserve the original indentation/spacing style of the line. Match the
-        # KEY and the value as the operator typed them ("KEY = v" included); a
-        # plain "=value" replace silently missed spaced assignments.
-        new_line = re.sub(
-            rf"^(\s*{re.escape(key)}\s*=\s*){re.escape(value)}",
-            lambda m: m.group(1) + new_value,
-            line,
-            count=1,
-            flags=re.IGNORECASE,
-        )
+        new_line = _rewrite(line, key, (value, new_value))
         if new_line == line:
             continue  # could not rewrite it -- do not report it as healed
         lines[idx] = new_line
@@ -92,7 +100,7 @@ def _read_env(install_dir: Path, result: dict) -> tuple[Path, str | None]:
     if not env.is_file():
         return env, None
     raw = env.read_text(encoding="utf-8")
-    if len(raw.encode("utf-8", "ignore")) > _MAX_ENV_BYTES:
+    if len(raw.encode("utf-8", "ignore")) > MAX_ENV_BYTES:
         result["error"] = "the .env is unexpectedly large -- not touching it"
         return env, None
     return env, raw
@@ -117,63 +125,43 @@ def find_superseded(install_dir: Path) -> dict:
         return result
 
 
-def _write_backup_and_replace(
-    env: Path, backup: Path, raw: str, new_text: str, mode: int
-) -> None:
-    """Write the backup of *raw*, then atomically replace *env* with *new_text*."""
-    # Backup carries the .env's own mode (it holds the same secrets).
-    bfd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
-    with os.fdopen(bfd, "w", encoding="utf-8") as fh:
-        fh.write(raw)
-    # Atomic replace: a crash mid-write must not leave a truncated .env.
-    tfd, tmp = tempfile.mkstemp(dir=str(env.parent), prefix=".env.tmp-")
-    try:
-        with os.fdopen(tfd, "w", encoding="utf-8") as fh:
-            fh.write(new_text)
-        os.chmod(tmp, mode)
-        os.replace(tmp, env)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+def _join(raw: str, lines: list[str]) -> str:
+    """``lines`` re-joined, keeping ``raw``'s trailing newline (or lack of one)."""
+    trailing = "\n" if raw.endswith("\n") else ""
+    return "\n".join(lines) + trailing
 
 
+def _heal(install_dir: Path, result: dict) -> None:
+    """Rewrite the superseded values in ``install_dir/.env``, filling ``result``."""
+    env, raw = _read_env(install_dir, result)
+    if raw is None:
+        return
+    lines, changed = _scan(raw)
+    if not changed:
+        return
+    new_text = _join(raw, lines)
+    if new_text == raw:
+        return
+    backup = commit(env, raw, new_text)
+    result["changed"] = changed
+    result["backup"] = str(backup)
+    logger.info(
+        "env self-heal rewrote %d superseded value(s); backup at %s",
+        len(changed),
+        backup,
+    )
+
+
+# Rewrite superseded default values in ``install_dir/.env``.
+#
+# Returns ``{"changed": [(key, old, new, reason), ...], "backup": str,
+# "error": None}``. ``changed`` is empty when there is nothing to do, which is
+# the normal case. Never raises.
 def heal_env(install_dir: Path) -> dict:
-    """Rewrite superseded default values in ``install_dir/.env``.
-
-    Returns ``{"changed": [(key, old, new, reason), ...], "backup": str,
-    "error": None}``. ``changed`` is empty when there is nothing to do, which is
-    the normal case. Never raises.
-    """
     result: dict = {"changed": [], "backup": "", "error": None}
     try:
-        env, raw = _read_env(install_dir, result)
-        if raw is None:
-            return result
-
-        lines, changed = _scan(raw)
-        if not changed:
-            return result
-
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        backup = env.with_name(f".env.bak-{stamp}")
-        trailing = "\n" if raw.endswith("\n") else ""
-        new_text = "\n".join(lines) + trailing
-        if new_text == raw:
-            return result
-        try:
-            mode = env.stat().st_mode & 0o777
-        except OSError:
-            mode = 0o600
-        _write_backup_and_replace(env, backup, raw, new_text, mode)
-        result["changed"] = changed
-        result["backup"] = str(backup)
-        logger.info(
-            "env self-heal rewrote %d superseded value(s); backup at %s",
-            len(changed),
-            backup,
-        )
-        return result
+        _heal(install_dir, result)
     except Exception as exc:
         logger.exception("env self-heal failed - leaving the .env untouched")
         result["error"] = str(exc)
-        return result
+    return result

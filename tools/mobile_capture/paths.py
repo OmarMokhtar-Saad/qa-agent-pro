@@ -97,6 +97,17 @@ def cert_marker(serial: str) -> Path:
     return capture_root() / ("cert-" + safe_name(serial) + ".json")
 
 
+def _make_private(path: Path) -> None:
+    """Create *path* and tighten it to 0700 where the platform allows."""
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        # Windows ignores POSIX modes and some network volumes refuse
+        # the call outright, exactly as mobile.paths.ensure_tree says.
+        logger.info("mobile_capture.paths: could not tighten %s", path)
+
+
 def ensure_tree() -> dict:
     """Create ``capture/`` and its children. ``{"error", "content"}``."""
     try:
@@ -105,13 +116,7 @@ def ensure_tree() -> dict:
             return {"error": base["error"], "content": None}
         dirs: dict[str, str] = {}
         for path in (capture_root(), ca_dir(), tmp_dir()):
-            path.mkdir(parents=True, exist_ok=True)
-            try:
-                path.chmod(0o700)
-            except OSError:
-                # Windows ignores POSIX modes and some network volumes refuse
-                # the call outright, exactly as mobile.paths.ensure_tree says.
-                logger.info("mobile_capture.paths: could not tighten %s", path)
+            _make_private(path)
             dirs[path.name] = str(path)
         return {
             "error": None,

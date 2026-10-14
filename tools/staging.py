@@ -30,6 +30,9 @@ import tempfile
 import time
 from pathlib import Path
 
+from config.settings_guard import never_raise
+from tools.process_env import get_env_str, home_dir
+
 logger = logging.getLogger(__name__)
 
 #: Default root, relative to the user's home directory. Overridable with
@@ -46,33 +49,31 @@ _ENV_VAR = "QA_STAGING_DIR"
 
 def staging_root() -> Path:
     """The staging root. Pure: creates nothing, never raises."""
-    raw = (os.environ.get("QA_STAGING_DIR") or "").strip()
+    raw = get_env_str("QA_STAGING_DIR")
     if raw:
         try:
             return Path(raw).expanduser()
-        except Exception:
+        except (OSError, RuntimeError, TypeError, ValueError):
             logger.warning(
                 "staging: unusable %s=%r -- using the default", _ENV_VAR, raw
             )
-    return Path.home().joinpath(*DEFAULT_ROOT_PARTS)
+    return home_dir().joinpath(*DEFAULT_ROOT_PARTS)
 
 
+# Never under ``tempfile.gettempdir()`` -- that is the one thing this
+# helper exists to avoid; see the module docstring.
+#
+# ``name`` is sanitised to its final path component before use: D1
+# (2026-09-26, v1.98 scope D) closed a path-traversal defect where an
+# unsanitised multi-segment ``name`` (or an absolute path) could create a
+# directory outside ``staging_root()``. ``Path(name).name`` already
+# collapses those cases, but a single-segment ``".."`` is pathlib's one
+# exception -- it returns ``".."`` verbatim (unlike ``"."``, which parses
+# to ``""``) -- so ``""``, ``"."`` and ``".."`` are folded to a literal
+# ``"default"`` subdirectory, preserving this module's never-raises
+# posture (degrade to a safe default, do not raise).
 def staging_dir(name: str) -> Path:
-    """Create (0700) and return a named subdirectory of the staging root.
-
-    Never under ``tempfile.gettempdir()`` -- that is the one thing this
-    helper exists to avoid; see the module docstring.
-
-    ``name`` is sanitised to its final path component before use: D1
-    (2026-09-26, v1.98 scope D) closed a path-traversal defect where an
-    unsanitised multi-segment ``name`` (or an absolute path) could create a
-    directory outside ``staging_root()``. ``Path(name).name`` already
-    collapses those cases, but a single-segment ``".."`` is pathlib's one
-    exception -- it returns ``".."`` verbatim (unlike ``"."``, which parses
-    to ``""``) -- so ``""``, ``"."`` and ``".."`` are folded to a literal
-    ``"default"`` subdirectory, preserving this module's never-raises
-    posture (degrade to a safe default, do not raise).
-    """
+    """Create (0700) and return a named subdirectory of the staging root."""
     safe_name = Path(str(name)).name
     if safe_name in ("", ".", ".."):
         safe_name = "default"
@@ -101,30 +102,31 @@ def make_staging_path(name: str, prefix: str, suffix: str) -> str:
     return path
 
 
-def prune_stale(name: str, glob_pattern: str, max_age_seconds: int = 3600) -> int:
-    """Delete files under ``staging_dir(name)`` matching glob_pattern that are
-    older than max_age_seconds. Returns the count deleted; never raises.
-
-    Same age-based sweep every exporter's ``cleanup_temp_files`` already runs
-    (see tools/xlsx_generator.py) -- reused rather than reinvented, so this
-    staging root gets the one pruning shape the codebase already has instead
-    of a second, divergent one.
-    """
-    deleted = 0
+def _prune_one(path: Path, now: float, max_age: int) -> bool:
+    """Delete one staged file if it is stale; True when it was removed."""
     try:
-        base = staging_dir(name)
+        age = now - path.stat().st_mtime
+        if age > max_age:
+            path.unlink(missing_ok=True)
+            logger.info("Cleaned up stale staged file: %s (age %.0fs)", path, age)
+            return True
+    except OSError:
+        logger.warning("Could not check/delete staged file: %s", path)
+    return False
+
+
+# Delete files under ``staging_dir(name)`` matching glob_pattern that are
+# older than max_age_seconds. Returns the count deleted; never raises.
+#
+# Same age-based sweep every exporter's ``cleanup_temp_files`` already runs
+# (see tools/xlsx_generator.py) -- reused rather than reinvented, so this
+# staging root gets the one pruning shape the codebase already has instead
+# of a second, divergent one.
+def prune_stale(name: str, glob_pattern: str, max_age_seconds: int = 3600) -> int:
+    """Delete stale files under ``staging_dir(name)``; return the count."""
+    deleted = 0
+    with never_raise(logger, "prune_stale(%s) failed", name, exc_info=True):
         now = time.time()
-        for path in base.glob(glob_pattern):
-            try:
-                age = now - path.stat().st_mtime
-                if age > max_age_seconds:
-                    path.unlink(missing_ok=True)
-                    deleted += 1
-                    logger.info(
-                        "Cleaned up stale staged file: %s (age %.0fs)", path, age
-                    )
-            except OSError:
-                logger.warning("Could not check/delete staged file: %s", path)
-    except Exception:
-        logger.debug("prune_stale(%s) failed", name, exc_info=True)
+        for path in staging_dir(name).glob(glob_pattern):
+            deleted += _prune_one(path, now, max_age_seconds)
     return deleted

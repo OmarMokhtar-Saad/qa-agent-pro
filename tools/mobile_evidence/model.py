@@ -16,6 +16,7 @@ is worse than an empty cell, because nobody re-checks a number already printed.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any, NamedTuple, cast
 
 KNOWN = "known"
 ABSENT = "absent"
@@ -68,21 +69,26 @@ def not_captured(why: str) -> Value:
     return Value(NOT_CAPTURED, None, why)
 
 
-def price(
-    model: object, tokens_in: object, tokens_out: object, rates: dict | None
-) -> float | None:
+class TokenCount(NamedTuple):
+    """The input and output token counts of one call, as recorded (any type)."""
+
+    tokens_in: object
+    tokens_out: object
+
+
+def price(model: object, tokens: TokenCount, rates: dict | None) -> float | None:
     """USD for one call from a ``{model: [in_per_1M, out_per_1M]}`` table, or None.
 
     None means "unpriced": the model is not in the table, or the token counts are not
     numbers. The caller counts the tokens anyway and says the cost is partial.
     """
-    pair = (rates or {}).get(str(model or ""))
+    pair: Any = (rates or {}).get(str(model or ""))
     if not isinstance(pair, (list, tuple)) or len(pair) != 2:
         return None
     try:
         rate_in, rate_out = float(pair[0]), float(pair[1])
-        count_in = float(tokens_in or 0)
-        count_out = float(tokens_out or 0)
+        count_in = float(cast("Any", tokens.tokens_in or 0))
+        count_out = float(cast("Any", tokens.tokens_out or 0))
     except (TypeError, ValueError, OverflowError):
         return None
     return count_in / 1e6 * rate_in + count_out / 1e6 * rate_out

@@ -150,7 +150,7 @@ def _env_fingerprint():
     tester edit -- so a release fanned a restart out across every
     supervisor sharing this install, even when the settings were
     unchanged. Mirrors the content-based rule
-    mcp_handlers._code_changed_since_start already applies to VERSION.
+    mcp_handlers.code_changed_since_start already applies to VERSION.
     Never raises."""
     try:
         env_path = os.path.join(
@@ -183,7 +183,7 @@ SETUP_CHECK_TOOL = "qa-doctor"
 SETUP_CHECK_MAX_RETRIES = 2
 SETUP_CHECK_TIMEOUT_S = 25.0
 # Fragments of the child's 'a reload was scheduled' reply
-# (handlers._reloading_message). Two ASCII-only pieces on
+# (handlers.reloading_message). Two ASCII-only pieces on
 # purpose: the real sentence joins them with an em dash, which JSON
 # encoders emit as an escape sequence, so a single literal spanning
 # it would silently stop matching.

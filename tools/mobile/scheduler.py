@@ -18,112 +18,36 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
+from typing import NamedTuple
 
 from tools.mobile import run_store, sdk_locator
+from tools.mobile.scheduler_filter import (  # noqa: F401
+    MAX_CASES,
+    FilterSpec,
+    _as_list,
+    _drop_reason,
+    _norm,
+    _priority_of,
+    apply_filters,
+)
 from tools.risk_scorer import score_and_sort
 
 logger = logging.getLogger(__name__)
 
 SOFT_GATE_EVERY = 20
-MAX_CASES = 500
 
 PRIORITIES = ("Critical", "High", "Medium", "Low")
 
 
-def _norm(value: object) -> str:
-    return " ".join(str(value or "").split()).strip().lower()
-
-
-def _as_list(value: object) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [part.strip() for part in value.split(",") if part.strip()]
-    return [str(part).strip() for part in value if str(part).strip()]
-
-
-def _drop_reason(
-    case: object,
-    ids: set[str],
-    priorities: set[str],
-    categories: set[str],
-    failed: tuple[str, set[str]],
-) -> tuple[str, str | None]:
-    """``(tc_id, why)``: *why* names the first filter excluding *case*, else None."""
-    if isinstance(case, dict):
-        tc_id = _norm(case.get("tc_id"))
-    else:
-        tc_id = _norm(getattr(case, "tc_id", ""))
-    priority = _priority_of(case)
-    category = _norm(getattr(case, "category", "") or "")
-    failed_run, failed_ids = failed
-    if ids and tc_id not in ids:
-        return tc_id, "not in ids"
-    if priorities and _norm(priority) not in priorities:
-        return tc_id, "priority " + priority
-    if categories and category not in categories:
-        return tc_id, "category " + category
-    if failed_run and tc_id not in failed_ids:
-        return tc_id, "did not fail in " + failed_run
-    return tc_id, None
-
-
-def apply_filters(cases: object, filters: object = None) -> dict:
-    """Filter *cases*. ``{"error", "content": {"cases", "dropped", "applied"}}``.
-
-    ``dropped`` names each excluded case AND the filter that excluded it, so a
-    tester who expected 40 cases and got 6 can see why instead of guessing.
-    """
-    try:
-        spec = filters if isinstance(filters, dict) else {}
-        items = list(cases or [])
-        ids = {_norm(v) for v in _as_list(spec.get("ids"))}
-        priorities = {_norm(v) for v in _as_list(spec.get("priority"))}
-        categories = {_norm(v) for v in _as_list(spec.get("category"))}
-        failed_run = str(spec.get("failed_last_run") or "").strip()
-        failed_ids: set[str] = set()
-        applied: list[str] = []
-        if failed_run:
-            point = (run_store.resume_point(failed_run) or {}).get("content") or {}
-            failed_ids = {_norm(v) for v in (point.get("failed") or [])}
-            applied.append("failed_last_run=" + failed_run)
-        applied.extend(
-            name
-            for name, active in (
-                ("ids", ids),
-                ("priority", priorities),
-                ("category", categories),
-            )
-            if active
-        )
-
-        kept, dropped = [], []
-        for case in items:
-            tc_id, why = _drop_reason(
-                case, ids, priorities, categories, (failed_run, failed_ids)
-            )
-            if why is None:
-                kept.append(case)
-            else:
-                dropped.append({"tc_id": tc_id, "why": why})
-        return {
-            "error": None,
-            "content": {
-                "cases": kept[:MAX_CASES],
-                "dropped": dropped,
-                "applied": applied,
-            },
-        }
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("mobile.scheduler.apply_filters failed")
-        return {"error": str(exc), "content": None}
-
-
-def _priority_of(case: object) -> str:
-    value = getattr(case, "priority", None)
-    if value is None and isinstance(case, dict):
-        value = case.get("priority")
-    return str(getattr(value, "value", value) or "")
+def _ordered(body: dict, cases: list, markdown: str) -> dict:
+    content = {
+        "cases": cases,
+        "risk_markdown": markdown,
+        "dropped": body.get("dropped") or [],
+        "applied": body.get("applied") or [],
+    }
+    return {"error": None, "content": content}
 
 
 def order_cases(cases: object, filters: object = None) -> dict:
@@ -135,132 +59,130 @@ def order_cases(cases: object, filters: object = None) -> dict:
         body = filtered["content"] or {}
         kept = list(body.get("cases") or [])
         if not kept:
-            return {
-                "error": None,
-                "content": {
-                    "cases": [],
-                    "risk_markdown": "",
-                    "dropped": body.get("dropped") or [],
-                    "applied": body.get("applied") or [],
-                },
-            }
+            return _ordered(body, [], "")
         sorted_cases, markdown = score_and_sort(kept)
-        return {
-            "error": None,
-            "content": {
-                "cases": list(sorted_cases),
-                "risk_markdown": str(markdown or ""),
-                "dropped": body.get("dropped") or [],
-                "applied": body.get("applied") or [],
-            },
-        }
+        return _ordered(body, list(sorted_cases), str(markdown or ""))
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.scheduler.order_cases failed")
         return {"error": str(exc), "content": None}
 
 
-def _run_manifest(
-    run_id: str, order: list[str], body: dict, manifest_extra: object
-) -> dict:
+class _Base(NamedTuple):
+    """What a manifest records of the plan: the run, its ORDER, the filters."""
+
+    run_id: str
+    order: list[str]
+    applied: list[str]
+
+
+@dataclass(frozen=True)
+class PlanOpts:
+    """The optional inputs of ``plan_run``: the filters and extra manifest fields."""
+
+    filters: object = None
+    manifest_extra: object = None
+
+
+# The same producer the explore lane reads -- see session.py. Both callers carry
+# it or the field does not exist, and an absent key reads as absent on the page
+# rather than as today's setting. The AVD comes from manifest_extra, which the
+# suite lane fills before this update.
+def _run_manifest(base: _Base, manifest_extra: object) -> dict:
     """The manifest ``plan_run`` stores: caller extras plus the run's ORDER."""
     manifest = dict(manifest_extra if isinstance(manifest_extra, dict) else {})
+    avd = manifest.get("avd")
+    image = str((sdk_locator.avd_system_image(avd) or {}).get("content") or "")
     manifest.update(
         {
-            "run_id": run_id,
-            "order": order,
-            "total": len(order),
-            "filters": body.get("applied") or [],
+            "run_id": base.run_id,
+            "order": base.order,
+            "total": len(base.order),
+            "filters": base.applied,
             "planned": time.time(),
-            # The same producer the explore lane reads -- see session.py. Both
-            # callers carry it or the field does not exist, and an absent key reads
-            # as absent on the page rather than as today's setting. The AVD comes
-            # from manifest_extra, which the suite lane fills before this update.
-            "system_image": str(
-                (sdk_locator.avd_system_image(manifest.get("avd")) or {}).get("content")
-                or ""
-            ),
+            "system_image": image,
         }
     )
     return manifest
 
 
-def plan_run(
-    run_id: str,
-    cases: object,
-    filters: object = None,
-    manifest_extra: object = None,
-) -> dict:
-    """Create the run and write its ORDER. ``{"error", "content": {...}}``.
+def _no_survivor(body: dict) -> dict:
+    applied = ", ".join(body.get("applied") or []) or "none"
+    return {
+        "error": (
+            "No case survived the filters, so no run was created. "
+            "Filters applied: " + applied + "."
+        ),
+        "content": None,
+    }
 
-    The order goes in the manifest because ``run_store.resume_point`` reads it
-    to answer "which case is next" -- so a resume in a fresh chat replays the
-    same risk order rather than re-sorting against a re-scored suite.
-    """
+
+def _planned(run_id: str, order: list[str], body: dict) -> dict:
+    content = {
+        "run_id": run_id,
+        "order": order,
+        "cases": list(body.get("cases") or []),
+        "risk_markdown": body.get("risk_markdown") or "",
+        "dropped": body.get("dropped") or [],
+    }
+    return {"error": None, "content": content}
+
+
+def _create(run_id: str, body: dict, manifest_extra: object) -> dict:
+    kept = list(body.get("cases") or [])
+    order = [str(getattr(case, "tc_id", "") or "") for case in kept]
+    base = _Base(run_id, order, body.get("applied") or [])
+    created = run_store.create_run(run_id, _run_manifest(base, manifest_extra))
+    if created.get("error"):
+        return created
+    return _planned(run_id, order, body)
+
+
+# The order goes in the manifest because ``run_store.resume_point`` reads it to
+# answer "which case is next" -- so a resume in a fresh chat replays the same
+# risk order rather than re-sorting against a re-scored suite.
+def plan_run(run_id: str, cases: object, opts: PlanOpts | None = None) -> dict:
+    """Create the run and write its ORDER. ``{"error", "content": {...}}``."""
     try:
-        ordered = order_cases(cases, filters)
+        opts = opts or PlanOpts()
+        ordered = order_cases(cases, opts.filters)
         if ordered.get("error"):
             return ordered
         body = ordered["content"] or {}
-        kept = list(body.get("cases") or [])
-        if not kept:
-            return {
-                "error": (
-                    "No case survived the filters, so no run was created. "
-                    "Filters applied: "
-                    + (", ".join(body.get("applied") or []) or "none")
-                    + "."
-                ),
-                "content": None,
-            }
-        order = [str(getattr(case, "tc_id", "") or "") for case in kept]
-        manifest = _run_manifest(run_id, order, body, manifest_extra)
-        created = run_store.create_run(run_id, manifest)
-        if created.get("error"):
-            return created
-        return {
-            "error": None,
-            "content": {
-                "run_id": run_id,
-                "order": order,
-                "cases": kept,
-                "risk_markdown": body.get("risk_markdown") or "",
-                "dropped": body.get("dropped") or [],
-            },
-        }
+        if not list(body.get("cases") or []):
+            return _no_survivor(body)
+        return _create(run_id, body, opts.manifest_extra)
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.scheduler.plan_run failed")
         return {"error": str(exc), "content": None}
 
 
-def next_case(run_id: str) -> dict:
-    """``{"tc_id", "index", "total", "gate", "done", "failed", "finished"}``.
+def _progress_of(body: dict, order: list[str]) -> dict:
+    index = int(body.get("next_index") or 0)
+    finished = index >= len(order)
+    done = len(body.get("done") or [])
+    return {
+        "tc_id": "" if finished else order[index],
+        "index": index,
+        "total": len(order),
+        "done": done,
+        "failed": list(body.get("failed") or []),
+        "finished": finished,
+        "gate": bool(not finished and done and done % SOFT_GATE_EVERY == 0),
+    }
 
-    ``gate`` is True on a multiple of ``SOFT_GATE_EVERY`` completed cases, and
-    only when there is something left -- asking "continue?" after the last case
-    is noise.
-    """
+
+# ``gate`` is True on a multiple of ``SOFT_GATE_EVERY`` completed cases, and
+# only when there is something left -- asking "continue?" after the last case
+# is noise.
+def next_case(run_id: str) -> dict:
+    """``{"tc_id", "index", "total", "gate", "done", "failed", "finished"}``."""
     try:
         point = run_store.resume_point(run_id)
         if point.get("error"):
             return point
-        body = point["content"] or {}
         manifest = (run_store.read_manifest(run_id) or {}).get("content") or {}
         order = [str(v) for v in (manifest.get("order") or [])]
-        index = int(body.get("next_index") or 0)
-        finished = index >= len(order)
-        done = len(body.get("done") or [])
-        return {
-            "error": None,
-            "content": {
-                "tc_id": "" if finished else order[index],
-                "index": index,
-                "total": len(order),
-                "done": done,
-                "failed": list(body.get("failed") or []),
-                "finished": finished,
-                "gate": bool(not finished and done and done % SOFT_GATE_EVERY == 0),
-            },
-        }
+        return {"error": None, "content": _progress_of(point["content"] or {}, order)}
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.scheduler.next_case failed")
         return {"error": str(exc), "content": None}

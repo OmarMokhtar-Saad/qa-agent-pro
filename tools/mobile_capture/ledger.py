@@ -19,131 +19,99 @@ trade a re-ask for an outage.
 
 from __future__ import annotations
 
-import json
 import logging
-import os
-import time
-from pathlib import Path
+from typing import NamedTuple
 
+from tools.mobile_capture import ledger_store as store
 from tools.mobile_capture import paths
+from tools.mobile_capture.ledger_store import (  # noqa: F401  re-exports: the on-disk side moved
+    LEDGER_VERSION,
+    MAX_DEVICES,
+    clock_ms,
+    device_rows,
+    read,
+    write_ledger_json,
+)
 
 logger = logging.getLogger(__name__)
 
-#: Serial+fingerprint rows kept. Oldest ``updated_ms`` evicted first.
-MAX_DEVICES: int = 200
 
-#: The on-disk shape. A file whose version this reader does not know is read as
-#: empty rather than guessed at: a wrong guess about a trust record is worse
-#: than re-earning the trust.
-LEDGER_VERSION: int = 1
+class LedgerEntry(NamedTuple):
+    """One device's earned tier: what :func:`record` stores."""
 
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
+    serial: str
+    fingerprint: str
+    tier: str
+    note: str = ""
 
 
-def _write_json(target: Path, payload: object) -> None:
-    """Temp file, fsync, ``os.replace`` -- the pattern ``mobile/run_store`` uses.
-
-    Reimplemented rather than imported: ``run_store._write_json`` is private to
-    a module about RUNS and redacts against a run's vocabulary. A device ledger
-    holding a serial and a hash needs neither, and importing a private name
-    across a package boundary would make a run module's refactor break device
-    trust.
-    """
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(target.name + ".tmp")
-    text = json.dumps(payload, indent=2, sort_keys=True, default=str)
-    with open(tmp, "w", encoding="utf-8") as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    os.replace(tmp, target)
+def _save(rows: list) -> None:
+    store.write_ledger_json(
+        paths.ledger_path(), {"version": store.LEDGER_VERSION, "devices": rows}
+    )
 
 
-def _rows() -> list:
-    """Every stored row, or ``[]``. Never raises."""
-    target = paths.ledger_path()
-    try:
-        if not target.is_file():
-            return []
-        raw = json.loads(target.read_text(encoding="utf-8"))
-    except Exception:
-        logger.warning(
-            "mobile_capture.ledger: %s is unreadable -- reading it as empty. "
-            "Device trust will be re-earned on the next prepare.",
-            target,
-        )
-        return []
-    if not isinstance(raw, dict) or raw.get("version") != LEDGER_VERSION:
-        logger.warning(
-            "mobile_capture.ledger: %s is not a ledger this reader knows -- "
-            "reading it as empty",
-            target,
-        )
-        return []
-    rows = raw.get("devices")
-    if not isinstance(rows, list):
-        return []
-    return [
-        row
-        for row in rows
-        if isinstance(row, dict) and row.get("serial") and row.get("fingerprint")
-    ]
+def _row_of(entry: LedgerEntry) -> dict:
+    """The stored row for *entry*, stamped now."""
+    return {
+        "serial": entry.serial,
+        "fingerprint": entry.fingerprint,
+        "tier": entry.tier,
+        "note": entry.note,
+        "updated_ms": store.clock_ms(),
+    }
 
 
-def read() -> dict:
-    """``{"error": None, "content": {"devices": [...]}}``."""
-    try:
-        return {"error": None, "content": {"devices": _rows()}}
-    except Exception as exc:
-        logger.exception("mobile_capture.ledger.read failed")
-        return {"error": str(exc), "content": None}
+def _merged_rows(rows: list, entry: LedgerEntry) -> list:
+    """*rows* without *entry*'s own row, plus *entry*, oldest first."""
+    own = (entry.serial, entry.fingerprint)
+    kept = [r for r in rows if (r.get("serial"), r.get("fingerprint")) != own]
+    kept.append(_row_of(entry))
+    kept.sort(key=lambda row: row.get("updated_ms") or 0)
+    return kept
 
 
-def record(serial: str, fingerprint: str, tier: str, *, note: str = "") -> dict:
+def record(entry: LedgerEntry) -> dict:
     """Store the tier *serial* earned under *fingerprint*. Replaces its own row."""
     try:
-        serial = str(serial)
-        fingerprint = str(fingerprint)
-        if not serial or not fingerprint:
+        entry = LedgerEntry(*(str(part) for part in entry))
+        if not entry.serial or not entry.fingerprint:
             return {
                 "error": "serial and fingerprint are both required",
                 "content": None,
             }
-        rows = [
-            row
-            for row in _rows()
-            if not (
-                row.get("serial") == serial and row.get("fingerprint") == fingerprint
-            )
-        ]
-        rows.append(
-            {
-                "serial": serial,
-                "fingerprint": fingerprint,
-                "tier": str(tier),
-                "note": str(note),
-                "updated_ms": _now_ms(),
-            }
-        )
-        rows.sort(key=lambda row: row.get("updated_ms") or 0)
-        evicted = max(0, len(rows) - MAX_DEVICES)
-        if evicted:
-            logger.info(
-                "mobile_capture.ledger: at MAX_DEVICES -- evicting %d oldest row(s)",
-                evicted,
-            )
-            rows = rows[evicted:]
-        _write_json(paths.ledger_path(), {"version": LEDGER_VERSION, "devices": rows})
+        rows, evicted = store._capped(_merged_rows(store.device_rows(), entry))
+        _save(rows)
         return {"error": None, "content": {"stored": rows[-1], "evicted": evicted}}
     except Exception as exc:
         logger.exception("mobile_capture.ledger.record failed")
         return {"error": str(exc), "content": None}
+
+
+def _found(row: dict) -> dict:
+    """The ``tier_for`` reply for a row that matches serial AND fingerprint."""
+    return {
+        "error": None,
+        "content": {
+            "tier": row.get("tier"),
+            "known_serial": True,
+            "updated_ms": row.get("updated_ms"),
+            "note": row.get("note", ""),
+        },
+    }
+
+
+def _unmatched(known: bool) -> dict:
+    """The ``tier_for`` reply when no row matches both serial and fingerprint."""
+    return {
+        "error": None,
+        "content": {
+            "tier": None,
+            "known_serial": known,
+            "updated_ms": None,
+            "note": "",
+        },
+    }
 
 
 def tier_for(serial: str, fingerprint: str) -> dict:
@@ -157,31 +125,23 @@ def tier_for(serial: str, fingerprint: str) -> dict:
     try:
         serial = str(serial)
         fingerprint = str(fingerprint)
-        rows = _rows()
+        rows = store.device_rows()
         for row in rows:
             if row.get("serial") == serial and row.get("fingerprint") == fingerprint:
-                return {
-                    "error": None,
-                    "content": {
-                        "tier": row.get("tier"),
-                        "known_serial": True,
-                        "updated_ms": row.get("updated_ms"),
-                        "note": row.get("note", ""),
-                    },
-                }
-        known = any(row.get("serial") == serial for row in rows)
-        return {
-            "error": None,
-            "content": {
-                "tier": None,
-                "known_serial": known,
-                "updated_ms": None,
-                "note": "",
-            },
-        }
+                return _found(row)
+        return _unmatched(any(row.get("serial") == serial for row in rows))
     except Exception as exc:
         logger.exception("mobile_capture.ledger.tier_for failed")
         return {"error": str(exc), "content": None}
+
+
+def _asked(serial: str) -> dict:
+    """The ``asked_before`` reply: the first row for *serial*, under any CA."""
+    for row in store.device_rows():
+        if str(row.get("serial") or "") == serial:
+            tier = str(row.get("tier") or "")
+            return {"error": None, "content": {"asked": True, "tier": tier}}
+    return {"error": None, "content": {"asked": False, "tier": ""}}
 
 
 def asked_before(serial: str) -> dict:
@@ -198,14 +158,7 @@ def asked_before(serial: str) -> dict:
     ``{"error", "content": {"asked": bool, "tier": str}}``; never raises.
     """
     try:
-        serial = str(serial)
-        for row in _rows():
-            if str(row.get("serial") or "") == serial:
-                return {
-                    "error": None,
-                    "content": {"asked": True, "tier": str(row.get("tier") or "")},
-                }
-        return {"error": None, "content": {"asked": False, "tier": ""}}
+        return _asked(str(serial))
     except Exception as exc:
         logger.exception("mobile_capture.ledger.asked_before failed")
         return {"error": str(exc), "content": None}
@@ -219,13 +172,11 @@ def forget(serial: str) -> dict:
     let a later run believe in trust that has been uninstalled.
     """
     try:
-        rows = _rows()
+        rows = store.device_rows()
         kept = [row for row in rows if row.get("serial") != str(serial)]
         removed = len(rows) - len(kept)
         if removed:
-            _write_json(
-                paths.ledger_path(), {"version": LEDGER_VERSION, "devices": kept}
-            )
+            _save(kept)
         return {"error": None, "content": {"removed": removed}}
     except Exception as exc:
         logger.exception("mobile_capture.ledger.forget failed")

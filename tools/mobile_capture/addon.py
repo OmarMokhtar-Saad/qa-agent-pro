@@ -2,67 +2,51 @@
 
 Loaded with ``mitmdump -s addon.py``, and runs INSIDE the mitmdump process --
 a DIFFERENT interpreter from the qa-agents server, provisioned separately
-(``tools/mobile_capture/mitm_provision.py``). This module therefore imports
-NOTHING from this tree (``tests/mobile_capture/test_addon_contract.py`` walks
-it with ``ast`` to keep that a checkable fact, not a promise) and nothing from
-``mitmproxy`` either, at module scope: the hook below reaches the flow object
-by DUCK TYPING (``flow.request.method`` etc, attributes every mitmdump
-``http.HTTPFlow`` exposes), so this file can be imported and its pure
-functions exercised in a plain interpreter that never installed mitmproxy --
-which is exactly what the test suite does (``mitmproxy`` is not a project
-dependency; see T2.4).
+(``tools/mobile_capture/mitm_provision.py``). It therefore imports NOTHING
+from this tree (``tests/mobile_capture/test_addon_contract.py`` walks it with
+``ast`` to keep that checkable) and nothing from ``mitmproxy`` at module
+scope: the hook reaches the flow by DUCK TYPING, so the pure functions run in
+a plain interpreter (``mitmproxy`` is not a project dependency; see T2.4).
 
-**It does NO redaction.** Redaction is qa-agents' job, at WRITE time
-(``tools/mobile_capture/flows.py``), applying ``tools/mobile_shared/scrub``'s
-nets under an armed, per-task :class:`contextvars.ContextVar` scope this
-process never sees. Splitting redaction into this file would put the pattern
-set in a process qa-agents cannot unit-test in-process.
+**It does NO redaction.** That is qa-agents' job at WRITE time
+(``tools/mobile_capture/flows.py``), under a scope this process never sees.
 
 **Routing.** Every flow is appended to the file the CURRENT-CASE pointer
-names, read FRESH on every flow so a case boundary mid-run is picked up
-without a restart. The pointer (``<run>.current``) is the ONE PRODUCER of
-which case is "current": written by
-:func:`tools.mobile_capture.flows.mark_case_current`, cleared by
-:func:`tools.mobile_capture.flows.mark_case_finished`. No pointer, or an
-unreadable one, means "outside any case" -- the flow lands in
-``<run>-outside.jsonl`` rather than being silently attributed to whichever
-case happens to be nearest (the defect this design specifically avoids; see
-T5.4).
+names (``<run>.current``), read FRESH per flow so a case boundary mid-run is
+picked up. It is written by :func:`tools.mobile_capture.flows.mark_case_current`
+and cleared by :func:`tools.mobile_capture.flows.mark_case_finished`. No or an
+unreadable pointer means "outside any case": the flow lands in
+``<run>-outside.jsonl``, never attributed to the nearest case (see T5.4).
 
-**The output root and run id both come from the environment**
-(``MITMCAP_RUN_ID`` / ``MITMCAP_DIR``, written onto the ``mitmdump``
-child's own environment by ``tools/mobile_capture/proxy.py`` -- the only
-channel available to a process spawned this way). Missing either means the
-addon writes nothing; it never raises out of a mitmdump hook, because a
-crashed addon would take the tester's own proxied device connection with it.
+**Run id and output root come from the environment** (``MITMCAP_RUN_ID`` /
+``MITMCAP_DIR``, set by ``tools/mobile_capture/proxy.py`` on the child).
+Missing either means nothing is written; it never raises out of a hook, as a
+crashed addon would take the tester's proxied device connection with it.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import sys
 import time
 
-#: One line's raw JSONL file, in THIS interpreter. Best-effort only -- this
-#: process cannot see what qa-agents ends up reading, so it is not the cap
-#: that actually protects a reader; that is ``flows.MAX_JSONL_BYTES``,
-#: enforced at the LAST consumer. Deliberately named without a
-#: MAX_/CAP_/LIMIT_ segment: the tree-wide bounds-ceilings sweep has no reach
-#: into a file that runs in another interpreter, and giving this a cap-shaped
-#: name would make the sweep demand a CEILINGS row it can never validate.
+# mitmdump loads this file by path with its directory on sys.path
+# (mitmproxy/addons/script.py load_script), so the sibling guard is a plain import.
+from addon_guard import swallow
+
+# One JSONL file's best-effort cap in THIS interpreter; the cap that protects a
+# reader is ``flows.MAX_JSONL_BYTES``, enforced at the last consumer. Named with
+# no MAX_/CAP_/LIMIT_ segment on purpose: the bounds-ceilings sweep cannot reach
+# a file running in another interpreter and would demand an unvalidatable row.
 _ADDON_STOP_BYTES = 32 * 1024 * 1024
 
-#: One body inlined into one JSON line, before qa-agents' own cap
-#: (``flows.MAX_BODY_BYTES``) runs at write time. Same naming reason as above.
+# One body inlined into a line, before ``flows.MAX_BODY_BYTES`` runs at write
+# time. Same naming reason as above.
 _ADDON_BODY_STOP_BYTES = 2 * 1024 * 1024
 
-#: The ONLY channel to this process. See the module docstring.
-# NOT settings flags, and deliberately off the QA_ prefix: the tree-wide
-# deleted-flag detector reads any QA_-prefixed literal as a Settings field,
-# and these are process env vars handed to the mitmdump child, which cannot
-# import config/settings at all. Widening that detector's allow-list to admit
-# them would blunt it for the thing it exists to catch.
+# The ONLY channel to this process. NOT settings flags, and off the QA_ prefix:
+# the deleted-flag detector reads any QA_ literal as a Settings field, and this
+# child cannot import config/settings; widening its allow-list would blunt it.
 RUN_ID_ENV = "MITMCAP_RUN_ID"
 DIR_ENV = "MITMCAP_DIR"
 
@@ -128,47 +112,57 @@ def _capped_body(data: object) -> tuple[str, bool]:
     )
 
 
-def flow_to_record(flow: object, *, now_ms: int | None = None) -> dict:
-    """One line's worth of a flow. Pure -- no I/O, no ``mitmproxy`` import.
+def _part(message: object, name: str, default: object) -> object:
+    return getattr(message, name, default) if message is not None else default
 
-    Reads *flow* by DUCK TYPING so this can be exercised against a plain
-    fake object in tests, not only a real ``http.HTTPFlow``. Carries NO
-    redaction: every value here is exactly what the device sent or received.
-    """
+
+def _header_pairs(message: object) -> dict:
+    if message is None:
+        return {}
+    return dict(getattr(message, "headers", None) or {})
+
+
+def _flow_times(now_ms: int | None) -> int:
+    return int(now_ms if now_ms is not None else time.time() * 1000)
+
+
+def _url_of(request: object) -> str:
+    return str(_part(request, "pretty_url", "") or _part(request, "url", "") or "")
+
+
+def flow_to_record(flow: object, *, now_ms: int | None = None) -> dict:
+    """One line's flow by DUCK TYPING; pure, NO redaction, no ``mitmproxy`` import."""
     request = getattr(flow, "request", None)
     response = getattr(flow, "response", None)
-    req_body, req_trunc = _capped_body(
-        getattr(request, "raw_content", None) if request is not None else None
-    )
-    resp_body, resp_trunc = _capped_body(
-        getattr(response, "raw_content", None) if response is not None else None
-    )
-    req_headers = (
-        dict(getattr(request, "headers", None) or {}) if request is not None else {}
-    )
-    resp_headers = (
-        dict(getattr(response, "headers", None) or {}) if response is not None else {}
-    )
-    url = ""
-    if request is not None:
-        url = str(
-            getattr(request, "pretty_url", "") or getattr(request, "url", "") or ""
-        )
+    req_body, req_trunc = _capped_body(_part(request, "raw_content", None))
+    resp_body, resp_trunc = _capped_body(_part(response, "raw_content", None))
     return {
-        "ts_ms": int(now_ms if now_ms is not None else time.time() * 1000),
-        "method": str(getattr(request, "method", "") or "")
-        if request is not None
-        else "",
-        "url": url,
-        "status": getattr(response, "status_code", None)
-        if response is not None
-        else None,
-        "request_headers": req_headers,
-        "response_headers": resp_headers,
+        "ts_ms": _flow_times(now_ms),
+        "method": str(_part(request, "method", "") or ""),
+        "url": _url_of(request),
+        "status": _part(response, "status_code", None),
+        "request_headers": _header_pairs(request),
+        "response_headers": _header_pairs(response),
         "request_body": req_body,
         "response_body": resp_body,
         "body_truncated": bool(req_trunc or resp_trunc),
     }
+
+
+def _open_for_append(path: str, line: str, max_bytes: int) -> bool:
+    existing = os.path.getsize(path) if os.path.exists(path) else 0
+    if existing >= max_bytes:
+        return False
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    is_new = not os.path.exists(path)
+    with open(path, "a", encoding=ENCODING) as handle:
+        handle.write(line)
+    if is_new:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    return True
 
 
 def append_line(path: str, record: dict, *, max_bytes: int = _ADDON_STOP_BYTES) -> bool:
@@ -179,37 +173,18 @@ def append_line(path: str, record: dict, *, max_bytes: int = _ADDON_STOP_BYTES) 
     safer than crashing the proxy a tester's whole device connection depends
     on.
     """
-    try:
+    with swallow("mobile_capture.addon: append failed"):
         line = json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n"
-        existing = os.path.getsize(path) if os.path.exists(path) else 0
-        if existing >= max_bytes:
-            return False
-        parent = os.path.dirname(path) or "."
-        os.makedirs(parent, exist_ok=True)
-        is_new = not os.path.exists(path)
-        with open(path, "a", encoding=ENCODING) as handle:
-            handle.write(line)
-        if is_new:
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
-        return True
-    except Exception as exc:  # pragma: no cover - defensive, another interpreter
-        sys.stderr.write("mobile_capture.addon: append failed: " + str(exc) + "\n")
-        return False
+        return _open_for_append(path, line, max_bytes)
+    return False
 
 
 def response(flow: object) -> None:
     """The mitmdump hook: called once per completed flow. Never raises."""
-    try:
+    with swallow("mobile_capture.addon: response hook failed"):
         run_id = _env_run_id()
         out_dir = _env_dir()
         if not run_id or not out_dir:
             return
         record = flow_to_record(flow)
         append_line(target_path(run_id, out_dir), record)
-    except Exception as exc:  # pragma: no cover - defensive, another interpreter
-        sys.stderr.write(
-            "mobile_capture.addon: response hook failed: " + str(exc) + "\n"
-        )

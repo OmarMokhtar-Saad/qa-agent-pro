@@ -11,11 +11,19 @@ candidate is never applied. Seams never raise.
 
 from __future__ import annotations
 
-import json
+import json  # noqa: F401
 import logging
+from typing import Any, cast
 
-from tools.mobile import knowledge_hooks, knowledge_limits
+from tools.mobile import (
+    actions,
+    knowledge_hooks,
+    knowledge_limits,
+    knowledge_stage_popups,
+)
 from tools.mobile.knowledge_hooks import Directive
+from tools.mobile.kplg_calls import Post, Pre
+from tools.mobile.kplg_popup_db import flush, snapshot  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -23,18 +31,20 @@ PRIORITY = 20
 MAX_DISMISS = 2
 
 
-def op_rid(step: object) -> tuple[str, str]:
+def op_rid(step: Any) -> tuple[str, str]:
     """``(op, rid)`` of an action model or dict ("" when absent)."""
     body = (
         step
         if isinstance(step, dict)
         else getattr(step, "model_dump", lambda **_: {})(mode="json")
     )
-    target = body.get("target") if isinstance(body.get("target"), dict) else {}
+    target = cast(
+        "dict", body.get("target") if isinstance(body.get("target"), dict) else {}
+    )
     return str(body.get("op") or ""), str(target.get("rid") or body.get("rid") or "")
 
 
-def screen_rids(screen: object) -> set:
+def screen_rids(screen: Any) -> set:
     """Resource ids on *screen*, with and without the package prefix."""
     out: set = set()
     elements = screen.get("elements") if isinstance(screen, dict) else None
@@ -47,14 +57,14 @@ def screen_rids(screen: object) -> set:
     return out
 
 
-def _snap_rows(ctx: object, key: str) -> list:
+def _snap_rows(ctx: Any, key: str) -> list:
     knowledge = getattr(ctx, "knowledge", None)
     snap = knowledge.get("snap") if isinstance(knowledge, dict) else None
     rows = snap.get(key) if isinstance(snap, dict) else None
     return rows if isinstance(rows, list) else []
 
 
-def _fired(ctx: object, item: str) -> int:
+def _fired(ctx: Any, item: str) -> int:
     return sum(
         1
         for ev in getattr(ctx, "kbuf", None) or []
@@ -65,53 +75,56 @@ def _fired(ctx: object, item: str) -> int:
 
 
 def _dismiss_step(rid: str):
-    from tools.mobile import actions
 
     got = actions.parse_script({"actions": [{"op": "tap", "target": {"rid": rid}}]})
     script = got.get("content")
     return list(getattr(script, "actions", None) or [])
 
 
-def _match(ctx: object, key: str, step: object, screen: object) -> tuple:
-    """``(row, rid)`` of the active popup to dismiss now, else ``(None, "")``."""
-    from tools.mobile import actions
+def _blocked(call: Pre) -> set:
+    """Resource ids on screen when a popup can block the step, else empty."""
 
-    op, want = op_rid(step)
+    op, want = op_rid(call.step)
     # Only an op that actuates is blocked by a popup; an assert or a wait is not.
     if op not in actions.MUTATING_OPS or op in actions.WAIT_OPS:
-        return None, ""
-    here = screen_rids(screen)
+        return set()
+    here = screen_rids(call.screen)
     if not want or want in here or want.split("/", 1)[-1] in here:
-        return None, ""
+        return set()
+    return here
+
+
+def _dismiss_hit(row: dict, key: str, here: set) -> str:
+    dismiss: Any = row.get("dismiss")
+    dismiss = dismiss if isinstance(dismiss, dict) else {}
+    rid = str(dismiss.get("rid") or "")
+    if (
+        dismiss.get("screen_key") == key
+        and rid
+        and (rid in here or rid.split("/", 1)[-1] in here)
+    ):
+        return rid
+    return ""
+
+
+def _match(ctx: Any, key: str, call: Pre) -> tuple:
+    """``(row, rid)`` of the active popup to dismiss now, else ``(None, "")``."""
+    here = _blocked(call)
     for row in _snap_rows(ctx, "popups"):
-        dismiss = row.get("dismiss") if isinstance(row.get("dismiss"), dict) else {}
-        rid = str(dismiss.get("rid") or "")
-        if (
-            dismiss.get("screen_key") == key
-            and rid
-            and (rid in here or rid.split("/", 1)[-1] in here)
-        ):
+        rid = _dismiss_hit(row, key, here)
+        if rid:
             return row, rid
     return None, ""
 
 
-def pre_step(ctx, entry, step, screen) -> Directive:
-    key = str((entry or {}).get("screen_key") or "")
-    if not key or not _snap_rows(ctx, "popups"):
-        return knowledge_hooks.NONE
-    row, rid = _match(ctx, key, step, screen)
-    if row is None:
-        return knowledge_hooks.NONE
-    item = "popups:%s" % row.get("id")
-    if _fired(ctx, item) >= MAX_DISMISS:
-        return knowledge_hooks.NONE
-    from tools.mobile import knowledge_stage_popups
+def _refuse(ctx: Any, item: str) -> Directive:
+    knowledge_hooks.kbuf_add(
+        ctx, {"kind": "popup_refused", "item": item, "why": "destructive dismiss"}
+    )
+    return knowledge_hooks.NONE
 
-    if knowledge_stage_popups.looks_destructive(rid):
-        knowledge_hooks.kbuf_add(
-            ctx, {"kind": "popup_refused", "item": item, "why": "destructive dismiss"}
-        )
-        return knowledge_hooks.NONE
+
+def _insert(ctx: Any, item: str, rid: str) -> Directive:
     steps = _dismiss_step(rid)[: knowledge_limits.PRECONDITION_STEPS]
     if not steps:
         return knowledge_hooks.NONE
@@ -121,8 +134,29 @@ def pre_step(ctx, entry, step, screen) -> Directive:
     )
 
 
-def post_step(ctx, entry, before, after) -> None:
+def _fire(ctx: Any, item: str, rid: str) -> Directive:
+
+    if knowledge_stage_popups.looks_destructive(rid):
+        return _refuse(ctx, item)
+    return _insert(ctx, item, rid)
+
+
+def pre_step(ctx, call: Pre) -> Directive:
+    key = str((call.entry or {}).get("screen_key") or "")
+    if not key or not _snap_rows(ctx, "popups"):
+        return knowledge_hooks.NONE
+    row, rid = _match(ctx, key, call)
+    if row is None:
+        return knowledge_hooks.NONE
+    item = "popups:%s" % row.get("id")
+    if _fired(ctx, item) >= MAX_DISMISS:
+        return knowledge_hooks.NONE
+    return _fire(ctx, item, rid)
+
+
+def post_step(ctx, call: Post) -> None:
     """Stamp ``entry["popup"]`` on the dismiss tap a popup directive inserted."""
+    entry = call.entry
     _, rid = op_rid((entry or {}).get("action") or {})
     for ev in getattr(ctx, "kbuf", None) or []:
         if (
@@ -133,54 +167,3 @@ def post_step(ctx, entry, before, after) -> None:
             ev["merged"] = True
             entry["popup"] = str(ev.get("item"))[:80]
             return
-
-
-def snapshot(conn, facts) -> dict:
-    """Active popups only: ``[{id, signature, dismiss}]``."""
-    from tools.mobile import knowledge_db
-
-    out = []
-    for row in knowledge_db.rows(
-        conn,
-        "popups",
-        "status = 'active' AND invalid_at IS NULL",
-        (),
-        knowledge_limits.SNAPSHOT_MAX_ROWS,
-    ):
-        try:
-            dismiss = json.loads(row.get("dismiss_json") or "{}")
-        except ValueError:
-            dismiss = {}
-        out.append({"id": row["id"], "signature": row["signature"], "dismiss": dismiss})
-    return {"popups": out}
-
-
-def flush(package: str, run_id: str, events: list) -> None:
-    """Record each fired popup once as a counter event (no counter changes)."""
-    from tools.mobile import knowledge_db
-
-    fired = [
-        e
-        for e in events or []
-        if isinstance(e, dict) and e.get("kind") == "popup_fired"
-    ]
-    if not fired:
-        return
-    conn = knowledge_db.open_rw(package)
-    if conn is None:
-        return
-    try:
-        for item in sorted({str(e.get("item")) for e in fired}):
-            parsed = knowledge_db.parse_item_id(item)
-            found = []
-            if parsed and parsed[0] == "popups":
-                found = knowledge_db.rows(
-                    conn, "popups", "id = ? AND invalid_at IS NULL", (parsed[1],), 1
-                )
-            if found:
-                key = {"signature": found[0]["signature"]}
-                knowledge_db.upsert_counter(
-                    conn, "popups", key, {}, run_id=run_id, why="fired"
-                )
-    finally:
-        conn.close()

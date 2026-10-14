@@ -20,8 +20,18 @@ import re
 import shutil
 from pathlib import Path
 
-from config.settings import settings
+from config.settings_guard import never_raise
 from tools.mobile import platform_info
+from tools.mobile.paths_conf import _configured
+from tools.mobile.paths_own import (
+    _existing_ancestor,
+    _ownership_ok,
+    _ownership_refused,
+    _ownership_unknown,
+    _ownership_windows,
+)
+from tools.mobile.paths_tree import build_tree
+from tools.process_env import get_env_str, home_dir  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -46,37 +56,18 @@ SUBDIRS: tuple[str, ...] = (
 DEFAULT_ROOT_PARTS: tuple[str, ...] = (".qa-agents", "mobile")
 
 
-def _configured() -> str:
-    """The operator's configured cache dir, or ``""``.
-
-    ``settings`` is the primary source (it is what ``.env`` feeds). The direct
-    ``os.environ`` read is a belt for exactly one case: the DETACHED provisioner
-    is a fresh interpreter, and if its ``Settings`` construction degrades for an
-    unrelated field the whole config resets to class defaults -- at which point
-    the cache dir would silently move under the running server's feet.
-    """
-    raw = ""
-    try:
-        raw = str(getattr(settings, "qa_mobile_cache_dir", "") or "").strip()
-    except Exception:  # pragma: no cover - settings is a module singleton
-        raw = ""
-    if not raw:
-        raw = (os.environ.get("QA_MOBILE_CACHE_DIR") or "").strip()
-    return raw
-
-
 def cache_root() -> Path:
     """The mobile cache root. Pure: creates nothing, never raises."""
     raw = _configured()
     if raw:
         try:
             return Path(raw).expanduser()
-        except Exception:
+        except (OSError, RuntimeError, TypeError, ValueError):
             logger.warning(
                 "mobile.paths: unusable QA_MOBILE_CACHE_DIR=%r -- using the default",
                 raw,
             )
-    return Path.home().joinpath(*DEFAULT_ROOT_PARTS)
+    return home_dir().joinpath(*DEFAULT_ROOT_PARTS)
 
 
 #: What may become a ``runs/<id>`` path segment (also ``run_store.valid_run_id``).
@@ -109,51 +100,44 @@ def ensure_tree() -> dict:
     """Create the root and every sub-directory, 0700 where the OS allows it."""
     try:
         root = cache_root()
-        root.mkdir(parents=True, exist_ok=True)
-        try:
-            root.chmod(0o700)
-        except OSError:
-            # Windows ignores POSIX modes and some network volumes refuse the
-            # call outright. A cache we cannot tighten is still usable, and
-            # nothing credential-shaped is ever written into it.
-            logger.info("mobile.paths: could not tighten permissions on %s", root)
-        dirs: dict[str, str] = {}
-        for name in SUBDIRS:
-            child = root / name
-            child.mkdir(parents=True, exist_ok=True)
-            dirs[name] = str(child)
+        dirs = build_tree(root, SUBDIRS)
         return {"error": None, "content": {"root": str(root), "dirs": dirs}}
     except Exception as exc:
         logger.exception("mobile.paths.ensure_tree failed")
         return {"error": str(exc), "content": None}
 
 
+# ``{ok, checked, detail, fix}`` -- is the mobile cache the USER's own?
+#
+# A cache root owned by somebody else is refused BEFORE anything is written
+# into it. On a shared or admin-provisioned machine that directory can belong
+# to root, and the failure it otherwise produces is a half-provisioned SDK
+# whose permission error is buried in a detached process's log.
+#
+# **On Windows this check does not run, and that is REPORTED rather than
+# hidden.** ``os.stat().st_uid`` is 0 for every file there, so a uid
+# comparison would pass unconditionally -- which is worse than not checking,
+# because a caller cannot tell the two apart. ``checked=False`` is the
+# disclosure -- and it had NO consumer until ``preflight``'s
+# ``cache_ownership`` check was added to render it: both readers of this
+# function (``provisioner.run`` and ``provisioner.start_detached``) branch on
+# ``ok`` alone, so on Windows the disclosure reached no tester at all while
+# this docstring claimed otherwise. ``docs/MOBILE_TESTING.md`` now repeats it
+# too. The Windows
+# equivalent is the ACL on the user's own profile directory, where the default
+# cache lives; enforcing an ACL from here is separate work with no coverage
+# available on a POSIX host.
+#
+# An undeterminable owner is reported as NOT ours, on the same rule
+# :func:`free_bytes` follows: "unknown" must never read as "fine".
 def ownership(target: Path | None = None) -> dict:
-    """``{ok, checked, detail, fix}`` -- is the mobile cache the USER's own?
-
-    A cache root owned by somebody else is refused BEFORE anything is written
-    into it. On a shared or admin-provisioned machine that directory can belong
-    to root, and the failure it otherwise produces is a half-provisioned SDK
-    whose permission error is buried in a detached process's log.
-
-    **On Windows this check does not run, and that is REPORTED rather than
-    hidden.** ``os.stat().st_uid`` is 0 for every file there, so a uid
-    comparison would pass unconditionally -- which is worse than not checking,
-    because a caller cannot tell the two apart. ``checked=False`` is the
-    disclosure -- and it had NO consumer until ``preflight``'s
-    ``cache_ownership`` check was added to render it: both readers of this
-    function (``provisioner.run`` and ``provisioner.start_detached``) branch on
-    ``ok`` alone, so on Windows the disclosure reached no tester at all while
-    this docstring claimed otherwise. ``docs/MOBILE_TESTING.md`` now repeats it
-    too. The Windows
-    equivalent is the ACL on the user's own profile directory, where the default
-    cache lives; enforcing an ACL from here is separate work with no coverage
-    available on a POSIX host.
-
-    An undeterminable owner is reported as NOT ours, on the same rule
-    :func:`free_bytes` follows: "unknown" must never read as "fine".
-    """
-    try:
+    """``{ok, checked, detail, fix}`` -- is the mobile cache the USER's own?"""
+    with never_raise(
+        logger,
+        "mobile.paths: could not read cache ownership: %s",
+        level=logging.WARNING,
+        with_exc=True,
+    ) as g:
         root = Path(target) if target is not None else cache_root()
         if platform_info.is_windows():
             return _ownership_windows(root)
@@ -163,111 +147,21 @@ def ownership(target: Path | None = None) -> dict:
         if owner == mine:
             return _ownership_ok(probe, mine)
         return _ownership_refused(probe, owner, mine)
-    except Exception as exc:
-        logger.warning("mobile.paths: could not read cache ownership: %s", exc)
-        return _ownership_unknown(exc)
+    return _ownership_unknown(g.exc)
 
 
-def _existing_ancestor(root: Path) -> Path:
-    """The nearest existing path at or above *root* (at most 8 levels up)."""
-    probe = root
-    for _ in range(8):
-        if probe.exists():
-            break
-        parent = probe.parent
-        if parent == probe:
-            break
-        probe = parent
-    return probe
-
-
-def _ownership_ok(probe: Path, mine: int) -> dict:
-    """The reply when the cache path is owned by the current user."""
-    return {
-        "error": None,
-        "content": {
-            "ok": True,
-            "checked": True,
-            "detail": str(probe) + " is owned by uid " + str(mine),
-            "fix": "",
-        },
-    }
-
-
-def _ownership_unknown(exc: Exception) -> dict:
-    """The reply when the owner could not be read: treated as NOT ours."""
-    return {
-        "error": None,
-        "content": {
-            "ok": False,
-            "checked": False,
-            "detail": (
-                "The owner of the mobile cache path could not be determined "
-                "(" + str(exc)[:120] + "), so it is treated as NOT ours."
-            ),
-            "fix": (
-                "Check that the path in QA_MOBILE_CACHE_DIR exists and is "
-                "readable, or unset it to use ~/.qa-agents/mobile."
-            ),
-        },
-    }
-
-
-def _ownership_windows(root: Path) -> dict:
-    """The reply for Windows, where the ownership check does not run."""
-    return {
-        "error": None,
-        "content": {
-            "ok": True,
-            "checked": False,
-            "detail": (
-                "Ownership is not checked on Windows: a POSIX owner id "
-                "carries no meaning there. The cache at "
-                + str(root)
-                + " sits under the user profile, whose ACL restricts it."
-            ),
-            "fix": "",
-        },
-    }
-
-
-def _ownership_refused(probe: Path, owner: int, mine: int) -> dict:
-    """The reply when the cache path is owned by somebody else."""
-    return {
-        "error": None,
-        "content": {
-            "ok": False,
-            "checked": True,
-            "detail": (
-                "The mobile cache path "
-                + str(probe)
-                + " is owned by uid "
-                + str(owner)
-                + ", not by you (uid "
-                + str(mine)
-                + "), so nothing was downloaded, installed or created there."
-            ),
-            "fix": (
-                "Take ownership of that directory, or point the lane at a "
-                "path you own with QA_MOBILE_CACHE_DIR in .env and restart "
-                "the MCP server."
-            ),
-        },
-    }
-
-
+# Free bytes on the volume holding *target* (default: the cache root).
+#
+# Returns ``-1`` when it cannot be determined, so a caller discloses
+# "unknown" rather than treating it as "plenty". The walk up to an existing
+# ancestor matters on a first run: the cache root does not exist yet, and
+# ``disk_usage`` on a missing path raises.
 def free_bytes(target: Path | None = None) -> int:
-    """Free bytes on the volume holding *target* (default: the cache root).
-
-    Returns ``-1`` when it cannot be determined, so a caller discloses
-    "unknown" rather than treating it as "plenty". The walk up to an existing
-    ancestor matters on a first run: the cache root does not exist yet, and
-    ``disk_usage`` on a missing path raises.
-    """
+    """Free bytes on the volume holding *target*, or ``-1`` when unknown."""
     probe = target if target is not None else cache_root()
     try:
         probe = Path(probe)
-    except Exception:
+    except (TypeError, ValueError):
         return -1
     for _ in range(8):
         try:

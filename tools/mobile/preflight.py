@@ -15,12 +15,12 @@ not worth failing on.
 
 from __future__ import annotations
 
-import asyncio
+import asyncio  # noqa: F401
 import logging
 
-from tools import host_privileges
-from tools.device_manager import valid_package_name
-from tools.mobile import (
+from tools import host_privileges  # noqa: F401
+from tools.device_manager import valid_package_name  # noqa: F401
+from tools.mobile import (  # noqa: F401
     adb,
     downloader,
     emulator,
@@ -28,1014 +28,103 @@ from tools.mobile import (
     paths,
     platform_info,
 )
-
-logger = logging.getLogger(__name__)
-
-#: What a probe step can raise: a process, file or socket failure, a timeout,
-#: or a malformed answer from adb/emulator tooling. A step that raises one of
-#: these becomes a failing row; any other error is a bug and propagates to
-#: ``check``'s catch-all.
-_STEP_ERRORS = (
-    OSError,
-    RuntimeError,
-    ValueError,
-    LookupError,
-    TypeError,
-    AttributeError,
-    asyncio.TimeoutError,
+from tools.mobile.preflight_adb import (  # noqa: F401
+    _adb_listed,
+    _path_row,
+    _step_adb_first_on_path,
+    _step_adb_responds,
+    _step_virtualization,
+    _virtualization_row,
+)
+from tools.mobile.preflight_boot import (  # noqa: F401
+    _ambiguous_row,
+    _boot_row,
+    _choose_serial,
+    _no_emulator_row,
+    _step_emulator_booted,
+)
+from tools.mobile.preflight_consts import (  # noqa: F401
+    _STEP_ERRORS,
+    ADVISORY_CHECKS,
+    CHECK_NAMES,
+    RUN_FREE_BYTES,
+    TYPING_BLOCKING_CHECKS,
+)
+from tools.mobile.preflight_dns import (  # noqa: F401
+    _device_dns_row,
+    _step_device_dns,
+    dns_probe,
+)
+from tools.mobile.preflight_dns_consts import (  # noqa: F401
+    DNS_DEVICE_FIX,
+    DNS_EMULATOR_FIX,
+    DNS_NO_ROUTE_FIX,
+    DNS_PING_WAIT_S,
+    DNS_PROBE_HOST,
+    DNS_PROBE_IP,
+    DNS_PROBE_TIMEOUT_S,
+    DNS_SLOW_NOTE,
+)
+from tools.mobile.preflight_dns_fail import (  # noqa: F401
+    _can_route,
+    _dns_failure_detail,
+    _dns_failure_record,
+    _dns_fix,
+    _failed_detail,
+    _overran_detail,
+)
+from tools.mobile.preflight_host import (  # noqa: F401
+    _disk_row,
+    _ownership_row,
+    _privilege_row,
+    _step_cache_ownership,
+    _step_free_disk,
+    _step_host_privileges,
+)
+from tools.mobile.preflight_ime import (  # noqa: F401
+    _not_pinned_rows,
+    _oracle_row,
+    _step_ime_oracle,
+    _step_ime_pinned,
+    _step_ime_probes,
+)
+from tools.mobile.preflight_ime_present import (  # noqa: F401
+    _installed_row,
+    _selected_row,
+    _step_ime_installed,
+    _step_ime_selected,
+)
+from tools.mobile.preflight_markdown import (  # noqa: F401
+    _advisory_failure,
+    _mark,
+    _record_lines,
+    _sort_key,
+    render,
+)
+from tools.mobile.preflight_package import (  # noqa: F401
+    _package_refusal,
+    _package_row,
+    _step_package_installed,
+)
+from tools.mobile.preflight_rows import (  # noqa: F401
+    _exit_code,
+    _failed,
+    _mark_typing_blocking,
+    _unanswered,
+)
+from tools.mobile.preflight_rows import (  # noqa: F401
+    record_row as _record,
+)
+from tools.mobile.preflight_run import (  # noqa: F401
+    _blocking_names,
+    _cancel_unread,
+    _early_ime,
+    _run_device_steps,
+    _run_probe_steps,
+    _run_steps,
+    _start_early_probes,
+    _summarise,
+    check,
 )
 
-
-#: Check names, in report order. Also the set the tests assert against, so a
-#: check that silently stops being emitted fails the suite.
-CHECK_NAMES: tuple[str, ...] = (
-    "virtualization",
-    "adb_responds",
-    "adb_first_on_path",
-    "emulator_booted",
-    "device_dns",
-    "package_installed",
-    "ime_pinned",
-    "ime_installed",
-    "ime_selected",
-    "ime_oracle",
-    "free_disk",
-    "cache_ownership",
-    "host_privileges",
-)
-
-#: Free space the lane wants available before a RUN (not a provision): room for
-#: dumps, checkpoints and a report.
-RUN_FREE_BYTES = 2 * 1024 * 1024 * 1024
-
-#: The name the DNS probe asks for. The platform's own connectivity check uses
-#: this host, so the probe adds no lookup the device was not already making.
-DNS_PROBE_HOST = "connectivitycheck.gstatic.com"
-
-#: The address the probe pings once a NAME has failed, to tell a broken resolver
-#: apart from a device with no route at all. A literal address is the whole
-#: point: resolving anything here would beg the question being asked.
-DNS_PROBE_IP = "8.8.8.8"
-
-#: Seconds the ADB CALL is given for ONE probe. This is the whole budget for a
-#: probe, and deliberately NOT a `ping -W`: `-W` bounds the wait for a REPLY,
-#: and a lookup that never resolves never gets as far as waiting for one.
-#: MEASURED on this lane's API 35 emulator against a stale resolver: a failing
-#: lookup costs 20.06-20.12s across 16 samples, and does not move at `-W 1` or
-#: `-W 10` -- what bounds it is Android's own resolver retry schedule, which
-#: `-W` cannot reach. The budget must therefore clear ~20s with room for a
-#: slower host. Under it the check reports its own timeout instead of the
-#: diagnosis it exists to give, which is exactly what a tester was left with.
-DNS_PROBE_TIMEOUT_S = 30
-
-#: Seconds `ping -W` waits for a REPLY. It bounds the ADDRESS probe, whose host
-#: needs no resolving, and is inert on the name probe as measured above. Kept
-#: small for that reason: an address that does not answer promptly is not
-#: routing, and waiting longer tells the tester nothing more.
-DNS_PING_WAIT_S = 3
-
-#: What the tester is told when names fail and packets still flow. The remedy is
-#: the emulator's own behaviour, not a guess: it reads the host's resolvers ONCE,
-#: at boot, so a host that changed network leaves the guest pointing at servers
-#: that are no longer there.
-DNS_EMULATOR_FIX = (
-    "The emulator reads the host's DNS servers once, when it starts, so "
-    "changing network on this machine leaves it pointing at resolvers that are "
-    "gone. Restart the emulator, or start it with `-dns-server 8.8.8.8,1.1.1.1`."
-)
-DNS_DEVICE_FIX = (
-    "The device answers pings but resolves no name. Check its own Wi-Fi or "
-    "mobile data, and any VPN or private-DNS setting on it."
-)
-DNS_NO_ROUTE_FIX = (
-    "The device reached nothing at all, by name or by address. Check that it is "
-    "on a network before running cases that need one."
-)
-
-#: What the tester is told when the lookup OUTLASTS the budget rather than
-#: failing outright. Reporting "adb did not answer within 30s" would be true and
-#: useless: the thing that did not answer is the RESOLVER, and no longer wait
-#: separates a resolver this slow from a broken one -- an app under test stalls
-#: on it the same way either way. So the check says that in its own words, and
-#: still sends the address probe, so the REMEDY is measured rather than guessed.
-DNS_SLOW_NOTE = (
-    "a resolver this slow cannot be told apart from a broken one by waiting "
-    "longer, and an app under test stalls on it the same way"
-)
-
-
-#: Checks whose failure disables a CAPABILITY rather than the run. The four IME
-#: checks are advisory because a lane with no pinned keyboard can still tap,
-#: swipe, scroll, assert and produce a report -- which is exactly what
-#: qa-doctor tells the tester. Before this split, `ok` was `not failing` over
-#: every check, so an unpinned keyboard refused the whole run and the product
-#: contradicted its own advice.
-#:
-#: Named here rather than passed at each of the ten `_record` call sites: a flag
-#: threaded through ten places is a flag someone forgets at the eleventh, and
-#: the SET is the thing a reviewer needs to see in one glance.
-#: ``cache_ownership`` is advisory for a DIFFERENT reason than the IME four, and
-#: the reason is a considered trade rather than a softening: ``paths.ownership``
-#: answers ``ok=False`` when the owner cannot be DETERMINED at all, so a blocking
-#: check would newly refuse runs on POSIX installs that proceed today. The gate
-#: that blocked was the SDK provisioner, retired 2026-09-18, so no SDK is written
-#: into the cache any more and nothing needs to block. What was missing was telling the TESTER, which is what
-#: this check does. ``test_the_ownership_check_cannot_block_a_run`` pins it.
-#: ``host_privileges`` is advisory for the SAME reason as ``cache_ownership``,
-#: and the reason is a considered trade rather than a softening:
-#: ``host_privileges.probe`` answers ``undetermined`` when elevation cannot be
-#: DETERMINED at all, so a blocking check would newly refuse runs that proceed
-#: today -- on exactly the locked-down machines this check exists to help. And
-#: elevation is not a precondition of a RUN in the first place: once
-#: virtualization is on, a non-administrator account taps, swipes, asserts and
-#: gets a report. No SDK download is left to gate (auto-provisioning was
-#: retired 2026-09-18). What was missing was telling the TESTER, which is what
-#: this check does. ``test_the_privilege_check_cannot_block_a_run`` pins it the
-#: way ``test_the_ownership_check_cannot_block_a_run`` pins the one above.
-ADVISORY_CHECKS: frozenset = frozenset(
-    {
-        "ime_pinned",
-        "ime_installed",
-        "ime_selected",
-        "ime_oracle",
-        "cache_ownership",
-        # ADVISORY, and the trade is the same one the two rows around it make: an
-        # app under test may be deliberately offline, and a run that only taps
-        # and asserts on local screens needs no resolver at all. Blocking here
-        # would refuse runs that work today in order to warn about a case that
-        # may not apply. What was missing was TELLING the tester, which is what
-        # this check does -- `test_the_dns_check_cannot_block_a_run` pins it.
-        "device_dns",
-        # WITHOUT this row the check is BLOCKING: `_record` computes
-        # `blocking = name not in ADVISORY_CHECKS` and `ok` is derived from the
-        # blocking failures, so a `can_elevate=False` -- or an UNDETERMINED --
-        # verdict would refuse every mobile run on exactly the locked-down
-        # machines this feature exists to help. The membership, not the
-        # docstring, is the mechanism; `test_the_privilege_check_cannot_block_a_run`
-        # pins it and mutant 9 reverts this line.
-        "host_privileges",
-    }
-)
-
-
-def _exit_code(body: object, default: int = 1) -> int:
-    """A probe's exit code, with ZERO read as zero.
-
-    ``int(body.get("rc") or 1)`` is the trap this exists to close: a successful
-    command exits 0, 0 is falsy, and the fallback then turns every success into
-    a failure. Written once because the same idiom was about to appear twice.
-    """
-    value = (body or {}).get("rc") if isinstance(body, dict) else None
-    if value is None or isinstance(value, bool):
-        return int(default)
-    try:
-        return int(value)
-    except (TypeError, ValueError, OverflowError):
-        return int(default)
-
-
-#: The IME check that BLOCKS when the caller says the script types
-#: (``check(needs_typing=True)``). Only ``ime_pinned``: without a pinned APK
-#: nothing can install the keyboard. ``ime_installed``/``ime_selected`` stay
-#: advisory because ``executor.replay`` installs and selects on demand, so
-#: before the first replay they are legitimately false; ``ime_oracle`` is
-#: checked by that replay's own probe.
-TYPING_BLOCKING_CHECKS: frozenset = frozenset({"ime_pinned"})
-
-
-def _mark_typing_blocking(checks: list) -> None:
-    """Make the typing-blocking records blocking, in place."""
-    for record in checks:
-        if isinstance(record, dict) and record.get("name") in TYPING_BLOCKING_CHECKS:
-            record["blocking"] = True
-
-
-def _record(name: str, ok: bool, detail: str, fix: str = "") -> dict:
-    return {
-        "name": str(name),
-        "ok": bool(ok),
-        "detail": str(detail),
-        "fix": str(fix),
-        "blocking": str(name) not in ADVISORY_CHECKS,
-    }
-
-
-def _unanswered(name: str, result: object, fix: str = "") -> dict | None:
-    """The record for a probe that DID NOT ANSWER, or None when it did.
-
-    ONE SHAPE, because this file has now produced the same defect three times:
-    ``package_installed`` read ``adb.installed_packages(...).get("content")``
-    with no look at ``error`` and printed "`pkg` is NOT installed" off a probe
-    that failed, and ``ime_installed`` and ``ime_selected`` did the identical
-    thing with ``ime.installed`` and ``ime.current_ime``. The same class had
-    already been fixed at ``session.install_state`` (44c2be95) and
-    ``render.install_menu_markdown`` (d7e0fff2), so this is the third and the
-    fix is a SHAPE rather than three more patches.
-
-    ``ok`` is False -- a probe that did not answer has not passed -- but the
-    DETAIL says the check could not be made, so a tester is never told to
-    install an app that may well be there. ``blocking`` follows the check's own
-    name via :func:`_record`, unchanged: this says nothing new about severity.
-
-    ``tests/mobile/test_mobile_probe_envelopes.py`` is the other half. This
-    removes the duplication inside this file; the scanner is what stops a
-    FOURTH site somewhere else.
-    """
-    body = result if isinstance(result, dict) else {}
-    problem = str(body.get("error") or "")
-    if not problem:
-        return None
-    return _record(
-        name,
-        False,
-        "could not be checked -- the device did not answer: " + problem[:200],
-        fix
-        or (
-            "Check the emulator is still up (`qa_list_devices`) and run the "
-            "preflight again. Nothing is known about this check either way."
-        ),
-    )
-
-
-def _dns_probe(serial: str):
-    """The name-resolution ping of step 4b, as one awaitable.
-
-    The ADB CALL carries the budget and `-W` is left to do the one job it can
-    do -- see DNS_PROBE_TIMEOUT_S for the numbers that decide which is which.
-    """
-    return adb.shell(
-        serial,
-        ["ping", "-c", "1", "-W", str(DNS_PING_WAIT_S), DNS_PROBE_HOST],
-        timeout=DNS_PROBE_TIMEOUT_S,
-    )
-
-
-def _start_early_probes(serial: str, target_package: str) -> dict:
-    """Start the read-only probes of steps 4b-9 at once. ``{}`` without a serial.
-
-    Only probes whose step WILL make the call are started, under the same
-    conditions that step checks, so no answer is fetched that nothing reads.
-    None of them changes the device: a ping, a package list, and three reads
-    of input-method state. Never raises; a probe that cannot be started is
-    simply left to its step.
-    """
-    tasks: dict = {}
-    if not serial:
-        return tasks
-    try:
-        tasks["dns"] = asyncio.ensure_future(_dns_probe(serial))
-        package = str(target_package or "").strip()
-        if package and valid_package_name(package):
-            tasks["packages"] = asyncio.ensure_future(adb.installed_packages(serial))
-        if bool(((ime.manifest_status() or {}).get("content") or {}).get("ok")):
-            tasks["ime_installed"] = asyncio.ensure_future(ime.installed(serial))
-            tasks["ime_selected"] = asyncio.ensure_future(ime.current_ime(serial))
-            tasks["ime_oracle"] = asyncio.ensure_future(ime.probe(serial))
-    except Exception:
-        logger.debug("mobile.preflight: early probes not started", exc_info=True)
-    return tasks
-
-
-def _failed(name: str, exc: Exception) -> dict:
-    """The row for a check that raised."""
-    return _record(name, False, "check failed: " + str(exc))
-
-
-async def _step_adb_responds(checks: list[dict]) -> list[str]:
-    """2. adb responds. Returns the attached serials (empty on any failure)."""
-    serials: list[str] = []
-    try:
-        listed = await adb.devices()
-        if listed.get("error"):
-            checks.append(
-                _record(
-                    "adb_responds",
-                    False,
-                    str(listed["error"]),
-                    "Install Android Studio, then try again.",
-                )
-            )
-        else:
-            serials = list(listed.get("content") or [])
-            checks.append(
-                _record(
-                    "adb_responds",
-                    True,
-                    "adb reports " + str(len(serials)) + " device(s)",
-                )
-            )
-    except _STEP_ERRORS as exc:
-        checks.append(_failed("adb_responds", exc))
-    return serials
-
-
-def _step_adb_first_on_path(checks: list[dict]) -> None:
-    """3. adb first on PATH."""
-    try:
-        path_state = (emulator.ensure_adb_first_on_path() or {}).get("content") or {}
-        shadowed = str(path_state.get("shadowed_by") or "")
-        checks.append(
-            _record(
-                "adb_first_on_path",
-                True,
-                (
-                    "using "
-                    + str(path_state.get("adb") or "adb")
-                    + (
-                        "; a different adb (" + shadowed + ") was earlier on "
-                        "PATH and has been moved behind it for this process"
-                        if shadowed
-                        else ""
-                    )
-                ),
-                (
-                    "Two adb versions on one machine fight over the adb "
-                    "server. Consider removing " + shadowed + " from PATH."
-                    if shadowed
-                    else ""
-                ),
-            )
-        )
-    except _STEP_ERRORS as exc:
-        checks.append(_failed("adb_first_on_path", exc))
-
-
-def _choose_serial(checks: list[dict], serials: list[str]) -> str:
-    """The one device this lane may pick for itself, or ``""`` (a row says why).
-
-    NEVER serials[0]. adb's order is not stable, and this lane
-    installs, types, taps and force-stops -- so picking the
-    first attached device can drive a tester's own phone.
-
-    The rule has TWO halves and both are pinned, because each one
-    alone reads like a bug to whoever meets it next:
-
-     * AMBIGUOUS set -> an emulator is the only device this lane
-       may choose for itself, and two of them refuse by name
-       rather than guess (`test_a_phone_is_never_chosen_over_an_
-       emulator`, `test_two_emulators_refuse_by_name_rather_than_
-       guess`).
-     * EXACTLY ONE attached device -> it is chosen, emulator or
-       not. Nothing is ambiguous about one device, and a tester
-       who runs the lane against a single physical handset on
-       purpose is a supported case; refusing it would be a guard
-       that stops the supported flow
-       (`test_a_single_attached_device_is_still_allowed`).
-
-    Reaching either branch at all requires a caller that resolved
-    no serial of its own; every production caller resolves one
-    first, so this is the fallback, not the usual path.
-    """
-    emulators = [s for s in serials if str(s).startswith("emulator-")]
-    if len(emulators) == 1:
-        return emulators[0]
-    if len(serials) == 1:
-        return serials[0]
-    ambiguous = ", ".join(str(s) for s in serials[:6])
-    checks.append(
-        _record(
-            "device_choice",
-            False,
-            "more than one device is attached and none could be "
-            "chosen safely: " + ambiguous,
-            "Name the device explicitly, because this lane "
-            "installs apps and taps the screen and must never "
-            "guess which one. Pass the emulator's serial, or "
-            "detach the others.",
-        )
-    )
-    return ""
-
-
-async def _step_emulator_booted(
-    checks: list[dict], serials: list[str], resolved_serial: str
-) -> str:
-    """4. emulator booted. Returns the serial in force (it may be chosen here)."""
-    try:
-        if not resolved_serial and serials:
-            resolved_serial = _choose_serial(checks, serials)
-        if not resolved_serial:
-            checks.append(
-                _record(
-                    "emulator_booted",
-                    False,
-                    "no running emulator or device was found",
-                    "Start the emulator from the mobile lane (or from "
-                    "Android Studio) and try again.",
-                )
-            )
-        else:
-            prop = await adb.getprop(resolved_serial, emulator.BOOT_PROP)
-            booted = (
-                not prop.get("error") and str(prop.get("content") or "").strip() == "1"
-            )
-            checks.append(
-                _record(
-                    "emulator_booted",
-                    booted,
-                    resolved_serial
-                    + ": "
-                    + emulator.BOOT_PROP
-                    + "="
-                    + str(prop.get("content") or prop.get("error") or "?"),
-                    (
-                        ""
-                        if booted
-                        else "The device is visible but still booting. Wait "
-                        "for the launcher to appear, then retry."
-                    ),
-                )
-            )
-    except _STEP_ERRORS as exc:
-        checks.append(_failed("emulator_booted", exc))
-    return resolved_serial
-
-
-def _step_virtualization(checks: list[dict], resolved_serial: str) -> None:
-    """4a. virtualization (an EMULATOR question).
-
-    Asked only when an emulator may be involved: no serial at all (one may
-    have to be started) or an `emulator-*` serial. A physical serial skips
-    it, because the Windows probe needs an elevated shell and used to
-    refuse a run that never touched a hypervisor. An UNDETERMINED answer
-    (the query itself failed) is advisory, never a refusal.
-    """
-    try:
-        if not resolved_serial or str(resolved_serial).startswith("emulator-"):
-            virt = (platform_info.virtualization() or {}).get("content") or {}
-            virt_record = _record(
-                "virtualization",
-                bool(virt.get("ok")),
-                str(virt.get("detail") or ""),
-                str(virt.get("fix") or ""),
-            )
-            if virt.get("undetermined"):
-                virt_record["blocking"] = False
-            checks.insert(0, virt_record)
-    except _STEP_ERRORS as exc:
-        checks.insert(0, _failed("virtualization", exc))
-
-
-async def _dns_failure_record(resolved_serial: str, overran: bool) -> dict:
-    """The failing ``device_dns`` row, with the remedy chosen by a route probe.
-
-    WHICH failure this is decides the remedy, so it is measured rather than
-    assumed: a device with no route at all is a different problem from one
-    whose resolver is stale, and telling a tester to restart the emulator when
-    the machine is simply offline wastes their time.
-    """
-    routed = await adb.shell(
-        resolved_serial,
-        ["ping", "-c", "1", "-W", str(DNS_PING_WAIT_S), DNS_PROBE_IP],
-        timeout=DNS_PROBE_TIMEOUT_S,
-    )
-    route_body = routed.get("content") or {}
-    can_route = not routed.get("error") and _exit_code(route_body) == 0
-    facts = await adb.device_facts(resolved_serial)
-    kind = str((facts.get("content") or {}).get("kind") or "")
-    # The REMEDY follows the route probe alone -- what the tester must change
-    # is the same whether the name failed fast or hung. The DETAIL is what
-    # carries the difference, because a tester who is told "cannot resolve"
-    # about a lookup that actually took 30s will not recognise the stall they
-    # are about to sit through.
-    if not can_route:
-        fix = DNS_NO_ROUTE_FIX
-    else:
-        fix = DNS_EMULATOR_FIX if kind == "emulator" else DNS_DEVICE_FIX
-    detail = _dns_failure_detail(resolved_serial, overran, can_route)
-    return _record("device_dns", False, detail, fix)
-
-
-def _dns_failure_detail(resolved_serial: str, overran: bool, can_route: bool) -> str:
-    """What the tester reads: the lookup's outcome combined with the route's."""
-    if overran and can_route:
-        detail = (
-            resolved_serial
-            + " did not resolve "
-            + DNS_PROBE_HOST
-            + " within "
-            + str(DNS_PROBE_TIMEOUT_S)
-            + "s, while "
-            + DNS_PROBE_IP
-            + " answered: "
-            + DNS_SLOW_NOTE
-        )
-    elif overran:
-        detail = (
-            resolved_serial
-            + " did not resolve "
-            + DNS_PROBE_HOST
-            + " within "
-            + str(DNS_PROBE_TIMEOUT_S)
-            + "s and did not reach "
-            + DNS_PROBE_IP
-            + " either"
-        )
-    elif can_route:
-        detail = (
-            resolved_serial
-            + " pings "
-            + DNS_PROBE_IP
-            + " but cannot resolve "
-            + DNS_PROBE_HOST
-            + ": packets route and names do not"
-        )
-    else:
-        detail = (
-            resolved_serial
-            + " reached neither "
-            + DNS_PROBE_HOST
-            + " nor "
-            + DNS_PROBE_IP
-        )
-    return detail
-
-
-async def _step_device_dns(
-    checks: list[dict], resolved_serial: str, early: dict
-) -> None:
-    """4b. the device can resolve a name."""
-    try:
-        if not resolved_serial:
-            checks.append(
-                _record(
-                    "device_dns",
-                    False,
-                    "no device answered, so its resolver could not be asked",
-                    "Start the emulator (or attach a device) and try again; "
-                    "the checks above say which step is missing.",
-                )
-            )
-            return
-        # The ADB CALL carries the budget and `-W` is left to do the
-        # one job it can do -- see DNS_PROBE_TIMEOUT_S for the numbers
-        # that decide which is which.
-        named = await (early.pop("dns", None) or _dns_probe(resolved_serial))
-        # A probe that OUTLASTED the budget is a FINDING, not a check
-        # that could not be made: adb was reachable enough to be left
-        # waiting on the resolver. So it does NOT go to `_unanswered`,
-        # whose "the device did not answer" is true and tells a tester
-        # nothing they can act on. It falls through to the same route
-        # probe as an outright failure, and only the DETAIL differs.
-        overran = bool(named.get("timed_out"))
-        unanswered = None if overran else _unanswered("device_dns", named)
-        if unanswered is not None:
-            checks.append(unanswered)
-            return
-        body = named.get("content") or {}
-        if not named.get("error") and _exit_code(body) == 0:
-            checks.append(
-                _record(
-                    "device_dns",
-                    True,
-                    resolved_serial + " resolves " + DNS_PROBE_HOST,
-                )
-            )
-        else:
-            checks.append(await _dns_failure_record(resolved_serial, overran))
-    except _STEP_ERRORS as exc:
-        checks.append(_failed("device_dns", exc))
-
-
-async def _step_package_installed(
-    checks: list[dict], target_package: str, resolved_serial: str, early: dict
-) -> None:
-    """5. target package installed."""
-    try:
-        package = str(target_package or "").strip()
-        refusal = _package_refusal(package, resolved_serial)
-        if refusal is not None:
-            checks.append(refusal)
-            return
-        installed = await (
-            early.pop("packages", None) or adb.installed_packages(resolved_serial)
-        )
-        unanswered = _unanswered("package_installed", installed)
-        if unanswered:
-            checks.append(unanswered)
-            return
-        present = package in (installed.get("content") or [])
-        checks.append(
-            _record(
-                "package_installed",
-                present,
-                package + (" is installed" if present else " is NOT installed"),
-                (
-                    ""
-                    if present
-                    else "Install the app first: give the mobile lane an "
-                    "APK path or a download URL, or open its Play Store "
-                    "listing on the emulator."
-                ),
-            )
-        )
-    except _STEP_ERRORS as exc:
-        checks.append(_failed("package_installed", exc))
-
-
-def _package_refusal(package: str, resolved_serial: str) -> dict | None:
-    """The failing row when the package cannot even be looked up, else ``None``."""
-    if not package:
-        return _record(
-            "package_installed",
-            False,
-            "no target app package was given",
-            "Tell the mobile lane which app to test: a local APK "
-            "path, a download URL, a Play Store listing, or the "
-            "package name of an app already on the emulator.",
-        )
-    if not valid_package_name(package):
-        return _record(
-            "package_installed",
-            False,
-            repr(package[:60]) + " is not a valid Android package name",
-            "Use the app's package id, for example com.example.app.",
-        )
-    if not resolved_serial:
-        return _record(
-            "package_installed",
-            False,
-            "cannot check " + package + " without a device",
-            "Start the emulator first.",
-        )
-    return None
-
-
-def _step_ime_pinned(checks: list[dict]) -> bool:
-    """6. IME pinned (Phase 0 Part B). Returns whether it is."""
-    pinned = False
-    try:
-        status = (ime.manifest_status() or {}).get("content") or {}
-        pinned = bool(status.get("ok"))
-        checks.append(
-            _record(
-                "ime_pinned",
-                pinned,
-                str(status.get("detail") or ""),
-                str(status.get("fix") or ""),
-            )
-        )
-    except _STEP_ERRORS as exc:
-        checks.append(_failed("ime_pinned", exc))
-    return pinned
-
-
-async def _step_ime_installed(
-    checks: list[dict], manifest: dict, resolved_serial: str, early: dict
-) -> None:
-    """7. the QA keyboard is installed."""
-    try:
-        if not resolved_serial:
-            checks.append(
-                _record(
-                    "ime_installed",
-                    False,
-                    "cannot check without a device",
-                    "Start the emulator first.",
-                )
-            )
-            return
-        present = (
-            await (early.pop("ime_installed", None) or ime.installed(resolved_serial))
-        ) or {}
-        # `ime.installed` propagates `adb.installed_packages`'s
-        # envelope verbatim (ime.py:197-198), so the evidence is
-        # here and used to be dropped: a failed probe rendered
-        # "is NOT installed" with a fix line about the next run.
-        unanswered = _unanswered("ime_installed", present)
-        if unanswered:
-            checks.append(unanswered)
-            return
-        ok = bool((present.get("content") or {}).get("installed"))
-        checks.append(
-            _record(
-                "ime_installed",
-                ok,
-                str(manifest.get("package"))
-                + (" is installed" if ok else " is NOT installed"),
-                (
-                    ""
-                    if ok
-                    else "This does not block a run. The mobile lane "
-                    "installs the QA keyboard itself at the start of "
-                    "a run whose script types or clears text."
-                ),
-            )
-        )
-    except _STEP_ERRORS as exc:
-        checks.append(_failed("ime_installed", exc))
-
-
-async def _step_ime_selected(
-    checks: list[dict], ime_id: str, resolved_serial: str, early: dict
-) -> None:
-    """8. the QA keyboard is the selected input method."""
-    try:
-        if not resolved_serial:
-            checks.append(
-                _record("ime_selected", False, "cannot check without a device")
-            )
-            return
-        current = await (
-            early.pop("ime_selected", None) or ime.current_ime(resolved_serial)
-        )
-        # THE SAME HOLE AS THE TWO NEIGHBOURS: `ime.current_ime` returns its
-        # adb envelope verbatim (ime.py:264-265), and reading only `content`
-        # made a failed probe render "active input method: (none)".
-        unanswered = _unanswered("ime_selected", current)
-        if unanswered:
-            checks.append(unanswered)
-            return
-        active = str(current.get("content") or "")
-        # By component identity: Android reports `pkg/.Class` and
-        # the manifest pins `pkg/pkg.Class`. `==` refused every run
-        # on a correctly configured device (2026-09-04, live).
-        ok = ime.same_component(active, ime_id)
-        checks.append(
-            _record(
-                "ime_selected",
-                ok,
-                "active input method: " + (active or "(none)"),
-                (
-                    ""
-                    if ok
-                    else "The mobile lane selects the QA keyboard "
-                    "itself, and restores yours when the run ends."
-                ),
-            )
-        )
-    except _STEP_ERRORS as exc:
-        checks.append(_failed("ime_selected", exc))
-
-
-async def _step_ime_oracle(
-    checks: list[dict], resolved_serial: str, early: dict
-) -> None:
-    """9. the QA keyboard answers a probe."""
-    try:
-        if not resolved_serial:
-            checks.append(_record("ime_oracle", False, "cannot check without a device"))
-            return
-        probed = await (early.pop("ime_oracle", None) or ime.probe(resolved_serial))
-        if probed.get("error"):
-            checks.append(
-                _record(
-                    "ime_oracle",
-                    False,
-                    str(probed["error"]),
-                    "Reinstall the QA keyboard and select it.",
-                )
-            )
-            return
-        body = probed["content"] or {}
-        checks.append(
-            _record(
-                "ime_oracle",
-                bool(body.get("ok")),
-                "probe result=" + str(body.get("result")),
-                (
-                    ""
-                    if body.get("ok")
-                    else "The QA keyboard did not answer a probe. "
-                    "Reinstall it and select it again."
-                ),
-            )
-        )
-    except _STEP_ERRORS as exc:
-        checks.append(_failed("ime_oracle", exc))
-
-
-async def _step_ime_probes(
-    checks: list[dict], pinned: bool, resolved_serial: str, early: dict
-) -> None:
-    """7/8/9. IME installed, selected, oracle.
-
-    Each is reported even when 6 failed, with the SAME reason, because a
-    tester reading "1 of 10 failed" and a tester reading "4 of 10 failed,
-    all for one missing release" take the same action -- and hiding three
-    of them would make the count a lie.
-    """
-    if not pinned:
-        for name in ("ime_installed", "ime_selected", "ime_oracle"):
-            checks.append(
-                _record(
-                    name,
-                    False,
-                    "not checked: " + ime.NOT_PINNED_DETAIL,
-                    ime.NOT_PINNED_FIX,
-                )
-            )
-        return
-    manifest = (ime.manifest() or {}).get("content") or {}
-    ime_id = str(manifest.get("ime_id") or "")
-    await _step_ime_installed(checks, manifest, resolved_serial, early)
-    await _step_ime_selected(checks, ime_id, resolved_serial, early)
-    await _step_ime_oracle(checks, resolved_serial, early)
-
-
-def _step_free_disk(checks: list[dict]) -> None:
-    """10. free disk."""
-    try:
-        disk = (downloader.check_disk(RUN_FREE_BYTES, paths.sub("runs")) or {}).get(
-            "content"
-        ) or {}
-        checks.append(
-            _record(
-                "free_disk",
-                bool(disk.get("ok")),
-                str(disk.get("detail") or ""),
-                (
-                    ""
-                    if disk.get("ok")
-                    else "Free some space on the volume holding "
-                    + str(paths.cache_root())
-                    + " and try again."
-                ),
-            )
-        )
-    except _STEP_ERRORS as exc:
-        checks.append(_failed("free_disk", exc))
-
-
-def _step_cache_ownership(checks: list[dict]) -> None:
-    """11. cache ownership.
-
-    ONE PRODUCER, ONE MEANING, EVERY CONSUMER. `paths.ownership()` has
-    produced a `checked` field since Phase 5 and NOTHING read it: both
-    consumers branch on `ok` alone, so on Windows -- where a POSIX uid
-    comparison carries no meaning, and the function therefore answers
-    `ok=True, checked=False` -- the disclosure that distinguishes "checked
-    and fine" from "not checked at all" reached no tester, while
-    `paths.ownership`'s own docstring claimed the docs repeated it. This is
-    the consumer that renders it, and the bracketed suffix is what makes
-    the two states distinguishable in the tester-facing line.
-    """
-    try:
-        owned = (paths.ownership() or {}).get("content") or {}
-        checks.append(
-            _record(
-                "cache_ownership",
-                bool(owned.get("ok")),
-                str(owned.get("detail") or "")
-                + (
-                    "" if bool(owned.get("checked")) else " [not verified on this host]"
-                ),
-                str(owned.get("fix") or ""),
-            )
-        )
-    except _STEP_ERRORS as exc:
-        checks.append(_failed("cache_ownership", exc))
-
-
-def _step_host_privileges(checks: list[dict]) -> None:
-    """12. host privileges.
-
-    ONE PRODUCER, ONE MEANING, EVERY CONSUMER: the same verdict the
-    qa_host_check tool and the virtualization fix text render. ADVISORY by
-    construction (see ADVISORY_CHECKS above), so `ok` cannot see it.
-    `undetermined` is reported as ok=True with the disclosure in `detail`:
-    a probe that could not read the machine is not a finding about the
-    machine, and rendering it as a failure is how a tester who CAN elevate
-    gets sent to IT.
-    """
-    try:
-        priv = (host_privileges.probe() or {}).get("content") or {}
-        determined = not priv.get("undetermined", True)
-        elevatable = bool(priv.get("elevated") or priv.get("can_elevate"))
-        checks.append(
-            _record(
-                "host_privileges",
-                (not determined) or elevatable,
-                str(priv.get("summary") or "no verdict")
-                + ("" if determined else " [not verified on this host]"),
-                ""
-                if elevatable
-                else "Nothing here is blocked. Prefer the admin-free "
-                "install route, and call qa_host_check for the per-step "
-                "list and the official download references.",
-            )
-        )
-    except _STEP_ERRORS as exc:
-        checks.append(_failed("host_privileges", exc))
-
-
-def _summarise(checks: list[dict], resolved_serial: str, needs_typing: bool) -> dict:
-    """The ``content`` of ``check``'s answer, from every row gathered."""
-    failing = [record["name"] for record in checks if not record["ok"]]
-    # `ok` is "nothing that BLOCKS a run failed". `failing` stays every
-    # failure, because the renderer still shows an advisory one with its fix
-    # -- a tester should read that typing is unavailable, and then be allowed
-    # to run anyway.
-    if needs_typing:
-        _mark_typing_blocking(checks)
-    blocking = [
-        record["name"]
-        for record in checks
-        if not record["ok"] and record.get("blocking", True)
-    ]
-    advisory = [name for name in failing if name not in blocking]
-    return {
-        "ok": not blocking,
-        "blocking": blocking,
-        "advisory": advisory,
-        "serial": resolved_serial,
-        "checks": checks,
-        "failing": failing,
-    }
-
-
-async def _run_steps(
-    checks: list[dict], target_package: str, serial: str, early: dict
-) -> str:
-    """Run every step in order, appending to *checks*; return the resolved serial.
-
-    *early* is filled with the started probe tasks so the caller can cancel
-    any task no step reached.
-    """
-    # 1. virtualization -----------------------------------------------
-    # (Computed at step 4a, once the serial is known, and inserted at
-    # position 0 so the row order is unchanged: a physical handset has no
-    # use for the emulator-accelerator answer.)
-    serials = await _step_adb_responds(checks)
-    _step_adb_first_on_path(checks)
-    resolved_serial = await _step_emulator_booted(checks, serials, serial)
-    _step_virtualization(checks, resolved_serial)
-
-    # THE READ-ONLY DEVICE PROBES, STARTED TOGETHER (S13). Steps 4b-9 each
-    # made one adb round trip and waited for it before the next began, so a
-    # slow resolver (the DNS ping has its own multi-second budget) held up
-    # four probes that do not depend on it. Each step still awaits ITS task
-    # at its own place, inside its own try, so the row order and every
-    # step's failure handling are exactly what the serial version produced;
-    # a step that finds no task makes the call itself.
-    early.update(_start_early_probes(resolved_serial, target_package))
-
-    await _step_device_dns(checks, resolved_serial, early)
-    await _step_package_installed(checks, target_package, resolved_serial, early)
-    pinned = _step_ime_pinned(checks)
-    await _step_ime_probes(checks, pinned, resolved_serial, early)
-    _step_free_disk(checks)
-    _step_cache_ownership(checks)
-    _step_host_privileges(checks)
-    return resolved_serial
-
-
-async def check(
-    target_package: str = "", serial: str = "", needs_typing: bool = False
-) -> dict:
-    """Run EVERY check and return all of them.
-
-    ``{"error", "content": {"ok", "serial", "checks": [...], "failing": [...]}}``.
-    ``error`` is reserved for this function itself failing; a failed CHECK is a
-    normal result with ``ok=False``, because a refusal a tester can act on is
-    not an error condition.
-    """
-    checks: list[dict] = []
-    early: dict = {}
-    try:
-        resolved_serial = await _run_steps(
-            checks, target_package, str(serial or ""), early
-        )
-        return {
-            "error": None,
-            "content": _summarise(checks, resolved_serial, needs_typing),
-        }
-    except Exception as exc:
-        logger.exception("mobile.preflight.check failed")
-        return {"error": str(exc), "content": None}
-    finally:
-        # A task no step reached (the function failed part-way) is cancelled
-        # rather than left to finish against a device nobody is reading.
-        for task in early.values():
-            task.cancel()
-
-
-def render(content: dict) -> str:
-    """The checks as tester-facing markdown, failures first with their fixes."""
-    lines: list[str] = []
-    body = dict(content or {})
-
-    def _advisory_failure(record: dict) -> bool:
-        return (not record.get("ok")) and record.get("blocking", True) is False
-
-    # Blocking failures first, then advisory ones, then the passes.
-    ordered = sorted(
-        body.get("checks") or [],
-        key=lambda record: (bool(record.get("ok")), _advisory_failure(record)),
-    )
-    for record in ordered:
-        advisory = _advisory_failure(record)
-        mark = "✅" if record.get("ok") else ("⚠️" if advisory else "❌")
-        label = " (advisory, does not block a run)" if advisory else ""
-        lines.append(
-            mark
-            + " **"
-            + str(record.get("name"))
-            + "**"
-            + label
-            + " — "
-            + str(record.get("detail"))
-        )
-        if not record.get("ok") and record.get("fix"):
-            lines.append("   ↳ " + str(record["fix"]))
-    return "\n".join(lines)
+logger = logging.getLogger("tools.mobile.preflight")

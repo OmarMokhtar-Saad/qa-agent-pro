@@ -29,8 +29,8 @@ HELPER_MODULE = "uiautomator2"
 
 _MAX_SERIAL_SHOWN = 64
 # Serials whose offer got anything but a yes; insertion-ordered, oldest dropped.
-_MAX_DECLINED = 64
-_declined: dict[str, None] = {}
+MAX_DECLINED = 64
+declined: dict[str, None] = {}
 # What a prompt or opt-in store failure can raise; anything else is a bug.
 _FAILURES = (
     OSError,
@@ -43,7 +43,7 @@ _FAILURES = (
 )
 
 
-def _installed() -> bool:
+def installed() -> bool:
     try:
         return importlib.util.find_spec(HELPER_MODULE) is not None
     except (ImportError, ValueError):
@@ -51,9 +51,9 @@ def _installed() -> bool:
 
 
 def _remember_decline(key: str) -> None:
-    while len(_declined) >= _MAX_DECLINED:
-        _declined.pop(next(iter(_declined)))
-    _declined[key] = None
+    while len(declined) >= MAX_DECLINED:
+        declined.pop(next(iter(declined)))
+    declined[key] = None
 
 
 def _question(serial: str) -> str:
@@ -100,7 +100,7 @@ def _enable_or_remember(serial: str, key: str, consent: object) -> bool:
 async def offer(serial: str, ask: Optional[AskCb]) -> bool:
     """Ask the tester about the helper for ``serial``; True only on a saved yes."""
     key = str(serial or "")
-    if key in _declined or not _installed() or tree_optin.is_enabled(serial):
+    if key in declined or not installed() or tree_optin.is_enabled(serial):
         return False
     answers: list = []
     try:

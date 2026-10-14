@@ -46,19 +46,19 @@ logger = logging.getLogger(__name__)
 # tailors the Atlassian-MCP connect instructions to the editor actually in use,
 # because "add this to your Cursor config" is useless in Claude Desktop.
 
-_HOST_CLIENT = {"name": ""}
+HOST_CLIENT = {"name": ""}
 
 
 def set_host_client(name: str) -> None:
     """Record the MCP client's name from the initialize handshake."""
-    _HOST_CLIENT["name"] = (name or "").strip().lower()
+    HOST_CLIENT["name"] = (name or "").strip().lower()
 
 
 def get_host_client() -> str:
     """Return the connected MCP client's name (lowercased), or '' if unknown.
 
     Read-only counterpart to set_host_client. Never raises."""
-    return _HOST_CLIENT["name"]
+    return HOST_CLIENT["name"]
 
 
 def resolve_generation_mode() -> str:

@@ -18,9 +18,12 @@ from __future__ import annotations
 import ipaddress
 import logging
 import socket
+from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+
+from config.settings_guard import never_raise
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +43,16 @@ _EMBEDDED_V4_PREFIXES = (
 )
 
 
+def _embeds_non_public_v4(addr: ipaddress._BaseAddress) -> bool:
+    """True when *addr* sits in an embedding prefix and carries a non-global IPv4."""
+    for prefix in _EMBEDDED_V4_PREFIXES:
+        if addr in prefix:
+            embedded = ipaddress.ip_address(int(addr) & 0xFFFFFFFF)
+            if not embedded.is_global:
+                return True
+    return False
+
+
 def embedded_v4_non_public(addr: ipaddress._BaseAddress) -> bool:
     """True when *addr* is an IPv6 address embedding a NON-public IPv4 address.
 
@@ -50,61 +63,72 @@ def embedded_v4_non_public(addr: ipaddress._BaseAddress) -> bool:
     unparseable address is treated as non-public, because this guard fails
     closed.
     """
-    try:
+    with never_raise(
+        logger,
+        "embedded_v4_non_public: unparseable address, failing closed",
+        level=logging.WARNING,
+    ):
         if addr.version != 6:
             return False
-        for prefix in _EMBEDDED_V4_PREFIXES:
-            if addr in prefix:
-                embedded = ipaddress.ip_address(int(addr) & 0xFFFFFFFF)
-                if not embedded.is_global:
-                    return True
-        return False
-    except Exception:
-        logger.warning("embedded_v4_non_public: unparseable address, failing closed")
-        return True
+        return _embeds_non_public_v4(addr)
+    return True
 
 
-def validate_public_url_sync(url: str) -> tuple:
-    """Synchronous twin of ``tools.jira_fetcher._validate_public_url``.
+def _parse_target(url: str) -> tuple[str | None, str | None]:
+    """``(hostname, error)``: the scheme allowlist, then a non-empty hostname."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return None, "Blocked: scheme '" + str(parsed.scheme) + "' not allowed"
+    if not parsed.hostname:
+        return None, "Blocked: invalid hostname"
+    return parsed.hostname, None
 
-    Returns ``(hostname, pinned_ip, error)`` -- ``error`` is None on success.
-    Same rule, same order, same failure text: scheme allowlist, then ONE DNS
-    resolution in which EVERY answer must be global and must not embed a
-    non-public IPv4 (NAT64 / IPv4-mapped). It exists because
-    ``tools/framework_template.py`` is blocking code called through
-    ``asyncio.to_thread`` and cannot await the coroutine version -- one rule with
-    two call conventions, rather than two rules that can drift apart. Never
-    raises; an unexpected failure is reported as a block, because this guard
-    fails closed.
-    """
+
+def _first_public_ip(hostname: str) -> tuple[Any, str | None]:
+    """``(ip, error)``: ONE resolution in which EVERY answer must be public."""
     try:
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            return (
-                None,
-                None,
-                "Blocked: scheme '" + str(parsed.scheme) + "' not allowed",
-            )
-        hostname = parsed.hostname
-        if not hostname:
-            return None, None, "Blocked: invalid hostname"
-        try:
-            infos = socket.getaddrinfo(hostname, None)
-        except socket.gaierror:
-            return None, None, "Blocked: could not resolve hostname '" + hostname + "'"
-        first_public = None
-        for info in infos:
-            addr = ipaddress.ip_address(info[4][0])
-            if not addr.is_global or embedded_v4_non_public(addr):
-                return None, None, "Blocked: non-public address"
-            if first_public is None:
-                first_public = info[4][0]
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return None, "Blocked: could not resolve hostname '" + hostname + "'"
+    first_public = None
+    for info in infos:
+        addr = ipaddress.ip_address(info[4][0])
+        if not addr.is_global or embedded_v4_non_public(addr):
+            return None, "Blocked: non-public address"
         if first_public is None:
-            return None, None, "Blocked: non-public address"
-        return hostname, first_public, None
-    except Exception:
-        logger.warning("validate_public_url_sync: failing closed", exc_info=True)
-        return None, None, "Blocked: address validation failed"
+            first_public = info[4][0]
+    if first_public is None:
+        return None, "Blocked: non-public address"
+    return first_public, None
+
+
+# Synchronous twin of ``tools.jira_fetcher._validate_public_url``.
+#
+# Returns ``(hostname, pinned_ip, error)`` -- ``error`` is None on success.
+# Same rule, same order, same failure text: scheme allowlist, then ONE DNS
+# resolution in which EVERY answer must be global and must not embed a
+# non-public IPv4 (NAT64 / IPv4-mapped). It exists because
+# ``tools/framework_template.py`` is blocking code called through
+# ``asyncio.to_thread`` and cannot await the coroutine version -- one rule with
+# two call conventions, rather than two rules that can drift apart. Never
+# raises; an unexpected failure is reported as a block, because this guard
+# fails closed.
+def validate_public_url_sync(url: str) -> tuple:
+    """``(hostname, pinned_ip, error)``; never raises, fails closed."""
+    with never_raise(
+        logger,
+        "validate_public_url_sync: failing closed",
+        level=logging.WARNING,
+        exc_info=True,
+    ):
+        hostname, error = _parse_target(url)
+        if hostname is None:
+            return None, None, error
+        ip, error = _first_public_ip(hostname)
+        if ip is None:
+            return None, None, error
+        return hostname, ip, None
+    return None, None, "Blocked: address validation failed"
 
 
 class PinnedIPSyncTransport(httpx.HTTPTransport):

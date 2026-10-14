@@ -15,10 +15,12 @@ def register_machine_tools(mcp, Context, rt) -> None:
     # unknown-tool error instead of a disabled notice, which belongs in the
     # release note. Device capture is unaffected -- qa_capture_screens and
     # qa_list_devices are registered above and still live.
-    if not _common._test_cases_only():
+    if not _common.test_cases_only():
         _register_wizard_tool(mcp, Context, rt)
-    _register_doctor_tools(mcp, Context, rt)
-    _register_machine_report_tools(mcp, Context, rt)
+    _register_doctor_tool(mcp, Context, rt)
+    _register_host_check_tool(mcp, Context, rt)
+    _register_machine_report_tool(mcp, Context, rt)
+    _register_selfcheck_tool(mcp, Context, rt)
 
 
 def _register_wizard_tool(mcp, Context, rt) -> None:
@@ -37,8 +39,8 @@ def _register_wizard_tool(mcp, Context, rt) -> None:
         )
 
 
-def _register_doctor_tools(mcp, Context, rt) -> None:
-    """Register qa-doctor and qa_host_check (every edition)."""
+def _register_doctor_tool(mcp, Context, rt) -> None:
+    """Register qa-doctor (every edition)."""
 
     @mcp.tool(name="qa-doctor")
     async def qa_doctor(ctx: Context, fix: bool = False) -> str:
@@ -56,14 +58,18 @@ def _register_doctor_tools(mcp, Context, rt) -> None:
             ),
         )
 
-    # ALL editions, NO flag: flag policy says a new feature ships ON, and this
-    # one falls into none of the four flag categories -- it makes no outbound
-    # call, needs no per-install config, is not an experiment, and there is no
-    # install where "do not tell the tester what this machine allows" is the
-    # right value. Registered UNCONDITIONALLY here and named in the ambient
-    # instructions block, which a test cross-checks per edition. Its producer is
-    # tools/host_privileges.py, top level, so this survives the test-cases-only
-    # edition, which ships no tools/mobile/ on disk.
+
+# ALL editions, NO flag: flag policy says a new feature ships ON, and this
+# one falls into none of the four flag categories -- it makes no outbound
+# call, needs no per-install config, is not an experiment, and there is no
+# install where "do not tell the tester what this machine allows" is the
+# right value. Registered UNCONDITIONALLY here and named in the ambient
+# instructions block, which a test cross-checks per edition. Its producer is
+# tools/host_privileges.py, top level, so this survives the test-cases-only
+# edition, which ships no tools/mobile/ on disk.
+def _register_host_check_tool(mcp, Context, rt) -> None:
+    """Register qa_host_check (every edition)."""
+
     @mcp.tool()
     async def qa_host_check(ctx: Context, refresh: bool = False) -> str:
         """What OS is this and can this account elevate? Call BEFORE proposing any install or provision command. ADVISORY ONLY: blocks nothing, names the admin-free route first, reports "cannot determine" as UNDETERMINED, never prompts for a password. Cached per process; `refresh=true` re-probes."""
@@ -74,16 +80,16 @@ def _register_doctor_tools(mcp, Context, rt) -> None:
         )
 
 
-def _register_machine_report_tools(mcp, Context, rt) -> None:
-    """Register qa_machine_report and the selfcheck tool (every edition)."""
+# ALL editions, NO flag. It makes no outbound call, needs no per-install
+# credential, is not an experiment, and there is no install where "do not
+# tell the client what this machine is" is the right value -- so it falls
+# into none of the four flag categories and owes no FEATURE_FLAGS entry.
+# Deliberately NOT named in tools/guidance.py: it is for a GUI client, not
+# for a chat model, and naming it there would spend instruction budget on a
+# tool no chat should call.
+def _register_machine_report_tool(mcp, Context, rt) -> None:
+    """Register qa_machine_report (every edition)."""
 
-    # ALL editions, NO flag. It makes no outbound call, needs no per-install
-    # credential, is not an experiment, and there is no install where "do not
-    # tell the client what this machine is" is the right value -- so it falls
-    # into none of the four flag categories and owes no FEATURE_FLAGS entry.
-    # Deliberately NOT named in tools/guidance.py: it is for a GUI client, not
-    # for a chat model, and naming it there would spend instruction budget on a
-    # tool no chat should call.
     @mcp.tool()
     async def qa_machine_report(ctx: Context, section: str = "all") -> str:
         """Machine-readable rows about THIS install for a non-chat client. JSON: `backend`, `doctor` (component/status/detail/fix_hint rows), `clients` (MCP clients and whether their entry points at THIS install) and `provisioning`. READ-ONLY, safe to poll; `qa-doctor` is the human-read one."""
@@ -92,6 +98,10 @@ def _register_machine_report_tools(mcp, Context, rt) -> None:
             ctx,
             host_check.handle_machine_report(section),
         )
+
+
+def _register_selfcheck_tool(mcp, Context, rt) -> None:
+    """Register the selfcheck tool (every edition)."""
 
     @mcp.tool(name=selfcheck_module.SELF_TOOL_NAME)
     async def qa_selfcheck(ctx: Context) -> str:

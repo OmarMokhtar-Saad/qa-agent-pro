@@ -18,6 +18,7 @@ from tools.mobile.resolve import (
     NONE,
     AskCb,
     Candidate,
+    PickOpts,
     Resolution,
     exact_key_match,
     resolve_or_ask,
@@ -53,5 +54,7 @@ async def pick_device(
     if not candidates:
         return Resolution(NONE, question=_NO_DEVICE)
     return await resolve_or_ask(
-        requested, candidates, noun="device", ask=ask, match=exact_key_match
+        requested,
+        candidates,
+        PickOpts(noun="device", ask=ask, match=exact_key_match),
     )

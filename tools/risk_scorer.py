@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 
 from tools.models import TestCase
+from tools.risk_scorer_section import _build_risk_section
 
 logger = logging.getLogger(__name__)
 
@@ -46,55 +47,29 @@ _HIGH_THRESHOLD = 24
 _MEDIUM_THRESHOLD = 14
 
 
+def _label_for(score: int) -> str:
+    """The risk label for a score (threshold ladder)."""
+    if score >= _CRITICAL_THRESHOLD:
+        return "CRITICAL"
+    if score >= _HIGH_THRESHOLD:
+        return "HIGH"
+    if score >= _MEDIUM_THRESHOLD:
+        return "MEDIUM"
+    return "LOW"
+
+
 def _compute_risk(tc: TestCase) -> tuple[int, str, str]:
     """Return (risk_score, risk_label, risk_rationale) for a single TestCase."""
     p_weight = _PRIORITY_WEIGHT.get(tc.priority.value, 1)
     t_weight = _TYPE_WEIGHT.get(tc.type.value, 1)
     score = p_weight * 10 + t_weight
-
-    if score >= _CRITICAL_THRESHOLD:
-        label = "CRITICAL"
-    elif score >= _HIGH_THRESHOLD:
-        label = "HIGH"
-    elif score >= _MEDIUM_THRESHOLD:
-        label = "MEDIUM"
-    else:
-        label = "LOW"
-
+    label = _label_for(score)
     rationale = (
         f"Priority={tc.priority.value} (weight={p_weight}), "
         f"Type={tc.type.value} (weight={t_weight}) "
         f"→ {label} (score={score})"
     )
     return score, label, rationale
-
-
-def _build_risk_section(scored: list[TestCase]) -> str:
-    """Build the markdown ## Risk Summary section."""
-    if not scored:
-        return ""
-
-    counts: dict[str, int] = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
-    for tc in scored:
-        counts[tc.risk_label] = counts.get(tc.risk_label, 0) + 1
-
-    lines = ["\n\n## Risk Summary\n"]
-    for label in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
-        n = counts.get(label, 0)
-        if n:
-            lines.append(f"- **{label}**: {n} test case{'s' if n != 1 else ''}")
-
-    lines.append("\n| TC ID | Title | Risk Label | Score | Rationale |")
-    lines.append("|-------|-------|-----------|-------|-----------|")
-    for tc in scored:
-        # Escape pipe chars in rationale so the table stays valid
-        rationale_safe = tc.risk_rationale.replace("|", "\\|")
-        lines.append(
-            f"| {tc.tc_id} | {tc.title[:60]} | **{tc.risk_label}** "
-            f"| {tc.risk_score} | {rationale_safe} |"
-        )
-
-    return "\n".join(lines)
 
 
 def build_risk_section(scored: list[TestCase]) -> str:
@@ -108,40 +83,41 @@ def build_risk_section(scored: list[TestCase]) -> str:
         return ""
 
 
-def score_and_sort(cases: list[TestCase]) -> tuple[list[TestCase], str]:
-    """Score cases by risk and sort critical-first.
+def _score_cases(cases: list[TestCase]) -> list[TestCase]:
+    """Copy every case with its risk fields set, sorted critical-first."""
+    scored: list[TestCase] = []
+    for tc in cases:
+        score, label, rationale = _compute_risk(tc)
+        update = {
+            "risk_score": score,
+            "risk_label": label,
+            "risk_rationale": rationale,
+        }
+        scored.append(tc.model_copy(update=update))
+    # Sort descending by risk_score (critical-first), stable on ties (preserves TC-ID order)
+    scored.sort(key=lambda tc: tc.risk_score, reverse=True)
+    return scored
 
-    Returns (scored_sorted_cases, risk_section_markdown).
-    On any error returns (cases, "") — never raises to callers.
-    """
+
+def _log_scored(scored: list[TestCase]) -> None:
+    logger.info(
+        "Risk scoring complete: %d cases scored; top risk_label=%s",
+        len(scored),
+        scored[0].risk_label if scored else "N/A",
+    )
+
+
+# Returns (scored_sorted_cases, risk_section_markdown).
+# On any error returns (cases, "") — never raises to callers.
+def score_and_sort(cases: list[TestCase]) -> tuple[list[TestCase], str]:
+    """Score cases by risk and sort critical-first."""
     if not cases:
         return cases, ""
-
     try:
-        scored: list[TestCase] = []
-        for tc in cases:
-            score, label, rationale = _compute_risk(tc)
-            scored.append(
-                tc.model_copy(
-                    update={
-                        "risk_score": score,
-                        "risk_label": label,
-                        "risk_rationale": rationale,
-                    }
-                )
-            )
-
-        # Sort descending by risk_score (critical-first), stable on ties (preserves TC-ID order)
-        scored.sort(key=lambda tc: tc.risk_score, reverse=True)
-
+        scored = _score_cases(cases)
         risk_section = _build_risk_section(scored)
-        logger.info(
-            "Risk scoring complete: %d cases scored; top risk_label=%s",
-            len(scored),
-            scored[0].risk_label if scored else "N/A",
-        )
+        _log_scored(scored)
         return scored, risk_section
-
     except Exception:
         logger.exception(
             "Risk scoring failed — returning unsorted cases without risk section"

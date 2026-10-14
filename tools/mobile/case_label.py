@@ -7,7 +7,7 @@ both; :func:`label_for` is the one fallback every renderer uses.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import NamedTuple, Optional
 
 UNLABELLED = "unlabelled step"
 
@@ -26,20 +26,24 @@ def _position(op_index: object) -> Optional[int]:
     return number + 1 if number >= 0 else None
 
 
-def refusal_case(
-    op_index: object, reason: str, tc_id: str = "", title: str = ""
-) -> dict:
-    """The case dict for a refused step.
+class Refused(NamedTuple):
+    """The tester-facing id and title of a refused case, each possibly unknown."""
 
-    *op_index* is the 0-based position of the refused action; None (the whole
-    script was refused) gives ``SCRIPT`` / ``Refused script``.
-    """
+    tc_id: str = ""
+    title: str = ""
+
+
+# *op_index* is the 0-based position of the refused action; None (the whole
+# script was refused) gives ``SCRIPT`` / ``Refused script``.
+def refusal_case(op_index: object, reason: str, known: Refused | None = None) -> dict:
+    """The case dict for a refused step."""
+    known = known or Refused()
     number = _position(op_index)
     tag = "STEP-" + str(number) if number else "SCRIPT"
     name = "Refused step " + str(number) if number else "Refused script"
     return {
-        "tc_id": _real(tc_id) or tag,
-        "title": _real(title) or name,
+        "tc_id": _real(known.tc_id) or tag,
+        "title": _real(known.title) or name,
         "reason": str(reason or ""),
     }
 

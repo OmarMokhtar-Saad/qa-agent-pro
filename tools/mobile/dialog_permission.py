@@ -14,7 +14,7 @@ decides nothing on such a screen and the next handler is tried.
 from __future__ import annotations
 
 from tools.mobile import dialog_handlers as dh
-from tools.mobile.dialog_defaults import ChoiceHandler
+from tools.mobile.dialog_choice import ChoiceHandler
 
 PERMISSION_PACKAGES = frozenset(
     {

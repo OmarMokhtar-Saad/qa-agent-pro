@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from typing import Any
 
 from tools.mobile import knowledge_gate
 from tools.mobile.knowledge_learn import StageResult
@@ -24,7 +25,7 @@ FAILED_OUTCOMES = frozenset(
 )
 
 
-def qualifying(steps: object) -> bool:
+def qualifying(steps: Any) -> bool:
     """True when *steps* hold a failed or tester-corrected step."""
     for step in steps or []:
         if not isinstance(step, dict):
@@ -37,7 +38,7 @@ def qualifying(steps: object) -> bool:
 def run(conn, lc) -> StageResult:
     notes: list = []
     try:
-        moved = knowledge_gate.gate(conn, lc.package, lc.run_id, lc.steps)
+        moved = knowledge_gate.gate(conn, lc.run_id, lc.steps)
         notes = ["%s:%s %s->%s" % (t.table, t.row_id, t.old, t.new) for t in moved[:20]]
         if qualifying(lc.steps):
             conn.execute(

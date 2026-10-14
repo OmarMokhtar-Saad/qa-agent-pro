@@ -13,18 +13,19 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
 from tools.mobile import knowledge_db, knowledge_limits
 from tools.mobile.knowledge_learn import StageResult
+from tools.mobile.kstg_popup_write import Sighting, store
+from tools.mobile.replay.guard import is_destructive
 
 logger = logging.getLogger(__name__)
 
 
-def looks_destructive(text: object) -> bool:
+def looks_destructive(text: Any) -> bool:
     """True when the executor's destructive lexicon matches *text* (an rid or label)."""
     try:
-        from tools.mobile.replay.guard import is_destructive
-
         return is_destructive(
             str(text or "").replace("_", " ").replace(".", " ").replace("/", " ")
         )
@@ -37,9 +38,11 @@ def looks_destructive(text: object) -> bool:
 _SIGNATURE_CLIP = 240
 
 
-def _anchors(conn, key: str) -> list:
+def popup_anchors(conn, key: str) -> list:
     found = knowledge_db.rows(
-        conn, "screens", "screen_key = ? AND invalid_at IS NULL", (key,), 1
+        conn,
+        "screens",
+        knowledge_db.Where("screen_key = ? AND invalid_at IS NULL", (key,), 1),
     )
     try:
         got = json.loads(found[0].get("anchors_json") or "[]") if found else []
@@ -48,7 +51,7 @@ def _anchors(conn, key: str) -> list:
     return sorted(str(a) for a in got) if isinstance(got, list) else []
 
 
-def signature(activity: object, anchors: list, dismiss_rid: str) -> str:
+def signature(activity: Any, anchors: list, dismiss_rid: str) -> str:
     """The popup identity, readable on purpose: activity plus sorted anchors, or
     the dismiss rid when no anchors are known. It is prose to the secret scan,
     so a popup whose anchors look secret is simply not learned."""
@@ -56,96 +59,40 @@ def signature(activity: object, anchors: list, dismiss_rid: str) -> str:
     return (str(activity or "") + "|" + basis)[:_SIGNATURE_CLIP]
 
 
-def find(steps: object) -> list:
+def _slot(cur: dict, nxt: dict) -> tuple | None:
+    x = cur.get("after_screen_key")
+    if not x or x == cur.get("screen_key") or nxt.get("screen_key") != x:
+        return None
+    if (
+        nxt.get("op") != "tap"
+        or nxt.get("outcome") != "ok"
+        or not nxt.get("target_rid")
+    ):
+        return None
+    if nxt.get("after_screen_key") != cur.get("screen_key") or str(x).startswith(
+        "sk1d:"
+    ):
+        return None
+    return (x, str(nxt.get("activity") or ""), nxt["target_rid"])
+
+
+def find(steps: Any) -> list:
     """``[(popup_key, activity, dismiss_rid, count)]`` found in one run's steps."""
     recs = list(steps or [])
     found: dict = {}
     for cur, nxt in zip(recs, recs[1:], strict=False):
-        x = cur.get("after_screen_key")
-        if not x or x == cur.get("screen_key") or nxt.get("screen_key") != x:
-            continue
-        if (
-            nxt.get("op") != "tap"
-            or nxt.get("outcome") != "ok"
-            or not nxt.get("target_rid")
-        ):
-            continue
-        if nxt.get("after_screen_key") != cur.get("screen_key") or str(x).startswith(
-            "sk1d:"
-        ):
-            continue
-        slot = (x, str(nxt.get("activity") or ""), nxt["target_rid"])
-        found[slot] = found.get(slot, 0) + 1
+        slot = _slot(cur, nxt)
+        if slot is not None:
+            found[slot] = found.get(slot, 0) + 1
     return [(k, a, r, n) for (k, a, r), n in sorted(found.items())]
-
-
-def _stored_rid(row: dict) -> object:
-    try:
-        got = json.loads(row.get("dismiss_json") or "{}")
-    except ValueError:
-        return None
-    return got.get("rid") if isinstance(got, dict) else None
-
-
-def _credit(conn, run_id: str, row: dict, sig: str, count: int) -> int:
-    """Count one more sighting on an existing row, once per run."""
-    try:
-        runs = json.loads(row.get("runs_json") or "[]")
-    except ValueError:
-        runs = []
-    if run_id and run_id in runs:
-        return 0
-    got = knowledge_db.upsert_counter(
-        conn,
-        "popups",
-        {"signature": sig},
-        {"times_seen": count, "runs_seen": 1},
-        run_id=run_id,
-        why="popup seen",
-    )
-    return 1 if got else 0
 
 
 def _upsert(conn, run_id: str, popup: tuple) -> int:
     key, activity, rid, count = popup
-    sig = signature(activity, _anchors(conn, key), rid)
-    found = knowledge_db.rows(
-        conn, "popups", "signature = ? AND invalid_at IS NULL", (sig,), 1
-    )
-    squat = (
-        bool(found)
-        and found[0].get("trust") == "imported"
-        and _stored_rid(found[0]) != rid
-    )
-    if found and not squat:
-        return _credit(conn, run_id, found[0], sig, count)
-    dismiss = {"op": "tap", "rid": rid, "screen_key": key, "activity": activity}
-    values = {
-        "signature": sig,
-        "dismiss_json": dismiss,
-        "times_seen": count,
-        "runs_seen": 1,
-        "status": "candidate",
-    }
-    if squat:
-        # An import never earns local credit for a dismiss this install did not
-        # observe: a fresh local row takes its place.
-        got = knowledge_db.supersede(
-            conn,
-            "popups",
-            found[0]["id"],
-            values,
-            run_id=run_id,
-            why="imported popup, other dismiss",
-        )
-        return 1 if got else 0
-    return (
-        1
-        if knowledge_db.insert(
-            conn, "popups", values, run_id=run_id, why="popup candidate"
-        )
-        else 0
-    )
+    sig = signature(activity, popup_anchors(conn, key), rid)
+    where = knowledge_db.Where("signature = ? AND invalid_at IS NULL", (sig,), 1)
+    found = knowledge_db.rows(conn, "popups", where)
+    return store(conn, Sighting(run_id, popup, sig), found)
 
 
 def run(conn, lc) -> StageResult:
@@ -158,9 +105,11 @@ def run(conn, lc) -> StageResult:
     ready = knowledge_db.rows(
         conn,
         "popups",
-        "status = 'candidate' AND invalid_at IS NULL AND runs_seen >= ?",
-        (knowledge_limits.POPUP_MIN_RUNS,),
-        20,
+        knowledge_db.Where(
+            "status = 'candidate' AND invalid_at IS NULL AND runs_seen >= ?",
+            (knowledge_limits.POPUP_MIN_RUNS,),
+            20,
+        ),
     )
     if ready:
         notes.append("%d popup candidates gate-ready" % len(ready))

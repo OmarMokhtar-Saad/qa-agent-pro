@@ -15,9 +15,11 @@ import json
 import logging
 import sqlite3
 from contextlib import closing
+from typing import NamedTuple
 
-from tools.mobile import app_knowledge
+from tools.mobile import app_knowledge, run_store
 from tools.mobile import knowledge_limits as limits
+from tools.mobile.report_text import esc
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +36,7 @@ def _empty() -> dict:
     return {"learned": [], "guards": [], "review": [], "recheck": 0, "skipped": []}
 
 
-def _package(run_id: str) -> str:
-    from tools.mobile import run_store
+def package_of(run_id: str) -> str:
 
     manifest = (run_store.read_manifest(run_id) or {}).get("content")
     return (
@@ -43,7 +44,7 @@ def _package(run_id: str) -> str:
     )
 
 
-def _summary(package: str, run_id: str) -> dict:
+def summary_of(package: str, run_id: str) -> dict:
     """``runs.summary_json`` for the run; ``{}`` when the store, table or row is absent."""
     try:
         path = app_knowledge.db_path(package)
@@ -69,35 +70,47 @@ def _item(raw: object) -> dict | None:
     return out if out["title"] or out["detail"] else None
 
 
+class _Call(NamedTuple):
+    package: str
+    run_id: str
+    summary: dict
+
+
+def _load_provider(section: dict, name: str, call: _Call) -> None:
+    try:
+        module = importlib.import_module("tools.mobile." + name)
+        key = _PROVIDER_KEY[name]
+        items = [_item(i) for i in module.build(*call) or []]
+        section[key] = [i for i in items if i][: limits.LIST_PAGE_ROWS]
+        guards = getattr(module, "guards", None)
+        if guards:
+            got = [_item(i) for i in guards(call.run_id) or []]
+            section["guards"] = [i for i in got if i][: limits.LIST_PAGE_ROWS]
+    except Exception:
+        logger.exception("report provider %s failed", name)
+
+
+def _totals(section: dict, summary: dict) -> None:
+    try:
+        section["recheck"] = max(0, int(summary.get("recheck") or 0))
+    except (TypeError, ValueError, OverflowError):
+        pass
+    skipped = summary.get("skipped")
+    if isinstance(skipped, list):
+        section["skipped"] = [str(s)[:_TEXT] for s in skipped[: limits.LIST_PAGE_ROWS]]
+
+
 def knowledge_section(run_id: object) -> dict:
     section = _empty()
     try:
         rid = str(run_id or "")
-        package = _package(rid)
+        package = package_of(rid)
         if not package:
             return section
-        summary = _summary(package, rid)
+        summary = summary_of(package, rid)
         for name in SECTION_PROVIDERS:
-            try:
-                module = importlib.import_module("tools.mobile." + name)
-                key = _PROVIDER_KEY[name]
-                items = [_item(i) for i in module.build(package, rid, summary) or []]
-                section[key] = [i for i in items if i][: limits.LIST_PAGE_ROWS]
-                guards = getattr(module, "guards", None)
-                if guards:
-                    got = [_item(i) for i in guards(rid) or []]
-                    section["guards"] = [i for i in got if i][: limits.LIST_PAGE_ROWS]
-            except Exception:
-                logger.exception("report provider %s failed", name)
-        try:
-            section["recheck"] = max(0, int(summary.get("recheck") or 0))
-        except (TypeError, ValueError, OverflowError):
-            pass
-        skipped = summary.get("skipped")
-        if isinstance(skipped, list):
-            section["skipped"] = [
-                str(s)[:_TEXT] for s in skipped[: limits.LIST_PAGE_ROWS]
-            ]
+            _load_provider(section, name, _Call(package, rid, summary))
+        _totals(section, summary)
     except Exception:
         logger.exception("knowledge_section failed")
         return _empty()
@@ -124,29 +137,32 @@ def _list(heading: str, items: list, esc) -> str:
     )
 
 
+def _recheck_p(body: dict, esc) -> str:
+    try:
+        recheck = int(body.get("recheck") or 0)
+    except (TypeError, ValueError, OverflowError):
+        recheck = 0
+    if recheck <= 0:
+        return ""
+    return '<p class="elab">' + esc("%d note(s) need a re-check" % recheck, 80) + "</p>"
+
+
+def _parts(body: dict, esc) -> list:
+    skipped = [{"title": s} for s in body.get("skipped") or []]
+    return [
+        _list("learned this run", body.get("learned") or [], esc),
+        _list("notes that fired", body.get("guards") or [], esc),
+        _list("needs your review", body.get("review") or [], esc),
+        _list("skipped notes", skipped, esc),
+        _recheck_p(body, esc),
+    ]
+
+
 def render_section(section: object) -> str:
     try:
         body = section if isinstance(section, dict) else {}
-        from tools.mobile.report_text import esc
 
-        parts = [
-            _list("learned this run", body.get("learned") or [], esc),
-            _list("notes that fired", body.get("guards") or [], esc),
-            _list("needs your review", body.get("review") or [], esc),
-        ]
-        skipped = [{"title": s} for s in body.get("skipped") or []]
-        parts.append(_list("skipped notes", skipped, esc))
-        try:
-            recheck = int(body.get("recheck") or 0)
-        except (TypeError, ValueError, OverflowError):
-            recheck = 0
-        if recheck > 0:
-            parts.append(
-                '<p class="elab">'
-                + esc("%d note(s) need a re-check" % recheck, 80)
-                + "</p>"
-            )
-        inner = "".join(p for p in parts if p)
+        inner = "".join(p for p in _parts(body, esc) if p)
         return '<div class="card">' + inner + "</div>" if inner else ""
     except Exception:
         logger.exception("render_section failed")

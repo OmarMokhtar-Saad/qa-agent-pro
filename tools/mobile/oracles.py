@@ -19,6 +19,7 @@ model is a fact that can be argued with.
 from __future__ import annotations
 
 import logging
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -36,44 +37,57 @@ SEVERITY_HIGH = "high"
 SEVERITY_MEDIUM = "medium"
 
 
-def findings(
-    crash: object,
-    inert: object,
-    screen_id: str = "",
-    prefix: object = None,
-) -> list:
-    """Every finding this turn's evidence supports. Never raises.
+class Scene(NamedTuple):
+    """Where the evidence was seen: the screen id and the action trace that reaches it."""
 
-    *crash* is the record ``crash_detector.crash_of_case`` returns (or ``{}``).
-    *inert* is ``executor.inert_ops(trace)``. *prefix* is the action trace that
-    reaches this screen -- what turns a finding into a bug report with real
-    steps rather than a sentence about a screenshot.
-    """
+    screen_id: str = ""
+    prefix: object = None
+
+
+def _crash_findings(crash: object, screen_id: str, reproduction: list) -> list:
+    body = crash if isinstance(crash, dict) else {}
+    if not body.get("detected"):
+        return []
+    return [
+        {
+            "kind": KIND_CRASH,
+            "severity": SEVERITY_HIGH,
+            "screen_id": str(screen_id or ""),
+            "evidence_refs": [str(body.get("marker") or "")],
+            "reproduction_prefix": reproduction,
+        }
+    ]
+
+
+def _inert_findings(inert: object, screen_id: str, reproduction: list) -> list:
+    ops = [str(op) for op in inert] if isinstance(inert, list) else []
+    if not ops:
+        return []
+    return [
+        {
+            "kind": KIND_INERT,
+            "severity": SEVERITY_MEDIUM,
+            "screen_id": str(screen_id or ""),
+            "evidence_refs": ops,
+            "reproduction_prefix": reproduction,
+        }
+    ]
+
+
+# *crash* is the record ``crash_detector.crash_of_case`` returns (or ``{}``).
+# *inert* is ``executor.inert_ops(trace)``. *scene.prefix* is the action trace that
+# reaches this screen -- what turns a finding into a bug report with real
+# steps rather than a sentence about a screenshot.
+def findings(crash: object, inert: object, scene: Scene | None = None) -> list:
+    """Every finding this turn's evidence supports. Never raises."""
     out: list = []
     try:
-        reproduction = list(prefix) if isinstance(prefix, (list, tuple)) else []
-        body = crash if isinstance(crash, dict) else {}
-        if body.get("detected"):
-            out.append(
-                {
-                    "kind": KIND_CRASH,
-                    "severity": SEVERITY_HIGH,
-                    "screen_id": str(screen_id or ""),
-                    "evidence_refs": [str(body.get("marker") or "")],
-                    "reproduction_prefix": reproduction,
-                }
-            )
-        ops = [str(op) for op in inert] if isinstance(inert, list) else []
-        if ops:
-            out.append(
-                {
-                    "kind": KIND_INERT,
-                    "severity": SEVERITY_MEDIUM,
-                    "screen_id": str(screen_id or ""),
-                    "evidence_refs": ops,
-                    "reproduction_prefix": reproduction,
-                }
-            )
+        seen = scene or Scene()
+        reproduction = (
+            list(seen.prefix) if isinstance(seen.prefix, (list, tuple)) else []
+        )
+        out.extend(_crash_findings(crash, seen.screen_id, reproduction))
+        out.extend(_inert_findings(inert, seen.screen_id, reproduction))
         return out[:MAX_FINDINGS]
     except Exception:  # pragma: no cover - defensive; a detector must not fail a run
         logger.exception("mobile.oracles.findings failed")

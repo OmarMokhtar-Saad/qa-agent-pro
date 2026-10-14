@@ -39,6 +39,22 @@ waiting for the one install that flips it.
 
 from __future__ import annotations
 
+from tools.guidance_instr import (  # noqa: F401
+    _INSTRUCTIONS_API,
+    _INSTRUCTIONS_CORE,
+    _INSTRUCTIONS_FULL,
+    _INSTRUCTIONS_MOBILE,
+)
+from tools.guidance_p_bug import _P_API, _P_BUG, _P_EXPLORE  # noqa: F401
+from tools.guidance_p_flow import _P_GENERATE, _P_JIRA  # noqa: F401
+from tools.guidance_p_mobile import _P_MOBILE  # noqa: F401
+from tools.guidance_prompts import (  # noqa: F401
+    _API_ONLY,
+    _FULL_ONLY,
+    _MOBILE_ONLY,
+    _PROMPTS,
+)
+
 # --- Server instructions ---------------------------------------------------- #
 # Sent once at initialize and resident in the client's context for the whole
 # session, so length is a real cost paid on every turn. ``MAX_INSTRUCTION_LINES``
@@ -67,87 +83,27 @@ from __future__ import annotations
 MAX_INSTRUCTION_LINES = 45
 
 
-_INSTRUCTIONS_CORE = """\
-QA Agents turns a feature or a ticket into a professional test suite, a bug
-report, or a guided exploratory session, for testers who do not write code. NO
-model runs on this server: YOU generate every artifact and hand it back through
-the matching submit tool. New machine, or odd behaviour: `qa-doctor` first.
-Before proposing ANY install or provision command: `qa_host_check` first.
-
-TEST CASES -- in this order:
-1. `qa_prepare_test_cases` returns a prep_id, the prompts, and the per-category
-   job list. Nothing is generated yet.
-2. `qa_get_category_job(prep_id, "all")` returns EVERY job packet in ONE call.
-   Never one call per category, never re-fetch a packet you hold.
-3. Generate each category and call `qa_submit_category` for each AS SOON AS
-   it is written, so a reload cannot lose it, and so the server's duplicate
-   prescreen sees the staged set. `qa_prep_status` shows what is outstanding.
-4. `qa_submit_suite` with the prep_id finalizes -- or hands back gaps to fix
-   and resubmit under the SAME prep_id.
-5. The submit already wrote an .xlsx -- relay ITS path, and never ask which
-   format they want. `qa_export_suite` only if the tester names another.
-When they have not said where the feature comes from, call
-`qa_generate_test_cases` with no arguments -- it asks them itself.
-
-JIRA: this server never calls Jira. A ticket URL comes back as a DIRECTIVE
-naming the tool YOUR client must call (`mcp__atlassian__getJiraIssue`, at the
-prefix it prints); make that call, pass its RAW JSON back unmodified in the
-argument named. Setup: `qa_configure_jira`. Prior work: `qa_search_corpus`.
-Jira auth fails: STOP, user reconnects; never read credentials/keychains.
-
-REPLIES THAT ARE NOT THE ANSWER, and the only correct response to each:
-* a DIRECTIVE -- run the named call, return with its raw result;
-* a markdown menu -- put it to the TESTER, then re-call with what it says to
-  send back: a `key`, a `device_id`, a `serial`, or the number it asks for;
-* a refusal naming an acknowledgement argument (`proceed_anyway`,
-  `image_gate_ack`, ...) -- explain the concern, re-send with that argument
-  only after they say go, never on the turn you were refused.
-"""
-
-_INSTRUCTIONS_FULL = """\
-BUGS AND EXPLORATION are prepare/submit pairs too -- `qa_bug_report` then
-`qa_submit_bug_report`, `qa_explore_step` then `qa_submit_explore_step`: YOU
-write the text between them. `qa_wizard` helps a tester choose.
-"""
-
-_INSTRUCTIONS_API = """\
-API TESTS: `qa_api_project`, then `qa_prepare_api_tests`,
-`qa_submit_api_tests`, `qa_write_api_test`.
-"""
-# Three lines. The first is the no-raw-adb rule (see MAX_INSTRUCTION_LINES);
-# the other two buy their place too: the two failure modes an ambient block
-# can actually prevent here are re-fetching a packet the model already holds
-# (it costs the tester's own tokens) and starting over in a new chat instead of
-# resuming. Everything else -- credentials, the guard, the budgets -- is in the
-# `qa_mobile_run` PROMPT, which a client pays for only when it is invoked.
-_INSTRUCTIONS_MOBILE = """\
-MOBILE: For anything on an Android emulator or device use the qa_mobile_test tool (goal=... for ad-hoc steps). Never run adb/uiautomator/ADB Keyboard directly; the tool owns the safety guard, keyboard handling and evidence. Never report a screen state, field value or login outcome that was not read from a qa_* observation. If the server cannot type or act, stop and report the blocker by name. Do not fall back to raw adb input, and do not claim a result.
-`qa_mobile_test` gives ONE packet at a time -- answer it with
-`qa_submit_mobile_step`, never re-fetch it; resume in any chat by run id. `qa_setup_capture` installs the API-capture certificate ahead of a run.
-"""
-
-
+# The ``instructions=`` block for this edition.
+#
+# ``test_cases_only`` mirrors ``handlers._common.test_cases_only()``,
+# ``api_tests`` mirrors ``settings.qa_api_test_enabled`` and ``mobile``
+# mirrors ``handlers._common._mobile_lane_enabled()`` -- the caller passes
+# the SAME expressions that gate registration, so a tool can never be named
+# here and absent there.
+#
+# ``mobile`` defaults to False so an existing caller keeps its behaviour. Its
+# block is a SIBLING of the full block, never nested inside it: the caller's
+# ``mobile`` argument is already ``_mobile_lane_enabled()``, so nesting it
+# under ``not test_cases_only`` was a SECOND copy of an edition gate -- the
+# same defect that kept the lane off every distribution build until
+# 2026-09-04, and it would have survived that fix, leaving a dist tester with
+# three registered tools and an instructions block that never names them.
+# ``prompt_texts`` gates the ``qa_mobile_run`` prompt on ``mobile`` alone;
+# these two now agree.
 def server_instructions(
     *, test_cases_only: bool, api_tests: bool, mobile: bool = False
 ) -> str:
-    """The ``instructions=`` block for this edition.
-
-    ``test_cases_only`` mirrors ``handlers._common._test_cases_only()``,
-    ``api_tests`` mirrors ``settings.qa_api_test_enabled`` and ``mobile``
-    mirrors ``handlers._common._mobile_lane_enabled()`` -- the caller passes
-    the SAME expressions that gate registration, so a tool can never be named
-    here and absent there.
-
-    ``mobile`` defaults to False so an existing caller keeps its behaviour. Its
-    block is a SIBLING of the full block, never nested inside it: the caller's
-    ``mobile`` argument is already ``_mobile_lane_enabled()``, so nesting it
-    under ``not test_cases_only`` was a SECOND copy of an edition gate -- the
-    same defect that kept the lane off every distribution build until
-    2026-09-04, and it would have survived that fix, leaving a dist tester with
-    three registered tools and an instructions block that never names them.
-    ``prompt_texts`` gates the ``qa_mobile_run`` prompt on ``mobile`` alone;
-    these two now agree.
-    """
+    """The ``instructions=`` block for this edition."""
     parts = [_INSTRUCTIONS_CORE]
     if not test_cases_only:
         parts.append(_INSTRUCTIONS_FULL)
@@ -162,269 +118,6 @@ def server_instructions(
 # One entry per MCP Prompt: name -> (one-line description, body). The
 # description is what a client lists in its prompt picker, so it reads as an
 # imperative the tester recognises, not as a module summary.
-
-_P_GENERATE = """\
-Generate a full test suite for a feature, end to end.
-
-Ask the tester for the feature first if they have not described it -- one
-paragraph of behaviour is enough, and a link to a ticket is better.
-
-1. Call `qa_prepare_test_cases` with what they gave you. It returns a prep_id,
-   a system prompt, shared user context, a response schema, and a job per test
-   category. It does NOT generate anything -- you do.
-2. If the reply is a DIRECTIVE (a ticket URL was given), follow it first: call
-   the Atlassian tool it names, pass the RAW JSON straight back into the
-   argument it names, and re-call `qa_prepare_test_cases`.
-3. If the reply is a markdown menu, your client could not show a dialog. Put
-   the menu to the TESTER, then follow the mapping the menu itself prints --
-   each option carries the backticked `key` that identifies it, and the menu
-   says which tool and argument that key means. Never send a position, and
-   never pick an option for them.
-4. If the reply REFUSES and names an acknowledgement argument -- an ambiguity
-   gate (`proceed_anyway`), a missing or stale screenshot (`image_gate_ack`,
-   `image_carry_ack`), a suspected duplicate run -- summarise the concern in
-   plain language and re-send with that argument ONLY after the tester says
-   go, on a later turn. Acknowledging on their behalf defeats the gate.
-5. Call `qa_get_category_job(prep_id, "all")` ONCE. That is every job packet in
-   one round trip. Do not call it per category and do not call it twice.
-6. Generate each category against ITS job instruction, the shared system prompt
-   and user context, emitting only an object matching the response schema and
-   setting each case's `category` to that job's category name exactly. Run any
-   step-zero jobs the payload lists yourself, in the parent turn, first.
-7. Call `qa_submit_category` for each category the moment it is finished. Do
-   not hold eight categories in memory to submit at the end -- staged work
-   survives a reload, memory does not. `qa_prep_status` tells you what is left.
-8. Call `qa_submit_suite` with the prep_id to finalize. If it comes back with
-   coverage gaps or weak cases instead, fix those and resubmit under the SAME
-   prep_id -- that is a step in the flow, not an error.
-9. The submit already wrote an .xlsx and gave you its path: hand the tester
-   THAT path as the deliverable, and never ask which format they want. Call
-   `qa_export_suite` only if they ask for another one themselves (csv,
-   gherkin, playwright, testrail).
-
-Read the prepare payload's own instructions and follow them where they are more
-specific than these steps: they are resolved for this run and this ticket.
-"""
-
-_P_JIRA = """\
-Generate a test suite from a Jira ticket.
-
-This server never contacts Jira. Your client's own Atlassian MCP connection
-does, and the server tells you exactly what to call.
-
-1. Call `qa_prepare_test_cases` with the ticket URL or key.
-2. The reply is a DIRECTIVE. It names the tool -- `mcp__atlassian__getJiraIssue`
-   under the standard prefix, but use the prefix the directive prints, because
-   clients namespace differently -- the fields to request, and the argument to
-   put the answer in. It may ask for a SECOND call for a parent issue.
-3. Make those calls and pass the RAW JSON result back UNMODIFIED. Do not
-   summarise it, re-key it, or hand back your own prose: the server parses the
-   real response shape and re-asks if it gets anything else.
-4. If you have no Atlassian connection, the reply lists the setup steps for
-   your client instead of failing. Relay them and stop -- `qa_configure_jira`
-   covers the server-side half.
-5. From here the flow is the ordinary one: `qa_get_category_job(prep_id,
-   "all")` once, generate, `qa_submit_category` per category as it lands,
-   `qa_submit_suite` to finalize. The submit hands back a finished .xlsx path
-   -- relay it, and never ask which format they want; call `qa_export_suite`
-   only if they ask for another format themselves.
-
-Attachments and screenshots on the ticket are not fetched by this server
-either. If the reply asks for images, get them through your client and attach
-them to the call it names.
-"""
-
-_P_BUG = """\
-Write a structured bug report from what the tester describes.
-
-1. Call `qa_bug_report` with their description, however rough. It returns a
-   task_id and a brief: the sections to write, the evidence to chase, and what
-   this tracker expects.
-2. Ask the tester for anything the brief flags as missing -- build, device,
-   steps, actual versus expected. One round of questions, not an interrogation.
-3. Write the report yourself against the brief. You are the model here.
-4. Call `qa_submit_bug_report` with the task_id and your report text.
-
-If the reply is a markdown menu, your client could not show a dialog: put the
-menu to the tester and re-call with the identifier that menu names -- a
-backticked `key`, a `device_id` or an adb `serial`, whichever it prints.
-"""
-
-_P_EXPLORE = """\
-Coach a tester through an exploratory testing session, one step at a time.
-
-1. Call `qa_explore_step` with the charter or feature under test. It returns a
-   task_id and the brief for the NEXT step -- one step, not a plan.
-2. Turn the brief into a concrete instruction the tester can act on now, and
-   wait for what they observed.
-3. Call `qa_submit_explore_step` with the task_id and their finding written up.
-4. Repeat from step 1 for the next step. The session adapts to what they hit,
-   so do not batch steps ahead or invent the next one yourself.
-
-Stop when the tester says the charter is covered, and offer to turn what they
-found into a bug report.
-"""
-
-_P_API = """\
-Generate REST-Assured / TestNG API tests into a Java project.
-
-1. Call `qa_api_project` to create a project from the configured template, or
-   to continue with an existing one. The reply names the project marker it
-   wrote or found -- that file, not a convention, decides the package.
-2. Call `qa_prepare_api_tests` with the endpoints, spec URL, or description.
-   It collects what it still needs first; while the intake status is
-   `collecting` it is asking you for more, and it turns `confirmable` only when
-   it has enough. Confirm with the TESTER at that point, not before.
-3. Generate the cases and call `qa_submit_api_tests` with them.
-4. Call `qa_write_api_test` to render Java into the project. Always call it
-   WITHOUT `apply` first and show the tester the dry run. A real write needs
-   `apply=true` AND a framework path AND this install configured for real
-   writes -- installs ship dry-run-first, so `apply=true` alone still returns a
-   dry run. The dry run itself names which of the three this machine is
-   missing, so read its reply rather than guessing -- `qa-doctor` does NOT
-   report the API framework path or the write flags (measured 2026-09-02; it
-   used to be pointed at here, and did not carry the answer).
-
-Never write into the tester's repo without showing them the dry run first.
-"""
-
-_P_MOBILE = """\
-Run test cases, or explore freely, on an Android emulator.
-
-Nothing runs until the tester has agreed to it: every step that installs an
-app, downloads an SDK or launches anything needs `apply=true`, and you send
-that only after the tester has said go, on a later turn.
-
-1. Call `qa_mobile_test` with no arguments. It answers with whatever the
-   machine needs next -- a setup guide, an install menu, a preflight
-   list with a fix per failed check, or the start menu.
-2. A markdown menu means your client could not show a dialog. Put it to the
-   TESTER, and re-call with the identifier THEIR option prints -- a backticked
-   `key` in `source`, or an adb `serial` for a device. THIS lane never accepts
-   a position, whatever your question UI shows: it may relabel the options
-   a/b/c/d and it may reorder them, so a tester who answered "the fourth one"
-   would start a different run. (Other tools DO take a number where their own
-   reply asks for one in so many words -- read the reply, do not generalise
-   from this rule.) Never choose for them.
-3. Once a run starts you get ONE packet: a case (or an exploratory goal), the
-   pruned screen, and the exact action vocabulary you may use. The budget is
-   TURNS, not actions, so plan the WHOLE case -- or a whole conversational
-   round -- as ONE script and send it straight back with
-   `qa_submit_mobile_step`. A script may carry dozens of actions and the
-   packet states its own ceiling; four scripts that each do one step of a
-   round cost four times what one script costs. Do not echo the screen, and
-   do not ask for a packet you already hold.
-4. If a step comes back needing a credential, ask the TESTER for that ONE field
-   in chat and pass the value in `tester_input` with `tester_input_field` set
-   to the field name. It is typed into the app and stored nowhere -- not in the
-   report, the checkpoint or the audit log. Never invent one, never reuse one
-   from an earlier run, and never repeat it back in your own message.
-5. If a step stops in front of something irreversible -- a confirm, a delete, a
-   payment -- nothing was tapped. Say so, ask the tester, and resubmit the same
-   script only if they agree.
-6. Every case is checkpointed as it finishes. To continue in a NEW chat, call
-   `qa_mobile_test` with the `run_id` and no session token: that takes the run
-   over, and the other chat is told at its next call. `qa_mobile_status` reads
-   the whole run back from disk and changes nothing.
-7. A finished run's reply starts with a short verdict block (verdict, each
-   requested step, the typed-field tally). Relay it to the tester word for
-   word -- never upgrade, soften or summarise it into a plainer claim.
-
-Never start, install to or drive a device yourself through a shell. This lane
-owns the emulator: it spawns it detached so it outlives the call, keeps its
-quickboot snapshot so a warm AVD restores instead of cold-booting, and hands
-back a `booting` reply you poll with `qa_mobile_status`. A hand-rolled
-`emulator -avd ...` from a tool shell dies with that shell and boots colder
-and slower than the one this lane starts for you.
-
-Device selection: if the tester already has an emulator running, pass its adb
-serial (e.g. `emulator-5554`) in `serial` on your NEXT `qa_mobile_test` call
-rather than letting the server guess or start a second one. Several booted
-devices come back as a menu of serials -- put it to the tester and resend with
-the `serial` they choose, not with its position in the list.
-
-A reply naming "booting" is not something to retry by
-calling `qa_mobile_test` again: call `qa_mobile_status` instead and keep
-polling it until it reports ready, then continue with the `run_id`.
-
-Do not start a second run of cases you have already started. If the same
-cases are already an unfinished run of the same app, `qa_mobile_test` answers
-with that run's id -- carry on with it by passing that `run_id`, rather than
-re-sending the cases. `new_run=true` starts a fresh one and is for when the
-tester asks for it.
-
-Keep each script inside the budget the packet states: one submit replays for a
-bounded time and the waits in one script have a total cap. If a reply comes
-back saying the budget was reached, nothing was lost -- the actions that ran
-are recorded and the screen you were given is the current one; send the rest
-as a second, shorter script.
-
-Wait for what the reply must SAY, not for a number: `wait_until_text` continues
-the moment that text appears, `wait_until_gone` when a spinner or 'Loading'
-leaves, `wait_until_changed` / `wait_until_idle` when the screen moves or
-settles. `max_s` only bounds a condition that never comes; no wait is a fixed
-sleep. Never sleep in a shell (sleep, Start-Sleep, timeout) between calls: the
-phone is not watched while you do.
-
-To check that the app REPLIED, use `assert new_text` (optionally with
-`contains`), or `text_present` naming something the reply must say. Never
-`screen_changed`: it only says the screen moved, which any navigation does.
-
-The short element ids belong to the screen you were given and are renumbered
-every time the server re-reads the screen. Use one for the FIRST action of a
-script; for anything after it, target by `role` (send, voice, input, back,
-close), by `rid`, or by `label`.
-
-Resuming works on an UNFINISHED run. A run whose cases have all reached a
-verdict is complete, and `unverified` and `blocked` are verdicts -- so resuming
-it hands back the report, not more work. To attempt such a case again, start a
-new run for it, and give the script an `assert`: `unverified` means nothing was
-checked, and a script that checks nothing cannot pass however many times it is
-run.
-
-7. When the run finishes, this server writes a self-contained report FOLDER
-   next to the run's own files and opens it: `index.html` beside a `media`
-   directory holding the recordings and frames. Relay the PATH it names and
-   say it is a folder: to send it on, zip the WHOLE folder and send that.
-   The html on its own opens with every picture missing. A report can be
-   built at any time, mid-run included, with `qa_mobile_status` and
-   `report_now=true`.
-
-A reply that says the call stopped short of its own time budget is not an error
-either: no step was half-done, and calling `qa_mobile_test` again with the run
-id carries on from the same place.
-
-A step that says the emulator is still starting, or an install is still
-running, is not an error: those outlive a single tool call by design. Call
-`qa_mobile_status` and continue when it reports ready.
-"""
-
-_PROMPTS: dict[str, tuple[str, str]] = {
-    "qa_generate": ("Generate a full test suite for a feature", _P_GENERATE),
-    "qa_jira_to_tests": ("Generate a test suite from a Jira ticket", _P_JIRA),
-    # NOT `qa_bug_report`: that is the TOOL's name. Prompts and tools are
-    # separate MCP registries, so the protocol allows the clash -- but a
-    # client picker lists both, and two identical rows with different
-    # behaviour is a trap for the tester. Every other prompt name here
-    # already differs from every tool name; the test pins that.
-    "qa_bug_report_workflow": ("Write a structured bug report", _P_BUG),
-    "qa_explore": ("Run a guided exploratory testing session", _P_EXPLORE),
-    "qa_api_tests": (
-        "Generate REST-Assured API tests",
-        _P_API,
-    ),  # NOT `qa_mobile_test`, for the reason recorded above `qa_bug_report_workflow`:
-    # a prompt sharing a tool's name puts two identical rows with different
-    # behaviour in the client's picker. Pinned by the same test.
-    "qa_mobile_run": ("Run tests on an Android emulator", _P_MOBILE),
-}
-
-#: Prompts that name a tool only the FULL edition registers.
-_FULL_ONLY = frozenset({"qa_bug_report_workflow", "qa_explore"})
-
-#: Prompts that name a tool registered only when the API test agent is on.
-_API_ONLY = frozenset({"qa_api_tests"})
-#: Prompts that name a tool registered only when the mobile lane is on.
-_MOBILE_ONLY = frozenset({"qa_mobile_run"})
 
 
 def prompt_texts(

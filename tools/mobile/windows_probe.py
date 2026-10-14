@@ -42,19 +42,14 @@ is the same call ``tools/mobile/report_selfcheck.py`` makes.
 
 from __future__ import annotations
 
-import importlib.util
 import logging
 import platform
 import sys
 
-from tools.mobile import locks, paths, platform_info, sdk_locator
+from tools.mobile import paths, platform_info, sdk_locator
+from tools.mobile.windows_probe_lock import PROBE_OWNER, _lock_round_trip  # noqa: F401
 
 logger = logging.getLogger(__name__)
-
-#: The owner label the probe takes the lock under. Distinctive on purpose: if a
-#: paste-back ever shows this holding a lock, the probe crashed mid-round-trip
-#: and the process that would release it is gone -- which the kernel handles.
-PROBE_OWNER = "windows-probe"
 
 #: The fact keys, in report order. :func:`render` walks THIS rather than the
 #: dict, so a fact that stops being rendered fails a test instead of quietly
@@ -73,49 +68,45 @@ FACT_KEYS: tuple[str, ...] = (
 )
 
 
-def _lock_round_trip() -> dict:
-    """Take and release the real emulator lock. Reports the PRIMITIVE used.
-
-    The primitive is determined the same way ``locks._lock_fd`` determines it --
-    by which module is importable -- rather than by asking ``locks``, so this
-    needs no change to the locking module whose invariant is the most
-    load-bearing thing in the lane.
-    """
-    primitive = ""
-    for name in ("fcntl", "msvcrt"):
-        try:
-            if importlib.util.find_spec(name) is not None:
-                primitive = name
-                break
-        except (ImportError, ValueError):  # pragma: no cover - defensive
-            continue
-    body: dict = {
-        "primitive": primitive or "none",
-        "acquired": False,
-        "released": False,
-        "detail": "",
+def _python_facts() -> dict:
+    return {
+        "version": sys.version.split()[0],
+        "sys.platform": platform_info.raw_platform(),
+        "platform.machine": platform.machine(),
     }
-    try:
-        taken = locks.acquire(locks.EMULATOR_LOCK, owner=PROBE_OWNER)
-        if taken.get("error"):
-            body["detail"] = str(taken["error"])[:300]
-            return body
-        got = taken.get("content") or {}
-        body["acquired"] = bool(got.get("acquired"))
-        if not body["acquired"]:
-            body["detail"] = (
-                "the lane's lock is held by "
-                + str(got.get("owner") or "another process")
-                + " -- close other chats and run this again"
-            )
-            return body
-        given = locks.release(locks.EMULATOR_LOCK, owner=PROBE_OWNER, as_holder=True)
-        body["released"] = not given.get("error")
-        body["detail"] = str(given.get("error") or "")[:300]
-    except Exception as exc:  # pragma: no cover - locks never raises
-        logger.warning("mobile.windows_probe: lock round trip failed: %s", exc)
-        body["detail"] = str(exc)[:300]
-    return body
+
+
+def _suffix_facts() -> dict:
+    return {
+        "adb": platform_info.exe("adb"),
+        "emulator": platform_info.exe("emulator"),
+        "sdkmanager": platform_info.script("sdkmanager"),
+        "avdmanager": platform_info.script("avdmanager"),
+    }
+
+
+def _cache_facts() -> dict:
+    return {
+        "root": str(paths.cache_root()),
+        "free_bytes": paths.free_bytes(),
+        "ownership": (paths.ownership() or {}).get("content") or {},
+    }
+
+
+def _fill_host(out: dict, host: dict) -> None:
+    out["support"] = platform_info.support_statement(
+        str(host.get("os") or platform_info.WINDOWS)
+    )
+    out["python"] = _python_facts()
+    out["host"] = host
+    out["virtualization"] = (platform_info.virtualization() or {}).get("content") or {}
+
+
+def _fill_tools(out: dict, located: dict, java: dict) -> None:
+    out["suffixes"] = _suffix_facts()
+    out["sdk"] = located
+    out["java"] = java
+    out["studio"] = sdk_locator.studio_present()
 
 
 def facts() -> dict:
@@ -125,32 +116,9 @@ def facts() -> dict:
         host = (platform_info.host_info() or {}).get("content") or {}
         located = (sdk_locator.locate_sdk() or {}).get("content") or {}
         java = (sdk_locator.locate_java() or {}).get("content") or {}
-        out["support"] = platform_info.support_statement(
-            str(host.get("os") or platform_info.WINDOWS)
-        )
-        out["python"] = {
-            "version": sys.version.split()[0],
-            "sys.platform": platform_info.raw_platform(),
-            "platform.machine": platform.machine(),
-        }
-        out["host"] = host
-        out["virtualization"] = (platform_info.virtualization() or {}).get(
-            "content"
-        ) or {}
-        out["suffixes"] = {
-            "adb": platform_info.exe("adb"),
-            "emulator": platform_info.exe("emulator"),
-            "sdkmanager": platform_info.script("sdkmanager"),
-            "avdmanager": platform_info.script("avdmanager"),
-        }
-        out["sdk"] = located
-        out["java"] = java
-        out["studio"] = sdk_locator.studio_present()
-        out["cache"] = {
-            "root": str(paths.cache_root()),
-            "free_bytes": paths.free_bytes(),
-            "ownership": (paths.ownership() or {}).get("content") or {},
-        }
+        _fill_host(out, host)
+        _fill_tools(out, located, java)
+        out["cache"] = _cache_facts()
         out["lock"] = _lock_round_trip()
     except Exception as exc:  # pragma: no cover - every callee is non-raising
         logger.exception("mobile.windows_probe.facts failed")

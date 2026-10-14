@@ -16,9 +16,14 @@ import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Optional, Protocol
+from typing import Any, Optional
 
 from tools.mobile import run_verdict
+from tools.mobile.lock_reaper_args import (  # noqa: F401
+    IdleQuery,
+    ReleaseCtx,
+    ReleasePorts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +40,7 @@ MAX_TRACKED_RUNS = 64
 _activity: OrderedDict = OrderedDict()
 
 
-def _stamp(value: object) -> Optional[float]:
+def _stamp(value: Any) -> Optional[float]:
     try:
         return None if value is None else float(value)
     except (TypeError, ValueError, OverflowError):
@@ -75,14 +80,11 @@ def idle_seconds(
     return max(0.0, current - max(stamps))
 
 
-def is_idle(
-    run_id: str,
-    persisted_ts: Optional[float] = None,
-    now: Optional[float] = None,
-    timeout_s: float = IDLE_RELEASE_TIMEOUT_S,
-) -> bool:
-    idle = idle_seconds(run_id, persisted_ts, now)
-    return idle is not None and idle >= timeout_s
+def is_idle(run_id: str, query: IdleQuery | None = None) -> bool:
+    q = query or IdleQuery()
+    limit = IDLE_RELEASE_TIMEOUT_S if q.timeout_s is None else q.timeout_s
+    idle = idle_seconds(run_id, q.persisted_ts, q.now)
+    return idle is not None and idle >= limit
 
 
 @dataclass(frozen=True)
@@ -109,16 +111,6 @@ class ReleaseNotice:
             + str(IDLE_RELEASE_TIMEOUT_S)
             + " s), so that run was ended as unverified and its lock freed."
         )
-
-
-class ReleasePorts(Protocol):
-    """The side effects; each may be a plain function or a coroutine function."""
-
-    def stop_heartbeat(self, run_id: str) -> Any: ...
-
-    def finalize(self, run_id: str, verdict: run_verdict.Verdict) -> Any: ...
-
-    def release_lock(self, serial: str, run_id: str) -> Any: ...
 
 
 async def call_port(port: Any, *args: Any) -> Any:
@@ -167,24 +159,27 @@ async def _free(ports: ReleasePorts, notice: ReleaseNotice, verdict: Any) -> boo
     return True
 
 
+def _idle_notice(run_id: str, ctx: ReleaseCtx) -> Optional[ReleaseNotice]:
+    """The notice for *run_id* when it has been idle long enough, else None."""
+    idle = idle_seconds(run_id, ctx.persisted_ts, ctx.now)
+    if idle is None or idle < IDLE_RELEASE_TIMEOUT_S:
+        return None
+    return ReleaseNotice(run_id, ctx.serial, idle)
+
+
 async def release_if_idle(
-    holder_run_id: str,
-    serial: str,
-    ports: ReleasePorts,
-    persisted_ts: Optional[float] = None,
-    now: Optional[float] = None,
+    holder_run_id: str, ctx: ReleaseCtx
 ) -> Optional[ReleaseNotice]:
     """Free *serial* from *holder_run_id* if it has been idle long enough.
 
     Returns the notice (its ``message()`` names the old run), or None when the
     holder is active, unknown, or could not be freed.
     """
-    idle = idle_seconds(holder_run_id, persisted_ts, now)
-    if idle is None or idle < IDLE_RELEASE_TIMEOUT_S:
+    notice = _idle_notice(holder_run_id, ctx)
+    if notice is None:
         return None
-    notice = ReleaseNotice(holder_run_id, serial, idle)
     verdict = run_verdict.synthesize(notice.reason())
-    if not await _free(ports, notice, verdict):
+    if not await _free(ctx.ports, notice, verdict):
         return None
     forget(holder_run_id)
     return notice

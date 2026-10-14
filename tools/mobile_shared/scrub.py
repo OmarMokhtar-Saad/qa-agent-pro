@@ -21,412 +21,56 @@ fields; the per-app vocabulary lives in the profile.
 
 from __future__ import annotations
 
-import html
-import json
-import re
-from contextlib import contextmanager
-from contextvars import ContextVar
-from typing import Iterable
+import html  # noqa: F401
+import json  # noqa: F401
+import re  # noqa: F401
+from contextlib import contextmanager  # noqa: F401
+from contextvars import ContextVar  # noqa: F401
+from typing import Iterable  # noqa: F401
 
-# Headers that carry an invariant worth seeing at a glance. Four, not seven: marking six of
-# ten rows is the same as marking none -- the eye stops treating the highlight as a signal.
-MARKED_HEADERS = {
-    "authorization",
-    "apikey",
-    "accept-language",
-    "x-credential-nid",
-    "x-credential-dependent-nid",
-}
-
-# Header values that must never reach a shared report verbatim. The credential nids are here
-# for a DIFFERENT reason than the tokens: a token is a secret nobody needs to read; a
-# credential nid is EVIDENCE -- it is how a report proves which patient a call acted for --
-# and because it had a job to do it was once left out, and a real national id shipped in
-# cleartext one line below a correctly masked bearer token. The mask keeps the last four
-# characters, so two calls made for different people still LOOK different.
-SECRET_HEADERS = {
-    "authorization",
-    "apikey",
-    "x-api-key",
-    "cookie",
-    "set-cookie",
-    "x-credential-nid",
-    "x-credential-dependent-nid",
-}
-
-# Known fixture values, shown verbatim because seeing them is the POINT: they are the
-# evidence that auth was actually wired onto the call. Keep this list tiny.
-FIXTURE_SECRETS = {"bearer test-token", "test-key", "jwt", ""}
-
-# The person-field family, one alternation per group so a reviewer can see what is
-# covered. Key-anchored: every alternative is bounded by a word edge or the key's own
-# end, so ``filename`` / ``username`` / ``hostname`` / ``serviceName`` / ``conceptName``
-# never match while ``full_name_english`` / ``firstName`` / ``contactNo1`` do.
-_KEY_NAMES = (
-    r"\bfull_?name\w*|\bfirst_?name\w*|\blast_?name\w*|\bfirst_and_last_name\w*|"
-    r"\bname_(?:arabic|english)\b|\bpatient_?name\w*|\w*Name(?:Arabic|English)\b|"
-    r"\bfirstAndLastName\w*"
+from tools.mobile_shared.scrub_arm import (  # noqa: F401
+    _SENSITIVE_VALUES,
+    arm,
+    armed,
+    armed_scope,
+    forget_sensitive,
+    learn_sensitive,
 )
-_KEY_CONTACT = r"\bcontact_?no\d*\b|\bmobile(?:_?number|_?no)?\b|\bphone(?:_?number|_?no)?\b|\bmsisdn\b"
-_KEY_IDENTITY = (
-    r"\bnational_?id\w*|nationalidiqama|\biqama\w*|identification_?number|\bhealth_?id\b|"
-    r"\bnid\b|\bpassport\w*"
+from tools.mobile_shared.scrub_keys import (  # noqa: F401
+    _KEY_AUTH,
+    _KEY_CONTACT,
+    _KEY_DEMOGRAPHICS,
+    _KEY_IDENTITY,
+    _KEY_NAMES,
+    FIXTURE_SECRETS,
+    MARKED_HEADERS,
+    MIN_SENSITIVE_LEN,
+    SECRET_HEADERS,
+    SENSITIVE_KEY_RE,
 )
-_KEY_DEMOGRAPHICS = r"date_?of_?birth|\bdob\b|\bbirth_?date\b|\bgender\b|\bage\b"
-# `_` IS A WORD CHARACTER, so `\btoken\b` has no boundary to find in
-# `access_token` and matched only the BARE word. Every real-world spelling was
-# therefore unmasked -- access_token, refresh_token, id_token, auth_token,
-# bearer_token, session_token, csrf_token -- and the same `\b` bug left
-# `client_secret` and `app_secret` open while plain `secret` was masked. Measured
-# against a captured plaintext request line: a JWT in `?access_token=` reached
-# the report whole, while `?password=` beside it was redacted, which is the worst
-# possible shape -- the page LOOKS scrubbed.
-#
-# So these two are matched anywhere inside the key, not on word boundaries. The
-# test is applied to a KEY, which is a bare identifier, never to prose, so a
-# substring match here cannot shred an ordinary sentence.
-# `sid` / `session*` / `pin` are here on RISK ASYMMETRY rather than certainty. A
-# session id is a credential -- it is what session hijacking steals -- and a PIN
-# is one outright. Both can also name something harmless. Over-masking costs a
-# tester one `<redacted>` in a report they can re-run; under-masking puts a live
-# session into a file they email to a colleague. `code` is deliberately NOT here:
-# an OAuth code is a credential but `code` is far more often a country or status
-# code, it is single-use and short-lived, and masking it would shred ordinary
-# rows. That one is a judgement, and it is written down rather than silent.
-_KEY_AUTH = (
-    r"\bpassword\w*|\bemail\w*|\w*token\w*|\bauthorization\b|\bapi_?key\b"
-    r"|\w*secret\w*|\bjwt\b|\bbearer\b|\botp\b|\bpasswd\w*"
-    r"|\bsid\b|\bsession\w*|\bpin\b"
+from tools.mobile_shared.scrub_mask import mask_value, redact_header  # noqa: F401
+from tools.mobile_shared.scrub_nets import (  # noqa: F401
+    QUERY_PAIR_RE,
+    TEXT_PAIR_RE,
+    _mask_pair,
+    _mask_query_pair,
+    scrub_pairs,
+    scrub_query,
 )
-SENSITIVE_KEY_RE = re.compile(
-    "|".join((_KEY_NAMES, _KEY_CONTACT, _KEY_IDENTITY, _KEY_DEMOGRAPHICS, _KEY_AUTH)),
-    re.I,
+from tools.mobile_shared.scrub_prose import (  # noqa: F401
+    _PROSE_AGE_RE,
+    _PROSE_BLOOD_RE,
+    _PROSE_KEEP_RE,
+    _PROSE_LABELLED_RE,
+    _PROSE_PERSON_RE,
+    _PROSE_PHONE_RE,
+    _mask_list,
+    scrub_prose,
 )
-
-# Short values are not identifiers, and masking them would shred ordinary payloads.
-MIN_SENSITIVE_LEN = 6
-
-# Populated per render by learn_sensitive / arm, reset by forget_sensitive so one page's
-# values can never leak into the next page's mask decisions. A ContextVar, not a plain
-# module-global set (T5.2): redaction now also runs at WRITE time
-# (tools/mobile_capture/flows.py), concurrently with render, and asyncio gives no LIFO
-# unwind guarantee across overlapping arming windows -- a save/restore context manager
-# over a shared mutable set would let one task's `forget_sensitive` silently un-arm
-# another task's still-in-flight values. Each asyncio task gets its OWN value here,
-# and `arm` always SETS a new frozenset rather than mutating one in place, because a
-# child task inherits the same object reference: an in-place mutation would leak
-# straight back across the boundary this ContextVar exists to draw.
-_SENSITIVE_VALUES: ContextVar[frozenset[str]] = ContextVar(
-    "mobile_evidence_scrub_sensitive_values", default=frozenset()
+from tools.mobile_shared.scrub_render import (  # noqa: F401
+    _mask_keyed,
+    _scrub_scalar,
+    e,
+    scrub_json,
+    scrub_text,
 )
-
-
-def redact_header(key: object, value: object) -> object:
-    """Mask a credential header unless its value is a known fixture.
-
-    Deliberately narrow: only SECRET_HEADERS are touched and every other header renders
-    exactly as captured. The mask keeps the scheme and the last 4 characters, enough to tell
-    that a token WAS sent and to match it against an environment, without carrying it.
-    """
-    text = str(value)
-    if (
-        str(key).lower() not in SECRET_HEADERS
-        or text.strip().lower() in FIXTURE_SECRETS
-    ):
-        return value
-    scheme, _, rest = text.partition(" ")
-    if rest:
-        return scheme + " <redacted:" + str(len(rest)) + " chars ..." + rest[-4:] + ">"
-    return "<redacted:" + str(len(text)) + " chars ..." + text[-4:] + ">"
-
-
-def mask_value(value: object) -> str:
-    """The header mask, applied to a bare value: keep the length and the last four.
-
-    THE TAIL IS DROPPED ON A SHORT VALUE. ``s[-4:]`` of a four-character secret is the whole
-    secret, so ``"password": "12"`` would have rendered ``<redacted:2 chars ...12>`` -- the
-    plaintext wearing a redaction label, which is worse than no mask because it reads as
-    safe. Below MIN_SENSITIVE_LEN there is nothing to distinguish and everything to give away.
-    """
-    text = str(value)
-    if len(text) < MIN_SENSITIVE_LEN:
-        return "<redacted:" + str(len(text)) + " chars>"
-    return "<redacted:" + str(len(text)) + " chars ..." + text[-4:] + ">"
-
-
-def learn_sensitive(data: object) -> int:
-    """Collect the identifying values this render must never print, from the run itself.
-
-    Called ONCE before rendering, not lazily during it: a body may render before any header
-    does, and a net armed halfway through the page is not a net. Shape-independent on
-    purpose: it walks whatever it is given looking for ``requestHeaders``.
-    """
-    stack = [data]
-    seen = 0
-    collected: set[str] = set()
-    while stack and seen < 200000:
-        node = stack.pop()
-        seen += 1
-        if isinstance(node, dict):
-            headers = node.get("requestHeaders")
-            if isinstance(headers, dict):
-                for key, value in headers.items():
-                    if (
-                        str(key).lower() in MARKED_HEADERS
-                        and str(key).lower() != "accept-language"
-                    ):
-                        text = str(value).strip()
-                        if (
-                            len(text) >= MIN_SENSITIVE_LEN
-                            and text.lower() not in FIXTURE_SECRETS
-                        ):
-                            collected.add(text)
-            stack.extend(node.values())
-        elif isinstance(node, list):
-            stack.extend(node)
-    if collected:
-        # A NEW frozenset, never a mutation of the one already held -- see the
-        # module docstring above _SENSITIVE_VALUES.
-        _SENSITIVE_VALUES.set(_SENSITIVE_VALUES.get() | collected)
-    return len(_SENSITIVE_VALUES.get())
-
-
-def arm(values: Iterable[object]) -> int:
-    """Add the tester's typed values to the net before a capture is written.
-
-    The lane types credentials onto the device from ``Context.tester_inputs``, which is never
-    persisted -- so the moment a logcat slice is taken is the ONLY moment the typed value is
-    known and can be masked. A value shorter than MIN_SENSITIVE_LEN is not armed, for the
-    reason :func:`mask_value` gives. Returns the size of the armed set.
-
-    Sets a NEW frozenset onto this task's :class:`~contextvars.ContextVar` rather than
-    mutating one in place -- a child task inherits the same object reference, so an
-    in-place ``|=`` would leak straight back across the boundary the ContextVar exists to
-    draw (see the module docstring above ``_SENSITIVE_VALUES``).
-    """
-    additions = {
-        str(value or "").strip()
-        for value in (values or ())
-        if len(str(value or "").strip()) >= MIN_SENSITIVE_LEN
-    }
-    if additions:
-        _SENSITIVE_VALUES.set(_SENSITIVE_VALUES.get() | additions)
-    return len(_SENSITIVE_VALUES.get())
-
-
-def forget_sensitive() -> None:
-    """Drop what the last render or capture learned, for THIS task only."""
-    _SENSITIVE_VALUES.set(frozenset())
-
-
-def armed() -> int:
-    """How many values the net currently holds (for tests and disclosure)."""
-    return len(_SENSITIVE_VALUES.get())
-
-
-@contextmanager
-def armed_scope(values: Iterable[object]):
-    """Arm *values* for the duration of the block, in THIS task only.
-
-    A thin ergonomic wrapper over :func:`arm` / a task-local reset -- used by
-    ``tools/mobile_capture/flows.py`` to redact one case's flows at write time. Restores
-    to whatever THIS task held before the scope opened (not to empty), so a nested or
-    sibling scope in the same task is never clobbered. Safe under non-LIFO unwind ACROSS
-    TASKS by construction: each ``asyncio`` task owns its own value in this ContextVar
-    (a copy taken at task-creation time), so opening or closing a scope in one task can
-    never touch another task's value -- there is no shared mutable object left to
-    corrupt, which is the hazard a save/restore-over-a-plain-set design does not close
-    (see the module docstring above ``_SENSITIVE_VALUES``).
-    """
-    token = _SENSITIVE_VALUES.set(_SENSITIVE_VALUES.get())
-    try:
-        arm(values)
-        yield
-    finally:
-        _SENSITIVE_VALUES.reset(token)
-
-
-# A key/value pair as it survives INSIDE free text, quoted or entity-quoted, with a string or
-# a bare number on the right. Bounded on purpose: the key is a plain identifier of at most 41
-# characters and the value stops at its closing quote or the end of a number, so this cannot
-# run away over a multi-megabyte body. The string branch understands BACKSLASH ESCAPES,
-# because a serialised-then-escaped JSON value can legitimately contain ``\"``.
-TEXT_PAIR_RE = re.compile(
-    r'(?P<q1>&quot;|")(?P<k>[A-Za-z_][A-Za-z0-9_]{0,40})(?P=q1)\s*:\s*'
-    r'(?:(?P<q2>&quot;|")(?P<sv>(?:\\.|(?!&quot;)[^"\\]){0,4000})(?P=q2)'
-    r"|(?P<nv>-?\d[\d.]{0,30}))"
-)
-
-
-def scrub_pairs(text: str) -> str:
-    """Mask a sensitive key's value where only the TEXT of the pair survives.
-
-    UNLIKE the value net, this does NOT depend on arming: a key names itself, so there is
-    nothing to arm. The ``:`` test comes first -- an ordinary label has no colon and leaves.
-    """
-    if ":" not in text:
-        return text
-
-    def one(match: re.Match) -> str:
-        if not SENSITIVE_KEY_RE.search(match.group("k")):
-            return match.group(0)
-        group = "sv" if match.group("sv") is not None else "nv"
-        value = match.group(group)
-        if not value:
-            return match.group(0)
-        # SPLICED BY POSITION, never by str.replace over the matched span. A replace would
-        # rewrite the value wherever it appears in that span -- including INSIDE THE KEY,
-        # which is reachable: `"password2": 2` matches, and replacing "2" would garble the
-        # key as well as mask the value. Offsets are relative to the match start.
-        low = match.start(group) - match.start(0)
-        high = match.end(group) - match.start(0)
-        whole = match.group(0)
-        return whole[:low] + mask_value(value) + whole[high:]
-
-    return TEXT_PAIR_RE.sub(one, text)
-
-
-# A key/value pair as it survives in a URL QUERY STRING or a form body: ``?token=abc`` /
-# ``&api_key=abc``. The pair net above reads JSON-shaped text and cannot see this shape,
-# which was found the moment a plaintext request line was captured off the wire: an app
-# that puts a token in a URL puts it exactly here. Bounded the same way -- the key is a
-# plain identifier of at most 41 characters and the value stops at the next separator.
-QUERY_PAIR_RE = re.compile(
-    r"(?P<lead>[?&;]|^|\s)(?P<k>[A-Za-z_][A-Za-z0-9_.\-]{0,40})=(?P<v>[^&;\s\"'<>#]{1,4000})"
-)
-
-
-def scrub_query(text: str) -> str:
-    """Mask a sensitive key's value where the pair survives as ``key=value``.
-
-    Like :func:`scrub_pairs`, this needs no arming: the key names itself. The ``=`` test
-    comes first so ordinary prose leaves without paying for the regex.
-    """
-    if "=" not in text:
-        return text
-
-    def one(match: re.Match) -> str:
-        if not SENSITIVE_KEY_RE.search(match.group("k")):
-            return match.group(0)
-        return (
-            match.group("lead") + match.group("k") + "=" + mask_value(match.group("v"))
-        )
-
-    return QUERY_PAIR_RE.sub(one, text)
-
-
-def scrub_text(text: object) -> str:
-    """Mask every armed value wherever it appears in free text, every sensitive
-    key/value pair that survives as text (JSON-shaped OR query-shaped), and the
-    labelled prose values. NOT a no-op on an unarmed render: the pair, query and
-    prose passes always run."""
-    out = scrub_prose(scrub_query(scrub_pairs("" if text is None else str(text))))
-    values = _SENSITIVE_VALUES.get()
-    if not values:
-        return out
-    # Longest first, so a value that contains another is masked whole rather than being
-    # half-rewritten by its own substring.
-    for value in sorted(values, key=len, reverse=True):
-        if value in out:
-            out = out.replace(value, mask_value(value))
-    return out
-
-
-# ── free prose ──────────────────────────────────────────────────────────────────
-#
-# The key nets need a KEY. An SDK's prompt body carries the patient as prose --
-# ``FACTS: patient: age 42, m, Riyadh, <name>, height 180cm, blood type B+`` and a
-# dependents roster -- and reached disk and the page in cleartext on the first live
-# capture. These are LABELLED-VALUE patterns, each bounded (no unbounded quantifier
-# over the whole text), so they cannot run away over a multi-megabyte body.
-_PROSE_AGE_RE = re.compile(
-    r"(?i)(?P<label>\b(?:age|\u0639\u0645\u0631)\s*[:=]?\s*)(?P<value>\d{1,3})\b"
-)
-_PROSE_BLOOD_RE = re.compile(
-    r"(?i)(?P<label>\bblood\s*type\s*[:=]?\s*)(?P<value>(?:AB|A|B|O)[+-])"
-)
-_PROSE_PHONE_RE = re.compile(r"(?<!\d)(?P<value>(?:\+?966|0)5\d{8})(?!\d)")
-# The roster label, then up to six comma-separated tokens of at most 60 chars each.
-_PROSE_PERSON_RE = re.compile(
-    r"(?i)(?P<label>\b(?:patient|dependents?|\u0627\u0644\u0645\u0631\u064a\u0636|\u0627\u0644\u062a\u0627\u0628\u0639(?:\u064a\u0646)?)\s*:\s*)"
-    r"(?P<list>[^,\n\u00b7]{1,60}(?:,\s*[^,\n\u00b7]{1,60}){0,5})"
-)
-# A token that is a bare number, a number with a unit, or a one-letter code is kept:
-# ``180cm``, ``71kg``, ``m``, ``f`` say nothing about WHO.
-_PROSE_KEEP_RE = re.compile(
-    r"^(?:[a-z]|\d+(?:\.\d+)?\s*[a-z%]{0,6}|\w+\s+\d+(?:\.\d+)?\s*[a-z%]{0,6})$", re.I
-)
-# A token that carries a measurement label, or that an earlier pass already masked,
-# is kept whole: ``age <redacted...>`` must not be masked a second time with its label.
-_PROSE_LABELLED_RE = re.compile(
-    r"^(?:age|blood\s*type|height|weight|bmi|bp|glucose|hr|spo2|temp|waistline|doses)\b|^<redacted:",
-    re.I,
-)
-
-
-def _mask_list(match: re.Match) -> str:
-    tokens = match.group("list").split(",")
-    out = []
-    for token in tokens:
-        raw = token.strip()
-        if not raw or _PROSE_KEEP_RE.match(raw) or _PROSE_LABELLED_RE.search(raw):
-            out.append(token)
-        else:
-            lead = token[: len(token) - len(token.lstrip())]
-            out.append(lead + mask_value(raw))
-    return match.group("label") + ",".join(out)
-
-
-def scrub_prose(text: str) -> str:
-    """Mask the labelled personal values a prompt carries as prose.
-
-    Age, blood type and a phone-shaped run are masked wherever they appear; the tokens
-    after a ``patient:`` / ``dependents:`` label are masked unless they are a number, a
-    measurement or a one-letter code. The LABEL always survives, so a reader sees that a
-    value stood there. Anything not labelled is NOT touched -- stated in the docs.
-    """
-    if not text:
-        return text
-    out = _PROSE_AGE_RE.sub(
-        lambda m: m.group("label") + mask_value(m.group("value")), text
-    )
-    out = _PROSE_BLOOD_RE.sub(
-        lambda m: m.group("label") + mask_value(m.group("value")), out
-    )
-    out = _PROSE_PHONE_RE.sub(lambda m: mask_value(m.group("value")), out)
-    return _PROSE_PERSON_RE.sub(_mask_list, out)
-
-
-def scrub_json(obj: object, _key: object = None) -> object:
-    """Walk a parsed body, masking by key name and by value.
-
-    THE KEY IS CHECKED FIRST, BEFORE ANY RECURSION, and this order is the whole point.
-    Recursing first would re-key each child by its OWN field name and throw the parent
-    away, so ``{"patient_name": {"first": "John", "last": "Doe"}}`` would sail through
-    untouched. A matched key masks its WHOLE value, scalar or subtree, and a list under a
-    sensitive key is still that key's value.
-    """
-    if _key and SENSITIVE_KEY_RE.search(str(_key)):
-        if isinstance(obj, (dict, list)):
-            # Masked as its serialised self, so two different subtrees still differ.
-            return mask_value(json.dumps(obj, ensure_ascii=False, sort_keys=True))
-        text = str(obj)
-        return obj if not text or text in ("None", "null") else mask_value(text)
-    if isinstance(obj, dict):
-        return {key: scrub_json(value, key) for key, value in obj.items()}
-    if isinstance(obj, list):
-        return [scrub_json(value, _key) for value in obj]
-    if isinstance(obj, str):
-        return scrub_text(obj)
-    if isinstance(obj, int) and not isinstance(obj, bool):
-        # An id arriving as a NUMBER under a key nobody listed is still an id, but only the
-        # value net can see it -- and only when this run presented it as a credential.
-        return mask_value(obj) if str(obj) in _SENSITIVE_VALUES.get() else obj
-    return obj
-
-
-def e(value: object, quote: bool = True) -> str:
-    """Escape for HTML -- and mask on the way through. THIS IS THE CHOKE POINT."""
-    return html.escape(
-        scrub_text(value if isinstance(value, str) else str(value)), quote
-    )

@@ -65,14 +65,15 @@ def _by_id_or_serial(text: str, cand: resolve.Candidate) -> bool:
     return bool(wanted) and wanted in (cand.key.lower(), cand.label.lower())
 
 
-async def _stop_one(run: ActiveRun, ports: StopPorts, reason: str) -> StopResult:
-    verdict = run_verdict.synthesize(reason, run.last_refusal, run.trace_verdict)
+async def _run_ports(
+    run: ActiveRun, ports: StopPorts, verdict: run_verdict.Verdict
+) -> list[str]:
     steps = (
         ("stop its heartbeat", ports.stop_heartbeat, (run.run_id,)),
         ("record its verdict", ports.finalize, (run.run_id, verdict)),
         (_FREE_LOCK, ports.release, (run.serial, run.run_id)),
     )
-    failed = []
+    failed: list[str] = []
     for what, port, args in steps:
         try:
             await lock_reaper.call_port(port, *args)
@@ -81,7 +82,12 @@ async def _stop_one(run: ActiveRun, ports: StopPorts, reason: str) -> StopResult
                 "stop_run: could not %s for %s", what, run.run_id, exc_info=True
             )
             failed.append(what)
-    lock_reaper.forget(run.run_id)
+    return failed
+
+
+def _stop_message(
+    run: ActiveRun, verdict: run_verdict.Verdict, failed: list[str]
+) -> str:
     where = "device " + run.serial if run.serial else "the device"
     message = (
         "Stopped run "
@@ -94,33 +100,56 @@ async def _stop_one(run: ActiveRun, ports: StopPorts, reason: str) -> StopResult
     )
     if failed:
         message += " Could not " + ", ".join(failed) + "; the lock expires on its own."
+    return message
+
+
+async def _stop_one(run: ActiveRun, ports: StopPorts, reason: str) -> StopResult:
+    verdict = run_verdict.synthesize(reason, run.last_refusal, run.trace_verdict)
+    failed = await _run_ports(run, ports, verdict)
+    lock_reaper.forget(run.run_id)
+    message = _stop_message(run, verdict, failed)
     return StopResult(
         _FREE_LOCK not in failed, message, run.run_id, run.serial, verdict
     )
 
 
+@dataclass(frozen=True)
+class StopOpts:
+    """How a stop asks and why it says it stopped."""
+
+    ask: Optional[resolve.AskCb] = None
+    reason: str = STOP_REASON
+
+
+async def _pick(
+    target: str, runs: list, ask: Optional[resolve.AskCb]
+) -> tuple[Optional[ActiveRun], str]:
+    found = await resolve.resolve_or_ask(
+        target,
+        _candidates(runs),
+        resolve.PickOpts(noun="run", ask=ask, match=_by_id_or_serial),
+    )
+    chosen = next((r for r in runs if r.run_id == found.value), None)
+    if not found.resolved or chosen is None:
+        return None, found.menu()
+    return chosen, ""
+
+
 async def stop(
     target: Optional[str],
     ports: StopPorts,
-    ask: Optional[resolve.AskCb] = None,
-    reason: str = STOP_REASON,
+    opts: Optional[StopOpts] = None,
 ) -> StopResult:
     """Stop the run *target* names (run id or serial); never touches another.
 
     An empty or ambiguous target with several active runs asks; with no way to
     ask (or no answer) it stops nothing and returns the text menu.
     """
+    opts = opts or StopOpts()
     runs = list(await lock_reaper.call_port(ports.active_runs, None) or [])
     if not runs:
         return StopResult(False, "No active mobile run to stop.")
-    found = await resolve.resolve_or_ask(
-        str(target or ""),
-        _candidates(runs),
-        noun="run",
-        ask=ask,
-        match=_by_id_or_serial,
-    )
-    chosen = next((r for r in runs if r.run_id == found.value), None)
-    if not found.resolved or chosen is None:
-        return StopResult(False, found.menu())
-    return await _stop_one(chosen, ports, reason)
+    chosen, menu = await _pick(str(target or ""), runs, opts.ask)
+    if chosen is None:
+        return StopResult(False, menu)
+    return await _stop_one(chosen, ports, opts.reason)

@@ -12,11 +12,16 @@ Nothing here raises.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
+from typing import Any, cast
 
 from tools.mobile import app_routes, knowledge_db
+from tools.mobile.kroute_activate import (  # noqa: F401
+    RouteRun,
+    _find_run,
+    activate_seeds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +31,9 @@ _PARAM = re.compile(r"^\{([A-Za-z0-9_.-]{1,40})\}$")
 
 
 def _rid(step: dict) -> str:
-    target = step.get("target") if isinstance(step.get("target"), dict) else {}
+    target = cast(
+        "dict", step.get("target") if isinstance(step.get("target"), dict) else {}
+    )
     return str(target.get("rid") or step.get("rid") or "")
 
 
@@ -59,7 +66,39 @@ def route_steps(package: str, name: str) -> tuple[list, dict]:
     return seed_steps(got.get("content") or {})
 
 
-def seed_shortcuts_from_routes(package: str, conn: object, run_id: str = "") -> int:
+def _seeded(conn: Any, name: str) -> list:
+    return knowledge_db.rows(
+        conn,
+        "shortcuts",
+        knowledge_db.Where("name = ? AND invalid_at IS NULL", ("route-" + name,), 1),
+    )
+
+
+def _seed_values(name: str, steps: list, args: dict) -> dict:
+    return {
+        "name": "route-" + name,
+        "origin": ORIGIN + name,
+        "trust": "tester",
+        "status": "candidate",
+        "steps_json": steps,
+        "args_json": args,
+        "precondition_json": {"screen_key": "", "rids": [steps[0]["rid"]]},
+        "start_key": "",
+        "end_key": "",
+    }
+
+
+def _insert_seed(conn: Any, values: dict, run_id: str) -> bool:
+    return bool(
+        knowledge_db.insert(
+            conn,
+            "shortcuts",
+            knowledge_db.Write(values, run_id=run_id, why="route seed"),
+        )
+    )
+
+
+def seed_shortcuts_from_routes(package: str, conn: Any, run_id: str = "") -> int:
     """Insert one candidate shortcut per saved route not seeded yet. Returns rows added."""
     added = 0
     listed = app_routes.list_routes(package)
@@ -67,87 +106,9 @@ def seed_shortcuts_from_routes(package: str, conn: object, run_id: str = "") -> 
         return 0
     for item in list(listed.get("content") or []):
         name = str(item.get("name") or "")
-        have = knowledge_db.rows(
-            conn, "shortcuts", "name = ? AND invalid_at IS NULL", ("route-" + name,), 1
-        )
+        have = _seeded(conn, name)
         steps, args = route_steps(package, name)
         if have or not steps:
             continue
-        values = {
-            "name": "route-" + name,
-            "origin": ORIGIN + name,
-            "trust": "tester",
-            "status": "candidate",
-            "steps_json": steps,
-            "args_json": args,
-            "precondition_json": {"screen_key": "", "rids": [steps[0]["rid"]]},
-            "start_key": "",
-            "end_key": "",
-        }
-        if knowledge_db.insert(
-            conn, "shortcuts", values, run_id=run_id, why="route seed"
-        ):
-            added += 1
+        added += _insert_seed(conn, _seed_values(name, steps, args), run_id)
     return added
-
-
-def _find_run(recs: list, steps: list) -> tuple[str, str]:
-    """``(start_key, end_key)`` of the first back-to-back OK run of *recs* that has
-    the route's ops and rids in order, else ``("", "")``."""
-    want = [(s["op"], s["rid"]) for s in steps]
-    for i in range(len(recs) - len(want) + 1):
-        window = recs[i : i + len(want)]
-        if [(r.get("op"), r.get("target_rid")) for r in window] != want:
-            continue
-        if any(r.get("outcome") != "ok" for r in window):
-            continue
-        if any(
-            a.get("after_screen_key") != b.get("screen_key")
-            for a, b in zip(window, window[1:], strict=False)
-        ):
-            continue
-        return str(window[0]["screen_key"]), str(
-            window[-1].get("after_screen_key") or ""
-        )
-    return "", ""
-
-
-def activate_seeds(conn: object, package: str, recs: list, run_id: str = "") -> int:
-    """Activate seeds whose route this run replayed. Returns seeds activated."""
-    done = 0
-    pending = knowledge_db.rows(
-        conn,
-        "shortcuts",
-        "origin LIKE 'route:%' AND status = 'candidate' AND start_key = '' AND invalid_at IS NULL",
-        (),
-        50,
-    )
-    for row in pending:
-        try:
-            steps = json.loads(row.get("steps_json") or "[]")
-        except ValueError:
-            continue
-        if not isinstance(steps, list) or not all(
-            isinstance(s, dict)
-            and isinstance(s.get("op"), str)
-            and isinstance(s.get("rid"), str)
-            for s in steps
-        ):
-            continue
-        start, end = _find_run(recs, steps) if steps else ("", "")
-        if not start or not end or start.startswith("sk1d:"):
-            continue
-        pre = {"screen_key": start, "rids": [steps[0]["rid"]]}
-        if knowledge_db.set_status(
-            conn,
-            "shortcuts",
-            row["id"],
-            "active",
-            run_id=run_id,
-            why="route replayed",
-            start_key=start,
-            end_key=end,
-            precondition_json=json.dumps(pre),
-        ):
-            done += 1
-    return done

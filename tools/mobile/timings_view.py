@@ -8,6 +8,7 @@ external assets.
 from __future__ import annotations
 
 import html
+from typing import Any
 
 from tools.mobile import step_timing
 
@@ -15,7 +16,7 @@ from tools.mobile import step_timing
 SLOWEST_SHOWN = 3
 
 
-def _parse(rows: object) -> list:
+def _parse(rows: Any) -> list:
     out = []
     for row in list(rows or [])[-step_timing.MAX_STEP_TIMING_ROWS :]:
         parsed = (
@@ -46,7 +47,7 @@ def summarize(rows: object) -> dict:
     }
 
 
-def _seconds(ms: object) -> str:
+def _seconds(ms: Any) -> str:
     try:
         return "{:.1f} s".format(int(ms) / 1000.0)
     except (TypeError, ValueError, OverflowError):

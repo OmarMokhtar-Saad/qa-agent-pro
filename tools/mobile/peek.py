@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 
+from config.settings_guard import never_raise
 from tools.mobile import adb, perception
 from tools.mobile.providers import composite
 from tools.mobile.replay.context import Context
@@ -32,45 +33,54 @@ logger = logging.getLogger(__name__)
 _FALLBACK = "Call `qa_capture_screens` without `peek` for a screenshot."
 
 
+_UNREADABLE = (
+    "\u26a0\ufe0f Could not read the screen. Check the device is unlocked "
+    "and connected (`qa_list_devices`).\n\n"
+)
+_UNPARSED = (
+    "\u26a0\ufe0f Could not read the screen: the dump could not be parsed. " + _FALLBACK
+)
+
+
+async def _observe(serial: str, raw: dict) -> object:
+    """The screen built as ``executor._dump`` builds it."""
+    sized = await adb.display_size(serial)
+    dpi = await adb.display_density(serial)
+    activity = await resolve_activity(Context(serial=serial))
+    return composite.observe(
+        raw.get("content"),
+        activity,
+        composite.ScreenView(sized.get("content"), dpi.get("content")),
+    )
+
+
+def _render(screen: dict) -> str:
+    """The markdown reply for a readable *screen*."""
+    block = perception.to_prompt_block(screen)
+    reason = perception.dump_unusable(screen)
+    lines = [
+        "## Screen peek",
+        "",
+        "Read-only: nothing was tapped, saved or attached.",
+        "",
+        block or "The screen shows no readable elements.",
+    ]
+    if reason:
+        lines += [
+            "",
+            f"The element list is not enough to act on ({reason}). " + _FALLBACK,
+        ]
+    return "\n".join(lines)
+
+
 async def peek(serial: str) -> str:
     """The current screen of *serial* as markdown. Never raises."""
-    try:
+    with never_raise(logger, "peek failed", exc_info=True):
         raw = await dump_raw(serial)
         if raw.get("error"):
-            return (
-                "\u26a0\ufe0f Could not read the screen. Check the device is unlocked "
-                "and connected (`qa_list_devices`).\n\n"
-                + wrap_untrusted("adb error", str(raw["error"]))
-            )
-        sized = await adb.display_size(serial)
-        dpi = await adb.display_density(serial)
-        activity = await resolve_activity(Context(serial=serial))
-        screen = composite.observe(
-            raw.get("content"),
-            activity,
-            display=sized.get("content"),
-            density=dpi.get("content"),
-        )
+            return _UNREADABLE + wrap_untrusted("adb error", str(raw["error"]))
+        screen = await _observe(serial, raw)
         if not isinstance(screen, dict) or screen.get("error"):
-            return (
-                "\u26a0\ufe0f Could not read the screen: the dump could not be parsed. "
-                + _FALLBACK
-            )
-        block = perception.to_prompt_block(screen)
-        reason = perception.dump_unusable(screen)
-        lines = [
-            "## Screen peek",
-            "",
-            "Read-only: nothing was tapped, saved or attached.",
-            "",
-            block or "The screen shows no readable elements.",
-        ]
-        if reason:
-            lines += [
-                "",
-                f"The element list is not enough to act on ({reason}). " + _FALLBACK,
-            ]
-        return "\n".join(lines)
-    except Exception:
-        logger.debug("peek failed", exc_info=True)
-        return "\u26a0\ufe0f Could not read the screen. " + _FALLBACK
+            return _UNPARSED
+        return _render(screen)
+    return "\u26a0\ufe0f Could not read the screen. " + _FALLBACK
