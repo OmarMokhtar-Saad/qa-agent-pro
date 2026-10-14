@@ -23,6 +23,12 @@ import re
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
+from tools.mobile.deny_terms import (
+    has_deny_term,
+    is_control_label,
+    leads_with_deny_term,
+)
+
 TAP_TEXT = "tap_text"
 TAP_RID = "tap_rid"
 BACK = "back"
@@ -79,40 +85,18 @@ def visible_resource_ids(xml: str) -> set:
     return {html.unescape(m) for m in _RID_ATTR.findall(xml or "") if m}
 
 
-#: Controls no handler may ever tap, matched case-insensitively against the
-#: action's text or resource-id. Losing data or widening a grant is the tester's
-#: call, never a dialog handler's.
-_DENY_TERMS = (
-    "uninstall",
-    "delete",
-    "clear data",
-    "clear storage",
-    "clear_data",
-    "clear_storage",
-    "allow all the time",
-    "allow_all_the_time",
-    "always_allow",
-    "allow_always",
-    "allow_all",
-    "allow always",
-    "always allow",
-    "allow all",
-    "erase",
-    "factory reset",
-    "factory_reset",
-    "force stop",
-    "force_stop",
-    "remove",
-    "disable",
-)
-
-
 def is_denied(action: DialogAction) -> bool:
-    """True when the action would tap a control on the denylist."""
+    """True when the action would tap a control on the denylist.
+
+    The terms live in ``deny_terms`` and match as whole words; visible text
+    longer than a control label (a paragraph) is judged by its opening words
+    only, and a resource id always is judged, whatever its length.
+    """
     if action.kind == BACK:
         return False
-    value = " ".join(action.value.lower().split())
-    return any(term in value for term in _DENY_TERMS)
+    if action.kind == TAP_TEXT and not is_control_label(action.value):
+        return leads_with_deny_term(action.value)
+    return has_deny_term(action.value)
 
 
 def _control_is_visible(action: DialogAction, ctx: DialogContext) -> bool:

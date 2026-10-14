@@ -7,7 +7,7 @@ import logging
 import time
 from typing import Any
 
-from tools.mobile import knowledge_trace, knowledge_versions
+from tools.mobile import knowledge_trace, knowledge_versions, kstg_foreign
 from tools.mobile.knowledge_learn_rows import (
     _facts,
     _mark,
@@ -59,7 +59,7 @@ def _ctx(conn, key: RunKey, row: dict) -> LearnCtx:
         key.package,
         key.run_id,
         _facts(key.package, key.run_id, row),
-        knowledge_trace.load_steps(key.run_id),
+        kstg_foreign.own_steps(knowledge_trace.load_steps(key.run_id), key.package),
         _verdict(key.run_id),
         conn,
         time.time(),

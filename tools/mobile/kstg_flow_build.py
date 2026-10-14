@@ -10,7 +10,7 @@ import hashlib
 import re
 from typing import Any
 
-from tools.mobile import actions, run_store
+from tools.mobile import actions, kstg_foreign, run_store
 from tools.mobile.app_flows_consts import MAX_FLOW_NAME_CHARS, OK_OUTCOMES
 
 MIN_STEPS = 2
@@ -27,15 +27,15 @@ def _dict(value: Any) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def reached(run_id: str) -> tuple[str, str]:
-    """``(goal, app)`` of an explore run that reached its goal, else ``("", "")``."""
+def reached(run_id: str) -> str:
+    """The goal of an explore run that reached it, else ``""``."""
     body = _manifest(run_id)
     explore = _dict(body.get("explore"))
     passed = _dict(body.get("final")).get("outcome") == "pass"
     if explore.get("stop") != "goal_reached" and not passed:
-        return "", ""
+        return ""
     goal = explore.get("goal") or _dict(explore.get("charter")).get("goal")
-    return " ".join(str(goal or "").split()), str(explore.get("app") or "")
+    return " ".join(str(goal or "").split())
 
 
 def normalise(goal: str) -> str:
@@ -56,17 +56,13 @@ def ended_clean(steps: list) -> bool:
     return bool(steps) and str(steps[-1].get("outcome") or "") in _ENDED_OK
 
 
-def _in_app(rec: dict, package: str) -> bool:
-    return str(rec.get("activity") or "").split("/", 1)[0] == package
-
-
 def app_actions(steps: list, package: str) -> list:
     """The replayable actions of *package*'s steps that ran as planned."""
     out = [
         rec["flow_action"]
         for rec in steps
         if rec.get("flow_action")
-        and _in_app(rec, package)
+        and kstg_foreign.own(rec, package)
         and str(rec.get("outcome") or "") in OK_OUTCOMES
     ]
     return out[: actions.MAX_MODEL_ACTIONS]

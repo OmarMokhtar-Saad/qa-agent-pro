@@ -112,6 +112,7 @@ from tools.mobile.locks_state import (  # noqa: F401
     Release,
     _Held,
     _refuse_name,
+    is_provisioning_owner,
     new_provisioning_owner,
 )
 

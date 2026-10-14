@@ -28,6 +28,7 @@ class StepRec(TypedDict, total=False):
     screen_key: str
     after_screen_key: str
     activity: str
+    screen_package: str
     outcome: str
     ms: int
     retries: int
@@ -68,6 +69,7 @@ def _head(entry: dict, action: dict) -> StepRec:
         screen_key=_text(entry.get("screen_key"), 64),
         after_screen_key=_text(entry.get("after_screen_key"), 64),
         activity=_text(entry.get("activity"), 200),
+        screen_package=_text(entry.get("screen_package"), 200),
         outcome=_text(entry.get("outcome"), 40),
     )
 

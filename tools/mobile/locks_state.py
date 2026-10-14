@@ -37,6 +37,14 @@ EMULATOR_LOCK = "emulator"
 DEVICE_LOCK_PREFIX = "device-"
 
 
+PROVISIONING_PREFIX = "provisioning:"
+
+
+def is_provisioning_owner(label: object) -> bool:
+    """Whether *label* is a pre-run owner label, not a run id."""
+    return str(label or "").startswith(PROVISIONING_PREFIX)
+
+
 def new_provisioning_owner() -> str:
     """A fresh owner label for the pre-run phase, when no ``run_id`` exists yet.
 
@@ -56,7 +64,7 @@ def new_provisioning_owner() -> str:
     is what a refusal message needs to say, but the random half is what makes it
     an identity.
     """
-    return "provisioning:%d:%s" % (os.getpid(), secrets.token_hex(4))
+    return "%s%d:%s" % (PROVISIONING_PREFIX, os.getpid(), secrets.token_hex(4))
 
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")

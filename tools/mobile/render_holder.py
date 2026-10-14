@@ -28,7 +28,7 @@ across both; that is a known cost, not a bug.
 from __future__ import annotations
 
 from config.settings_guard import never_raise
-from tools.mobile import run_store, session_resolve
+from tools.mobile import locks, run_store, session_resolve
 from tools.mobile.session_core import STATE_REPORT
 
 _NO_LOCK_TEXT = (
@@ -72,7 +72,7 @@ def _holder_label(body: dict) -> str:
     who = str(body.get("holder") or "").strip()
     if (
         who
-        and not who.startswith("provisioning:")
+        and not locks.is_provisioning_owner(who)
         and not run_store.looks_like_a_run_id(who)
     ):
         return ""
@@ -85,7 +85,7 @@ def _holder_finished(who: str) -> bool:
     THE HOLDER'S OWN STATE, asked once, of the producer that answers the
     tester's `qa_mobile_status`. Only meaningful for a label that IS a run id.
     """
-    if not who or who.startswith("provisioning:"):
+    if not who or locks.is_provisioning_owner(who):
         return False
     with never_raise():
         resolved = session_resolve.resolve(who)
@@ -132,7 +132,7 @@ def _held_text(who: str) -> str:
 
 def _holder_paragraph(who: str, same: bool, finished: bool) -> str:
     """The paragraph that says who holds the device and what the tester can do."""
-    if who.startswith("provisioning:"):
+    if locks.is_provisioning_owner(who):
         return _provisioning_text(same)
     if who and finished:
         return _finished_text(who)

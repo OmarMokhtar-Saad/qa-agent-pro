@@ -1,7 +1,7 @@
 """Learning stage flows: a clean explore run becomes a replayable app flow.
 
 When an explore run ended with ``goal_reached`` (or a pass verdict) and its last step
-ran as planned, the steps that worked in each app are saved as one flow per app, named
+ran as planned, the steps that worked in the package under test are saved as its one flow, named
 from the normalised goal (``flows.json``, via ``app_flows``). Typed values never enter
 it: a value is a ``{field}`` placeholder, a secret step keeps only its field name.
 The flow is offered to the next run by ``knowledge_plug_flows``. Never raises.
@@ -26,21 +26,16 @@ def _save(package: str, name: str, acts: list) -> str:
     return str(saved.get("error") or "")[:120]
 
 
-def _packages(lc, app: str) -> list:
-    return sorted({p for p in (lc.package, app) if p})
-
-
 def run(conn, lc) -> StageResult:
-    goal, app = kstg_flow_build.reached(lc.run_id)
+    goal = kstg_flow_build.reached(lc.run_id)
     if not goal or not kstg_flow_build.ended_clean(lc.steps):
         return StageResult("flows", notes=["no clean goal_reached run"])
     name = kstg_flow_build.flow_name(goal)
     result = StageResult("flows")
-    for package in _packages(lc, app):
-        acts = kstg_flow_build.app_actions(lc.steps, package)
-        if len(acts) < kstg_flow_build.MIN_STEPS:
-            continue
-        why = _save(package, name, acts)
-        result.wrote += 0 if why else 1
-        result.notes.append("%s: %s" % (package, why or "saved " + name))
+    acts = kstg_flow_build.app_actions(lc.steps, lc.package)
+    if len(acts) < kstg_flow_build.MIN_STEPS:
+        return result
+    why = _save(lc.package, name, acts)
+    result.wrote += 0 if why else 1
+    result.notes.append("%s: %s" % (lc.package, why or "saved " + name))
     return result

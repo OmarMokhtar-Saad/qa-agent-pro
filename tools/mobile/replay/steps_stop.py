@@ -81,6 +81,8 @@ def _stamp_screen_key(ctx: Context, entry: dict, screen: Any) -> None:
             screen, str(getattr(ctx, "package", "") or ""), activity
         ).key
         entry["activity"] = activity
+        if isinstance(screen, dict):
+            entry["screen_package"] = str(screen.get("package") or "")
     except Exception:
         logger.exception("mobile app knowledge: screen key failed")
 

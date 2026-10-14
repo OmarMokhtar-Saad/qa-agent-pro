@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from tools.mobile.kstg_mist_detail import detail, join
+from tools.mobile.kstg_proven import proven
 
 OK_OUTCOMES = ("ok", "assert_pass", "visual_check", "done")
 TAP_OPS = ("tap", "tap_text", "click", "long_press")
@@ -100,6 +101,7 @@ def find_hits(steps: list) -> list:
     last = ("", "", "")
     for i, rec in enumerate(steps):
         sig = "field_collision" if _collision(rec, seen) else signature_of(rec)
+        sig = sig if sig and proven(steps, i, sig) else ""
         here = (sig, rec.get("screen_key"), rec.get("target_rid"))
         if sig and here != last:
             prev = steps[i - 1] if i else None

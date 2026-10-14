@@ -91,7 +91,9 @@ def release_if_held(serial: str, run_id: str) -> dict:
     name = locks.device_lock_name(serial)
     if not held or (name and name not in held):
         return {"error": None, "content": {"released": False, "reason": "not held"}}
-    return release_device_lock(run_id, DeviceRelease(force=True))
+    released = release_device_lock(run_id, DeviceRelease(force=True))
+    run_lease_release.mark_released(run_id)
+    return released
 
 
 # **The one chokepoint for ending a run's hold on a device.** Every
@@ -147,6 +149,8 @@ async def _restore_run_state(owner: str) -> tuple[dict, dict, dict]:
         logger, "mobile.session.finish_device: disarm skipped", exc_info=True
     ):
         await ime.disarm(serial_of(owner) or "")
+    if locks.is_provisioning_owner(owner):
+        return {}, {}, {}
     restored = await ime_session.restore(owner)
     # The run's animation scales go back too, on the same chokepoint and for the
     # same reason: every teardown path reaches this function.
