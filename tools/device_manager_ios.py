@@ -21,6 +21,12 @@ _UDID_RE = re.compile(
 
 _DEVICECTL_HEADERS = ("devices", "name", "---", "identifier")
 
+# Columns after the UDID that mean "this server cannot drive it": devicectl
+# also lists simulators (`simulated`; booted ones come from simctl) and paired
+# phones that are not reachable now (`unavailable`). Matched as whole columns.
+_NOT_DRIVABLE = frozenset({"simulated", "unavailable"})
+_COLUMN_GAP = re.compile(r"\s{2,}")
+
 
 def _sim_row(sim: dict) -> dict | None:
     if (sim.get("state") or "").lower() != "booted":
@@ -71,6 +77,9 @@ def _devicectl_row(raw: str) -> dict | None:
     if not match or not _valid_device_id(match.group(1)):
         return None
     udid = match.group(1)
+    rest = {c.strip().lower() for c in _COLUMN_GAP.split(line[match.end() :])}
+    if rest & _NOT_DRIVABLE:
+        return None
     name = line[: match.start()].strip() or udid
     return {"id": udid, "name": name, "platform": "ios", "kind": "device"}
 
@@ -79,6 +88,7 @@ def _devicectl_row(raw: str) -> dict | None:
 #
 # devicectl's tabular text output is parsed leniently: any UDID-shaped token on
 # a data row is treated as the identifier and the preceding text as the name.
+# Rows marked `simulated` or `unavailable` are skipped (see _NOT_DRIVABLE).
 # Best-effort -- returns an empty list if devicectl is unavailable or the
 # format is unrecognised.
 async def list_ios_physical() -> list[dict]:

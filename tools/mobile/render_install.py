@@ -44,9 +44,17 @@ _INSTALL_TAIL = (
     "their turn, not on this one."
 )
 
+#: Why the menu came up with no package: the call named no app at all. A
+#: screen-only check (is the device unlocked, what is showing) needs no app.
+_NO_APP_NOTE = (
+    "This call named no `app`, `package` or `source`, so there is no app to "
+    "test yet. To only look at the device's current screen, call "
+    "`qa_capture_screens(peek=true)` instead; it needs no app.\n\n"
+)
+
 
 def _install_head(package: str, probed: bool) -> str:
-    head = "## Which app should this run test?\n\n"
+    head = "## Which app should this run test?\n\n" + _NO_APP_NOTE
     if package and probed:
         head = "## `" + str(package)[:80] + "` is not installed on the emulator\n\n"
     elif package:

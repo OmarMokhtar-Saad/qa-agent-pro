@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.111.0] - 2026-10-14
+## [1.111.1] - 2026-10-14
 
 ### Added
 
@@ -29,19 +29,11 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- A typed field that reads empty afterwards is reported as unconfirmed,
-  not as an error: the run first waits, bounded, for the screen to move
-  on (an auto-submitting one-time code clears its field).
-- Learning keeps only what a run proved: flows are saved per app package,
-  steps on another app's screens are skipped, an unconfirmed outcome is
-  never learned, and a mistake the run moved past is dropped.
+- The install menu shown when a mobile call names no app now says so,
+  and points a screen-only check at `qa_capture_screens(peek=true)`.
 
 ### Fixed
 
-- Dialog guard: destructive words match as whole words, so release notes
-  that mention a removal are no longer refused as a Remove button; short
-  labels, labels that open with a destructive word, Arabic labels and
-  camelCase ids such as btnDelete are refused.
-- A run marks a device lease released only when it held that lease, and
-  the setup phase before a run no longer restores keyboard, animation
-  and accessibility settings it never changed.
+- The device list no longer offers iOS simulators reported by devicectl
+  or paired iPhones that are not connected; booted simulators are still
+  listed.
