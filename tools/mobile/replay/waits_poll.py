@@ -94,6 +94,13 @@ async def _begin(ctx: Context, screen: object, probe: Probe) -> tuple:
 # until a poll has replaced the screen the wait started on.
 async def _wait_for(ctx: Context, screen: object, probe: Probe) -> tuple:
     """THE watched condition poll behind the text, gone and idle waits."""
+    if probe.met(None, screen):  # already true: no probe, no dump
+        return True, screen, False
+    return await _watch(ctx, screen, probe)
+
+
+async def _watch(ctx: Context, screen: object, probe: Probe) -> tuple:
+    """The poll loop of :func:`_wait_for` for a condition not yet met."""
     deadline, ticker, gate = await _begin(ctx, screen, probe)
     previous, current, took = None, screen, 0.0
     while True:

@@ -62,6 +62,20 @@ async def trusted_baseline(
     return base
 
 
+def before_action(serial: str, shown: str) -> screen_probe.Reading | None:
+    """The trusted probe reading kept for the dump that showed *shown*, even
+    after an action ran (an action bumps the generation, never the reading).
+
+    ``None`` unless the anchor and the last dump are the same generation and
+    that dump showed *shown*: a later dump or an untaken anchor is distrusted.
+    """
+    key = str(serial or "")
+    held, read = _ANCHOR.get(key), _READ.get(key)
+    if not shown or held is None or read is None:
+        return None
+    return held[1] if (read[0], read[1]) == (shown, held[0]) else None
+
+
 async def _anchor(serial: str, gen: int) -> None:
     """Probe now; keep the reading only when it equals the "before" one and
     nothing actuated while it ran."""

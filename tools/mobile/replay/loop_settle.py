@@ -46,6 +46,18 @@ def _device_error_stop(run: _ReplayRun, acted: Acted) -> dict:
 # heavy AVD. ONLY the dump is skipped: `_settle` still runs on the
 # screen in hand, so `no_change` and the system-dialog and
 # left-app checks are kept.
+def _nothing_actuated(step: _Step, acted: Acted) -> bool:
+    """Whether the step touched nothing, so the screen in hand is still current.
+
+    A wait only reads, and an optional tap that found nothing (its outcome
+    says ``skipped``) never tapped: neither pays a settle dump.
+    """
+    if step.op in actions_mod.WAIT_OPS:
+        return True
+    skipped = (acted.outcome.get("content") or {}).get("skipped")
+    return step.op == "tap_text_if_present" and bool(skipped)
+
+
 def _front_landing(run: _ReplayRun, step: _Step, acted: Acted) -> bool:
     """Whether a ``launch`` only brought this app's own task to the front."""
     package = getattr(step.action, "package", None)
@@ -130,6 +142,7 @@ async def _settle_device(
     """Settle after a device action: ``(screen, reply)``; ``reply`` None = go on."""
     entry, screen = acted.entry, acted.screen
     front = _front_landing(run, step, acted) or acted.fresh
+    front = front or _nothing_actuated(step, acted)
     typed = _typed_in_place(run, step, acted)
     if front or typed:
         step_timing.mark("dump_skipped")

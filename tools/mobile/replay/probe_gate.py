@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import time
 
-from tools.mobile import dump_latency, screen_anchor, screen_probe
+from tools.mobile import dump_latency, screen_anchor, screen_probe, step_timing
 from tools.mobile.replay.context import Context, _sleep
 from tools.mobile.replay.context_consts import WAIT_POLL_S
 from tools.mobile.replay.screen import _screen_hash
@@ -49,6 +49,9 @@ class Gate:
 
     def __init__(self, ctx: Context, base: screen_probe.Reading, mode: str) -> None:
         self.ctx, self.base, self.mode = ctx, base, mode
+        #: True until the first verdict: the baseline was bracketed by the dump
+        #: in hand a moment ago, so a calm gate answers from that dump at once.
+        self.primed = False
 
     async def rebase(self, shown: object) -> bool:
         """Re-anchor on the screen just dumped; False when the probe is unusable.
@@ -76,11 +79,15 @@ class Gate:
         until = deadline - dump_latency.p90_ms(self.ctx.serial) / 1000.0
         if time.monotonic() >= until:
             return "drop"
-        held = await self.hold(until)
+        trusted = self.mode == CALM and _quiet_trusted(self.ctx, current)
+        primed, self.primed = self.primed and trusted, False
+        held = "quiet" if primed else await self.hold(until)
         if held == "moved":
             return "dump"
-        trusted = self.mode == CALM and _quiet_trusted(self.ctx, current)
-        return "calm" if held == "quiet" and trusted else "drop"
+        calm = held == "quiet" and trusted and _quiet_trusted(self.ctx, current)
+        if calm:
+            step_timing.mark("gate_skip")
+        return "calm" if calm else "drop"
 
 
 async def _baseline(ctx: Context, screen: object, mode: str) -> object:
@@ -99,7 +106,11 @@ async def open_gate(ctx: Context, screen: object, mode: str) -> Gate | None:
     if mode not in (TEXT, CALM):
         return None
     base = await _baseline(ctx, screen, mode)
-    return Gate(ctx, base, mode) if base else None
+    if not base:
+        return None
+    gate = Gate(ctx, base, mode)
+    gate.primed = True
+    return gate
 
 
 async def rebased(gate: Gate | None, shown: object) -> Gate | None:

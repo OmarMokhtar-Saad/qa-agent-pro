@@ -14,7 +14,7 @@ from tools.mobile.replay.context_consts import (
 )
 from tools.mobile.replay.dump import _dump
 from tools.mobile.replay.screen import _stamp_after
-from tools.mobile.replay.settle_auto import _auto_settle
+from tools.mobile.replay.settle_auto import _auto_settle, _probe_skip
 from tools.mobile.replay.settle_cut import Cut, CutView, _cut_detail, _cut_of
 from tools.mobile.replay.settle_dialog import _answer_dialogs
 from tools.mobile.replay.settle_mark import (
@@ -46,7 +46,7 @@ logger = logging.getLogger("tools.mobile.executor")
 async def _settle(job: SettleJob, screen: Any, opts: SettleOpts) -> tuple:
     """Re-read the screen after an action that could have changed it."""
     if opts.redump:
-        screen, stop = await _settle_redump(job, screen)
+        screen, stop = await _settle_redump(job, screen, opts)
         if stop is not None:
             return screen, stop
     # A registered dialog handler answers a known interruption BEFORE the screen
@@ -65,8 +65,26 @@ async def _settle(job: SettleJob, screen: Any, opts: SettleOpts) -> tuple:
     return screen, None
 
 
-async def _settle_redump(job: SettleJob, screen: Any) -> tuple:
-    """``_settle``'s re-dump half: ``(screen, stop)``, ``stop`` set on a failed dump."""
+def _no_auto_settle(screen: Any, opts: SettleOpts) -> bool:
+    """True when no auto-settle follows this op (the probe skip needs one to)."""
+    skip = str(opts.op or "") in NO_AUTO_SETTLE_OPS or opts.before_change_wait
+    return skip or _target_in_hand(opts.next_target, screen)
+
+
+def _skip_eligible(screen: Any, opts: SettleOpts) -> bool:
+    """True when the settle would auto-settle after its dump (the same cases)."""
+    return opts.mark_no_change and not _no_auto_settle(screen, opts)
+
+
+async def _settle_redump(job: SettleJob, screen: Any, opts: SettleOpts) -> tuple:
+    """``_settle``'s re-dump half: ``(screen, stop)``, ``stop`` set on a failed dump.
+
+    The dump is skipped, and the screen in hand kept, when the frame probe stayed
+    equal to that screen's trusted pre-action baseline for the whole settle window.
+    """
+    if _skip_eligible(screen, opts) and await _probe_skip(job.ctx, screen):
+        job.entry["probe_skip"] = True
+        return screen, None
     dumped = await _dump(job.ctx)
     if dumped.get("error"):
         job.entry["outcome"] = "dump_failed"
@@ -107,8 +125,7 @@ async def _settle_unchanged(job: SettleJob, screen: Any, opts: SettleOpts) -> tu
     # (`launch` brought to front) already decided nothing moved, and a wait's
     # own poll (`mark_no_change=False`) is its own settle.
     # A script whose next op waits for the screen to change observes it anyway.
-    skip = str(opts.op or "") in NO_AUTO_SETTLE_OPS or opts.before_change_wait
-    skip = skip or _target_in_hand(opts.next_target, screen)
+    skip = _no_auto_settle(screen, opts) or job.entry.get("probe_skip") is True
     if unchanged and opts.redump and before.content_hash and not skip:
         read = await _auto_settle(job.ctx, screen, before.content_hash)
         _stamp_after(job.entry, read)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from tools.mobile import dump_latency, latency_scale, screen_anchor
+from tools.mobile import dump_latency, latency_scale, screen_anchor, step_timing
 from tools.mobile.replay.context import Context, _sleep
 from tools.mobile.replay.context_consts import AUTO_SETTLE_MAX_S, WAIT_POLL_S
 from tools.mobile.replay.dump import _dump, _focus_probe
@@ -81,3 +81,25 @@ async def _focus_wait(ctx: Context, deadline: float, until: float) -> None:
     before_focus = await _focus_probe(ctx.serial, deadline - time.monotonic())
     if await _focus_moves(ctx, before_focus, until):
         await _focus_stable(ctx, until)
+
+
+async def _probe_skip(ctx: Context, screen: Any) -> bool:
+    """True when the frame stayed equal to the trusted pre-action baseline of
+    *screen* for the whole settle window: the post-action dump is then skipped.
+
+    The window is the settle deadline PLUS one dump's p90: what the old settle
+    and its dump together observed, so a skip never watches less than a dump
+    would have. False (dump as before) on no trusted baseline, a moved frame,
+    or any probe error.
+    """
+    base = screen_anchor.before_action(ctx.serial, _screen_hash(screen))
+    if base is None:
+        return False
+    until = _settle_deadline(ctx) + (dump_latency.p90_ms(ctx.serial) or 0) / 1000.0
+    try:
+        unmoved = await wait_moved(ctx, base, until) is None
+    except (OSError, ValueError, RuntimeError):
+        return False
+    if unmoved:
+        step_timing.mark("probe_skip")
+    return unmoved

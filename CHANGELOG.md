@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.119.0] - 2026-10-15
+## [1.120.0] - 2026-10-15
 
 ### Added
 
@@ -29,21 +29,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Fewer screen reads per step: a cheap screen check (focused window
-  plus a screenshot fingerprint) tells whether the screen moved, so
-  settles, element and text waits, change waits and optional taps
-  read the full screen only when it did. Secure screens that block
+- A step whose screen never moved after a tap keeps the screen it
+  already read instead of reading it again; the step timing line
+  counts these as probe_skip.
+- An optional tap whose text is not on an unchanged screen is skipped
+  at once with no new read (counted as gate_skip), and a wait whose
+  condition already holds returns at once.
+- Waiting for the screen to go idle watches screenshot fingerprints
+  and reads the full screen at most once. Secure screens that block
   screenshots fall back to full reads.
-- A step no longer settles before a wait that reads the screen itself,
-  a field's read-back is reused, switching keyboards keeps the last
-  read, and a read cut short is kept for the next step.
-- Dialog settles wait for the dialog to close instead of a fixed pause.
-
-### Fixed
-
-- A learned flow no longer breaks mid-replay when the app shows a
-  screen from another learned flow (onboarding, a Face ID prompt):
-  replay switches to that flow and comes back, at most twice a turn.
-- A step that lands on a known next screen ends its landing wait at
-  once, and a typed value followed by another text step is no longer
-  reported as no change.
