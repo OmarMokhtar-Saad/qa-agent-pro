@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from tools.mobile import actions as actions_mod
-from tools.mobile import fill_label
+from tools.mobile import fill_fallback, fill_label
 from tools.mobile.replay.context import STATUS_NEEDS_MODEL, _ReplayRun, _result
 from tools.mobile.replay.elements import _screen_elements, resolve_tap_text
 from tools.mobile.replay.steps_stop import StepAt, _close, _reply, _stop
@@ -59,5 +59,19 @@ def _fill_element(run: _ReplayRun, action: Any, at: StepAt) -> tuple[Any, dict |
     element = picked.get("element")
     if element is not None:
         return element, None
+    spare, detail = _fill_fallback(at, label, picked)
+    if spare is not None:
+        return spare, None
+    return None, _fill_miss(run, at, detail)
+
+
+def _fill_fallback(at: StepAt, label: str, picked: dict) -> tuple[Any, str]:
+    """The single empty input field for a label that missed, else the refusal."""
     detail = fill_label.refusal_detail(label, picked)
-    return element, _fill_miss(run, at, detail)
+    found = []
+    if not picked.get("candidates"):
+        found = fill_fallback.candidates(_screen_elements(at.screen))
+    if len(found) == 1 and fill_fallback.fits(str(label), found[0]):
+        at.entry["fill_note"] = fill_fallback.used_note(str(label), found[0])
+        return found[0], detail
+    return None, detail + (fill_fallback.listing(found) if found else "")

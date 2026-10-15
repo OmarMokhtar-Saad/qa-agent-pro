@@ -76,6 +76,8 @@ async def _keyboard_ready_note(serial: str, run_id: str, lines: list) -> None:
                 "\u26a0\ufe0f "
                 + mobile_ime.fallback_notice(str(ready["error"])[:300], serial)
             )
+        elif (ready.get("content") or {}).get("upgrade"):
+            lines.append(str(ready["content"]["upgrade"])[:400])
 
 
 # Notes for ``_mobile_a11y_stage`` (moved out of the body to keep it short):

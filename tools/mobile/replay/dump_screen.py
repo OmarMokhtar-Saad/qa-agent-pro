@@ -10,6 +10,7 @@ from typing import Any
 from tools.mobile import (
     adb,
     dump_latency,
+    dump_reuse,
     step_timing,
 )
 from tools.mobile.providers import composite
@@ -57,16 +58,23 @@ async def _fetched(serial: str, deadline: float | None) -> dict:
         await dump_latency.join(serial)
     elif not await dump_latency.join(serial, deadline - time.monotonic()):
         return _cut()
+    under = dump_reuse.token(serial)
     task = dump_latency.start(serial, _raw_dump(serial))
     try:
-        if deadline is None:
-            return await step_timing.timed("ui_dump", asyncio.shield(task))
-        wait = max(0.0, deadline - time.monotonic())
-        return await step_timing.timed(
-            "ui_dump", asyncio.wait_for(asyncio.shield(task), wait)
-        )
+        raw = await _awaited(task, deadline)
     except asyncio.TimeoutError:
         return _cut()
+    dump_reuse.store(serial, under, raw)
+    return raw
+
+
+async def _awaited(task: asyncio.Future, deadline: float | None) -> dict:
+    if deadline is None:
+        return await step_timing.timed("ui_dump", asyncio.shield(task))
+    wait = max(0.0, deadline - time.monotonic())
+    return await step_timing.timed(
+        "ui_dump", asyncio.wait_for(asyncio.shield(task), wait)
+    )
 
 
 async def _observed(ctx: Context, raw: dict) -> dict:

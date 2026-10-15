@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from tools.mobile.charter_coerce import _unset
@@ -61,13 +62,30 @@ ASKABLE = tuple(question["field"] for question in QUESTIONS)
 #: kind of gap in the other direction, so it gets the same treatment: named,
 #: not silently assumed either way. Audit item 4.
 RESET_HINT_WORDS = (
-    "reset",
-    "clear data",
-    "clear app data",
-    "fresh install",
-    "reinstall",
-    "wipe",
+    r"\b(?:reset|clear|wipe|erase)\s+(?:the\s+|all\s+|its\s+)?(?:app\s+)?"
+    r"(?:data|state|storage|cache)\b",
+    r"\breset\s+(?:the\s+)?(?:app|application|device|phone)\b",
+    r"\bwipe\s+(?:the\s+)?(?:app|device|phone)\b",
+    r"\bfactory\s+reset\b",
+    r"\bfresh\s+install",
+    r"\b(?:re|un)install",
 )
+
+#: A negation in the few words before a match means the goal FORBIDS the
+#: action ("if it is already installed, do not reinstall"): no hint.
+_NEGATED = re.compile(
+    r"(?:\bnot|n't|\bnever|\bwithout|\bavoid|\bno need to)\W+(?:\w+\W+){0,3}$"
+)
+_RESET_RES = tuple(re.compile(pattern) for pattern in RESET_HINT_WORDS)
+
+
+def _asks_for_reset(text: str) -> bool:
+    """True when *text* names a reset/clear/reinstall it does not forbid."""
+    return any(
+        not _NEGATED.search(text[max(0, hit.start() - 40) : hit.start()])
+        for rx in _RESET_RES
+        for hit in rx.finditer(text)
+    )
 
 
 # "" unless *raw* left `destructive` unset AND *goal* names a reset.
@@ -86,7 +104,7 @@ def destructive_hint(raw: object, goal: object) -> str:
     if str(body.get("destructive") or "").strip():
         return ""
     text = str(goal or "").lower()
-    if not any(word in text for word in RESET_HINT_WORDS):
+    if not _asks_for_reset(text):
         return ""
     return (
         "This goal reads like it wants a reset, but no `destructive` was "

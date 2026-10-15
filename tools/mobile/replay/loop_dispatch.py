@@ -55,6 +55,8 @@ async def _device_step(
     entry["detail"] = _confirmed(
         entry, str((outcome.get("content") or {}).get("detail") or "")
     )
+    if entry.get("fill_note"):
+        entry["detail"] = (entry["fill_note"] + " " + entry["detail"]).strip()
     if step.scroll_missed:
         entry["detail"] = (SCROLL_TARGET_MISSED + " " + entry["detail"]).strip()
     return await _settle_device(run, step, Acted(outcome, entry, screen))

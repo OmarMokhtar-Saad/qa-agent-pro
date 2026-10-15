@@ -6,7 +6,7 @@ from tools.mobile.kstg_mist_detail import detail, join
 from tools.mobile.kstg_proven import proven
 
 OK_OUTCOMES = ("ok", "assert_pass", "visual_check", "done")
-TAP_OPS = ("tap", "tap_text", "click", "long_press")
+TAP_OPS = ("tap", "tap_text", "tap_text_if_present", "click", "long_press")
 _OUTCOME_SIGNATURE = {
     "wait_timeout": "timeout",
     "missing_element": "element_missing",
@@ -43,10 +43,13 @@ def _typed_failed(rec: dict) -> bool:
 
 
 def _dead_tap(rec: dict) -> bool:
+    """Dead only when PROVEN: the replay re-read the screen after its full
+    settle wait and it was unchanged. A structural key match alone proves
+    nothing (the key ignores text); anything else is unknown, never learned."""
     after = str(rec.get("after_screen_key") or "")
     if rec.get("op") not in TAP_OPS or not after:
         return False
-    return rec.get("outcome") in ("ok", "no_change") and after == rec.get("screen_key")
+    return rec.get("settled_unchanged") is True and after == rec.get("screen_key")
 
 
 def signature_of(rec: dict) -> str:

@@ -6,7 +6,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from tools.mobile.action_consts import MAX_TEXT_CHARS, TAP_TEXT_MAX_QUERY_CHARS
+from tools.mobile.action_consts import (
+    MAX_TEXT_CHARS,
+    TAP_IF_PRESENT_MAX_S,
+    TAP_TEXT_MAX_QUERY_CHARS,
+)
 from tools.mobile.fill_label import FILL_MAX_LABEL_CHARS
 
 
@@ -65,6 +69,20 @@ class TapTextAction(_Base):
 
     op: Literal["tap_text"]
     text: str = Field(min_length=1, max_length=TAP_TEXT_MAX_QUERY_CHARS)
+
+
+class TapTextIfPresentAction(_Base):
+    """Tap the control carrying this text IF it shows up within ``max_s``.
+
+    For an optional element (a consent prompt, a promo). It polls the screen
+    for the text and, when it appears, taps it exactly like ``tap_text``; when
+    it never does the step records ``absent`` and the script goes on. It never
+    fails the script.
+    """
+
+    op: Literal["tap_text_if_present"]
+    text: str = Field(min_length=1, max_length=TAP_TEXT_MAX_QUERY_CHARS)
+    max_s: float = Field(default=2, gt=0, le=TAP_IF_PRESENT_MAX_S)
 
 
 class TypeAction(_Base):

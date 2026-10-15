@@ -10,7 +10,6 @@ from tools.mobile import knowledge_limits
 from tools.mobile.action_consts import (
     MAX_ACTIONS,
     MAX_EXPECT_APPS,
-    MAX_TOTAL_WAIT_MS,
     WAIT_UNTIL_OPS,
 )
 from tools.mobile.action_models_assert import AskTesterAction, AssertAction, DoneAction
@@ -21,6 +20,7 @@ from tools.mobile.action_models_basic import (
     HomeAction,
     TapAction,
     TapTextAction,
+    TapTextIfPresentAction,
     TypeAction,
 )
 from tools.mobile.action_models_nav import (
@@ -32,12 +32,13 @@ from tools.mobile.action_models_nav import (
     WaitAction,
     WaitUntilAction,
 )
-from tools.mobile.action_waits import total_wait_ms
+from tools.mobile.action_waits import wait_budget_error
 
 Action = Annotated[
     Union[
         TapAction,
         TapTextAction,
+        TapTextIfPresentAction,
         TypeAction,
         FillAction,
         ClearAction,
@@ -71,17 +72,9 @@ class Script(BaseModel):
 
     @model_validator(mode="after")
     def waits_fit_one_submit(self) -> "Script":
-        total = total_wait_ms(self.actions)
-        if total > MAX_TOTAL_WAIT_MS:
-            raise ValueError(
-                "the waits in this script total "
-                + str(total)
-                + " ms, over the "
-                + str(MAX_TOTAL_WAIT_MS)
-                + " ms one submit allows; set ms per wait explicitly, or split "
-                "the case into shorter scripts -- the server hands the screen "
-                "back between them"
-            )
+        error = wait_budget_error(self.actions)
+        if error:
+            raise ValueError(error)
         return self
 
     @model_validator(mode="after")
@@ -104,6 +97,7 @@ class Script(BaseModel):
 OPS = (
     "tap",
     "tap_text",
+    "tap_text_if_present",
     "type",
     "fill",
     "clear_app_data",

@@ -62,14 +62,14 @@ from tools.mobile.explore_stop import (
     stop_reason,  # noqa: F401
 )  # identity re-exports (P3 shim rule); unused ones carry noqa
 from tools.mobile.providers import composite
-from tools.mobile.replay.dump import dump_raw, resolve_activity
+from tools.mobile.replay.dump import dump_raw_reusing, resolve_activity
 
 logger = logging.getLogger(__name__)
 
 
 async def _observe_screen(ctx: object) -> dict:
     """Dump and prune the foreground screen: the pruned result, or an error dict."""
-    dumped = await dump_raw(getattr(ctx, "serial", ""))
+    dumped = await dump_raw_reusing(getattr(ctx, "serial", ""))
     if dumped.get("error"):
         return dumped
     sized = await adb.display_size(getattr(ctx, "serial", ""))

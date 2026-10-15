@@ -112,7 +112,7 @@ def _head_items(manifest: dict, cases: list) -> list:
     return items
 
 
-def _tail_items(cases: list, coverage: dict | None) -> list:
+def _tail_items(cases: list, coverage: dict | None, explore: bool) -> list:
     items = []
     # The one coverage sentence (run_store owns it): "finished" alone would read
     # as "every case judged" on a run that judged two of three.
@@ -120,7 +120,7 @@ def _tail_items(cases: list, coverage: dict | None) -> list:
         items.append(("Verdicts", coverage_phrase(coverage)))
     # ONE producer with `verdict_line`'s own tally (`mobile_render.typed_field_tally`)
     # -- the report and the chat reply must never disagree on a field count.
-    tally = mobile_render.typed_field_tally(cases).strip()
+    tally = mobile_render.typed_field_tally(cases, explore).strip()
     if tally:
         items.append(("Typed fields", tally))
     return items
@@ -139,7 +139,8 @@ def _meta_html(meta: _MetaIn) -> str:
     manifest, cases = meta.manifest, meta.cases
     items = _head_items(manifest, cases)
     items.append(("State", _state_text(manifest, cases, meta.partial)))
-    items += _tail_items(cases, meta.coverage)
+    explore = manifest.get("lane") == "explore"
+    items += _tail_items(cases, meta.coverage, explore)
     return "".join(
         "<span><b>" + esc(k, 20) + "</b> " + esc(v, 200) + "</span>"
         for k, v in items

@@ -11,7 +11,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Protocol
 
-from tools.mobile import lock_reaper, resolve, run_verdict
+from tools.mobile import lock_reaper, resolve, run_list, run_verdict
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +135,44 @@ async def _pick(
     return chosen, ""
 
 
+def _newest_run() -> tuple[str, dict]:
+    """``(run_id, manifest)`` of the most recently touched run, else ``("", {})``."""
+    rows = (run_list.list_runs(1, gc=False) or {}).get("content") or []
+    row = rows[0] if rows and isinstance(rows[0], dict) else {}
+    manifest = row.get("manifest")
+    return str(row.get("run_id") or ""), manifest if isinstance(manifest, dict) else {}
+
+
+def _nothing_to_stop() -> str:
+    """Why nothing is active: the newest run usually already ended on its own."""
+    try:
+        run_id, manifest = _newest_run()
+    except (OSError, ValueError, TypeError, KeyError):
+        logger.warning("stop_run: newest run unreadable", exc_info=True)
+        run_id, manifest = "", {}
+    if not run_id:
+        return "No active mobile run to stop."
+    final = manifest.get("final")
+    if not isinstance(final, dict):
+        return (
+            "No active mobile run to stop. The latest run, "
+            + run_id
+            + ", recorded no end."
+        )
+    return _finished_text(run_id, str(final.get("outcome") or ""))
+
+
+def _finished_text(run_id: str, outcome: str) -> str:
+    """The stop text for a run whose manifest recorded its end."""
+    return (
+        "Nothing to stop: the latest run, "
+        + run_id
+        + ", already finished and released the device."
+        + (" Its recorded verdict: " + outcome + "." if outcome else "")
+        + " This is not a failure; `qa_mobile_status` shows how it ended."
+    )
+
+
 async def stop(
     target: Optional[str],
     ports: StopPorts,
@@ -148,7 +186,7 @@ async def stop(
     opts = opts or StopOpts()
     runs = list(await lock_reaper.call_port(ports.active_runs, None) or [])
     if not runs:
-        return StopResult(False, "No active mobile run to stop.")
+        return StopResult(False, _nothing_to_stop())
     chosen, menu = await _pick(str(target or ""), runs, opts.ask)
     if chosen is None:
         return StopResult(False, menu)

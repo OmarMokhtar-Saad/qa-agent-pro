@@ -100,6 +100,7 @@ def _lease_fields(lease: dict, lease_age: float) -> dict:
         "holder": str(lease.get("holder") or ""),
         "lease_state": str(lease.get("state") or run_store.NONE),
         "lease_age": lease_age,
+        "lease_released": bool(lease.get("released")),
     }
 
 

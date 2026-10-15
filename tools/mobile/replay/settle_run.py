@@ -99,9 +99,13 @@ async def _settle_unchanged(job: SettleJob, screen: Any, opts: SettleOpts) -> tu
     # own poll (`mark_no_change=False`) is its own settle.
     skip = str(opts.op or "") in NO_AUTO_SETTLE_OPS
     if unchanged and opts.redump and before.content_hash and not skip:
-        screen = await _auto_settle(job.ctx, screen, before.content_hash)
-        _stamp_after(job.entry, screen)
+        read = await _auto_settle(job.ctx, screen, before.content_hash)
+        _stamp_after(job.entry, read)
         unchanged = _unchanged(before, _mark_of(job.entry, "after"))
+        # PROVEN only when the settle took a fresh read (a failed dump hands
+        # the old screen back): the learner never calls a tap dead otherwise.
+        job.entry["settled_unchanged"] = unchanged and read is not screen
+        screen = read
     return screen, unchanged
 
 

@@ -19,6 +19,7 @@ MAX_FIELD_CHARS = 80
 ALLOWED_OPS = (
     "tap",
     "tap_text",
+    "tap_text_if_present",
     "type",
     "fill",
     "clear",

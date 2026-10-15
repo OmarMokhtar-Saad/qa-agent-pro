@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from tools.mobile import dump_reuse
 from tools.mobile.adb_host import host
 from tools.process_runner import ArunOpts, arun
 
@@ -62,6 +63,15 @@ def _warn_timed_out(cmd: list[str], timeout: float, stdin_data: bytes | None) ->
     )
 
 
+async def _spawn_noting(cmd: list[str], timeout: float, stdin: bytes | None):
+    """``_spawn``, ending any held dump before and after an actuating command."""
+    dump_reuse.note_command(cmd)
+    try:
+        return await _spawn(cmd, timeout, stdin)
+    finally:
+        dump_reuse.note_command(cmd)
+
+
 async def run_argv(
     cmd: list[str], timeout: float, stdin_data: bytes | None = None
 ) -> tuple[int, bytes, bytes]:
@@ -71,7 +81,7 @@ async def run_argv(
     ``asyncio.TimeoutError`` on overrun; both are converted by the callers
     below, so nothing raises past this module.
     """
-    r, clock = await _spawn(cmd, timeout, stdin_data)
+    r, clock = await _spawn_noting(cmd, timeout, stdin_data)
     if r.timed_out:
         _warn_timed_out(cmd, timeout, stdin_data)
     if r.exc is not None:

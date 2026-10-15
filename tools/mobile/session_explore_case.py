@@ -10,6 +10,7 @@ from config.settings_guard import never_raise
 from tools.mobile import case_runner, run_store
 from tools.mobile.replay.guard import MAX_GUARD_NODE_CHARS
 from tools.mobile.session_explore_ids import (
+    EXPLORE_MODULE,
     EXPLORE_TITLE_PREFIX,
     explore_turn_number,
     explore_turn_tc_id,
@@ -92,6 +93,8 @@ def _case_body(record: TurnRecord, now: float) -> dict:
     goal = " ".join(str(body.get("goal") or "").split())[:200] or "no goal recorded"
     return {
         "tc_id": explore_turn_tc_id(turn),
+        # The chat tally reads this to say "warnings", not "failed".
+        "module": EXPLORE_MODULE,
         "title": (EXPLORE_TITLE_PREFIX + str(turn) + " — " + goal)[:250],
         **_explore_result_fields(result, record.verdict),
         "escapes": 0,

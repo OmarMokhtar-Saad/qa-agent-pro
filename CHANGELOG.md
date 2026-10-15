@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.112.0] - 2026-10-15
+## [1.113.0] - 2026-10-15
 
 ### Added
 
@@ -29,17 +29,32 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- `source=app_tester` now installs the app itself: it finds the app in
-  App Tester, taps its Download or Update button, finishes the system
-  installer and continues the run once the new version is installed.
-  The newest release is taken without a second question.
+- Mobile runs are faster: the next step reuses the screen the last step
+  already read instead of reading it again, and a tap already waits for the
+  screen to settle, so a script can batch a whole form and its submit in one
+  turn.
+- New script op `tap_text_if_present`: taps the element whose text matches,
+  and does nothing and continues if it is absent; use it for optional popups
+  instead of a separate read turn.
+- Waits for a condition can now run up to 120 seconds; fixed waits stay capped
+  at 40 seconds.
+- An older QA keyboard on the phone is upgraded in place. If its signature
+  does not match, you get a one-line uninstall command; the keyboard is never
+  removed for you. The fastest screen reading needs a newer QA keyboard
+  release than the one this version installs.
 
 ### Fixed
 
-- App Tester no longer opens the wrong app. It goes back to the app list
-  when it reopens on another app's page, and only list rows count: every
-  word of the name you give must match the row's name or package id.
-  Release notes are never read as apps, and several matching apps are
-  asked about.
-- App Tester's one-time setup for AAB releases (Get started) now stops
-  the install and asks you to finish it on the phone.
+- An OTP or PIN field that cannot be read back after typing is no longer
+  reported as a device error that fails the case; its result is unknown.
+- A `fill` whose label matches no field fills the only empty input field on
+  the screen whose name fits the label, or one with no name; otherwise it
+  lists the empty fields so the next step can name the right one.
+- The login and OTP screens are no longer mistaken for the same screen, and a
+  tap is only reported as having done nothing once the screen settled
+  unchanged.
+- Exploration runs report stumbles as warnings, not failures, and a field
+  that failed and was then typed successfully is not counted as failed.
+- After a run the device lease shows as released, the stop text says the run
+  already finished when it recorded an end, and the reset hint no longer
+  fires on unrelated text.

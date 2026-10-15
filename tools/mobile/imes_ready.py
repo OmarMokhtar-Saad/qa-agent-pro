@@ -5,7 +5,14 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from tools.mobile import ime, imes_record, imes_remember, imes_select, imes_state
+from tools.mobile import (
+    ime,
+    imes_record,
+    imes_remember,
+    imes_select,
+    imes_state,
+    imes_upgrade,
+)
 
 logger = logging.getLogger("tools.mobile.ime_session")
 
@@ -104,6 +111,28 @@ def _needs_install(body: dict) -> bool:
     return not body.get("installed") or body.get("pinned") is False
 
 
+async def _maybe_upgrade(serial: str, run_id: str, body: dict) -> str:
+    """Upgrade an older installed QA keyboard in place; the user-visible note, or ``""``."""
+    old = await imes_upgrade.older_version(serial, bool(body.get("installed")))
+    if not old or await imes_remember._remember_keyboard(serial, run_id):
+        return ""
+    done = await ime.install(serial)
+    if done.get("error"):
+        # Never uninstall: the run goes on the slow path with the note.
+        body["pinned"] = None
+        return imes_upgrade.refused_note(old, done, serial)
+    body["installed"], body["pinned"] = True, True
+    return imes_upgrade.upgraded_note(old)
+
+
+def _with_note(reply: dict, note: str) -> dict:
+    """*reply* carrying the upgrade note when there is one and no error."""
+    content = reply.get("content")
+    if note and not reply.get("error") and isinstance(content, dict):
+        content["upgrade"] = note
+    return reply
+
+
 async def _prepare(serial: str, run_id: str, body: dict) -> dict | None:
     """Remember the tester's keyboard, then install if needed; an error, else ``None``."""
     # REMEMBER FIRST. Everything below this line changes the device.
@@ -139,12 +168,13 @@ async def _ensure_ready(serial: str, run_id: str) -> dict:
         if now.get("error"):
             return now
         body = now.get("content") or {}
-        if _already_ready(body):
+        note = await _maybe_upgrade(serial, run_id, body)
+        if not note and _already_ready(body):
             return _ready_reply()
         refused = await _prepare(serial, run_id, body)
         if refused:
             return refused
-        return await imes_select._select_ours(serial)
+        return _with_note(await imes_select._select_ours(serial), note)
     except Exception as exc:
         logger.exception("mobile.ime_session.ensure_ready failed")
         return {"error": str(exc), "content": None}

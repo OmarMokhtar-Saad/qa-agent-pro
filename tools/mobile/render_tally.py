@@ -40,23 +40,29 @@ from typing import Any
 from tools.mobile.session_explore_ids import EXPLORE_MODULE
 
 
-def _typed_outcomes(rows: list[dict]) -> tuple[int, list[str]]:
-    verified = 0
-    failed: list[str] = []
+def _type_steps(rows: list[dict]) -> list[tuple[str, str]]:
+    """``(field, outcome)`` of every type or fill step, in trace order."""
+    steps: list[tuple[str, str]] = []
     for row in rows:
         for item in list(row.get("trace") or []):
-            if not isinstance(item, dict):
+            action: Any = item.get("action") if isinstance(item, dict) else None
+            if not isinstance(action, dict) or action.get("op") not in ("type", "fill"):
                 continue
-            action: Any = (
-                item.get("action") if isinstance(item.get("action"), dict) else {}
-            )
-            if str(action.get("op") or "") != "type":
-                continue
-            outcome = str(item.get("outcome") or "")
-            if outcome == "ok":
-                verified += 1
-            elif outcome in ("device_error", "refused"):
-                failed.append(str(action.get("field") or "") or "(unnamed field)")
+            name = str(action.get("field") or "") or "(unnamed field)"
+            steps.append((name, str(item.get("outcome") or "")))
+    return steps
+
+
+def _typed_outcomes(rows: list[dict]) -> tuple[int, list[str]]:
+    steps = _type_steps(rows)
+    failed: list[str] = []
+    for name, outcome in steps:
+        if outcome == "ok" and name in failed:
+            # A field that failed and was typed again successfully was retried.
+            failed = [n for n in failed if n != name]
+        elif outcome in ("device_error", "refused"):
+            failed.append(name)
+    verified = sum(1 for _, outcome in steps if outcome == "ok")
     return verified, failed
 
 
@@ -65,14 +71,14 @@ def _is_explore(rows: list[dict]) -> bool:
     return bool(rows) and all(r.get("module") == EXPLORE_MODULE for r in rows)
 
 
-def _typed_field_tally(rows: list[dict]) -> str:
+def _typed_field_tally(rows: list[dict], explore: bool = False) -> str:
     """ "N typed fields verified, M failed", naming each failed field."""
     verified, failed = _typed_outcomes(rows)
     if not verified and not failed:
         return ""
     # An explore turn that stumbled is a warning: the run's verdict is the final
     # done(pass), not every step. A suite case that failed still says "failed".
-    word = "warnings" if _is_explore(rows) else "failed"
+    word = "warnings" if explore or _is_explore(rows) else "failed"
     line = str(verified) + " typed fields verified, " + str(len(failed)) + " " + word
     if failed:
         line += ": " + ", ".join(repr(name[:60]) for name in failed[:12])
@@ -81,9 +87,9 @@ def _typed_field_tally(rows: list[dict]) -> str:
     return line + "\n\n"
 
 
-def typed_field_tally(rows: list[dict]) -> str:
-    """Public wrapper around :func:`_typed_field_tally`."""
-    return _typed_field_tally(rows)
+def typed_field_tally(rows: list[dict], explore: bool = False) -> str:
+    """Public wrapper; `explore` is True when the run's lane is explore."""
+    return _typed_field_tally(rows, explore)
 
 
 #: Verdicts that are TERMINAL but not an ANSWER. A pass or a fail settles the

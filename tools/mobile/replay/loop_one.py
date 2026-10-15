@@ -24,7 +24,10 @@ from tools.mobile.replay.steps_know import (
     _knowledge_stop,
     _knowledge_target,
 )
-from tools.mobile.replay.steps_stop import StepAt, _budget_stop
+from tools.mobile.replay.steps_stop import StepAt, _budget_stop, _close
+from tools.mobile.replay.waits import _wait_until_text
+from tools.mobile.replay.waits_cond import _needs_model_reply
+from tools.mobile.replay.waits_types import TextWait
 
 
 class Turn(NamedTuple):
@@ -110,6 +113,35 @@ async def _run_step(run: _ReplayRun, turn: Turn, cur: Cur) -> dict | None:
     return await _act(run, turn, cast("_Step", step))
 
 
+async def _present_cur(run: _ReplayRun, turn: Turn, cur: Cur) -> Cur | dict | None:
+    """``tap_text_if_present``: poll (bounded) for its text. Present gives the
+    plain ``tap_text`` step to run; absent records ``ok`` (skipped) and gives ``None``.
+    A poll cut short (a crash, a dialog, another app) is NOT absence: it is
+    recorded ``interrupted`` and the reply hands the screen back to the model.
+    """
+    action = cur.aim.ref
+    want = TextWait(action.text, int(action.max_s * 1000))
+    found, screen, _ = await _wait_until_text(run.ctx, turn.state.screen, want)
+    interruption, run.ctx.wait_interruption = run.ctx.wait_interruption, ""
+    turn.state.screen = screen
+    if found:
+        return Cur(Aim("tap_text", action), cur.at._replace(screen=screen))
+    if interruption:
+        return _interrupted_reply(run, cur.at._replace(screen=screen), interruption)
+    cur.at.entry.update(
+        outcome="ok", detail="`" + action.text[:80] + "` absent, skipped"
+    )
+    _close(run, cur.at._replace(screen=screen))
+    return None
+
+
+def _interrupted_reply(run: _ReplayRun, at: StepAt, interruption: str) -> dict:
+    """Stop for the model: an optional tap whose poll was interrupted."""
+    at.entry.update(outcome="interrupted", detail=interruption)
+    _close(run, at)
+    return _needs_model_reply(run, at.screen, at.entry)
+
+
 # NEVER on index 0. A budget that can stop the first action makes no
 # progress at all, and each stop costs one of three escapes, so a short
 # budget would turn every case into `blocked` without ever touching the
@@ -126,4 +158,9 @@ async def _replay_one(run: _ReplayRun, turn: Turn, item: tuple) -> dict | None:
     cur = Cur(Aim(op, action), StepAt(index, cast("dict", entry), turn.state.screen))
     if op in ("done", "ask_tester"):
         return _terminal_stop(run, cur)
+    if op == "tap_text_if_present":
+        present = await _present_cur(run, turn, cur)
+        if present is None or isinstance(present, dict):
+            return present
+        return await _run_step(run, turn, present)
     return await _run_step(run, turn, cur)

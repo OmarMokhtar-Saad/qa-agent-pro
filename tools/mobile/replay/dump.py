@@ -19,6 +19,7 @@ from tools.mobile.replay.dump_raw import (  # noqa: F401
     _pick_source,
     _raw_dump,
     dump_raw,
+    dump_raw_reusing,
     logger,
 )
 from tools.mobile.replay.dump_screen import (  # noqa: F401

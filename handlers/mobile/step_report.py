@@ -32,6 +32,12 @@ def _mobile_render_report_file(run_id: str) -> tuple[str, bool, str]:
         )
 
 
+#: The last line of a finished run's reply: stops the chat's status/stop/status.
+RUN_OVER_NOTE = (
+    "\n\nRun finished; device released; no qa_mobile_status/qa_mobile_stop needed."
+)
+
+
 # The run is over: give the emulator back. THE HOLDER releasing its
 # own lock -- there is no reaper in this lane, and nothing here could
 # take a lock from another process even if it wanted to. Under the
@@ -90,6 +96,8 @@ async def _mobile_report_text(run_id: str, session_token: str, body: dict) -> st
         **_relay_kwargs(resolved, rows),
         typed_field_line=mobile_render.typed_field_tally(rows),
     )
-    return relay + mobile_render.summary_block(
-        rows, mobile_render.SummaryOpts(**summary)
+    return (
+        relay
+        + mobile_render.summary_block(rows, mobile_render.SummaryOpts(**summary))
+        + RUN_OVER_NOTE
     )

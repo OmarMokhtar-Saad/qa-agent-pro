@@ -32,6 +32,16 @@ SUBMIT_BUDGET_MS = 40000
 #: shorter one against the same screen.
 MAX_TOTAL_WAIT_MS = 40000
 
+#: The SUM of the ``max_s`` bounds of every condition wait in one script. They
+#: return the moment their condition holds, so ``max_s`` is only a ceiling, and
+#: the replay's wall-clock budget stop already bounds a submit; a login flow of
+#: four 15 s waits was refused against the fixed-wait total above.
+MAX_CONDITION_WAIT_MS = 120000
+
+#: The longest ``tap_text_if_present`` polls for its label, in seconds. A
+#: short window: the op is for an optional element and must never stall a run.
+TAP_IF_PRESENT_MAX_S = 5
+
 #: What a ``wait`` carrying only ``until_text`` counts as, for the total above:
 #: the bound the executor actually applies to it. Mirrored rather than imported
 #: -- ``actions`` must not import ``executor`` -- and pinned equal to
@@ -87,6 +97,7 @@ MUTATING_OPS = frozenset(
     {
         "tap",
         "tap_text",
+        "tap_text_if_present",
         "type",
         "fill",
         "clear",

@@ -96,6 +96,7 @@ def _held_status(current: dict, session_id: str, now: float | None) -> dict:
             "holder": holder,
             "taken_over_from": str(current.get("taken_over_from") or ""),
             "age": age,
+            "released": bool(current.get("released_at")),
         },
     }
 

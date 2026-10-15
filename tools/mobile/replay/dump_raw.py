@@ -9,6 +9,7 @@ from typing import Any
 from tools.mobile import (
     adb,
     dump_latency,
+    dump_reuse,
     latency_scale,
     step_timing,
     tree_optin,
@@ -34,7 +35,23 @@ async def dump_raw(serial: str, *, use_provider: bool = True) -> dict:
     task = dump_latency.start(
         serial, adb.uiautomator_dump(serial, use_provider=use_provider)
     )
-    return await asyncio.shield(task)
+    return await step_timing.timed("ui_dump", asyncio.shield(task))
+
+
+async def dump_raw_reusing(serial: str) -> dict:
+    """:func:`dump_raw`, but serve the replay's last dump when it is provably current.
+
+    Only for the read that FOLLOWS a replay (the explore turn's packet): a
+    polling loop must never use it, since it exists to see the screen change.
+    Nothing actuated on the device since that dump (see
+    :mod:`tools.mobile.dump_reuse`) and it is younger than its age bound, or
+    this takes a real dump.
+    """
+    held = dump_reuse.take(serial)
+    if held is not None:
+        step_timing.mark("dump_reused_raw")
+        return held
+    return await dump_raw(serial)
 
 
 #: What a dump cut at a wait's deadline reports. An error result, because the

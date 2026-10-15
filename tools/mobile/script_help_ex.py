@@ -25,6 +25,11 @@ _MODELS: dict = {
 OP_EXAMPLES: dict = {
     "tap": {"op": "tap", "target": {"label": "Sign in"}},
     "tap_text": {"op": "tap_text", "text": "Sign in"},
+    "tap_text_if_present": {
+        "op": "tap_text_if_present",
+        "text": "Not now",
+        "max_s": 2,
+    },
     "type": {"op": "type", "target": {"label": "Email"}, "text": "hello"},
     "fill": {"op": "fill", "label": "Email", "text": "hello"},
     "clear_app_data": {"op": "clear_app_data"},

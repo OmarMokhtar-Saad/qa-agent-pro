@@ -125,6 +125,7 @@ from tools.mobile.action_models_basic import (  # noqa: F401
     HomeAction,
     TapAction,
     TapTextAction,
+    TapTextIfPresentAction,
     Target,
     TypeAction,
     _Base,

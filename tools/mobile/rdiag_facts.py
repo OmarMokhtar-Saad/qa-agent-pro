@@ -58,6 +58,13 @@ def _run_cells(run_id: str, manifest: dict, state_cell: tuple) -> list:
 
 
 def _holder_cell(holder: str, lease: dict) -> tuple:
+    if lease.get("released_at"):
+        return (
+            "lease",
+            "released",
+            "by session " + esc(holder, 40),
+            "",
+        )
     return (
         "lease",
         "held by session " + esc(holder, 40),

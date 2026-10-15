@@ -81,6 +81,16 @@ def _status_explore_line(body: dict) -> list[str]:
     ]
 
 
+def _status_lease_lines(body: dict) -> list[str]:
+    """The lease row: released once the run ended, else who holds it."""
+    holder = str(body.get("holder") or "")
+    if body.get("lease_released"):
+        return ["- lease: released (the run ended and freed the device)"]
+    if holder:
+        return ["- lease: held by session `" + holder[:40] + "`"]
+    return []
+
+
 def status_block(resolved: object, coverage_line: str = "") -> str:
     """What ``qa_mobile_status`` prints: where the run is, from disk only."""
     with never_raise():
@@ -88,9 +98,7 @@ def status_block(resolved: object, coverage_line: str = "") -> str:
         lines = _status_head_lines(body)
         lines[2:2] = _status_stopped_lines(body)
         lines.extend(_status_counter_lines(body, coverage_line))
-        holder = str(body.get("holder") or "")
-        if holder:
-            lines.append("- lease: held by session `" + holder[:40] + "`")
+        lines += _status_lease_lines(body)
         lines += _status_abandoned_lines(body)
         lines += _status_explore_line(body)
         return "\n".join(lines)

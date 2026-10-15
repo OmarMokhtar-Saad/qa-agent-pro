@@ -93,7 +93,7 @@ async def _verified_result(job: _TypeJob, value: str, before: str | None) -> dic
     result = _typed_result(value, job.secret, landed)
     # EMPTY after the commit: only the screen can say whether that is a dead
     # field or an auto-submitting OTP that moved on, so the replay asks it.
-    result["content"]["empty_after"] = after == ""
+    result["content"]["empty_after"] = after is not None and not after
     return result
 
 

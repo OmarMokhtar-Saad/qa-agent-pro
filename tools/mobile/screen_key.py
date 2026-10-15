@@ -1,6 +1,12 @@
 """A stable identity for a screen, built from structure and never from text.
 
-Pure, no I/O, never raises. ``screen_key`` hashes the package, the activity and
+Version ``sk2``: the key also folds in the input structure (``_structure``),
+because screens whose only anchors are shared containers (a login form and a
+code-entry screen, neither with resource ids) collided under ``sk1``. Stored
+``sk1:`` keys are never matched again (relearned under the new key); degraded
+keys keep the ``sk1d:`` prefix the rest of the code tests for.
+
+Pure, no I/O, never raises.``screen_key`` hashes the package, the activity and
 the resource ids that occur exactly once on the screen (the *anchors*), so three
 chat screens that differ only in message text share one key. A screen with fewer
 than two anchors gets a *degraded* key (class counts); learning treats such keys
@@ -82,6 +88,31 @@ def _anchors(elements: list, package: str) -> tuple:
     return tuple(anchors[: knowledge_limits.MAX_ANCHORS])
 
 
+def _is_input(element: dict) -> bool:
+    cls = str(element.get("cls") or "").lower()
+    return bool(element.get("editable")) or "edittext" in cls
+
+
+def _field_shape(element: dict) -> str:
+    label = text_shape(element.get("hint")) + "/" + text_shape(element.get("desc"))
+    return "%s:%s" % (element.get("cls"), label)
+
+
+def _structure(elements: list) -> str:
+    """The input structure outside lists: each input field's class and the shape
+    of its hint/description, and how many controls are tappable. Never text or
+    values, so a timer, a typed value or a message cannot move it."""
+    boxes, fields, taps = _list_boxes(elements), [], 0
+    for element in elements:
+        box: Any = _bounds(element)
+        if box and any(_inside(box, outer) for outer in boxes):
+            continue
+        taps += 1 if element.get("clickable") else 0
+        if _is_input(element):
+            fields.append(_field_shape(element))
+    return "in=%s;tap=%d" % (",".join(sorted(fields)), taps)
+
+
 def _title(elements: list) -> str:
     for element in elements:
         rid = str(element.get("rid") or "").lower()
@@ -111,7 +142,8 @@ def screen_key(screen: object, package: str = "", activity: str = "") -> ScreenK
         if len(anchors) < 2:
             key = _degraded(package, activity, elements)
             return ScreenKey(key, activity, anchors, title, True)
-        key = "sk1:" + _sha("|".join((package, activity, "|".join(anchors))))
+        parts = (package, activity, "|".join(anchors), _structure(elements))
+        key = "sk2:" + _sha("|".join(parts))
         return ScreenKey(key, activity, anchors, title, False)
     except (ValueError, TypeError, KeyError, AttributeError):
         return ScreenKey("sk1d:" + _sha("error"), "", (), "", True)

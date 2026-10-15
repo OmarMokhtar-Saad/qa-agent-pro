@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from tools.mobile.action_consts import (
+    MAX_CONDITION_WAIT_MS,
     MAX_TOTAL_WAIT_MS,
     UNTIL_TEXT_DEFAULT_MS,
     WAIT_UNTIL_OPS,
@@ -79,3 +80,39 @@ def total_wait_ms(actions: object) -> int:
     if bare:
         explicit += bare * bare_wait_ms_each(actions)
     return explicit
+
+
+def condition_wait_ms(actions: object) -> int:
+    """The ``max_s`` ceilings of every condition wait in *actions*, in ms."""
+    total = 0
+    for action in list(actions or []):
+        if str(getattr(action, "op", "") or "") in WAIT_UNTIL_OPS:
+            total += int(float(getattr(action, "max_s", 0) or 0) * 1000)
+    return total
+
+
+def _over_cap(actions: object) -> tuple:
+    """``(total, cap)`` of the first wait class over its cap, else ``(0, 0)``."""
+    condition = condition_wait_ms(actions)
+    fixed = total_wait_ms(actions) - condition
+    if fixed > MAX_TOTAL_WAIT_MS:
+        return fixed, MAX_TOTAL_WAIT_MS
+    if condition > MAX_CONDITION_WAIT_MS:
+        return condition, MAX_CONDITION_WAIT_MS
+    return 0, 0
+
+
+def wait_budget_error(actions: object) -> str:
+    """Why *actions* spend too long waiting, or ``""`` when they fit.
+
+    Fixed waits answer to :data:`MAX_TOTAL_WAIT_MS`; event-driven condition
+    waits answer to the looser :data:`MAX_CONDITION_WAIT_MS`.
+    """
+    total, cap = _over_cap(actions)
+    if not cap:
+        return ""
+    return (
+        f"the waits in this script total {total} ms, over the {cap} ms one "
+        "submit allows; set ms per wait explicitly, or split the case into "
+        "shorter scripts -- the server hands the screen back between them"
+    )

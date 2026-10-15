@@ -30,6 +30,7 @@ def _target_notes() -> list[str]:
         "run's own app's data (pm clear) and relaunches it, judged by the "
         "destructive guard like every other irreversible action.",
         "tap_text(text) is the short form of tap: it taps the ONE control carrying that visible text, and REFUSES when more than one control carries it rather than choosing between them. On a screen with the same word on several rows, use tap with a narrower target instead. It takes no target of its own.",
+        "tap_text_if_present(text, max_s) is tap_text for an OPTIONAL control (a consent prompt, a promo): it polls up to max_s (default 2, at most 5) for the text and taps it when it shows; when it never does the step is a no-op recorded as absent and the script goes on. It never fails the script.",
     ]
 
 
