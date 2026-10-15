@@ -17,6 +17,7 @@ from handlers.mobile.content_args import (
 from handlers.mobile.content_finding import _mobile_fold_finding
 from handlers.mobile.content_flow import _mobile_flow_finish, _mobile_flow_prepare
 from handlers.mobile.content_route import _mobile_route_finish, _mobile_route_prepare
+from tools.mobile import flow_replay_state
 
 
 class _NoteCtx(NamedTuple):
@@ -132,11 +133,23 @@ async def _run_step(call: StepCall, plans: tuple, held: dict) -> tuple:
     )
 
 
+def _opt_out(args: tuple, kwargs: dict, flow_name: str) -> str:
+    """``flow="none"`` turns auto-replay off for the run and plans no flow."""
+    if str(flow_name or "").strip().lower() != "none":
+        return flow_name
+    run_id = mobile_step._call_arg(
+        mobile_step.handle_submit_mobile_step, StepCall(args, kwargs), "run_id"
+    )
+    flow_replay_state.optout(run_id)
+    return ""
+
+
 async def _planned(args: tuple, kwargs: dict) -> tuple:
     """Plan flow/route and fold the finding; ``(early, plans, call, finding_note)``."""
     flow_name, flow_params, save_flow, route_name, save_route, finding = (
         _pop_flow_route_args(kwargs)
     )
+    flow_name = _opt_out(args, kwargs, flow_name)
     if (route_name or save_route) and (flow_name or save_flow):
         refusal = _FLOW_WARN + "Pass a flow OR a route, not both. Nothing was touched."
         return (refusal, []), None, None, ""

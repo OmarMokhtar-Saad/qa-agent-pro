@@ -12,16 +12,25 @@ from __future__ import annotations
 from tools.mobile.replay.context import Context
 
 _KEY = "before_action_hash"
+_GONE = "gone_satisfied"
 
 
 def note_action(ctx: Context, before_hash: str) -> None:
     """Remember the content hash of the screen an action started on."""
     ctx.env[_KEY] = str(before_hash or "")
+    ctx.env.pop(_GONE, None)
+
+
+def note_gone(ctx: Context) -> None:
+    """A wait for something to go away was met: that IS the change."""
+    ctx.env[_GONE] = True
 
 
 def clear_action(ctx: Context) -> None:
     """Forget the remembered hash: only the wait right after a device op may use it."""
-    (getattr(ctx, "env", None) or {}).pop(_KEY, None)
+    env = getattr(ctx, "env", None) or {}
+    env.pop(_KEY, None)
+    env.pop(_GONE, None)
 
 
 def _spinning(screen: object) -> bool:
@@ -34,7 +43,10 @@ def _spinning(screen: object) -> bool:
 
 def already_changed(ctx: Context, now_hash: str, screen: object = None) -> bool:
     """True once, when the last action started on a different, settled screen."""
-    before = (getattr(ctx, "env", None) or {}).pop(_KEY, "")
+    env = getattr(ctx, "env", None) or {}
+    if env.pop(_GONE, False):
+        return True
+    before = env.pop(_KEY, "")
     if _spinning(screen):
         return False
     return bool(before and now_hash and before != now_hash)

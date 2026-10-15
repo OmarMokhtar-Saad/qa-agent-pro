@@ -133,7 +133,19 @@ def _verification_summary(trace: list[dict]) -> str:
 # ``assert`` for saying so.
 def _has_verification(trace: list[dict]) -> bool:
     """True when *trace* holds evidence a ``done verdict=pass`` can stand on."""
-    return any(str(item.get("outcome") or "") == "assert_pass" for item in trace)
+    return any(is_positive_pass(item) for item in trace)
+
+
+# A passed ``text_absent`` proves only that something is not there: a blank,
+# wrong or crashed screen satisfies it too. A pass needs at least one POSITIVE
+# check (text or element present, new text, screen reached).
+def is_positive_pass(item: object) -> bool:
+    """True for an ``assert_pass`` trace entry that is not a negative-only check."""
+    if not isinstance(item, dict) or str(item.get("outcome") or "") != "assert_pass":
+        return False
+    action = item.get("action")
+    kind = str(action.get("kind") or "") if isinstance(action, dict) else ""
+    return kind != "text_absent"
 
 
 def _verified(trace: list[dict], ctx: Context) -> bool:

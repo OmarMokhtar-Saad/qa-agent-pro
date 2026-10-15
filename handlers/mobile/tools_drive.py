@@ -43,7 +43,7 @@ def _register_mobile_test_tool(mcp, kit, rt) -> None:
         system_image: str = "",
         confirm_destructive: bool = False,
     ) -> list[ContentBlock]:
-        """Drive an Android device: ad-hoc steps (goal=...), cases, exploration.
+        """Drive an Android device: an exploration run toward goal=..., or cases.
 
         ANY Android device action goes through this tool. Do NOT use raw adb or shell: it owns the destructive guard, run folder and evidence.
 

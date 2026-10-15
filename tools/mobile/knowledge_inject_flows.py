@@ -7,15 +7,24 @@ from tools.mobile import knowledge_inject, kstg_flow_packets
 _PRIO = 1
 
 
+_HOW = (
+    " The server replays it by itself when the app is on its first screen; "
+    "flow=%s replays it on demand, flow=none turns auto-replay off."
+)
+
+
 def _text(row: dict) -> str:
     fields = row.get("fields") or []
     secret = "; secret fields: %s" % ", ".join(map(str, fields)) if fields else ""
-    return "known flow available: %s (%s steps%s). Replay it with flow=%s." % (
+    covers = str(row.get("covers") or "")
+    span = " It %s." % covers if covers else ""
+    head = "known flow available: %s (%s steps%s).%s" % (
         row["name"],
         row.get("steps"),
         secret,
-        row["name"],
+        span,
     )
+    return head + _HOW % row["name"]
 
 
 def _packet_text(rows: list) -> str:

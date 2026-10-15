@@ -8,9 +8,9 @@ from typing import Any
 
 from handlers.mobile.step_state import _MOBILE_IMAGE_SPECS, _MOBILE_SHOT_WANT
 from tools.mobile import adb as mobile_adb
+from tools.mobile import dump_reuse, step_timing
 from tools.mobile import run_store as mobile_run_store
 from tools.mobile import screenshot as mobile_screenshot
-from tools.mobile import step_timing
 
 logger = logging.getLogger("tools.mcp_handlers")
 
@@ -108,6 +108,8 @@ async def _mobile_capture_screen_note(turn: ShotTurn, attach: bool) -> str:
         return mobile_screenshot.NO_IMAGE_CHANNEL_NOTE
     if not serial:
         return mobile_screenshot.CAPTURE_FAILED_NOTE
+    if dump_reuse.consume_shot_skip(serial) and not attach:
+        return mobile_screenshot.NOT_ATTACHED_NOTE  # refused: screen unchanged
     note, spec = await _capture_and_pick_spec(serial, turn)
     if spec is None:
         return note

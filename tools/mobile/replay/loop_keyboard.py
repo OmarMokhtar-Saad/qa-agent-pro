@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from tools.mobile import ime
@@ -38,12 +39,22 @@ def _keyboard_note(fallback_note: str, down: dict) -> str:
     return str((down.get("content") or {}).get("note") or "")
 
 
+_KEYBOARD_WORDS = re.compile(r"\b(keyboard|typing|type|ime)\b")
+
+
+def _keyboard_related(content: dict) -> bool:
+    """True when why the script ended concerns typing or the keyboard."""
+    why = str(content.get("reason") or "").lower()
+    return bool(_KEYBOARD_WORDS.search(why))
+
+
 def _with_note(replied: Any, note: str) -> Any:
     """*replied* with the keyboard *note* put on its content."""
     content = replied.get("content") if isinstance(replied, dict) else None
     if note and isinstance(content, dict):
         content["keyboard"] = note
-        content["reason"] = (str(content.get("reason") or "") + " " + note).strip()
+        if _keyboard_related(content):
+            content["reason"] = (str(content.get("reason") or "") + " " + note).strip()
     return replied
 
 

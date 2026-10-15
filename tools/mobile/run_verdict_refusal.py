@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 
-from tools.mobile import actions
+from tools.mobile import actions, dump_reuse
 
 logger = logging.getLogger("tools.mobile.run_verdict")
 
@@ -66,4 +66,5 @@ def log_refusal(error: object) -> str:
     detail = ((limit + " ") if limit else "") + _clip(error, DETAIL_CHARS)
     line = "refused: " + rule + " " + detail
     logger.info("%s", line)
+    dump_reuse.note_refusal()
     return line

@@ -12,9 +12,15 @@ from tools.mobile.resolve import AskCb
 
 APP_TESTER_PACKAGE = "dev.firebase.appdistribution"
 
-#: Scrolls of the App Tester list made to look for the package id; each one is
-#: a screen dump, so this bounds the search, not the list.
-MAX_LISTING_SCROLLS = 6
+#: Safety cap on the scrolls of one pass over the App Tester list. The real
+#: bound is LISTING_DEADLINE_S; the cap only stops a list that never ends.
+MAX_LISTING_SCROLLS = 40
+
+#: Wall-clock budget of one list scan (every scroll is a swipe plus a dump).
+LISTING_DEADLINE_S = 90.0
+
+#: Re-reads of a screen that parsed to no rows (a spinner) before giving up.
+MAX_EMPTY_REREADS = 3
 
 #: Back presses (and screen reads after each) made to leave the app page App
 #: Tester reopens on and reach its app list.
@@ -50,6 +56,8 @@ class _Run:
     offsets: dict = field(default_factory=dict)
     #: current offset (scrolls) from the screen the scan started on.
     pos: int = 0
+    #: one (direction, rows seen, new rows, offset) entry per scroll made.
+    scrolls: list = field(default_factory=list)
 
 
 class Seen(NamedTuple):

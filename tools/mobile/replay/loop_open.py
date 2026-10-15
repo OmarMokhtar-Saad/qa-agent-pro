@@ -8,6 +8,7 @@ from typing import Any, NamedTuple
 
 from tools.mobile import actions as actions_mod
 from tools.mobile import knowledge_feedback
+from tools.mobile.replay import steps_snapshot
 from tools.mobile.replay.context import (
     STATUS_ERROR,
     Context,
@@ -118,6 +119,7 @@ def _step_prelude(
     screen = state.screen
     entry = _fresh_entry(index, action, screen)
     _stamp_screen_key(run.ctx, entry, screen)
+    steps_snapshot.stamp_target(entry, entry.get("action") or {}, screen)
     op = str(getattr(action, "op", "") or "")
     expected_id = _route_expected(run.ctx, index, len(run.items))
     if expected_id and expected_id != _screen_id(screen):

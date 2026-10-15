@@ -26,9 +26,12 @@ def target_text(action: dict) -> str:
     return kplg_popup_ref.label_of(action)
 
 
-def _target(action: dict) -> dict:
+def _target(action: dict, snap: dict | None = None) -> dict:
     raw = action.get("target") if isinstance(action.get("target"), dict) else {}
-    return {k: str(raw[k])[:200] for k in _TARGET_KEYS if raw.get(k)}
+    out = {k: str(raw[k])[:200] for k in _TARGET_KEYS if raw.get(k)}
+    if out or not isinstance(snap, dict):
+        return out
+    return {k: str(snap[k])[:200] for k in _TARGET_KEYS if snap.get(k)}
 
 
 def _label_param(label: str) -> str:
@@ -55,14 +58,15 @@ def _typed(action: dict, out: dict) -> dict:
     return out
 
 
-def flow_action(action: dict) -> dict:
+def flow_action(action: dict, snap: dict | None = None) -> dict:
     """The replayable form of *action*, or ``{}`` when it cannot be kept safely."""
     op = str(action.get("op") or "")
     if op not in ALLOWED_OPS:
         return {}
     out: dict = {"op": op}
-    if _target(action):
-        out["target"] = _target(action)
+    target = _target(action, snap)
+    if target:
+        out["target"] = target
     if op in _TYPED:
         if op == "fill" and action.get("label"):
             out["label"] = str(action["label"])[:200]

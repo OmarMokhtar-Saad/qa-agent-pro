@@ -91,6 +91,21 @@ def _plain_nav(op: str, body: dict) -> list | None:
     return None
 
 
+def _plain_text_op(op: str, body: dict, target: tuple) -> list | None:
+    """The plain words of type, fill and the tap-by-text ops, else None."""
+    if op in ("tap_text", "tap_text_if_present"):
+        label = _text(body.get("text"), 80)
+        return ["Tapped ", _q(label)] if label else ["Tapped an element by its text"]
+    typed = _typed_literal({**body, "op": "type"})
+    if op == "type":
+        name, role, thing = target
+        return ["Typed ", _q(typed)] + ([" into "] + thing if name or role else [])
+    if op == "fill":
+        label = _text(body.get("label"), 60)
+        return ["Filled ", _q(typed), " into the ", _q(label or "unlabelled"), " field"]
+    return None
+
+
 # Typed text goes through :func:`_typed_literal`, so a credential is the
 # mask here exactly as it is in the step table.
 def _plain_action(action: object) -> list:
@@ -102,9 +117,8 @@ def _plain_action(action: object) -> list:
         return [_TARGET_VERBS[op]] + thing
     if op in _FIXED_WORDS:
         return [_FIXED_WORDS[op]]
-    if op == "type":
-        typed = _typed_literal(body)
-        return ["Typed ", _q(typed)] + ([" into "] + thing if name or role else [])
+    if (said := _plain_text_op(op, body, (name, role, thing))) is not None:
+        return said
     if (nav := _plain_nav(op, body)) is not None:
         return nav
     if op in _WAIT_OPS:

@@ -29,7 +29,7 @@ def _key(version: str) -> tuple[int, ...] | None:
     return tuple(int(part) for part in parts)
 
 
-async def _installed_version(serial: str, package: str) -> str:
+async def installed_version(serial: str, package: str) -> str:
     """``versionName`` of the installed package, ``""`` when it cannot be read."""
     got = await adb.shell(
         serial, ["dumpsys", "package", package], timeout=adb.PM_LIST_TIMEOUT_S
@@ -58,7 +58,7 @@ async def older_version(serial: str, installed: bool) -> str:
     token = (str(serial), want)
     if not installed or token in _JUDGED or not info.get("package"):
         return ""
-    have = await _installed_version(serial, str(info["package"]))
+    have = await installed_version(serial, str(info["package"]))
     if have:
         _JUDGED.add(token)
     return have if _is_older(have, want) else ""

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 
-from tools.mobile import adb, run_store
+from tools.mobile import adb, flow_replay, run_store
 from tools.mobile.explore_runner_apply import apply_turn_result  # noqa: F401
 from tools.mobile.explore_runner_consts import (  # noqa: F401
     _PACKAGE_RE,
@@ -87,6 +87,36 @@ async def _observe_screen(ctx: object) -> dict:
 #
 # ``{"error", "content": {"status", "state", "screen", "packet", "remaining"}}``
 # with ``status`` one of ``running`` / the three stop reasons.
+async def _auto_replay(run_id: str, ctx: object, held: Held) -> dict:
+    """The screen after any learned flow the server replayed on its own.
+
+    Stored best-effort (same contract as case_runner's: a screen the report
+    can draw, never able to stop a turn).
+    """
+    auto = await flow_replay.run(
+        run_id, ctx, flow_replay.Auto(held.screen, held.body, False)
+    )
+    screen = held.screen
+    if auto.ran:
+        again = await _observe_screen(ctx)
+        screen = (
+            auto.screen if again.get("error") else again.get("content") or auto.screen
+        )
+    run_store.write_screen(run_id, screen)
+    return screen
+
+
+async def _observed(run_id: str, env: TurnEnv, body: dict) -> dict:
+    """The observed screen (after any auto-replay), or the error dict."""
+    pruned = await _observe_screen(env.ctx)
+    if pruned.get("error"):
+        return pruned
+    screen = await _auto_replay(
+        run_id, env.ctx, Held(body, pruned.get("content") or {})
+    )
+    return {"error": None, "content": screen}
+
+
 async def next_turn(run_id: str, state: object, env: TurnEnv) -> dict:
     """Dump, prune and build the turn packet -- or stop."""
     try:
@@ -94,16 +124,10 @@ async def next_turn(run_id: str, state: object, env: TurnEnv) -> dict:
         halted = halt_result(body, env.now)
         if halted is not None:
             return halted
-
-        pruned = await _observe_screen(env.ctx)
-        if pruned.get("error"):
-            return pruned
-        screen = pruned.get("content") or {}
-
-        # Same contract as case_runner's: a screen the report can draw,
-        # stored best-effort, never able to stop a turn.
-        run_store.write_screen(run_id, screen)
-        return packet_turn(run_id, Held(body, screen), env.now)
+        seen = await _observed(run_id, env, body)
+        if seen.get("error"):
+            return seen
+        return packet_turn(run_id, Held(body, seen["content"]), env.now)
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("mobile.explore_runner.next_turn failed")
         return {"error": str(exc), "content": None}

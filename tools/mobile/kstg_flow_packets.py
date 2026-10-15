@@ -26,17 +26,25 @@ def _fits(acts: list) -> bool:
 
 
 def chunk(acts: list) -> list:
-    """Replayable packets covering every action, or ``[]`` when one cannot stand alone."""
+    """Replayable packets covering the usable PREFIX of *acts*.
+
+    The prefix ends before the first action that cannot stand alone as a script.
+    """
     packets: list = []
     cur: list = []
     for act in acts:
         if cur and not _fits(cur + [act]):
             packets.append(cur)
             cur = []
+        if not _fits(cur + [act]):
+            break
         cur.append(act)
-        if not _fits(cur):
-            return []
     return packets + [cur] if cur else packets
+
+
+def kept(packets: list) -> int:
+    """How many actions the *packets* hold."""
+    return sum(len(p) for p in packets)
 
 
 def names(goal: str, count: int) -> list:

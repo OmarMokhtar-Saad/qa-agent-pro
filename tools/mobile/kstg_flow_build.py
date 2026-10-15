@@ -59,13 +59,22 @@ def ended_clean(steps: list) -> bool:
     return bool(steps) and str(steps[-1].get("outcome") or "") in _ENDED_OK
 
 
-def app_actions(steps: list, package: str) -> list:
-    """The replayable actions of *package*'s steps that ran as planned."""
-    out = [
-        rec["flow_action"]
+def app_recs(steps: list, package: str) -> list:
+    """The replayable step records of *package* that ran as planned and landed.
+
+    A step that errored, found no element, needed the model, or whose screen never
+    changed as expected (``landed`` False) is not part of the route, so it is left out.
+    """
+    return [
+        rec
         for rec in steps
         if rec.get("flow_action")
         and kstg_foreign.own(rec, package)
         and str(rec.get("outcome") or "") in OK_OUTCOMES
+        and rec.get("landed") is not False
     ]
-    return out
+
+
+def app_actions(steps: list, package: str) -> list:
+    """The replayable actions of *package*'s steps that ran as planned."""
+    return [rec["flow_action"] for rec in app_recs(steps, package)]

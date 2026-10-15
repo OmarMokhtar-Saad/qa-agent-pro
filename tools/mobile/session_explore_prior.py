@@ -7,6 +7,7 @@ from typing import Any
 
 from tools.mobile import run_store
 from tools.mobile.replay.guard import NOTHING_MOVED_PREFIX
+from tools.mobile.replay.screen_has import is_positive_pass
 from tools.mobile.session_core import _CASE_STORE_ERRORS
 
 logger = logging.getLogger("tools.mobile.session")
@@ -46,10 +47,7 @@ def _has_assert_pass(listed: dict) -> bool:
         if not isinstance(body, dict):
             continue
         for item in list(body.get("trace") or []):
-            if (
-                isinstance(item, dict)
-                and str(item.get("outcome") or "") == "assert_pass"
-            ):
+            if is_positive_pass(item):
                 return True
     return False
 

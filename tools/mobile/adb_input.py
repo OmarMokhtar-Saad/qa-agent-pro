@@ -76,18 +76,18 @@ def _url_refusal(text: str) -> dict | None:
     return None
 
 
-async def open_url(serial: str, url: str) -> dict:
-    """Hand *url* to the device's VIEW intent (download links, Play Store)."""
+async def open_url(serial: str, url: str, package: str = "") -> dict:
+    """Hand *url* to the device's VIEW intent (download links, Play Store); with
+    *package* only that app's activity may take it (``-p``)."""
     text = str(url or "").strip()
     refusal = _url_refusal(text)
     if refusal is not None:
         return refusal
     # adb joins argv with spaces and the device's sh re-parses it, so the URL
     # is quoted as one word (`?` and `#` are shell syntax there).
-    return await host().shell(
-        serial,
-        ["am", "start", "-a", "android.intent.action.VIEW", "-d", shlex.quote(text)],
-    )
+    only = ["-p", shlex.quote(package)] if package else []
+    argv = ["am", "start", "-a", "android.intent.action.VIEW", "-d", shlex.quote(text)]
+    return await host().shell(serial, argv + only)
 
 
 def is_ime_id(text: str) -> bool:

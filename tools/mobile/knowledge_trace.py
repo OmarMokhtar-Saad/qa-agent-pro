@@ -65,7 +65,9 @@ def _head(entry: dict, action: dict) -> StepRec:
         op=_text(action.get("op"), 40),
         target_rid=_rid(action),
         target_text=knowledge_trace_flow.target_text(action),
-        flow_action=knowledge_trace_flow.flow_action(action),
+        flow_action=knowledge_trace_flow.flow_action(
+            action, entry.get("target_snapshot")
+        ),
         text_field=_text(entry.get("text_field") or action.get("field"), 80),
         screen_key=_text(entry.get("screen_key"), 64),
         after_screen_key=_text(entry.get("after_screen_key"), 64),

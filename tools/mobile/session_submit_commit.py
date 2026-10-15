@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tools.mobile import explore_runner, media
+from tools.mobile import explore_runner, finding_check, media
 from tools.mobile.session_explore_case import TurnRecord, _checkpoint_explore_turn
 from tools.mobile.session_explore_net import _explore_finish_network
 from tools.mobile.session_explore_plan import _explore_planned_case, _persist_explore
@@ -54,18 +54,29 @@ async def _finish_clip(call: ExploreCall, replay: _ReplayedTurn) -> None:
 # choice. `media.remember` APPENDS onto the case record; in this lane the
 # checkpoint above is what CREATES that record, so calling this first would
 # find no case, log the loss and drop the clip on the floor.
+def _checked(payload: dict, outcome: dict, state: dict) -> dict:
+    """*payload* with its finding marked unverified when the trace contradicts it."""
+    if not isinstance(payload, dict) or not payload.get("finding"):
+        return payload
+    finding = finding_check.check_finding(
+        payload["finding"], _full_trace(outcome, state)
+    )
+    return {**payload, "finding": finding}
+
+
 async def _commit_explore_turn(
     call: ExploreCall, payload: dict, replay: _ReplayedTurn
 ) -> dict:
     """Fold the replayed turn into the explore state, checkpoint it and reply."""
     outcome = replay.outcome
     state = call.resolved.get("explore") or {}
-    folded = explore_runner.apply_turn_result(state, payload)
+    folded = explore_runner.apply_turn_result(state, _checked(payload, outcome, state))
     if folded.get("error"):
         return folded
     turn = folded.get("content") or {}
     if isinstance(turn.get("state"), dict):
         turn["state"]["queued_actions"] = outcome.get("queued_actions") or []
+    _fold_auto_trace(turn, outcome)
     checkpoint = await _checkpoint_turn(call, turn, outcome)
     await _finish_clip(call, replay)
     return await _settle_explore_turn(
@@ -93,3 +104,17 @@ async def _settle_explore_turn(settle: _Settle) -> dict:
     )
     case = _explore_turn_case(settle.checkpoint, outcome, verdict)
     return _explore_turn_reply(_TurnReply(case, notice, resolved, stopped))
+
+
+def _full_trace(outcome: dict, state: dict) -> list:
+    """This turn's trace with the steps auto-replayed before it in front."""
+    carried = state.get("auto_trace") if isinstance(state, dict) else None
+    return list(carried or []) + list(outcome.get("trace") or [])
+
+
+def _fold_auto_trace(turn: dict, outcome: dict) -> None:
+    """Put the steps the server auto-replayed before this turn in front of its trace."""
+    state = turn.get("state")
+    carried = state.pop("auto_trace", None) if isinstance(state, dict) else None
+    if carried:
+        outcome["trace"] = list(carried) + list(outcome.get("trace") or [])

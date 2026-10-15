@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 
-from tools.mobile import adb, run_store
+from tools.mobile import adb, run_store, step_timing
 from tools.mobile import run_packets as mobile_run
 from tools.mobile.case_run_counts import case_view, escapes_used
 from tools.mobile.case_run_evidence import _abandon, _begin_evidence
@@ -41,6 +41,7 @@ def _now() -> float:
 # ``{"error", "content": {"tc_id", "screen", "packet", "escapes"}}``.
 async def start_case(run_id: str, case: object, ctx: Context) -> dict:
     """Clean-launch the app, dump the first screen, build the planning packet."""
+    step_timing.begin()
     try:
         return await _start(run_id, case, ctx)
     except Exception as exc:  # pragma: no cover - defensive
@@ -61,7 +62,7 @@ async def _start(run_id: str, case: object, ctx: Context) -> dict:
     if stopped.get("error"):
         return stopped
     evidence = await _begin_evidence(run_id, tc_id, ctx)
-    launched = await adb.launch(ctx.serial, ctx.package)
+    launched = await step_timing.timed("launch", adb.launch(ctx.serial, ctx.package))
     if launched.get("error"):
         return await _abandon(_Ref(run_id, tc_id, ctx), evidence, launched)
     return await _plan_first_screen(run_id, ctx, _Opened(tc_id, view, evidence))
@@ -69,12 +70,14 @@ async def _start(run_id: str, case: object, ctx: Context) -> dict:
 
 async def _plan_first_screen(run_id: str, ctx: Context, opened: _Opened) -> dict:
     """Wait for the app, resolve the screen, write the planning checkpoint."""
-    settle = await _wait_for_foreground(ctx)
+    settle = await step_timing.timed("foreground_wait", _wait_for_foreground(ctx))
     if settle.error:
         ref = _Ref(run_id, opened.tc_id, ctx)
         return await _abandon(ref, opened.evidence, settle.error)
-    screen = await _settled_screen(ctx, settle)
-    return _write_planning(run_id, opened, screen)
+    screen = await step_timing.timed("first_settle", _settled_screen(ctx, settle))
+    planned = _write_planning(run_id, opened, screen)
+    run_store.append_step_timing(run_id, step_timing.current_row(0))
+    return planned
 
 
 # THE SETTLE PRUNE passes NO activity on purpose: it answers ONE question --

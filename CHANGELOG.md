@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.114.0] - 2026-10-15
+## [1.115.0] - 2026-10-15
 
 ### Added
 
@@ -29,41 +29,35 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Optional popup checks (`tap_text_if_present`) return as soon as the
-  screen is settled instead of polling for the whole wait; text found on
-  several controls picks the clickable one in the top dialog, or exact
-  text, and otherwise skips with a note instead of stopping the script.
-- Polled waits no longer add a pause after a screen read that was already
-  slow.
-- App Tester stops at the app's row when the package is known, no longer
-  scrolls up first, scrolls back exactly to the row it found, and waits
-  for the app page by watching the screen instead of a fixed pause.
-- A learned flow longer than one script is saved whole as ordered parts
-  (name-p1, -p2, ...) to replay in order, instead of being cut at 10
-  steps; past 4 parts nothing is saved and the reason is recorded.
-- Learning saved before 1.113.0 is used again: it is moved to the current
-  screen id when exactly one current screen matches, as that app is
-  learned; old rows that match several screens go stale 30 days after
-  that app's first move, and rows no screen matches or of other apps
-  are left alone.
-- The report says "is gone" for absent-text checks, labels the header time
-  "Elapsed" and step times "on device", and names fills by their label or
-  id.
-- The drive tool tells the model to report only tool-proven results, never
-  mark an unexercised check passed, ask before skipping a goal step, and
-  prove a destination with present text or a screen check.
+- Learned flows are replayed by the server: when an explore turn starts
+  on a saved flow's screen, the flow runs directly instead of only being
+  hinted to the model, and hands back at the step where the screen
+  differs (send `flow=none` to opt out). Flows keep taps by id only,
+  leave out failed steps, save the part that worked, and older short
+  flows that never reached the goal are dropped.
+- App Tester opens the app's page by its Firebase link when the tester
+  input gives the app id, remembers where each app sits in the list,
+  drags slowly instead of flinging, treats the list as ended only when
+  rows repeat, reads an empty screen again instead of stopping, and gives
+  up after 90 s; the blind scroll back to the top is gone.
+- Faster steps: a step reuses the screen it just read when nothing acted
+  on the device since, a refused script takes no new screen read or
+  screenshot, and a met wait-until-gone counts as the screen change the
+  next wait asks for.
+- The run's first timing row shows launch, foreground wait and first
+  settle, so a slow start is visible.
+- A pass needs a positive check (present text or a screen check); a
+  run proven only by absent text is not accepted as passed, and checks
+  whose read-back is unknown are counted as unconfirmed.
+- The report header time is labelled "Elapsed", and the keyboard note is
+  added only to keyboard-related reasons.
 
 ### Fixed
 
-- Typing into a field the app submits by itself (such as an OTP) no longer
-  stops the script or shows as "refused": the step is ok with a "screen
-  advanced" note and the following waits run.
-- A `fill` sent with `field` but no `text` gets an error that says exactly
-  what to send.
-- Learning no longer picks up screens of other apps such as App Tester,
-  and skips runs whose app is unknown or matches no screen seen; a version
-  read of "null" counts as unknown.
-- A run's saved learn state matches the knowledge store, a fill known only
-  by its label stays in saved flows as a parameter named after the label
-  (no value stored; credential-like labels are not saved), and mistakes
-  with no target get a plain note.
+- `type` aimed at a field that is not found falls back to the only empty
+  input on screen (such as an OTP box) and says so; otherwise the error
+  suggests targeting the field by its label.
+- Findings the run's steps do not back (such as typing with no type
+  step, or a failed step) are marked unverified.
+- A skipped install (app already installed) is said once in the start
+  reply, which asks whether to reinstall or update.

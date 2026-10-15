@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tools.mobile.session_device as session_device
 from handlers import _common
+from handlers.mobile import run_skipped
 from handlers.mobile.run_install import (
     _app_stage_not_installed,
     _app_stage_open_store,
@@ -57,10 +58,19 @@ def _remember_installed(call: _AppCall, target: str) -> None:
         app_alias.remember_alias(call.serial, call.value, target)
 
 
+def _note_skipped_install(call: _AppCall, target: str) -> None:
+    """Remember an install the goal or source asked for but the probe skipped."""
+    label = mobile_render.install_source_for_label(str(call.source or "").strip())
+    asked = label or _inferred_source(call)
+    if asked not in ("", "installed_package"):
+        run_skipped.mark_skipped(call.serial, target, asked)
+
+
 def _probe_outcome(call: _AppCall, target: str, body: dict) -> tuple | None:
     """The finished ``(markdown, package)`` pair for an installed or pending app."""
     if body.get("installed"):
         _remember_installed(call, target)
+        _note_skipped_install(call, target)
         return "", target
     if body.get("pending"):
         return (

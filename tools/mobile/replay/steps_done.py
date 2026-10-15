@@ -18,9 +18,10 @@ from tools.mobile.replay.steps_stop import StepAt, _close, _reply, _stop
 
 _UNVERIFIED_PASS = (
     "verdict=pass was not accepted: nothing in this run "
-    "has recorded an assert_pass, so nothing was verified. "
-    "Add an `assert` for what the case is supposed to "
-    "show. "
+    "has recorded a positive assert_pass (text_present, element, "
+    "new_text), so nothing was verified; text_absent alone only "
+    "shows something is missing. Add an `assert` for what the case "
+    "is supposed to show on screen. "
 )
 _BLOCKED_PASS = (
     "verdict=pass was not accepted: the previous turn failed "

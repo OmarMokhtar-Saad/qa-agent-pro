@@ -29,8 +29,8 @@ async def _mobile_doctor_section() -> list:
         return []
     lines = [
         "### Mobile emulator lane",
-        "- Device actions go through `qa_mobile_test` (goal=... for ad-hoc"
-        " steps), not raw adb: it owns the safety guard, keyboard handling and"
+        "- Device actions go through `qa_mobile_test` (goal=... starts an exploration"
+        " run), not raw adb: it owns the safety guard, keyboard handling and"
         " evidence.",
     ]
     lines += await _mobile_sdk_ime_lines()

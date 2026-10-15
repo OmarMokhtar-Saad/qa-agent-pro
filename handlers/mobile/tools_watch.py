@@ -14,7 +14,7 @@ def _register_mobile_status_tool(mcp, Context, rt) -> None:
         session_token: str = "",
         report_now: bool = False,
     ) -> str:
-        """Where a mobile run stands, read from disk. Touches no device. Device actions go through `qa_mobile_test` (goal=... for ad-hoc steps), never raw adb.
+        """Where a mobile run stands, read from disk. Touches no device. Device actions go through `qa_mobile_test` (goal=... starts an exploration run toward that goal), never raw adb.
 
         Emulator, lease holder, cases done/failed/remaining. Call after anything outliving a tool call (big install, cold boot). No run_id lists runs; report_now=true writes the HTML report and returns its path."""
         return await rt._tracked(

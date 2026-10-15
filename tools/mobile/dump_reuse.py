@@ -47,8 +47,15 @@ READ_ONLY_PREFIXES = (
 #: Host-side adb verbs that never touch the screen.
 READ_ONLY_VERBS = ("devices", "get-state", "version", "start-server", "get-serialno")
 
+#: Seconds a refused script's reply may stand on the last dump: nothing was
+#: replayed, so the screen is the one the model already read.
+REFUSED_MAX_AGE_S = 20.0
+
 _GEN: dict[str, int] = {}
 _HELD: dict[str, tuple] = {}
+_LAST: dict[str, tuple] = {}
+_REFUSED: list[tuple[float, str]] = []
+_SHOT_SKIP: list[str] = []
 
 
 def _serial_of(cmd: list[str]) -> str:
@@ -87,6 +94,7 @@ def bump(serial: str) -> None:
     key = str(serial or "")
     _GEN[key] = _GEN.get(key, 0) + 1
     _HELD.pop(key, None)
+    _LAST.pop(key, None)
 
 
 def token(serial: str) -> int:
@@ -101,6 +109,7 @@ def store(serial: str, started_under: int, result: dict) -> None:
         return
     _HELD.pop(key, None)
     _HELD[key] = (copy.deepcopy(result), time.monotonic(), started_under)
+    _LAST[key] = _HELD[key]
     while len(_HELD) > MAX_HELD_SERIALS:
         del _HELD[next(iter(_HELD))]
 
@@ -116,7 +125,50 @@ def take(serial: str) -> dict | None:
     return held[0]
 
 
+def _only_fresh_serial(now: float) -> str:
+    """The one serial with a recent dump; "" when none or several (ambiguous)."""
+    fresh = [k for k, v in _LAST.items() if now - v[1] <= 4 * REFUSED_MAX_AGE_S]
+    return fresh[0] if len(fresh) == 1 else ""
+
+
+def note_refusal() -> None:
+    """A script was refused before any replay: the next read may reuse the last dump.
+
+    A refusal does not name its device, so it is pinned to the one serial with a
+    recent dump; with several devices live it marks nothing (a fresh dump runs).
+    """
+    now = time.monotonic()
+    serial = _only_fresh_serial(now)
+    _REFUSED[:] = [(now, serial)] if serial else []
+
+
+def take_after_refusal(serial: str) -> dict | None:
+    """The last dump when *serial* was just refused and nothing actuated since; once."""
+    marked, marked_serial = _REFUSED[0] if _REFUSED else (0.0, "")
+    _REFUSED.clear()
+    held = _LAST.get(str(serial or ""))
+    now = time.monotonic()
+    if marked_serial != str(serial or "") or held is None:
+        return None
+    if now - marked > REFUSED_MAX_AGE_S:
+        return None
+    if held[2] != token(serial) or now - held[1] > 4 * REFUSED_MAX_AGE_S:
+        return None
+    _SHOT_SKIP[:] = [str(serial or "")]
+    return copy.deepcopy(held[0])
+
+
+def consume_shot_skip(serial: str) -> bool:
+    """True once when this serial's dump was just re-served after a refusal."""
+    hit = bool(_SHOT_SKIP) and _SHOT_SKIP[0] == str(serial or "")
+    _SHOT_SKIP.clear()
+    return hit
+
+
 def reset() -> None:
     """Forget every held dump and generation (tests; a process-global cache)."""
     _GEN.clear()
     _HELD.clear()
+    _LAST.clear()
+    _REFUSED.clear()
+    _SHOT_SKIP.clear()

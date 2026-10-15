@@ -10,6 +10,7 @@ from typing import Any
 
 from tools.mobile import (
     adb,
+    dump_reuse,
     step_timing,
 )
 from tools.mobile.replay.context_ctx import Context
@@ -35,6 +36,7 @@ class _Carried:
     taken: float
     package: str
     activity: str
+    gen: int = 0
 
 
 _CARRIED: dict = {}
@@ -60,9 +62,19 @@ def _remember(ctx: Context, observed: Any) -> None:
         time.monotonic(),
         str(content.get("package") or ""),
         str(content.get("activity") or ""),
+        dump_reuse.token(key),
     )
     while len(_CARRIED) > MAX_CARRIED_SERIALS:
         del _CARRIED[next(iter(_CARRIED))]
+
+
+def _is_current(held: _Carried | None, ctx: Context) -> bool:
+    """Young, same package, and nothing actuated since it was read."""
+    if held is None or time.monotonic() - held.taken > REUSE_MAX_AGE_S:
+        return False
+    if ctx.package and held.package != ctx.package:
+        return False
+    return held.gen == dump_reuse.token(str(ctx.serial or ""))
 
 
 async def _take_carried(ctx: Context) -> dict | None:
@@ -76,9 +88,7 @@ async def _take_carried(ctx: Context) -> dict | None:
     if not ctx.carry_screen:
         return None
     held = _CARRIED.pop(str(ctx.serial or ""), None)
-    if held is None or time.monotonic() - held.taken > REUSE_MAX_AGE_S:
-        return None
-    if ctx.package and held.package != ctx.package:
+    if not _is_current(held, ctx):
         return None
     focus = await _focus_probe(ctx.serial, REUSE_PROBE_S)
     if not focus or focus != held.activity:

@@ -8,6 +8,7 @@ from tools.mobile.replay.screen import _stamp_after
 from tools.mobile.replay.settle_mark import SettleJob, SettleOpts
 from tools.mobile.replay.settle_run import _settle
 from tools.mobile.replay.waits_poll import _wait_until_element
+from tools.mobile.replay.waits_prior import note_gone
 from tools.mobile.replay.waits_spec import _condition_words
 from tools.mobile.replay.waits_text import _wait_until_idle, _wait_until_text
 from tools.mobile.replay.waits_types import (
@@ -17,6 +18,11 @@ from tools.mobile.replay.waits_types import (
     WaitSpec,
     WaitView,
 )
+
+
+def _is_gone(action: object, kind: str) -> bool:
+    """Whether the condition was for something to disappear."""
+    return kind == "gone" or bool(getattr(action, "until_gone", False))
 
 
 def _element_want(action: object, spec: WaitSpec) -> ElementWait:
@@ -82,6 +88,17 @@ def _miss_words(interruption: str, label: str) -> str:
     return interruption and interruption + " (while " + label + ")"
 
 
+async def _on_met(run: _ReplayRun, step: CondStep, met: tuple) -> tuple:
+    """Record a met condition and settle: ``(screen, stop reply or None)``."""
+    action, spec, entry = step
+    screen, words = met
+    entry["outcome"], entry["detail"] = "ok", words
+    if _is_gone(action, spec[0]):
+        note_gone(run.ctx)
+    screen, stop = await _settle_met(run, step, screen)
+    return screen, (None if stop is None else {"error": None, "content": stop})
+
+
 async def _condition_wait(run: _ReplayRun, step: CondStep, screen: object) -> tuple:
     """A wait on a text, element or idle condition: ``(screen, reply)``.
 
@@ -93,10 +110,9 @@ async def _condition_wait(run: _ReplayRun, step: CondStep, screen: object) -> tu
     )
     met, missed, label = _condition_words(action, spec[0], spec[1])
     if found:
-        entry["outcome"], entry["detail"] = "ok", met
-        screen, stop = await _settle_met(run, step, screen)
+        screen, stop = await _on_met(run, step, (screen, met))
         if stop is not None:
-            return screen, {"error": None, "content": stop}
+            return screen, stop
     else:
         _record_miss(entry, _miss_words(interruption, label), missed)
     _stamp_after(entry, screen)

@@ -54,6 +54,7 @@ from handlers.mobile.run_request import (  # noqa: F401
     _MobileTestRequest,
 )
 from handlers.mobile.run_route import _mobile_test_route
+from handlers.mobile.run_skipped import take_note
 from handlers.mobile.run_source import _mobile_pick_source, _SourceCall  # noqa: F401
 from handlers.mobile.run_start import _mobile_avd_of as mobile_avd_of  # noqa: F401
 from handlers.mobile.run_start import _mobile_start as mobile_start  # noqa: F401
@@ -135,6 +136,11 @@ async def _mobile_prepare_app(
     return await _prepare_tail(req, serial, (target, taken, captured))
 
 
+async def _start_notes(serial: str) -> str:
+    """Notes that go before the start reply: skipped install, heavy AVD."""
+    return await take_note(serial) + await _mobile_heavy_avd_note(serial)
+
+
 async def _mobile_new_run(req: _MobileTestRequest) -> str:
     """The new-run path: pick the source, claim a device, prepare, start."""
     picked, owner, early = await _new_run_open(req)
@@ -151,7 +157,7 @@ async def _mobile_new_run(req: _MobileTestRequest) -> str:
         if not picked:
             return req.source_menu()
         reply, handed_off = await _new_run_start(req, (picked, owner, serial), prepared)
-        return idle_note + await _mobile_heavy_avd_note(serial) + reply
+        return idle_note + await _start_notes(serial) + reply
     finally:
         if not handed_off:
             await _mobile_finish_pre_run(owner)

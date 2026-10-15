@@ -134,6 +134,12 @@ class AdbDeviceUi(_ScrollMixin):
         done = await self._adb.launch(self.serial, package)
         return not done.get("error")
 
+    async def open_link(self, url: str, package: str) -> bool:
+        """Open *url* in *package* only (a VIEW intent); True when it started."""
+        self._last = None
+        done = await self._adb.open_url(self.serial, url, package)
+        return not done.get("error")
+
     async def foreground(self) -> str:
         got = await self._adb.current_activity(self.serial)
         return str(got.get("content") or "").split("/", 1)[0]

@@ -39,6 +39,9 @@ def packet_turn(run_id: str, held: Held, now: float | None) -> dict:
     packet = mobile_run.build_explore_turn(
         body, screen, mobile_run.ExploreRef(run_id=run_id, remaining=left)
     )
+    note = (body.get("auto_replay") or {}).get("note")
+    if note and isinstance(packet, dict):
+        packet["auto_replay"] = note
     return turn_result(RUNNING, body, TurnParts(screen, packet, left))
 
 

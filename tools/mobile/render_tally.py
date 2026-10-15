@@ -56,6 +56,11 @@ def _step_name(action: dict) -> str:
     return "(unnamed field)"
 
 
+#: The words a type or fill step's detail carries when the read-back could not
+#: answer (``ADVANCED_NOTE`` and the fill fallback both say it).
+UNKNOWN_READBACK = "read-back is unknown"  # the shared marker phrase
+
+
 def _type_steps(rows: list[dict]) -> list[tuple[str, str]]:
     """``(field, outcome)`` of every type or fill step, in trace order."""
     steps: list[tuple[str, str]] = []
@@ -64,12 +69,15 @@ def _type_steps(rows: list[dict]) -> list[tuple[str, str]]:
             action: Any = item.get("action") if isinstance(item, dict) else None
             if not isinstance(action, dict) or action.get("op") not in ("type", "fill"):
                 continue
-            name = _step_name(action)
-            steps.append((name, str(item.get("outcome") or "")))
+            outcome = str(item.get("outcome") or "")
+            if outcome == "ok" and UNKNOWN_READBACK in str(item.get("detail") or ""):
+                outcome = "unconfirmed"
+            steps.append((_step_name(action), outcome))
     return steps
 
 
-def _typed_outcomes(rows: list[dict]) -> tuple[int, list[str]]:
+def _typed_outcomes(rows: list[dict]) -> tuple[int, list[str], int]:
+    """``(verified, failed names, unconfirmed)``: unknown read-back is not verified."""
     steps = _type_steps(rows)
     failed: list[str] = []
     for name, outcome in steps:
@@ -79,7 +87,8 @@ def _typed_outcomes(rows: list[dict]) -> tuple[int, list[str]]:
         elif outcome in ("device_error", "refused"):
             failed.append(name)
     verified = sum(1 for _, outcome in steps if outcome == "ok")
-    return verified, failed
+    unconfirmed = sum(1 for _, outcome in steps if outcome == "unconfirmed")
+    return verified, failed, unconfirmed
 
 
 def _is_explore(rows: list[dict]) -> bool:
@@ -89,13 +98,15 @@ def _is_explore(rows: list[dict]) -> bool:
 
 def _typed_field_tally(rows: list[dict], explore: bool = False) -> str:
     """ "N typed fields verified, M failed", naming each failed field."""
-    verified, failed = _typed_outcomes(rows)
-    if not verified and not failed:
+    verified, failed, unconfirmed = _typed_outcomes(rows)
+    if not verified and not failed and not unconfirmed:
         return ""
     # An explore turn that stumbled is a warning: the run's verdict is the final
     # done(pass), not every step. A suite case that failed still says "failed".
     word = "warnings" if explore or _is_explore(rows) else "failed"
     line = str(verified) + " typed fields verified, " + str(len(failed)) + " " + word
+    if unconfirmed:
+        line += ", " + str(unconfirmed) + " unconfirmed (read-back unknown)"
     if failed:
         line += ": " + ", ".join(repr(name[:60]) for name in failed[:12])
         if len(failed) > 12:

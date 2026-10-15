@@ -104,6 +104,14 @@ def ambiguous_role_detail(count: Any) -> str:
     )
 
 
+#: Appended for a `type` that missed: its field is found by a name, not an id.
+TYPE_HINT = (
+    " For `type`: name the field by its visible label or hint (or use `fill` "
+    "with that label); with exactly one empty input field on screen the "
+    "replay types into it without a name."
+)
+
+
 # Why a target resolved to nothing, in the model's own terms.
 #
 # Five answers, because they need five different next moves, and a model told
@@ -124,6 +132,11 @@ def ambiguous_role_detail(count: Any) -> str:
 def missing_element_detail(resolved: Any) -> str:
     """Why a target resolved to nothing, in the model's own terms."""
     body = resolved if isinstance(resolved, dict) else {}
+    detail = _missing_reason(body)
+    return detail + TYPE_HINT if body.get("op") == "type" else detail
+
+
+def _missing_reason(body: dict) -> str:
     candidates = _candidates(body)
     if candidates > 1:
         return ambiguous_role_detail(candidates)

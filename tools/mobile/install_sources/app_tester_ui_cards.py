@@ -6,9 +6,9 @@ from typing import Optional, Union
 
 from tools.mobile.install_source import InstallOutcome
 from tools.mobile.install_sources.app_tester_ui_consts import (
+    APP_TESTER_PACKAGE,
     APP_TESTER_POLL_S,
     MAX_BACK_TO_LIST,
-    MAX_LISTING_SCROLLS,
     SleepFn,
     _Flow,
     _Run,
@@ -20,6 +20,7 @@ from tools.mobile.install_sources.app_tester_ui_funcs import (
     _tap_failed,
     _unresolved_message,
 )
+from tools.mobile.install_sources.app_tester_ui_link import open_by_link
 from tools.mobile.install_sources.app_tester_ui_rows import is_listing, matching_rows
 from tools.mobile.install_sources.app_tester_ui_scan import scan_listing
 from tools.mobile.resolve import Candidate, PickOpts, resolve_or_ask
@@ -32,6 +33,9 @@ class _CardMixin:
     """The listing steps of the flow."""
 
     async def _open_card(self: _Flow, run: _Run, xml: str) -> Optional[InstallOutcome]:
+        if await open_by_link(run, APP_TESTER_PACKAGE, self._sleep):
+            run.card_tapped = True
+            return None
         picked = await self._pick_row(run, xml)
         if isinstance(picked, InstallOutcome):
             return picked
@@ -58,8 +62,7 @@ class _CardMixin:
     ) -> Optional[InstallOutcome]:
         """Tap the row by its bundle id. With scroll_back, a row off the
         screen is reached by scrolling back the offsets the scan read it at;
-        only when that misses is it looked for, at most MAX_LISTING_SCROLLS
-        scrolls up."""
+        a miss is a failed tap (no blind scrolling)."""
         tapped = await run.ui.tap_text(text)
         if scroll_back and not tapped:
             tapped = await _scroll_to_row(run, text)
@@ -86,16 +89,13 @@ async def _pick_by_label(
 
 
 async def _scroll_to_row(run: _Run, text: str) -> bool:
-    """Scroll back to the row's remembered offset and tap it; else look up."""
+    """Scroll back exactly to the row's remembered offset and tap it. A row with
+    no remembered offset is not looked for blindly: False."""
     want, here = run.offsets.get(text), run.pos
     if want is not None:
         for _ in range(abs(here - want)):
             await (run.ui.scroll_up() if here > want else run.ui.scroll_down())
         run.pos = want
-        if await run.ui.tap_text(text):
-            return True
-    for _ in range(MAX_LISTING_SCROLLS):
-        await run.ui.scroll_up()
         if await run.ui.tap_text(text):
             return True
     return False

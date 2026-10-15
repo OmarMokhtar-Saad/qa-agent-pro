@@ -5,11 +5,13 @@ from __future__ import annotations
 from typing import NamedTuple, Optional, Union
 
 from tools.mobile.install_source import InstallOutcome, InstallRequest
+from tools.mobile.install_sources import app_tester_ui_memory as memory
 from tools.mobile.install_sources.app_tester_ui_consts import (
     APP_TESTER_PACKAGE,
     _Flow,
     _Run,
 )
+from tools.mobile.install_sources.app_tester_ui_link import open_by_link
 from tools.mobile.resolve import AskCb
 
 
@@ -20,6 +22,8 @@ class ListedApp(NamedTuple):
     label: str
     tester: str = APP_TESTER_PACKAGE
     package: str = ""
+    #: Firebase app id (or a tester link holding it): opens the page by link.
+    firebase_id: str = ""
 
 
 _LAUNCH_FAILED = InstallOutcome(
@@ -46,4 +50,7 @@ class _PickMixin:
         if shot is None:
             return _LAUNCH_FAILED
         run = _Run(ui, InstallRequest(want.serial, want.package, want.label), ask, None)
+        memory.remember_app_id(want.package, want.firebase_id)
+        if await open_by_link(run, want.tester, self._sleep):
+            return want.package
         return await self._pick_row(run, shot.xml)

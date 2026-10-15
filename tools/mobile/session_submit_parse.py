@@ -8,6 +8,7 @@ from tools.mobile import actions as actions_mod
 from tools.mobile import carry_policy, case_runner
 from tools.mobile import charter as charter_mod
 from tools.mobile.replay.context import Context
+from tools.mobile.replay.dump import _drop_carried
 from tools.mobile.session_core import STATE_RUNNING
 from tools.mobile.session_explore_ids import explore_turn_case_id
 from tools.mobile.session_explore_prior import (
@@ -37,9 +38,11 @@ def _explore_needs_model(reason: str, resolved: dict) -> dict:
 
 
 def _prime_explore_turn(run_id: str, ctx: Context, payload: dict) -> None:
-    """Expect the apps this turn names; carry the screen only after an inert turn."""
+    """Expect the apps this turn names; start on the carried reply screen when known."""
     ctx.expect_apps = tuple(actions_mod.expect_apps_from(payload))
-    ctx.carry_screen = carry_policy.allowed(run_id)
+    if not carry_policy.allowed(run_id):
+        _drop_carried(getattr(ctx, "serial", ""))
+    ctx.carry_screen = True
 
 
 def _noted_outcome(run_id: str, replayed: dict) -> dict:

@@ -83,5 +83,6 @@ async def app_tester_stage(call: _AppCall, target: str) -> tuple:
         return await _open_tester_store(call.serial), target
     label = call.value or target
     known = await known_package(call.serial, label)
-    want = ListedApp(call.serial, label, tester, known)
+    link = call.source_text
+    want = ListedApp(call.serial, label, tester, known, link)
     return await _install_listed(call, want)

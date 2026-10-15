@@ -47,7 +47,7 @@ async def dump_raw_reusing(serial: str) -> dict:
     :mod:`tools.mobile.dump_reuse`) and it is younger than its age bound, or
     this takes a real dump.
     """
-    held = dump_reuse.take(serial)
+    held = dump_reuse.take_after_refusal(serial) or dump_reuse.take(serial)
     if held is not None:
         step_timing.mark("dump_reused_raw")
         return held

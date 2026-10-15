@@ -19,7 +19,7 @@ import json
 import logging
 from typing import Any
 
-from tools.mobile import app_store
+from tools.mobile import app_flows_meta, app_store
 from tools.mobile.app_flows_check import secret_fields, template_from_script
 from tools.mobile.app_flows_consts import (
     ALLOWED_OPS,
@@ -74,7 +74,9 @@ def _add_flow(body: dict, name: str, template: dict) -> str:
         return (
             "this app already has %d saved flows; delete one first" % MAX_FLOWS_PER_APP
         )
-    flows[name] = {"params": list(template["params"]), "steps": list(template["steps"])}
+    entry = {"params": list(template["params"]), "steps": list(template["steps"])}
+    meta = app_flows_meta.clean(template.get("meta"), len(entry["steps"]))
+    flows[name] = dict(entry, meta=meta) if meta else entry
     return ""
 
 
@@ -116,7 +118,15 @@ def get_flow(package: Any, name: Any) -> dict:
     entry = flows.get(name) if isinstance(flows, dict) else None
     if not isinstance(entry, dict):
         return _err("no saved flow with that name")
-    return template_from_script(entry.get("steps"))
+    return _with_meta(template_from_script(entry.get("steps")), entry)
+
+
+def _with_meta(got: dict, entry: dict) -> dict:
+    """*got* (a parsed template) carrying the entry's per-step screen record."""
+    if not got.get("error"):
+        meta = app_flows_meta.clean(entry.get("meta"), len(got["content"]["steps"]))
+        got["content"] = dict(got["content"], meta=meta) if meta else got["content"]
+    return got
 
 
 def list_flows(package: Any) -> dict:
@@ -133,6 +143,8 @@ def list_flows(package: Any) -> dict:
                 "steps": len(template["steps"]),
                 "params": template["params"],
                 "fields": secret_fields(template),
+                "reached": app_flows_meta.reached(template),
+                "covers": app_flows_meta.covers(template),
             }
         )
     return {"error": None, "content": rows}

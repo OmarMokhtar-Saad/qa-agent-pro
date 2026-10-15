@@ -5,8 +5,9 @@ from __future__ import annotations
 from typing import Any, NamedTuple
 
 from tools.mobile import actions as actions_mod
+from tools.mobile import fill_fallback
 from tools.mobile.replay.context import STATUS_NEEDS_MODEL, _ReplayRun, _result
-from tools.mobile.replay.elements import missing_element_detail
+from tools.mobile.replay.elements import _screen_elements, missing_element_detail
 from tools.mobile.replay.steps_stop import StepAt, _close, _reply, _stop
 from tools.mobile.replay.steps_text import _fill_element, _tap_text_element
 from tools.mobile.replay.verdicts import _actuated
@@ -47,6 +48,28 @@ def _missing_stop(run: _ReplayRun, at: StepAt, resolution: dict) -> dict:
     return _reply(_result(stop, selector_stale=stale, actuated=_actuated(run.trace)))
 
 
+def _target_label(target: Any) -> str:
+    """The words a ``type`` target used to name its field (any selector)."""
+    body = target if isinstance(target, dict) else {}
+    keys = ("text", "label", "desc", "hint", "rid", "id")
+    return " ".join(str(body[k]) for k in keys if isinstance(body.get(k), str))
+
+
+def _type_fallback(target: Any, at: StepAt) -> Any:
+    """The one empty input field a ``type`` whose target missed may stand in on.
+
+    Same rule as a ``fill`` whose label missed: exactly one empty input-capable
+    field with no name of its own, or a name sharing a word with the target.
+    ``None`` when the screen has none or several.
+    """
+    found = fill_fallback.candidates(_screen_elements(at.screen))
+    label = _target_label(target)
+    if len(found) != 1 or not fill_fallback.fits(label, found[0]):
+        return None
+    at.entry["fill_note"] = fill_fallback.used_note(label, found[0])
+    return found[0]
+
+
 # ``assert`` is exempt for the same reason ``scroll`` is, and it
 # matters more: a missing element IS the answer an
 # ``assert kind="element"`` was asked for. Letting the generic
@@ -68,8 +91,11 @@ def _target_element(
     resolution = (resolved or {}).get("content") or {}
     element = resolution.get("element")
     scroll_missed = element is None and aim.op == "scroll"
+    if element is None and aim.op == "type":
+        element = _type_fallback(aim.ref, at)
     if element is None and aim.op not in ("scroll", "assert"):
-        return element, scroll_missed, _missing_stop(run, at, resolution)
+        seen = {**resolution, "op": aim.op}
+        return element, scroll_missed, _missing_stop(run, at, seen)
     return element, scroll_missed, None
 
 
