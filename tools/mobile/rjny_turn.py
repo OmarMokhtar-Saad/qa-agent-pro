@@ -52,7 +52,7 @@ def _turn_meta(f: dict) -> str:
     """``"3 steps · 1.2 s"``: the step count and, when known, the wall time."""
     meta = [_count(len(f["rows"]), "step")]
     if f["wall"] is not None:
-        meta.append(fmt_ms(f["wall"]))
+        meta.append(fmt_ms(f["wall"]) + " on device")
     return " · ".join(meta)
 
 

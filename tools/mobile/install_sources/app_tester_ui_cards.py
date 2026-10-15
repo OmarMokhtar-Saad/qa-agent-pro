@@ -20,11 +20,8 @@ from tools.mobile.install_sources.app_tester_ui_funcs import (
     _tap_failed,
     _unresolved_message,
 )
-from tools.mobile.install_sources.app_tester_ui_rows import (
-    is_listing,
-    matching_rows,
-    parse_rows,
-)
+from tools.mobile.install_sources.app_tester_ui_rows import is_listing, matching_rows
+from tools.mobile.install_sources.app_tester_ui_scan import scan_listing
 from tools.mobile.resolve import Candidate, PickOpts, resolve_or_ask
 from tools.untrusted import wrap_untrusted
 
@@ -41,42 +38,77 @@ class _CardMixin:
         return await self._tap_card(run, picked, scroll_back=True)
 
     async def _pick_row(self: _Flow, run: _Run, xml: str) -> Union[str, InstallOutcome]:
-        """The bundle id of the app's row: the request's package when listed,
-        else the one row matching the label. Several matches, or one match on
+        """The bundle id of the app's row: the request's package (only a hint)
+        when listed and no second row fits the label, else the one row matching
+        the label. Several matches, or one match on
         a list not read to its end, are asked about."""
         listing = await _to_listing(run, xml, self._sleep)
         if listing is None:
             return _not_on_list()
-        rows, whole = await _scan_listing(run, listing)
-        if any(row.bundle == run.request.package for row in rows):
-            return run.request.package
+        rows, whole = await scan_listing(run, listing)
         label = run.request.app_label.strip()
-        if not label:
-            return _label_required()
-        hits = matching_rows(label, rows)
-        if not hits:
-            return _rows_not_found(label, rows)
-        if len(hits) == 1:
-            return str(hits[0].bundle) if whole else await _confirm_row(run, hits[0])
-        return await _ask_row(run, hits)
+        hits = matching_rows(label, rows) if label else []
+        listed = any(row.bundle == run.request.package for row in rows)
+        if listed and len(hits) < 2:
+            return run.request.package
+        return await _pick_by_label(run, label, (hits, rows, whole))
 
     async def _tap_card(
         self: _Flow, run: _Run, text: str, scroll_back: bool = False
     ) -> Optional[InstallOutcome]:
-        """Tap the row by its bundle id. With scroll_back, a row that is not on
-        the current screen is looked for by scrolling up, at most
-        MAX_LISTING_SCROLLS times."""
+        """Tap the row by its bundle id. With scroll_back, a row off the
+        screen is reached by scrolling back the offsets the scan read it at;
+        only when that misses is it looked for, at most MAX_LISTING_SCROLLS
+        scrolls up."""
         tapped = await run.ui.tap_text(text)
-        for _ in range(MAX_LISTING_SCROLLS if scroll_back else 0):
-            if tapped:
-                break
-            await run.ui.scroll_up()
-            tapped = await run.ui.tap_text(text)
+        if scroll_back and not tapped:
+            tapped = await _scroll_to_row(run, text)
         if not tapped:
             return _tap_failed(text)
         run.card_tapped = True
-        await self._sleep(APP_TESTER_POLL_S)
+        await _wait_left_listing(run, self._sleep)
         return None
+
+
+async def _pick_by_label(
+    run: _Run, label: str, found: tuple
+) -> Union[str, InstallOutcome]:
+    """The row the label names: one hit is taken (confirmed when the list was
+    not read whole), several are asked about."""
+    if not label:
+        return _label_required()
+    hits = found[0]
+    if not hits:
+        return _rows_not_found(label, found[1])
+    if len(hits) == 1:
+        return str(hits[0].bundle) if found[2] else await _confirm_row(run, hits[0])
+    return await _ask_row(run, hits)
+
+
+async def _scroll_to_row(run: _Run, text: str) -> bool:
+    """Scroll back to the row's remembered offset and tap it; else look up."""
+    want, here = run.offsets.get(text), run.pos
+    if want is not None:
+        for _ in range(abs(here - want)):
+            await (run.ui.scroll_up() if here > want else run.ui.scroll_down())
+        run.pos = want
+        if await run.ui.tap_text(text):
+            return True
+    for _ in range(MAX_LISTING_SCROLLS):
+        await run.ui.scroll_up()
+        if await run.ui.tap_text(text):
+            return True
+    return False
+
+
+async def _wait_left_listing(run: _Run, sleep: SleepFn) -> None:
+    """After the tap, poll the screen until the list is gone (the app page is
+    up), at most MAX_BACK_TO_LIST reads; the pause is only between reads."""
+    for _ in range(MAX_BACK_TO_LIST):
+        shot = await run.ui.screen()
+        if shot is not None and not is_listing(shot.xml):
+            return
+        await sleep(APP_TESTER_POLL_S)
 
 
 async def _to_listing(run: _Run, xml: str, sleep: SleepFn) -> Optional[str]:
@@ -100,38 +132,6 @@ async def _read_until_listing(run: _Run, sleep: SleepFn) -> str:
             break
         await sleep(APP_TESTER_POLL_S)
     return xml
-
-
-async def _rewind(run: _Run, xml: str) -> str:
-    """Scroll up until the list stops moving (its top), at most
-    MAX_LISTING_SCROLLS times, so rows above the start are read too."""
-    for _ in range(MAX_LISTING_SCROLLS):
-        await run.ui.scroll_up()
-        shot = await run.ui.screen()
-        if shot is None or parse_rows(shot.xml) == parse_rows(xml):
-            break
-        xml = shot.xml
-    return xml
-
-
-async def _scan_listing(run: _Run, xml: str) -> tuple:
-    """From the top, scroll the list until the package's row shows, a scroll
-    adds no new row (end of list), a screen cannot be read, or
-    MAX_LISTING_SCROLLS scrolls were made. Returns (every row read in list
-    order, whether the scan stopped before the scroll cap)."""
-    rows = parse_rows(xml)
-    if not any(row.bundle == run.request.package for row in rows):
-        rows = parse_rows(await _rewind(run, xml))
-    for _ in range(MAX_LISTING_SCROLLS):
-        if any(row.bundle == run.request.package for row in rows):
-            return rows, True
-        await run.ui.scroll_down()
-        shot = await run.ui.screen()
-        fresh = [r for r in parse_rows(shot.xml if shot else "") if r not in rows]
-        if not fresh:
-            return rows, True
-        rows += fresh
-    return rows, any(row.bundle == run.request.package for row in rows)
 
 
 async def _confirm_row(run: _Run, row) -> Union[str, InstallOutcome]:

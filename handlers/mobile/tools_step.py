@@ -40,7 +40,7 @@ def _register_mobile_submit_step_tool(mcp, kit, rt) -> None:
 
         The reply is the verdict plus the NEXT packet. For a credential, ask the TESTER for that field and pass it as tester_input with tester_input_field (several: tester_inputs='{"login_password": "...", "login_otp": "..."}'); it is typed into the app and stored nowhere. Pass confirm_destructive=true only after the TESTER confirms a guard stop.
 
-        `note`: as on `qa_mobile_test`. Never report a screen state, field value or login outcome that was not read from a qa_* observation. If the server cannot type or act, stop and report the blocker by name. Do not fall back to raw adb input, and do not claim a result. `finding`: explore runs only, one observation per turn."""
+        `note`: as on `qa_mobile_test`. Report only what a qa_* observation read. If the server cannot type or act, stop and name the blocker; no raw adb, no claimed result. `finding`: explore runs only, one observation per turn."""
         fields = {k: v for k, v in locals().items() if k not in _STEP_UNSENT}
         return await rt._mobile_reply(
             rt.MobileReplySpec(

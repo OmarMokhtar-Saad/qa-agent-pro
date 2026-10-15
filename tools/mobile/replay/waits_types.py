@@ -13,6 +13,13 @@ class Probe(NamedTuple):
     label: str
 
 
+class Pace(NamedTuple):
+    """One poll's timing: the monotonic *deadline* and the *pause* before its read."""
+
+    deadline: float
+    pause: float
+
+
 class TextWait(NamedTuple):
     """Wait for *text* to appear (or, with *gone*, to leave) within *ms*."""
 

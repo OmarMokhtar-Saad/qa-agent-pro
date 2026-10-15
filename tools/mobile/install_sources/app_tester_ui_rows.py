@@ -18,6 +18,7 @@ LIST_RID = ":id/appListRecyclerView"
 ROW_RID = ":id/row"
 AAB_SETUP_RID = ":id/aab_instructions_dialog_container"
 _END = "</hierarchy>"
+_BOUNDS_RE = re.compile(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]")
 _SPLIT_RE = re.compile(r"[\s|.\-_]+")
 
 
@@ -78,3 +79,24 @@ def matching_rows(label: str, rows) -> list:
     if not want:
         return []
     return [row for row in rows if want <= _words(row.name) | _words(row.bundle)]
+
+
+def _top_edge(node: ElementTree.Element) -> int | None:
+    found = _BOUNDS_RE.fullmatch(node.get("bounds") or "")
+    return int(found.group(2)) if found else None
+
+
+def list_at_top(xml: str) -> bool:
+    """True when the list's first row starts at the list's own top edge: a
+    list scrolled down has its first row cut off or lower. Without bounds on
+    both, nothing is proven (False)."""
+    root = _root(xml)
+    if root is None:
+        return False
+    nodes = list(root.iter("node"))
+    lists = [n for n in nodes if _rid(n).endswith(LIST_RID)]
+    rows = [n for n in nodes if _rid(n).endswith(ROW_RID)]
+    if not lists or not rows:
+        return False
+    top, first = _top_edge(lists[0]), _top_edge(rows[0])
+    return top is not None and first is not None and first == top

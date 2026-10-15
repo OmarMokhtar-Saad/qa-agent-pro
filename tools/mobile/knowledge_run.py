@@ -63,6 +63,12 @@ _MAX_FACTS = 64
 _TASKS: set = set()
 
 
+def _known(value: object) -> str:
+    """A version read, with the literal ``null`` of a missing field as unknown."""
+    text = str(value or "")
+    return "" if text.strip().lower() in ("null", "none") else text
+
+
 async def read_app_version(serial: str, package: str, *, shell=None) -> tuple[str, str]:
     """``(versionName, versionCode)`` of the installed app, ``("", "")`` on failure."""
     try:
@@ -70,7 +76,7 @@ async def read_app_version(serial: str, package: str, *, shell=None) -> tuple[st
         if got is None:
             return "", ""
         code = "" if got.version_code is None else str(got.version_code)
-        return str(got.version_name or ""), code
+        return _known(got.version_name), _known(code)
     except Exception:
         logger.exception("knowledge: step failed")
         return "", ""
@@ -93,7 +99,7 @@ def _remember(facts: RunFacts) -> None:
 
 
 async def _version(ctx: object, package: str, known: dict) -> tuple:
-    name, code = known.get("app_version") or "", known.get("version_code") or ""
+    name, code = _known(known.get("app_version")), _known(known.get("version_code"))
     if not name and package:
         serial = str(getattr(ctx, "serial", "") or "")
         name, code = await read_app_version(serial, package)

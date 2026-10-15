@@ -19,6 +19,7 @@ class ListedApp(NamedTuple):
     serial: str
     label: str
     tester: str = APP_TESTER_PACKAGE
+    package: str = ""
 
 
 _LAUNCH_FAILED = InstallOutcome(
@@ -44,5 +45,5 @@ class _PickMixin:
         shot = await ui.screen()
         if shot is None:
             return _LAUNCH_FAILED
-        run = _Run(ui, InstallRequest(want.serial, "", want.label), ask, None)
+        run = _Run(ui, InstallRequest(want.serial, want.package, want.label), ask, None)
         return await self._pick_row(run, shot.xml)

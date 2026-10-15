@@ -10,7 +10,7 @@ import hashlib
 import re
 from typing import Any
 
-from tools.mobile import actions, kstg_foreign, run_store
+from tools.mobile import kstg_foreign, run_store
 from tools.mobile.app_flows_consts import MAX_FLOW_NAME_CHARS, OK_OUTCOMES
 
 MIN_STEPS = 2
@@ -42,11 +42,14 @@ def normalise(goal: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", goal.lower()))
 
 
-def flow_name(goal: str) -> str:
-    """A valid flow name keyed by the normalised goal: a short slug plus its hash."""
+def flow_name(goal: str, reserve: int = 0) -> str:
+    """A valid flow name keyed by the normalised goal: a short slug plus its hash.
+
+    *reserve* characters stay free for a ``-pN`` packet suffix.
+    """
     norm = normalise(goal)
     digest = hashlib.sha1(norm.encode("utf-8")).hexdigest()[:_HASH_CHARS]
-    room = MAX_FLOW_NAME_CHARS - _HASH_CHARS - 1
+    room = MAX_FLOW_NAME_CHARS - _HASH_CHARS - 1 - reserve
     slug = norm.replace(" ", "-")[:room].strip("-") or "goal"
     return "%s-%s" % (slug, digest)
 
@@ -65,4 +68,4 @@ def app_actions(steps: list, package: str) -> list:
         and kstg_foreign.own(rec, package)
         and str(rec.get("outcome") or "") in OK_OUTCOMES
     ]
-    return out[: actions.MAX_MODEL_ACTIONS]
+    return out

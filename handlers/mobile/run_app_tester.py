@@ -5,7 +5,7 @@ from __future__ import annotations
 from handlers import _common
 from handlers.mobile.run_request import _AppCall, _mobile_ask
 from tools.mobile import adb as mobile_adb
-from tools.mobile import app_alias
+from tools.mobile import app_alias, app_stage_pick, resolve_cache, run_store
 from tools.mobile.install_source import InstallOutcome, InstallRequest
 from tools.mobile.install_sources.app_tester_ui import AppTesterUiSource
 from tools.mobile.install_sources.app_tester_ui_pick import ListedApp
@@ -62,6 +62,18 @@ async def _install_listed(call: _AppCall, want: ListedApp) -> tuple:
     return "", bundle
 
 
+async def known_package(serial: str, label: str) -> str:
+    """The package this label is already known to name on this device: the
+    resolved-app cache first, then the one installed app the label fits (no
+    question is asked here). ``""`` when neither knows. Only a hint for the
+    list scan: a package the list does not hold changes nothing."""
+    key = resolve_cache.cache_key(serial, label)
+    cached = run_store.read_resolved_app(key) if label else {}
+    if cached.get("package"):
+        return str(cached["package"])
+    return (await app_stage_pick.pick_installed(serial, label)).package
+
+
 async def app_tester_stage(call: _AppCall, target: str) -> tuple:
     """Launch the installed App Tester, find the app named by the hint in its
     list, install it (Download + system installer) and continue the run with
@@ -69,5 +81,7 @@ async def app_tester_stage(call: _AppCall, target: str) -> tuple:
     tester = await installed_tester(call.serial)
     if not tester:
         return await _open_tester_store(call.serial), target
-    want = ListedApp(call.serial, call.value or target, tester)
+    label = call.value or target
+    known = await known_package(call.serial, label)
+    want = ListedApp(call.serial, label, tester, known)
     return await _install_listed(call, want)

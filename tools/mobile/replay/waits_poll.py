@@ -13,7 +13,7 @@ from tools.mobile.replay.context_consts import (
 from tools.mobile.replay.dump import DUMP_CUT_DETAIL, _dump
 from tools.mobile.replay.screen import _screen_has_element
 from tools.mobile.replay.waits_interrupt import _interruption_of
-from tools.mobile.replay.waits_types import Probe
+from tools.mobile.replay.waits_types import Pace, Probe
 
 
 def _wait_deadline(ctx: Context, seconds: float) -> float:
@@ -23,17 +23,12 @@ def _wait_deadline(ctx: Context, seconds: float) -> float:
     )
 
 
-async def _next_read(ctx: Context, current: object, deadline: float) -> tuple:
-    """Sleep one poll, then read: ``(final_or_None, content)``.
+async def _read_now(ctx: Context, current: object, deadline: float) -> tuple:
+    """One dump: ``(final_or_None, content)``.
 
     *final* is the ``(found, screen, timed_out)`` answer when the wait ends on
-    this read (deadline, a cut dump or a device error); otherwise ``None``.
+    this read (a cut dump or a device error); otherwise ``None``.
     """
-    if time.monotonic() >= deadline:
-        return (False, current, True), None
-    await _sleep(min(WAIT_POLL_S, max(0.0, deadline - time.monotonic())))
-    if time.monotonic() >= deadline:
-        return (False, current, True), None
     # Cut at the deadline like every other poll's dump, so a slow dump cannot
     # carry the wait past its bound; a cut is never a device interruption.
     dumped = await _dump(ctx, deadline=deadline)
@@ -45,14 +40,35 @@ async def _next_read(ctx: Context, current: object, deadline: float) -> tuple:
     return None, dumped.get("content")
 
 
+async def _next_read(ctx: Context, current: object, pace: Pace) -> tuple:
+    """Pause, then read: ``(final_or_None, content, read_s)``.
+
+    ``read_s`` is how long the dump took, so the next pause can shrink by it.
+    """
+    deadline = pace.deadline
+    if time.monotonic() >= deadline:
+        return (False, current, True), None, 0.0
+    await _sleep(min(pace.pause, max(0.0, deadline - time.monotonic())))
+    if time.monotonic() >= deadline:
+        return (False, current, True), None, 0.0
+    started = time.monotonic()
+    final, content = await _read_now(ctx, current, deadline)
+    return final, content, time.monotonic() - started
+
+
+def _pause_after(took: float) -> float:
+    """The pause before the next read: a dump that already took a poll interval
+    or longer is itself the pause, so none is added."""
+    return 0.0 if took >= WAIT_POLL_S else WAIT_POLL_S
+
+
 # ``probe.met(previous, current)`` is the condition; ``previous`` is ``None``
 # until a poll has replaced the screen the wait started on.
 async def _wait_for(ctx: Context, screen: object, probe: Probe) -> tuple:
     """THE watched condition poll behind the text, gone and idle waits."""
     budget = (probe.ms / 1000.0) if probe.ms else DEFAULT_WAIT_UNTIL_TEXT_S
     deadline = _wait_deadline(ctx, budget)
-    previous: object = None
-    current = screen
+    previous, current, took = None, screen, 0.0
     ticker = watch.Ticker(probe.label)
     while True:
         if probe.met(previous, current):
@@ -61,7 +77,9 @@ async def _wait_for(ctx: Context, screen: object, probe: Probe) -> tuple:
         if interruption:
             ctx.wait_interruption = interruption
             return False, current, False
-        final, content = await _next_read(ctx, current, deadline)
+        final, content, took = await _next_read(
+            ctx, current, Pace(deadline, _pause_after(took))
+        )
         if final:
             return final
         previous, current = current, content

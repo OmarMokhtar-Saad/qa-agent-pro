@@ -8,6 +8,7 @@ from tools.mobile import actions as actions_mod
 from tools.mobile import fill_fallback, fill_label
 from tools.mobile.replay.context import STATUS_NEEDS_MODEL, _ReplayRun, _result
 from tools.mobile.replay.elements import _screen_elements, resolve_tap_text
+from tools.mobile.replay.present_pick import resolve_optional_text
 from tools.mobile.replay.steps_stop import StepAt, _close, _reply, _stop
 
 
@@ -26,12 +27,19 @@ def _ambiguous_detail(picked: dict, wanted: str) -> str:
     )
 
 
+def _pick(action: Any, screen: Any) -> dict:
+    """The control a ``tap_text`` names; an OPTIONAL tap may narrow several."""
+    optional = getattr(action, "op", "") == "tap_text_if_present"
+    resolve = resolve_optional_text if optional else resolve_tap_text
+    return resolve(getattr(action, "text", ""), screen)
+
+
 def _tap_text_element(
     run: _ReplayRun, action: Any, at: StepAt
 ) -> tuple[Any, dict | None]:
     """A ``tap_text`` step's element, or ``None`` and the reply that stops on a
     text that names no control or several."""
-    picked = resolve_tap_text(getattr(action, "text", ""), at.screen)
+    picked = _pick(action, at.screen)
     element = picked.get("element")
     if element is not None:
         return element, None

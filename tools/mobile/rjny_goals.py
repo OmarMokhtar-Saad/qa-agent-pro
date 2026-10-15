@@ -18,7 +18,7 @@ def _goal_meta(facts: list) -> list:
     walls = [f["wall"] for f in facts if f["wall"] is not None]
     meta = [_count(len(facts), "turn"), _count(steps, "step")]
     if walls:
-        meta.append(fmt_ms(sum(walls)))
+        meta.append(fmt_ms(sum(walls)) + " on device")
     return meta
 
 

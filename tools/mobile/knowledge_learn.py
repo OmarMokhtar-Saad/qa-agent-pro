@@ -21,8 +21,10 @@ from tools.mobile import (
     knowledge_db,
     knowledge_limits,  # noqa: F401
     knowledge_run,
+    knowledge_run_store,
     knowledge_trace,  # noqa: F401
     knowledge_versions,  # noqa: F401
+    kstg_foreign,
     run_store,  # noqa: F401
 )
 from tools.mobile.knowledge_learn_rows import (  # noqa: F401
@@ -58,12 +60,20 @@ def _learn(conn, key: RunKey) -> dict:
     row = _ensure(conn, key.run_id)
     if row.get("learn_state") in ("learned", "skipped"):
         return {"state": row["learn_state"], "noop": True}
+    steps = knowledge_trace.load_steps(key.run_id)
+    why = kstg_foreign.package_problem(key.package, steps)
+    if why:
+        return _finish(conn, key, Outcome("skipped", why, {"skipped": why}))
     _begin(conn, key.run_id)
     summary, error = _walk(conn, key, row)
-    state = "failed" if error else "learned"
     _compact(conn)
-    _save(conn, key.run_id, Outcome(state, error, summary))
-    return {"state": state, "error": error, "summary": summary}
+    return _finish(conn, key, Outcome("failed" if error else "learned", error, summary))
+
+
+def _finish(conn, key: RunKey, out: Outcome) -> dict:
+    _save(conn, key.run_id, out)
+    knowledge_run_store.store_state(key.run_id, out.state)
+    return {"state": out.state, "error": out.error, "summary": out.summary}
 
 
 def _failed(key: RunKey, exc: Exception) -> dict:

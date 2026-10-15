@@ -40,6 +40,22 @@ from typing import Any
 from tools.mobile.session_explore_ids import EXPLORE_MODULE
 
 
+def _step_name(action: dict) -> str:
+    """The field a type or fill step named: its field, label or target id."""
+    target = action.get("target")
+    target = target if isinstance(target, dict) else {}
+    for value in (
+        action.get("field"),
+        action.get("label"),
+        target.get("label"),
+        target.get("text"),
+        target.get("rid"),
+    ):
+        if str(value or "").strip():
+            return str(value)[:40]
+    return "(unnamed field)"
+
+
 def _type_steps(rows: list[dict]) -> list[tuple[str, str]]:
     """``(field, outcome)`` of every type or fill step, in trace order."""
     steps: list[tuple[str, str]] = []
@@ -48,7 +64,7 @@ def _type_steps(rows: list[dict]) -> list[tuple[str, str]]:
             action: Any = item.get("action") if isinstance(item, dict) else None
             if not isinstance(action, dict) or action.get("op") not in ("type", "fill"):
                 continue
-            name = str(action.get("field") or "") or "(unnamed field)"
+            name = _step_name(action)
             steps.append((name, str(item.get("outcome") or "")))
     return steps
 

@@ -94,7 +94,8 @@ def _seen(ctx, key: str) -> bool:
 
 
 def _note_screen(ctx, screen: object) -> None:
-    if not kstg_foreign.screen_own(screen, str(getattr(ctx, "package", "") or "")):
+    package = str(getattr(ctx, "package", "") or "")
+    if not kstg_foreign.screen_own(screen, package, str(getattr(ctx, "activity", ""))):
         return
     sk = screen_key.screen_key(
         screen,

@@ -108,7 +108,7 @@ def _head_items(manifest: dict, cases: list) -> list:
     ]
     took = _duration(manifest, cases)
     if took:
-        items.append(("Duration", took))
+        items.append(("Elapsed (start to last case)", took))
     return items
 
 

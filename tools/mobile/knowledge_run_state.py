@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import time
 
-from tools.mobile import knowledge_db, knowledge_limits, run_store
+from tools.mobile import knowledge_db, knowledge_limits, knowledge_run_store, run_store
 from tools.mobile.knowledge_run_args import STATES, Move, RunKey
 
 logger = logging.getLogger("tools.mobile.knowledge_run")
@@ -43,6 +43,7 @@ def mark_state(key: RunKey, state: str, error: str = "") -> bool:
         return False
     try:
         _upsert_state(conn, key.run_id, Move(state, error))
+        knowledge_run_store.store_state(key.run_id, state)
         return True
     except Exception:
         logger.exception("knowledge run: mark_state failed")

@@ -7,8 +7,15 @@ value becomes a ``{field}`` placeholder, a secret step keeps only its field name
 
 from __future__ import annotations
 
+import re
+
 from tools.mobile import kplg_popup_ref
-from tools.mobile.app_flows_consts import ALLOWED_OPS, PLACEHOLDER_RE
+from tools.mobile.app_flows_consts import (
+    ALLOWED_OPS,
+    CREDENTIAL_WORDS,
+    MAX_PARAM_NAME_CHARS,
+    PLACEHOLDER_RE,
+)
 
 _TYPED = ("type", "fill")
 _TARGET_KEYS = ("rid", "text", "label", "role")
@@ -24,10 +31,20 @@ def _target(action: dict) -> dict:
     return {k: str(raw[k])[:200] for k in _TARGET_KEYS if raw.get(k)}
 
 
+def _label_param(label: str) -> str:
+    """The ``{param}`` a label-only fill becomes, or ``""`` when none is safe."""
+    name = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
+    name = ("f_" + name if name[:1].isdigit() else name)[: MAX_PARAM_NAME_CHARS - 1]
+    if any(word in CREDENTIAL_WORDS for word in name.split("_")):
+        return ""
+    return name if PLACEHOLDER_RE.fullmatch("{%s}" % name) else ""
+
+
 def _typed(action: dict, out: dict) -> dict:
     field = str(action.get("field") or "")
     if not field:
-        return {}
+        name = _label_param(out.get("label", ""))
+        return {**out, "text": "{%s}" % name} if name else {}
     out["field"] = field[:80]
     if action.get("secret"):
         out["secret"] = True

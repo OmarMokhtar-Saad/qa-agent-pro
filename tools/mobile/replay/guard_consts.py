@@ -37,10 +37,8 @@ CONFIRM_MISMATCH_HINT = (
 #: that no observation showed. Carried by every blocked-type reply, and
 #: restated in ``tools/guidance.py`` and both mobile tool docstrings.
 NO_FABRICATION_NOTE = (
-    "Never report a screen state, field value or login outcome that was not "
-    "read from a qa_* observation. If the server cannot type or act, stop and "
-    "report the blocker by name. Do not fall back to raw adb input, and do not "
-    "claim a result."
+    "Report only what a qa_* observation read. If the server cannot type or "
+    "act, stop and name the blocker; no raw adb, no claimed result."
 )
 
 

@@ -48,7 +48,7 @@ Send {"op": "clear_app_data"} as a script action to wipe this run's OWN app's da
 
 One script may carry SEVERAL actions -- up to actions.MAX_MODEL_ACTIONS (10), replayed in order until one needs the screen re-read or the case ends -- so batch what you already know you want done rather than one action per call: {"actions": [{"op": "tap", "text": "Email"}, {"op": "type", "text": "user@example.com"}, {"op": "tap", "text": "Continue"}, {"op": "assert", "kind": "new_text", "text": "Password"}]} is ONE submit, not four. A script that carries exactly one action still runs, but the reply says so: use more of the budget you already have per call.
 
-To type into a form field, prefer {"op": "fill", "label": "Email", "text": "user@example.com"} over a tap then a type: it finds the editable field by its hint, text or description, or the nearest field below or right of a matching label, taps it, types and checks the text landed. For a secret send "secret": true with "field" naming the tester input, never the value. If two fields match, the step is refused with the candidates named: resend with a narrower label.
+To type into a form field, prefer {"op": "fill", "label": "Email", "text": "user@example.com"} over a tap then a type: it finds the editable field by its hint, text or description, or the nearest field below or right of a matching label, taps it, types and checks the text landed. `field` is read only for a secret fill (a plain fill ignores it) and never replaces `text`: a plain fill needs `text`, as above. For a secret send "secret": true with "field" naming the tester input, never the value. If two fields match, the step is refused with the candidates named: resend with a narrower label.
 
 The NEXT packet carries a PNG of the screen only when the element list is not enough, when you pass screenshot=true, or when this script ENDS with {"op": "assert", "kind": "visual", "note": "<what to judge>"} (that stop is not charged as an escape, up to a cap). Its screen_image note says whether one is attached.
 
@@ -56,7 +56,7 @@ When the destructive guard stops a control and the TESTER confirms it, resubmit 
 
 Optional `env`="name=value,..." on qa_mobile_test declares this run's setup (e.g. backend=staging) so env-scoped app notes apply; a script may carry knowledge_feedback.
 
-Never report a screen state, field value or login outcome that was not read from a qa_* observation. If the server cannot type or act, stop and report the blocker by name. Do not fall back to raw adb input, and do not claim a result.
+Report only what a qa_* observation read. If the server cannot type or act, stop and name the blocker; no raw adb, no claimed result.
 
 A finished run's reply STARTS with a short verdict block (verdict, each requested step, the typed-field tally). Relay that block to the tester word for word -- never upgrade, soften or summarise it into a plainer claim than it makes.
 

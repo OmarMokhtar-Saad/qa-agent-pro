@@ -70,7 +70,8 @@ def _plain_turn_op(op: str, body: dict) -> list:
     if op == "assert":
         text = _text(body.get("text") or body.get("contains"), 80)
         if text:
-            return ["Checked that ", _q(text), " is on screen"]
+            gone = body.get("kind") == "text_absent"
+            return ["Checked that ", _q(text), " is gone" if gone else " is on screen"]
         return ["Checked the screen"]
     if op == "done":
         reason = _text(body.get("reason"), 200)

@@ -21,7 +21,16 @@ _SYMPTOM = {
     "element_missing": "%s was not found on this screen",
     "tester_correction": "a tester corrected the step on %s",
 }
-_NO_TARGET = "the screen"
+_NO_TARGET = ""
+_NO_TARGET_SYMPTOM = {
+    "field_collision": "two different fields were typed into on this screen",
+    "text_not_landed": "typing on this screen did not land",
+    "dead_tap": "a tap left the screen unchanged",
+    "wrong_screen": "an action led to a different screen than expected",
+    "timeout": "a wait on this screen timed out",
+    "element_missing": "the action had no target element on this screen",
+    "tester_correction": "a tester corrected a step on this screen",
+}
 
 
 def degraded(key: str) -> bool:
@@ -115,13 +124,23 @@ def find_hits(steps: list) -> list:
     return hits
 
 
+def _on(rec: dict) -> str:
+    return " on %s" % _name(rec) if _name(rec) else ""
+
+
+def _symptom(sig: str, rec: dict) -> str:
+    if _name(rec):
+        return _SYMPTOM[sig] % _name(rec)
+    return _NO_TARGET_SYMPTOM[sig]
+
+
 def texts(hit: dict) -> tuple:
     """``(symptom, fix)`` from templates and names only."""
     rec, prev, fix = hit["rec"], hit["prev"], hit["fix"]
-    symptom = _SYMPTOM[hit["sig"]] % _name(rec)
+    symptom = _symptom(hit["sig"], rec)
     if prev is not None and prev.get("op"):
-        symptom += " (after %s on %s)" % (prev.get("op"), _name(prev))
+        symptom += " (after %s%s)" % (prev.get("op"), _on(prev))
     fixed = ""
     if fix is not None:
-        fixed = "a later %s on %s worked on this screen" % (fix.get("op"), _name(fix))
+        fixed = "a later %s%s worked on this screen" % (fix.get("op"), _on(fix))
     return symptom[:200], join(fixed, detail(rec, fix))

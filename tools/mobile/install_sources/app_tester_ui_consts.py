@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, NamedTuple, Optional, Protocol
 
 from tools.mobile.app_info import AppVersion
@@ -46,6 +46,10 @@ class _Run:
     card_tapped: bool = False
     release_done: bool = False
     tapped: int = 0
+    #: bundle id -> scroll offset from the scan's start the row was read at.
+    offsets: dict = field(default_factory=dict)
+    #: current offset (scrolls) from the screen the scan started on.
+    pos: int = 0
 
 
 class Seen(NamedTuple):

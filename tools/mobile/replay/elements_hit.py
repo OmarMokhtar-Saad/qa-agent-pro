@@ -39,17 +39,25 @@ def _screen_elements(screen: Any) -> list:
 # :func:`actuated_element` is the one producer of "what does a tap here
 # actuate", and the same one the destructive guard is judged by, so the count
 # and the guard cannot disagree about a screen.
-def resolve_tap_text(text: Any, screen: Any) -> dict:
-    """``{"element", "candidates", "ambiguous"}`` for one `tap_text`."""
-    target, group = actions_mod.tap_text_candidates(text, screen)
-    if target is None:
-        return {"element": None, "candidates": 0, "ambiguous": False}
+def tap_text_controls(text: Any, screen: Any) -> tuple[list, list]:
+    """``(controls, elements)``: the distinct controls a `tap_text` word would
+    actuate, and the screen's element list they came from."""
+    _target, group = actions_mod.tap_text_candidates(text, screen)
     controls = {}
     for element in group:
         point = _center(element)
         actuated = actuated_element(screen, point) if point else None
         chosen = actuated if isinstance(actuated, dict) else element
         controls[actions_mod._identity(chosen)] = chosen
+    return list(controls.values()), _screen_elements(screen)
+
+
+def resolve_tap_text(text: Any, screen: Any) -> dict:
+    """``{"element", "candidates", "ambiguous"}`` for one `tap_text`."""
+    target, group = actions_mod.tap_text_candidates(text, screen)
+    if target is None:
+        return {"element": None, "candidates": 0, "ambiguous": False}
+    controls, _elements = tap_text_controls(text, screen)
     if len(controls) > action_consts.TAP_TEXT_MAX_CANDIDATES:
         return {"element": None, "candidates": len(controls), "ambiguous": True}
     resolved = (actions_mod.resolve_target(target, screen) or {}).get("content") or {}

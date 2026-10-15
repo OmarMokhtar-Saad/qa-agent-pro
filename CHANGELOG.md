@@ -4,7 +4,7 @@ All notable changes to QA Agent Pro are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.113.0] - 2026-10-15
+## [1.114.0] - 2026-10-15
 
 ### Added
 
@@ -29,32 +29,41 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Mobile runs are faster: the next step reuses the screen the last step
-  already read instead of reading it again, and a tap already waits for the
-  screen to settle, so a script can batch a whole form and its submit in one
-  turn.
-- New script op `tap_text_if_present`: taps the element whose text matches,
-  and does nothing and continues if it is absent; use it for optional popups
-  instead of a separate read turn.
-- Waits for a condition can now run up to 120 seconds; fixed waits stay capped
-  at 40 seconds.
-- An older QA keyboard on the phone is upgraded in place. If its signature
-  does not match, you get a one-line uninstall command; the keyboard is never
-  removed for you. The fastest screen reading needs a newer QA keyboard
-  release than the one this version installs.
+- Optional popup checks (`tap_text_if_present`) return as soon as the
+  screen is settled instead of polling for the whole wait; text found on
+  several controls picks the clickable one in the top dialog, or exact
+  text, and otherwise skips with a note instead of stopping the script.
+- Polled waits no longer add a pause after a screen read that was already
+  slow.
+- App Tester stops at the app's row when the package is known, no longer
+  scrolls up first, scrolls back exactly to the row it found, and waits
+  for the app page by watching the screen instead of a fixed pause.
+- A learned flow longer than one script is saved whole as ordered parts
+  (name-p1, -p2, ...) to replay in order, instead of being cut at 10
+  steps; past 4 parts nothing is saved and the reason is recorded.
+- Learning saved before 1.113.0 is used again: it is moved to the current
+  screen id when exactly one current screen matches, as that app is
+  learned; old rows that match several screens go stale 30 days after
+  that app's first move, and rows no screen matches or of other apps
+  are left alone.
+- The report says "is gone" for absent-text checks, labels the header time
+  "Elapsed" and step times "on device", and names fills by their label or
+  id.
+- The drive tool tells the model to report only tool-proven results, never
+  mark an unexercised check passed, ask before skipping a goal step, and
+  prove a destination with present text or a screen check.
 
 ### Fixed
 
-- An OTP or PIN field that cannot be read back after typing is no longer
-  reported as a device error that fails the case; its result is unknown.
-- A `fill` whose label matches no field fills the only empty input field on
-  the screen whose name fits the label, or one with no name; otherwise it
-  lists the empty fields so the next step can name the right one.
-- The login and OTP screens are no longer mistaken for the same screen, and a
-  tap is only reported as having done nothing once the screen settled
-  unchanged.
-- Exploration runs report stumbles as warnings, not failures, and a field
-  that failed and was then typed successfully is not counted as failed.
-- After a run the device lease shows as released, the stop text says the run
-  already finished when it recorded an end, and the reset hint no longer
-  fires on unrelated text.
+- Typing into a field the app submits by itself (such as an OTP) no longer
+  stops the script or shows as "refused": the step is ok with a "screen
+  advanced" note and the following waits run.
+- A `fill` sent with `field` but no `text` gets an error that says exactly
+  what to send.
+- Learning no longer picks up screens of other apps such as App Tester,
+  and skips runs whose app is unknown or matches no screen seen; a version
+  read of "null" counts as unknown.
+- A run's saved learn state matches the knowledge store, a fill known only
+  by its label stays in saved flows as a parameter named after the label
+  (no value stored; credential-like labels are not saved), and mistakes
+  with no target get a plain note.

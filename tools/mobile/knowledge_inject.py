@@ -103,6 +103,17 @@ def stable_block(run_id: Any) -> str:
         return ""
 
 
+def _screen_items(snap: dict, screen: Any, key: str) -> list:
+    """Items under the screen's key plus those still stored under its old ``sk1`` key."""
+    items = _items(snap, key)
+    legacy = screen_key.legacy_key(screen)
+    if not legacy:
+        return items
+    have = {str(i.get("id")) for i in items}
+    more = [i for i in _items(snap, legacy) if str(i.get("id")) not in have]
+    return sorted(items + more, key=sort_key)
+
+
 def screen_rules(run_id: Any, screen: Any) -> str:
     try:
         snap = knowledge_snapshot.for_run(run_id) or knowledge_snapshot.load_for_run(
@@ -111,7 +122,7 @@ def screen_rules(run_id: Any, screen: Any) -> str:
         sk = screen_key.screen_key(screen)
         if getattr(sk, "degraded", True):
             return ""
-        return screen_text(_items(snap, sk.key))
+        return screen_text(_screen_items(snap, screen, sk.key))
     except Exception:
         logger.exception("screen_rules failed")
         return ""

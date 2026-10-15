@@ -12,6 +12,8 @@ from tools.mobile.replay.know_guard import NoteStep
 from tools.mobile.replay.knowledge import _apply_knowledge
 from tools.mobile.replay.loop_dispatch import _dispatch_op
 from tools.mobile.replay.loop_open import _step_prelude
+from tools.mobile.replay.present_pick import resolve_optional_text
+from tools.mobile.replay.present_wait import present_read
 from tools.mobile.replay.steps_assert import Seen
 from tools.mobile.replay.steps_done import _ask_tester_step, _done_stop
 from tools.mobile.replay.steps_elem import Aim, _resolve_element
@@ -25,7 +27,6 @@ from tools.mobile.replay.steps_know import (
     _knowledge_target,
 )
 from tools.mobile.replay.steps_stop import StepAt, _budget_stop, _close
-from tools.mobile.replay.waits import _wait_until_text
 from tools.mobile.replay.waits_cond import _needs_model_reply
 from tools.mobile.replay.waits_types import TextWait
 
@@ -114,25 +115,38 @@ async def _run_step(run: _ReplayRun, turn: Turn, cur: Cur) -> dict | None:
 
 
 async def _present_cur(run: _ReplayRun, turn: Turn, cur: Cur) -> Cur | dict | None:
-    """``tap_text_if_present``: poll (bounded) for its text. Present gives the
-    plain ``tap_text`` step to run; absent records ``ok`` (skipped) and gives ``None``.
-    A poll cut short (a crash, a dialog, another app) is NOT absence: it is
-    recorded ``interrupted`` and the reply hands the screen back to the model.
+    """``tap_text_if_present``: look (bounded) for its text. Present gives the
+    plain ``tap_text`` step to run; absent, or on several controls with none
+    clearly right, records ``ok`` (skipped) and gives ``None``: it never fails
+    the script. A look cut short (a crash, a dialog, another app) is NOT
+    absence: it is recorded ``interrupted`` and the model gets the screen.
     """
     action = cur.aim.ref
     want = TextWait(action.text, int(action.max_s * 1000))
-    found, screen, _ = await _wait_until_text(run.ctx, turn.state.screen, want)
-    interruption, run.ctx.wait_interruption = run.ctx.wait_interruption, ""
-    turn.state.screen = screen
-    if found:
-        return Cur(Aim("tap_text", action), cur.at._replace(screen=screen))
-    if interruption:
-        return _interrupted_reply(run, cur.at._replace(screen=screen), interruption)
-    cur.at.entry.update(
-        outcome="ok", detail="`" + action.text[:80] + "` absent, skipped"
+    found, screen, interruption = await present_read(
+        run.ctx, turn.state, (cur.at.position, want)
     )
-    _close(run, cur.at._replace(screen=screen))
-    return None
+    turn.state.screen = screen
+    at = cur.at._replace(screen=screen)
+    if interruption:
+        return _interrupted_reply(run, at, interruption)
+    if found and resolve_optional_text(action.text, screen)["element"] is not None:
+        return Cur(Aim("tap_text", action), at)
+    return _skipped(run, at, _skip_detail(action.text, found))
+
+
+def _skip_detail(text: str, found: bool) -> str:
+    """Why an optional tap did nothing: its text never showed, or it showed
+    but no single control could be tapped (several matches, or none of them
+    a tappable control)."""
+    note = "found but no single control to tap" if found else "not found"
+    return "`" + text[:80] + "` " + note + ", skipped"
+
+
+def _skipped(run: _ReplayRun, at: StepAt, detail: str) -> None:
+    """Record an optional tap as ``ok`` (skipped) and go on."""
+    at.entry.update(outcome="ok", detail=detail)
+    _close(run, at)
 
 
 def _interrupted_reply(run: _ReplayRun, at: StepAt, interruption: str) -> dict:

@@ -149,6 +149,22 @@ def screen_key(screen: object, package: str = "", activity: str = "") -> ScreenK
         return ScreenKey("sk1d:" + _sha("error"), "", (), "", True)
 
 
+def legacy_from(package: str, activity: str, anchors: Any) -> str:
+    """The ``sk1`` key a screen had before the input structure joined the hash."""
+    parts = (str(package), str(activity), "|".join(str(a) for a in anchors or ()))
+    return "sk1:" + _sha("|".join(parts))
+
+
+def legacy_key(screen: object, package: str = "", activity: str = "") -> str:
+    """The old ``sk1`` key of a perception screen, ``""`` when it is degraded."""
+    sk = screen_key(screen, package, activity)
+    if sk.degraded:
+        return ""
+    body = screen if isinstance(screen, dict) else {}
+    package = str(package or body.get("package") or "")
+    return legacy_from(package, sk.activity, sk.anchors)
+
+
 def similarity(a_anchors: Any, b_anchors: Any) -> float:
     """Jaccard overlap of two anchor collections; 0.0 when both are empty."""
     try:

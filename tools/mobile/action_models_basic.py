@@ -125,6 +125,13 @@ class TypeAction(_Base):
         return self
 
 
+_FILL_NEEDS_TEXT = (
+    "fill needs `text` (missing or blank): pass the value to type as `text`; "
+    "`field` is only for a secret fill and cannot stand in for it, "
+    'e.g. {"op": "fill", "label": "Email", "text": "user@example.com"}'
+)
+
+
 class FillAction(_Base):
     """Type into the field a visible LABEL names -- no selector needed.
 
@@ -158,7 +165,7 @@ class FillAction(_Base):
                     "asked for) and must leave text empty"
                 )
         elif not self.text.strip():
-            raise ValueError("fill needs text")
+            raise ValueError(_FILL_NEEDS_TEXT)
         return self
 
 

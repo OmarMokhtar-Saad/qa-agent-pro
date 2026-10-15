@@ -44,12 +44,21 @@ def _version(lc) -> str:
     return str(getattr(lc.facts, "app_version", "") or "")
 
 
+def _rekeyed(old: dict, item: Item) -> bool:
+    """True when the row sits under an old ``sk1`` key and this run saw it under ``sk2``."""
+    return str(old.get("screen_key") or "").startswith("sk1:") and str(
+        item.key[0]
+    ).startswith("sk2:")
+
+
 def _reorder(conn, plan: Plan) -> bool:
     old, lc = plan.old, plan.item.lc
     keep = {k: old[k] for k in _KEEP if k in old}
     new = {
         **keep,
-        "screen_key": old["screen_key"],
+        "screen_key": plan.item.key[0]
+        if _rekeyed(old, plan.item)
+        else old["screen_key"],
         "fp_json": old["fp_json"],
         "fp_hash": old["fp_hash"],
         "locators_json": plan.after,
@@ -90,7 +99,7 @@ def update(conn, old: dict, item: Item) -> bool:
     hits = int(old.get("hits") or 0) + item.obs["hits"]
     misses = int(old.get("misses") or 0) + item.obs["misses"]
     plan = Plan(old, item, after, hits, misses)
-    if [e["l"] for e in after] != [e["l"] for e in before]:
+    if _rekeyed(old, item) or [e["l"] for e in after] != [e["l"] for e in before]:
         return _reorder(conn, plan)
     return _in_place(conn, plan)
 
